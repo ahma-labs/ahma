@@ -79,7 +79,7 @@ impl GroupCounts {
             OpStatus::Running => self.running += 1,
             OpStatus::Pending | OpStatus::Waiting => self.queued += 1,
             OpStatus::Succeeded => self.succeeded += 1,
-            OpStatus::Failed | OpStatus::Cancelled => self.failed += 1,
+            OpStatus::Failed | OpStatus::Cancelled | OpStatus::Denied => self.failed += 1,
         }
     }
 

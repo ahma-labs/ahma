@@ -67,7 +67,7 @@ async fn run_ratatui(
     use ahma_common::daemon_hub::try_start_hub_server;
 
     let unicode = detect_unicode();
-    let theme = Theme::new(unicode);
+    let theme = Theme::with_color(unicode, !no_color());
     let mut state = AppState::new(
         &connection.display_url,
         connection.transport_label(),
@@ -102,9 +102,23 @@ async fn run_ratatui(
             state.current_provider_url = Some(profile.provider_url);
             state.llm_label = format!("profile:{} / {}", profile.name, profile.model);
         } else {
-            tracing::warn!("Failed to load profile override: {profile_name}");
+            // The user asked for a specific profile by name and did not get it;
+            // opening as if they had never passed the flag is a surprise.
+            crate::startup_notices::push(
+                crate::startup_notices::Level::Warn,
+                format!(
+                    "--profile {profile_name} could not be loaded; continuing without it. \
+                     Use /agent list to see the profiles saved for this project."
+                ),
+            );
         }
     }
+
+    // Everything that happened before the first frame (bridge restarts, a self
+    // re-exec, a refused reuse, this profile failure) surfaces here rather than
+    // in a log file the user was never told about.
+    drain_startup_notices(&mut state);
+    load_granted_scopes(&mut state);
 
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
     state.mcp_source_tx = Some(spawn_mcp_source(
@@ -343,7 +357,6 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         || handle_navigation_action(&action, state)
         || handle_approval_action(&action, state)
         || handle_operation_action(&action, state)
-        || handle_palette_action(&action, state)
         || handle_log_filter_action(&action, state)
         || handle_chat_action(&action, state)
         || handle_navigator_action(&action, state)
@@ -388,7 +401,7 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         Action::ToggleProjectFilter if state.focus == crate::state::Focus::OpsDag => {
             state.show_all_projects = !state.show_all_projects;
         }
-        Action::ToggleDetail | Action::AwaitOp | Action::Unknown | Action::Enter => {}
+        Action::Unknown | Action::Enter => {}
         _ => {}
     }
 }
@@ -715,7 +728,6 @@ fn scroll_focus_up(state: &mut crate::state::AppState) {
             state.chat_scroll = (state.chat_scroll + 1).min(max);
             state.sync_chat_scroll_to_animation();
         }
-        _ => {}
     }
 }
 
@@ -761,7 +773,6 @@ fn move_focus_to_top(state: &mut crate::state::AppState) {
             state.chat_scroll = state.chat_max_scroll.get();
             state.sync_chat_scroll_to_animation();
         }
-        _ => {}
     }
 }
 
@@ -781,7 +792,6 @@ fn move_focus_to_bottom(state: &mut crate::state::AppState) {
             state.chat_scroll = 0;
             state.sync_chat_scroll_to_animation();
         }
-        _ => {}
     }
 }
 
@@ -830,6 +840,50 @@ fn resolve_approval_always(state: &mut crate::state::AppState) {
 }
 
 #[cfg(feature = "tui")]
+/// Ask again for the path a selected denied operation was refused (SPEC
+/// R-PERM.7.1). This is the escape hatch a denial never had: the row that
+/// records the refusal is the place you answer it from.
+///
+/// The question is re-raised *through the instance's own broker* rather than
+/// faked locally, so the modal the user answers is the same one the automatic
+/// flow raises, resolves through the same coordinator, and persists through the
+/// same preview-and-approve path.
+#[cfg(feature = "tui")]
+fn reraise_grant_for_selected_op(state: &mut crate::state::AppState) {
+    use crate::state::{LogEntry, LogLevel, OpStatus};
+
+    // Inside the detail overlay, act on the operation being viewed rather than
+    // whatever the tree selection happens to be behind it — same rule as `c`.
+    let op = match &state.modal {
+        crate::state::ModalState::OperationDetail(d) => {
+            let id = d.op_id.clone();
+            state.operations.iter().find(|o| o.id == id).cloned()
+        }
+        _ => state.selected_op().cloned(),
+    };
+    let Some(op) = op else { return };
+
+    let Some((path, access)) = op.denial.clone().filter(|_| op.status == OpStatus::Denied) else {
+        state.push_log(LogEntry {
+            timestamp: chrono::Local::now(),
+            level: LogLevel::Info,
+            message: "[a] asks for sandbox access — select a denied operation first.".to_string(),
+        });
+        return;
+    };
+
+    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::ReRaiseScopeGrant {
+        path: path.clone(),
+        access: access.clone(),
+        target_instance_id: op.instance_id.clone(),
+    });
+    state.push_log(LogEntry {
+        timestamp: chrono::Local::now(),
+        level: LogLevel::Info,
+        message: format!("Asking again for {access} access to {path}…"),
+    });
+}
+
 fn send_daemon_msg(msg: ahma_common::daemon_hub::ClientMsg) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
@@ -886,6 +940,7 @@ fn handle_operation_action(
     match action {
         Action::CancelOp => request_cancel_selected_op(state),
         Action::PinOp => toggle_selected_op_pin(state),
+        Action::ReRaiseGrant => reraise_grant_for_selected_op(state),
         _ => return false,
     }
 
@@ -929,116 +984,6 @@ fn toggle_selected_op_pin(state: &mut crate::state::AppState) {
     {
         op.pinned = !op.pinned;
     }
-}
-
-#[cfg(feature = "tui")]
-fn handle_palette_action(
-    action: &crate::keymap::Action,
-    state: &mut crate::state::AppState,
-) -> bool {
-    use crate::keymap::Action;
-
-    match action {
-        Action::OpenPalette => open_palette(state),
-        Action::PaletteEsc => close_palette(state),
-        Action::PaletteChar(c) => {
-            if let Some(palette) = state.palette_mut() {
-                palette.input.push(*c);
-            }
-            refresh_palette_completions(state);
-        }
-        Action::PaletteBackspace => {
-            if let Some(palette) = state.palette_mut() {
-                palette.input.pop();
-            }
-            refresh_palette_completions(state);
-        }
-        Action::PaletteComplete => apply_palette_completion(state),
-        Action::PaletteDown => advance_palette_selection(state),
-        Action::PaletteUp => rewind_palette_selection(state),
-        Action::PaletteSubmit => submit_palette_command(state),
-        _ => return false,
-    }
-
-    true
-}
-
-#[cfg(feature = "tui")]
-fn open_palette(state: &mut crate::state::AppState) {
-    state.modal = crate::state::ModalState::Palette(crate::state::PaletteState::default());
-    refresh_palette_completions(state);
-    state.focus = crate::state::Focus::Palette;
-}
-
-#[cfg(feature = "tui")]
-fn close_palette(state: &mut crate::state::AppState) {
-    if state.palette().is_some() {
-        state.close_modal();
-    }
-    state.focus = crate::state::Focus::OpsDag;
-}
-
-#[cfg(feature = "tui")]
-fn refresh_palette_completions(state: &mut crate::state::AppState) {
-    let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
-    if let Some(palette) = state.palette_mut() {
-        palette.update_completions(&tools);
-    }
-}
-
-#[cfg(feature = "tui")]
-fn apply_palette_completion(state: &mut crate::state::AppState) {
-    let Some(palette) = state.palette_mut() else {
-        return;
-    };
-    let n = palette.completions.len();
-    if n == 0 {
-        return;
-    }
-
-    palette.selected_completion = (palette.selected_completion + 1) % n;
-    let idx = palette.selected_completion;
-    if let Some(name) = palette.completions.get(idx).cloned() {
-        palette.input = name;
-    }
-}
-
-#[cfg(feature = "tui")]
-fn advance_palette_selection(state: &mut crate::state::AppState) {
-    if let Some(palette) = state.palette_mut() {
-        let n = palette.completions.len();
-        if n > 0 {
-            palette.selected_completion = (palette.selected_completion + 1) % n;
-        }
-    }
-}
-
-#[cfg(feature = "tui")]
-fn rewind_palette_selection(state: &mut crate::state::AppState) {
-    if let Some(palette) = state.palette_mut() {
-        let n = palette.completions.len();
-        if n > 0 {
-            palette.selected_completion =
-                palette.selected_completion.checked_sub(1).unwrap_or(n - 1);
-        }
-    }
-}
-
-#[cfg(feature = "tui")]
-fn submit_palette_command(state: &mut crate::state::AppState) {
-    use crate::state::{LogEntry, LogLevel};
-
-    let cmd = state.palette().map(|p| p.input.clone()).unwrap_or_default();
-    close_palette(state);
-    if cmd.is_empty() {
-        return;
-    }
-
-    state.push_log(LogEntry {
-        timestamp: chrono::Local::now(),
-        level: LogLevel::Info,
-        message: format!("Command: {cmd}"),
-    });
 }
 
 #[cfg(feature = "tui")]
@@ -1329,6 +1274,7 @@ fn format_recent_ops(operations: &[crate::state::Operation]) -> String {
                 OpStatus::Failed => "FAILED",
                 OpStatus::Cancelled => "cancelled",
                 OpStatus::Waiting => "waiting",
+                OpStatus::Denied => "DENIED (sandbox)",
             };
             let name = op.display_name();
             let elapsed = op.elapsed_display();
@@ -1744,6 +1690,18 @@ fn handle_settings_key(
         return false;
     }
 
+    // Ctrl-C quits from everywhere, including here. This handler runs first in
+    // the dispatch chain and used to return `true` for every key, so the
+    // keymap's "Ctrl-C always quits" was false while the panel was open.
+    if key.code == KeyCode::Char('c')
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
+        state.should_quit = true;
+        return true;
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => state.settings_editor.close(),
         KeyCode::Up | KeyCode::Char('k') => state.settings_editor.item_up(),
@@ -1770,8 +1728,38 @@ fn handle_help_key(key: crossterm::event::KeyEvent, state: &mut crate::state::Ap
     }
 
     match (key.code, key.modifiers) {
-        (KeyCode::Esc, _) | (KeyCode::Char('?'), _) => {
+        // Ctrl-C quits from the help overlay too — it swallowed every key,
+        // which made the documented "Ctrl-C always quits" untrue exactly where
+        // a stuck user is most likely to try it.
+        (KeyCode::Char('c'), m) if m.contains(crossterm::event::KeyModifiers::CONTROL) => {
+            state.should_quit = true;
+            true
+        }
+        // `q` closes help, matching every other overlay in the app.
+        (KeyCode::Esc, _) | (KeyCode::Char('?'), _) | (KeyCode::Char('q'), _) => {
+            state.help_scroll = 0;
             state.close_modal();
+            true
+        }
+        // The overlay is taller than the screen it is capped to, so it scrolls.
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+            state.help_scroll = state.help_scroll.saturating_add(1);
+            true
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+            state.help_scroll = state.help_scroll.saturating_sub(1);
+            true
+        }
+        (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => {
+            state.help_scroll = state.help_scroll.saturating_add(10);
+            true
+        }
+        (KeyCode::PageUp, _) => {
+            state.help_scroll = state.help_scroll.saturating_sub(10);
+            true
+        }
+        (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
+            state.help_scroll = 0;
             true
         }
         _ => true,
@@ -1831,7 +1819,7 @@ fn active_picker_mut(state: &mut crate::state::AppState) -> Option<&mut crate::s
 /// keystroke as typed text (the bug where pressing "y" just sent "y" as a
 /// message), forcing the user to Tab away before the global keymap saw it.
 ///
-/// We deliberately bail when a text-entry overlay is active (navigator, palette,
+/// We deliberately bail when a text-entry overlay is active (navigator,
 /// pickers, log filter) so the user can still type a `y`/`n` there.
 #[cfg(feature = "tui")]
 fn handle_approval_key(
@@ -1963,6 +1951,14 @@ fn handle_web_approval_key(
             resolve_web_approval(state, WebApprovalDecision::AllowSession);
             true
         }
+        // SPEC R-WEB.5 defines three tiers. `AllowOnce` existed in the decision
+        // enum and had a log branch here, but no key ever produced it — one of
+        // the three specified tiers was unreachable, so "I'm not sure yet" had
+        // no answer short of allowing the whole session.
+        (KeyCode::Char('o'), KeyModifiers::NONE) => {
+            resolve_web_approval(state, WebApprovalDecision::AllowOnce);
+            true
+        }
         (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
             resolve_web_approval(state, WebApprovalDecision::Deny);
             true
@@ -2080,6 +2076,18 @@ fn handle_chat_input_key(
         }
         (KeyCode::Esc, _) => {
             state.clear_chat_input();
+            true
+        }
+        // `?` on an empty input opens help, the same way `/` opens the
+        // navigator. Without this the help overlay was unreachable from the
+        // default screen state: both sub-windows default closed, so focus is
+        // Chat and the global `?` binding never fires — pressing `?` just
+        // typed a literal question mark while the help overlay's own first
+        // line claimed "? Toggle this help".
+        (KeyCode::Char('?'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+            if state.chat_input_is_empty() =>
+        {
+            state.modal = crate::state::ModalState::Help;
             true
         }
         (KeyCode::Char('/'), KeyModifiers::NONE) if state.chat_input_is_empty() => {
@@ -2458,6 +2466,9 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
                 state.focus = crate::state::Focus::Log;
             }
         }
+        // Informational sub-window (SPEC R5.4(b): the persistent TUI scope
+        // panel); not focusable, so plain toggle without a focus change.
+        "/scope" => state.scope_window_open = !state.scope_window_open,
         _ => return false,
     }
 
@@ -3213,6 +3224,53 @@ fn validate_nav_tool_run(tool: &str, state: &crate::state::AppState) -> Result<(
 }
 
 #[cfg(feature = "tui")]
+/// Read the user's persistent scope grants so the `/scope` panel can show
+/// which roots exist because the user granted them. Read-only: the write path
+/// stays with `ahma sandbox grant/revoke`, which gates every write behind the
+/// preview-and-approve exchange and the catastrophic-path denylist (SPEC
+/// R5.4.5) — machinery the TUI must not duplicate half-way.
+#[cfg(feature = "tui")]
+fn load_granted_scopes(state: &mut crate::state::AppState) {
+    let settings = ahma_common::config::AhmaSettings::load();
+    state.granted_scopes = settings
+        .sandbox
+        .persistent_scopes
+        .iter()
+        .map(|s| {
+            (
+                s.path.display().to_string(),
+                match s.access {
+                    ahma_common::config::ScopeAccess::Ro => "ro".to_string(),
+                    ahma_common::config::ScopeAccess::Rw => "rw".to_string(),
+                },
+            )
+        })
+        .collect();
+}
+
+/// Move the pre-UI startup notices onto the screen: all of them into the log
+/// pane, and the warnings additionally into the chat transcript, which is the
+/// pane that is open by default. A warning the user has to run `/log` to
+/// discover is not much better than one in a file.
+#[cfg(feature = "tui")]
+fn drain_startup_notices(state: &mut crate::state::AppState) {
+    use crate::startup_notices::Level;
+
+    for notice in crate::startup_notices::drain() {
+        state.push_log(crate::state::LogEntry {
+            timestamp: chrono::Local::now(),
+            level: match notice.level {
+                Level::Info => crate::state::LogLevel::Info,
+                Level::Warn => crate::state::LogLevel::Warn,
+            },
+            message: notice.message.clone(),
+        });
+        if notice.level == Level::Warn {
+            push_assistant_message(state, format!("Note: {}", notice.message));
+        }
+    }
+}
+
 fn push_assistant_message(state: &mut crate::state::AppState, content: impl Into<String>) {
     state.chat.push(crate::state::ChatEntry::Assistant {
         content: content.into(),
@@ -3957,7 +4015,7 @@ fn window_status_for(op: &crate::state::Operation) -> crate::state::WindowStatus
         OpStatus::Running => WindowStatus::Running,
         OpStatus::Pending | OpStatus::Waiting => WindowStatus::Pending,
         OpStatus::Succeeded => WindowStatus::Finished,
-        OpStatus::Failed => WindowStatus::Error,
+        OpStatus::Failed | OpStatus::Denied => WindowStatus::Error,
         OpStatus::Cancelled => WindowStatus::Cancelled,
     }
 }
@@ -4194,6 +4252,28 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             handle_event_tools_list_updated(tools, state);
         }
         SourceEvent::SandboxStatus { status } => state.sandbox_status = status,
+        SourceEvent::SandboxScope { scope } => {
+            // A successful configuration supersedes any recorded failure.
+            state.sandbox_failed_reason = None;
+            state.sandbox_scope = Some(scope);
+        }
+        SourceEvent::SandboxFailed { error } => {
+            state.sandbox_status = "FAILED".to_string();
+            // Keep the reason on state so the /scope window can show it after
+            // this log line scrolls away (SPEC R7.3: fail loudly, with
+            // instructions — a bare [FAILED] chip is neither).
+            state.sandbox_failed_reason = Some(error.clone());
+            state.push_log(crate::state::LogEntry {
+                timestamp: chrono::Local::now(),
+                level: crate::state::LogLevel::Error,
+                message: format!(
+                    "Sandbox configuration FAILED: {error} — tool calls are refused until a \
+                     scope locks. See /scope for details; fix the scope source (open a \
+                     workspace folder, pass --sandbox-scope, or configure [sandbox] \
+                     container_root) and restart."
+                ),
+            });
+        }
         SourceEvent::SessionId { id } => {
             state.session_id = if id.is_empty() { None } else { Some(id) };
         }
@@ -4357,12 +4437,25 @@ async fn run_text_stub(connection: &ResolvedConnection) -> Result<()> {
 
 // ─── Utility ─────────────────────────────────────────────────────────────────
 
+/// Whether to draw box-drawing and status glyphs rather than ASCII fallbacks.
+///
+/// Keyed on the terminal's own capability signal only. `NO_COLOR` used to gate
+/// this too, which inverted the standard's meaning: a user asking for no colour
+/// got ASCII glyphs *and* a fully coloured UI, since nothing here ever consulted
+/// it when choosing styles. Colour is [`no_color`]'s business; glyphs are this
+/// function's. See https://no-color.org.
 fn detect_unicode() -> bool {
-    std::env::var("NO_COLOR").is_err()
-        && !std::env::var("TERM")
-            .unwrap_or_default()
-            .to_lowercase()
-            .contains("dumb")
+    !std::env::var("TERM")
+        .unwrap_or_default()
+        .to_lowercase()
+        .contains("dumb")
+}
+
+/// Honour the `NO_COLOR` convention: any non-empty value means "do not emit
+/// colour". The standard is about colour specifically, so it must not also
+/// change which characters are drawn.
+pub fn no_color() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
 }
 
 fn http_base_url(connection: &ResolvedConnection) -> String {
@@ -4371,7 +4464,13 @@ fn http_base_url(connection: &ResolvedConnection) -> String {
         | crate::connection::ResolvedTransport::Http3(url) => url.clone(),
         #[cfg(unix)]
         crate::connection::ResolvedTransport::UnixSocket(path) => {
-            std::env::var("AHMA_HTTP_URL").unwrap_or_else(|_| format!("unix://{}", path))
+            // `AHMA_HTTP_URL` is retired (R-CFG1.2) and warn-and-ignored: it was
+            // an undocumented second way to redirect the endpoint, invisible to
+            // the retired-env drift test precisely because it was undocumented.
+            // `ahma tui --connect <URL>` does the same job at the invocation
+            // site, where it can be seen.
+            ahma_common::config::warn_retired_env("AHMA_HTTP_URL");
+            format!("unix://{}", path)
         }
     }
 }
@@ -4815,10 +4914,6 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
     }
     if inside_rect(col, row, state.ops_area.get()) {
         state.focus = crate::state::Focus::OpsDag;
-        return;
-    }
-    if inside_rect(col, row, state.detail_area.get()) {
-        state.focus = crate::state::Focus::OpsDag;
     }
 }
 
@@ -5090,6 +5185,9 @@ mod tests {
         use crate::state::AppState;
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        let _home = crate::HOME_SEAM_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("AHMA_TEST_HOME", dir.path());
         }
@@ -5141,6 +5239,9 @@ mod tests {
     fn persist_selected_model_writes_and_clears_agent_settings() {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        let _home = crate::HOME_SEAM_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("AHMA_TEST_HOME", dir.path());
         }
@@ -5531,6 +5632,39 @@ mod tests {
         );
     }
 
+    /// `?` on an empty chat input opens the help overlay — the default screen
+    /// state has both sub-windows closed, so the global `?` binding is
+    /// unreachable and this path is the only working route to help by key.
+    #[test]
+    fn question_mark_on_empty_input_opens_help() {
+        use crate::state::{AppState, Focus, ModalState};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+        let handled = super::handle_chat_input_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(handled);
+        assert!(matches!(state.modal, ModalState::Help));
+
+        // With text in the input, `?` is ordinary typing, not a shortcut: the
+        // editor consumes it and no modal opens.
+        state.modal = ModalState::None;
+        state.chat_input.insert_str("what");
+        super::handle_chat_input_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(matches!(state.modal, ModalState::None));
+        assert_eq!(
+            state.chat_input.lines(),
+            ["what?"],
+            "mid-sentence ? must be typed into the editor"
+        );
+    }
+
     /// When no approval is pending, `y` must fall through to normal handling.
     #[test]
     fn test_approval_key_ignored_without_pending_gate() {
@@ -5737,6 +5871,87 @@ mod tests {
         assert!(super::handle_basic_nav_command("/tasks", &mut state));
         assert!(state.tasks_window_open);
         assert_eq!(state.focus, Focus::OpsDag);
+    }
+
+    /// Startup notices reach the screen: everything into the log pane, and
+    /// warnings additionally into the chat transcript — the pane that is
+    /// actually open by default. Previously these were `tracing::warn!` into a
+    /// log file the user was never told about.
+    #[test]
+    fn startup_notices_surface_in_log_and_chat() {
+        use crate::startup_notices::{Level, TEST_GUARD, drain, push};
+        use crate::state::AppState;
+
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = drain();
+        push(Level::Info, "quietly reused the running server");
+        push(Level::Warn, "Restarted the running ahma server");
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::drain_startup_notices(&mut state);
+
+        assert_eq!(state.log.len(), 2, "both notices reach the log pane");
+        let chat: String = format!("{:?}", state.chat.entries());
+        assert!(
+            chat.contains("Restarted the running ahma server"),
+            "a warning must also be visible in chat: {chat}"
+        );
+        assert!(
+            !chat.contains("quietly reused"),
+            "info-level notices stay in the log pane"
+        );
+    }
+
+    /// `/scope` toggles the sandbox-scope window without stealing focus — it is
+    /// informational (SPEC R5.4(b): the persistent TUI scope panel).
+    #[test]
+    fn scope_command_toggles_scope_window() {
+        use crate::state::{AppState, Focus};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        assert!(super::handle_basic_nav_command("/scope", &mut state));
+        assert!(state.scope_window_open);
+        assert_eq!(state.focus, Focus::Chat, "no focus change");
+        assert!(super::handle_basic_nav_command("/scope", &mut state));
+        assert!(!state.scope_window_open);
+    }
+
+    /// A `sandbox/failed` event keeps its reason on state (for the /scope
+    /// window) and pushes an actionable error into the log pane; the next
+    /// successful configuration clears it.
+    #[test]
+    fn sandbox_failed_reason_is_kept_until_configured() {
+        use crate::mcp_source::SourceEvent;
+        use crate::state::AppState;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::handle_source_event(
+            SourceEvent::SandboxFailed {
+                error: "no usable roots".into(),
+            },
+            &mut state,
+        );
+        assert_eq!(state.sandbox_status, "FAILED");
+        assert_eq!(
+            state.sandbox_failed_reason.as_deref(),
+            Some("no usable roots")
+        );
+        assert!(
+            state
+                .log
+                .iter()
+                .any(|e| e.message.contains("no usable roots")),
+            "failure reason must reach the log pane"
+        );
+        super::handle_source_event(
+            SourceEvent::SandboxScope {
+                scope: crate::state::SandboxScopeInfo {
+                    write: vec!["/w".into()],
+                    ..Default::default()
+                },
+            },
+            &mut state,
+        );
+        assert!(state.sandbox_failed_reason.is_none());
+        assert_eq!(state.locked_scope_root(), Some("/w"));
     }
 
     /// Clicking a log row opens that line full-screen, wrapped, so a line wider

@@ -251,11 +251,19 @@ impl DaemonState {
         duration_ms: u64,
         ended_epoch_ms: Option<u64>,
         exit_code: Option<i64>,
+        denial: Option<ahma_common::daemon_hub::OpDenial>,
     ) {
         if let Some(instance_ops) = self.ops.get_mut(instance_id)
             && let Some(op) = instance_ops.get_mut(op_id)
         {
-            op.status = parse_op_status(status_str);
+            // A denial arrives as status "Failed" plus the denial field (the
+            // wire evolves by adding fields only, R24.5). The richer local
+            // status wins so the row can say `denied: <path>`.
+            op.status = match &denial {
+                Some(_) => OpStatus::Denied,
+                None => parse_op_status(status_str),
+            };
+            op.denial = denial.map(|d| (d.path, d.access));
             op.result_summary = result_summary;
             op.duration_ms = Some(duration_ms);
             op.exit_code = exit_code;
@@ -535,6 +543,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 duration_ms,
                 ended_epoch_ms,
                 exit_code,
+                denial,
             } => {
                 state.on_op_finished(
                     &instance_id,
@@ -544,6 +553,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                     duration_ms,
                     ended_epoch_ms,
                     exit_code,
+                    denial,
                 );
                 Applied::ListChanged
             }
@@ -564,6 +574,10 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
             DaemonEvent::LogLine { .. } => Applied::None, // not yet surfaced in TUI
         },
         DaemonMsg::Ping { .. } => Applied::None, // hub-to-instance ping; no state change for subscribers
+        // Instance-directed: the hub routes a TUI's re-raise request to the
+        // instance that owns the path. A subscriber seeing it has nothing to do
+        // — the re-raised question arrives as a normal ScopeGrantRequested.
+        DaemonMsg::ReRaiseScopeGrant { .. } => Applied::None,
         DaemonMsg::ChatToken { token } => Applied::ChatToken(token),
         DaemonMsg::ChatThinking { token } => Applied::ChatThinking(token),
         DaemonMsg::ApprovalRequested { id, tool, args } => {
@@ -756,6 +770,7 @@ mod tests {
             100,
             None,
             Some(0),
+            None,
         );
 
         let ops = s.all_ops();
@@ -770,7 +785,90 @@ mod tests {
         let mut s = DaemonState::new();
         s.add_instance(inst("i1", "Test"));
         // Should not panic.
-        s.on_op_finished("i1", "nonexistent-op", "Completed", None, 0, None, None);
+        s.on_op_finished(
+            "i1",
+            "nonexistent-op",
+            "Completed",
+            None,
+            0,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// A denial arrives as status "Failed" plus the `denial` field (the wire
+    /// evolves by adding fields only). The richer local status must win, so the
+    /// row can say *which path* was refused instead of a bare "failed", and so
+    /// the grant question can be re-raised for that pair (SPEC R-PERM.7/.7.1).
+    #[test]
+    fn denial_field_promotes_failed_to_denied() {
+        use ahma_common::daemon_hub::OpDenial;
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+        s.on_op_started(
+            "i1",
+            "op-1".to_string(),
+            "run_terminal_command".to_string(),
+            "touch /etc/foo".to_string(),
+            None,
+            None,
+            None,
+            OpWireIdentity::default(),
+        );
+        s.on_op_finished(
+            "i1",
+            "op-1",
+            "Failed",
+            Some("Operation not permitted".into()),
+            5,
+            None,
+            None,
+            Some(OpDenial {
+                path: "/etc".into(),
+                access: "rw".into(),
+            }),
+        );
+
+        let ops = s.all_ops();
+        assert_eq!(ops[0].status, OpStatus::Denied);
+        assert_eq!(ops[0].denial, Some(("/etc".into(), "rw".into())));
+        // The shared identity renderer must say "denied", not "failed".
+        let line = ops[0].identity().render(false);
+        assert!(line.contains("denied"), "identity line: {line}");
+        assert!(
+            line.contains("/etc"),
+            "identity line names the path: {line}"
+        );
+    }
+
+    /// An ordinary failure with no denial field stays a failure — the promotion
+    /// is driven by the field, never guessed from the status word.
+    #[test]
+    fn plain_failure_without_denial_stays_failed() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+        s.on_op_started(
+            "i1",
+            "op-1".to_string(),
+            "cargo".to_string(),
+            "cargo build".to_string(),
+            None,
+            None,
+            None,
+            OpWireIdentity::default(),
+        );
+        s.on_op_finished(
+            "i1",
+            "op-1",
+            "Failed",
+            Some("boom".into()),
+            5,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(s.all_ops()[0].status, OpStatus::Failed);
     }
 
     #[test]
@@ -797,7 +895,7 @@ mod tests {
             None,
             OpWireIdentity::default(),
         );
-        s.on_op_finished("i1", "op-a", "Completed", None, 0, None, None);
+        s.on_op_finished("i1", "op-a", "Completed", None, 0, None, None, None);
 
         let ops = s.all_ops();
         assert_eq!(ops.len(), 2);
@@ -861,7 +959,7 @@ mod tests {
             None,
             OpWireIdentity::default(),
         );
-        s.on_op_finished("i1", "op-2", "Failed", None, 0, None, None);
+        s.on_op_finished("i1", "op-2", "Failed", None, 0, None, None, None);
 
         // Stamp op-2's completion now, then let real time pass past a tiny
         // retention window — exercises the same "older than retention"
@@ -989,6 +1087,7 @@ mod tests {
                     duration_ms: 1200,
                     ended_epoch_ms: None,
                     exit_code: None,
+                    denial: None,
                 },
             },
         );
@@ -1189,7 +1288,7 @@ mod tests {
             None,
             OpWireIdentity::default(),
         );
-        s.on_op_finished("i1", "op-1", "Completed", None, 5, None, None);
+        s.on_op_finished("i1", "op-1", "Completed", None, 5, None, None, None);
         s.prune_terminal();
         let ops = s.all_ops();
         assert_eq!(ops.len(), 1, "recently completed op is retained");
@@ -1903,6 +2002,7 @@ mod tests {
                     duration_ms: 42,
                     ended_epoch_ms: None,
                     exit_code: None,
+                    denial: None,
                 },
             },
         )

@@ -19,6 +19,7 @@ pub mod mcp_connections;
 pub mod mcp_source;
 pub mod session_config;
 pub mod settings_editor;
+pub mod startup_notices;
 pub mod state;
 pub mod task_tree;
 pub mod theme;
@@ -27,6 +28,18 @@ pub mod ui;
 pub use connection::{ResolvedConnection, ResolvedTransport};
 
 use anyhow::Result;
+
+/// Serializes tests that redirect the home directory through the
+/// `AHMA_TEST_HOME` debug seam.
+///
+/// Environment variables are process-global. `cargo nextest` gives each test
+/// its own process, so these tests are isolated there — but under plain
+/// `cargo test` they share one process and race: two tests pointing the seam at
+/// different temp directories make one of them save into the other's, and the
+/// first to call `remove_var` unsets it for both. Taking this lock costs
+/// nothing under nextest and makes the suite correct under either runner.
+#[cfg(test)]
+pub static HOME_SEAM_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// CLI-resolved token/context preferences for the local-LLM chat agent.
 ///
@@ -52,10 +65,28 @@ pub async fn run_tui(
     path: Option<std::path::PathBuf>,
     token_prefs: TokenPrefs,
 ) -> Result<()> {
+    // Set by the previous process image when it re-exec'd itself to match a
+    // newer running bridge (see connection::handle_existing_candidate). The
+    // user saw the screen flicker and was never told why; the restarted
+    // process is the only one that can still say so.
+    if std::env::var("AHMA_RESTARTED").is_ok() {
+        startup_notices::push(
+            startup_notices::Level::Warn,
+            "This TUI restarted itself to match the newer ahma server already running.",
+        );
+    }
+
     if connect.is_none()
         && let Err(e) = connection::ensure_server_running(path.as_deref()).await
     {
-        tracing::warn!("Could not ensure server is running: {}", e);
+        // Not fatal — resolve_connection re-probes and may still find or start
+        // a server. But it must not be silent: this arm catches the version
+        // mismatch that says "please update TUI binary", the spawn timeout,
+        // and every other reason the usual path did not work.
+        startup_notices::push(
+            startup_notices::Level::Warn,
+            format!("Could not start or reuse a local ahma server: {e:#}"),
+        );
     }
     let connection = connection::resolve_connection(connect).await?;
     app::run(&connection, profile, path, token_prefs).await

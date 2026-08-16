@@ -22,7 +22,6 @@ pub enum SettingsCategory {
 
 impl SettingsCategory {
     pub const ALL: &[Self] = &[
-        Self::Features,
         Self::Tools,
         Self::Sandbox,
         Self::Logging,
@@ -43,15 +42,18 @@ impl SettingsCategory {
         }
     }
 
+    /// A short ASCII marker for the sidebar. Deliberately not emoji: SPEC R22.3
+    /// forbids them in terminal output, and these were rendered ungated by the
+    /// crate's unicode detection, so a non-Unicode terminal got mojibake.
     pub fn icon(self) -> &'static str {
         match self {
-            Self::Features => "⚡",
-            Self::Tools => "🔧",
-            Self::Sandbox => "🔒",
-            Self::Logging => "📋",
-            Self::Http => "🌐",
-            Self::Auth => "🔑",
-            Self::Instance => "🏷",
+            Self::Features => "-",
+            Self::Tools => "T",
+            Self::Sandbox => "S",
+            Self::Logging => "L",
+            Self::Http => "H",
+            Self::Auth => "A",
+            Self::Instance => "I",
         }
     }
 }
@@ -169,6 +171,9 @@ pub struct SettingsEditor {
     pub dirty: bool,
     /// Status message shown at the bottom ("✓ Saved", "⚠ Error", etc.)
     pub status_message: Option<(String, std::time::Instant)>,
+    /// Set once Esc has been pressed with unsaved changes pending, so the next
+    /// Esc discards deliberately rather than by accident.
+    pub confirming_discard: bool,
     /// Inline edit mode for string/numeric fields.
     pub editing: Option<String>,
 }
@@ -182,6 +187,7 @@ impl Default for SettingsEditor {
             selected_item: 0,
             dirty: false,
             status_message: None,
+            confirming_discard: false,
             editing: None,
         }
     }
@@ -199,10 +205,27 @@ impl SettingsEditor {
         self.status_message = None;
     }
 
-    /// Close the settings panel.
+    /// Close the panel. With unsaved changes the first attempt asks instead of
+    /// discarding: the footer says "unsaved changes", and throwing them away on
+    /// a single Esc contradicts it. A second Esc confirms.
     pub fn close(&mut self) {
+        if self.dirty && !self.confirming_discard {
+            self.confirming_discard = true;
+            self.status_message = Some((
+                "Unsaved changes — [s] saves, Esc again discards".into(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        self.force_close();
+    }
+
+    /// Close unconditionally, discarding any unsaved edits.
+    pub fn force_close(&mut self) {
         self.open = false;
         self.editing = None;
+        self.dirty = false;
+        self.confirming_discard = false;
     }
 
     /// The currently selected category.
@@ -242,15 +265,36 @@ impl SettingsEditor {
     }
 
     /// Toggle the currently selected boolean setting.
+    /// Toggle the selected setting, or explain why it cannot be toggled.
+    ///
+    /// Silence was the defect here: security-tier rows and every string/numeric
+    /// row simply ignored the keypress, so most of the panel looked broken
+    /// rather than read-only.
     pub fn toggle_current(&mut self) {
         let category = self.current_category();
         let mut items = self.items_for_category(category);
-        if let Some(item) = items.get_mut(self.selected_item)
-            && item.toggle()
-        {
+        let Some(item) = items.get_mut(self.selected_item) else {
+            return;
+        };
+        if item.toggle() {
             self.apply_item_to_settings(category, self.selected_item, &item.value);
             self.dirty = true;
+            return;
         }
+        let why = if item.security_tier {
+            // R-CFG2.3: the dangerous switches are CLI-flag-only by design, so
+            // they are always visible at the invocation site.
+            format!(
+                "{} is security-tier: set it with a CLI flag, not here",
+                item.key
+            )
+        } else {
+            format!(
+                "{} is not editable here — edit ~/.ahma/settings.toml",
+                item.key
+            )
+        };
+        self.status_message = Some((why, std::time::Instant::now()));
     }
 
     /// Reset the currently selected setting to its default.
@@ -753,23 +797,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toggle_feature() {
+    /// The panel opens on Tools now: the old first category (Features) held
+    /// five switches nothing in the workspace reads, so a user's first
+    /// interaction with settings was toggling controls wired to nothing.
+    fn toggle_first_category_item() {
         let mut editor = SettingsEditor::default();
-        assert!(editor.settings().features.simplify);
-        // selected_category=0 and selected_item=0 are already the defaults
+        assert_eq!(editor.current_category(), SettingsCategory::Tools);
+        editor.item_down(); // index 1 = force_sync (bool)
+        assert!(!editor.settings().tools.force_sync);
         editor.toggle_current();
-        assert!(!editor.settings().features.simplify);
+        assert!(editor.settings().tools.force_sync);
         assert!(editor.dirty);
     }
 
     #[test]
     fn reset_to_default() {
         let mut editor = SettingsEditor::default();
-        // selected_category=0 and selected_item=0 are already the defaults
-        editor.toggle_current(); // simplify → false
-        assert!(!editor.settings().features.simplify);
+        editor.item_down(); // Tools → force_sync (bool, default false)
+        editor.toggle_current();
+        assert!(editor.settings().tools.force_sync);
         editor.reset_current();
-        assert!(editor.settings().features.simplify);
+        assert!(!editor.settings().tools.force_sync);
     }
 
     #[test]
@@ -788,14 +836,14 @@ mod tests {
     #[test]
     fn category_navigation() {
         let mut editor = SettingsEditor::default();
-        assert_eq!(editor.current_category(), SettingsCategory::Features);
-        editor.category_down();
         assert_eq!(editor.current_category(), SettingsCategory::Tools);
+        editor.category_down();
+        assert_eq!(editor.current_category(), SettingsCategory::Sandbox);
         editor.category_up();
-        assert_eq!(editor.current_category(), SettingsCategory::Features);
+        assert_eq!(editor.current_category(), SettingsCategory::Tools);
         // Should not go below 0
         editor.category_up();
-        assert_eq!(editor.current_category(), SettingsCategory::Features);
+        assert_eq!(editor.current_category(), SettingsCategory::Tools);
     }
 
     #[test]
@@ -804,22 +852,83 @@ mod tests {
         let path = dir.path().join("settings.toml");
 
         let mut editor = SettingsEditor::default();
-        // selected_category=0 and selected_item=0 are already the defaults
+        editor.item_down(); // Tools → force_sync (bool)
         editor.toggle_current();
 
         editor.settings.save_to(&path).unwrap();
 
         let reloaded = AhmaSettings::load_from(&path);
-        assert!(!reloaded.features.simplify);
+        assert!(
+            reloaded.tools.force_sync,
+            "the edit round-trips through disk"
+        );
+    }
+
+    /// A row that cannot be toggled must say so. Silence made most of the
+    /// panel look broken: string and numeric rows swallowed Space with no
+    /// feedback, and so did the security-tier rows.
+    #[test]
+    fn non_toggleable_rows_explain_themselves() {
+        let mut editor = SettingsEditor::default();
+
+        // Sandbox item 0 is security-tier (CLI-flag-only per R-CFG2.3).
+        editor.category_down();
+        assert_eq!(editor.current_category(), SettingsCategory::Sandbox);
+        editor.toggle_current();
+        let (msg, _) = editor.status_message.clone().expect("must explain");
+        assert!(msg.contains("security-tier"), "got: {msg}");
+        assert!(
+            !editor.dirty,
+            "and must not pretend to have changed anything"
+        );
+
+        // Logging item 0 is a String — editable, but only in the file.
+        editor.status_message = None;
+        editor.category_down();
+        assert_eq!(editor.current_category(), SettingsCategory::Logging);
+        editor.toggle_current();
+        let (msg, _) = editor.status_message.clone().expect("must explain");
+        assert!(msg.contains("settings.toml"), "got: {msg}");
+        assert!(!editor.dirty);
+    }
+
+    /// Esc with unsaved changes asks before discarding — the footer already
+    /// says "unsaved changes", so throwing them away on one keypress
+    /// contradicts the panel's own message. A second Esc confirms.
+    #[test]
+    fn closing_dirty_asks_before_discarding() {
+        let mut editor = SettingsEditor {
+            open: true,
+            ..Default::default()
+        };
+        editor.item_down();
+        editor.toggle_current();
+        assert!(editor.dirty);
+
+        editor.close();
+        assert!(editor.open, "first Esc must not discard");
+        let (msg, _) = editor.status_message.clone().expect("must warn");
+        assert!(msg.contains("Unsaved"), "got: {msg}");
+
+        editor.close();
+        assert!(!editor.open, "second Esc confirms the discard");
+    }
+
+    /// A clean panel closes on the first Esc — the confirmation is for unsaved
+    /// work, not a toll on every exit.
+    #[test]
+    fn closing_clean_needs_no_confirmation() {
+        let mut editor = SettingsEditor {
+            open: true,
+            ..Default::default()
+        };
+        editor.close();
+        assert!(!editor.open);
     }
 
     #[test]
     fn items_count_per_category() {
         let editor = SettingsEditor::default();
-        assert_eq!(
-            editor.items_for_category(SettingsCategory::Features).len(),
-            5
-        );
         assert!(editor.items_for_category(SettingsCategory::Tools).len() >= 5);
         assert!(editor.items_for_category(SettingsCategory::Sandbox).len() >= 3);
     }
@@ -828,14 +937,15 @@ mod tests {
 
     #[test]
     fn category_label_and_icon_cover_all_variants() {
+        // Features is intentionally absent from ALL: its switches were inert.
+        // Markers are ASCII — SPEC R22.3 forbids emoji in terminal output.
         let expected = [
-            (SettingsCategory::Features, "Features", "⚡"),
-            (SettingsCategory::Tools, "Tools", "🔧"),
-            (SettingsCategory::Sandbox, "Sandbox", "🔒"),
-            (SettingsCategory::Logging, "Logging", "📋"),
-            (SettingsCategory::Http, "HTTP", "🌐"),
-            (SettingsCategory::Auth, "Auth", "🔑"),
-            (SettingsCategory::Instance, "Instance", "🏷"),
+            (SettingsCategory::Tools, "Tools", "T"),
+            (SettingsCategory::Sandbox, "Sandbox", "S"),
+            (SettingsCategory::Logging, "Logging", "L"),
+            (SettingsCategory::Http, "HTTP", "H"),
+            (SettingsCategory::Auth, "Auth", "A"),
+            (SettingsCategory::Instance, "Instance", "I"),
         ];
         assert_eq!(SettingsCategory::ALL.len(), expected.len());
         for (cat, label, icon) in expected {
@@ -1076,8 +1186,8 @@ mod tests {
         let mut editor = SettingsEditor::default();
         editor.item_down(); // selected_item = 1
         assert_eq!(editor.selected_item, 1);
-        editor.category_down(); // moves to Tools and resets item
-        assert_eq!(editor.current_category(), SettingsCategory::Tools);
+        editor.category_down(); // moves to Sandbox and resets item
+        assert_eq!(editor.current_category(), SettingsCategory::Sandbox);
         assert_eq!(editor.selected_item, 0);
 
         // Jump to the last category and confirm category_down is a no-op there.
@@ -1121,8 +1231,7 @@ mod tests {
     #[test]
     fn toggle_current_security_tier_is_noop() {
         let mut editor = SettingsEditor::default();
-        // Navigate to Sandbox (index 2); item 0 = disable (security_tier).
-        editor.category_down();
+        // Navigate to Sandbox (index 1); item 0 = disable (security_tier).
         editor.category_down();
         assert_eq!(editor.current_category(), SettingsCategory::Sandbox);
         let before = editor.settings().sandbox.disable;
@@ -1134,7 +1243,6 @@ mod tests {
     #[test]
     fn toggle_current_tools_bool_field() {
         let mut editor = SettingsEditor::default();
-        editor.category_down(); // Tools
         assert_eq!(editor.current_category(), SettingsCategory::Tools);
         editor.item_down(); // index 1 = force_sync (bool)
         assert!(!editor.settings().tools.force_sync);
@@ -1154,8 +1262,7 @@ mod tests {
     #[test]
     fn reset_current_restores_modified_string_field() {
         let mut editor = SettingsEditor::default();
-        // Go to Logging (index 3); item 0 = target (String, default "file").
-        editor.category_down();
+        // Go to Logging (index 2); item 0 = target (String, default "file").
         editor.category_down();
         editor.category_down();
         assert_eq!(editor.current_category(), SettingsCategory::Logging);
@@ -1353,12 +1460,16 @@ mod tests {
     fn save_writes_to_home_seam_and_reloads() {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        let _home = crate::HOME_SEAM_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("AHMA_TEST_HOME", dir.path());
         }
         let mut editor = SettingsEditor::default();
         // Mutate a value, then persist via the no-arg save() (uses settings_path()).
-        editor.toggle_current(); // features.simplify -> false
+        editor.item_down(); // Tools → force_sync (bool, default false)
+        editor.toggle_current();
         editor.dirty = true;
         editor.save();
 
@@ -1371,7 +1482,7 @@ mod tests {
 
         // Round-trip: a fresh load through the same home seam sees the change.
         let reloaded = AhmaSettings::load();
-        assert!(!reloaded.features.simplify);
+        assert!(reloaded.tools.force_sync);
 
         unsafe {
             std::env::remove_var("AHMA_TEST_HOME");

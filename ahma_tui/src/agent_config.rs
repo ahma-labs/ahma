@@ -66,6 +66,11 @@ pub fn append_transcript_entry(cwd: &Path, profile_name: &str, line_json: &str) 
     if !dir.exists() {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create {}", dir.display()))?;
+        // Chat transcripts are plaintext conversation logs written *into the
+        // user's project*. Committing them by accident is the surprise worth
+        // preventing, so the directory ignores itself the moment it is created
+        // — the same courtesy `ahma logs gitignore` extends to operational logs.
+        ignore_self(&dir);
     }
     let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y-%m-%d")));
     use std::io::Write;
@@ -83,6 +88,21 @@ fn profiles_path(cwd: &Path) -> PathBuf {
 
 fn transcripts_dir(cwd: &Path, profile_name: &str) -> PathBuf {
     cwd.join(".ahma").join("conversations").join(profile_name)
+}
+
+/// Drop a self-ignoring `.gitignore` into a directory ahma creates inside the
+/// user's project. Self-contained (`*` plus an un-ignore for the file itself),
+/// so it needs no edit to the repository's own `.gitignore` and cannot conflict
+/// with one. Best-effort: failing to write it must never fail the transcript.
+fn ignore_self(dir: &Path) {
+    let marker = dir.join(".gitignore");
+    if marker.exists() {
+        return;
+    }
+    let _ = std::fs::write(
+        &marker,
+        "# Written by ahma: local chat transcripts, not project content.\n*\n",
+    );
 }
 
 #[cfg(test)]
@@ -249,5 +269,28 @@ mod tests {
         assert_eq!(lines.len(), 2, "two appended lines");
         assert_eq!(lines[0], r#"{"role":"user","text":"hi"}"#);
         assert_eq!(lines[1], r#"{"role":"assistant","text":"yo"}"#);
+    }
+
+    /// Transcripts are plaintext conversation logs written into the user's
+    /// project; they must not become a surprise commit. The directory ignores
+    /// itself on creation, without touching the repository's own `.gitignore`.
+    #[test]
+    fn transcript_dir_ignores_itself() {
+        let tmp = tempdir().unwrap();
+        append_transcript_entry(tmp.path(), "agent", r#"{"role":"user","text":"hi"}"#)
+            .expect("append should succeed");
+
+        let marker = tmp
+            .path()
+            .join(".ahma")
+            .join("conversations")
+            .join("agent")
+            .join(".gitignore");
+        let body = fs::read_to_string(&marker).expect("self-ignoring .gitignore written");
+        assert!(body.contains('*'), "must ignore its own contents: {body}");
+        assert!(
+            !tmp.path().join(".gitignore").exists(),
+            "the project's own .gitignore must not be touched"
+        );
     }
 }

@@ -28,8 +28,7 @@ pub use list_tools::{
 
 pub use cli::{
     Cli, DaemonArgs, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs, LlmTestArgs, SettingsArgs,
-    SettingsCommand, Subcommands, TlsArgs, TlsCommand, TuiArgs, VaultArgs, VaultCommand,
-    VaultCreateArgs,
+    SettingsCommand, Subcommands, TlsArgs, TlsCommand, TuiArgs,
 };
 pub use cli::{build_app_config, dispatch_subcommand, load_settings};
 

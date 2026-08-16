@@ -1,9 +1,9 @@
 //! Ratatui rendering — all panel draw functions.
 //!
-//! The top-level [`draw`] function dispatches to either the chat or monitor
-//! layout based on `state.mode`.
-
-#![allow(dead_code)]
+//! The top-level [`draw`] function renders one chat-first layout: a header, the
+//! chat body with its optional `/scope`, `/tasks` and `/log` sub-windows stacked
+//! above it, the approval banner, the input box, and a footer — then whichever
+//! single overlay is open on top (SPEC R23).
 
 #[cfg(feature = "tui")]
 use ratatui::{
@@ -37,12 +37,11 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     draw_chat_layout(frame, state, theme);
 
     // Overlays drawn on top of whichever layout is active. At most one user
-    // overlay is open (SPEC R23); the palette is rendered inline in the layout,
-    // so it is a no-op here.
+    // overlay is open (SPEC R23).
     let full = frame.area();
     match &state.modal {
-        crate::state::ModalState::None | crate::state::ModalState::Palette(_) => {}
-        crate::state::ModalState::Help => draw_help(frame, theme, full),
+        crate::state::ModalState::None => {}
+        crate::state::ModalState::Help => draw_help(frame, state, theme, full),
         crate::state::ModalState::Navigator(_) => draw_navigator(frame, state, theme, full),
         crate::state::ModalState::ProviderPicker(picker)
         | crate::state::ModalState::ModelPicker(picker) => draw_picker(frame, picker, theme, full),
@@ -196,14 +195,16 @@ fn window_status_style(status: crate::state::WindowStatus, theme: &Theme) -> Sty
 }
 
 /// Colour for the sandbox status chip. `NESTED: <host>` / `DEFERRED: <host>`
-/// carry a variable host suffix, so match by prefix. Nested/deferred are warnings
-/// (ahma is not the sole authority); UNSANDBOXED/FAILED are alarming.
+/// carry a variable host suffix, so match by prefix. Nested/deferred get their
+/// own colour (ahma is not the sole authority — that must not look like
+/// INITIALIZING, which merely means "starting up"); UNSANDBOXED/FAILED are
+/// alarming.
 fn sandbox_status_style(status: &str, theme: &Theme) -> Style {
     match status {
         "LOCKED" => theme.success(),
         "INITIALIZING" => theme.pending(),
         "FAILED" | "UNSANDBOXED" => theme.failed(),
-        s if s.starts_with("NESTED") || s.starts_with("DEFERRED") => theme.pending(),
+        s if s.starts_with("NESTED") || s.starts_with("DEFERRED") => theme.host_authority(),
         _ => theme.unknown_health(),
     }
 }
@@ -791,9 +792,16 @@ fn draw_zoomed_chat_pane(
 #[cfg(feature = "tui")]
 fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme, chat_a: Rect) {
     let mut constraints = Vec::new();
+    let show_scope = state.scope_window_open;
     let show_tasks = state.tasks_window_open;
     let show_log = state.log_window_open;
 
+    if show_scope {
+        // Sized to content (honest panes, R24.8: budget the rows the renderer
+        // draws); scope_window_lines caps itself rather than relying on clipping.
+        let scope_h = scope_window_height(state, chat_a);
+        constraints.push(Constraint::Length(scope_h));
+    }
     if show_tasks {
         let tasks_h = (chat_a.height / 3).clamp(6, 16);
         constraints.push(Constraint::Length(tasks_h));
@@ -806,6 +814,11 @@ fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme,
 
     let areas = Layout::vertical(constraints).split(chat_a);
     let mut idx = 0;
+    if show_scope {
+        let area = areas[idx];
+        idx += 1;
+        draw_scope_window(frame, state, theme, area);
+    }
     if show_tasks {
         let area = areas[idx];
         idx += 1;
@@ -898,11 +911,14 @@ fn get_health_indicator(
     unicode: bool,
     theme: &Theme,
 ) -> (&'static str, Style) {
+    // Losing the server says so in a word. A one-character glyph flip is not a
+    // state change a user notices, and the chat input keeps looking live
+    // meanwhile — so the disconnected case is spelled out.
     match (server_healthy, unicode) {
         (true, true) => (" ●", theme.healthy()),
         (true, false) => (" *", theme.healthy()),
-        (false, true) => (" ○", theme.unhealthy()),
-        (false, false) => (" -", theme.unhealthy()),
+        (false, true) => (" ○ OFFLINE", theme.unhealthy()),
+        (false, false) => (" - OFFLINE", theme.unhealthy()),
     }
 }
 
@@ -977,12 +993,31 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
 
     let external_part = format_external_tools_part(state);
     let max_path_len = max_header_workspace_len(area.width);
-    let workspace_short = shorten_path(&state.workspace, max_path_len);
     let sandbox_style = sandbox_status_style(&state.sandbox_status, theme);
-    let sandbox_part = if !state.workspace.is_empty() {
-        format!(" · sandbox: {workspace_short}")
-    } else {
-        String::new()
+    // Honest scope display (SPEC R5.4): once the server reports its locked
+    // scope, show *that* — not the TUI's launch directory, which can differ
+    // (container-root fallback, auto-narrowing). Before the report arrives the
+    // launch path is only a guess, so mark it as such instead of presenting it
+    // as the boundary.
+    let sandbox_part = match state.locked_scope_root() {
+        Some(root) => {
+            let extra = state
+                .sandbox_scope
+                .as_ref()
+                .map(|s| s.write.len().saturating_sub(1))
+                .unwrap_or(0);
+            let short = shorten_path(root, max_path_len);
+            if extra > 0 {
+                format!(" · sandbox: {short} +{extra}")
+            } else {
+                format!(" · sandbox: {short}")
+            }
+        }
+        None if !state.workspace.is_empty() => {
+            let short = shorten_path(&state.workspace, max_path_len);
+            format!(" · sandbox: {short}?")
+        }
+        None => String::new(),
     };
     let sandbox_status_part = if !state.sandbox_status.is_empty() {
         format!(" [{}]", state.sandbox_status)
@@ -996,6 +1031,16 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         String::new()
     };
 
+    // Token spend and context fill — the numbers that decide whether to keep
+    // chatting or /compact. Computed all along but only ever rendered by a
+    // header that had no callers; narrow terminals get the context-fill share
+    // alone, since that is the part that changes a decision.
+    let tokens_part = if area.width > 100 {
+        format_tokens_part(state)
+    } else {
+        context_fill_segment(state)
+    };
+
     let line = Line::from(vec![
         Span::styled(" ahma chat", theme.title()),
         Span::styled(
@@ -1007,6 +1052,7 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         Span::styled(sandbox_part, theme.dim()),
         Span::styled(sandbox_status_part, sandbox_style),
         Span::styled(active_skills_part, theme.normal()),
+        Span::styled(tokens_part, theme.dim()),
         health_span,
         Span::styled(" · ", theme.dim()),
         daemon_span,
@@ -1620,8 +1666,13 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     };
 
     let title_left = get_input_title_left(state, theme);
+    // Same honesty rule as the header: prefer the server-locked scope; the
+    // launch path is a guess until then and is marked with `?`.
     let title_right = Line::from(Span::styled(
-        format!(" sandbox: {} ", shorten_path(&state.workspace, 45)),
+        match state.locked_scope_root() {
+            Some(root) => format!(" sandbox: {} ", shorten_path(root, 45)),
+            None => format!(" sandbox: {}? ", shorten_path(&state.workspace, 45)),
+        },
         theme.dim(),
     ))
     .right_aligned();
@@ -1699,8 +1750,10 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
             ("Enter", "send"),
             ("Shift+Enter", "newline"),
             ("/", "commands"),
+            ("?", "help"),
             ("/tasks", "tasks view"),
             ("/log", "log view"),
+            ("/scope", "sandbox"),
             ("/quit", "quit"),
         ],
     };
@@ -1720,61 +1773,229 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     );
 }
 
-/// Recent operation transitions across all connected instances — monitor
-/// mode's "what has been happening" history, newest first. Every row is a
-/// click target that opens the operation's full-screen detail view.
+/// Content lines for the `/scope` window — the persistent TUI scope panel
+/// (SPEC R5.4(b), R-PERM.5.1). Mirrors the vocabulary of the server's canonical
+/// `ScopeView::render_text` (write/read/tmp/source) so every surface reads the
+/// same, and states who is actually protecting the session (SPEC R7.5).
 #[cfg(feature = "tui")]
-fn draw_activity_feed(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    use crate::state::OpEventKind;
+fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    const MAX_ROOTS_SHOWN: usize = 4;
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
+    if let Some(reason) = &state.sandbox_failed_reason {
+        lines.push(Line::from(Span::styled(
+            format!("FAILED: {reason}"),
+            theme.failed(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Tool calls are refused until a scope locks. Fix: open a workspace folder, pass \
+             --sandbox-scope <path>, or configure [sandbox] container_root; then restart.",
+            theme.dim(),
+        )));
+        return lines;
+    }
+
+    let Some(scope) = &state.sandbox_scope else {
+        let status = if state.sandbox_status.is_empty() {
+            "UNKNOWN"
+        } else {
+            state.sandbox_status.as_str()
+        };
+        let explanation = match status {
+            "INITIALIZING" => {
+                "The server is still negotiating scope (roots/list or elicitation). \
+                 Tool calls are held until it locks."
+            }
+            _ => {
+                "No sandbox report received on this connection yet \
+                 (daemon-only attach, or an older server)."
+            }
+        };
+        lines.push(Line::from(Span::styled(
+            format!("Scope not reported — status: {status}"),
+            theme.pending(),
+        )));
+        lines.push(Line::from(Span::styled(explanation, theme.dim())));
+
+        // A hub-only attach never receives `sandbox/configured`, but every
+        // registered instance reports the scope it is running under. Showing
+        // that beats showing nothing — clearly attributed, because it is the
+        // instance's own claim rather than a scope this TUI saw locked, and it
+        // carries no enforcement or provenance information.
+        for inst in state.active_instances.iter().take(3) {
+            lines.push(Line::from(vec![
+                Span::styled("reported: ", theme.dim()),
+                Span::styled(shorten_path(&inst.scope, 46), theme.normal()),
+                Span::styled(format!("  by {} ({})", inst.label, inst.mode), theme.dim()),
+            ]));
+        }
+        return lines;
+    };
+
+    // Who is actually protecting this session. NESTED/DEFERRED/DISABLED must
+    // read differently from plain enforcement — R7.5's honesty rule.
+    let (authority, authority_style) = match scope.active.as_deref() {
+        Some("ahma_nested_in_host") => (
+            format!(
+                "ahma (kernel), nested inside {}",
+                scope.host.as_deref().unwrap_or("a host sandbox")
+            ),
+            theme.host_authority(),
+        ),
+        Some("deferred_to_host") => (
+            format!(
+                "{} — ahma is NOT enforcing",
+                scope.host.as_deref().unwrap_or("host sandbox")
+            ),
+            theme.host_authority(),
+        ),
+        Some("disabled") => ("NONE — no kernel confinement".to_string(), theme.failed()),
+        _ => ("ahma (kernel)".to_string(), theme.success()),
+    };
+    let enforcement_style = if scope.enforced {
+        theme.success()
+    } else {
+        theme.failed()
+    };
+    let enforcement = if scope.enforced {
+        "ENFORCED"
+    } else {
+        "DISABLED"
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{enforcement} · "), enforcement_style),
+        Span::styled("authority: ", theme.dim()),
+        Span::styled(authority, authority_style),
+    ]));
+
+    if scope.write.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("write : ", theme.dim()),
+            Span::styled("(none — awaiting scope)", theme.pending()),
+        ]));
+    } else {
+        for (i, root) in scope.write.iter().take(MAX_ROOTS_SHOWN).enumerate() {
+            let label = if i == 0 { "write : " } else { "        " };
+            lines.push(Line::from(vec![
+                Span::styled(label, theme.dim()),
+                Span::styled(shorten_path(root, 70), theme.normal()),
+            ]));
+        }
+        if scope.write.len() > MAX_ROOTS_SHOWN {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "        … +{} more (run `ahma status` for the full list)",
+                    scope.write.len() - MAX_ROOTS_SHOWN
+                ),
+                theme.dim(),
+            )));
+        }
+    }
+
+    let read_summary = if scope.read.is_empty() {
+        "(none beyond write roots)".to_string()
+    } else if scope.read.len() <= 2 {
+        scope
+            .read
+            .iter()
+            .map(|p| shorten_path(p, 34))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        format!(
+            "{} +{} more",
+            shorten_path(&scope.read[0], 34),
+            scope.read.len() - 1
+        )
+    };
+    lines.push(Line::from(vec![
+        Span::styled("read  : ", theme.dim()),
+        Span::styled(read_summary, theme.normal()),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("tmp   : ", theme.dim()),
+        Span::styled(
+            if scope.tmp { "ON" } else { "OFF" }.to_string(),
+            theme.normal(),
+        ),
+        Span::styled(" · source: ", theme.dim()),
+        Span::styled(
+            scope.source.clone().unwrap_or_else(|| "unknown".into()),
+            theme.normal(),
+        ),
+    ]));
+
+    // The roots that exist because the user granted them, named separately
+    // from the workspace so an out-of-workspace writable path is explicable —
+    // and reversible: the revoke command is stated, not left to be searched
+    // for (SPEC R5.4.6, grants are inspectable and reversible by name).
+    if !state.granted_scopes.is_empty() {
+        let shown = state
+            .granted_scopes
+            .iter()
+            .take(2)
+            .map(|(path, access)| format!("{} ({access})", shorten_path(path, 30)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = state.granted_scopes.len().saturating_sub(2);
+        let suffix = if more > 0 {
+            format!(" +{more} more")
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("grants: ", theme.dim()),
+            Span::styled(format!("{shown}{suffix}"), theme.normal()),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "        `ahma sandbox list` / `ahma sandbox revoke <path>` to review or remove",
+            theme.dim(),
+        )));
+    }
+
+    // Platform limitation that cannot be expressed as scope (macOS reads
+    // unconfined) — shown here per SPEC R-PERM.5.1, not buried in docs.
+    if let Some(note) = &scope.platform_note {
+        lines.push(Line::from(Span::styled(
+            format!("note  : {}", truncate(note, 110)),
+            theme.pending(),
+        )));
+    }
+    // Persistent R7 disclosure when ahma is not the sole authority — the log
+    // line scrolls away; this window is where it stays visible.
+    if matches!(
+        scope.active.as_deref(),
+        Some("ahma_nested_in_host") | Some("deferred_to_host") | Some("disabled")
+    ) && let Some(d) = &scope.disclosure
+    {
+        lines.push(Line::from(Span::styled(truncate(d, 110), theme.pending())));
+    }
+    lines
+}
+
+/// Height for the `/scope` window: sized to its content (+2 border rows),
+/// never more than half the available area — honest panes (R24.8) budget the
+/// rows the renderer actually draws.
+#[cfg(feature = "tui")]
+fn scope_window_height(state: &AppState, area: Rect) -> u16 {
+    let theme = Theme::new(state.unicode);
+    let content = scope_window_lines(state, &theme).len() as u16;
+    (content + 2).clamp(4, (area.height / 2).max(4))
+}
+
+/// The persistent sandbox-scope sub-window, toggled with `/scope`. Informational
+/// only (no focus, no scrolling): the content self-caps and names the overflow.
+#[cfg(feature = "tui")]
+fn draw_scope_window(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let block = Block::default()
-        .title(Span::styled(
-            " Activity — click a row for details ",
-            theme.title(),
-        ))
+        .title(Span::styled(" Sandbox · scope ", theme.title()))
+        .title(Line::from(Span::styled(" /scope closes ", theme.dim())).right_aligned())
         .borders(Borders::ALL)
         .border_style(theme.border_unfocused());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    for (i, event) in state.events.iter().take(inner.height as usize).enumerate() {
-        let (glyph, style) = match &event.kind {
-            OpEventKind::Started => (if state.unicode { "▶" } else { ">" }, theme.running()),
-            OpEventKind::Finished(status) => {
-                (status.glyph(state.unicode), theme.op_status_style(status))
-            }
-        };
-        let instance = event
-            .instance
-            .as_deref()
-            .map(|l| format!(" ({l})"))
-            .unwrap_or_default();
-        let duration = event
-            .duration_ms
-            .map(|ms| format!(" {}", format_duration_short(ms)))
-            .unwrap_or_default();
-
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {} ", event.timestamp.format("%H:%M:%S")),
-                theme.dim(),
-            ),
-            Span::styled(format!("{glyph} "), style),
-            Span::styled(
-                truncate(&event.title, (inner.width as usize).saturating_sub(24)),
-                theme.normal(),
-            ),
-            Span::styled(instance, theme.dim()),
-            Span::styled(duration, theme.dim()),
-        ]);
-
-        let row_rect = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
-        frame.render_widget(Paragraph::new(line), row_rect);
-        state.click_targets.borrow_mut().push((
-            ClickTarget::OpenOperationDetail(event.op_id.clone()),
-            row_rect,
-        ));
-    }
+    frame.render_widget(Paragraph::new(scope_window_lines(state, theme)), inner);
 }
 
 // ─── Navigator overlay ────────────────────────────────────────────────────────
@@ -1974,25 +2195,6 @@ fn draw_picker(frame: &mut Frame, picker: &crate::state::PickerState, theme: &Th
 
 // ─── Header ───────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
-fn header_health_span(state: &AppState, theme: &Theme) -> Span<'static> {
-    if state.server_healthy {
-        let label = if state.unicode {
-            " ● HEALTHY"
-        } else {
-            " * HEALTHY"
-        };
-        Span::styled(label, theme.healthy())
-    } else {
-        let label = if state.unicode {
-            " ○ OFFLINE"
-        } else {
-            " - OFFLINE"
-        };
-        Span::styled(label, theme.unhealthy())
-    }
-}
-
 /// Approximate characters per token, matching the agent's budget math.
 #[cfg(feature = "tui")]
 const STATUS_CHARS_PER_TOKEN: usize = 4;
@@ -2014,6 +2216,26 @@ fn format_tokens_part(state: &AppState) -> String {
         conversation_chars(state),
         state.token_prefs.context_length,
     )
+}
+
+/// Just the `· NN% ctx` share of [`token_status_segment`], for headers too
+/// narrow to carry the full in/out/total breakdown. Empty when the model's
+/// context window is unknown — a percentage of an unknown whole is noise.
+#[cfg(feature = "tui")]
+fn context_fill_segment(state: &AppState) -> String {
+    let Some(window) = state.token_prefs.context_length.filter(|&w| w > 0) else {
+        return String::new();
+    };
+    let used = if state.last_prompt_tokens > 0 {
+        state.last_prompt_tokens
+    } else {
+        estimate_tokens(conversation_chars(state))
+    };
+    if used == 0 {
+        return String::new();
+    }
+    let pct = ((used as f64 / window as f64) * 100.0).round() as u32;
+    format!(" · {}% ctx", pct.min(999))
 }
 
 /// Total characters of the visible conversation — the basis for a token estimate
@@ -2091,92 +2313,6 @@ fn token_status_segment(
         out.push_str(&format!(" · {}% ctx", pct.min(999)));
     }
     out
-}
-
-#[cfg(feature = "tui")]
-fn format_external_part(state: &AppState) -> String {
-    let mut http_count = 0;
-    let mut stdio_count = 0;
-    for s in &state.mcp_connections.servers {
-        if s.enabled {
-            match &s.kind {
-                crate::mcp_connections::McpServerKind::Http { .. } => http_count += 1,
-                crate::mcp_connections::McpServerKind::Stdio { .. } => stdio_count += 1,
-            }
-        }
-    }
-    let external_tools = state.mcp_connections.aggregate_tool_names().len();
-    if http_count > 0 || stdio_count > 0 {
-        format!(" · ext (http:{http_count} stdio:{stdio_count})/{external_tools}")
-    } else {
-        String::new()
-    }
-}
-
-#[cfg(feature = "tui")]
-fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let health_span = header_health_span(state, theme);
-
-    let sandbox_style = sandbox_status_style(&state.sandbox_status, theme);
-
-    let session_part = state
-        .session_id
-        .as_deref()
-        .map(|id| format!(" · session {}", &id[..id.len().min(8)]))
-        .unwrap_or_default();
-
-    let max_path_len = if area.width > 120 {
-        35
-    } else if area.width > 100 {
-        25
-    } else {
-        15
-    };
-    let workspace_short = shorten_path(&state.workspace, max_path_len);
-    let external_part = format_external_part(state);
-    let tokens_part = format_tokens_part(state);
-    // Only surface minimization when it is on — the default-off case stays quiet.
-    let minimize_part = if state.minimize_tokens { " · min" } else { "" };
-
-    let daemon_char = match (state.daemon_healthy, state.unicode) {
-        (true, true) => " · ● DMON",
-        (true, false) => " · * DMON",
-        (false, true) => " · ○ DMON",
-        (false, false) => " · - DMON",
-    };
-    let daemon_style = if state.daemon_healthy {
-        theme.healthy()
-    } else {
-        theme.unhealthy()
-    };
-    let daemon_span = Span::styled(daemon_char, daemon_style);
-
-    let sandbox_part = if !state.workspace.is_empty() {
-        format!(" · sandbox: {workspace_short}")
-    } else {
-        String::new()
-    };
-    let sandbox_status_part = if !state.sandbox_status.is_empty() {
-        format!(" [{}]", state.sandbox_status)
-    } else {
-        String::new()
-    };
-
-    let line = Line::from(vec![
-        Span::styled(" ahma", theme.title()),
-        Span::styled(session_part, theme.dim()),
-        Span::styled(sandbox_part, theme.dim()),
-        Span::styled(sandbox_status_part, sandbox_style),
-        Span::styled(external_part, theme.dim()),
-        Span::styled(tokens_part, theme.pending()),
-        Span::styled(minimize_part, theme.dim()),
-        Span::styled(format!(" · {}", state.transport_label), theme.dim()),
-        health_span,
-        daemon_span,
-    ]);
-
-    let para = Paragraph::new(line).style(theme.header_bar());
-    frame.render_widget(para, area);
 }
 
 // ─── Operations DAG ───────────────────────────────────────────────────────────
@@ -2708,8 +2844,14 @@ fn build_tree_op_item(
     // A finished row shows *how* it finished, not just how long it took. "Failed"
     // without a code is not actionable; `exit 101` is (SPEC R24.7). Operations that
     // are not processes have no code, and say nothing rather than inventing one.
-    let elapsed_part = match op.exit_code {
-        Some(code) if op.status.is_terminal() => {
+    // A denial is not a failure and must not read as one: name the path the
+    // kernel refused, and the key that asks for it (SPEC R-PERM.7/.7.1). This
+    // is the row a user acts on, so the affordance belongs on the row.
+    let elapsed_part = match (&op.denial, op.exit_code) {
+        (Some((path, access)), _) if op.status == crate::state::OpStatus::Denied => {
+            format!("  denied: {} ({access}) · [a] ask", shorten_path(path, 28))
+        }
+        (_, Some(code)) if op.status.is_terminal() => {
             format!("  exit {code} · {}", op.elapsed_display())
         }
         _ => format!("  {}", op.elapsed_display()),
@@ -2758,431 +2900,6 @@ fn build_tree_op_item(
 }
 
 // ─── Detail pane ──────────────────────────────────────────────────────────────
-
-#[cfg(feature = "tui")]
-fn draw_detail(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let focused = state.focus == Focus::OpsDag;
-    let border_style = if focused {
-        theme.border_focused()
-    } else {
-        theme.border_unfocused()
-    };
-
-    state.detail_area.set(area);
-
-    let rows = state.task_rows.borrow();
-    let selected_row = rows.get(state.ops_selected);
-    match selected_row.map(|r| &r.kind) {
-        Some(crate::task_tree::RowKind::Instance {
-            group_id,
-            label,
-            detail,
-            counts,
-            ..
-        }) => {
-            render_selected_instance_detail(
-                frame,
-                state,
-                theme,
-                area,
-                border_style,
-                group_id,
-                label,
-                detail,
-                counts,
-            );
-        }
-        Some(crate::task_tree::RowKind::Group { key, label, .. }) => {
-            render_selected_group_detail(frame, state, theme, area, border_style, key, label);
-        }
-        Some(crate::task_tree::RowKind::Op { op_index, .. })
-        | Some(crate::task_tree::RowKind::Output { op_index, .. }) => {
-            if let Some(op) = state.operations.get(*op_index) {
-                render_selected_detail(frame, state, theme, area, border_style, op);
-            } else {
-                render_empty_detail(frame, theme, area, border_style);
-            }
-        }
-        None => {
-            if let Some(op) = state.selected_op() {
-                render_selected_detail(frame, state, theme, area, border_style, op);
-            } else {
-                render_empty_detail(frame, theme, area, border_style);
-            }
-        }
-    }
-}
-
-#[cfg(feature = "tui")]
-fn render_empty_detail(frame: &mut Frame, theme: &Theme, area: Rect, border_style: Style) {
-    let block = Block::default()
-        .title(Span::styled(" Detail ", theme.title()))
-        .borders(Borders::ALL)
-        .border_style(border_style);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(Span::styled("  Select an operation", theme.dim())),
-        inner,
-    );
-}
-
-#[cfg(feature = "tui")]
-fn render_selected_detail(
-    frame: &mut Frame,
-    state: &AppState,
-    theme: &Theme,
-    area: Rect,
-    border_style: Style,
-    op: &crate::state::Operation,
-) {
-    let title = if let Some(label) = &op.instance_label {
-        let pid_part = op.pid.map(|p| format!(":{}", p)).unwrap_or_default();
-        format!(" {} [{}{}]  {} ", op.id, label, pid_part, op.tool_name)
-    } else {
-        format!(" {}  {} ", op.id, op.tool_name)
-    };
-    let block = Block::default()
-        .title(Span::styled(title, theme.title()))
-        .borders(Borders::ALL)
-        .border_style(border_style);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height == 0 {
-        return;
-    }
-
-    let [header_row_a, rest_a] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-
-    let [status_a, analyze_a] = Layout::horizontal([
-        Constraint::Min(10),
-        Constraint::Length(11), // " [Analyze] "
-    ])
-    .areas(header_row_a);
-
-    let status_line = Line::from(vec![
-        Span::styled("status  ", theme.dim()),
-        Span::styled(
-            format!("{} {:?}", op.status.glyph(state.unicode), op.status),
-            theme.op_status_style(&op.status),
-        ),
-        Span::styled(format!("  ({})", op.elapsed_display()), theme.dim()),
-    ]);
-    frame.render_widget(Paragraph::new(status_line), status_a);
-
-    let analyze_btn = Span::styled(" [Analyze] ", theme.running());
-    frame.render_widget(Paragraph::new(analyze_btn), analyze_a);
-
-    // Register Analyze ClickTarget
-    state
-        .click_targets
-        .borrow_mut()
-        .push((ClickTarget::AnalyzeOperation(op.id.clone()), analyze_a));
-
-    let lines = build_detail_lines(
-        op,
-        state,
-        theme,
-        rest_a.width as usize,
-        rest_a.height as usize,
-    );
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    frame.render_widget(para, rest_a);
-}
-
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn render_selected_instance_detail(
-    frame: &mut Frame,
-    state: &AppState,
-    theme: &Theme,
-    area: Rect,
-    border_style: Style,
-    group_id: &str,
-    label: &str,
-    detail: &str,
-    counts: &crate::task_tree::GroupCounts,
-) {
-    let title = if group_id.is_empty() {
-        " Local Terminal (You) ".to_string()
-    } else {
-        format!(" Instance {} ", label)
-    };
-    let block = Block::default()
-        .title(Span::styled(title, theme.title()))
-        .borders(Borders::ALL)
-        .border_style(border_style);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height == 0 {
-        return;
-    }
-
-    // Lead with the answer, not the identity (SPEC R24.8.6). Selecting an
-    // instance is a question about work — "what did I ask this client to do,
-    // and how did it go?" — so the tally line and the recent operations come
-    // first, and the wiring detail is demoted to a dim footer for the rare
-    // moment someone is debugging the connection itself.
-    let mut lines = vec![instance_tally_line(counts, theme, state.unicode)];
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("Recent operations", theme.title())));
-
-    // Budget: everything above plus the identity footer (blank + 1 line).
-    let used = lines.len() + 2;
-    let op_budget = (inner.height as usize).saturating_sub(used).max(1);
-    let recent = recent_instance_ops(state, group_id, op_budget);
-    if recent.is_empty() {
-        lines.push(Line::from(Span::styled("  nothing run yet", theme.dim())));
-    } else {
-        for op in recent {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {} ", op.status.glyph(state.unicode)),
-                    theme.op_status_style(&op.status),
-                ),
-                Span::styled(
-                    truncate(&op.display_name(), inner.width.saturating_sub(14) as usize),
-                    theme.normal(),
-                ),
-                Span::styled(format!("  {}", op.elapsed_display()), theme.dim()),
-            ]));
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        instance_identity_footer(state, group_id, detail),
-        theme.dim(),
-    )));
-
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
-}
-
-/// One-line outcome summary for an instance: `2 running · 1 queued · 14 ok · 1 failed`.
-/// Zero-valued terms are dropped so the eye lands on what is actually happening.
-#[cfg(feature = "tui")]
-fn instance_tally_line(
-    counts: &crate::task_tree::GroupCounts,
-    theme: &Theme,
-    unicode: bool,
-) -> Line<'static> {
-    let sep = if unicode { " · " } else { " | " };
-    let terms: [(usize, &str, Style); 4] = [
-        (counts.running, "running", theme.running()),
-        (counts.queued, "queued", theme.pending()),
-        (counts.succeeded, "ok", theme.success()),
-        (counts.failed, "failed", theme.failed()),
-    ];
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (n, label, style) in terms {
-        if n == 0 {
-            continue;
-        }
-        if !spans.is_empty() {
-            spans.push(Span::styled(sep.to_string(), theme.dim()));
-        }
-        spans.push(Span::styled(format!("{n} {label}"), style));
-    }
-    if spans.is_empty() {
-        spans.push(Span::styled(
-            "idle — no operations".to_string(),
-            theme.dim(),
-        ));
-    }
-    Line::from(spans)
-}
-
-/// The most recent operations belonging to `group_id`, newest first, capped at
-/// `limit`. An empty `group_id` is the TUI's own local group, whose operations
-/// carry no instance id.
-#[cfg(feature = "tui")]
-fn recent_instance_ops<'a>(
-    state: &'a AppState,
-    group_id: &str,
-    limit: usize,
-) -> Vec<&'a crate::state::Operation> {
-    let mut matching: Vec<&crate::state::Operation> = state
-        .operations
-        .iter()
-        .filter(|op| match op.instance_id.as_deref() {
-            Some(id) => id == group_id,
-            None => group_id.is_empty(),
-        })
-        .collect();
-    // `operations` is append-ordered, so the tail is the newest work.
-    matching.reverse();
-    matching.truncate(limit);
-    matching
-}
-
-/// The connection wiring, on one dim line: transport, pid, and sandbox scope.
-#[cfg(feature = "tui")]
-fn instance_identity_footer(state: &AppState, group_id: &str, detail: &str) -> String {
-    let info = if group_id.is_empty() {
-        None
-    } else {
-        state
-            .active_instances
-            .iter()
-            .find(|inst| inst.id == group_id)
-    };
-    match info {
-        Some(info) => format!(
-            "{} · {} · pid {} · {}",
-            info.client.as_deref().unwrap_or("unknown"),
-            info.mode,
-            info.pid,
-            info.scope
-        ),
-        None if detail.is_empty() => "this terminal (you)".to_string(),
-        None => format!("this terminal (you) · {detail}"),
-    }
-}
-
-#[cfg(feature = "tui")]
-fn render_selected_group_detail(
-    frame: &mut Frame,
-    _state: &AppState,
-    theme: &Theme,
-    area: Rect,
-    border_style: Style,
-    key: &str,
-    label: &str,
-) {
-    let block = Block::default()
-        .title(Span::styled(format!(" Group {} ", label), theme.title()))
-        .borders(Borders::ALL)
-        .border_style(border_style);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height == 0 {
-        return;
-    }
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Group Key  ", theme.dim()),
-            Span::styled(key.to_string(), theme.normal()),
-        ]),
-        Line::from(vec![
-            Span::styled("Label      ", theme.dim()),
-            Span::styled(label.to_string(), theme.normal()),
-        ]),
-    ];
-
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
-}
-
-#[cfg(feature = "tui")]
-fn build_detail_lines(
-    op: &crate::state::Operation,
-    state: &AppState,
-    theme: &Theme,
-    width: usize,
-    height: usize,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    push_detail_summary_lines(&mut lines, op, state, theme, width);
-
-    if !op.alerts.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Alerts:", theme.failed())));
-        for alert in &op.alerts {
-            lines.push(Line::from(Span::styled(
-                format!("  ⚠ {alert}"),
-                theme.failed(),
-            )));
-        }
-    }
-
-    push_stdout_tail_lines(&mut lines, op, state, theme, width, height);
-    lines
-}
-
-#[cfg(feature = "tui")]
-fn push_detail_summary_lines(
-    lines: &mut Vec<Line<'static>>,
-    op: &crate::state::Operation,
-    _state: &AppState,
-    theme: &Theme,
-    width: usize,
-) {
-    if let Some(cmd) = &op.command {
-        lines.push(Line::from(vec![
-            Span::styled("cmd     ", theme.dim()),
-            Span::styled(truncate(cmd, width.saturating_sub(10)), theme.normal()),
-        ]));
-    }
-    if let Some(cwd) = &op.cwd {
-        lines.push(Line::from(vec![
-            Span::styled("cwd     ", theme.dim()),
-            Span::styled(shorten_path(cwd, 40), theme.normal()),
-        ]));
-    }
-    if let Some(pid) = op.pid {
-        lines.push(Line::from(vec![
-            Span::styled("pid     ", theme.dim()),
-            Span::styled(pid.to_string(), theme.normal()),
-        ]));
-    }
-    // args are a legacy guess at the command line — redundant once the wire
-    // carries the real command.
-    if op.command.is_none() && !op.args.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("args    ", theme.dim()),
-            Span::styled(
-                truncate(&op.args.join(" "), width.saturating_sub(10)),
-                theme.normal(),
-            ),
-        ]));
-    }
-    if let Some(parent) = &op.parent_id {
-        lines.push(Line::from(vec![
-            Span::styled("waits   ", theme.dim()),
-            Span::styled(parent.clone(), theme.pending()),
-        ]));
-    }
-}
-
-#[cfg(feature = "tui")]
-fn push_stdout_tail_lines(
-    lines: &mut Vec<Line<'static>>,
-    op: &crate::state::Operation,
-    state: &AppState,
-    theme: &Theme,
-    width: usize,
-    height: usize,
-) {
-    if op.stdout_tail.is_empty() {
-        return;
-    }
-
-    let separator = if state.unicode {
-        "─".repeat(width.saturating_sub(4))
-    } else {
-        "-".repeat(width.saturating_sub(4))
-    };
-    lines.push(Line::from(Span::styled(
-        format!("  {separator}"),
-        theme.dim(),
-    )));
-
-    let tail_height = height.saturating_sub(lines.len());
-    let visible_tail: Vec<_> = op.stdout_tail.iter().rev().take(tail_height).collect();
-    for line in visible_tail.into_iter().rev() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", truncate(line, width.saturating_sub(4))),
-            theme.dim(),
-        )));
-    }
-}
 
 // ─── Log pane ─────────────────────────────────────────────────────────────────
 
@@ -3404,30 +3121,43 @@ fn draw_blocked_symlink_banner(
     };
     let full_target_str = full_target.to_string_lossy();
 
+    // Vocabulary matched to the scope-grant modal — "outside the sandbox
+    // scope", the path shown literally, the key named in a bracketed hint —
+    // so the two out-of-scope questions read as one idiom rather than two.
+    // The glyph is unicode-gated (the emoji here were the only ones in the
+    // crate, ungated and double-width, and SPEC R22.3 forbids them anyway).
+    let warn = if theme.unicode { "⚠" } else { "!" };
     let text = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  ⚠️ SECURITY WARNING: OUT-OF-SCOPE SYMLINK ⚠️",
-            theme.failed().bold(),
+            format!("  {warn} Log file · outside sandbox scope"),
+            theme.approval_border(),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::raw("  Log file "),
+            Span::styled("  ", theme.normal()),
             Span::styled(&info.path, theme.normal().bold()),
-            Span::raw(" is a symbolic link pointing to:"),
+            Span::styled(" is a symlink pointing to:", theme.normal()),
         ]),
         Line::from(Span::styled(
             format!("    {}", full_target_str),
-            theme.failed(),
+            theme.pending().bold(),
         )),
-        Line::from(""),
-        Line::from("  This destination lies outside your configured workspace sandbox scopes."),
-        Line::from("  For security, reading out-of-scope files is blocked by default."),
         Line::from(""),
         Line::from(Span::styled(
-            "  Press [a] to approve this symlink exception and start tailing.",
-            theme.success().bold(),
+            "  That destination lies outside this workspace, so reading it is blocked.",
+            theme.dim(),
         )),
+        Line::from(Span::styled(
+            "  Approving affects this view only — it records no persistent grant.",
+            theme.dim(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [a] ", theme.approval_key()),
+            Span::styled("Read it anyway", theme.normal().bold()),
+            Span::styled("    any other key = leave it blocked", theme.dim()),
+        ]),
         Line::from(""),
     ];
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
@@ -3558,11 +3288,15 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
         Line::from(""),
         Line::from(Span::styled(format!("Why: {reason}."), theme.dim())),
         Line::from(Span::styled(
-            "Approving records a persistent grant in ~/.ahma/settings.toml and takes",
+            "Approving records a persistent grant in ~/.ahma/settings.toml. This running",
             theme.dim(),
         )),
         Line::from(Span::styled(
-            "effect on the NEXT server start — it does not change this running session.",
+            "session's scope stays locked: ask the agent to run the `restart` tool (or",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            "restart ahma) to apply the grant now — otherwise it applies on next start.",
             theme.dim(),
         )),
         Line::from(""),
@@ -3596,14 +3330,31 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
     frame.render_widget(block, popup);
 
     let tool = gate.tool.as_deref().unwrap_or("A tool");
+    // R-WEB.6.1: the URL is attacker-influenced text rendered inside a security
+    // prompt. Cap it so a crafted long URL cannot push the buttons off a
+    // fixed-height popup or bury the question in wrapped noise.
+    let url = truncate(&gate.url, 256);
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(tool.to_string(), theme.normal().bold()),
             Span::styled(" wants to reach the domain:", theme.normal()),
         ]),
         Line::from(Span::styled(gate.domain.clone(), theme.success().bold())),
-        Line::from(Span::styled(format!("  {}", gate.url), theme.dim())),
+        Line::from(Span::styled(format!("  {url}"), theme.dim())),
+    ];
+
+    // R-WEB.6.4: cleartext HTTP is permitted (some dev environments need it)
+    // but never silently — the caution is part of the question.
+    if gate.url.starts_with("http://") {
+        let warn = if state.unicode { "⚠ " } else { "! " };
+        lines.push(Line::from(Span::styled(
+            format!("  {warn}cleartext HTTP — this traffic is not encrypted"),
+            theme.pending().bold(),
+        )));
+    }
+
+    lines.extend([
         Line::from(""),
         Line::from(Span::styled(
             "Approving applies to this session; 'always' also saves it to",
@@ -3616,14 +3367,16 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
         Line::from(""),
         Line::from(vec![
             Span::styled("  [n] ", theme.failed().bold()),
-            Span::styled("Deny (default)    ", theme.normal().bold()),
+            Span::styled("Deny (default)  ", theme.normal().bold()),
+            Span::styled("[o] ", theme.pending().bold()),
+            Span::styled("Once  ", theme.normal()),
             Span::styled("[s] ", theme.pending().bold()),
-            Span::styled("Allow session    ", theme.normal()),
+            Span::styled("Session  ", theme.normal()),
             Span::styled("[a] ", theme.success().bold()),
-            Span::styled("Allow always", theme.normal()),
+            Span::styled("Always", theme.normal()),
         ]),
         Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
-    ];
+    ]);
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
@@ -3767,45 +3520,6 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
 
 // ─── Footer ───────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
-fn draw_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let keys: &[(&str, &str)] = match state.focus {
-        Focus::OpsDag => &[
-            ("Tab", "next pane"),
-            ("j/k", "select"),
-            ("Enter", "details"),
-            ("Space", "fold"),
-            ("z", "zoom"),
-            ("f", "all projects"),
-            ("c", "cancel"),
-            ("p", "pin"),
-            ("q", "quit"),
-        ],
-        Focus::Log => &[
-            ("Tab", "next pane"),
-            ("j/k", "scroll"),
-            ("/", "filter"),
-            ("g/G", "top/bottom"),
-            ("z", "zoom"),
-            ("q", "quit"),
-        ],
-        Focus::Palette => &[("Esc", "close"), ("Tab", "complete"), ("Enter", "run")],
-        Focus::Chat => &[("/", "commands"), ("Tab", "monitor panels"), ("q", "quit")],
-    };
-
-    let mut spans: Vec<Span> = vec![];
-    for (key, desc) in keys {
-        spans.push(Span::styled(format!("  {key} "), theme.footer_key()));
-        spans.push(Span::styled(desc.to_string(), theme.footer()));
-    }
-    let content_len: usize = keys.iter().map(|(k, d)| k.len() + d.len() + 3).sum();
-    let padding = (area.width as usize).saturating_sub(content_len);
-    spans.push(Span::styled(" ".repeat(padding), theme.footer()));
-
-    let para = Paragraph::new(Line::from(spans)).style(theme.footer());
-    frame.render_widget(para, area);
-}
-
 // ─── Help overlay ─────────────────────────────────────────────────────────────
 
 /// Format a slice of (key, description) pairs into styled [`Line`]s.
@@ -3835,7 +3549,7 @@ fn format_help_rows<'a>(
 }
 
 #[cfg(feature = "tui")]
-fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
+fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let use_two_columns = area.width >= 100;
 
     let w = if use_two_columns {
@@ -3854,6 +3568,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
 
     let block = Block::default()
         .title(Span::styled(" Help — ahma TUI ", theme.title()))
+        .title(Line::from(Span::styled(" ↑↓ scroll · Esc closes ", theme.dim())).right_aligned())
         .borders(Borders::ALL)
         .border_style(theme.border_focused());
     let inner = block.inner(popup);
@@ -3865,7 +3580,6 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Tab / Shift-Tab", "Cycle focus"),
         ("?", "Toggle this help"),
         ("Esc / ?", "Close help overlay"),
-        (":", "Open command palette"),
         ("", ""),
         ("CHAT", ""),
         ("Enter", "Send message"),
@@ -3900,10 +3614,6 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("/run <tool> {json}", "Run tool with JSON args"),
         ("/skills", "List Agent Skills; run one with /<name> [args]"),
         ("", ""),
-        ("COMMAND PALETTE (:)", ""),
-        ("Tab", "Next completion"),
-        ("Enter", "Run command"),
-        ("", ""),
         ("WINDOW ACTIONS", ""),
         ("/n", "Restore/expand window n"),
         ("/xn", "Close/cancel window n"),
@@ -3921,10 +3631,11 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ),
         ("f", "Toggle this-project / all-projects filter"),
         ("c", "Cancel selected"),
-        ("p", "Pin to top"),
-        ("a", "Await selected"),
+        ("p", "Pin selected"),
+        ("a", "Ask for access (on a denied operation)"),
         ("/analyze [op_id]", "Ask AI to analyze operation"),
-        ("/monitor file <path>", "Start log monitoring"),
+        ("/log file <path>", "Start log monitoring"),
+        ("/scope", "Show sandbox scope & provenance"),
         ("", ""),
         ("LOG", ""),
         ("/", "Start filter (Esc to clear)"),
@@ -3942,7 +3653,6 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Tab / Shift-Tab", "Cycle focus"),
         ("?", "Toggle this help"),
         ("Esc / ? (when help open)", "Close help overlay"),
-        (":", "Open command palette"),
         ("", ""),
         ("CHAT", ""),
         ("Enter", "Send message"),
@@ -3972,10 +3682,11 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ),
         ("f", "Toggle this-project / all-projects filter"),
         ("c", "Cancel selected"),
-        ("p", "Pin to top"),
-        ("a", "Await selected"),
+        ("p", "Pin selected"),
+        ("a", "Ask for access (on a denied operation)"),
         ("/analyze [op_id]", "Ask AI to analyze operation"),
-        ("/monitor file <path>", "Start log monitoring"),
+        ("/log file <path>", "Start log monitoring"),
+        ("/scope", "Show sandbox scope & provenance"),
         ("", ""),
         ("LOG", ""),
         ("/", "Start filter (Esc to clear)"),
@@ -3998,10 +3709,6 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("/run <tool> {json}", "Run a tool manually with JSON args"),
         ("/skills", "List Agent Skills; run one with /<name> [args]"),
         ("", ""),
-        ("COMMAND PALETTE (:)", ""),
-        ("Tab", "Next completion"),
-        ("Enter", "Run command"),
-        ("", ""),
         ("WINDOW ACTIONS", ""),
         ("/n", "Restore/expand window n (e.g. /3)"),
         ("/xn", "Close/cancel window n (e.g. /x3)"),
@@ -4010,7 +3717,10 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Mouse Click on Window", "Toggle expand/collapse"),
     ];
 
-    if use_two_columns {
+    // The content is taller than the cap on ordinary terminals, so it scrolls
+    // and says so — the scrollbar thumb reaching bottom exactly when the
+    // content does is the honest-panes contract (SPEC R24.8.1).
+    let (total_rows, scroll) = if use_two_columns {
         let chunks = Layout::horizontal([
             Constraint::Percentage(49),
             Constraint::Length(2),
@@ -4020,9 +3730,15 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
 
         let left_lines = format_help_rows(left_rows, 21, theme);
         let right_lines = format_help_rows(right_rows, 21, theme);
+        let total = left_lines.len().max(right_lines.len());
+        let scroll = clamp_scroll(state.help_scroll, total, inner.height);
 
-        let left_para = Paragraph::new(Text::from(left_lines)).wrap(Wrap { trim: false });
-        let right_para = Paragraph::new(Text::from(right_lines)).wrap(Wrap { trim: false });
+        let left_para = Paragraph::new(Text::from(left_lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        let right_para = Paragraph::new(Text::from(right_lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
 
         let sep = Block::default()
             .borders(Borders::LEFT)
@@ -4031,92 +3747,34 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         frame.render_widget(left_para, chunks[0]);
         frame.render_widget(sep, chunks[1]);
         frame.render_widget(right_para, chunks[2]);
+        (total, scroll)
     } else {
         let lines = format_help_rows(single_rows, 24, theme);
-        let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        let total = lines.len();
+        let scroll = clamp_scroll(state.help_scroll, total, inner.height);
+        let para = Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
         frame.render_widget(para, inner);
-    }
-}
-
-// ─── Command palette overlay ──────────────────────────────────────────────────
-
-#[cfg(feature = "tui")]
-fn palette_list_items(
-    completions: &[String],
-    selected: usize,
-    limit: usize,
-    theme: &Theme,
-) -> Vec<ListItem<'static>> {
-    completions
-        .iter()
-        .take(limit)
-        .enumerate()
-        .map(|(i, name)| {
-            let style = if i == selected {
-                theme.selected_item()
-            } else {
-                theme.normal()
-            };
-            ListItem::new(Span::styled(format!(" {name}"), style))
-        })
-        .collect()
-}
-
-#[cfg(feature = "tui")]
-fn draw_palette(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let Some(palette) = state.palette() else {
-        return;
+        (total, scroll)
     };
-    let w = 60u16.min(area.width);
-    let max_items = 10u16;
-    let h = (3 + max_items).min(area.height);
-    let popup = centered_rect(w, h, area);
 
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(Span::styled(" : Command ", theme.title()))
-        .borders(Borders::ALL)
-        .border_style(theme.border_focused());
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    if inner.height == 0 {
-        return;
-    }
-
-    // Input line with blinking cursor illusion
-    let cursor = overlay_bar_cursor(state.unicode);
-    let input_display = format!("> {}{cursor}", palette.input);
-    let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
-    frame.render_widget(
-        Paragraph::new(Span::styled(input_display, theme.running())),
-        input_area,
-    );
-
-    if inner.height < 3 || palette.completions.is_empty() {
-        return;
-    }
-
-    let sep_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
-    render_horizontal_rule(frame, sep_area, state.unicode, theme);
-
-    let list_h = inner.height.saturating_sub(2);
-    if list_h == 0 {
-        return;
-    }
-    let list_area = Rect::new(inner.x, inner.y + 2, inner.width, list_h);
-
-    let items = palette_list_items(
-        &palette.completions,
-        palette.selected_completion,
-        list_h as usize,
+    draw_scrollbar(
+        frame,
         theme,
+        total_rows,
+        inner.height as usize,
+        scroll as usize,
+        inner,
     );
+}
 
-    let mut list_state = ListState::default().with_selected(Some(palette.selected_completion));
-    let list = List::new(items).highlight_style(theme.selected_item());
-    frame.render_stateful_widget(list, list_area, &mut list_state);
+/// Clamp a requested scroll offset so the last row is the last thing shown —
+/// scrolling past the end leaves a blank pane and lies about there being more.
+#[cfg(feature = "tui")]
+fn clamp_scroll(requested: u16, total_rows: usize, visible_h: u16) -> u16 {
+    let max = (total_rows as u16).saturating_sub(visible_h);
+    requested.min(max)
 }
 
 // ─── Utility ──────────────────────────────────────────────────────────────────
@@ -4126,10 +3784,12 @@ fn truncate(s: &str, max_chars: usize) -> String {
         return String::new();
     }
     let mut chars = s.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
+    let mut truncated: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
-        let keep = truncated.len().saturating_sub(1);
-        format!("{}…", &truncated[..keep])
+        // Drop the last *character*, not the last byte — byte-slicing here
+        // panicked mid-codepoint on any multibyte tail (CJK paths, emoji).
+        truncated.pop();
+        format!("{truncated}…")
     } else {
         truncated
     }
@@ -4147,7 +3807,7 @@ pub(crate) fn shorten_llm_label(label: &str) -> String {
 }
 
 pub(crate) fn shorten_path(path: &str, max_chars: usize) -> String {
-    if path.len() <= max_chars {
+    if path.chars().count() <= max_chars {
         return path.to_string();
     }
     let home = std::env::var("HOME").unwrap_or_default();
@@ -4156,12 +3816,18 @@ pub(crate) fn shorten_path(path: &str, max_chars: usize) -> String {
     } else {
         path.to_string()
     };
-    if shortened.len() <= max_chars {
+    let char_count = shortened.chars().count();
+    if char_count <= max_chars {
         return shortened;
     }
+    // Keep the trailing `keep` characters. Character-based, not byte-based:
+    // byte indexing panicked mid-codepoint on non-ASCII paths (`~/Résumé/…`).
     let keep = max_chars.saturating_sub(1);
-    let start = shortened.len().saturating_sub(keep);
-    format!("…{}", &shortened[start..])
+    let tail: String = shortened
+        .chars()
+        .skip(char_count.saturating_sub(keep))
+        .collect();
+    format!("…{tail}")
 }
 
 /// Returns a centered `Rect` of the given size within `area`.
@@ -4230,8 +3896,19 @@ fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area:
     let list_area = content_chunks[0];
     let footer_area = content_chunks[1];
 
+    // Keep the selected row on screen and tell the truth about overflow — a
+    // category taller than the fixed popup silently lost its tail (R24.8.1).
+    let total = content_items.len();
+    let visible = list_area.height as usize;
+    let offset = state
+        .settings_editor
+        .selected_item
+        .saturating_sub(visible.saturating_sub(1))
+        .min(total.saturating_sub(visible));
     let content_list = List::new(content_items);
-    frame.render_widget(content_list, list_area);
+    let mut list_state = ListState::default().with_offset(offset);
+    frame.render_stateful_widget(content_list, list_area, &mut list_state);
+    draw_scrollbar(frame, theme, total, visible, offset, list_area);
 
     // Draw status message and action hints
     frame.render_widget(
@@ -4281,10 +3958,18 @@ fn build_settings_content_items(
 
             let val_string = format_setting_value(&item.value);
 
+            // Distinguish the three kinds of row the panel actually holds.
+            // Without this, a string/numeric row looked identical to a togglable
+            // one and simply swallowed Space — most of the panel read as broken
+            // rather than read-only.
+            let editable = matches!(item.value, crate::settings_editor::SettingValue::Bool(_))
+                && !item.security_tier;
             let sec_indicator = if item.security_tier {
                 Span::styled(" [locked]", theme.dim())
+            } else if editable {
+                Span::styled(" [space]", theme.dim())
             } else {
-                Span::raw("")
+                Span::styled(" [file]  ", theme.dim())
             };
 
             let label_style = if is_selected {
@@ -4319,7 +4004,7 @@ fn settings_footer_line(state: &AppState, theme: &Theme) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {}", status_str), theme.pending()),
         Span::styled(
-            "  [Space] Toggle  [r] Reset  [s] Save  [Esc/q] Close ",
+            "  [Space] Toggle  [r] Reset  [s] Save  [Esc/q] Close   ([file] = edit settings.toml)",
             theme.dim(),
         ),
     ])
@@ -4589,11 +4274,12 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let theme = Theme::new(true);
+        let state = AppState::new("http://localhost:3000", "HTTP", true);
         // Both the two-column (>=100 wide) and single-column layouts.
         for width in [120u16, 70] {
             let mut terminal = Terminal::new(TestBackend::new(width, 50)).unwrap();
             terminal
-                .draw(|frame| draw_help(frame, &theme, Rect::new(0, 0, width, 50)))
+                .draw(|frame| draw_help(frame, &state, &theme, Rect::new(0, 0, width, 50)))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             let screen: String = (0..50)
@@ -4650,28 +4336,190 @@ mod tests {
         );
     }
 
-    /// The instance panel answers "how did it go", so zero-valued tallies are
-    /// noise and are dropped; an instance with no work says so in words.
+    /// The scope panel states the whole posture: enforcement, who the
+    /// authority is, every write root, tmp, provenance, and the user's own
+    /// grants with the command that removes them (SPEC R5.4, R5.4.6).
     #[test]
-    fn instance_tally_line_drops_zero_terms() {
-        use crate::task_tree::GroupCounts;
+    fn scope_window_states_roots_authority_and_provenance() {
+        use crate::state::{AppState, SandboxScopeInfo};
         let theme = Theme::new(true);
-        let text = |l: &Line| -> String { l.spans.iter().map(|s| &*s.content).collect() };
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.sandbox_scope = Some(SandboxScopeInfo {
+            write: vec!["/home/u/proj".into()],
+            read: vec![],
+            tmp: false,
+            enforced: true,
+            source: Some("roots/list".into()),
+            active: Some("ahma".into()),
+            ..Default::default()
+        });
+        state.granted_scopes = vec![("/opt/cache".into(), "rw".into())];
 
-        let busy = GroupCounts {
-            running: 2,
-            queued: 0,
-            succeeded: 14,
-            failed: 1,
+        let text = scope_window_lines(&state, &theme)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(text.contains("ENFORCED"), "{text}");
+        assert!(text.contains("ahma (kernel)"), "{text}");
+        assert!(text.contains("/home/u/proj"), "{text}");
+        assert!(text.contains("source: roots/list"), "{text}");
+        assert!(text.contains("/opt/cache (rw)"), "grants shown: {text}");
+        assert!(text.contains("ahma sandbox revoke"), "revoke named: {text}");
+    }
+
+    /// Deferring to a host means ahma is not enforcing; the panel must say that
+    /// in words (SPEC R7.5), not leave it to a colour.
+    #[test]
+    fn scope_window_names_host_authority_when_deferred() {
+        use crate::state::{AppState, SandboxScopeInfo};
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.sandbox_scope = Some(SandboxScopeInfo {
+            write: vec!["/home/u/proj".into()],
+            enforced: false,
+            active: Some("deferred_to_host".into()),
+            host: Some("Cursor".into()),
+            ..Default::default()
+        });
+
+        let text = scope_window_lines(&state, &theme)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(text.contains("Cursor"), "{text}");
+        assert!(text.contains("ahma is NOT enforcing"), "{text}");
+    }
+
+    /// Before any report arrives the panel says so and explains why, rather
+    /// than rendering an empty box or implying a scope it has not been told.
+    #[test]
+    fn scope_window_is_explicit_when_nothing_reported() {
+        use crate::state::AppState;
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.sandbox_status = "INITIALIZING".to_string();
+
+        let text = scope_window_lines(&state, &theme)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(text.contains("Scope not reported"), "{text}");
+        assert!(text.contains("still negotiating scope"), "{text}");
+    }
+
+    /// The help overlay is capped shorter than its content, so its tail — the
+    /// LOG section, including the click-a-line affordance R24.8.4 requires it
+    /// to advertise — must be reachable by scrolling. Before this it was not
+    /// rendered at all, in the pane that documents the rule.
+    #[test]
+    fn help_tail_is_reachable_by_scrolling() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::new(true);
+        let render = |scroll: u16| -> String {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.help_scroll = scroll;
+            let mut terminal = Terminal::new(TestBackend::new(70, 30)).unwrap();
+            terminal
+                .draw(|frame| draw_help(frame, &state, &theme, Rect::new(0, 0, 70, 30)))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..30)
+                .map(|y| {
+                    (0..70)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         };
-        let line = text(&instance_tally_line(&busy, &theme, true));
-        assert_eq!(line, "2 running · 14 ok · 1 failed");
 
-        let idle = GroupCounts::default();
-        assert_eq!(
-            text(&instance_tally_line(&idle, &theme, true)),
-            "idle — no operations"
+        let top = render(0);
+        let bottom = render(200); // clamped to the true maximum
+        assert!(top.contains("GLOBAL"), "top shows the first section");
+        assert!(
+            !top.contains("Switch log file"),
+            "the tail must genuinely be off-screen at rest, else this proves nothing"
         );
+        assert!(
+            bottom.contains("Switch log file"),
+            "scrolling to the end must reveal the LOG section:\n{bottom}"
+        );
+    }
+
+    /// Scrolling past the end is clamped, so the last row stays the last thing
+    /// shown rather than scrolling away into blank space.
+    #[test]
+    fn clamp_scroll_stops_at_the_last_row() {
+        assert_eq!(clamp_scroll(0, 50, 10), 0);
+        assert_eq!(clamp_scroll(5, 50, 10), 5);
+        assert_eq!(clamp_scroll(999, 50, 10), 40);
+        // Content that fits never scrolls.
+        assert_eq!(clamp_scroll(999, 8, 10), 0);
+    }
+
+    /// The web modal is a security prompt over attacker-influenced text, so
+    /// SPEC R-WEB.6 pins its contents: all three tiers offered, the URL capped
+    /// (R-WEB.6.1), and cleartext HTTP called out (R-WEB.6.4).
+    #[test]
+    fn web_modal_offers_three_tiers_and_flags_cleartext() {
+        use crate::state::WebApprovalGate;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::new(true);
+        let render = |url: &str| -> String {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.web_approval = Some(WebApprovalGate {
+                decision_id: "d".into(),
+                domain: "example.com".into(),
+                url: url.to_string(),
+                tool: Some("fetch_webpage".into()),
+            });
+            let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+            terminal
+                .draw(|f| draw_web_approval_modal(f, &state, &theme, Rect::new(0, 0, 90, 24)))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..24)
+                .map(|y| {
+                    (0..90)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let https = render("https://example.com/a");
+        for tier in ["[n]", "[o]", "[s]", "[a]"] {
+            assert!(
+                https.contains(tier),
+                "tier {tier} must be offered:\n{https}"
+            );
+        }
+        assert!(
+            !https.contains("cleartext"),
+            "https must not raise the cleartext caution"
+        );
+
+        let http = render("http://example.com/a");
+        assert!(http.contains("cleartext"), "http must be flagged:\n{http}");
+    }
+
+    /// A crafted long URL must not be able to push the buttons out of a
+    /// fixed-height popup (R-WEB.6.1).
+    #[test]
+    fn web_modal_caps_a_hostile_url() {
+        let long = format!("https://example.com/{}", "a".repeat(4000));
+        assert!(truncate(&long, 256).chars().count() <= 256);
     }
 
     #[test]
@@ -4699,6 +4547,26 @@ mod tests {
         // Provider reported usage → exact cumulative counts, no context window.
         let s = token_status_segment(1700, 1200, 500, 1200, 0, None);
         assert_eq!(s, " · tkns 1.2k in / 500 out (1.7k ttl)");
+    }
+
+    /// The narrow-header variant keeps the decision-relevant half (context
+    /// fill) and drops the in/out/total breakdown. With no known context
+    /// window there is no percentage to state, so it renders nothing rather
+    /// than a percentage of an unknown whole.
+    #[test]
+    fn context_fill_segment_needs_a_known_window() {
+        use crate::state::AppState;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.token_prefs.context_length = None;
+        state.last_prompt_tokens = 2048;
+        assert_eq!(context_fill_segment(&state), "");
+
+        state.token_prefs.context_length = Some(4096);
+        assert_eq!(context_fill_segment(&state), " · 50% ctx");
+
+        // Nothing sent yet and nothing to estimate → still nothing to say.
+        state.last_prompt_tokens = 0;
+        assert_eq!(context_fill_segment(&state), "");
     }
 
     #[test]

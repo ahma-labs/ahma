@@ -698,7 +698,7 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
 #### Making the question findable
 
 - **R-PERM.7**: **A denial is a first-class, visible event**, not just an error string: every denial **must** appear in the operation stream with the operation identity of the command that caused it (R24.7), so it is visible in the TUI monitor and chat views and in replay after late attach.
-- **R-PERM.7.1**: **A denied operation is selectable and re-raisable**: in the TUI, selecting a denied operation and confirming **must** re-raise the grant question through the same broker, with the same preview. This is an explicit human action and therefore bypasses the R-PERM.4 ask-once memo (it is not an unsolicited re-prompt). This is the "escape hatch with context" that hooks have never had.
+- **R-PERM.7.1**: **A denied operation is selectable and re-raisable**: in the TUI, selecting a denied operation and confirming **must** re-raise the grant question through the same broker, with the same preview. This is an explicit human action and therefore bypasses the R-PERM.4 ask-once memo (it is not an unsolicited re-prompt). This is the "escape hatch with context" that hooks have never had. _Implementation_: the denial travels the hub wire on `OpFinished.denial` (`{path, access}`, add-only per R24.5, `status` stays `"Failed"` for pre-upgrade readers); the TUI promotes it to `OpStatus::Denied` and renders `denied: <path> · [a] ask`; `a` sends `ClientMsg::ReRaiseScopeGrant`, which the hub routes to the owning instance, where `GrantCoordinator::reopen` clears the ask-once memo for that `(path, access)` and raises a normal `ScopeGrantRequested` — the same broker, the same modal, the same persistence path.
 
 ---
 
@@ -1677,10 +1677,11 @@ correct **at startup**, not only for events that happen afterwards.
   tallies: running / queued / succeeded / failed), operations beneath them,
   children indented under their parent (session groups, spawned subtasks —
   arbitrary depth). Finished tasks resolve in place to a terminal glyph +
-  duration. Enter or click on a task expands it inline into its live output
+  duration. Space or click on a task expands it inline into its live output
   tail (running) or historic output/result summary (finished); expanding one
-  task collapses the previously expanded one (single-expand accordion).
-  Instance and session headers fold/unfold their subtree instead.
+  task collapses the previously expanded one (single-expand accordion), and
+  Enter opens the full-screen operation detail overlay instead.
+  Instance and session headers fold/unfold their subtree.
 
 - **R24.5 — Field-only wire evolution.** The task-tree protocol additions
   (`parent_id`, `started_epoch_ms`, `ended_epoch_ms` on `DaemonEvent`;

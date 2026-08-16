@@ -44,6 +44,16 @@ pub enum SourceEvent {
     SandboxStatus {
         status: String,
     },
+    /// The complete scope + provenance carried by `notifications/sandbox/configured`
+    /// (SPEC R5.4: every writable root, read root, tmp, enforcement, and source).
+    SandboxScope {
+        scope: crate::state::SandboxScopeInfo,
+    },
+    /// `notifications/sandbox/failed` with its reason, so the failure outlives
+    /// a log line and can be shown with remediation (SPEC R7.3: fail loudly).
+    SandboxFailed {
+        error: String,
+    },
     SessionId {
         id: String,
     },
@@ -633,8 +643,8 @@ async fn handle_sse_event(
         warn!("Sandbox configuration failed: {}", error);
         send(
             tx,
-            SourceEvent::SandboxStatus {
-                status: "FAILED".to_string(),
+            SourceEvent::SandboxFailed {
+                error: error.to_string(),
             },
         )
         .await;
@@ -643,45 +653,78 @@ async fn handle_sse_event(
     if method == Some("notifications/sandbox/configured") {
         debug!("Sandbox configured successfully!");
         let params = value.get("params");
-        let active = params
-            .and_then(|p| p.get("active"))
-            .and_then(|v| v.as_str());
-        let host = params.and_then(|p| p.get("host")).and_then(|v| v.as_str());
-        let disclosure = params
-            .and_then(|p| p.get("active_disclosure"))
-            .and_then(|v| v.as_str());
+        // The server nests the full ScopeView under `params.scope` (SPEC R5.4:
+        // "the configured notification carries the complete scope and its
+        // provenance"). Older emitters put `active`/`host`/`active_disclosure`
+        // at the top level of params, so fall back there field-by-field.
+        let scope_obj = params.and_then(|p| p.get("scope"));
+        let field = |key: &str| -> Option<&Value> {
+            scope_obj
+                .and_then(|s| s.get(key))
+                .or_else(|| params.and_then(|p| p.get(key)))
+        };
+        let str_field = |key: &str| field(key).and_then(Value::as_str).map(str::to_string);
+        let paths_field = |key: &str| -> Vec<String> {
+            field(key)
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let scope = crate::state::SandboxScopeInfo {
+            write: paths_field("write"),
+            read: paths_field("read"),
+            tmp: field("tmp").and_then(Value::as_bool).unwrap_or(false),
+            // A notification with no scope payload comes from a server that
+            // only emits it after enforcing — assume enforced there rather
+            // than rendering a false "DISABLED".
+            enforced: field("enforced").and_then(Value::as_bool).unwrap_or(true),
+            source: str_field("source"),
+            active: str_field("active"),
+            host: str_field("host"),
+            disclosure: str_field("active_disclosure"),
+            platform_note: str_field("platform_note"),
+        };
 
         // Map the active-sandbox token to a compact status-bar label. Missing
         // params (older servers, or the bare notification) => LOCKED, preserving
         // backward compatibility.
-        let status = match active {
-            Some("ahma_nested_in_host") => match host {
+        let status = match scope.active.as_deref() {
+            Some("ahma_nested_in_host") => match scope.host.as_deref() {
                 Some(h) => format!("NESTED: {h}"),
                 None => "NESTED".to_string(),
             },
-            Some("deferred_to_host") => match host {
+            Some("deferred_to_host") => match scope.host.as_deref() {
                 Some(h) => format!("DEFERRED: {h}"),
                 None => "DEFERRED".to_string(),
             },
             Some("disabled") => "UNSANDBOXED".to_string(),
             _ => "LOCKED".to_string(),
         };
+        let not_sole_authority = matches!(
+            scope.active.as_deref(),
+            Some("ahma_nested_in_host") | Some("deferred_to_host") | Some("disabled")
+        );
+        let disclosure_text = scope.disclosure.clone();
+        send(tx, SourceEvent::SandboxScope { scope }).await;
         send(tx, SourceEvent::SandboxStatus { status }).await;
 
         // When ahma is not the sole authority, surface the loud, actionable
         // disclosure once in the log pane so the remediation is visible in-TUI —
-        // not just in the server's stderr the user may never see.
-        if matches!(
-            active,
-            Some("ahma_nested_in_host") | Some("deferred_to_host") | Some("disabled")
-        ) && let Some(text) = disclosure
-        {
+        // not just in the server's stderr the user may never see. (The `/scope`
+        // window keeps it visible persistently after this line scrolls away.)
+        if not_sole_authority && let Some(text) = disclosure_text {
             send(
                 tx,
                 SourceEvent::LogLine(LogEntry {
                     timestamp: chrono::Local::now(),
                     level: LogLevel::Warn,
-                    message: text.to_string(),
+                    message: text,
                 }),
             )
             .await;
@@ -1090,7 +1133,9 @@ fn extract_http_base_url(connection: &ResolvedConnection) -> String {
         ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => url.clone(),
         #[cfg(unix)]
         ResolvedTransport::UnixSocket(path) => {
-            std::env::var("AHMA_HTTP_URL").unwrap_or_else(|_| format!("unix://{}", path))
+            // Retired (R-CFG1.2); use `ahma tui --connect <URL>` instead.
+            ahma_common::config::warn_retired_env("AHMA_HTTP_URL");
+            format!("unix://{}", path)
         }
     }
 }
@@ -1368,12 +1413,12 @@ mod tests {
         assert_eq!(extract_http_base_url(&http3), "http://h:5678");
     }
 
+    /// A Unix-socket connection reports a `unix://` base URL. `AHMA_HTTP_URL`
+    /// no longer redirects it (retired, R-CFG1.2) — so unlike before, this does
+    /// not need to bail out when the variable happens to be set.
     #[cfg(unix)]
     #[test]
     fn mcp_extract_http_base_url_unix_socket_default() {
-        if std::env::var("AHMA_HTTP_URL").is_ok() {
-            return;
-        }
         let conn = ResolvedConnection {
             display_url: "d".to_string(),
             transport: ResolvedTransport::UnixSocket("/run/ahma.sock".to_string()),
@@ -1774,7 +1819,7 @@ mod tests {
             .await
             .expect("ok");
         match rx.try_recv().expect("event emitted") {
-            SourceEvent::SandboxStatus { status } => assert_eq!(status, "FAILED"),
+            SourceEvent::SandboxFailed { error } => assert_eq!(error, "scope locked"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -1787,8 +1832,106 @@ mod tests {
         handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
             .await
             .expect("ok");
-        match rx.try_recv().expect("event emitted") {
+        // First event carries the (empty) scope; second the compact status.
+        match rx.try_recv().expect("scope event emitted") {
+            SourceEvent::SandboxScope { scope } => {
+                assert!(scope.write.is_empty());
+                assert!(scope.enforced, "bare notification assumes enforced");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match rx.try_recv().expect("status event emitted") {
             SourceEvent::SandboxStatus { status } => assert_eq!(status, "LOCKED"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The real wire shape (SPEC R5.4): the full ScopeView nested under
+    /// `params.scope` — write/read roots, tmp, enforcement, provenance, and the
+    /// active-sandbox posture. This is what `Sandbox::scope_json` emits and what
+    /// the bridge forwards verbatim; the top-level-params shape covered by the
+    /// `nested_in_host` test below is the legacy fallback.
+    #[tokio::test]
+    async fn mcp_handle_sse_event_sandbox_configured_nested_scope_payload() {
+        let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
+        let client = test_client();
+        let value = json!({
+            "method": "notifications/sandbox/configured",
+            "params": {
+                "scope": {
+                    "enforced": true,
+                    "write": ["/home/user/proj", "/home/user/cache"],
+                    "read": ["/opt/toolchain"],
+                    "tmp": true,
+                    "source": "roots/list",
+                    "active": "ahma",
+                    "active_disclosure": "Sandbox: ahma kernel sandbox is ENFORCING"
+                }
+            }
+        });
+        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
+            .await
+            .expect("ok");
+        match rx.try_recv().expect("scope event emitted") {
+            SourceEvent::SandboxScope { scope } => {
+                assert_eq!(scope.write, vec!["/home/user/proj", "/home/user/cache"]);
+                assert_eq!(scope.read, vec!["/opt/toolchain"]);
+                assert!(scope.tmp);
+                assert!(scope.enforced);
+                assert_eq!(scope.source.as_deref(), Some("roots/list"));
+                assert_eq!(scope.active.as_deref(), Some("ahma"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match rx.try_recv().expect("status event emitted") {
+            SourceEvent::SandboxStatus { status } => assert_eq!(status, "LOCKED"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Sole authority => no disclosure log line.
+        assert!(rx.try_recv().is_err(), "no extra events expected");
+    }
+
+    /// `disabled` nested under `params.scope` must reach the chip as
+    /// UNSANDBOXED — this exact path was dead before the nested-shape parsing
+    /// landed (the TUI read only top-level params, which the server never sent,
+    /// so every configured notification rendered as [LOCKED]).
+    #[tokio::test]
+    async fn mcp_handle_sse_event_sandbox_configured_nested_disabled() {
+        let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
+        let client = test_client();
+        let value = json!({
+            "method": "notifications/sandbox/configured",
+            "params": {
+                "scope": {
+                    "enforced": false,
+                    "write": ["/home/user/proj"],
+                    "read": [],
+                    "tmp": false,
+                    "source": "explicit",
+                    "active": "disabled",
+                    "active_disclosure": "Sandbox: DISABLED — no kernel confinement is active."
+                }
+            }
+        });
+        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
+            .await
+            .expect("ok");
+        match rx.try_recv().expect("scope event emitted") {
+            SourceEvent::SandboxScope { scope } => {
+                assert!(!scope.enforced);
+                assert_eq!(scope.active.as_deref(), Some("disabled"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match rx.try_recv().expect("status event emitted") {
+            SourceEvent::SandboxStatus { status } => assert_eq!(status, "UNSANDBOXED"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match rx.try_recv().expect("disclosure log line emitted") {
+            SourceEvent::LogLine(entry) => {
+                assert_eq!(entry.level, LogLevel::Warn);
+                assert!(entry.message.contains("DISABLED"));
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -1808,12 +1951,20 @@ mod tests {
         handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
             .await
             .expect("ok");
-        // First event: the compact status-bar label naming the host.
+        // First event: the parsed scope (legacy top-level shape still honored).
+        match rx.try_recv().expect("scope event emitted") {
+            SourceEvent::SandboxScope { scope } => {
+                assert_eq!(scope.active.as_deref(), Some("ahma_nested_in_host"));
+                assert_eq!(scope.host.as_deref(), Some("Claude Code"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Second event: the compact status-bar label naming the host.
         match rx.try_recv().expect("status event emitted") {
             SourceEvent::SandboxStatus { status } => assert_eq!(status, "NESTED: Claude Code"),
             other => panic!("unexpected: {other:?}"),
         }
-        // Second event: the loud remediation surfaced as a warning log line.
+        // Third event: the loud remediation surfaced as a warning log line.
         match rx.try_recv().expect("log line emitted") {
             SourceEvent::LogLine(entry) => {
                 assert_eq!(entry.level, LogLevel::Warn);

@@ -192,6 +192,31 @@ impl GrantCoordinator {
         Some(req)
     }
 
+    /// Re-open a question the session already answered, at the user's explicit
+    /// request (SPEC R-PERM.7.1: selecting a denied operation and confirming
+    /// re-raises the grant question).
+    ///
+    /// This is the one sanctioned way past the ask-once memo, and it is safe
+    /// precisely because it is not automatic: the memo exists so ahma does not
+    /// *nag*, and a person deliberately choosing a denied row and confirming is
+    /// not ahma nagging. Still returns `None` when the same `(path, access)` is
+    /// already in flight — re-raising a live question would just duplicate the
+    /// modal, not add information.
+    pub fn reopen(
+        &self,
+        path: &Path,
+        access: ScopeAccess,
+        reason: GrantReason,
+        tool: Option<String>,
+    ) -> Option<ScopeGrantRequest> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let key = (canonicalize_best_effort(path), access);
+            inner.dismissed.remove(&key);
+        }
+        self.begin(path, access, reason, tool)
+    }
+
     /// Resolve a decision with the human's answer. First-answer-wins and idempotent:
     /// a second call for the same `decision_id` returns [`GrantResolveOutcome::AlreadyResolved`].
     ///
@@ -473,6 +498,52 @@ mod tests {
         assert!(
             c.begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
                 .is_some()
+        );
+    }
+
+    /// `reopen` is the user-initiated escape hatch from the ask-once memo
+    /// (SPEC R-PERM.7.1): after a denial the path is dismissed for the session
+    /// and `begin` correctly refuses to nag, but a person selecting the denied
+    /// row and confirming must still get the question back.
+    #[test]
+    fn reopen_asks_again_after_the_session_dismissed_the_path() {
+        let c = coord();
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+
+        let req = c
+            .begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
+            .expect("first ask");
+        c.resolve(&req.decision_id, GrantDecision::Deny);
+
+        // The memo holds against an automatic re-ask …
+        assert!(
+            c.begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
+                .is_none(),
+            "a denied path must not re-prompt on its own"
+        );
+
+        // … and yields to an explicit human request.
+        let again = c
+            .reopen(p, ScopeAccess::Rw, GrantReason::StderrHeuristic, None)
+            .expect("reopen must re-raise");
+        assert_ne!(again.decision_id, req.decision_id, "a fresh decision");
+        assert_eq!(again.access, ScopeAccess::Rw);
+    }
+
+    /// Re-raising a question that is already on screen would duplicate the
+    /// modal without adding information.
+    #[test]
+    fn reopen_is_a_noop_while_the_question_is_in_flight() {
+        let c = coord();
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        let _live = c
+            .begin(p, ScopeAccess::Ro, GrantReason::PreExecViolation, None)
+            .expect("first ask");
+        assert!(
+            c.reopen(p, ScopeAccess::Ro, GrantReason::PreExecViolation, None)
+                .is_none()
         );
     }
 

@@ -22,8 +22,10 @@ pub enum Action {
     Reject,
     // Op actions
     CancelOp,
-    AwaitOp,
     PinOp,
+    /// Ask for access to the path a selected *denied* operation was refused —
+    /// re-raises the grant question through the same broker (SPEC R-PERM.7.1).
+    ReRaiseGrant,
     /// Fold/unfold the selected task-tree node inline (Space) — Enter drills
     /// into the full-screen detail view instead.
     ToggleNode,
@@ -33,16 +35,6 @@ pub enum Action {
     ToggleProjectFilter,
     // Toggles
     ToggleHelp,
-    ToggleDetail,
-    // Old palette (`:`)
-    OpenPalette,
-    PaletteChar(char),
-    PaletteBackspace,
-    PaletteComplete,
-    PaletteEsc,
-    PaletteSubmit,
-    PaletteUp,
-    PaletteDown,
     // Log filter
     StartFilter,
     FilterChar(char),
@@ -90,12 +82,11 @@ pub enum Action {
 #[cfg(feature = "tui")]
 pub fn map_key(key: KeyEvent, focus: Focus, modal: &ModalState, log_filter_active: bool) -> Action {
     // Open overlays take key priority, in this order: navigator > log-file
-    // switcher > palette. (Help and the inline pickers are dispatched before
-    // map_key is reached.)
+    // switcher. (Help and the inline pickers are dispatched before map_key is
+    // reached.)
     match modal {
         ModalState::Navigator(_) => return map_navigator_key(key),
         ModalState::LogFiles { .. } => return map_log_modal_key(key),
-        ModalState::Palette(_) => return map_palette_key(key),
         ModalState::OperationDetail(_) => return map_op_detail_key(key),
         ModalState::LogLineDetail(_) => return map_log_line_detail_key(key),
         _ => {}
@@ -247,8 +238,8 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
 
         // Op actions (only meaningful when OpsDag is focused)
         (Char('c'), KM::NONE) if focus == Focus::OpsDag => Action::CancelOp,
-        (Char('a'), KM::NONE) if focus == Focus::OpsDag => Action::AwaitOp,
         (Char('p'), KM::NONE) if focus == Focus::OpsDag => Action::PinOp,
+        (Char('a'), KM::NONE) if focus == Focus::OpsDag => Action::ReRaiseGrant,
         (Char('f'), KM::NONE) if focus == Focus::OpsDag => Action::ToggleProjectFilter,
         (Char(' '), KM::NONE) if focus == Focus::OpsDag => Action::ToggleNode,
 
@@ -257,10 +248,6 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
 
         // Toggles
         (Char('?'), _) => Action::ToggleHelp,
-        (Char('d'), KM::NONE) => Action::ToggleDetail,
-
-        // Old `:` palette (kept for backward compat in Monitor mode)
-        (Char(':'), _) => Action::OpenPalette,
 
         // Navigator via `/` in non-filter context
         (Char('/'), KM::NONE) if focus != Focus::Log => Action::OpenNavigator,
@@ -270,24 +257,6 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
 
         (Esc, _) => Action::FocusChat,
 
-        _ => Action::Unknown,
-    }
-}
-
-#[cfg(feature = "tui")]
-fn map_palette_key(key: KeyEvent) -> Action {
-    use KeyCode::*;
-    use KeyModifiers as KM;
-
-    match (key.code, key.modifiers) {
-        (Esc, _) => Action::PaletteEsc,
-        (Enter, _) => Action::PaletteSubmit,
-        (Tab, _) => Action::PaletteComplete,
-        (BackTab, _) => Action::PaletteDown,
-        (Up, _) => Action::PaletteUp,
-        (Down, _) => Action::PaletteDown,
-        (Backspace, _) => Action::PaletteBackspace,
-        (Char(c), KM::NONE) | (Char(c), KM::SHIFT) => Action::PaletteChar(c),
         _ => Action::Unknown,
     }
 }
@@ -317,7 +286,7 @@ pub fn map_key(_key: (), _focus: Focus, _modal: &ModalState, _log_filter_active:
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
-    use crate::state::{CommandNavigator, Focus, ModalState, PaletteState};
+    use crate::state::{CommandNavigator, Focus, ModalState};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// Build a KeyEvent with the given code and modifiers.
@@ -332,10 +301,6 @@ mod tests {
 
     fn navigator_modal() -> ModalState {
         ModalState::Navigator(CommandNavigator::default())
-    }
-
-    fn palette_modal() -> ModalState {
-        ModalState::Palette(PaletteState::default())
     }
 
     fn logfiles_modal() -> ModalState {
@@ -631,94 +596,6 @@ mod tests {
                 kn(KeyCode::Char('z')),
                 Focus::Chat,
                 &logfiles_modal(),
-                false
-            ),
-            Action::Unknown
-        );
-    }
-
-    // ─── Palette modal dispatch (map_palette_key) ───────────────────────────────
-
-    #[test]
-    fn palette_esc() {
-        assert_eq!(
-            map_key(kn(KeyCode::Esc), Focus::Chat, &palette_modal(), false),
-            Action::PaletteEsc
-        );
-    }
-
-    #[test]
-    fn palette_enter() {
-        assert_eq!(
-            map_key(kn(KeyCode::Enter), Focus::Chat, &palette_modal(), false),
-            Action::PaletteSubmit
-        );
-    }
-
-    #[test]
-    fn palette_tab() {
-        assert_eq!(
-            map_key(kn(KeyCode::Tab), Focus::Chat, &palette_modal(), false),
-            Action::PaletteComplete
-        );
-    }
-
-    #[test]
-    fn palette_backtab() {
-        assert_eq!(
-            map_key(kn(KeyCode::BackTab), Focus::Chat, &palette_modal(), false),
-            Action::PaletteDown
-        );
-    }
-
-    #[test]
-    fn palette_up() {
-        assert_eq!(
-            map_key(kn(KeyCode::Up), Focus::Chat, &palette_modal(), false),
-            Action::PaletteUp
-        );
-    }
-
-    #[test]
-    fn palette_down() {
-        assert_eq!(
-            map_key(kn(KeyCode::Down), Focus::Chat, &palette_modal(), false),
-            Action::PaletteDown
-        );
-    }
-
-    #[test]
-    fn palette_backspace() {
-        assert_eq!(
-            map_key(kn(KeyCode::Backspace), Focus::Chat, &palette_modal(), false),
-            Action::PaletteBackspace
-        );
-    }
-
-    #[test]
-    fn palette_char_none_and_shift() {
-        assert_eq!(
-            map_key(kn(KeyCode::Char('p')), Focus::Chat, &palette_modal(), false),
-            Action::PaletteChar('p')
-        );
-        assert_eq!(
-            map_key(
-                k(KeyCode::Char('P'), KeyModifiers::SHIFT),
-                Focus::Chat,
-                &palette_modal(),
-                false
-            ),
-            Action::PaletteChar('P')
-        );
-    }
-
-    #[test]
-    fn palette_unknown_fallthrough() {
-        assert_eq!(
-            map_key(
-                k(KeyCode::Char('a'), KeyModifiers::CONTROL),
-                Focus::Chat,
-                &palette_modal(),
                 false
             ),
             Action::Unknown
@@ -1032,11 +909,23 @@ mod tests {
         );
     }
 
+    /// `d` was bound to an explicit no-op (ToggleDetail); the binding is gone
+    /// and the key falls through as Unknown. (`a`, formerly the no-op AwaitOp,
+    /// now carries the denied-row grant re-raise — see below.)
     #[test]
-    fn global_opsdag_await_a() {
+    fn removed_noop_binding_falls_through() {
+        assert_eq!(
+            map_key(kn(KeyCode::Char('d')), Focus::OpsDag, &none_modal(), false),
+            Action::Unknown
+        );
+    }
+
+    /// `a` on the tasks pane asks for access to a denied operation's path.
+    #[test]
+    fn opsdag_a_reraises_the_grant_question() {
         assert_eq!(
             map_key(kn(KeyCode::Char('a')), Focus::OpsDag, &none_modal(), false),
-            Action::AwaitOp
+            Action::ReRaiseGrant
         );
     }
 
@@ -1057,18 +946,12 @@ mod tests {
     }
 
     #[test]
-    fn global_toggle_detail_d() {
-        assert_eq!(
-            map_key(kn(KeyCode::Char('d')), Focus::OpsDag, &none_modal(), false),
-            Action::ToggleDetail
-        );
-    }
-
-    #[test]
-    fn global_open_palette_colon() {
+    /// The `:` command palette was removed: it was a reachable but invisible
+    /// mode that swallowed keys and only ever logged "Command: <text>".
+    fn global_colon_no_longer_opens_palette() {
         assert_eq!(
             map_key(kn(KeyCode::Char(':')), Focus::OpsDag, &none_modal(), false),
-            Action::OpenPalette
+            Action::Unknown
         );
     }
 

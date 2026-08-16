@@ -106,6 +106,21 @@ pub struct DaemonChatMessage {
     pub content: String,
 }
 
+/// A sandbox denial attached to a finished operation (SPEC R-PERM.7).
+///
+/// Carries what the kernel refused, so every surface can say *which path* was
+/// denied rather than showing a bare "Failed", and so the TUI can offer to
+/// re-raise the grant question for exactly that `(path, access)` pair
+/// (R-PERM.7.1) without re-parsing an error string.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpDenial {
+    /// The path the denial referenced, as the scanner found it.
+    pub path: String,
+    /// The access the denied operation needed: `"rw"` for a blocked write,
+    /// `"ro"` for a blocked read.
+    pub access: String,
+}
+
 /// Metadata about a registered ahma instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceInfo {
@@ -181,6 +196,16 @@ pub enum DaemonEvent {
         /// the surface says the status word rather than inventing a code.
         #[serde(default)]
         exit_code: Option<i64>,
+        /// Set when the failure was a **sandbox denial** rather than an ordinary
+        /// error: the path (and access) the kernel refused. A denial is a
+        /// first-class, visible event, not an error string (SPEC R-PERM.7) — it
+        /// is what lets the TUI render `denied: <path>` and offer to re-raise the
+        /// grant question for that path.
+        ///
+        /// `status` deliberately stays `"Failed"` so pre-upgrade readers still
+        /// see a failure (R24.5: the wire evolves by adding fields only).
+        #[serde(default)]
+        denial: Option<OpDenial>,
     },
     /// A single line of live output from a running operation.
     /// Streamed as the child process produces it, so subscribers (TUI) can
@@ -268,6 +293,17 @@ pub enum ClientMsg {
     /// An instance announcing a scope-grant decision is resolved, so the hub can
     /// dismiss the prompt on any other TUI showing the same `decision_id`.
     ScopeGrantResolved { decision_id: String },
+    /// A TUI asking an instance to raise the grant question again for a path it
+    /// already refused this session (SPEC R-PERM.7.1). Sent when the user picks
+    /// a denied operation and confirms — an explicit human action, which is why
+    /// it is allowed past the ask-once memo that suppresses automatic re-asks.
+    ReRaiseScopeGrant {
+        /// The denied path, as carried on the operation that was refused.
+        path: String,
+        /// `"ro"` or `"rw"` — the access the denied operation needed.
+        access: String,
+        target_instance_id: Option<String>,
+    },
     /// An instance asking every TUI to raise an "allow web access to X?" prompt for
     /// an unknown domain under a `deny` web policy (SPEC R-WEB.6). The parallel of
     /// [`Self::ScopeGrantRequested`] for network egress; the decision takes effect
@@ -366,6 +402,10 @@ pub enum DaemonMsg {
     /// Tell every TUI to dismiss the scope-grant modal for `decision_id` (a twin
     /// surface answered, or the instance withdrew it).
     ScopeGrantDismiss { decision_id: String },
+    /// Ask this instance to re-raise the grant question for a path it already
+    /// refused this session, because the user explicitly asked for it from a
+    /// denied operation row (SPEC R-PERM.7.1).
+    ReRaiseScopeGrant { path: String, access: String },
     /// Prompt every TUI to raise an "allow web access to X?" modal for an unknown
     /// domain under a `deny` web policy (SPEC R-WEB.6). The default/Enter choice
     /// must be the safe Deny; an approval takes effect for the session (or is
@@ -1193,6 +1233,12 @@ where
             target_instance_id,
         } => route_submit_web_approval(&hub, decision_id, decision, target_instance_id).await,
 
+        ClientMsg::ReRaiseScopeGrant {
+            path,
+            access,
+            target_instance_id,
+        } => route_reraise_scope_grant(&hub, path, access, target_instance_id).await,
+
         _ => {
             debug!("daemon: unexpected message, closing connection");
         }
@@ -1274,6 +1320,20 @@ async fn route_submit_scope_grant(
                 decision,
             })
             .await;
+    }
+}
+
+/// Route a user-initiated re-raise to the instance that owns the denied path.
+async fn route_reraise_scope_grant(
+    hub: &Arc<DaemonHub>,
+    path: String,
+    access: String,
+    target_instance_id: Option<String>,
+) {
+    if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await
+        && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
+    {
+        let _ = tx.send(DaemonMsg::ReRaiseScopeGrant { path, access }).await;
     }
 }
 
@@ -1589,6 +1649,7 @@ mod tests {
             duration_ms: 10,
             ended_epoch_ms: None,
             exit_code: Some(101),
+            denial: None,
         };
         let back: DaemonEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         match back {
@@ -1859,6 +1920,7 @@ mod tests {
                 duration_ms: 1500,
                 ended_epoch_ms: None,
                 exit_code: None,
+                denial: None,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -2143,6 +2205,7 @@ mod tests {
                     duration_ms: 1200,
                     ended_epoch_ms: None,
                     exit_code: None,
+                    denial: None,
                 },
             },
         )
@@ -2280,6 +2343,7 @@ mod tests {
                 duration_ms: 10,
                 ended_epoch_ms: None,
                 exit_code: None,
+                denial: None,
             },
         )
         .await;
@@ -2528,6 +2592,7 @@ mod tests {
                     duration_ms: 1,
                     ended_epoch_ms: None,
                     exit_code: None,
+                    denial: None,
                 },
             )
             .await;
@@ -2615,6 +2680,7 @@ mod tests {
                 duration_ms: 0,
                 ended_epoch_ms: None,
                 exit_code: None,
+                denial: None,
             },
         )
         .await;
@@ -2646,6 +2712,7 @@ mod tests {
                 duration_ms: 0,
                 ended_epoch_ms: None,
                 exit_code: None,
+                denial: None,
             },
         )
         .await;
@@ -3139,6 +3206,7 @@ mod tests {
                     duration_ms: 5,
                     ended_epoch_ms: None,
                     exit_code: None,
+                    denial: None,
                 },
             },
         )

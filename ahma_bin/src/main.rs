@@ -95,10 +95,6 @@ async fn main() -> Result<()> {
     check_powershell_available();
 
     match subcommand {
-        Subcommands::Vault(_) => {
-            tracing::info!("Dispatching vault subcommand");
-            anyhow::bail!("`ahma vault` command is no longer supported.")
-        }
         Subcommands::Tui(tui_args) => {
             tracing::info!("Starting TUI control plane");
             // Resolve explicit on/off token-preference flags; None = fall back

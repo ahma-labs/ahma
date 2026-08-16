@@ -259,6 +259,33 @@ pub struct NavCommand {
     pub description: String,
 }
 
+/// The complete sandbox scope as reported by the server in
+/// `notifications/sandbox/configured` (SPEC R5.4: scope is always visible with
+/// provenance). This is the TUI-side mirror of the server's `ScopeView` JSON —
+/// the one canonical representation every surface renders.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SandboxScopeInfo {
+    /// Directories the AI may write to (display strings, server-canonicalized).
+    pub write: Vec<String>,
+    /// Read-only directories granted beyond the write roots.
+    pub read: Vec<String>,
+    /// Whether the system temp directory was added via `--tmp`.
+    pub tmp: bool,
+    /// Whether kernel enforcement is active (`false` == `--no-sandbox`).
+    pub enforced: bool,
+    /// Provenance of the scope: `explicit` | `roots/list` | `elicited` | `container`.
+    pub source: Option<String>,
+    /// Active-sandbox token: `ahma` | `ahma_nested_in_host` | `deferred_to_host` | `disabled`.
+    pub active: Option<String>,
+    /// Detected host sandbox label (Cursor, Claude Code, …), when nested/deferred.
+    pub host: Option<String>,
+    /// The loud R7 disclosure line, when ahma is not the sole authority.
+    pub disclosure: Option<String>,
+    /// Platform limitation that cannot be expressed as scope (e.g. macOS
+    /// reads-unconfined, SPEC R-PERM.5.1). Must be shown, not buried.
+    pub platform_note: Option<String>,
+}
+
 /// The full set of built-in `/` commands.
 pub fn builtin_commands() -> Vec<NavCommand> {
     const CMDS: &[(&str, &str)] = &[
@@ -289,6 +316,7 @@ pub fn builtin_commands() -> Vec<NavCommand> {
         ("/skills", "list Agent Skills invocable with /<name>"),
         ("/tasks", "open tasks view window"),
         ("/log", "open log view window"),
+        ("/scope", "show the locked sandbox scope and its provenance"),
         (
             "/log file <path> [prompt]",
             "start background log monitor on file",
@@ -503,7 +531,6 @@ pub enum Focus {
     Chat,
     OpsDag,
     Log,
-    Palette,
 }
 
 impl Focus {
@@ -527,7 +554,6 @@ impl Focus {
                 }
             }
             Self::Log => Self::Chat,
-            Self::Palette => Self::Chat,
         }
     }
 
@@ -550,7 +576,6 @@ impl Focus {
                 }
             }
             Self::OpsDag => Self::Chat,
-            Self::Palette => Self::Chat,
         }
     }
 
@@ -650,11 +675,19 @@ pub enum OpStatus {
     Cancelled,
     /// Awaiting another operation (blocked dependency).
     Waiting,
+    /// Refused by the sandbox rather than failed on its own terms. A denial is
+    /// a first-class outcome, not a flavour of failure (SPEC R-PERM.7): the row
+    /// says which path was refused, and the user can re-raise the grant
+    /// question from it (R-PERM.7.1).
+    Denied,
 }
 
 impl OpStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Denied
+        )
     }
 
     /// The status word as it appears on the hub wire — the vocabulary the
@@ -667,6 +700,9 @@ impl OpStatus {
             Self::Failed => "Failed",
             Self::Cancelled => "Cancelled",
             Self::Waiting => "Waiting",
+            // A denial travels the wire as a failure plus a `denial` field, so
+            // the wire word stays "Failed" for pre-upgrade readers (R24.5).
+            Self::Denied => "Failed",
         }
     }
 
@@ -679,6 +715,7 @@ impl OpStatus {
                 Self::Failed => "✗",
                 Self::Cancelled => "⊘",
                 Self::Waiting => "⏸",
+                Self::Denied => "✗",
             }
         } else {
             match self {
@@ -688,6 +725,7 @@ impl OpStatus {
                 Self::Failed => "x",
                 Self::Cancelled => "-",
                 Self::Waiting => "|",
+                Self::Denied => "x",
             }
         }
     }
@@ -729,6 +767,10 @@ pub struct Operation {
     pub origin: Option<String>,
     /// Process exit code, when the runner reported one.
     pub exit_code: Option<i64>,
+    /// The path and access a sandbox denial refused, when `status` is
+    /// [`OpStatus::Denied`]. Held so the row can name the path and the grant
+    /// question can be re-raised for exactly that pair (SPEC R-PERM.7.1).
+    pub denial: Option<(String, String)>,
     /// When the most recent live output line arrived (set locally, not from
     /// the wire). Drives the fast-vs-slow cadence of the card's activity panel.
     pub last_output_at: Option<Instant>,
@@ -790,6 +832,7 @@ impl Operation {
             started_time: chrono::Local::now(),
             description: String::new(),
             cwd: None,
+            denial: None,
             args: vec![],
             parent_id: None,
             stdout_tail: VecDeque::with_capacity(STDOUT_TAIL_CAP),
@@ -867,6 +910,14 @@ impl Operation {
         let outcome = match self.status {
             OpStatus::Running | OpStatus::Pending => OpOutcome::Running {
                 elapsed_secs: self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+            },
+            // "denied: /path" says what happened and what to do about it;
+            // "failed" says neither (SPEC R24.7, R-PERM.7).
+            OpStatus::Denied => OpOutcome::Denied {
+                reason: match &self.denial {
+                    Some((path, access)) => format!("{path} ({access}) outside sandbox scope"),
+                    None => "outside sandbox scope".to_string(),
+                },
             },
             _ => OpOutcome::Finished {
                 exit_code: self.exit_code,
@@ -1103,42 +1154,6 @@ pub enum ClickTarget {
     OpenLogLine(String),
 }
 
-// ─── Command palette ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Default)]
-pub struct PaletteState {
-    pub input: String,
-    pub completions: Vec<String>,
-    pub selected_completion: usize,
-    /// When set, user must type `y` to confirm before the command is dispatched.
-    pub confirm_prompt: Option<String>,
-}
-
-impl PaletteState {
-    /// Reset the palette's transient fields when (re)opening. Visibility is
-    /// owned by [`ModalState`], not this struct (SPEC R23).
-    pub fn reset(&mut self) {
-        self.input.clear();
-        self.completions.clear();
-        self.selected_completion = 0;
-        self.confirm_prompt = None;
-    }
-
-    pub fn update_completions(&mut self, tools: &[String]) {
-        if self.input.is_empty() {
-            self.completions = tools.to_vec();
-        } else {
-            let q = self.input.to_lowercase();
-            self.completions = tools
-                .iter()
-                .filter(|t| t.to_lowercase().contains(&q))
-                .cloned()
-                .collect();
-        }
-        self.selected_completion = 0;
-    }
-}
-
 // ─── Modal overlays ───────────────────────────────────────────────────────────
 
 /// The single active overlay/modal (SPEC R23).
@@ -1162,8 +1177,6 @@ pub enum ModalState {
     Help,
     /// The `/` command navigator.
     Navigator(CommandNavigator),
-    /// The command palette / confirm prompt.
-    Palette(PaletteState),
     /// The inline provider picker.
     ProviderPicker(PickerState),
     /// The inline model picker.
@@ -1360,6 +1373,25 @@ pub struct AppState {
     // ── Windows & Panels ──
     pub tasks_window_open: bool,
     pub log_window_open: bool,
+    /// The `/scope` sub-window showing the locked sandbox scope (SPEC R5.4(b)).
+    pub scope_window_open: bool,
+    /// Scroll offset of the help overlay, in rendered rows. The overlay is
+    /// size-capped, so without this its tail — including the section that
+    /// documents the log pane — was unreachable on ordinary terminals, in
+    /// breach of the honest-panes rule it exists to describe (SPEC R24.8).
+    pub help_scroll: u16,
+    /// Complete scope + provenance from `notifications/sandbox/configured`.
+    /// `None` until the server reports it (or when attached daemon-only).
+    pub sandbox_scope: Option<SandboxScopeInfo>,
+    /// Error text from `notifications/sandbox/failed`, kept until the next
+    /// successful configuration so the reason outlives the log scrollback.
+    pub sandbox_failed_reason: Option<String>,
+    /// Persistent scope grants read from `~/.ahma/settings.toml`
+    /// (`[sandbox] persistent_scopes`), shown in the `/scope` panel as
+    /// `(path, access)`. These are the roots the user granted themselves, as
+    /// distinct from the workspace the client reported — without them the
+    /// panel cannot say *why* an out-of-workspace root is writable.
+    pub granted_scopes: Vec<(String, String)>,
     pub chat: ChatHistory,
     /// Current text in the multi-line input box.
     #[cfg(feature = "tui")]
@@ -1424,10 +1456,6 @@ pub struct AppState {
     pub ops_area: std::cell::Cell<Rect>,
     #[cfg(not(feature = "tui"))]
     pub ops_area: std::cell::Cell<()>,
-    #[cfg(feature = "tui")]
-    pub detail_area: std::cell::Cell<Rect>,
-    #[cfg(not(feature = "tui"))]
-    pub detail_area: std::cell::Cell<()>,
     #[cfg(feature = "tui")]
     pub chat_input_area: std::cell::Cell<Rect>,
     #[cfg(not(feature = "tui"))]
@@ -1620,16 +1648,13 @@ impl AppState {
         self.last_wait_tick = None;
     }
 
-    /// True when a text-entry overlay (navigator, palette, or an inline picker)
-    /// is open. Used to decide whether a bare key should be consumed as overlay
-    /// input rather than a global shortcut (e.g. approval `y`/`n`).
+    /// True when a text-entry overlay (navigator or an inline picker) is open.
+    /// Used to decide whether a bare key should be consumed as overlay input
+    /// rather than a global shortcut (e.g. approval `y`/`n`).
     pub fn text_entry_modal_open(&self) -> bool {
         matches!(
             self.modal,
-            ModalState::Navigator(_)
-                | ModalState::Palette(_)
-                | ModalState::ProviderPicker(_)
-                | ModalState::ModelPicker(_)
+            ModalState::Navigator(_) | ModalState::ProviderPicker(_) | ModalState::ModelPicker(_)
         )
     }
 
@@ -1664,22 +1689,6 @@ impl AppState {
     pub fn navigator_mut(&mut self) -> Option<&mut CommandNavigator> {
         match &mut self.modal {
             ModalState::Navigator(n) => Some(n),
-            _ => None,
-        }
-    }
-
-    /// The command palette, if it is open.
-    pub fn palette(&self) -> Option<&PaletteState> {
-        match &self.modal {
-            ModalState::Palette(p) => Some(p),
-            _ => None,
-        }
-    }
-
-    /// The command palette (mutable), if it is open.
-    pub fn palette_mut(&mut self) -> Option<&mut PaletteState> {
-        match &mut self.modal {
-            ModalState::Palette(p) => Some(p),
             _ => None,
         }
     }
@@ -1817,6 +1826,11 @@ impl AppState {
 
             tasks_window_open: false,
             log_window_open: false,
+            scope_window_open: false,
+            help_scroll: 0,
+            sandbox_scope: None,
+            sandbox_failed_reason: None,
+            granted_scopes: Vec::new(),
             chat: ChatHistory::default(),
             chat_input: TextArea::default(),
             llm_label,
@@ -1852,10 +1866,6 @@ impl AppState {
             ops_area: std::cell::Cell::new(Rect::default()),
             #[cfg(not(feature = "tui"))]
             ops_area: std::cell::Cell::new(()),
-            #[cfg(feature = "tui")]
-            detail_area: std::cell::Cell::new(Rect::default()),
-            #[cfg(not(feature = "tui"))]
-            detail_area: std::cell::Cell::new(()),
             #[cfg(feature = "tui")]
             chat_input_area: std::cell::Cell::new(Rect::default()),
             #[cfg(not(feature = "tui"))]
@@ -2142,6 +2152,20 @@ impl AppState {
             self.events.pop_back();
         }
         self.events.push_front(event);
+    }
+
+    /// The sandbox path the header may honestly display: the server-locked
+    /// primary write root once `sandbox/configured` has arrived, and only then.
+    /// Before lock, the TUI knows its own launch directory but NOT the scope —
+    /// the two can differ (container-root fallback, auto-narrowing, a different
+    /// `roots/list` answer), so the launch path is returned separately by the
+    /// caller and must be labelled as unconfirmed (SPEC R5.4: no scope decision
+    /// is communicated by guesswork).
+    pub fn locked_scope_root(&self) -> Option<&str> {
+        self.sandbox_scope
+            .as_ref()
+            .and_then(|s| s.write.first())
+            .map(String::as_str)
     }
 
     pub fn push_activity(&mut self, entry: AiActivityEntry) {
@@ -3340,7 +3364,6 @@ mod tests {
         s.modal = ModalState::Help;
         assert!(s.is_help_open());
         assert!(s.navigator().is_none());
-        assert!(s.palette().is_none());
 
         // Opening the navigator replaces help — both are never open at once.
         s.modal = ModalState::Navigator(CommandNavigator::opened(&[], vec![]));

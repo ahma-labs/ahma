@@ -111,6 +111,7 @@ meant setting one changed the chat client's behaviour but not the server's.
 | Variable | Replacement |
 |---|---|
 | `AHMA_HTTP_PORT` | `--port` CLI flag on `serve http` subcommand |
+| `AHMA_HTTP_URL` | `ahma tui --connect <URL>` |
 | `AHMA_UNIX_SOCKET` | `--unix-socket-path` CLI flag or `http.unix_socket_path` in settings.toml |
 | `AHMA_UNIX_SOCKET` (TUI) | `ahma tui --connect unix://<path>`, or the same `http.unix_socket_path` settings key |
 | `AHMA_DISABLE_QUIC` | `--disable-quic` CLI flag or `http.disable_quic = true` in settings.toml |
@@ -195,7 +196,8 @@ These are standard ecosystem variables that Ahma reads but does not define:
 | `XDG_RUNTIME_DIR` | Linux: per-user runtime directory for daemon socket |
 | `CARGO_HOME` | Cargo home override; affects package cache scope |
 | `PATH` | Executable search path |
-| `NO_COLOR` | Disables color output if set |
+| `NO_COLOR` | Any non-empty value suppresses colour in the TUI (https://no-color.org). Styles keep bold/dim emphasis; only hues are dropped. Glyph choice is separate — it follows `TERM` |
+| `TERM` | `dumb` selects ASCII fallbacks for box-drawing and status glyphs |
 | `OTEL_*` / `TRACEPARENT` | OpenTelemetry distributed tracing |
 
 ---

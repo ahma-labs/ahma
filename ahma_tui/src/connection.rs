@@ -510,11 +510,15 @@ async fn handle_existing_candidate(
     if let (Some(bridge_scope), Some(wanted)) = (bridge_default_scope, wanted_scope)
         && !scope_matches(bridge_scope, wanted)
     {
-        tracing::warn!(
-            bridge_scope,
-            wanted_scope = %wanted.display(),
-            "Found a running bridge, but it is sandboxed to a different project; \
-             spawning a fresh one scoped to this project instead of reusing it."
+        // R7: never disclose sandbox state silently — and a tracing::warn to a
+        // log file the user has not been told about is silent.
+        crate::startup_notices::push(
+            crate::startup_notices::Level::Info,
+            format!(
+                "A running ahma server is sandboxed to a different project ({bridge_scope}); \
+                 started a fresh one scoped to {} instead of reusing it.",
+                wanted.display()
+            ),
         );
         return Ok(None);
     }
@@ -531,10 +535,14 @@ async fn handle_existing_candidate(
     };
 
     if client_is_newer {
-        tracing::info!(
-            "TUI version (v{}) is newer than running bridge version (v{}). Requesting bridge restart...",
-            client_version,
-            bridge_version
+        // Restarting a server this TUI did not start is a side effect on
+        // someone else's session (an IDE may be attached to it) — say so.
+        crate::startup_notices::push(
+            crate::startup_notices::Level::Warn,
+            format!(
+                "Restarted the running ahma server: it was v{bridge_version} and this TUI is \
+                 v{client_version}. Any editor session attached to it reconnects to the new server."
+            ),
         );
 
         let _ = trigger_candidate_restart(candidate).await;
@@ -549,6 +557,9 @@ async fn handle_existing_candidate(
         Ok(None)
     } else {
         if std::env::var("AHMA_RESTARTED").is_err() {
+            // exec() replaces this process image, so a notice pushed here would
+            // be discarded with it. The restarted process reports instead, via
+            // the AHMA_RESTARTED marker it is launched with (see below).
             tracing::info!(
                 "TUI version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
                 client_version,

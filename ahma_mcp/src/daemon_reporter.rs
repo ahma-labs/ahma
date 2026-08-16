@@ -299,6 +299,9 @@ async fn run_reporter_loop(
                     // Replayed completions carry their exit code too, so a
                     // late-attaching TUI shows `exit 101`, not a bare "failed".
                     exit_code: op.result.as_ref().and_then(exit_code_from_value),
+                    // Replay carries denials too, so a TUI opened after the fact
+                    // still sees which path was refused (SPEC R-PERM.7).
+                    denial: denial_from_operation(op),
                 },
             };
             if send_msg(&mut writer, &finished_ev).await.is_err() {
@@ -470,6 +473,32 @@ async fn run_reporter_loop(
                                 }
                             }
                         }
+                        Ok(DaemonMsg::ReRaiseScopeGrant { path, access }) => {
+                            debug!("daemon_reporter: received ReRaiseScopeGrant path={path} access={access}");
+                            if let Some(coord) = &grant_coordinator {
+                                let access = match access.as_str() {
+                                    "rw" => ahma_common::config::ScopeAccess::Rw,
+                                    _ => ahma_common::config::ScopeAccess::Ro,
+                                };
+                                // reopen() clears the session's ask-once memo for
+                                // this (path, access) first: the memo stops ahma
+                                // nagging, and a person picking a denied row and
+                                // confirming is not ahma nagging (SPEC R-PERM.7.1).
+                                match coord.reopen(
+                                    std::path::Path::new(&path),
+                                    access,
+                                    ahma_common::scope_grant::GrantReason::StderrHeuristic,
+                                    Some("re-raised from the TUI".to_string()),
+                                ) {
+                                    Some(req) => {
+                                        let _ = send_msg(&mut writer, &ClientMsg::ScopeGrantRequested { request: req }).await;
+                                    }
+                                    // Already in flight — the modal the user wants
+                                    // is on screen already.
+                                    None => debug!("daemon_reporter: re-raise skipped, question already in flight"),
+                                }
+                            }
+                        }
                         Ok(DaemonMsg::SubmitWebApproval { decision_id, decision }) => {
                             debug!("daemon_reporter: received SubmitWebApproval id={decision_id} decision={decision:?}");
                             if let Some(coord) = &web_coordinator {
@@ -607,6 +636,7 @@ fn daemon_event_for(
             ended_epoch_ms: now_ms,
             // "Completed" without a code is not actionable; `exit 0` is.
             exit_code: exit_code_from_value(result),
+            denial: None,
         },
         Ev::Failed {
             operation_id,
@@ -622,6 +652,9 @@ fn daemon_event_for(
             // there is usually no code to read. `None` renders as "failed", which
             // is honest — better than a fabricated code.
             exit_code: None,
+            // A sandbox denial is a different thing from a failure and must say
+            // so on every surface (SPEC R-PERM.7).
+            denial: denial_from_text(error),
         },
         Ev::Cancelled {
             operation_id,
@@ -634,6 +667,7 @@ fn daemon_event_for(
             duration_ms: *duration_ms,
             ended_epoch_ms: now_ms,
             exit_code: None,
+            denial: None,
         },
         Ev::TimedOut {
             operation_id,
@@ -645,6 +679,7 @@ fn daemon_event_for(
             duration_ms: *duration_ms,
             ended_epoch_ms: now_ms,
             exit_code: None,
+            denial: None,
         },
         _ => return None,
     })
@@ -704,6 +739,28 @@ fn status_label(s: OperationStatus) -> String {
         OperationStatus::TimedOut => "TimedOut",
     }
     .to_string()
+}
+
+/// Recognise a sandbox denial in a failed operation's text so it can travel the
+/// hub wire as a denial rather than an anonymous failure (SPEC R-PERM.7).
+///
+/// Reuses the same scanner the live grant flow uses, so what the TUI labels
+/// `denied:` is exactly what would have raised a grant prompt — the two can
+/// never disagree about whether something was a denial.
+fn denial_from_text(text: &str) -> Option<ahma_common::daemon_hub::OpDenial> {
+    let hit = crate::sandbox::denial_scan::scan_denial(text)?;
+    Some(ahma_common::daemon_hub::OpDenial {
+        path: hit.path.display().to_string(),
+        access: match hit.access {
+            ahma_common::config::ScopeAccess::Ro => "ro".to_string(),
+            ahma_common::config::ScopeAccess::Rw => "rw".to_string(),
+        },
+    })
+}
+
+/// The denial carried by a finished operation's recorded result, if any.
+fn denial_from_operation(op: &Operation) -> Option<ahma_common::daemon_hub::OpDenial> {
+    denial_from_text(&result_summary_from(op)?)
 }
 
 fn result_summary_from(op: &Operation) -> Option<String> {
@@ -842,6 +899,7 @@ mod tests {
             duration_ms: 42,
         };
         let Some(DaemonEvent::OpFinished {
+            denial: _,
             id,
             status,
             duration_ms,
@@ -1209,6 +1267,33 @@ mod tests {
         );
         let s = result_summary_from(&op).expect("fallback");
         assert!(s.contains("99"), "fallback serializes the JSON, got {s}");
+    }
+
+    // ── denial detection on the wire ──────────────────────────────────────────
+
+    /// A kernel denial in a failed operation's text travels the hub wire as a
+    /// denial, not an anonymous failure (SPEC R-PERM.7). This is what lets the
+    /// TUI say `denied: /etc` and offer to re-raise the grant question.
+    #[test]
+    fn denial_text_becomes_a_wire_denial() {
+        let hit = denial_from_text(
+            "touch: cannot touch '/etc/foo': Operation not permitted (os error 1)",
+        )
+        .expect("a kernel denial must be recognised");
+        assert!(hit.path.contains("/etc"), "path carried: {}", hit.path);
+        assert!(
+            hit.access == "rw" || hit.access == "ro",
+            "access is normalised for the wire, got {}",
+            hit.access
+        );
+    }
+
+    /// An ordinary failure must not be dressed up as a sandbox denial — that
+    /// would send the user chasing a grant that was never the problem.
+    #[test]
+    fn ordinary_failure_text_is_not_a_denial() {
+        assert!(denial_from_text("error[E0599]: no method named `foo`").is_none());
+        assert!(denial_from_text("test result: FAILED. 3 passed; 1 failed").is_none());
     }
 
     // ── persist_resolved_grant ────────────────────────────────────────────────

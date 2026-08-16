@@ -880,9 +880,6 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
     match cmd {
         Subcommands::Serve(serve_args) => dispatch_serve(serve_args, cfg).await,
         Subcommands::Tool(tool_cmd) => dispatch_tool(tool_cmd, cfg).await,
-        Subcommands::Vault(_) => {
-            anyhow::bail!("`ahma vault` command is no longer supported.")
-        }
         Subcommands::Tui(_) => {
             anyhow::bail!(
                 "tui is provided by the ahma_bin crate (includes ahma_tui). \
@@ -1139,12 +1136,12 @@ pub struct Cli {
     #[arg(long = "opentelemetry", value_name = "URL", global = true)]
     pub opentelemetry: Option<String>,
 
-    /// Run this server session inside an existing task vault (a per-task isolated
+    /// Run this server session inside a task vault (a per-task isolated
     /// directory containing inputs, workdir, outputs, trash, and audit logs).
     /// Enforces the "dedicated folder per task" security principle by restricting
     /// the sandbox scope to <vault>/workdir/, initializing an audit log at
     /// <vault>/audit.jsonl, and routing deletions to <vault>/trash/. The vault
-    /// must exist (create with `ahma vault create <slug>` first).
+    /// layout is created at PATH if it does not already exist.
     #[arg(long = "task-vault", value_name = "PATH", global = true)]
     pub task_vault: Option<PathBuf>,
 
@@ -1301,8 +1298,6 @@ pub enum Subcommands {
     Serve(ServeArgs),
     /// Tool management and execution utilities.
     Tool(ToolArgs),
-    /// Task vault management: create and inspect per-question working directories.
-    Vault(VaultArgs),
     /// Start the TUI control plane (terminal dashboard for active tasks).
     Tui(TuiArgs),
     /// Local TLS certificate management: init, rotate, and check status.
@@ -1862,8 +1857,9 @@ pub enum ServeTransport {
   # Linux abstract socket (@ prefix)
   ahma serve unix --socket-path @ahma
 
-  # Or set via environment variable
-  AHMA_UNIX_SOCKET=/tmp/ahma.sock ahma serve unix")]
+  # Or persist the path in ~/.ahma/settings.toml
+  #   [http] unix_socket_path = \"/run/ahma/mcp.sock\"
+  ahma serve unix")]
     Unix(UnixArgs),
 }
 
@@ -1927,8 +1923,8 @@ pub struct UnixArgs {
     /// Supports filesystem paths (`/tmp/ahma.sock`) and Linux abstract sockets
     /// using the `@` prefix (`@ahma`).
     ///
-    /// Defaults to the value of `AHMA_UNIX_SOCKET`, or `/tmp/ahma.sock`
-    /// if neither the flag nor the env var is set.
+    /// Defaults to `[http] unix_socket_path` in `~/.ahma/settings.toml`, or
+    /// `/tmp/ahma.sock`. (`AHMA_UNIX_SOCKET` is retired and ignored, R-CFG1.2.)
     #[arg(long = "socket-path")]
     pub socket_path: Option<String>,
 }
@@ -2048,35 +2044,6 @@ pub struct InfoArgs {
     pub filter: Option<String>,
 }
 
-// ── vault ─────────────────────────────────────────────────────────────────────
-
-/// Arguments for `ahma vault`.
-#[derive(Parser, Debug)]
-pub struct VaultArgs {
-    #[command(subcommand)]
-    pub command: VaultCommand,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum VaultCommand {
-    /// Create a new task vault (a per-task isolated directory tree) for a user question
-    /// containing inputs/, workdir/, outputs/, trash/, and audit.jsonl. Prints the root path.
-    #[command(after_help = "EXAMPLES:
-  ahma vault create summarise-q4-report
-  ahma vault create \"analyse customer data\"")]
-    Create(VaultCreateArgs),
-    /// List all existing task vaults.
-    List,
-}
-
-/// Arguments for `ahma vault create`.
-#[derive(Parser, Debug)]
-pub struct VaultCreateArgs {
-    /// A short human-readable slug describing the task (becomes part of the directory name).
-    #[arg(value_name = "SLUG")]
-    pub slug: String,
-}
-
 // ── tui ───────────────────────────────────────────────────────────────────────
 
 /// Arguments for `ahma tui`.
@@ -2094,8 +2061,8 @@ pub struct TuiArgs {
     /// URL of the ahma server to monitor.
     ///
     /// When omitted, `ahma tui` probes local transports in order:
-    /// Unix socket (default `/tmp/ahma.sock`, or `AHMA_UNIX_SOCKET`) on Unix,
-    /// then `http://localhost:3000`.
+    /// Unix socket (default `/tmp/ahma.sock`, or `[http] unix_socket_path`
+    /// in `~/.ahma/settings.toml`) on Unix, then `http://localhost:3000`.
     ///
     /// Supported URL formats:
     ///   http://host:port        — plain HTTP / HTTP2 / HTTP3
@@ -4739,17 +4706,12 @@ mod tests {
 
     // ─── dispatch_subcommand bail arms (crate-split stubs) ────────────────────
 
-    #[tokio::test]
-    async fn test_dispatch_subcommand_vault_bails() {
-        let err = dispatch_subcommand(
-            Subcommands::Vault(VaultArgs {
-                command: VaultCommand::List,
-            }),
-            make_cfg(),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("no longer supported"));
+    /// The `vault` subcommand is gone entirely (the vault crate was removed in
+    /// #571); clap must reject it rather than parse a help-only stub.
+    #[test]
+    fn test_vault_subcommand_no_longer_parses() {
+        let err = Cli::try_parse_from(["ahma", "vault", "list"]);
+        assert!(err.is_err(), "`ahma vault` must be an unknown subcommand");
     }
 
     #[tokio::test]
