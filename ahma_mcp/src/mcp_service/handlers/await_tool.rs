@@ -561,8 +561,11 @@ impl AhmaMcpService {
     }
 
     async fn format_already_completed_or_not_found(&self, op_id: &str) -> CallToolResult {
-        let completed_ops = self.operation_monitor.get_completed_operations().await;
-        let Some(completed_op) = completed_ops.iter().find(|op| op.id == op_id) else {
+        let Some(completed_op) = self
+            .operation_monitor
+            .check_completion_history_pub(op_id)
+            .await
+        else {
             return common::text_result(format!("Operation {} not found", op_id));
         };
         let mut contents = vec![ContentBlock::text(format!(
@@ -570,7 +573,7 @@ impl AhmaMcpService {
             op_id
         ))];
         contents.extend(common::serialize_operations_to_content(
-            std::slice::from_ref(completed_op),
+            std::slice::from_ref(&completed_op),
         ));
         CallToolResult::success(contents)
     }

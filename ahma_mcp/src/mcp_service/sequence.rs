@@ -16,7 +16,6 @@ use crate::client_type::McpClientType;
 use crate::config::{SequenceStep, SubcommandConfig, ToolConfig};
 use crate::constants::SEQUENCE_STEP_DELAY_MS;
 use crate::mcp_service::progress_push::ProgressPushRouter;
-use crate::operation_monitor::OperationMonitor;
 
 use super::handlers::common;
 use super::subcommand::find_subcommand_config_from_args;
@@ -133,7 +132,6 @@ async fn apply_step_delay(step_delay_ms: u64, current_index: usize, total_steps:
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_sequence_tool(
     adapter: &Adapter,
-    _operation_monitor: &OperationMonitor,
     progress_push: &ProgressPushRouter,
     configs: &Arc<RwLock<HashMap<String, ToolConfig>>>,
     config: &ToolConfig,
@@ -267,54 +265,58 @@ async fn handle_sequence_tool_sync(
     Ok(final_result)
 }
 
-/// Handles asynchronous sequence execution - starts all steps and returns immediately
+/// A sequence step resolved to everything the adapter needs to start it.
+struct ResolvedStep {
+    /// Name registered with the adapter and used for the operation id.
+    tool_name: String,
+    args: Option<Map<String, Value>>,
+    subcommand_config: SubcommandConfig,
+    command_parts: Vec<String>,
+}
+
+/// Shared driver for both async sequence flavours (top-level and subcommand):
+/// resolves each step via `resolve_step`, registers progress, starts the step,
+/// and collects started/skipped messages. `skip_working_directory` enables the
+/// skip-condition check — top-level sequences only, matching prior behavior.
 #[allow(clippy::too_many_arguments)]
-async fn handle_sequence_tool_async(
+async fn run_async_sequence(
     adapter: &Adapter,
     progress_push: &ProgressPushRouter,
-    configs: &Arc<RwLock<HashMap<String, ToolConfig>>>,
-    params: CallToolRequestParams,
-    context: RequestContext<RoleServer>,
+    context: &RequestContext<RoleServer>,
     sequence: &[SequenceStep],
     step_delay_ms: u64,
     force_progress_notifications: bool,
+    kind: SequenceKind,
+    skip_working_directory: Option<&str>,
+    mut resolve_step: impl FnMut(&SequenceStep) -> Result<ResolvedStep, McpError>,
 ) -> Result<CallToolResult, McpError> {
     let mut final_result = CallToolResult::success(vec![]);
-    let kind = SequenceKind::TopLevel;
-    let parent_args = params.arguments.clone().unwrap_or_default();
-    let working_directory = extract_working_directory(adapter, &params);
 
     for (index, step) in sequence.iter().enumerate() {
-        if should_skip_step_with_context(&kind, step, &working_directory) {
+        if let Some(working_directory) = skip_working_directory
+            && should_skip_step_with_context(&kind, step, working_directory)
+        {
             final_result
                 .content
                 .push(ContentBlock::text(format_step_skipped_message(&kind, step)));
             continue;
         }
 
-        let mut merged_args = merge_step_arguments(&parent_args, &step.args);
-        merged_args.insert(
-            "working_directory".to_string(),
-            Value::String(working_directory.clone()),
-        );
+        let resolved = resolve_step(step)?;
 
-        let step_tool_config = get_tool_config(configs, &step.tool)?;
-        let (subcommand_config, command_parts) =
-            find_step_subcommand(&step_tool_config, &step.subcommand, &step.tool)?;
-
-        let id = next_id(&step.tool, Some(&step.subcommand));
-        register_progress_target(progress_push, &context, &id, force_progress_notifications).await;
+        let id = next_id(&resolved.tool_name, Some(&step.subcommand));
+        register_progress_target(progress_push, context, &id, force_progress_notifications).await;
 
         let step_result = adapter
             .execute_async_in_dir_with_options(
-                &step.tool,
-                &command_parts.join(" "),
+                &resolved.tool_name,
+                &resolved.command_parts.join(" "),
                 ".",
                 crate::adapter::AsyncExecOptions {
                     id: Some(id),
-                    args: Some(merged_args),
+                    args: resolved.args,
                     timeout: None,
-                    subcommand_config: Some(subcommand_config),
+                    subcommand_config: Some(&resolved.subcommand_config),
                     log_monitor_config: None,
                 },
             )
@@ -329,10 +331,12 @@ async fn handle_sequence_tool_async(
                     )));
             }
             Err(e) => {
-                let error_message = format!(
-                    "Sequence step '{}' failed to start: {}. Halting sequence.",
-                    step.tool, e
-                );
+                let (prefix, step_name) = match kind {
+                    SequenceKind::TopLevel => ("Sequence step", &step.tool),
+                    SequenceKind::Subcommand => ("Subcommand sequence step", &step.subcommand),
+                };
+                let error_message =
+                    format!("{prefix} '{step_name}' failed to start: {e}. Halting sequence.");
                 tracing::error!("{}", error_message);
                 return Err(common::mcp_internal(error_message));
             }
@@ -342,6 +346,52 @@ async fn handle_sequence_tool_async(
     }
 
     Ok(final_result)
+}
+
+/// Handles asynchronous sequence execution - starts all steps and returns immediately
+#[allow(clippy::too_many_arguments)]
+async fn handle_sequence_tool_async(
+    adapter: &Adapter,
+    progress_push: &ProgressPushRouter,
+    configs: &Arc<RwLock<HashMap<String, ToolConfig>>>,
+    params: CallToolRequestParams,
+    context: RequestContext<RoleServer>,
+    sequence: &[SequenceStep],
+    step_delay_ms: u64,
+    force_progress_notifications: bool,
+) -> Result<CallToolResult, McpError> {
+    let parent_args = params.arguments.clone().unwrap_or_default();
+    let working_directory = extract_working_directory(adapter, &params);
+
+    run_async_sequence(
+        adapter,
+        progress_push,
+        &context,
+        sequence,
+        step_delay_ms,
+        force_progress_notifications,
+        SequenceKind::TopLevel,
+        Some(&working_directory),
+        |step| {
+            let mut merged_args = merge_step_arguments(&parent_args, &step.args);
+            merged_args.insert(
+                "working_directory".to_string(),
+                Value::String(working_directory.clone()),
+            );
+
+            let step_tool_config = get_tool_config(configs, &step.tool)?;
+            let (subcommand_config, command_parts) =
+                find_step_subcommand(&step_tool_config, &step.subcommand, &step.tool)?;
+
+            Ok(ResolvedStep {
+                tool_name: step.tool.clone(),
+                args: Some(merged_args),
+                subcommand_config: subcommand_config.clone(),
+                command_parts,
+            })
+        },
+    )
+    .await
 }
 
 /// Handles execution of subcommand sequences - subcommands that invoke multiple cargo commands in order.
@@ -360,62 +410,39 @@ pub async fn handle_subcommand_sequence(
         .step_delay_ms
         .or(config.step_delay_ms)
         .unwrap_or(SEQUENCE_STEP_DELAY_MS);
-    let mut final_result = CallToolResult::success(vec![]);
-    let kind = SequenceKind::Subcommand;
 
-    for (index, step) in sequence.iter().enumerate() {
-        let (step_config, command_parts) =
-            find_subcommand_config_from_args(config, Some(step.subcommand.clone())).ok_or_else(
-                || {
-                    let msg = format!(
-                        "Subcommand sequence step '{}' not found in tool config. Halting sequence.",
-                        step.subcommand
-                    );
-                    tracing::error!("{}", msg);
-                    common::mcp_internal(msg)
-                },
-            )?;
-
-        let id = next_id(&config.name, Some(&step.subcommand));
-        register_progress_target(progress_push, &context, &id, force_progress_notifications).await;
-
-        let step_result = adapter
-            .execute_async_in_dir_with_options(
-                &config.name,
-                &command_parts.join(" "),
-                ".",
-                crate::adapter::AsyncExecOptions {
-                    id: Some(id),
-                    args: params.arguments.clone(),
-                    timeout: None,
-                    subcommand_config: Some(step_config),
-                    log_monitor_config: None,
-                },
+    run_async_sequence(
+        adapter,
+        progress_push,
+        &context,
+        sequence,
+        step_delay_ms,
+        force_progress_notifications,
+        SequenceKind::Subcommand,
+        None,
+        |step| {
+            let (step_config, command_parts) = find_subcommand_config_from_args(
+                config,
+                Some(step.subcommand.clone()),
             )
-            .await;
-
-        match step_result {
-            Ok(id) => {
-                final_result
-                    .content
-                    .push(ContentBlock::text(format_step_started_message(
-                        &kind, step, &id,
-                    )));
-            }
-            Err(e) => {
+            .ok_or_else(|| {
                 let msg = format!(
-                    "Subcommand sequence step '{}' failed to start: {}. Halting sequence.",
-                    step.subcommand, e
+                    "Subcommand sequence step '{}' not found in tool config. Halting sequence.",
+                    step.subcommand
                 );
                 tracing::error!("{}", msg);
-                return Err(common::mcp_internal(msg));
-            }
-        }
+                common::mcp_internal(msg)
+            })?;
 
-        apply_step_delay(step_delay_ms, index, sequence.len()).await;
-    }
-
-    Ok(final_result)
+            Ok(ResolvedStep {
+                tool_name: config.name.clone(),
+                args: params.arguments.clone(),
+                subcommand_config: step_config.clone(),
+                command_parts,
+            })
+        },
+    )
+    .await
 }
 
 /// Formats a message for a sequence step that was started.

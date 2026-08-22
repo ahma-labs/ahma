@@ -199,10 +199,10 @@ impl ProgressPushRouter {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
 
-                let op_id = event.operation_id().to_string();
                 let Some((progress, message)) = progress_for_event(&event) else {
                     continue;
                 };
+                let op_id = event.operation_id().to_string();
 
                 if event.is_terminal() {
                     // Single atomic get-and-remove — see `claim_terminal` for

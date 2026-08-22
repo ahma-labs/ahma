@@ -49,8 +49,8 @@ mod subcommand;
 mod types;
 
 pub use types::{
-    ActiveAgentSession, ExtensionToolHandler, GuidanceConfig, LegacyGuidanceConfig, META_PARAMS,
-    PromptRunner, SequenceKind, get_global_prompt_runner, register_global_extension_handler,
+    ActiveAgentSession, ExtensionToolHandler, GuidanceConfig, META_PARAMS, PromptRunner,
+    SequenceKind, get_global_prompt_runner, register_global_extension_handler,
     register_global_prompt_runner,
 };
 
@@ -299,19 +299,11 @@ impl AhmaMcpService {
             .map(tool_info_from_tool)
             .collect();
 
-        {
-            let configs_lock = self.configs.read().unwrap();
-            for config in configs_lock.values() {
-                if !self.is_config_visible_to_client(config) {
-                    continue;
-                }
-                tools.extend(
-                    self.create_tools_from_config(config)
-                        .into_iter()
-                        .map(tool_info_from_tool),
-                );
-            }
-        }
+        tools.extend(
+            self.visible_config_tools()
+                .into_iter()
+                .map(tool_info_from_tool),
+        );
 
         let external_mgr = self.mcp_connections.read().await;
         for ext_tool in external_mgr.aggregate_tools() {
@@ -319,6 +311,18 @@ impl AhmaMcpService {
         }
 
         tools
+    }
+
+    /// The `Tool` entries for every configured tool that is visible to the
+    /// client. Shared by `get_all_available_tools` and `list_tools` so their
+    /// filtering cannot drift apart.
+    fn visible_config_tools(&self) -> Vec<Tool> {
+        let configs_lock = self.configs.read().unwrap();
+        configs_lock
+            .values()
+            .filter(|config| self.is_config_visible_to_client(config))
+            .flat_map(|config| self.create_tools_from_config(config))
+            .collect()
     }
 
     /// The built-in tools every session exposes, before per-client config
@@ -911,8 +915,7 @@ impl AhmaMcpService {
     fn build_single_tool_from_config(&self, tool_config: &ToolConfig) -> Tool {
         let base_name = &tool_config.name;
         let description = self.tool_description(tool_config, base_name);
-        let input_schema =
-            schema::generate_schema_for_tool_config(tool_config, self.guidance.as_ref());
+        let input_schema = schema::generate_schema_for_tool_config(tool_config);
         Tool::new(base_name.clone(), description, input_schema).with_title(base_name.clone())
     }
 
@@ -938,7 +941,7 @@ impl AhmaMcpService {
         let sub_description =
             Self::flattened_subcommand_description(tool_config, subcommand_config);
         let description = self.tool_description_text(tool_config, &flat_name, &sub_description);
-        let input_schema = Arc::new(schema::generate_single_command_schema_pub(
+        let input_schema = Arc::new(schema::generate_single_command_schema(
             tool_config,
             &(sub_path.to_string(), subcommand_config),
         ));
@@ -1134,16 +1137,9 @@ impl AhmaMcpService {
 
         // Sync operations never enter the OperationMonitor, so the event
         // forwarder cannot see them — push start/final progress directly.
-        let push_enabled =
-            progress_token.is_some() && self.effective_supports_progress(client_type);
-        self.push_sync_start_progress(
-            push_enabled,
-            progress_token.clone(),
-            &peer,
-            base_command,
-            working_directory,
-        )
-        .await;
+        let push_token = progress_token.filter(|_| self.effective_supports_progress(client_type));
+        self.push_sync_start_progress(push_token.clone(), &peer, base_command, working_directory)
+            .await;
 
         let result = self
             .adapter
@@ -1161,8 +1157,7 @@ impl AhmaMcpService {
             .await;
 
         self.push_sync_final_progress(
-            push_enabled,
-            progress_token,
+            push_token,
             &peer,
             &id,
             base_command,
@@ -1182,20 +1177,17 @@ impl AhmaMcpService {
         }
     }
 
-    /// Pushes the initial 0% progress notification for a sync tool call, when
-    /// the caller both supplied a progress token and supports progress pushes.
-    /// No-op otherwise.
+    /// Pushes the initial 0% progress notification for a sync tool call.
+    /// `progress_token` must already be filtered by the client's progress
+    /// support (see the `push_token` computation in callers); `None` is a
+    /// no-op.
     async fn push_sync_start_progress(
         &self,
-        push_enabled: bool,
         progress_token: Option<rmcp::model::ProgressToken>,
         peer: &Peer<RoleServer>,
         base_command: &str,
         working_directory: &str,
     ) {
-        if !push_enabled {
-            return;
-        }
         let Some(token) = progress_token else {
             return;
         };
@@ -1218,7 +1210,6 @@ impl AhmaMcpService {
     #[allow(clippy::too_many_arguments)]
     async fn push_sync_final_progress(
         &self,
-        push_enabled: bool,
         progress_token: Option<rmcp::model::ProgressToken>,
         peer: &Peer<RoleServer>,
         id: &str,
@@ -1227,9 +1218,6 @@ impl AhmaMcpService {
         duration_ms: u64,
         result: &Result<String, anyhow::Error>,
     ) {
-        if !push_enabled {
-            return;
-        }
         let Some(token) = progress_token else {
             return;
         };
@@ -1249,32 +1237,32 @@ impl AhmaMcpService {
         progress_push::push_progress(peer, token, 100.0, message, true).await;
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn call_async_tool(
+    /// Registers `op_id` as a progress-push destination when the client
+    /// supplied a progress token. Owns the token + capability resolution so
+    /// the five start paths (configured async tools, `run_terminal_command`
+    /// sync-special/async, `log_monitor`, livelog) cannot drift apart.
+    pub(crate) async fn register_progress_if_requested(
         &self,
-        tool_name: &str,
-        id: String,
-        base_command: &str,
-        working_directory: &str,
-        arguments: serde_json::Map<String, serde_json::Value>,
-        timeout: Option<u64>,
-        subcommand_config: &crate::config::SubcommandConfig,
-        config: &ToolConfig,
+        op_id: &str,
+        peer: Peer<RoleServer>,
         progress_token: Option<rmcp::model::ProgressToken>,
         client_type: McpClientType,
-        peer: Peer<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        self.emit_vault_tool_call(&id, tool_name, &Self::summarize_arguments(&arguments))
-            .await;
-
+    ) {
         if let Some(token) = progress_token {
             let progress_enabled = self.effective_supports_progress(client_type);
             self.progress_push
-                .register(&id, peer, token, client_type, progress_enabled)
+                .register(op_id, peer, token, client_type, progress_enabled)
                 .await;
         }
+    }
 
-        let log_monitor_config = config.monitor_level.as_deref().map(|level_str| {
+    /// Derives the per-operation log monitor configuration from a tool config's
+    /// `monitor_level`/`monitor_stream` fields.
+    fn log_monitor_config_from_tool(
+        &self,
+        config: &ToolConfig,
+    ) -> Option<crate::log_monitor::LogMonitorConfig> {
+        config.monitor_level.as_deref().map(|level_str| {
             let level = level_str
                 .parse::<crate::log_monitor::LogLevel>()
                 .unwrap_or(crate::log_monitor::LogLevel::Error);
@@ -1288,7 +1276,37 @@ impl AhmaMcpService {
                 monitor_stream: stream,
                 rate_limit_seconds: self.monitor_rate_limit_seconds,
             }
-        });
+        })
+    }
+
+    /// Starts an async operation and reports the result: vault telemetry,
+    /// progress registration, adapter start, inline completion window, and
+    /// cleanup on a failed start. Shared by configured async tools and
+    /// `run_terminal_command`'s async path; `vault_args_summary` and
+    /// `map_start_error` carry the per-caller differences (argument summary
+    /// shape and start-failure error mapping).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn call_async_tool(
+        &self,
+        tool_name: &str,
+        id: String,
+        base_command: &str,
+        working_directory: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+        timeout: Option<u64>,
+        subcommand_config: &crate::config::SubcommandConfig,
+        log_monitor_config: Option<crate::log_monitor::LogMonitorConfig>,
+        vault_args_summary: &str,
+        progress_token: Option<rmcp::model::ProgressToken>,
+        client_type: McpClientType,
+        peer: Peer<RoleServer>,
+        map_start_error: impl FnOnce(&anyhow::Error) -> McpError,
+    ) -> Result<CallToolResult, McpError> {
+        self.emit_vault_tool_call(&id, tool_name, vault_args_summary)
+            .await;
+
+        self.register_progress_if_requested(&id, peer, progress_token, client_type)
+            .await;
 
         let job_id = self
             .adapter
@@ -1308,6 +1326,8 @@ impl AhmaMcpService {
 
         match job_id {
             Ok(id) => {
+                // Automatic async: wait out the inline window (SPEC R2.6.1) so
+                // fast commands answer without an `await` round-trip.
                 if let Some(result) = handlers::common::try_automatic_async_completion(
                     &self.operation_monitor,
                     &id,
@@ -1328,9 +1348,7 @@ impl AhmaMcpService {
                 // arrive to clean up the push registration.
                 self.progress_push.unregister(&id).await;
                 self.emit_vault_tool_complete(&id, false, 0).await;
-                let error_message = format!("Failed to start asynchronous operation: {}", e);
-                tracing::error!("{}", error_message);
-                Err(handlers::common::mcp_internal(error_message))
+                Err(map_start_error(&e))
             }
         }
     }
@@ -1541,16 +1559,7 @@ impl ServerHandler for AhmaMcpService {
         );
         async move {
             let mut tools = self.builtin_tools();
-
-            {
-                let configs_lock = self.configs.read().unwrap();
-                for config in configs_lock.values() {
-                    if !self.is_config_visible_to_client(config) {
-                        continue;
-                    }
-                    tools.extend(self.create_tools_from_config(config));
-                }
-            }
+            tools.extend(self.visible_config_tools());
 
             // Add external MCP tools from McpConnectionManager
             let external_mgr = self.mcp_connections.read().await;
@@ -1596,8 +1605,8 @@ impl ServerHandler for AhmaMcpService {
                 .map(|g| g.enabled)
                 .unwrap_or(false);
 
-            let mut tool_name = params.name.clone();
-            let mut tool_args = params.arguments.clone();
+            let mut tool_name = params.name;
+            let mut tool_args = params.arguments;
 
             if is_guard_active
                 && let Some(early) = self.harness_guard_preprocess(&mut tool_name, &mut tool_args)
@@ -1605,10 +1614,18 @@ impl ServerHandler for AhmaMcpService {
                 return Ok(early);
             }
 
+            // The loop detector is the only consumer of the (possibly healed)
+            // arguments after dispatch, so only it pays for a clone.
+            let loop_detector_args = if is_guard_active {
+                tool_args.clone()
+            } else {
+                None
+            };
+
             let mut run_params = CallToolRequestParams::new(tool_name.clone());
-            run_params.arguments = tool_args.clone();
-            run_params.meta = params.meta.clone();
-            run_params.task = params.task.clone();
+            run_params.arguments = tool_args;
+            run_params.meta = params.meta;
+            run_params.task = params.task;
 
             // Every tool call gates on the scope being settled (SPEC R5.1.2) —
             // here, once, rather than in each handler. The built-in file tools
@@ -1707,7 +1724,11 @@ impl ServerHandler for AhmaMcpService {
             };
 
             if is_guard_active {
-                self.record_result_in_loop_detector(tool_name.as_ref(), &tool_args, &result);
+                self.record_result_in_loop_detector(
+                    tool_name.as_ref(),
+                    loop_detector_args.as_ref(),
+                    &result,
+                );
             }
 
             result
@@ -1793,16 +1814,17 @@ impl AhmaMcpService {
     fn record_result_in_loop_detector(
         &self,
         tool_name: &str,
-        tool_args: &Option<serde_json::Map<String, Value>>,
+        tool_args: Option<&serde_json::Map<String, Value>>,
         result: &Result<CallToolResult, McpError>,
     ) {
         let failed = match result {
             Ok(res) => res.is_error.unwrap_or(false),
             Err(_) => true,
         };
-        let args = tool_args.clone().unwrap_or_default();
+        let empty = serde_json::Map::new();
+        let args = tool_args.unwrap_or(&empty);
         if let Ok(guard) = self.harness_guard.try_lock() {
-            guard.observe(tool_name, &args, failed);
+            guard.observe(tool_name, args, failed);
         }
     }
 
@@ -1945,18 +1967,13 @@ impl AhmaMcpService {
 
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
-        if let Some(token) = progress_token {
-            let progress_enabled = self.effective_supports_progress(client_type);
-            self.progress_push
-                .register(
-                    &op_id,
-                    context.peer.clone(),
-                    token,
-                    client_type,
-                    progress_enabled,
-                )
-                .await;
-        }
+        self.register_progress_if_requested(
+            &op_id,
+            context.peer.clone(),
+            progress_token,
+            client_type,
+        )
+        .await;
 
         let op_id_clone = op_id.clone();
         let monitor_clone = monitor.clone();
@@ -2054,7 +2071,6 @@ impl AhmaMcpService {
         if config.sequence.is_some() {
             return sequence::handle_sequence_tool(
                 &self.adapter,
-                &self.operation_monitor,
                 &self.progress_push,
                 &self.configs,
                 &config,
@@ -2073,16 +2089,15 @@ impl AhmaMcpService {
             .await
     }
 
-    /// Routes a `tools/call` for a configured (non-built-in) tool. Validates
-    /// the sandbox is locked, resolves the tool config, and dispatches by
-    /// tool type (sequence / livelog / subcommand).
+    /// Routes a `tools/call` for a configured (non-built-in) tool. Resolves
+    /// the tool config and dispatches by tool type (sequence / livelog /
+    /// subcommand). The sandbox-ready gate has already run in `call_tool`,
+    /// its only caller, for every non-exempt tool name.
     async fn dispatch_configured_tool(
         &self,
         params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.guard_sandbox_ready_for_tool_calls().await?;
-
         if params.name.contains("::")
             && let Some(result) = self.try_dispatch_external_mcp_tool(&params).await
         {
@@ -2189,6 +2204,7 @@ impl AhmaMcpService {
                 .await
             }
             crate::adapter::ExecutionMode::AsyncResultPush => {
+                let vault_args_summary = Self::summarize_arguments(&arguments);
                 self.call_async_tool(
                     tool_name,
                     id,
@@ -2197,10 +2213,17 @@ impl AhmaMcpService {
                     arguments,
                     timeout,
                     subcommand_config,
-                    config,
+                    self.log_monitor_config_from_tool(config),
+                    &vault_args_summary,
                     progress_token,
                     client_type,
                     context.peer.clone(),
+                    |e| {
+                        let error_message =
+                            format!("Failed to start asynchronous operation: {}", e);
+                        tracing::error!("{}", error_message);
+                        handlers::common::mcp_internal(error_message)
+                    },
                 )
                 .await
             }
@@ -2289,18 +2312,13 @@ impl AhmaMcpService {
         let op_id = format!("livelog_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
-        if let Some(token) = progress_token {
-            let progress_enabled = self.effective_supports_progress(client_type);
-            self.progress_push
-                .register(
-                    &op_id,
-                    context.peer.clone(),
-                    token,
-                    client_type,
-                    progress_enabled,
-                )
-                .await;
-        }
+        self.register_progress_if_requested(
+            &op_id,
+            context.peer.clone(),
+            progress_token,
+            client_type,
+        )
+        .await;
         match handlers::livelog_tool::handle_livelog_start(
             op_id.clone(),
             config,
@@ -2392,11 +2410,13 @@ impl AhmaMcpService {
     ///
     /// This is useful for testing and introspection.
     pub fn list_tool_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = vec![
-            "await".into(),
-            "status".into(),
-            "run_terminal_command".into(),
-        ];
+        // `HARDCODED_TOOLS` is asserted (in `hardcoded_tools_match_builtin_tools`)
+        // to match `builtin_tools()` exactly, and is far cheaper than rebuilding
+        // every builtin's JSON schema just to read the names.
+        let mut names: Vec<String> = Self::HARDCODED_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         let configs_lock = self.configs.read().unwrap();
         for config in configs_lock.values() {
@@ -2661,7 +2681,7 @@ mod tests {
         );
         assert!(text.contains("reason='stop everything'"));
         assert!(
-            monitor.get_active_operations().await.is_empty(),
+            monitor.get_all_active_operations().await.is_empty(),
             "cancel-all must leave no active operations"
         );
     }
@@ -2923,11 +2943,7 @@ mod tests {
     async fn create_tool_from_config_prepends_guidance_block() {
         let mut guidance_blocks = std::collections::HashMap::new();
         guidance_blocks.insert("my_tool".to_string(), "GUIDE".to_string());
-        let guidance = GuidanceConfig {
-            guidance_blocks,
-            templates: std::collections::HashMap::new(),
-            legacy_guidance: None,
-        };
+        let guidance = GuidanceConfig { guidance_blocks };
 
         let service = make_service_with_monitor(
             Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
@@ -3305,11 +3321,7 @@ mod tests {
     async fn tool_description_prepends_guidance_by_key_override() {
         let mut guidance_blocks = std::collections::HashMap::new();
         guidance_blocks.insert("gk".to_string(), "GUIDE".to_string());
-        let guidance = GuidanceConfig {
-            guidance_blocks,
-            templates: std::collections::HashMap::new(),
-            legacy_guidance: None,
-        };
+        let guidance = GuidanceConfig { guidance_blocks };
         let service = make_service_with_monitor(
             Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
                 Duration::from_secs(30),
@@ -4214,7 +4226,7 @@ mod tests {
             rmcp::model::ContentBlock::text("boom"),
         ]));
         for _ in 0..3 {
-            service.record_result_in_loop_detector("mytool", &args, &err_result);
+            service.record_result_in_loop_detector("mytool", args.as_ref(), &err_result);
         }
         // After three identical failures the same call is blocked by the pipeline.
         let mut name: Cow<'static, str> = Cow::Owned("mytool".to_string());
@@ -4228,7 +4240,7 @@ mod tests {
 
         // A success clears the detector, so the call proceeds again.
         let ok_result: Result<CallToolResult, McpError> = Ok(handlers::common::text_result("done"));
-        service.record_result_in_loop_detector("mytool", &args, &ok_result);
+        service.record_result_in_loop_detector("mytool", args.as_ref(), &ok_result);
         let mut name2: Cow<'static, str> = Cow::Owned("mytool".to_string());
         let mut a2 = args.clone();
         assert!(

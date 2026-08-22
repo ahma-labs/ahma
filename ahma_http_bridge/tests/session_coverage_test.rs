@@ -68,10 +68,7 @@ async fn test_uri_percent_encoding_decoding() {
         .get_session(&session_id)
         .expect("Session should exist");
 
-    let scope = session
-        .get_sandbox_scope()
-        .await
-        .expect("Should have scope");
+    let scope = session.get_sandbox_scope().expect("Should have scope");
 
     assert_eq!(scope, expected, "Percent-encoded spaces should be decoded");
 }
@@ -106,10 +103,7 @@ async fn test_uri_localhost_form() {
         .get_session(&session_id)
         .expect("Session should exist");
 
-    let scope = session
-        .get_sandbox_scope()
-        .await
-        .expect("Should have scope");
+    let scope = session.get_sandbox_scope().expect("Should have scope");
 
     assert_eq!(
         scope,
@@ -155,10 +149,7 @@ async fn test_uri_query_and_fragment_stripped() {
         .get_session(&session_id)
         .expect("Session should exist");
 
-    let scope = session
-        .get_sandbox_scope()
-        .await
-        .expect("Should have scope");
+    let scope = session.get_sandbox_scope().expect("Should have scope");
 
     assert_eq!(
         scope, expected,
@@ -306,10 +297,7 @@ async fn test_mixed_valid_invalid_roots() {
         .get_session(&session_id)
         .expect("Session should exist");
 
-    let scopes = session
-        .get_sandbox_scopes()
-        .await
-        .expect("Should have scopes");
+    let scopes = session.get_sandbox_scopes().expect("Should have scopes");
 
     // Should only include the valid file:// paths
     assert_eq!(scopes.len(), 2, "Should have exactly 2 valid scopes");
@@ -435,15 +423,9 @@ async fn test_get_sandbox_scope_returns_first() {
         .get_session(&session_id)
         .expect("Session should exist");
 
-    let single_scope = session
-        .get_sandbox_scope()
-        .await
-        .expect("Should have scope");
+    let single_scope = session.get_sandbox_scope().expect("Should have scope");
 
-    let all_scopes = session
-        .get_sandbox_scopes()
-        .await
-        .expect("Should have scopes");
+    let all_scopes = session.get_sandbox_scopes().expect("Should have scopes");
 
     assert_eq!(
         single_scope, expected_first,
@@ -599,7 +581,6 @@ async fn test_termination_reasons() {
     // Test each termination reason
     let reasons = [
         SessionTerminationReason::ClientRequested,
-        SessionTerminationReason::RootsChangeRejected,
         SessionTerminationReason::ProcessCrashed,
         SessionTerminationReason::Timeout,
     ];

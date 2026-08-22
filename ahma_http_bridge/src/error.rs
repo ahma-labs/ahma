@@ -17,6 +17,16 @@ pub enum BridgeError {
     #[error("Server process error: {0}")]
     ServerProcess(String),
 
+    /// The concurrent-session cap was hit and no stale session could be
+    /// evicted. Matched structurally (not by message text) to return HTTP 429
+    /// instead of 500. The Display text keeps the historical `ServerProcess`
+    /// prefix so the user-facing message is unchanged.
+    #[error("Server process error: Session limit exceeded (max: {max})")]
+    SessionLimitExceeded {
+        /// The configured maximum number of concurrent sessions.
+        max: usize,
+    },
+
     /// Protocol or communication failure with subprocess
     #[error("Communication error: {0}")]
     Communication(String),

@@ -47,7 +47,6 @@ use futures::stream::{self, StreamExt};
 use serde_json::Value;
 use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc};
 use subtle::ConstantTimeEq as _;
-use tokio_stream::wrappers::BroadcastStream;
 use tower_governor::{
     GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
 };
@@ -424,7 +423,7 @@ fn build_cors_layer(bind_addr: &SocketAddr) -> CorsLayer {
 }
 
 /// MCP Session-Id header name (per MCP spec 2025-03-26)
-const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+pub(crate) const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const MCP_PATH: &str = "/mcp";
 const HEALTH_PATH: &str = "/health";
 const ACCEPT_HEADER: &str = "accept";
@@ -433,7 +432,7 @@ const SSE_ACCEPT_MIME: &str = "text/event-stream";
 const BEARER_PREFIX: &str = "Bearer ";
 const BEARER_WWW_AUTHENTICATE: &str = "Bearer realm=\"ahma-http-bridge\"";
 
-fn session_id_from_headers(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(MCP_SESSION_ID_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -500,35 +499,6 @@ async fn bearer_auth_middleware(
     }
 }
 
-/// Starts the HTTP bridge server and blocks until shutdown.
-///
-/// This function initializes the session manager, sets up the Axum router for MCP
-/// endpoints, and binds to the specified address.
-///
-/// # Returns
-///
-/// * `Ok(())` upon graceful shutdown (currently runs indefinitely).
-/// * `Err(BridgeError)` if binding fails or the server encounters a fatal error.
-///
-/// # Port Binding
-///
-/// If `config.bind_addr` specifies port 0, the OS will assign a random available port.
-/// The actual bound port is printed to stderr as `AHMA_BOUND_PORT=<port>` to assist
-/// with test infrastructure integration.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use ahma_http_bridge::{BridgeConfig, start_bridge};
-///
-/// #[tokio::main]
-/// async fn main() {
-///    let config = BridgeConfig::default();
-///    if let Err(e) = start_bridge(config).await {
-///        eprintln!("Bridge failed: {}", e);
-///    }
-/// }
-/// ```
 /// Block until SIGINT (Ctrl-C) or SIGTERM is received.
 ///
 /// Used by both TCP and Unix accept loops to trigger graceful shutdown when the OS or
@@ -599,6 +569,35 @@ fn spawn_idle_timeout_checker(timeout: u64, state: Arc<BridgeState>) {
     });
 }
 
+/// Starts the HTTP bridge server and blocks until shutdown.
+///
+/// This function initializes the session manager, sets up the Axum router for MCP
+/// endpoints, and binds to the specified address.
+///
+/// # Returns
+///
+/// * `Ok(())` upon graceful shutdown (currently runs indefinitely).
+/// * `Err(BridgeError)` if binding fails or the server encounters a fatal error.
+///
+/// # Port Binding
+///
+/// If `config.bind_addr` specifies port 0, the OS will assign a random available port.
+/// The actual bound port is printed to stderr as `AHMA_BOUND_PORT=<port>` to assist
+/// with test infrastructure integration.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use ahma_http_bridge::{BridgeConfig, start_bridge};
+///
+/// #[tokio::main]
+/// async fn main() {
+///    let config = BridgeConfig::default();
+///    if let Err(e) = start_bridge(config).await {
+///        eprintln!("Bridge failed: {}", e);
+///    }
+/// }
+/// ```
 pub async fn start_bridge(mut config: BridgeConfig) -> Result<()> {
     if config.idle_timeout_secs.is_some() && config.active_sessions.is_none() {
         config.active_sessions = Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
@@ -1410,10 +1409,10 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
     // to prevent gaps between replay and live events.
     let rx = session.subscribe();
 
-    // Parse Last-Event-Id header for replay support
+    // Parse Last-Event-Id header for replay support (HeaderMap lookups are
+    // case-insensitive, so the lowercase name matches any spelling).
     let last_event_id: Option<u64> = headers
         .get(LAST_EVENT_ID_HEADER)
-        .or_else(|| headers.get("Last-Event-Id"))
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
 
@@ -1463,45 +1462,13 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
             .map(|(id, msg)| Ok::<_, Infallible>(Event::default().id(id.to_string()).data(msg))),
     );
 
-    // Convert broadcast receiver to a stream of SSE events.
-    // When the receiver falls behind (broadcast channel capacity exceeded),
-    // BroadcastStream yields `Lagged(n)` with the number of skipped messages.
-    // We log this prominently and bump a per-session counter so the loss is
-    // observable in tests, metrics, and debug logs.
-    let session_arc = session.clone();
-    let session_id_clone = session_id.clone();
-    let live_stream = BroadcastStream::new(rx).filter_map(move |result| {
-        let session_id = session_id_clone.clone();
-        let session_ref = session_arc.clone();
-        async move {
-            match result {
-                Ok((id, msg)) => {
-                    debug!(session_id = %session_id, event_id = id, "Sending SSE event: {}", msg);
-                    Some(Ok::<_, Infallible>(
-                        Event::default().id(id.to_string()).data(msg),
-                    ))
-                }
-                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                    session_ref.record_lagged_events(n);
-                    let total = session_ref.total_lagged_events();
-                    warn!(
-                        session_id = %session_id,
-                        lagged_count = n,
-                        total_lagged = total,
-                        "SSE receiver lagged — {} event(s) dropped (total: {})",
-                        n,
-                        total
-                    );
-                    // Yield an SSE comment so the client's EventSource sees
-                    // activity (keeps connection alive) without injecting a
-                    // fake JSON-RPC message into the MCP protocol stream.
-                    Some(Ok(
-                        Event::default().comment(format!("lagged: {} events dropped", n))
-                    ))
-                }
-            }
-        }
-    });
+    // Convert broadcast receiver to a stream of SSE events (shared adapter:
+    // logs and counts `Lagged(n)` losses, yields keep-alive comments).
+    let live_stream = crate::request_handler::broadcast_sse_event_stream(
+        session.clone(),
+        rx,
+        "Sending SSE event",
+    );
 
     // Chain replay events before live stream for seamless reconnection
     let combined = replay_stream.chain(live_stream);
@@ -1624,57 +1591,7 @@ mod tests {
         }
     }
 
-    fn is_uri_safe_byte(b: u8) -> bool {
-        matches!(
-            b,
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':'
-        )
-    }
-
-    const FILE_URI_PREFIX: &str = "file://";
-    const WINDOWS_EXTENDED_PATH_PREFIX: &str = r"\\?\";
-
-    /// Encode a filesystem path as a file:// URI.
-    ///
-    /// Windows: `C:\foo\bar` → `file:///C:/foo/bar`
-    /// Unix:    `/tmp/bar`   → `file:///tmp/bar`
-    fn encode_file_uri(path: &Path) -> String {
-        let mut path_str = path.to_string_lossy().into_owned();
-
-        // Strip Windows extended-length prefix (\\?\) if present.
-        if path_str.starts_with(WINDOWS_EXTENDED_PATH_PREFIX) {
-            path_str = path_str[WINDOWS_EXTENDED_PATH_PREFIX.len()..].to_string();
-        }
-
-        // Normalise path separators to forward slashes.
-        path_str = path_str.replace('\\', "/");
-
-        let mut out = String::with_capacity(path_str.len() + 10);
-        out.push_str(FILE_URI_PREFIX);
-
-        // On Windows a drive-letter path looks like "C:/Users/…".
-        // RFC 8089 §2 requires the path to start with "/" so that it occupies
-        // the path component, not the authority.
-        #[cfg(target_os = "windows")]
-        {
-            let is_drive = path_str.len() >= 2
-                && path_str.as_bytes()[0].is_ascii_alphabetic()
-                && path_str.as_bytes()[1] == b':';
-            if is_drive {
-                out.push('/');
-            }
-        }
-
-        for &b in path_str.as_bytes() {
-            if is_uri_safe_byte(b) {
-                out.push(b as char);
-            } else {
-                out.push('%');
-                out.push_str(&format!("{:02X}", b));
-            }
-        }
-        out
-    }
+    use ahma_common::file_uri::encode_file_uri;
 
     #[test]
     fn test_default_config() {
@@ -1938,7 +1855,6 @@ for line in sys.stdin:
 
         let sandbox_scope = session
             .get_sandbox_scope()
-            .await
             .expect("Sandbox scope should be set after roots lock");
         assert_eq!(sandbox_scope, temp_dir.path().to_path_buf());
 
@@ -2288,7 +2204,7 @@ for line in sys.stdin:
             }
             other => panic!("expected Active, got {other:?}"),
         }
-        let scope = session.get_sandbox_scope().await.expect("scope set");
+        let scope = session.get_sandbox_scope().expect("scope set");
         assert_eq!(scope, temp_dir.path().to_path_buf());
 
         assert_tool_call_ok(&app, &session_id, 1).await;

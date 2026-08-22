@@ -4,7 +4,6 @@
 //! - Concurrent operation tracking edge cases
 //! - Memory cleanup validation for completed operations
 //! - Status query performance under high load
-//! - Advanced await functionality edge cases
 //! - Operation lifecycle and state transition validation
 
 use anyhow::Result;
@@ -84,7 +83,7 @@ async fn test_concurrent_operation_tracking() -> Result<()> {
     assert_eq!(completed.len(), num_concurrent);
 
     // Verify no active operations remain
-    let active = monitor.get_active_operations().await;
+    let active = monitor.get_all_active_operations().await;
     assert_eq!(active.len(), 0);
 
     // Verify each operation can be retrieved
@@ -133,7 +132,7 @@ async fn test_memory_cleanup_validation() -> Result<()> {
     assert_eq!(completed.len(), num_operations);
 
     // Verify no operations remain in active tracking
-    let active = monitor.get_active_operations().await;
+    let active = monitor.get_all_active_operations().await;
     assert_eq!(active.len(), 0);
 
     // Test that all operations can be retrieved via wait_for_operation
@@ -197,7 +196,7 @@ async fn run_query_task(
     while start_time.elapsed() < Duration::from_millis(duration_ms) {
         match query_count % 4 {
             0 => {
-                let _ = monitor.get_active_operations().await;
+                let _ = monitor.get_all_active_operations().await;
             }
             1 => {
                 let _ = monitor.get_completed_operations().await;
@@ -273,67 +272,6 @@ async fn test_status_query_performance_under_load() -> Result<()> {
         .collect::<Result<Vec<_>, _>>()?;
 
     assert_query_performance(&results, num_query_tasks);
-
-    Ok(())
-}
-
-/// Test advanced await functionality edge cases
-#[tokio::test]
-async fn test_advanced_await_functionality_edge_cases() -> Result<()> {
-    let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(30)));
-
-    // Test with very short timeout
-    let short_timeout_result = monitor.wait_for_operations_advanced(None, Some(1)).await;
-    // Should complete quickly even with no operations
-    assert!(short_timeout_result.is_empty());
-
-    // Test with tool filter that matches nothing
-    let no_match_result = monitor
-        .wait_for_operations_advanced(Some("nonexistent_tool"), Some(2))
-        .await;
-    assert!(no_match_result.is_empty());
-
-    // Create operations with different tool names
-    let tool_names = ["cargo", "git", "test", "other"];
-    for (i, &tool) in tool_names.iter().enumerate() {
-        let op_id = format!("await_test_{}_{}", tool, i);
-        let operation = Operation::new(
-            op_id.clone(),
-            tool.to_string(),
-            format!("Await test for {}", tool),
-            Some(json!({"tool": tool, "index": i})),
-        );
-
-        monitor.add_operation(operation).await;
-
-        // Complete operations immediately
-        monitor
-            .update_status(
-                &op_id,
-                OperationStatus::Completed,
-                Some(json!({"tool_result": tool})),
-            )
-            .await;
-    }
-
-    // Test tool filter for specific tools
-    let cargo_results = monitor
-        .wait_for_operations_advanced(Some("cargo"), Some(5))
-        .await;
-    assert_eq!(cargo_results.len(), 1);
-    assert!(cargo_results[0].tool_name.starts_with("cargo"));
-
-    // Test multiple tool filter
-    let multi_results = monitor
-        .wait_for_operations_advanced(Some("cargo,git"), Some(5))
-        .await;
-    assert_eq!(multi_results.len(), 2);
-
-    // Test filter with no timeout (default timeout)
-    let default_results = monitor
-        .wait_for_operations_advanced(Some("test"), None)
-        .await;
-    assert_eq!(default_results.len(), 1);
 
     Ok(())
 }

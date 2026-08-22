@@ -7,6 +7,8 @@ mod release;
 mod source;
 pub mod verify;
 
+pub(crate) use platform::AHMA_BINARY_NAME;
+
 use anyhow::{Context, Result};
 use clap::Args;
 use std::{
@@ -321,11 +323,7 @@ async fn warn_if_running_binary_differs(install_dir: &std::path::Path) {
     let Ok(current) = std::env::current_exe() else {
         return;
     };
-    let target = install_dir.join(if cfg!(target_os = "windows") {
-        "ahma.exe"
-    } else {
-        "ahma"
-    });
+    let target = install_dir.join(AHMA_BINARY_NAME);
     if target.exists()
         && let (Ok(a), Ok(b)) = (dunce::canonicalize(&current), dunce::canonicalize(&target))
         && a != b
@@ -668,12 +666,7 @@ mod tests {
         // When a dummy file exists at the expected target location the canonicalize
         // branches are exercised (paths will differ from the real current_exe).
         let temp_dir = tempfile::tempdir().unwrap();
-        let binary_name = if cfg!(target_os = "windows") {
-            "ahma.exe"
-        } else {
-            "ahma"
-        };
-        let target = temp_dir.path().join(binary_name);
+        let target = temp_dir.path().join(AHMA_BINARY_NAME);
         std::fs::write(&target, b"fake binary").unwrap();
         // Exercises target.exists() == true and the dunce::canonicalize comparison.
         // A "Note: running … but updating …" line may be printed to stderr.

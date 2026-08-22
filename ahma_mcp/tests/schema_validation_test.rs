@@ -121,7 +121,7 @@ async fn test_builtin_tools_have_valid_json_schema() {
         .get("run_terminal_command")
         .expect("run_terminal_command should be present in default config");
 
-    let schema = generate_schema_for_tool_config(tool_config, &None);
+    let schema = generate_schema_for_tool_config(tool_config);
     let result = validate_json_schema_map(&schema, "run_terminal_command");
     assert!(
         result.is_ok(),
@@ -145,7 +145,7 @@ async fn test_all_tools_have_valid_json_schema() {
     let mut errors = Vec::new();
 
     for (tool_name, tool_config) in &tools {
-        let schema = generate_schema_for_tool_config(tool_config, &None);
+        let schema = generate_schema_for_tool_config(tool_config);
         if let Err(e) = validate_json_schema_map(&schema, tool_name) {
             errors.push(e);
         }
@@ -174,7 +174,7 @@ async fn test_run_terminal_command_schema_no_required_in_properties() {
         .get("run_terminal_command")
         .expect("run_terminal_command tool config should exist");
 
-    let schema = generate_schema_for_tool_config(tool_config, &None);
+    let schema = generate_schema_for_tool_config(tool_config);
 
     // Check that the schema has required as an array at the top level
     let required = schema

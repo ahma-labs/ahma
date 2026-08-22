@@ -21,7 +21,7 @@
 //!   through `path_security::validate_path` to catch symlink escapes and
 //!   traversal sequences.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Windows helper (compiled out on non-Windows)
@@ -117,6 +117,65 @@ pub fn parse_file_uri_to_path(uri: &str) -> Option<PathBuf> {
         let decoded = percent_decode_utf8(rest)?;
         Some(PathBuf::from(decoded))
     }
+}
+
+/// Encodes a filesystem path as a `file://` URI (e.g. for MCP `roots/list`
+/// responses).
+///
+/// The inverse of [`parse_file_uri_to_path`]: every byte outside the RFC 3986
+/// unreserved set (plus `/` and `:`) is percent-encoded, so paths containing
+/// spaces, `#`, `?`, or non-ASCII characters round-trip through the parser
+/// instead of producing URIs whose query/fragment stripping corrupts them.
+///
+/// * Backslashes are normalised to forward slashes.
+/// * A Windows extended-length prefix (`\\?\`) is stripped.
+/// * On Windows, drive-letter paths (`C:\…`) gain the standard leading slash
+///   (`file:///C:/…`), matching the drive handling in
+///   [`parse_file_uri_to_path`].
+pub fn encode_file_uri(path: &Path) -> String {
+    let mut path_str = path.to_string_lossy().into_owned();
+
+    // Strip Windows extended-length prefix (\\?\) if present.
+    if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+        path_str = stripped.to_string();
+    }
+    // Normalise path separators to forward slashes.
+    path_str = path_str.replace('\\', "/");
+
+    let mut out = String::with_capacity(path_str.len() + 10);
+    out.push_str("file://");
+
+    #[cfg(target_os = "windows")]
+    {
+        let is_drive = path_str.len() >= 2
+            && path_str.as_bytes()[0].is_ascii_alphabetic()
+            && path_str.as_bytes()[1] == b':';
+        if is_drive {
+            out.push('/');
+        }
+    }
+
+    for &b in path_str.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(
+                    char::from_digit((b >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((b & 0xF) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Decodes a percent-encoded UTF-8 string.
@@ -398,6 +457,59 @@ mod tests {
         let p = parse_file_uri_to_path("file:///scope/a%2F..%2Foutside");
         // Decoded: /scope/a/../outside — validate_path handles the traversal check.
         assert_eq!(p, Some(PathBuf::from("/scope/a/../outside")));
+    }
+
+    // ── encode_file_uri ─────────────────────────────────────────────────────
+
+    #[test]
+    fn encode_plain_absolute_path() {
+        let uri = encode_file_uri(Path::new("/home/user/project"));
+        assert_eq!(uri, "file:///home/user/project");
+    }
+
+    #[test]
+    fn encode_percent_encodes_space_and_hash() {
+        let uri = encode_file_uri(Path::new("/tmp/my project/#42"));
+        assert_eq!(uri, "file:///tmp/my%20project/%2342");
+    }
+
+    #[test]
+    fn encode_normalizes_backslashes() {
+        let uri = encode_file_uri(Path::new(r"a\b\c"));
+        assert!(uri.contains("a/b/c"), "separators normalized: {uri}");
+        assert!(!uri.contains('\\'), "no backslashes remain: {uri}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn encode_round_trips_through_parse() {
+        for raw in [
+            "/home/user/project",
+            "/tmp/my project/sub dir",
+            "/home/user/notes#1",
+            "/home/user/what?why",
+            "/home/café/naïve",
+        ] {
+            let path = PathBuf::from(raw);
+            let uri = encode_file_uri(&path);
+            assert_eq!(
+                parse_file_uri_to_path(&uri),
+                Some(path),
+                "round-trip failed for {raw} (uri: {uri})"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn encode_round_trips_windows_drive_path() {
+        let path = PathBuf::from(r"C:\Users\name\My Project");
+        let uri = encode_file_uri(&path);
+        assert_eq!(uri, "file:///C:/Users/name/My%20Project");
+        assert_eq!(
+            parse_file_uri_to_path(&uri),
+            Some(PathBuf::from("C:/Users/name/My Project"))
+        );
     }
 
     // ── parse_file_uri_to_path (Windows — compile-guarded) ─────────────────

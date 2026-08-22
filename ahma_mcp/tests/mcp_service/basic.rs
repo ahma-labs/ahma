@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod mcp_service_tests {
     use ahma_mcp::config::{CommandOption, SubcommandConfig, ToolConfig};
-    use ahma_mcp::mcp_service::{GuidanceConfig, LegacyGuidanceConfig};
+    use ahma_mcp::mcp_service::GuidanceConfig;
     use ahma_mcp::utils::logging::init_test_logging;
     use rmcp::model::ProtocolVersion;
     use serde_json::json;
@@ -39,14 +39,6 @@ mod mcp_service_tests {
             config.guidance_blocks["async_behavior"],
             "This tool operates asynchronously"
         );
-
-        assert_eq!(config.templates.len(), 1);
-        assert!(config.templates.contains_key("default"));
-
-        assert!(config.legacy_guidance.is_some());
-        let legacy = config.legacy_guidance.unwrap();
-        assert_eq!(legacy.general_guidance.len(), 1);
-        assert!(legacy.general_guidance.contains_key("await"));
     }
 
     #[test]
@@ -63,41 +55,6 @@ mod mcp_service_tests {
 
         assert_eq!(config.guidance_blocks.len(), 1);
         assert!(config.guidance_blocks.contains_key("test"));
-        assert_eq!(config.templates.len(), 0); // Should default to empty
-        assert!(config.legacy_guidance.is_none()); // Should default to None
-    }
-
-    #[test]
-    fn test_legacy_guidance_config() {
-        init_test_logging();
-        // Test LegacyGuidanceConfig structure
-        let json_str = r#"{
-            "general_guidance": {
-                "await": "Wait for operations",
-                "status": "Check status"
-            },
-            "tool_specific_guidance": {
-                "cargo": {
-                    "build": "Build the project",
-                    "test": "Run tests"
-                },
-                "git": {
-                    "commit": "Commit changes"
-                }
-            }
-        }"#;
-
-        let config: LegacyGuidanceConfig = serde_json::from_str(json_str).unwrap();
-
-        assert_eq!(config.general_guidance.len(), 2);
-        assert_eq!(config.tool_specific_guidance.len(), 2);
-        assert!(config.tool_specific_guidance.contains_key("cargo"));
-        assert!(config.tool_specific_guidance.contains_key("git"));
-
-        let cargo_guidance = &config.tool_specific_guidance["cargo"];
-        assert_eq!(cargo_guidance.len(), 2);
-        assert!(cargo_guidance.contains_key("build"));
-        assert!(cargo_guidance.contains_key("test"));
     }
 
     #[test]

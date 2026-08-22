@@ -232,13 +232,24 @@ fn extract_id(text: &str) -> Result<String> {
     ))
 }
 
+/// Iterate over the text of every text content block, in order.
+///
+/// The single crate-wide extraction seam for MCP tool-call content: callers
+/// layer their own joining/empty-result policy on top.
+pub(crate) fn text_contents(contents: &[ContentBlock]) -> impl Iterator<Item = &str> {
+    contents
+        .iter()
+        .filter_map(|c| c.as_text())
+        .map(|t| t.text.as_str())
+}
+
 fn join_text_contents(contents: &[ContentBlock]) -> Result<String> {
     let mut combined = String::new();
-    for text_content in contents.iter().filter_map(|c| c.as_text()) {
+    for text in text_contents(contents) {
         if !combined.is_empty() {
             combined.push_str("\n\n");
         }
-        combined.push_str(&text_content.text);
+        combined.push_str(text);
     }
 
     if combined.is_empty() {
@@ -249,9 +260,9 @@ fn join_text_contents(contents: &[ContentBlock]) -> Result<String> {
 }
 
 fn first_text_content(contents: &[ContentBlock]) -> Result<String> {
-    contents
-        .iter()
-        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+    text_contents(contents)
+        .next()
+        .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("No text content in response"))
 }
 

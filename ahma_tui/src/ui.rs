@@ -970,10 +970,25 @@ fn max_header_workspace_len(width: u16) -> usize {
     }
 }
 
+/// Total number of external MCP tools, without materialising the formatted,
+/// sorted tool-name list ([`McpConnectionManager::aggregate_tools`]) — this
+/// runs on every rendered frame, where only the count matters.
+#[cfg(feature = "tui")]
+fn external_tool_count(state: &AppState) -> usize {
+    state
+        .mcp_connections
+        .tools_by_server
+        .values()
+        .map(Vec::len)
+        .sum()
+}
+
 #[cfg(feature = "tui")]
 fn format_external_tools_part(state: &AppState) -> String {
     let (http_count, stdio_count) = get_mcp_connection_counts(&state.mcp_connections.servers);
-    let external_tools = state.mcp_connections.aggregate_tool_names().len();
+    // Only the count is needed — summing per-server lengths avoids cloning and
+    // sorting every ToolInfo on each rendered frame.
+    let external_tools = external_tool_count(state);
     if http_count > 0 || stdio_count > 0 {
         format!(" · ext (http:{http_count} stdio:{stdio_count}) / {external_tools} tools")
     } else {

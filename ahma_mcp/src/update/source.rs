@@ -60,11 +60,7 @@ pub async fn install_from_git_ref(
 
     if dry_run {
         println!("[dry-run] Would run: RUSTFLAGS='{rustflags}' {display}");
-        return Ok(install_dir.join(if cfg!(target_os = "windows") {
-            "ahma.exe"
-        } else {
-            "ahma"
-        }));
+        return Ok(install_dir.join(super::AHMA_BINARY_NAME));
     }
 
     if which_cargo().is_none() {
@@ -94,11 +90,7 @@ pub async fn install_from_git_ref(
         bail!("cargo install failed with status {status}");
     }
 
-    let binary = install_dir.join(if cfg!(target_os = "windows") {
-        "ahma.exe"
-    } else {
-        "ahma"
-    });
+    let binary = install_dir.join(super::AHMA_BINARY_NAME);
 
     if !binary.exists() {
         bail!(
@@ -216,11 +208,7 @@ mod tests {
             "dry-run should succeed without spawning cargo"
         );
         let path = result.unwrap();
-        let expected_name = if cfg!(target_os = "windows") {
-            "ahma.exe"
-        } else {
-            "ahma"
-        };
+        let expected_name = crate::update::AHMA_BINARY_NAME;
         assert_eq!(
             path.file_name().and_then(|n| n.to_str()),
             Some(expected_name),

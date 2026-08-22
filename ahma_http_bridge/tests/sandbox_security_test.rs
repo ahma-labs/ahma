@@ -186,7 +186,7 @@ async fn test_sandbox_lock_immutability() {
 
     // Verify the scope is still the ORIGINAL scope, not the attacker's scope
     let session = manager.get_session(&session_id).unwrap();
-    let scope = session.get_sandbox_scope().await;
+    let scope = session.get_sandbox_scope();
     assert_eq!(
         scope,
         Some(expected_scope),
@@ -266,7 +266,7 @@ async fn test_multi_root_workspace_sandbox() {
 
     // Verify the first root is used as primary sandbox scope
     let session = manager.get_session(&session_id).unwrap();
-    let scope = session.get_sandbox_scope().await;
+    let scope = session.get_sandbox_scope();
     assert!(scope.is_some(), "Sandbox scope should be set");
 
     // First root should be the primary scope
@@ -331,6 +331,6 @@ async fn test_empty_roots_use_explicit_fallback_scope() {
     );
 
     let session = manager.get_session(&session_id).unwrap();
-    let scope = session.get_sandbox_scope().await;
+    let scope = session.get_sandbox_scope();
     assert_eq!(scope, Some(fallback_scope));
 }

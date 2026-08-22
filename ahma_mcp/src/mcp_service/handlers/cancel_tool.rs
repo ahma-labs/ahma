@@ -27,7 +27,7 @@ pub fn cancel_schema() -> Arc<Map<String, Value>> {
     );
     // Neither field is individually `required` — the handler enforces the
     // "exactly one of id/all" rule with a clear error.
-    Arc::new(schema::object_input_schema(props, &[]).as_ref().clone())
+    schema::object_input_schema(props, &[])
 }
 
 impl AhmaMcpService {

@@ -1060,15 +1060,22 @@ impl Default for SandboxSettings {
 /// it the *same* way before comparing it against the denylist — a `~`-spelled
 /// path that skipped expansion would sail past a check keyed on the absolute one.
 pub fn expand_home(path: &Path) -> PathBuf {
+    expand_home_with(path, dirs::home_dir().as_deref())
+}
+
+/// As [`expand_home`], but with an explicit home directory. `None` leaves the
+/// path unchanged. Exists so call sites (and their tests) can inject the home
+/// directory instead of depending on the ambient environment.
+pub fn expand_home_with(path: &Path, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return path.to_path_buf();
+    };
     let s = path.to_string_lossy();
     if s == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    } else if (s.starts_with("~/") || s.starts_with("~\\"))
-        && let Some(home) = dirs::home_dir()
-    {
-        let mut expanded = home;
+        return home.to_path_buf();
+    }
+    if s.starts_with("~/") || s.starts_with("~\\") {
+        let mut expanded = home.to_path_buf();
         expanded.push(&s[2..]);
         return expanded;
     }

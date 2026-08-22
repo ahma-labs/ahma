@@ -12,6 +12,16 @@ pub fn set_prefer_musl_override() {
     let _ = PREFER_MUSL_OVERRIDE.set(());
 }
 
+/// Name of the ahma executable on the current platform.
+///
+/// The single source of truth for the platform binary name — do not re-derive
+/// `if cfg!(windows) { "ahma.exe" } else { "ahma" }` elsewhere.
+pub const AHMA_BINARY_NAME: &str = if cfg!(target_os = "windows") {
+    "ahma.exe"
+} else {
+    "ahma"
+};
+
 /// GitHub release asset platform identifier (matches CI packaging).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Platform {
@@ -36,11 +46,7 @@ impl Platform {
     }
 
     pub fn binary_name(&self) -> &'static str {
-        if cfg!(target_os = "windows") {
-            "ahma.exe"
-        } else {
-            "ahma"
-        }
+        AHMA_BINARY_NAME
     }
 }
 

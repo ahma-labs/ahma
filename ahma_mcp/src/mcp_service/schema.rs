@@ -7,8 +7,6 @@ use std::sync::Arc;
 
 use crate::config::{CommandOption, SubcommandConfig, ToolConfig};
 
-use super::types::GuidanceConfig;
-
 /// Normalizes option types to JSON Schema types.
 pub fn normalize_option_type(option_type: &str) -> &'static str {
     match option_type {
@@ -233,17 +231,14 @@ pub fn collect_leaf_subcommands<'a>(
 }
 
 /// Generates the JSON schema for a tool configuration file.
-pub fn generate_schema_for_tool_config(
-    tool_config: &ToolConfig,
-    guidance: &Option<GuidanceConfig>,
-) -> Arc<Map<String, Value>> {
+///
+/// Guidance is deliberately not an input: it augments tool *descriptions*,
+/// never schemas.
+pub fn generate_schema_for_tool_config(tool_config: &ToolConfig) -> Arc<Map<String, Value>> {
     let mut leaf_subcommands = Vec::new();
     if let Some(subcommands) = &tool_config.subcommand {
         collect_leaf_subcommands(subcommands, "", &mut leaf_subcommands);
     }
-
-    // Suppress unused guidance warning - guidance is used for tool descriptions, not schemas
-    let _ = guidance;
 
     match leaf_subcommands.as_slice() {
         [(name, cfg)] if name == "default" => Arc::new(generate_single_command_schema(
@@ -320,7 +315,9 @@ fn build_schema_object(properties: Map<String, Value>, required: Vec<Value>) -> 
     schema
 }
 
-fn generate_single_command_schema(
+/// Generates the schema for a single leaf subcommand (also used directly by
+/// tool flattening in `mcp_service`).
+pub(crate) fn generate_single_command_schema(
     tool_config: &ToolConfig,
     leaf_subcommand: &(String, &SubcommandConfig),
 ) -> Map<String, Value> {
@@ -334,14 +331,6 @@ fn generate_single_command_schema(
     add_livelog_parameters(&mut properties, &mut required, tool_config);
 
     build_schema_object(properties, required)
-}
-
-/// Public wrapper for generating a single-subcommand schema (used by tool flattening).
-pub fn generate_single_command_schema_pub(
-    tool_config: &ToolConfig,
-    leaf_subcommand: &(String, &SubcommandConfig),
-) -> Map<String, Value> {
-    generate_single_command_schema(tool_config, leaf_subcommand)
 }
 
 /// Processes a single subcommand entry for multi-command schema generation.
@@ -486,7 +475,7 @@ mod tests {
     #[test]
     fn test_livelog_parameters_appear_in_schema() {
         let tool = livelog_tool_config_with_params();
-        let schema = generate_schema_for_tool_config(&tool, &None);
+        let schema = generate_schema_for_tool_config(&tool);
         let props = schema["properties"].as_object().expect("properties object");
 
         // Declared params become string properties with their descriptions.

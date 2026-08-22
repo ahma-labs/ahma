@@ -228,7 +228,7 @@ async fn test_operation_monitor_basic_functionality() -> Result<()> {
     monitor.add_operation(operation).await;
 
     // Verify it's in active operations
-    let active_ops = monitor.get_active_operations().await;
+    let active_ops = monitor.get_all_active_operations().await;
     let active_op = active_ops.iter().find(|op| op.id == "basic_test");
     assert!(
         active_op.is_some(),
@@ -253,7 +253,7 @@ async fn test_operation_monitor_basic_functionality() -> Result<()> {
     assert!(completed_op.unwrap().result.is_some());
 
     // Verify it's no longer in active operations
-    let active_ops_after = monitor.get_active_operations().await;
+    let active_ops_after = monitor.get_all_active_operations().await;
     let active_op_after = active_ops_after.iter().find(|op| op.id == "basic_test");
     assert!(
         active_op_after.is_none(),

@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use clap::Parser as _;
 
 use ahma_mcp::shell::cli::{
-    Cli, LlmCommand, Subcommands, TlsCommand, build_app_config, dispatch_subcommand, load_settings,
+    Cli, LlmCommand, Subcommands, TlsCommand, build_app_config_with_settings, dispatch_subcommand,
+    load_settings,
 };
 
 use ahma_mcp::utils::logging::{
@@ -62,7 +63,9 @@ async fn main() -> Result<()> {
 
     set_log_role(detect_log_role_from_startup());
 
-    let cfg = build_app_config(&cli);
+    // Reuse the settings already loaded for the log-target decision above —
+    // settings.toml is read and parsed once per process start, not twice.
+    let cfg = build_app_config_with_settings(&cli, settings_for_log);
     let subcommand = cli.command;
 
     let _telemetry_guard =

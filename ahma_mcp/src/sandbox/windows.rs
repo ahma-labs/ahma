@@ -301,11 +301,7 @@ pub fn resolve_launcher_exe() -> Result<PathBuf, SandboxError> {
 }
 
 fn resolve_launcher_exe_uncached() -> Result<PathBuf, SandboxError> {
-    let exe_name = if cfg!(target_os = "windows") {
-        "ahma.exe"
-    } else {
-        "ahma"
-    };
+    let exe_name = crate::update::AHMA_BINARY_NAME;
     let current = std::env::current_exe().map_err(|e| {
         SandboxError::PrerequisiteFailed(format!("cannot determine the running executable: {e}"))
     })?;

@@ -54,16 +54,7 @@ impl AhmaMcpService {
         &self,
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
-        let file_name = args
-            .get("file")
-            .and_then(Value::as_str)
-            .ok_or_else(|| mcp_invalid_params("'file' parameter is required"))?;
-
-        if file_name.contains('/') || file_name.contains('\\') || file_name.starts_with('.') {
-            return Err(mcp_invalid_params(format!(
-                "Invalid log file name '{file_name}': must be a plain filename, not a path"
-            )));
-        }
+        let file_name = require_plain_log_filename(&args)?;
 
         let log_dir = project_log_dir();
         let symlink_path = log_dir.join(file_name);
@@ -279,13 +270,11 @@ pub fn logs_approve_schema() -> Arc<Map<String, Value>> {
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Validates and resolves a caller-supplied log file name into a safe absolute path.
-///
-/// Rejects absolute paths, path separators, and traversals that escape the log directory.
-async fn require_safe_log_path(
-    args: &Map<String, Value>,
-    log_dir: &Path,
-) -> Result<PathBuf, McpError> {
+/// Extracts the required `file` argument and enforces that it is a plain
+/// filename: no path separators, no leading dot. Shared by
+/// `handle_logs_approve` and `require_safe_log_path` — the two validations are
+/// security-relevant and must stay identical.
+fn require_plain_log_filename(args: &Map<String, Value>) -> Result<&str, McpError> {
     let file_name = args
         .get("file")
         .and_then(Value::as_str)
@@ -297,6 +286,17 @@ async fn require_safe_log_path(
             "Invalid log file name '{file_name}': must be a plain filename, not a path"
         )));
     }
+    Ok(file_name)
+}
+
+/// Validates and resolves a caller-supplied log file name into a safe absolute path.
+///
+/// Rejects absolute paths, path separators, and traversals that escape the log directory.
+async fn require_safe_log_path(
+    args: &Map<String, Value>,
+    log_dir: &Path,
+) -> Result<PathBuf, McpError> {
+    let file_name = require_plain_log_filename(args)?;
 
     let candidate = log_dir.join(file_name);
 

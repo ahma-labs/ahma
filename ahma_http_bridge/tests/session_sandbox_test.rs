@@ -86,7 +86,6 @@ async fn test_sandbox_scope_should_use_client_roots_not_server_cwd() {
 
     let sandbox_scope = session
         .get_sandbox_scope()
-        .await
         .expect("Sandbox scope should be set");
 
     // CRITICAL: Sandbox scope should be client's workspace, NOT server's CWD
@@ -204,8 +203,7 @@ async fn test_roots_change_after_lock_is_tolerated_noop() {
     let locked_scopes = session_manager
         .get_session(&session_id)
         .unwrap()
-        .get_sandbox_scopes()
-        .await;
+        .get_sandbox_scopes();
 
     // A client roots change after lock must be tolerated as a no-op.
     let result = session_manager.handle_roots_changed(&session_id).await;
@@ -223,8 +221,7 @@ async fn test_roots_change_after_lock_is_tolerated_noop() {
     let after_scopes = session_manager
         .get_session(&session_id)
         .unwrap()
-        .get_sandbox_scopes()
-        .await;
+        .get_sandbox_scopes();
     assert_eq!(
         locked_scopes, after_scopes,
         "Locked sandbox scope must be immutable across a roots change"
@@ -317,11 +314,9 @@ async fn test_multiple_sessions_have_independent_sandbox_scopes() {
 
     let scope1 = session1
         .get_sandbox_scope()
-        .await
         .expect("Session 1 should have sandbox scope");
     let scope2 = session2
         .get_sandbox_scope()
-        .await
         .expect("Session 2 should have sandbox scope");
 
     assert_eq!(scope1, path_a);
@@ -360,10 +355,7 @@ async fn test_file_uri_prefix_correctly_stripped() {
         .get_session(&session_id)
         .expect("Session should exist");
 
-    let sandbox_scope = session
-        .get_sandbox_scope()
-        .await
-        .expect("Should have scope");
+    let sandbox_scope = session.get_sandbox_scope().expect("Should have scope");
 
     // Should be the path without file:// prefix
     assert_eq!(

@@ -58,8 +58,6 @@ async fn test_service_creation_with_guidance_config() {
     let configs = Arc::new(HashMap::new());
     let guidance_config = GuidanceConfig {
         guidance_blocks: HashMap::new(),
-        templates: HashMap::new(),
-        legacy_guidance: None,
     };
     let guidance = Arc::new(Some(guidance_config));
 
@@ -231,11 +229,7 @@ async fn test_service_with_guidance_blocks() {
         "Shell commands should be safe".to_string(),
     );
 
-    let guidance_config = GuidanceConfig {
-        guidance_blocks,
-        templates: HashMap::new(),
-        legacy_guidance: None,
-    };
+    let guidance_config = GuidanceConfig { guidance_blocks };
     let guidance = Arc::new(Some(guidance_config));
 
     let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)

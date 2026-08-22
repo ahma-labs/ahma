@@ -569,7 +569,7 @@ fn uninstall_binary(dry_run: bool) -> Result<()> {
 /// deleting the developer's real `~/.local/bin/ahma`, which made a retired variable
 /// look load-bearing when the real requirement was just an injectable parameter.
 fn uninstall_binary_in(install_dir: &Path, dry_run: bool) -> Result<()> {
-    let binary_name = if cfg!(windows) { "ahma.exe" } else { "ahma" };
+    let binary_name = crate::update::AHMA_BINARY_NAME;
     let binary_path = install_dir.join(binary_name);
     let old_path = install_dir.join(if cfg!(windows) {
         "ahma.old.exe"
@@ -1748,8 +1748,7 @@ mod tests {
     #[test]
     fn uninstall_binary_dry_run_keeps_binary() -> Result<()> {
         let tmp = tempdir()?;
-        let binary_name = if cfg!(windows) { "ahma.exe" } else { "ahma" };
-        let bin = tmp.path().join(binary_name);
+        let bin = tmp.path().join(crate::update::AHMA_BINARY_NAME);
         std::fs::write(&bin, "binary").ok();
         uninstall_binary_in(tmp.path(), true)?;
         assert!(bin.exists(), "dry-run keeps binary");

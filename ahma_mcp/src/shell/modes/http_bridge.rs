@@ -5,7 +5,6 @@
 
 use crate::shell::cli::AppConfig;
 use anyhow::{Context, Result};
-use dunce;
 use std::env;
 
 /// Run in HTTP bridge mode.
@@ -32,83 +31,9 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
         .to_string();
 
     // Determine explicit fallback scope for no-roots clients.
-    // SECURITY: only treat CLI/env as explicit fallback; do not silently use CWD.
-    let explicit_fallback_scope = if !config.sandbox_scopes.is_empty() {
-        Some(
-            dunce::canonicalize(&config.sandbox_scopes[0])
-                .unwrap_or_else(|_| config.sandbox_scopes[0].clone()),
-        )
-    } else if config.use_scratch_dir {
-        config
-            .scratch_directory
-            .as_ref()
-            .and_then(|dir| ahma_common::config::ensure_sandbox_directory(dir).ok())
-    } else {
-        None
-    };
+    let explicit_fallback_scope = super::resolve_explicit_fallback_scope(&config);
 
-    // Subprocess gets the `serve stdio` subcommand.
-    let mut server_args = vec!["serve".to_string()];
-
-    // Pass global options to child process
-    if config.no_sandbox {
-        server_args.push("--no-sandbox".to_string());
-    }
-    if config.use_scratch_dir {
-        server_args.push("--sandbox".to_string());
-    }
-    if config.tmp_access {
-        server_args.push("--tmp".to_string());
-    }
-    if config.log_monitor {
-        server_args.push("--log-monitor".to_string());
-    }
-    server_args.push("--monitor-rate-limit".to_string());
-    server_args.push(config.monitor_rate_limit_secs.to_string());
-    server_args.push("--timeout".to_string());
-    server_args.push(config.timeout_secs.to_string());
-    if config.force_sync {
-        server_args.push("--sync".to_string());
-    }
-    if config.no_temp_files {
-        server_args.push("--disable-temp-files".to_string());
-    }
-    if config.skip_availability_probes {
-        server_args.push("--skip-probes".to_string());
-    }
-    if let Some(ref otel_ep) = config.observability.endpoint {
-        server_args.push("--opentelemetry".to_string());
-        server_args.push(otel_ep.clone());
-    }
-    for scope in &config.sandbox_scopes {
-        server_args.push("--sandbox-scope".to_string());
-        server_args.push(scope.to_string_lossy().to_string());
-    }
-    for dir in &config.working_dirs {
-        server_args.push("--working-dir".to_string());
-        server_args.push(dir.to_string_lossy().to_string());
-    }
-
-    // Pass --tools-dir only if explicitly provided (otherwise subprocess auto-detects)
-    if config.explicit_tools_dir
-        && let Some(ref tools_dir) = config.tools_dir
-    {
-        server_args.push("--tools-dir".to_string());
-        server_args.push(tools_dir.to_string_lossy().to_string());
-    }
-
-    if let Some(ref task_vault) = config.task_vault {
-        server_args.push("--task-vault".to_string());
-        server_args.push(task_vault.to_string_lossy().to_string());
-    }
-
-    server_args.push("stdio".to_string());
-
-    // Pass through tool bundle selection
-    for bundle in &config.tool_bundles {
-        server_args.push("--tool".to_string());
-        server_args.push(bundle.clone());
-    }
+    let server_args = super::build_stdio_server_args(&config, "--tool", true);
 
     let enable_colored_output = true;
     tracing::info!(

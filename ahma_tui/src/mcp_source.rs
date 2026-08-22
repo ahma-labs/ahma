@@ -6,6 +6,11 @@
 
 use std::time::Duration;
 
+use ahma_common::file_uri::encode_file_uri;
+use ahma_common::mcp_methods::{
+    INITIALIZED_METHOD, ROOTS_LIST_METHOD, SANDBOX_CONFIGURED_METHOD, SANDBOX_FAILED_METHOD,
+};
+use ahma_common::sse::{event_data_to_json, pop_next_sse_event};
 use anyhow::Result;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -544,7 +549,7 @@ async fn init_mcp_session(
     // Step 2: notifications/initialized (only now that the SSE return stream is live).
     let notif_body = json!({
         "jsonrpc": "2.0",
-        "method": "notifications/initialized"
+        "method": INITIALIZED_METHOD
     });
     let _ = client
         .post(&url)
@@ -563,67 +568,6 @@ async fn init_mcp_session(
     Ok(McpSession::new(session_id))
 }
 
-/// Helper function to encode a filesystem path as a file:// URI path component.
-fn encode_file_uri(path: &std::path::Path) -> String {
-    let mut path_str = path.to_string_lossy().into_owned();
-
-    // Strip Windows extended-length prefix (\\?\) if present.
-    if path_str.starts_with(r"\\?\") {
-        path_str = path_str[4..].to_string();
-    }
-
-    // Normalise path separators to forward slashes.
-    path_str = path_str.replace('\\', "/");
-
-    let mut out = String::with_capacity(path_str.len() + 10);
-    out.push_str("file://");
-
-    #[cfg(target_os = "windows")]
-    {
-        let is_drive = path_str.len() >= 2
-            && path_str.as_bytes()[0].is_ascii_alphabetic()
-            && path_str.as_bytes()[1] == b':';
-        if is_drive {
-            out.push('/');
-        }
-    }
-
-    out.push_str(&path_str);
-    out
-}
-
-fn first_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
-    let lf = buffer.find("\n\n").map(|idx| (idx, 2));
-    let crlf = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
-
-    match (lf, crlf) {
-        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
-fn pop_next_sse_event(buffer: &mut String) -> Option<String> {
-    let (idx, delimiter_len) = first_sse_event_boundary(buffer)?;
-    let raw_event = buffer[..idx].to_string();
-    *buffer = buffer[idx + delimiter_len..].to_string();
-    Some(raw_event)
-}
-
-fn event_data_to_json(raw_event: &str) -> Option<Value> {
-    let data: Vec<&str> = raw_event
-        .lines()
-        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
-        .map(str::trim)
-        .collect();
-
-    if data.is_empty() {
-        return None;
-    }
-    serde_json::from_str::<Value>(&data.join("\n")).ok()
-}
-
 async fn handle_sse_event(
     client: &reqwest::Client,
     mcp_url: &str,
@@ -634,7 +578,7 @@ async fn handle_sse_event(
 ) -> Result<()> {
     let method = value.get("method").and_then(|m| m.as_str());
 
-    if method == Some("notifications/sandbox/failed") {
+    if method == Some(SANDBOX_FAILED_METHOD) {
         let error = value
             .get("params")
             .and_then(|p| p.get("error"))
@@ -650,7 +594,7 @@ async fn handle_sse_event(
         .await;
     }
 
-    if method == Some("notifications/sandbox/configured") {
+    if method == Some(SANDBOX_CONFIGURED_METHOD) {
         debug!("Sandbox configured successfully!");
         let params = value.get("params");
         // The server nests the full ScopeView under `params.scope` (SPEC R5.4:
@@ -731,7 +675,7 @@ async fn handle_sse_event(
         }
     }
 
-    if method == Some("roots/list") {
+    if method == Some(ROOTS_LIST_METHOD) {
         let request_id = value
             .get("id")
             .cloned()
@@ -1189,90 +1133,8 @@ async fn call_logs_read(
 mod tests {
     use super::*;
 
-    // ── pop_next_sse_event ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_pop_next_sse_event_lf_delimiter() {
-        let mut buf = "event: ping\ndata: {}\n\nmore".to_string();
-        let event = pop_next_sse_event(&mut buf);
-        assert_eq!(event.as_deref(), Some("event: ping\ndata: {}"));
-        assert_eq!(buf, "more");
-    }
-
-    #[test]
-    fn test_pop_next_sse_event_crlf_delimiter() {
-        let mut buf = "data: hello\r\n\r\nremainder".to_string();
-        let event = pop_next_sse_event(&mut buf);
-        assert_eq!(event.as_deref(), Some("data: hello"));
-        assert_eq!(buf, "remainder");
-    }
-
-    #[test]
-    fn test_pop_next_sse_event_no_delimiter_returns_none() {
-        let mut buf = "data: incomplete".to_string();
-        assert!(pop_next_sse_event(&mut buf).is_none());
-        assert_eq!(buf, "data: incomplete");
-    }
-
-    #[test]
-    fn test_pop_next_sse_event_empty_buf() {
-        let mut buf = String::new();
-        assert!(pop_next_sse_event(&mut buf).is_none());
-    }
-
-    #[test]
-    fn test_pop_next_sse_event_multiple_events() {
-        let mut buf = "data: 1\n\ndata: 2\n\n".to_string();
-        assert_eq!(pop_next_sse_event(&mut buf).as_deref(), Some("data: 1"));
-        assert_eq!(pop_next_sse_event(&mut buf).as_deref(), Some("data: 2"));
-        assert!(pop_next_sse_event(&mut buf).is_none());
-    }
-
-    // ── event_data_to_json ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_event_data_to_json_single_data_line() {
-        let raw = "data: {\"method\":\"roots/list\",\"id\":1}";
-        let v = event_data_to_json(raw).expect("should parse");
-        assert_eq!(v["method"].as_str(), Some("roots/list"));
-    }
-
-    #[test]
-    fn test_event_data_to_json_no_data_prefix_returns_none() {
-        let raw = "event: ping\n: comment";
-        assert!(event_data_to_json(raw).is_none());
-    }
-
-    #[test]
-    fn test_event_data_to_json_invalid_json_returns_none() {
-        let raw = "data: not-valid-json";
-        assert!(event_data_to_json(raw).is_none());
-    }
-
-    #[test]
-    fn test_event_data_to_json_strips_data_prefix() {
-        let raw = "data: {\"ok\":true}";
-        let v = event_data_to_json(raw).expect("should parse");
-        assert_eq!(v["ok"].as_bool(), Some(true));
-    }
-
-    // ── encode_file_uri ───────────────────────────────────────────────────────
-
-    #[cfg(unix)]
-    #[test]
-    fn test_encode_file_uri_unix_absolute() {
-        let path = std::path::Path::new("/home/user/project");
-        let uri = encode_file_uri(path);
-        assert_eq!(uri, "file:///home/user/project");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_encode_file_uri_unix_nested() {
-        let path = std::path::Path::new("/tmp/foo/bar baz");
-        let uri = encode_file_uri(path);
-        assert_eq!(uri, "file:///tmp/foo/bar baz");
-    }
+    // The SSE framing helpers and encode_file_uri moved to `ahma_common`
+    // (`sse` / `file_uri` modules) — their unit tests live there now.
 
     #[test]
     fn test_status_call_error_includes_actionable_hint() {
@@ -1318,51 +1180,6 @@ mod tests {
     async fn record_handler(State(st): State<RecState>, Json(body): Json<Value>) -> StatusCode {
         let _ = st.tx.send(body);
         StatusCode::OK
-    }
-
-    #[test]
-    fn mcp_boundary_lf_only() {
-        assert_eq!(first_sse_event_boundary("a\n\nb"), Some((1, 2)));
-    }
-
-    #[test]
-    fn mcp_boundary_crlf_only() {
-        assert_eq!(first_sse_event_boundary("a\r\n\r\nb"), Some((1, 4)));
-    }
-
-    #[test]
-    fn mcp_boundary_lf_before_crlf() {
-        assert_eq!(first_sse_event_boundary("a\n\nb\r\n\r\n"), Some((1, 2)));
-    }
-
-    #[test]
-    fn mcp_boundary_crlf_before_lf() {
-        assert_eq!(first_sse_event_boundary("ab\r\n\r\nc\n\nd"), Some((2, 4)));
-    }
-
-    #[test]
-    fn mcp_boundary_none() {
-        assert_eq!(first_sse_event_boundary("abc"), None);
-    }
-
-    #[test]
-    fn mcp_event_data_multiline_join() {
-        // Two `data:` lines are concatenated with '\n' before JSON parsing.
-        let raw = "data: {\"x\":\ndata: 5}";
-        let v = event_data_to_json(raw).expect("multiline data joins into valid json");
-        assert_eq!(v["x"].as_i64(), Some(5));
-    }
-
-    #[test]
-    fn mcp_event_data_empty_returns_none() {
-        assert!(event_data_to_json("").is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn mcp_encode_file_uri_relative() {
-        let uri = encode_file_uri(std::path::Path::new("foo/bar"));
-        assert_eq!(uri, "file://foo/bar");
     }
 
     #[test]

@@ -30,7 +30,9 @@ pub use cli::{
     Cli, DaemonArgs, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs, LlmTestArgs, SettingsArgs,
     SettingsCommand, Subcommands, TlsArgs, TlsCommand, TuiArgs,
 };
-pub use cli::{build_app_config, dispatch_subcommand, load_settings};
+pub use cli::{
+    build_app_config, build_app_config_with_settings, dispatch_subcommand, load_settings,
+};
 
 pub use resolution::{
     find_matching_tool, find_tool_config, normalize_tools_dir, resolve_cli_subcommand,

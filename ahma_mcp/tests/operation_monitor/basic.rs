@@ -324,7 +324,7 @@ async fn test_operation_monitor_get_active_operations() {
     monitor.add_operation(op1).await;
     monitor.add_operation(op2).await;
 
-    let active_ops = monitor.get_active_operations().await;
+    let active_ops = monitor.get_all_active_operations().await;
     assert_eq!(active_ops.len(), 1);
     assert_eq!(active_ops[0].id, "active1");
 }

@@ -3,7 +3,6 @@ use super::common;
 use super::working_directory;
 use crate::AhmaMcpService;
 use crate::client_type::McpClientType;
-use crate::mcp_service::progress_push;
 use crate::mcp_service::schema;
 use crate::shell_pool::platform_shell_program;
 use rmcp::{
@@ -281,7 +280,6 @@ impl AhmaMcpService {
         } else if let Some(mode_str) = common::opt_str(&args, "execution_mode") {
             match mode_str.as_str() {
                 "Synchronous" => crate::adapter::ExecutionMode::Synchronous,
-                "AsyncResultPush" => crate::adapter::ExecutionMode::AsyncResultPush,
                 _ => crate::adapter::ExecutionMode::AsyncResultPush,
             }
         } else {
@@ -406,28 +404,19 @@ impl AhmaMcpService {
 
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
-        let description = format!(
-            "Execute {} in {}",
-            platform_shell_program(),
-            working_directory
-        );
 
         // Sync operations never enter the OperationMonitor, so the event
-        // forwarder cannot see them — push start/final progress directly.
-        let push_enabled =
-            progress_token.is_some() && self.effective_supports_progress(client_type);
-        if let Some(token) = progress_token.clone()
-            && push_enabled
-        {
-            progress_push::push_progress(
-                &context.peer,
-                token,
-                0.0,
-                format!("{}: {}", platform_shell_program(), description),
-                false,
-            )
-            .await;
-        }
+        // forwarder cannot see them — push start/final progress directly via
+        // the shared sync-progress helpers (the shell's "base command" is the
+        // platform shell program).
+        let push_token = progress_token.filter(|_| self.effective_supports_progress(client_type));
+        self.push_sync_start_progress(
+            push_token.clone(),
+            &context.peer,
+            platform_shell_program(),
+            working_directory,
+        )
+        .await;
 
         let result = self
             .adapter
@@ -444,24 +433,16 @@ impl AhmaMcpService {
         self.emit_vault_tool_complete(&id, result.is_ok(), duration_ms)
             .await;
 
-        if let Some(token) = progress_token
-            && push_enabled
-        {
-            let (success, full_output) = match &result {
-                Ok(output) => (true, output.clone()),
-                Err(e) => (false, format!("Error: {}", e)),
-            };
-            let message = progress_push::sync_final_message(
-                &id,
-                platform_shell_program(),
-                &description,
-                working_directory,
-                success,
-                duration_ms,
-                &full_output,
-            );
-            progress_push::push_progress(&context.peer, token, 100.0, message, true).await;
-        }
+        self.push_sync_final_progress(
+            push_token,
+            &context.peer,
+            &id,
+            platform_shell_program(),
+            working_directory,
+            duration_ms,
+            &result,
+        )
+        .await;
 
         match result {
             Ok(output) => Ok(common::text_result(output)),
@@ -505,18 +486,8 @@ impl AhmaMcpService {
 
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
-        if let Some(token) = progress_token {
-            let progress_enabled = self.effective_supports_progress(client_type);
-            self.progress_push
-                .register(
-                    &id,
-                    context.peer.clone(),
-                    token,
-                    client_type,
-                    progress_enabled,
-                )
-                .await;
-        }
+        self.register_progress_if_requested(&id, context.peer.clone(), progress_token, client_type)
+            .await;
 
         let started = match session_id {
             Some(session) => {
@@ -593,81 +564,34 @@ impl AhmaMcpService {
             "run_terminal_command",
             cmd_str,
         );
-        self.emit_vault_tool_call(
-            &id,
-            "run_terminal_command",
-            &format!(
-                "{{\"working_directory\":\"{}\",\"command\":\"{}\"}}",
-                working_directory,
-                adapter_args
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-            ),
-        )
-        .await;
+        let vault_args_summary = format!(
+            "{{\"working_directory\":\"{}\",\"command\":\"{}\"}}",
+            working_directory, cmd_str
+        );
 
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
-        if let Some(token) = progress_token {
-            let progress_enabled = self.effective_supports_progress(client_type);
-            self.progress_push
-                .register(
-                    &id,
-                    context.peer.clone(),
-                    token,
-                    client_type,
-                    progress_enabled,
-                )
-                .await;
-        }
 
-        let job_id = self
-            .adapter
-            .execute_async_in_dir_with_options(
-                "run_terminal_command",
-                platform_shell_program(),
-                working_directory,
-                crate::adapter::AsyncExecOptions {
-                    id: Some(id.clone()),
-                    args: Some(adapter_args),
-                    timeout,
-                    subcommand_config: Some(subcommand_config),
-                    log_monitor_config,
-                },
-            )
-            .await;
-
-        match job_id {
-            Ok(id) => {
-                // Automatic async: wait out the inline window (SPEC R2.6.1) so
-                // fast commands answer without an `await` round-trip.
-                if let Some(result) = common::try_automatic_async_completion(
-                    &self.operation_monitor,
-                    &id,
-                    self.effective_request_budget(client_type),
-                )
-                .await
-                {
-                    return Ok(result);
-                }
-
-                let hint = crate::tool_hints::preview(&id, "run_terminal_command");
-                let message = format!("AHMA ID: {}{}", id, hint);
-                Ok(common::text_result(message))
-            }
-            Err(e) => {
-                // The operation never started, so no terminal event will
-                // arrive to clean up the push registration.
-                self.progress_push.unregister(&id).await;
-                self.emit_vault_tool_complete(&id, false, 0).await;
-                // Async is the *default* path, so this is the error agents
-                // actually see: it must carry the same structured
-                // `sandbox_denial` + remediation the sync path carries, or a
-                // scope violation reaches the model as unactionable prose.
-                Err(common::async_execution_error(&e))
-            }
-        }
+        self.call_async_tool(
+            "run_terminal_command",
+            id,
+            platform_shell_program(),
+            working_directory,
+            adapter_args,
+            timeout,
+            subcommand_config,
+            log_monitor_config,
+            &vault_args_summary,
+            progress_token,
+            client_type,
+            context.peer.clone(),
+            // Async is the *default* path, so this is the error agents
+            // actually see: it must carry the same structured
+            // `sandbox_denial` + remediation the sync path carries, or a
+            // scope violation reaches the model as unactionable prose.
+            common::async_execution_error,
+        )
+        .await
     }
 }
 

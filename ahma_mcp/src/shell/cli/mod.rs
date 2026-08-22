@@ -2695,13 +2695,21 @@ fn compute_credential_read_denies(
 }
 
 pub fn build_app_config(cli: &Cli) -> AppConfig {
+    // Load user settings (priority layer 2: below CLI flags, above env vars)
+    build_app_config_with_settings(cli, load_settings(cli))
+}
+
+/// [`build_app_config`] with the settings already loaded, for callers (the
+/// `ahma` binary's `main`) that have parsed `settings.toml` earlier in startup
+/// — avoiding a second read+parse of the same file per process start.
+pub fn build_app_config_with_settings(
+    cli: &Cli,
+    s: ahma_common::config::AhmaSettings,
+) -> AppConfig {
     apply_process_wide_cli_overrides(cli);
 
     let serve = extract_serve_fields(&cli.command);
     let tool = extract_tool_fields(&cli.command);
-
-    // Load user settings (priority layer 2: below CLI flags, above env vars)
-    let s = load_settings(cli);
 
     // `[logging] dir` — applied here, before main() initialises logging, so the
     // file appender opens on the configured directory rather than a resolved

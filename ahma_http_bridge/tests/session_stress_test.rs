@@ -206,7 +206,7 @@ async fn test_concurrent_sandbox_lock_attempts() {
     assert!(session_manager.session_exists(&session_id));
 
     let session = session_manager.get_session(&session_id).unwrap();
-    let scope = session.get_sandbox_scope().await;
+    let scope = session.get_sandbox_scope();
     assert!(scope.is_some(), "Session should have locked sandbox scope");
 
     // Cleanup
@@ -245,7 +245,7 @@ async fn test_many_independent_sandbox_scopes() {
     // Verify each session has its correct sandbox scope
     for (session_id, expected) in &session_data {
         let session = session_manager.get_session(session_id).unwrap();
-        let scope = session.get_sandbox_scope().await.unwrap();
+        let scope = session.get_sandbox_scope().unwrap();
         assert_eq!(scope, *expected, "Session should have scope {:?}", expected);
     }
 
@@ -262,7 +262,6 @@ async fn test_many_independent_sandbox_scopes() {
                     .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
                 let scope = session
                     .get_sandbox_scope()
-                    .await
                     .ok_or_else(|| anyhow::anyhow!("No scope"))?;
                 Ok::<_, anyhow::Error>((exp, scope))
             }
@@ -292,7 +291,6 @@ async fn test_termination_reasons() {
 
     let reasons = vec![
         SessionTerminationReason::ClientRequested,
-        SessionTerminationReason::RootsChangeRejected,
         SessionTerminationReason::Timeout,
         SessionTerminationReason::ProcessCrashed,
     ];
@@ -338,7 +336,7 @@ async fn test_rapid_session_lifecycle() {
 
         // Verify
         let session = session_manager.get_session(&session_id).unwrap();
-        let scope = session.get_sandbox_scope().await.unwrap();
+        let scope = session.get_sandbox_scope().unwrap();
         assert_eq!(scope, expected_scope);
 
         // Terminate
@@ -481,7 +479,7 @@ async fn test_uri_parsing_edge_cases() {
 
         if lock_result.is_ok() {
             let session = session_manager.get_session(&session_id).unwrap();
-            let scope = session.get_sandbox_scope().await.unwrap();
+            let scope = session.get_sandbox_scope().unwrap();
             assert_eq!(
                 scope, expected,
                 "URI {} should parse to {:?}",
@@ -586,7 +584,7 @@ async fn test_multiple_roots_uses_first() {
         .unwrap();
 
     let session = session_manager.get_session(&session_id).unwrap();
-    let scope = session.get_sandbox_scope().await.unwrap();
+    let scope = session.get_sandbox_scope().unwrap();
 
     assert_eq!(
         scope, first_path,

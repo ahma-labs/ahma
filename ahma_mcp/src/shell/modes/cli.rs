@@ -121,9 +121,7 @@ async fn execute_via_mcp_service(
 }
 
 fn extract_text_content(content: &[ContentBlock]) -> String {
-    content
-        .iter()
-        .filter_map(|item| item.as_text().map(|text| text.text.clone()))
+    crate::client::text_contents(content)
         .collect::<Vec<_>>()
         .join("\n")
 }

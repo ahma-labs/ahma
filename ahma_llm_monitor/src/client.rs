@@ -1038,7 +1038,9 @@ async fn chat_stream_start(
 fn take_sse_line(buffer: &mut String) -> Option<String> {
     let newline_pos = buffer.find('\n')?;
     let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
-    *buffer = buffer[newline_pos + 1..].to_string();
+    // `drain` shifts the tail in place instead of reallocating the whole
+    // remaining buffer for every consumed line.
+    buffer.drain(..=newline_pos);
     Some(line)
 }
 

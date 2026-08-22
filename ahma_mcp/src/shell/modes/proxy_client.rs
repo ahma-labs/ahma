@@ -5,6 +5,8 @@
 //! JSON-RPC traffic to the running server.
 
 use crate::transport_patch::PatchedStdioTransport;
+#[cfg(unix)]
+use ahma_common::mcp_methods::{INITIALIZED_METHOD, ROOTS_LIST_METHOD};
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 #[cfg(unix)]
@@ -65,7 +67,7 @@ impl CachedHandshake {
         if method == Some("initialize") && self.init_request.is_none() {
             self.init_request = Some(val.clone());
         }
-        if method == Some("notifications/initialized") && self.notif_initialized.is_none() {
+        if method == Some(INITIALIZED_METHOD) && self.notif_initialized.is_none() {
             self.notif_initialized = Some(val.clone());
         }
         if self.pending_roots_list_id.is_some()
@@ -79,7 +81,7 @@ impl CachedHandshake {
     /// Observe a message forwarded from the bridge to the client, and note when
     /// it is a `roots/list` request whose answer we need to watch for.
     fn observe_bridge_to_client(&mut self, val: &serde_json::Value) {
-        if val.get("method").and_then(|m| m.as_str()) == Some("roots/list") {
+        if val.get("method").and_then(|m| m.as_str()) == Some(ROOTS_LIST_METHOD) {
             self.pending_roots_list_id = val.get("id").cloned();
         }
     }
@@ -132,7 +134,7 @@ where
                 ));
             };
             let val = serde_json::to_value(&msg).unwrap_or_default();
-            if val.get("method").and_then(|m| m.as_str()) != Some("roots/list") {
+            if val.get("method").and_then(|m| m.as_str()) != Some(ROOTS_LIST_METHOD) {
                 continue;
             }
             let mut resp = roots_response.clone();
@@ -197,14 +199,18 @@ async fn emit_session_event_downstream<S>(
 /// Overlay the proxy's reconnect count onto a forwarded
 /// `notifications/ahma/heartbeat` (#485): the server behind the proxy cannot
 /// know how many times its transport was rebuilt, so the proxy owns this field.
+/// Returns whether the value was mutated, so the caller only rebuilds the typed
+/// message from JSON when the overlay actually applied.
 #[cfg(unix)]
-fn overlay_heartbeat_reconnects(val: &mut serde_json::Value, reconnects: u32) {
+fn overlay_heartbeat_reconnects(val: &mut serde_json::Value, reconnects: u32) -> bool {
     if reconnects > 0
         && val.get("method").and_then(|m| m.as_str()) == Some("notifications/ahma/heartbeat")
         && let Some(params) = val.get_mut("params").and_then(|p| p.as_object_mut())
     {
         params.insert("reconnects".to_string(), serde_json::json!(reconnects));
+        return true;
     }
+    false
 }
 
 /// Async hook that respawns the background bridge. Provided by the frontend
@@ -380,7 +386,7 @@ async fn relay_forward_failure_to_client<S>(
 fn message_is_replayed_by_handshake(val: &serde_json::Value) -> bool {
     matches!(
         val.get("method").and_then(|m| m.as_str()),
-        Some("initialize") | Some("notifications/initialized")
+        Some("initialize") | Some(INITIALIZED_METHOD)
     )
 }
 
@@ -593,15 +599,16 @@ async fn run_proxy_client_unix(
 ) -> Result<bool> {
     use ahma_http_mcp_client::unix_client::unix_socket_transport;
 
-    let client_transport = unix_socket_transport(socket_path, "http://localhost/mcp")
-        .with_context(|| format!("Failed to connect proxy to UDS {socket_path}"))?;
+    let client_transport = unix_socket_transport(socket_path, "http://localhost/mcp");
     let stdio_transport = PatchedStdioTransport::new_stdio();
 
     tracing::info!(socket = socket_path, "Proxy connected to bridge via UDS");
     let socket_path_owned = socket_path.to_string();
     let mut reconnect = move || {
-        unix_socket_transport(&socket_path_owned, "http://localhost/mcp")
-            .with_context(|| format!("Failed to reconnect proxy to UDS {socket_path_owned}"))
+        Ok(unix_socket_transport(
+            &socket_path_owned,
+            "http://localhost/mcp",
+        ))
     };
     let result = run_transport_proxy(
         stdio_transport,
@@ -686,12 +693,14 @@ where
                     tracing::info!(transport, "Proxy exiting: stdio EOF (Cursor client disconnected)");
                     break;
                 };
-                let val = serde_json::to_value(msg).unwrap();
+                let val = serde_json::to_value(&msg).unwrap();
                 let request_id = val.get("id").filter(|id| !id.is_null()).cloned();
                 handshake.observe_client_to_bridge(&val);
                 // `val` is kept alive past the send: the gone-endpoint recovery
                 // path below resends this exact message on a fresh transport.
-                let tx_msg = serde_json::from_value(val.clone()).unwrap();
+                // The typed message itself is forwarded — the client-to-server
+                // message type is identical on both transports, so no
+                // round-trip back through `serde_json::from_value` is needed.
                 // No inner retry here: an rmcp transport `send` error means the
                 // worker behind this transport is gone, not that the channel is
                 // momentarily busy (`send` awaits capacity). Re-sending the same
@@ -699,7 +708,7 @@ where
                 // and inflates the failure count below. Recovery is the
                 // reconnect path, which rebuilds the transport and replays the
                 // handshake.
-                if let Err(e) = client.send(tx_msg).await {
+                if let Err(e) = client.send(msg).await {
                     // A single forward failure must NOT tear down the whole
                     // multiplexed session. Only the per-request timeout is
                     // returned by the bridge as an ordinary HTTP 200 response;
@@ -894,12 +903,19 @@ where
                     );
                     break;
                 };
-                let mut val = serde_json::to_value(msg).unwrap();
+                let mut val = serde_json::to_value(&msg).unwrap();
                 handshake.observe_bridge_to_client(&val);
                 // The server cannot know its transport was rebuilt; the proxy
-                // owns the heartbeat's `reconnects` field (#485).
-                overlay_heartbeat_reconnects(&mut val, reconnects);
-                let tx_msg = serde_json::from_value(val).unwrap();
+                // owns the heartbeat's `reconnects` field (#485). Only a
+                // heartbeat the overlay actually mutated is rebuilt from JSON;
+                // every other message forwards as the typed value it arrived as
+                // (the server-to-client message type is identical on both
+                // transports).
+                let tx_msg = if overlay_heartbeat_reconnects(&mut val, reconnects) {
+                    serde_json::from_value(val).unwrap()
+                } else {
+                    msg
+                };
                 if let Err(e) = stdio.send(tx_msg).await {
                     tracing::error!(
                         transport,
@@ -992,18 +1008,13 @@ async fn run_proxy_client_http(
         return Err(anyhow!("Initialize failed with HTTP {status}"));
     }
 
-    let session_id = response
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            tracing::error!(
-                url = %mcp_url,
-                "Proxy HTTP initialize missing mcp-session-id header"
-            );
-            anyhow!("Missing mcp-session-id header in initialize response")
-        })?
-        .to_string();
+    let session_id = crate::mcp_client::session_id_header(&response).ok_or_else(|| {
+        tracing::error!(
+            url = %mcp_url,
+            "Proxy HTTP initialize missing mcp-session-id header"
+        );
+        anyhow!("Missing mcp-session-id header in initialize response")
+    })?;
 
     let resp_bytes = response
         .bytes()

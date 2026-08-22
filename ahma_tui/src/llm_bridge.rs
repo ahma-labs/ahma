@@ -262,22 +262,11 @@ pub fn spawn_tool_call_task(
             }
         }
 
-        let builder = reqwest::Client::builder();
-        let (request_base_url, builder) = if let Some(path) = mcp.base_url.strip_prefix("unix://") {
-            #[cfg(unix)]
-            {
-                ("http://localhost".to_string(), builder.unix_socket(path))
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = path;
-                (mcp.base_url.clone(), builder)
-            }
-        } else {
-            (mcp.base_url.clone(), builder)
-        };
-        let client = match builder.build() {
-            Ok(c) => c,
+        // Shared, process-wide client (keyed by base URL): building a fresh
+        // reqwest client per tool call re-does TLS/pool setup and loses
+        // keep-alive connection reuse.
+        let (request_base_url, client) = match ahma_core::agent::cached_http_client(&mcp.base_url) {
+            Ok(pair) => pair,
             Err(e) => {
                 let _ = tx
                     .send(BridgeEvent::ToolCallFinished {

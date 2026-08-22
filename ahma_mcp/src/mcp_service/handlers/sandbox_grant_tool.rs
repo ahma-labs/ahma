@@ -272,17 +272,14 @@ pub fn resolve_grant_path(raw: &str, home: Option<&Path>, workspace: Option<&Pat
 }
 
 /// Expand a leading `~/` or `~\` (or a bare `~`) to `home`.
+///
+/// Thin wrapper over the shared [`ahma_common::config::expand_home_with`] so
+/// every surface expands `~` the same way; kept here only to preserve the
+/// `&str`-based call sites (and their injectable-home tests).
 fn expand_tilde(raw: &str, home: Option<&Path>) -> String {
-    let Some(home) = home else {
-        return raw.to_string();
-    };
-    if raw == "~" {
-        return home.to_string_lossy().into_owned();
-    }
-    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
-        return home.join(rest).to_string_lossy().into_owned();
-    }
-    raw.to_string()
+    ahma_common::config::expand_home_with(Path::new(raw), home)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Lexically clean a path: collapse `.` and resolve `..` without touching the

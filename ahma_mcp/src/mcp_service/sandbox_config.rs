@@ -13,6 +13,7 @@
 //! CVE-2026-48124 (sandboxed agent writes a workspace config that a trusted
 //! component outside the sandbox then executes).
 
+use ahma_common::mcp_methods::{SANDBOX_CONFIGURED_METHOD, SANDBOX_FAILED_METHOD};
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use rmcp::service::{Peer, RoleServer};
 use std::collections::HashMap;
@@ -110,19 +111,18 @@ async fn emit_sandbox_notification_via_peer_with_scope(
 
 /// Parse a single `file://` URI from a roots/list response into a `PathBuf`.
 /// Returns `None` and logs a warning for non-file or unparseable URIs.
+///
+/// Delegates to `ahma_common::file_uri::parse_file_uri_to_path` — the single
+/// hardened parser shared with the HTTP bridge (rejects non-`file` schemes,
+/// NUL bytes, relative paths, invalid percent-encoding).
 fn parse_root_uri_to_scope(uri: &str) -> Option<PathBuf> {
-    let url = url::Url::parse(uri).ok()?;
-    if url.scheme() != "file" {
-        tracing::warn!("Ignoring non-file URI: {}", uri);
-        return None;
-    }
-    match url.to_file_path() {
-        Ok(path) => {
+    match ahma_common::file_uri::parse_file_uri_to_path(uri) {
+        Some(path) => {
             tracing::info!("Parsed valid file URI: {} -> {:?}", uri, path);
             Some(path)
         }
-        Err(()) => {
-            tracing::warn!("Failed to convert file URI to path: {}", uri);
+        None => {
+            tracing::warn!("Ignoring invalid or non-file root URI: {}", uri);
             None
         }
     }
@@ -171,7 +171,7 @@ impl AhmaMcpService {
                 tracing::error!("Failed to update sandbox from roots: {}", e);
                 emit_sandbox_notification_via_peer(
                     peer,
-                    "notifications/sandbox/failed",
+                    SANDBOX_FAILED_METHOD,
                     Some(&e.to_string()),
                 )
                 .await;
@@ -198,7 +198,7 @@ impl AhmaMcpService {
                      Exiting to prevent running without kernel-level security.",
                     e
                 );
-                emit_sandbox_notification("notifications/sandbox/failed", Some(&e.to_string()));
+                emit_sandbox_notification(SANDBOX_FAILED_METHOD, Some(&e.to_string()));
                 std::process::exit(1);
             }
             tracing::info!("Landlock sandbox enforced successfully");
@@ -370,6 +370,34 @@ impl AhmaMcpService {
         }
     }
 
+    /// Shared fallback for a failed `roots/list` round-trip (error or
+    /// timeout): with pre-configured scopes the failure is logged at info and
+    /// an empty root list is returned so configuration proceeds against those
+    /// scopes; otherwise the failure is logged at error, a
+    /// `notifications/sandbox/failed` carrying `notification_error` is
+    /// emitted, and `None` tells the caller to abort.
+    async fn roots_list_failure_fallback(
+        &self,
+        peer: &Peer<RoleServer>,
+        fallback_note: &str,
+        error_log: &str,
+        notification_error: &str,
+    ) -> Option<Vec<rmcp::model::Root>> {
+        if !self.adapter.sandbox().scopes().is_empty() {
+            tracing::info!("{}", fallback_note);
+            Some(vec![])
+        } else {
+            tracing::error!("{}", error_log);
+            emit_sandbox_notification_via_peer(
+                peer,
+                SANDBOX_FAILED_METHOD,
+                Some(notification_error),
+            )
+            .await;
+            None
+        }
+    }
+
     pub async fn configure_sandbox_from_roots(&self, peer: &Peer<RoleServer>) {
         // SPEC R5.1 / R5.1.1 / R5.2.2: the sandbox scope is committed exactly once
         // and is immutable thereafter. A second invocation — e.g. a pure-stdio
@@ -393,53 +421,50 @@ impl AhmaMcpService {
         // Attempt roots/list; fall back to pre-configured scopes on timeout or error
         // so that clients that don't support roots/list (e.g. Antigravity) still work
         // when --sandbox-scope was provided at startup.
+        // Both failure arms normalize to an error string and share one
+        // fallback: with pre-configured scopes the failure is downgraded and
+        // configuration proceeds against them; otherwise `sandbox/failed` is
+        // emitted and configuration aborts.
         let roots = match tokio::time::timeout(timeout_duration, peer.list_roots()).await {
             Ok(Ok(result)) => {
                 self.adapter.sandbox().set_roots_received(true);
                 result.roots
             }
             Ok(Err(e)) => {
-                if !self.adapter.sandbox().scopes().is_empty() {
-                    tracing::info!(
-                        "roots/list returned error ({}); using pre-configured scopes",
-                        e
-                    );
-                    vec![]
-                } else {
-                    tracing::error!("Failed to request roots/list: {}", e);
-                    emit_sandbox_notification_via_peer(
+                match self
+                    .roots_list_failure_fallback(
                         peer,
-                        "notifications/sandbox/failed",
-                        Some(&e.to_string()),
+                        &format!(
+                            "roots/list returned error ({}); using pre-configured scopes",
+                            e
+                        ),
+                        &format!("Failed to request roots/list: {}", e),
+                        &e.to_string(),
                     )
-                    .await;
-                    return;
+                    .await
+                {
+                    Some(roots) => roots,
+                    None => return,
                 }
             }
             Err(_) => {
-                if !self.adapter.sandbox().scopes().is_empty() {
-                    tracing::info!(
-                        "Timeout waiting for roots/list response after {:?}; \
-                         using pre-configured scopes",
-                        timeout_duration
-                    );
-                    vec![]
-                } else {
-                    tracing::error!(
-                        "Timeout waiting for roots/list response after {:?}. \
-                         This may indicate a stdio communication issue.",
-                        timeout_duration
-                    );
-                    emit_sandbox_notification_via_peer(
+                let timeout_message = format!(
+                    "Timeout waiting for roots/list response after {:?}",
+                    timeout_duration
+                );
+                match self
+                    .roots_list_failure_fallback(
                         peer,
-                        "notifications/sandbox/failed",
-                        Some(&format!(
-                            "Timeout waiting for roots/list response after {:?}",
-                            timeout_duration
-                        )),
+                        &format!("{timeout_message}; using pre-configured scopes"),
+                        &format!(
+                            "{timeout_message}. This may indicate a stdio communication issue."
+                        ),
+                        &timeout_message,
                     )
-                    .await;
-                    return;
+                    .await
+                {
+                    Some(roots) => roots,
+                    None => return,
                 }
             }
         };
@@ -560,7 +585,7 @@ impl AhmaMcpService {
         tracing::info!("Sandbox configured:\n{}", sandbox.scope_text(source));
         emit_sandbox_notification_via_peer_with_scope(
             peer,
-            "notifications/sandbox/configured",
+            SANDBOX_CONFIGURED_METHOD,
             None,
             Some(scope_json),
         )

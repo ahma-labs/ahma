@@ -31,7 +31,6 @@ fn test_guidance_config_deserialization() {
     let config: GuidanceConfig = serde_json::from_value(guidance_json).unwrap();
     assert!(config.guidance_blocks.contains_key("async_behavior"));
     assert!(config.guidance_blocks.contains_key("sync_behavior"));
-    assert!(!config.templates.is_empty());
 }
 
 #[test]
@@ -42,6 +41,8 @@ fn test_mtdf_validator_creation() {
     // Test passed if we reach this point
 }
 
+/// Guidance files from older versions may still carry a `legacy_guidance`
+/// section — deserialization must tolerate (and ignore) it.
 #[test]
 fn test_guidance_config_legacy_structure() {
     init_test_logging();
@@ -60,10 +61,7 @@ fn test_guidance_config_legacy_structure() {
     });
 
     let config: GuidanceConfig = serde_json::from_value(legacy_json).unwrap();
-    assert!(config.legacy_guidance.is_some());
-    let legacy = config.legacy_guidance.as_ref().unwrap();
-    assert!(legacy.general_guidance.contains_key("test"));
-    assert!(legacy.tool_specific_guidance.contains_key("cargo"));
+    assert!(config.guidance_blocks.is_empty());
 }
 
 #[test]
@@ -75,8 +73,6 @@ fn test_guidance_config_empty() {
 
     let config: GuidanceConfig = serde_json::from_value(empty_json).unwrap();
     assert!(config.guidance_blocks.is_empty());
-    assert!(config.templates.is_empty());
-    assert!(config.legacy_guidance.is_none());
 }
 
 #[test]
@@ -303,8 +299,6 @@ async fn test_service_with_configs() {
             );
             blocks
         },
-        templates: HashMap::new(),
-        legacy_guidance: None,
     }));
 
     let service = AhmaMcpService::new(
@@ -342,10 +336,6 @@ fn test_guidance_config_with_legacy_fallback() {
 
     let config: GuidanceConfig = serde_json::from_value(guidance_json).unwrap();
     assert!(config.guidance_blocks.contains_key("test_key"));
-    assert!(config.legacy_guidance.is_some());
-    let legacy = config.legacy_guidance.as_ref().unwrap();
-    assert!(legacy.general_guidance.contains_key("await"));
-    assert!(legacy.tool_specific_guidance.contains_key("cargo"));
 }
 
 #[test]

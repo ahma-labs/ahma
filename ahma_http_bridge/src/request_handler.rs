@@ -1,5 +1,7 @@
+use crate::bridge::{MCP_SESSION_ID_HEADER, session_id_from_headers};
 use crate::error::BridgeError;
 use crate::session::{McpRoot, SessionManager};
+use ahma_common::mcp_methods::{INITIALIZED_METHOD, ROOTS_LIST_METHOD};
 use ahma_common::timeouts::BRIDGE_TOOL_CALL_CEILING_SECS;
 use axum::{
     body::Body,
@@ -15,9 +17,6 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info, warn};
-
-/// MCP Session-Id header name (per MCP spec 2025-03-26)
-const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
 /// Create a JSON response with appropriate headers
 fn json_response(value: Value) -> Response {
@@ -131,14 +130,16 @@ async fn session_has_sampling(s: &crate::session::Session) -> bool {
     caps.as_ref().and_then(|c| c.get("sampling")).is_some()
 }
 
-async fn session_name_matches_label(s: &crate::session::Session, target: &str) -> bool {
+/// `target_lower` must already be lowercased; the session name is lowercased
+/// here, making the comparison case-insensitive.
+async fn session_name_matches_label(s: &crate::session::Session, target_lower: &str) -> bool {
     let info_guard = s.client_info.lock().await;
     let name = info_guard
         .as_ref()
         .and_then(|info| info.get("name"))
         .and_then(|n| n.as_str())
         .unwrap_or("");
-    name.to_lowercase().contains(&target.to_lowercase())
+    name.to_lowercase().contains(target_lower)
 }
 
 async fn find_target_session_for_sampling(
@@ -146,32 +147,32 @@ async fn find_target_session_for_sampling(
     current_session_id: &str,
     target_label: Option<&str>,
 ) -> Option<Arc<crate::session::Session>> {
-    let other_sessions = || {
-        session_manager
-            .get_all_sessions()
-            .into_iter()
-            .filter(|s| s.id != current_session_id)
-    };
+    let other_sessions: Vec<Arc<crate::session::Session>> = session_manager
+        .get_all_sessions()
+        .into_iter()
+        .filter(|s| s.id != current_session_id)
+        .collect();
+    let target_lower = target_label.map(str::to_lowercase);
 
     // First pass: find a session with sampling that also matches the label (if given)
-    for s in other_sessions() {
-        if !session_has_sampling(&s).await {
+    for s in &other_sessions {
+        if !session_has_sampling(s).await {
             continue;
         }
-        let label_matches = match target_label {
-            Some(target) => session_name_matches_label(&s, target).await,
+        let label_matches = match &target_lower {
+            Some(target) => session_name_matches_label(s, target).await,
             None => true,
         };
         if label_matches {
-            return Some(s);
+            return Some(s.clone());
         }
     }
 
     // Fallback: if label didn't match exactly, return any session with sampling
-    if target_label.is_some() {
-        for s in other_sessions() {
-            if session_has_sampling(&s).await {
-                return Some(s);
+    if target_lower.is_some() {
+        for s in &other_sessions {
+            if session_has_sampling(s).await {
+                return Some(s.clone());
             }
         }
     }
@@ -182,11 +183,16 @@ async fn find_target_session_for_sampling(
 async fn handle_routed_sampling_request(
     session_manager: &SessionManager,
     session_id: &str,
-    payload: &Value,
+    mut payload: Value,
     is_sse: bool,
 ) -> Response {
-    let params = payload.get("params");
-    let target_label = params
+    // The id of the caller's request; every error and the final response must
+    // carry it. Captured up front because the payload itself is rewritten with
+    // the routed id below.
+    let original_id = payload_id(&payload);
+
+    let target_label = payload
+        .get("params")
         .and_then(|p| p.get("__route_target_label"))
         .and_then(|l| l.as_str())
         .map(String::from);
@@ -204,7 +210,7 @@ async fn handle_routed_sampling_request(
                 "No active IDE session (Cursor, VS Code, etc.) with sampling capability found. \
                  Make sure your IDE is running and connected to ahma."
                     .to_string();
-            return error_response(payload_id(payload), -32603, &err_msg);
+            return error_response(original_id, -32603, &err_msg);
         }
     };
 
@@ -221,21 +227,18 @@ async fn handle_routed_sampling_request(
     let (tx, rx) = oneshot::channel();
     target_session.routed_requests.insert(routed_id.clone(), tx);
 
-    let mut routed_payload = payload.clone();
-    routed_payload["id"] = serde_json::json!(routed_id);
-    if let Some(params_mut) = routed_payload
-        .get_mut("params")
-        .and_then(|p| p.as_object_mut())
-    {
+    // Rewrite the owned payload in place instead of deep-cloning it.
+    payload["id"] = serde_json::json!(routed_id);
+    if let Some(params_mut) = payload.get_mut("params").and_then(|p| p.as_object_mut()) {
         params_mut.remove("__route_target_label");
     }
 
-    let json_str = match serde_json::to_string(&routed_payload) {
+    let json_str = match serde_json::to_string(&payload) {
         Ok(s) => s,
         Err(e) => {
             target_session.routed_requests.remove(&routed_id);
             return error_response(
-                payload_id(payload),
+                original_id,
                 -32603,
                 &format!("Failed to serialize routed payload: {e}"),
             );
@@ -245,7 +248,7 @@ async fn handle_routed_sampling_request(
     if target_session.broadcast(json_str).is_err() {
         target_session.routed_requests.remove(&routed_id);
         return error_response(
-            payload_id(payload),
+            original_id,
             -32603,
             "Target session's SSE channel is closed",
         );
@@ -255,10 +258,7 @@ async fn handle_routed_sampling_request(
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(response)) => {
             let mut final_response = response;
-            final_response["id"] = payload
-                .get("id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            final_response["id"] = original_id;
             if is_sse {
                 if let Some(session) = session_manager.get_session(session_id) {
                     let (id, json_str) = session_sse_event(&session, &final_response);
@@ -273,14 +273,10 @@ async fn handle_routed_sampling_request(
                 with_session_header(json_response(final_response), session_id)
             }
         }
-        Ok(Err(_)) => error_response(payload_id(payload), -32603, "Routed request sender dropped"),
+        Ok(Err(_)) => error_response(original_id, -32603, "Routed request sender dropped"),
         Err(_) => {
             target_session.routed_requests.remove(&routed_id);
-            error_response(
-                payload_id(payload),
-                -32002,
-                "Request timed out on the client side",
-            )
+            error_response(original_id, -32002, "Request timed out on the client side")
         }
     }
 }
@@ -292,10 +288,7 @@ pub async fn handle_session_isolated_request(
     headers: HeaderMap,
     payload: Value,
 ) -> Response {
-    let session_id = headers
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    let session_id = session_id_from_headers(&headers).map(String::from);
     let method = payload.get("method").and_then(|m| m.as_str());
 
     tracing::Span::current().record("method", method.unwrap_or(""));
@@ -317,7 +310,7 @@ pub async fn handle_session_isolated_request(
     }
     if let Some(session_id) = session_id {
         if method == Some("sampling/createMessage") {
-            return handle_routed_sampling_request(&session_manager, &session_id, &payload, false)
+            return handle_routed_sampling_request(&session_manager, &session_id, payload, false)
                 .await;
         }
         return handle_existing_session_request(&session_manager, &session_id, method, &payload)
@@ -369,13 +362,11 @@ async fn handle_initialize_error(
 }
 
 async fn register_session_details(
-    session_manager: &Arc<SessionManager>,
+    session_manager: &SessionManager,
     session_id: &str,
     payload: &Value,
 ) {
     if let Some(session) = session_manager.get_session(session_id) {
-        *session.session_manager.lock().await = Some(Arc::downgrade(session_manager));
-
         let client_info = payload
             .get("params")
             .and_then(|p| p.get("clientInfo"))
@@ -434,7 +425,7 @@ async fn create_session_or_error(
         Ok(id) => Ok(id),
         Err(e) => {
             error!("Failed to create session: {}", e);
-            let response = if e.to_string().contains("Session limit exceeded") {
+            let response = if matches!(e, BridgeError::SessionLimitExceeded { .. }) {
                 error_response_with_status(
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
                     request_id,
@@ -516,7 +507,7 @@ async fn handle_existing_session_request(
         return response;
     }
 
-    let is_initialized_notification = method == Some("notifications/initialized");
+    let is_initialized_notification = method == Some(INITIALIZED_METHOD);
     if is_initialized_notification {
         debug!(session_id = %session_id, "Received notifications/initialized");
     }
@@ -768,7 +759,7 @@ async fn handle_client_response(
                 );
             }
             if let Some((_, method)) = session.pending_client_requests.remove(&id_str)
-                && method == "roots/list"
+                && method == ROOTS_LIST_METHOD
             {
                 is_roots_list = true;
             }
@@ -843,13 +834,13 @@ fn collect_valid_mcp_roots(session_id: &str, roots: &[Value]) -> Vec<McpRoot> {
     mcp_roots
 }
 
-fn parse_roots_list_result(session_id: &str, result: &Value) -> Option<Vec<McpRoot>> {
+fn parse_roots_list_result(session_id: &str, result: &Value) -> Vec<McpRoot> {
     let Some(roots) = result.get("roots").and_then(|r| r.as_array()) else {
         warn!(session_id = %session_id, "roots/list response missing 'roots' array or it is invalid: {:?}", result);
-        return Some(vec![]);
+        return vec![];
     };
 
-    Some(collect_valid_mcp_roots(session_id, roots))
+    collect_valid_mcp_roots(session_id, roots)
 }
 
 /// Attempt to lock sandbox from a `roots/list` style result payload.
@@ -858,9 +849,7 @@ async fn try_lock_sandbox_from_roots(
     session_id: &str,
     result: &Value,
 ) {
-    let Some(mcp_roots) = parse_roots_list_result(session_id, result) else {
-        return;
-    };
+    let mcp_roots = parse_roots_list_result(session_id, result);
 
     // An empty roots list is a *decision point*, not a no-op.
     //
@@ -928,7 +917,7 @@ async fn handle_roots_list_response(
     method: Option<&str>,
     response: &Value,
 ) {
-    if method == Some("roots/list")
+    if method == Some(ROOTS_LIST_METHOD)
         && let Some(result) = response.get("result")
     {
         try_lock_sandbox_from_roots(session_manager, session_id, result).await;
@@ -1069,6 +1058,51 @@ fn session_sse_event(session: &crate::session::Session, value: &Value) -> (u64, 
     (id, json_str)
 }
 
+/// Map a session broadcast receiver into a stream of SSE events.
+///
+/// `Ok` items become id+data events. When the receiver falls behind (broadcast
+/// channel capacity exceeded), `BroadcastStream` yields `Lagged(n)` with the
+/// number of skipped messages: the session's lag counter is bumped so the loss
+/// is observable in tests, metrics, and debug logs, and an SSE comment is
+/// yielded so the client's EventSource sees activity (keeps the connection
+/// alive) without injecting a fake JSON-RPC message into the MCP protocol
+/// stream. `log_context` prefixes the per-event debug line.
+///
+/// Shared by the GET /mcp live stream (bridge) and the POST SSE interleaved
+/// stream below.
+pub(crate) fn broadcast_sse_event_stream(
+    session: Arc<crate::session::Session>,
+    rx: tokio::sync::broadcast::Receiver<(u64, String)>,
+    log_context: &'static str,
+) -> impl futures::Stream<Item = Result<Event, Infallible>> {
+    BroadcastStream::new(rx).filter_map(move |result| {
+        let session = session.clone();
+        async move {
+            match result {
+                Ok((id, msg)) => {
+                    debug!(session_id = %session.id, event_id = id, "{log_context}: {msg}");
+                    Some(Ok::<_, Infallible>(sse_event(id, msg)))
+                }
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    session.record_lagged_events(n);
+                    let total = session.total_lagged_events();
+                    warn!(
+                        session_id = %session.id,
+                        lagged_count = n,
+                        total_lagged = total,
+                        "SSE receiver lagged — {} event(s) dropped (total: {})",
+                        n,
+                        total
+                    );
+                    Some(Ok(
+                        Event::default().comment(format!("lagged: {} events dropped", n))
+                    ))
+                }
+            }
+        }
+    })
+}
+
 /// Handles POST requests that accept `text/event-stream` (SSE) responses.
 ///
 /// Per MCP Streamable HTTP spec, POST with `Accept: text/event-stream` returns
@@ -1080,32 +1114,12 @@ fn session_sse_event(session: &crate::session::Session, value: &Value) -> (u64, 
 #[tracing::instrument(skip_all, fields(method, session_id))]
 fn build_interleaved_sse_stream(
     session: Arc<crate::session::Session>,
-    session_id: String,
     rx: tokio::sync::broadcast::Receiver<(u64, String)>,
     response: Value,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     let (response_id, response_json) = session_sse_event(&session, &response);
 
-    let session_clone = session.clone();
-    let sid = session_id;
-    let notification_stream = BroadcastStream::new(rx).filter_map(move |result| {
-        let sid = sid.clone();
-        let session_ref = session_clone.clone();
-        async move {
-            match result {
-                Ok((id, msg)) => {
-                    debug!(session_id = %sid, event_id = id, "POST SSE notification: {}", msg);
-                    Some(Ok::<_, Infallible>(sse_event(id, msg)))
-                }
-                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                    session_ref.record_lagged_events(n);
-                    Some(Ok(
-                        Event::default().comment(format!("lagged: {} events dropped", n))
-                    ))
-                }
-            }
-        }
-    });
+    let notification_stream = broadcast_sse_event_stream(session, rx, "POST SSE notification");
 
     let response_event =
         stream::once(async move { Ok::<_, Infallible>(sse_event(response_id, response_json)) });
@@ -1175,10 +1189,7 @@ pub async fn handle_session_isolated_request_sse(
     headers: HeaderMap,
     payload: Value,
 ) -> Response {
-    let session_id = headers
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    let session_id = session_id_from_headers(&headers).map(String::from);
     let method = payload.get("method").and_then(|m| m.as_str());
     let has_id = payload.get("id").is_some();
 
@@ -1206,10 +1217,10 @@ pub async fn handle_session_isolated_request_sse(
     };
 
     if method == Some("sampling/createMessage") {
-        return handle_routed_sampling_request(&session_manager, &session_id, &payload, true).await;
+        return handle_routed_sampling_request(&session_manager, &session_id, payload, true).await;
     }
 
-    let is_initialized_notification = method == Some("notifications/initialized");
+    let is_initialized_notification = method == Some(INITIALIZED_METHOD);
 
     if let Some(response) = check_sse_request_gating(
         &session_manager,
@@ -1365,8 +1376,7 @@ async fn forward_request_sse(
                 .await;
 
             // Build SSE stream: broadcast events that arrived during processing + the response
-            let combined =
-                build_interleaved_sse_stream(session, session_id.to_string(), rx, response);
+            let combined = build_interleaved_sse_stream(session, rx, response);
 
             with_session_header(
                 Sse::new(combined)
@@ -1687,24 +1697,13 @@ mod tests {
     #[test]
     fn parse_roots_list_result_handles_all_shapes() {
         let with_roots = json!({"roots": [{"uri": "file:///a"}, {"uri": "file:///b"}]});
-        assert_eq!(
-            parse_roots_list_result("sid", &with_roots).unwrap().len(),
-            2
-        );
+        assert_eq!(parse_roots_list_result("sid", &with_roots).len(), 2);
 
         let no_roots = json!({"something": "else"});
-        assert!(
-            parse_roots_list_result("sid", &no_roots)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(parse_roots_list_result("sid", &no_roots).is_empty());
 
         let roots_not_array = json!({"roots": "oops"});
-        assert!(
-            parse_roots_list_result("sid", &roots_not_array)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(parse_roots_list_result("sid", &roots_not_array).is_empty());
     }
 
     // ─── calculate_tool_timeout ─────────────────────────────────────────
@@ -2063,7 +2062,7 @@ mod tests {
             "method": "sampling/createMessage",
             "params": {}
         });
-        let resp = handle_routed_sampling_request(&mgr, "sid", &payload, false).await;
+        let resp = handle_routed_sampling_request(&mgr, "sid", payload, false).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32603);
@@ -2266,8 +2265,10 @@ mod tests {
     async fn session_name_matches_label_is_case_insensitive() {
         let mgr = keepalive_manager();
         let s = make_sampling_session(&mgr, "Cursor IDE").await;
+        // The target is pre-lowercased by the caller; the session name is
+        // lowercased inside, so the comparison stays case-insensitive.
         assert!(session_name_matches_label(&s, "cursor").await);
-        assert!(session_name_matches_label(&s, "IDE").await);
+        assert!(session_name_matches_label(&s, "ide").await);
         assert!(!session_name_matches_label(&s, "zed").await);
 
         // Session without client_info → empty name → only matches empty target.
@@ -2344,7 +2345,7 @@ mod tests {
             "method": "sampling/createMessage",
             "params": {}
         });
-        let resp = handle_routed_sampling_request(&mgr, &current, &payload, false).await;
+        let resp = handle_routed_sampling_request(&mgr, &current, payload, false).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32603);
@@ -2396,7 +2397,7 @@ mod tests {
             "method": "sampling/createMessage",
             "params": {}
         });
-        let resp = handle_routed_sampling_request(&mgr, &current, &payload, false).await;
+        let resp = handle_routed_sampling_request(&mgr, &current, payload, false).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         // The original request id is restored onto the response.
@@ -2422,7 +2423,7 @@ mod tests {
             "method": "sampling/createMessage",
             "params": { "__route_target_label": "cursor" }
         });
-        let resp = handle_routed_sampling_request(&mgr, &current, &payload, true).await;
+        let resp = handle_routed_sampling_request(&mgr, &current, payload, true).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(content_type(&resp).contains("text/event-stream"));
         assert_eq!(header_session_id(&resp).as_deref(), Some(current.as_str()));
@@ -2984,8 +2985,7 @@ mod tests {
             .broadcast("{\"note\":\"interleaved\"}".to_string())
             .expect("broadcast ok");
 
-        let stream =
-            build_interleaved_sse_stream(session, id.clone(), rx, json!({"resp": "final"}));
+        let stream = build_interleaved_sse_stream(session, rx, json!({"resp": "final"}));
         let resp = Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response();

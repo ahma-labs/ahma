@@ -44,6 +44,7 @@
 
 use crate::error::{BridgeError, Result};
 use crate::peer::{PeerFactory, PeerShutdownFn, PeerStreams, SubprocessPeerFactory};
+use ahma_common::mcp_methods::{SANDBOX_CONFIGURED_METHOD, SANDBOX_FAILED_METHOD};
 use ahma_common::sandbox_state::{SandboxState, SandboxStateMachine};
 use ahma_common::state_machine::{FsmState, StateMachine};
 use chrono::Local;
@@ -88,10 +89,9 @@ pub enum HandshakeState {
     AwaitingSseOnly,
     /// MCP initialized received, waiting for SSE connection
     AwaitingMcpOnly,
-    /// Both SSE and MCP initialized, roots/list_changed sent, awaiting sandbox lock
+    /// Both SSE and MCP initialized, roots/list_changed sent. Terminal for this
+    /// machine: the sandbox lock itself is tracked by the `SandboxStateMachine`.
     RootsRequested,
-    /// Sandbox locked, handshake complete
-    Complete,
 }
 
 impl FsmState for HandshakeState {
@@ -101,12 +101,11 @@ impl FsmState for HandshakeState {
             HandshakeState::AwaitingSseOnly => "AwaitingSseOnly",
             HandshakeState::AwaitingMcpOnly => "AwaitingMcpOnly",
             HandshakeState::RootsRequested => "RootsRequested",
-            HandshakeState::Complete => "Complete",
         }
     }
 
     fn is_terminal(&self) -> bool {
-        matches!(self, HandshakeState::Complete)
+        matches!(self, HandshakeState::RootsRequested)
     }
 }
 
@@ -147,8 +146,6 @@ pub const DEFAULT_MAX_SESSIONS: usize = 100;
 pub enum SessionTerminationReason {
     /// Client requested termination (HTTP DELETE)
     ClientRequested,
-    /// Roots change attempted after sandbox lock (security violation)
-    RootsChangeRejected,
     /// Subprocess crashed
     ProcessCrashed,
     /// Session timed out
@@ -171,8 +168,6 @@ pub struct Session {
     /// Wakes the I/O task's termination branch when `terminated` flips to true,
     /// so it does not have to poll the flag.
     terminated_notify: Notify,
-    /// Termination reason (if terminated)
-    termination_reason: Mutex<Option<SessionTerminationReason>>,
     /// Async cleanup hook invoked on explicit session termination.
     ///
     /// For subprocess peers this kills the child process.  For in-memory peers
@@ -211,8 +206,6 @@ pub struct Session {
     pub client_info: Mutex<Option<Value>>,
     /// Client capabilities sent in initialize request
     pub capabilities: Mutex<Option<Value>>,
-    /// Weak reference back to the session manager
-    pub session_manager: Mutex<Option<std::sync::Weak<SessionManager>>>,
     /// Map of pending routed request IDs to response channels
     pub routed_requests: Arc<DashMap<String, oneshot::Sender<Value>>>,
     /// Map of pending server-to-client request IDs to their method name (e.g. roots/list)
@@ -275,9 +268,7 @@ impl Session {
     pub fn is_sse_connected(&self) -> bool {
         matches!(
             self.handshake_state(),
-            HandshakeState::AwaitingSseOnly
-                | HandshakeState::RootsRequested
-                | HandshakeState::Complete
+            HandshakeState::AwaitingSseOnly | HandshakeState::RootsRequested
         )
     }
 
@@ -285,9 +276,7 @@ impl Session {
     pub fn is_mcp_initialized(&self) -> bool {
         matches!(
             self.handshake_state(),
-            HandshakeState::AwaitingMcpOnly
-                | HandshakeState::RootsRequested
-                | HandshakeState::Complete
+            HandshakeState::AwaitingMcpOnly | HandshakeState::RootsRequested
         )
     }
 
@@ -297,14 +286,6 @@ impl Session {
             return;
         }
         self.mcp_initialized_notify.notified().await;
-    }
-
-    /// Wait for sandbox application
-    pub async fn wait_for_sandbox_applied(&self) {
-        if self.is_sandbox_locked() {
-            return;
-        }
-        let _ = self.sandbox_state_machine.wait_for_active().await;
     }
 
     /// Check if the handshake has timed out
@@ -328,7 +309,7 @@ impl Session {
     ///
     /// Sourced from the sandbox state machine, the single source of truth for the
     /// committed scope (SPEC R20/R23). The session keeps no shadow copy.
-    pub async fn get_sandbox_scope(&self) -> Option<PathBuf> {
+    pub fn get_sandbox_scope(&self) -> Option<PathBuf> {
         self.sandbox_state_machine
             .current()
             .scopes()
@@ -336,7 +317,7 @@ impl Session {
     }
 
     /// Get all sandbox scopes (from the sandbox state machine).
-    pub async fn get_sandbox_scopes(&self) -> Option<Vec<PathBuf>> {
+    pub fn get_sandbox_scopes(&self) -> Option<Vec<PathBuf>> {
         self.sandbox_state_machine
             .current()
             .scopes()
@@ -409,53 +390,62 @@ impl Session {
         json_str: String,
         error_context: &str,
     ) -> Result<()> {
-        self.sender
-            .lock()
-            .await
+        // Clone the sender under a short lock rather than holding the Mutex
+        // across the (potentially blocking) `send().await`.
+        let sender = self.sender.lock().await.clone();
+        sender
             .send(json_str)
             .await
             .map_err(|e| BridgeError::Communication(format!("{error_context}: {e}")))?;
         Ok(())
     }
 
-    /// Helper to transitions state and return necessary action
-    fn transition_sse_connected(&self) -> HandshakeAction {
+    /// One handshake half has arrived (SSE stream opened, or MCP initialized):
+    /// advance the state machine and return the follow-up action.
+    ///
+    /// The two halves are mirror images: from `AwaitingBoth` the arriving half
+    /// moves to its partial state (`partial_to`); from the state that was only
+    /// waiting for this half (`completing_from`) it completes the handshake.
+    fn transition_handshake_half(
+        &self,
+        event: &'static str,
+        partial_to: HandshakeState,
+        completing_from: HandshakeState,
+    ) -> HandshakeAction {
         self.handshake_state.transition(|state| match *state {
             HandshakeState::AwaitingBoth => {
-                *state = HandshakeState::AwaitingSseOnly;
-                info!(session_id = %self.id, from = ?HandshakeState::AwaitingBoth, to = ?HandshakeState::AwaitingSseOnly, "SSE connected");
+                *state = partial_to;
+                info!(session_id = %self.id, from = ?HandshakeState::AwaitingBoth, to = ?partial_to, "{event}");
                 HandshakeAction::None
             }
-            HandshakeState::AwaitingMcpOnly => {
+            s if s == completing_from => {
                 *state = HandshakeState::RootsRequested;
-                info!(session_id = %self.id, from = ?HandshakeState::AwaitingMcpOnly, to = ?HandshakeState::RootsRequested, "SSE connected (completing handshake)");
+                info!(session_id = %self.id, from = ?completing_from, to = ?HandshakeState::RootsRequested, "{event} (completing handshake)");
                 HandshakeAction::SendRootsListChanged
             }
             other => {
-                debug!(session_id = %self.id, state = ?other, "SSE connected but already handled/advanced");
+                debug!(session_id = %self.id, state = ?other, "{event} but already handled/advanced");
                 HandshakeAction::None
             }
         })
     }
 
+    /// Helper to transitions state and return necessary action
+    fn transition_sse_connected(&self) -> HandshakeAction {
+        self.transition_handshake_half(
+            "SSE connected",
+            HandshakeState::AwaitingSseOnly,
+            HandshakeState::AwaitingMcpOnly,
+        )
+    }
+
     /// Helper to transition state for MCP initialization
     fn transition_mcp_initialized(&self) -> HandshakeAction {
-        let action = self.handshake_state.transition(|state| match *state {
-            HandshakeState::AwaitingBoth => {
-                *state = HandshakeState::AwaitingMcpOnly;
-                info!(session_id = %self.id, from = ?HandshakeState::AwaitingBoth, to = ?HandshakeState::AwaitingMcpOnly, "MCP initialized");
-                HandshakeAction::None
-            }
-            HandshakeState::AwaitingSseOnly => {
-                *state = HandshakeState::RootsRequested;
-                info!(session_id = %self.id, from = ?HandshakeState::AwaitingSseOnly, to = ?HandshakeState::RootsRequested, "MCP initialized (completing handshake)");
-                HandshakeAction::SendRootsListChanged
-            }
-            other => {
-                debug!(session_id = %self.id, state = ?other, "MCP initialized but already handled/advanced");
-                HandshakeAction::None
-            }
-        });
+        let action = self.transition_handshake_half(
+            "MCP initialized",
+            HandshakeState::AwaitingMcpOnly,
+            HandshakeState::AwaitingSseOnly,
+        );
         // Always notify waiters, even when the state was already advanced — the
         // notification must not be lost to a race with the transition.
         self.mcp_initialized_notify.notify_waiters();
@@ -482,16 +472,6 @@ impl Session {
             }
             HandshakeAction::None => Ok(false),
         }
-    }
-
-    /// Mark handshake as complete (sandbox locked).
-    pub fn mark_handshake_complete(&self) {
-        self.handshake_state.transition(|state| {
-            if *state == HandshakeState::RootsRequested {
-                *state = HandshakeState::Complete;
-                info!(session_id = %self.id, "Handshake complete");
-            }
-        });
     }
 
     /// Send roots/list_changed notification to subprocess.
@@ -687,7 +667,6 @@ fn take_pending_request(
     pending.remove(id).map(|(_, sender)| sender)
 }
 
-/// Wait for a JSON-RPC response via a oneshot channel, or return immediately for notifications.
 /// How long a session's peer cleanup (killing the subprocess) may take before we
 /// give up on it and carry on.
 ///
@@ -729,6 +708,7 @@ fn fail_pending_requests(
     }
 }
 
+/// Wait for a JSON-RPC response via a oneshot channel, or return immediately for notifications.
 async fn await_response(
     response_rx: Option<oneshot::Receiver<Value>>,
     timeout: Option<Duration>,
@@ -829,10 +809,10 @@ fn handle_sandbox_failed(session: &Arc<Session>, value: &Value) {
 /// Drives the `SandboxStateMachine` forward based on `notifications/sandbox/*` methods.
 fn handle_sandbox_notification(session: &Arc<Session>, value: &Value) {
     match value.get("method").and_then(Value::as_str) {
-        Some("notifications/sandbox/configured") => {
+        Some(SANDBOX_CONFIGURED_METHOD) => {
             handle_sandbox_configured(session, value);
         }
-        Some("notifications/sandbox/failed") => {
+        Some(SANDBOX_FAILED_METHOD) => {
             handle_sandbox_failed(session, value);
         }
         Some(method_str) => {
@@ -930,27 +910,7 @@ impl SessionManager {
                 let Some(manager) = manager.upgrade() else {
                     break;
                 };
-
-                let mut to_terminate = Vec::new();
-                for entry in manager.sessions.iter() {
-                    let session_id = entry.key().clone();
-                    let session = entry.value();
-
-                    if session.is_terminated() {
-                        to_terminate.push((session_id, SessionTerminationReason::ProcessCrashed));
-                    } else if session.is_handshake_timed_out().is_some() {
-                        to_terminate.push((session_id, SessionTerminationReason::Timeout));
-                    }
-                }
-
-                for (session_id, reason) in to_terminate {
-                    tracing::info!(
-                        session_id = %session_id,
-                        reason = ?reason,
-                        "Sweeper cleaning up inactive/terminated session"
-                    );
-                    let _ = manager.terminate_session(&session_id, reason).await;
-                }
+                manager.prune_stale_sessions().await;
             }
         });
     }
@@ -1083,10 +1043,9 @@ impl SessionManager {
             if current_count >= self.config.max_sessions
                 && !self.evict_oldest_inactive_session().await
             {
-                return Err(BridgeError::ServerProcess(format!(
-                    "Session limit exceeded (max: {})",
-                    self.config.max_sessions
-                )));
+                return Err(BridgeError::SessionLimitExceeded {
+                    max: self.config.max_sessions,
+                });
             }
         }
 
@@ -1132,7 +1091,6 @@ impl SessionManager {
             broadcast_tx: broadcast_tx.clone(),
             terminated: AtomicBool::new(false),
             terminated_notify: Notify::new(),
-            termination_reason: Mutex::new(None),
             peer_shutdown: Mutex::new(shutdown_fn),
             exit_cause: Mutex::new(exit_cause),
             handshake_state: StateMachine::new(HandshakeState::AwaitingBoth),
@@ -1145,7 +1103,6 @@ impl SessionManager {
             event_history: std::sync::Mutex::new(VecDeque::new()),
             client_info: Mutex::new(None),
             capabilities: Mutex::new(None),
-            session_manager: Mutex::new(None),
             routed_requests: Arc::new(DashMap::new()),
             pending_client_requests: Arc::new(DashMap::new()),
             sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
@@ -1249,8 +1206,8 @@ impl SessionManager {
         ))
     }
 
-    /// Send a message to a session's subprocess
-    pub async fn send_message(&self, session_id: &str, message: &Value) -> Result<()> {
+    /// Look up a session that exists and has not been terminated.
+    fn live_session(&self, session_id: &str) -> Result<Arc<Session>> {
         let session = self.sessions.get(session_id).ok_or_else(|| {
             BridgeError::Communication(format!("Session not found: {}", session_id))
         })?;
@@ -1260,6 +1217,13 @@ impl SessionManager {
                 "Session has been terminated".to_string(),
             ));
         }
+
+        Ok(session.clone())
+    }
+
+    /// Send a message to a session's subprocess
+    pub async fn send_message(&self, session_id: &str, message: &Value) -> Result<()> {
+        let session = self.live_session(session_id)?;
 
         session
             .send_to_subprocess(message, "Failed to send to subprocess")
@@ -1273,15 +1237,7 @@ impl SessionManager {
         request: &Value,
         timeout: Option<Duration>,
     ) -> Result<Value> {
-        let session = self.sessions.get(session_id).ok_or_else(|| {
-            BridgeError::Communication(format!("Session not found: {}", session_id))
-        })?;
-
-        if session.is_terminated() {
-            return Err(BridgeError::Communication(
-                "Session has been terminated".to_string(),
-            ));
-        }
+        let session = self.live_session(session_id)?;
 
         let id_opt = extract_request_id(request);
 
@@ -1351,9 +1307,6 @@ impl SessionManager {
         {
             warn!(session_id = %session_id, error = %e, "Failed to transition sandbox state to Configuring");
         }
-
-        // Transition handshake state to Complete
-        session.mark_handshake_complete();
 
         Ok(true)
     }
@@ -1429,7 +1382,6 @@ impl SessionManager {
             );
 
             session.set_terminated(true);
-            *session.termination_reason.lock().await = Some(reason);
 
             // Answer in-flight requests FIRST.
             //
@@ -1630,13 +1582,7 @@ impl SessionManager {
         // Send explicit error responses to all pending requests before clearing.
         // This prevents "Response channel closed" errors that manifest as cryptic
         // "Canceled: canceled" messages in clients.
-        let pending_count = session.pending_requests.len();
-        if pending_count > 0 {
-            warn!(
-                session_id = %session.id,
-                pending_count = pending_count,
-                "Session terminated with pending requests - sending error responses"
-            );
+        if !session.pending_requests.is_empty() {
             // R-SIGN.5: if the peer died abnormally, its exit monitor has
             // classified the cause (e.g. the macOS code-signing SIGKILL).
             // Surface that to the client instead of a bare "terminated
@@ -1653,25 +1599,7 @@ impl SessionManager {
                 Some(cause) => format!("Session terminated: server subprocess died: {cause}"),
                 None => "Session terminated unexpectedly - subprocess may have crashed or handshake failed".to_string(),
             };
-            // Drain all pending requests and send error response
-            let pending: Vec<_> = session
-                .pending_requests
-                .iter()
-                .map(|entry| entry.key().clone())
-                .collect();
-            for id in pending {
-                if let Some(sender) = take_pending_request(&session.pending_requests, &id) {
-                    let error_response = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": -32603,
-                            "message": message
-                        }
-                    });
-                    let _ = sender.send(error_response);
-                }
-            }
+            fail_pending_requests(&session.pending_requests, &session.id, &message);
         }
     }
 }
@@ -1758,7 +1686,6 @@ mod session_logic_tests {
             broadcast_tx,
             terminated: AtomicBool::new(false),
             terminated_notify: Notify::new(),
-            termination_reason: Mutex::new(None),
             peer_shutdown: Mutex::new(None),
             exit_cause: Mutex::new(None),
             handshake_state: StateMachine::new(HandshakeState::AwaitingBoth),
@@ -1771,7 +1698,6 @@ mod session_logic_tests {
             event_history: std::sync::Mutex::new(VecDeque::new()),
             client_info: Mutex::new(None),
             capabilities: Mutex::new(None),
-            session_manager: Mutex::new(None),
             routed_requests: Arc::new(DashMap::new()),
             pending_client_requests: Arc::new(DashMap::new()),
             sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
@@ -1887,28 +1813,6 @@ mod session_logic_tests {
         assert_eq!(session.handshake_state(), HandshakeState::RootsRequested);
     }
 
-    // ── mark_handshake_complete ──────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn mark_handshake_complete_from_roots_requested() {
-        // RootsRequested -> Complete (lines 495-500).
-        let (session, _rx) = make_test_session();
-        session.mark_mcp_initialized().await.unwrap();
-        session.mark_sse_connected().await.unwrap(); // -> RootsRequested
-        session.mark_handshake_complete();
-        assert_eq!(session.handshake_state(), HandshakeState::Complete);
-        assert!(session.is_sse_connected());
-        assert!(session.is_mcp_initialized());
-    }
-
-    #[test]
-    fn mark_handshake_complete_noop_when_not_roots_requested() {
-        // The `if` guard in mark_handshake_complete is false → stays AwaitingBoth.
-        let (session, _rx) = make_test_session();
-        session.mark_handshake_complete();
-        assert_eq!(session.handshake_state(), HandshakeState::AwaitingBoth);
-    }
-
     // ── wait_for_mcp_initialized ─────────────────────────────────────────────
 
     #[tokio::test]
@@ -1980,10 +1884,9 @@ mod session_logic_tests {
         // AwaitingBoth: neither.
         assert!(!session.is_sse_connected());
         assert!(!session.is_mcp_initialized());
-        // Complete: both.
+        // RootsRequested: both.
         session.mark_sse_connected().await.unwrap();
         session.mark_mcp_initialized().await.unwrap();
-        session.mark_handshake_complete();
         assert!(session.is_sse_connected());
         assert!(session.is_mcp_initialized());
     }
@@ -2085,11 +1988,11 @@ mod session_logic_tests {
         ));
     }
 
-    #[tokio::test]
-    async fn get_sandbox_scope_and_scopes() {
+    #[test]
+    fn get_sandbox_scope_and_scopes() {
         let (session, _rx) = make_test_session();
-        assert!(session.get_sandbox_scope().await.is_none());
-        assert!(session.get_sandbox_scopes().await.is_none());
+        assert!(session.get_sandbox_scope().is_none());
+        assert!(session.get_sandbox_scopes().is_none());
 
         let a = std::env::temp_dir().join("a");
         let b = std::env::temp_dir().join("b");
@@ -2097,8 +2000,8 @@ mod session_logic_tests {
             .sandbox_state_machine
             .transition_to_configuring(vec![a.clone(), b.clone()])
             .unwrap();
-        assert_eq!(session.get_sandbox_scope().await, Some(a.clone()));
-        assert_eq!(session.get_sandbox_scopes().await, Some(vec![a, b]));
+        assert_eq!(session.get_sandbox_scope(), Some(a.clone()));
+        assert_eq!(session.get_sandbox_scopes(), Some(vec![a, b]));
     }
 
     #[tokio::test]
@@ -2111,10 +2014,6 @@ mod session_logic_tests {
             .unwrap();
         let scopes = session.wait_for_sandbox_active().await.unwrap();
         assert_eq!(scopes, vec![scope]);
-        // wait_for_sandbox_applied also short-circuits when already active.
-        tokio::time::timeout(Duration::from_secs(1), session.wait_for_sandbox_applied())
-            .await
-            .expect("should not block when active");
     }
 
     #[tokio::test]
@@ -2876,8 +2775,7 @@ mod session_logic_tests {
         assert_eq!(HandshakeState::AwaitingSseOnly.name(), "AwaitingSseOnly");
         assert_eq!(HandshakeState::AwaitingMcpOnly.name(), "AwaitingMcpOnly");
         assert_eq!(HandshakeState::RootsRequested.name(), "RootsRequested");
-        assert_eq!(HandshakeState::Complete.name(), "Complete");
-        assert!(HandshakeState::Complete.is_terminal());
-        assert!(!HandshakeState::RootsRequested.is_terminal());
+        assert!(HandshakeState::RootsRequested.is_terminal());
+        assert!(!HandshakeState::AwaitingBoth.is_terminal());
     }
 }

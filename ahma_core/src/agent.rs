@@ -1,4 +1,7 @@
 use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
+use ahma_common::file_uri::encode_file_uri;
+use ahma_common::mcp_methods::{INITIALIZED_METHOD, ROOTS_LIST_METHOD, SANDBOX_CONFIGURED_METHOD};
+use ahma_common::sse::{event_data_to_json, pop_next_sse_event};
 use ahma_llm_monitor::ChatMessage;
 use ahma_llm_monitor::client::LlmClient;
 use ahma_mcp::ActiveAgentSession;
@@ -264,29 +267,30 @@ fn protected_head(msg_json: &[serde_json::Value]) -> usize {
 }
 
 pub fn trim_conversation(msg_json: &mut Vec<serde_json::Value>, budget: usize) {
-    let total = |msgs: &[serde_json::Value]| -> usize {
-        msgs.iter()
-            .map(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_str())
-                    .map(|s| s.len())
-                    .unwrap_or(0)
-            })
-            .sum()
+    let content_len = |m: &serde_json::Value| -> usize {
+        m.get("content")
+            .and_then(|c| c.as_str())
+            .map(|s| s.len())
+            .unwrap_or(0)
     };
 
-    if total(msg_json) <= budget {
+    let mut total: usize = msg_json.iter().map(content_len).sum();
+    if total <= budget {
         return;
     }
 
     let protected_head = protected_head(msg_json);
 
+    // Same trimming decisions as removing one message at a time from
+    // `protected_head`, but tracked with a running total and applied as a
+    // single batch `drain` instead of an O(n) `Vec::remove` per message.
     let mut dropped = 0usize;
-    while total(msg_json) > budget && msg_json.len() > protected_head + 2 {
-        msg_json.remove(protected_head);
+    while total > budget && msg_json.len() - dropped > protected_head + 2 {
+        total -= content_len(&msg_json[protected_head + dropped]);
         dropped += 1;
     }
     if dropped > 0 {
+        msg_json.drain(protected_head..protected_head + dropped);
         tracing::info!(
             "small-model context: dropped {dropped} oldest message(s) to fit the {budget}-char conversation budget"
         );
@@ -1304,26 +1308,52 @@ async fn finish_with_limit_summary(
     }
 }
 
+/// Process-wide cache of `reqwest::Client`s keyed by bridge base URL.
+/// Building a fresh client per tool call re-does TLS and connection-pool
+/// setup every time and forfeits HTTP keep-alive reuse entirely; sharing one
+/// client per base URL keeps connections warm across the agent loop's many
+/// sequential tool calls. `reqwest::Client` clones are cheap `Arc` handles.
+static HTTP_CLIENT_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, reqwest::Client>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Return the effective request base URL and a cached `reqwest::Client` for an
+/// MCP bridge `base_url`. `unix://<path>` URLs (Unix only) yield a client
+/// bound to that socket with `http://localhost` as the request base; all other
+/// URLs get a plain client and are used as-is.
+pub fn cached_http_client(base_url: &str) -> Result<(String, reqwest::Client), String> {
+    let unix_path = if cfg!(unix) {
+        base_url.strip_prefix("unix://")
+    } else {
+        None
+    };
+    let request_base = if unix_path.is_some() {
+        "http://localhost".to_string()
+    } else {
+        base_url.to_string()
+    };
+
+    let mut cache = HTTP_CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(client) = cache.get(base_url) {
+        return Ok((request_base, client.clone()));
+    }
+
+    let builder = reqwest::Client::builder();
+    #[cfg(unix)]
+    let builder = match unix_path {
+        Some(path) => builder.unix_socket(path),
+        None => builder,
+    };
+    let client = builder.build().map_err(|e| e.to_string())?;
+    cache.insert(base_url.to_string(), client.clone());
+    Ok((request_base, client))
+}
+
 async fn spawn_local_tool_call(
     mcp: McpChatConfig,
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<(String, bool), String> {
-    let builder = reqwest::Client::builder();
-    let (request_base_url, builder) = if let Some(path) = mcp.base_url.strip_prefix("unix://") {
-        #[cfg(unix)]
-        {
-            ("http://localhost".to_string(), builder.unix_socket(path))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            (mcp.base_url.clone(), builder)
-        }
-    } else {
-        (mcp.base_url.clone(), builder)
-    };
-    let client = builder.build().map_err(|e| e.to_string())?;
+    let (request_base_url, client) = cached_http_client(&mcp.base_url)?;
     let url = format!("{}/mcp", request_base_url);
     let session_id = get_or_create_session(&client, &url, &mcp).await?;
     call_mcp_tool_http(&client, &url, &session_id, tool, arguments).await
@@ -1334,8 +1364,8 @@ async fn spawn_external_tool_call_http(
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<(String, bool), String> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/mcp", base_url.trim_end_matches('/'));
+    let (request_base, client) = cached_http_client(base_url.trim_end_matches('/'))?;
+    let url = format!("{}/mcp", request_base);
     let sid = get_or_create_external_session(&client, &url).await?;
     call_mcp_tool_http(&client, &url, &sid, tool, arguments).await
 }
@@ -1404,7 +1434,7 @@ async fn get_or_create_external_session(
 
     let initialized_body = serde_json::json!({
         "jsonrpc": "2.0",
-        "method": "notifications/initialized"
+        "method": INITIALIZED_METHOD
     });
 
     let _ = client
@@ -1415,67 +1445,6 @@ async fn get_or_create_external_session(
         .await;
 
     Ok(sid)
-}
-
-/// Encode a filesystem path as a `file://` URI for `roots/list` responses.
-fn encode_file_uri(path: &std::path::Path) -> String {
-    let mut path_str = path.to_string_lossy().into_owned();
-
-    // Strip Windows extended-length prefix (\\?\) if present.
-    if path_str.starts_with(r"\\?\") {
-        path_str = path_str[4..].to_string();
-    }
-    // Normalise path separators to forward slashes.
-    path_str = path_str.replace('\\', "/");
-
-    let mut out = String::with_capacity(path_str.len() + 10);
-    out.push_str("file://");
-
-    #[cfg(target_os = "windows")]
-    {
-        let is_drive = path_str.len() >= 2
-            && path_str.as_bytes()[0].is_ascii_alphabetic()
-            && path_str.as_bytes()[1] == b':';
-        if is_drive {
-            out.push('/');
-        }
-    }
-
-    out.push_str(&path_str);
-    out
-}
-
-/// Find the first SSE event boundary (`\n\n` or `\r\n\r\n`) in `buffer`.
-fn first_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
-    let lf = buffer.find("\n\n").map(|idx| (idx, 2));
-    let crlf = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
-    match (lf, crlf) {
-        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
-/// Pop the next complete SSE event from `buffer`, leaving the remainder.
-fn pop_next_sse_event(buffer: &mut String) -> Option<String> {
-    let (idx, delimiter_len) = first_sse_event_boundary(buffer)?;
-    let raw_event = buffer[..idx].to_string();
-    *buffer = buffer[idx + delimiter_len..].to_string();
-    Some(raw_event)
-}
-
-/// Parse the `data:` lines of a raw SSE event into a JSON value.
-fn event_data_to_json(raw_event: &str) -> Option<serde_json::Value> {
-    let data: Vec<&str> = raw_event
-        .lines()
-        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
-        .map(str::trim)
-        .collect();
-    if data.is_empty() {
-        return None;
-    }
-    serde_json::from_str::<serde_json::Value>(&data.join("\n")).ok()
 }
 
 /// Long-lived SSE listener for an agent-created MCP session.
@@ -1556,13 +1525,13 @@ async fn handle_session_sse_event(
 ) {
     let method = value.get("method").and_then(|m| m.as_str());
 
-    if method == Some("notifications/sandbox/configured")
+    if method == Some(SANDBOX_CONFIGURED_METHOD)
         && let Some(tx) = locked_tx.take()
     {
         let _ = tx.send(());
     }
 
-    if method == Some("roots/list")
+    if method == Some(ROOTS_LIST_METHOD)
         && let Some(request_id) = value.get("id").cloned()
     {
         respond_to_roots_list(post_client, sse_url, session_id, request_id, workspace_root).await;
@@ -1723,7 +1692,7 @@ pub async fn get_or_create_session(
     // which the listener answers.
     let initialized_body = serde_json::json!({
         "jsonrpc": "2.0",
-        "method": "notifications/initialized"
+        "method": INITIALIZED_METHOD
     });
     let _ = client
         .post(url)
@@ -3400,67 +3369,8 @@ mod tests {
         assert!(content.chars().count() < 800, "capped near the budget");
     }
 
-    // ── encode_file_uri ──
-
-    #[test]
-    fn encode_file_uri_produces_file_scheme() {
-        let uri = encode_file_uri(std::path::Path::new("/a/b/c"));
-        assert!(uri.starts_with("file://"), "got {uri}");
-        assert!(uri.ends_with("/a/b/c"), "got {uri}");
-    }
-
-    #[test]
-    fn encode_file_uri_normalizes_backslashes() {
-        let uri = encode_file_uri(std::path::Path::new(r"a\b\c"));
-        assert!(uri.contains("a/b/c"), "separators normalized: {uri}");
-        assert!(!uri.contains('\\'), "no backslashes remain: {uri}");
-    }
-
-    // ── SSE framing: first_sse_event_boundary / pop_next_sse_event / event_data_to_json ──
-
-    #[test]
-    fn first_sse_event_boundary_lf_crlf_and_none() {
-        assert_eq!(first_sse_event_boundary("ab\n\ncd"), Some((2, 2)));
-        assert_eq!(first_sse_event_boundary("ab\r\n\r\ncd"), Some((2, 4)));
-        assert_eq!(first_sse_event_boundary("no boundary here"), None);
-    }
-
-    #[test]
-    fn first_sse_event_boundary_prefers_earliest() {
-        // CRLF boundary precedes a later LF boundary.
-        assert_eq!(first_sse_event_boundary("a\r\n\r\nb\n\nc"), Some((1, 4)));
-        // LF boundary precedes a later CRLF boundary.
-        assert_eq!(first_sse_event_boundary("ab\n\nx\r\n\r\ny"), Some((2, 2)));
-    }
-
-    #[test]
-    fn pop_next_sse_event_extracts_and_leaves_remainder() {
-        let mut buf = "event1\n\nevent2\n\n".to_string();
-        assert_eq!(pop_next_sse_event(&mut buf).as_deref(), Some("event1"));
-        assert_eq!(buf, "event2\n\n");
-        assert_eq!(pop_next_sse_event(&mut buf).as_deref(), Some("event2"));
-        assert_eq!(buf, "");
-        // No remaining boundary → None, buffer untouched.
-        assert_eq!(pop_next_sse_event(&mut buf), None);
-    }
-
-    #[test]
-    fn event_data_to_json_parses_single_and_multiline() {
-        let v = event_data_to_json("data: {\"a\":1}").unwrap();
-        assert_eq!(v["a"], 1);
-        // Multi-line data with CRLF endings is joined and parsed as one value.
-        let raw = "data: {\r\ndata: \"k\": 1\r\ndata: }";
-        let v2 = event_data_to_json(raw).unwrap();
-        assert_eq!(v2["k"], 1);
-    }
-
-    #[test]
-    fn event_data_to_json_none_for_no_data_or_invalid() {
-        // No `data:` lines at all.
-        assert!(event_data_to_json("event: ping\nid: 1").is_none());
-        // Present but unparseable JSON.
-        assert!(event_data_to_json("data: not json {").is_none());
-    }
+    // encode_file_uri and the SSE framing helpers moved to `ahma_common`
+    // (`file_uri` / `sse` modules) — their unit tests live there now.
 
     // ── parse_mcp_response / parse_error_message / extract_content_text ──
 

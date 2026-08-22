@@ -141,17 +141,6 @@ impl McpConnectionManager {
         self.servers.iter().collect()
     }
 
-    pub fn aggregate_tool_names(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for (server, tools) in &self.tools_by_server {
-            for tool in tools {
-                out.push(format!("{server}::{}", tool.name));
-            }
-        }
-        out.sort();
-        out
-    }
-
     pub fn aggregate_tools(&self) -> Vec<ToolInfo> {
         let mut out = Vec::new();
         for (server, tools) in &self.tools_by_server {
@@ -497,12 +486,7 @@ async fn call_mcp_tool_stdio(
         .context("Failed tools/call via stdio")?;
 
     let is_error = res.is_error.unwrap_or(false);
-    let mut texts = Vec::new();
-    for content in res.content {
-        if let Some(txt) = content.as_text() {
-            texts.push(txt.text.clone());
-        }
-    }
+    let texts: Vec<&str> = crate::client::text_contents(&res.content).collect();
     let content_str = if texts.is_empty() {
         "Empty result".to_string()
     } else {
@@ -510,6 +494,15 @@ async fn call_mcp_tool_stdio(
     };
 
     Ok((content_str, is_error))
+}
+
+/// Extract the `mcp-session-id` header an MCP server stamps on its HTTP
+/// `initialize` response. Shared by every in-crate HTTP MCP client.
+pub(crate) fn session_id_header(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 async fn initialize_mcp_session(client: &reqwest::Client, base_url: &str) -> Result<String> {
@@ -532,19 +525,15 @@ async fn initialize_mcp_session(client: &reqwest::Client, base_url: &str) -> Res
         .await
         .context("Failed initialize request")?;
 
-    let sid = init_resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow!("initialize response missing mcp-session-id"))?
-        .to_string();
+    let sid = session_id_header(&init_resp)
+        .ok_or_else(|| anyhow!("initialize response missing mcp-session-id"))?;
 
     let _ = client
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
         .header("mcp-session-id", &sid)
-        .json(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}))
+        .json(&json!({"jsonrpc":"2.0", "method": ahma_common::mcp_methods::INITIALIZED_METHOD}))
         .send()
         .await;
 
@@ -718,44 +707,6 @@ mod tests {
             }
             _ => panic!("Expected Stdio server"),
         }
-    }
-
-    #[test]
-    fn test_aggregate_tool_names() {
-        let mut manager = McpConnectionManager::default();
-        manager.tools_by_server.insert(
-            "srv1".to_string(),
-            vec![
-                ToolInfo {
-                    name: "tool_a".to_string(),
-                    description: None,
-                    input_schema: serde_json::json!({}),
-                },
-                ToolInfo {
-                    name: "tool_b".to_string(),
-                    description: None,
-                    input_schema: serde_json::json!({}),
-                },
-            ],
-        );
-        manager.tools_by_server.insert(
-            "srv2".to_string(),
-            vec![ToolInfo {
-                name: "tool_c".to_string(),
-                description: None,
-                input_schema: serde_json::json!({}),
-            }],
-        );
-
-        let tools = manager.aggregate_tool_names();
-        assert_eq!(
-            tools,
-            vec![
-                "srv1::tool_a".to_string(),
-                "srv1::tool_b".to_string(),
-                "srv2::tool_c".to_string(),
-            ]
-        );
     }
 
     #[test]

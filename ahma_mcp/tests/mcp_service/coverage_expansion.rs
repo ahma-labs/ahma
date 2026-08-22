@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ahma_mcp::adapter::Adapter;
-use ahma_mcp::mcp_service::{AhmaMcpService, GuidanceConfig, LegacyGuidanceConfig};
+use ahma_mcp::mcp_service::{AhmaMcpService, GuidanceConfig};
 use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
 use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
@@ -36,7 +36,7 @@ async fn test_get_info_returns_complete_server_info() {
 
 #[tokio::test]
 async fn test_service_creation_with_guidance_config() {
-    // This test specifically constructs a GuidanceConfig with LegacyGuidanceConfig,
+    // This test specifically constructs a non-empty GuidanceConfig,
     // which is the point of the test — keep inline setup for the guidance parts.
     let _temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
 
@@ -58,16 +58,11 @@ async fn test_service_creation_with_guidance_config() {
 
     let configs = Arc::new(HashMap::new());
     let guidance_config = GuidanceConfig {
-        guidance_blocks: HashMap::new(),
-        templates: HashMap::new(),
-        legacy_guidance: Some(LegacyGuidanceConfig {
-            general_guidance: {
-                let mut general = HashMap::new();
-                general.insert("default".to_string(), "Test guidance".to_string());
-                general
-            },
-            tool_specific_guidance: HashMap::new(),
-        }),
+        guidance_blocks: {
+            let mut blocks = HashMap::new();
+            blocks.insert("default".to_string(), "Test guidance".to_string());
+            blocks
+        },
     };
     let guidance = Arc::new(Some(guidance_config));
 
@@ -193,29 +188,15 @@ async fn test_guidance_config_with_tool_specific_guidance() {
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 
-    let mut tool_specific_guidance = HashMap::new();
-    let mut git_guidance = HashMap::new();
-    git_guidance.insert("tips".to_string(), "Git specific guidance".to_string());
-    let mut cargo_guidance = HashMap::new();
-    cargo_guidance.insert("tips".to_string(), "Cargo specific guidance".to_string());
-    tool_specific_guidance.insert("git".to_string(), git_guidance);
-    tool_specific_guidance.insert("cargo".to_string(), cargo_guidance);
+    let mut guidance_blocks = HashMap::new();
+    guidance_blocks.insert(
+        "default".to_string(),
+        "General guidance for all tools".to_string(),
+    );
+    guidance_blocks.insert("git".to_string(), "Git specific guidance".to_string());
+    guidance_blocks.insert("cargo".to_string(), "Cargo specific guidance".to_string());
 
-    let guidance_config = GuidanceConfig {
-        guidance_blocks: HashMap::new(),
-        templates: HashMap::new(),
-        legacy_guidance: Some(LegacyGuidanceConfig {
-            general_guidance: {
-                let mut general = HashMap::new();
-                general.insert(
-                    "default".to_string(),
-                    "General guidance for all tools".to_string(),
-                );
-                general
-            },
-            tool_specific_guidance,
-        }),
-    };
+    let guidance_config = GuidanceConfig { guidance_blocks };
     let guidance = Arc::new(Some(guidance_config));
     let configs = Arc::new(HashMap::new());
 

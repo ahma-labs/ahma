@@ -3797,11 +3797,17 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
                     "chat_entries": state.chat.entries().len(),
                     "model": state.selected_model(),
                 });
-                let _ = crate::agent_config::append_transcript_entry(
-                    &cwd,
-                    profile,
-                    &payload.to_string(),
-                );
+                // Blocking file append must not run on the async event loop
+                // (repo rule: no blocking I/O in async context) — hand it to
+                // the blocking pool; best-effort, as before.
+                let profile = profile.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = crate::agent_config::append_transcript_entry(
+                        &cwd,
+                        &profile,
+                        &payload.to_string(),
+                    );
+                });
             }
         }
         BridgeEvent::Error(msg) => {

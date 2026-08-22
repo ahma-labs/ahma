@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 use tokio::sync::{
     RwLock, broadcast,
@@ -160,27 +160,7 @@ fn default_completion_watch() -> Arc<watch::Sender<bool>> {
 impl Operation {
     /// Create a new operation info
     pub fn new(id: String, tool_name: String, description: String, result: Option<Value>) -> Self {
-        Self {
-            id,
-            tool_name,
-            description,
-            title: None,
-            cwd: None,
-            command: None,
-            parent_id: None,
-            state: OperationStatus::Pending,
-            result,
-            start_time: SystemTime::now(),
-            end_time: None,
-            first_wait_time: None,
-            timeout_duration: None,
-            cancellation_token: CancellationToken::new(),
-            completion_watch: Arc::new(watch::channel(false).0),
-            stdout_tail: VecDeque::new(),
-            alerts: Vec::new(),
-            output_file: None,
-            last_activity: SystemTime::now(),
-        }
+        Self::new_with_timeout(id, tool_name, description, result, None)
     }
 
     /// Create a new operation info with timeout
@@ -313,15 +293,6 @@ impl MonitorConfig {
     }
 }
 
-/// Check if an operation's tool name matches any of the given filter prefixes.
-/// Returns true if no filters are provided (i.e., all operations match).
-fn matches_tool_filter(op: &Operation, filters: &Option<Vec<String>>) -> bool {
-    filters.as_ref().is_none_or(|f| {
-        let name = op.tool_name.to_lowercase();
-        f.iter().any(|filter| name.starts_with(filter))
-    })
-}
-
 /// Build a structured JSON cancellation result for debugging/LLM visibility.
 fn build_cancellation_result(reason: Option<String>) -> Value {
     let reason_str = reason.unwrap_or_else(|| "Cancelled by user".to_string());
@@ -329,33 +300,6 @@ fn build_cancellation_result(reason: Option<String>) -> Value {
         "cancelled": true,
         "reason": reason_str
     })
-}
-
-/// Parse a comma-separated tool filter string into lowercase prefixes.
-fn parse_tool_filters(tool_filter: Option<&str>) -> Option<Vec<String>> {
-    tool_filter.map(|filters| {
-        filters
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .collect()
-    })
-}
-
-/// Log progressive timeout warnings at 50%, 75%, and 90% thresholds.
-fn log_progress_warnings(progress_percent: u8, remaining_secs: i64, warnings_sent: &mut [bool; 3]) {
-    const THRESHOLDS: [u8; 3] = [50, 75, 90];
-    const MESSAGES: [&str; 3] = [
-        "Wait operation 50% complete. Current active operations being monitored.",
-        "Wait operation 75% complete. Consider checking operation status.",
-        "Wait operation 90% complete. Operations may timeout soon!",
-    ];
-
-    for (i, &threshold) in THRESHOLDS.iter().enumerate() {
-        if progress_percent >= threshold && !warnings_sent[i] {
-            warnings_sent[i] = true;
-            tracing::warn!("{} - {}s remaining", MESSAGES[i], remaining_secs.max(0));
-        }
-    }
 }
 
 /// Operation monitor that tracks and manages cargo operations
@@ -697,13 +641,6 @@ impl OperationMonitor {
         self.events.emit(terminal_event_for(&op));
     }
 
-    /// Returns all currently active (non-terminal) operations.
-    ///
-    /// Note: Completed operations are accessible via `get_completed_operations`.
-    pub async fn get_all_active_operations(&self) -> Vec<Operation> {
-        self.get_active_operations().await
-    }
-
     pub async fn update_status(&self, id: &str, status: OperationStatus, result: Option<Value>) {
         let mut ops = self.operations.write().await;
         let mut operation_to_move = None;
@@ -835,7 +772,10 @@ impl OperationMonitor {
         cancelled
     }
 
-    pub async fn get_active_operations(&self) -> Vec<Operation> {
+    /// Returns all currently active (non-terminal) operations.
+    ///
+    /// Note: Completed operations are accessible via `get_completed_operations`.
+    pub async fn get_all_active_operations(&self) -> Vec<Operation> {
         let ops = self.operations.read().await;
         ops.values()
             .filter(|op| !op.state.is_terminal())
@@ -850,7 +790,7 @@ impl OperationMonitor {
 
     /// How many operations are running right now, excluding `exclude_id`.
     ///
-    /// Cheaper than [`Self::get_active_operations`] (no clone) because the only
+    /// Cheaper than [`Self::get_all_active_operations`] (no clone) because the only
     /// question asked is "is the caller already fanning out?" — which is what
     /// sizes the inline result window (SPEC R2.6.1). The operation being
     /// started is excluded because it is not something to overlap *with*.
@@ -862,7 +802,7 @@ impl OperationMonitor {
     }
 
     pub async fn get_shutdown_summary(&self) -> ShutdownSummary {
-        let operations = self.get_active_operations().await;
+        let operations = self.get_all_active_operations().await;
         let total_active = operations.len();
         ShutdownSummary {
             total_active,
@@ -977,110 +917,6 @@ impl OperationMonitor {
             // operation must already be in history at this point.
             self.check_completion_history_pub(id).await
         }
-    }
-
-    /// Get active operations that match the given tool filter.
-    async fn get_filtered_active_operations(
-        &self,
-        filters: &Option<Vec<String>>,
-    ) -> Vec<Operation> {
-        let ops = self.operations.read().await;
-        ops.values()
-            .filter(|op| !op.state.is_terminal())
-            .filter(|op| matches_tool_filter(op, filters))
-            .cloned()
-            .collect()
-    }
-
-    /// Collect completed operations from history that match the filter and finished
-    /// after the given start time.
-    async fn collect_completed_since(
-        &self,
-        filters: &Option<Vec<String>>,
-        since: SystemTime,
-    ) -> Vec<Operation> {
-        let history = self.completion_history.read().await;
-        history
-            .values()
-            .filter(|op| matches_tool_filter(op, filters))
-            .filter(|op| op.end_time.is_some_and(|t| t >= since))
-            .cloned()
-            .collect()
-    }
-
-    /// Collect all completed operations from history that match the filter.
-    async fn collect_all_completed(&self, filters: &Option<Vec<String>>) -> Vec<Operation> {
-        let history = self.completion_history.read().await;
-        history
-            .values()
-            .filter(|op| matches_tool_filter(op, filters))
-            .cloned()
-            .collect()
-    }
-
-    /// Advanced await functionality that waits for multiple operations with progressive timeout warnings.
-    ///
-    /// # Arguments
-    /// * `tool_filter` - Optional comma-separated list of tool prefixes to await for
-    /// * `timeout_seconds` - Timeout in seconds (1-1800 range, defaults to 240)
-    ///
-    /// # Returns
-    /// A vector of completed operations that match the filter criteria
-    pub async fn wait_for_operations_advanced(
-        &self,
-        tool_filter: Option<&str>,
-        timeout_seconds: Option<u32>,
-    ) -> Vec<Operation> {
-        let timeout_secs = timeout_seconds.unwrap_or(240).clamp(1, 1800);
-        let timeout = Duration::from_secs(timeout_secs as u64);
-        let start_time = Instant::now();
-        let tool_filters = parse_tool_filters(tool_filter);
-
-        tracing::info!(
-            "Starting advanced await operation: timeout={}s, tool_filter={:?}",
-            timeout_secs,
-            tool_filters
-        );
-
-        let mut warnings_sent = [false; 3];
-        let mut completed_operations = Vec::new();
-
-        loop {
-            let elapsed = start_time.elapsed();
-
-            if elapsed >= timeout {
-                tracing::warn!("Advanced await operation timed out after {}s", timeout_secs);
-                break;
-            }
-
-            let progress_percent = (elapsed.as_secs_f64() / timeout.as_secs_f64() * 100.0) as u8;
-            let remaining_secs = timeout_secs as i64 - elapsed.as_secs() as i64;
-            log_progress_warnings(progress_percent, remaining_secs, &mut warnings_sent);
-
-            let active_ops = self.get_filtered_active_operations(&tool_filters).await;
-
-            if active_ops.is_empty() {
-                completed_operations = self.collect_all_completed(&tool_filters).await;
-                tracing::info!(
-                    "Advanced await completed: {} operations finished, no active operations remaining",
-                    completed_operations.len()
-                );
-                break;
-            }
-
-            let wait_start_system_time = SystemTime::now() - elapsed;
-            let newly_completed = self
-                .collect_completed_since(&tool_filters, wait_start_system_time)
-                .await;
-            completed_operations.extend(newly_completed);
-
-            tokio::time::sleep(Duration::from_millis(
-                crate::constants::SEQUENCE_STEP_DELAY_MS,
-            ))
-            .await;
-        }
-
-        completed_operations
     }
 }
 
@@ -1808,7 +1644,7 @@ mod tests {
         for id in ["op_a", "op_b", "op_c"] {
             add_active_op(&monitor, id).await;
         }
-        assert_eq!(monitor.get_active_operations().await.len(), 3);
+        assert_eq!(monitor.get_all_active_operations().await.len(), 3);
 
         let mut cancelled = monitor
             .cancel_all_operations(Some("test teardown".to_string()))
@@ -1817,7 +1653,7 @@ mod tests {
 
         assert_eq!(cancelled, vec!["op_a", "op_b", "op_c"]);
         assert!(
-            monitor.get_active_operations().await.is_empty(),
+            monitor.get_all_active_operations().await.is_empty(),
             "no operation should remain active after cancel-all"
         );
         // Each cancelled op landed in history as Cancelled with the reason.

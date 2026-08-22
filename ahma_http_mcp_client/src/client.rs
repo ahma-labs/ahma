@@ -364,8 +364,6 @@ impl Transport<RoleClient> for HttpMcpTransport {
 
             // Try to parse response as JSON-RPC message and send to channel
             // Note: Notifications might not return a body, or return empty body
-            // Try to parse response as JSON-RPC message and send to channel
-            // Note: Notifications might not return a body, or return empty body
             // We read the full body bytes to determine if it's empty, rather than relying on
             // Content-Length header which might be missing or unreliable in some environments (e.g. CI).
             let body_bytes = res.bytes().await?;

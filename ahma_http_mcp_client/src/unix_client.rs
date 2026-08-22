@@ -11,7 +11,6 @@ pub use unix_impl::*;
 
 #[cfg(unix)]
 mod unix_impl {
-    use anyhow::Result;
     use rmcp::transport::{
         StreamableHttpClientTransport, UnixSocketHttpClient,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -28,10 +27,10 @@ mod unix_impl {
     pub fn unix_socket_transport(
         socket_path: &str,
         uri: &str,
-    ) -> Result<StreamableHttpClientTransport<UnixSocketHttpClient>> {
+    ) -> StreamableHttpClientTransport<UnixSocketHttpClient> {
         let client = UnixSocketHttpClient::new(socket_path, uri);
         let config = StreamableHttpClientTransportConfig::with_uri(uri);
-        Ok(StreamableHttpClientTransport::with_client(client, config))
+        StreamableHttpClientTransport::with_client(client, config)
     }
 }
 
@@ -50,21 +49,13 @@ mod tests {
         let socket = temp_dir.path().join("ahma.sock");
         let socket_path = socket.to_string_lossy();
 
-        let result = unix_socket_transport(&socket_path, "http://localhost/mcp");
-        assert!(
-            result.is_ok(),
-            "expected Ok transport for filesystem socket path"
-        );
+        let _transport = unix_socket_transport(&socket_path, "http://localhost/mcp");
     }
 
     /// A Linux abstract socket form (`@`-prefixed) also constructs successfully.
     #[tokio::test]
     async fn abstract_socket_path_constructs_ok() {
-        let result = unix_socket_transport("@ahma", "http://localhost/mcp");
-        assert!(
-            result.is_ok(),
-            "expected Ok transport for abstract socket name"
-        );
+        let _transport = unix_socket_transport("@ahma", "http://localhost/mcp");
     }
 
     /// Different URI values all construct successfully.
@@ -79,8 +70,7 @@ mod tests {
             "http://127.0.0.1:3000/mcp",
             "http://example.invalid/api/v1/mcp",
         ] {
-            let result = unix_socket_transport(&socket_path, uri);
-            assert!(result.is_ok(), "expected Ok transport for uri {uri}");
+            let _transport = unix_socket_transport(&socket_path, uri);
         }
     }
 }
