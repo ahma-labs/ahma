@@ -1,7 +1,7 @@
 use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
-use ahma_common::file_uri::encode_file_uri;
-use ahma_common::mcp_methods::{INITIALIZED_METHOD, ROOTS_LIST_METHOD, SANDBOX_CONFIGURED_METHOD};
-use ahma_common::sse::{event_data_to_json, pop_next_sse_event};
+use ahma_http_mcp_client::streamable::{
+    ConflictRetryPolicy, ConnectOptions, Connector, StreamableHttpMcpClient, ToolCallOutcome,
+};
 use ahma_llm_monitor::ChatMessage;
 use ahma_llm_monitor::client::LlmClient;
 use ahma_mcp::ActiveAgentSession;
@@ -1362,202 +1362,31 @@ async fn spawn_external_tool_call_http(
     call_mcp_tool_http(&client, &url, &sid, tool, arguments).await
 }
 
-/// Extract the `mcp-session-id` from an `initialize` response, or build a
-/// **diagnostic** error including the HTTP status and a bounded body snippet.
-///
-/// The bare "missing header" message hides the real failure — auth (401),
-/// session limit (429), a bridge init-forward error (500), or the request
-/// hitting an endpoint that isn't the MCP bridge at all. Because the header is
-/// absent in every one of those cases, the agent loop used to see the same
-/// opaque string and retry blindly. Surfacing status + body makes the actual
-/// cause visible in the chat and in logs. `context` distinguishes the internal
-/// vs. external handshake in the message.
-async fn session_id_from_initialize(
-    resp: reqwest::Response,
-    context: &str,
-) -> Result<String, String> {
-    if let Some(sid) = resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-    {
-        return Ok(sid.to_string());
-    }
-
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    let snippet: String = body.chars().take(500).collect();
-    let body_note = if snippet.trim().is_empty() {
-        "<empty body>".to_string()
-    } else {
-        snippet
-    };
-    Err(format!(
-        "No mcp-session-id header in {context} (HTTP {status}). \
-         This usually means the request reached something other than a locked \
-         ahma bridge session — check auth, session limits, and that the bridge \
-         URL is correct. Response body: {body_note}"
-    ))
-}
-
+/// Initialize a session against an *external* Streamable-HTTP MCP server via
+/// the shared client's minimal handshake (initialize +
+/// `notifications/initialized`). Intentionally no SSE stream and no roots
+/// answering: external servers are not assumed to implement ahma's
+/// roots/sandbox gate, and this path never performed that handshake —
+/// preserved as-is from the pre-unification implementation.
 async fn get_or_create_external_session(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<String, String> {
-    let init_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "roots": { "listChanged": false } },
-            "clientInfo": { "name": "ahma-core-external-tool", "version": env!("CARGO_PKG_VERSION") }
-        }
-    });
-
-    let resp = client
-        .post(url)
-        .json(&init_body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to initialize external session: {e}"))?;
-
-    let sid = session_id_from_initialize(resp, "external initialize response").await?;
-
-    let initialized_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": INITIALIZED_METHOD
-    });
-
-    let _ = client
-        .post(url)
-        .header("mcp-session-id", &sid)
-        .json(&initialized_body)
-        .send()
-        .await;
-
-    Ok(sid)
-}
-
-/// Long-lived SSE listener for an agent-created MCP session.
-///
-/// The bridge gates `tools/call` **per session**: a session that never answers
-/// the bridge's `roots/list` request stays in `AwaitingRoots` and every
-/// `tools/call` returns HTTP 409 "Sandbox initializing". The GET `/mcp` SSE
-/// stream is the only channel over which the bridge can deliver `roots/list`,
-/// so it must be open *before* `notifications/initialized` (handshake ordering
-/// required by SPEC). This task:
-///   1. opens the stream and signals `ready_tx` once it is established,
-///   2. answers `roots/list` with the workspace scope (locking the sandbox for
-///      this session), and
-///   3. signals `locked_tx` when the bridge confirms via
-///      `notifications/sandbox/configured`.
-///
-/// It then keeps the stream open for the session lifetime.
-async fn run_session_sse_listener(
-    sse_client: reqwest::Client,
-    post_client: reqwest::Client,
-    sse_url: String,
-    session_id: String,
-    workspace_root: std::path::PathBuf,
-    ready_tx: tokio::sync::oneshot::Sender<()>,
-    mut locked_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) -> Result<(), String> {
-    let response = sse_client
-        .get(&sse_url)
-        .header("Accept", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("mcp-session-id", &session_id)
-        .send()
-        .await
-        .map_err(|e| format!("SSE GET failed: {e}"))?;
-
-    if !response.status().is_success() {
-        // Dropping `ready_tx` here makes the caller observe a failed handshake.
-        return Err(format!("SSE stream failed with HTTP {}", response.status()));
-    }
-    let _ = ready_tx.send(());
-
-    let mut resp = response;
-    let mut buffer = String::new();
-    while let Ok(Some(bytes)) = resp.chunk().await {
-        let Ok(chunk_str) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        buffer.push_str(chunk_str);
-        while let Some(raw_event) = pop_next_sse_event(&mut buffer) {
-            let Some(value) = event_data_to_json(&raw_event) else {
-                continue;
-            };
-            handle_session_sse_event(
-                &value,
-                &post_client,
-                &sse_url,
-                &session_id,
-                &workspace_root,
-                &mut locked_tx,
-            )
-            .await;
-        }
-    }
-
-    Ok(())
-}
-
-/// Dispatch one decoded SSE event received during the session listener's
-/// lifetime: signal `locked_tx` on sandbox-configured confirmation, and
-/// answer server-initiated `roots/list` requests.
-async fn handle_session_sse_event(
-    value: &serde_json::Value,
-    post_client: &reqwest::Client,
-    sse_url: &str,
-    session_id: &str,
-    workspace_root: &std::path::Path,
-    locked_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
-) {
-    let method = value.get("method").and_then(|m| m.as_str());
-
-    if method == Some(SANDBOX_CONFIGURED_METHOD)
-        && let Some(tx) = locked_tx.take()
-    {
-        let _ = tx.send(());
-    }
-
-    if method == Some(ROOTS_LIST_METHOD)
-        && let Some(request_id) = value.get("id").cloned()
-    {
-        respond_to_roots_list(post_client, sse_url, session_id, request_id, workspace_root).await;
-    }
-}
-
-/// Answer a server-initiated `roots/list` request over the SSE session by
-/// POSTing back a single-root result describing the sandboxed workspace.
-async fn respond_to_roots_list(
-    post_client: &reqwest::Client,
-    sse_url: &str,
-    session_id: &str,
-    request_id: serde_json::Value,
-    workspace_root: &std::path::Path,
-) {
-    let roots = vec![serde_json::json!({
-        "uri": encode_file_uri(workspace_root),
-        "name": workspace_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("workspace"),
-    })];
-    let roots_response = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": { "roots": roots }
-    });
-    let _ = post_client
-        .post(sse_url)
-        .header("Content-Type", "application/json")
-        .header("mcp-session-id", session_id)
-        .json(&roots_response)
-        .send()
-        .await;
+    let connector = Connector {
+        mcp_url: url.to_string(),
+        post_client: client.clone(),
+        sse_client: client.clone(),
+    };
+    // clientInfo.name is load-bearing (the server keys behaviour off it) —
+    // this consumer keeps its own identity.
+    let session = StreamableHttpMcpClient::connect_minimal(
+        connector,
+        "ahma-core-external-tool",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .map_err(|e| format!("Failed to initialize external session: {e:#}"))?;
+    Ok(session.session_id().to_string())
 }
 
 /// Process-wide cache of MCP sessions this process has already negotiated
@@ -1620,93 +1449,33 @@ pub async fn get_or_create_session(
         return Ok(sid);
     }
 
-    // Step 1: initialize → obtain the session id.
-    let init_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "roots": { "listChanged": false } },
-            "clientInfo": { "name": "ahma-core-tool", "version": env!("CARGO_PKG_VERSION") }
-        }
-    });
-
-    let resp = client
-        .post(url)
-        .json(&init_body)
-        .send()
+    // Full MCP Streamable-HTTP handshake via the shared client: initialize,
+    // open the GET /mcp SSE stream BEFORE notifications/initialized, answer
+    // the bridge's roots/list with the workspace scope, then wait (non-fatal)
+    // for notifications/sandbox/configured so the first tools/call doesn't
+    // race the lock. The SSE listener stays alive for the session lifetime.
+    let connector = Connector {
+        mcp_url: url.to_string(),
+        post_client: client.clone(),
+        sse_client: client.clone(),
+    };
+    let opts = ConnectOptions {
+        // clientInfo.name is load-bearing: the bridge keys `supports_progress`
+        // and `request_budget` off it.
+        client_name: "ahma-core-tool".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        roots: vec![mcp.workspace_root.clone()],
+        notifications: None,
+        // Pre-unification values, preserved: 5 s for the SSE return stream to
+        // open (fatal), 10 s for the sandbox-lock confirmation (non-fatal —
+        // tools/call retries through the 409 gate).
+        sse_open_timeout: std::time::Duration::from_secs(5),
+        sandbox_lock_timeout: Some(std::time::Duration::from_secs(10)),
+    };
+    let session = StreamableHttpMcpClient::connect(connector, opts)
         .await
-        .map_err(|e| format!("Failed to initialize session: {e}"))?;
-
-    let sid = session_id_from_initialize(resp, "initialize response").await?;
-
-    // Step 2: open the GET /mcp SSE stream BEFORE announcing readiness, so the
-    // bridge has a channel to deliver its roots/list request. The listener is
-    // detached and kept alive for the session lifetime.
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
-    {
-        let sse_client = client.clone();
-        let post_client = client.clone();
-        let sse_url = url.to_string();
-        let sid_clone = sid.clone();
-        let workspace_root = mcp.workspace_root.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_session_sse_listener(
-                sse_client,
-                post_client,
-                sse_url,
-                sid_clone,
-                workspace_root,
-                ready_tx,
-                Some(locked_tx),
-            )
-            .await
-            {
-                tracing::warn!("agent MCP SSE listener ended: {e}");
-            }
-        });
-    }
-
-    // A dropped sender (Err) or timeout means the SSE stream never opened; abort
-    // so the caller surfaces a real error instead of a half-open session that
-    // can never receive roots/list (and thus always 409s).
-    match tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx).await {
-        Ok(Ok(())) => {}
-        _ => {
-            return Err("MCP SSE stream failed to open; sandbox handshake aborted".to_string());
-        }
-    }
-
-    // Step 3: notifications/initialized (only now that the SSE return stream is
-    // live). The bridge responds by sending roots/list over the SSE stream,
-    // which the listener answers.
-    let initialized_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": INITIALIZED_METHOD
-    });
-    let _ = client
-        .post(url)
-        .header("mcp-session-id", &sid)
-        .json(&initialized_body)
-        .send()
-        .await;
-
-    // Step 4: wait until the bridge confirms the sandbox is locked for this
-    // session. The lock completes a few ms after roots/list is answered; without
-    // this wait the first tools/call can still race ahead and 409. A timeout is
-    // non-fatal — the listener keeps running and call_mcp_tool_http retries on
-    // 409 — so we proceed rather than fail the whole turn.
-    match tokio::time::timeout(std::time::Duration::from_secs(10), locked_rx).await {
-        Ok(Ok(())) => {}
-        _ => {
-            tracing::warn!(
-                session_id = %sid,
-                "MCP sandbox lock not confirmed within timeout; proceeding (tools/call will retry on 409)"
-            );
-        }
-    }
+        .map_err(|e| format!("{e:#}"))?;
+    let sid = session.session_id().to_string();
 
     SESSION_CACHE
         .lock()
@@ -1769,54 +1538,27 @@ pub async fn call_mcp_tool_http(
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<(String, bool), String> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": tool,
-            "arguments": arguments
-        }
-    });
+    let session = StreamableHttpMcpClient::attach(client.clone(), url, session_id);
 
     // A 409 means the session's sandbox lock has not finalised yet (the
     // roots/list → lock round-trip completes a few ms after the handshake). The
     // bridge's own contract is "retry tools/call after handshake completes", so
     // retry briefly rather than surfacing a misleading "sandbox initializing"
-    // error to the model on the very first call.
-    const MAX_409_RETRIES: u32 = 5;
-    let mut attempt: u32 = 0;
-    let resp = loop {
-        let resp = client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .header("mcp-session-id", session_id)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP request failed: {e}"))?;
-
-        if resp.status() == reqwest::StatusCode::CONFLICT && attempt < MAX_409_RETRIES {
-            attempt += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            continue;
-        }
-        break resp;
+    // error to the model on the very first call. Pre-unification values,
+    // preserved: 5 retries × 300 ms.
+    let retry = ConflictRetryPolicy {
+        max_retries: 5,
+        delay: std::time::Duration::from_millis(300),
     };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("HTTP {status}: {text}"));
-    }
-
-    let json_resp = resp
-        .json::<serde_json::Value>()
+    match session
+        .call_tool(tool, arguments, retry)
         .await
-        .map_err(|e| format!("Failed to parse tool response JSON: {e}"))?;
-
-    Ok(parse_mcp_response(&json_resp))
+        .map_err(|e| format!("{e:#}"))?
+    {
+        ToolCallOutcome::Success(json_resp) => Ok(parse_mcp_response(&json_resp)),
+        ToolCallOutcome::SandboxInitializing { body } => Err(format!("HTTP 409 Conflict: {body}")),
+        ToolCallOutcome::HttpError { status, body } => Err(format!("HTTP {status}: {body}")),
+    }
 }
 
 pub fn needs_approval(tool_name: &str, tool_approval_enabled: bool) -> bool {
@@ -3718,7 +3460,7 @@ mod tests {
         )
         .await
         .expect_err("unparseable body must error");
-        assert!(err.contains("Failed to parse tool response JSON"), "{err}");
+        assert!(err.contains("failed to parse tools/call response"), "{err}");
     }
 
     #[tokio::test]
@@ -3804,10 +3546,14 @@ mod tests {
         let err = dispatch_tool_execution("ext::do", serde_json::json!({}), &cfg)
             .await
             .expect_err("missing session header must error");
+        // The error must identify the *external* handshake and stay
+        // diagnostic (missing session header), matching the shared client's
+        // message wrapped by `get_or_create_external_session`.
         assert!(
-            err.contains("No mcp-session-id header in external initialize response"),
+            err.contains("Failed to initialize external session"),
             "{err}"
         );
+        assert!(err.contains("No mcp-session-id header"), "{err}");
     }
 
     #[tokio::test]

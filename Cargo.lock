@@ -88,6 +88,7 @@ name = "ahma_core"
 version = "0.19.4"
 dependencies = [
  "ahma_common",
+ "ahma_http_mcp_client",
  "ahma_llm_monitor",
  "ahma_mcp",
  "anyhow",
@@ -181,6 +182,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "axum",
  "clap",
  "dirs",
  "futures",
@@ -284,6 +286,7 @@ dependencies = [
  "ahma_common",
  "ahma_core",
  "ahma_http_bridge",
+ "ahma_http_mcp_client",
  "ahma_llm_monitor",
  "ahma_mcp",
  "anyhow",

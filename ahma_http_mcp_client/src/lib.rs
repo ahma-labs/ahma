@@ -37,6 +37,8 @@
 pub mod client;
 /// Error types for HTTP MCP client operations.
 pub mod error;
+/// Shared MCP Streamable-HTTP client (handshake, SSE, roots, 409 gate).
+pub mod streamable;
 /// Unix domain socket MCP transport (Unix only).
 #[cfg(unix)]
 pub mod unix_client;

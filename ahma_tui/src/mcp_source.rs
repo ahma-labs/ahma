@@ -6,11 +6,10 @@
 
 use std::time::Duration;
 
-use ahma_common::file_uri::encode_file_uri;
-use ahma_common::mcp_methods::{
-    INITIALIZED_METHOD, ROOTS_LIST_METHOD, SANDBOX_CONFIGURED_METHOD, SANDBOX_FAILED_METHOD,
+use ahma_common::mcp_methods::{SANDBOX_CONFIGURED_METHOD, SANDBOX_FAILED_METHOD};
+use ahma_http_mcp_client::streamable::{
+    ConflictRetryPolicy, ConnectOptions, Connector, StreamableHttpMcpClient, ToolCallOutcome,
 };
-use ahma_common::sse::{event_data_to_json, pop_next_sse_event};
 use anyhow::Result;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -200,7 +199,7 @@ async fn mcp_source_task(
 
     let mut prev_healthy = false;
     let mut prev_status_ok = true;
-    let mut mcp_state: Option<McpSession> = None;
+    let mut mcp_state: Option<StreamableHttpMcpClient> = None;
 
     // Backoff state for MCP session init failures.  After each consecutive
     // failure the wait grows (1 s → 3 s → 8 s → 20 s → 60 s cap) to avoid
@@ -230,7 +229,7 @@ async fn mcp_source_task(
                     Some(McpSourceCommand::RefreshLogs) => {
                         if prev_healthy
                             && let Some(ref session) = mcp_state
-                            && let Ok(files) = call_logs_list(&client, &request_base_url, session).await
+                            && let Ok(files) = call_logs_list(session).await
                         {
                             send(&tx, SourceEvent::LogFilesUpdated { files }).await;
                         }
@@ -246,7 +245,7 @@ async fn mcp_source_task(
                         // 5-second SSE-drop grace period, allowing the auto-spawned bridge to
                         // idle-exit promptly once no client is connected.
                         if let Some(ref session) = mcp_state {
-                            delete_mcp_session(&client, &request_base_url, session.id()).await;
+                            session.delete_session(Duration::from_secs(2)).await;
                         }
                         break;
                     }
@@ -302,9 +301,9 @@ async fn mcp_source_task(
                     match init_mcp_session(&client, &sse_client, &request_base_url, workspace_path.clone(), tx.clone()).await {
                         Ok(session) => {
                             init_fail_count = 0;
-                            send(&tx, SourceEvent::SessionId { id: session.id.clone() }).await;
+                            send(&tx, SourceEvent::SessionId { id: session.session_id().to_string() }).await;
                             // Fetch tools list once after connecting
-                            if let Ok(tools) = call_tools_list(&client, &request_base_url, &session).await {
+                            if let Ok(tools) = call_tools_list(&session).await {
                                 send(&tx, SourceEvent::ToolsListUpdated { tools }).await;
                             }
                             mcp_state = Some(session);
@@ -322,7 +321,7 @@ async fn mcp_source_task(
 
                 // Call status to get current operations
                 if let Some(ref session) = mcp_state {
-                    match call_status(&client, &request_base_url, session).await {
+                    match call_status(&request_base_url, session).await {
                         Ok(StatusPoll::Ready(ops)) => {
                             prev_status_ok = true;
                             send(&tx, SourceEvent::OperationsUpdated { ops }).await;
@@ -348,7 +347,7 @@ async fn mcp_source_task(
                             // while it stays alive server-side, and repeated hiccups can pile
                             // up enough orphaned sessions to blow through the server's
                             // concurrent-session cap.
-                            delete_mcp_session(&client, &request_base_url, session.id()).await;
+                            session.delete_session(Duration::from_secs(2)).await;
                             mcp_state = None;
                             // Same backoff as init failures — a run of status hiccups
                             // must not re-init every 3-10s and keep growing the pile.
@@ -366,7 +365,7 @@ async fn mcp_source_task(
                 if !prev_healthy { continue; }
                 if let Some(ref session) = mcp_state {
                     // 1. Poll logs list
-                    let files = match call_logs_list(&client, &request_base_url, session).await {
+                    let files = match call_logs_list(session).await {
                         Ok(f) => {
                             send(&tx, SourceEvent::LogFilesUpdated { files: f.clone() }).await;
                             f
@@ -399,8 +398,6 @@ async fn mcp_source_task(
                         if file_size_changed || last_read_offset == 0 {
                             let limit = if last_read_offset == 0 { 500 } else { 100 };
                             match call_logs_read(
-                                &client,
-                                &request_base_url,
                                 session,
                                 active_file,
                                 last_read_offset,
@@ -430,38 +427,20 @@ async fn mcp_source_task(
 
 // ─── MCP session ──────────────────────────────────────────────────────────────
 
-struct McpSession {
-    id: String,
-    next_id: std::sync::atomic::AtomicU64,
-}
-
-impl McpSession {
-    fn new(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            next_id: std::sync::atomic::AtomicU64::new(10),
-        }
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn next_req_id(&self) -> u64 {
-        self.next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-/// Perform the minimal MCP handshake required before tool calls:
-/// `initialize` → get session ID, `notifications/initialized` → ready, and start long-lived GET /mcp SSE stream.
+/// Perform the full MCP Streamable-HTTP handshake via the shared client:
+/// `initialize` → open the long-lived GET /mcp SSE stream BEFORE
+/// `notifications/initialized` → answer the server's `roots/list` with the
+/// workspace scope. The shared client answers `roots/list` itself; we
+/// deliberately do NOT proactively POST an empty roots list — doing so races
+/// the real reply and can lock the sandbox with zero scopes (every subsequent
+/// tool call then 409s).
 async fn init_mcp_session(
     client: &reqwest::Client,
     sse_client: &reqwest::Client,
     base_url: &str,
     workspace_path: Option<std::path::PathBuf>,
     tx: mpsc::Sender<SourceEvent>,
-) -> Result<McpSession> {
+) -> Result<StreamableHttpMcpClient> {
     send(
         &tx,
         SourceEvent::SandboxStatus {
@@ -471,111 +450,50 @@ async fn init_mcp_session(
     .await;
     let url = format!("{base_url}/mcp");
 
-    // Step 1: initialize
-    let init_body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "roots": { "listChanged": false } },
-            "clientInfo": { "name": "ahma-tui", "version": env!("CARGO_PKG_VERSION") }
-        }
-    });
-
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&init_body)
-        .send()
-        .await?;
-
-    let session_id = resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("no mcp-session-id in initialize response"))?;
-
-    // Step 1.5: Open the long-lived GET /mcp SSE stream BEFORE announcing readiness.
-    //
-    // The MCP Streamable-HTTP handshake requires the SSE return stream to be open
-    // before `notifications/initialized`; otherwise the server has nowhere to
-    // deliver its roots/list request and the session hangs with no response
-    // (observed as repeated "Broadcasting to 0 SSE subscribers" on the bridge).
-    // The listener signals `ready_rx` once the GET returns 2xx.
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let sse_client_clone = sse_client.clone();
-    let client_clone = client.clone();
-    let sse_url_clone = url.clone();
-    let session_id_clone = session_id.clone();
-    let workspace_path_clone = workspace_path.clone();
-    let tx_clone = tx.clone();
-
-    tokio::spawn(async move {
-        if let Err(e) = run_sse_listener(
-            sse_client_clone,
-            client_clone,
-            sse_url_clone,
-            session_id_clone,
-            workspace_path_clone,
-            tx_clone,
-            Some(ready_tx),
-        )
-        .await
-        {
-            warn!("TUI MCP SSE listener terminated with error: {e:#}");
-        }
-    });
-
-    // Wait for the SSE stream to be established. A dropped sender (Err) means the
-    // listener failed before the stream opened; a timeout means it never did.
-    // Either way we abort the handshake so the caller retries with backoff rather
-    // than proceeding into a half-open session that can never receive responses.
-    match tokio::time::timeout(Duration::from_secs(5), ready_rx).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            return Err(anyhow::anyhow!(
-                "MCP SSE stream failed to open; aborting handshake"
-            ));
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "timed out waiting for MCP SSE stream to open; aborting handshake"
-            ));
-        }
+    // Server-pushed notifications (sandbox scope/failure above all) are
+    // translated into SourceEvents by a dedicated task; the shared client's
+    // SSE listener forwards every decoded event onto this channel.
+    let (notif_tx, mut notif_rx) = mpsc::channel::<Value>(64);
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(value) = notif_rx.recv().await {
+                handle_notification(&value, &tx).await;
+            }
+        });
     }
 
-    // Step 2: notifications/initialized (only now that the SSE return stream is live).
-    let notif_body = json!({
-        "jsonrpc": "2.0",
-        "method": INITIALIZED_METHOD
+    // Determine the workspace root to answer roots/list with.
+    let actual_path = workspace_path.unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     });
-    let _ = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("mcp-session-id", &session_id)
-        .json(&notif_body)
-        .send()
-        .await;
 
-    // The server's roots/list request is answered over the SSE stream by
-    // `handle_sse_event`, which replies with the actual workspace scope. We
-    // deliberately do NOT proactively POST an empty roots list here: doing so
-    // races the real reply and can lock the sandbox with zero scopes (every
-    // subsequent tool call then 409s).
-
-    Ok(McpSession::new(session_id))
+    let connector = Connector {
+        mcp_url: url,
+        post_client: client.clone(),
+        sse_client: sse_client.clone(),
+    };
+    let opts = ConnectOptions {
+        // clientInfo.name is load-bearing: the server keys `supports_progress`
+        // and `request_budget` off it.
+        client_name: "ahma-tui".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        roots: vec![actual_path],
+        notifications: Some(notif_tx),
+        // Pre-unification value, preserved: 5 s for the SSE stream to open.
+        sse_open_timeout: Duration::from_secs(5),
+        // The TUI does not wait for the sandbox lock here (preserved): the
+        // status poll treats the 409 gate as `StatusPoll::Initializing` and
+        // keeps the session until the lock settles.
+        sandbox_lock_timeout: None,
+    };
+    StreamableHttpMcpClient::connect(connector, opts).await
 }
 
-async fn handle_sse_event(
-    client: &reqwest::Client,
-    mcp_url: &str,
-    value: &Value,
-    session_id: &str,
-    workspace_path: Option<&std::path::Path>,
-    tx: &mpsc::Sender<SourceEvent>,
-) -> Result<()> {
+/// Translate one server-pushed notification into `SourceEvent`s. `roots/list`
+/// is answered by the shared client's SSE listener before it reaches here, so
+/// this only reacts to the sandbox lifecycle notifications.
+async fn handle_notification(value: &Value, tx: &mpsc::Sender<SourceEvent>) {
     let method = value.get("method").and_then(|m| m.as_str());
 
     if method == Some(SANDBOX_FAILED_METHOD) {
@@ -675,146 +593,35 @@ async fn handle_sse_event(
         }
     }
 
-    if method == Some(ROOTS_LIST_METHOD) {
-        let request_id = value
-            .get("id")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("roots/list must include id"))?;
-
-        // Determine workspace path to send
-        let actual_path = workspace_path.map(|p| p.to_path_buf()).unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        });
-
-        let roots_json = vec![json!({
-            "uri": encode_file_uri(&actual_path),
-            "name": actual_path.file_name().and_then(|n| n.to_str()).unwrap_or("workspace")
-        })];
-
-        let roots_response = json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "roots": roots_json
-            }
-        });
-
-        debug!("Sending roots response: {:?}", roots_response);
-        let _ = client
-            .post(mcp_url)
-            .header("Content-Type", "application/json")
-            .header("mcp-session-id", session_id)
-            .json(&roots_response)
-            .send()
-            .await;
-    }
-
-    Ok(())
-}
-
-async fn run_sse_listener(
-    sse_client: reqwest::Client,
-    client: reqwest::Client,
-    sse_url: String,
-    session_id: String,
-    workspace_path: Option<std::path::PathBuf>,
-    tx: mpsc::Sender<SourceEvent>,
-    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) -> Result<()> {
-    let response = sse_client
-        .get(&sse_url)
-        .header("Accept", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("mcp-session-id", &session_id)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        // `ready_tx` is dropped here, which the caller observes as a failed
-        // handshake (the SSE return stream never opened).
-        return Err(anyhow::anyhow!(
-            "SSE stream failed with HTTP {}",
-            response.status()
-        ));
-    }
-
-    // The GET /mcp SSE stream is now established server-side, so the server has
-    // a channel to deliver roots/list and notifications. Signal the caller that
-    // it is safe to send `notifications/initialized` (see `init_mcp_session`).
-    if let Some(ready_tx) = ready_tx {
-        let _ = ready_tx.send(());
-    }
-
-    let mut resp = response;
-    let mut buffer = String::new();
-    while let Ok(Some(bytes)) = resp.chunk().await {
-        if let Ok(chunk_str) = std::str::from_utf8(&bytes) {
-            buffer.push_str(chunk_str);
-            while let Some(raw_event) = pop_next_sse_event(&mut buffer) {
-                if let Some(json_val) = event_data_to_json(&raw_event)
-                    && let Err(e) = handle_sse_event(
-                        &client,
-                        &sse_url,
-                        &json_val,
-                        &session_id,
-                        workspace_path.as_deref(),
-                        &tx,
-                    )
-                    .await
-                {
-                    debug!("Error handling SSE event: {:?}", e);
-                }
-            }
-        }
-    }
-
-    Ok(())
+    // `roots/list` is intentionally not handled here: the shared client's SSE
+    // listener answers it with the workspace scope before forwarding the event.
 }
 
 // ─── Tool calls ───────────────────────────────────────────────────────────────
 
-/// POST one JSON-RPC request to the bridge's `/mcp` endpoint with the shared
-/// session headers, returning the raw HTTP response for the caller to inspect.
-async fn post_json_rpc(
-    client: &reqwest::Client,
-    base_url: &str,
-    session: &McpSession,
-    method: &str,
-    params: Value,
-) -> Result<reqwest::Response> {
-    let url = format!("{base_url}/mcp");
-    let req_id = session.next_req_id();
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": method,
-        "params": params
-    });
-
-    Ok(client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("mcp-session-id", &session.id)
-        .json(&body)
-        .send()
-        .await?)
-}
-
-/// Invoke an MCP tool via `tools/call`, decode the JSON-RPC response, and turn
-/// a JSON-RPC `error` object into an `Err` tagged with the tool name.
+/// Invoke an MCP tool via `tools/call` (no 409 retries — the TUI polls on its
+/// own cadence), decode the JSON-RPC response, and turn a JSON-RPC `error`
+/// object (or a transport-level failure) into an `Err` tagged with the tool
+/// name.
 async fn call_tool_json(
-    client: &reqwest::Client,
-    base_url: &str,
-    session: &McpSession,
+    session: &StreamableHttpMcpClient,
     tool: &str,
     args: Value,
 ) -> Result<Value> {
-    let params = json!({ "name": tool, "arguments": args });
-    let resp = post_json_rpc(client, base_url, session, "tools/call", params)
+    let resp = match session
+        .call_tool(tool, args, ConflictRetryPolicy::NONE)
         .await?
-        .json::<Value>()
-        .await?;
+    {
+        ToolCallOutcome::Success(resp) => resp,
+        ToolCallOutcome::SandboxInitializing { body } => {
+            return Err(anyhow::anyhow!(
+                "{tool} error: sandbox initializing: {body}"
+            ));
+        }
+        ToolCallOutcome::HttpError { status, body } => {
+            return Err(anyhow::anyhow!("{tool} failed: HTTP {status}: {body}"));
+        }
+    };
 
     if let Some(err) = resp.get("error") {
         let err_msg = err
@@ -825,18 +632,6 @@ async fn call_tool_json(
     }
 
     Ok(resp)
-}
-
-/// Best-effort `DELETE /mcp` so the bridge frees the session immediately
-/// instead of waiting for its idle/SSE-drop grace period.
-async fn delete_mcp_session(client: &reqwest::Client, base_url: &str, session_id: &str) {
-    let mcp_url = format!("{base_url}/mcp");
-    let _ = client
-        .delete(&mcp_url)
-        .header("mcp-session-id", session_id)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await;
 }
 
 /// Exponential backoff after consecutive MCP session failures, capped at 60 s:
@@ -852,41 +647,17 @@ fn backoff_secs(fail_count: u32) -> u64 {
 }
 
 async fn call_tools_list(
-    client: &reqwest::Client,
-    base_url: &str,
-    session: &McpSession,
+    session: &StreamableHttpMcpClient,
 ) -> Result<Vec<crate::mcp_connections::ToolInfo>> {
-    let resp = post_json_rpc(client, base_url, session, "tools/list", json!({}))
-        .await?
-        .json::<Value>()
-        .await?;
-
-    let tools = resp
-        .pointer("/result/tools")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| {
-                    let name = t.get("name").and_then(|n| n.as_str())?;
-                    let description = t
-                        .get("description")
-                        .and_then(|d| d.as_str())
-                        .map(String::from);
-                    let input_schema = t.get("inputSchema").cloned().unwrap_or(serde_json::json!({
-                        "type": "object",
-                        "additionalProperties": true
-                    }));
-                    Some(crate::mcp_connections::ToolInfo {
-                        name: name.to_string(),
-                        description,
-                        input_schema,
-                    })
-                })
-                .collect()
+    let tools = session.tools_list().await?;
+    Ok(tools
+        .into_iter()
+        .map(|t| crate::mcp_connections::ToolInfo {
+            name: t.name,
+            description: t.description,
+            input_schema: t.input_schema,
         })
-        .unwrap_or_default();
-
-    Ok(tools)
+        .collect())
 }
 
 fn status_call_error(url: &str, status: reqwest::StatusCode) -> anyhow::Error {
@@ -913,27 +684,19 @@ enum StatusPoll {
     Initializing,
 }
 
-async fn call_status(
-    client: &reqwest::Client,
-    base_url: &str,
-    session: &McpSession,
-) -> Result<StatusPoll> {
-    let params = json!({ "name": "status", "arguments": {} });
-    let resp = post_json_rpc(client, base_url, session, "tools/call", params).await?;
-
-    if resp.status() == reqwest::StatusCode::CONFLICT {
-        // Transient: sandbox still locking. Keep the session and retry.
-        return Ok(StatusPoll::Initializing);
+async fn call_status(base_url: &str, session: &StreamableHttpMcpClient) -> Result<StatusPoll> {
+    // No in-call 409 retries (preserved): a CONFLICT means the sandbox is
+    // still locking — keep the session and retry on the next status tick.
+    match session
+        .call_tool("status", json!({}), ConflictRetryPolicy::NONE)
+        .await?
+    {
+        ToolCallOutcome::SandboxInitializing { .. } => Ok(StatusPoll::Initializing),
+        ToolCallOutcome::HttpError { status, .. } => {
+            Err(status_call_error(&format!("{base_url}/mcp"), status))
+        }
+        ToolCallOutcome::Success(val) => Ok(StatusPoll::Ready(parse_operations(&val))),
     }
-
-    if !resp.status().is_success() {
-        let s = resp.status();
-        return Err(status_call_error(&format!("{base_url}/mcp"), s));
-    }
-
-    let val = resp.json::<Value>().await?;
-    let ops = parse_operations(&val);
-    Ok(StatusPoll::Ready(ops))
 }
 
 // ─── Parsing helpers ──────────────────────────────────────────────────────────
@@ -1088,12 +851,8 @@ async fn send(tx: &mpsc::Sender<SourceEvent>, event: SourceEvent) {
     let _ = tx.send(event).await; // ignore channel-closed errors
 }
 
-async fn call_logs_list(
-    client: &reqwest::Client,
-    base_url: &str,
-    session: &McpSession,
-) -> Result<Vec<LogFileInfo>> {
-    let resp = call_tool_json(client, base_url, session, "logs_list", json!({})).await?;
+async fn call_logs_list(session: &StreamableHttpMcpClient) -> Result<Vec<LogFileInfo>> {
+    let resp = call_tool_json(session, "logs_list", json!({})).await?;
 
     let content_text = resp
         .pointer("/result/content/0/text")
@@ -1105,9 +864,7 @@ async fn call_logs_list(
 }
 
 async fn call_logs_read(
-    client: &reqwest::Client,
-    base_url: &str,
-    session: &McpSession,
+    session: &StreamableHttpMcpClient,
     file_name: &str,
     offset: usize,
     limit: usize,
@@ -1117,7 +874,7 @@ async fn call_logs_read(
         "offset": offset,
         "limit": limit
     });
-    let resp = call_tool_json(client, base_url, session, "logs_read", args).await?;
+    let resp = call_tool_json(session, "logs_read", args).await?;
 
     let text = resp
         .pointer("/result/content/0/text")
@@ -1145,12 +902,10 @@ mod tests {
     }
 
     // ── coverage batch: SSE/parse helpers + axum-mocked HTTP calls ─────────────
-    use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
     use axum::{Json, Router};
-    use tokio::sync::oneshot;
 
     async fn spawn_test_server(router: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1172,23 +927,10 @@ mod tests {
             .expect("client build")
     }
 
-    #[derive(Clone)]
-    struct RecState {
-        tx: tokio::sync::mpsc::UnboundedSender<Value>,
-    }
-
-    async fn record_handler(State(st): State<RecState>, Json(body): Json<Value>) -> StatusCode {
-        let _ = st.tx.send(body);
-        StatusCode::OK
-    }
-
-    #[test]
-    fn mcp_session_id_and_req_id_sequence() {
-        let s = McpSession::new("sess-xyz");
-        assert_eq!(s.id(), "sess-xyz");
-        assert_eq!(s.next_req_id(), 10);
-        assert_eq!(s.next_req_id(), 11);
-        assert_eq!(s.next_req_id(), 12);
+    /// A shared-client session attached to `base` with a fixed test id —
+    /// the handshake itself is covered by `ahma_http_mcp_client`'s tests.
+    fn test_session(base: &str) -> StreamableHttpMcpClient {
+        StreamableHttpMcpClient::attach(test_client(), format!("{base}/mcp"), "s")
     }
 
     #[test]
@@ -1437,10 +1179,8 @@ mod tests {
         }
         let router = Router::new().route("/mcp", post(handler));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let tools = call_tools_list(&test_client(), &base, &session)
-            .await
-            .expect("tools list ok");
+        let session = test_session(&base);
+        let tools = call_tools_list(&session).await.expect("tools list ok");
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name, "alpha");
         assert_eq!(tools[0].description.as_deref(), Some("d"));
@@ -1457,10 +1197,8 @@ mod tests {
         }
         let router = Router::new().route("/mcp", post(handler));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let tools = call_tools_list(&test_client(), &base, &session)
-            .await
-            .expect("ok");
+        let session = test_session(&base);
+        let tools = call_tools_list(&session).await.expect("ok");
         assert!(tools.is_empty());
         handle.abort();
     }
@@ -1477,10 +1215,8 @@ mod tests {
         }
         let router = Router::new().route("/mcp", post(handler));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let poll = call_status(&test_client(), &base, &session)
-            .await
-            .expect("status ok");
+        let session = test_session(&base);
+        let poll = call_status(&base, &session).await.expect("status ok");
         match poll {
             StatusPoll::Ready(ops) => {
                 assert_eq!(ops.len(), 1);
@@ -1495,8 +1231,8 @@ mod tests {
     async fn mcp_call_status_conflict_is_initializing() {
         let router = Router::new().route("/mcp", post(|| async { StatusCode::CONFLICT }));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let poll = call_status(&test_client(), &base, &session)
+        let session = test_session(&base);
+        let poll = call_status(&base, &session)
             .await
             .expect("conflict maps to Initializing");
         assert!(matches!(poll, StatusPoll::Initializing));
@@ -1507,8 +1243,8 @@ mod tests {
     async fn mcp_call_status_forbidden_is_error() {
         let router = Router::new().route("/mcp", post(|| async { StatusCode::FORBIDDEN }));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let err = match call_status(&test_client(), &base, &session).await {
+        let session = test_session(&base);
+        let err = match call_status(&base, &session).await {
             Ok(_) => panic!("403 must error"),
             Err(e) => e,
         };
@@ -1533,10 +1269,8 @@ mod tests {
         }
         let router = Router::new().route("/mcp", post(handler));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let files = call_logs_list(&test_client(), &base, &session)
-            .await
-            .expect("logs_list ok");
+        let session = test_session(&base);
+        let files = call_logs_list(&session).await.expect("logs_list ok");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "a.log");
         assert!(files[0].is_approved);
@@ -1551,8 +1285,8 @@ mod tests {
         }
         let router = Router::new().route("/mcp", post(handler));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let err = call_logs_list(&test_client(), &base, &session)
+        let session = test_session(&base);
+        let err = call_logs_list(&session)
             .await
             .expect_err("error field must surface");
         assert!(format!("{err:#}").contains("boom"));
@@ -1566,8 +1300,8 @@ mod tests {
         }
         let router = Router::new().route("/mcp", post(handler));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let err = call_logs_list(&test_client(), &base, &session)
+        let session = test_session(&base);
+        let err = call_logs_list(&session)
             .await
             .expect_err("missing content must error");
         assert!(format!("{err:#}").contains("Invalid response format"));
@@ -1585,8 +1319,8 @@ mod tests {
         }
         let router = Router::new().route("/mcp", post(handler));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let text = call_logs_read(&test_client(), &base, &session, "a.log", 0, 100)
+        let session = test_session(&base);
+        let text = call_logs_read(&session, "a.log", 0, 100)
             .await
             .expect("logs_read ok");
         assert_eq!(text, "line1\nline2");
@@ -1601,8 +1335,8 @@ mod tests {
         }
         let router = Router::new().route("/mcp", post(handler));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let err = call_logs_read(&test_client(), &base, &session, "a.log", 0, 100)
+        let session = test_session(&base);
+        let err = call_logs_read(&session, "a.log", 0, 100)
             .await
             .expect_err("error field must surface");
         assert!(format!("{err:#}").contains("nope"));
@@ -1616,8 +1350,8 @@ mod tests {
         }
         let router = Router::new().route("/mcp", post(handler));
         let (base, handle) = spawn_test_server(router).await;
-        let session = McpSession::new("s");
-        let err = call_logs_read(&test_client(), &base, &session, "a.log", 0, 100)
+        let session = test_session(&base);
+        let err = call_logs_read(&session, "a.log", 0, 100)
             .await
             .expect_err("missing content must error");
         assert!(format!("{err:#}").contains("Invalid response format"));
@@ -1627,14 +1361,11 @@ mod tests {
     #[tokio::test]
     async fn mcp_handle_sse_event_sandbox_failed() {
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
-        let client = test_client();
         let value = json!({
             "method": "notifications/sandbox/failed",
             "params": { "error": "scope locked" }
         });
-        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
-            .await
-            .expect("ok");
+        handle_notification(&value, &tx).await;
         match rx.try_recv().expect("event emitted") {
             SourceEvent::SandboxFailed { error } => assert_eq!(error, "scope locked"),
             other => panic!("unexpected: {other:?}"),
@@ -1644,11 +1375,8 @@ mod tests {
     #[tokio::test]
     async fn mcp_handle_sse_event_sandbox_configured() {
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
-        let client = test_client();
         let value = json!({ "method": "notifications/sandbox/configured" });
-        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
-            .await
-            .expect("ok");
+        handle_notification(&value, &tx).await;
         // First event carries the (empty) scope; second the compact status.
         match rx.try_recv().expect("scope event emitted") {
             SourceEvent::SandboxScope { scope } => {
@@ -1671,7 +1399,6 @@ mod tests {
     #[tokio::test]
     async fn mcp_handle_sse_event_sandbox_configured_nested_scope_payload() {
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
-        let client = test_client();
         let value = json!({
             "method": "notifications/sandbox/configured",
             "params": {
@@ -1686,9 +1413,7 @@ mod tests {
                 }
             }
         });
-        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
-            .await
-            .expect("ok");
+        handle_notification(&value, &tx).await;
         match rx.try_recv().expect("scope event emitted") {
             SourceEvent::SandboxScope { scope } => {
                 assert_eq!(scope.write, vec!["/home/user/proj", "/home/user/cache"]);
@@ -1715,7 +1440,6 @@ mod tests {
     #[tokio::test]
     async fn mcp_handle_sse_event_sandbox_configured_nested_disabled() {
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
-        let client = test_client();
         let value = json!({
             "method": "notifications/sandbox/configured",
             "params": {
@@ -1730,9 +1454,7 @@ mod tests {
                 }
             }
         });
-        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
-            .await
-            .expect("ok");
+        handle_notification(&value, &tx).await;
         match rx.try_recv().expect("scope event emitted") {
             SourceEvent::SandboxScope { scope } => {
                 assert!(!scope.enforced);
@@ -1756,7 +1478,6 @@ mod tests {
     #[tokio::test]
     async fn mcp_handle_sse_event_sandbox_configured_nested_in_host() {
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
-        let client = test_client();
         let value = json!({
             "method": "notifications/sandbox/configured",
             "params": {
@@ -1765,9 +1486,7 @@ mod tests {
                 "active_disclosure": "Sandbox: ahma kernel sandbox is ENFORCING, but ... INTERSECTION ... run ahma as a configured MCP server ..."
             }
         });
-        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
-            .await
-            .expect("ok");
+        handle_notification(&value, &tx).await;
         // First event: the parsed scope (legacy top-level shape still honored).
         match rx.try_recv().expect("scope event emitted") {
             SourceEvent::SandboxScope { scope } => {
@@ -1798,122 +1517,13 @@ mod tests {
     #[tokio::test]
     async fn mcp_handle_sse_event_other_method_noop() {
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
-        let client = test_client();
         let value = json!({ "method": "notifications/progress" });
-        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
-            .await
-            .expect("ok");
+        handle_notification(&value, &tx).await;
         assert!(rx.try_recv().is_err(), "no event should be emitted");
     }
 
-    #[tokio::test]
-    async fn mcp_handle_sse_event_roots_list_missing_id_errors() {
-        let (tx, _rx) = mpsc::channel::<SourceEvent>(8);
-        let client = test_client();
-        let value = json!({ "method": "roots/list" });
-        let err = handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
-            .await
-            .expect_err("missing id must error");
-        assert!(format!("{err:#}").contains("must include id"));
-    }
-
-    #[tokio::test]
-    async fn mcp_handle_sse_event_roots_list_posts_reply() {
-        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
-        let state = RecState { tx: rec_tx };
-        let router = Router::new()
-            .route("/mcp", post(record_handler))
-            .with_state(state);
-        let (base, handle) = spawn_test_server(router).await;
-        let mcp_url = format!("{base}/mcp");
-
-        let (tx, _rx) = mpsc::channel::<SourceEvent>(8);
-        let tmp = tempfile::TempDir::new().unwrap();
-        let value = json!({ "jsonrpc": "2.0", "id": 7, "method": "roots/list", "params": {} });
-
-        handle_sse_event(
-            &test_client(),
-            &mcp_url,
-            &value,
-            "sid-1",
-            Some(tmp.path()),
-            &tx,
-        )
-        .await
-        .expect("roots/list handled");
-
-        let recorded = rec_rx.try_recv().expect("roots reply posted");
-        assert_eq!(recorded["id"], json!(7));
-        assert!(recorded["result"]["roots"].is_array());
-        let uri = recorded["result"]["roots"][0]["uri"].as_str().unwrap();
-        assert!(uri.starts_with("file://"), "uri={uri}");
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn mcp_run_sse_listener_processes_event_and_signals_ready() {
-        async fn sse_roots_body() -> Response {
-            let body =
-                "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"roots/list\",\"params\":{}}\n\n";
-            (
-                StatusCode::OK,
-                [("content-type", "text/event-stream")],
-                body,
-            )
-                .into_response()
-        }
-        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
-        let state = RecState { tx: rec_tx };
-        let router = Router::new()
-            .route("/mcp", get(sse_roots_body).post(record_handler))
-            .with_state(state);
-        let (base, handle) = spawn_test_server(router).await;
-        let sse_url = format!("{base}/mcp");
-
-        let (tx, _rx) = mpsc::channel::<SourceEvent>(8);
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let tmp = tempfile::TempDir::new().unwrap();
-
-        run_sse_listener(
-            test_client(),
-            test_client(),
-            sse_url,
-            "sid-2".to_string(),
-            Some(tmp.path().to_path_buf()),
-            tx,
-            Some(ready_tx),
-        )
-        .await
-        .expect("listener completes ok");
-
-        assert!(ready_rx.await.is_ok(), "ready signal fired");
-        let recorded = rec_rx.try_recv().expect("roots reply posted by listener");
-        assert_eq!(recorded["id"], json!(7));
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn mcp_run_sse_listener_non_2xx_errors() {
-        let router =
-            Router::new().route("/mcp", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
-        let (base, handle) = spawn_test_server(router).await;
-        let sse_url = format!("{base}/mcp");
-        let (tx, _rx) = mpsc::channel::<SourceEvent>(8);
-
-        let err = run_sse_listener(
-            test_client(),
-            test_client(),
-            sse_url,
-            "sid-3".to_string(),
-            None,
-            tx,
-            None,
-        )
-        .await
-        .expect_err("non-2xx SSE must error");
-        assert!(format!("{err:#}").contains("SSE stream failed"));
-        handle.abort();
-    }
+    // The roots/list answering and SSE-listener mechanics moved to the shared
+    // client (`ahma_http_mcp_client::streamable`) — their tests live there now.
 
     #[tokio::test]
     async fn mcp_init_session_success() {
@@ -1946,7 +1556,7 @@ mod tests {
         let session = init_mcp_session(&test_client(), &reqwest::Client::new(), &base, None, tx)
             .await
             .expect("handshake succeeds");
-        assert_eq!(session.id(), "session-ok");
+        assert_eq!(session.session_id(), "session-ok");
         match rx.try_recv().expect("status event") {
             SourceEvent::SandboxStatus { status } => assert_eq!(status, "INITIALIZING"),
             other => panic!("unexpected first event: {other:?}"),
@@ -1969,7 +1579,7 @@ mod tests {
             Ok(_) => panic!("missing session id must error"),
             Err(e) => e,
         };
-        assert!(format!("{err:#}").contains("no mcp-session-id"));
+        assert!(format!("{err:#}").contains("mcp-session-id"));
         handle.abort();
     }
 

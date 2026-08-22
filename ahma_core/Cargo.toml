@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 ahma_mcp = { path = "../ahma_mcp" }
 ahma_common = { path = "../ahma_common" }
+ahma_http_mcp_client = { path = "../ahma_http_mcp_client" }
 ahma_llm_monitor = { path = "../ahma_llm_monitor" }
 anyhow.workspace = true
 chrono.workspace = true

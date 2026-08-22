@@ -1,6 +1,9 @@
+use ahma_http_mcp_client::streamable::{
+    ConflictRetryPolicy, Connector, StreamableHttpMcpClient, ToolCallOutcome,
+};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -254,58 +257,21 @@ impl McpConnectionManager {
     async fn fetch_server_tools(&self, server: &McpServerConfig) -> Result<Vec<ToolInfo>> {
         match &server.kind {
             McpServerKind::Http { url } => {
-                let client = reqwest::Client::new();
-                let sid = initialize_mcp_session(&client, url).await?;
-                let resp = client
-                    .post(format!("{}/mcp", url.trim_end_matches('/')))
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "application/json")
-                    .header("mcp-session-id", sid)
-                    .json(&json!({
-                        "jsonrpc":"2.0",
-                        "id": 2,
-                        "method": "tools/list",
-                        "params": {}
-                    }))
-                    .send()
+                let client = connect_minimal_session(url)
                     .await
-                    .with_context(|| format!("Failed tools/list for {}", server.name))?;
-
-                if !resp.status().is_success() {
-                    return Err(anyhow!("tools/list failed for {}", server.name));
-                }
-
-                let val = resp
-                    .json::<Value>()
+                    .with_context(|| format!("Failed initialize for {}", server.name))?;
+                let tools = client
+                    .tools_list()
                     .await
-                    .context("Failed to parse tools/list response")?;
-
-                let mut tools = Vec::new();
-                if let Some(arr) = val
-                    .get("result")
-                    .and_then(|r| r.get("tools"))
-                    .and_then(|t| t.as_array())
-                {
-                    for t in arr {
-                        if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
-                            let description = t
-                                .get("description")
-                                .and_then(|d| d.as_str())
-                                .map(String::from);
-                            let input_schema =
-                                t.get("inputSchema").cloned().unwrap_or(serde_json::json!({
-                                    "type": "object",
-                                    "additionalProperties": true
-                                }));
-                            tools.push(ToolInfo {
-                                name: name.to_string(),
-                                description,
-                                input_schema,
-                            });
-                        }
-                    }
-                }
-                Ok(tools)
+                    .with_context(|| format!("tools/list failed for {}", server.name))?;
+                Ok(tools
+                    .into_iter()
+                    .map(|t| ToolInfo {
+                        name: t.name,
+                        description: t.description,
+                        input_schema: t.input_schema,
+                    })
+                    .collect())
             }
             McpServerKind::Stdio { command, args } => {
                 self.fetch_server_tools_stdio(&server.name, command, args)
@@ -505,39 +471,25 @@ pub(crate) fn session_id_header(resp: &reqwest::Response) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn initialize_mcp_session(client: &reqwest::Client, base_url: &str) -> Result<String> {
-    let url = format!("{}/mcp", base_url.trim_end_matches('/'));
-    let init_resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"roots": {"listChanged": false}},
-                "clientInfo": {"name": "ahma-mcp-client", "version": env!("CARGO_PKG_VERSION")}
-            }
-        }))
-        .send()
-        .await
-        .context("Failed initialize request")?;
-
-    let sid = session_id_header(&init_resp)
-        .ok_or_else(|| anyhow!("initialize response missing mcp-session-id"))?;
-
-    let _ = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("mcp-session-id", &sid)
-        .json(&json!({"jsonrpc":"2.0", "method": ahma_common::mcp_methods::INITIALIZED_METHOD}))
-        .send()
-        .await;
-
-    Ok(sid)
+/// Minimal handshake against an *external* Streamable-HTTP MCP server via the
+/// shared client (initialize + notifications/initialized). Intentionally no
+/// SSE stream and no roots answering: external servers are not assumed to
+/// gate `tools/call` on `roots/list`, and this aggregation client never did —
+/// preserved as-is from the pre-unification implementation.
+async fn connect_minimal_session(base_url: &str) -> Result<StreamableHttpMcpClient> {
+    let connector = Connector {
+        mcp_url: format!("{}/mcp", base_url.trim_end_matches('/')),
+        post_client: reqwest::Client::new(),
+        sse_client: reqwest::Client::new(),
+    };
+    // clientInfo.name is load-bearing: servers may key behaviour off it.
+    StreamableHttpMcpClient::connect_minimal(
+        connector,
+        "ahma-mcp-client",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .context("Failed initialize request")
 }
 
 async fn call_mcp_tool_http(
@@ -545,38 +497,23 @@ async fn call_mcp_tool_http(
     tool: &str,
     arguments: Value,
 ) -> Result<(String, bool)> {
-    let client = reqwest::Client::new();
-    let sid = initialize_mcp_session(&client, base_url).await?;
-    let url = format!("{}/mcp", base_url.trim_end_matches('/'));
+    let client = connect_minimal_session(base_url).await?;
 
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("mcp-session-id", &sid)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {
-                "name": tool,
-                "arguments": arguments
-            }
-        }))
-        .send()
+    // No 409 retry policy here (preserved): external servers do not implement
+    // ahma's sandbox gate, so a 409 is treated like any other HTTP error.
+    let val = match client
+        .call_tool(tool, arguments, ConflictRetryPolicy::NONE)
         .await
-        .context("Failed tools/call request")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("tools/call failed: HTTP {status}: {body}"));
-    }
-
-    let val = resp
-        .json::<Value>()
-        .await
-        .context("Failed to parse tools/call response")?;
+        .context("Failed tools/call request")?
+    {
+        ToolCallOutcome::Success(val) => val,
+        ToolCallOutcome::SandboxInitializing { body } => {
+            return Err(anyhow!("tools/call failed: HTTP 409 Conflict: {body}"));
+        }
+        ToolCallOutcome::HttpError { status, body } => {
+            return Err(anyhow!("tools/call failed: HTTP {status}: {body}"));
+        }
+    };
 
     let failed = val.get("error").is_some()
         || val
