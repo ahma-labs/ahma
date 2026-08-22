@@ -49,10 +49,6 @@ env:
   RUST_BACKTRACE: 1
   IS_DEV_BUILD: "true"
   RUSTC_WRAPPER: sccache
-  SCCACHE_DIR: ${{ github.workspace }}/.sccache
-  # Must match build.yml's cap: this tier restores build.yml's `-test-` entries, and a smaller
-  # cap here would make sccache evict most of what it just downloaded on the first write.
-  SCCACHE_CACHE_SIZE: 1G
   SCCACHE_DIRECT: "true"
 
 jobs:
@@ -100,20 +96,22 @@ jobs:
           restore-keys: |
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Restore sccache
-        uses: actions/cache/restore@v5
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: sccache-test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            sccache-test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
-            sccache-test-${{ runner.os }}-${{ runner.arch }}-
-
+      # `read-only` is rule 1 of build.yml's caching note, enforced by sccache rather than by the
+      # convention of omitting a save step: this tier reads the objects build.yml's main runs
+      # wrote and writes nothing back, so PR runs cannot evict main's entries. It reads the same
+      # namespace build.yml populates, which is why the env block above must keep matching
+      # build.yml's exactly -- see the note on CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
           rustflags: ""
           cache: false
+
+      - name: Set up sccache (ghac, read-only)
+        uses: ./.github/actions/sccache-ghac
+        with:
+          mode: read-only
+          extra-tools: nextest,cargo-deny
 
       - name: Configure deterministic tooling env
         run: |
@@ -123,11 +121,6 @@ jobs:
             echo "LC_ALL=C"
             echo "LANG=C"
           } >> "$GITHUB_ENV"
-
-      - name: Install sccache, nextest and cargo-deny
-        uses: taiki-e/install-action@v2
-        with:
-          tool: sccache,nextest,cargo-deny
 
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -153,8 +146,11 @@ jobs:
       - name: Cargo Nextest (smoke)
         run: cargo nextest run --profile smoke --locked --no-default-features
 
-      - name: Show sccache stats
+      # Verifies the backend and the hit rate, but cannot fail on "misses without writes": this
+      # tier is READ_ONLY, so writing nothing is the intended behaviour, and the action skips
+      # that particular assertion when it sees SCCACHE_GHA_RW_MODE=READ_ONLY.
+      - name: Verify sccache (ghac)
         if: always()
-        run: |
-          sccache --show-stats || true
-          sccache --stop-server || true
+        uses: ./.github/actions/sccache-verify
+        with:
+          label: Fast Tier

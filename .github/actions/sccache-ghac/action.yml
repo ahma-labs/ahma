@@ -1,0 +1,109 @@
+name: Set up sccache on the GitHub Actions cache backend
+description: >-
+  Installs sccache and points it at its native GitHub Actions cache backend (ghac), which stores
+  each compilation object as its own Actions cache entry instead of tarring SCCACHE_DIR into one.
+  This is the ONLY place ghac is switched on; see the caching note at the top of build.yml.
+
+inputs:
+  mode:
+    description: >-
+      `read-write` (default) for main-branch jobs that should populate the cache, or `read-only`
+      for PR jobs. `read-only` is rule 1 of the caching note enforced by sccache itself rather
+      than by the convention of omitting a save step.
+    required: false
+    default: read-write
+  extra-tools:
+    description: >-
+      Comma-separated extra tools to hand to taiki-e/install-action alongside sccache, so a job
+      needs one install step rather than two (e.g. `nextest,cargo-llvm-cov`).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # ghac needs credentials, and the runner exposes those only to JavaScript actions, not to
+    # `run:` steps -- hence github-script + exportVariable.
+    #
+    # ACTIONS_CACHE_SERVICE_V2 is load-bearing and is NOT in the requirement list in #562.
+    # opendal picks the API version from that variable alone (`get_cache_service_version`:
+    # non-empty -> V2, empty -> V1) and only V2 reads ACTIONS_RESULTS_URL; V1 tries
+    # ACTIONS_CACHE_URL first and talks to the retired `_apis/artifactcache` endpoints. Export
+    # the URL and token without it and sccache lands on the dead v1 service, fails every write,
+    # degrades to read-only and stays green -- #561's exact shape. So this step asserts on all
+    # three inputs rather than defaulting them to "" the way opendal's own README snippet does;
+    # an empty ACTIONS_CACHE_URL is worse than an unset one, because V1's `or_else` fallback to
+    # ACTIONS_RESULTS_URL only fires when the variable is absent, not when it is set to empty.
+    - name: Export Actions cache credentials for sccache (ghac)
+      uses: actions/github-script@v9
+      with:
+        script: |
+          const url = process.env.ACTIONS_RESULTS_URL;
+          const token = process.env.ACTIONS_RUNTIME_TOKEN;
+          if (!url || !token) {
+            core.setFailed(
+              'ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN are not visible to this action, so ' +
+              'sccache cannot reach the ghac backend. It would silently fall back to the disk ' +
+              'cache. See the ghac section of the caching note in build.yml.');
+            return;
+          }
+          core.setSecret(token);
+          core.exportVariable('ACTIONS_RESULTS_URL', url);
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', token);
+          // Forced on rather than defaulted off: v1 is decommissioned on github.com, so an
+          // absent flag can only mean the runner stopped advertising it, never that v1 is the
+          // right choice here. Warn so the reason is in the log if this ever starts happening.
+          if (!process.env.ACTIONS_CACHE_SERVICE_V2) {
+            core.warning(
+              'ACTIONS_CACHE_SERVICE_V2 was not set by the runner; forcing it on so opendal ' +
+              'uses the v2 cache service. If ghac reads/writes start failing, check whether ' +
+              'the runner renamed this flag.');
+          }
+          core.exportVariable('ACTIONS_CACHE_SERVICE_V2', process.env.ACTIONS_CACHE_SERVICE_V2 || 'true');
+
+    # Written to GITHUB_ENV rather than to each caller's `env:` block so there is exactly one
+    # switch in the repo. sccache reads its config when the server starts, and the server starts
+    # lazily at the first compile request, so exporting it here is early enough for every caller.
+    #
+    # `on` is what sccache's docs use. Unlike SCCACHE_MAX_SIZE in #561, a wrong value here cannot
+    # fail silently: `bool_from_env_var` accepts true/on/1/false/off/0 case-insensitively and
+    # `bail!`s on anything else, and `Config::load()` propagates that, so sccache refuses to start
+    # rather than quietly ignoring the setting.
+    #
+    # SCCACHE_GHA_VERSION (the manual purge knob) is deliberately NOT set: sccache enables ghac on
+    # that variable's mere presence and skips reading SCCACHE_GHA_ENABLED entirely, so setting it
+    # would create a second, hidden way for ghac to be on while the line below says it is off.
+    - name: Enable the ghac backend
+      shell: bash
+      # Through `env:` rather than `${{ }}` interpolated into the script: an input expanded into
+      # shell source is a script-injection surface, and it also makes the script unreadable to
+      # shellcheck.
+      env:
+        MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        case "$MODE" in
+          read-write) ;;
+          read-only)  echo "SCCACHE_GHA_RW_MODE=READ_ONLY" >> "$GITHUB_ENV" ;;
+          *)
+            echo "::error::sccache-ghac: mode must be read-write or read-only, got '$MODE'"
+            exit 1
+            ;;
+        esac
+        echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+
+    # sccache is version-pinned HERE, once, for every caller -- and the single pin is the point,
+    # not an incidental tidiness. Three reasons, in increasing order of how quietly they fail:
+    #   - The ghac backend needs >= v0.11.0 (v0.10.0 spoke ghac API v2, v0.11.0 moved to v4 and
+    #     the docs say earlier versions "probably will not work").
+    #   - sccache namespaces its ghac objects as `sccache-v{VERSION}`, so an unpinned upgrade
+    #     silently cold-starts the cache and reads as a regression.
+    #   - For the same reason, two CALLERS on different versions never share an object. Pinning
+    #     each job separately would therefore be a latent bug the moment the pins drifted; one
+    #     pin for all of them is what keeps fast-tier.yml reading what build.yml wrote.
+    # `@0.17` tracks the 0.17.x series; taiki-e/install-action has no ">=" syntax, so a series pin
+    # is how a floor is expressed.
+    - name: Install sccache${{ inputs.extra-tools && ' and workflow tools' || '' }}
+      uses: taiki-e/install-action@v2
+      with:
+        tool: sccache@0.17${{ inputs.extra-tools && format(',{0}', inputs.extra-tools) || '' }}

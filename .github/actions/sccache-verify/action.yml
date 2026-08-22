@@ -1,0 +1,206 @@
+name: Verify the sccache ghac backend and report stats
+description: >-
+  Asserts that sccache actually used the ghac backend and that its error counters are clean, then
+  writes a stats table to the step summary. Every ghac failure mode is silent (see the caching
+  note in build.yml), so this asserts rather than prints: a cache that measures nothing looks
+  exactly like a cache that works.
+
+inputs:
+  label:
+    description: Job family name, used to title the step-summary section.
+    required: true
+  write-error-ceiling-pct:
+    description: >-
+      Maximum share of attempted writes that may be lost on a WARM run before the job fails.
+      See the long comment in the script for why this is a rate and not zero.
+    required: false
+    default: "5"
+  warm-run-writes:
+    description: >-
+      A run attempting more than this many writes is treated as a cold start, where the ceiling is
+      reported but not enforced. See the script for why write volume is the right discriminator.
+    required: false
+    default: "500"
+  report-quota:
+    description: >-
+      Set to `true` on exactly one job to append repo-wide Actions cache usage to the summary.
+      Requires `permissions: actions: read` and `github-token`.
+    required: false
+    default: "false"
+  github-token:
+    description: Token used only when `report-quota` is true.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Verify ghac backend and report sccache stats
+      shell: bash
+      env:
+        LABEL: ${{ inputs.label }}
+        CEILING_PCT: ${{ inputs.write-error-ceiling-pct }}
+        WARM_RUN_WRITES: ${{ inputs.warm-run-writes }}
+        REPORT_QUOTA: ${{ inputs.report-quota }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        # Callers invoke this with `if: always()`, so it also runs when the job died before the
+        # toolchain was installed. Report nothing rather than stacking a second, misleading
+        # failure on top of the real one. Once sccache exists, every command below may be fatal.
+        if ! command -v sccache >/dev/null 2>&1; then
+          echo "sccache is not installed; the job failed before it ran. Nothing to verify."
+          exit 0
+        fi
+
+        # Into RUNNER_TEMP, never the checkout: several callers run this on a tree that later
+        # steps (and the release jobs) expect to be clean.
+        stats="${RUNNER_TEMP:-.}/sccache-stats.json"
+
+        sccache --show-stats
+        sccache --show-stats --stats-format=json > "$stats"
+
+        # Asserted on the JSON form, not the text: `--show-stats` output has no stable grammar,
+        # and #561 is the standing reminder that a plausible-looking config that never took
+        # effect looks exactly like one that did. `cache_location` is the proof it took effect --
+        # it reads "ghac, name: <hash>, prefix: /sccache/" only when the remote backend is live,
+        # and falls back to a disk path otherwise.
+        loc=$(jq -r '.cache_location' "$stats")
+        requests=$(jq -r '.stats.compile_requests' "$stats")
+        writes=$(jq -r '.stats.cache_writes' "$stats")
+        timeouts=$(jq -r '.stats.cache_timeouts' "$stats")
+        # Write errors are counted separately from the rest: they are the one ghac failure mode
+        # with a known, benign cause, and lumping them in would mask a genuinely new fault.
+        # cache_errors is a PerLanguageCount (a map); the rest are scalars.
+        write_errors=$(jq -r '.stats.cache_write_errors' "$stats")
+        errors=$(jq -r '.stats.cache_read_errors
+                        + ([.stats.cache_errors.counts[]] | add // 0)' "$stats")
+        # Every miss attempts a write, so total misses is the write-error denominator.
+        misses_all=$(jq -r '[.stats.cache_misses.counts[]] | add // 0' "$stats")
+        # "Rust" is sccache's own language key (CompilerKind::lang_kind), so these are directly
+        # comparable to the hit-rate figures quoted in #562/#563.
+        hits=$(jq -r '.stats.cache_hits.counts.Rust // 0' "$stats")
+        misses=$(jq -r '.stats.cache_misses.counts.Rust // 0' "$stats")
+        rate=$(awk -v h="$hits" -v m="$misses" 'BEGIN { t=h+m; printf "%.2f", (t ? 100*h/t : 0) }')
+
+        if [ "$misses_all" -gt "$WARM_RUN_WRITES" ]; then
+          run_kind="cold start"
+        else
+          run_kind="warm"
+        fi
+
+        if [ "${SCCACHE_GHA_RW_MODE:-}" = "READ_ONLY" ]; then
+          mode="read-only"
+          # Say so next to the number, because "116 of 116" is alarming until you know that a
+          # refused put is counted as a write error and refusing them is the point here.
+          write_note=" (all refused by design)"
+        else
+          mode="read-write"
+          write_note=""
+        fi
+
+        {
+          echo "### sccache — ${LABEL}"
+          echo
+          echo "| metric | value |"
+          echo "|---|---|"
+          echo "| backend | \`$loc\` |"
+          echo "| mode | $mode |"
+          echo "| run kind | $run_kind ($misses_all attempted writes) |"
+          echo "| compile requests | $requests |"
+          echo "| Rust hit rate | ${rate}% ($hits hit / $misses miss) |"
+          echo "| cache writes | $writes |"
+          echo "| cache write errors | $write_errors of $misses_all$write_note |"
+          echo "| cache read/general errors | $errors |"
+          echo "| cache timeouts | $timeouts |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$REPORT_QUOTA" = "true" ] && [ -n "${GH_TOKEN:-}" ]; then
+          # The repo-wide quota is the constraint the whole caching design exists to respect, and
+          # nothing else reports it now that the janitor is gone. Never fatal: it is an
+          # observation about the repo, not about this job, and a token/permission problem here
+          # must not redden a build.
+          usage=$(gh api "repos/${GITHUB_REPOSITORY}/actions/cache/usage" 2>/dev/null || echo "")
+          if [ -n "$usage" ]; then
+            bytes=$(printf '%s' "$usage" | jq -r '.active_caches_size_in_bytes')
+            count=$(printf '%s' "$usage" | jq -r '.active_caches_count')
+            gib=$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b/1073741824 }')
+            {
+              echo
+              echo "Repo-wide Actions cache: **${gib} GiB** across ${count} entries (quota 10 GiB)."
+              echo "ghac objects are bounded only by GitHub's LRU and its 7-day-unused eviction,"
+              echo "so the steady state is \"live set + about a week of churn\"."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+        fi
+
+        failed=0
+
+        case "$loc" in
+          ghac*) ;;
+          *)
+            echo "::error::sccache is not using the ghac backend (cache_location: $loc). SCCACHE_GHA_ENABLED did not take effect, so this job silently used a cold local disk cache."
+            failed=1
+            ;;
+        esac
+
+        if [ "$errors" -ne 0 ]; then
+          echo "::error::sccache reported $errors cache read/general errors. Write errors have a known cause; these do not, so treat this as a new failure mode."
+          failed=1
+        fi
+
+        # Write errors are judged as a RATE on warm runs and only reported on cold ones, and that
+        # is a finding rather than a softened assertion. Run 31469484298 identified them: HTTP
+        # 429, {"code":"resource_exhausted","msg":"rate limit exceeded"}, arriving in a burst.
+        # sccache does not retry them even though opendal marks the error `(temporary)` and
+        # GitHub sends `retry-after: 1`, because GHACache::build (src/cache/gha.rs) layers only
+        # HttpClientLayer and LoggingLayer onto the operator, with no RetryLayer. The loss rate is
+        # therefore a function of how much a run WRITES, not of whether the backend is healthy:
+        # the same configuration lost 15.4% of 1967 writes and 1.1% of 353.
+        #
+        # That is why write volume, not the error count, decides whether the ceiling binds. A cold
+        # start -- a lockfile bump, a new job family's first run, a toolchain change -- legitimately
+        # writes at a scale where 429s are expected, and a lost write costs one future miss, not
+        # correctness. Failing there would redden main for doing exactly what it is supposed to do.
+        # On a warm run the same rate means something is wrong, so there it is fatal.
+        if [ "${SCCACHE_GHA_RW_MODE:-}" = "READ_ONLY" ]; then
+          # In READ_ONLY every put returns "Cannot write to read-only storage", and sccache counts
+          # each one in cache_write_errors. So a read-only tier reports write_errors == misses_all
+          # -- 100% -- while working perfectly, and any ceiling at all would fail it every run.
+          # This is the same counter that makes a genuinely broken backend detectable (see the
+          # write-probe case in build.yml's note); the difference is only whether we asked for it.
+          # Judge a read-only tier on hit rate, which is the only thing it can influence.
+          if [ "$write_errors" -ne "$misses_all" ]; then
+            echo "::warning::read-only tier: $write_errors of $misses_all writes refused, expected all $misses_all. Not fatal, but the counters do not add up."
+          else
+            echo "read-only tier: all $misses_all attempted writes refused, as configured. Rust hit rate ${rate}%."
+          fi
+        elif [ "$write_errors" -ne 0 ]; then
+          if [ "$misses_all" -gt "$WARM_RUN_WRITES" ]; then
+            echo "::warning::sccache lost $write_errors of $misses_all cache writes on a cold-start run. Expected to be ghac 429s; the ${CEILING_PCT}% ceiling is not enforced at this write volume. The next warm run is the one that matters."
+          elif [ "$((write_errors * 100))" -gt "$((misses_all * CEILING_PCT))" ]; then
+            echo "::error::sccache lost $write_errors of $misses_all cache writes on a warm run, over the ${CEILING_PCT}% ceiling. Set SCCACHE_ERROR_LOG and SCCACHE_LOG=warn,sccache::server=debug to get the status codes."
+            failed=1
+          else
+            echo "::warning::sccache lost $write_errors of $misses_all cache writes, within the ${CEILING_PCT}% ceiling. Expected to be ghac 429s; see the caching note in build.yml."
+          fi
+        fi
+
+        # The residual silent case: read-only reached some other way, so nothing is ever written
+        # and nothing is counted as an error either. Misses without writes is the signature.
+        # Guarded on misses so a 100%-hit run is not treated as a failure, and skipped entirely
+        # when the caller asked for read-only, where writing nothing is the whole point.
+        if [ "${SCCACHE_GHA_RW_MODE:-}" != "READ_ONLY" ] && [ "$misses" -gt 0 ] && [ "$writes" -eq 0 ]; then
+          echo "::error::sccache recorded $misses Rust misses but wrote 0 objects. The ghac backend is not storing anything."
+          failed=1
+        fi
+
+        # Reported, not fatal. A timeout is a miss caused by a slow cache, which is what
+        # throttling looks like -- but it is also the one signal that can move for reasons outside
+        # this repo, and reddening main on it would be flaky.
+        if [ "$timeouts" -ne 0 ]; then
+          echo "::warning::sccache reported $timeouts cache timeouts. Under ghac this is the throttling signal; watch it across runs."
+        fi
+
+        exit "$failed"
