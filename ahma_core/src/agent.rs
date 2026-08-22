@@ -774,14 +774,6 @@ async fn dispatch_tool_execution(
     spawn_external_tool_call_http(&base, tool, args_value).await
 }
 
-/// True when a chat-completion error indicates the model/provider rejected the
-/// request because of tool definitions (as opposed to a non-recoverable failure),
-/// so the caller should retry the turn without tools instead of ending it.
-fn is_tool_unsupported_error(err: &str) -> bool {
-    let err_msg = err.to_lowercase();
-    err_msg.contains("400") || err_msg.contains("tool") || err_msg.contains("not supported")
-}
-
 /// Fetch one assistant turn via MCP sampling (when the client targets an
 /// `mcp://` base URL). Sampling is never streamed, so the caller still needs
 /// to emit the returned content.
@@ -856,7 +848,7 @@ async fn handle_completion_stream_error(
     mcp: &Option<McpChatConfig>,
     tx: &Sender<AgentEvent>,
 ) {
-    if is_tool_unsupported_error(&e.to_string()) {
+    if e.is_tools_rejected() {
         info!(error = %e, "agent: model rejected tools — falling back to plain chat (no tool use this turn)");
         let _ = tx
             .send(AgentEvent::Error(

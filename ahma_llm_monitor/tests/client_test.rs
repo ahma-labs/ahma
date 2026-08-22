@@ -6,7 +6,7 @@ use wiremock::{
     matchers::{method, path},
 };
 
-use ahma_llm_monitor::LlmClient;
+use ahma_llm_monitor::{ApiErrorKind, LlmClient};
 
 fn make_response(content: &str) -> serde_json::Value {
     json!({
@@ -102,6 +102,39 @@ async fn test_detect_issues_api_error() {
         .await;
 
     assert!(result.is_err());
+}
+
+/// A provider error response surfaces as a typed, classified
+/// `LlmMonitorError::Api` — not as opaque text callers would have to sniff.
+/// 401 is deliberately used here because it is non-retryable, so the request
+/// fails immediately without exercising the backoff sleeps.
+#[tokio::test]
+async fn test_chat_completion_error_is_typed_and_classified() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": {
+                "message": "Incorrect API key provided",
+                "type": "invalid_request_error",
+                "code": "invalid_api_key"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = LlmClient::new(server.uri(), "test-model", None);
+    let err = client
+        .chat_completion_with_tools(vec![json!({"role": "user", "content": "hi"})], &[])
+        .await
+        .expect_err("401 must fail the request");
+
+    assert_eq!(err.api_kind(), Some(ApiErrorKind::Auth));
+    assert_eq!(err.provider_message(), Some("Incorrect API key provided"));
+    // The rendered error keeps both the status and the provider's message.
+    let text = err.to_string();
+    assert!(text.contains("401"), "{text}");
+    assert!(text.contains("Incorrect API key provided"), "{text}");
 }
 
 #[tokio::test]

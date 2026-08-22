@@ -71,6 +71,32 @@ fn backoff_delay(attempt: u32) -> Duration {
         .min(LLM_RETRY_MAX_DELAY)
 }
 
+/// `Retry-After` from a response's headers, when present as (possibly
+/// fractional) delta-seconds. HTTP-date form is rare on LLM endpoints and is
+/// ignored rather than mis-parsed.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let secs: f64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
+}
+
+/// Convert a non-success HTTP response into a typed [`LlmMonitorError::Api`],
+/// consuming the body. The raw status/body pair is logged here, once, so
+/// nothing the provider said is lost even when the extracted provider message
+/// is shorter than the full body.
+async fn api_error_from_response(response: reqwest::Response) -> LlmMonitorError {
+    let status = response.status();
+    let retry_after = parse_retry_after(response.headers());
+    let body_text = response.text().await.unwrap_or_default();
+    warn!(status = %status, body = %body_text, "llm: HTTP error from LLM endpoint");
+    LlmMonitorError::from_api_response(status.as_u16(), retry_after, &body_text)
+}
+
 /// Send an HTTP request with bounded exponential backoff on transient failures
 /// (timeouts/connect errors and 429/5xx). `build` constructs a fresh request per
 /// attempt. A non-retryable response (success or a non-429 4xx) is returned as
@@ -101,7 +127,7 @@ where
                     attempt += 1;
                     continue;
                 }
-                return Err(LlmMonitorError::Http(e));
+                return Err(LlmMonitorError::from(e));
             }
         }
     }
@@ -449,19 +475,14 @@ impl LlmClient {
 
         let response = tokio::time::timeout(timeout, request.send())
             .await
-            .map_err(|_| LlmMonitorError::Timeout)?
-            .map_err(LlmMonitorError::Http)?;
+            .map_err(|_| LlmMonitorError::Timeout(None))?
+            .map_err(LlmMonitorError::from)?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body_text = response.text().await.unwrap_or_default();
-            warn!("LLM API error {}: {}", status, body_text);
-            return Err(LlmMonitorError::Parse(format!(
-                "HTTP {status}: {body_text}"
-            )));
+            return Err(api_error_from_response(response).await);
         }
 
-        let json: Value = response.json().await.map_err(LlmMonitorError::Http)?;
+        let json: Value = response.json().await.map_err(LlmMonitorError::from)?;
 
         let pointer = match self.flavor {
             ApiFlavor::OpenAi => "/choices/0/message/content",
@@ -634,30 +655,20 @@ impl LlmClient {
         .await
         .inspect_err(|e| {
             let elapsed_ms = started.elapsed().as_millis();
-            if e.to_string().contains("timed out") {
+            if e.is_timeout() {
                 warn!(model = %self.model, elapsed_ms, "llm: chat completion timed out after retries — model too slow, or prompt exceeds its context window");
             } else {
                 warn!(model = %self.model, elapsed_ms, error = %e, "llm: chat completion request failed after retries");
             }
         })?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body_text = response.text().await.unwrap_or_default();
-            warn!(
-                model = %self.model,
-                status = %status,
-                body = %body_text,
-                "llm: HTTP error from chat completion endpoint"
-            );
-            return Err(LlmMonitorError::Parse(format!(
-                "HTTP {status}: {body_text}"
-            )));
+            return Err(api_error_from_response(response).await);
         }
 
         let json = response
             .json::<Value>()
             .await
-            .map_err(LlmMonitorError::Http)?;
+            .map_err(LlmMonitorError::from)?;
         let parsed = match self.flavor {
             ApiFlavor::OpenAi => parse_chat_completion_response(json),
             ApiFlavor::Anthropic => anthropic::parse_messages_response(json),
@@ -748,12 +759,7 @@ impl LlmClient {
             warn!(model = %self.model, elapsed_ms = started.elapsed().as_millis(), error = %e, "llm: streaming chat request failed after retries");
         })?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body_text = response.text().await.unwrap_or_default();
-            warn!(model = %self.model, status = %status, body = %body_text, "llm: HTTP error from streaming endpoint");
-            return Err(LlmMonitorError::Parse(format!(
-                "HTTP {status}: {body_text}"
-            )));
+            return Err(api_error_from_response(response).await);
         }
 
         let byte_stream = response.bytes_stream();
@@ -1007,24 +1013,21 @@ async fn chat_stream_start(
     let resp = match req.send().await {
         Err(e) => {
             warn!(error = %e, "llm: chat stream request failed");
-            return Some((Err(LlmMonitorError::Http(e)), ChatStreamState::Done));
+            return Some((Err(LlmMonitorError::from(e)), ChatStreamState::Done));
         }
         Ok(resp) => resp,
     };
 
     if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        warn!(status = %status, body = %body, "llm: HTTP error from LLM endpoint");
         return Some((
-            Err(LlmMonitorError::Parse(format!("HTTP {status}: {body}"))),
+            Err(api_error_from_response(resp).await),
             ChatStreamState::Done,
         ));
     }
 
     debug!("llm: streaming response started");
     use futures::TryStreamExt as _;
-    let byte_stream = resp.bytes_stream().map_err(LlmMonitorError::Http);
+    let byte_stream = resp.bytes_stream().map_err(LlmMonitorError::from);
     Some((
         Ok(String::new()), // empty first yield to advance state
         ChatStreamState::Streaming {
@@ -1138,7 +1141,7 @@ async fn drain_streaming_deltas(
             None => break,
             Some(Err(e)) => {
                 warn!(model = %model, error = %e, "llm: streaming byte error");
-                return Err(LlmMonitorError::Http(e));
+                return Err(LlmMonitorError::from(e));
             }
             Some(Ok(bytes)) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
         }
@@ -1283,6 +1286,69 @@ mod tests {
                 "{s}"
             );
         }
+    }
+
+    #[test]
+    fn retry_after_header_parses_integer_and_fractional_seconds() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("17"));
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(17)));
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("0.5"));
+        assert_eq!(
+            parse_retry_after(&headers),
+            Some(Duration::from_millis(500))
+        );
+
+        // HTTP-date (or garbage) is ignored rather than mis-parsed.
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Fri, 31 Dec 1999 23:59:59 GMT"),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[tokio::test]
+    async fn connect_refused_classifies_as_connect_error() {
+        // Bind then drop a listener so the port actively refuses connections.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let err = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .expect_err("connecting to a closed port must fail");
+        let typed = LlmMonitorError::from(err);
+        assert!(matches!(typed, LlmMonitorError::Connect(_)), "{typed}");
+        assert!(!typed.is_timeout());
+    }
+
+    #[tokio::test]
+    async fn request_timeout_classifies_as_timeout_error() {
+        // A listener that is never accepted from: the kernel completes the TCP
+        // handshake into the backlog, the request is written, and no response
+        // ever comes — so the client-side deadline is what fires. No server
+        // thread is needed (and a joined one would deadlock the current-thread
+        // runtime against reqwest's background pool shutdown).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // The deadline provokes the timeout under test; it fires regardless of
+        // machine speed because the server never answers.
+        let err = Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await
+            .expect_err("a never-responding server must time the request out");
+        drop(listener);
+        let typed = LlmMonitorError::from(err);
+        assert!(typed.is_timeout(), "{typed}");
+        assert!(typed.to_string().contains("timed out"), "{typed}");
     }
 
     #[test]

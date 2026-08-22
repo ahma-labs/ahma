@@ -15,6 +15,7 @@
 - **Streaming Chat**: `chat_stream` yields incremental tokens for the TUI chat interface rather than blocking to completion.
 - **Tool Calls**: `ChatToolCall` carries provider tool-invocation requests back to the caller.
 - **Local Provider Discovery**: `discover_local_providers` probes well-known local endpoints (e.g. Ollama, LM Studio) and reports which are reachable, so a local model can be chosen without manual configuration.
+- **Typed Errors**: Failures surface as `LlmMonitorError` variants — `Api` (with an `ApiErrorKind` classification: rate-limited, auth, context-length exceeded, invalid request, server; plus the provider-reported message and any `Retry-After`), `Connect`, `Timeout`, `Http`, `Parse`. Classification of a provider error response happens once, in this crate; consumers MUST branch on the typed variants/kinds (e.g. `is_tools_rejected`, `is_timeout`), never by substring-matching rendered error text. The provider's raw message stays available on the error for display and logging.
 
 ## 3. Non-Functional Requirements
 
