@@ -135,6 +135,7 @@ impl AhmaMcpService {
             let mut configs_lock = self.configs.write().unwrap();
             *configs_lock = new_configs;
         }
+        self.invalidate_config_tools_cache();
 
         // Notify clients that the tool list has changed.
         // Clone peer outside the lock before async call to avoid holding guard across .await

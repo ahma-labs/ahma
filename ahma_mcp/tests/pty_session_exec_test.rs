@@ -139,12 +139,10 @@ async fn pty_output_reaches_tail_and_spill() {
         .unwrap();
 
     let op = wait_done(&monitor, &id).await;
+    let tail = op.stdout_tail.snapshot();
     assert!(
-        op.stdout_tail
-            .iter()
-            .any(|l| l.contains("pty-spill-marker")),
-        "tail: {:?}",
-        op.stdout_tail
+        tail.iter().any(|l| l.contains("pty-spill-marker")),
+        "tail: {tail:?}"
     );
     let output_file = op
         .result

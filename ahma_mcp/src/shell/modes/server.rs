@@ -283,6 +283,44 @@ async fn wait_for_active_operations(
     }
 }
 
+/// The single graceful-shutdown choreography for every exit path of the stdio
+/// server. Both the signal handler ([`run_shutdown_handler`]) and the
+/// session-end path (`service.waiting()` returning) run exactly this sequence,
+/// so the steps cannot drift apart between exits:
+///
+/// 1. With `grace` set, wait up to that long for in-flight operations to
+///    finish, then cancel whatever remains — each cancellation reaps the
+///    operation's full process tree, so no spawned work outlives the server.
+///    `None` skips the wait: [`crate::adapter::Adapter::shutdown`] still
+///    cancels every tracked operation immediately (used on session end, where
+///    the client is gone and nothing will consume a late result).
+/// 2. Disclose termination to the client (`notifications/sandbox/terminated`).
+/// 3. Shut the adapter down: cancel stragglers, drain task handles, kill
+///    persistent session shells.
+///
+/// The stdio server owns no Unix socket, so there is no socket file to remove
+/// here. A shutdown path that *does* own one must remove it only after an
+/// identity check (device+inode still ours — SPEC R-ISO.3); that lives with
+/// the socket owner, `ahma_http_bridge`.
+async fn graceful_shutdown(
+    adapter: &Arc<crate::adapter::Adapter>,
+    operation_monitor: &Arc<crate::operation_monitor::OperationMonitor>,
+    grace: Option<Duration>,
+    reason: &str,
+) {
+    if let Some(grace) = grace {
+        let summary = operation_monitor.get_shutdown_summary().await;
+        if summary.total_active > 0 {
+            wait_for_active_operations(operation_monitor, grace, summary.total_active, reason)
+                .await;
+        } else {
+            info!("OK No active operations - proceeding with immediate shutdown");
+        }
+    }
+    emit_sandbox_terminated(reason);
+    adapter.shutdown().await;
+}
+
 // ============================================================================
 // CRITICAL: Graceful Shutdown Implementation for Development Workflow
 // ============================================================================
@@ -320,23 +358,13 @@ async fn run_shutdown_handler(
     };
 
     info!("🛑 Shutdown initiated - checking for active operations...");
-    let shutdown_summary = operation_monitor.get_shutdown_summary().await;
-
-    if shutdown_summary.total_active > 0 {
-        wait_for_active_operations(
-            &operation_monitor,
-            shutdown_timeout,
-            shutdown_summary.total_active,
-            shutdown_reason,
-        )
-        .await;
-    } else {
-        info!("OK No active operations - proceeding with immediate shutdown");
-    }
-
-    info!("🔄 Shutting down adapter and shell pools...");
-    emit_sandbox_terminated(shutdown_reason);
-    adapter.shutdown().await;
+    graceful_shutdown(
+        &adapter,
+        &operation_monitor,
+        Some(shutdown_timeout),
+        shutdown_reason,
+    )
+    .await;
 
     // Force process exit if service doesn't stop naturally
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1295,8 +1323,9 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         Ok(_) => "session_ended".to_string(),
         Err(e) => format!("session_error: {:#}", e),
     };
-    emit_sandbox_terminated(&reason);
-    adapter.shutdown().await;
+    // No grace wait on session end: the client is gone, so nothing will
+    // consume a late result — cancel and reap immediately.
+    graceful_shutdown(&adapter, &operation_monitor, None, &reason).await;
     result?;
 
     Ok(())
@@ -2530,6 +2559,73 @@ mod tests {
             polls.load(std::sync::atomic::Ordering::Relaxed),
             3,
             "the wait must return on the first check that observes the stop"
+        );
+    }
+
+    /// Regression (shutdown unification): every exit path runs the same
+    /// choreography, and that choreography leaves no active operation behind —
+    /// whatever is still running when the grace period lapses is cancelled
+    /// with the shutdown reason. Zero grace makes the wait deterministic:
+    /// the drain loop never sleeps, so the test exercises exactly the
+    /// "grace elapsed, cancel the stragglers" branch.
+    #[tokio::test]
+    async fn graceful_shutdown_cancels_remaining_operations_on_every_path() {
+        use crate::operation_monitor::{
+            MonitorConfig, Operation, OperationMonitor, OperationStatus,
+        };
+
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(3600),
+        )));
+        let shell_pool = Arc::new(crate::shell_pool::ShellPoolManager::new(
+            crate::shell_pool::ShellPoolConfig::default(),
+        ));
+        let td = tempdir().unwrap();
+        let sandbox = Arc::new(
+            crate::sandbox::Sandbox::new(
+                vec![td.path().to_path_buf()],
+                crate::sandbox::SandboxMode::Test,
+                false,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let adapter =
+            Arc::new(crate::adapter::Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap());
+
+        let mut op = Operation::new(
+            "shutdown-straggler".to_string(),
+            "test_tool".to_string(),
+            "op still running at shutdown".to_string(),
+            None,
+        );
+        op.state = OperationStatus::InProgress;
+        monitor.add_operation(op).await;
+
+        graceful_shutdown(
+            &adapter,
+            &monitor,
+            Some(Duration::ZERO),
+            "test: shutdown unification",
+        )
+        .await;
+
+        assert_eq!(
+            monitor.get_shutdown_summary().await.total_active,
+            0,
+            "graceful_shutdown must leave no active operations"
+        );
+        let op = monitor
+            .get_completed_operations()
+            .await
+            .into_iter()
+            .find(|op| op.id == "shutdown-straggler")
+            .expect("cancelled operation must be found in completion history");
+        assert_eq!(
+            op.state,
+            OperationStatus::Cancelled,
+            "the straggler must have been cancelled by the shared shutdown routine"
         );
     }
 }

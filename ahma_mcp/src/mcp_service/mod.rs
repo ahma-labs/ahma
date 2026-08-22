@@ -114,7 +114,19 @@ const SANDBOX_EXEMPT_BUILTINS: &[&str] = &[
 pub struct AhmaMcpService {
     pub adapter: Arc<Adapter>,
     pub operation_monitor: Arc<crate::operation_monitor::OperationMonitor>,
+    /// Tool configurations, keyed by tool name. Writers MUST invalidate
+    /// [`Self::invalidate_config_tools_cache`] after mutating (as
+    /// [`Self::update_tools`] does), or `tools/list` serves stale entries.
     pub configs: Arc<RwLock<HashMap<String, ToolConfig>>>,
+    /// Lazily-built builtin `Tool` list. The builtin set and every builtin
+    /// schema are static for the life of the service, but each `Tool` (schema
+    /// map included) used to be rebuilt on every `tools/list` request; built
+    /// once here and cheaply cloned instead (`Tool` holds `Cow`/`Arc` fields).
+    builtin_tools_cache: Arc<std::sync::OnceLock<Vec<Tool>>>,
+    /// Cache of the constructed config-backed `Tool` list (visible entries
+    /// only). Schema generation per config is the expensive part; the cache is
+    /// dropped whenever `configs` changes ([`Self::invalidate_config_tools_cache`]).
+    config_tools_cache: Arc<RwLock<Option<Arc<Vec<Tool>>>>>,
     pub guidance: Arc<Option<GuidanceConfig>>,
     /// When true, forces all operations to run synchronously (overrides async-by-default).
     /// This is set when the --sync CLI flag is used.
@@ -316,13 +328,32 @@ impl AhmaMcpService {
     /// The `Tool` entries for every configured tool that is visible to the
     /// client. Shared by `get_all_available_tools` and `list_tools` so their
     /// filtering cannot drift apart.
+    ///
+    /// Schema construction per config is expensive and the result only changes
+    /// when `configs` does, so the built list is cached until
+    /// [`Self::invalidate_config_tools_cache`] drops it (every `configs`
+    /// writer must call it — [`Self::update_tools`] does).
     fn visible_config_tools(&self) -> Vec<Tool> {
-        let configs_lock = self.configs.read().unwrap();
-        configs_lock
-            .values()
-            .filter(|config| self.is_config_visible_to_client(config))
-            .flat_map(|config| self.create_tools_from_config(config))
-            .collect()
+        if let Some(cached) = self.config_tools_cache.read().unwrap().as_ref() {
+            return cached.as_ref().clone();
+        }
+        let tools: Vec<Tool> = {
+            let configs_lock = self.configs.read().unwrap();
+            configs_lock
+                .values()
+                .filter(|config| self.is_config_visible_to_client(config))
+                .flat_map(|config| self.create_tools_from_config(config))
+                .collect()
+        };
+        *self.config_tools_cache.write().unwrap() = Some(Arc::new(tools.clone()));
+        tools
+    }
+
+    /// Drop the cached config-backed `Tool` list so the next `tools/list`
+    /// rebuilds it from the current `configs`. Must accompany every mutation
+    /// of [`Self::configs`].
+    fn invalidate_config_tools_cache(&self) {
+        *self.config_tools_cache.write().unwrap() = None;
     }
 
     /// The built-in tools every session exposes, before per-client config
@@ -332,7 +363,19 @@ impl AhmaMcpService {
     /// [`Self::get_all_available_tools`] (what ahma's own agent loop sees).
     /// Those were two separately maintained literals and they had drifted: the
     /// agent-facing one was three tools and two descriptions behind.
+    ///
+    /// The set (schemas included) is static per service, so it is built once
+    /// and cloned per call — `Tool` is cheap to clone (`Cow` strings, `Arc`
+    /// schema map), while *building* one means constructing a full JSON schema.
     fn builtin_tools(&self) -> Vec<Tool> {
+        self.builtin_tools_cache
+            .get_or_init(|| self.build_builtin_tools())
+            .clone()
+    }
+
+    /// Construct the builtin `Tool` values. Only called once per service, via
+    /// the [`Self::builtin_tools`] cache.
+    fn build_builtin_tools(&self) -> Vec<Tool> {
         vec![
             // Hard-wired await command - always available
             Tool::new(
@@ -755,6 +798,8 @@ impl AhmaMcpService {
             adapter,
             operation_monitor,
             configs: Arc::new(RwLock::new((*configs).clone())),
+            builtin_tools_cache: Arc::new(std::sync::OnceLock::new()),
+            config_tools_cache: Arc::new(RwLock::new(None)),
             guidance,
             force_synchronous,
             defer_sandbox,
@@ -3173,6 +3218,9 @@ mod tests {
             .write()
             .unwrap()
             .insert(config.name.clone(), config);
+        // Direct `configs` writers must invalidate the tools/list cache,
+        // exactly as `update_tools` does.
+        service.invalidate_config_tools_cache();
     }
 
     fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {

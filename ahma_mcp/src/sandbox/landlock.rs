@@ -237,13 +237,15 @@ fn add_landlock_profile_rules(
     access_all: landlock::BitFlags<landlock::AccessFs>,
     package_cache_write: bool,
 ) -> Result<()> {
-    use super::profiles::{ProfileAccess, applicable_rules};
+    use super::profiles::{ProfileAccess, applicable_rules, enabled_profile_names};
     use landlock::{AccessFs, PathBeneath, PathFd, RulesetCreatedAttr};
 
-    let enabled = ahma_common::config::AhmaSettings::load().sandbox.profiles;
+    // Loaded once per process (see `enabled_profile_names`): sandbox
+    // configuration cannot change mid-session, and this runs per spawn.
+    let enabled = enabled_profile_names();
     let access_read_execute = access_read | AccessFs::Execute;
 
-    for rule in applicable_rules(&enabled, package_cache_write) {
+    for rule in applicable_rules(enabled, package_cache_write) {
         let access = match rule.access {
             ProfileAccess::Ro => access_read,
             ProfileAccess::Rx => access_read_execute,

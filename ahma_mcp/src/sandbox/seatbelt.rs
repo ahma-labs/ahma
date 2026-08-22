@@ -315,12 +315,14 @@ impl Sandbox {
     /// `~/.cargo` — would hand over `credentials.toml` and write access to every
     /// binary on the user's PATH.
     fn get_macos_profile_rules(&self) -> String {
-        use super::profiles::{RuleKind, applicable_rules};
+        use super::profiles::{RuleKind, applicable_rules, enabled_profile_names};
 
-        let enabled = ahma_common::config::AhmaSettings::load().sandbox.profiles;
+        // Loaded once per process (see `enabled_profile_names`): sandbox
+        // configuration cannot change mid-session, and this runs per spawn.
+        let enabled = enabled_profile_names();
         let mut rules = String::new();
 
-        for rule in applicable_rules(&enabled, self.package_cache_write) {
+        for rule in applicable_rules(enabled, self.package_cache_write) {
             let target = match rule.kind {
                 RuleKind::Dir => format!("(subpath \"{}\")", rule.path.display()),
                 RuleKind::File => format!("(literal \"{}\")", rule.path.display()),

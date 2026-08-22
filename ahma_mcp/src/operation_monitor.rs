@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 use tokio::sync::{
@@ -32,7 +32,7 @@ const EVENT_STREAM_CAPACITY: usize = 1024;
 /// Cap on `completion_history` size: once this many terminal operations have
 /// accumulated, the oldest is evicted on each new completion. Mirrors the
 /// bound already applied to `Operation::stdout_tail` (see
-/// `append_output_line`) — without one, a long-lived server session
+/// [`MAX_TAIL_LINES`]) — without one, a long-lived server session
 /// accumulates one entry per operation for the life of the process.
 const MAX_COMPLETION_HISTORY: usize = 1000;
 
@@ -129,11 +129,15 @@ pub struct Operation {
     /// Not serialised — only meaningful for live operations held in OperationMonitor.
     #[serde(skip, default = "default_completion_watch")]
     pub completion_watch: Arc<watch::Sender<bool>>,
-    /// Tail of stdout/stderr lines for this operation (max 100).
-    /// A `VecDeque` so evicting the oldest line is O(1); serializes as a JSON
-    /// array exactly like a `Vec`.
+    /// Tail of stdout/stderr lines for this operation (max
+    /// [`MAX_TAIL_LINES`]). Held in a shared per-operation cell so the
+    /// output hot path ([`OperationMonitor::append_output_line`]) appends
+    /// under a **read** lock on the operations map plus this operation's own
+    /// mutex, instead of serializing every streamed line of every concurrent
+    /// operation behind the monitor-global write lock. Serializes as a JSON
+    /// array of strings, exactly as the plain `VecDeque<String>` did.
     #[serde(default)]
-    pub stdout_tail: VecDeque<String>,
+    pub stdout_tail: SharedTail,
     /// Any warnings/errors detected for this operation
     #[serde(default)]
     pub alerts: Vec<String>,
@@ -147,14 +151,119 @@ pub struct Operation {
     /// bumped on every [`OperationMonitor::append_output_line`], and reset
     /// forward when a system suspend is detected so a laptop sleep is never
     /// mistaken for a wedged build. Wall-clock (`SystemTime`, not the monotonic
-    /// `Instant`) precisely so the check survives system sleep.
-    #[serde(with = "time", default = "SystemTime::now")]
-    pub last_activity: SystemTime,
+    /// `Instant`) precisely so the check survives system sleep. Shares the
+    /// hot-path cell rationale of [`Operation::stdout_tail`]: bumped through a
+    /// per-operation handle so proof-of-life never needs the monitor-global
+    /// write lock. Serializes as the same RFC 3339 string as before.
+    #[serde(default = "ActivityStamp::now")]
+    pub last_activity: ActivityStamp,
 }
 
 /// Default factory for `completion_watch` used during serde deserialisation.
 fn default_completion_watch() -> Arc<watch::Sender<bool>> {
     Arc::new(watch::channel(false).0)
+}
+
+/// Bounded length of [`Operation::stdout_tail`].
+pub const MAX_TAIL_LINES: usize = 100;
+
+/// Shared, bounded tail of an operation's streamed output lines.
+///
+/// A thin `Arc<Mutex<VecDeque<String>>>`: cloning an [`Operation`] (status
+/// snapshots, upsert re-adds) shares the cell rather than deep-copying the
+/// window, and — the point — the per-line hot path appends through this
+/// per-operation mutex under a shared read lock on the operations map,
+/// instead of taking the monitor-global write lock for every streamed line.
+/// Serializes exactly as the plain `VecDeque<String>` it replaces: a JSON
+/// array of strings.
+#[derive(Debug, Clone, Default)]
+pub struct SharedTail(Arc<Mutex<VecDeque<String>>>);
+
+impl SharedTail {
+    /// Append a line, evicting the oldest once [`MAX_TAIL_LINES`] is reached.
+    pub fn push_line(&self, line: String) {
+        let mut tail = self.0.lock().unwrap();
+        if tail.len() >= MAX_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+
+    /// A point-in-time copy of the buffered lines.
+    pub fn snapshot(&self) -> VecDeque<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+}
+
+impl Serialize for SharedTail {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let tail = self.0.lock().unwrap();
+        serializer.collect_seq(tail.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedTail {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let lines = VecDeque::<String>::deserialize(deserializer)?;
+        Ok(Self(Arc::new(Mutex::new(lines))))
+    }
+}
+
+/// Wall-clock activity stamp shared across clones of one [`Operation`].
+///
+/// Same rationale as [`SharedTail`]: proof-of-life updates (every output line,
+/// every CPU-liveness probe) go through this per-operation cell so they never
+/// need exclusive access to the whole operations map. Serializes as the same
+/// RFC 3339 string the plain `SystemTime` field used (via [`time`]).
+#[derive(Debug, Clone)]
+pub struct ActivityStamp(Arc<Mutex<SystemTime>>);
+
+impl ActivityStamp {
+    /// A stamp set to the current wall-clock time.
+    pub fn now() -> Self {
+        Self::from(SystemTime::now())
+    }
+
+    /// The stamped time.
+    pub fn get(&self) -> SystemTime {
+        *self.0.lock().unwrap()
+    }
+
+    /// Overwrite the stamp.
+    pub fn set(&self, t: SystemTime) {
+        *self.0.lock().unwrap() = t;
+    }
+
+    /// Reset the stamp to now (proof of life).
+    pub fn touch(&self) {
+        self.set(SystemTime::now());
+    }
+}
+
+impl From<SystemTime> for ActivityStamp {
+    fn from(t: SystemTime) -> Self {
+        Self(Arc::new(Mutex::new(t)))
+    }
+}
+
+impl Serialize for ActivityStamp {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        time::serialize(&self.get(), serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityStamp {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from(time::deserialize(deserializer)?))
+    }
 }
 
 impl Operation {
@@ -187,10 +296,10 @@ impl Operation {
             timeout_duration: timeout,
             cancellation_token: CancellationToken::new(),
             completion_watch: Arc::new(watch::channel(false).0),
-            stdout_tail: VecDeque::new(),
+            stdout_tail: SharedTail::default(),
             alerts: Vec::new(),
             output_file: None,
-            last_activity: SystemTime::now(),
+            last_activity: ActivityStamp::now(),
         }
     }
 
@@ -374,19 +483,22 @@ impl OperationMonitor {
 
     /// Append a line of live output to the operation's tail buffer and stream
     /// it to event subscribers.
+    ///
+    /// This is the per-line hot path for every streaming subprocess, so it
+    /// takes only a **read** lock on the operations map (concurrent operations
+    /// append in parallel; status readers are not blocked behind output) and
+    /// mutates through the operation's own [`SharedTail`] / [`ActivityStamp`]
+    /// cells. Fan-out to subscribers shares one `Arc<OperationEvent>` per line.
     pub async fn append_output_line(&self, id: &str, line: String, is_stderr: bool) {
-        let mut ops = self.operations.write().await;
-        if let Some(op) = ops.get_mut(id) {
-            if op.stdout_tail.len() >= 100 {
-                op.stdout_tail.pop_front();
-            }
-            op.stdout_tail.push_back(line.clone());
+        {
+            let ops = self.operations.read().await;
+            let Some(op) = ops.get(id) else {
+                return;
+            };
+            op.stdout_tail.push_line(line.clone());
             // Output is proof of life: reset the idle-output watchdog clock.
-            op.last_activity = SystemTime::now();
-        } else {
-            return;
+            op.last_activity.touch();
         }
-        drop(ops);
 
         self.events.emit(OperationEvent::OutputLine {
             operation_id: id.to_string(),
@@ -420,9 +532,9 @@ impl OperationMonitor {
     /// Without this, any command whose output is buffered (`… | tail`) or simply
     /// slow to speak (a long compile) is killed for "stalling" while it is busy.
     pub async fn note_liveness(&self, id: &str) {
-        let mut ops = self.operations.write().await;
-        if let Some(op) = ops.get_mut(id) {
-            op.last_activity = SystemTime::now();
+        let ops = self.operations.read().await;
+        if let Some(op) = ops.get(id) {
+            op.last_activity.touch();
         }
     }
 
@@ -506,7 +618,7 @@ impl OperationMonitor {
         {
             let mut ops = self.operations.write().await;
             for op in ops.values_mut().filter(|op| !op.state.is_terminal()) {
-                op.last_activity = now;
+                op.last_activity.set(now);
                 let alert = format!(
                     "⚠ system appears to have slept ~{:.0}s while this operation was running; \
                      it may be wedged — idle-output watchdog was reset for it",
@@ -564,7 +676,7 @@ impl OperationMonitor {
                     // denied write") was a confident guess that sent debugging in
                     // the wrong direction when the real culprit was a buffered pipe.
                     if let Some(idle_limit) = self.config.idle_timeout {
-                        let idle = now.duration_since(op.last_activity).ok()?;
+                        let idle = now.duration_since(op.last_activity.get()).ok()?;
                         if idle > idle_limit {
                             let reason = format!(
                                 "Operation stalled: no output and no CPU activity for {:.1}s \
@@ -1427,7 +1539,7 @@ mod tests {
         );
         let past = SystemTime::now() - age;
         op.start_time = past;
-        op.last_activity = past;
+        op.last_activity = ActivityStamp::from(past);
         op.state = OperationStatus::InProgress;
         monitor.add_operation(op).await;
     }
@@ -1571,7 +1683,7 @@ mod tests {
 
         let op = monitor.get_operation("op").await.unwrap();
         let idle = SystemTime::now()
-            .duration_since(op.last_activity)
+            .duration_since(op.last_activity.get())
             .unwrap_or(Duration::ZERO);
         assert!(
             idle < Duration::from_secs(1),

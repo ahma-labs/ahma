@@ -185,32 +185,54 @@ pub struct SandboxProfile {
 /// Compiled in via `include_str!` so a released binary is self-contained (no
 /// data files to install, nothing to go missing), while the *source of truth* is
 /// still a data file anyone can read and copy.
-pub fn builtin_profiles() -> Vec<SandboxProfile> {
-    const SOURCES: &[&str] = &[
-        include_str!("../../profiles/rust.toml"),
-        include_str!("../../profiles/node.toml"),
-        include_str!("../../profiles/go.toml"),
-        include_str!("../../profiles/common.toml"),
-    ];
-    SOURCES
-        .iter()
-        .filter_map(|src| match toml::from_str::<RawProfile>(src) {
-            Ok(raw) => Some(SandboxProfile {
-                name: raw.name,
-                description: raw.description,
-                rules: raw.rules,
-                deny_write: raw.deny_write,
-                hosts: raw.hosts,
-            }),
-            Err(e) => {
-                // A malformed builtin is a build-time bug, not a user problem; it
-                // is pinned by `every_builtin_profile_parses`. Degrade rather than
-                // panic so one bad profile cannot brick every sandbox.
-                tracing::error!("built-in sandbox profile failed to parse: {e}");
-                None
-            }
-        })
-        .collect()
+pub fn builtin_profiles() -> &'static [SandboxProfile] {
+    // Parsed once per process: the sources are compiled in and immutable, and
+    // this sits on the sandbox-spawn hot path (every `run_terminal_command`
+    // resolves profile rules) — re-parsing four TOML documents per spawn was
+    // pure waste.
+    static PROFILES: std::sync::OnceLock<Vec<SandboxProfile>> = std::sync::OnceLock::new();
+    PROFILES.get_or_init(|| {
+        const SOURCES: &[&str] = &[
+            include_str!("../../profiles/rust.toml"),
+            include_str!("../../profiles/node.toml"),
+            include_str!("../../profiles/go.toml"),
+            include_str!("../../profiles/common.toml"),
+        ];
+        SOURCES
+            .iter()
+            .filter_map(|src| match toml::from_str::<RawProfile>(src) {
+                Ok(raw) => Some(SandboxProfile {
+                    name: raw.name,
+                    description: raw.description,
+                    rules: raw.rules,
+                    deny_write: raw.deny_write,
+                    hosts: raw.hosts,
+                }),
+                Err(e) => {
+                    // A malformed builtin is a build-time bug, not a user problem; it
+                    // is pinned by `every_builtin_profile_parses`. Degrade rather than
+                    // panic so one bad profile cannot brick every sandbox.
+                    tracing::error!("built-in sandbox profile failed to parse: {e}");
+                    None
+                }
+            })
+            .collect()
+    })
+}
+
+/// The `[sandbox] profiles` list from `~/.ahma/settings.toml`, loaded once per
+/// process.
+///
+/// Sandbox configuration is fixed for the life of a session (the R5 invariant:
+/// scope and enforcement decisions never change mid-session; a settings edit —
+/// like a persistent scope grant, R5.4.4/R5.4.5 — takes effect on the next
+/// server start). Both kernel backends used to re-read and re-parse the whole
+/// settings file on **every sandboxed spawn**, which was hot-path waste and
+/// implied a mid-session behavior change the sandbox forbids.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn enabled_profile_names() -> &'static [String] {
+    static ENABLED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ENABLED.get_or_init(|| ahma_common::config::AhmaSettings::load().sandbox.profiles)
 }
 
 /// The names of every shipped profile — the default value of `[sandbox] profiles`.
@@ -219,7 +241,7 @@ pub fn builtin_profiles() -> Vec<SandboxProfile> {
 /// preserved exactly. What changes is that it is now *visible* and *refusable*,
 /// rather than invisible and mandatory.
 pub fn default_profile_names() -> Vec<String> {
-    builtin_profiles().into_iter().map(|p| p.name).collect()
+    builtin_profiles().iter().map(|p| p.name.clone()).collect()
 }
 
 /// Resolve the rules contributed by the enabled profiles.
@@ -474,7 +496,7 @@ mod tests {
             "all four shipped profiles parse: {:?}",
             profiles.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
-        for p in &profiles {
+        for p in profiles {
             assert!(!p.description.is_empty(), "{} needs a description", p.name);
             assert!(!p.rules.is_empty(), "{} grants nothing", p.name);
         }
