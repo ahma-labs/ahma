@@ -277,16 +277,17 @@ impl AhmaMcpService {
     /// factored out so it is testable without constructing a real
     /// `NotificationContext` (its `Peer` cannot be built outside rmcp itself).
     fn apply_custom_notification(&self, method: &str, params: Option<&serde_json::Value>) {
-        if method == "notifications/ahma/heartbeat" {
+        if method == ahma_common::mcp_methods::HEARTBEAT_METHOD {
             self.last_received_signal.store(
                 ahma_common::keepalive::current_timestamp_ms(),
                 std::sync::atomic::Ordering::Relaxed,
             );
-        } else if method == "notifications/ahma/pushChannelChanged" {
-            let connected = params
-                .and_then(|p| p.get("connected"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+        } else if method == ahma_common::mcp_methods::PUSH_CHANNEL_CHANGED_METHOD {
+            // Lenient by design (SPEC R2.6.5.3): missing or malformed params
+            // fall back to `connected: false`, the safe "no live channel"
+            // assumption — never an error.
+            let connected =
+                ahma_common::mcp_methods::PushChannelChangedParams::from_params(params).connected;
             self.push_channel_open
                 .store(connected, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2505,7 +2506,10 @@ impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
             let params = serde_json::to_value(payload)?;
 
             peer.send_notification(rmcp::model::ServerNotification::CustomNotification(
-                rmcp::model::CustomNotification::new("notifications/ahma/heartbeat", Some(params)),
+                rmcp::model::CustomNotification::new(
+                    ahma_common::mcp_methods::HEARTBEAT_METHOD,
+                    Some(params),
+                ),
             ))
             .await?;
         }
@@ -4404,6 +4408,21 @@ mod tests {
         assert!(
             !service.push_channel_open(),
             "missing params must fall back to the safe default (false), same as unset"
+        );
+
+        // A malformed `connected` (wrong type) must also land on the safe
+        // default — lenient parsing, pinned so the typed path can never
+        // become stricter than the old `.get("connected").as_bool()` chain.
+        service
+            .push_channel_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        service.apply_custom_notification(
+            "notifications/ahma/pushChannelChanged",
+            Some(&json!({"connected": "yes"})),
+        );
+        assert!(
+            !service.push_channel_open(),
+            "malformed connected must fall back to the safe default (false)"
         );
     }
 

@@ -44,7 +44,10 @@
 
 use crate::error::{BridgeError, Result};
 use crate::peer::{PeerFactory, PeerShutdownFn, PeerStreams, SubprocessPeerFactory};
-use ahma_common::mcp_methods::{SANDBOX_CONFIGURED_METHOD, SANDBOX_FAILED_METHOD};
+use ahma_common::mcp_methods::{
+    PUSH_CHANNEL_CHANGED_METHOD, PushChannelChangedParams, SANDBOX_CONFIGURED_METHOD,
+    SANDBOX_FAILED_METHOD, SandboxLifecycleParams,
+};
 use ahma_common::sandbox_state::{SandboxState, SandboxStateMachine};
 use ahma_common::state_machine::{FsmState, StateMachine};
 use chrono::Local;
@@ -500,8 +503,8 @@ impl Session {
     pub async fn send_push_channel_changed(&self, connected: bool) -> Result<()> {
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
-            "method": "notifications/ahma/pushChannelChanged",
-            "params": { "connected": connected }
+            "method": PUSH_CHANNEL_CHANGED_METHOD,
+            "params": PushChannelChangedParams { connected }
         });
         self.send_to_subprocess(&notification, "Failed to send pushChannelChanged")
             .await
@@ -733,23 +736,16 @@ async fn await_response(
 }
 
 /// Extract the write scopes carried in a `notifications/sandbox/configured`
-/// payload (`params.scope.write`, an array of display path strings).
+/// payload (`params.scope.write`, an array of display path strings —
+/// [`SandboxLifecycleParams`], SPEC R5.4/R5.6).
 ///
-/// Returns an empty vec when the notification omits the scope summary; the
-/// caller then preserves any in-flight `Configuring` scopes instead.
+/// Returns an empty vec when the notification omits the scope summary (or
+/// carries a malformed one — parsing is lenient, never an error); the caller
+/// then preserves any in-flight `Configuring` scopes instead.
 fn parse_configured_scopes(value: &Value) -> Vec<PathBuf> {
-    value
-        .get("params")
-        .and_then(|p| p.get("scope"))
-        .and_then(|s| s.get("write"))
-        .and_then(Value::as_array)
-        .map(|writes| {
-            writes
-                .iter()
-                .filter_map(Value::as_str)
-                .map(PathBuf::from)
-                .collect()
-        })
+    SandboxLifecycleParams::from_notification(value)
+        .scope
+        .map(|scope| scope.write.into_iter().map(PathBuf::from).collect())
         .unwrap_or_default()
 }
 
@@ -782,14 +778,14 @@ fn handle_sandbox_configured(session: &Arc<Session>, value: &Value) {
 }
 
 fn handle_sandbox_failed(session: &Arc<Session>, value: &Value) {
-    let err_msg = value
-        .get("params")
-        .and_then(|p| p.get("error"))
-        .and_then(|e| e.as_str())
-        .unwrap_or("Unknown error");
+    // Lenient: a missing or malformed `params.error` falls back to a generic
+    // message — the Failed transition must happen regardless of payload shape.
+    let err_msg = SandboxLifecycleParams::from_notification(value)
+        .error
+        .unwrap_or_else(|| "Unknown error".to_string());
     if let Err(e) = session
         .sandbox_state_machine
-        .transition_to_failed(err_msg.to_string())
+        .transition_to_failed(err_msg.clone())
     {
         warn!(
             session_id = %session.id,
@@ -1664,6 +1660,30 @@ mod sandbox_configured_parse_tests {
         });
         assert!(parse_configured_scopes(&notif).is_empty());
     }
+
+    #[test]
+    fn parse_configured_scopes_skips_non_string_entries() {
+        // Pins the historical `filter_map(Value::as_str)` leniency: a
+        // mixed-type write array keeps its strings rather than erroring.
+        let notif = json!({
+            "method": "notifications/sandbox/configured",
+            "params": { "scope": { "write": ["/keep", 7, null, "/also"] } }
+        });
+        assert_eq!(
+            parse_configured_scopes(&notif),
+            vec![PathBuf::from("/keep"), PathBuf::from("/also")]
+        );
+    }
+
+    #[test]
+    fn parse_configured_scopes_non_object_params_is_empty() {
+        // `params` present but not an object → treated as missing → empty.
+        let notif = json!({
+            "method": "notifications/sandbox/configured",
+            "params": "garbage"
+        });
+        assert!(parse_configured_scopes(&notif).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -2081,6 +2101,22 @@ mod session_logic_tests {
         // No params.error → "Unknown error" default branch.
         let (session, _rx) = make_test_session();
         handle_sandbox_failed(&session, &json!({"method": "notifications/sandbox/failed"}));
+        assert!(matches!(
+            session.current_sandbox_state(),
+            SandboxState::Failed { error } if error == "Unknown error"
+        ));
+    }
+
+    #[test]
+    fn handle_sandbox_failed_malformed_error_defaults_message() {
+        // A non-string `params.error` must not reject the notification: the
+        // Failed transition still happens, with the generic fallback message
+        // (pins the leniency of the typed parse against the old `.as_str()`).
+        let (session, _rx) = make_test_session();
+        handle_sandbox_failed(
+            &session,
+            &json!({"method": "notifications/sandbox/failed", "params": {"error": 42}}),
+        );
         assert!(matches!(
             session.current_sandbox_state(),
             SandboxState::Failed { error } if error == "Unknown error"

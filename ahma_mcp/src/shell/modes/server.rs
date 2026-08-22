@@ -199,10 +199,13 @@ fn network_enforcement_note() -> &'static str {
 }
 
 fn emit_sandbox_terminated(reason: &str) {
+    let params = ahma_common::mcp_methods::SandboxTerminatedParams {
+        reason: reason.to_string(),
+    };
     if let Ok(notification) = serde_json::to_string(&serde_json::json!({
         "jsonrpc": "2.0",
-        "method": "notifications/sandbox/terminated",
-        "params": { "reason": reason }
+        "method": ahma_common::mcp_methods::SANDBOX_TERMINATED_METHOD,
+        "params": params
     })) {
         let _ = emit_stdout_notification(&notification);
     }

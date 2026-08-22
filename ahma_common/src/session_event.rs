@@ -69,6 +69,22 @@ impl SessionEventKind {
     }
 }
 
+/// The typed `params` envelope of a `notifications/ahma/session_event`
+/// (SPEC R8.8.1: `{kind, timestamp, seq, detail}`), also embedded as the
+/// `data` of its `notifications/message` mirror (R8.8.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEventParams {
+    /// What happened (wire value: snake_case, see [`SessionEventKind`]).
+    pub kind: SessionEventKind,
+    /// Milliseconds since the Unix epoch at emission time.
+    pub timestamp: u64,
+    /// Per-emitter monotonic sequence number so a client can detect gaps.
+    pub seq: u64,
+    /// Kind-specific detail (schemas:
+    /// `docs/session-health-notifications.md` §3.2).
+    pub detail: serde_json::Value,
+}
+
 /// The `params` of a `notifications/ahma/session_event`, also embedded as the
 /// `data` of its `notifications/message` mirror.
 pub fn event_params(
@@ -77,12 +93,13 @@ pub fn event_params(
     timestamp_ms: u64,
     detail: serde_json::Value,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "kind": kind.as_str(),
-        "timestamp": timestamp_ms,
-        "seq": seq,
-        "detail": detail,
+    serde_json::to_value(SessionEventParams {
+        kind,
+        timestamp: timestamp_ms,
+        seq,
+        detail,
     })
+    .expect("SessionEventParams serialization is infallible (string keys only)")
 }
 
 /// The complete `notifications/ahma/session_event` JSON-RPC notification.
@@ -161,6 +178,38 @@ mod tests {
         assert_eq!(SessionEventKind::GrantPending.mirror_level(), "warning");
         assert_eq!(SessionEventKind::GrantDecided.mirror_level(), "warning");
         assert_eq!(SessionEventKind::Health.mirror_level(), "info");
+    }
+
+    #[test]
+    fn typed_params_match_legacy_wire_bytes() {
+        // Byte-for-byte pin against the shape `event_params` built with a raw
+        // `json!` before `SessionEventParams` existed: same field names, same
+        // order (serde_json `preserve_order`), same value encodings.
+        let detail = serde_json::json!({"cause": "transport_failure"});
+        let legacy = serde_json::json!({
+            "kind": SessionEventKind::Reconnected.as_str(),
+            "timestamp": 1_789_000_000_000u64,
+            "seq": 3,
+            "detail": detail,
+        });
+        let typed = event_params(SessionEventKind::Reconnected, 3, 1_789_000_000_000, detail);
+        assert_eq!(
+            serde_json::to_string(&typed).unwrap(),
+            serde_json::to_string(&legacy).unwrap()
+        );
+    }
+
+    #[test]
+    fn typed_params_round_trip() {
+        let original = SessionEventParams {
+            kind: SessionEventKind::GrantDecided,
+            timestamp: 42,
+            seq: 7,
+            detail: serde_json::json!({"grant_id": "abc"}),
+        };
+        let back: SessionEventParams =
+            serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+        assert_eq!(back, original);
     }
 
     #[test]

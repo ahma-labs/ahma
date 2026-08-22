@@ -13,7 +13,9 @@
 //! CVE-2026-48124 (sandboxed agent writes a workspace config that a trusted
 //! component outside the sandbox then executes).
 
-use ahma_common::mcp_methods::{SANDBOX_CONFIGURED_METHOD, SANDBOX_FAILED_METHOD};
+use ahma_common::mcp_methods::{
+    SANDBOX_CONFIGURED_METHOD, SANDBOX_FAILED_METHOD, SandboxLifecycleParams, SandboxScopeSummary,
+};
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use rmcp::service::{Peer, RoleServer};
 use std::collections::HashMap;
@@ -36,18 +38,15 @@ use crate::config::ToolConfig;
 /// `error` is `None` for `notifications/sandbox/configured`, `Some(msg)` for failed.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn emit_sandbox_notification(method: &str, error: Option<&str>) {
-    let payload = match error {
-        Some(err) => serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": { "error": err }
-        }),
-        None => serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": {}
-        }),
+    let params = SandboxLifecycleParams {
+        error: error.map(str::to_string),
+        scope: None,
     };
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params
+    });
     match serde_json::to_string(&payload) {
         Ok(notification) => {
             let _ = emit_stdout_notification(&notification);
@@ -90,13 +89,32 @@ async fn emit_sandbox_notification_via_peer_with_scope(
     error: Option<&str>,
     scope: Option<serde_json::Value>,
 ) {
-    let mut params = match error {
-        Some(err) => serde_json::json!({ "error": err }),
-        None => serde_json::json!({}),
+    // `Sandbox::scope_json` always produces an object matching
+    // `SandboxScopeSummary` (pinned by `scope_json_round_trips_through_typed_
+    // summary` below), so this conversion cannot fail in practice; a non-object
+    // is downgraded to "no scope attached" rather than dropping the whole
+    // notification.
+    let scope =
+        scope.and_then(
+            |value| match serde_json::from_value::<SandboxScopeSummary>(value) {
+                Ok(summary) => Some(summary),
+                Err(e) => {
+                    tracing::warn!("Malformed scope summary omitted from {}: {}", method, e);
+                    None
+                }
+            },
+        );
+    let params = SandboxLifecycleParams {
+        error: error.map(str::to_string),
+        scope,
     };
-    if let (Some(scope), Some(obj)) = (scope, params.as_object_mut()) {
-        obj.insert("scope".to_string(), scope);
-    }
+    let params = match serde_json::to_value(&params) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to serialize {} params: {}", method, e);
+            return;
+        }
+    };
     if let Err(e) = peer
         .send_notification(rmcp::model::ServerNotification::CustomNotification(
             rmcp::model::CustomNotification::new(method, Some(params)),
@@ -676,6 +694,75 @@ mod tests {
     #[test]
     fn emit_sandbox_notification_with_error_does_not_panic() {
         emit_sandbox_notification("notifications/sandbox/failed", Some("something went wrong"));
+    }
+
+    // ── typed scope summary stays in lockstep with the producers ─────────────
+
+    /// `ScopeView::to_json` (the producer in `sandbox/display.rs`) must
+    /// round-trip byte-for-byte through `SandboxScopeSummary` (the shared
+    /// typed shape in `ahma_common::mcp_methods`): same fields, same order,
+    /// nothing dropped. A field added to one side without the other fails
+    /// here instead of silently changing the wire format (SPEC R5.4).
+    #[test]
+    fn scope_view_json_round_trips_through_typed_summary() {
+        let writes = vec![
+            std::path::PathBuf::from("/work/project"),
+            std::path::PathBuf::from("/work/extra"),
+        ];
+        let reads = vec![std::path::PathBuf::from("/opt/toolchain")];
+        let produced = crate::sandbox::ScopeView {
+            write_scopes: &writes,
+            read_scopes: &reads,
+            tmp_access: true,
+            enforced: true,
+            source: crate::sandbox::ScopeSource::RootsList,
+        }
+        .to_json();
+
+        let typed: SandboxScopeSummary = serde_json::from_value(produced.clone())
+            .expect("producer output must parse into the typed summary");
+        assert!(
+            typed.extra.is_empty(),
+            "producer emitted fields the typed summary does not declare: {:?} — \
+             add them to SandboxScopeSummary",
+            typed.extra.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_string(&typed).unwrap(),
+            serde_json::to_string(&produced).unwrap(),
+            "typed summary must reproduce the producer's bytes exactly"
+        );
+        assert_eq!(typed.write, vec!["/work/project", "/work/extra"]);
+        assert_eq!(typed.source, "roots/list");
+    }
+
+    /// Same lockstep pin for the full `Sandbox::scope_json` payload, which
+    /// layers `active` / `active_disclosure` / `host` on top of
+    /// `ScopeView::to_json` — this is the exact value the
+    /// `notifications/sandbox/configured` emitter attaches (SPEC R5.4/R5.6).
+    #[tokio::test]
+    async fn scope_json_round_trips_through_typed_summary() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+        let sandbox = service.adapter.sandbox();
+        let produced = sandbox.scope_json(sandbox.scope_source());
+
+        let typed: SandboxScopeSummary = serde_json::from_value(produced.clone())
+            .expect("scope_json output must parse into the typed summary");
+        assert!(
+            typed.extra.is_empty(),
+            "scope_json emitted undeclared fields: {:?}",
+            typed.extra.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_string(&typed).unwrap(),
+            serde_json::to_string(&produced).unwrap(),
+            "typed summary must reproduce scope_json's bytes exactly"
+        );
+        assert!(
+            typed.active.is_some() && typed.active_disclosure.is_some(),
+            "scope_json always discloses the active sandbox (SPEC R5.4)"
+        );
     }
 
     // ── service construction helper ──────────────────────────────────────────
