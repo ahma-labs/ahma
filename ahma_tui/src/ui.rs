@@ -796,11 +796,14 @@ fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme,
     let show_tasks = state.tasks_window_open;
     let show_log = state.log_window_open;
 
-    if show_scope {
-        // Sized to content (honest panes, R24.8: budget the rows the renderer
-        // draws); scope_window_lines caps itself rather than relying on clipping.
-        let scope_h = scope_window_height(state, chat_a);
-        constraints.push(Constraint::Length(scope_h));
+    // Sized to content (honest panes, R24.8: budget the rows the renderer
+    // draws); scope_window_lines caps itself rather than relying on clipping.
+    // Built once here and handed to the renderer — the height calculation and
+    // the draw used to each build their own copy (with their own `Theme`),
+    // every frame the window was open.
+    let scope_lines = show_scope.then(|| scope_window_lines(state, theme));
+    if let Some(lines) = &scope_lines {
+        constraints.push(Constraint::Length(scope_window_height(lines.len(), chat_a)));
     }
     if show_tasks {
         let tasks_h = (chat_a.height / 3).clamp(6, 16);
@@ -814,10 +817,10 @@ fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme,
 
     let areas = Layout::vertical(constraints).split(chat_a);
     let mut idx = 0;
-    if show_scope {
+    if let Some(lines) = scope_lines {
         let area = areas[idx];
         idx += 1;
-        draw_scope_window(frame, state, theme, area);
+        draw_scope_window(frame, theme, area, lines);
     }
     if show_tasks {
         let area = areas[idx];
@@ -1295,11 +1298,32 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     let text_width = (inner.width as usize).saturating_sub(1).max(1);
 
     // Pre-wrap into physical rows at the *current* width, so one rendered row
-    // equals one screen line. All scroll math is then in true screen rows and
-    // re-derived every frame — a terminal resize immediately re-wraps and
-    // re-bounds the scroll, and chat_scroll == 0 always shows the real bottom.
-    let logical = build_chat_history_lines(state, theme, text_width);
-    let rows = wrap_lines_to_rows(&logical, text_width);
+    // equals one screen line. All scroll math is then in true screen rows —
+    // a terminal resize immediately re-wraps (the width is part of the cache
+    // key) and re-bounds the scroll, and chat_scroll == 0 always shows the
+    // real bottom.
+    //
+    // Rebuilding this on every frame is the TUI's single biggest per-frame
+    // cost (O(total transcript chars), one `(char, Style)` cell per character),
+    // and the redraw tick fires forever even when nothing changes. So the rows
+    // are cached: while the transcript renders wall-clock/animation content
+    // (streaming cursor, liveness glyph, ticking elapsed time) it changes every
+    // frame and is rebuilt every frame, exactly as before; once the turn
+    // settles, the rows are reused until the transcript (generation counter),
+    // width, or unicode mode changes.
+    let mut cache = state.chat_rows_cache.borrow_mut();
+    let key = (state.chat.generation(), text_width, state.unicode);
+    if transcript_is_live(state) {
+        let logical = build_chat_history_lines(state, theme, text_width);
+        cache.rows = wrap_lines_to_rows(&logical, text_width);
+        // Wall-clock content: valid for this frame only, never for reuse.
+        cache.key = None;
+    } else if cache.key != Some(key) {
+        let logical = build_chat_history_lines(state, theme, text_width);
+        cache.rows = wrap_lines_to_rows(&logical, text_width);
+        cache.key = Some(key);
+    }
+    let rows = &cache.rows;
     let max_scroll = rows.len().saturating_sub(visible_h);
     state.chat_max_scroll.set(max_scroll);
 
@@ -1331,6 +1355,27 @@ fn chat_history_hint(state: &AppState) -> &'static str {
     } else {
         "  Type a message and press Enter to start chatting"
     }
+}
+
+/// Whether the transcript's rendering depends on inputs no cache key can
+/// capture: the liveness glyph and stream cursor on the last entry (any
+/// non-idle liveness state), or a user turn whose elapsed time is still
+/// ticking against the wall clock (`started_at` set, `duration_ms` not yet).
+/// While live, the wrapped rows must be rebuilt every frame; the scan itself
+/// is O(entries) with no allocation.
+#[cfg(feature = "tui")]
+fn transcript_is_live(state: &AppState) -> bool {
+    state.liveness_state != crate::state::LivenessState::Idle
+        || state.chat.entries().iter().any(|e| {
+            matches!(
+                e,
+                ChatEntry::User {
+                    started_at: Some(_),
+                    duration_ms: None,
+                    ..
+                }
+            )
+        })
 }
 
 #[cfg(feature = "tui")]
@@ -1993,16 +2038,15 @@ fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
 /// never more than half the available area — honest panes (R24.8) budget the
 /// rows the renderer actually draws.
 #[cfg(feature = "tui")]
-fn scope_window_height(state: &AppState, area: Rect) -> u16 {
-    let theme = Theme::new(state.unicode);
-    let content = scope_window_lines(state, &theme).len() as u16;
-    (content + 2).clamp(4, (area.height / 2).max(4))
+fn scope_window_height(content_lines: usize, area: Rect) -> u16 {
+    (content_lines as u16 + 2).clamp(4, (area.height / 2).max(4))
 }
 
 /// The persistent sandbox-scope sub-window, toggled with `/scope`. Informational
 /// only (no focus, no scrolling): the content self-caps and names the overflow.
+/// `lines` is the [`scope_window_lines`] content the layout was budgeted from.
 #[cfg(feature = "tui")]
-fn draw_scope_window(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+fn draw_scope_window(frame: &mut Frame, theme: &Theme, area: Rect, lines: Vec<Line<'static>>) {
     let block = Block::default()
         .title(Span::styled(" Sandbox · scope ", theme.title()))
         .title(Line::from(Span::styled(" /scope closes ", theme.dim())).right_aligned())
@@ -2010,7 +2054,7 @@ fn draw_scope_window(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
         .border_style(theme.border_unfocused());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(scope_window_lines(state, theme)), inner);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ─── Navigator overlay ────────────────────────────────────────────────────────
@@ -3058,20 +3102,37 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
     frame.render_widget(block, area);
 
-    // Get lines to display
-    let display_lines = if let Some(ref _file) = state.active_log_file {
-        get_file_display_lines(state, theme, inner.width)
-    } else {
-        get_system_display_lines(state, theme, inner.width)
-    };
+    // Wrapped mode must materialise every row up front — the scroll bounds are
+    // in physical rows, which only wrapping can count. Unwrapped mode (the
+    // default) knows the total without formatting anything, so only the
+    // `inner.height` rows actually on screen are formatted and styled;
+    // building all 500–2000 buffered lines per frame and throwing away
+    // everything but the visible slice was the log pane's entire per-frame
+    // cost.
+    let wrapped_lines = state.log_wrap_enabled.then(|| {
+        if state.active_log_file.is_some() {
+            get_file_display_lines(state, theme, inner.width)
+        } else {
+            get_system_display_lines(state, theme, inner.width)
+        }
+    });
+    // System-log entries surviving the filter (unwrapped path only) — computed
+    // once, used for both the row count and the visible slice.
+    let filtered =
+        (wrapped_lines.is_none() && state.active_log_file.is_none()).then(|| state.filtered_log());
 
-    if display_lines.is_empty() {
+    let total = match (&wrapped_lines, &filtered) {
+        (Some(lines), _) => lines.len(),
+        (None, Some(entries)) => entries.len(),
+        (None, None) => state.active_log_lines.len(),
+    };
+    if total == 0 {
         render_empty_log_hint(frame, state, theme, inner);
         return;
     }
 
     let visible_h = inner.height as usize;
-    let max_scroll = display_lines.len().saturating_sub(visible_h);
+    let max_scroll = total.saturating_sub(visible_h);
     state.log_max_scroll.set(max_scroll);
     // While following, stay pinned to the newest line so freshly arrived output
     // is always visible at the bottom; otherwise honor the user's scroll offset.
@@ -3081,12 +3142,22 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         state.log_scroll.min(max_scroll)
     };
 
-    let visible_lines: Vec<Line> = display_lines
-        .iter()
-        .skip(scroll)
-        .take(visible_h)
-        .cloned()
-        .collect();
+    let visible_lines: Vec<Line<'static>> = match (wrapped_lines, &filtered) {
+        (Some(lines), _) => lines.into_iter().skip(scroll).take(visible_h).collect(),
+        (None, Some(entries)) => entries
+            .iter()
+            .skip(scroll)
+            .take(visible_h)
+            .map(|e| system_log_entry_line(e, theme))
+            .collect(),
+        (None, None) => state
+            .active_log_lines
+            .iter()
+            .skip(scroll)
+            .take(visible_h)
+            .map(|raw| style_raw_log_line(&raw.replace('\t', "    "), theme))
+            .collect(),
+    };
 
     // One click target per visible row, so a line that is too long for the pane
     // can be opened and read in full. Registered before the paragraph is drawn
@@ -3094,7 +3165,17 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     register_log_line_click_targets(state, &visible_lines, inner);
 
     frame.render_widget(Paragraph::new(visible_lines), inner);
-    draw_scrollbar(frame, theme, display_lines.len(), visible_h, scroll, inner);
+    draw_scrollbar(frame, theme, total, visible_h, scroll, inner);
+}
+
+/// One unwrapped, styled row for a system log entry — the same formatting
+/// [`get_system_display_lines`] applies, for the visible-slice fast path.
+#[cfg(feature = "tui")]
+fn system_log_entry_line(e: &crate::state::LogEntry, theme: &Theme) -> Line<'static> {
+    let ts = e.timestamp.format("%H:%M:%S").to_string();
+    let level_label = e.level.label();
+    let full_line = format!("{} {} {}", ts, level_label, e.message);
+    style_system_log_line(&full_line, &ts, level_label, theme)
 }
 
 /// Register a [`ClickTarget::OpenLogLine`] for each rendered log row, carrying
@@ -4194,6 +4275,188 @@ mod tests {
         assert!(
             !screen.contains("entry-0\n") && !screen.ends_with("entry-0"),
             "the oldest output is what should scroll away, got:\n{screen}"
+        );
+    }
+
+    /// Render the chat history pane into a TestBackend and read back the screen.
+    fn render_chat_screen(state: &AppState, theme: &Theme, w: u16, h: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|frame| draw_chat_history(frame, state, theme, Rect::new(0, 0, w, h)))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The wrapped-transcript cache must be *used* when the transcript is
+    /// settled, and must *never* serve stale chat: any mutation or width change
+    /// rebuilds the rows on the next frame, and a live turn bypasses it.
+    #[test]
+    fn chat_rows_cache_reuses_settled_transcript_and_never_serves_stale() {
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.chat.push(crate::state::ChatEntry::User {
+            text: "hello".into(),
+            payload: None,
+            started_at: None,
+            duration_ms: Some(5),
+        });
+        state.chat.push(crate::state::ChatEntry::Assistant {
+            content: "first answer".into(),
+            streaming: false,
+        });
+
+        let screen = render_chat_screen(&state, &theme, 40, 10);
+        assert!(screen.contains("first answer"), "got:\n{screen}");
+        let warm_key = state.chat_rows_cache.borrow().key;
+        assert!(warm_key.is_some(), "a settled transcript must be cached");
+
+        // Prove the cache is actually consulted: plant a sentinel row under the
+        // warm key and confirm the next frame renders it instead of rebuilding.
+        state.chat_rows_cache.borrow_mut().rows = vec![make_line("SENTINEL-ROW")];
+        let screen = render_chat_screen(&state, &theme, 40, 10);
+        assert!(
+            screen.contains("SENTINEL-ROW"),
+            "an unchanged transcript must be served from the cache, got:\n{screen}"
+        );
+
+        // Any mutation bumps the generation: the sentinel is gone and the new
+        // entry is on screen the very next frame.
+        state.chat.push(crate::state::ChatEntry::Assistant {
+            content: "second answer".into(),
+            streaming: false,
+        });
+        let screen = render_chat_screen(&state, &theme, 40, 10);
+        assert!(
+            screen.contains("second answer") && !screen.contains("SENTINEL-ROW"),
+            "a chat mutation must invalidate the cache, got:\n{screen}"
+        );
+
+        // A width change re-wraps rather than reusing rows wrapped for the old
+        // width.
+        state.chat_rows_cache.borrow_mut().rows = vec![make_line("SENTINEL-ROW")];
+        let screen = render_chat_screen(&state, &theme, 30, 10);
+        assert!(
+            screen.contains("second answer") && !screen.contains("SENTINEL-ROW"),
+            "a resize must re-wrap the transcript, got:\n{screen}"
+        );
+
+        // A live turn renders wall-clock/animation content: the rows must be
+        // rebuilt every frame, marked uncacheable.
+        state.liveness_state = crate::state::LivenessState::Streaming;
+        render_chat_screen(&state, &theme, 30, 10);
+        assert!(
+            state.chat_rows_cache.borrow().key.is_none(),
+            "a live transcript must never be cached across frames"
+        );
+    }
+
+    /// `transcript_is_live` must catch both liveness sources: a non-idle
+    /// turn (glyph/cursor animation) and a user entry whose elapsed time is
+    /// still ticking against the wall clock.
+    #[test]
+    fn transcript_liveness_detects_ticking_and_streaming_content() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        assert!(!transcript_is_live(&state), "empty transcript is settled");
+
+        state.chat.push(crate::state::ChatEntry::User {
+            text: "hi".into(),
+            payload: None,
+            started_at: Some(std::time::Instant::now()),
+            duration_ms: None,
+        });
+        assert!(
+            transcript_is_live(&state),
+            "a pending user duration ticks every frame"
+        );
+
+        state.chat.finish_user_timing();
+        assert!(
+            !transcript_is_live(&state),
+            "settled once the duration is set"
+        );
+
+        state.liveness_state = crate::state::LivenessState::Thinking;
+        assert!(transcript_is_live(&state), "a non-idle turn animates");
+    }
+
+    /// The unwrapped log pane formats only the visible slice — this must render
+    /// exactly what formatting everything used to show: pinned to the newest
+    /// line while following, the chosen slice when detached, with scroll
+    /// bounds over the full buffer either way.
+    #[test]
+    fn unwrapped_log_fast_path_shows_the_right_slice_and_bounds() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        for i in 0..50 {
+            state.push_log(crate::state::LogEntry {
+                timestamp: chrono::Local::now(),
+                level: crate::state::LogLevel::Info,
+                message: format!("line-{i}"),
+            });
+        }
+
+        let render = |state: &AppState| -> String {
+            let (w, h) = (60u16, 8u16);
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|frame| draw_log(frame, state, &theme, Rect::new(0, 0, w, h)))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Following: pinned to the newest entries (6 inner rows).
+        state.log_follow = true;
+        let screen = render(&state);
+        assert!(
+            screen.contains("line-49") && !screen.contains("line-0 "),
+            "following must show the newest lines, got:\n{screen}"
+        );
+        assert_eq!(
+            state.log_max_scroll.get(),
+            50 - 6,
+            "scroll bounds must cover the whole buffer, not just the slice"
+        );
+
+        // Detached at the top: the oldest entries.
+        state.log_follow = false;
+        state.log_scroll = 0;
+        let screen = render(&state);
+        assert!(
+            screen.contains("line-0") && !screen.contains("line-49"),
+            "a detached offset must show its slice, got:\n{screen}"
+        );
+
+        // The filter narrows both the rows and the bounds.
+        state.log_filter = "line-4".into();
+        let screen = render(&state);
+        assert!(
+            screen.contains("line-4") && !screen.contains("line-30"),
+            "the filter must apply on the fast path, got:\n{screen}"
+        );
+        assert_eq!(
+            state.log_max_scroll.get(),
+            11usize.saturating_sub(6),
+            "bounds must be over the filtered rows (line-4, line-40..49)"
         );
     }
 

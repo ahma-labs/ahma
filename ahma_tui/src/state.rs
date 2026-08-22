@@ -88,9 +88,16 @@ pub enum ChatEntry {
 }
 
 /// Ring buffer of chat history entries (capped at `CHAT_HISTORY_CAP`).
+///
+/// `entries` is private on purpose: every mutation goes through a method, and
+/// every method bumps `generation`. The renderer caches the wrapped transcript
+/// rows keyed on this counter (see `AppState::chat_rows_cache`), so a mutation
+/// path that bypassed the bump would serve stale chat — keep the field private.
 #[derive(Debug, Default)]
 pub struct ChatHistory {
     entries: VecDeque<ChatEntry>,
+    /// Bumped on every mutation; cache-invalidation key for derived render data.
+    generation: u64,
 }
 
 impl ChatHistory {
@@ -99,14 +106,21 @@ impl ChatHistory {
             self.entries.pop_front();
         }
         self.entries.push_back(entry);
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn entries(&self) -> &VecDeque<ChatEntry> {
         &self.entries
     }
 
+    /// Monotonic change counter: unchanged generation ⇒ unchanged entries.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Drop completed entries, keeping only work still in progress: assistant
@@ -122,6 +136,7 @@ impl ChatHistory {
                 } | ChatEntry::ToolCall { result: None, .. }
             )
         });
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Append a token to the last `Assistant` entry if it's still streaming.
@@ -133,6 +148,7 @@ impl ChatHistory {
         }) = self.entries.back_mut()
         {
             content.push_str(token);
+            self.generation = self.generation.wrapping_add(1);
         } else {
             self.push(ChatEntry::Assistant {
                 content: token.to_string(),
@@ -150,6 +166,7 @@ impl ChatHistory {
         }) = self.entries.back_mut()
         {
             content.push_str(token);
+            self.generation = self.generation.wrapping_add(1);
         } else {
             self.push(ChatEntry::Thinking {
                 content: token.to_string(),
@@ -169,6 +186,7 @@ impl ChatHistory {
                 *streaming = false;
             }
         }
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Locate the latest `User` entry and set its `duration_ms` based on `started_at` elapsed time.
@@ -184,6 +202,7 @@ impl ChatHistory {
                     && let Some(start) = started_at
                 {
                     *duration_ms = Some(start.elapsed().as_millis() as u64);
+                    self.generation = self.generation.wrapping_add(1);
                 }
                 break;
             }
@@ -218,6 +237,7 @@ impl ChatHistory {
             .filter(keep)
             .map(|(_, entry)| entry)
             .collect();
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn start_tool_call(&mut self, id: String, name: String, args: String) {
@@ -242,10 +262,26 @@ impl ChatHistory {
             {
                 *entry_result = Some(result);
                 *entry_failed = failed;
+                self.generation = self.generation.wrapping_add(1);
                 break;
             }
         }
     }
+}
+
+/// Cached physical rows of the chat transcript, so an idle redraw tick does not
+/// re-format and re-wrap the whole history (O(total transcript chars) per frame
+/// otherwise — the single biggest per-frame allocation in the TUI).
+///
+/// `key` records the inputs the rows were built from: chat generation, wrap
+/// width, and unicode mode. `None` marks the rows as valid for this frame only —
+/// used while the transcript renders wall-clock/animation content (streaming
+/// cursor, liveness glyph, live elapsed time) that no key can capture.
+#[cfg(feature = "tui")]
+#[derive(Default)]
+pub struct ChatRowsCache {
+    pub key: Option<(u64, usize, bool)>,
+    pub rows: Vec<ratatui::text::Line<'static>>,
 }
 
 // ─── Command navigator ────────────────────────────────────────────────────────
@@ -1506,6 +1542,12 @@ pub struct AppState {
     pub ops_list_state: std::cell::RefCell<ratatui::widgets::ListState>,
     #[cfg(not(feature = "tui"))]
     pub ops_list_state: std::cell::RefCell<()>,
+    /// Wrapped-transcript row cache — see [`ChatRowsCache`]. Interior mutability
+    /// because it is filled during rendering, which is pure over `&AppState`.
+    #[cfg(feature = "tui")]
+    pub chat_rows_cache: std::cell::RefCell<ChatRowsCache>,
+    #[cfg(not(feature = "tui"))]
+    pub chat_rows_cache: std::cell::RefCell<()>,
 
     // ── Settings editor ──
     pub settings_editor: crate::settings_editor::SettingsEditor,
@@ -1902,6 +1944,10 @@ impl AppState {
             ops_list_state: std::cell::RefCell::new(ratatui::widgets::ListState::default()),
             #[cfg(not(feature = "tui"))]
             ops_list_state: std::cell::RefCell::new(()),
+            #[cfg(feature = "tui")]
+            chat_rows_cache: std::cell::RefCell::new(ChatRowsCache::default()),
+            #[cfg(not(feature = "tui"))]
+            chat_rows_cache: std::cell::RefCell::new(()),
 
             settings_editor: crate::settings_editor::SettingsEditor::default(),
 
@@ -2761,6 +2807,57 @@ mod tests {
         assert_eq!(count_wrapped_lines(" ", 10), 1);
         assert_eq!(count_wrapped_lines("", 10), 1);
         assert_eq!(count_wrapped_lines("one two three four five", 100), 1);
+    }
+
+    /// Every `ChatHistory` mutation must bump the generation counter — the
+    /// renderer caches the wrapped transcript keyed on it, so a mutation that
+    /// forgot to bump would freeze the chat pane on stale content.
+    #[test]
+    fn chat_generation_bumps_on_every_mutation() {
+        let mut c = ChatHistory::default();
+        let mut last = c.generation();
+        let mut expect_bump = |c: &ChatHistory, what: &str| {
+            assert_ne!(c.generation(), last, "{what} must bump the generation");
+            last = c.generation();
+        };
+
+        c.push(ChatEntry::User {
+            text: "hi".into(),
+            payload: None,
+            started_at: Some(std::time::Instant::now()),
+            duration_ms: None,
+        });
+        expect_bump(&c, "push");
+
+        c.finish_user_timing();
+        expect_bump(&c, "finish_user_timing (sets a duration)");
+
+        c.append_thinking("mull");
+        expect_bump(&c, "append_thinking (new entry)");
+        c.append_thinking(" it over");
+        expect_bump(&c, "append_thinking (existing entry)");
+
+        c.append_token("tok");
+        expect_bump(&c, "append_token (new entry)");
+        c.append_token("en");
+        expect_bump(&c, "append_token (existing entry)");
+
+        c.finish_stream();
+        expect_bump(&c, "finish_stream");
+
+        c.start_tool_call("t1".into(), "echo".into(), "{}".into());
+        expect_bump(&c, "start_tool_call");
+        c.finish_tool_call("t1", "ok".into(), false);
+        expect_bump(&c, "finish_tool_call");
+
+        c.compact(0);
+        expect_bump(&c, "compact");
+
+        c.retain_in_flight();
+        expect_bump(&c, "retain_in_flight");
+
+        c.clear();
+        expect_bump(&c, "clear");
     }
 
     /// The chat prefix pattern follows the turn state — the direction IS the
