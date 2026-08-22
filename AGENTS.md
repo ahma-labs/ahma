@@ -145,8 +145,8 @@ JSON-RPC `-32001`. Assert it explicitly.
 
 **Dual-transport coverage** (SPEC §R15.5): every HTTP-bridge test calling `tools/call` or
 `tools/list` runs against **both** `application/json` and `text/event-stream`. Extract the body
-into `run_*(mode)` and add `_json`/`_sse` entry points; set up with `common::setup_test_mcp(mode)`
-(not the legacy `sse_test_helpers`). Exempt: `sse_*`, `handshake_*`, `sandbox_*` tests.
+into `run_*(mode)` and add `_json`/`_sse` entry points; set up with `common::setup_test_mcp(mode)`.
+Exempt: `sse_*`, `handshake_*`, `sandbox_*` tests.
 
 **No print-only integration tests.** Printing is fine; asserting on success/failure and key
 output patterns is mandatory.

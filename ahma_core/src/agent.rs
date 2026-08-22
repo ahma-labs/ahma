@@ -1538,7 +1538,18 @@ pub async fn call_mcp_tool_http(
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<(String, bool), String> {
-    let session = StreamableHttpMcpClient::attach(client.clone(), url, session_id);
+    // This call site only carries a bare cached session id (see
+    // `SESSION_CACHE`), not the version that session's own `initialize`
+    // negotiated, so it echoes the spec's own default. The bridge validates
+    // the header against a fixed supported-set, not per-session negotiation
+    // history, so this is a safe, spec-compliant value — never the exact
+    // negotiated revision when it differs from the default.
+    let session = StreamableHttpMcpClient::attach(
+        client.clone(),
+        url,
+        session_id,
+        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    );
 
     // A 409 means the session's sandbox lock has not finalised yet (the
     // roots/list → lock round-trip completes a few ms after the handshake). The

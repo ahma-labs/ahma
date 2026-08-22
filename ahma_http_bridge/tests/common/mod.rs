@@ -24,7 +24,7 @@ pub use server::{
     InProcessServerInstance, ServerGuard, TestServerInstance, spawn_in_process_server,
     spawn_server_guard_strict_roots, spawn_server_guard_with_config,
     spawn_server_guard_with_config_extra_env, spawn_server_guard_with_deferred_sandbox,
-    spawn_test_server, spawn_test_server_with_timeout,
+    spawn_test_server, spawn_test_server_strict_roots, spawn_test_server_with_timeout,
 };
 #[allow(unused_imports)]
 pub use uri::{

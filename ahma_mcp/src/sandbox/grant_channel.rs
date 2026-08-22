@@ -95,8 +95,9 @@ pub fn runtime_denial_remediation_cli(path: &Path, access: ScopeAccess) -> Strin
     format!(
         "ahma's kernel sandbox blocked an out-of-scope {verb} to '{denied}'. This is expected: \
          writing outside the workspace (for example installing a global binary under ~/.cargo) is \
-         denied by default. To allow it, run `ahma sandbox grant {target}{ro_flag}` (it asks for \
-         confirmation), then re-run the command. No flags are required.",
+         denied by default. To allow it, run `ahma sandbox grant {target}{ro_flag}` — the grant \
+         is validated against a denylist, persisted to ~/.ahma/settings.toml, and takes effect \
+         on the next server start — then re-run the command.",
         verb = verb,
         denied = path.display(),
         target = target.display(),

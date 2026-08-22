@@ -380,7 +380,12 @@ async fn call_tool_no_retry_surfaces_sandbox_initializing() {
     state.conflicts_before_success.store(100, Ordering::SeqCst);
     let (mcp_url, server) = spawn_mock(state.clone()).await;
 
-    let client = StreamableHttpMcpClient::attach(reqwest::Client::new(), &mcp_url, "s1");
+    let client = StreamableHttpMcpClient::attach(
+        reqwest::Client::new(),
+        &mcp_url,
+        "s1",
+        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    );
     let outcome = client
         .call_tool("status", json!({}), ConflictRetryPolicy::NONE)
         .await
@@ -409,7 +414,12 @@ async fn call_tool_retries_through_transient_409() {
     state.conflicts_before_success.store(2, Ordering::SeqCst);
     let (mcp_url, server) = spawn_mock(state.clone()).await;
 
-    let client = StreamableHttpMcpClient::attach(reqwest::Client::new(), &mcp_url, "s2");
+    let client = StreamableHttpMcpClient::attach(
+        reqwest::Client::new(),
+        &mcp_url,
+        "s2",
+        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    );
     let policy = ConflictRetryPolicy {
         max_retries: 5,
         delay: TestTimeouts::scale_millis(20),
@@ -449,7 +459,12 @@ async fn call_tool_non_409_http_error_is_reported() {
     });
     let mcp_url = format!("http://127.0.0.1:{port}/mcp");
 
-    let client = StreamableHttpMcpClient::attach(reqwest::Client::new(), &mcp_url, "s3");
+    let client = StreamableHttpMcpClient::attach(
+        reqwest::Client::new(),
+        &mcp_url,
+        "s3",
+        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    );
     let outcome = client
         .call_tool("x", json!({}), ConflictRetryPolicy::NONE)
         .await
@@ -472,7 +487,12 @@ async fn tools_list_parses_and_skips_nameless() {
     let state = MockState::default();
     let (mcp_url, server) = spawn_mock(state.clone()).await;
 
-    let client = StreamableHttpMcpClient::attach(reqwest::Client::new(), &mcp_url, "s4");
+    let client = StreamableHttpMcpClient::attach(
+        reqwest::Client::new(),
+        &mcp_url,
+        "s4",
+        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    );
     let tools = client.tools_list().await.expect("tools/list ok");
     assert_eq!(tools.len(), 2);
     assert_eq!(tools[0].name, "alpha");
@@ -503,7 +523,12 @@ async fn tools_list_non_2xx_errors() {
     });
     let mcp_url = format!("http://127.0.0.1:{port}/mcp");
 
-    let client = StreamableHttpMcpClient::attach(reqwest::Client::new(), &mcp_url, "s5");
+    let client = StreamableHttpMcpClient::attach(
+        reqwest::Client::new(),
+        &mcp_url,
+        "s5",
+        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    );
     let err = client
         .tools_list()
         .await
@@ -520,7 +545,12 @@ async fn delete_session_sends_delete_with_session_header() {
     let state = MockState::default();
     let (mcp_url, server) = spawn_mock(state.clone()).await;
 
-    let client = StreamableHttpMcpClient::attach(reqwest::Client::new(), &mcp_url, "to-delete");
+    let client = StreamableHttpMcpClient::attach(
+        reqwest::Client::new(),
+        &mcp_url,
+        "to-delete",
+        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    );
     client.delete_session(TestTimeouts::scale_secs(2)).await;
 
     assert_eq!(

@@ -633,9 +633,20 @@ fn spawn_server_process(exe: &std::path::Path, args: &[&str]) -> Result<()> {
 /// or `ahma serve http` (on Windows) and polls until healthy.
 pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Result<()> {
     let client_version = env!("CARGO_PKG_VERSION");
+    // Pre-flight the scope candidate with the same hard rejections the server
+    // will apply (must exist — never created here — and no $HOME / ancestors /
+    // filesystem root, SPEC R5.2.4). Without this, `ahma tui /typo/path`
+    // silently materialised the typo as a sandbox root, and `ahma tui` from
+    // `$HOME` started a bridge whose every per-session subprocess then died on
+    // the rejection — far from the cause. Failing here names the problem at
+    // launch. The path is a deliberate human choice (the launch directory or an
+    // explicit argument), which is why it may become an explicit scope at all.
     let path_to_use = match scope_path {
-        Some(p) => Some(p.to_path_buf()),
-        None => std::env::current_dir().ok(),
+        Some(p) => Some(ahma_mcp::sandbox::preflight_scope_candidate(p)?),
+        None => match std::env::current_dir() {
+            Ok(cwd) => Some(ahma_mcp::sandbox::preflight_scope_candidate(&cwd)?),
+            Err(_) => None,
+        },
     };
     let candidates = default_candidates();
     for candidate in &candidates {

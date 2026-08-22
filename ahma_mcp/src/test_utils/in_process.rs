@@ -68,6 +68,7 @@ pub async fn create_in_process_mcp_from_dir(tools_dir: &Path) -> Result<InProces
         false,
     )?;
     sandbox.set_roots_received(true);
+    let _ = sandbox.commit_existing_scopes();
     wire_in_process_mcp(configs, sandbox).await
 }
 
@@ -83,6 +84,7 @@ pub async fn create_in_process_mcp(configs: HashMap<String, ToolConfig>) -> Resu
     };
     let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, false, false, false)?;
     sandbox.set_roots_received(true);
+    let _ = sandbox.commit_existing_scopes();
     wire_in_process_mcp(configs, sandbox).await
 }
 
@@ -119,6 +121,7 @@ pub async fn create_in_process_mcp_with_scope(
     // validate_path completely, defeating these tests on Windows CI and macOS+Cursor.
     let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false)?;
     sandbox.set_roots_received(true);
+    let _ = sandbox.commit_existing_scopes();
     wire_in_process_mcp(configs, sandbox).await
 }
 
@@ -130,9 +133,9 @@ pub async fn create_in_process_mcp_with_scope(
 /// vector to get a server whose scope is not yet settled, which is how the
 /// `tools/call` gate (SPEC R5.1.2) becomes observable.
 ///
-/// Unlike the `()`-client constructors this does **not** call
-/// `set_roots_received(true)` when `scopes` is empty — that flag is precisely
-/// what those tests need to be false.
+/// Unlike the `()`-client constructors this does **not** commit the scope when
+/// `scopes` is empty — an uncommitted scope is precisely the state those tests
+/// need, because the `tools/call` gate keys on the commit latch.
 pub async fn create_in_process_mcp_with_client<C: ClientHandler>(
     client: C,
     configs: HashMap<String, ToolConfig>,
@@ -150,6 +153,9 @@ pub async fn create_in_process_mcp_with_client<C: ClientHandler>(
     };
     let sandbox = Sandbox::new(scopes, mode, false, false, false)?;
     sandbox.set_roots_received(roots_settled);
+    if roots_settled {
+        let _ = sandbox.commit_existing_scopes();
+    }
     wire_in_process_mcp_with_client(client, configs, sandbox).await
 }
 
@@ -264,6 +270,7 @@ pub async fn build_test_service_with_configs(
         false,
     )?;
     sandbox.set_roots_received(true);
+    let _ = sandbox.commit_existing_scopes();
     let sandbox = Arc::new(sandbox);
     let adapter = Arc::new(Adapter::new(
         Arc::clone(&operation_monitor),

@@ -7,8 +7,6 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::time::sleep;
 
-use ahma_common::file_uri::encode_file_uri;
-
 /// A running HTTP bridge instance for integration testing.
 pub struct HttpBridgeTestInstance {
     pub child: Child,
@@ -179,20 +177,30 @@ impl HttpMcpTestClient {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let body: serde_json::Value = resp.json().await.context("Failed to parse JSON response")?;
+        // Notifications are answered 202 Accepted with an empty body (MCP
+        // Streamable HTTP); represent that as JSON null rather than failing.
+        let bytes = resp.bytes().await.context("Failed to read response body")?;
+        let body: serde_json::Value = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).context("Failed to parse JSON response")?
+        };
 
         Ok((body, session_id))
     }
 
     /// Send only the MCP initialize request and capture the session ID.
     pub async fn initialize_only(&mut self) -> anyhow::Result<()> {
+        // Declares the `roots` capability because this client genuinely answers
+        // roots/list (see `roots_handshake`). A roots-less declaration on a
+        // bridge without a fallback scope now fails the sandbox up front.
         let init_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
             "params": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {},
+                "capabilities": {"roots": {"listChanged": false}},
                 "clientInfo": {"name": "test-client", "version": "1.0.0"}
             }
         });
@@ -321,13 +329,23 @@ impl HttpMcpTestClient {
                         Err(_) => continue,
                     };
 
+                    // An explicit-scope bridge locks its sandbox without ever
+                    // requesting roots/list (SPEC R5.2.2); `configured` is then
+                    // the completion signal for the handshake wait below.
+                    if value.get("method").and_then(|m| m.as_str())
+                        == Some("notifications/sandbox/configured")
+                        && let Some(tx) = roots_ready_tx.take()
+                    {
+                        let _ = tx.send(());
+                    }
+
                     if value.get("method").and_then(|m| m.as_str()) == Some("roots/list") {
                         let id = value.get("id").cloned().expect("roots/list must have id");
                         let roots_json: Vec<serde_json::Value> = roots
                             .iter()
                             .map(|p| {
                                 serde_json::json!({
-                                    "uri": encode_file_uri(p),
+                                    "uri": ahma_common::file_uri::encode_file_uri(p),
                                     "name": p.file_name().and_then(|n| n.to_str()).unwrap_or("root")
                                 })
                             })

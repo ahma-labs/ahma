@@ -24,7 +24,7 @@ mod common;
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::uri::paths_equivalent;
-use common::{McpTestClient, TestServerInstance, spawn_test_server};
+use common::{McpTestClient, TestServerInstance, spawn_test_server_strict_roots};
 use serde_json::json;
 use std::env;
 use tempfile::TempDir;
@@ -48,8 +48,10 @@ async fn get_server_url() -> (String, Option<TestServerInstance>) {
         }
     }
 
-    // Spawn our own server with dynamic port
-    let server = spawn_test_server()
+    // Spawn our own server with dynamic port, in strict-roots mode: this test
+    // asserts the tool defaults to the client's roots/list scope, which only
+    // exists when no explicit fallback scope is configured (SPEC R5.2.2).
+    let server = spawn_test_server_strict_roots()
         .await
         .expect("Failed to spawn test server");
     let url = server.base_url();

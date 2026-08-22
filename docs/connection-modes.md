@@ -8,7 +8,7 @@
 
 The IDE spawns `ahma` as a subprocess and communicates via standard I/O. This is the recommended mode for development because:
 
-- The IDE sets `cwd` to `${workspaceFolder}`, so the sandbox scope is automatic.
+- The sandbox scope comes from the workspace roots your IDE reports via `roots/list` (VS Code and Cursor do this automatically). The subprocess's working directory is **never** trusted as a scope on its own (SPEC R5.2.1) — it is client-config-controlled and spoofable.
 - Each workspace gets its own sandboxed server instance.
 - No network exposure.
 
@@ -112,9 +112,9 @@ First start the server in a terminal with your preferred flags, defaulting to po
 ahma serve http --scratch --log-monitor
 ```
 
-The HTTP server requires **HTTP/2 or HTTP/3**. HTTP/1.1 connections are explicitly rejected.
+The HTTP server accepts **HTTP/1.1 and HTTP/2** by default (pass `--disable-http1-1` to require HTTP/2+), and clients may upgrade to **HTTP/3** via Alt-Svc.
 
-- **HTTP/2** (h2c — cleartext, no TLS required): the default transport for all HTTP clients.
+- **HTTP/2** (h2c — cleartext, no TLS required): the preferred transport for all HTTP clients.
 - **HTTP/3** (QUIC): clients that advertise Alt-Svc support (including `ahma tui`) will automatically upgrade to QUIC when local TLS material is present at `~/.ahma/tls/`. Run `ahma tls init` to provision the certificate. See [TLS management](#tls-management-for-quic) below.
 
 Default endpoint: `http://localhost:3000/mcp`
@@ -122,6 +122,14 @@ Default endpoint: `http://localhost:3000/mcp`
 - `POST /mcp` with `Accept: application/json`: JSON-RPC, preferred for speed and low overhead.
 - `POST /mcp` with `Accept: text/event-stream`: Streamable HTTP (SSE fallback for some networks).
 - `GET /mcp` with `Accept: text/event-stream`: SSE stream for server-to-client events.
+
+Protocol notes:
+
+- Notifications (id-less JSON-RPC messages) are answered `202 Accepted` with no body, on both POST transports.
+- An unknown or expired `Mcp-Session-Id` is answered `404 Not Found` — re-send `initialize` to start a fresh session.
+- JSON-RPC **batch arrays are rejected** with `400` (batching was removed from the MCP spec in 2025-06-18).
+- Browser requests are accepted only from loopback origins; a non-loopback `Origin` header is rejected with `403` (DNS-rebinding guard). Non-browser clients send no `Origin` and are unaffected.
+- The **deprecated 2024-11-05 two-endpoint HTTP+SSE transport** (`/sse` + `/messages`) is **not** implemented; clients must speak Streamable HTTP on `/mcp`.
 
 > **Client configuration**: Configure your HTTP client with HTTP/2 prior-knowledge (`--http2-prior-knowledge` in curl, `http2_prior_knowledge()` in reqwest) because the server does not negotiate via ALPN (no TLS).
 
@@ -138,9 +146,7 @@ Then configure your IDE to connect to for example `http://localhost:3000/mcp`:
 }
 ```
 
-HTTP server that proxies MCP protocol to a stdio subprocess. Used for web clients, remote agents, debugging, or multi-client scenarios.
-
-#  Used for increased visibility, web clients, remote agents, debugging, or multi-client scenarios. While sandbox scope is automatic in stdio mode, HTTP mode requires your MCP client to support `roots/list` responses. VSCode and Cursor do this automatically. For clients that don't, you can set a fixed sandbox scope (e.g. `--sandbox-scope /path/to/your/project`).
+HTTP server that proxies MCP protocol to a stdio subprocess. Used for increased visibility, web clients, remote agents, debugging, or multi-client scenarios. HTTP mode derives each session's sandbox scope from that client's `roots/list` answer (VS Code and Cursor answer automatically). For clients that don't support roots, set a fixed sandbox scope (e.g. `--sandbox-scope /path/to/your/project`) — an explicit scope is locked and is never replaced by client roots (SPEC R5.2.2). A client that declares no `roots` capability on a bridge with no `--sandbox-scope` gets an immediate, actionable error instead of a handshake timeout.
 
 ```bash
 # Start on default port 3000 (sandbox scope from roots/list)
@@ -155,7 +161,7 @@ ahma serve http --http-port 8080 --http-host 127.0.0.1
 
 | Feature | STDIO Mode | HTTP Mode |
 |---------|-----------|----------|
-| Sandbox scope | Set by IDE via `cwd` | Per session via `roots/list` |
+| Sandbox scope | Client `roots/list` (or explicit flag) | Per session via `roots/list` (or explicit flag) |
 | Per-project isolation | Automatic | Automatic (per session) |
 | Configuration | `mcp.json` in IDE | CLI args or env vars |
 | Use case | Standard IDE integration | Debugging, advanced setups |
@@ -223,7 +229,7 @@ Ahma treats an empty `roots/list` response as "client has no workspace roots yet
 
 `--scratch` (deprecated alias `--sandbox`) is *not* a resolution: it adds an auxiliary scratch directory alongside the real workspace scope, and does nothing unless you also set `[sandbox] scratch_directory`. It used to default to `~/sandbox` and double as the scope fallback, which is how sessions ended up silently locked to a directory nobody chose.
 
-## 3. Unix Socket Mode
+## 4. Unix Socket Mode
 
 Serves MCP Streamable HTTP over a Unix domain socket instead of TCP. Lower latency than HTTP mode, no port conflicts, and access-controlled by filesystem permissions.
 

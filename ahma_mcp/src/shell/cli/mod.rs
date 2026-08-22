@@ -497,7 +497,10 @@ fn resolve_sandbox_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
 fn resolve_deferred_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     if !cfg.working_dirs.is_empty() {
         let scopes = canonicalize_paths(&cfg.working_dirs, "working directory")?;
-        tracing::info!("Sandbox initialized from AHMA_WORKING_DIRS: {:?}", scopes);
+        tracing::info!(
+            "Deferred sandbox seeded from --working-dir / [sandbox] working_dirs: {:?}",
+            scopes
+        );
         return Ok(Some(scopes));
     }
 
@@ -726,6 +729,17 @@ fn create_sandbox_instance(
     .with_scratch_dir(scratch_dir)
     .with_persistent_scopes(persistent_write_scopes, persistent_read_scopes)
     .with_package_cache_write(cfg.package_cache_write);
+
+    // SPEC R5.2 step 1: an explicit scope is **locked immediately** — commit it
+    // now so the `tools/call` gate (which requires a committed scope, R5.1.2.1)
+    // opens without any roots/list round-trip. In defer mode the same flags are
+    // only a *provisional* seed forwarded by the bridge; the commit then happens
+    // at the single door (`configure_sandbox_from_roots`), which refuses to
+    // replace explicit scopes with client roots (R5.2.2).
+    if explicit_scopes && !cfg.defer_sandbox && !scopes.is_empty() {
+        let _ = s.commit_existing_scopes();
+        tracing::info!("Explicit sandbox scope committed at startup (SPEC R5.2): {scopes:?}");
+    }
 
     tracing::info!("Sandbox scopes initialized: {:?}", scopes);
 

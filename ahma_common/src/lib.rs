@@ -52,6 +52,7 @@ pub mod hostname;
 pub mod keepalive;
 pub mod local_tls;
 pub mod mcp_methods;
+pub mod mcp_protocol;
 pub mod net_approval;
 pub mod observability;
 pub mod op_identity;

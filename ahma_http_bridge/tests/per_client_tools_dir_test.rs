@@ -17,7 +17,7 @@
 mod common;
 
 use ahma_common::timeouts::TestTimeouts;
-use common::{McpTestClient, TransportMode, spawn_server_guard_with_config};
+use common::{McpTestClient, TransportMode, spawn_server_guard_strict_roots};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -74,13 +74,10 @@ async fn run_per_client_tools_dir_discovery(transport: TransportMode) {
     // come from the *client* workspace discovery path, not from startup load.
     let bridge_tools_dir = TempDir::new().expect("bridge tools tempdir");
 
-    let server = match spawn_server_guard_with_config(
-        bridge_tools_dir.path(),
-        client_workspace.path(),
-        None,
-    )
-    .await
-    {
+    // Strict-roots mode: the per-client `.ahma/` discovery root must come from
+    // the client's roots/list answer. (A bridge-level fallback scope is an
+    // explicit scope and is locked without querying roots at all, per R5.2.2.)
+    let server = match spawn_server_guard_strict_roots(bridge_tools_dir.path()).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!(

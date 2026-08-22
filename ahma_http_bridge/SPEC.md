@@ -10,11 +10,13 @@
 ## 2. Acceptance Criteria
 
 - **HTTP/SSE Transport**: Exposes MCP protocol over POST `/mcp` (JSON-RPC) and GET `/mcp` (Server-Sent Events stream for notifications).
-- **Streamable HTTP**: Supports multiplexed response streaming and Event ID ordering on POST requests with `Accept: text/event-stream`.
+- **Streamable HTTP**: Supports multiplexed response streaming and Event ID ordering on POST requests with `Accept: text/event-stream`. Notifications (id-less messages) are answered with HTTP 202 on both POST transports; an unknown or terminated session ID is answered with HTTP 404 so a spec-conforming client re-initializes; JSON-RPC batch arrays are rejected with HTTP 400 (batching was removed from the MCP spec in 2025-06-18).
+- **Stateful by design**: every session is bound to a live subprocess holding a kernel sandbox lock, so the spec's optional *stateless* server mode is deliberately out of scope — a scope commit cannot be stateless. The bridge instead implements the stateful session lifecycle in full (session header, DELETE termination, 404-driven re-initialize).
+- **Origin validation**: requests carrying a non-loopback `Origin` header are rejected (DNS-rebinding guard, per the MCP transport security requirements). Non-browser clients send no `Origin` and are unaffected.
 - **Reconnection Resilience**: Implements an event history buffer to replay missed events using the `Last-Event-Id` header.
 - **Session Isolation**: Spawns a dedicated, isolated `ahma serve stdio` subprocess per `Mcp-Session-Id`.
-- **Sandbox Derivation**: Derives the sandbox scope from the client's first `roots/list` response and locks it. Rejects any scope widening attempts with HTTP 403.
-- **Auto-Restart**: Automatically restarts the stdio subprocess if it crashes.
+- **Sandbox Derivation**: Derives the sandbox scope from the client's first `roots/list` response and locks it (unless an explicit `--sandbox-scope` was given, which is locked and never replaced — SPEC R5.2.2). Once locked, a later `roots/list_changed` is a tolerated no-op (SPEC R10.5): acknowledged with 202, not forwarded, session kept alive. A client that declares no `roots` capability at `initialize`, on a bridge with no fallback scope, has its sandbox failed immediately so `tools/call` gets a deterministic remediated 403 instead of a handshake timeout.
+- **Subprocess death**: a crashed subprocess fails its session's in-flight requests with a classified error (R-SIGN.5) and the session terminates; the client re-initializes into a fresh session. (An earlier auto-restart-with-handshake-replay mechanism was intentionally removed.)
 - **Health check**: Exposes a `/health` endpoint to monitor server status.
 
 ## 3. Non-Functional Requirements

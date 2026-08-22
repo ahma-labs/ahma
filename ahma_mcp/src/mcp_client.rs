@@ -1146,7 +1146,7 @@ mod tests {
     #[tokio::test]
     async fn call_tool_http_unreachable_errors() {
         // Exercises the McpServerKind::Http dispatch arm -> call_mcp_tool_http
-        // -> initialize_mcp_session, which fails to connect on a dead port.
+        // -> connect_minimal_session, which fails to connect on a dead port.
         let mut mgr = McpConnectionManager::default();
         mgr.add_server(McpServerConfig {
             name: "h".to_string(),

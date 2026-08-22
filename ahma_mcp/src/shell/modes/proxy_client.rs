@@ -1020,6 +1020,13 @@ async fn run_proxy_client_http(
         .bytes()
         .await
         .context("Failed to read initialize response body")?;
+    // The version the server answered with is what every subsequent HTTP
+    // request must echo in `MCP-Protocol-Version` (2025-06-18 Streamable HTTP).
+    let protocol_version = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+        .map(|v| ahma_common::mcp_protocol::negotiated_protocol_version(&v))
+        .unwrap_or_else(|_| {
+            ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION.to_string()
+        });
     let resp_msg: TxJsonRpcMessage<RoleServer> =
         serde_json::from_slice(&resp_bytes).context("Failed to parse initialize response JSON")?;
     stdio
@@ -1042,6 +1049,7 @@ async fn run_proxy_client_http(
     let sse_url = mcp_url.clone();
     let sse_session_id = session_id.clone();
 
+    let sse_protocol_version = protocol_version.clone();
     tokio::spawn(async move {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -1052,6 +1060,9 @@ async fn run_proxy_client_http(
             reqwest::header::ACCEPT,
             reqwest::header::HeaderValue::from_static("text/event-stream"),
         );
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&sse_protocol_version) {
+            headers.insert(ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER, v);
+        }
 
         let res = match sse_client.get(&sse_url).headers(headers).send().await {
             Ok(r) => r,
@@ -1122,6 +1133,10 @@ async fn run_proxy_client_http(
                 let mut req = client.post(&mcp_url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .header("mcp-session-id", &session_id)
+                    .header(
+                        ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER,
+                        &protocol_version,
+                    )
                     .json(&val);
 
                 if has_id && is_request {
@@ -1164,6 +1179,10 @@ async fn run_proxy_client_http(
     let _ = client
         .delete(&mcp_url)
         .header("mcp-session-id", &session_id)
+        .header(
+            ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER,
+            &protocol_version,
+        )
         .send()
         .await;
 

@@ -1,8 +1,6 @@
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::test_utils::http::{HttpMcpTestClient, spawn_http_bridge};
-use anyhow::Context;
 use serde_json::json;
-use tempfile::TempDir;
 use tokio::time::sleep;
 
 fn short_sleep_command() -> &'static str {
@@ -25,9 +23,12 @@ async fn test_http_no_progress_token_does_not_emit_progress_notifications() -> a
 
     // run_terminal_command is a core built-in tool - no JSON config needed
 
-    let client_root_dir = TempDir::new().context("Failed to create temp dir (client_root)")?;
+    // The bridge is spawned with an explicit `--sandbox-scope` (SPEC R5.2.2), so
+    // that scope commits at startup without ever querying roots/list. Use it as
+    // the client's answer too, so the working directory below is inside it.
+    let client_root_dir = server.temp_dir.path().to_path_buf();
     let mut events_rx = client
-        .initialize_with_roots_events(vec![client_root_dir.path().to_path_buf()])
+        .initialize_with_roots_events(vec![client_root_dir.clone()])
         .await?;
 
     // Wait for sandbox to lock (platform-aware retry: Windows CI is 3-5x slower).
@@ -43,7 +44,7 @@ async fn test_http_no_progress_token_does_not_emit_progress_notifications() -> a
             "name": "run_terminal_command",
             "arguments": {
                 "command": short_sleep_command(),
-                "working_directory": client_root_dir.path().to_string_lossy()
+                "working_directory": client_root_dir.to_string_lossy()
             }
         }
     });
@@ -92,9 +93,12 @@ async fn test_http_progress_token_is_echoed_in_progress_notifications() -> anyho
 
     // run_terminal_command is a core built-in tool - no JSON config needed
 
-    let client_root_dir = TempDir::new().context("Failed to create temp dir (client_root)")?;
+    // The bridge is spawned with an explicit `--sandbox-scope` (SPEC R5.2.2), so
+    // that scope commits at startup without ever querying roots/list. Use it as
+    // the client's answer too, so the working directory below is inside it.
+    let client_root_dir = server.temp_dir.path().to_path_buf();
     let mut events_rx = client
-        .initialize_with_roots_events(vec![client_root_dir.path().to_path_buf()])
+        .initialize_with_roots_events(vec![client_root_dir.clone()])
         .await?;
 
     // Wait for sandbox to lock (platform-aware retry: Windows CI is 3-5x slower).
@@ -111,7 +115,7 @@ async fn test_http_progress_token_is_echoed_in_progress_notifications() -> anyho
             "name": "run_terminal_command",
             "arguments": {
                 "command": short_sleep_command(),
-                "working_directory": client_root_dir.path().to_string_lossy()
+                "working_directory": client_root_dir.to_string_lossy()
             }
         }
     });
@@ -243,9 +247,12 @@ async fn test_http_await_takes_over_the_progress_stream() -> anyhow::Result<()> 
     let server = spawn_http_bridge().await?;
     let mut client = HttpMcpTestClient::new(server.base_url());
 
-    let client_root_dir = TempDir::new().context("Failed to create temp dir (client_root)")?;
+    // The bridge is spawned with an explicit `--sandbox-scope` (SPEC R5.2.2), so
+    // that scope commits at startup without ever querying roots/list. Use it as
+    // the client's answer too, so the working directory below is inside it.
+    let client_root_dir = server.temp_dir.path().to_path_buf();
     let mut events_rx = client
-        .initialize_with_roots_events(vec![client_root_dir.path().to_path_buf()])
+        .initialize_with_roots_events(vec![client_root_dir.clone()])
         .await?;
 
     let call_token = "tok_originating_call";
@@ -264,7 +271,7 @@ async fn test_http_await_takes_over_the_progress_stream() -> anyhow::Result<()> 
                 "name": "run_terminal_command",
                 "arguments": {
                     "command": outlives_inline_window(),
-                    "working_directory": client_root_dir.path().to_string_lossy()
+                    "working_directory": client_root_dir.to_string_lossy()
                 }
             }
         }),

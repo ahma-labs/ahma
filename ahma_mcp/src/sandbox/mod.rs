@@ -81,7 +81,7 @@ pub use command::{
     set_egress_proxy_env, set_secret_env_allow,
 };
 pub use confinement::outer_confinement;
-pub use core::{ContainerNarrowing, Sandbox};
+pub use core::{ContainerNarrowing, Sandbox, ScopeCommit};
 pub use core::{add_log_exception, is_target_allowed, load_exceptions};
 pub use credential_reads::{
     default_credential_read_denies, effective_credential_read_denies, keychain_access_allowed,
@@ -108,7 +108,7 @@ pub use prerequisites::{
     check_sandbox_prerequisites, exit_with_sandbox_error, test_sandbox_exec_available,
 };
 pub use scope_lock::ScopeLockState;
-pub use scopes::normalize_path_lexically;
+pub use scopes::{normalize_path_lexically, preflight_scope_candidate};
 pub use types::{SandboxMode, ScopesGuard};
 /// Re-entry hook for the Windows AppContainer launcher. Exported unconditionally
 /// (a no-op off Windows) so `main` can call it without a `cfg` of its own; it

@@ -189,14 +189,6 @@ fn is_in_temp_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether `candidate` is `container` or lies under it, compared after
-/// resolution (SPEC R5.7: scope decisions hold after symlink resolution; and
-/// `Path::starts_with` is case-sensitive on Windows though the filesystem is
-/// not, so a raw `C:\users\...` would otherwise miss a canonical `C:\Users\...`).
-fn resolves_within(candidate: &Path, container: &Path) -> bool {
-    scopes::resolve_for_comparison(candidate).starts_with(scopes::resolve_for_comparison(container))
-}
-
 /// The name of the immediate child of `container` that `requested` lives in, or
 /// `None` when `requested` is the container itself or lies outside it.
 ///
@@ -291,6 +283,21 @@ pub struct Sandbox {
     /// so a later tool call naming a *different* project cannot re-point the
     /// writable scope (R5.1.1 — one commit, never re-derived).
     pub(super) narrowed_to: std::sync::RwLock<Option<PathBuf>>,
+}
+
+/// Outcome of a scope commit ([`Sandbox::commit_scopes`] /
+/// [`Sandbox::commit_existing_scopes`]).
+///
+/// `AlreadyCommitted` is a **tolerated no-op**, not an error (SPEC R10.5): real
+/// clients re-emit `roots/list_changed` routinely, and the immutability of the
+/// commit — not session teardown — is what prevents scope widening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ScopeCommit {
+    /// This call won the one-shot latch; the scopes are now locked.
+    Applied,
+    /// The scope was already committed; nothing was changed.
+    AlreadyCommitted,
 }
 
 /// What [`Sandbox::narrow_container_to`] did, when it did something.
@@ -400,7 +407,10 @@ impl Sandbox {
             livelog,
             package_cache_write: true,
             egress_proxy_addr: std::sync::RwLock::new(None),
-            scope_lock: super::scope_lock::ScopeLock::new(true),
+            // A fresh sandbox has received nothing from any client, so
+            // `scope_source()` never reports `roots/list` for a scope that
+            // never saw roots.
+            scope_lock: super::scope_lock::ScopeLock::new(),
             container_root: None,
             narrowed_to: std::sync::RwLock::new(None),
         })
@@ -488,10 +498,54 @@ impl Sandbox {
         self
     }
 
-    /// Update the sandbox scopes, preserving the temp directory if `--tmp` was set,
-    /// the sandbox_dir if `--sandbox` was set, and any user-granted persistent
-    /// scopes (`[sandbox].persistent_scopes`).
-    pub fn update_scopes(&self, scopes: Vec<PathBuf>) -> Result<()> {
+    /// Commit the sandbox scope by **replacing** the provisional scopes with
+    /// `scopes` — the single door through which a scope becomes locked (SPEC
+    /// R5.1.1).
+    ///
+    /// The one-shot commit latch and the scope mutation are one operation, so
+    /// scope immutability holds *by construction*: there is no public way to
+    /// replace the scopes of an already-committed sandbox. A call that loses the
+    /// latch returns [`ScopeCommit::AlreadyCommitted`] without touching the
+    /// locked scope — the tolerated no-op R10.5 requires.
+    ///
+    /// Fail-closed on error: if canonicalization/validation of `scopes` fails
+    /// *after* the latch was claimed, the latch stays consumed and the sandbox
+    /// keeps its previous (narrower, possibly empty) scopes. A retry cannot
+    /// widen a scope whose commit already failed; the session surfaces the
+    /// failure instead (`notifications/sandbox/failed`).
+    pub fn commit_scopes(&self, scopes: Vec<PathBuf>) -> Result<ScopeCommit> {
+        if !self.scope_lock.try_commit() {
+            return Ok(ScopeCommit::AlreadyCommitted);
+        }
+        self.apply_scopes(scopes)?;
+        Ok(ScopeCommit::Applied)
+    }
+
+    /// Commit the sandbox scope **as it currently stands** (pre-configured /
+    /// explicit scopes), without replacing anything.
+    ///
+    /// This is the commit path for scopes that were already seeded at
+    /// construction — an explicit `--sandbox-scope`, a task vault, or the user's
+    /// container root — where there is nothing to replace, only a latch to
+    /// claim. Returns [`ScopeCommit::AlreadyCommitted`] when the latch was
+    /// already claimed.
+    pub fn commit_existing_scopes(&self) -> ScopeCommit {
+        if self.scope_lock.try_commit() {
+            ScopeCommit::Applied
+        } else {
+            ScopeCommit::AlreadyCommitted
+        }
+    }
+
+    /// Replace the sandbox scopes, preserving the temp directory if `--tmp` was
+    /// set, the scratch dir if `--scratch` was set, and any user-granted
+    /// persistent scopes (`[sandbox].persistent_scopes`).
+    ///
+    /// Private on purpose: every wholesale scope replacement must go through
+    /// [`commit_scopes`](Self::commit_scopes), which claims the one-shot commit
+    /// latch first. The only post-commit mutation is
+    /// [`narrow_container_to`](Self::narrow_container_to), which can only shrink.
+    fn apply_scopes(&self, scopes: Vec<PathBuf>) -> Result<()> {
         let mut canonicalized = scopes::canonicalize_scopes(
             scopes,
             self.mode,
@@ -560,19 +614,6 @@ impl Sandbox {
         self.scope_lock.roots_received()
     }
 
-    /// Provenance of this session's locked scope (SPEC R5.2 precedence, rendered
-    /// per R5.4).
-    ///
-    /// One derivation, on the type that owns the flags, so no two surfaces can
-    /// disagree about *why* the scope is what it is. It used to be open-coded in
-    /// both the `notifications/sandbox/configured` emitter and the shell handler
-    /// that refuses to substitute a default scope — a model comparing the
-    /// notification against an error body would have seen the drift first.
-    ///
-    /// `Elicited` and `Pending` are not distinguishable from these flags: both
-    /// are user-chosen, so both arrive here as [`ScopeSource::Explicit`], which
-    /// is the branch that keeps running rather than the declared default that
-    /// refuses. Callers holding richer provenance should render that instead.
     /// Record that this session's scope came from the user's container root
     /// (SPEC R5.2.3), arming auto-narrowing (R5.2.6).
     ///
@@ -620,6 +661,14 @@ impl Sandbox {
     /// gives it the error message it deserves.
     pub fn narrow_container_to(&self, requested: &Path) -> Option<ContainerNarrowing> {
         let container = self.container_root.clone()?;
+        // Narrowing is armed only while the container is genuinely the scope
+        // source. When the client later reported usable roots (or the scope is
+        // explicit), the live scope is already a project the user/client chose —
+        // there is no container in the writable set to narrow, and rewriting a
+        // roots-derived scope entry with a joined child name would corrupt it.
+        if self.scope_source() != ScopeSource::Container {
+            return None;
+        }
         // Cheap pre-check outside the write lock; re-checked under it below.
         if self.narrowed_to.read().unwrap().is_some() {
             return None;
@@ -642,11 +691,14 @@ impl Sandbox {
             // macOS) so either spelling validates. Narrowing has to replace
             // *every* spelling of the container with the same spelling of the
             // child, or the alias would silently keep the whole container
-            // writable. Anything else in the set — persistent grants, scratch,
-            // `--tmp` — is not part of the container and survives untouched.
-            let (container_aliases, mut kept): (Vec<PathBuf>, Vec<PathBuf>) = scopes
-                .drain(..)
-                .partition(|s| resolves_within(s, &container));
+            // writable. The match is on **the container itself** (any spelling),
+            // not "anything under it": a persistent grant that happens to live
+            // inside the container is a user-chosen scope of its own and must
+            // survive untouched, not be rewritten with a joined child name.
+            let (container_aliases, mut kept): (Vec<PathBuf>, Vec<PathBuf>) =
+                scopes.drain(..).partition(|s| {
+                    scopes::resolve_for_comparison(s) == scopes::resolve_for_comparison(&container)
+                });
             let mut narrowed_scopes: Vec<PathBuf> = container_aliases
                 .into_iter()
                 .map(|alias| alias.join(&child_name))
@@ -671,13 +723,35 @@ impl Sandbox {
         Some(ContainerNarrowing { container, child })
     }
 
+    /// Provenance of this session's scope (SPEC R5.2 precedence, rendered per
+    /// R5.4).
+    ///
+    /// One derivation, on the type that owns the flags, so no two surfaces can
+    /// disagree about *why* the scope is what it is. It used to be open-coded in
+    /// both the `notifications/sandbox/configured` emitter and the shell handler
+    /// that refuses to substitute a default scope — a model comparing the
+    /// notification against an error body would have seen the drift first.
+    ///
+    /// `roots_received()` is set only when *usable* client roots were parsed and
+    /// applied, so a client that answers `roots/list` with an empty array
+    /// (Antigravity, Cursor with no folder open — SPEC R5.2.7) does **not**
+    /// masquerade as `roots/list` provenance: the scope it actually runs under
+    /// (the container root) is what gets reported, which is also what arms the
+    /// R5.2.8 working-directory refusal.
+    ///
+    /// `Pending` is the honest answer for a scope that has no provenance yet —
+    /// nothing explicit, no usable roots, no container. `Elicited` is not
+    /// derivable from these flags; a caller holding richer provenance should
+    /// render that instead.
     pub fn scope_source(&self) -> ScopeSource {
         if self.has_explicit_scopes() {
             ScopeSource::Explicit
         } else if self.roots_received() {
             ScopeSource::RootsList
-        } else {
+        } else if self.container_root.is_some() {
             ScopeSource::Container
+        } else {
+            ScopeSource::Pending
         }
     }
 
@@ -693,15 +767,6 @@ impl Sandbox {
         self.scope_lock.is_committed()
     }
 
-    /// Atomically claim the one-shot scope commit. Returns `true` for the single
-    /// caller that wins the latch (and may proceed to apply/enforce scopes) and
-    /// `false` for every subsequent call, which must treat the configuration as
-    /// a tolerated no-op rather than widening the locked sandbox (SPEC R5.1.1).
-    #[must_use]
-    pub fn try_commit(&self) -> bool {
-        self.scope_lock.try_commit()
-    }
-
     /// Check if the sandbox is in test mode.
     pub fn is_test_mode(&self) -> bool {
         self.mode == SandboxMode::Test
@@ -714,10 +779,16 @@ impl Sandbox {
 
     /// Returns true when tool calls can execute against sandboxed roots.
     ///
-    /// In test mode, tool calls are always allowed. In normal modes, at least one
-    /// rooted scope must be configured (typically via roots/list).
+    /// In test mode, tool calls are always allowed. In normal modes the scope
+    /// must be **committed** (SPEC R5.1.2.1) — a non-empty *provisional* scope is
+    /// not enough. The old `!scopes().is_empty()` check let a call through while
+    /// negotiation was still running, on the theory that the provisional scope is
+    /// a subset of the committed one. That is false for the one provisional
+    /// source that matters: a container root spans every project the user owns
+    /// and only *narrows* after commit, so running against it early was running
+    /// against a *wider* scope than the one about to be locked.
     pub fn is_ready_for_tool_calls(&self) -> bool {
-        self.is_test_mode() || !self.scopes().is_empty()
+        self.is_test_mode() || self.is_committed()
     }
 
     /// Check if no-temp-files mode is enabled.
@@ -928,7 +999,7 @@ mod persistent_scope_tests {
 
     /// The core guarantee behind `ahma sandbox grant`: a granted external
     /// directory survives a client `roots/list` that otherwise replaces the
-    /// workspace scope wholesale. Without the re-append in `update_scopes`, the
+    /// workspace scope wholesale. Without the re-append in `commit_scopes`, the
     /// grant would silently vanish the moment Cursor sent its workspace root.
     #[test]
     fn granted_scopes_survive_roots_list_replacement() {
@@ -956,8 +1027,13 @@ mod persistent_scope_tests {
         assert!(sb.read_scopes().iter().any(|p| p == toolchains.path()));
 
         // Simulate the client sending workspace roots, replacing the scope set.
-        sb.update_scopes(vec![client_root.path().to_path_buf()])
-            .unwrap();
+        // `commit_scopes` is the only door: replacement and the one-shot commit
+        // latch are a single operation (SPEC R5.1.1).
+        assert_eq!(
+            sb.commit_scopes(vec![client_root.path().to_path_buf()])
+                .unwrap(),
+            ScopeCommit::Applied
+        );
 
         let scopes = sb.scopes();
         let client_canon = dunce::canonicalize(client_root.path()).unwrap();

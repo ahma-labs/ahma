@@ -930,7 +930,12 @@ mod tests {
     /// A shared-client session attached to `base` with a fixed test id —
     /// the handshake itself is covered by `ahma_http_mcp_client`'s tests.
     fn test_session(base: &str) -> StreamableHttpMcpClient {
-        StreamableHttpMcpClient::attach(test_client(), format!("{base}/mcp"), "s")
+        StreamableHttpMcpClient::attach(
+            test_client(),
+            format!("{base}/mcp"),
+            "s",
+            ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+        )
     }
 
     #[test]

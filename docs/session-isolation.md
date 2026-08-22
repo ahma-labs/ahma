@@ -50,8 +50,8 @@ ahma serve http --session-isolation
 
 ## Security Invariants
 
-- **Strict Sandbox Derivation**: The sandbox scope is derived *strictly* from the client's first `roots/list` response.
-- **Zero Scope Widening**: Once locked, any subsequent attempt by the client to alter or expand the roots list will be rejected, and the HTTP bridge will terminate the session immediately (HTTP 403 Forbidden).
+- **Strict Sandbox Derivation**: The sandbox scope is derived *strictly* from the client's first `roots/list` response — unless the bridge was started with an explicit `--sandbox-scope`, which is locked and is never replaced by client roots (SPEC R5.2.2).
+- **Zero Scope Widening**: Once locked, the scope is immutable (SPEC R5.1.1). A later `roots/list_changed` is a **tolerated no-op** (SPEC R10.5): the bridge acknowledges it with HTTP 202 and keeps the session alive without forwarding it — real clients re-emit the notification routinely, and terminating on it caused pointless session churn. Sandbox escape is prevented by the immutability of the commit, not by tearing the session down.
 - **Process Cleanup**: When a subprocess crashes, the bridge terminates the associated session and marks it for cleanup. If the session expires or is closed via `DELETE /mcp`, the subprocess is forcefully killed (`kill_on_drop`).
 
 ## Bridge Lifecycle

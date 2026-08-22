@@ -36,6 +36,15 @@ async fn start_http_bridge(
         .expect("Failed to start HTTP bridge")
 }
 
+/// Strict-roots bridge (no fallback scope) for tests that assert on the scope
+/// derived from the client's roots/list answer — an explicit fallback scope is
+/// locked without querying roots at all (SPEC R5.2.2).
+async fn start_http_bridge_strict_roots(tools_dir: &std::path::Path) -> ServerGuard {
+    common::spawn_server_guard_strict_roots(tools_dir)
+        .await
+        .expect("Failed to start strict-roots HTTP bridge")
+}
+
 /// Send a JSON-RPC request to the MCP endpoint
 async fn send_mcp_request(
     client: &Client,
@@ -461,7 +470,7 @@ async fn test_roots_uri_parsing_percent_encoded_path() {
         .await
         .expect("Failed to create client root");
 
-    let server = start_http_bridge(&tools_dir, server_scope_dir.path()).await;
+    let server = start_http_bridge_strict_roots(&tools_dir).await;
     let base_url = server.base_url();
     let client = common::make_h2_client();
 
@@ -539,7 +548,7 @@ async fn test_roots_uri_parsing_file_localhost() {
         .await
         .expect("Failed to create client root");
 
-    let server = start_http_bridge(&tools_dir, server_scope_dir.path()).await;
+    let server = start_http_bridge_strict_roots(&tools_dir).await;
     let base_url = server.base_url();
     let client = common::make_h2_client();
 

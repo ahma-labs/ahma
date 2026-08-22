@@ -61,7 +61,8 @@ async fn test_missing_session_id_json() {
     );
 }
 
-/// Test: POST with nonexistent session ID returns 403.
+/// Test: POST with nonexistent session ID returns 404 (the spec's signal to
+/// drop the stale session and re-initialize).
 /// Covers check_session_exists.
 #[tokio::test]
 async fn test_nonexistent_session_json() {
@@ -90,7 +91,7 @@ async fn test_nonexistent_session_json() {
         .await
         .expect("Request failed");
 
-    assert_eq!(resp.status().as_u16(), 403, "Should return 403 Forbidden");
+    assert_eq!(resp.status().as_u16(), 404, "Should return 404 Not Found");
     let body: serde_json::Value = resp.json().await.expect("JSON body");
     let err = body.get("error").expect("Should have error");
     assert_eq!(err.get("code").and_then(|c| c.as_i64()), Some(-32600));
@@ -184,7 +185,7 @@ async fn test_sse_missing_session_id() {
     assert_eq!(err.get("code").and_then(|c| c.as_i64()), Some(-32600));
 }
 
-/// Test: POST with Accept: text/event-stream and nonexistent session ID returns 403.
+/// Test: POST with Accept: text/event-stream and nonexistent session ID returns 404.
 #[tokio::test]
 async fn test_sse_nonexistent_session() {
     let server = spawn_test_server()
@@ -212,7 +213,7 @@ async fn test_sse_nonexistent_session() {
         .await
         .expect("Request failed");
 
-    assert_eq!(resp.status().as_u16(), 403);
+    assert_eq!(resp.status().as_u16(), 404);
     let body: serde_json::Value = resp.json().await.expect("JSON body");
     let err = body.get("error").expect("Should have error");
     assert_eq!(err.get("code").and_then(|c| c.as_i64()), Some(-32600));
@@ -366,14 +367,16 @@ async fn run_tools_call_timeout(mode: TransportMode) {
     else {
         return;
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
+    // No explicit `working_directory`: the bridge is spawned with an explicit
+    // `--sandbox-scope` (SPEC R5.2.2), which commits at startup without ever
+    // querying roots/list, so the process's real cwd is not inside it. Omit
+    // the field and let the handler substitute the locked scope.
     let result = mcp
         .call_tool(
             "run_terminal_command",
             json!({
                 "command": "echo ok",
-                "working_directory": cwd.to_string_lossy(),
                 "timeout_seconds": 30
             }),
         )

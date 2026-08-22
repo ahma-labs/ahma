@@ -100,55 +100,9 @@ pub fn parse_file_uri(uri: &str) -> Option<PathBuf> {
 /// authority.  This is required for correct round-trip parsing via
 /// `url::Url::parse` → `url.to_file_path()`.
 pub fn encode_file_uri(path: &Path) -> String {
-    let mut path_str = path.to_string_lossy().into_owned();
-
-    // Strip Windows extended-length prefix (\\?\) if present.
-    if path_str.starts_with(r"\\?\") {
-        path_str = path_str[4..].to_string();
-    }
-
-    // Normalise path separators to forward slashes.
-    path_str = path_str.replace('\\', "/");
-
-    let mut out = String::with_capacity(path_str.len() + 10);
-    out.push_str("file://");
-
-    // On Windows a drive-letter path looks like "C:/Users/…".
-    // RFC 8089 §2 requires the path to start with "/" so that it occupies
-    // the path component, not the authority.  Insert the leading slash here
-    // so we produce "file:///C:/Users/…" (or "file://localhost/C:/Users/…").
-    #[cfg(target_os = "windows")]
-    {
-        let is_drive = path_str.len() >= 2
-            && path_str.as_bytes()[0].is_ascii_alphabetic()
-            && path_str.as_bytes()[1] == b':';
-        if is_drive {
-            out.push('/');
-        }
-    }
-
-    for b in path_str.as_bytes() {
-        let b = *b;
-        let keep = matches!(
-            b,
-            b'a'..=b'z'
-                | b'A'..=b'Z'
-                | b'0'..=b'9'
-                | b'-'
-                | b'.'
-                | b'_'
-                | b'~'
-                | b'/'
-                | b':'  // keep colon for Windows drive letters (e.g. C:/)
-        );
-        if keep {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push_str(&format!("{:02X}", b));
-        }
-    }
-    out
+    // Delegates to the shared encoder so security/encoding improvements apply
+    // everywhere (the workspace used to carry six byte-similar copies).
+    ahma_common::file_uri::encode_file_uri(path)
 }
 
 /// Malformed URI test cases for edge case testing.

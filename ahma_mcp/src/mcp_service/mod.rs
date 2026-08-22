@@ -791,10 +791,10 @@ impl AhmaMcpService {
         let progress_push = progress_push::ProgressPushRouter::new(operation_monitor.clone());
         progress_push.spawn_forwarder(&operation_monitor);
 
-        // Reset roots_received to false so that client roots/list negotiation
-        // or no-roots auto-scoping can occur for this service session.
-        adapter.sandbox().set_roots_received(false);
-
+        // A fresh `Sandbox` starts with `roots_received == false`; nothing to
+        // reset here. (This used to undo a `true` the constructor seeded, which
+        // left every non-MCP construction reporting `roots/list` provenance for
+        // a scope that never saw roots.)
         let service = Self {
             adapter,
             operation_monitor,
@@ -1887,12 +1887,28 @@ impl AhmaMcpService {
         if self.adapter.sandbox().is_ready_for_tool_calls() {
             return Ok(());
         }
-        // R5.2.3: with no scope to be had, refuse *with the remediation*. The old
-        // message said only "retry after roots/list completes", which is a lie to
-        // the client that most needs this error — one that already answered
-        // `roots/list` with `{"roots": []}` (R5.2.7) and will never send another.
-        // It waits, retries, and eventually leaves for an unsandboxed terminal.
-        let error_message = "ahma has no sandbox scope, so it will not run anything yet. \
+        // Two distinct refusals share the -32001 code:
+        //
+        // * Provisional scope, commit still pending (R5.1.2.1): the negotiation
+        //   is running but did not settle inside the wait budget. Retrying is
+        //   the whole remediation. Executing anyway is not an option — the one
+        //   provisional source that matters, the container root, is *wider*
+        //   than the scope about to be committed.
+        //
+        // * No scope to be had (R5.2.3): refuse *with the remediation*. The old
+        //   message said only "retry after roots/list completes", which is a lie
+        //   to the client that most needs this error — one that already answered
+        //   `roots/list` with `{"roots": []}` (R5.2.7) and will never send
+        //   another. It waits, retries, and eventually leaves for an unsandboxed
+        //   terminal.
+        let scopes_pending = !self.adapter.sandbox().scopes().is_empty();
+        let error_message = if scopes_pending {
+            "ahma's sandbox scope is still being negotiated (the commit has not settled \
+             yet), so it will not run anything at this instant. Retry shortly — this \
+             resolves as soon as the scope is committed."
+                .to_string()
+        } else {
+            "ahma has no sandbox scope, so it will not run anything yet. \
              If your editor is still opening a workspace this resolves by itself in a moment — \
              retry once. If your client reports no workspace roots (Antigravity and LM Studio \
              answer `roots/list` with an empty list), it never will, and one of these is \
@@ -1901,17 +1917,25 @@ impl AhmaMcpService {
              projects; or start ahma with `--sandbox-scope <project-dir>`. ahma does not pick \
              a directory for you — running in one nobody chose is what this refusal exists to \
              prevent."
-            .to_string();
+                .to_string()
+        };
         tracing::warn!("{}", error_message);
         Err(McpError::new(
             rmcp::model::ErrorCode(-32001),
             error_message,
             Some(serde_json::json!({
-                "kind": "sandbox_scope_missing",
+                "kind": if scopes_pending { "sandbox_scope_uncommitted" }
+                        else { "sandbox_scope_missing" },
+                "lock_state": ahma_common::state_machine::FsmState::name(
+                    &self.adapter.sandbox().lock_state()),
                 "roots_received": self.adapter.sandbox().roots_received(),
-                "remediation": "Open a workspace folder in the client, set `[sandbox] \
-                                container_root` in ~/.ahma/settings.toml, or start ahma with \
-                                `--sandbox-scope <project-dir>`.",
+                "remediation": if scopes_pending {
+                    "Retry shortly; the scope commit is in flight."
+                } else {
+                    "Open a workspace folder in the client, set `[sandbox] container_root` \
+                     in ~/.ahma/settings.toml, or start ahma with `--sandbox-scope \
+                     <project-dir>`."
+                },
             })),
         ))
     }
@@ -2137,8 +2161,10 @@ impl AhmaMcpService {
 
     /// Routes a `tools/call` for a configured (non-built-in) tool. Resolves
     /// the tool config and dispatches by tool type (sequence / livelog /
-    /// subcommand). The sandbox-ready gate has already run in `call_tool`,
-    /// its only caller, for every non-exempt tool name.
+    /// subcommand). The sandbox gate has already run at the single dispatch
+    /// point (SPEC R5.1.2.2) — the per-handler gate this method used to carry
+    /// was the pre-R5.1.2.2 leftover that let the built-in file tools go
+    /// ungated while double-gating this path.
     async fn dispatch_configured_tool(
         &self,
         params: CallToolRequestParams,
@@ -3616,7 +3642,16 @@ mod tests {
     #[tokio::test]
     async fn guard_and_skip_roots_defaults() {
         let service = make_service().await;
-        // Strict test adapter has a rooted scope -> ready.
+        // A rooted but *uncommitted* scope is not enough: the gate keys on the
+        // commit latch (R5.1.2.1), because the one provisional source that
+        // matters — a container root — is wider than the scope it commits to.
+        let err = service
+            .guard_sandbox_ready_for_tool_calls()
+            .await
+            .expect_err("uncommitted scope must be refused");
+        assert_eq!(err.code, rmcp::model::ErrorCode(-32001));
+        // Once committed, the same scope passes the gate.
+        let _ = service.adapter.sandbox().commit_existing_scopes();
         assert!(service.guard_sandbox_ready_for_tool_calls().await.is_ok());
         // Not explicit, not test mode -> we still ask the client for roots.
         assert!(!service.should_skip_client_roots_sandbox_setup());

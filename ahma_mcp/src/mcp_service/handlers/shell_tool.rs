@@ -967,7 +967,10 @@ mod tests {
     // the directory and abandoned ahma for its own unsandboxed terminal.
 
     /// A service whose scope provenance is exactly the flag pair
-    /// `locked_scope_source` reads (explicit / roots-received).
+    /// `scope_source()` reads (explicit / roots-received). When neither is set,
+    /// the scope is armed as the user's **container root** so the provenance is
+    /// [`ScopeSource::Container`] (a fresh sandbox with no container would now
+    /// honestly report `pending`).
     ///
     /// `SandboxMode::Strict` on purpose: `SandboxMode::Test` resolves scope but
     /// never substitutes it, so it cannot exercise this decision at all.
@@ -976,6 +979,8 @@ mod tests {
         explicit: bool,
         roots_received: bool,
     ) -> AhmaMcpService {
+        let container_root = (!explicit && !roots_received)
+            .then(|| dunce::canonicalize(scope).expect("tempdir canonicalizes"));
         let sandbox = Sandbox::new(
             vec![scope.to_path_buf()],
             SandboxMode::Strict,
@@ -984,7 +989,8 @@ mod tests {
             false,
         )
         .expect("sandbox must build")
-        .with_explicit_scopes(explicit);
+        .with_explicit_scopes(explicit)
+        .with_container_root(container_root);
 
         let operation_monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
             TestTimeouts::get(TimeoutCategory::ToolCall),
@@ -1008,9 +1014,6 @@ mod tests {
         )
         .await
         .expect("service must build");
-        // Must be set *after* construction: `AhmaMcpService::new` clears the flag
-        // so each session renegotiates roots. Setting it on the sandbox first
-        // would be silently undone.
         service.adapter.sandbox().set_roots_received(roots_received);
         service
     }

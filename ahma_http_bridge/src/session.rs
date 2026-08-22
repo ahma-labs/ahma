@@ -159,7 +159,7 @@ pub enum SessionTerminationReason {
 pub struct Session {
     /// Unique session identifier
     pub id: String,
-    /// Channel to send messages to the subprocess (wrapped in Mutex for restart support)
+    /// Channel to send messages to the subprocess.
     sender: Mutex<mpsc::Sender<String>>,
     /// Map of pending request IDs to response channels
     pending_requests: Arc<DashMap<String, oneshot::Sender<Value>>>,
@@ -478,7 +478,7 @@ impl Session {
     }
 
     /// Send roots/list_changed notification to subprocess.
-    pub async fn send_roots_list_changed(&self) -> Result<()> {
+    async fn send_roots_list_changed(&self) -> Result<()> {
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/roots/list_changed"
@@ -1262,8 +1262,8 @@ impl SessionManager {
 
     /// Lock sandbox scope for a session (called when observing first roots/list response).
     ///
-    /// Per R8.4.4-R8.4.5, sandbox scope is determined from the first roots/list response
-    /// and cannot be changed. In the simplified design, the subprocess is spawned with
+    /// Per SPEC R5.1.1 / R5.2.2 / R10.3, sandbox scope is determined from the first
+    /// roots/list response and cannot be changed. In the simplified design, the subprocess is spawned with
     /// `--defer-sandbox` and configures its own sandbox after roots are received.
     ///
     /// This method only records the scopes for bridge-side enforcement (e.g. rejecting

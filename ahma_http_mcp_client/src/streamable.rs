@@ -22,6 +22,7 @@
 
 use ahma_common::file_uri::encode_file_uri;
 use ahma_common::mcp_methods::{INITIALIZED_METHOD, ROOTS_LIST_METHOD, SANDBOX_CONFIGURED_METHOD};
+use ahma_common::mcp_protocol::{MCP_PROTOCOL_VERSION_HEADER, negotiated_protocol_version};
 use ahma_common::sse::{event_data_to_json, pop_next_sse_event};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,12 @@ use tracing::{debug, warn};
 pub const SESSION_ID_HEADER: &str = "mcp-session-id";
 
 /// MCP protocol version this client announces in `initialize`.
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+///
+/// The `initialize` response may negotiate down to an older revision (see
+/// [`ahma_common::mcp_protocol`]); the version actually in effect for a
+/// session is [`StreamableHttpMcpClient::protocol_version`], not this
+/// constant.
+pub const PROTOCOL_VERSION: &str = ahma_common::mcp_protocol::REQUESTED_PROTOCOL_VERSION;
 
 /// How to reach the server: the full `/mcp` endpoint URL plus the reqwest
 /// clients to use. Callers construct the clients themselves so
@@ -137,6 +143,10 @@ pub struct StreamableHttpMcpClient {
     post_client: reqwest::Client,
     mcp_url: String,
     session_id: String,
+    /// The version the server answered in `initialize` (2025-06-18
+    /// `MCP-Protocol-Version` negotiation) — echoed on every subsequent
+    /// request via [`MCP_PROTOCOL_VERSION_HEADER`].
+    protocol_version: String,
     next_id: AtomicU64,
 }
 
@@ -145,6 +155,7 @@ impl std::fmt::Debug for StreamableHttpMcpClient {
         f.debug_struct("StreamableHttpMcpClient")
             .field("mcp_url", &self.mcp_url)
             .field("session_id", &self.session_id)
+            .field("protocol_version", &self.protocol_version)
             .finish_non_exhaustive()
     }
 }
@@ -153,7 +164,7 @@ impl StreamableHttpMcpClient {
     /// Full MCP Streamable-HTTP handshake (steps 1–4 of the hard invariant),
     /// including SSE-before-initialized ordering and `roots/list` answering.
     pub async fn connect(connector: Connector, opts: ConnectOptions) -> Result<Self> {
-        let session_id = initialize_session(
+        let (session_id, protocol_version) = initialize_session(
             &connector.post_client,
             &connector.mcp_url,
             &opts.client_name,
@@ -170,12 +181,14 @@ impl StreamableHttpMcpClient {
         {
             let connector = connector.clone();
             let session_id = session_id.clone();
+            let protocol_version = protocol_version.clone();
             let roots = opts.roots.clone();
             let notifications = opts.notifications.clone();
             tokio::spawn(async move {
                 if let Err(e) = run_sse_listener(
                     connector,
                     session_id,
+                    protocol_version,
                     roots,
                     notifications,
                     ready_tx,
@@ -212,6 +225,7 @@ impl StreamableHttpMcpClient {
             .post(&connector.mcp_url)
             .header("Content-Type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
+            .header(MCP_PROTOCOL_VERSION_HEADER, &protocol_version)
             .json(&json!({ "jsonrpc": "2.0", "method": INITIALIZED_METHOD }))
             .send()
             .await;
@@ -234,6 +248,7 @@ impl StreamableHttpMcpClient {
             post_client: connector.post_client,
             mcp_url: connector.mcp_url,
             session_id,
+            protocol_version,
             next_id: AtomicU64::new(FIRST_REQUEST_ID),
         })
     }
@@ -246,7 +261,7 @@ impl StreamableHttpMcpClient {
         client_name: &str,
         client_version: &str,
     ) -> Result<Self> {
-        let session_id = initialize_session(
+        let (session_id, protocol_version) = initialize_session(
             &connector.post_client,
             &connector.mcp_url,
             client_name,
@@ -261,6 +276,7 @@ impl StreamableHttpMcpClient {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
+            .header(MCP_PROTOCOL_VERSION_HEADER, &protocol_version)
             .json(&json!({ "jsonrpc": "2.0", "method": INITIALIZED_METHOD }))
             .send()
             .await;
@@ -269,6 +285,7 @@ impl StreamableHttpMcpClient {
             post_client: connector.post_client,
             mcp_url: connector.mcp_url,
             session_id,
+            protocol_version,
             next_id: AtomicU64::new(FIRST_REQUEST_ID),
         })
     }
@@ -276,15 +293,21 @@ impl StreamableHttpMcpClient {
     /// Attach to an already-negotiated session (a cached session id, or one
     /// negotiated by another component such as the TUI's MCP source). No
     /// handshake is performed.
+    ///
+    /// `protocol_version` is the version that session's own `initialize`
+    /// negotiated; pass [`ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION`]
+    /// if the caller never captured it.
     pub fn attach(
         post_client: reqwest::Client,
         mcp_url: impl Into<String>,
         session_id: impl Into<String>,
+        protocol_version: impl Into<String>,
     ) -> Self {
         Self {
             post_client,
             mcp_url: mcp_url.into(),
             session_id: session_id.into(),
+            protocol_version: protocol_version.into(),
             next_id: AtomicU64::new(FIRST_REQUEST_ID),
         }
     }
@@ -292,6 +315,13 @@ impl StreamableHttpMcpClient {
     /// The negotiated session id.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The protocol version negotiated at `initialize` (or supplied to
+    /// [`Self::attach`]), echoed on every subsequent request via
+    /// `MCP-Protocol-Version`.
+    pub fn protocol_version(&self) -> &str {
+        &self.protocol_version
     }
 
     /// The full `/mcp` endpoint URL.
@@ -314,6 +344,7 @@ impl StreamableHttpMcpClient {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header(SESSION_ID_HEADER, &self.session_id)
+            .header(MCP_PROTOCOL_VERSION_HEADER, &self.protocol_version)
             .json(&body)
             .send()
             .await
@@ -378,6 +409,7 @@ impl StreamableHttpMcpClient {
             .post_client
             .delete(&self.mcp_url)
             .header(SESSION_ID_HEADER, &self.session_id)
+            .header(MCP_PROTOCOL_VERSION_HEADER, &self.protocol_version)
             .timeout(timeout)
             .send()
             .await;
@@ -430,7 +462,7 @@ async fn initialize_session(
     mcp_url: &str,
     client_name: &str,
     client_version: &str,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let init_body = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -451,28 +483,34 @@ async fn initialize_session(
         .await
         .with_context(|| format!("initialize request to {mcp_url} failed"))?;
 
-    if let Some(sid) = resp
+    let Some(sid) = resp
         .headers()
         .get(SESSION_ID_HEADER)
         .and_then(|v| v.to_str().ok())
-    {
-        return Ok(sid.to_string());
-    }
-
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    let snippet: String = body.chars().take(500).collect();
-    let body_note = if snippet.trim().is_empty() {
-        "<empty body>".to_string()
-    } else {
-        snippet
+        .map(str::to_string)
+    else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(500).collect();
+        let body_note = if snippet.trim().is_empty() {
+            "<empty body>".to_string()
+        } else {
+            snippet
+        };
+        return Err(anyhow!(
+            "No {SESSION_ID_HEADER} header in initialize response (HTTP {status}). \
+             This usually means the request reached something other than an MCP \
+             Streamable-HTTP server — check auth, session limits, and that the URL \
+             is correct. Response body: {body_note}"
+        ));
     };
-    Err(anyhow!(
-        "No {SESSION_ID_HEADER} header in initialize response (HTTP {status}). \
-         This usually means the request reached something other than an MCP \
-         Streamable-HTTP server — check auth, session limits, and that the URL \
-         is correct. Response body: {body_note}"
-    ))
+
+    // The negotiated version is in the `initialize` result body, not a
+    // header — read it before the response is consumed further.
+    let init_response = resp.json::<Value>().await.unwrap_or(Value::Null);
+    let protocol_version = negotiated_protocol_version(&init_response);
+
+    Ok((sid, protocol_version))
 }
 
 /// Long-lived SSE listener for a session: opens the GET stream, signals
@@ -483,6 +521,7 @@ async fn initialize_session(
 async fn run_sse_listener(
     connector: Connector,
     session_id: String,
+    protocol_version: String,
     roots: Vec<PathBuf>,
     notifications: Option<mpsc::Sender<Value>>,
     ready_tx: tokio::sync::oneshot::Sender<()>,
@@ -522,6 +561,7 @@ async fn run_sse_listener(
             handle_sse_event(
                 &connector,
                 &session_id,
+                &protocol_version,
                 &roots,
                 &notifications,
                 &mut locked_tx,
@@ -539,6 +579,7 @@ async fn run_sse_listener(
 async fn handle_sse_event(
     connector: &Connector,
     session_id: &str,
+    protocol_version: &str,
     roots: &[PathBuf],
     notifications: &Option<mpsc::Sender<Value>>,
     locked_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
@@ -555,7 +596,8 @@ async fn handle_sse_event(
     if method == Some(ROOTS_LIST_METHOD) {
         match value.get("id").cloned() {
             Some(request_id) => {
-                respond_to_roots_list(connector, session_id, request_id, roots).await;
+                respond_to_roots_list(connector, session_id, protocol_version, request_id, roots)
+                    .await;
             }
             None => debug!("roots/list request without id; cannot answer"),
         }
@@ -574,6 +616,7 @@ async fn handle_sse_event(
 async fn respond_to_roots_list(
     connector: &Connector,
     session_id: &str,
+    protocol_version: &str,
     request_id: Value,
     roots: &[PathBuf],
 ) {
@@ -597,6 +640,7 @@ async fn respond_to_roots_list(
         .post(&connector.mcp_url)
         .header("Content-Type", "application/json")
         .header(SESSION_ID_HEADER, session_id)
+        .header(MCP_PROTOCOL_VERSION_HEADER, protocol_version)
         .json(&roots_response)
         .send()
         .await;

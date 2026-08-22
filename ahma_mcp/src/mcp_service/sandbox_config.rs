@@ -130,9 +130,11 @@ async fn emit_sandbox_notification_via_peer_with_scope(
 /// Parse a single `file://` URI from a roots/list response into a `PathBuf`.
 /// Returns `None` and logs a warning for non-file or unparseable URIs.
 ///
-/// Delegates to `ahma_common::file_uri::parse_file_uri_to_path` — the single
-/// hardened parser shared with the HTTP bridge (rejects non-`file` schemes,
-/// NUL bytes, relative paths, invalid percent-encoding).
+/// Delegates to the shared `ahma_common::file_uri` parser — the same one the
+/// HTTP bridge uses — so its security properties (NUL-byte rejection,
+/// single-pass percent-decoding, relative-path rejection) apply on the direct
+/// stdio path too. This used to be a second, `url::Url`-based implementation
+/// without the NUL check.
 fn parse_root_uri_to_scope(uri: &str) -> Option<PathBuf> {
     match ahma_common::file_uri::parse_file_uri_to_path(uri) {
         Some(path) => {
@@ -140,7 +142,7 @@ fn parse_root_uri_to_scope(uri: &str) -> Option<PathBuf> {
             Some(path)
         }
         None => {
-            tracing::warn!("Ignoring invalid or non-file root URI: {}", uri);
+            tracing::warn!("Ignoring non-file or unparseable root URI: {}", uri);
             None
         }
     }
@@ -173,21 +175,32 @@ impl AhmaMcpService {
         }
     }
 
-    /// Query the client for workspace roots and initialize the sandbox scope.
+    /// Commit the sandbox scope from the client's roots and (on Linux) enforce
+    /// Landlock restrictions. Emits `notifications/sandbox/failed` and returns
+    /// `false` on error or when the scope was already committed (tolerated
+    /// no-op, nothing to announce).
     ///
-    /// This implements the MCP roots protocol where the server requests the
-    /// client's workspace roots to establish sandbox boundaries.
-    /// Update sandbox scopes and (on Linux) enforce Landlock restrictions.
-    /// Emits `notifications/sandbox/failed` and returns `false` on error.
+    /// The replacement and the one-shot commit latch are a single operation
+    /// (`Sandbox::commit_scopes`, SPEC R5.1.1): there is no path that mutates
+    /// the scope without claiming the latch.
     async fn apply_and_enforce_scopes(
         &self,
         new_scopes: Vec<PathBuf>,
         peer: &Peer<RoleServer>,
     ) -> bool {
-        match self.adapter.sandbox().update_scopes(new_scopes.clone()) {
-            Ok(()) => tracing::info!("Sandbox scopes updated successfully"),
+        match self.adapter.sandbox().commit_scopes(new_scopes) {
+            Ok(crate::sandbox::ScopeCommit::Applied) => {
+                tracing::info!("Sandbox scopes committed successfully")
+            }
+            Ok(crate::sandbox::ScopeCommit::AlreadyCommitted) => {
+                tracing::warn!(
+                    "roots/list provided scopes but the sandbox is already committed - \
+                     ignoring to preserve the immutable scope (SPEC R5.2.2)"
+                );
+                return false;
+            }
             Err(e) => {
-                tracing::error!("Failed to update sandbox from roots: {}", e);
+                tracing::error!("Failed to commit sandbox scope from roots: {}", e);
                 emit_sandbox_notification_via_peer(
                     peer,
                     SANDBOX_FAILED_METHOD,
@@ -198,16 +211,20 @@ impl AhmaMcpService {
             }
         }
 
-        // On Linux, apply process-level Landlock now that we have scopes. This
-        // restricts only the calling thread (defense-in-depth) and, more
-        // importantly, fails fast if the scopes are not enforceable. The actual
-        // containment of executed commands happens at spawn time: every child
-        // gets the current ruleset applied in pre_exec (see Sandbox::create_command).
-        // SECURITY: exit if Landlock enforcement fails — cannot guarantee security without it.
+        self.enforce_committed_scopes()
+    }
+
+    /// On Linux, apply process-level Landlock over the committed scopes. This
+    /// restricts only the calling thread (defense-in-depth) and, more
+    /// importantly, fails fast if the scopes are not enforceable. The actual
+    /// containment of executed commands happens at spawn time: every child
+    /// gets the current ruleset applied in pre_exec (see Sandbox::create_command).
+    /// SECURITY: exit if Landlock enforcement fails — cannot guarantee security without it.
+    fn enforce_committed_scopes(&self) -> bool {
         #[cfg(target_os = "linux")]
         if !self.adapter.sandbox().is_test_mode() {
             if let Err(e) = crate::sandbox::enforce_landlock_sandbox(
-                &new_scopes,
+                &self.adapter.sandbox().scopes(),
                 &self.adapter.sandbox().read_scopes(),
                 self.adapter.sandbox().is_no_temp_files(),
                 self.adapter.sandbox().package_cache_write(),
@@ -335,7 +352,10 @@ impl AhmaMcpService {
     /// the scope is committed (SPEC R5.2). That gate is the invariant; blocking
     /// the loop was only ever its accidental implementation.
     pub fn spawn_sandbox_configuration(&self, peer: Peer<RoleServer>) {
-        let already_running = self.sandbox_config_in_flight.send_if_modified(|running| {
+        // `send_if_modified` returns whether it modified — i.e. whether *we*
+        // claimed the in-flight latch. (This was previously named
+        // `already_running`, which read as the exact opposite.)
+        let claimed = self.sandbox_config_in_flight.send_if_modified(|running| {
             if *running {
                 false
             } else {
@@ -343,7 +363,7 @@ impl AhmaMcpService {
                 true
             }
         });
-        if !already_running {
+        if !claimed {
             tracing::debug!("Sandbox configuration already in flight - not starting another");
             return;
         }
@@ -434,7 +454,45 @@ impl AhmaMcpService {
             return;
         }
 
-        let timeout_duration = TestTimeouts::get(TimeoutCategory::SseStream);
+        // SPEC R5.2.2: an explicit scope (`--sandbox-scope`, `--working-directories`,
+        // task vault) is locked and never widened or replaced — the server must not
+        // request or apply `roots/list` for it. This guard lives here, at the single
+        // door every roots-driven configuration passes through, rather than only in
+        // `on_initialized`: a `roots/list_changed` (the defer-mode handshake, or a
+        // stray client re-emit) lands here directly, and without this check the
+        // client's answer would replace an operator-chosen scope — exactly the
+        // client-widens-operator-scope path R5.2.2 exists to block.
+        {
+            let sandbox = self.adapter.sandbox();
+            if sandbox.has_explicit_scopes() && !sandbox.scopes().is_empty() {
+                match sandbox.commit_existing_scopes() {
+                    crate::sandbox::ScopeCommit::AlreadyCommitted => {
+                        tracing::warn!(
+                            "roots/list(_changed) for an already-committed explicit scope - \
+                             ignoring (SPEC R5.2.2)"
+                        );
+                        return;
+                    }
+                    crate::sandbox::ScopeCommit::Applied => {
+                        tracing::info!(
+                            "Explicit sandbox scope committed without querying roots/list \
+                             (SPEC R5.2.2): {:?}",
+                            sandbox.scopes()
+                        );
+                    }
+                }
+                if !self.enforce_committed_scopes() {
+                    return;
+                }
+                self.announce_committed_scope(peer, None).await;
+                return;
+            }
+        }
+
+        // Handshake-class deadline: this bounds a scope-negotiation round-trip, so
+        // it must NOT use `SseStream` (a long-poll request ceiling that its own
+        // docs forbid for handshake/readiness waits).
+        let timeout_duration = TestTimeouts::get(TimeoutCategory::Handshake);
         tracing::info!(timeout = ?timeout_duration, "Requesting roots/list from client...");
 
         // Attempt roots/list; fall back to pre-configured scopes on timeout or error
@@ -445,10 +503,7 @@ impl AhmaMcpService {
         // configuration proceeds against them; otherwise `sandbox/failed` is
         // emitted and configuration aborts.
         let roots = match tokio::time::timeout(timeout_duration, peer.list_roots()).await {
-            Ok(Ok(result)) => {
-                self.adapter.sandbox().set_roots_received(true);
-                result.roots
-            }
+            Ok(Ok(result)) => result.roots,
             Ok(Err(e)) => {
                 match self
                     .roots_list_failure_fallback(
@@ -499,42 +554,55 @@ impl AhmaMcpService {
             roots.len()
         );
 
+        // Record roots-received only for *usable* roots (SPEC R5.2.7): an empty
+        // answer, or one with no parseable `file://` URIs, reported no workspace.
+        // Setting the flag on any successful round-trip made `scope_source()`
+        // report `roots/list` for a scope that actually came from the container
+        // root — which also bypassed the R5.2.8 working-directory refusal for
+        // exactly the empty-roots clients (Antigravity) that need it.
+        if !new_scopes.is_empty() {
+            self.adapter.sandbox().set_roots_received(true);
+        }
+
         // Remember the first client root so we can look for `<root>/.ahma`
         // AFTER the scopes vec is moved into `apply_and_enforce_scopes`.
         let client_root: Option<PathBuf> = new_scopes.first().cloned();
 
         if !new_scopes.is_empty() {
-            // Claim the one-shot commit BEFORE mutating scopes so a concurrent or
-            // repeat roots/list can never widen the locked sandbox (SPEC R5.1.1).
-            // The loser of the race returns without touching the committed scope.
-            if !self.adapter.sandbox().try_commit() {
-                tracing::warn!(
-                    "roots/list provided scopes but the sandbox is already committed - \
-                     ignoring to preserve the immutable scope (SPEC R5.2.2)"
-                );
-                return;
-            }
+            // `commit_scopes` claims the one-shot latch and replaces the scopes
+            // as a single operation (SPEC R5.1.1); a concurrent or repeat
+            // roots/list loses the latch inside it and never touches the
+            // committed scope.
             tracing::debug!(
-                "Attempting to update sandbox scopes with {} paths",
+                "Attempting to commit sandbox scopes with {} paths",
                 new_scopes.len()
             );
             if !self.apply_and_enforce_scopes(new_scopes, peer).await {
                 return;
             }
         } else if !self.adapter.sandbox().scopes().is_empty() {
-            // Client provided no file:// roots but we have pre-configured scopes
-            // from --working-directories. These are valid, so proceed.
-            if !self.adapter.sandbox().try_commit() {
-                tracing::warn!(
-                    "Pre-configured scopes present but the sandbox is already committed - \
-                     ignoring repeat configuration (SPEC R5.2.2)"
-                );
-                return;
+            // Client provided no usable file:// roots but we have pre-configured
+            // scopes (the container root, or defer-mode seeds). Commit them as
+            // they stand.
+            match self.adapter.sandbox().commit_existing_scopes() {
+                crate::sandbox::ScopeCommit::AlreadyCommitted => {
+                    tracing::warn!(
+                        "Pre-configured scopes present but the sandbox is already committed - \
+                         ignoring repeat configuration (SPEC R5.2.2)"
+                    );
+                    return;
+                }
+                crate::sandbox::ScopeCommit::Applied => {}
             }
             tracing::info!(
-                "No new scopes from roots/list; using pre-configured scopes: {:?}",
+                "No usable roots from roots/list; committed pre-configured scopes: {:?}",
                 self.adapter.sandbox().scopes()
             );
+            // Defer mode skips platform enforcement at startup, so this commit is
+            // the first chance to apply the process-level defense-in-depth layer.
+            if !self.enforce_committed_scopes() {
+                return;
+            }
         } else {
             // Client returned an empty roots list and there are no pre-configured scopes.
             // Do NOT emit notifications/sandbox/configured here: emitting it would mark the
@@ -550,6 +618,18 @@ impl AhmaMcpService {
             return;
         }
 
+        self.announce_committed_scope(peer, client_root).await;
+    }
+
+    /// Post-commit follow-through, shared by every commit path: anchor the log
+    /// directory, run one-shot per-client tool discovery, load external MCP
+    /// servers, and emit the `notifications/sandbox/configured` disclosure
+    /// (SPEC R5.4).
+    async fn announce_committed_scope(
+        &self,
+        peer: &Peer<RoleServer>,
+        client_root: Option<PathBuf>,
+    ) {
         // Anchor the default log directory to the primary workspace scope so that
         // logs_list and operation spill files land inside the project.  Best-effort:
         // silently ignored if --log-dir was already set or scope was already recorded.

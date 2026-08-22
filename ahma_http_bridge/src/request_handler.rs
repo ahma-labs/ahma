@@ -134,12 +134,29 @@ fn missing_session_id_response(id: Value) -> Response {
     )
 }
 
+/// JSON-RPC batch arrays get a definitive 400: batching was removed from the
+/// MCP spec (2025-06-18) and this bridge never supported it — the old behavior
+/// forwarded the raw array to the subprocess, which is worse than saying no.
+pub(crate) fn batch_not_supported_response() -> Response {
+    error_response_with_status(
+        StatusCode::BAD_REQUEST,
+        Value::Null,
+        -32600,
+        "JSON-RPC batch requests are not supported by this server. Send one request per POST.",
+    )
+}
+
+/// Per MCP Streamable HTTP, an unknown or terminated session ID gets **404**,
+/// which is what tells a spec-conforming client (rmcp included) to drop the
+/// stale session ID and re-`initialize`. This used to be 403, which clients
+/// treat as a terminal authorization failure — breaking the standard
+/// session-expiry recovery path.
 fn session_not_found_response(id: Value) -> Response {
     error_response_with_status(
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         id,
         -32600,
-        "Session not found or terminated",
+        "Session not found or terminated. Send a new initialize request to start a session.",
     )
 }
 
@@ -447,6 +464,47 @@ async fn register_session_details(
     }
 }
 
+/// Fail the sandbox up front for a client that can never provide roots.
+///
+/// The scope of this session can only come from the client's `roots/list`
+/// answer (no `--sandbox-scope` fallback is configured). A client that did not
+/// declare the `roots` capability at `initialize` will never answer one — the
+/// capability declaration is exactly the information the spec provides so the
+/// server does not have to find out the hard way. Without this, such a client
+/// was driven through the full roots handshake anyway: 45 seconds of 409s,
+/// then a 504. Failing the sandbox now turns that into an immediate,
+/// remediated 403 on the first `tools/call`, while `tools/list` and the rest
+/// of the session keep working.
+async fn maybe_fail_sandbox_for_rootless_client(
+    session_manager: &SessionManager,
+    session_id: &str,
+    payload: &Value,
+) {
+    if !session_manager.requires_client_roots() {
+        return;
+    }
+    let declares_roots = payload
+        .get("params")
+        .and_then(|p| p.get("capabilities"))
+        .and_then(|c| c.get("roots"))
+        .is_some();
+    if declares_roots {
+        return;
+    }
+    warn!(
+        session_id = %session_id,
+        "Client declared no roots capability and no fallback scope is configured; \
+         failing the sandbox up front instead of waiting out the roots handshake"
+    );
+    session_manager.fail_sandbox(
+        session_id,
+        "this client did not declare the MCP `roots` capability, so it cannot report a \
+         workspace, and the bridge was started without a fallback scope. Start the bridge \
+         with `--sandbox-scope <project-dir>`, or set `[sandbox] container_root` in \
+         ~/.ahma/settings.toml, or use a client that supports roots/list.",
+    );
+}
+
 /// Handles initialization requests by creating a new session.
 ///
 /// Shared by both transports (SPEC RB.1); `mode` only selects the encoding of
@@ -470,6 +528,7 @@ async fn handle_initialize(
     };
 
     register_session_details(session_manager, &new_session_id, payload).await;
+    maybe_fail_sandbox_for_rootless_client(session_manager, &new_session_id, payload).await;
 
     info!(session_id = %new_session_id, "Session created, forwarding initialize request");
     match session_manager
@@ -1031,10 +1090,28 @@ async fn forward_request(
     is_initialized_notification: bool,
     mode: ResponseMode,
 ) -> Response {
+    // A JSON-RPC notification (no `id`) gets no response object. Per MCP
+    // Streamable HTTP, the server MUST answer HTTP 202 Accepted with no body.
+    // The JSON path used to fall through to the request pipeline, whose
+    // notification handling synthesized `{"jsonrpc":"2.0","result":null}` and
+    // returned it as HTTP 200 — an id-less "response" that is not even valid
+    // JSON-RPC. The SSE path was already correct; this shares its helper.
+    if payload.get("id").is_none() {
+        return forward_notification(
+            session_manager,
+            session_id,
+            method,
+            payload,
+            is_initialized_notification,
+        )
+        .await;
+    }
+
     // For SSE requests, capture the session and subscribe to its broadcast
     // channel BEFORE sending, so events published while the subprocess handles
-    // the request are not missed.
-    let sse_subscription = if mode == ResponseMode::Sse && payload.get("id").is_some() {
+    // the request are not missed. `payload` is a request (has an `id`) by
+    // construction here — notifications already returned above.
+    let sse_subscription = if mode == ResponseMode::Sse {
         match session_manager.get_session(session_id) {
             Some(session) => {
                 let rx = session.subscribe();
@@ -1329,6 +1406,48 @@ fn build_initialize_sse_response(
     sse_single_event_response_with_id(event_id, json_str)
 }
 
+/// Forward a notification (no id) and return HTTP 202 Accepted.
+///
+/// Per MCP Streamable HTTP spec §3.2.1, the server MUST respond with HTTP 202
+/// for JSON-RPC notifications (messages without an `id`) — on **both** POST
+/// transports, which is why both `forward_request` and the SSE pipeline route
+/// through this one helper. Returning an SSE stream here causes rmcp clients
+/// that call `expect_accepted_or_json()` to reject the response with
+/// `UnexpectedServerResponse("expect accepted or json, got Sse(...)")`, which
+/// terminates the proxy transport and — when the transport is the stdio
+/// proxy's Unix-socket client — causes BrokenPipe on the next stdin write
+/// from the test driver.
+async fn forward_notification(
+    session_manager: &SessionManager,
+    session_id: &str,
+    _method: Option<&str>,
+    payload: &Value,
+    is_initialized_notification: bool,
+) -> Response {
+    let request_timeout = Duration::from_secs(session_manager.request_timeout_secs());
+
+    match session_manager
+        .send_request(session_id, payload, Some(request_timeout))
+        .await
+    {
+        Ok(_response) => {
+            mark_session_initialized(session_manager, session_id, is_initialized_notification)
+                .await;
+            with_session_header(StatusCode::ACCEPTED.into_response(), session_id)
+        }
+        Err(e) => {
+            error!(session_id = %session_id, "Failed to forward notification: {}", e);
+            // A notification has no id by definition; `payload_id` yields JSON
+            // `null`, which is still emitted so the field is never absent.
+            error_response(
+                payload_id(payload),
+                -32603,
+                &format!("Failed to send request: {}", e),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1517,9 +1636,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_not_found_response_is_403() {
+    async fn session_not_found_response_is_404() {
         let resp = session_not_found_response(json!(9));
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = body_json(resp).await;
         assert_eq!(body["id"], json!(9));
         assert_eq!(body["error"]["code"], -32600);
@@ -1737,10 +1856,10 @@ mod tests {
     // ─── check_session_exists ───────────────────────────────────────────
 
     #[test]
-    fn check_session_exists_returns_403_for_unknown() {
+    fn check_session_exists_returns_404_for_unknown() {
         let mgr = keepalive_manager();
         let resp = check_session_exists(&mgr, "does-not-exist", json!(4)).expect("should be Some");
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1814,12 +1933,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn isolated_request_unknown_session_is_403() {
+    async fn isolated_request_unknown_session_is_404() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         let resp =
             handle_session_isolated_request(mgr, headers_with_session("nope"), payload).await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(body_json(resp).await["id"], json!(1));
     }
 
@@ -1833,25 +1952,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn isolated_sse_request_unknown_session_is_403() {
+    async fn isolated_sse_request_unknown_session_is_404() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         let resp =
             handle_session_isolated_request_sse(mgr, headers_with_session("nope"), payload).await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(body_json(resp).await["id"], json!(1));
     }
 
     /// A notification (no `id`) that errors must still carry `"id": null` —
     /// present, not omitted. `notifications/initialized` to an unknown session
-    /// takes the 403 path with nothing to correlate against.
+    /// takes the 404 path with nothing to correlate against.
     #[tokio::test]
     async fn isolated_request_notification_error_carries_null_id_not_absent() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
         let resp =
             handle_session_isolated_request(mgr, headers_with_session("nope"), payload).await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = body_json(resp).await;
         assert!(
             body.get("id").is_some(),
@@ -2045,8 +2164,8 @@ mod tests {
         let mgr = keepalive_manager();
         let resp = handle_roots_changed_request(&mgr, "missing", json!(1))
             .await
-            .expect("err → Some(403)");
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            .expect("err → Some(404)");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ─── handle_client_response ─────────────────────────────────────────
@@ -2134,15 +2253,33 @@ mod tests {
         }
     }
 
-    // ─── SSE notification dispatch ──────────────────────────────────────
+    // ─── forward_notification / SSE notification dispatch ───────────────
+
+    #[tokio::test]
+    async fn forward_notification_returns_202() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        // A notification (no id) → send_request returns immediately with null.
+        let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        let resp =
+            forward_notification(&mgr, &id, Some("notifications/initialized"), &payload, true)
+                .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+        assert!(
+            mgr.get_session(&id).unwrap().is_mcp_initialized(),
+            "the initialized side effect must run on the SSE path too"
+        );
+    }
 
     #[tokio::test]
     async fn forward_sse_notification_returns_202() {
         // MCP Streamable HTTP §3.2.1: notifications (no id) on the SSE
-        // transport are acknowledged with HTTP 202, not an SSE stream.
+        // transport are acknowledged with HTTP 202, not an SSE stream. This
+        // exercises the same behavior through the unified `forward_request`
+        // entrypoint every real request actually goes through.
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
-        // A notification (no id) → send_request returns immediately with null.
         let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
         let resp = forward_request(
             &mgr,
@@ -2620,8 +2757,11 @@ mod tests {
     // ─── forward_request ────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn forward_request_ok_for_notification_returns_200() {
-        // A notification (no id) returns immediately from send_request.
+    async fn forward_request_notification_returns_202_no_body() {
+        // A notification (no id) gets HTTP 202 with no JSON-RPC body on the
+        // JSON POST path too (MCP Streamable HTTP). It used to fall into the
+        // request pipeline and come back as HTTP 200 with a synthesized
+        // id-less "response" object.
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
@@ -2634,19 +2774,21 @@ mod tests {
             ResponseMode::Json,
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
         assert!(mgr.get_session(&id).unwrap().is_mcp_initialized());
     }
 
     #[tokio::test]
     async fn forward_request_tools_call_branch_uses_tool_timeout() {
-        // tools/call with no id exercises the calculate_tool_timeout branch and
-        // still returns immediately (notification semantics).
+        // An id-less tools/call is a notification and now takes the
+        // notification path (202); the tool-timeout branch is only reached by
+        // real requests, which carry an id.
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({
             "jsonrpc": "2.0",
+            "id": 42,
             "method": "tools/call",
             "params": {"arguments": {"timeout_seconds": 5}}
         });
@@ -2833,7 +2975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_session_unknown_is_403() {
+    async fn existing_session_unknown_is_404() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         let resp = handle_existing_session_request(
@@ -2844,7 +2986,7 @@ mod tests {
             ResponseMode::Json,
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ─── check_initialization_required / wait_for_initialization ────────
@@ -2986,13 +3128,13 @@ mod tests {
     // ─── gate_session_request ───────────────────────────────────────
 
     #[tokio::test]
-    async fn sse_gating_returns_403_for_unknown_session() {
+    async fn sse_gating_returns_404_for_unknown_session() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         let resp = gate_session_request(&mgr, "missing", Some("tools/list"), &payload, false)
             .await
             .expect("should gate");
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -3078,7 +3220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_sse_request_session_not_found_is_403() {
+    async fn forward_sse_request_session_not_found_is_404() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         let resp = forward_request(
@@ -3090,7 +3232,7 @@ mod tests {
             ResponseMode::Sse,
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

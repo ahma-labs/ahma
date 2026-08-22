@@ -1,10 +1,12 @@
-//! Shared `file://` URI parsing for sandbox root resolution.
+//! Shared `file://` URI parsing **and encoding** for sandbox root resolution.
 //!
 //! Both the HTTP bridge (`ahma_http_bridge`) and the core MCP service
 //! (`ahma_mcp`) need to convert `file://` URIs from the MCP `roots/list`
-//! protocol into filesystem paths that the sandbox validation layer can use.
-//! This module provides a single, well-tested implementation that both crates
-//! can depend on.
+//! protocol into filesystem paths that the sandbox validation layer can use —
+//! and every in-house client that *answers* `roots/list` needs the reverse.
+//! This module provides a single, well-tested implementation of both
+//! directions; the workspace previously carried six byte-similar private
+//! copies of the encoder, which is exactly how one of them stays unfixed.
 //!
 //! ## Security notes
 //!
@@ -42,6 +44,65 @@ fn is_windows_drive_path(path: &str) -> bool {
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Encodes a filesystem path as a `file://` URI (e.g. for MCP `roots/list`
+/// responses).
+///
+/// The inverse of [`parse_file_uri_to_path`]: every byte outside the RFC 3986
+/// unreserved set (plus `/` and `:`) is percent-encoded, so paths containing
+/// spaces, `#`, `?`, or non-ASCII characters round-trip through the parser
+/// instead of producing URIs whose query/fragment stripping corrupts them.
+///
+/// * Backslashes are normalised to forward slashes.
+/// * A Windows extended-length prefix (`\\?\`) is stripped.
+/// * On Windows, drive-letter paths (`C:\…`) gain the standard leading slash
+///   (`file:///C:/…`), matching the drive handling in
+///   [`parse_file_uri_to_path`].
+pub fn encode_file_uri(path: &Path) -> String {
+    let mut path_str = path.to_string_lossy().into_owned();
+
+    // Strip Windows extended-length prefix (\\?\) if present.
+    if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+        path_str = stripped.to_string();
+    }
+    // Normalise path separators to forward slashes.
+    path_str = path_str.replace('\\', "/");
+
+    let mut out = String::with_capacity(path_str.len() + 10);
+    out.push_str("file://");
+
+    #[cfg(target_os = "windows")]
+    {
+        let is_drive = path_str.len() >= 2
+            && path_str.as_bytes()[0].is_ascii_alphabetic()
+            && path_str.as_bytes()[1] == b':';
+        if is_drive {
+            out.push('/');
+        }
+    }
+
+    for &b in path_str.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(
+                    char::from_digit((b >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((b & 0xF) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
+}
 
 /// Parses a `file://` URI into a `PathBuf`.
 ///
@@ -117,65 +178,6 @@ pub fn parse_file_uri_to_path(uri: &str) -> Option<PathBuf> {
         let decoded = percent_decode_utf8(rest)?;
         Some(PathBuf::from(decoded))
     }
-}
-
-/// Encodes a filesystem path as a `file://` URI (e.g. for MCP `roots/list`
-/// responses).
-///
-/// The inverse of [`parse_file_uri_to_path`]: every byte outside the RFC 3986
-/// unreserved set (plus `/` and `:`) is percent-encoded, so paths containing
-/// spaces, `#`, `?`, or non-ASCII characters round-trip through the parser
-/// instead of producing URIs whose query/fragment stripping corrupts them.
-///
-/// * Backslashes are normalised to forward slashes.
-/// * A Windows extended-length prefix (`\\?\`) is stripped.
-/// * On Windows, drive-letter paths (`C:\…`) gain the standard leading slash
-///   (`file:///C:/…`), matching the drive handling in
-///   [`parse_file_uri_to_path`].
-pub fn encode_file_uri(path: &Path) -> String {
-    let mut path_str = path.to_string_lossy().into_owned();
-
-    // Strip Windows extended-length prefix (\\?\) if present.
-    if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
-        path_str = stripped.to_string();
-    }
-    // Normalise path separators to forward slashes.
-    path_str = path_str.replace('\\', "/");
-
-    let mut out = String::with_capacity(path_str.len() + 10);
-    out.push_str("file://");
-
-    #[cfg(target_os = "windows")]
-    {
-        let is_drive = path_str.len() >= 2
-            && path_str.as_bytes()[0].is_ascii_alphabetic()
-            && path_str.as_bytes()[1] == b':';
-        if is_drive {
-            out.push('/');
-        }
-    }
-
-    for &b in path_str.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
-                out.push(b as char)
-            }
-            _ => {
-                out.push('%');
-                out.push(
-                    char::from_digit((b >> 4) as u32, 16)
-                        .unwrap()
-                        .to_ascii_uppercase(),
-                );
-                out.push(
-                    char::from_digit((b & 0xF) as u32, 16)
-                        .unwrap()
-                        .to_ascii_uppercase(),
-                );
-            }
-        }
-    }
-    out
 }
 
 /// Decodes a percent-encoded UTF-8 string.

@@ -251,9 +251,13 @@ impl McpTestClient {
 
         if method == Some("notifications/sandbox/configured") {
             *configured_seen = true;
-            if *roots_answered {
-                return Ok(true);
-            }
+            // `configured` is the authoritative completion signal. A bridge
+            // started with an explicit `--sandbox-scope` locks that scope
+            // without ever querying roots/list (SPEC R5.2.2), so waiting for a
+            // roots request here would hang forever. When the server *does*
+            // ask (strict-roots mode), the ask always precedes `configured`,
+            // so answering below still happens first.
+            return Ok(true);
         }
 
         if method == Some("roots/list") {

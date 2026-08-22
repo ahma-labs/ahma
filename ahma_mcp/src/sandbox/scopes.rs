@@ -92,6 +92,36 @@ pub(crate) fn home_breadth(candidate: &Path, home: Option<&Path>) -> HomeBreadth
     }
 }
 
+/// Pre-flight validation for a single scope candidate, for launchers (the TUI)
+/// that pick a scope *before* any server exists.
+///
+/// Applies the same hard rejections the server itself will apply — the path
+/// must exist (it is **never** created here), and the filesystem root, `$HOME`,
+/// and every strict ancestor of `$HOME` are refused (SPEC R5.2.4) — so a bad
+/// candidate fails at launch with this error instead of surfacing minutes later
+/// as a dead per-session subprocess. Returns the canonical path on success.
+pub fn preflight_scope_candidate(candidate: &Path) -> Result<PathBuf> {
+    if !candidate.exists() {
+        return Err(anyhow!(
+            "Sandbox scope candidate does not exist: '{}'. ahma does not create scope \
+             directories from a launcher path — create it first, or launch from the \
+             project directory you mean to work in.",
+            candidate.display()
+        ));
+    }
+    let canonicalized = canonicalize_scopes(
+        vec![candidate.to_path_buf()],
+        SandboxMode::Strict,
+        "Launch the TUI from a project directory, or pass one: `ahma tui <project-dir>`.",
+    )?;
+    canonicalized.into_iter().next().ok_or_else(|| {
+        anyhow!(
+            "scope candidate resolved to nothing: {}",
+            candidate.display()
+        )
+    })
+}
+
 /// Canonicalize and validate a list of sandbox scopes.
 ///
 /// Rejects filesystem roots and empty paths in Strict mode, plus the home
@@ -252,6 +282,42 @@ mod tests {
     use super::*;
     use crate::test_utils::path_helpers::{test_abs, test_root};
     use std::path::PathBuf;
+
+    // -----------------------------------------------------------------------
+    // preflight_scope_candidate — launcher-side pre-flight (SPEC R5.2.4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn preflight_accepts_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = preflight_scope_candidate(dir.path()).expect("tempdir is a valid scope");
+        assert_eq!(canonical, dunce::canonicalize(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn preflight_refuses_a_nonexistent_path_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("typo-subdir");
+        let err = preflight_scope_candidate(&missing).expect_err("missing path must be refused");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "error must say why: {err}"
+        );
+        assert!(
+            !missing.exists(),
+            "pre-flight must never materialise the candidate"
+        );
+    }
+
+    #[test]
+    fn preflight_refuses_the_filesystem_root() {
+        let err =
+            preflight_scope_candidate(&test_root()).expect_err("filesystem root must be refused");
+        assert!(
+            err.to_string().contains("not a valid sandbox scope"),
+            "error must state the rejection: {err}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // is_filesystem_root — cross-platform

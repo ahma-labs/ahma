@@ -6,7 +6,7 @@
 //! - Temp directory is properly canonicalized cross-platform
 //! - Interaction with --disable-temp-files flag
 
-use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+use ahma_mcp::sandbox::{Sandbox, SandboxMode, ScopeCommit};
 use tempfile::tempdir;
 
 /// Test that temp directory can be added as a sandbox scope
@@ -213,9 +213,12 @@ fn test_update_scopes_preserves_temp_when_tmp_access() {
     );
 
     // Simulate roots/list_changed: update scopes to a new project (no temp)
-    sandbox
-        .update_scopes(vec![project2.path().to_path_buf()])
-        .unwrap();
+    assert_eq!(
+        sandbox
+            .commit_scopes(vec![project2.path().to_path_buf()])
+            .unwrap(),
+        ScopeCommit::Applied
+    );
 
     // Temp dir should still be in scopes because tmp_access=true
     let updated_scopes = sandbox.scopes();
@@ -246,9 +249,12 @@ fn test_update_scopes_no_temp_when_tmp_access_false() {
     let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false).unwrap();
 
     // Update scopes to a new project (no temp) — temp should NOT be re-added
-    sandbox
-        .update_scopes(vec![project2.path().to_path_buf()])
-        .unwrap();
+    assert_eq!(
+        sandbox
+            .commit_scopes(vec![project2.path().to_path_buf()])
+            .unwrap(),
+        ScopeCommit::Applied
+    );
 
     let updated_scopes = sandbox.scopes();
 
@@ -275,9 +281,12 @@ fn test_update_scopes_no_temp_duplication() {
     let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, true).unwrap();
 
     // Update scopes WITH temp already included — should not duplicate
-    sandbox
-        .update_scopes(vec![project.path().to_path_buf(), temp_dir.clone()])
-        .unwrap();
+    assert_eq!(
+        sandbox
+            .commit_scopes(vec![project.path().to_path_buf(), temp_dir.clone()])
+            .unwrap(),
+        ScopeCommit::Applied
+    );
 
     let updated_scopes = sandbox.scopes();
     let temp_count = updated_scopes

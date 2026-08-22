@@ -74,7 +74,14 @@ async fn run_ratatui(
         unicode,
     );
     if let Some(ref path) = workspace_path {
-        state.workspace = path.to_string_lossy().into_owned();
+        // Canonicalized like `project_root` below: this string becomes the chat
+        // session's `McpChatConfig.workspace_root` and hence its `roots/list`
+        // answer, so a relative or symlinked spelling here would hand the server
+        // a different-looking scope than the one the bridge locked.
+        state.workspace = dunce::canonicalize(path)
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .into_owned();
     }
     // Project root for the task-tree filter: the explicit path argument, else
     // the directory the TUI was started from. Canonicalized so it compares

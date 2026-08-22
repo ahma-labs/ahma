@@ -697,10 +697,13 @@ fn build_mcp_router(
     rate_limit_rps: u64,
     rate_limit_burst: u32,
 ) -> Router {
-    // /health and /restart are intentionally outside auth + rate-limit layers.
+    // /health is intentionally outside auth + rate-limit layers: load-balancer
+    // probes must never be blocked or throttled. /restart is NOT exempt — it
+    // kills the whole bridge, so it goes through bearer auth and rate limiting
+    // like every MCP route, plus its own loopback-peer check (see
+    // handle_restart).
     let exempt_routes = Router::new()
         .route("/health", get(health_check))
-        .route("/restart", post(handle_restart))
         .with_state(state.clone());
 
     let mcp_routes = Router::new()
@@ -710,6 +713,7 @@ fn build_mcp_router(
                 .get(handle_sse_stream)
                 .delete(handle_session_delete),
         )
+        .route("/restart", post(handle_restart))
         .fallback(handle_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1227,7 +1231,34 @@ async fn health_check(State(state): State<Arc<BridgeState>>) -> impl IntoRespons
 const RESTART_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Handler for POST /restart
-async fn handle_restart(State(state): State<Arc<BridgeState>>) -> impl IntoResponse {
+///
+/// Anyone who can call this kills the bridge, so it is gated three ways: it
+/// sits behind the bearer-auth and rate-limit layers (unlike `/health`), it
+/// validates `Origin` like every MCP route, and — because the default local
+/// deployment has no bearer token — the TCP peer must be a loopback address.
+/// Unix-socket listeners inject no `ConnectInfo`; filesystem permissions on
+/// the socket are the equivalent gate there.
+async fn handle_restart(
+    State(state): State<Arc<BridgeState>>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Some(rejection) = validate_origin(request.headers()) {
+        return rejection;
+    }
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0);
+    if let Some(addr) = peer
+        && !addr.ip().is_loopback()
+    {
+        warn!(peer = %addr, "Refusing /restart from non-loopback peer");
+        return (
+            StatusCode::FORBIDDEN,
+            "Restart is only accepted from loopback connections.",
+        )
+            .into_response();
+    }
     info!("Restart requested. Shutting down bridge process...");
     #[cfg_attr(not(unix), allow(unused_variables))]
     let listener_kind = state.listener_kind.clone();
@@ -1272,6 +1303,7 @@ async fn handle_restart(State(state): State<Arc<BridgeState>>) -> impl IntoRespo
             "version": format!("{}+{}", env!("CARGO_PKG_VERSION"), ahma_common::BUILD_ID)
         })),
     )
+        .into_response()
 }
 
 /// Fallback handler for unknown routes.
@@ -1307,6 +1339,12 @@ async fn handle_session_delete(
     State(state): State<Arc<BridgeState>>,
     headers: HeaderMap,
 ) -> Response {
+    if let Some(rejection) = validate_origin(&headers) {
+        return rejection;
+    }
+    if let Some(rejection) = validate_protocol_version_header(&headers) {
+        return rejection;
+    }
     // Get session ID from header
     let session_id = match session_id_from_headers(&headers) {
         Some(id) => id.to_string(),
@@ -1377,6 +1415,12 @@ async fn handle_session_delete(
 /// };
 /// ```
 async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: HeaderMap) -> Response {
+    if let Some(rejection) = validate_origin(&headers) {
+        return rejection;
+    }
+    if let Some(rejection) = validate_protocol_version_header(&headers) {
+        return rejection;
+    }
     // Get session ID from header - required for SSE
     // Return 404 (not 400) to hide SSE from clients without a session
     let session_id = match session_id_from_headers(&headers) {
@@ -1538,11 +1582,96 @@ fn accepts_sse(headers: &HeaderMap) -> bool {
 ///
 /// Supports both JSON and SSE response formats based on Accept header (R8A)
 /// In session isolation mode, routes requests to the correct session subprocess
+/// Protocol revisions this bridge accepts in the `MCP-Protocol-Version` header.
+///
+/// The bridge is a transport: actual capability negotiation happens in the
+/// per-session subprocess (rmcp). This list exists to give a *definitive* 400
+/// to a client pinned to a revision the transport genuinely does not speak,
+/// per the 2025-06-18 Streamable HTTP requirement, rather than failing
+/// somewhere later with a worse message.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+
+/// Validate the `MCP-Protocol-Version` header (2025-06-18 Streamable HTTP).
+///
+/// Absent header → assume `2025-03-26` and proceed (the spec's
+/// backwards-compatibility rule; every pre-2025-06-18 client omits it).
+/// Present but unsupported → HTTP 400 naming the supported set.
+fn validate_protocol_version_header(headers: &HeaderMap) -> Option<Response> {
+    let value = headers.get("mcp-protocol-version")?;
+    let value = value.to_str().unwrap_or("");
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&value) {
+        return None;
+    }
+    warn!(version = %value, "Rejecting request with unsupported MCP-Protocol-Version");
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Unsupported MCP-Protocol-Version: '{value}'. Supported: {}.",
+                SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+            ),
+        )
+            .into_response(),
+    )
+}
+
+/// Server-side `Origin` validation (MCP Streamable HTTP security requirement).
+///
+/// A browser reached via DNS rebinding sends the attacker's `Origin`; CORS
+/// headers alone don't stop the request from being *processed* — they only
+/// gate what the browser lets the page read afterwards. So requests carrying
+/// an `Origin` that is not a loopback origin are rejected outright. Non-browser
+/// clients (rmcp, curl, IDEs) send no `Origin` header and are unaffected.
+fn validate_origin(headers: &HeaderMap) -> Option<Response> {
+    let origin = headers.get(axum::http::header::ORIGIN)?;
+    let origin = origin.to_str().unwrap_or("");
+    if origin_is_loopback(origin) {
+        return None;
+    }
+    warn!(origin = %origin, "Rejecting request with non-loopback Origin (DNS-rebinding guard)");
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            "Origin not allowed: this MCP bridge only accepts browser requests from \
+             loopback origins (http://localhost, http://127.0.0.1, http://[::1]).",
+        )
+            .into_response(),
+    )
+}
+
+/// True when `origin` is a loopback origin (`scheme://host[:port]` with a
+/// loopback host). `Origin: null` and non-loopback hosts are rejected.
+fn origin_is_loopback(origin: &str) -> bool {
+    let Some((_scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let host = if let Some(stripped) = rest.strip_prefix('[') {
+        // IPv6 literal: [::1] or [::1]:port
+        stripped.split(']').next().unwrap_or("")
+    } else {
+        rest.split(':').next().unwrap_or("")
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
 async fn handle_mcp_request(
     State(state): State<Arc<BridgeState>>,
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response {
+    if let Some(rejection) = validate_origin(&headers) {
+        return rejection;
+    }
+    if let Some(rejection) = validate_protocol_version_header(&headers) {
+        return rejection;
+    }
+    // JSON-RPC batch arrays are not supported (batching was removed from the
+    // MCP spec in 2025-06-18). Refusing loudly beats the old behavior, which
+    // forwarded the raw array to the subprocess with undefined results.
+    if payload.is_array() {
+        return crate::request_handler::batch_not_supported_response();
+    }
     let sse_accepted = accepts_sse(&headers);
     debug!("Received HTTP request");
 
@@ -1590,8 +1719,6 @@ mod tests {
             "python3"
         }
     }
-
-    use ahma_common::file_uri::encode_file_uri;
 
     #[test]
     fn test_default_config() {
@@ -1773,7 +1900,7 @@ for line in sys.stdin:
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         // Verify MCP is now initialized
         let session = session_manager
@@ -1826,7 +1953,7 @@ for line in sys.stdin:
             "result": {
                 "roots": [
                     {
-                        "uri": encode_file_uri(temp_dir.path()),
+                        "uri": ahma_common::file_uri::encode_file_uri(temp_dir.path()),
                         "name": "root"
                     }
                 ]
@@ -2063,7 +2190,7 @@ for line in sys.stdin:
 
         // Complete MCP init.
         let (status, _) = post_mcp(&app, &session_id, &initialized_notification()).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::ACCEPTED);
 
         let session = session_manager.get_session(&session_id).expect("session");
 
@@ -2134,10 +2261,10 @@ for line in sys.stdin:
                 // `initialized` arrives, then auto_lock runs right after.
                 session.mark_sse_connected().await.expect("sse mark");
                 let (status, _) = post_mcp(&app, &session_id, &initialized_notification()).await;
-                assert_eq!(status, StatusCode::OK);
+                assert_eq!(status, StatusCode::ACCEPTED);
             } else {
                 let (status, _) = post_mcp(&app, &session_id, &initialized_notification()).await;
-                assert_eq!(status, StatusCode::OK);
+                assert_eq!(status, StatusCode::ACCEPTED);
                 session.mark_sse_connected().await.expect("sse mark");
             }
 
@@ -2184,7 +2311,7 @@ for line in sys.stdin:
 
         // `initialized` -> auto_lock from default_scope -> Configuring{temp_dir}.
         let (status, _) = post_mcp(&app, &session_id, &initialized_notification()).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::ACCEPTED);
 
         // Subprocess confirms configuration (no scope payload).
         session.mark_sse_connected().await.expect("sse mark");
@@ -2803,5 +2930,75 @@ for line in sys.stdin:
             first_identity, second_identity,
             "a replaced socket path must have a new identity"
         );
+    }
+}
+
+#[cfg(test)]
+mod transport_guard_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_origins_are_accepted() {
+        for origin in [
+            "http://localhost",
+            "http://localhost:3000",
+            "https://LOCALHOST:8443",
+            "http://127.0.0.1:3000",
+            "http://[::1]:3000",
+        ] {
+            assert!(origin_is_loopback(origin), "{origin} must be loopback");
+        }
+    }
+
+    #[test]
+    fn non_loopback_origins_are_rejected() {
+        for origin in [
+            "http://evil.example.com",
+            "http://127.0.0.1.evil.com",
+            "null",
+            "",
+            "http://192.168.1.10:3000",
+        ] {
+            assert!(!origin_is_loopback(origin), "{origin} must be rejected");
+        }
+    }
+
+    #[test]
+    fn origin_header_gates_requests() {
+        let mut headers = HeaderMap::new();
+        assert!(
+            validate_origin(&headers).is_none(),
+            "no Origin header (non-browser client) must pass"
+        );
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://localhost:3000"),
+        );
+        assert!(validate_origin(&headers).is_none());
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://attacker.example"),
+        );
+        let resp = validate_origin(&headers).expect("must reject");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn protocol_version_header_is_validated_when_present() {
+        let mut headers = HeaderMap::new();
+        assert!(
+            validate_protocol_version_header(&headers).is_none(),
+            "absent header assumes 2025-03-26 per spec"
+        );
+        for version in super::SUPPORTED_PROTOCOL_VERSIONS {
+            headers.insert("mcp-protocol-version", HeaderValue::from_static(version));
+            assert!(
+                validate_protocol_version_header(&headers).is_none(),
+                "{version} must be accepted"
+            );
+        }
+        headers.insert("mcp-protocol-version", HeaderValue::from_static("banana"));
+        let resp = validate_protocol_version_header(&headers).expect("must reject");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

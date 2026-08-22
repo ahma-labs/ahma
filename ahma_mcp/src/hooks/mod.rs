@@ -1206,9 +1206,10 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // handed us. This is not a spoofable CWD inference (SPEC R5.2.1): the IDE
         // passes the command's own execution directory in the hook payload, which
         // is exactly the scope this command should be confined to — the same role
-        // roots/list plays for the MCP server. Without this the sandbox falls back
-        // to the default `~/sandbox`, so every real project command is rejected as
-        // "outside the sandbox root" and the hook blocks it (fail-closed, R5.5.3).
+        // roots/list plays for the MCP server, and the same reasoning that lets
+        // the TUI treat its launch directory as an explicit choice (R5.2.1.1).
+        // Without this the hook would have no scope at all and would block every
+        // command (fail-closed, R5.5.3).
         sandbox_scopes: vec![PathBuf::from(&payload.cwd)],
         use_scratch_dir: false,
         ..cfg

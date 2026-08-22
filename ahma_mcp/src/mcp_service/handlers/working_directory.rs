@@ -145,14 +145,19 @@ pub fn resolve(
         ));
     };
 
-    if source == ScopeSource::Container {
+    if matches!(source, ScopeSource::Container | ScopeSource::Pending) {
+        // Container: the scope spans every project the user owns — a directory
+        // nobody chose *for this task* (R5.2.8). Pending: the scope has no
+        // established provenance at all, so substituting it would be running in
+        // a directory whose origin ahma cannot even attribute. Both refuse.
         tracing::warn!(
             tool = %tool,
             scope = %scope,
-            "tool called without working_directory while the scope is the user's container \
-             root; refusing rather than running in a directory that spans every project"
+            source = source.as_str(),
+            "tool called without working_directory while the scope is not a chosen project \
+             (source: container root or pending); refusing rather than substituting"
         );
-        return Err(no_working_directory_error(sandbox, tool, &scope));
+        return Err(no_working_directory_error(sandbox, tool, &scope, source));
     }
 
     let why = format!(
@@ -209,13 +214,26 @@ fn substitution_notice(directory: &str, why: &str) -> String {
 /// (R5.4(d): scope-related errors show the scope and its provenance), plus a
 /// machine-readable `data` payload shaped like the `sandbox_denial` one so a
 /// client can act on it without parsing prose.
-fn no_working_directory_error(sandbox: &Sandbox, tool: &str, scope: &str) -> McpError {
-    let source = ScopeSource::Container;
+fn no_working_directory_error(
+    sandbox: &Sandbox,
+    tool: &str,
+    scope: &str,
+    source: ScopeSource,
+) -> McpError {
     let scope_text = sandbox.scope_text(source);
+    let why = match source {
+        ScopeSource::Container => {
+            "your container root — the directory that holds *all* your projects, not the one \
+             this task is about"
+        }
+        _ => {
+            "a directory with no established provenance — nothing explicit, no client-reported \
+             workspace root"
+        }
+    };
     let message = format!(
         "`{tool}` was called without `working_directory`, and this session's sandbox scope is \
-         your container root (source: {source}) — the directory that holds *all* your \
-         projects, not the one this task is about. Refusing to run in `{scope}`, because \
+         {why} (source: {source}). Refusing to run in `{scope}`, because \
          commands that land there fail with ordinary-looking shell errors (`not a git \
          repository`, `No such file or directory`) that give no hint the directory was \
          substituted.\n\
@@ -228,7 +246,10 @@ fn no_working_directory_error(sandbox: &Sandbox, tool: &str, scope: &str) -> Mcp
     );
     let data = serde_json::json!({
         "kind": "working_directory_required",
-        "reason": "scope_source_is_container",
+        "reason": match source {
+            ScopeSource::Container => "scope_source_is_container",
+            _ => "scope_source_is_pending",
+        },
         "tool": tool,
         "scope_source": source.as_str(),
         "substituted_scope": scope,
@@ -251,22 +272,17 @@ mod tests {
     }
 
     /// An enforcing sandbox scoped to `scope` with no provenance recorded, i.e.
-    /// [`ScopeSource::Container`].
-    ///
-    /// `set_roots_received(false)` is not redundant: a fresh `Sandbox` starts
-    /// with the flag set, and a live session only clears it during
-    /// `AhmaMcpService::new` so each session renegotiates roots.
+    /// [`ScopeSource::Pending`] (a fresh `Sandbox` has received nothing from any
+    /// client and carries no container root).
     fn default_scope_sandbox(scope: &std::path::Path) -> Sandbox {
-        let sb = Sandbox::new(
+        Sandbox::new(
             vec![scope.to_path_buf()],
             SandboxMode::Strict,
             false,
             false,
             false,
         )
-        .expect("tempdir is a valid scope");
-        sb.set_roots_received(false);
-        sb
+        .expect("tempdir is a valid scope")
     }
 
     /// A sandbox whose scope came from `roots/list`, i.e. a real client-chosen
@@ -463,7 +479,7 @@ mod tests {
     #[test]
     fn container_scope_refuses_and_names_the_tool() {
         let dir = tempfile::tempdir().unwrap();
-        let sb = default_scope_sandbox(dir.path());
+        let sb = container_sandbox(dir.path());
         let err = resolve(&sb, "cargo", &Map::new()).unwrap_err();
 
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -477,6 +493,48 @@ mod tests {
         assert_eq!(data["reason"], "scope_source_is_container");
         assert_eq!(data["tool"], "cargo");
         assert_eq!(data["scope_source"], "container");
+    }
+
+    /// A scope with no provenance at all (nothing explicit, no roots, no
+    /// container) is equally not a directory anyone chose for this task, so an
+    /// omitted `working_directory` refuses there too.
+    #[test]
+    fn pending_scope_refuses_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = default_scope_sandbox(dir.path());
+        let err = resolve(&sb, "cargo", &Map::new()).unwrap_err();
+
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        let data = err.data.expect("refusal carries an actionable payload");
+        assert_eq!(data["kind"], "working_directory_required");
+        assert_eq!(data["reason"], "scope_source_is_pending");
+        assert_eq!(data["scope_source"], "pending");
+    }
+
+    /// Once the client has reported usable roots, the container is no longer the
+    /// scope source and narrowing must not fire — rewriting a roots-derived
+    /// scope entry with a joined child name would corrupt it.
+    #[test]
+    fn roots_scope_with_stale_container_root_is_never_narrowed() {
+        let container = tempfile::tempdir().unwrap();
+        let sb = container_sandbox(container.path());
+        let root = dunce::canonicalize(container.path()).unwrap();
+        // The client later reports a usable root: provenance moves to roots/list.
+        sb.set_roots_received(true);
+        let before = sb.scopes().to_vec();
+
+        let wd = resolve(
+            &sb,
+            "cargo",
+            &args_with_dir(&root.join("proj-a").join("src").to_string_lossy()),
+        )
+        .unwrap();
+
+        assert!(
+            wd.narrowing().is_none(),
+            "roots provenance disarms narrowing"
+        );
+        assert_eq!(sb.scopes().to_vec(), before, "scope must be untouched");
     }
 
     /// A container scope only refuses when the caller named nothing: an explicit

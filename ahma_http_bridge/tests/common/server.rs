@@ -475,6 +475,21 @@ pub async fn spawn_test_server() -> Result<TestServerInstance, String> {
 pub async fn spawn_test_server_with_timeout(
     handshake_timeout_secs: Option<u64>,
 ) -> Result<TestServerInstance, String> {
+    spawn_test_server_inner(handshake_timeout_secs, true).await
+}
+
+/// Like [`spawn_test_server`] but in **strict-roots** mode: no `--sandbox-scope`
+/// fallback, so each session's scope comes from that client's `roots/list`
+/// answer. Required by tests that exercise the roots flow — an explicit
+/// fallback scope is locked without querying roots at all (SPEC R5.2.2).
+pub async fn spawn_test_server_strict_roots() -> Result<TestServerInstance, String> {
+    spawn_test_server_inner(None, false).await
+}
+
+async fn spawn_test_server_inner(
+    handshake_timeout_secs: Option<u64>,
+    with_fallback_scope: bool,
+) -> Result<TestServerInstance, String> {
     let binary = resolve_binary_path().map_err(|e| {
         eprintln!("WARNING  {e}");
         e
@@ -483,7 +498,8 @@ pub async fn spawn_test_server_with_timeout(
     let tools_dir = workspace.join(".ahma");
     let temp_dir = TempDir::new().map_err(|e| format!("Failed to create temp dir: {}", e))?;
     let sandbox_scope = temp_dir.path().to_path_buf();
-    let spec = build_server_spec(&tools_dir, Some(&sandbox_scope), handshake_timeout_secs);
+    let scope_arg = with_fallback_scope.then_some(sandbox_scope.as_path());
+    let spec = build_server_spec(&tools_dir, scope_arg, handshake_timeout_secs);
 
     eprintln!("[TestServer] Starting test server with dynamic port");
     let (mut child, line_rx) = spawn_server_child(

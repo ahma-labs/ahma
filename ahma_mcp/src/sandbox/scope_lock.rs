@@ -60,12 +60,12 @@ pub(crate) struct ScopeLock {
 }
 
 impl ScopeLock {
-    /// Create a lock in the pre-commit phase. `roots_received` seeds whether the
-    /// client roots are already considered in hand (e.g. explicit scopes start
-    /// as if roots were received).
-    pub(crate) fn new(roots_received: bool) -> Self {
+    /// Create a lock in the pre-commit phase: no roots received, not committed.
+    /// (It used to take a `roots_received` seed, which let a sandbox be born
+    /// claiming `roots/list` provenance for a scope no client ever reported.)
+    pub(crate) fn new() -> Self {
         Self {
-            roots_received: AtomicBool::new(roots_received),
+            roots_received: AtomicBool::new(false),
             committed: AtomicBool::new(false),
         }
     }
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn state_derivation_tracks_latches() {
-        let lock = ScopeLock::new(false);
+        let lock = ScopeLock::new();
         assert_eq!(lock.state(), ScopeLockState::AwaitingRoots);
 
         lock.set_roots_received(true);
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn commit_is_one_shot() {
-        let lock = ScopeLock::new(true);
+        let lock = ScopeLock::new();
         assert!(!lock.is_committed());
         assert!(lock.try_commit(), "first commit must win the latch");
         assert!(lock.is_committed());
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn committed_state_is_sticky_against_roots_toggle() {
-        let lock = ScopeLock::new(true);
+        let lock = ScopeLock::new();
         assert!(lock.try_commit());
         // Negotiation bookkeeping after commit must not unlock the scope.
         lock.set_roots_received(false);
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn clone_preserves_latch_values() {
-        let lock = ScopeLock::new(true);
+        let lock = ScopeLock::new();
         assert!(lock.try_commit());
         let cloned = lock.clone();
         assert!(

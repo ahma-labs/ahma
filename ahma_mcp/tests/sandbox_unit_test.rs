@@ -6,7 +6,7 @@
 //! - SandboxError formatting
 //! - Platform-specific sandbox checks
 
-use ahma_mcp::sandbox::{Sandbox, SandboxMode, normalize_path_lexically};
+use ahma_mcp::sandbox::{Sandbox, SandboxMode, ScopeCommit, normalize_path_lexically};
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
@@ -160,7 +160,10 @@ fn test_update_scopes_preserves_sandbox_dir() {
     .with_scratch_dir(Some(sandbox_dir.clone()));
 
     // Simulate roots/list arriving with a real workspace root.
-    sandbox.update_scopes(vec![workspace.clone()]).unwrap();
+    assert_eq!(
+        sandbox.commit_scopes(vec![workspace.clone()]).unwrap(),
+        ScopeCommit::Applied
+    );
 
     let scopes = sandbox.scopes();
     assert!(
@@ -177,8 +180,8 @@ fn test_update_scopes_preserves_sandbox_dir() {
 
 // ============= One-shot commit latch (SPEC R5.1.1) tests =============
 
-/// A fresh sandbox is not yet committed; the first `try_commit` wins and every
-/// later `try_commit` loses. This is the latch that prevents a repeat
+/// A fresh sandbox is not yet committed; the first commit wins and every
+/// later commit loses. This is the latch that prevents a repeat
 /// `roots/list` / `roots/list_changed` from re-deriving (and widening) scope on
 /// the direct-stdio path, mirroring the HTTP bridge's post-lock no-op.
 #[test]
@@ -197,20 +200,59 @@ fn test_commit_latch_is_one_shot() {
         !sandbox.is_committed(),
         "new sandbox must start uncommitted"
     );
-    assert!(sandbox.try_commit(), "first try_commit must win the latch");
+    assert_eq!(
+        sandbox.commit_existing_scopes(),
+        ScopeCommit::Applied,
+        "first commit must win the latch"
+    );
     assert!(
         sandbox.is_committed(),
         "sandbox must report committed after winning"
     );
-    assert!(
-        !sandbox.try_commit(),
-        "second try_commit must lose (one-shot)"
+    assert_eq!(
+        sandbox.commit_existing_scopes(),
+        ScopeCommit::AlreadyCommitted,
+        "second commit must lose (one-shot)"
     );
-    assert!(
-        !sandbox.try_commit(),
-        "every subsequent try_commit must keep losing"
+    assert_eq!(
+        sandbox.commit_existing_scopes(),
+        ScopeCommit::AlreadyCommitted,
+        "every subsequent commit must keep losing"
     );
     assert!(sandbox.is_committed(), "commit state must remain latched");
+}
+
+/// Scope immutability holds by construction: `commit_scopes` is the only door
+/// that replaces scopes, and once the latch is claimed it refuses to touch the
+/// locked scope — there is no API left that can (SPEC R5.1.1 / R5.2.2).
+#[test]
+fn test_committed_scope_cannot_be_replaced() {
+    let first = tempdir().unwrap();
+    let second = tempdir().unwrap();
+    let sandbox = Sandbox::new(
+        vec![first.path().to_path_buf()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(sandbox.commit_existing_scopes(), ScopeCommit::Applied);
+    let locked = sandbox.scopes().to_vec();
+
+    assert_eq!(
+        sandbox
+            .commit_scopes(vec![second.path().to_path_buf()])
+            .unwrap(),
+        ScopeCommit::AlreadyCommitted,
+        "a second commit must be a tolerated no-op"
+    );
+    assert_eq!(
+        sandbox.scopes().to_vec(),
+        locked,
+        "the locked scope must be untouched by the losing commit"
+    );
 }
 
 /// The commit latch survives `Clone` (the service clones its handler), so a
@@ -227,14 +269,19 @@ fn test_commit_latch_survives_clone() {
     )
     .unwrap();
 
-    assert!(sandbox.try_commit(), "first commit wins");
+    assert_eq!(
+        sandbox.commit_existing_scopes(),
+        ScopeCommit::Applied,
+        "first commit wins"
+    );
     let cloned = sandbox.clone();
     assert!(
         cloned.is_committed(),
         "clone must observe the committed latch"
     );
-    assert!(
-        !cloned.try_commit(),
+    assert_eq!(
+        cloned.commit_existing_scopes(),
+        ScopeCommit::AlreadyCommitted,
         "clone must not be able to re-win the latch"
     );
 }
@@ -258,7 +305,10 @@ fn test_update_scopes_no_sandbox_dir_replaces() {
     .unwrap();
     // No sandbox_dir set.
 
-    sandbox.update_scopes(vec![new_scope.clone()]).unwrap();
+    assert_eq!(
+        sandbox.commit_scopes(vec![new_scope.clone()]).unwrap(),
+        ScopeCommit::Applied
+    );
 
     let scopes = sandbox.scopes();
     assert!(
@@ -293,7 +343,10 @@ fn test_update_scopes_preserves_sandbox_dir_and_tmp() {
     .unwrap()
     .with_scratch_dir(Some(sandbox_dir.clone()));
 
-    sandbox.update_scopes(vec![workspace.clone()]).unwrap();
+    assert_eq!(
+        sandbox.commit_scopes(vec![workspace.clone()]).unwrap(),
+        ScopeCommit::Applied
+    );
 
     let scopes = sandbox.scopes();
     assert!(

@@ -14,7 +14,7 @@ mod common;
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::{
-    McpTestClient, ToolCallResult, encode_file_uri, spawn_server_guard_with_deferred_sandbox,
+    McpTestClient, ToolCallResult, encode_file_uri, spawn_server_guard_strict_roots,
     write_pwd_tool_config,
 };
 use futures::StreamExt;
@@ -58,9 +58,9 @@ async fn test_tool_call_before_roots_handshake() {
     let tools_dir = temp_dir.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let server = spawn_server_guard_with_deferred_sandbox(&tools_dir)
+    let server = spawn_server_guard_strict_roots(&tools_dir)
         .await
-        .expect("Failed to start deferred-sandbox server");
+        .expect("Failed to start strict-roots server");
     let mut mcp_client = McpTestClient::with_url(&server.base_url());
 
     // 1. Send only the initialize request (not initialized notification yet).
@@ -205,9 +205,9 @@ async fn test_slow_client_handshake() {
     let tools_dir = temp_dir.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let server = spawn_server_guard_with_deferred_sandbox(&tools_dir)
+    let server = spawn_server_guard_strict_roots(&tools_dir)
         .await
-        .expect("Failed to start deferred-sandbox server");
+        .expect("Failed to start strict-roots server");
     let base_url = server.base_url();
     let client = common::make_h2_client();
     let mut mcp_client = McpTestClient::with_url(&base_url);
@@ -280,9 +280,9 @@ async fn test_rapid_connect_disconnect() {
     let tools_dir = temp_dir.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let server = spawn_server_guard_with_deferred_sandbox(&tools_dir)
+    let server = spawn_server_guard_strict_roots(&tools_dir)
         .await
-        .expect("Failed to start deferred-sandbox server");
+        .expect("Failed to start strict-roots server");
     let base_url = server.base_url();
 
     // Attempt 1: Connect, Initialize, then Abandon.

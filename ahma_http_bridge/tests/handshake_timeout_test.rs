@@ -15,7 +15,7 @@
 mod common;
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
-use common::{spawn_test_server, spawn_test_server_with_timeout};
+use common::{spawn_test_server_strict_roots, spawn_test_server_with_timeout};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{Value, json};
 
@@ -219,7 +219,11 @@ async fn test_proper_vscode_handshake_allows_tool_calls() {
     use common::McpTestClient;
     use tempfile::TempDir;
 
-    let server = spawn_test_server()
+    // Strict-roots: this test locks the sandbox to `root_path` via the
+    // client's own roots/list answer, so the bridge must not carry an
+    // explicit fallback scope (SPEC R5.2.2 — an explicit scope commits at
+    // startup without ever querying roots).
+    let server = spawn_test_server_strict_roots()
         .await
         .expect("Failed to spawn test server");
 

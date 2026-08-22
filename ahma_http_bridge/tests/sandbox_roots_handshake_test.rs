@@ -27,8 +27,7 @@ mod common;
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::{
     SANDBOX_BYPASS_ENV_VARS, SandboxTestEnv, ServerGuard, encode_file_uri, malformed_uris,
-    parse_file_uri, spawn_server_guard_strict_roots, spawn_server_guard_with_deferred_sandbox,
-    write_pwd_tool_config,
+    parse_file_uri, spawn_server_guard_strict_roots, write_pwd_tool_config,
 };
 use futures::StreamExt;
 use reqwest::Client;
@@ -53,15 +52,12 @@ fn server_base_url(server: &ServerGuard) -> String {
     format!("http://127.0.0.1:{}", server.port())
 }
 
-async fn start_initialized_session(tools_dir: &Path) -> (ServerGuard, String, Client, String) {
-    let server = spawn_server_guard_with_deferred_sandbox(tools_dir)
-        .await
-        .expect("Failed to start deferred-sandbox server");
-    initialize_against(server).await
-}
-
-/// Same as [`start_initialized_session`] but with **no** explicit fallback scope,
-/// so a client that supplies no usable roots never gets a locked sandbox.
+/// Start a session against a deferred-sandbox server with **no** explicit
+/// fallback scope, so a client that supplies no usable roots never gets a
+/// locked sandbox: the real scope comes from that client's `roots/list`
+/// answer (SPEC R5.2.2 — an explicit fallback scope commits at startup
+/// without ever querying roots, so tests that exercise the roots flow must
+/// not carry one).
 async fn start_initialized_session_strict_roots(
     tools_dir: &Path,
 ) -> (ServerGuard, String, Client, String) {
@@ -688,7 +684,8 @@ async fn test_session_with_only_malformed_uris() {
     let tools_dir = temp_dir.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
+    let (_server, base_url, client, session_id) =
+        start_initialized_session_strict_roots(&tools_dir).await;
 
     // Answer roots/list with only malformed URIs
     let malformed_uris = vec![
@@ -739,7 +736,8 @@ async fn test_multi_root_workspace_scoping() {
     // Create test file in root2 to prove it's accessible
     std::fs::write(root2.path().join("test.txt"), "hello").expect("Failed to create test file");
 
-    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
+    let (_server, base_url, client, session_id) =
+        start_initialized_session_strict_roots(&tools_dir).await;
 
     // Answer roots/list with both roots
     let root_uris = vec![encode_file_uri(root1.path()), encode_file_uri(root2.path())];
@@ -800,7 +798,8 @@ async fn test_url_encoded_path_in_roots() {
     let tools_dir = base_temp.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
+    let (_server, base_url, client, session_id) =
+        start_initialized_session_strict_roots(&tools_dir).await;
 
     // Create properly encoded URI with space
     let root_uri = encode_file_uri(&special_path);
@@ -928,7 +927,7 @@ async fn test_handshake_ordering_sse_first() {
     let tools_dir = temp_dir.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let _server = spawn_server_guard_with_deferred_sandbox(&tools_dir)
+    let _server = spawn_server_guard_strict_roots(&tools_dir)
         .await
         .expect("Failed to start deferred-sandbox server");
     let base_url = server_base_url(&_server);
@@ -1006,7 +1005,8 @@ async fn test_mixed_valid_invalid_uris() {
     let tools_dir = tools_temp.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
+    let (_server, base_url, client, session_id) =
+        start_initialized_session_strict_roots(&tools_dir).await;
 
     // Mix of valid and invalid URIs
     let root_uris = vec![
@@ -1084,7 +1084,8 @@ async fn test_post_lock_roots_change_does_not_widen_sandbox() {
     let tools_dir = tools_temp.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
+    let (_server, base_url, client, session_id) =
+        start_initialized_session_strict_roots(&tools_dir).await;
 
     // Answer roots/list with initial root (locks sandbox)
     let initial_uri = encode_file_uri(initial_root.path());
@@ -1178,7 +1179,8 @@ async fn test_working_directory_outside_sandbox_rejected() {
     let tools_dir = tools_temp.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
+    let (_server, base_url, client, session_id) =
+        start_initialized_session_strict_roots(&tools_dir).await;
 
     // Lock sandbox to ONLY allowed_root
     let allowed_uri = encode_file_uri(allowed_root.path());
