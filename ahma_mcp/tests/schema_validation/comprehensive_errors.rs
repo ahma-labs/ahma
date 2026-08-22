@@ -93,7 +93,13 @@ async fn test_error_message_quality_and_helpfulness() -> Result<()> {
     let error_report = validator.format_errors(&errors, &PathBuf::from("multi_error.json"));
 
     assert!(error_report.contains("Found") && error_report.contains("error(s):"));
-    assert!(error_report.contains("docs/tool-schema-guide.md"));
+    // The report must point at the schema reference docs.
+    assert!(
+        error_report.contains("docs/mtdf-schema.json")
+            && error_report.contains("docs/custom-tools.md"),
+        "Error report should reference the schema docs, got: {}",
+        error_report
+    );
     assert!(error_report.contains("Common fixes:"));
     assert!(error_report.contains("1.") || error_report.contains("1 "));
 

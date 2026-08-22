@@ -3,6 +3,7 @@
 mod basic;
 mod cancellation;
 mod comprehensive;
+mod history_regressions;
 mod id_reuse_bug;
 pub mod stress;
 pub mod timeout_enforcement_test;

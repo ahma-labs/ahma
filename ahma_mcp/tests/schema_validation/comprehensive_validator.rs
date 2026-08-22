@@ -32,10 +32,9 @@ async fn test_validator_configuration_options() -> Result<()> {
     assert!(strict_result.is_err());
     let strict_errors = strict_result.unwrap_err();
     assert!(strict_errors.iter().any(|e| {
-        e.error_type == ValidationErrorType::SchemaViolation
+        e.error_type == ValidationErrorType::UnknownField
             && e.message.contains("unknown field")
-            && (e.message.contains("unknown_root_field")
-                || e.message.contains("unknown_sub_field"))
+            && (e.message.contains("unknown_root_field") || e.message.contains("unknown_sub_field"))
     }));
 
     let permissive_validator = MtdfValidator::new()

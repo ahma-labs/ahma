@@ -173,23 +173,56 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
         }
     }
 
-    // 5. Give the sandbox time to lock (bridge auto-lock + subprocess confirmation)
-    tokio::time::sleep(TestTimeouts::scale_secs(3)).await;
+    // 5+6. tools/list, retried until the sandbox locks (bridge auto-lock +
+    //      subprocess confirmation). The stdio path emits no client-visible
+    //      "sandbox locked" notification, so poll the observable instead:
+    //      keep issuing tools/list (fresh id per attempt) until a successful
+    //      response with a non-empty tools array arrives, under a
+    //      SandboxReady deadline.
+    let sandbox_deadline = Instant::now() + TestTimeouts::get(TimeoutCategory::SandboxReady);
+    let mut req_id: u64 = 2;
+    let mut tools_resp: Option<serde_json::Value> = None;
+    loop {
+        send!(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "tools/list",
+            "params": {}
+        }));
 
-    // 6. tools/list
-    send!(serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/list",
-        "params": {}
-    }));
+        // Per-attempt read window, capped by the overall deadline. Every
+        // outstanding request is a tools/list, so accept a response to ANY
+        // issued id (>= 2, <= current) — matching only the newest id would
+        // discard a slow server's reply to the previous attempt and starve
+        // the loop under load.
+        let attempt_timeout = TestTimeouts::get(TimeoutCategory::ToolCall)
+            .min(sandbox_deadline.saturating_duration_since(Instant::now()));
+        let newest_id = req_id;
+        let resp = read_until(&mut reader, attempt_timeout, |v| {
+            v.get("method").is_none() // a response, not a server-initiated request
+                && v.get("id")
+                    .and_then(|i| i.as_u64())
+                    .is_some_and(|i| (2..=newest_id).contains(&i))
+        })
+        .await;
 
-    let tools_resp = read_until(
-        &mut reader,
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-        |v| v.get("id").and_then(|i| i.as_u64()) == Some(2),
-    )
-    .await;
+        if let Some(resp) = resp {
+            let ready = resp.get("error").is_none()
+                && resp
+                    .pointer("/result/tools")
+                    .and_then(|t| t.as_array())
+                    .is_some_and(|t| !t.is_empty());
+            tools_resp = Some(resp);
+            if ready {
+                break;
+            }
+        }
+        if Instant::now() >= sandbox_deadline {
+            break;
+        }
+        tokio::time::sleep(TestTimeouts::poll_interval()).await;
+        req_id += 1;
+    }
 
     let _ = child.kill().await;
     let _ = child.wait().await;

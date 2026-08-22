@@ -3,38 +3,47 @@
 //! These tests verify the tool listing functionality works correctly with
 //! both stdio and HTTP MCP servers.
 
+use ahma_mcp::test_utils::cli::build_binary_cached;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Get the path to the pre-built ahma_mcp binary
+/// Get the path to the ahma binary, building it (once, cached and
+/// cross-process locked) if it is missing or stale.
 fn get_ahma_mcp_binary() -> PathBuf {
-    ahma_mcp::test_utils::cli::get_binary_path("ahma", "ahma")
+    build_binary_cached("ahma_mcp", "ahma")
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("Failed to get workspace dir")
+        .to_path_buf()
+}
+
+/// Write an mcp.json into `dir` that points at a stdio ahma server.
+fn write_stdio_mcp_config(dir: &std::path::Path, binary: &std::path::Path) -> PathBuf {
+    let tools_dir = workspace_root().join(".ahma");
+    let mcp_config_path = dir.join("mcp.json");
+    let mcp_config = format!(
+        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--server-child","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
+        cmd = binary.to_str().unwrap().replace('\\', "/"),
+        tools = tools_dir.to_str().unwrap().replace('\\', "/")
+    );
+    std::fs::write(&mcp_config_path, &mcp_config).expect("Failed to write mcp.json");
+    mcp_config_path
 }
 
 /// Test that the binary shows help for --list-tools
 #[test]
 fn test_list_tools_help() {
     let binary = get_ahma_mcp_binary();
-    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("Failed to get workspace dir")
-        .to_path_buf();
+    let project_root = workspace_root();
 
-    // Use pre-built binary if available, otherwise fall back to cargo run
-    let output = if binary.exists() {
-        Command::new(&binary)
-            .current_dir(&project_root)
-            .args(["--help"])
-            .output()
-            .expect("Failed to execute command")
-    } else {
-        eprintln!("Warning: Pre-built binary not found, falling back to cargo run");
-        Command::new("cargo")
-            .current_dir(&project_root)
-            .args(["run", "-p", "ahma_mcp", "--", "--help"])
-            .output()
-            .expect("Failed to execute command")
-    };
+    let output = Command::new(&binary)
+        .current_dir(&project_root)
+        .args(["--help"])
+        .output()
+        .expect("Failed to execute command");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -52,37 +61,20 @@ fn test_list_tools_help() {
     );
 }
 
-/// Test that we can list tools from a stdio MCP server
+/// List tools from a stdio MCP server: one server config, two invocations.
+/// The default (text) format is asserted for both tool listings and the
+/// header section; `--format json` is asserted separately because its output
+/// genuinely differs.
 #[test]
 fn test_list_tools_from_stdio_server() {
-    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let project_root = workspace_root();
     let ahma_binary = get_ahma_mcp_binary();
-    let tools_dir = project_root.join(".ahma");
-
-    // Check if pre-built binary exists
-    if !ahma_binary.exists() {
-        eprintln!("Warning: Pre-built binary not found. Run 'cargo build' first for faster tests.");
-        let build_output = Command::new("cargo")
-            .args(["build", "-p", "ahma_mcp"])
-            .output()
-            .expect("Failed to build");
-        assert!(build_output.status.success(), "Failed to build");
-    }
 
     // Create a temp mcp.json pointing to the stdio server
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
-    let mcp_config_path = temp_dir.path().join("mcp.json");
-    let mcp_config = format!(
-        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--server-child","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
-        cmd = ahma_binary.to_str().unwrap().replace('\\', "/"),
-        tools = tools_dir.to_str().unwrap().replace('\\', "/")
-    );
-    std::fs::write(&mcp_config_path, &mcp_config).expect("Failed to write mcp.json");
+    let mcp_config_path = write_stdio_mcp_config(temp_dir.path(), &ahma_binary);
 
-    // Run ahma_mcp tool list with the mcp.json config
+    // --- Default (text) format ---
     let output = Command::new(&ahma_binary)
         .args([
             "--no-sandbox",
@@ -112,38 +104,15 @@ fn test_list_tools_from_stdio_server() {
         stdout,
         stderr
     );
-}
-
-/// Test JSON output format
-#[test]
-fn test_list_tools_json_format() {
-    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let ahma_binary = get_ahma_mcp_binary();
-    let tools_dir = project_root.join(".ahma");
-
-    // Check if pre-built binary exists
-    if !ahma_binary.exists() {
-        let build_output = Command::new("cargo")
-            .args(["build", "-p", "ahma_mcp"])
-            .output()
-            .expect("Failed to build");
-        assert!(build_output.status.success(), "Failed to build");
-    }
-
-    // Create a temp mcp.json pointing to the stdio server
-    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
-    let mcp_config_path = temp_dir.path().join("mcp.json");
-    let mcp_config = format!(
-        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--server-child","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
-        cmd = ahma_binary.to_str().unwrap().replace('\\', "/"),
-        tools = tools_dir.to_str().unwrap().replace('\\', "/")
+    // Should have a header section
+    assert!(
+        stdout.contains("MCP") || stdout.contains("Tool"),
+        "Output should contain 'MCP' or 'Tool' header.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
     );
-    std::fs::write(&mcp_config_path, &mcp_config).expect("Failed to write mcp.json");
 
-    // Run ahma_mcp tool list --format json
+    // --- JSON format ---
     let output = Command::new(&ahma_binary)
         .args([
             "--no-sandbox",
@@ -158,7 +127,7 @@ fn test_list_tools_json_format() {
         ])
         .current_dir(&project_root)
         .output()
-        .expect("Failed to execute ahma_mcp tool list");
+        .expect("Failed to execute ahma_mcp tool list --format json");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -177,79 +146,12 @@ fn test_list_tools_json_format() {
     );
 }
 
-/// Test output format contains expected sections
-#[test]
-fn test_list_tools_output_format() {
-    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let ahma_binary = get_ahma_mcp_binary();
-    let tools_dir = project_root.join(".ahma");
-
-    // Check if pre-built binary exists
-    if !ahma_binary.exists() {
-        let build_output = Command::new("cargo")
-            .args(["build", "-p", "ahma_mcp"])
-            .output()
-            .expect("Failed to build");
-        assert!(build_output.status.success(), "Failed to build");
-    }
-
-    // Create a temp mcp.json pointing to the stdio server
-    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
-    let mcp_config_path = temp_dir.path().join("mcp.json");
-    let mcp_config = format!(
-        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--server-child","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
-        cmd = ahma_binary.to_str().unwrap().replace('\\', "/"),
-        tools = tools_dir.to_str().unwrap().replace('\\', "/")
-    );
-    std::fs::write(&mcp_config_path, &mcp_config).expect("Failed to write mcp.json");
-
-    let output = Command::new(&ahma_binary)
-        .args([
-            "--no-sandbox",
-            "tool",
-            "list",
-            "--server",
-            "test",
-            "--mcp-config",
-            mcp_config_path.to_str().unwrap(),
-        ])
-        .current_dir(&project_root)
-        .output()
-        .expect("Failed to execute ahma_mcp tool list");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Should have a header section
-    assert!(
-        stdout.contains("MCP") || stdout.contains("Tool"),
-        "Output should contain 'MCP' or 'Tool' header.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
-}
-
 /// Test that we can list tools by running a command directly via trailing args
 #[test]
 fn test_list_tools_trailing_args() {
-    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let project_root = workspace_root();
     let ahma_binary = get_ahma_mcp_binary();
     let tools_dir = project_root.join(".ahma");
-
-    // Check if pre-built binary exists
-    if !ahma_binary.exists() {
-        let build_output = Command::new("cargo")
-            .args(["build", "-p", "ahma_mcp"])
-            .output()
-            .expect("Failed to build");
-        assert!(build_output.status.success(), "Failed to build");
-    }
 
     // Run ahma tool list -- <command>
     let output = Command::new(&ahma_binary)
@@ -296,15 +198,6 @@ fn test_list_tools_trailing_args() {
 #[test]
 fn test_list_tools_no_connection_suggestions() {
     let ahma_binary = get_ahma_mcp_binary();
-
-    // Check if pre-built binary exists
-    if !ahma_binary.exists() {
-        let build_output = Command::new("cargo")
-            .args(["build", "-p", "ahma_mcp"])
-            .output()
-            .expect("Failed to build");
-        assert!(build_output.status.success(), "Failed to build");
-    }
 
     // Create a temp directory to run from so no mcp.json is found
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");

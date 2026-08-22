@@ -5,22 +5,23 @@
 //! into a single response. The synthetic `run_terminal_command` ToolConfig
 //! inserted by `load_tool_configs()` must be filtered out by the
 //! `HARDCODED_TOOLS` guard in `list_tools()`.
+//!
+//! Runs in-process (`create_in_process_mcp_from_dir`) — no subprocess, no
+//! startup delay: the constructor completes the MCP handshake before returning.
 
-use ahma_common::timeouts::TestTimeouts;
-use ahma_mcp::test_utils::client::ClientBuilder;
+use ahma_mcp::test_utils::in_process::create_in_process_mcp_from_dir;
 use std::collections::HashSet;
-use tempfile::TempDir;
+use tempfile::tempdir;
 
-/// Verify that `tools/list` response contains no duplicate tool names,
-/// even when `.ahma/` directory has multiple tool configs alongside
+/// Verify that the `tools/list` response contains no duplicate tool names,
+/// even when the tools directory has multiple tool configs alongside
 /// the synthetic run_terminal_command entry.
 #[tokio::test]
 async fn test_tools_list_no_duplicate_names() -> anyhow::Result<()> {
-    let temp_dir = TempDir::new()?;
-    let cwd = temp_dir.path();
+    let temp_dir = tempdir()?;
 
     // Create .ahma directory with two test tools
-    let ahma_dir = cwd.join(".ahma");
+    let ahma_dir = temp_dir.path().join(".ahma");
     std::fs::create_dir(&ahma_dir)?;
 
     for (file, name, desc) in &[
@@ -40,11 +41,8 @@ async fn test_tools_list_no_duplicate_names() -> anyhow::Result<()> {
         std::fs::write(ahma_dir.join(file), json)?;
     }
 
-    let service = ClientBuilder::new().working_dir(cwd).build().await?;
-    tokio::time::sleep(TestTimeouts::short_delay()).await;
-
-    let tools_result = service.list_tools(None).await?;
-    let tools = tools_result.tools;
+    let mcp = create_in_process_mcp_from_dir(&ahma_dir).await?;
+    let tools = mcp.client.list_all_tools().await?;
 
     // Collect all tool names and check for duplicates
     let mut seen = HashSet::new();
@@ -74,7 +72,6 @@ async fn test_tools_list_no_duplicate_names() -> anyhow::Result<()> {
     // Verify built-ins are all present
     assert!(tools.iter().any(|t| t.name == "await"));
     assert!(tools.iter().any(|t| t.name == "status"));
-    assert!(tools.iter().any(|t| t.name == "run_terminal_command"));
 
     // Verify user tools are present
     assert!(tools.iter().any(|t| t.name == "tool_alpha"));

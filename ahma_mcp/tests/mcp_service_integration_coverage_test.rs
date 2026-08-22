@@ -8,18 +8,14 @@
 //!
 //! These tests spawn the actual ahma_mcp binary and communicate via MCP protocol.
 
-use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::skip_if_disabled_async_result;
 use ahma_mcp::test_utils::client::ClientBuilder;
-use ahma_mcp::test_utils::in_process::{
-    create_in_process_mcp_empty, create_in_process_mcp_from_dir,
-};
+use ahma_mcp::test_utils::in_process::create_in_process_mcp_empty;
 use ahma_mcp::test_utils::project::{TestProjectOptions, create_rust_project};
 use ahma_mcp::utils::logging::init_test_logging;
 use anyhow::Result;
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
-use std::path::Path;
 
 // ============================================================================
 // Test Helpers - Reduce boilerplate and improve readability
@@ -116,102 +112,13 @@ async fn test_status_tool_with_tool_filter() -> Result<()> {
     Ok(())
 }
 
-/// Test status tool with specific id filter
-#[tokio::test]
-async fn test_status_tool_with_id_filter() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-
-    let result = mcp
-        .client
-        .call_tool(make_params(
-            "status",
-            Some(json!({"id": "nonexistent_op_12345"})),
-        ))
-        .await?;
-
-    assert!(!result.content.is_empty());
-    assert_text_contains_any(
-        &result,
-        &["not found", "total: 0", "nonexistent_op_12345"],
-        "Status should indicate operation not found",
-    );
-
-    Ok(())
-}
+// NOTE: status-with-id, await-no-pending, await-nonexistent-id, and
+// await-with-tool-filter duplicates were removed — they are covered at least
+// as strongly by the in-process tests in mcp_service/call_tool_handlers.rs.
 
 // ============================================================================
 // Await Tool Coverage Tests
 // ============================================================================
-
-/// Test await tool with no pending operations
-#[tokio::test]
-async fn test_await_tool_no_pending_operations() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-
-    let result = mcp
-        .client
-        .call_tool(make_params("await", Some(json!({}))))
-        .await?;
-
-    assert!(!result.content.is_empty());
-    assert_text_contains_any(
-        &result,
-        &["No pending operations", "Completed", "operations"],
-        "Await should handle no pending ops",
-    );
-
-    Ok(())
-}
-
-/// Test await tool with specific id that doesn't exist
-#[tokio::test]
-async fn test_await_tool_nonexistent_id() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-
-    let result = mcp
-        .client
-        .call_tool(make_params(
-            "await",
-            Some(json!({"id": "fake_operation_xyz"})),
-        ))
-        .await?;
-
-    assert!(!result.content.is_empty());
-    assert_text_contains_any(
-        &result,
-        &["not found", "fake_operation_xyz"],
-        "Await should handle non-existent operation",
-    );
-
-    Ok(())
-}
-
-/// Test await tool with tools filter
-#[tokio::test]
-async fn test_await_tool_with_tool_filter() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-
-    let result = mcp
-        .client
-        .call_tool(make_params(
-            "await",
-            Some(json!({"tools": "nonexistent_tool"})),
-        ))
-        .await?;
-
-    assert!(!result.content.is_empty());
-    assert_text_contains_any(
-        &result,
-        &["No pending operations", "nonexistent_tool"],
-        "Await should handle empty filter results",
-    );
-
-    Ok(())
-}
 
 /// Test await for an async operation that actually completes
 #[tokio::test]
@@ -258,117 +165,9 @@ fn extract_id(result: &rmcp::model::CallToolResult) -> Option<String> {
         .map(|word| word.trim_matches(|c| c == '"' || c == ',').to_string())
 }
 
-// ============================================================================
-// Cancel Tool Coverage Tests
-// ============================================================================
-
-/// Test cancel tool with missing id parameter
-#[tokio::test]
-async fn test_cancel_tool_missing_id() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-    let client = &mcp.client;
-
-    if !client_has_tool(client, "cancel").await? {
-        return Ok(());
-    }
-
-    let result = tokio::time::timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-        client.call_tool(make_params("cancel", Some(json!({})))),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("call_tool timed out"))?;
-
-    assert!(result.is_err(), "Cancel without id should fail with error");
-
-    Ok(())
-}
-
-/// Checks if a tool exists in the client's tool list
-async fn client_has_tool(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    name: &str,
-) -> Result<bool> {
-    let tools: Vec<rmcp::model::Tool> = client.list_all_tools().await?;
-    Ok(tools.iter().any(|t| t.name.as_ref() as &str == name))
-}
-
-/// Test cancel tool with non-existent id
-#[tokio::test]
-async fn test_cancel_tool_nonexistent_operation() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-    let client = &mcp.client;
-
-    if !client_has_tool(client, "cancel").await? {
-        return Ok(());
-    }
-
-    let result = tokio::time::timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-        client.call_tool(make_params(
-            "cancel",
-            Some(json!({"id": "nonexistent_op_999"})),
-        )),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("call_tool timed out"))??;
-
-    assert_text_contains_any(
-        &result,
-        &["not found", "FAIL", "never existed"],
-        "Cancel should report operation not found",
-    );
-
-    Ok(())
-}
-
-// ============================================================================
-// Tool Not Found / Disabled Coverage Tests
-// ============================================================================
-
-/// Test calling a tool that doesn't exist
-#[tokio::test]
-async fn test_call_nonexistent_tool() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-
-    let result = mcp
-        .client
-        .call_tool(make_params(
-            "this_tool_definitely_does_not_exist_xyz123",
-            Some(json!({})),
-        ))
-        .await;
-
-    assert!(result.is_err(), "Non-existent tool should return error");
-
-    Ok(())
-}
-
-/// Test calling a tool with invalid subcommand
-#[tokio::test]
-async fn test_call_tool_invalid_subcommand() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_from_dir(Path::new(".ahma")).await?;
-
-    if !client_has_tool_prefix(&mcp.client, "file-tools").await? {
-        return Ok(());
-    }
-
-    let result = mcp
-        .client
-        .call_tool(make_params(
-            "file-tools",
-            Some(json!({"subcommand": "nonexistent_subcommand"})),
-        ))
-        .await;
-
-    assert!(result.is_err(), "Invalid subcommand should return error");
-
-    Ok(())
-}
+// NOTE: cancel-missing-id, cancel-nonexistent, call-nonexistent-tool, and
+// invalid-subcommand duplicates were removed — they are covered at least as
+// strongly by the in-process tests in mcp_service/call_tool_handlers.rs.
 
 /// Checks if any tool with the given prefix exists
 async fn client_has_tool_prefix(
@@ -542,57 +341,6 @@ async fn test_file_tools_in_temp_directory() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
-// Multiple Tool Filter Tests
-// ============================================================================
-
-/// Test status with comma-separated tool filters
-#[tokio::test]
-async fn test_status_with_multiple_tool_filters() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-
-    let result = mcp
-        .client
-        .call_tool(make_params(
-            "status",
-            Some(json!({"tools": "cargo,git,run_terminal_command"})),
-        ))
-        .await?;
-
-    assert!(!result.content.is_empty());
-    assert_text_contains_any(
-        &result,
-        &[
-            "Operations status",
-            "cargo",
-            "git",
-            "run_terminal_command",
-            "total",
-        ],
-        "Status should handle multiple filters",
-    );
-
-    Ok(())
-}
-
-/// Test await with comma-separated tool filters
-#[tokio::test]
-async fn test_await_with_multiple_tool_filters() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-
-    let result = mcp
-        .client
-        .call_tool(make_params("await", Some(json!({"tools": "cargo,git"}))))
-        .await?;
-
-    assert!(!result.content.is_empty());
-    assert_text_contains_any(
-        &result,
-        &["No pending operations", "cargo", "git", "Completed"],
-        "Await should handle multiple filters",
-    );
-
-    Ok(())
-}
+// NOTE: multiple-tool-filter status/await duplicates were removed — they are
+// covered at least as strongly by mcp_service/call_tool_handlers.rs
+// (test_status_tool_with_tool_name_filter, test_await_tool_multiple_tool_filters).

@@ -5,7 +5,7 @@ mod mcp_service_tests {
     use ahma_mcp::utils::logging::init_test_logging;
     use rmcp::model::ProtocolVersion;
     use serde_json::json;
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     #[test]
     fn test_guidance_config_deserialization() {
@@ -217,27 +217,9 @@ mod mcp_service_tests {
         assert!(service.configs.read().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn test_service_with_tool_configs() {
-        init_test_logging();
-        let mut configs = HashMap::new();
-        configs.insert(
-            "test_tool".to_string(),
-            ToolConfig {
-                name: "test_tool".to_string(),
-                command: "echo".to_string(),
-                description: "Test tool".to_string(),
-                enabled: true,
-                ..Default::default()
-            },
-        );
-
-        let (service, _temp) = ahma_mcp::test_utils::build_test_service_with_configs(configs)
-            .await
-            .expect("Failed to create test service with configs");
-
-        assert!(service.configs.read().unwrap().contains_key("test_tool"));
-    }
+    // NOTE: the former `test_service_with_tool_configs` (a minimal
+    // build_test_service_with_configs round-trip) is covered at least as
+    // strongly by `coverage.rs::test_service_with_tool_configs`.
 
     #[tokio::test]
     async fn test_service_is_sync_safe() {

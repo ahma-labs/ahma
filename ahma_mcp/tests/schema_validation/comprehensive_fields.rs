@@ -32,7 +32,11 @@ async fn test_field_validation_edge_cases() -> Result<()> {
 
     let result =
         validator.validate_tool_config(&PathBuf::from("all_types.json"), &all_types_config);
-    assert!(result.is_ok(), "All valid types config should pass: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "All valid types config should pass: {:?}",
+        result
+    );
 
     let type_mistakes = vec![("bool", "boolean"), ("int", "integer"), ("str", "string")];
 
@@ -56,7 +60,11 @@ async fn test_field_validation_edge_cases() -> Result<()> {
 
         let result =
             validator.validate_tool_config(&PathBuf::from("mistake.json"), &mistake_config);
-        assert!(result.is_err(), "Wrong type '{}' should be invalid", wrong_type);
+        assert!(
+            result.is_err(),
+            "Wrong type '{}' should be invalid",
+            wrong_type
+        );
 
         let errors = result.unwrap_err();
         let has_helpful_suggestion = errors.iter().any(|e| {
@@ -68,8 +76,7 @@ async fn test_field_validation_edge_cases() -> Result<()> {
         assert!(
             has_helpful_suggestion,
             "Should have helpful suggestion for '{}' -> '{}'",
-            wrong_type,
-            correct_type
+            wrong_type, correct_type
         );
     }
 

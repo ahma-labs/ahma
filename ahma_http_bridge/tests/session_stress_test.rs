@@ -54,6 +54,7 @@ fn test_file_uri(relative_path: &str) -> (String, PathBuf) {
 
 /// Test creating many sessions concurrently
 #[tokio::test]
+#[ignore = "stress — run via --run-ignored all"]
 async fn test_concurrent_session_creation() {
     let default_scope = test_temp_path("stress_test");
     let session_manager = create_test_session_manager(Some(default_scope));
@@ -123,6 +124,7 @@ async fn test_concurrent_session_creation() {
 
 /// Test concurrent session creation and termination (race condition stress)
 #[tokio::test]
+#[ignore = "stress — run via --run-ignored all"]
 async fn test_concurrent_creation_and_termination() {
     let default_scope = test_temp_path("race_test");
     let session_manager = create_test_session_manager(Some(default_scope));
@@ -217,6 +219,7 @@ async fn test_concurrent_sandbox_lock_attempts() {
 
 /// Test many sessions with independent sandbox scopes
 #[tokio::test]
+#[ignore = "stress — run via --run-ignored all"]
 async fn test_many_independent_sandbox_scopes() {
     let default_scope = test_temp_path("multi_scope_test");
     let session_manager = create_test_session_manager(Some(default_scope.clone()));

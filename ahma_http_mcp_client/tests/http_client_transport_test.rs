@@ -308,49 +308,6 @@ mod http_transport_send {
     }
 
     #[tokio::test]
-    async fn send_handles_401_unauthorized() {
-        let _guard = token_env_guard().lock().unwrap();
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("expired_token.json");
-
-        let token = json!({
-            "access_token": "expired_token",
-            "refresh_token": null,
-            "expires_in": 0,
-            "scopes": null
-        });
-        std::fs::write(&token_path, token.to_string()).unwrap();
-
-        unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
-
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
-
-        let result = transport.send(request).await;
-        assert!(result.is_err(), "Send should fail on 401");
-
-        unsafe { env::remove_var(TOKEN_PATH_ENV) };
-    }
-
-    #[tokio::test]
     async fn send_handles_network_timeout() {
         let _guard = token_env_guard().lock().unwrap();
         let tmp = tempdir().unwrap();
@@ -503,11 +460,13 @@ mod http_transport_send {
         let _ = std::fs::remove_file(&token_path_str);
     }
 
+    /// Table-driven coverage of send() surfacing non-2xx HTTP statuses as errors.
+    /// Consolidates the former per-status copies (400/401/403/404/502/503/504).
     #[tokio::test]
-    async fn send_handles_400_bad_request() {
+    async fn send_handles_http_error_statuses() {
         let _guard = token_env_guard().lock().unwrap();
         let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_400.json");
+        let token_path = tmp.path().join("token_error_statuses.json");
 
         let token = json!({
             "access_token": "valid_token",
@@ -519,250 +478,46 @@ mod http_transport_send {
 
         unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
 
-        let server = MockServer::start().await;
+        let cases: &[(u16, &str)] = &[
+            (400, "Bad Request"),
+            (401, "Unauthorized"),
+            (403, "Forbidden"),
+            (404, "Not Found"),
+            (502, "Bad Gateway"),
+            (503, "Service Unavailable"),
+            (504, "Gateway Timeout"),
+        ];
 
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(400).set_body_string("Bad Request"))
-            .expect(1)
-            .mount(&server)
-            .await;
+        for &(status, body) in cases {
+            let server = MockServer::start().await;
 
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
+            Mock::given(method("POST"))
+                .and(path("/mcp"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
 
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
+            let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
+            let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
 
-        let result = transport.send(request).await;
-        assert!(result.is_err(), "Send should fail on 400");
-        assert!(result.unwrap_err().to_string().contains("400"));
+            let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
+                serde_json::from_value(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "test",
+                    "params": {}
+                }))
+                .unwrap();
 
-        unsafe { env::remove_var(TOKEN_PATH_ENV) };
-    }
-
-    #[tokio::test]
-    async fn send_handles_403_forbidden() {
-        let _guard = token_env_guard().lock().unwrap();
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_403.json");
-
-        let token = json!({
-            "access_token": "valid_token",
-            "refresh_token": null,
-            "expires_in": 3600,
-            "scopes": null
-        });
-        std::fs::write(&token_path, token.to_string()).unwrap();
-
-        unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
-
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
-
-        let result = transport.send(request).await;
-        assert!(result.is_err(), "Send should fail on 403");
-        assert!(result.unwrap_err().to_string().contains("403"));
-
-        unsafe { env::remove_var(TOKEN_PATH_ENV) };
-    }
-
-    #[tokio::test]
-    async fn send_handles_404_not_found() {
-        let _guard = token_env_guard().lock().unwrap();
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_404.json");
-
-        let token = json!({
-            "access_token": "valid_token",
-            "refresh_token": null,
-            "expires_in": 3600,
-            "scopes": null
-        });
-        std::fs::write(&token_path, token.to_string()).unwrap();
-
-        unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
-
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
-
-        let result = transport.send(request).await;
-        assert!(result.is_err(), "Send should fail on 404");
-        assert!(result.unwrap_err().to_string().contains("404"));
-
-        unsafe { env::remove_var(TOKEN_PATH_ENV) };
-    }
-
-    #[tokio::test]
-    async fn send_handles_502_bad_gateway() {
-        let _guard = token_env_guard().lock().unwrap();
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_502.json");
-
-        let token = json!({
-            "access_token": "valid_token",
-            "refresh_token": null,
-            "expires_in": 3600,
-            "scopes": null
-        });
-        std::fs::write(&token_path, token.to_string()).unwrap();
-
-        unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
-
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(502).set_body_string("Bad Gateway"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
-
-        let result = transport.send(request).await;
-        assert!(result.is_err(), "Send should fail on 502");
-        assert!(result.unwrap_err().to_string().contains("502"));
-
-        unsafe { env::remove_var(TOKEN_PATH_ENV) };
-    }
-
-    #[tokio::test]
-    async fn send_handles_503_service_unavailable() {
-        let _guard = token_env_guard().lock().unwrap();
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_503.json");
-
-        let token = json!({
-            "access_token": "valid_token",
-            "refresh_token": null,
-            "expires_in": 3600,
-            "scopes": null
-        });
-        std::fs::write(&token_path, token.to_string()).unwrap();
-
-        unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
-
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
-
-        let result = transport.send(request).await;
-        assert!(result.is_err(), "Send should fail on 503");
-        assert!(result.unwrap_err().to_string().contains("503"));
-
-        unsafe { env::remove_var(TOKEN_PATH_ENV) };
-    }
-
-    #[tokio::test]
-    async fn send_handles_504_gateway_timeout() {
-        let _guard = token_env_guard().lock().unwrap();
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_504.json");
-
-        let token = json!({
-            "access_token": "valid_token",
-            "refresh_token": null,
-            "expires_in": 3600,
-            "scopes": null
-        });
-        std::fs::write(&token_path, token.to_string()).unwrap();
-
-        unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
-
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(504).set_body_string("Gateway Timeout"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
-
-        let result = transport.send(request).await;
-        assert!(result.is_err(), "Send should fail on 504");
-        assert!(result.unwrap_err().to_string().contains("504"));
+            let result = transport.send(request).await;
+            assert!(result.is_err(), "Send should fail on {status}");
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains(&status.to_string()),
+                "Error for {status} should include the status code: {err}"
+            );
+        }
 
         unsafe { env::remove_var(TOKEN_PATH_ENV) };
     }
@@ -1154,57 +909,9 @@ mod oauth_callback_server_tests {
     use super::*;
     use url::Url;
 
-    // Note: These tests verify OAuth callback server behavior indirectly
-    // since listen_for_callback_async is private. The actual OAuth flow
-    // is tested via mocked endpoints in integration tests or real OAuth flows.
-
-    #[tokio::test]
-    async fn callback_url_parsing_simulation() {
-        // Simulate parsing callback URL with code and state
-        let callback_url = "http://localhost:8080/?code=test_auth_code&state=test_state_token";
-        let parsed_url = Url::parse(callback_url).unwrap();
-
-        let code = parsed_url
-            .query_pairs()
-            .find(|(key, _)| key == "code")
-            .map(|(_, value)| value.into_owned());
-
-        let state = parsed_url
-            .query_pairs()
-            .find(|(key, _)| key == "state")
-            .map(|(_, value)| value.into_owned());
-
-        assert_eq!(code, Some("test_auth_code".to_string()));
-        assert_eq!(state, Some("test_state_token".to_string()));
-    }
-
-    #[tokio::test]
-    async fn callback_url_missing_code() {
-        // Simulate missing code parameter
-        let callback_url = "http://localhost:8080/?state=test_state";
-        let parsed_url = Url::parse(callback_url).unwrap();
-
-        let code = parsed_url
-            .query_pairs()
-            .find(|(key, _)| key == "code")
-            .map(|(_, value)| value.into_owned());
-
-        assert!(code.is_none(), "Code should be missing");
-    }
-
-    #[tokio::test]
-    async fn callback_url_missing_state() {
-        // Simulate missing state parameter
-        let callback_url = "http://localhost:8080/?code=test_code";
-        let parsed_url = Url::parse(callback_url).unwrap();
-
-        let state = parsed_url
-            .query_pairs()
-            .find(|(key, _)| key == "state")
-            .map(|(_, value)| value.into_owned());
-
-        assert!(state.is_none(), "State should be missing");
-    }
+    // Note: listen_for_callback_async is private, so callback parsing is not
+    // exercised here. The actual OAuth flow is tested via mocked endpoints in
+    // integration tests or real OAuth flows.
 
     #[tokio::test]
     async fn oauth_client_configuration() {

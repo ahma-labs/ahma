@@ -3188,6 +3188,13 @@ mod tests {
         // Use a platform-appropriate path that `create_dir_all` cannot create:
         // - Unix: /nonexistent/... fails (no root perms)
         // - Windows: Z:\nonexistent\... fails (non-existent drive)
+        // Root CAN create under / (CAP_DAC_OVERRIDE), so the premise doesn't
+        // hold there — skip rather than fail in root containers.
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, /nonexistent is creatable");
+            return;
+        }
         #[cfg(unix)]
         let bad_path = PathBuf::from("/nonexistent/path/that/does/not/exist");
         #[cfg(windows)]

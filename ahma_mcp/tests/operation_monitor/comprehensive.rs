@@ -96,6 +96,52 @@ async fn test_concurrent_operation_tracking() -> Result<()> {
     Ok(())
 }
 
+/// Test that a mixed population is split correctly between the active set and the
+/// completion history: completing half of the tracked operations must move exactly
+/// those to history while the rest stay active.
+#[tokio::test]
+async fn test_partial_completion_split_between_active_and_history() {
+    let config = MonitorConfig::with_timeout(Duration::from_secs(30));
+    let monitor = Arc::new(OperationMonitor::new(config));
+
+    // Add multiple operations
+    for i in 0..10 {
+        let op = Operation::new(
+            format!("split_op_{}", i),
+            "test_tool".to_string(),
+            format!("Concurrent operation {}", i),
+            None,
+        );
+        monitor.add_operation(op).await;
+        monitor
+            .update_status(
+                &format!("split_op_{}", i),
+                OperationStatus::InProgress,
+                None,
+            )
+            .await;
+    }
+
+    // All should be active
+    let active = monitor.get_all_active_operations().await;
+    assert_eq!(active.len(), 10);
+
+    // Complete odd-numbered operations
+    for i in (1..10).step_by(2) {
+        monitor
+            .update_status(&format!("split_op_{}", i), OperationStatus::Completed, None)
+            .await;
+    }
+
+    // Should have 5 active (even-numbered)
+    let active = monitor.get_all_active_operations().await;
+    assert_eq!(active.len(), 5);
+
+    // Should have 5 in history (odd-numbered)
+    let history = monitor.get_completed_operations().await;
+    assert_eq!(history.len(), 5);
+}
+
 /// Test memory cleanup for completed operations over time
 #[tokio::test]
 async fn test_memory_cleanup_validation() -> Result<()> {
@@ -374,6 +420,48 @@ async fn test_cancellation_functionality_edge_cases() -> Result<()> {
     assert!(!cancel_again); // Should return false for already terminal operation
 
     Ok(())
+}
+
+/// Test that failed operations are properly tracked, including the *content* of the
+/// error result stored in completion history (not just its presence).
+#[tokio::test]
+async fn test_failed_operation_tracking() {
+    let config = MonitorConfig::with_timeout(Duration::from_secs(30));
+    let monitor = Arc::new(OperationMonitor::new(config));
+
+    let op = Operation::new(
+        "fail_test".to_string(),
+        "test_tool".to_string(),
+        "Operation that will fail".to_string(),
+        None,
+    );
+    monitor.add_operation(op).await;
+
+    monitor
+        .update_status("fail_test", OperationStatus::InProgress, None)
+        .await;
+
+    let error_result = json!({
+        "error": "Compilation failed",
+        "exit_code": 1,
+        "stderr": "error[E0382]: use of moved value"
+    });
+
+    monitor
+        .update_status("fail_test", OperationStatus::Failed, Some(error_result))
+        .await;
+
+    // Should be in history with Failed state
+    let history = monitor.get_completed_operations().await;
+    let op = history.iter().find(|op| op.id == "fail_test").unwrap();
+
+    assert_eq!(op.state, OperationStatus::Failed);
+    assert!(
+        op.result.as_ref().unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("Compilation failed")
+    );
 }
 
 /// Test shutdown summary functionality

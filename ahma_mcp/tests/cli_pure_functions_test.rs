@@ -4,10 +4,16 @@
 //! - find_matching_tool
 //! - find_tool_config
 //! - resolve_cli_subcommand
+//! - normalize_tools_dir
+//! - Cli argument parsing (clap)
 
 use ahma_mcp::config::{SubcommandConfig, ToolConfig};
-use ahma_mcp::shell::resolution::{find_matching_tool, find_tool_config, resolve_cli_subcommand};
+use ahma_mcp::shell::resolution::{
+    find_matching_tool, find_tool_config, normalize_tools_dir, resolve_cli_subcommand,
+};
 use std::collections::HashMap;
+use std::fs;
+use tempfile::TempDir;
 
 // ============= Helper Functions =============
 
@@ -333,6 +339,37 @@ fn test_resolve_cli_subcommand_disabled_subcommand_ignored() {
     assert!(result.is_err());
 }
 
+/// The command parts must come from the config's `command` field, not the
+/// tool's name — they can differ.
+#[test]
+fn test_resolve_cli_subcommand_uses_command_field() {
+    let config =
+        create_tool_config_with_subcommands("mytool", "tool_cmd", vec![create_subcommand("sub")]);
+
+    let (resolved_sub, parts) =
+        resolve_cli_subcommand("mytool", &config, "mytool_sub", None).unwrap();
+    assert_eq!(resolved_sub.name, "sub");
+    assert_eq!(parts, vec!["tool_cmd", "sub"]);
+}
+
+/// Error paths with an empty subcommand list (Some(vec![]) rather than None).
+#[test]
+fn test_resolve_cli_subcommand_errors_empty_subcommand_list() {
+    let config = ToolConfig {
+        name: "mytool".to_string(),
+        subcommand: Some(vec![]),
+        ..Default::default()
+    };
+
+    // Invalid format: the called name is unrelated to the tool name
+    let res = resolve_cli_subcommand("mytool", &config, "invalidformat", None);
+    assert!(res.is_err()); // expects tool_subcommand
+
+    // Missing subcommand
+    let res = resolve_cli_subcommand("mytool", &config, "mytool_missing", None);
+    assert!(res.is_err());
+}
+
 #[test]
 fn test_resolve_cli_subcommand_no_subcommands() {
     let config = create_test_tool_config("cargo", "cargo");
@@ -369,4 +406,49 @@ fn test_find_and_resolve_workflow() {
         resolve_cli_subcommand(key, config, "cargo_build", None).unwrap();
     assert_eq!(subcommand.name, "build");
     assert_eq!(command_parts, vec!["cargo", "build"]);
+}
+
+// ============= normalize_tools_dir Tests =============
+
+#[test]
+fn test_normalize_tools_dir_explicit() {
+    let tmp_dir = TempDir::new().unwrap();
+    let explicit_path = tmp_dir.path().join("custom_tools");
+    fs::create_dir(&explicit_path).unwrap();
+
+    let result = normalize_tools_dir(Some(explicit_path.clone()));
+    assert_eq!(result, Some(explicit_path));
+}
+
+#[test]
+fn test_normalize_tools_dir_legacy_structure() {
+    let tmp_dir = TempDir::new().unwrap();
+    let ahma_dir = tmp_dir.path().join(".ahma");
+    let tools_dir = ahma_dir.join("tools");
+    fs::create_dir_all(&tools_dir).unwrap();
+
+    // If I pass .ahma/tools, it should return .ahma
+    let result = normalize_tools_dir(Some(tools_dir));
+    assert_eq!(result, Some(ahma_dir));
+}
+
+// ============= Cli Argument Parsing Tests =============
+
+/// Pure clap parsing — runs on all platforms.
+#[test]
+fn test_cli_argument_parsing() {
+    use ahma_mcp::shell::cli::{Cli, ServeTransport, Subcommands};
+    use clap::Parser;
+
+    // Test `Cli::try_parse_from` with the new subcommand API.
+    let args = vec!["ahma_mcp", "serve", "http", "--port", "8080"];
+    let cli = Cli::try_parse_from(args).unwrap();
+
+    let Subcommands::Serve(serve_args) = cli.command else {
+        panic!("Expected serve subcommand");
+    };
+    let Some(ServeTransport::Http(http_args)) = serve_args.transport else {
+        panic!("Expected http transport");
+    };
+    assert_eq!(http_args.port, 8080);
 }

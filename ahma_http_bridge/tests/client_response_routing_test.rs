@@ -1,9 +1,9 @@
 mod common;
 
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::{McpTestClient, TransportMode, spawn_in_process_server};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::time::sleep;
 
 #[derive(Clone, Copy, Debug)]
@@ -334,13 +334,23 @@ async fn test_response_routing_locks_sandbox_with_real_id() {
         "Response submission should succeed"
     );
 
-    // Give the peer/bridge a moment to process the configured notification
-    sleep(Duration::from_millis(200)).await;
+    // The peer/bridge needs a moment to process the configured notification.
+    // Poll the tool call until the sandbox-pending gate (-32001) clears, bounded
+    // by the SandboxReady budget; the assertions below judge the final result.
+    let deadline = tokio::time::Instant::now() + TestTimeouts::get(TimeoutCategory::SandboxReady);
+    let call_res2 = loop {
+        let res = mcp
+            .call_tool("run_terminal_command", json!({ "command": "pwd" }))
+            .await;
+        let sandbox_pending =
+            !res.success && res.error.as_deref().is_some_and(|e| e.contains("-32001"));
+        if !sandbox_pending || tokio::time::Instant::now() >= deadline {
+            break res;
+        }
+        sleep(TestTimeouts::poll_interval()).await;
+    };
 
     // Tool call should NOT return 409 (-32001) anymore, because the sandbox is now configured/Active!
-    let call_res2 = mcp
-        .call_tool("run_terminal_command", json!({ "command": "pwd" }))
-        .await;
     if call_res2.success {
         // success
     } else {

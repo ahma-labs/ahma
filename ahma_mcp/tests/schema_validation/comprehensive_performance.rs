@@ -84,7 +84,11 @@ async fn test_performance_for_large_tool_sets() -> Result<()> {
     );
 
     let errors = error_result.expect_err("invalid config should fail");
-    assert!(errors.len() >= 30, "Should find many errors, got: {}", errors.len());
+    assert!(
+        errors.len() >= 30,
+        "Should find many errors, got: {}",
+        errors.len()
+    );
 
     Ok(())
 }

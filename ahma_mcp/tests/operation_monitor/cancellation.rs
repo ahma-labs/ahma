@@ -1,6 +1,6 @@
 use ahma_mcp::{
     adapter::Adapter,
-    operation_monitor::{MonitorConfig, OperationMonitor, OperationStatus},
+    operation_monitor::{MonitorConfig, Operation, OperationMonitor, OperationStatus},
     sandbox::Sandbox,
     shell_pool::{ShellPoolConfig, ShellPoolManager},
     test_utils::concurrency::wait_for_condition,
@@ -216,6 +216,58 @@ async fn test_operation_cancellation_before_execution() {
     }
 
     println!("OK Pre-execution cancellation test passed");
+}
+
+/// Test concurrent cancellation doesn't cause issues: when several tasks race to
+/// cancel the same operation, exactly one wins.
+#[tokio::test]
+async fn test_concurrent_cancellation_safety() {
+    let config = MonitorConfig::with_timeout(Duration::from_secs(30));
+    let monitor = Arc::new(OperationMonitor::new(config));
+
+    let op = Operation::new(
+        "race_cancel".to_string(),
+        "test_tool".to_string(),
+        "Operation for race testing".to_string(),
+        None,
+    );
+    monitor.add_operation(op).await;
+    monitor
+        .update_status("race_cancel", OperationStatus::InProgress, None)
+        .await;
+
+    // Spawn multiple tasks trying to cancel the same operation
+    let mut handles = vec![];
+    for i in 0..5 {
+        let monitor_clone = monitor.clone();
+        let handle = tokio::spawn(async move {
+            monitor_clone
+                .cancel_operation_with_reason("race_cancel", Some(format!("Canceller {}", i)))
+                .await
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all cancellation attempts
+    let results: Vec<bool> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // Exactly one should succeed
+    let success_count: usize = results.iter().filter(|&&b| b).count();
+    assert_eq!(
+        success_count, 1,
+        "Exactly one cancellation should succeed, got {}",
+        success_count
+    );
+
+    // Operation should be in history with Cancelled state
+    let history = monitor.get_completed_operations().await;
+    let op = history.iter().find(|op| op.id == "race_cancel");
+    assert!(op.is_some());
+    assert_eq!(op.unwrap().state, OperationStatus::Cancelled);
 }
 
 /// Test the basic cancellation token functionality

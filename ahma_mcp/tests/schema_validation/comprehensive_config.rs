@@ -33,7 +33,11 @@ async fn test_complex_configuration_validation_scenarios() -> Result<()> {
 
     let result =
         validator.validate_tool_config(&PathBuf::from("inheritance.json"), &inheritance_config);
-    assert!(result.is_ok(), "Inheritance config should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Inheritance config should be valid: {:?}",
+        result
+    );
 
     let enablement_config = json!({
         "name": "enablement_test",
@@ -50,7 +54,10 @@ async fn test_complex_configuration_validation_scenarios() -> Result<()> {
 
     let result =
         validator.validate_tool_config(&PathBuf::from("enablement.json"), &enablement_config);
-    assert!(result.is_ok(), "Config should parse without enablement checks yet");
+    assert!(
+        result.is_ok(),
+        "Config should parse without enablement checks yet"
+    );
 
     let guidance_key_config = json!({
         "name": "guidance_key_test",
@@ -67,7 +74,11 @@ async fn test_complex_configuration_validation_scenarios() -> Result<()> {
 
     let result =
         validator.validate_tool_config(&PathBuf::from("guidance_key.json"), &guidance_key_config);
-    assert!(result.is_ok(), "Guidance key config should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Guidance key config should be valid: {:?}",
+        result
+    );
 
     let contradictory_config = json!({
         "name": "contradictory_test",

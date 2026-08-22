@@ -1785,7 +1785,7 @@ This project follows a strict test pyramid to keep CI stable on 2-core GitHub Ac
 
 **Decision rule**: _Can this test be written without spawning a process?_ If yes, write it that way. `ClientBuilder` and `spawn_http_bridge` are reserved for the E2E layer.
 
-**⚠️ Warning**: `setup_mcp_service_with_client()` is a **subprocess wrapper** (it calls `start_process_with_args`), not an in-process helper. Using it for integration tests causes CI timeouts on 2-CPU runners.
+**⚠️ Warning**: `Client::start_process_with_args()` (and anything built on it) is a **subprocess wrapper**, not an in-process helper. Using it for integration tests causes CI timeouts on 2-CPU runners.
 
 ### 10.1.2 Choosing the Right In-Process Helper
 
@@ -1909,7 +1909,7 @@ Use `create_rust_test_project` for all tests that need a filesystem. This ensure
 #### R16.2: MCP Service Helpers
 - **In-process (preferred)**: Use `create_in_process_mcp_from_dir(tools_dir)` for MCP protocol logic, tool dispatch, and argument-parsing tests — no subprocess, full MCP handshake, runs in <50 ms. Use `create_in_process_mcp_with_scope(tools_dir, scopes)` when the test must assert that a path or symlink is **rejected** (strict sandbox mode).
 - **HTTP**: Use `spawn_http_bridge()` and `HttpMcpTestClient` for HTTP/SSE integration testing.
-- **Subprocess (E2E only)**: `setup_mcp_service_with_client()` spawns a real subprocess; reserve it for tests that specifically validate binary wiring or CLI flags.
+- **Subprocess (E2E only)**: `ClientBuilder` spawns a real subprocess; reserve it for tests that specifically validate binary wiring or CLI flags.
 
 #### R16.3: Binary Resolution
 Always use `cli::build_binary_cached()` to avoid redundant `cargo build` calls and ensure tests are fast and CI-friendly.

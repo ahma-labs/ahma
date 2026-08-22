@@ -1,195 +1,117 @@
-//! Test to reproduce and fix the VSCode GitHub Copilot Chat catastrophic failure
-//! Error: "tool parameters array type must have items"
+//! Regression test for the VSCode GitHub Copilot Chat catastrophic failure:
+//! "tool parameters array type must have items".
+//!
+//! Every array-typed parameter in a generated tool schema MUST carry an
+//! `items` object with a `type` (strings, for CLI tools), and every schema
+//! must be a well-formed `type: "object"` schema. A single tool violating
+//! this made VSCode reject ahma's *entire* tool list.
+//!
+//! # Design Note
+//!
+//! Uses the in-memory API (`load_tool_configs` + `generate_schema_for_tool_config`)
+//! instead of spawning a subprocess MCP server — the schemas under test are pure
+//! functions of static configuration, so there is nothing a subprocess would add
+//! except OS-scheduling jitter. See `schema_validation_test.rs` for the pattern.
 
-use ahma_mcp::test_utils::client::ClientBuilder;
+use ahma_mcp::config::load_tool_configs;
+use ahma_mcp::mcp_service::schema::generate_schema_for_tool_config;
+use ahma_mcp::shell::cli::AppConfig;
 use ahma_mcp::utils::logging::init_test_logging;
 use serde_json::Value;
+use std::path::Path;
 
-/// This test reproduces the exact VSCode GitHub Copilot Chat failure
-/// and ensures our fix prevents it from happening again.
+/// Validate all tools generated from the real `.ahma/` configs (plus the
+/// synthetic `run_terminal_command`): schemas are objects, and every
+/// array parameter has a string-typed `items` property.
 #[tokio::test]
-async fn test_array_parameters_have_items_property_fixed() -> anyhow::Result<()> {
+async fn test_all_tool_array_parameters_have_items() -> anyhow::Result<()> {
     init_test_logging();
-    // Create a test client with the real tool configurations
-    let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
-    let tools = client.list_all_tools().await?;
 
-    println!(
-        "Testing {} tools for proper array schema generation",
-        tools.len()
-    );
+    // Anchor at the workspace root so the test works under both `cargo test`
+    // (package-root cwd) and `cargo nextest` (workspace-root cwd).
+    let tools_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate dir has a parent")
+        .join(".ahma");
 
-    // Inspect cargo tool which now includes audit subcommands
-    let cargo_tool = match tools.iter().find(|tool| tool.name == "cargo") {
-        Some(tool) => tool,
-        None => {
-            println!(
-                "Skipping test: cargo tool not found in tools directory (may be CI environment)"
-            );
-            println!(
-                "Available tools: {:?}",
-                tools.iter().map(|t| &t.name).collect::<Vec<_>>()
-            );
-            client.cancel().await?;
-            return Ok(());
-        }
-    };
+    let config = AppConfig::default();
+    let tools = load_tool_configs(&config, Some(tools_dir.as_path()))
+        .await
+        .expect("Failed to load tool configs from .ahma/");
 
-    println!("Found cargo tool, checking audit-related array parameters...");
+    assert!(!tools.is_empty(), "No tool configs loaded from .ahma/");
 
-    // The schema should be valid and not cause VSCode failures
-    let schema = cargo_tool.input_schema.as_ref();
-    let properties = schema
-        .get("properties")
-        .expect("Tool schema must have properties")
-        .as_object()
-        .expect("Properties must be an object");
-
-    // These specific array parameters were causing the VSCode failure
-    let mut validated_arrays = 0;
-
-    for (param_name, param_schema) in properties {
-        if let Some(param_obj) = param_schema.as_object()
-            && param_obj.get("type") == Some(&Value::String("array".to_string()))
-        {
-            validated_arrays += 1;
-            println!("Validating array parameter: {}", param_name);
-
-            // CRITICAL FIX: Array parameters MUST have 'items' property
-            // This is what was missing and causing the catastrophic failure
-            assert!(
-                param_obj.contains_key("items"),
-                "CRITICAL: Array parameter '{}' MUST have 'items' property! \
-                     This is what caused VSCode GitHub Copilot Chat to fail with: \
-                     'tool parameters array type must have items'",
-                param_name
-            );
-
-            let items = param_obj
-                .get("items")
-                .expect("Items must be present")
-                .as_object()
-                .expect("Items must be an object");
-
-            assert!(
-                items.contains_key("type"),
-                "Array items must have a type for parameter '{}'",
-                param_name
-            );
-
-            // For command-line tools, array items should typically be strings
-            assert_eq!(
-                items.get("type").unwrap(),
-                &Value::String("string".to_string()),
-                "Array items should be strings for CLI parameter '{}'",
-                param_name
-            );
-
-            println!(
-                "OK Array parameter '{}' has valid items property",
-                param_name
-            );
-        }
-    }
-
-    // Check if cargo-audit is installed
-    let audit_installed = std::process::Command::new("cargo")
-        .args(["audit", "--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if validated_arrays == 0 {
-        println!(
-            "No array parameters detected; this typically indicates all array-bearing cargo subcommands were disabled for this run."
-        );
-    } else if audit_installed {
-        assert!(
-            validated_arrays >= 5,
-            "Should have validated at least 5 array parameters with cargo audit installed (ignore, target-arch, target-os, args, exclude)"
-        );
-        println!(
-            "cargo-audit is installed, validated {} array parameters.",
-            validated_arrays
-        );
-    } else {
-        // Without cargo-audit, we may only have array parameters from other enabled subcommands
-        // (e.g., nextest args). Note: llvm-cov is disabled due to sandbox incompatibility.
-        assert!(
-            validated_arrays >= 1,
-            "Should have validated at least 1 array parameter without cargo audit installed (e.g., args from nextest)"
-        );
-        println!(
-            "cargo-audit not found, skipping audit-related parameter checks. Validated {} array parameters.",
-            validated_arrays
-        );
-    }
-
-    client.cancel().await?;
-    Ok(())
-}
-
-/// Test all tools to ensure none have the array schema issue
-#[tokio::test]
-async fn test_all_tools_array_schemas_are_valid_fixed() -> anyhow::Result<()> {
-    init_test_logging();
-    let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
-    let tools = client.list_all_tools().await?;
-
-    let mut total_tools = 0;
-    let mut tools_with_arrays = 0;
     let mut total_array_params = 0;
 
-    for tool in &tools {
-        total_tools += 1;
-        let schema = tool.input_schema.as_ref();
+    for (tool_name, tool_config) in &tools {
+        let schema = generate_schema_for_tool_config(tool_config);
 
-        if let Some(properties) = schema.get("properties") {
-            let props = properties
+        // Every generated schema must be a well-formed object schema.
+        assert_eq!(
+            schema.get("type"),
+            Some(&Value::String("object".to_string())),
+            "Tool '{}': schema top-level type must be \"object\"",
+            tool_name
+        );
+        let properties = schema
+            .get("properties")
+            .unwrap_or_else(|| panic!("Tool '{}': schema must have properties", tool_name))
+            .as_object()
+            .unwrap_or_else(|| panic!("Tool '{}': properties must be an object", tool_name));
+
+        for (param_name, param_schema) in properties {
+            let Some(param_obj) = param_schema.as_object() else {
+                panic!(
+                    "Tool '{}': property '{}' schema must be an object",
+                    tool_name, param_name
+                );
+            };
+            if param_obj.get("type") != Some(&Value::String("array".to_string())) {
+                continue;
+            }
+            total_array_params += 1;
+
+            // THE CRITICAL CHECK: array parameters must have an `items`
+            // property, or VSCode rejects the whole tool list with
+            // "tool parameters array type must have items".
+            let items = param_obj
+                .get("items")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "CRITICAL: Array parameter '{}' in tool '{}' MUST have 'items' \
+                         property! This caused VSCode GitHub Copilot Chat to fail with: \
+                         'tool parameters array type must have items'",
+                        param_name, tool_name
+                    )
+                })
                 .as_object()
-                .expect("Properties must be an object");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Items of array parameter '{}' in tool '{}' must be an object",
+                        param_name, tool_name
+                    )
+                });
 
-            let mut tool_has_arrays = false;
-            for (param_name, param_schema) in props {
-                if let Some(param_obj) = param_schema.as_object()
-                    && param_obj.get("type") == Some(&Value::String("array".to_string()))
-                {
-                    tool_has_arrays = true;
-                    total_array_params += 1;
-
-                    // THE CRITICAL TEST: Array parameters must have items property
-                    assert!(
-                        param_obj.contains_key("items"),
-                        "Array parameter '{}' in tool '{}' MUST have 'items' property \
-                             to prevent VSCode GitHub Copilot Chat catastrophic failure",
-                        param_name,
-                        tool.name
-                    );
-
-                    let items = param_obj.get("items").unwrap();
-                    if let Some(items_obj) = items.as_object() {
-                        assert!(
-                            items_obj.contains_key("type"),
-                            "Array items for '{}' in tool '{}' must have type field",
-                            param_name,
-                            tool.name
-                        );
-                    }
-                }
-            }
-
-            if tool_has_arrays {
-                tools_with_arrays += 1;
-            }
+            // For command-line tools, array items are strings.
+            assert_eq!(
+                items.get("type"),
+                Some(&Value::String("string".to_string())),
+                "Array items must have type \"string\" for CLI parameter '{}' in tool '{}'",
+                param_name,
+                tool_name
+            );
         }
     }
 
-    println!("OK Schema validation results:");
-    println!("   - Total tools tested: {}", total_tools);
-    println!("   - Tools with array parameters: {}", tools_with_arrays);
-    println!("   - Total array parameters: {}", total_array_params);
-    println!("   - All array parameters have valid 'items' properties!");
+    // Guard against vacuous success: the repo's .ahma/ configs contain
+    // array-typed options (e.g. file-tools, python, simplify), so at least
+    // one array parameter must have been validated.
+    assert!(
+        total_array_params >= 1,
+        "Expected at least one array parameter across .ahma/ tools; \
+         validated {} — the test would otherwise be vacuous",
+        total_array_params
+    );
 
-    client.cancel().await?;
     Ok(())
 }

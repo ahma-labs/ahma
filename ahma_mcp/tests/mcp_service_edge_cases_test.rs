@@ -6,7 +6,6 @@
 //! 3. Sandboxed Shell (validation, timeouts, execution modes)
 //! 4. Await tool (empty states)
 
-use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::test_utils::client::McpClientFixture;
 use ahma_mcp::test_utils::in_process::create_in_process_mcp_empty;
 use ahma_mcp::utils::logging::init_test_logging;
@@ -61,44 +60,15 @@ async fn test_status_filter_nonexistent_tool() -> Result<()> {
     Ok(())
 }
 
-/// Test status tool query for non-existent operation ID
-#[tokio::test]
-async fn test_status_nonexistent_id() -> Result<()> {
-    init_test_logging();
-    let fixture = setup_client_fixture().await?;
-    let client = &fixture.client;
-
-    let result = call_test_tool(client, "status", json!({"id": "op_999999"})).await?;
-    let text = assert_success_and_get_text(&result);
-
-    assert!(text.contains("not found"));
-
-    fixture.client.cancel().await?;
-    Ok(())
-}
+// NOTE: status-nonexistent-id, cancel-missing-id, and cancel-nonexistent
+// duplicates were removed — they are covered at least as strongly by the
+// in-process tests in mcp_service/call_tool_handlers.rs
+// (test_status_tool_with_id, test_cancel_tool_missing_id,
+// test_cancel_tool_nonexistent_operation).
 
 // ============================================================================
 // Test: Cancel Tool Edge Cases
 // ============================================================================
-
-/// Test cancel missing id
-#[tokio::test]
-async fn test_cancel_missing_id() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-    let client = &mcp.client;
-
-    let result = tokio::time::timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-        call_test_tool(client, "cancel", json!({})),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("call_tool timed out"))?;
-
-    assert_required_param_error(result, "required");
-
-    Ok(())
-}
 
 fn assert_required_param_error<E: std::fmt::Debug>(
     result: Result<rmcp::model::CallToolResult, E>,
@@ -115,26 +85,6 @@ fn assert_required_param_error<E: std::fmt::Debug>(
     } else if let Ok(r) = result {
         assert!(r.is_error.unwrap_or(false));
     }
-}
-
-/// Test cancel non-existent operation
-#[tokio::test]
-async fn test_cancel_nonexistent_operation() -> Result<()> {
-    init_test_logging();
-    let mcp = create_in_process_mcp_empty().await?;
-    let client = &mcp.client;
-
-    let result = tokio::time::timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-        call_test_tool(client, "cancel", json!({"id": "op_999999"})),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("call_tool timed out"))??;
-    let text = assert_success_and_get_text(&result);
-
-    assert!(text.contains("not found") || text.contains("completed"));
-
-    Ok(())
 }
 
 /// Test cancel with explicit reason

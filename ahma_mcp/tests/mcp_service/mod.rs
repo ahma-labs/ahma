@@ -12,6 +12,4 @@ mod comprehensive_resilience;
 mod comprehensive_schema;
 mod comprehensive_security;
 mod coverage;
-mod coverage_expansion;
-mod integration;
 mod shell_tool;

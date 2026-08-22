@@ -34,17 +34,23 @@ async fn test_status_tool_with_tool_name_filter() -> Result<()> {
     let result = mcp.client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
 
-    if let Some(content) = result.content.first()
-        && let Some(text_content) = content.as_text()
-    {
-        assert!(
-            text_content.text.contains("cargo")
-                || text_content.text.contains("Operations status")
-                || text_content.text.contains("active")
-        );
-    }
+    let text = result_text(&result);
+    assert!(
+        text.contains("cargo") || text.contains("Operations status") || text.contains("active"),
+        "Status should reference filter or summary. Got: {text}"
+    );
 
     Ok(())
+}
+
+/// Extracts the text content of a tool result, failing the test if absent.
+fn result_text(result: &rmcp::model::CallToolResult) -> &str {
+    result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.as_str())
+        .expect("Result should contain text content")
 }
 
 /// Test status tool with specific id parameter
@@ -60,12 +66,13 @@ async fn test_status_tool_with_id() -> Result<()> {
 
     let result = mcp.client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
+    assert!(!result.is_error.unwrap_or(false));
 
-    if let Some(content) = result.content.first()
-        && let Some(text_content) = content.as_text()
-    {
-        assert!(text_content.text.contains("not found") || text_content.text.contains("found"));
-    }
+    let text = result_text(&result);
+    assert!(
+        text.contains("not found"),
+        "Status should report the operation as not found. Got: {text}"
+    );
 
     Ok(())
 }
@@ -121,13 +128,11 @@ async fn test_await_tool_with_id_not_found() -> Result<()> {
     let result = mcp.client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
 
-    if let Some(content) = result.content.first()
-        && let Some(text_content) = content.as_text()
-    {
-        assert!(
-            text_content.text.contains("not found") || text_content.text.contains("No pending")
-        );
-    }
+    let text = result_text(&result);
+    assert!(
+        text.contains("not found") || text.contains("No pending"),
+        "Await should report the operation as not found. Got: {text}"
+    );
 
     Ok(())
 }
@@ -175,6 +180,12 @@ async fn test_await_tool_multiple_tool_filters() -> Result<()> {
     let result = mcp.client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
 
+    let text = result_text(&result);
+    assert!(
+        text.contains("No pending") || text.contains("Completed") || text.contains("operation"),
+        "Await should handle multiple tool filters. Got: {text}"
+    );
+
     Ok(())
 }
 
@@ -189,15 +200,11 @@ async fn test_await_tool_empty_params() -> Result<()> {
     let result = mcp.client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
 
-    if let Some(content) = result.content.first()
-        && let Some(text_content) = content.as_text()
-    {
-        assert!(
-            text_content.text.contains("No pending")
-                || text_content.text.contains("await")
-                || text_content.text.contains("operation")
-        );
-    }
+    let text = result_text(&result);
+    assert!(
+        text.contains("No pending") || text.contains("await") || text.contains("operation"),
+        "Await with empty params should report no pending operations. Got: {text}"
+    );
 
     Ok(())
 }
@@ -224,10 +231,14 @@ async fn test_cancel_tool_missing_id() -> Result<()> {
     .map_err(|_| anyhow::anyhow!("call_tool for cancel (missing id) timed out"))?;
 
     // Should fail with missing parameter error
+    let err = match result {
+        Err(e) => e,
+        Ok(ok) => panic!("Expected Err for missing id, got: {:?}", ok),
+    };
+    let msg = format!("{:?}", err);
     assert!(
-        result.is_err(),
-        "Expected Err for missing id, got: {:?}",
-        result
+        msg.contains("required") || msg.contains("missing"),
+        "Expected error mentioning 'required' or 'missing', got: {msg}"
     );
     Ok(())
 }
@@ -245,16 +256,13 @@ async fn test_cancel_tool_nonexistent_operation() -> Result<()> {
 
     let result = mcp.client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
+    assert!(!result.is_error.unwrap_or(false));
 
-    if let Some(content) = result.content.first()
-        && let Some(text_content) = content.as_text()
-    {
-        assert!(
-            text_content.text.contains("not found")
-                || text_content.text.contains("never existed")
-                || text_content.text.contains("FAIL")
-        );
-    }
+    let text = result_text(&result);
+    assert!(
+        text.contains("not found") || text.contains("never existed") || text.contains("FAIL"),
+        "Cancel should report operation not found. Got: {text}"
+    );
 
     Ok(())
 }

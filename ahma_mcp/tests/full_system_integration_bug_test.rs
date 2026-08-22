@@ -101,34 +101,18 @@ mod tests {
             terminal_events
         );
 
-        // Simulate a notification loop that runs multiple times over the
-        // history snapshot — dedup by id must yield exactly one notification.
-        println!("🔄 Simulating notification loop...");
-        let mut notified_operations = std::collections::HashSet::new();
-        let mut notifications_sent = 0usize;
-        for iteration in 1..=10 {
+        // The operation must persist in completion history across repeated
+        // reads (await/status rely on this; the loop-until-clear design that
+        // caused the original bug would drop it).
+        for _ in 1..=3 {
             let completed_ops = operation_monitor.get_completed_operations().await;
-            if !completed_ops.is_empty() {
-                println!(
-                    "📊 Iteration {}: Found {} completed operations in history",
-                    iteration,
-                    completed_ops.len()
-                );
-                for op in completed_ops {
-                    if op.id == id && notified_operations.insert(op.id.clone()) {
-                        notifications_sent += 1;
-                    }
-                }
-            }
+            assert!(
+                completed_ops.iter().any(|op| op.id == id),
+                "Operation should persist in completion history"
+            );
         }
 
-        assert_eq!(
-            notifications_sent, 1,
-            "BUG: Expected exactly 1 completed notification, but got {}. The notification logic is flawed.",
-            notifications_sent
-        );
-
-        println!("OK Full system integration test passed - operation was notified exactly once.");
+        println!("OK Full system integration test passed - exactly one terminal event emitted.");
     }
 
     /// Test system under load with multiple operations, ensuring each is notified once.
@@ -187,40 +171,19 @@ mod tests {
             "Not all operations completed in time."
         );
 
-        // Simulate notification loop and track notifications
-        let mut all_notified_operations = std::collections::HashSet::new();
-        for iteration in 1..=6 {
+        // Every started operation must be present in completion history, and
+        // stay there across repeated reads.
+        for _ in 1..=3 {
             let completed_ops = operation_monitor.get_completed_operations().await;
-            println!(
-                "📊 Iteration {}: Found {} operations in history",
-                iteration,
-                completed_ops.len()
-            );
-            for op in completed_ops {
-                if all_notified_operations.insert(op.id.clone()) {
-                    println!("   - Sending notification for new operation {}", op.id);
-                }
+            for op_id in &op_ids {
+                assert!(
+                    completed_ops.iter().any(|op| op.id == *op_id),
+                    "Operation {} should be in completion history",
+                    op_id
+                );
             }
         }
 
-        // --- Analysis ---
-        println!("🔍 Analysis of total notifications sent:");
-        for op_id in &op_ids {
-            let was_notified = all_notified_operations.contains(op_id);
-            println!("   - Operation {}: Notified? {}", op_id, was_notified);
-            assert!(was_notified, "BUG: Operation {} was never notified!", op_id);
-        }
-
-        assert_eq!(
-            all_notified_operations.len(),
-            op_ids.len(),
-            "BUG: The number of unique notified operations ({}) does not match the number of started operations ({}).",
-            all_notified_operations.len(),
-            op_ids.len()
-        );
-
-        println!(
-            "OK Multiple operations integration test passed - each operation was notified exactly once."
-        );
+        println!("OK Multiple operations integration test passed.");
     }
 }

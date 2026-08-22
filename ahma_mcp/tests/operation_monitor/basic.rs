@@ -1,7 +1,9 @@
 use ahma_mcp::operation_monitor::{
     MonitorConfig, Operation, OperationMonitor, OperationStatus, ShutdownSummary,
 };
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::time::timeout;
 
 #[test]
 fn test_operation_status_is_terminal() {
@@ -574,6 +576,54 @@ async fn test_operation_monitor_multiple_status_updates() {
     let final_op = &completed_ops[0];
     assert_eq!(final_op.state, OperationStatus::Completed);
     assert_eq!(final_op.result, Some(serde_json::json!({"progress": 100})));
+}
+
+/// Test waiting for an operation that completes successfully, observed through the
+/// operation's own completion watch channel (`subscribe_completion`) rather than
+/// `wait_for_operation` — the only coverage of that subscription path.
+#[tokio::test]
+async fn test_wait_for_completion_success() {
+    let config = MonitorConfig::with_timeout(Duration::from_secs(30));
+    let monitor = Arc::new(OperationMonitor::new(config));
+
+    let op = Operation::new(
+        "wait_test_watch".to_string(),
+        "test_tool".to_string(),
+        "Operation to wait for".to_string(),
+        None,
+    );
+    // Subscribe to the watch channel *before* adding the operation to the monitor,
+    // so we don't miss the completion signal.
+    let mut completion_rx = op.subscribe_completion();
+    monitor.add_operation(op).await;
+
+    monitor
+        .update_status("wait_test_watch", OperationStatus::InProgress, None)
+        .await;
+
+    // Spawn a task to complete the operation after a short delay
+    let monitor_clone = monitor.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        monitor_clone
+            .update_status(
+                "wait_test_watch",
+                OperationStatus::Completed,
+                Some(serde_json::json!({"result": "done"})),
+            )
+            .await;
+    });
+
+    // Wait for completion with timeout
+    let wait_result = timeout(Duration::from_secs(1), completion_rx.wait_for(|done| *done)).await;
+
+    assert!(wait_result.is_ok(), "Should complete before timeout");
+
+    // Verify it's in history with correct state
+    let history = monitor.get_completed_operations().await;
+    let completed_op = history.iter().find(|op| op.id == "wait_test_watch");
+    assert!(completed_op.is_some());
+    assert_eq!(completed_op.unwrap().state, OperationStatus::Completed);
 }
 
 #[tokio::test]

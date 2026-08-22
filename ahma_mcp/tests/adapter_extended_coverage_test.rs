@@ -76,74 +76,86 @@ fn test_execution_mode_enum() {
 // === needs_file_handling Tests ===
 
 #[test]
-fn test_needs_file_handling_newline() {
-    assert!(needs_file_handling("line1\nline2"));
-    assert!(needs_file_handling("a\nb\nc"));
-}
+fn test_needs_file_handling_cases() {
+    // (input, expected) — problematic strings need file handling, safe ones don't.
+    let cases: &[(&str, bool)] = &[
+        // Newlines / carriage returns
+        ("line1\nline2", true),
+        ("a\nb\nc", true),
+        ("text\rwith\rreturns", true),
+        // Quotes
+        ("it's fine", true),
+        ("text with 'single quotes'", true),
+        ("he said \"hello\"", true),
+        ("text with \"double quotes\"", true),
+        // Shell-special characters
+        ("path\\to\\file", true),
+        ("text with \\backslashes", true),
+        ("run `cmd`", true),
+        ("text with `backticks`", true),
+        ("echo $HOME", true),
+        ("text with $variables", true),
+        // Safe strings
+        ("hello", false),
+        ("hello world", false),
+        ("simple text", false),
+        ("text with spaces", false),
+        ("path/to/file", false),
+        ("file-name_123.txt", false),
+        ("text-with-dashes", false),
+        ("", false),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(
+            needs_file_handling(input),
+            *expected,
+            "needs_file_handling({:?}) should be {}",
+            input,
+            expected
+        );
+    }
 
-#[test]
-fn test_needs_file_handling_carriage_return() {
-    assert!(needs_file_handling("text\rwith\rreturns"));
-}
-
-#[test]
-fn test_needs_file_handling_quotes() {
-    assert!(needs_file_handling("it's fine"));
-    assert!(needs_file_handling("he said \"hello\""));
-}
-
-#[test]
-fn test_needs_file_handling_special_chars() {
-    assert!(needs_file_handling("path\\to\\file"));
-    assert!(needs_file_handling("run `cmd`"));
-    assert!(needs_file_handling("echo $HOME"));
-}
-
-#[test]
-fn test_needs_file_handling_length_boundary() {
-    // Exactly at limit - should NOT need file handling
+    // Length boundary: exactly at the limit is safe, one over needs file handling.
     let at_limit = "x".repeat(8192);
     assert!(!needs_file_handling(&at_limit));
-
-    // One over limit - SHOULD need file handling
     let over_limit = "x".repeat(8193);
     assert!(needs_file_handling(&over_limit));
-}
-
-#[test]
-fn test_needs_file_handling_safe_strings() {
-    assert!(!needs_file_handling("hello"));
-    assert!(!needs_file_handling("hello world"));
-    assert!(!needs_file_handling("path/to/file"));
-    assert!(!needs_file_handling("file-name_123.txt"));
-    assert!(!needs_file_handling(""));
 }
 
 // === escape_shell_argument Tests ===
 
 #[test]
-fn test_escape_shell_argument_simple() {
-    assert_eq!(escape_shell_argument("hello"), "'hello'");
-    assert_eq!(escape_shell_argument(""), "''");
-}
+fn test_escape_shell_argument_cases() {
+    // Exact expected escapes: a single quote is escaped by ending the
+    // single-quoted string, inserting an escaped quote, and starting a new
+    // single-quoted string ('"'"').
+    let cases: &[(&str, &str)] = &[
+        ("hello", "'hello'"),
+        ("", "''"),
+        ("simple", "'simple'"),
+        ("text with spaces", "'text with spaces'"),
+        // Other special chars are safe inside single quotes
+        (
+            "$HOME \"test\" `cmd` \\path",
+            "'$HOME \"test\" `cmd` \\path'",
+        ),
+        // Embedded single quotes
+        ("don't break", "'don'\"'\"'t break'"),
+        ("it's a 'test'", "'it'\"'\"'s a '\"'\"'test'\"'\"''"),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(
+            &escape_shell_argument(input),
+            expected,
+            "escape_shell_argument({:?})",
+            input
+        );
+    }
 
-#[test]
-fn test_escape_shell_argument_with_single_quote() {
-    // Single quote should be escaped by ending the single-quoted string,
-    // inserting an escaped quote, and starting a new single-quoted string
-    let result = escape_shell_argument("it's");
-    assert!(result.contains("'\"'\"'"));
-}
-
-#[test]
-fn test_escape_shell_argument_multiple_quotes() {
+    // Structural checks for multiple embedded quotes
     let result = escape_shell_argument("it's 'quoted'");
-    // Should escape single quotes
     assert!(result.starts_with("'"));
     assert!(result.ends_with("'"));
-    // The string has 3 single quotes: it's, 'quoted'
-    // Each single quote becomes '"'"' (5 chars including the escape)
-    // Just verify the escape pattern exists
     let pattern = "'\"'\"'";
     let count = result.matches(pattern).count();
     assert!(
@@ -151,13 +163,7 @@ fn test_escape_shell_argument_multiple_quotes() {
         "Should have escaped single quotes, got count: {}",
         count
     );
-}
-
-#[test]
-fn test_escape_shell_argument_special_chars_no_single_quote() {
-    // Other special chars are safe inside single quotes
-    let result = escape_shell_argument("$HOME \"test\" `cmd` \\path");
-    assert_eq!(result, "'$HOME \"test\" `cmd` \\path'");
+    assert!(escape_shell_argument("it's").contains(pattern));
 }
 
 // === Adapter with_root Tests ===
@@ -611,21 +617,6 @@ async fn test_path_option_validation() {
     assert!(result.is_ok());
 }
 
-// === Shell command redirect tests ===
-// Note: These tests are commented out as they require shell command execution
-// which behaves differently depending on system configuration.
-// The redirect functionality (2>&1 appending) is tested elsewhere.
-
-// #[tokio::test]
-// async fn test_shell_command_gets_redirect() {
-//     // Tests auto-appending of 2>&1 for shell commands
-// }
-
-// #[tokio::test]
-// async fn test_shell_command_existing_redirect_not_duplicated() {
-//     // Tests that 2>&1 is not duplicated when already present
-// }
-
 // === Option with alias Tests ===
 
 #[tokio::test]
@@ -999,17 +990,6 @@ async fn test_sync_command_exit_code_failure() {
         "Expected failure error, got: {}",
         err
     );
-}
-
-// === Shell program detection Tests ===
-
-#[test]
-fn test_is_shell_program_detection() {
-    // These are shell programs
-    assert!(needs_file_handling("test\nwith\nnewlines")); // Just testing it compiles
-
-    // Test the internal logic indirectly through prepare_command_and_args
-    // The shell detection is tested via shell_commands_append_redirect_once above
 }
 
 // === Array with null elements Tests ===

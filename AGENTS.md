@@ -87,7 +87,7 @@ stability: GitHub runners have 2 cores, every spawned subprocess burns scheduler
 
 Decision rule: *can this be written without forking a process?* If yes, do that.
 
-⚠️ **`setup_mcp_service_with_client()` spawns a subprocess** despite the name — it is E2E.
+⚠️ **`ClientBuilder`/`Client::start_process*` spawn a subprocess** — tests built on them are E2E.
 
 **Asserting on what the client receives.** For anything ahma *pushes* — `notifications/progress`
 above all — assert on the wire, not on the router's bookkeeping. `test_utils::recording_client::

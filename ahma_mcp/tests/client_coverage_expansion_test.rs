@@ -53,38 +53,20 @@ async fn build_test_client() -> Result<ahma_mcp::test_utils::in_process::InProce
 // Client Initialization and Process Spawning Tests
 // ============================================================================
 
-/// Test that new_client works with the tools directory
+/// Single subprocess smoke test for `Client::start_process_with_args`: the
+/// startup flags are not mutually exclusive, so one spawn verifies them all —
+/// `--tools-dir`, `--sync`, debug logging (`RUST_LOG`), and stderr logging
+/// (`AHMA_LOG_TARGET`). Flag behavior itself is covered in depth by
+/// cli_mode_coverage_test.rs.
 #[tokio::test]
-async fn test_client_start_process_with_tools_dir() -> Result<()> {
-    init_test_logging();
-    let mcp = build_test_client().await?;
-    let client = &mcp.client;
-
-    // Verify client is functional by listing tools (using the MCP protocol)
-    let tools = client.list_all_tools().await?;
-
-    // Should have default tools available
-    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref() as &str).collect();
-    assert!(
-        tool_names.contains(&"run_terminal_command")
-            || tool_names.contains(&"await")
-            || tool_names.contains(&"status"),
-        "Expected standard tools, got: {:?}",
-        tool_names
-    );
-
-    Ok(())
-}
-
-/// Test that new_client_with_args handles extra arguments like --sync
-#[tokio::test]
-async fn test_client_start_process_with_sync_flag() -> Result<()> {
+async fn test_client_start_process_smoke() -> Result<()> {
     init_test_logging();
 
-    // Enable synchronous tool execution via --sync flag
     let client = ClientBuilder::new()
         .tools_dir(".ahma")
         .arg("--sync")
+        .env("RUST_LOG", "debug")
+        .env("AHMA_LOG_TARGET", "stderr")
         .build()
         .await?;
 
@@ -92,43 +74,7 @@ async fn test_client_start_process_with_sync_flag() -> Result<()> {
     let tools = client.list_all_tools().await?;
     assert!(!tools.is_empty());
 
-    client.cancel().await?;
-    Ok(())
-}
-
-/// Test that new_client_with_args works with debug flag
-#[tokio::test]
-async fn test_client_start_process_with_debug_flag() -> Result<()> {
-    init_test_logging();
-
-    // Enable debug logging via env var (--debug flag removed in new CLI)
-    let client = ClientBuilder::new()
-        .tools_dir(".ahma")
-        .env("RUST_LOG", "debug")
-        .build()
-        .await?;
-
-    // Verify client is functional by listing tools
-    let tools = client.list_all_tools().await?;
-    assert!(!tools.is_empty());
-
-    client.cancel().await?;
-    Ok(())
-}
-
-/// Test that new_client_with_args works with --log-to-stderr flag
-#[tokio::test]
-async fn test_client_start_process_with_log_to_stderr() -> Result<()> {
-    init_test_logging();
-
-    // Route logs to stderr via env var (--log-to-stderr flag removed in new CLI)
-    let client = ClientBuilder::new()
-        .tools_dir(".ahma")
-        .env("AHMA_LOG_TARGET", "stderr")
-        .build()
-        .await?;
-
-    // Verify client is functional
+    // Verify a tool call round-trips
     let result = call_test_tool(&client, "status", json!({})).await?;
     assert!(!result.content.is_empty());
 
@@ -346,21 +292,11 @@ async fn test_run_terminal_command_with_working_dir() -> Result<()> {
 }
 
 // ============================================================================
-// Error Handling Tests
+// Listing Tests
 // ============================================================================
 
-/// Test calling a tool that doesn't exist
-#[tokio::test]
-async fn test_call_nonexistent_tool() -> Result<()> {
-    init_test_logging();
-    let mcp = build_test_client().await?;
-    let client = &mcp.client;
-
-    let result = call_test_tool(client, "this_tool_definitely_does_not_exist_xyz", json!({})).await;
-    // Should return an error
-    assert!(result.is_err(), "Expected error for nonexistent tool");
-    Ok(())
-}
+// Note: calling a nonexistent tool is covered in-process by
+// mcp_service/call_tool_handlers.rs::test_call_nonexistent_tool.
 
 /// Test list_tools returns expected format
 #[tokio::test]

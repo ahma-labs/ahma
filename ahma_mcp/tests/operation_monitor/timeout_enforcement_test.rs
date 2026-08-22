@@ -45,3 +45,30 @@ async fn test_operation_timeout_enforcement() {
         op.state
     );
 }
+
+/// Test that operations within timeout are not prematurely timed out
+#[tokio::test]
+async fn test_operation_within_timeout_not_timed_out() {
+    let config = MonitorConfig::with_timeout(Duration::from_secs(60));
+    let monitor = Arc::new(OperationMonitor::new(config));
+
+    let op = Operation::new(
+        "no_timeout_test".to_string(),
+        "test_tool".to_string(),
+        "Operation that should not timeout".to_string(),
+        None,
+    );
+    monitor.add_operation(op).await;
+
+    monitor
+        .update_status("no_timeout_test", OperationStatus::InProgress, None)
+        .await;
+
+    // Check timeouts immediately - operation just started, should not timeout
+    monitor.check_timeouts().await;
+
+    // Operation should still be active
+    let active = monitor.get_all_active_operations().await;
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].state, OperationStatus::InProgress);
+}

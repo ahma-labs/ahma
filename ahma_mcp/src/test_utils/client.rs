@@ -2,7 +2,6 @@ use super::fs::get_workspace_dir;
 pub use super::fs::get_workspace_tools_dir;
 
 use crate::adapter::Adapter;
-use crate::client::Client;
 use crate::mcp_service::AhmaMcpService;
 use crate::operation_monitor::{MonitorConfig, OperationMonitor};
 use crate::sandbox::{Sandbox, SandboxMode};
@@ -17,7 +16,6 @@ use rmcp::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 use tempfile::{TempDir, tempdir};
 use tokio::process::Command;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -362,28 +360,6 @@ pub(super) fn is_nested_sandbox_environment() -> bool {
 fn ahma_mcp_internal_sandbox_probe() -> bool {
     use crate::sandbox::test_sandbox_exec_available;
     test_sandbox_exec_available().is_err()
-}
-
-// Backward compatibility wrappers
-
-pub async fn setup_mcp_service_with_client() -> Result<(TempDir, Client)> {
-    // Create a temporary directory for tool configs
-    // run_terminal_command is a core built-in tool, no JSON config needed
-    let temp_dir = tempfile::tempdir()?;
-    let tools_dir = temp_dir.path();
-
-    let mut client = Client::new();
-    client
-        .start_process_with_args(Some(tools_dir.to_str().unwrap()), &[])
-        .await?;
-
-    // Give the server a moment to start
-    tokio::time::sleep(Duration::from_millis(
-        crate::constants::SEQUENCE_STEP_DELAY_MS,
-    ))
-    .await;
-
-    Ok((temp_dir, client))
 }
 
 pub async fn setup_test_environment() -> (AhmaMcpService, TempDir) {

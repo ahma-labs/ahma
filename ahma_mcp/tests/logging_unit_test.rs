@@ -135,6 +135,13 @@ fn test_unwritable_directory_detection() {
     {
         use std::os::unix::fs::PermissionsExt;
 
+        // Root bypasses DAC permission checks (CAP_DAC_OVERRIDE), so the
+        // read-only premise below doesn't hold — skip rather than fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, directory permissions are not enforced");
+            return;
+        }
+
         let temp_dir = tempdir().unwrap();
         let log_dir = temp_dir.path().join("readonly_logs");
         fs::create_dir_all(&log_dir).unwrap();
@@ -305,13 +312,78 @@ fn test_init_logging_returns_ok() {
     assert!(result.is_ok());
 }
 
+/// Test init_test_logging convenience function
+/// This tests the stderr logging path with trace level
 #[test]
 fn test_init_test_logging() {
-    // This is a convenience function for tests
     use ahma_mcp::utils::logging::init_test_logging;
 
-    // Should not panic
+    // init_test_logging calls init_logging("trace", false)
     init_test_logging();
+    // Should not panic and logging should work
+    tracing::info!("Test logging message");
+    tracing::debug!("Debug message");
+    tracing::trace!("Trace message");
+}
+
+/// Test that init_logging can be called multiple times (idempotent via Once)
+#[test]
+fn test_init_logging_idempotent() {
+    use ahma_mcp::utils::logging::init_logging;
+
+    // First call
+    let result1 = init_logging("info", false);
+    assert!(result1.is_ok());
+
+    // Second call should also succeed (no-op due to Once)
+    let result2 = init_logging("debug", true);
+    assert!(result2.is_ok());
+
+    // Third call
+    let result3 = init_logging("warn", false);
+    assert!(result3.is_ok());
+}
+
+/// Test that various tracing macros work after initialization
+#[test]
+fn test_tracing_macro_levels() {
+    use ahma_mcp::utils::logging::init_test_logging;
+    init_test_logging();
+
+    // Test all log levels
+    tracing::error!("Error level test");
+    tracing::warn!("Warn level test");
+    tracing::info!("Info level test");
+    tracing::debug!("Debug level test");
+    tracing::trace!("Trace level test");
+
+    // Test with fields
+    tracing::info!(operation = "test", status = "success", "Structured log");
+
+    // Test spans
+    let _span = tracing::info_span!("test_span", test_id = 123);
+    let _guard = _span.enter();
+    tracing::info!("Inside span");
+}
+
+/// Test tracing with async context
+#[tokio::test]
+async fn test_tracing_async() {
+    use ahma_mcp::utils::logging::init_test_logging;
+    init_test_logging();
+
+    // Create an async span
+    async {
+        tracing::info!("Inside async context");
+    }
+    .await;
+
+    // Test instrument macro pattern (common in async code)
+    async fn instrumented_fn() {
+        tracing::debug!("In instrumented function");
+    }
+
+    instrumented_fn().await;
 }
 
 // ============= Environment Variable Tests =============

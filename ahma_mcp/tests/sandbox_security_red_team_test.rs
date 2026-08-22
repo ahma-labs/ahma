@@ -845,6 +845,10 @@ async fn red_team_command_read_escape_blocked_linux_custom() {
     use std::io::Write;
 
     init_test_logging();
+    // Kernel-level read blocking is exactly what this test asserts; without
+    // Landlock the spawned child runs with application-level checks only and
+    // the out-of-scope read genuinely succeeds.
+    skip_if_landlock_unavailable!();
     let temp_dir = TempDir::new().unwrap();
     let outside_dir = TempDir::new().unwrap();
     let outside_file = outside_dir.path().join("secret.txt");
@@ -874,33 +878,14 @@ async fn red_team_command_read_escape_blocked_linux_custom() {
 
     let result = client.call_tool(params).await;
 
+    // A rejected call (Err) is a block; a returned result must indicate
+    // failure whether the server reported it as JSON or plain text.
     if let Ok(tools_res) = result {
-        for content in tools_res.content {
-            if let Some(text) = content.as_text() {
-                let res_json: serde_json::Value = serde_json::from_str(&text.text).unwrap();
-                let exit_code = res_json
-                    .get("exit_code")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let stderr = res_json
-                    .get("stderr")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let stdout = res_json
-                    .get("stdout")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                // Should fail with exit code != 0 or Permission denied
-                assert!(
-                    exit_code != 0 || stderr.contains("Permission denied"),
-                    "SECURITY: Should not be able to read file outside sandbox on Linux. Exit: {}, Stderr: {}, Stdout: {}",
-                    exit_code,
-                    stderr,
-                    stdout
-                );
-            }
-        }
+        assert!(
+            blocked_shell_result_indicates_failure(&tools_res),
+            "SECURITY: Should not be able to read file outside sandbox on Linux. Result: {}",
+            result_text(&tools_res)
+        );
     }
 
     client.cancel().await.unwrap();

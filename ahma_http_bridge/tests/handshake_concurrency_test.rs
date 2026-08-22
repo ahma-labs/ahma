@@ -13,170 +13,37 @@
 mod common;
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
-use common::{McpTestClient, SandboxTestEnv, ServerGuard};
+use common::{
+    McpTestClient, ToolCallResult, encode_file_uri, spawn_server_guard_with_deferred_sandbox,
+    write_pwd_tool_config,
+};
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use tempfile::TempDir;
 use tokio::time::sleep;
 
-#[cfg(target_os = "macos")]
-fn should_skip_in_nested_sandbox() -> bool {
-    matches!(
-        ahma_mcp::sandbox::test_sandbox_exec_available(),
-        Err(ahma_mcp::sandbox::SandboxError::NestedSandboxDetected)
-    )
-}
-
-#[cfg(not(target_os = "macos"))]
-fn should_skip_in_nested_sandbox() -> bool {
-    false
-}
-
-// =============================================================================
-// Test Infrastructure (Duplicated from sandbox_roots_handshake_test.rs)
-// =============================================================================
-
-fn find_available_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("Failed to bind to any port")
-        .local_addr()
-        .expect("Failed to get local address")
-        .port()
-}
-
-fn get_ahma_mcp_binary() -> PathBuf {
-    ahma_mcp::test_utils::cli::build_binary_cached("ahma_bin", "ahma")
-}
-
-async fn start_deferred_sandbox_server(
-    port: u16,
-    tools_dir: &std::path::Path,
-) -> std::process::Child {
-    let binary = get_ahma_mcp_binary();
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("Failed to get workspace dir")
-        .to_path_buf();
-
-    let mut cmd = Command::new(&binary);
-    cmd.args([
-        "--sync",
-        "--tools-dir",
-        &*tools_dir.to_string_lossy(),
-        "--defer-sandbox",
-        "--log-to-stderr",
-        "serve",
-        "http",
-        "--port",
-        &port.to_string(),
-    ])
-    .current_dir(&workspace);
-
-    SandboxTestEnv::configure(&mut cmd);
-    SandboxTestEnv::apply_nested_sandbox_override(&mut cmd);
-
-    let child = cmd
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("Failed to start HTTP bridge");
-
-    let client = common::make_h2_client();
-    let health_url = format!("http://127.0.0.1:{}/health", port);
-    let timeout = TestTimeouts::get(TimeoutCategory::HealthCheck);
-    let poll_interval = TestTimeouts::poll_interval();
-    let start = std::time::Instant::now();
-
-    while start.elapsed() < timeout {
-        sleep(poll_interval).await;
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return child;
-        }
-    }
-
-    let mut child = child;
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!("HTTP bridge failed to start within timeout");
-}
-
-fn build_mcp_post(
-    client: &Client,
-    base_url: &str,
-    session_id: Option<&str>,
-) -> reqwest::RequestBuilder {
-    let url = format!("{}/mcp", base_url);
-    let mut req = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .timeout(TestTimeouts::get(TimeoutCategory::HttpRequest));
-    if let Some(id) = session_id {
-        req = req.header("Mcp-Session-Id", id);
-    }
-    req
-}
-
-async fn send_mcp_request(
-    client: &Client,
-    base_url: &str,
-    request: &Value,
-    session_id: Option<&str>,
-) -> Result<(Value, Option<String>), String> {
-    let response = build_mcp_post(client, base_url, session_id)
-        .json(request)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {:?}", e))?;
-
-    let status = response.status();
-    let new_session_id = response
-        .headers()
-        .get("mcp-session-id")
-        .or_else(|| response.headers().get("Mcp-Session-Id"))
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("HTTP {}: {}", status, text));
-    }
-
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    Ok((body, new_session_id))
-}
-
-async fn send_mcp_request_raw(
-    client: &Client,
-    base_url: &str,
-    request: &Value,
-    session_id: Option<&str>,
-) -> Result<(u16, Value), String> {
-    let response = build_mcp_post(client, base_url, session_id)
-        .json(request)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {:?}", e))?;
-
-    let status = response.status().as_u16();
-    let text = response.text().await.unwrap_or_default();
-    let body = if text.trim().is_empty() {
-        json!({})
-    } else {
-        serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }))
-    };
-
-    Ok((status, body))
+/// Assert that a tool call was rejected by the sandbox handshake gate:
+/// HTTP 409 with JSON-RPC error code -32001.
+fn assert_sandbox_gated(result: &ToolCallResult, context: &str) {
+    assert!(
+        !result.success,
+        "{}: tool call must be rejected while the handshake is pending",
+        context
+    );
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("409"),
+        "{}: expected HTTP 409 during handshake; got error {:?}",
+        context,
+        result.error
+    );
+    assert!(
+        error.contains("-32001"),
+        "{}: expected JSON-RPC code -32001 during handshake; got error {:?}",
+        context,
+        result.error
+    );
 }
 
 // =============================================================================
@@ -187,33 +54,14 @@ async fn send_mcp_request_raw(
 /// This ensures that no operations can bypass the sandbox check by racing the handshake.
 #[tokio::test]
 async fn test_tool_call_before_roots_handshake() {
-    if should_skip_in_nested_sandbox() {
-        eprintln!("Skipping strict sandbox handshake test in nested sandbox environment");
-        return;
-    }
-
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let tools_dir = temp_dir.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-
-    let port = find_available_port();
-    let _server = ServerGuard::new(start_deferred_sandbox_server(port, &tools_dir).await, port);
-    let base_url = format!("http://127.0.0.1:{}", port);
-    let client = common::make_h2_client();
-    let mut mcp_client = McpTestClient::with_url(&base_url);
+    let server = spawn_server_guard_with_deferred_sandbox(&tools_dir)
+        .await
+        .expect("Failed to start deferred-sandbox server");
+    let mut mcp_client = McpTestClient::with_url(&server.base_url());
 
     // 1. Send only the initialize request (not initialized notification yet).
     //    This establishes the session without triggering roots/list.
@@ -221,39 +69,14 @@ async fn test_tool_call_before_roots_handshake() {
         .initialize_only("test-client")
         .await
         .expect("Initialize failed");
-    let session_id = mcp_client.session_id().expect("No session ID").to_string();
 
     // 2. Try to call a tool before the handshake is complete (no initialized sent yet).
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {"subcommand": "default"}
-        }
-    });
+    let result = mcp_client
+        .call_tool("pwd", json!({"subcommand": "default"}))
+        .await;
 
-    let (status, body) = send_mcp_request_raw(&client, &base_url, &tool_call, Some(&session_id))
-        .await
-        .expect("Pre-handshake tools/call request failed");
-
-    // 3. Verify strict gating behavior
-    assert_eq!(
-        status, 409,
-        "Expected HTTP 409 during handshake; got status {} body {:?}",
-        status, body
-    );
-    let code = body
-        .get("error")
-        .and_then(|e| e.get("code"))
-        .and_then(|c| c.as_i64())
-        .unwrap_or_default();
-    assert_eq!(
-        code, -32001,
-        "Expected JSON-RPC code -32001 during handshake; got body {:?}",
-        body
-    );
+    // 3. Verify strict gating behavior.
+    assert_sandbox_gated(&result, "pre-handshake tools/call");
 
     // 4. Complete the handshake: open SSE first, then send initialized.
     //    This is the correct protocol order — the SSE listener must be open
@@ -264,7 +87,7 @@ async fn test_tool_call_before_roots_handshake() {
         .await
         .expect("Roots handshake failed");
 
-    // 6. Verify tool call now works
+    // 5. Verify tool call now works
     let result = mcp_client
         .call_tool(
             "pwd",
@@ -304,8 +127,8 @@ fn parse_roots_list_id(text: &str) -> Option<Value> {
 }
 
 /// SSE task for `test_slow_client_handshake`: opens the SSE stream, waits for the server's
-/// `roots/list` request, simulates a slow client by delaying 2 s, sends the roots response,
-/// then waits for `notifications/sandbox/configured` before returning.
+/// `roots/list` request, simulates a slow client with a short delay, sends the roots
+/// response, then waits for `notifications/sandbox/configured` before returning.
 async fn run_slow_roots_sse_task(
     client: Client,
     base_url: String,
@@ -337,8 +160,10 @@ async fn run_slow_roots_sse_task(
 
     let id = request_id.expect("Did not receive roots/list request");
 
-    // SIMULATE DELAY (e.g. user prompt)
-    sleep(TestTimeouts::scale_secs(2)).await;
+    // SIMULATE a slow client (e.g. a user prompt). The delay only needs to be
+    // long enough for the main task to observe the pending-handshake gate; the
+    // property under test is that the server *waits* rather than timing out.
+    sleep(TestTimeouts::scale_millis(250)).await;
 
     // Send the roots response.
     let roots_json = vec![json!({"uri": root_uri, "name": "root"})];
@@ -347,7 +172,15 @@ async fn run_slow_roots_sse_task(
         "id": id,
         "result": {"roots": roots_json}
     });
-    let _ = send_mcp_request(&client, &base_url, &response, Some(&session_id)).await;
+    let _ = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Mcp-Session-Id", session_id.clone())
+        .json(&response)
+        .timeout(TestTimeouts::get(TimeoutCategory::HttpRequest))
+        .send()
+        .await;
 
     // Wait for notifications/sandbox/configured so the sandbox is truly Active
     // before the task returns.  Without this, the retry tool call races with
@@ -368,31 +201,14 @@ async fn run_slow_roots_sse_task(
 /// The server should wait for the roots response before allowing tool calls.
 #[tokio::test]
 async fn test_slow_client_handshake() {
-    if should_skip_in_nested_sandbox() {
-        eprintln!("Skipping strict sandbox handshake test in nested sandbox environment");
-        return;
-    }
-
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let tools_dir = temp_dir.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-
-    let port = find_available_port();
-    let _server = ServerGuard::new(start_deferred_sandbox_server(port, &tools_dir).await, port);
-    let base_url = format!("http://127.0.0.1:{}", port);
+    let server = spawn_server_guard_with_deferred_sandbox(&tools_dir)
+        .await
+        .expect("Failed to start deferred-sandbox server");
+    let base_url = server.base_url();
     let client = common::make_h2_client();
     let mut mcp_client = McpTestClient::with_url(&base_url);
 
@@ -403,7 +219,7 @@ async fn test_slow_client_handshake() {
     let session_id = mcp_client.session_id().expect("No session ID").to_string();
 
     // Start SSE connection but DELAY sending the roots response.
-    let root_uri = common::encode_file_uri(temp_dir.path());
+    let root_uri = encode_file_uri(temp_dir.path());
     let sse_task = tokio::spawn(run_slow_roots_sse_task(
         client.clone(),
         base_url.clone(),
@@ -413,60 +229,29 @@ async fn test_slow_client_handshake() {
 
     // Try to call tool during the delay - should fail with strict gating.
     sleep(TestTimeouts::short_delay()).await;
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {"subcommand": "default"}
-        }
-    });
-
-    let (status, body) = send_mcp_request_raw(&client, &base_url, &tool_call, Some(&session_id))
-        .await
-        .expect("tools/call during slow handshake request failed");
-    assert_eq!(
-        status, 409,
-        "Expected HTTP 409 while handshake is pending; got status {} body {:?}",
-        status, body
-    );
-    let code = body
-        .get("error")
-        .and_then(|e| e.get("code"))
-        .and_then(|c| c.as_i64())
-        .unwrap_or_default();
-    assert_eq!(
-        code, -32001,
-        "Expected JSON-RPC code -32001 while handshake pending; got body {:?}",
-        body
-    );
+    let result = mcp_client
+        .call_tool("pwd", json!({"subcommand": "default"}))
+        .await;
+    assert_sandbox_gated(&result, "tools/call during slow handshake");
 
     // Wait for handshake to complete (includes sandbox/configured).
     sse_task.await.expect("SSE task failed");
 
     // Now it should work.
-    let tool_call_retry = json!({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
+    let result = mcp_client
+        .call_tool(
+            "pwd",
+            json!({
                 "subcommand": "default",
                 "working_directory": temp_dir.path().to_string_lossy()
-            }
-        }
-    });
-
-    let (response, _) = send_mcp_request(&client, &base_url, &tool_call_retry, Some(&session_id))
-        .await
-        .expect("Tool call retry failed");
+            }),
+        )
+        .await;
 
     assert!(
-        response.get("error").is_none(),
+        result.success,
         "Tool call should succeed after slow handshake: {:?}",
-        response
+        result.error
     );
 }
 
@@ -482,49 +267,21 @@ async fn test_slow_client_handshake() {
 /// without scheduler starvation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rapid_connect_disconnect() {
-    if should_skip_in_nested_sandbox() {
-        eprintln!("Skipping strict sandbox handshake test in nested sandbox environment");
-        return;
-    }
-
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let tools_dir = temp_dir.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-
-    let port = find_available_port();
-    let _server = ServerGuard::new(start_deferred_sandbox_server(port, &tools_dir).await, port);
-    let base_url = format!("http://127.0.0.1:{}", port);
+    let server = spawn_server_guard_with_deferred_sandbox(&tools_dir)
+        .await
+        .expect("Failed to start deferred-sandbox server");
+    let base_url = server.base_url();
 
     // Attempt 1: Connect, Initialize, then Abandon.
     // The client is scoped to this block so its HTTP/2 connection is dropped
     // (and the abandoned session's load is released) before Attempt 2 starts.
     {
-        let client = common::make_h2_client();
-        let init_request = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"roots": {}},
-                "clientInfo": {"name": "abandoning-client", "version": "1.0.0"}
-            }
-        });
-
-        let _ = send_mcp_request(&client, &base_url, &init_request, None).await;
+        let mut abandoning_client = McpTestClient::with_url(&base_url);
+        let _ = abandoning_client.initialize_only("abandoning-client").await;
         // client dropped here — HTTP/2 connection released, abandoned session unloaded
     }
 

@@ -8,30 +8,14 @@ use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 use ahma_mcp::schema_validation::MtdfValidator;
 use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
 use ahma_mcp::utils::logging::init_test_logging;
-use rmcp::handler::server::ServerHandler;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 
-#[test]
-fn test_guidance_config_deserialization() {
-    init_test_logging();
-    let guidance_json = json!({
-        "guidance_blocks": {
-            "async_behavior": "**IMPORTANT:** This tool operates asynchronously...",
-            "sync_behavior": "This tool runs synchronously and returns results immediately."
-        },
-        "templates": {
-            "async_full": "**IMPORTANT:** This tool operates asynchronously..."
-        }
-    });
-
-    let config: GuidanceConfig = serde_json::from_value(guidance_json).unwrap();
-    assert!(config.guidance_blocks.contains_key("async_behavior"));
-    assert!(config.guidance_blocks.contains_key("sync_behavior"));
-}
+// NOTE: guidance-config deserialization (blocks + templates + legacy section)
+// is covered at least as strongly by `basic.rs::test_guidance_config_deserialization`.
 
 #[test]
 fn test_mtdf_validator_creation() {
@@ -199,18 +183,8 @@ fn test_tool_hints_creation() {
     assert_eq!(hints.test, Some("Test hint".to_string()));
 }
 
-#[tokio::test]
-async fn test_service_creation_and_basic_functionality() {
-    init_test_logging();
-    let (service, _temp) = ahma_mcp::test_utils::build_test_service()
-        .await
-        .expect("Failed to create test service");
-
-    // Test get_info
-    let info = service.get_info();
-    assert_eq!(info.protocol_version, rmcp::model::ProtocolVersion::LATEST);
-    assert!(info.capabilities.tools.is_some());
-}
+// NOTE: the former `test_service_creation_and_basic_functionality` was an exact
+// duplicate of `basic_coverage.rs::test_get_info_returns_complete_server_info`.
 
 #[tokio::test]
 async fn test_service_with_configs() {
@@ -459,30 +433,9 @@ async fn test_service_with_tool_configs() {
     };
     configs.insert("cargo".to_string(), tool_config);
 
-    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
-    let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
-    let shell_config = ShellPoolConfig::default();
-    let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-
-    let _temp = tempdir().unwrap();
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![_temp.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
-    let adapter =
-        Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
-    let configs = Arc::new(configs);
-    let guidance = Arc::new(None);
-
-    let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
+    let (service, _temp) = ahma_mcp::test_utils::build_test_service_with_configs(configs)
         .await
-        .unwrap();
+        .expect("Failed to create test service with configs");
 
     assert!(service.configs.read().unwrap().contains_key("cargo"));
     let cargo_config = service

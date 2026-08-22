@@ -276,12 +276,14 @@ async fn run_high_volume_concurrent_requests(num_requests: usize, transport: Tra
 
 /// Concurrent tool calls using `Accept: application/json`.
 #[tokio::test]
+#[ignore = "stress — run via --run-ignored all"]
 async fn test_concurrent_tool_calls_json() {
     run_concurrent_tool_calls(TransportMode::Json).await;
 }
 
 /// Concurrent tool calls using `Accept: text/event-stream`.
 #[tokio::test]
+#[ignore = "stress — run via --run-ignored all"]
 async fn test_concurrent_tool_calls_sse() {
     run_concurrent_tool_calls(TransportMode::Sse).await;
 }
@@ -298,6 +300,7 @@ async fn test_concurrent_tool_calls_sse() {
 /// Budget math (Windows CI, `--profile ci`, `threads-required = 2`):
 ///   3 concurrent PS spawns × ~30 s each ≈ 90 s wall time — well inside 180 s.
 #[tokio::test]
+#[ignore = "stress — run via --run-ignored all"]
 async fn test_high_volume_concurrent_requests_json() {
     let num_requests: usize = if cfg!(target_os = "windows") && is_low_core_or_ci() {
         // 2-CPU CI: PowerShell AppContainer overhead makes high fan-out cause
@@ -317,6 +320,7 @@ async fn test_high_volume_concurrent_requests_json() {
 ///
 /// See `test_high_volume_concurrent_requests_json` for Windows CI budget math.
 #[tokio::test]
+#[ignore = "stress — run via --run-ignored all"]
 async fn test_high_volume_concurrent_requests_sse() {
     let num_requests: usize = if cfg!(target_os = "windows") && is_low_core_or_ci() {
         // 2-CPU CI: PowerShell AppContainer overhead makes high fan-out cause

@@ -52,9 +52,15 @@ async fn test_handshake_state_machine_transitions() {
 }
 
 #[tokio::test]
+#[ignore = "stress — run via --run-ignored all"]
 async fn test_handshake_state_machine_race_condition_stress() {
     let config = SessionManagerConfig {
-        server_command: "sh".to_string(), // Use sh to ignore extra args
+        // The race under test is between mark_sse_connected and
+        // mark_mcp_initialized, but delivering roots/list_changed needs the
+        // child's channel still open — an instant no-op command exits before
+        // the send and fails it with "channel closed". Keep a child alive for
+        // the duration of each iteration.
+        server_command: "sh".to_string(),
         server_args: vec!["-c".to_string(), "sleep 10".to_string()],
         default_scope: Some(std::path::PathBuf::from(".")),
         handshake_timeout_secs: 5,
