@@ -228,7 +228,16 @@ async fn test_slow_client_handshake() {
     ));
 
     // Try to call tool during the delay - should fail with strict gating.
-    sleep(TestTimeouts::short_delay()).await;
+    //
+    // This must be reliably shorter than `run_slow_roots_sse_task`'s own delay
+    // (`scale_millis(250)`) on every platform, or the handshake may already be
+    // complete by the time we attempt the call. `TestTimeouts::short_delay()`
+    // is tuned independently per platform (100ms non-Windows, a flat 3s on
+    // Windows) and isn't guaranteed to stay below that — on Windows 3s > the
+    // SSE task's scaled 1s delay, so the race was lost every time. Deriving
+    // both delays from `scale_millis` keeps their ratio fixed under the same
+    // multiplier regardless of platform.
+    sleep(TestTimeouts::scale_millis(50)).await;
     let result = mcp_client
         .call_tool("pwd", json!({"subcommand": "default"}))
         .await;
