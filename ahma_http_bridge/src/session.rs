@@ -757,7 +757,8 @@ fn parse_configured_scopes(value: &Value) -> Vec<PathBuf> {
 ///
 /// Drives the `SandboxStateMachine` forward based on `notifications/sandbox/*` methods.
 ///
-/// The subprocess's `notifications/sandbox/configured` is authoritative: it is
+/// The subprocess's `notifications/sandbox/configured` is authoritative — the
+/// sole input that opens the `tools/call` gate (SPEC RB.2): it is
 /// only emitted after the subprocess has applied and enforced its scopes, so the
 /// bridge advances to `Active` from *any* non-terminal state. Requiring the
 /// bridge to reach `Configuring` first was racy — if `configured` arrived before
@@ -1270,7 +1271,9 @@ impl SessionManager {
     /// `--defer-sandbox` and configures its own sandbox after roots are received.
     ///
     /// This method only records the scopes for bridge-side enforcement (e.g. rejecting
-    /// roots changes after lock) and for debugging.
+    /// roots changes after lock) and for debugging. It *stages* `Configuring` — it never
+    /// transitions the session to `Active`: only the subprocess's
+    /// `notifications/sandbox/configured` opens the `tools/call` gate (SPEC RB.2).
     ///
     /// Returns `true` if the sandbox was newly locked by this call.
     /// Returns an error if no valid lock source is available.

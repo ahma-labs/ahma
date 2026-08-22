@@ -58,7 +58,8 @@ fn json_rpc_error_value(id: Value, code: i32, message: &str) -> Value {
     })
 }
 
-/// Build the recoverable "request timed out" response for a forwarded request.
+/// Build the recoverable "request timed out" response for a forwarded request
+/// (SPEC RB.1.2 — identical semantics on both transports).
 ///
 /// Returned with **HTTP 200** (not 500) and the original request `id` so the
 /// rmcp client correlates it to the pending request and surfaces it as that
@@ -67,7 +68,15 @@ fn json_rpc_error_value(id: Value, code: i32, message: &str) -> Value {
 /// `proxy_client` treats as fatal and tears the whole MCP session down. The
 /// operation itself keeps running in the subprocess; the caller can await again
 /// or wait for the completion notification.
-fn request_timeout_response(payload: &Value) -> Response {
+///
+/// In SSE mode the same JSON-RPC error body is delivered as a single SSE event,
+/// matching how the response itself would have been encoded.
+fn request_timeout_response(
+    session_manager: &SessionManager,
+    session_id: &str,
+    payload: &Value,
+    mode: ResponseMode,
+) -> Response {
     let id = payload_id(payload);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -80,7 +89,16 @@ fn request_timeout_response(payload: &Value) -> Response {
                         notification."
         }
     });
-    json_response_with_status(StatusCode::OK, body)
+    match mode {
+        ResponseMode::Json => json_response_with_status(StatusCode::OK, body),
+        ResponseMode::Sse => {
+            let (event_id, json_str) = session_manager
+                .get_session(session_id)
+                .map(|session| session_sse_event(&session, &body))
+                .unwrap_or_else(|| (1, serialize_sse_data(&body)));
+            sse_single_event_response_with_id(event_id, json_str)
+        }
+    }
 }
 
 /// Attach MCP session header when available.
@@ -281,12 +299,49 @@ async fn handle_routed_sampling_request(
     }
 }
 
-/// Handles requests in session isolation mode.
-#[tracing::instrument(skip_all, fields(method, session_id))]
+/// How the response to a `POST /mcp` request is encoded on the wire.
+///
+/// SPEC RB.1: the JSON and SSE transports share ONE request pipeline
+/// (validate → gate → dispatch → encode); this enum is the *only* thing that
+/// may differ between them. Gate order and error/timeout semantics are
+/// identical by construction because they live in the shared code paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseMode {
+    /// `Accept: application/json` — a single JSON body.
+    Json,
+    /// `Accept: text/event-stream` — an SSE stream (or `202 Accepted` for
+    /// notifications, per MCP Streamable HTTP spec §3.2.1).
+    Sse,
+}
+
+/// Handles requests in session isolation mode (JSON transport).
 pub async fn handle_session_isolated_request(
     session_manager: Arc<SessionManager>,
     headers: HeaderMap,
     payload: Value,
+) -> Response {
+    handle_post_request(session_manager, headers, payload, ResponseMode::Json).await
+}
+
+/// Handles requests in session isolation mode (SSE transport).
+pub async fn handle_session_isolated_request_sse(
+    session_manager: Arc<SessionManager>,
+    headers: HeaderMap,
+    payload: Value,
+) -> Response {
+    handle_post_request(session_manager, headers, payload, ResponseMode::Sse).await
+}
+
+/// The single shared `POST /mcp` pipeline (SPEC RB.1).
+///
+/// Routing, session validation, gating and dispatch are identical for both
+/// transports; `mode` only selects how the final response is encoded.
+#[tracing::instrument(skip_all, fields(method, session_id, mode = ?mode))]
+async fn handle_post_request(
+    session_manager: Arc<SessionManager>,
+    headers: HeaderMap,
+    payload: Value,
+    mode: ResponseMode,
 ) -> Response {
     let session_id = session_id_from_headers(&headers).map(String::from);
     let method = payload.get("method").and_then(|m| m.as_str());
@@ -306,15 +361,26 @@ pub async fn handle_session_isolated_request(
                 )
                 .await;
         }
-        return handle_initialize(&session_manager, &payload).await;
+        return handle_initialize(&session_manager, &payload, mode).await;
     }
     if let Some(session_id) = session_id {
         if method == Some("sampling/createMessage") {
-            return handle_routed_sampling_request(&session_manager, &session_id, payload, false)
-                .await;
-        }
-        return handle_existing_session_request(&session_manager, &session_id, method, &payload)
+            return handle_routed_sampling_request(
+                &session_manager,
+                &session_id,
+                payload,
+                mode == ResponseMode::Sse,
+            )
             .await;
+        }
+        return handle_existing_session_request(
+            &session_manager,
+            &session_id,
+            method,
+            &payload,
+            mode,
+        )
+        .await;
     }
 
     debug!(
@@ -382,8 +448,15 @@ async fn register_session_details(
 }
 
 /// Handles initialization requests by creating a new session.
+///
+/// Shared by both transports (SPEC RB.1); `mode` only selects the encoding of
+/// the successful response.
 #[tracing::instrument(skip_all, fields(session_id))]
-async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Value) -> Response {
+async fn handle_initialize(
+    session_manager: &Arc<SessionManager>,
+    payload: &Value,
+    mode: ResponseMode,
+) -> Response {
     debug!("Processing initialize request (no session ID)");
 
     if let Some(err_response) = validate_initialize_payload(payload) {
@@ -407,7 +480,15 @@ async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Valu
         )
         .await
     {
-        Ok(response) => with_session_header(json_response(response), &new_session_id),
+        Ok(response) => {
+            let encoded = match mode {
+                ResponseMode::Json => json_response(response),
+                ResponseMode::Sse => {
+                    build_initialize_sse_response(session_manager, &new_session_id, &response)
+                }
+            };
+            with_session_header(encoded, &new_session_id)
+        }
         Err(e) => {
             handle_initialize_error(session_manager, &new_session_id, payload_id(payload), e).await
         }
@@ -480,62 +561,39 @@ async fn handle_roots_changed_request(
     }
 }
 
-/// Handles requests for an existing session.
+/// Handles requests for an existing session: the shared gate, then the shared
+/// mode-aware dispatch (SPEC RB.1).
 async fn handle_existing_session_request(
     session_manager: &SessionManager,
     session_id: &str,
     method: Option<&str>,
     payload: &Value,
+    mode: ResponseMode,
 ) -> Response {
-    // Every error below answers *this* request, so it carries this id.
-    let request_id = payload_id(payload);
-
-    if let Some(response) = check_session_exists(session_manager, session_id, request_id.clone()) {
-        return response;
-    }
-
-    if method == Some("notifications/roots/list_changed")
-        && let Some(response) =
-            handle_roots_changed_request(session_manager, session_id, request_id.clone()).await
-    {
-        return response;
-    }
-
-    if method == Some("tools/call")
-        && let Some(response) = check_sandbox_lock(session_manager, session_id, request_id.clone())
-    {
-        return response;
-    }
-
     let is_initialized_notification = method == Some(INITIALIZED_METHOD);
     if is_initialized_notification {
         debug!(session_id = %session_id, "Received notifications/initialized");
     }
 
-    let is_client_response = is_client_response(method, payload);
-
-    if let Some(response) = check_initialization_required(
+    if let Some(response) = gate_session_request(
         session_manager,
         session_id,
         method,
-        request_id,
+        payload,
         is_initialized_notification,
-        is_client_response,
     )
     .await
     {
         return response;
     }
 
-    if is_client_response {
-        return handle_client_response(session_manager, session_id, payload).await;
-    }
     forward_request(
         session_manager,
         session_id,
         method,
         payload,
         is_initialized_notification,
+        mode,
     )
     .await
 }
@@ -602,7 +660,9 @@ fn get_conflict_message(requires_client_roots: bool) -> &'static str {
 ///
 /// `request_id` is echoed into every error body so the caller can correlate the
 /// refusal with its `tools/call`. HTTP statuses are unaffected — the sandbox
-/// gate's observable contract (409 + JSON-RPC -32001) is a SPEC hard invariant.
+/// gate's observable contract (409 + JSON-RPC -32001) is a SPEC hard invariant
+/// (RB.1.1), and it opens only on the subprocess's authoritative
+/// `notifications/sandbox/configured` (RB.2).
 fn check_sandbox_lock(
     session_manager: &SessionManager,
     session_id: &str,
@@ -950,14 +1010,42 @@ async fn mark_session_initialized(
     }
 }
 
-/// Forwards a request to the session manager.
+/// Forwards a request to the session manager and encodes the outcome.
+///
+/// Shared by both transports (SPEC RB.1): the timeout budget, the post-forward
+/// side effects (roots lock, initialized flag) and the error/timeout semantics
+/// are identical; only the encoding of each outcome differs by `mode`:
+///
+/// * JSON: every outcome is a JSON body (requests and notifications alike).
+/// * SSE, request (has `id`): an SSE stream interleaving already-queued
+///   broadcast events with the response event.
+/// * SSE, notification (no `id`): HTTP 202 Accepted, per MCP Streamable HTTP
+///   spec §3.2.1 — returning an SSE stream here makes rmcp clients calling
+///   `expect_accepted_or_json()` reject the response with
+///   `UnexpectedServerResponse`, tearing down the proxy transport.
 async fn forward_request(
     session_manager: &SessionManager,
     session_id: &str,
     method: Option<&str>,
     payload: &Value,
     is_initialized_notification: bool,
+    mode: ResponseMode,
 ) -> Response {
+    // For SSE requests, capture the session and subscribe to its broadcast
+    // channel BEFORE sending, so events published while the subprocess handles
+    // the request are not missed.
+    let sse_subscription = if mode == ResponseMode::Sse && payload.get("id").is_some() {
+        match session_manager.get_session(session_id) {
+            Some(session) => {
+                let rx = session.subscribe();
+                Some((session, rx))
+            }
+            None => return session_not_found_response(payload_id(payload)),
+        }
+    } else {
+        None
+    };
+
     let request_timeout = if method == Some("tools/call") {
         calculate_tool_timeout(payload, session_manager.tool_call_timeout_secs())
     } else {
@@ -972,20 +1060,32 @@ async fn forward_request(
             handle_roots_list_response(session_manager, session_id, method, &response).await;
             mark_session_initialized(session_manager, session_id, is_initialized_notification)
                 .await;
-            with_session_header(json_response(response), session_id)
+            let encoded = match sse_subscription {
+                Some((session, rx)) => {
+                    Sse::new(build_interleaved_sse_stream(session, rx, response))
+                        .keep_alive(KeepAlive::default())
+                        .into_response()
+                }
+                None if mode == ResponseMode::Sse => StatusCode::ACCEPTED.into_response(),
+                None => json_response(response),
+            };
+            with_session_header(encoded, session_id)
         }
-        // A per-request timeout is recoverable: the subprocess is alive and the
-        // operation is still running, only our wait window elapsed. Return it as
-        // an HTTP 200 JSON-RPC error so the session survives (see
-        // `request_timeout_response`). A genuine transport/protocol failure still
-        // gets a fatal -32603 / HTTP 500 below.
+        // A per-request timeout is recoverable ON BOTH TRANSPORTS (SPEC
+        // RB.1.2): the subprocess is alive and the operation is still running,
+        // only our wait window elapsed. Return it as an HTTP 200 JSON-RPC error
+        // so the session survives (see `request_timeout_response`). A genuine
+        // transport/protocol failure still gets a fatal -32603 / HTTP 500 below.
         Err(BridgeError::Timeout) => {
             warn!(
                 session_id = %session_id,
                 "Forwarded request timed out; operation still running — returning \
                  recoverable timeout (session preserved)"
             );
-            with_session_header(request_timeout_response(payload), session_id)
+            with_session_header(
+                request_timeout_response(session_manager, session_id, payload, mode),
+                session_id,
+            )
         }
         Err(e) => {
             error!(session_id = %session_id, "Failed to send request: {}", e);
@@ -1103,33 +1203,68 @@ pub(crate) fn broadcast_sse_event_stream(
     })
 }
 
-/// Handles POST requests that accept `text/event-stream` (SSE) responses.
+/// Build the SSE stream for a POST request's response (SPEC RB.3).
 ///
 /// Per MCP Streamable HTTP spec, POST with `Accept: text/event-stream` returns
 /// an SSE stream containing the JSON-RPC response event plus any interleaved
-/// server notifications. For requests (with `id`), the stream forwards broadcast
-/// events and delivers the response, then closes. For notifications (no `id`),
-/// a single acknowledgment event is returned.
-/// Handles requests in session isolation mode (SSE transport).
-#[tracing::instrument(skip_all, fields(method, session_id))]
+/// server notifications. The interleave is **deterministic**: exactly the
+/// broadcast events already queued on `rx` (subscribed before the request was
+/// forwarded) are drained and emitted, followed by the response event, then the
+/// stream closes.
+///
+/// This replaces an earlier 50 ms wall-clock `take_until` window, which added
+/// 50 ms latency to *every* POST-SSE response and made the event set
+/// timing-dependent: an event racing the window's edge was sometimes included,
+/// sometimes not. Events that arrive after the response is ready are not lost —
+/// they remain in the session's replay buffer and are delivered on the live
+/// `GET /mcp` stream (or via `Last-Event-Id` replay).
 fn build_interleaved_sse_stream(
     session: Arc<crate::session::Session>,
-    rx: tokio::sync::broadcast::Receiver<(u64, String)>,
+    mut rx: tokio::sync::broadcast::Receiver<(u64, String)>,
     response: Value,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let mut events: Vec<Event> = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok((id, msg)) => {
+                debug!(session_id = %session.id, event_id = id, "POST SSE notification: {msg}");
+                events.push(sse_event(id, msg));
+            }
+            Err(TryRecvError::Lagged(n)) => {
+                session.record_lagged_events(n);
+                let total = session.total_lagged_events();
+                warn!(
+                    session_id = %session.id,
+                    lagged_count = n,
+                    total_lagged = total,
+                    "SSE receiver lagged — {} event(s) dropped (total: {})",
+                    n,
+                    total
+                );
+                events.push(Event::default().comment(format!("lagged: {} events dropped", n)));
+            }
+            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+        }
+    }
+
     let (response_id, response_json) = session_sse_event(&session, &response);
+    events.push(sse_event(response_id, response_json));
 
-    let notification_stream = broadcast_sse_event_stream(session, rx, "POST SSE notification");
-
-    let response_event =
-        stream::once(async move { Ok::<_, Infallible>(sse_event(response_id, response_json)) });
-
-    notification_stream
-        .take_until(tokio::time::sleep(Duration::from_millis(50)))
-        .chain(response_event)
+    stream::iter(events.into_iter().map(Ok::<_, Infallible>))
 }
 
-async fn check_sse_request_gating(
+/// The single request gate shared by both transports (SPEC RB.1).
+///
+/// Order: session exists → client responses (handled inline) → roots-changed
+/// no-op check → sandbox gate for `tools/call` (SPEC RB.1.1: HTTP 409 /
+/// JSON-RPC -32001 before the sandbox lock) → wait for MCP initialization.
+///
+/// Returns `Some(response)` when the request was fully answered here (either
+/// rejected by a gate or handled as a client response); `None` when the caller
+/// should forward it to the subprocess.
+async fn gate_session_request(
     session_manager: &SessionManager,
     session_id: &str,
     method: Option<&str>,
@@ -1144,9 +1279,8 @@ async fn check_sse_request_gating(
         return Some(response);
     }
 
-    // Client responses and notifications that modify state use the same JSON path
-    let is_client_response = is_client_response(method, payload);
-    if is_client_response {
+    // Client responses (result/error with an id, no method) are consumed here.
+    if is_client_response(method, payload) {
         return Some(handle_client_response(session_manager, session_id, payload).await);
     }
 
@@ -1165,7 +1299,8 @@ async fn check_sse_request_gating(
         return Some(response);
     }
 
-    // Wait for MCP initialization if needed
+    // Wait for MCP initialization if needed. Client responses returned above,
+    // so `is_client_response` is `false` here by construction.
     if let Some(response) = check_initialization_required(
         session_manager,
         session_id,
@@ -1182,82 +1317,6 @@ async fn check_sse_request_gating(
     None
 }
 
-/// Handles requests in session isolation mode (SSE transport).
-#[tracing::instrument(skip_all, fields(method, session_id))]
-pub async fn handle_session_isolated_request_sse(
-    session_manager: Arc<SessionManager>,
-    headers: HeaderMap,
-    payload: Value,
-) -> Response {
-    let session_id = session_id_from_headers(&headers).map(String::from);
-    let method = payload.get("method").and_then(|m| m.as_str());
-    let has_id = payload.get("id").is_some();
-
-    tracing::Span::current().record("method", method.unwrap_or(""));
-    tracing::Span::current().record("session_id", session_id.as_deref().unwrap_or(""));
-    debug!(method = ?method, session_id = ?session_id, has_id, "Incoming MCP POST SSE request");
-
-    // Initialize: create session, forward, return SSE with response
-    if method == Some("initialize") {
-        if let Some(ref id) = session_id
-            && session_manager.session_exists(id)
-        {
-            let _ = session_manager
-                .terminate_session(
-                    id,
-                    crate::session::SessionTerminationReason::ClientRequested,
-                )
-                .await;
-        }
-        return handle_initialize_sse(&session_manager, &payload).await;
-    }
-
-    let Some(session_id) = session_id else {
-        return missing_session_id_response(payload_id(&payload));
-    };
-
-    if method == Some("sampling/createMessage") {
-        return handle_routed_sampling_request(&session_manager, &session_id, payload, true).await;
-    }
-
-    let is_initialized_notification = method == Some(INITIALIZED_METHOD);
-
-    if let Some(response) = check_sse_request_gating(
-        &session_manager,
-        &session_id,
-        method,
-        &payload,
-        is_initialized_notification,
-    )
-    .await
-    {
-        return response;
-    }
-
-    // For notifications (no id): forward and return a single SSE ack event
-    if !has_id {
-        return forward_notification_sse(
-            &session_manager,
-            &session_id,
-            method,
-            &payload,
-            is_initialized_notification,
-        )
-        .await;
-    }
-
-    // For requests (has id): subscribe to broadcast, forward request, stream
-    // broadcast events + response event
-    forward_request_sse(
-        &session_manager,
-        &session_id,
-        method,
-        &payload,
-        is_initialized_notification,
-    )
-    .await
-}
-
 fn build_initialize_sse_response(
     session_manager: &Arc<SessionManager>,
     session_id: &str,
@@ -1268,132 +1327,6 @@ fn build_initialize_sse_response(
         .map(|session| session_sse_event(&session, response))
         .unwrap_or_else(|| (1, serialize_sse_data(response)));
     sse_single_event_response_with_id(event_id, json_str)
-}
-
-/// Handle initialize with SSE response.
-async fn handle_initialize_sse(session_manager: &Arc<SessionManager>, payload: &Value) -> Response {
-    if let Some(err_response) = validate_initialize_payload(payload) {
-        return err_response;
-    }
-
-    let new_session_id = match create_session_or_error(session_manager, payload_id(payload)).await {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-
-    register_session_details(session_manager, &new_session_id, payload).await;
-
-    match session_manager
-        .send_request(
-            &new_session_id,
-            payload,
-            Some(Duration::from_secs(session_manager.request_timeout_secs())),
-        )
-        .await
-    {
-        Ok(response) => with_session_header(
-            build_initialize_sse_response(session_manager, &new_session_id, &response),
-            &new_session_id,
-        ),
-        Err(e) => {
-            handle_initialize_error(session_manager, &new_session_id, payload_id(payload), e).await
-        }
-    }
-}
-
-/// Forward a notification (no id) and return HTTP 202 Accepted.
-///
-/// Per MCP Streamable HTTP spec §3.2.1, the server MUST respond with HTTP 202
-/// for JSON-RPC notifications (messages without an `id`).  Returning an SSE
-/// stream here causes rmcp clients that call `expect_accepted_or_json()` to
-/// reject the response with `UnexpectedServerResponse("expect accepted or json,
-/// got Sse(...)")`, which terminates the proxy transport and — when the
-/// transport is the stdio proxy's Unix-socket client — causes BrokenPipe on
-/// the next stdin write from the test driver.
-async fn forward_notification_sse(
-    session_manager: &SessionManager,
-    session_id: &str,
-    _method: Option<&str>,
-    payload: &Value,
-    is_initialized_notification: bool,
-) -> Response {
-    let request_timeout = Duration::from_secs(session_manager.request_timeout_secs());
-
-    match session_manager
-        .send_request(session_id, payload, Some(request_timeout))
-        .await
-    {
-        Ok(_response) => {
-            mark_session_initialized(session_manager, session_id, is_initialized_notification)
-                .await;
-            with_session_header(StatusCode::ACCEPTED.into_response(), session_id)
-        }
-        Err(e) => {
-            error!(session_id = %session_id, "Failed to forward notification: {}", e);
-            // A notification has no id by definition; `payload_id` yields JSON
-            // `null`, which is still emitted so the field is never absent.
-            error_response(
-                payload_id(payload),
-                -32603,
-                &format!("Failed to send request: {}", e),
-            )
-        }
-    }
-}
-
-/// Forward a request (has id) and return an SSE stream with interleaved
-/// broadcast events and the response event.
-async fn forward_request_sse(
-    session_manager: &SessionManager,
-    session_id: &str,
-    method: Option<&str>,
-    payload: &Value,
-    is_initialized_notification: bool,
-) -> Response {
-    let session = match session_manager.get_session(session_id) {
-        Some(s) => s,
-        None => return session_not_found_response(payload_id(payload)),
-    };
-
-    // Subscribe to broadcast BEFORE sending the request so we don't miss events
-    let rx = session.subscribe();
-
-    let request_timeout = if method == Some("tools/call") {
-        calculate_tool_timeout(payload, session_manager.tool_call_timeout_secs())
-    } else {
-        Duration::from_secs(session_manager.request_timeout_secs())
-    };
-
-    // Send the request to the subprocess
-    let response_result = session_manager
-        .send_request(session_id, payload, Some(request_timeout))
-        .await;
-
-    match response_result {
-        Ok(response) => {
-            handle_roots_list_response(session_manager, session_id, method, &response).await;
-            mark_session_initialized(session_manager, session_id, is_initialized_notification)
-                .await;
-
-            // Build SSE stream: broadcast events that arrived during processing + the response
-            let combined = build_interleaved_sse_stream(session, rx, response);
-
-            with_session_header(
-                Sse::new(combined)
-                    .keep_alive(KeepAlive::default())
-                    .into_response(),
-                session_id,
-            )
-        }
-        Err(e) => {
-            error!(session_id = %session_id, "Failed to send request: {}", e);
-            error_response(
-                payload_id(payload),
-                -32603,
-                &format!("Failed to send request: {}", e),
-            )
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1933,7 +1866,7 @@ mod tests {
     async fn handle_initialize_rejects_invalid_payload() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
-        let resp = handle_initialize(&mgr, &payload).await;
+        let resp = handle_initialize(&mgr, &payload, ResponseMode::Json).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32602);
     }
@@ -1942,7 +1875,7 @@ mod tests {
     async fn handle_initialize_sse_rejects_invalid_payload() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
-        let resp = handle_initialize_sse(&mgr, &payload).await;
+        let resp = handle_initialize(&mgr, &payload, ResponseMode::Sse).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32602);
     }
@@ -2201,19 +2134,31 @@ mod tests {
         }
     }
 
-    // ─── forward_notification_sse ───────────────────────────────────────
+    // ─── SSE notification dispatch ──────────────────────────────────────
 
     #[tokio::test]
-    async fn forward_notification_sse_returns_202() {
+    async fn forward_sse_notification_returns_202() {
+        // MCP Streamable HTTP §3.2.1: notifications (no id) on the SSE
+        // transport are acknowledged with HTTP 202, not an SSE stream.
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         // A notification (no id) → send_request returns immediately with null.
         let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        let resp =
-            forward_notification_sse(&mgr, &id, Some("notifications/initialized"), &payload, true)
-                .await;
+        let resp = forward_request(
+            &mgr,
+            &id,
+            Some("notifications/initialized"),
+            &payload,
+            true,
+            ResponseMode::Sse,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+        assert!(
+            mgr.get_session(&id).unwrap().is_mcp_initialized(),
+            "the initialized side effect must run on the SSE path too"
+        );
     }
 
     // ─── Additional helpers for sampling / roots tests ──────────────────
@@ -2680,8 +2625,15 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        let resp =
-            forward_request(&mgr, &id, Some("notifications/initialized"), &payload, true).await;
+        let resp = forward_request(
+            &mgr,
+            &id,
+            Some("notifications/initialized"),
+            &payload,
+            true,
+            ResponseMode::Json,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
         assert!(mgr.get_session(&id).unwrap().is_mcp_initialized());
@@ -2698,7 +2650,15 @@ mod tests {
             "method": "tools/call",
             "params": {"arguments": {"timeout_seconds": 5}}
         });
-        let resp = forward_request(&mgr, &id, Some("tools/call"), &payload, false).await;
+        let resp = forward_request(
+            &mgr,
+            &id,
+            Some("tools/call"),
+            &payload,
+            false,
+            ResponseMode::Json,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -2721,7 +2681,15 @@ mod tests {
             "method": "tools/call",
             "params": {"name": "run_terminal_command", "arguments": {"timeout_seconds": 0}}
         });
-        let resp = forward_request(&mgr, &id, Some("tools/call"), &payload, false).await;
+        let resp = forward_request(
+            &mgr,
+            &id,
+            Some("tools/call"),
+            &payload,
+            false,
+            ResponseMode::Json,
+        )
+        .await;
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -2750,8 +2718,15 @@ mod tests {
         let id = mgr.create_session().await.expect("create session");
         mgr.get_session(&id).unwrap().set_terminated(true);
         let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        let resp =
-            forward_request(&mgr, &id, Some("notifications/initialized"), &payload, true).await;
+        let resp = forward_request(
+            &mgr,
+            &id,
+            Some("notifications/initialized"),
+            &payload,
+            true,
+            ResponseMode::Json,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32603);
     }
@@ -2767,7 +2742,14 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}});
-        let resp = handle_existing_session_request(&mgr, &id, Some("tools/call"), &payload).await;
+        let resp = handle_existing_session_request(
+            &mgr,
+            &id,
+            Some("tools/call"),
+            &payload,
+            ResponseMode::Json,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32001);
@@ -2845,7 +2827,8 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "id": "abc", "result": {}});
-        let resp = handle_existing_session_request(&mgr, &id, None, &payload).await;
+        let resp =
+            handle_existing_session_request(&mgr, &id, None, &payload, ResponseMode::Json).await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
     }
 
@@ -2853,8 +2836,14 @@ mod tests {
     async fn existing_session_unknown_is_403() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        let resp =
-            handle_existing_session_request(&mgr, "missing", Some("tools/list"), &payload).await;
+        let resp = handle_existing_session_request(
+            &mgr,
+            "missing",
+            Some("tools/list"),
+            &payload,
+            ResponseMode::Json,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -2994,13 +2983,13 @@ mod tests {
         assert!(body.contains("final"), "body was: {body}");
     }
 
-    // ─── check_sse_request_gating ───────────────────────────────────────
+    // ─── gate_session_request ───────────────────────────────────────
 
     #[tokio::test]
     async fn sse_gating_returns_403_for_unknown_session() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        let resp = check_sse_request_gating(&mgr, "missing", Some("tools/list"), &payload, false)
+        let resp = gate_session_request(&mgr, "missing", Some("tools/list"), &payload, false)
             .await
             .expect("should gate");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -3011,7 +3000,7 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "id": "abc", "result": {}});
-        let resp = check_sse_request_gating(&mgr, &id, None, &payload, false)
+        let resp = gate_session_request(&mgr, &id, None, &payload, false)
             .await
             .expect("client response is handled in gating");
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
@@ -3023,7 +3012,7 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}});
-        let resp = check_sse_request_gating(&mgr, &id, Some("tools/call"), &payload, false)
+        let resp = gate_session_request(&mgr, &id, Some("tools/call"), &payload, false)
             .await
             .expect("tools/call gated");
         assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -3043,45 +3032,149 @@ mod tests {
             .unwrap();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
         assert!(
-            check_sse_request_gating(&mgr, &id, Some("ping"), &payload, false)
+            gate_session_request(&mgr, &id, Some("ping"), &payload, false)
                 .await
                 .is_none()
         );
     }
 
-    // ─── forward_request_sse ────────────────────────────────────────────
+    // ─── forward_request in SSE mode ────────────────────────────────────
+
+    /// A peer that answers every id-bearing JSON-RPC request with an empty
+    /// `result`, echoing the request id. Lets tests exercise the Ok dispatch
+    /// branch in-process without a subprocess.
+    struct EchoPeerFactory;
+    impl PeerFactory for EchoPeerFactory {
+        fn create(&self) -> BoxFuture<anyhow::Result<PeerStreams>> {
+            Box::pin(async move {
+                let (bridge_end, peer_end) = tokio::io::duplex(64 * 1024);
+                let (peer_read, mut peer_write) = tokio::io::split(peer_end);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    let mut lines = BufReader::new(peer_read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let Some(id) = v.get("id") else { continue };
+                        let mut reply =
+                            json!({"jsonrpc": "2.0", "id": id, "result": {}}).to_string();
+                        reply.push('\n');
+                        if peer_write.write_all(reply.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let (bridge_read, bridge_write) = tokio::io::split(bridge_end);
+                Ok(PeerStreams {
+                    stdin: Box::new(bridge_write),
+                    stdout: Box::new(bridge_read),
+                    stderr: None,
+                    shutdown_fn: None,
+                    exit_cause: None,
+                })
+            })
+        }
+    }
 
     #[tokio::test]
-    async fn forward_request_sse_session_not_found_is_403() {
+    async fn forward_sse_request_session_not_found_is_403() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        let resp = forward_request_sse(&mgr, "missing", Some("tools/list"), &payload, false).await;
+        let resp = forward_request(
+            &mgr,
+            "missing",
+            Some("tools/list"),
+            &payload,
+            false,
+            ResponseMode::Sse,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
-    async fn forward_request_sse_ok_returns_sse_stream() {
-        // A no-id payload returns immediately from send_request, exercising the
-        // Ok branch and the interleaved stream construction.
-        let mgr = keepalive_manager();
+    async fn forward_sse_request_ok_returns_sse_stream() {
+        // An id-bearing request the peer answers → the Ok branch encodes the
+        // response as an SSE stream (interleaved stream construction).
+        let mgr = manager_with(None, 10, 3600, Arc::new(EchoPeerFactory));
         let id = mgr.create_session().await.expect("create session");
-        let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        let resp =
-            forward_request_sse(&mgr, &id, Some("notifications/initialized"), &payload, true).await;
+        let payload = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list"});
+        let resp = forward_request(
+            &mgr,
+            &id,
+            Some("tools/list"),
+            &payload,
+            false,
+            ResponseMode::Sse,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(content_type(&resp).contains("text/event-stream"));
         assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+        let body = body_string(resp).await;
+        assert!(body.contains("\"result\""), "body was: {body}");
     }
 
     #[tokio::test]
-    async fn forward_request_sse_errors_when_session_terminated() {
+    async fn forward_sse_request_errors_when_session_terminated() {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         mgr.get_session(&id).unwrap().set_terminated(true);
         let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        let resp =
-            forward_request_sse(&mgr, &id, Some("notifications/initialized"), &payload, true).await;
+        let resp = forward_request(
+            &mgr,
+            &id,
+            Some("notifications/initialized"),
+            &payload,
+            true,
+            ResponseMode::Sse,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32603);
+    }
+
+    /// SPEC RB.1.2 dual-transport: the recoverable-timeout semantics are
+    /// identical on the SSE transport — HTTP 200 carrying the -32002 error with
+    /// the original request id, delivered as an SSE event; the session
+    /// survives. Before the pipeline unification the SSE path drifted and
+    /// returned a transport-fatal HTTP 500 / -32603 here.
+    #[tokio::test]
+    async fn forward_sse_request_timeout_is_recoverable_http_200_not_500() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        // id present (a real request) and timeout_seconds: 0 → the bridge wait
+        // window elapses immediately while the peer never answers.
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {"name": "run_terminal_command", "arguments": {"timeout_seconds": 0}}
+        });
+        let resp = forward_request(
+            &mgr,
+            &id,
+            Some("tools/call"),
+            &payload,
+            false,
+            ResponseMode::Sse,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a per-request timeout must not be a transport-fatal non-2xx"
+        );
+        assert!(content_type(&resp).contains("text/event-stream"));
+        assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+        let body = body_string(resp).await;
+        assert!(body.contains("-32002"), "body was: {body}");
+        assert!(body.contains("42"), "must echo the request id: {body}");
+        assert!(
+            body.contains("still running"),
+            "message should explain the op continues: {body}"
+        );
+        assert!(mgr.session_exists(&id), "the session must survive");
     }
 }
