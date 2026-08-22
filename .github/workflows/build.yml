@@ -87,11 +87,21 @@ permissions:
 #
 # The one real cost is that ghac issues roughly one HTTP request per compilation unit against a
 # rate-limited service, where the tarball restore it replaces moved ~2.2 GiB in about 9s. That
-# shows up as HTTP 429s on write, and is why `sccache-verify` gates on a write-error RATE rather
-# than on zero, and does not enforce that rate at cold-start write volumes at all. The full
-# reasoning, including the missing RetryLayer in sccache's GHACache::build that makes 429s fatal
-# to a write instead of retried, is in that action's script -- it is a property of the backend,
-# so it lives with the check rather than here.
+# shows up as HTTP 429s on write, and it got materially worse the moment this rollout landed: the
+# rate limit is shared by every job in a run, so six families writing concurrently contend in a
+# way the one-family spike never did. The first all-ghac main run (32599878209) lost 87% of
+# job-coverage's writes and 53% of the ubuntu leg's, while both compiled, tested and READ the
+# cache normally (77.73% Rust hit rate on the leg that lost half its writes).
+#
+# So a lost write is a normal operating condition here, not a fault: it costs one future miss,
+# never correctness, and it self-heals as the namespaces warm and contention falls. `sccache-verify`
+# reports the rate and fails only on TOTAL loss, which cannot be contention. What to watch is the
+# trend -- if the loss rate does not fall over the next several main runs, the caches are not
+# converging and the fix is to reduce concurrent write pressure (stagger the families, or make the
+# non-critical ones read-only), not to loosen the check further. The full reasoning, including the
+# missing RetryLayer in sccache's GHACache::build that makes 429s fatal to a write instead of
+# retried, is in that action's script -- it is a property of the backend, so it lives with the
+# check rather than here.
 #
 # Every ghac failure mode is silent, which is why `sccache-verify` asserts rather than prints.
 # Read against sccache v0.17.0 + opendal 0.55.0:

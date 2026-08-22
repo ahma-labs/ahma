@@ -9,18 +9,12 @@ inputs:
   label:
     description: Job family name, used to title the step-summary section.
     required: true
-  write-error-ceiling-pct:
+  write-loss-warn-pct:
     description: >-
-      Maximum share of attempted writes that may be lost on a WARM run before the job fails.
-      See the long comment in the script for why this is a rate and not zero.
+      Share of attempted writes that may be lost before this is called out as a warning. Never
+      fatal on its own -- see the long comment in the script for what is fatal instead, and why.
     required: false
-    default: "5"
-  warm-run-writes:
-    description: >-
-      A run attempting more than this many writes is treated as a cold start, where the ceiling is
-      reported but not enforced. See the script for why write volume is the right discriminator.
-    required: false
-    default: "500"
+    default: "25"
   report-quota:
     description: >-
       Set to `true` on exactly one job to append repo-wide Actions cache usage to the summary.
@@ -39,8 +33,7 @@ runs:
       shell: bash
       env:
         LABEL: ${{ inputs.label }}
-        CEILING_PCT: ${{ inputs.write-error-ceiling-pct }}
-        WARM_RUN_WRITES: ${{ inputs.warm-run-writes }}
+        WARN_PCT: ${{ inputs.write-loss-warn-pct }}
         REPORT_QUOTA: ${{ inputs.report-quota }}
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
@@ -84,11 +77,8 @@ runs:
         misses=$(jq -r '.stats.cache_misses.counts.Rust // 0' "$stats")
         rate=$(awk -v h="$hits" -v m="$misses" 'BEGIN { t=h+m; printf "%.2f", (t ? 100*h/t : 0) }')
 
-        if [ "$misses_all" -gt "$WARM_RUN_WRITES" ]; then
-          run_kind="cold start"
-        else
-          run_kind="warm"
-        fi
+        loss_pct=$(awk -v e="$write_errors" -v m="$misses_all" \
+                       'BEGIN { printf "%.1f", (m ? 100*e/m : 0) }')
 
         if [ "${SCCACHE_GHA_RW_MODE:-}" = "READ_ONLY" ]; then
           mode="read-only"
@@ -107,11 +97,10 @@ runs:
           echo "|---|---|"
           echo "| backend | \`$loc\` |"
           echo "| mode | $mode |"
-          echo "| run kind | $run_kind ($misses_all attempted writes) |"
           echo "| compile requests | $requests |"
           echo "| Rust hit rate | ${rate}% ($hits hit / $misses miss) |"
-          echo "| cache writes | $writes |"
-          echo "| cache write errors | $write_errors of $misses_all$write_note |"
+          echo "| cache writes | $writes of $misses_all attempted |"
+          echo "| cache write errors | $write_errors (${loss_pct}% of attempts)$write_note |"
           echo "| cache read/general errors | $errors |"
           echo "| cache timeouts | $timeouts |"
         } >> "$GITHUB_STEP_SUMMARY"
@@ -156,14 +145,21 @@ runs:
         # sccache does not retry them even though opendal marks the error `(temporary)` and
         # GitHub sends `retry-after: 1`, because GHACache::build (src/cache/gha.rs) layers only
         # HttpClientLayer and LoggingLayer onto the operator, with no RetryLayer. The loss rate is
-        # therefore a function of how much a run WRITES, not of whether the backend is healthy:
-        # the same configuration lost 15.4% of 1967 writes and 1.1% of 353.
+        # therefore about pressure on the endpoint, not about whether the backend is healthy.
         #
-        # That is why write volume, not the error count, decides whether the ceiling binds. A cold
-        # start -- a lockfile bump, a new job family's first run, a toolchain change -- legitimately
-        # writes at a scale where 429s are expected, and a lost write costs one future miss, not
-        # correctness. Failing there would redden main for doing exactly what it is supposed to do.
-        # On a warm run the same rate means something is wrong, so there it is fatal.
+        # An earlier version of this check gated on THIS JOB's write volume, on the theory that a
+        # high-volume run is a cold start where 429s are expected. Run 32599878209 disproved that
+        # the first time six families wrote concurrently instead of one: job-coverage lost 259 of
+        # only 298 writes (87%) and the ubuntu leg 237 of 448 (53%), both under the volume
+        # threshold and so both judged "warm" and failed -- while compiling, testing and reading
+        # the cache perfectly (77.73% Rust hit rate on the leg that "failed"). The rate limit is
+        # shared across every job in the run, so what predicts 429s is aggregate concurrent
+        # pressure, which no single job can observe. Any per-job volume threshold is measuring the
+        # wrong variable, and a stricter one just fails more often.
+        #
+        # So the write-error rate is no longer fatal at any level. A lost write costs one future
+        # miss, never correctness, and it self-heals as namespaces warm and contention falls. What
+        # IS fatal is total loss, which cannot be contention -- see below.
         if [ "${SCCACHE_GHA_RW_MODE:-}" = "READ_ONLY" ]; then
           # In READ_ONLY every put returns "Cannot write to read-only storage", and sccache counts
           # each one in cache_write_errors. So a read-only tier reports write_errors == misses_all
@@ -176,15 +172,16 @@ runs:
           else
             echo "read-only tier: all $misses_all attempted writes refused, as configured. Rust hit rate ${rate}%."
           fi
+        elif [ "$misses_all" -gt 0 ] && [ "$write_errors" -eq "$misses_all" ]; then
+          # TOTAL loss is the only write-error state that is unambiguously broken. It is the
+          # signature of a backend that degraded to read-only without being asked to: nothing
+          # this job compiled was stored, so the job did work no future run can reuse.
+          echo "::error::sccache lost ALL $misses_all cache writes. On a read-write tier that means nothing was stored -- the backend is refusing every put, not merely throttling. Set SCCACHE_ERROR_LOG and SCCACHE_LOG=warn,sccache::server=debug to get the status codes."
+          failed=1
+        elif [ "$((write_errors * 100))" -gt "$((misses_all * WARN_PCT))" ]; then
+          echo "::warning::sccache lost $write_errors of $misses_all cache writes (${loss_pct}%), above the ${WARN_PCT}% notice level. Expected to be ghac 429s under cross-job contention; watch whether it falls as the namespaces warm."
         elif [ "$write_errors" -ne 0 ]; then
-          if [ "$misses_all" -gt "$WARM_RUN_WRITES" ]; then
-            echo "::warning::sccache lost $write_errors of $misses_all cache writes on a cold-start run. Expected to be ghac 429s; the ${CEILING_PCT}% ceiling is not enforced at this write volume. The next warm run is the one that matters."
-          elif [ "$((write_errors * 100))" -gt "$((misses_all * CEILING_PCT))" ]; then
-            echo "::error::sccache lost $write_errors of $misses_all cache writes on a warm run, over the ${CEILING_PCT}% ceiling. Set SCCACHE_ERROR_LOG and SCCACHE_LOG=warn,sccache::server=debug to get the status codes."
-            failed=1
-          else
-            echo "::warning::sccache lost $write_errors of $misses_all cache writes, within the ${CEILING_PCT}% ceiling. Expected to be ghac 429s; see the caching note in build.yml."
-          fi
+          echo "::notice::sccache lost $write_errors of $misses_all cache writes (${loss_pct}%). Expected to be ghac 429s; see the caching note in build.yml."
         fi
 
         # The residual silent case: read-only reached some other way, so nothing is ever written
