@@ -94,14 +94,46 @@ permissions:
 # cache normally (77.73% Rust hit rate on the leg that lost half its writes).
 #
 # So a lost write is a normal operating condition here, not a fault: it costs one future miss,
-# never correctness, and it self-heals as the namespaces warm and contention falls. `sccache-verify`
-# reports the rate and fails only on TOTAL loss, which cannot be contention. What to watch is the
-# trend -- if the loss rate does not fall over the next several main runs, the caches are not
-# converging and the fix is to reduce concurrent write pressure (stagger the families, or make the
-# non-critical ones read-only), not to loosen the check further. The full reasoning, including the
-# missing RetryLayer in sccache's GHACache::build that makes 429s fatal to a write instead of
-# retried, is in that action's script -- it is a property of the backend, so it lives with the
-# check rather than here.
+# never correctness. `sccache-verify` reports the rate and fails only on TOTAL loss, which cannot
+# be contention. The mechanism -- the missing RetryLayer in sccache's GHACache::build, which makes
+# a 429 fatal to a write instead of retried -- is documented in that action's script, because it
+# is a property of the backend. It is filed upstream as mozilla/sccache#2821.
+#
+# WHAT A LOST WRITE COSTS. "It self-heals as the namespaces warm" was the original reading here
+# and it was wrong. Runs 32599878209 and 32601341637 are consecutive main runs, so run 2's hit
+# rate is a direct read-out of what run 1 managed to store -- and for every family that started
+# cold, the two are the same number:
+#
+#     family              run 1 stored / attempted     run 2 Rust hit rate
+#     windows-latest            337 / 610  (55%)             41.29%
+#     macos-latest              369 / 905  (41%)             39.20%
+#     ubuntu-24.04-arm          274 / 895  (31%)             34.37%
+#     Android                   128 / 819  (16%)             23.92%
+#
+# (job-coverage and the ubuntu-latest leg sit far above their store rate -- 88.75% and 89.86% --
+# because they were already warm from the solo-coverage era. They are not counterexamples; they
+# are what a warm namespace looks like.)
+#
+# Two things follow. First, the write-loss rate is a CEILING on the hit rate, not a delay before
+# reaching one: an object that was never stored is not slow to read, it is absent until something
+# recompiles it and wins the rate limit. Second, that ceiling is per family and cannot be shared.
+# sccache keys on the whole compiler invocation, so an Android target triple, an aarch64 target
+# and a `cargo check` metadata emit have no keys in common with anything else in the run. A job's
+# writes serve only its own future self.
+#
+# Which is what makes the read-only tiers a trade rather than a sacrifice. Android
+# (job-android-nextest, below) and CodeQL (codeql.yml) are the two largest writers that gate
+# nothing: neither is on the release path, and neither writes an object any other job can read.
+# Both are set `mode: read-only`, taking their write bursts out of the shared rate limit
+# entirely. Be exact about the price, because it is theirs alone and it is not small: both now
+# compile cold every run, and their hit rates decay to ~0 as their existing objects fall out of
+# GitHub's 7-day-unused eviction. `sccache-verify` will not flag that -- it judges a READ_ONLY
+# tier on hit rate alone, and a read-only tier legitimately reports 100% refused writes. The
+# numbers that justify the trade are the four matrix legs' hit rates in the table above.
+#
+# If those do not climb, the remaining lever is staggering the families so their write bursts stop
+# overlapping (`needs:` between job groups), at a real wall-clock cost -- not loosening the check
+# further, and not making a leg that gates the release read-only.
 #
 # Every ghac failure mode is silent, which is why `sccache-verify` asserts rather than prints.
 # Read against sccache v0.17.0 + opendal 0.55.0:
@@ -510,9 +542,16 @@ jobs:
           rustflags: ""
           cache: false
 
+      # READ-ONLY on purpose -- see "WHAT A LOST WRITE COSTS" in the caching note at the top.
+      # Android is the single largest writer in the run and the only consumer of what it writes:
+      # cargo-ndk builds Android target triples no other job compiles, so these objects can never
+      # serve another job, while their write burst contends for the run-wide ghac rate limit that
+      # every job shares. It trades its own hit rate for write headroom on the legs that gate the
+      # release. Android is not on that path.
       - name: Set up sccache (ghac)
         uses: ./.github/actions/sccache-ghac
         with:
+          mode: read-only
           extra-tools: nextest,cargo-ndk
 
       - name: Add Cargo Bin to PATH

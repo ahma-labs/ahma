@@ -70,10 +70,6 @@ jobs:
           restore-keys: |
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
-      # ghac replaces the sccache tarball here too. This workflow runs on BOTH push and
-      # pull_request, and `mode` is rule 1 above expressed as configuration rather than as the
-      # convention of gating a save step on `push`: a PR run reads main's objects and writes
-      # nothing, because sccache itself refuses to write in READ_ONLY.
       - name: Setup Rust Toolchain
         if: matrix.language == 'rust'
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -82,11 +78,23 @@ jobs:
           rustflags: ""
           cache: false
 
+      # ghac replaces the sccache tarball here too, and this tier is READ-ONLY on every trigger.
+      #
+      # On `pull_request` that is rule 1 above expressed as configuration rather than as the
+      # convention of gating a save step on `push`: a PR run reads main's objects and writes
+      # nothing, because sccache itself refuses to write in READ_ONLY.
+      #
+      # On `push` it is the write-contention decision recorded in build.yml's caching note. This
+      # workflow runs concurrently with build.yml's matrix on the same push, against a ghac rate
+      # limit that is shared by every job in the run. `cargo check` emits metadata, so its objects
+      # share no key with anything the matrix builds -- these writes cost the matrix headroom and
+      # can never serve it. CodeQL gives up its own hit rate (it now compiles cold every run) so
+      # the legs that gate the release do not.
       - name: Set up sccache (ghac)
         if: matrix.language == 'rust'
         uses: ./.github/actions/sccache-ghac
         with:
-          mode: ${{ github.event_name == 'push' && 'read-write' || 'read-only' }}
+          mode: read-only
 
       - name: Configure deterministic tooling env
         if: matrix.language == 'rust'

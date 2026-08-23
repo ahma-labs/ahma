@@ -144,8 +144,9 @@ runs:
         # 429, {"code":"resource_exhausted","msg":"rate limit exceeded"}, arriving in a burst.
         # sccache does not retry them even though opendal marks the error `(temporary)` and
         # GitHub sends `retry-after: 1`, because GHACache::build (src/cache/gha.rs) layers only
-        # HttpClientLayer and LoggingLayer onto the operator, with no RetryLayer. The loss rate is
-        # therefore about pressure on the endpoint, not about whether the backend is healthy.
+        # HttpClientLayer and LoggingLayer onto the operator, with no RetryLayer -- filed upstream
+        # as mozilla/sccache#2821. The loss rate is therefore about pressure on the endpoint, not
+        # about whether the backend is healthy.
         #
         # An earlier version of this check gated on THIS JOB's write volume, on the theory that a
         # high-volume run is a cold start where 429s are expected. Run 32599878209 disproved that
@@ -179,7 +180,7 @@ runs:
           echo "::error::sccache lost ALL $misses_all cache writes. On a read-write tier that means nothing was stored -- the backend is refusing every put, not merely throttling. Set SCCACHE_ERROR_LOG and SCCACHE_LOG=warn,sccache::server=debug to get the status codes."
           failed=1
         elif [ "$((write_errors * 100))" -gt "$((misses_all * WARN_PCT))" ]; then
-          echo "::warning::sccache lost $write_errors of $misses_all cache writes (${loss_pct}%), above the ${WARN_PCT}% notice level. Expected to be ghac 429s under cross-job contention; watch whether it falls as the namespaces warm."
+          echo "::warning::sccache lost $write_errors of $misses_all cache writes (${loss_pct}%), above the ${WARN_PCT}% notice level. Expected to be ghac 429s under cross-job contention. This is a ceiling on next run's hit rate, not a delay -- see WHAT A LOST WRITE COSTS in build.yml."
         elif [ "$write_errors" -ne 0 ]; then
           echo "::notice::sccache lost $write_errors of $misses_all cache writes (${loss_pct}%). Expected to be ghac 429s; see the caching note in build.yml."
         fi
