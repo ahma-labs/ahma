@@ -2220,6 +2220,16 @@ To maintain high performance and avoid cache bloat, the following strategies are
 - **R13.2.5**: Each CI job **must** use `SCCACHE_GHA_CACHE_FROM` with comma-separated fallbacks to enable cache sharing between related jobs on the same platform.
 - **R13.2.6**: Debug-profile jobs on the same platform (clippy, nextest, android, coverage) **should** include each other in their `CACHE_FROM` lists since they produce compatible cache entries.
 - **R13.2.7**: Release-profile jobs **must not** include debug caches in `CACHE_FROM` since `--release` flag produces incompatible cache entries.
+- **R13.2.8** (**TEMPORARY**): CI currently builds `sccache` from an experimental fork
+  (`paulirotta/sccache@gha-retry-layer`, pinned to a commit in `.github/actions/sccache-ghac`)
+  instead of installing the released `sccache@0.17`, to validate a candidate `RetryLayer` fix for
+  the ghac backend's dropped-write bug, tracked upstream as
+  [mozilla/sccache#2821](https://github.com/mozilla/sccache/issues/2821) (`GHACache::build`
+  installs no retry layer, so a ghac HTTP 429 kills a cache write outright instead of being
+  retried). This is validation, not policy, and CI **must** revert to installing the stable
+  release build once #2821 lands in a released sccache version, or by **January 2027** if it has
+  not landed by then — whichever comes first. See the "EXPERIMENTAL FORK OF SCCACHE" note in
+  `build.yml` for the full revert checklist.
 
 ### 13.3 Cargo Registry Caching
 - **R13.3.1**: The Cargo registry (`~/.cargo/registry`) and git database (`~/.cargo/git`) **must** be cached using `actions/cache` or specialized actions, adhering to the Daily Rotation rule.

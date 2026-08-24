@@ -135,6 +135,29 @@ permissions:
 # overlapping (`needs:` between job groups), at a real wall-clock cost -- not loosening the check
 # further, and not making a leg that gates the release read-only.
 #
+# EXPERIMENTAL FORK OF SCCACHE (temporary -- revert condition below)
+#
+# The missing RetryLayer described above is not fixed in any released sccache. Right now
+# `.github/actions/sccache-ghac` builds sccache FROM SOURCE against
+# `paulirotta/sccache@gha-retry-layer` (pinned to a commit; see that action for the exact rev)
+# instead of installing the stable `sccache@0.17` release, so this repo's CI runs a candidate
+# patch that has not been reviewed or released upstream and is not what anyone else building this
+# workspace locally gets. `job-android-nextest` is also temporarily back to `read-write` (see that
+# job) so the comparison run has the same six concurrent writers as the baseline runs this
+# experiment is judged against, and `job-cargo-nextest` / `job-android-nextest` force a cold ghac
+# namespace via `SCCACHE_GHA_VERSION` so the tuned retry budget is actually exercised instead of
+# reading a namespace the last experiment run already warmed.
+#
+# REVERT WHEN: mozilla/sccache#2821 lands in a released sccache version (merged upstream and
+# picked up in a tagged release we can pin to), OR by January 2027 if it has not landed by then --
+# whichever comes first. Do not still be building from this fork after that. Revert steps are
+# marked at each TEMPORARY/EXPERIMENT-tagged step in `.github/actions/sccache-ghac/action.yml` and
+# `.github/actions/sccache-verify/action.yml`; summarized: reinstall `sccache@0.17` via
+# taiki-e/install-action, delete the source-build/cache/log-capture steps in sccache-ghac, delete
+# the `SCCACHE_GHA_VERSION` env blocks on job-cargo-nextest and job-android-nextest, put
+# job-android-nextest back to `mode: read-only`, and drop the retry-count reporting added to
+# sccache-verify's summary and its log-upload step. Tracked in SPEC.md R13.2.8.
+#
 # Every ghac failure mode is silent, which is why `sccache-verify` asserts rather than prints.
 # Read against sccache v0.17.0 + opendal 0.55.0:
 #   - Rate limited: documented as "the build will continue, but the storage might not be
@@ -215,6 +238,22 @@ env:
 jobs:
   job-cargo-nextest:
     name: Cargo Nextest (${{ matrix.os }})
+    # TEMPORARY (mozilla/sccache#2821 validation; revert by the condition in the EXPERIMENTAL
+    # FORK OF SCCACHE note above -- upstream landing or January 2027): SCCACHE_GHA_VERSION forces
+    # every job in
+    # this matrix into a namespace ghac has never seen, so the run starts fully cold instead
+    # of reading the ~99%-stored objects the tuned retry layer already wrote on the last two
+    # runs. That prior success is why the write contention this fix targets stopped
+    # reproducing: run 2 saw only mild, first-retry 429s because most objects were already
+    # cached. A cold matrix reproduces the ~4000-write burst from the baseline runs
+    # (32599878209, 32601341637) and actually exercises the later retry attempts (4-6) the
+    # tuning added. Job-scoped, not workflow-level: SCCACHE_GHA_VERSION's mere presence
+    # enables ghac regardless of SCCACHE_GHA_ENABLED (src/config.rs), and the release jobs
+    # rely on staying off ghac entirely (rule 2 above) -- setting this workflow-wide would
+    # flip them onto a cache they are not meant to touch. Delete this env block (and the
+    # matching one on job-android-nextest) once the cold-run comparison is done.
+    env:
+      SCCACHE_GHA_VERSION: cold-20260823
     defaults:
       run:
         shell: bash
@@ -491,6 +530,11 @@ jobs:
     runs-on: macos-latest
     env:
       TERM: xterm-256color
+      # TEMPORARY (mozilla/sccache#2821 validation; same revert condition as the EXPERIMENTAL
+      # FORK OF SCCACHE note at the top of this file): see the matching comment on
+      # job-cargo-nextest -- same cold-namespace reasoning, must be the same value so this
+      # job still shares objects with the rest of the matrix.
+      SCCACHE_GHA_VERSION: cold-20260823
     steps:
       - uses: actions/checkout@v6
         with:
@@ -542,16 +586,20 @@ jobs:
           rustflags: ""
           cache: false
 
-      # READ-ONLY on purpose -- see "WHAT A LOST WRITE COSTS" in the caching note at the top.
-      # Android is the single largest writer in the run and the only consumer of what it writes:
-      # cargo-ndk builds Android target triples no other job compiles, so these objects can never
-      # serve another job, while their write burst contends for the run-wide ghac rate limit that
-      # every job shares. It trades its own hit rate for write headroom on the legs that gate the
-      # release. Android is not on that path.
+      # READ-WRITE for the duration of this experiment, reverting the read-only trade made in
+      # #593. That trade exists only because a ghac 429 kills a write outright -- which is the
+      # thing mozilla/sccache#2821 fixes and this branch is testing. Leaving Android read-only
+      # here would remove the largest writer from the run and so remove most of the write
+      # contention the patched binary is supposed to survive; the test would pass for the wrong
+      # reason. Six families writing concurrently is also what runs 32599878209 and 32601341637
+      # looked like, and those are the numbers this run has to be compared against.
+      #
+      # Revert to `mode: read-only` if the fix does not hold up, and in any case no later than the
+      # revert condition in the "EXPERIMENTAL FORK OF SCCACHE" note above (upstream landing, or
+      # January 2027).
       - name: Set up sccache (ghac)
         uses: ./.github/actions/sccache-ghac
         with:
-          mode: read-only
           extra-tools: nextest,cargo-ndk
 
       - name: Add Cargo Bin to PATH

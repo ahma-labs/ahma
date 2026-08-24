@@ -80,6 +80,24 @@ runs:
         loss_pct=$(awk -v e="$write_errors" -v m="$misses_all" \
                        'BEGIN { printf "%.1f", (m ? 100*e/m : 0) }')
 
+        # EXPERIMENT (mozilla/sccache#2821, temporary along with the source build in
+        # sccache-ghac; revert when the fix lands upstream or by January 2027, whichever comes
+        # first -- see build.yml's "EXPERIMENTAL FORK OF SCCACHE" note and SPEC.md R13.2.8).
+        # Zero write errors is not by itself evidence that the RetryLayer works --
+        # a run that was never throttled reports the same zero. What distinguishes them is
+        # whether any request had to be retried at all. opendal's RetryLayer logs one
+        # "will retry ..." line per attempt at warn under target `opendal::layers::retry`, so
+        # these two counts say "N requests were throttled, and here is what survived it".
+        # A run with retries > 0 and write_errors ~ 0 is the fix working; retries == 0 means the
+        # run proves nothing and needs more concurrent write pressure to be a real test.
+        retries=0
+        rate_limited=0
+        log="${SCCACHE_ERROR_LOG:-}"
+        if [ -n "$log" ] && [ -f "$log" ]; then
+          retries=$(grep -c "will retry" "$log" || true)
+          rate_limited=$(grep -c "RateLimited" "$log" || true)
+        fi
+
         if [ "${SCCACHE_GHA_RW_MODE:-}" = "READ_ONLY" ]; then
           mode="read-only"
           # Say so next to the number, because "116 of 116" is alarming until you know that a
@@ -103,6 +121,7 @@ runs:
           echo "| cache write errors | $write_errors (${loss_pct}% of attempts)$write_note |"
           echo "| cache read/general errors | $errors |"
           echo "| cache timeouts | $timeouts |"
+          echo "| ghac requests retried | $retries (log mentions RateLimited $rate_limited times) |"
         } >> "$GITHUB_STEP_SUMMARY"
 
         if [ "$REPORT_QUOTA" = "true" ] && [ -n "${GH_TOKEN:-}" ]; then
@@ -202,3 +221,17 @@ runs:
         fi
 
         exit "$failed"
+
+    # EXPERIMENT (mozilla/sccache#2821, temporary -- revert when the fix lands upstream or by
+    # January 2027, whichever comes first). The retry counts above are a summary; the log
+    # itself is the evidence that goes upstream -- it carries the status codes, the operation each
+    # retry belonged to, and the backoff actually waited. Uploaded on failure too, because a run
+    # that went wrong is exactly when it is worth reading.
+    - name: Upload the sccache server log
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: sccache-log-${{ inputs.label }}
+        path: ${{ env.SCCACHE_ERROR_LOG }}
+        if-no-files-found: ignore
+        retention-days: 14

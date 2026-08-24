@@ -103,7 +103,86 @@ runs:
     #     pin for all of them is what keeps fast-tier.yml reading what build.yml wrote.
     # `@0.17` tracks the 0.17.x series; taiki-e/install-action has no ">=" syntax, so a series pin
     # is how a floor is expressed.
-    - name: Install sccache${{ inputs.extra-tools && ' and workflow tools' || '' }}
+    #
+    # TEMPORARY, and the whole point of this branch: `sccache` is NOT in this list right now. It
+    # is built from source below instead, from the patched fork under test. Reverting this
+    # experiment means putting `sccache@0.17` back at the front of `tool:` and deleting the two
+    # steps that follow. Everything else in this action is unchanged.
+    #
+    # Revert when: mozilla/sccache#2821 lands in a released sccache version, or by January 2027 if
+    # it has not landed by then, whichever comes first -- see the "EXPERIMENTAL FORK OF SCCACHE"
+    # note in build.yml (and SPEC.md R13.2.8) for the full revert checklist.
+    - name: Install workflow tools
+      if: inputs.extra-tools != ''
       uses: taiki-e/install-action@v2
       with:
-        tool: sccache@0.17${{ inputs.extra-tools && format(',{0}', inputs.extra-tools) || '' }}
+        tool: ${{ inputs.extra-tools }}
+
+    # sccache under test: paulirotta/sccache@gha-retry-layer, the candidate fix for
+    # mozilla/sccache#2821 (GHACache::build installs no RetryLayer, so a ghac 429 kills a write
+    # outright). Pinned to a commit, not a branch: the cache key below is only honest if the ref
+    # cannot move under it, and two jobs on different sccache builds would not share a ghac object
+    # anyway -- the same reason the release pin above is single-sourced.
+    #
+    # `--no-default-features --features gha` builds the one backend this repo uses. It is also
+    # what keeps the build tractable on a runner: the default feature set pulls every backend
+    # (s3, gcs, azure, redis, memcached, webdav, oss, cos, dist-client) and their transitive
+    # crypto stacks. The version string is unchanged at 0.17.0, so this binary reads and writes
+    # the SAME `sccache-v0.17.0` ghac namespace as the released one -- deliberately, because the
+    # comparison against the runs in mozilla/sccache#2821 only holds if the objects are the same.
+    - name: Cache the patched sccache build
+      id: sccache-patched-cache
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/bin/sccache
+          ~/.cargo/bin/sccache.exe
+        key: sccache-patched-${{ runner.os }}-${{ runner.arch }}-ba87de4abb66f08d7d3466962230239aafc8629e
+
+    - name: Build the patched sccache
+      if: steps.sccache-patched-cache.outputs.cache-hit != 'true'
+      shell: bash
+      # RUSTC_WRAPPER is `sccache` for every job in these workflows, so building sccache with it
+      # set would ask cargo to invoke a binary that does not exist yet. Unset for this step only.
+      env:
+        RUSTC_WRAPPER: ""
+      run: |
+        set -euo pipefail
+        cargo install \
+          --git https://github.com/paulirotta/sccache \
+          --rev ba87de4abb66f08d7d3466962230239aafc8629e \
+          --locked \
+          --no-default-features --features gha \
+          sccache
+
+    # Every ghac failure mode is silent, so the retry layer has to be observable or this branch
+    # proves nothing: a run with zero write errors because the fix worked looks exactly like a run
+    # with zero write errors because nothing was ever throttled. opendal's RetryLayer logs each
+    # retry at warn under target `opendal::layers::retry`, and sccache routes its server log to
+    # SCCACHE_ERROR_LOG. `sccache-verify` counts those lines and reports them next to the write
+    # errors, which is what turns "no errors" into "N requests were throttled and N recovered".
+    - name: Capture the sccache server log
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "SCCACHE_ERROR_LOG=${RUNNER_TEMP}/sccache-server.log" >> "$GITHUB_ENV"
+        echo "SCCACHE_LOG=warn" >> "$GITHUB_ENV"
+
+    # TEMPORARY, same experiment as the two steps above: the server's own startup probe
+    # (`.sccache_check`, src/cache/cache.rs) is written through the same retried operator as
+    # everything else, and the client only waits sccache's fixed SERVER_STARTUP_TIMEOUT (10s,
+    # src/commands.rs) for that probe to resolve before giving up on the whole server. Cold run
+    # 32631888674 hit exactly that: two of five jobs died with "Timed out waiting for server
+    # startup" because the tuned retry budget (up to ~31s across 6 attempts, more with jitter) can
+    # outlast the client's patience when the probe itself lands in a long rate-limit window --
+    # which is the likeliest moment for that to happen, since every job's server starts and probes
+    # at once. Not overridable by a plain env var (SCCACHE_CONF picks a config *file*, config.rs),
+    # so this generates one. Revert together with the two steps above -- delete this step too.
+    # Same revert condition as those steps: mozilla/sccache#2821 landing, or January 2027.
+    - name: Raise the sccache server-startup timeout
+      shell: bash
+      run: |
+        set -euo pipefail
+        conf="${RUNNER_TEMP}/sccache-config.toml"
+        echo "server_startup_timeout_ms = 90000" > "$conf"
+        echo "SCCACHE_CONF=${conf}" >> "$GITHUB_ENV"
