@@ -499,20 +499,14 @@ pub fn try_emit_exec_parse_error_fallback() -> bool {
 /// parse-error fallback, where clap's own parsing is unavailable. Returns `None`
 /// for a missing/unknown value so the caller can apply its default.
 fn sniff_platform(args: &[String]) -> Option<HookPlatform> {
-    let mut iter = args.iter();
-    while let Some(a) = iter.next() {
-        let val = if let Some(v) = a.strip_prefix("--platform=") {
-            Some(v.to_string())
-        } else if a == "--platform" {
-            iter.next().cloned()
-        } else {
-            None
-        };
-        if let Some(v) = val {
-            return parse_platform_cli_name(&v);
-        }
-    }
-    None
+    args.iter()
+        .find_map(|a| a.strip_prefix("--platform="))
+        .or_else(|| {
+            args.windows(2)
+                .find(|w| w[0] == "--platform")
+                .map(|w| w[1].as_str())
+        })
+        .and_then(parse_platform_cli_name)
 }
 
 /// Resolve a `--platform` CLI value (e.g. `"cursor"`) to its [`HookPlatform`],
@@ -554,13 +548,21 @@ fn run_revoke_consent() -> Result<()> {
 /// `ahma hooks doctor` — report why ahma may be unable to sandbox, plus consent state.
 fn run_doctor() -> Result<()> {
     println!("ahma hooks doctor\n");
+    print_doctor_binary_info();
+    print_doctor_kernel_sandbox_info();
+    print_doctor_consent_info();
+    Ok(())
+}
 
+fn print_doctor_binary_info() {
     match std::env::current_exe() {
         Ok(p) => println!("  binary       : {}", p.display()),
         Err(e) => println!("  binary       : <unknown> ({e})"),
     }
     println!("  version      : {}", env!("CARGO_PKG_VERSION"));
+}
 
+fn print_doctor_kernel_sandbox_info() {
     match crate::sandbox::test_sandbox_exec_available() {
         Ok(()) => println!("  kernel sandbox: AVAILABLE"),
         Err(e) => println!(
@@ -570,7 +572,9 @@ fn run_doctor() -> Result<()> {
              Landlock-capable kernel (5.13+)."
         ),
     }
+}
 
+fn print_doctor_consent_info() {
     let store = HookConsentStore::current();
     if store.is_consented() {
         println!(
@@ -583,7 +587,6 @@ fn run_doctor() -> Result<()> {
     } else {
         println!("  consent      : none (fall-open fails closed; commands are blocked)");
     }
-    Ok(())
 }
 
 pub fn run_install(args: HooksInstallArgs) -> Result<()> {
@@ -729,26 +732,11 @@ fn is_ahma_hooks_active_with_configs(active_mcps: &[PathBuf]) -> bool {
 /// so the user can see whether installed hooks actually *do* anything — installed
 /// but inactive hooks pass every command through UNSANDBOXED.
 fn describe_activation(active_mcps: &[PathBuf]) -> (bool, String) {
-    if let Some(Some(forced)) = HOOKS_MODE_OVERRIDE.get() {
-        return (
-            *forced,
-            format!("--hooks {} flag", if *forced { "on" } else { "off" }),
-        );
+    if let Some(res) = check_explicit_hooks_override() {
+        return res;
     }
-    if let Ok(val) = std::env::var("AHMA_HOOKS")
-        && let Some(forced) = parse_on_off_flag(&val)
-    {
-        return (
-            forced,
-            format!("AHMA_HOOKS={}", if forced { "on" } else { "off" }),
-        );
-    }
-    if std::env::var("AHMA_DISABLE_HOOKS")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
-        return (false, "AHMA_DISABLE_HOOKS=1".to_string());
+    if let Some(res) = check_env_hooks_override() {
+        return res;
     }
     if active_mcps.is_empty() {
         (
@@ -761,6 +749,33 @@ fn describe_activation(active_mcps: &[PathBuf]) -> (bool, String) {
             "auto: ahma MCP server detected in client config".to_string(),
         )
     }
+}
+
+fn check_explicit_hooks_override() -> Option<(bool, String)> {
+    let forced = (*HOOKS_MODE_OVERRIDE.get()?)?;
+    Some((
+        forced,
+        format!("--hooks {} flag", if forced { "on" } else { "off" }),
+    ))
+}
+
+fn check_env_hooks_override() -> Option<(bool, String)> {
+    if let Ok(val) = std::env::var("AHMA_HOOKS")
+        && let Some(forced) = parse_on_off_flag(&val)
+    {
+        return Some((
+            forced,
+            format!("AHMA_HOOKS={}", if forced { "on" } else { "off" }),
+        ));
+    }
+    if std::env::var("AHMA_DISABLE_HOOKS")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return Some((false, "AHMA_DISABLE_HOOKS=1".to_string()));
+    }
+    None
 }
 
 fn detect_active_mcp_configs() -> Vec<PathBuf> {
@@ -1038,19 +1053,20 @@ fn extract_command_output(input: &Value) -> String {
     combined
 }
 
-/// Append the text found under any of [`COMMAND_OUTPUT_KEYS`] in `object` to `into`,
-/// newline-joined. Split out of [`extract_command_output`] so the two levels of the
-/// payload (top-level and nested `tool_output`) share one code path.
 fn collect_command_output_fields(object: &Map<String, Value>, into: &mut String) {
     for key in COMMAND_OUTPUT_KEYS {
-        if let Some(s) = object.get(*key).and_then(Value::as_str)
-            && !s.is_empty()
-        {
-            if !into.is_empty() {
-                into.push('\n');
-            }
-            into.push_str(s);
+        if let Some(s) = object.get(*key).and_then(Value::as_str) {
+            append_nonempty_output_chunk(into, s);
         }
+    }
+}
+
+fn append_nonempty_output_chunk(into: &mut String, s: &str) {
+    if !s.is_empty() {
+        if !into.is_empty() {
+            into.push('\n');
+        }
+        into.push_str(s);
     }
 }
 
@@ -1422,11 +1438,13 @@ fn selected_platforms(requested: &[HookPlatform]) -> Vec<HookPlatform> {
 }
 
 fn detect_project_root() -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("Failed to determine current working directory")?;
-    let cwd = dunce::canonicalize(&cwd).unwrap_or(cwd);
+    let cwd = std::env::current_dir().context("Failed to get current dir")?;
 
     for ancestor in cwd.ancestors() {
-        if ancestor.join(".git").exists() {
+        if ancestor.join(".git").exists()
+            || ancestor.join(".cursor").exists()
+            || ancestor.join(".vscode").exists()
+        {
             return Ok(ancestor.to_path_buf());
         }
     }
@@ -1443,26 +1461,15 @@ struct ExtractedToolArgs {
 
 fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
     let Some(raw_args) = input.get("tool_input").or_else(|| input.get("toolArgs")) else {
-        // Not a shell tool invocation — allow through without modification
         return Ok(None);
     };
 
-    let args_val = if let Some(s) = raw_args.as_str() {
-        serde_json::from_str(s).context("Failed to parse toolArgs JSON string")?
-    } else {
-        raw_args.clone()
-    };
-
+    let args_val = parse_raw_tool_args(raw_args)?;
     let args_obj = args_val
         .as_object()
         .ok_or_else(|| anyhow!("Tool arguments must be a JSON object"))?;
 
-    let (command, key) = if let Some(c) = args_obj.get("command").and_then(Value::as_str) {
-        (c, "command")
-    } else if let Some(c) = args_obj.get("CommandLine").and_then(Value::as_str) {
-        (c, "CommandLine")
-    } else {
-        // Tool does not invoke a shell command (e.g. editFiles, createFile) — allow through
+    let Some((command, key)) = extract_command_and_key(args_obj) else {
         return Ok(None);
     };
 
@@ -1471,6 +1478,24 @@ fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
         command: command.to_string(),
         arg_key: key.to_string(),
     }))
+}
+
+fn parse_raw_tool_args(raw_args: &Value) -> Result<Value> {
+    if let Some(s) = raw_args.as_str() {
+        serde_json::from_str(s).context("Failed to parse toolArgs JSON string")
+    } else {
+        Ok(raw_args.clone())
+    }
+}
+
+fn extract_command_and_key(args_obj: &Map<String, Value>) -> Option<(&str, &str)> {
+    if let Some(c) = args_obj.get("command").and_then(Value::as_str) {
+        Some((c, "command"))
+    } else if let Some(c) = args_obj.get("CommandLine").and_then(Value::as_str) {
+        Some((c, "CommandLine"))
+    } else {
+        None
+    }
 }
 
 /// Compute the hook decision for a given tool invocation.

@@ -125,6 +125,8 @@ impl SyncRun {
     }
 }
 
+type OutputReadTask = JoinHandle<std::io::Result<Vec<u8>>>;
+
 #[derive(Debug, Default)]
 struct BoundedLineCollector {
     lines: VecDeque<String>,
@@ -588,20 +590,7 @@ impl Adapter {
         // child instead of letting us route the kill through the shared
         // `kill_process_tree` chokepoint below, so `child` has to stay owned
         // here.
-        let stdout_pipe = child.stdout.take().expect("stdout piped");
-        let stderr_pipe = child.stderr.take().expect("stderr piped");
-        let stdout_task: JoinHandle<std::io::Result<Vec<u8>>> = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let mut stdout_pipe = stdout_pipe;
-            tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut buf).await?;
-            Ok(buf)
-        });
-        let stderr_task: JoinHandle<std::io::Result<Vec<u8>>> = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let mut stderr_pipe = stderr_pipe;
-            tokio::io::AsyncReadExt::read_to_end(&mut stderr_pipe, &mut buf).await?;
-            Ok(buf)
-        });
+        let (stdout_task, stderr_task) = Self::spawn_output_reader_tasks(&mut child);
 
         let wait_res = tokio::time::timeout(timeout, child.wait()).await;
 
@@ -704,6 +693,26 @@ impl Adapter {
             exit_code,
             result,
         }
+    }
+
+    fn spawn_output_reader_tasks(
+        child: &mut tokio::process::Child,
+    ) -> (OutputReadTask, OutputReadTask) {
+        let stdout_pipe = child.stdout.take().expect("stdout piped");
+        let stderr_pipe = child.stderr.take().expect("stderr piped");
+        let stdout_task: JoinHandle<std::io::Result<Vec<u8>>> = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut stdout_pipe = stdout_pipe;
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut buf).await?;
+            Ok(buf)
+        });
+        let stderr_task: JoinHandle<std::io::Result<Vec<u8>>> = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut stderr_pipe = stderr_pipe;
+            tokio::io::AsyncReadExt::read_to_end(&mut stderr_pipe, &mut buf).await?;
+            Ok(buf)
+        });
+        (stdout_task, stderr_task)
     }
 
     /// Synchronously executes a command with optional retry logic for transient errors.

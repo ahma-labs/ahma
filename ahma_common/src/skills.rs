@@ -1,4 +1,4 @@
-//! Agent Skills discovery and `SKILL.md` parsing (SPEC §15, R-SK8).
+//! Agent Skills discovery and `SKILL.md` parsing (SPEC §10, R-SK8).
 //!
 //! Implements the [Agent Skills open standard](https://agentskills.io/specification):
 //! a skill is a directory whose name matches the required `name` frontmatter
@@ -254,87 +254,99 @@ fn parse_yaml_subset(frontmatter: &str) -> BTreeMap<String, String> {
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        // Top-level keys start at column 0; anything indented here is a stray continuation.
-        if line.starts_with(' ') || line.starts_with('\t') {
+        if trimmed.is_empty() || trimmed.starts_with('#') || line.starts_with([' ', '\t']) {
             continue;
         }
         let Some((key, raw_value)) = line.split_once(':') else {
             continue;
         };
         let key = key.trim().to_string();
-        let mut raw_value = raw_value.trim();
-
-        // Strip trailing inline comments if not quoted.
-        if !raw_value.starts_with('"')
-            && !raw_value.starts_with('\'')
-            && let Some((val, _comment)) = raw_value.split_once(" #")
-        {
-            raw_value = val.trim();
-        }
+        let raw_value = clean_raw_value(raw_value.trim());
 
         let value = match raw_value {
             "" => {
-                // Check if next lines are indented block list items (`- item`) or nested map
-                let mut list_items = Vec::new();
-                while lines.peek().is_some_and(|l| {
-                    let t = l.trim();
-                    t.starts_with("- ")
-                        || t.starts_with(' ')
-                        || t.starts_with('\t')
-                        || t.is_empty()
-                        || t.starts_with('#')
-                }) {
-                    let next_line = lines.next().unwrap_or_default();
-                    let t = next_line.trim();
-                    if let Some(item) = t.strip_prefix("- ") {
-                        list_items.push(unquote(item.trim()).to_string());
-                    }
-                }
-                if !list_items.is_empty() {
-                    list_items.join(", ")
+                if let Some(list_val) = parse_indented_list_items(&mut lines) {
+                    list_val
                 } else {
                     continue;
                 }
             }
-            block
-                if block == ">" || block == "|" || {
-                    let mut c = block.chars();
-                    matches!(c.next(), Some('>') | Some('|'))
-                        && matches!(c.next(), Some('-') | Some('+'))
-                        && c.next().is_none()
-                } =>
-            {
-                let fold = block.starts_with('>');
-                let mut parts: Vec<String> = Vec::new();
-                while lines.peek().is_some_and(|l| {
-                    l.starts_with(' ') || l.trim().is_empty() || l.trim().starts_with('#')
-                }) {
-                    let l = lines.next().unwrap_or_default();
-                    let t = l.trim();
-                    if !t.starts_with('#') {
-                        parts.push(t.to_string());
-                    }
-                }
-                // Trim trailing blank continuation lines.
-                while parts.last().is_some_and(|p| p.is_empty()) {
-                    parts.pop();
-                }
-                if fold {
-                    parts.retain(|p| !p.is_empty());
-                    parts.join(" ")
-                } else {
-                    parts.join("\n")
-                }
-            }
+            block if is_block_scalar_indicator(block) => parse_block_scalar(block, &mut lines),
             scalar => unquote(scalar).to_string(),
         };
         fields.insert(key, value);
     }
 
     fields
+}
+
+fn clean_raw_value(raw_value: &str) -> &str {
+    if !raw_value.starts_with(['"', '\''])
+        && let Some((val, _comment)) = raw_value.split_once(" #")
+    {
+        val.trim()
+    } else {
+        raw_value
+    }
+}
+
+fn is_block_scalar_indicator(block: &str) -> bool {
+    if block == ">" || block == "|" {
+        return true;
+    }
+    let mut c = block.chars();
+    matches!(c.next(), Some('>') | Some('|'))
+        && matches!(c.next(), Some('-') | Some('+'))
+        && c.next().is_none()
+}
+
+fn parse_indented_list_items<'a, I>(lines: &mut std::iter::Peekable<I>) -> Option<String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut list_items = Vec::new();
+    while lines.peek().is_some_and(|l| {
+        let t = l.trim();
+        t.starts_with("- ") || t.starts_with([' ', '\t', '#']) || t.is_empty()
+    }) {
+        let next_line = lines.next().unwrap_or_default();
+        let t = next_line.trim();
+        if let Some(item) = t.strip_prefix("- ") {
+            list_items.push(unquote(item.trim()).to_string());
+        }
+    }
+    if !list_items.is_empty() {
+        Some(list_items.join(", "))
+    } else {
+        None
+    }
+}
+
+fn parse_block_scalar<'a, I>(block: &str, lines: &mut std::iter::Peekable<I>) -> String
+where
+    I: Iterator<Item = &'a str>,
+{
+    let fold = block.starts_with('>');
+    let mut parts: Vec<String> = Vec::new();
+    while lines
+        .peek()
+        .is_some_and(|l| l.starts_with(' ') || l.trim().is_empty() || l.trim().starts_with('#'))
+    {
+        let l = lines.next().unwrap_or_default();
+        let t = l.trim();
+        if !t.starts_with('#') {
+            parts.push(t.to_string());
+        }
+    }
+    while parts.last().is_some_and(|p| p.is_empty()) {
+        parts.pop();
+    }
+    if fold {
+        parts.retain(|p| !p.is_empty());
+        parts.join(" ")
+    } else {
+        parts.join("\n")
+    }
 }
 
 /// Strip one layer of matching single or double quotes.

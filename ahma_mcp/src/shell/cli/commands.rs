@@ -168,22 +168,30 @@ fn print_settings_plain(rows: &[SettingRow], file_path: Option<&std::path::Path>
 
     let mut section = "";
     for row in rows {
-        let (sec, key) = row.key.split_once('.').unwrap_or(("", row.key));
-        if sec != section {
-            if !section.is_empty() {
-                println!();
-            }
-            println!("[{sec}]");
-            section = sec;
-        }
-        let source = if row.value != row.default {
-            "[file]"
-        } else {
-            "[default]"
-        };
-        println!("{:<45} = {}  # {}", key, row.value, source);
+        print_settings_row(row, &mut section);
     }
 
+    print_settings_file_footer(file_path);
+}
+
+fn print_settings_row(row: &SettingRow, section: &mut &str) {
+    let (sec, key) = row.key.split_once('.').unwrap_or(("", row.key));
+    if sec != *section {
+        if !section.is_empty() {
+            println!();
+        }
+        println!("[{sec}]");
+        *section = sec;
+    }
+    let source = if row.value != row.default {
+        "[file]"
+    } else {
+        "[default]"
+    };
+    println!("{:<45} = {}  # {}", key, row.value, source);
+}
+
+fn print_settings_file_footer(file_path: Option<&std::path::Path>) {
     let Some(p) = file_path else { return };
     println!();
     if p.exists() {
@@ -732,16 +740,13 @@ fn print_permission_record(r: &ahma_common::permissions::GrantRecord) {
 /// see them. Listing them here is the whole point of making them data: a grant you
 /// cannot see is a grant you cannot evaluate, and one you cannot refuse.
 fn print_profiles(settings: &ahma_common::config::AhmaSettings) {
-    use crate::sandbox::profiles::{ProfileAccess, builtin_profiles, resolved_rules};
+    use crate::sandbox::profiles::{builtin_profiles, resolved_rules};
 
     let enabled = &settings.sandbox.profiles;
     println!("sandbox profiles (built-in toolchain carve-outs):");
     if enabled.is_empty() {
         println!("  (none — every toolchain path must be granted explicitly)");
         println!();
-        // Still owed: with every profile off, "what can a sandboxed command
-        // reach?" has an answer — usually a stark one — and it is exactly the
-        // configuration whose owner most wants it stated.
         print_network_host_summary(settings);
         return;
     }
@@ -749,19 +754,9 @@ fn print_profiles(settings: &ahma_common::config::AhmaSettings) {
     let rules = resolved_rules(enabled, settings.sandbox.package_cache_write);
     let hosts = crate::sandbox::profiles::profile_hosts(enabled);
     for profile in builtin_profiles() {
-        if !enabled.iter().any(|n| n == &profile.name) {
-            continue;
+        if enabled.iter().any(|n| n == &profile.name) {
+            print_profile_entry(profile, &rules, &hosts, settings);
         }
-        println!("  • {} — {}", profile.name, profile.description);
-        for r in rules.iter().filter(|r| r.profile == profile.name) {
-            let access = match r.access {
-                ProfileAccess::Ro => "read",
-                ProfileAccess::Rx => "read+execute",
-                ProfileAccess::Rw => "read+write",
-            };
-            println!("      {}  ({access})", r.path.display());
-        }
-        print_profile_hosts(settings, &profile.name, &hosts);
     }
     println!();
     println!("  Disable any of these with `[sandbox] profiles` in the settings file.");
@@ -773,6 +768,25 @@ fn print_profiles(settings: &ahma_common::config::AhmaSettings) {
         println!("  ⚠ {note}");
         println!();
     }
+}
+
+fn print_profile_entry(
+    profile: &crate::sandbox::profiles::SandboxProfile,
+    rules: &[crate::sandbox::profiles::ResolvedRule],
+    hosts: &[crate::sandbox::profiles::ProfileHost],
+    settings: &ahma_common::config::AhmaSettings,
+) {
+    use crate::sandbox::profiles::ProfileAccess;
+    println!("  • {} — {}", profile.name, profile.description);
+    for r in rules.iter().filter(|r| r.profile == profile.name) {
+        let access = match r.access {
+            ProfileAccess::Ro => "read",
+            ProfileAccess::Rx => "read+execute",
+            ProfileAccess::Rw => "read+write",
+        };
+        println!("      {}  ({access})", r.path.display());
+    }
+    print_profile_hosts(settings, &profile.name, hosts);
 }
 
 /// The host half of one profile's cost (SPEC R-PERM.5.2).

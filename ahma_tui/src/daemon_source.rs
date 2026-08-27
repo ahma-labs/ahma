@@ -347,34 +347,8 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
     let mut prune_counter: u8 = 0;
 
     loop {
-        // Ensure daemon is running (may spawn it).
-        if let Err(e) = ensure_daemon_running().await {
-            debug!(
-                "daemon_source: daemon unavailable ({e}); retry in {:?}",
-                backoff
-            );
-            let _ = tx
-                .send(SourceEvent::DaemonHealthChanged { healthy: false })
-                .await;
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(30));
+        let Some(stream) = connect_or_retry_daemon(&tx, &mut backoff).await else {
             continue;
-        }
-
-        let stream = match connect_to_daemon().await {
-            Ok(s) => s,
-            Err(e) => {
-                debug!(
-                    "daemon_source: connect failed ({e}); retry in {:?}",
-                    backoff
-                );
-                let _ = tx
-                    .send(SourceEvent::DaemonHealthChanged { healthy: false })
-                    .await;
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-                continue;
-            }
         };
 
         backoff = Duration::from_secs(5);
@@ -397,32 +371,79 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
         }
 
         let mut state = DaemonState::new();
-
-        loop {
-            match recv_msg::<_, DaemonMsg>(&mut reader).await {
-                Ok(msg) => match handle_daemon_msg(&mut state, &tx, msg).await {
-                    Some(true) => {
-                        prune_counter += 1;
-                        if prune_counter >= 10 {
-                            state.prune_terminal();
-                            prune_counter = 0;
-                        }
-                    }
-                    Some(false) => {}
-                    None => return, // Channel closed — TUI exited.
-                },
-                Err(e) => {
-                    debug!("daemon_source: connection lost ({e})");
-                    let _ = tx
-                        .send(SourceEvent::DaemonHealthChanged { healthy: false })
-                        .await;
-                    break;
-                }
-            }
+        if !run_daemon_event_loop(&mut reader, &tx, &mut state, &mut prune_counter).await {
+            return;
         }
 
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+async fn connect_or_retry_daemon(
+    tx: &mpsc::Sender<SourceEvent>,
+    backoff: &mut Duration,
+) -> Option<ahma_common::daemon_hub::DaemonStream> {
+    if let Err(e) = ensure_daemon_running().await {
+        debug!(
+            "daemon_source: daemon unavailable ({e}); retry in {:?}",
+            *backoff
+        );
+        let _ = tx
+            .send(SourceEvent::DaemonHealthChanged { healthy: false })
+            .await;
+        tokio::time::sleep(*backoff).await;
+        *backoff = (*backoff * 2).min(Duration::from_secs(30));
+        return None;
+    }
+
+    match connect_to_daemon().await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            debug!(
+                "daemon_source: connect failed ({e}); retry in {:?}",
+                *backoff
+            );
+            let _ = tx
+                .send(SourceEvent::DaemonHealthChanged { healthy: false })
+                .await;
+            tokio::time::sleep(*backoff).await;
+            *backoff = (*backoff * 2).min(Duration::from_secs(30));
+            None
+        }
+    }
+}
+
+async fn run_daemon_event_loop<R>(
+    reader: &mut BufReader<R>,
+    tx: &mpsc::Sender<SourceEvent>,
+    state: &mut DaemonState,
+    prune_counter: &mut u8,
+) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        match recv_msg::<_, DaemonMsg>(reader).await {
+            Ok(msg) => match handle_daemon_msg(state, tx, msg).await {
+                Some(true) => {
+                    *prune_counter += 1;
+                    if *prune_counter >= 10 {
+                        state.prune_terminal();
+                        *prune_counter = 0;
+                    }
+                }
+                Some(false) => {}
+                None => return false, // Channel closed — TUI exited.
+            },
+            Err(e) => {
+                debug!("daemon_source: connection lost ({e})");
+                let _ = tx
+                    .send(SourceEvent::DaemonHealthChanged { healthy: false })
+                    .await;
+                return true;
+            }
+        }
     }
 }
 

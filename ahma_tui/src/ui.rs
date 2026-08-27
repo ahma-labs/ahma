@@ -624,45 +624,7 @@ fn operation_detail_lines(
     theme: &Theme,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let kv = |k: &str, v: String, style: Style| {
-        Line::from(vec![
-            Span::styled(format!("{k:<10}"), theme.dim()),
-            Span::styled(v, style),
-        ])
-    };
-
-    let mut lines = vec![kv("id", op.id.clone(), theme.normal())];
-    if let Some(instance) = &op.instance_label {
-        lines.push(kv("instance", instance.clone(), theme.normal()));
-    }
-    if let Some(origin) = &op.origin {
-        lines.push(kv("origin", origin.clone(), theme.normal()));
-    }
-    let mut status = format!("{:?}", op.status);
-    if let Some(code) = op.exit_code {
-        status.push_str(&format!(" (exit {code})"));
-    }
-    lines.push(kv("status", status, theme.op_status_style(&op.status)));
-    lines.push(kv(
-        "started",
-        op.started_time.format("%Y-%m-%d %H:%M:%S").to_string(),
-        theme.normal(),
-    ));
-    lines.push(kv("duration", op.elapsed_display(), theme.normal()));
-    if let Some(cwd) = &op.cwd {
-        lines.push(kv("cwd", cwd.clone(), theme.normal()));
-    }
-    if let Some(pid) = op.pid {
-        lines.push(kv("pid", pid.to_string(), theme.normal()));
-    }
-    if let Some(cmd) = &op.command {
-        // The full command, wrapped by the Paragraph — shown in full, this is
-        // the detail view's reason to exist.
-        lines.push(kv("command", format!("$ {cmd}"), theme.normal()));
-    }
-    for alert in &op.alerts {
-        lines.push(kv("alert", format!("⚠ {alert}"), theme.failed()));
-    }
+    let mut lines = operation_header_lines(op, theme);
 
     lines.push(Line::from(Span::styled(
         "─".repeat(width.max(1)),
@@ -685,6 +647,50 @@ fn operation_detail_lines(
             summary.clone(),
             theme.op_status_style(&op.status),
         )));
+    }
+    lines
+}
+
+#[cfg(feature = "tui")]
+fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Line<'static>> {
+    let kv = |k: &str, v: String, style: Style| {
+        Line::from(vec![
+            Span::styled(format!("{k:<10}"), theme.dim()),
+            Span::styled(v, style),
+        ])
+    };
+
+    let mut lines = vec![kv("id", op.id.clone(), theme.normal())];
+    if let Some(instance) = &op.instance_label {
+        lines.push(kv("instance", instance.clone(), theme.normal()));
+    }
+    if let Some(origin) = &op.origin {
+        lines.push(kv("origin", origin.clone(), theme.normal()));
+    }
+    let status = match op.exit_code {
+        Some(code) => format!("{:?} (exit {code})", op.status),
+        None => format!("{:?}", op.status),
+    };
+    lines.push(kv("status", status, theme.op_status_style(&op.status)));
+    lines.push(kv(
+        "started",
+        op.started_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+        theme.normal(),
+    ));
+    lines.push(kv("duration", op.elapsed_display(), theme.normal()));
+    if let Some(cwd) = &op.cwd {
+        lines.push(kv("cwd", cwd.clone(), theme.normal()));
+    }
+    if let Some(pid) = op.pid {
+        lines.push(kv("pid", pid.to_string(), theme.normal()));
+    }
+    if let Some(cmd) = &op.command {
+        // The full command, wrapped by the Paragraph — shown in full, this is
+        // the detail view's reason to exist.
+        lines.push(kv("command", format!("$ {cmd}"), theme.normal()));
+    }
+    for alert in &op.alerts {
+        lines.push(kv("alert", format!("⚠ {alert}"), theme.failed()));
     }
     lines
 }
@@ -1838,62 +1844,49 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
 /// `ScopeView::render_text` (write/read/tmp/source) so every surface reads the
 /// same, and states who is actually protecting the session (SPEC R7.5).
 #[cfg(feature = "tui")]
-fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
-    const MAX_ROOTS_SHOWN: usize = 4;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    if let Some(reason) = &state.sandbox_failed_reason {
-        lines.push(Line::from(Span::styled(
-            format!("FAILED: {reason}"),
-            theme.failed(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "Tool calls are refused until a scope locks. Fix: open a workspace folder, pass \
-             --sandbox-scope <path>, or configure [sandbox] container_root; then restart.",
-            theme.dim(),
-        )));
-        return lines;
-    }
-
-    let Some(scope) = &state.sandbox_scope else {
-        let status = if state.sandbox_status.is_empty() {
-            "UNKNOWN"
-        } else {
-            state.sandbox_status.as_str()
-        };
-        let explanation = match status {
-            "INITIALIZING" => {
-                "The server is still negotiating scope (roots/list or elicitation). \
-                 Tool calls are held until it locks."
-            }
-            _ => {
-                "No sandbox report received on this connection yet \
-                 (daemon-only attach, or an older server)."
-            }
-        };
-        lines.push(Line::from(Span::styled(
-            format!("Scope not reported — status: {status}"),
-            theme.pending(),
-        )));
-        lines.push(Line::from(Span::styled(explanation, theme.dim())));
-
-        // A hub-only attach never receives `sandbox/configured`, but every
-        // registered instance reports the scope it is running under. Showing
-        // that beats showing nothing — clearly attributed, because it is the
-        // instance's own claim rather than a scope this TUI saw locked, and it
-        // carries no enforcement or provenance information.
-        for inst in state.active_instances.iter().take(3) {
-            lines.push(Line::from(vec![
-                Span::styled("reported: ", theme.dim()),
-                Span::styled(shorten_path(&inst.scope, 46), theme.normal()),
-                Span::styled(format!("  by {} ({})", inst.label, inst.mode), theme.dim()),
-            ]));
-        }
-        return lines;
+fn unscoped_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let status = if state.sandbox_status.is_empty() {
+        "UNKNOWN"
+    } else {
+        state.sandbox_status.as_str()
     };
+    let explanation = match status {
+        "INITIALIZING" => {
+            "The server is still negotiating scope (roots/list or elicitation). \
+             Tool calls are held until it locks."
+        }
+        _ => {
+            "No sandbox report received on this connection yet \
+             (daemon-only attach, or an older server)."
+        }
+    };
+    lines.push(Line::from(Span::styled(
+        format!("Scope not reported — status: {status}"),
+        theme.pending(),
+    )));
+    lines.push(Line::from(Span::styled(explanation, theme.dim())));
 
-    // Who is actually protecting this session. NESTED/DEFERRED/DISABLED must
-    // read differently from plain enforcement — R7.5's honesty rule.
+    // A hub-only attach never receives `sandbox/configured`, but every
+    // registered instance reports the scope it is running under. Showing
+    // that beats showing nothing — clearly attributed, because it is the
+    // instance's own claim rather than a scope this TUI saw locked, and it
+    // carries no enforcement or provenance information.
+    for inst in state.active_instances.iter().take(3) {
+        lines.push(Line::from(vec![
+            Span::styled("reported: ", theme.dim()),
+            Span::styled(shorten_path(&inst.scope, 46), theme.normal()),
+            Span::styled(format!("  by {} ({})", inst.label, inst.mode), theme.dim()),
+        ]));
+    }
+    lines
+}
+
+#[cfg(feature = "tui")]
+fn scope_authority_spans(
+    scope: &crate::state::SandboxScopeInfo,
+    theme: &Theme,
+) -> (String, Style, &'static str, Style) {
     let (authority, authority_style) = match scope.active.as_deref() {
         Some("ahma_nested_in_host") => (
             format!(
@@ -1912,51 +1905,50 @@ fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
         Some("disabled") => ("NONE — no kernel confinement".to_string(), theme.failed()),
         _ => ("ahma (kernel)".to_string(), theme.success()),
     };
-    let enforcement_style = if scope.enforced {
-        theme.success()
+    let (enforcement, enforcement_style) = if scope.enforced {
+        ("ENFORCED", theme.success())
     } else {
-        theme.failed()
+        ("DISABLED", theme.failed())
     };
-    let enforcement = if scope.enforced {
-        "ENFORCED"
-    } else {
-        "DISABLED"
-    };
-    lines.push(Line::from(vec![
-        Span::styled(format!("{enforcement} · "), enforcement_style),
-        Span::styled("authority: ", theme.dim()),
-        Span::styled(authority, authority_style),
-    ]));
+    (authority, authority_style, enforcement, enforcement_style)
+}
 
-    if scope.write.is_empty() {
+#[cfg(feature = "tui")]
+fn scope_write_roots_lines(write_roots: &[String], theme: &Theme) -> Vec<Line<'static>> {
+    const MAX_ROOTS_SHOWN: usize = 4;
+    let mut lines = Vec::new();
+    if write_roots.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("write : ", theme.dim()),
             Span::styled("(none — awaiting scope)", theme.pending()),
         ]));
     } else {
-        for (i, root) in scope.write.iter().take(MAX_ROOTS_SHOWN).enumerate() {
+        for (i, root) in write_roots.iter().take(MAX_ROOTS_SHOWN).enumerate() {
             let label = if i == 0 { "write : " } else { "        " };
             lines.push(Line::from(vec![
                 Span::styled(label, theme.dim()),
                 Span::styled(shorten_path(root, 70), theme.normal()),
             ]));
         }
-        if scope.write.len() > MAX_ROOTS_SHOWN {
+        if write_roots.len() > MAX_ROOTS_SHOWN {
             lines.push(Line::from(Span::styled(
                 format!(
                     "        … +{} more (run `ahma status` for the full list)",
-                    scope.write.len() - MAX_ROOTS_SHOWN
+                    write_roots.len() - MAX_ROOTS_SHOWN
                 ),
                 theme.dim(),
             )));
         }
     }
+    lines
+}
 
-    let read_summary = if scope.read.is_empty() {
+#[cfg(feature = "tui")]
+fn format_scope_read_summary(read_roots: &[String]) -> String {
+    if read_roots.is_empty() {
         "(none beyond write roots)".to_string()
-    } else if scope.read.len() <= 2 {
-        scope
-            .read
+    } else if read_roots.len() <= 2 {
+        read_roots
             .iter()
             .map(|p| shorten_path(p, 34))
             .collect::<Vec<_>>()
@@ -1964,13 +1956,74 @@ fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     } else {
         format!(
             "{} +{} more",
-            shorten_path(&scope.read[0], 34),
-            scope.read.len() - 1
+            shorten_path(&read_roots[0], 34),
+            read_roots.len() - 1
         )
+    }
+}
+
+#[cfg(feature = "tui")]
+fn scope_granted_lines(granted_scopes: &[(String, String)], theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if !granted_scopes.is_empty() {
+        let shown = granted_scopes
+            .iter()
+            .take(2)
+            .map(|(path, access)| format!("{} ({access})", shorten_path(path, 30)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = granted_scopes.len().saturating_sub(2);
+        let suffix = if more > 0 {
+            format!(" +{more} more")
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("grants: ", theme.dim()),
+            Span::styled(format!("{shown}{suffix}"), theme.normal()),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "        `ahma sandbox list` / `ahma sandbox revoke <path>` to review or remove",
+            theme.dim(),
+        )));
+    }
+    lines
+}
+
+#[cfg(feature = "tui")]
+fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if let Some(reason) = &state.sandbox_failed_reason {
+        lines.push(Line::from(Span::styled(
+            format!("FAILED: {reason}"),
+            theme.failed(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Tool calls are refused until a scope locks. Fix: open a workspace folder, pass \
+             --sandbox-scope <path>, or configure [sandbox] container_root; then restart.",
+            theme.dim(),
+        )));
+        return lines;
+    }
+
+    let Some(scope) = &state.sandbox_scope else {
+        return unscoped_window_lines(state, theme);
     };
+
+    let (authority, authority_style, enforcement, enforcement_style) =
+        scope_authority_spans(scope, theme);
+    lines.push(Line::from(vec![
+        Span::styled(format!("{enforcement} · "), enforcement_style),
+        Span::styled("authority: ", theme.dim()),
+        Span::styled(authority, authority_style),
+    ]));
+
+    lines.extend(scope_write_roots_lines(&scope.write, theme));
+
     lines.push(Line::from(vec![
         Span::styled("read  : ", theme.dim()),
-        Span::styled(read_summary, theme.normal()),
+        Span::styled(format_scope_read_summary(&scope.read), theme.normal()),
     ]));
 
     lines.push(Line::from(vec![
@@ -1986,44 +2039,14 @@ fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
         ),
     ]));
 
-    // The roots that exist because the user granted them, named separately
-    // from the workspace so an out-of-workspace writable path is explicable —
-    // and reversible: the revoke command is stated, not left to be searched
-    // for (SPEC R5.4.6, grants are inspectable and reversible by name).
-    if !state.granted_scopes.is_empty() {
-        let shown = state
-            .granted_scopes
-            .iter()
-            .take(2)
-            .map(|(path, access)| format!("{} ({access})", shorten_path(path, 30)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let more = state.granted_scopes.len().saturating_sub(2);
-        let suffix = if more > 0 {
-            format!(" +{more} more")
-        } else {
-            String::new()
-        };
-        lines.push(Line::from(vec![
-            Span::styled("grants: ", theme.dim()),
-            Span::styled(format!("{shown}{suffix}"), theme.normal()),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "        `ahma sandbox list` / `ahma sandbox revoke <path>` to review or remove",
-            theme.dim(),
-        )));
-    }
+    lines.extend(scope_granted_lines(&state.granted_scopes, theme));
 
-    // Platform limitation that cannot be expressed as scope (macOS reads
-    // unconfined) — shown here per SPEC R-PERM.5.1, not buried in docs.
     if let Some(note) = &scope.platform_note {
         lines.push(Line::from(Span::styled(
             format!("note  : {}", truncate(note, 110)),
             theme.pending(),
         )));
     }
-    // Persistent R7 disclosure when ahma is not the sole authority — the log
-    // line scrolls away; this window is where it stays visible.
     if matches!(
         scope.active.as_deref(),
         Some("ahma_nested_in_host") | Some("deferred_to_host") | Some("disabled")
@@ -2753,41 +2776,41 @@ fn build_instance_row(
         spans.push(Span::styled(format!("  {detail}"), theme.dim()));
     }
 
-    // Right-hand tallies: how much is being done in parallel, at a glance.
-    let (r, q, s, f) = (
-        counts.running,
-        counts.queued,
-        counts.succeeded,
-        counts.failed,
-    );
-    let mut tallies: Vec<(usize, &str, Style)> = Vec::new();
+    spans.extend(instance_tally_spans(counts, unicode, theme));
+
+    truncate_row_spans_to_width(&mut spans, width);
+    Line::from(spans)
+}
+
+#[cfg(feature = "tui")]
+fn instance_tally_spans(
+    counts: &crate::task_tree::GroupCounts,
+    unicode: bool,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if counts.total() == 0 {
+        spans.push(Span::styled("  idle".to_string(), theme.dim()));
+        return spans;
+    }
+
     let (run_g, que_g, ok_g, fail_g) = if unicode {
         ("⟳", "◷", "✓", "✗")
     } else {
         (">", ".", "v", "x")
     };
-    if r > 0 {
-        tallies.push((r, run_g, theme.running()));
-    }
-    if q > 0 {
-        tallies.push((q, que_g, theme.dim()));
-    }
-    if s > 0 {
-        tallies.push((s, ok_g, theme.success()));
-    }
-    if f > 0 {
-        tallies.push((f, fail_g, theme.failed()));
-    }
-    if counts.total() == 0 {
-        spans.push(Span::styled("  idle".to_string(), theme.dim()));
-    } else {
-        for (n, glyph, style) in tallies {
+    let tallies = [
+        (counts.running, run_g, theme.running()),
+        (counts.queued, que_g, theme.dim()),
+        (counts.succeeded, ok_g, theme.success()),
+        (counts.failed, fail_g, theme.failed()),
+    ];
+    for (n, glyph, style) in tallies {
+        if n > 0 {
             spans.push(Span::styled(format!("  {n}{glyph}"), style));
         }
     }
-
-    truncate_row_spans_to_width(&mut spans, width);
-    Line::from(spans)
+    spans
 }
 
 /// Rough width guard: truncate the detail span first, then the label span if

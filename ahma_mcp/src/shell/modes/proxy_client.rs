@@ -123,34 +123,47 @@ where
             .map_err(|e| anyhow!("reconnect: failed to resend notifications/initialized: {e:?}"))?;
     }
 
-    let Some(roots_response) = &handshake.roots_response else {
-        return Ok(());
-    };
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let Some(msg) = client.receive().await else {
-                return Err(anyhow!(
-                    "reconnect: bridge closed before requesting roots/list"
-                ));
-            };
-            let val = serde_json::to_value(&msg).unwrap_or_default();
-            if val.get("method").and_then(|m| m.as_str()) != Some(ROOTS_LIST_METHOD) {
-                continue;
-            }
-            let mut resp = roots_response.clone();
-            if let Some(id) = val.get("id") {
-                resp["id"] = id.clone();
-            }
-            let resp_msg: TxJsonRpcMessage<RoleClient> = serde_json::from_value(resp)
-                .context("reconnect: cached roots/list response no longer deserializes")?;
-            return client
-                .send(resp_msg)
-                .await
-                .map_err(|e| anyhow!("reconnect: failed to answer roots/list: {e:?}"));
+    if let Some(roots_response) = &handshake.roots_response {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            wait_and_answer_roots_list(client, roots_response),
+        )
+        .await
+        .map_err(|_| anyhow!("reconnect: timed out waiting for roots/list"))??;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_and_answer_roots_list<C>(
+    client: &mut C,
+    roots_response: &serde_json::Value,
+) -> Result<()>
+where
+    C: Transport<RoleClient>,
+    C::Error: std::fmt::Debug,
+{
+    loop {
+        let Some(msg) = client.receive().await else {
+            return Err(anyhow!(
+                "reconnect: bridge closed before requesting roots/list"
+            ));
+        };
+        let val = serde_json::to_value(&msg).unwrap_or_default();
+        if val.get("method").and_then(|m| m.as_str()) != Some(ROOTS_LIST_METHOD) {
+            continue;
         }
-    })
-    .await
-    .map_err(|_| anyhow!("reconnect: timed out waiting for roots/list"))?
+        let mut resp = roots_response.clone();
+        if let Some(id) = val.get("id") {
+            resp["id"] = id.clone();
+        }
+        let resp_msg: TxJsonRpcMessage<RoleClient> = serde_json::from_value(resp)
+            .context("reconnect: cached roots/list response no longer deserializes")?;
+        return client
+            .send(resp_msg)
+            .await
+            .map_err(|e| anyhow!("reconnect: failed to answer roots/list: {e:?}"));
+    }
 }
 
 /// Session-health disclosure (#485): the proxy is the *only* party that knows

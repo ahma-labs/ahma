@@ -173,14 +173,7 @@ fn select_platforms(
 
     // If caller specified platforms via --platform flag, filter to those.
     if !platform_filter.is_empty() {
-        return relevant
-            .into_iter()
-            .filter(|p| {
-                platform_filter.iter().any(|f| {
-                    f.eq_ignore_ascii_case(p.cli_name()) || f.eq_ignore_ascii_case(p.label())
-                })
-            })
-            .collect();
+        return filter_platforms_by_cli_args(relevant, platform_filter);
     }
 
     let labels: Vec<&str> = relevant.iter().map(|p| p.label()).collect();
@@ -192,6 +185,20 @@ fn select_platforms(
     chosen
         .into_iter()
         .filter_map(|i| relevant.get(i).copied())
+        .collect()
+}
+
+fn filter_platforms_by_cli_args(
+    relevant: Vec<Platform>,
+    platform_filter: &[String],
+) -> Vec<Platform> {
+    relevant
+        .into_iter()
+        .filter(|p| {
+            platform_filter
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(p.cli_name()) || f.eq_ignore_ascii_case(p.label()))
+        })
         .collect()
 }
 

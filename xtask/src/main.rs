@@ -878,8 +878,7 @@ struct Candidate {
     is_dir: bool,
 }
 
-/// Clean stale build artifacts from `target/` without destroying caches the next build needs.
-fn clean_stale(args: &[String]) {
+fn parse_clean_opts(args: &[String]) -> CleanOpts {
     let mut opts = CleanOpts {
         dry_run: false,
         max_age_days: 3,
@@ -904,8 +903,6 @@ fn clean_stale(args: &[String]) {
                     eprintln!("ERROR: --max-size-gb requires a numeric argument");
                     process::exit(1);
                 });
-                // Rejects NaN and infinity as well as zero/negative: a non-finite budget
-                // would make the size pass either a no-op or an unbounded delete loop.
                 if !v.is_finite() || v <= 0.0 {
                     eprintln!("ERROR: --max-size-gb must be a positive, finite number");
                     process::exit(1);
@@ -924,6 +921,12 @@ fn clean_stale(args: &[String]) {
         }
         i += 1;
     }
+    opts
+}
+
+/// Clean stale build artifacts from `target/` without destroying caches the next build needs.
+fn clean_stale(args: &[String]) {
+    let opts = parse_clean_opts(args);
 
     let target_dir = workspace_root().join("target");
     if !target_dir.exists() {
@@ -937,15 +940,21 @@ fn clean_stale(args: &[String]) {
     }
 
     let size_before = dir_size(&target_dir);
-    // Report the total unconditionally: unbounded `target/` growth is easy to miss until a
-    // build dies on a full disk, and `clean-stale` is the one command routinely pointed at it.
     println!(
         "target/ is {:.2} GB before cleaning.",
         size_before as f64 / BYTES_PER_GB
     );
 
     let report = clean_target(&target_dir, &opts);
+    print_clean_stale_summary(size_before, &report, &opts, &target_dir);
+}
 
+fn print_clean_stale_summary(
+    size_before: u64,
+    report: &CleanReport,
+    opts: &CleanOpts,
+    target_dir: &Path,
+) {
     let reclaimed_gb = report.bytes_reclaimed as f64 / BYTES_PER_GB;
     let verb = if opts.dry_run {
         "Dry run complete: would remove"
@@ -965,12 +974,10 @@ fn clean_stale(args: &[String]) {
     } else {
         println!(
             "target/ is now {:.2} GB.",
-            dir_size(&target_dir) as f64 / BYTES_PER_GB
+            dir_size(target_dir) as f64 / BYTES_PER_GB
         );
     }
 
-    // A budget that could not be met is a real result, not a rounding error: say so rather
-    // than letting a "Clean complete" line imply the ceiling now holds.
     if let Some(budget_gb) = opts.max_size_gb {
         let after = size_before.saturating_sub(report.bytes_reclaimed) as f64 / BYTES_PER_GB;
         if after > budget_gb {
@@ -1049,11 +1056,11 @@ fn clean_target(target_dir: &Path, opts: &CleanOpts) -> CleanReport {
 /// Directories under `target/` that hold build output. Discovered rather than hardcoded to
 /// `debug`/`release` so custom cargo profiles and `llvm-cov-target/` (a full duplicate build
 /// tree left behind by `cargo llvm-cov`) are cleaned too.
-fn discover_profile_dirs(target_dir: &Path) -> Vec<PathBuf> {
-    fn is_profile_dir(p: &Path) -> bool {
-        p.join(".fingerprint").is_dir() || p.join("incremental").is_dir()
-    }
+fn is_profile_dir(p: &Path) -> bool {
+    p.join(".fingerprint").is_dir() || p.join("incremental").is_dir()
+}
 
+fn discover_profile_dirs(target_dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let Ok(entries) = fs::read_dir(target_dir) else {
         return found;
@@ -1065,21 +1072,23 @@ fn discover_profile_dirs(target_dir: &Path) -> Vec<PathBuf> {
         }
         if is_profile_dir(&path) {
             found.push(path);
-            continue;
-        }
-        // One level down, for wrappers like `llvm-cov-target/debug` and cross-compilation
-        // output at `target/<triple>/<profile>`.
-        if let Ok(nested) = fs::read_dir(&path) {
-            for sub in nested.flatten() {
-                let sub_path = sub.path();
-                if sub_path.is_dir() && is_profile_dir(&sub_path) {
-                    found.push(sub_path);
-                }
-            }
+        } else {
+            collect_nested_profile_dirs(&path, &mut found);
         }
     }
     found.sort();
     found
+}
+
+fn collect_nested_profile_dirs(path: &Path, found: &mut Vec<PathBuf>) {
+    if let Ok(nested) = fs::read_dir(path) {
+        for sub in nested.flatten() {
+            let sub_path = sub.path();
+            if sub_path.is_dir() && is_profile_dir(&sub_path) {
+                found.push(sub_path);
+            }
+        }
+    }
 }
 
 fn remove_coverage_counters(dir: &Path, opts: &CleanOpts, report: &mut CleanReport) {
@@ -1227,20 +1236,20 @@ fn dir_or_file_size(path: &Path, metadata: &fs::Metadata) -> u64 {
     if metadata.is_file() {
         return metadata.len();
     }
-    if metadata.is_dir() {
-        let mut total = 0u64;
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                // `symlink_metadata` so a symlink counts as its own small entry rather than
-                // the size of whatever it points at, which may be outside target/ entirely.
-                if let Ok(m) = fs::symlink_metadata(entry.path()) {
-                    total += dir_or_file_size(&entry.path(), &m);
-                }
-            }
-        }
-        return total;
+    if !metadata.is_dir() {
+        return 0;
     }
-    0
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            fs::symlink_metadata(entry.path())
+                .ok()
+                .map(|m| dir_or_file_size(&entry.path(), &m))
+        })
+        .sum()
 }
 
 fn evaluate_one_candidate(

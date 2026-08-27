@@ -570,49 +570,28 @@ pub enum Focus {
 }
 
 impl Focus {
+    fn active_order(tasks_open: bool, log_open: bool) -> Vec<Self> {
+        let mut order = vec![Self::Chat];
+        if tasks_open {
+            order.push(Self::OpsDag);
+        }
+        if log_open {
+            order.push(Self::Log);
+        }
+        order
+    }
+
     /// Cycle through active panels.
     pub fn cycle_next_active(self, tasks_open: bool, log_open: bool) -> Self {
-        match self {
-            Self::Chat => {
-                if tasks_open {
-                    Self::OpsDag
-                } else if log_open {
-                    Self::Log
-                } else {
-                    Self::Chat
-                }
-            }
-            Self::OpsDag => {
-                if log_open {
-                    Self::Log
-                } else {
-                    Self::Chat
-                }
-            }
-            Self::Log => Self::Chat,
-        }
+        let order = Self::active_order(tasks_open, log_open);
+        let pos = order.iter().position(|&f| f == self).unwrap_or(0);
+        order[(pos + 1) % order.len()]
     }
 
     pub fn cycle_prev_active(self, tasks_open: bool, log_open: bool) -> Self {
-        match self {
-            Self::Chat => {
-                if log_open {
-                    Self::Log
-                } else if tasks_open {
-                    Self::OpsDag
-                } else {
-                    Self::Chat
-                }
-            }
-            Self::Log => {
-                if tasks_open {
-                    Self::OpsDag
-                } else {
-                    Self::Chat
-                }
-            }
-            Self::OpsDag => Self::Chat,
-        }
+        let order = Self::active_order(tasks_open, log_open);
+        let pos = order.iter().position(|&f| f == self).unwrap_or(0);
+        order[(pos + order.len() - 1) % order.len()]
     }
 
     pub fn cycle_next(self) -> Self {
@@ -2485,24 +2464,12 @@ impl AppState {
     /// different subset of fields, so we merge rather than replace to avoid
     /// clobbering output that was delivered by a different path.
     fn merge_operation(existing: &mut Operation, op: Operation) {
+        Self::merge_scalar_metadata(existing, &op);
+
         // Status always advances (but never regresses from terminal back to running).
         if !existing.status.is_terminal() || op.status.is_terminal() {
             existing.status = op.status;
         }
-
-        // Scalar metadata: take from incoming if it carries a richer value.
-        if !op.description.is_empty() {
-            existing.description = op.description;
-        }
-        if !op.args.is_empty() {
-            existing.args = op.args;
-        }
-        Self::prefer_incoming(&mut existing.cwd, op.cwd);
-        Self::prefer_incoming(&mut existing.pid, op.pid);
-        Self::prefer_incoming(&mut existing.scope, op.scope);
-        Self::prefer_incoming(&mut existing.result_summary, op.result_summary);
-        Self::prefer_incoming(&mut existing.completed_at, op.completed_at);
-        Self::prefer_incoming(&mut existing.duration_ms, op.duration_ms);
 
         // Merge stdout tails without duplicating: the poll path re-sends the
         // operation's FULL current tail on every cycle, and the hub path
@@ -2512,15 +2479,33 @@ impl AppState {
         let new_lines = Self::tail_suffix_to_append(&existing.stdout_tail, &op.stdout_tail);
         Self::append_stdout_lines(existing, new_lines);
 
-        // Append new alerts (deduplicate by content).
-        for alert in op.alerts {
-            if !existing.alerts.contains(&alert) {
-                existing.alerts.push(alert);
-            }
-        }
+        Self::merge_alerts(&mut existing.alerts, op.alerts);
 
         // pinned is sticky — once pinned it stays pinned.
         existing.pinned = existing.pinned || op.pinned;
+    }
+
+    fn merge_scalar_metadata(existing: &mut Operation, op: &Operation) {
+        if !op.description.is_empty() {
+            existing.description = op.description.clone();
+        }
+        if !op.args.is_empty() {
+            existing.args = op.args.clone();
+        }
+        Self::prefer_incoming(&mut existing.cwd, op.cwd.clone());
+        Self::prefer_incoming(&mut existing.pid, op.pid);
+        Self::prefer_incoming(&mut existing.scope, op.scope.clone());
+        Self::prefer_incoming(&mut existing.result_summary, op.result_summary.clone());
+        Self::prefer_incoming(&mut existing.completed_at, op.completed_at);
+        Self::prefer_incoming(&mut existing.duration_ms, op.duration_ms);
+    }
+
+    fn merge_alerts(existing_alerts: &mut Vec<String>, incoming_alerts: Vec<String>) {
+        for alert in incoming_alerts {
+            if !existing_alerts.contains(&alert) {
+                existing_alerts.push(alert);
+            }
+        }
     }
 
     /// Overwrite an optional field only when the incoming update supplies a

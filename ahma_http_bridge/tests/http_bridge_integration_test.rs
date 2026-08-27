@@ -451,7 +451,7 @@ fn pwd_tool_call(request_id: u64, working_directory: &Path) -> Value {
 ///
 /// WARNING TO FUTURE AI/MAINTAINERS:
 /// - Do NOT change this test to accept either success OR sandbox failure.
-/// - Do NOT add test-mode env var bypasses (see SPEC.md R21.3).
+/// - Do NOT add test-mode env var bypasses (see SPEC.md R-CFG9.2).
 /// - Fix scoping/session isolation if this fails.
 #[tokio::test]
 #[serial]

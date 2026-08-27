@@ -189,26 +189,19 @@ async fn find_target_session_for_sampling(
         .collect();
     let target_lower = target_label.map(str::to_lowercase);
 
-    // First pass: find a session with sampling that also matches the label (if given)
-    for s in &other_sessions {
-        if !session_has_sampling(s).await {
-            continue;
-        }
-        let label_matches = match &target_lower {
-            Some(target) => session_name_matches_label(s, target).await,
-            None => true,
-        };
-        if label_matches {
-            return Some(s.clone());
+    // First pass: find a session with sampling that matches target_label
+    if let Some(target) = &target_lower {
+        for s in &other_sessions {
+            if session_has_sampling(s).await && session_name_matches_label(s, target).await {
+                return Some(s.clone());
+            }
         }
     }
 
-    // Fallback: if label didn't match exactly, return any session with sampling
-    if target_lower.is_some() {
-        for s in &other_sessions {
-            if session_has_sampling(s).await {
-                return Some(s.clone());
-            }
+    // Fallback pass: find any session with sampling
+    for s in &other_sessions {
+        if session_has_sampling(s).await {
+            return Some(s.clone());
         }
     }
 
@@ -2913,7 +2906,7 @@ mod tests {
         assert_eq!(body["id"], json!("tc-json"));
     }
 
-    /// SPEC §R15.5 dual-transport: the same gate over `text/event-stream`.
+    /// AGENTS.md §R15.5 dual-transport: the same gate over `text/event-stream`.
     #[tokio::test]
     async fn isolated_sse_request_tools_call_before_lock_is_409_32001_with_request_id() {
         let mgr = keepalive_manager();
@@ -2949,7 +2942,7 @@ mod tests {
         );
     }
 
-    /// SPEC §R15.5 dual-transport mirror of the handshake-timeout assertion.
+    /// AGENTS.md §R15.5 dual-transport mirror of the handshake-timeout assertion.
     #[tokio::test]
     async fn isolated_sse_request_handshake_timeout_is_504_32002_with_request_id() {
         let mgr = manager_with(None, 10, 0, Arc::new(KeepAlivePeerFactory));

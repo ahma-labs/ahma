@@ -1564,54 +1564,62 @@ pub struct SettingsOriginCtx {
 /// settings key it overrides.
 pub fn settings_origin_ctx(cli: &Cli) -> SettingsOriginCtx {
     let mut cli_overrides: Vec<(&'static str, String)> = Vec::new();
-    {
-        let mut flag = |on: bool, key: &'static str| {
-            if on {
-                cli_overrides.push((key, "true".to_string()));
-            }
-        };
-        flag(cli.sync, "tools.force_sync");
-        flag(cli.skip_probes, "tools.skip_probes");
-        flag(cli.no_sandbox, "sandbox.disable");
-        flag(cli.defer_sandbox, "sandbox.defer");
-        flag(cli.tmp, "sandbox.tmp_access");
-        flag(cli.no_temp_files, "sandbox.disable_temp");
-        flag(cli.use_scratch, "sandbox.use_scratch_directory");
-        flag(cli.log_monitor, "logging.log_monitor");
-        flag(cli.disable_quic, "http.disable_quic");
-        flag(cli.disable_http1_1, "http.disable_http1_1");
+    collect_boolean_flag_overrides(cli, &mut cli_overrides);
+    collect_option_overrides(cli, &mut cli_overrides);
+    SettingsOriginCtx {
+        no_settings: cli.no_settings,
+        settings_path: cli.settings_path.clone(),
+        cli_overrides,
+    }
+}
+
+fn collect_boolean_flag_overrides(cli: &Cli, out: &mut Vec<(&'static str, String)>) {
+    let boolean_flags: &[(&'static str, bool)] = &[
+        ("tools.force_sync", cli.sync),
+        ("tools.skip_probes", cli.skip_probes),
+        ("sandbox.disable", cli.no_sandbox),
+        ("sandbox.defer", cli.defer_sandbox),
+        ("sandbox.tmp_access", cli.tmp),
+        ("sandbox.disable_temp", cli.no_temp_files),
+        ("sandbox.use_scratch_directory", cli.use_scratch),
+        ("logging.log_monitor", cli.log_monitor),
+        ("http.disable_quic", cli.disable_quic),
+        ("http.disable_http1_1", cli.disable_http1_1),
+    ];
+    for &(key, on) in boolean_flags {
+        if on {
+            out.push((key, "true".to_string()));
+        }
     }
     if cli.log_to_stderr {
-        cli_overrides.push(("logging.target", "\"stderr\"".to_string()));
+        out.push(("logging.target", "\"stderr\"".to_string()));
     }
+}
+
+fn collect_option_overrides(cli: &Cli, out: &mut Vec<(&'static str, String)>) {
     if let Some(v) = cli.timeout {
-        cli_overrides.push(("tools.timeout_secs", v.to_string()));
+        out.push(("tools.timeout_secs", v.to_string()));
     }
     if let Some(v) = cli.monitor_rate_limit {
-        cli_overrides.push(("logging.monitor_rate_limit_secs", v.to_string()));
+        out.push(("logging.monitor_rate_limit_secs", v.to_string()));
     }
     if let Some(v) = cli.handshake_timeout {
-        cli_overrides.push(("http.handshake_timeout_secs", v.to_string()));
+        out.push(("http.handshake_timeout_secs", v.to_string()));
     }
     if let Some(p) = &cli.require_token_path {
-        cli_overrides.push((
+        out.push((
             "auth.require_token_path",
             format!("{:?}", p.display().to_string()),
         ));
     }
     if let Some(v) = cli.rate_limit_rps {
-        cli_overrides.push(("auth.rate_limit_rps", v.to_string()));
+        out.push(("auth.rate_limit_rps", v.to_string()));
     }
     if let Some(v) = cli.rate_limit_burst {
-        cli_overrides.push(("auth.rate_limit_burst", v.to_string()));
+        out.push(("auth.rate_limit_burst", v.to_string()));
     }
     if let Some(l) = &cli.instance_label {
-        cli_overrides.push(("instance.label", format!("{l:?}")));
-    }
-    SettingsOriginCtx {
-        no_settings: cli.no_settings,
-        settings_path: cli.settings_path.clone(),
-        cli_overrides,
+        out.push(("instance.label", format!("{l:?}")));
     }
 }
 

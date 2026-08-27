@@ -472,28 +472,35 @@ static DAEMON_SOCK_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::
 #[cfg(test)]
 pub fn init_test_daemon_isolation() {
     DAEMON_ISOLATION_INIT.call_once(|| {
-        // 1. Isolate Unix socket path
-        if std::env::var_os("AHMA_DAEMON_SOCK").is_none() {
-            let pid = std::process::id();
-            let count = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let socket_name = format!("ah_t_{}_{}.sock", pid, count);
-            let temp_dir = std::env::temp_dir();
-            let socket_path = temp_dir.join(socket_name);
-            unsafe {
-                std::env::set_var("AHMA_DAEMON_SOCK", socket_path);
-            }
-        }
-
-        // 2. Isolate Windows daemon port
-        if std::env::var_os("AHMA_DAEMON_PORT").is_none() {
-            let bind_res = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr());
-            if let Ok(addr) = bind_res {
-                unsafe {
-                    std::env::set_var("AHMA_DAEMON_PORT", addr.port().to_string());
-                }
-            }
-        }
+        isolate_test_unix_socket();
+        isolate_test_windows_port();
     });
+}
+
+#[cfg(test)]
+fn isolate_test_unix_socket() {
+    if std::env::var_os("AHMA_DAEMON_SOCK").is_none() {
+        let pid = std::process::id();
+        let count = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let socket_name = format!("ah_t_{}_{}.sock", pid, count);
+        let temp_dir = std::env::temp_dir();
+        let socket_path = temp_dir.join(socket_name);
+        unsafe {
+            std::env::set_var("AHMA_DAEMON_SOCK", socket_path);
+        }
+    }
+}
+
+#[cfg(test)]
+fn isolate_test_windows_port() {
+    if std::env::var_os("AHMA_DAEMON_PORT").is_none() {
+        let bind_res = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr());
+        if let Ok(addr) = bind_res {
+            unsafe {
+                std::env::set_var("AHMA_DAEMON_PORT", addr.port().to_string());
+            }
+        }
+    }
 }
 
 /// Return the platform-default socket path for the hub daemon.
@@ -1518,11 +1525,19 @@ where
     // Subscribe to live events BEFORE replaying retained history, so any
     // event that arrives during replay is queued by the broadcast channel
     // rather than lost in the gap between snapshot and live stream.
-    let mut rx = hub.broadcast.subscribe();
+    let rx = hub.broadcast.subscribe();
 
-    // Replay everything that happened before this subscriber connected — the
-    // operations that already ran, then any still-pending approvals — so the
-    // monitor shows all calls, not just ones that start from now on.
+    if replay_subscriber_backlog(writer, hub).await.is_err() {
+        return;
+    }
+
+    stream_subscriber_events(writer, rx).await;
+}
+
+async fn replay_subscriber_backlog<W>(writer: &mut W, hub: &Arc<DaemonHub>) -> Result<(), ()>
+where
+    W: AsyncWriteExt + Unpin,
+{
     let mut backlog = hub.replay_events().await;
     backlog.extend(
         hub.pending_approvals
@@ -1539,10 +1554,16 @@ where
     for msg in backlog {
         if let Err(e) = send_msg(writer, &msg).await {
             debug!("daemon: subscriber backlog replay write failed: {e}");
-            return;
+            return Err(());
         }
     }
+    Ok(())
+}
 
+async fn stream_subscriber_events<W>(writer: &mut W, mut rx: broadcast::Receiver<DaemonMsg>)
+where
+    W: AsyncWriteExt + Unpin,
+{
     loop {
         match rx.recv().await {
             Ok(msg) => {

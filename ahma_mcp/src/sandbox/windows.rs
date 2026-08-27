@@ -387,8 +387,12 @@ pub fn default_appcontainer_readable_dirs() -> Vec<PathBuf> {
 ///
 /// The rule that trips people up is that a backslash is only an escape *when it
 /// precedes a quote*: `a\b` stays `a\b`, but `a\"` needs the backslash doubled.
+fn needs_windows_quotes(arg: &str) -> bool {
+    arg.is_empty() || arg.contains([' ', '\t', '\n', '\u{b}', '"'])
+}
+
 pub fn quote_windows_arg(arg: &str) -> String {
-    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\u{b}', '"']) {
+    if !needs_windows_quotes(arg) {
         return arg.to_string();
     }
     let mut out = String::with_capacity(arg.len() + 2);
@@ -401,13 +405,8 @@ pub fn quote_windows_arg(arg: &str) -> String {
                 out.push('\\');
             }
             '"' => {
-                // Double the run of backslashes, then escape the quote.
-                for _ in 0..backslashes {
-                    out.push('\\');
-                }
+                append_escaped_quote(&mut out, backslashes);
                 backslashes = 0;
-                out.push('\\');
-                out.push('"');
             }
             _ => {
                 backslashes = 0;
@@ -415,12 +414,23 @@ pub fn quote_windows_arg(arg: &str) -> String {
             }
         }
     }
-    // Backslashes immediately before the closing quote must be doubled too.
+    append_trailing_backslashes(&mut out, backslashes);
+    out.push('"');
+    out
+}
+
+fn append_escaped_quote(out: &mut String, backslashes: usize) {
     for _ in 0..backslashes {
         out.push('\\');
     }
+    out.push('\\');
     out.push('"');
-    out
+}
+
+fn append_trailing_backslashes(out: &mut String, backslashes: usize) {
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
 }
 
 /// Assemble the `lpCommandLine` string for `CreateProcessW`.
@@ -1334,9 +1344,6 @@ fn run_appcontainer_launcher(request: &LauncherRequest) -> anyhow::Result<u32> {
     unsafe {
         let container_sid = derive_container_sid(&request.container)?;
 
-        // The one capability a build toolchain genuinely needs: outbound internet,
-        // for `cargo fetch`, `git`, `npm`. No private-network capability (which
-        // also grants inbound server rights), no library or device capabilities.
         let internet_client = well_known_sid(WinCapabilityInternetClientSid)?;
         let mut capabilities = [SID_AND_ATTRIBUTES {
             Sid: internet_client.as_psid(),
@@ -1350,149 +1357,160 @@ fn run_appcontainer_launcher(request: &LauncherRequest) -> anyhow::Result<u32> {
             Reserved: 0,
         };
 
-        // Size the attribute list, then fill it.
-        let mut size: usize = 0;
-        if InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) != FALSE {
-            anyhow::bail!("InitializeProcThreadAttributeList unexpectedly succeeded when sizing");
-        }
-        let last = std::io::Error::last_os_error();
-        if last.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-            anyhow::bail!("InitializeProcThreadAttributeList sizing failed: {last}");
-        }
-        let mut attribute_buffer = vec![0u8; size];
-        let attribute_list = attribute_buffer.as_mut_ptr().cast();
-        if InitializeProcThreadAttributeList(attribute_list, 1, 0, &mut size) == FALSE {
-            anyhow::bail!(
-                "InitializeProcThreadAttributeList failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        let (mut attribute_buffer, attribute_list) =
+            init_security_attribute_list(&mut security_capabilities)?;
 
-        let attribute_result = (|| -> anyhow::Result<u32> {
-            if UpdateProcThreadAttribute(
-                attribute_list,
-                0,
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                std::ptr::addr_of!(security_capabilities).cast(),
-                std::mem::size_of::<SECURITY_CAPABILITIES>(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            ) == FALSE
-            {
-                anyhow::bail!(
-                    "UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-
-            // Hand the child the pipes tokio created for us. They were made
-            // inheritable when this process was spawned, but say so explicitly
-            // rather than depending on the parent's choice.
-            let stdin = GetStdHandle(STD_INPUT_HANDLE);
-            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
-            let stderr = GetStdHandle(STD_ERROR_HANDLE);
-            for h in [stdin, stdout, stderr] {
-                // `GetStdHandle` signals "no such handle" as NULL and failure as
-                // INVALID_HANDLE_VALUE (-1); marking -1 inheritable would fail and
-                // marking NULL would be meaningless.
-                if !h.is_null() && h != INVALID_HANDLE_VALUE {
-                    let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-                }
-            }
-
-            let mut startup: STARTUPINFOEXW = std::mem::zeroed();
-            startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-            startup.lpAttributeList = attribute_list;
-            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-            startup.StartupInfo.hStdInput = stdin;
-            startup.StartupInfo.hStdOutput = stdout;
-            startup.StartupInfo.hStdError = stderr;
-
-            let mut command_line = to_wide(&build_command_line(&request.program, &request.args));
-            let mut process_info: PROCESS_INFORMATION = std::mem::zeroed();
-
-            // `CREATE_SUSPENDED` so the child is in the kill-on-close job before it
-            // executes an instruction; otherwise a fast-exiting or fast-forking
-            // child can escape the job it was meant to be born into.
-            // `lpEnvironment`/`lpCurrentDirectory` are NULL so the child inherits
-            // this process's environment and working directory, which the server
-            // already set on the launcher (including the redirected %TEMP%).
-            let created = CreateProcessW(
-                std::ptr::null(),
-                command_line.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                TRUE,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::addr_of!(startup.StartupInfo),
-                &mut process_info,
-            );
-            if created == FALSE {
-                anyhow::bail!(
-                    "CreateProcessW('{}') into AppContainer failed: {}",
-                    request.program,
-                    std::io::Error::last_os_error()
-                );
-            }
-
-            // Kill-on-close job: this launcher is what tokio's `kill_on_drop`
-            // signals, and killing it must take the real program with it.
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if !job.is_null() {
-                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                if SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    std::ptr::addr_of!(info).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                ) == FALSE
-                    || AssignProcessToJobObject(job, process_info.hProcess) == FALSE
-                {
-                    // The launcher runs before any logging is initialised, so a
-                    // `tracing` call here would go nowhere. stderr is the tool
-                    // command's own stderr, which ahma surfaces to the caller —
-                    // the right place for a degradation the user should see.
-                    eprintln!(
-                        "ahma: could not place the AppContainer child in a kill-on-close job: {}",
-                        std::io::Error::last_os_error()
-                    );
-                }
-                // Handle stays open for this process's lifetime on purpose.
-            }
-
-            ResumeThread(process_info.hThread);
-            let _ = CloseHandle(process_info.hThread);
-
-            let wait = WaitForSingleObject(process_info.hProcess, INFINITE);
-            if wait != WAIT_OBJECT_0 {
-                let _ = CloseHandle(process_info.hProcess);
-                anyhow::bail!(
-                    "WaitForSingleObject on the AppContainer child failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            let mut exit_code: u32 = 0;
-            if GetExitCodeProcess(process_info.hProcess, &mut exit_code) == FALSE {
-                let _ = CloseHandle(process_info.hProcess);
-                anyhow::bail!(
-                    "GetExitCodeProcess failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            let _ = CloseHandle(process_info.hProcess);
-            Ok(exit_code)
-        })();
+        let attribute_result = spawn_and_wait_appcontainer_child(request, attribute_list);
 
         DeleteProcThreadAttributeList(attribute_list);
-        // Keep the capability array alive until the attribute list is gone: the
-        // list holds a pointer into it, not a copy.
+        let _ = &mut attribute_buffer;
         let _ = &mut capabilities;
         let _ = &mut security_capabilities;
         attribute_result
     }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn init_security_attribute_list(
+    security_capabilities: &mut SECURITY_CAPABILITIES,
+) -> anyhow::Result<(Vec<u8>, *mut std::ffi::c_void)> {
+    let mut size: usize = 0;
+    if InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) != FALSE {
+        anyhow::bail!("InitializeProcThreadAttributeList unexpectedly succeeded when sizing");
+    }
+    let last = std::io::Error::last_os_error();
+    if last.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+        anyhow::bail!("InitializeProcThreadAttributeList sizing failed: {last}");
+    }
+    let mut attribute_buffer = vec![0u8; size];
+    let attribute_list = attribute_buffer.as_mut_ptr().cast();
+    if InitializeProcThreadAttributeList(attribute_list, 1, 0, &mut size) == FALSE {
+        anyhow::bail!(
+            "InitializeProcThreadAttributeList failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    if UpdateProcThreadAttribute(
+        attribute_list,
+        0,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+        std::ptr::addr_of!(*security_capabilities).cast(),
+        std::mem::size_of::<SECURITY_CAPABILITIES>(),
+        std::ptr::null_mut(),
+        std::ptr::null(),
+    ) == FALSE
+    {
+        anyhow::bail!(
+            "UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok((attribute_buffer, attribute_list))
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn setup_inherited_stdio_handles(
+    startup: &mut STARTUPINFOEXW,
+    attribute_list: *mut std::ffi::c_void,
+) {
+    let stdin = GetStdHandle(STD_INPUT_HANDLE);
+    let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    let stderr = GetStdHandle(STD_ERROR_HANDLE);
+    for h in [stdin, stdout, stderr] {
+        if !h.is_null() && h != INVALID_HANDLE_VALUE {
+            let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        }
+    }
+
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.lpAttributeList = attribute_list.cast();
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = stdin;
+    startup.StartupInfo.hStdOutput = stdout;
+    startup.StartupInfo.hStdError = stderr;
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn assign_child_to_kill_on_close_job(process_handle: HANDLE) {
+    let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+    if !job.is_null() {
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::addr_of!(info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == FALSE
+            || AssignProcessToJobObject(job, process_handle) == FALSE
+        {
+            eprintln!(
+                "ahma: could not place the AppContainer child in a kill-on-close job: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn wait_and_get_exit_code(process_handle: HANDLE) -> anyhow::Result<u32> {
+    let wait = WaitForSingleObject(process_handle, INFINITE);
+    if wait != WAIT_OBJECT_0 {
+        let _ = CloseHandle(process_handle);
+        anyhow::bail!(
+            "WaitForSingleObject on the AppContainer child failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut exit_code: u32 = 0;
+    if GetExitCodeProcess(process_handle, &mut exit_code) == FALSE {
+        let _ = CloseHandle(process_handle);
+        anyhow::bail!(
+            "GetExitCodeProcess failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let _ = CloseHandle(process_handle);
+    Ok(exit_code)
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn spawn_and_wait_appcontainer_child(
+    request: &LauncherRequest,
+    attribute_list: *mut std::ffi::c_void,
+) -> anyhow::Result<u32> {
+    let mut startup: STARTUPINFOEXW = std::mem::zeroed();
+    setup_inherited_stdio_handles(&mut startup, attribute_list);
+
+    let mut command_line = to_wide(&build_command_line(&request.program, &request.args));
+    let mut process_info: PROCESS_INFORMATION = std::mem::zeroed();
+
+    let created = CreateProcessW(
+        std::ptr::null(),
+        command_line.as_mut_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+        TRUE,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::addr_of!(startup.StartupInfo),
+        &mut process_info,
+    );
+    if created == FALSE {
+        anyhow::bail!(
+            "CreateProcessW('{}') into AppContainer failed: {}",
+            request.program,
+            std::io::Error::last_os_error()
+        );
+    }
+
+    assign_child_to_kill_on_close_job(process_info.hProcess);
+
+    ResumeThread(process_info.hThread);
+    let _ = CloseHandle(process_info.hThread);
+
+    wait_and_get_exit_code(process_info.hProcess)
 }
 
 /// Materialise a well-known capability SID (`S-1-15-3-*`).

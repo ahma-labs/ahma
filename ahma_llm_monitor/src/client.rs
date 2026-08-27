@@ -601,38 +601,7 @@ impl LlmClient {
         messages: Vec<Value>,
         tools: &[Value],
     ) -> Result<ChatCompletionResponse, LlmMonitorError> {
-        let (url, body) = match self.flavor {
-            ApiFlavor::OpenAi => {
-                let mut body = json!({
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": 0.2,
-                    "stream": false,
-                });
-                if !tools.is_empty() {
-                    body["tools"] = Value::Array(tools.to_vec());
-                    body["tool_choice"] = json!("auto");
-                }
-                self.apply_num_ctx(&mut body);
-                (format!("{}/chat/completions", self.base_url), body)
-            }
-            ApiFlavor::Anthropic => {
-                let (system, amsgs) = anthropic::openai_to_anthropic(&messages);
-                let atools = anthropic::openai_tools_to_anthropic(tools);
-                (
-                    format!("{}/messages", self.base_url),
-                    anthropic::build_messages_body(
-                        &self.model,
-                        system,
-                        amsgs,
-                        &atools,
-                        false,
-                        anthropic::DEFAULT_MAX_TOKENS,
-                        self.thinking,
-                    ),
-                )
-            }
-        };
+        let (url, body) = self.build_chat_completion_request_payload(&messages, tools);
 
         let started = std::time::Instant::now();
         info!(
@@ -674,22 +643,70 @@ impl LlmClient {
             ApiFlavor::Anthropic => anthropic::parse_messages_response(json),
         };
         if let Ok(ref resp) = parsed {
-            let (prompt_tokens, completion_tokens) = resp
-                .usage
-                .as_ref()
-                .map(|u| (u.prompt_tokens, u.completion_tokens))
-                .unwrap_or((0, 0));
-            info!(
-                model = %self.model,
-                elapsed_ms = started.elapsed().as_millis(),
-                content_chars = resp.content.len(),
-                tool_calls = resp.tool_calls.len(),
-                prompt_tokens,
-                completion_tokens,
-                "llm: chat completion received"
-            );
+            self.log_chat_completion_metrics(resp, started, "chat completion received");
         }
         parsed
+    }
+
+    fn build_chat_completion_request_payload(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> (String, Value) {
+        match self.flavor {
+            ApiFlavor::OpenAi => {
+                let mut body = json!({
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "stream": false,
+                });
+                if !tools.is_empty() {
+                    body["tools"] = Value::Array(tools.to_vec());
+                    body["tool_choice"] = json!("auto");
+                }
+                self.apply_num_ctx(&mut body);
+                (format!("{}/chat/completions", self.base_url), body)
+            }
+            ApiFlavor::Anthropic => {
+                let (system, amsgs) = anthropic::openai_to_anthropic(messages);
+                let atools = anthropic::openai_tools_to_anthropic(tools);
+                (
+                    format!("{}/messages", self.base_url),
+                    anthropic::build_messages_body(
+                        &self.model,
+                        system,
+                        amsgs,
+                        &atools,
+                        false,
+                        anthropic::DEFAULT_MAX_TOKENS,
+                        self.thinking,
+                    ),
+                )
+            }
+        }
+    }
+
+    fn log_chat_completion_metrics(
+        &self,
+        resp: &ChatCompletionResponse,
+        started: std::time::Instant,
+        label: &str,
+    ) {
+        let (prompt_tokens, completion_tokens) = resp
+            .usage
+            .as_ref()
+            .map(|u| (u.prompt_tokens, u.completion_tokens))
+            .unwrap_or((0, 0));
+        info!(
+            model = %self.model,
+            elapsed_ms = started.elapsed().as_millis(),
+            content_chars = resp.content.len(),
+            tool_calls = resp.tool_calls.len(),
+            prompt_tokens,
+            completion_tokens,
+            "llm: {label}"
+        );
     }
 
     /// Streaming variant of [`Self::chat_completion_with_tools`].
@@ -767,20 +784,7 @@ impl LlmClient {
             drain_streaming_deltas(byte_stream, &deltas, &self.model, started).await?;
         let parsed = parse_chat_completion_response(response_json);
         if let Ok(ref resp) = parsed {
-            let (prompt_tokens, completion_tokens) = resp
-                .usage
-                .as_ref()
-                .map(|u| (u.prompt_tokens, u.completion_tokens))
-                .unwrap_or((0, 0));
-            info!(
-                model = %self.model,
-                elapsed_ms = started.elapsed().as_millis(),
-                content_chars = resp.content.len(),
-                tool_calls = resp.tool_calls.len(),
-                prompt_tokens,
-                completion_tokens,
-                "llm: streaming chat completion assembled"
-            );
+            self.log_chat_completion_metrics(resp, started, "streaming chat completion assembled");
         }
         parsed
     }

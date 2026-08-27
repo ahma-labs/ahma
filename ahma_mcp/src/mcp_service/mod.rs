@@ -1607,24 +1607,8 @@ impl ServerHandler for AhmaMcpService {
             let mut tools = self.builtin_tools();
             tools.extend(self.visible_config_tools());
 
-            // Add external MCP tools from McpConnectionManager
             let external_mgr = self.mcp_connections.read().await;
-            for ext_tool in external_mgr.aggregate_tools() {
-                let description = ext_tool.description.clone();
-                let input_schema = match ext_tool.input_schema.clone() {
-                    serde_json::Value::Object(map) => map,
-                    _ => serde_json::Map::new(),
-                };
-                let schema_arc = Arc::new(input_schema);
-                tools.push(
-                    Tool::new(
-                        ext_tool.name.clone(),
-                        description.unwrap_or_default(),
-                        schema_arc,
-                    )
-                    .with_title(ext_tool.name.clone()),
-                );
-            }
+            append_external_mcp_tools(&mut tools, &external_mgr);
 
             Ok(ListToolsResult {
                 meta: None,
@@ -1684,90 +1668,9 @@ impl ServerHandler for AhmaMcpService {
                 self.guard_sandbox_ready_for_tool_calls().await?;
             }
 
-            let result = match tool_name.as_ref() {
-                "status" => {
-                    self.handle_status(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "await" => {
-                    let mut caller = handlers::await_tool::AwaitCaller::from_context(&context);
-                    caller.push_channel_open = self.push_channel_open();
-                    self.handle_await_for_caller(run_params, caller).await
-                }
-                "run_terminal_command" => {
-                    self.handle_run_terminal_command(run_params, context).await
-                }
-                "cancel" => {
-                    self.handle_cancel(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "sandbox_grant" => {
-                    let client_type = McpClientType::from_peer(&context.peer);
-                    self.handle_sandbox_grant(run_params.arguments.unwrap_or_default(), client_type)
-                        .await
-                }
-                "logs_list" => {
-                    self.handle_logs_list(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "logs_approve" => {
-                    self.handle_logs_approve(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "logs_read" => {
-                    self.handle_logs_read(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "logs_search" => {
-                    self.handle_logs_search(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "restart" => {
-                    self.handle_restart(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "read_file" => {
-                    self.handle_read_file(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "list_dir" => {
-                    self.handle_list_dir(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "file_search" => {
-                    self.handle_file_search(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "grep_search" => {
-                    self.handle_grep_search(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "fetch_webpage" => {
-                    self.handle_fetch_webpage(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "write_file" => {
-                    self.handle_write_file(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "replace_in_file" => {
-                    self.handle_replace_in_file(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "agent" => {
-                    self.handle_agent(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "todo_write" => {
-                    self.handle_todo_write(run_params.arguments.unwrap_or_default())
-                        .await
-                }
-                "log_monitor" => {
-                    self.handle_log_monitor(run_params.arguments.unwrap_or_default(), context)
-                        .await
-                }
-                _ => self.dispatch_configured_tool(run_params, context).await,
-            };
+            let result = self
+                .dispatch_tool_call(tool_name.as_ref(), run_params, context)
+                .await;
 
             if is_guard_active {
                 self.record_result_in_loop_detector(
@@ -1803,7 +1706,118 @@ impl ServerHandler for AhmaMcpService {
     }
 }
 
+fn append_external_mcp_tools(
+    tools: &mut Vec<Tool>,
+    external_mgr: &crate::mcp_client::McpConnectionManager,
+) {
+    for ext_tool in external_mgr.aggregate_tools() {
+        let description = ext_tool.description.clone();
+        let input_schema = match ext_tool.input_schema.clone() {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        let schema_arc = Arc::new(input_schema);
+        tools.push(
+            Tool::new(
+                ext_tool.name.clone(),
+                description.unwrap_or_default(),
+                schema_arc,
+            )
+            .with_title(ext_tool.name.clone()),
+        );
+    }
+}
+
 impl AhmaMcpService {
+    async fn dispatch_tool_call(
+        &self,
+        tool_name: &str,
+        run_params: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        match tool_name {
+            "status" => {
+                self.handle_status(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "await" => {
+                let mut caller = handlers::await_tool::AwaitCaller::from_context(&context);
+                caller.push_channel_open = self.push_channel_open();
+                self.handle_await_for_caller(run_params, caller).await
+            }
+            "run_terminal_command" => self.handle_run_terminal_command(run_params, context).await,
+            "cancel" => {
+                self.handle_cancel(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "sandbox_grant" => {
+                let client_type = McpClientType::from_peer(&context.peer);
+                self.handle_sandbox_grant(run_params.arguments.unwrap_or_default(), client_type)
+                    .await
+            }
+            "logs_list" => {
+                self.handle_logs_list(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "logs_approve" => {
+                self.handle_logs_approve(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "logs_read" => {
+                self.handle_logs_read(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "logs_search" => {
+                self.handle_logs_search(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "restart" => {
+                self.handle_restart(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "read_file" => {
+                self.handle_read_file(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "list_dir" => {
+                self.handle_list_dir(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "file_search" => {
+                self.handle_file_search(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "grep_search" => {
+                self.handle_grep_search(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "fetch_webpage" => {
+                self.handle_fetch_webpage(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "write_file" => {
+                self.handle_write_file(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "replace_in_file" => {
+                self.handle_replace_in_file(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "agent" => {
+                self.handle_agent(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "todo_write" => {
+                self.handle_todo_write(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            "log_monitor" => {
+                self.handle_log_monitor(run_params.arguments.unwrap_or_default(), context)
+                    .await
+            }
+            _ => self.dispatch_configured_tool(run_params, context).await,
+        }
+    }
     /// Heals the tool name and arguments via the harness guard, and checks for
     /// repeated identical failures (loop detection). Returns `Some(result)` when a
     /// loop is detected — the caller should return that result immediately.

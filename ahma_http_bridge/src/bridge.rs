@@ -612,20 +612,7 @@ pub async fn start_bridge(mut config: BridgeConfig) -> Result<()> {
 
 /// Create the shared bridge state (session manager + Arc wrapper) from a `BridgeConfig`.
 fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
-    let session_config = SessionManagerConfig {
-        server_command: config.server_command.clone(),
-        server_args: config.server_args.clone(),
-        default_scope: config.default_sandbox_scope.clone(),
-        enable_colored_output: config.enable_colored_output,
-        handshake_timeout_secs: config.handshake_timeout_secs,
-        request_timeout_secs: config.request_timeout_secs,
-        tool_call_timeout_secs: config.tool_call_timeout_secs,
-        max_sessions: config.max_sessions,
-        // Forward the injected PeerFactory (P5 in-process test harness support).
-        // When `Some`, sessions use an in-memory MCP service rather than
-        // spawning a subprocess — this is the key enabler for fast bridge tests.
-        peer_factory: config.peer_factory.clone(),
-    };
+    let session_config = create_session_config(config);
     let mut session_manager = SessionManager::new(session_config);
     if let Some(ref counter) = config.active_sessions {
         session_manager.active_sessions = Some(counter.clone());
@@ -637,6 +624,20 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
         listener_kind: config.listener_kind.clone(),
     })
+}
+
+fn create_session_config(config: &BridgeConfig) -> SessionManagerConfig {
+    SessionManagerConfig {
+        server_command: config.server_command.clone(),
+        server_args: config.server_args.clone(),
+        default_scope: config.default_sandbox_scope.clone(),
+        enable_colored_output: config.enable_colored_output,
+        handshake_timeout_secs: config.handshake_timeout_secs,
+        request_timeout_secs: config.request_timeout_secs,
+        tool_call_timeout_secs: config.tool_call_timeout_secs,
+        max_sessions: config.max_sessions,
+        peer_factory: config.peer_factory.clone(),
+    }
 }
 
 /// On Unix, spawn a background task that watches for SIGHUP and reloads the

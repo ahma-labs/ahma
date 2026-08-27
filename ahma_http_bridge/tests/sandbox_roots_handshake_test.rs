@@ -14,7 +14,7 @@
 //!
 //! These tests are security-critical. Do NOT:
 //! - Weaken assertions to accept sandbox failures as "passing"
-//! - Add test-mode env var bypasses (see SPEC.md R21.3)
+//! - Add test-mode env var bypasses (see SPEC.md R-CFG9.2)
 //! - Remove environment variable clearing (see AGENTS.md guardrails)
 //!
 //! ## Test Environment

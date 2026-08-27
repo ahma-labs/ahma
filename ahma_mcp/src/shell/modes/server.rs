@@ -841,104 +841,93 @@ pub(crate) fn split_version_and_build_id(v: &str) -> (&str, Option<&str>) {
 
 pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
     let mut args = vec!["serve".to_string(), "--server-child".to_string()];
+    forward_path_and_scope_flags(&mut args, config);
+    forward_boolean_flags(&mut args, config);
+    forward_numeric_and_auth_flags(&mut args, config);
+    args
+}
 
-    // Helpers so every forwarded flag stays on a single, auditable line.
-    fn push(args: &mut Vec<String>, flag: &str) {
-        args.push(flag.to_string());
-    }
-    fn push_val(args: &mut Vec<String>, flag: &str, val: impl Into<String>) {
-        args.push(flag.to_string());
-        args.push(val.into());
-    }
+fn push_val(args: &mut Vec<String>, flag: &str, val: impl Into<String>) {
+    args.push(flag.to_string());
+    args.push(val.into());
+}
 
-    // Forward ONLY genuinely explicit sandbox scopes (from --sandbox-scope,
-    // --working-dir, or task vault) so the bridge is not locked to a
-    // provisional temp/CWD that the stdio parent derived at startup.
-    // --sandbox and --tmp are forwarded as boolean flags below so the bridge
-    // can derive ~/sandbox and temp access independently for each session.
+fn forward_path_and_scope_flags(args: &mut Vec<String>, config: &AppConfig) {
     for scope in &config.sandbox_scopes {
-        push_val(&mut args, "--sandbox-scope", scope.to_string_lossy());
+        push_val(args, "--sandbox-scope", scope.to_string_lossy());
     }
     for wd in &config.working_dirs {
-        push_val(&mut args, "--working-dir", wd.to_string_lossy());
+        push_val(args, "--working-dir", wd.to_string_lossy());
     }
 
     if config.explicit_tools_dir
         && let Some(ref tools_dir) = config.tools_dir
     {
-        push_val(&mut args, "--tools-dir", tools_dir.to_string_lossy());
+        push_val(args, "--tools-dir", tools_dir.to_string_lossy());
     }
 
     if let Some(ref task_vault) = config.task_vault {
-        push_val(&mut args, "--task-vault", task_vault.to_string_lossy());
+        push_val(args, "--task-vault", task_vault.to_string_lossy());
     }
 
     for bundle in &config.tool_bundles {
-        push_val(&mut args, "--tools", bundle.clone());
+        push_val(args, "--tools", bundle.clone());
     }
 
     let idle_timeout = config
         .idle_timeout_secs
         .unwrap_or(AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS);
     if idle_timeout > 0 {
-        push_val(&mut args, "--idle-timeout", idle_timeout.to_string());
+        push_val(args, "--idle-timeout", idle_timeout.to_string());
     }
 
     if !config.unix_socket_path.is_empty() {
         let socket = config.unix_socket_path.clone();
-        push_val(&mut args, "--unix-socket-path", socket);
+        push_val(args, "--unix-socket-path", socket);
     }
+}
 
-    // Boolean flags — each enabled only when the config field is set.
-    if config.no_sandbox {
-        push(&mut args, "--no-sandbox");
+fn forward_boolean_flags(args: &mut Vec<String>, config: &AppConfig) {
+    let flags: &[(&str, bool)] = &[
+        ("--no-sandbox", config.no_sandbox),
+        ("--skip-probes", config.skip_availability_probes),
+        ("--sync", config.force_sync),
+        ("--defer-sandbox", config.defer_sandbox),
+        ("--scratch", config.use_scratch_dir),
+        ("--tmp", config.tmp_access),
+        ("--disable-temp-files", config.no_temp_files),
+    ];
+    for &(flag, enabled) in flags {
+        if enabled {
+            args.push(flag.to_string());
+        }
     }
-    if config.skip_availability_probes {
-        push(&mut args, "--skip-probes");
-    }
-    if config.force_sync {
-        push(&mut args, "--sync");
-    }
-    if config.defer_sandbox {
-        push(&mut args, "--defer-sandbox");
-    }
-    if config.use_scratch_dir {
-        push(&mut args, "--scratch");
-    }
-    if config.tmp_access {
-        push(&mut args, "--tmp");
-    }
-    if config.no_temp_files {
-        push(&mut args, "--disable-temp-files");
-    }
+}
 
-    // Numeric flags — forwarded only when non-zero.
+fn forward_numeric_and_auth_flags(args: &mut Vec<String>, config: &AppConfig) {
     if config.rate_limit_rps > 0 {
         let rps = config.rate_limit_rps.to_string();
-        push_val(&mut args, "--rate-limit-rps", rps);
+        push_val(args, "--rate-limit-rps", rps);
     }
     if config.rate_limit_burst > 0 {
         let burst = config.rate_limit_burst.to_string();
-        push_val(&mut args, "--rate-limit-burst", burst);
+        push_val(args, "--rate-limit-burst", burst);
     }
     if config.handshake_timeout_secs > 0 {
         let handshake = config.handshake_timeout_secs.to_string();
-        push_val(&mut args, "--handshake-timeout", handshake);
+        push_val(args, "--handshake-timeout", handshake);
     }
 
-    // Auth flags.
     if let Some(ref token) = config.require_token {
-        push_val(&mut args, "--require-token", token.clone());
+        push_val(args, "--require-token", token.clone());
     }
     if let Some(ref path) = config.require_token_path {
-        push_val(&mut args, "--require-token-path", path.to_string_lossy());
+        push_val(args, "--require-token-path", path.to_string_lossy());
     }
 
     if !config.instance_label.is_empty() {
-        push_val(&mut args, "--instance-label", config.instance_label.clone());
+        push_val(args, "--instance-label", config.instance_label.clone());
     }
-
-    args
 }
 
 /// Open a capture file for bridge output, writing `banner` as its first line.

@@ -957,33 +957,53 @@ fn push_tool_message_with_hints(
 ) {
     let mut final_payload = payload;
     if let Some(obj) = final_payload.as_object_mut() {
-        if should_inject_error_hint(failed, inject_error_hint, *error_hinted) {
-            *error_hinted = true;
-            let key = if obj.contains_key("error") {
-                "error"
-            } else {
-                "output"
-            };
-            append_hint_to_field(
-                obj,
-                key,
-                "\n\u{1f4a1} [Harness Hint: The previous tool call failed. Carefully read the error output above. Ensure parameter values are correct, check for typo errors, and try a different approach.]",
-            );
-        }
-        if should_inject_read_hint(tool_name, inject_read_hint, *read_file_hinted) {
-            *read_file_hinted = true;
-            append_hint_to_field(
-                obj,
-                "output",
-                "\n\u{1f4a1} [Harness Hint: When modifying files that already exist, you MUST use `replace_in_file` with exact old/new string matching. Avoid using `write_file` for existing files.]",
-            );
-        }
+        inject_harness_hints_into_payload(
+            obj,
+            tool_name,
+            failed,
+            inject_error_hint,
+            inject_read_hint,
+            error_hinted,
+            read_file_hinted,
+        );
     }
     msg_json.push(serde_json::json!({
         "role": "tool",
         "tool_call_id": tool_call_id,
         "content": truncate_middle(&final_payload.to_string(), result_char_cap)
     }));
+}
+
+fn inject_harness_hints_into_payload(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    tool_name: &str,
+    failed: bool,
+    inject_error_hint: bool,
+    inject_read_hint: bool,
+    error_hinted: &mut bool,
+    read_file_hinted: &mut bool,
+) {
+    if should_inject_error_hint(failed, inject_error_hint, *error_hinted) {
+        *error_hinted = true;
+        let key = if obj.contains_key("error") {
+            "error"
+        } else {
+            "output"
+        };
+        append_hint_to_field(
+            obj,
+            key,
+            "\n\u{1f4a1} [Harness Hint: The previous tool call failed. Carefully read the error output above. Ensure parameter values are correct, check for typo errors, and try a different approach.]",
+        );
+    }
+    if should_inject_read_hint(tool_name, inject_read_hint, *read_file_hinted) {
+        *read_file_hinted = true;
+        append_hint_to_field(
+            obj,
+            "output",
+            "\n\u{1f4a1} [Harness Hint: When modifying files that already exist, you MUST use `replace_in_file` with exact old/new string matching. Avoid using `write_file` for existing files.]",
+        );
+    }
 }
 
 /// Handle a possibly length-truncated completion, right after it is fetched
@@ -1071,8 +1091,6 @@ pub async fn execute_agent_turn(
     )
     .await
     else {
-        // The concrete error was already logged in fetch_completion and pushed to
-        // the TUI as AgentEvent::Error; this records why the turn stopped.
         warn!("agent: turn aborted — no completion returned by the model");
         return false;
     };
@@ -1084,12 +1102,7 @@ pub async fn execute_agent_turn(
         "agent: model turn completed"
     );
 
-    if let Some(usage) = &completion.usage {
-        let _ = tx.send(AgentEvent::Usage(usage.clone())).await;
-        if usage.prompt_tokens > 0 {
-            *last_prompt_tokens = usage.prompt_tokens;
-        }
-    }
+    record_turn_usage(&completion.usage, tx, last_prompt_tokens).await;
 
     msg_json.push(serde_json::json!({
         "role": "assistant",
@@ -1104,14 +1117,7 @@ pub async fn execute_agent_turn(
     }
 
     if completion.tool_calls.is_empty() {
-        info!("agent: final answer received (no tool calls) — ending agentic loop");
-        // When streamed, the content was already emitted token-by-token; only
-        // emit it here for non-streamed paths (e.g. MCP sampling).
-        if !content_streamed && !completion.content.is_empty() {
-            let _ = tx.send(AgentEvent::Token(completion.content)).await;
-        }
-        let _ = tx.send(AgentEvent::Done).await;
-        return false;
+        return handle_final_agent_response(completion, content_streamed, tx).await;
     }
 
     let Some(mcp_cfg) = mcp.clone() else {
@@ -1123,6 +1129,55 @@ pub async fn execute_agent_turn(
         return false;
     };
 
+    dispatch_turn_tool_calls(
+        completion,
+        mcp_cfg,
+        tx.clone(),
+        gate,
+        msg_json,
+        error_hinted,
+        read_file_hinted,
+    )
+    .await;
+
+    true
+}
+
+async fn record_turn_usage(
+    usage: &Option<ahma_llm_monitor::client::TokenUsage>,
+    tx: &Sender<AgentEvent>,
+    last_prompt_tokens: &mut u32,
+) {
+    if let Some(usage) = usage {
+        let _ = tx.send(AgentEvent::Usage(usage.clone())).await;
+        if usage.prompt_tokens > 0 {
+            *last_prompt_tokens = usage.prompt_tokens;
+        }
+    }
+}
+
+async fn handle_final_agent_response(
+    completion: ahma_llm_monitor::client::ChatCompletionResponse,
+    content_streamed: bool,
+    tx: &Sender<AgentEvent>,
+) -> bool {
+    info!("agent: final answer received (no tool calls) — ending agentic loop");
+    if !content_streamed && !completion.content.is_empty() {
+        let _ = tx.send(AgentEvent::Token(completion.content)).await;
+    }
+    let _ = tx.send(AgentEvent::Done).await;
+    false
+}
+
+async fn dispatch_turn_tool_calls(
+    completion: ahma_llm_monitor::client::ChatCompletionResponse,
+    mcp_cfg: McpChatConfig,
+    tx: Sender<AgentEvent>,
+    gate: Arc<dyn AgentApprovalGate>,
+    msg_json: &mut Vec<serde_json::Value>,
+    error_hinted: &mut bool,
+    read_file_hinted: &mut bool,
+) {
     let tool_names: Vec<&str> = completion
         .tool_calls
         .iter()
@@ -1161,8 +1216,6 @@ pub async fn execute_agent_turn(
             result_char_cap,
         );
     }
-
-    true
 }
 
 pub fn spawn_agent_task(

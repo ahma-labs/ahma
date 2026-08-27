@@ -1627,38 +1627,36 @@ fn handle_navigator_action(
                 state.close_modal();
             }
         }
-        Action::NavChar(c) => {
-            if let Some(nav) = state.navigator_mut() {
-                nav.input.push(*c);
-            }
-            refresh_navigator_completions(state);
-        }
-        Action::NavBackspace => {
-            if let Some(nav) = state.navigator_mut() {
-                nav.input.pop();
-            }
-            refresh_navigator_completions(state);
-        }
-        Action::NavComplete => {
-            if let Some(nav) = state.navigator_mut() {
-                nav.tab_complete();
-            }
-        }
-        Action::NavUp => {
-            if let Some(nav) = state.navigator_mut() {
-                nav.select_prev();
-            }
-        }
-        Action::NavDown => {
-            if let Some(nav) = state.navigator_mut() {
-                nav.select_next();
-            }
-        }
         Action::NavSubmit => submit_navigator_command(state),
+        Action::NavChar(c) => mutate_navigator(state, |nav| nav.input.push(*c), true),
+        Action::NavBackspace => mutate_navigator(
+            state,
+            |nav| {
+                nav.input.pop();
+            },
+            true,
+        ),
+        Action::NavComplete => mutate_navigator(state, |nav| nav.tab_complete(), false),
+        Action::NavUp => mutate_navigator(state, |nav| nav.select_prev(), false),
+        Action::NavDown => mutate_navigator(state, |nav| nav.select_next(), false),
         _ => return false,
     }
 
     true
+}
+
+#[cfg(feature = "tui")]
+fn mutate_navigator(
+    state: &mut crate::state::AppState,
+    f: impl FnOnce(&mut crate::state::CommandNavigator),
+    refresh_completions: bool,
+) {
+    if let Some(nav) = state.navigator_mut() {
+        f(nav);
+    }
+    if refresh_completions {
+        refresh_navigator_completions(state);
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -2634,32 +2632,12 @@ fn handle_mcp_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool
     }
 
     if cmd == "/mcp refresh" {
-        if let Some(tx) = &state.bridge_tx {
-            crate::llm_bridge::spawn_external_tools_refresh(
-                state.mcp_connections.clone(),
-                tx.clone(),
-            );
-            push_assistant_message(state, "Refreshing external MCP tools in the background...");
-        } else {
-            push_assistant_message(
-                state,
-                "Bridge is not available; cannot refresh external tools.",
-            );
-        }
+        handle_mcp_refresh(state);
         return true;
     }
 
     if let Some(rest) = cmd.strip_prefix("/mcp remove ") {
-        let name = rest.trim();
-        if name.is_empty() {
-            push_assistant_message(state, "Usage: /mcp remove <name>");
-            return true;
-        }
-        state.mcp_connections.remove_server(name);
-        if let Ok(cwd) = std::env::current_dir() {
-            let _ = state.mcp_connections.save(&cwd);
-        }
-        push_assistant_message(state, format!("Removed MCP server `{name}`."));
+        handle_mcp_remove(rest, state);
         return true;
     }
 
@@ -2674,6 +2652,33 @@ fn handle_mcp_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool
     }
 
     false
+}
+
+#[cfg(feature = "tui")]
+fn handle_mcp_refresh(state: &mut crate::state::AppState) {
+    if let Some(tx) = &state.bridge_tx {
+        crate::llm_bridge::spawn_external_tools_refresh(state.mcp_connections.clone(), tx.clone());
+        push_assistant_message(state, "Refreshing external MCP tools in the background...");
+    } else {
+        push_assistant_message(
+            state,
+            "Bridge is not available; cannot refresh external tools.",
+        );
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_mcp_remove(rest: &str, state: &mut crate::state::AppState) {
+    let name = rest.trim();
+    if name.is_empty() {
+        push_assistant_message(state, "Usage: /mcp remove <name>");
+        return;
+    }
+    state.mcp_connections.remove_server(name);
+    if let Ok(cwd) = std::env::current_dir() {
+        let _ = state.mcp_connections.save(&cwd);
+    }
+    push_assistant_message(state, format!("Removed MCP server `{name}`."));
 }
 
 #[cfg(feature = "tui")]
@@ -4264,29 +4269,6 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         SourceEvent::ToolsListUpdated { tools } => {
             handle_event_tools_list_updated(tools, state);
         }
-        SourceEvent::SandboxStatus { status } => state.sandbox_status = status,
-        SourceEvent::SandboxScope { scope } => {
-            // A successful configuration supersedes any recorded failure.
-            state.sandbox_failed_reason = None;
-            state.sandbox_scope = Some(scope);
-        }
-        SourceEvent::SandboxFailed { error } => {
-            state.sandbox_status = "FAILED".to_string();
-            // Keep the reason on state so the /scope window can show it after
-            // this log line scrolls away (SPEC R7.3: fail loudly, with
-            // instructions — a bare [FAILED] chip is neither).
-            state.sandbox_failed_reason = Some(error.clone());
-            state.push_log(crate::state::LogEntry {
-                timestamp: chrono::Local::now(),
-                level: crate::state::LogLevel::Error,
-                message: format!(
-                    "Sandbox configuration FAILED: {error} — tool calls are refused until a \
-                     scope locks. See /scope for details; fix the scope source (open a \
-                     workspace folder, pass --sandbox-scope, or configure [sandbox] \
-                     container_root) and restart."
-                ),
-            });
-        }
         SourceEvent::SessionId { id } => {
             state.session_id = if id.is_empty() { None } else { Some(id) };
         }
@@ -4303,6 +4285,103 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         SourceEvent::InstancesUpdated { instances } => {
             handle_instances_updated(instances, state);
         }
+        SourceEvent::SandboxStatus { .. }
+        | SourceEvent::SandboxScope { .. }
+        | SourceEvent::SandboxFailed { .. } => {
+            handle_source_sandbox_event(event, state);
+        }
+        SourceEvent::ApprovalRequested { .. }
+        | SourceEvent::ScopeGrantRequested { .. }
+        | SourceEvent::ScopeGrantDismiss { .. }
+        | SourceEvent::WebApprovalRequested { .. }
+        | SourceEvent::WebApprovalDismiss { .. } => {
+            handle_source_gate_event(event, state);
+        }
+        SourceEvent::ChatToken { .. }
+        | SourceEvent::ChatThinking { .. }
+        | SourceEvent::AgentDone
+        | SourceEvent::AgentError { .. }
+        | SourceEvent::Usage { .. }
+        | SourceEvent::ToolCallStarted { .. }
+        | SourceEvent::ToolCallFinished { .. } => {
+            handle_source_chat_event(event, state);
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_source_sandbox_event(
+    event: crate::mcp_source::SourceEvent,
+    state: &mut crate::state::AppState,
+) {
+    use crate::mcp_source::SourceEvent;
+    match event {
+        SourceEvent::SandboxStatus { status } => state.sandbox_status = status,
+        SourceEvent::SandboxScope { scope } => {
+            state.sandbox_failed_reason = None;
+            state.sandbox_scope = Some(scope);
+        }
+        SourceEvent::SandboxFailed { error } => {
+            state.sandbox_status = "FAILED".to_string();
+            state.sandbox_failed_reason = Some(error.clone());
+            state.push_log(crate::state::LogEntry {
+                timestamp: chrono::Local::now(),
+                level: crate::state::LogLevel::Error,
+                message: format!(
+                    "Sandbox configuration FAILED: {error} — tool calls are refused until a \
+                     scope locks. See /scope for details; fix the scope source (open a \
+                     workspace folder, pass --sandbox-scope, or configure [sandbox] \
+                     container_root) and restart."
+                ),
+            });
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_source_gate_event(
+    event: crate::mcp_source::SourceEvent,
+    state: &mut crate::state::AppState,
+) {
+    use crate::mcp_source::SourceEvent;
+    match event {
+        SourceEvent::ApprovalRequested { id, tool, args } => {
+            request_tool_approval(state, id, tool, args, None);
+        }
+        SourceEvent::ScopeGrantRequested { request } => {
+            state.scope_grant = Some(crate::state::ScopeGrantGate::from_request(request));
+        }
+        SourceEvent::ScopeGrantDismiss { decision_id }
+            if state
+                .scope_grant
+                .as_ref()
+                .is_some_and(|g| g.decision_id == decision_id) =>
+        {
+            state.scope_grant = None;
+        }
+        SourceEvent::WebApprovalRequested { request } => {
+            state.web_approval = Some(crate::state::WebApprovalGate::from_request(request));
+        }
+        SourceEvent::WebApprovalDismiss { decision_id }
+            if state
+                .web_approval
+                .as_ref()
+                .is_some_and(|g| g.decision_id == decision_id) =>
+        {
+            state.web_approval = None;
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_source_chat_event(
+    event: crate::mcp_source::SourceEvent,
+    state: &mut crate::state::AppState,
+) {
+    use crate::mcp_source::SourceEvent;
+    match event {
         SourceEvent::ChatToken { token } => {
             state.chat.append_token(&token);
             state.mark_stream_activity(crate::state::LivenessState::Streaming);
@@ -4312,38 +4391,6 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             state.chat.append_thinking(&token);
             state.mark_stream_activity(crate::state::LivenessState::Thinking);
             state.chat_scroll = 0;
-        }
-        SourceEvent::ApprovalRequested { id, tool, args } => {
-            request_tool_approval(state, id, tool, args, None);
-        }
-        SourceEvent::ScopeGrantRequested { request } => {
-            // A grant prompt never overwrites a different pending one silently; the
-            // newest replaces only if it is a fresh decision (dedup happens upstream
-            // in the GrantCoordinator, so duplicates never reach here).
-            state.scope_grant = Some(crate::state::ScopeGrantGate::from_request(request));
-        }
-        SourceEvent::ScopeGrantDismiss { decision_id } => {
-            if state
-                .scope_grant
-                .as_ref()
-                .is_some_and(|g| g.decision_id == decision_id)
-            {
-                state.scope_grant = None;
-            }
-        }
-        SourceEvent::WebApprovalRequested { request } => {
-            // Dedup happens upstream in the WebApprovalCoordinator, so duplicates
-            // never reach here; the newest request becomes the pending prompt.
-            state.web_approval = Some(crate::state::WebApprovalGate::from_request(request));
-        }
-        SourceEvent::WebApprovalDismiss { decision_id } => {
-            if state
-                .web_approval
-                .as_ref()
-                .is_some_and(|g| g.decision_id == decision_id)
-            {
-                state.web_approval = None;
-            }
         }
         SourceEvent::AgentDone => {
             state.reset_liveness();
@@ -4363,8 +4410,6 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             completion_tokens,
             total_tokens,
         } => {
-            // Mirror the in-process BridgeEvent::Usage accumulation so the
-            // status-bar token counter populates on the daemon-hub path too.
             state.token_usage.prompt_tokens += prompt_tokens;
             state.token_usage.completion_tokens += completion_tokens;
             state.token_usage.total_tokens += total_tokens;
@@ -4383,6 +4428,7 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             state.chat.finish_tool_call(&id, result, failed);
             state.chat_scroll = 0;
         }
+        _ => {}
     }
 }
 
@@ -4814,59 +4860,47 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
     }
 }
 
-/// Returns true when the click position falls on the close button area of a window.
-/// Single-height windows use their entire right edge; taller windows require
-/// the click to be on the title row.
 #[cfg(feature = "tui")]
-fn is_close_button_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
-    // Wide enough for the explicit "[x99]" close cell plus its margin.
-    let in_close_zone = col >= rect.x + rect.width.saturating_sub(6);
-    if rect.height == 1 {
-        in_close_zone
-    } else {
-        row == rect.y && in_close_zone
-    }
+enum WindowHit {
+    Close(usize),
+    Toggle(usize),
+    Detail(usize),
 }
 
 #[cfg(feature = "tui")]
-fn handle_window_rect_click(col: u16, row: u16, state: &mut crate::state::AppState) -> bool {
-    // Collect the hit result first; acting on it requires a mutable borrow of `state`.
-    enum Hit {
-        Close(usize),
-        Toggle(usize),
-        Detail(usize),
-    }
-    let hit = {
-        let rects = state.window_rects.borrow();
-        rects.iter().find_map(|&(win_id, rect)| {
-            if !inside_rect(col, row, rect) {
-                return None;
-            }
-            if is_close_button_click(col, row, rect) {
-                Some(Hit::Close(win_id))
-            } else if is_collapse_marker_click(col, row, rect) {
-                Some(Hit::Toggle(win_id))
-            } else {
-                Some(Hit::Detail(win_id))
-            }
-        })
-    };
+fn find_window_rect_hit(
+    col: u16,
+    row: u16,
+    rects: &[(usize, ratatui::layout::Rect)],
+) -> Option<WindowHit> {
+    rects.iter().find_map(|&(win_id, rect)| {
+        if !inside_rect(col, row, rect) {
+            return None;
+        }
+        if is_close_button_click(col, row, rect) {
+            Some(WindowHit::Close(win_id))
+        } else if is_collapse_marker_click(col, row, rect) {
+            Some(WindowHit::Toggle(win_id))
+        } else {
+            Some(WindowHit::Detail(win_id))
+        }
+    })
+}
 
+#[cfg(feature = "tui")]
+fn apply_window_hit(hit: Option<WindowHit>, state: &mut crate::state::AppState) -> bool {
     match hit {
-        Some(Hit::Close(win_id)) => {
+        Some(WindowHit::Close(win_id)) => {
             close_window_by_id(win_id, state);
             true
         }
-        Some(Hit::Toggle(win_id)) => {
+        Some(WindowHit::Toggle(win_id)) => {
             if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
                 w.collapsed = !w.collapsed;
             }
             true
         }
-        Some(Hit::Detail(win_id)) => {
-            // Click on the card body = drill into the operation's full-screen
-            // detail view. Windows without a backing operation (UNSANDBOXED
-            // CLI runs, LLM steps) keep the old expand/collapse behavior.
+        Some(WindowHit::Detail(win_id)) => {
             let op_id = state
                 .windows
                 .iter()
@@ -4886,6 +4920,12 @@ fn handle_window_rect_click(col: u16, row: u16, state: &mut crate::state::AppSta
     }
 }
 
+#[cfg(feature = "tui")]
+fn handle_window_rect_click(col: u16, row: u16, state: &mut crate::state::AppState) -> bool {
+    let hit = find_window_rect_hit(col, row, &state.window_rects.borrow());
+    apply_window_hit(hit, state)
+}
+
 /// The `[+] N` / `[-] N` marker at the left edge of a card's title row —
 /// clicking it toggles expand/collapse rather than drilling into the detail
 /// view. Collapsed cards are one row; expanded cards count only their top row.
@@ -4897,6 +4937,20 @@ fn is_collapse_marker_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> 
         row == rect.y
     };
     on_title_row && col < rect.x + 8
+}
+
+/// Returns true when the click position falls on the close button area of a window.
+/// Single-height windows use their entire right edge; taller windows require
+/// the click to be on the title row.
+#[cfg(feature = "tui")]
+fn is_close_button_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
+    // Wide enough for the explicit "[x99]" close cell plus its margin.
+    let in_close_zone = col >= rect.x + rect.width.saturating_sub(6);
+    if rect.height == 1 {
+        in_close_zone
+    } else {
+        row == rect.y && in_close_zone
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -4931,8 +4985,7 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
 }
 
 #[cfg(feature = "tui")]
-fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
-    // A full-screen detail overlay covers the screen — the wheel scrolls it.
+fn scroll_overlay(up: bool, state: &mut crate::state::AppState) -> bool {
     let detail_max = state.detail_max_scroll.get();
     let overlay_scroll = match &mut state.modal {
         crate::state::ModalState::OperationDetail(d) => Some(&mut d.scroll),
@@ -4945,9 +4998,14 @@ fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::A
         } else {
             (*scroll + 1).min(detail_max)
         };
-        return;
+        true
+    } else {
+        false
     }
+}
 
+#[cfg(feature = "tui")]
+fn scroll_chat(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) -> bool {
     let chat_area = state.chat_area.get();
     if inside_rect(col, row, chat_area) {
         let max = state.chat_max_scroll.get();
@@ -4957,9 +5015,14 @@ fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::A
             state.chat_scroll = state.chat_scroll.min(max).saturating_sub(1);
         }
         state.sync_chat_scroll_to_animation();
-        return;
+        true
+    } else {
+        false
     }
+}
 
+#[cfg(feature = "tui")]
+fn scroll_log(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
     let log_area = state.log_area.get();
     if inside_rect(col, row, log_area) {
         if up {
@@ -4973,6 +5036,14 @@ fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::A
             state.maybe_reengage_log_follow();
         }
     }
+}
+
+#[cfg(feature = "tui")]
+fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
+    if scroll_overlay(up, state) || scroll_chat(col, row, up, state) {
+        return;
+    }
+    scroll_log(col, row, up, state);
 }
 
 fn determine_scrolled_panel(state: &crate::state::AppState) -> &'static str {

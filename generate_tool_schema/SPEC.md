@@ -21,4 +21,4 @@
 ## 4. Out of Scope
 
 - Validating tool definitions at runtime — that is `ahma tool validate` and the startup validation in `ahma_mcp`, which reject invalid configs with actionable messages.
-- Defining the MTDF itself — see root [SPEC.md](../SPEC.md) §3.
+- Defining the MTDF itself — see root [SPEC.md](../SPEC.md) §5.

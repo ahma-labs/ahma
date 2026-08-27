@@ -1,6 +1,6 @@
 # Ahma Requirements
 
-> **For AI Assistants:** This is the **single source of truth** for the project. Always read this before making changes. Update this file when requirements change, bugs are discovered, or implementation status changes.
+> **Specification:** This document defines **what** the Ahma product and services do and **why**. For developer workflows, testing philosophy, and repository conventions, see [AGENTS.md](AGENTS.md).
 
 ## Quick Status
 
@@ -12,7 +12,7 @@
 | Unified Operation Event Stream | tests-pass | Single `OperationEvent` stream (`ahma_common::event_dispatcher`); `OperationMonitor` is the sole lifecycle emitter; subscribers: MCP progress push, daemon hub, vault audit, TUI |
 | Output Spill Files | tests-pass | Complete per-operation output at `<log dir>/operations/<id>.log`; advertised as `output_file` in results; retention-cleaned |
 | Small-Model Context Harness | tests-pass | `ahma tui` budgets tool results + trims conversation for limited-context local models; `--context-length`, `--small-model-harness`/`--no-small-model-harness` |
-| Feature-Gated Incubating Crates | tests-pass | vault/simplify/decompose/worker/renewal behind non-default cargo features; graceful `feature_not_compiled` CLI errors |
+| Feature-Gated Incubating Crates | tests-pass | `simplify` (code-complexity analysis) is the only non-default cargo feature today; `full` is now an alias for it. vault, decompose, worker, and renewal were fully removed as crates, not feature-gated (see "Removed" below) |
 | Latency Regression Guards | tests-pass | Ignored benchmarks guard end-to-end dispatch latency and per-line streaming cost (`latency_guard_test`) |
 | Linux Sandbox (Landlock) | tests-pass | Kernel-level FS sandboxing on Linux 5.13+ |
 | macOS Sandbox (Seatbelt) | tests-pass | Kernel-level FS sandboxing via `sandbox-exec` — **write** confinement only. Reads are unconfined (APFS firmlink limitation, R6.2.2) and controlled by a credential denylist instead (R6.2.3); disclosed at runtime per R-PERM.5.1 |
@@ -55,39 +55,6 @@
 | Binary Code Signing (R-SIGN) | in-progress | macOS ad-hoc binary gets `SIGKILL (Code Signature Invalid)` under heavy-build memory pressure / in-place rebuild → opaque `Connection closed`. Done: atomic out-of-place install + local re-sign in `ahma update` (R-SIGN.2, R-SIGN.1-local); signal-death classification surfaced in the client's JSON-RPC error + panic log-flush (R-SIGN.5). Pending: Developer-ID release signing (R-SIGN.1, blocked on Apple Developer credentials), Windows WDAC/SAC verify (R-SIGN.3) |
 
 ---
-
-## Removed: orphaned incubating crates (`ahma_decompose`, `ahma_worker`, `ahma_renewal`)
-
-These three AGPL-3.0-or-later crates were removed from the workspace because nothing in the
-shipped product invoked them:
-
-- **`ahma_renewal`** — renewal contract for long-running tasks. Had zero dependents and no SPEC.
-- **`ahma_worker`** — ephemeral worker code synthesis. Had zero dependents.
-- **`ahma_decompose`** — local-LLM decompose orchestration. Had zero dependents; self-flagged for deprecation in its own `lib.rs`.
-
-The related `tool_type: decompose`/`worker` handler stubs inside `ahma_mcp` and the
-`.ahma/decompose.json` example are tracked separately. The sources remain in git history if
-these roadmap features are revived; recover them from the commit that deleted the crate
-directories.
-
----
-
-## TODO: Python bindings (former `ahma_py` crate)
-
-The `ahma_py` crate has been removed from the workspace and the source files deleted. Before removal it served as the project's Python bindings (PyO3) to expose `ahma_core` to Python consumers and provided build notes for producing a wheel. Key points captured from the crate's source before deletion:
-
-- Purpose: Python bindings for `ahma_core` via PyO3; intended to publish an `ahma-py` wheel for Jupyter/FastAPI/Streamlit use-cases.
-- AGPL separation: planned separate `ahma_py_agpl` distribution for bindings that expose AGPL-licensed crates (e.g., `ahma_decompose`, `ahma_worker`).
-- Build hints (from removed crate): use `maturin` to build/develop the wheel; example commands were included in the crate docs.
-- Implementation notes: some APIs were stubs that returned errors when AGPL dependencies were not present (explicitly instructing the integrator to add the AGPL crate if they accept those terms).
-
-Deferred action items (documented TODO):
-
-1. Re-evaluate packaging and licensing approach for Python bindings (single wheel vs. split permissive/AGPL wheels).
-2. If re-introducing bindings: add `pyo3` and `maturin` build guidance to workspace docs, update `workspace.dependencies` or document build-time requirements, and gate AGPL features behind a separate crate/package.
-3. Preserve a record of the removed crate in the git history and reference the commit that deleted `ahma_py` for future restoration.
-
-The deleted crate files were under `ahma_py/` prior to removal. Check the git history if you need the original sources.
 
 ## 1. Project Overview
 
@@ -285,7 +252,7 @@ bounded window and decides from the outcome.
 
 ## 3.5 Configuration Standard (R-CFG)
 
-Server configuration (everything except MTDF tool definitions) **must** be deterministic, inspectable, and tamper-resistant. Environment variables are ambient, persistent state: they leak across sessions, are settable by any process sharing the user's environment, and are invisible at the invocation site. They are therefore being removed as a configuration source. This section is the single source of truth for configuration resolution; where older sections (R5.3, R21.4, `docs/environment-variables.md`) conflict, R-CFG wins.
+Server configuration (everything except MTDF tool definitions) **must** be deterministic, inspectable, and tamper-resistant. Environment variables are ambient, persistent state: they leak across sessions, are settable by any process sharing the user's environment, and are invisible at the invocation site. They are therefore being removed as a configuration source. This section is the single source of truth for configuration resolution; where older sections (R5.3, `docs/environment-variables.md`) conflict, R-CFG wins.
 
 ### R-CFG1: Configuration Sources and Precedence
 
@@ -317,7 +284,7 @@ Server configuration (everything except MTDF tool definitions) **must** be deter
 
 ### R-CFG4: Resolve Once, Then Immutable
 
-- **R-CFG4.1**: All configuration **must** be resolved exactly once at startup into an immutable resolved-config structure passed down by constructor argument (extends R21.4). No production code may read configuration (env, settings files) after startup; runtime re-reads are a tamper channel.
+- **R-CFG4.1**: All configuration **must** be resolved exactly once at startup into an immutable resolved-config structure passed down by constructor argument (extends R-CFG9.5's env-var-minimization principle). No production code may read configuration (env, settings files) after startup; runtime re-reads are a tamper channel.
 - **R-CFG4.2**: Only the configuration-resolution module may call `std::env::var*` for `AHMA_*` names. This **must** be enforced by a CI check (grep test or clippy `disallowed-methods`) with an explicit allowlist for R-CFG1.3 reads.
 - **R-CFG4.3**: The sandbox scope derived from resolved configuration remains subject to R5.1: set once, never mutated.
 
@@ -337,7 +304,7 @@ Server configuration (everything except MTDF tool definitions) **must** be deter
 
 - **R-CFG7.1**: Next minor release: project settings file, trust tiers, `--origin`, strict parsing, flag pairs; Security-tier `AHMA_*` variables (`AHMA_DISABLE_SANDBOX`, `AHMA_SANDBOX_SCOPE`, `AHMA_SANDBOX_DEFER`, `AHMA_WORKING_DIRS`, `AHMA_TMP_ACCESS`, `AHMA_DISABLE_TEMP`, `AHMA_NO_PACKAGE_CACHE_WRITE`, `AHMA_TASK_VAULT`, `AHMA_REQUIRE_TOKEN`, `AHMA_REQUIRE_TOKEN_PATH`, `AHMA_TLS_DIR`, `AHMA_INSECURE_SKIP_VERIFY`) ignored with `warn`. Preference-tier variables demoted below settings files and warned.
 - **R-CFG7.2**: The following minor release: all remaining `AHMA_*` configuration variables ignored. Only R-CFG1.3 allowlisted reads survive.
-- **R-CFG7.3**: `docs/environment-variables.md`, `docs/connection-modes.md` (the Antigravity example currently sets `AHMA_SANDBOX_SCOPE`; it must use `--sandbox-scope` in `args`), `skills/ahma/SKILL.md`, and README **must** be updated in the same PR as each migration step (R-DOC, R-SK6).
+- **R-CFG7.3**: `docs/environment-variables.md`, `docs/connection-modes.md` (the Antigravity example currently sets `AHMA_SANDBOX_SCOPE`; it must use `--sandbox-scope` in `args`), `skills/ahma/SKILL.md`, and README **must** be updated in the same PR as each migration step (see [AGENTS.md](AGENTS.md) §1 Feature Documentation Contract (R-DOC) and §3 R-SK6).
 
 ### R-CFG8: Required Tests
 
@@ -353,9 +320,10 @@ Production and test code must be separated so that test harness machinery can ne
   1. `#[cfg(test)]` compile-time gates (preferred — zero runtime cost in production builds).
   2. The `AppConfig.is_server_child` field (set only via the `--server-child` CLI flag or the `AHMA_SERVER_CHILD` internal plumbing variable, which is set by the parent ahma process before spawning a subprocess).
   3. Constructor/function parameters (dependency injection).
-- **R-CFG9.2**: Production code **must not** read `NEXTEST`, `CARGO_MANIFEST_DIR`, `CARGO_LLVM_COV`, `CARGO_TARGET_DIR`, or any other cargo-set environment variable. These variables are set by the build/test toolchain and must not influence runtime security decisions (R21.3). The `--server-child` flag is the exclusive mechanism for subprocess detection in production. **Single carve-out (R-ISO.1):** `NEXTEST` / `NEXTEST_RUN_ID` may be read for exactly one purpose — forcing test isolation of endpoint rendezvous (private socket/port instead of the machine-global ones), via `ahma_common::test_isolation` only. This influence is fail-closed by construction: the variable can only *restrict* the process to private endpoints; it can never widen filesystem/network access, restart shared services, or weaken a sandbox decision. (Production already reads `AHMA_TEST_ISOLATION` to the same effect, so this adds no new attacker capability.)
+- **R-CFG9.2**: Production code **must not** read `NEXTEST`, `CARGO_MANIFEST_DIR`, `CARGO_LLVM_COV`, `CARGO_TARGET_DIR`, or any other cargo-set environment variable. These variables are set by the build/test toolchain and must not influence runtime security decisions. The `--server-child` flag is the exclusive mechanism for subprocess detection in production. **Single carve-out (R-ISO.1):** `NEXTEST` / `NEXTEST_RUN_ID` may be read for exactly one purpose — forcing test isolation of endpoint rendezvous (private socket/port instead of the machine-global ones), via `ahma_common::test_isolation` only. This influence is fail-closed by construction: the variable can only *restrict* the process to private endpoints; it can never widen filesystem/network access, restart shared services, or weaken a sandbox decision. (Production already reads `AHMA_TEST_ISOLATION` to the same effect, so this adds no new attacker capability.)
 - **R-CFG9.3**: Test helper code inside `#[cfg(test)]` blocks or `test_utils` modules **may** read `AHMA_TEST_BINARY`, `CARGO_TARGET_DIR`, `NEXTEST`, and `CARGO_LLVM_COV` to locate test fixtures and adjust timeouts. These reads are acceptable because they are gated behind compile-time test flags and do not run in production binaries.
 - **R-CFG9.4**: The `AHMA_DAEMON_PORT` and `AHMA_DAEMON_SOCK` variables are test-isolation helpers set by `init_test_daemon_isolation()`. They **must** only be read inside `#[cfg(test)]`-gated code paths or in functions that are explicitly documented as test-only. They are INTERNAL plumbing (not user-facing) and **must** be listed in `docs/environment-variables.md` as `INTERNAL/TEST`.
+- **R-CFG9.5**: **Environment variable minimization.** Beyond the test/production split above, the system **must** minimize configuration via environment variables generally, to prevent security side-channel attacks and configuration clutter. Configuration parameters **must** be declared on the command line or in explicit configuration structures (`AppConfig`) and passed down through constructor arguments, rather than queried directly from the environment at the point of use.
 
 ---
 
@@ -1413,88 +1381,9 @@ These three mechanisms together bound how long any abandoned `ahma serve stdio` 
 
 ---
 
-## 8. Development Workflow
+## 8. Implementation Constraints
 
-### 8.0 Documentation Requirements
-
-#### R-DOC: Feature Documentation Contract
-
-Every major feature in ahma **must** have a corresponding page in `docs/` and an entry in `README.md`. This applies to both stable and experimental features.
-
-**R-DOC.1 — Dedicated doc page**: Each major feature **must** have its own `docs/<feature>.md` file with:
-- A clear statement of whether the feature is stable or **Experimental** (version introduced).
-- A motivating "Why" paragraph explaining the security or usability rationale.
-- A practical quickstart with runnable commands or code.
-- A reference table of configuration options where applicable.
-- A "See also" section linking to related docs and the relevant SPEC.md section.
-
-**R-DOC.2 — README entry**: Each major feature **must** have a brief entry in `README.md` under the appropriate section (stable features) or the "vX.Y Experimental Features" section (new/unstable features). The entry **must** link to the dedicated doc page.
-
-**R-DOC.3 — SPEC.md accuracy**: When a feature's behaviour is changed, the corresponding SPEC.md section and its `docs/<feature>.md` page **must** be updated in the same commit or PR.
-
-**R-DOC.4 — Experimental graduation**: When an experimental feature is stabilised, its doc page **must** remove the "Experimental" notice, update SPEC.md status to `tests-pass`, and move its README entry from the "Experimental" section to the appropriate stable section.
-
-**R-DOC.5 — Removal**: When a feature is removed, its `docs/<feature>.md` **must** be deleted and all README and SPEC.md references **must** be removed in the same commit.
-
-**R-DOC.6 — No orphan docs**: Every file in `docs/` **must** be referenced from at least one of: `README.md`, `SPEC.md`, or another `docs/*.md` file. Orphan documentation is misleading and should not accumulate.
-
-**R-DOC.7 — CLI Help Text Guidelines**: Command-line interface help descriptions **must** follow two strict guidelines:
-- **Contiguous Layout**: Descriptions for arguments, flags, and subcommands **must** be written as contiguous blocks of text without blank lines (double carriage returns). Since Clap outputs help text inside lists, internal blank lines disrupt the alignment and layout.
-- **Educational Context**: Help text for complex or non-obvious features (e.g., `--task-vault`) **must** be educational. It must explain what the feature is and why/when a user or tool would use it, while remaining concise and precise.
-
-| Feature area | Stable doc | SPEC.md section |
-|---|---|---|
-| Kernel sandbox | [docs/security-sandbox.md](docs/security-sandbox.md) | R5, R6 |
-| Connection modes | [docs/connection-modes.md](docs/connection-modes.md) | §6 |
-| Custom tools / MTDF | [docs/custom-tools.md](docs/custom-tools.md) | §5 |
-| Live log monitoring | [docs/live-log-monitoring.md](docs/live-log-monitoring.md) | §5.5 |
-| Environment variables | [docs/environment-variables.md](docs/environment-variables.md) | — |
-| Installation | [docs/installation.md](docs/installation.md) | — |
-| Session isolation | [docs/session-isolation.md](docs/session-isolation.md) | R10 |
-| Task vaults | [docs/task-vault.md](docs/task-vault.md) | §5.8 |
-| Decompose | [docs/decompose.md](docs/decompose.md) | §5.6 |
-| TUI | [docs/tui.md](docs/tui.md) | — |
-| Egress sandbox | [docs/egress-sandbox.md](docs/egress-sandbox.md) | — |
-| Network egress (subprocess) | [docs/network-egress.md](docs/network-egress.md) | R-WEB.16, R-PERM.5.3 |
-| Execution audit log | [docs/execution-audit-log.md](docs/execution-audit-log.md) | R-HANDOFF.10 |
-| Artifacts | [docs/artifacts.md](docs/artifacts.md) | — |
-| Worker synthesis | [docs/worker-synthesis.md](docs/worker-synthesis.md) | §5.7 |
-| Bundle audit | [docs/bundle-audit.md](docs/bundle-audit.md) | — |
-| Renewal contract | [docs/renewal-contract.md](docs/renewal-contract.md) | — |
-| ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | — |
-
-### 8.1 Core Principle: Use Ahma
-
-**Always use Ahma** instead of terminal commands:
-
-| Instead of... | Use Ahma tool... |
-|---------------|---------------------|
-| `run_in_terminal("cargo build")` | `cargo` with `{"subcommand": "build"}` |
-| `run_in_terminal("any command")` | `run_terminal_command` with `{"command": "any command"}` |
-
-**Why**: We dogfood our own product. Using Ahma catches bugs immediately, runs faster (no GUI prompts), and enforces sandbox security.
-
-### 8.2 Quality Checks
-
-Before committing, run (via Ahma):
-
-1. `cargo fmt` — format code
-2. `cargo nextest run` — run tests
-3. `cargo clippy --fix --allow-dirty` — fix lint warnings
-4. `cargo doc --no-deps` — verify docs build
-
-### 8.3 Terminal Fallback (Rare)
-
-Only use terminal directly when:
-
-1. **Coverage**: `cargo llvm-cov` — instrumentation incompatible with sandboxing
-2. **Ahma completely broken** — fix immediately after recovery
-
----
-
-## 9. Implementation Constraints
-
-### 9.1 Meta-Parameters
+### 8.1 Meta-Parameters
 
 These control execution environment but **must not** be passed as CLI arguments:
 
@@ -1502,12 +1391,14 @@ These control execution environment but **must not** be passed as CLI arguments:
 - `execution_mode`: Sync vs async
 - `timeout_seconds`: Operation timeout
 
-### 9.2 Async I/O Hygiene
+### 8.2 Process Lifetime Hygiene
 
-> **Note on numbering**: these requirements were previously `R10.1`–`R10.3`, which collided with the unrelated `R10` "Session Isolation" family in §7 (`R10.1`–`R10.8`). One id could not name two requirements, so §9.2's are renamed to the self-describing `R-ASYNC` and `R-PROC` namespaces. Nothing outside this section referenced the old ids.
-
-- **R-ASYNC.1**: Blocking I/O (`std::fs`) **must not** be used in async functions. Use `tokio::fs` instead.
-- **R-ASYNC.2**: Test code is exempt (blocking acceptable in `#[tokio::test]`).
+> **Note on numbering**: R-PROC was previously `R10.1`–`R10.3`, which collided with the
+> unrelated `R10` "Session Isolation" family in §7 (`R10.1`–`R10.8`). One id could not name
+> two requirements, so it was renamed to the self-describing `R-PROC` namespace. Nothing
+> outside this section referenced the old id. (The async-I/O-in-async-fn coding convention
+> that used to sit alongside it here has no code citations and lives solely in
+> [AGENTS.md](AGENTS.md) §4 now, to avoid saying it twice.)
 
 #### R-PROC: Child Process Lifetime
 
@@ -1516,23 +1407,17 @@ These control execution environment but **must not** be passed as CLI arguments:
 - **R-PROC.3**: **Deliberately detached daemons are exempt, and must say so.** A spawn whose entire purpose is to *outlive* its parent — the auto-spawned bridge, the daemon hub — **must not** set `kill_on_drop`, and uses `process_group(0)` for the opposite reason (to survive the terminal's process group, not to be reaped with it). Such a spawn **must** carry a comment stating that it is intentionally detached, so the exemption is visibly deliberate and not mistaken for an R-PROC.1 violation.
 - **R-PROC.4**: **Group-kill is not graceful, and that's accepted.** SIGKILL (the group kill mandated by R-PROC.2) cannot be caught, so a killed child never gets to run its own signal handlers or cleanup. Git is the concrete example: git registers removal of `.git/index.lock` against SIGINT/SIGTERM/SIGHUP, not SIGKILL, so a `git` process ahma kills via timeout, cancel, or sandbox denial can leave `.git/index.lock` orphaned, breaking every subsequent git command in that workspace until a human deletes it. This is a known, deliberate consequence of `kill_process_tree`'s SIGKILL-only design, not a defect — a SIGTERM-first grace period was considered and rejected because it would add latency to every timeout/cancel across the whole tool surface (builds, tests, arbitrary shell commands) for a benefit narrow to signal-cleanup-aware tools like git. The mitigation is detection, not prevention: `collect_lock_file_suggestions` (`ahma_mcp/src/mcp_service/handlers/await_tool.rs`) scans `.git/` alongside `target`/`node_modules`/`.cargo`/`tmp`/`temp` for stale lock files after an await timeout and surfaces `rm`-style remediation steps, the same mechanism already used for cargo/npm lock files.
 
-### 9.3 Error Handling
-
-- **R11.1**: Use `anyhow::Result` for internal error propagation.
-- **R11.2**: Convert to `McpError` at MCP service boundary.
-- **R11.3**: Include actionable context in error messages.
-
-### 9.4 Unified Shell Output
+### 8.3 Unified Shell Output
 
 - **R12.1**: All shell commands **must** redirect stderr to stdout (`2>&1`).
 - **R12.2**: AI clients receive single, chronologically ordered stream.
 
-### 9.5 Cancellation Handling
+### 8.4 Cancellation Handling
 
 - **R13.1**: Distinguish MCP protocol cancellations from process cancellations.
 - **R13.2**: Only cancel actual background operations, not synchronous MCP tool calls (`await`, `status`, `cancel`).
 
-### 9.6 Concurrency Architecture Principles
+### 8.5 Concurrency Architecture Principles
 
 #### R18: No-Wait State Transitions
 
@@ -1582,17 +1467,12 @@ started_rx.await.ok();  // Don't return until spawn is live
   - Event listeners with guaranteed delivery
   - NOT: multiple copies of state with synchronization attempts
 
-#### R21: Security Against Environment Pollution
-
-- **R21.1**: Production behavior **must not** be controllable via environment variables that an attacker or malicious process could set.
-- **R21.2**: Test-only behavior **should** be controlled via:
-  - Compile-time features (`#[cfg(test)]`)
-  - Explicit CLI parameters (e.g., `--disable-sandbox`)
-  - Constructor parameters passed at initialization
-- **R21.3**: The following patterns are **FORBIDDEN**:
-  - Any different behavior based on automatic "test mode" detection from environment variables like `NEXTEST`, `CARGO_TARGET_DIR`, etc.
-  - Any environment variable that bypasses security checks
-- **R21.4**: **Environment Variable Minimization**: The system **must** minimize configuration via environment variables to prevent security side-channel attacks and configuration clutter. Configuration parameters **must** be declared on the command line or in explicit configuration structures (`AppConfig`) and passed down through constructor arguments rather than being queried directly from the environment at execution time. The full resolution standard, trust tiers, and env-var retirement schedule are specified in §3.5 (R-CFG), which supersedes any older text that honors `AHMA_*` variables.
+> Environment-variable security (production must not be controllable via
+> attacker-settable env vars, test-only behavior must be gated behind
+> `#[cfg(test)]`/CLI params/constructor injection) is specified once, in
+> §3.5's R-CFG9 "Test-Only Configuration" — this section previously
+> restated it as R21 with an overlapping numbering scheme; R-CFG9 is now
+> the sole authority.
 
 #### R22: Visual Minimalism
 
@@ -1772,392 +1652,21 @@ correct **at startup**, not only for events that happen afterwards.
     tallies and recent operation identities (R24.7) — and demotes transport,
     pid, uuid, and scope to a single dim line for connection debugging.
 
----
-
-## 10. Testing Philosophy
-
-### 10.1 Core Principles
-
-- **R14.1**: All new functionality **must** have tests.
-- **R14.2**: Tests should be: Fast (<100ms), Isolated, Deterministic, Documented.
-- **R14.3**: Bug fixes **must** include a regression test.
-- **R14.4**: Prefer in-memory unit tests over subprocess E2E tests. A test that validates static configuration, schema generation, path security, tool dispatch, argument parsing, async operation lifecycle, or any pure logic **must not** spawn an OS process. Only use `ClientBuilder`/`spawn_http_bridge` when the test specifically validates binary wiring or CLI flag behaviour that cannot be exercised via the in-process API.
-- **R14.5**: Tests **must not** depend on an external Python runtime (`python3`, `pip`, or any `.py` script). Python is a supported _execution target_ for worker synthesis, but CI test suites assume only a Rust toolchain is present. Use Rust-native equivalents in tests; if a feature requires Python at runtime, make the test conditional and document the external prerequisite explicitly.
-
-### 10.1.1 The Test Pyramid
-
-This project follows a strict test pyramid to keep CI stable on 2-core GitHub Actions runners. Every subprocess spawned by a test consumes an OS thread *and* process-scheduler slots. When 20+ tests run concurrently, IPC pipe back-pressure causes handshake timeouts — these look like logic bugs but are infrastructure failures.
-
-| Layer | Tool | When to use | Execution time |
-|-------|------|-------------|----------------|
-| **Unit** (preferred) | Direct API calls, `#[cfg(test)]` modules | Logic, schema generation, config parsing, state machines | <5 ms |
-| **Integration (in-process)** | `create_in_process_mcp_from_dir()` / `create_in_process_mcp_with_scope()` | MCP protocol logic, tool dispatch, path security, argument parsing, async operations | <50 ms |
-| **E2E (subprocess)** | `ClientBuilder`, `spawn_http_bridge` | Binary wiring, CLI flags, cross-binary IPC | 1–5 s |
-
-**Decision rule**: _Can this test be written without spawning a process?_ If yes, write it that way. `ClientBuilder` and `spawn_http_bridge` are reserved for the E2E layer.
-
-**⚠️ Warning**: `Client::start_process_with_args()` (and anything built on it) is a **subprocess wrapper**, not an in-process helper. Using it for integration tests causes CI timeouts on 2-CPU runners.
-
-### 10.1.2 Choosing the Right In-Process Helper
-
-Both helpers live in `ahma_mcp::test_utils::in_process`:
-
-| Helper | Sandbox | Use when |
-|--------|---------|----------|
-| `create_in_process_mcp_from_dir(tools_dir)` | `Sandbox::new(Test)` — **path validation ENFORCED** | Tool dispatch, arg parsing, async lifecycle, schema tests |
-| `create_in_process_mcp_with_scope(tools_dir, scopes)` | `Sandbox::new(Strict)` — **path validation ENFORCED** | Tests that assert a path or symlink is **rejected** |
-
-Both helpers strictly enforce path validation since `new_test` and validation bypasses have been removed. Tests must ensure that input files and working directories are correctly scoped.
-
-
-### 10.2 Test File Isolation (CRITICAL)
-
-- **ALL tests MUST use temporary directories** via `tempfile` crate.
-- **NEVER** create test files directly in repository structure.
-- `TempDir` automatically cleans up on drop.
-
-```rust
-use tempfile::tempdir;
-
-let temp_dir = tempdir().unwrap();
-let test_file = temp_dir.path().join("test.txt");
-fs::write(&test_file, "test content").unwrap();
-```
-
-### 10.3 CLI Binary Integration Tests
-
-- All binaries (`ahma`, `generate-tool-schema`) **must** have integration tests.
-- Tests in `ahma/tests/cli_binary_integration_test.rs`.
-- Cover: `--help`, `--version`, basic functionality.
-
-### 10.4 Test Utilities - Prevent Code Duplication
-
-**R-TEST-PATH**: All binary path resolution in tests **MUST** use centralized helpers:
-
-- **R-TEST-PATH.1**: Use `ahma_mcp::test_utils::cli::get_binary_path(package, binary)` to get binary paths
-- **R-TEST-PATH.2**: Use `ahma_mcp::test_utils::cli::build_binary_cached(package, binary)` for builds with caching
-- **R-TEST-PATH.3**: **NEVER** manually access `std::env::var("CARGO_TARGET_DIR")` outside of `test_utils::cli`
-
-**Why**: CI environments may set `CARGO_TARGET_DIR` to relative paths (e.g., `target`). The centralized helpers correctly resolve these relative to the workspace root. Manual path resolution duplicates this logic and inevitably introduces bugs.
-
-**Enforcement**: See `scripts/lint_test_paths.sh` for automated detection of violations.
-
-### 10.5 CI-Resilient Testing Patterns
-
-**R15**: Tests must pass reliably in CI environments with concurrent test execution.
-
-#### R15.1: Avoid Race Conditions in Async Testresults, prefer either **synchronous tool execution** (`synchronous: true`) or the `await` tool. Notifications are best-effort; use the `await` tool for reliable result retrieval.
-- **R15.1.3**: Use generous timeouts (10+ seconds) for async
-- **R15.1.1**: Never use `tokio::select!` to race response completion against notification reception. When the response branch wins, the transport may already be closing.
-- **R15.1.2**: For stdio MCP tests that verify results, prefer either **synchronous tool execution** (`synchronous: true`) or the `await` tool. Notifications are best-effort; use the `await` tool for reliable result retrieval.
-- **R15.1.3**: Use generous timeouts (10+ seconds) for async waiting. CI environments are slower and more variable than local development.
-
-#### R15.2: Test Timeout and Polling Guidelines
-
-- **R15.2.1**: Never use fixed `sleep()` to wait for async conditions. Use `wait_for_condition()` from `test_utils`.
-- **R15.2.2**: For health checks and server readiness, poll with increasing backoff instead of fixed delays.
-- **R15.2.3**: When testing notifications or async events, use channel-based communication with explicit timeouts.
-
-#### R15.3: Stdio Transport Gotchas
-
-- **R15.3.1**: Async operation **results** no longer rely on transport delivery. `OperationMonitor` stores results via `tokio::sync::watch` channel; `wait_for_operation()` is race-free (watch stores the current value, so a late subscriber sees `true` immediately). The old `Arc<Notify>` + `wait_for_history_propagation_pub` polling hack has been removed. Push notifications remain best-effort for progress updates
-- **R15.3.2**: The `handle_notification` callback is only invoked when rmcp's internal reader successfully parses and delivers the notification. Transport teardown can prevent this.
-- **R15.3.3**: For notification tests, consider using HTTP mode with SSE instead of stdio - SSE keeps the notification stream open independently.
-- **R15.3.4**: Async operation **results** no longer rely on transport delivery. `OperationMonitor` stores results via `tokio::sync::watch` channel; `wait_for_operation()` is race-free (watch stores the current value, so a late subscriber sees `true` immediately). The old `Arc<Notify>` + `wait_for_history_propagation_pub` polling hack has been removed. Push notifications remain best-effort for progress updates.
-
-#### R15.4: Coverage Overhead Mitigation
-
-- **R15.4.1**: `llvm-cov` instrumentation significantly slows down execution (10x-20x), especially for process-heavy tests like stdio integration.
-- **R15.4.2**: Integration tests involving child processes or networks **must** use generous timeouts (30s+). A 10s timeout that works in `release` mode will reliably fail in `coverage` mode.
-- **R15.4.3**: Flaky failures that occur ONLY in coverage CI jobs almost always indicate timeouts being too tight for the instrumented binary overhead.
-
-#### R15.5: Dual-Transport Test Coverage (HTTP Bridge)
-
-The HTTP bridge exposes a single `/mcp` POST endpoint whose response format is content-negotiated via the `Accept` header:
-
-| `Accept` value         | Handler                                  | Response                                    |
-|------------------------|------------------------------------------|---------------------------------------------|
-| `application/json`     | `handle_session_isolated_request`        | Single JSON-RPC response body               |
-| `text/event-stream`    | `handle_session_isolated_request_sse`    | SSE stream: notifications + response event  |
-
-**Requirement**: Every test that exercises tool execution (i.e. calls `tools/call` or `tools/list`) MUST cover BOTH response modes.
-
-**Implementation pattern** — extract the test body into a shared `async fn run_<case>(mode: TransportMode)`, then add two `#[tokio::test]` entry points:
-
-```rust
-async fn run_my_tool_test(mode: TransportMode) {
-    let Some((_server, mcp)) = setup_test_mcp(mode).await else { return; };
-    // ... assertions ...
-}
-
-#[tokio::test]
-async fn test_my_tool_json() { run_my_tool_test(TransportMode::Json).await; }
-
-#[tokio::test]
-async fn test_my_tool_sse()  { run_my_tool_test(TransportMode::Sse).await; }
-```
-
-**Naming convention** — append `_json` / `_sse` suffix to every test entry point that covers a specific transport mode.  Do NOT use these suffixes for tests that are transport-agnostic (e.g. pure protocol handshake tests, session lifecycle tests, or SSE-specific protocol tests such as event-ID replay).
-
-**Infrastructure** — use `common::setup_test_mcp(mode)` (defined in `tests/common/mod.rs`).  This spawns a fresh server, completes the full MCP handshake including roots exchange, and returns an `McpTestClient` configured with the requested `TransportMode`. The client's `send_request()` / `call_tool()` / `list_tools()` methods automatically use the correct `Accept` header.
-
-**Exemptions** — the following test files are transport-specific by design and do NOT need `_json` / `_sse` variants:
-- `sse_streaming_test.rs` — validates POST SSE content-negotiation, event IDs, Last-Event-Id replay
-- `sse_endpoint_test.rs`  — validates GET `/mcp` SSE notification stream and event structure
-- `handshake_*.rs`       — validates session handshake protocol invariants
-- `sandbox_*.rs`         — validates sandbox gating rules
-
-**Concurrency limits** — all test files using `setup_test_mcp` spawn one server per test function.  They MUST be listed in the `threads-required = 2` override filter in the `[profile.ci.overrides]` section of `.config/nextest.toml` to prevent resource storms on GitHub Actions' 2-CPU runners (where `test-threads = "num-cpus"` = 2 and `threads-required = 2` together allow only one such test to run at a time).  The `[profile.default]` section intentionally omits `threads-required` so that local developer machines (e.g. an M4 Ultra with many cores) run tests with full parallelism.  The CI profile is activated explicitly via `cargo nextest run --profile ci` in `build.yml`; plain `cargo nextest run` always uses the default profile.
-
-### 10.6 Testing Patterns and Helpers
-
-> [!IMPORTANT]
-> **ALL** integration tests MUST use the centralized helpers in `ahma/src/test_utils.rs`. Do NOT reinvent spawn logic, HTTP clients, or project scaffolding.
-
-#### R16.1: Project Scaffolding (`test_utils::test_project`)
-Use `create_rust_test_project` for all tests that need a filesystem. This ensures isolated unique directories via `tempfile` and no repository pollution.
-
-#### R16.2: MCP Service Helpers
-- **In-process (preferred)**: Use `create_in_process_mcp_from_dir(tools_dir)` for MCP protocol logic, tool dispatch, and argument-parsing tests — no subprocess, full MCP handshake, runs in <50 ms. Use `create_in_process_mcp_with_scope(tools_dir, scopes)` when the test must assert that a path or symlink is **rejected** (strict sandbox mode).
-- **HTTP**: Use `spawn_http_bridge()` and `HttpMcpTestClient` for HTTP/SSE integration testing.
-- **Subprocess (E2E only)**: `ClientBuilder` spawns a real subprocess; reserve it for tests that specifically validate binary wiring or CLI flags.
-
-#### R16.3: Binary Resolution
-Always use `cli::build_binary_cached()` to avoid redundant `cargo build` calls and ensure tests are fast and CI-friendly.
-
-#### R16.4: Concurrent Test Helpers (`test_utils::concurrent_test_helpers`)
-
-**Purpose**: Safe patterns for testing concurrent operations.
-
-```rust
-use ahma_mcp::test_utils::concurrent_test_helpers::*;
-
-// Spawn tasks that start simultaneously
-let results = spawn_tasks_with_barrier(5, |task_id| async move {
-    // All tasks start at the exact same instant
-    perform_operation(task_id).await
-}).await;
-
-// Verify no duplicates
-assert_all_unique(&results);
-
-// Bounded concurrency for resource-limited CI
-let results = spawn_bounded_concurrent(items, 4, |item| async move {
-    process(item).await
-}).await;
-```
-
-**Why**: AI-generated concurrent tests often have subtle race conditions. Barriers ensure deterministic starts; bounded spawning prevents OOM.
-
-#### R16.4: Timeout and Polling (`test_utils::concurrent_test_helpers`)
-
-**Purpose**: CI-resilient waiting patterns.
-
-```rust
-use ahma_mcp::test_utils::concurrent_test_helpers::*;
-
-// Wrap operations with clear timeout errors
-let result = with_ci_timeout(
-    "operation completion",
-    CI_DEFAULT_TIMEOUT,
-    async { monitor.wait_for_operation("op-1").await }
-).await?;
-
-// Wait with exponential backoff (more efficient)
-wait_with_backoff("server ready", Duration::from_secs(10), || async {
-    health_check().await.is_ok()
-}).await?;
-```
-
-**Why**: Fixed `sleep()` is flaky on variable CI. Timeouts provide clear diagnostics when things hang.
-
-#### R16.5: Async Assertions (`test_utils::async_assertions`)
-
-**Purpose**: Assert timing behavior in async tests.
-
-```rust
-use ahma_mcp::test_utils::async_assertions::*;
-
-// Assert operation completes in time
-let result = assert_completes_within(
-    Duration::from_secs(5),
-    "quick operation",
-    async { fetch_data().await }
-).await;
-
-// Assert condition becomes true
-assert_eventually(
-    Duration::from_secs(10),
-    Duration::from_millis(100),
-    "operation becomes complete",
-    || async { monitor.is_complete("op-1").await }
-).await;
-```
-
-**Why**: Standard assertions don't work with async conditions. These provide clear failure messages.
-
-### 10.7 CI Anti-Patterns to Avoid
-
-**R17**: Avoid these patterns that reliably cause CI failures but may work locally.
-
-| Anti-Pattern | Problem | Solution |
-|-------------|---------|----------|
-| `tokio::time::sleep(Duration::from_secs(1))` | Flaky on slow CI runners | Use `wait_for_condition()` or `wait_with_backoff()` |
-| `tokio::select!` racing response vs notification | Transport teardown wins | Use synchronous mode for notification tests |
-| `std::fs::create_dir("./test_dir")` | Pollutes repo, conflicts between tests | Use `tempdir()` or `test_project::create_rust_test_project()` |
-| `Command::new("cargo").arg("build")` | Slow, skips cached binaries | Use `cli::build_binary_cached()` |
-| Spawning 100+ concurrent tasks | OOM on CI, thread exhaustion | Use `spawn_bounded_concurrent()` |
-| Expecting notification order | Async execution order is undefined | Collect notifications, assert set membership |
-| Hard-coded ports | Port conflicts with parallel tests | Use port 0 for auto-assignment |
-| Shared mutable state without locks | Data races under concurrent tests | Use `Arc<Mutex<_>>` or channels |
-
-#### R17.1: Example Anti-Pattern vs Correct Pattern
-
-FAIL **WRONG**: Fixed sleep for operation completion
-```rust
-async fn test_operation_completes() {
-    let op_id = start_operation().await;
-    tokio::time::sleep(Duration::from_secs(2)).await;  // Flaky!
-    assert!(is_complete(&op_id));
-}
-```
-
-OK **CORRECT**: Condition-based waiting
-```rust
-async fn test_operation_completes() {
-    let op_id = start_operation().await;
-    wait_with_backoff("operation complete", Duration::from_secs(10), || async {
-        is_complete(&op_id).await
-    }).await?;
-    // Now we know it's complete
-}
-```
-
-FAIL **WRONG**: Creating files in repo directory
-```rust
-let f = File::create("test.txt"); // WRONG
-```
-
-OK **CORRECT**: Using temp directory
-```rust
-let t = tempdir();
-let f = File::create(t.path().join("test.txt")); // OK
-```
-
-### 10.8 Platform-Aware Timeouts
-
-**R18**: All test timeouts **must** use the `ahma_common::timeouts` module for platform-aware scaling.
-
-#### R18.1: Problem Statement
-
-Windows CI runners are 3-5x slower than Linux/macOS for:
-- Process spawning and stdio communication
-- File system operations (especially temp directories)
-- Network socket operations
-- PowerShell startup (vs bash)
-
-Hardcoded timeouts that work locally on macOS/Linux will reliably fail on Windows CI, leading to "whack-a-mole" fixes across the codebase.
-
-#### R18.2: Solution - Centralized Timeout Utility
-
-The `ahma_common::timeouts` module provides:
-
-```rust
-use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
-
-// Use semantic categories with platform-appropriate defaults
-let timeout = TestTimeouts::get(TimeoutCategory::Handshake);  // 60s base, 4x on Windows
-
-// Scale custom durations
-let custom = TestTimeouts::scale_secs(5);  // 5s base, 20s on Windows
-
-// Platform-appropriate polling interval
-let interval = TestTimeouts::poll_interval();  // 100ms on Unix, 500ms on Windows
-```
-
-#### R18.3: Timeout Categories
-
-| Category | Base (Unix) | Windows | Coverage Mode | Purpose |
-|----------|-------------|---------|---------------|---------|
-| `ProcessSpawn` | 30s | 120s | 240s | Binary loading, process startup |
-| `Handshake` | 60s | 240s | 480s | MCP initialize + roots exchange |
-| `ToolCall` | 30s | 120s | 240s | Individual tool execution |
-| `SandboxReady` | 60s | 240s | 480s | Post-roots sandbox activation |
-| `HttpRequest` | 30s | 120s | 240s | HTTP request/response cycle |
-| `SseStream` | 120s | 480s | 960s | SSE stream operations |
-| `HealthCheck` | 15s | 60s | 120s | Server health polling |
-| `Cleanup` | 10s | 40s | 80s | Test cleanup operations |
-| `Quick` | 5s | 20s | 40s | Sub-second operations |
-
-#### R18.4: Migration Requirements
-
-- **R18.4.1**: New tests **must** use `TestTimeouts` instead of hardcoded `Duration::from_secs()`.
-- **R18.4.2**: Existing tests with Windows CI failures **should** be migrated to `TestTimeouts`.
-- **R18.4.3**: When adding delays after async operations (e.g., post-SSE exchange), use `TestTimeouts::short_delay()`.
-- **R18.4.4**: Polling loops **must** use `TestTimeouts::poll_interval()` instead of hardcoded intervals.
-
-#### R18.5: Why Platform Multipliers
-
-The 4x multiplier for Windows is based on empirical CI data:
-- Windows GitHub Actions runners have ~4x slower process spawn times
-- PowerShell startup is ~3x slower than bash
-- Windows temp directories have higher latency than Linux tmpfs
-- Coverage mode (`llvm-cov`) adds another 2x overhead
-
-The multipliers stack: Windows + Coverage = 8x base timeout.
-
-### 11.1 Canonical Reuse Patterns
-
-These rules codify the architecture simplification strategy: isolate repetitive protocol/setup
-details behind shared helpers so core execution algorithms remain easy to read.
-
-#### R19: Production Helper Patterns
-
-- **R19.1**: MCP handlers that return a single text response **should** use
-  `mcp_service::handlers::common::text_result(...)` instead of inlining
-  `CallToolResult::success(vec![Content::text(...)])`.
-- **R19.2**: Common MCP error constructors without extra data **should** use
-  `mcp_service::handlers::common::{mcp_internal, mcp_invalid_params}`.
-- **R19.3**: JSON argument extraction in MCP handlers **should** use
-  `mcp_service::handlers::common::{require_str, opt_str}` where applicable.
-- **R19.4**: Tool-call readiness checks **must** use
-  `sandbox::Sandbox::is_ready_for_tool_calls()` instead of duplicating
-  `scopes().is_empty() && !is_test_mode()` checks.
-- **R19.5**: Built-in tool input schemas (`await`, `status`, `run_terminal_command`)
-  **must** be generated with `mcp_service::schema` helper builders
-  (`string_property`, `path_property`, enum helpers, `object_input_schema`).
-
-#### R20: Test Harness Reuse Patterns
-
-- **R20.1**: HTTP bridge tool tests **should** use `tests/common/setup_test_mcp_for_tools(...)`
-  for setup + required-tool gating, rather than open-coding availability checks.
-- **R20.2**: Reusable assertions in HTTP bridge tests **should** use
-  `tests/common/assert_tool_success_with_output(...)` where output is required.
-- **R20.3**: Tests that need tempdir + `.ahma` tools dir + MCP client **should** use
-  `ahma_mcp::test_utils::client::McpClientFixture`.
-- **R20.4**: Integration tests with custom bridge startup parameters **should** use
-  `tests/common/server::spawn_server_guard_with_config(...)` instead of duplicating
-  process startup/port/health polling code.
-- **R20.5**: Timeout values in integration tests **must** use `TestTimeouts` categories or
-  scaling helpers; numeric `Duration::from_secs(<literal>)` / `from_millis(<literal>)`
-  should only be used in narrowly justified micro-timing helpers.
-
-#### R21: Guardrail Enforcement
-
-- **R21.2**: Guardrail scripts **must** reject newly added literal `Duration::from_secs(...)`
-  / `Duration::from_millis(...)` patterns in timeout-sensitive handshake/bridge integration tests.
-- **R21.3**: Guardrail scripts **should** verify that custom HTTP bridge integration tests
-  use shared startup helpers from `tests/common/server.rs`.
-
-### 11.2 Recurring Failure Mode Detection
-
-This repo has a recurring failure mode: tests can pass while real-world usage is broken.
+#### R25: Tool-call session reuse (TUI chat)
+
+Chat tool calls from `ahma tui` **must** reuse a single negotiated MCP session rather than
+performing a full `initialize`/`roots/list` handshake and spawning a fresh bridge subprocess
+per call. The session id established by a tool call's `get_or_create_session` **must** be fed
+back into `state.session_id` so every later tool call in the turn — and across turns — reuses
+it instead of racing the bridge's session limit. (This id was referenced from four call sites
+— `ahma_tui/SPEC.md`, `ahma_tui/src/llm_bridge.rs`, `ahma_core/src/agent.rs` — before this
+entry existed here; those citations now resolve.)
 
 ---
 
-## 12. Feature Requirements by Module
+## 9. Feature Requirements by Module
 
-### 12.1 ahma
+### 9.1 ahma
 
 | Feature | Status | Description |
 |---------|--------|-------------|
@@ -2174,18 +1683,18 @@ This repo has a recurring failure mode: tests can pass while real-world usage is
 | Sequence tools | PASS | Multi-command workflows |
 | Tool reload | in-progress | Explicit `restart` only; directory watcher withdrawn (R1.4) |
 
-### 12.2 ahma-http-bridge
+### 9.2 ahma-http-bridge
 
 | Feature | Status | Description |
 |---------|--------|-------------|
 | HTTP-to-stdio bridge | PASS | Proxy JSON-RPC to subprocess |
 | SSE streaming | PASS | Server-sent events for notifications |
 | Session isolation | PASS | Per-session sandbox scope |
-| Auto-restart | PASS | Restart crashed subprocess |
+| Subprocess crash handling | PASS | No auto-restart by design — session fails loudly and the client re-initializes fresh (R8.4) |
 | Health endpoint | PASS | `/health` monitoring |
 | Session termination | PASS | DELETE with `Mcp-Session-Id` |
 
-### 12.3 ahma-http-mcp-client
+### 9.3 ahma-http-mcp-client
 
 | Feature | Status | Description |
 |---------|--------|-------------|
@@ -2195,7 +1704,7 @@ This repo has a recurring failure mode: tests can pass while real-world usage is
 | Token storage | PASS | Persist to temp directory |
 | Token refresh | PLANNED | Auto-refresh expired tokens |
 
-### 12.4 ahma --validate
+### 9.4 ahma --validate
 
 | Feature | Status | Description |
 |---------|--------|-------------|
@@ -2204,139 +1713,7 @@ This repo has a recurring failure mode: tests can pass while real-world usage is
 
 ---
 
-## 13. CI Caching Strategy
-
-To maintain high performance and avoid cache bloat, the following strategies are employed in GitHub Actions:
-
-### 13.1 Daily Rotation
-- **R13.1.1**: All caches **must** use a daily rotating key (e.g., `...-day${{ steps.day-number.outputs.day }}`) to ensure they contain only current files and do not grow indefinitely.
-- **R13.1.2**: `restore-keys` **must** be used to fall back to the most recent previous cache (from earlier in the day or a previous day).
-
-### 13.2 Distributed Caching (sccache)
-- **R13.2.1**: **sccache** **must** be used as the compiler wrapper across all macOS and Linux CI jobs. Windows CI is exempt from sccache and instead relies on plain Cargo target caching.
-- **R13.2.2**: The **GitHub Actions Backend** (`SCCACHE_GHA_ENABLED: "true"`) **must** be used for `sccache` on macOS/Linux to allow atomic uploads of object files directly to the GHA cache API.
-- **R13.2.3**: Windows CI is exempt from sccache requirements, and compiles without a compiler wrapper.
-- **R13.2.4**: Each CI job **must** use unique `SCCACHE_GHA_CACHE_TO` keys to prevent concurrent write conflicts. Key format: `sccache-{OS}-{ARCH}-{JOB}-day{DAY}`.
-- **R13.2.5**: Each CI job **must** use `SCCACHE_GHA_CACHE_FROM` with comma-separated fallbacks to enable cache sharing between related jobs on the same platform.
-- **R13.2.6**: Debug-profile jobs on the same platform (clippy, nextest, android, coverage) **should** include each other in their `CACHE_FROM` lists since they produce compatible cache entries.
-- **R13.2.7**: Release-profile jobs **must not** include debug caches in `CACHE_FROM` since `--release` flag produces incompatible cache entries.
-- **R13.2.8** (**TEMPORARY**): CI currently builds `sccache` from an experimental fork
-  (`paulirotta/sccache@gha-retry-layer`, pinned to a commit in `.github/actions/sccache-ghac`)
-  instead of installing the released `sccache@0.17`, to validate a candidate `RetryLayer` fix for
-  the ghac backend's dropped-write bug, tracked upstream as
-  [mozilla/sccache#2821](https://github.com/mozilla/sccache/issues/2821) (`GHACache::build`
-  installs no retry layer, so a ghac HTTP 429 kills a cache write outright instead of being
-  retried). This is validation, not policy, and CI **must** revert to installing the stable
-  release build once #2821 lands in a released sccache version, or by **January 2027** if it has
-  not landed by then — whichever comes first. See the "EXPERIMENTAL FORK OF SCCACHE" note in
-  `build.yml` for the full revert checklist.
-
-### 13.3 Cargo Registry Caching
-- **R13.3.1**: The Cargo registry (`~/.cargo/registry`) and git database (`~/.cargo/git`) **must** be cached using `actions/cache` or specialized actions, adhering to the Daily Rotation rule.
-
-### 13.4 GitHub Actions Versioning
-- **R13.4.1**: GitHub Actions **must** be referenced by version tags (e.g. `@v6`, `@v5`) rather than full commit hashes, to ensure readability, maintainability, and automatic receipt of minor version updates and security patches.
-- **R13.4.2**: Workflows **must** be updated to target the latest available major versions of each respective action.
-
----
-
-## 13. Build & Development
-
-### 13.1 Prerequisites
-
-```bash
-# Rust 1.93+ required
-rustup update stable
-
-# Build
-cargo build --release
-
-# The binary will be at target/release/ahma
-```
-
-### 13.2 mcp.json Configuration
-
-```json
-{
-  "servers": {
-    "Ahma": {
-      "type": "stdio",
-      "cwd": "${workspaceFolder}",
-      "command": "/path/to/ahma/target/release/ahma",
-      "args": []
-    }
-  }
-}
-```
-
-### 13.3 Quality Checks
-
-> **CRITICAL for AI Assistants:** Run all checks and ensure they pass **before stopping work**.
-
-```bash
-cargo fmt                           # Format code
-cargo clippy --all-targets          # Check for lints (must pass)
-cargo build --release               # Verify build succeeds
-cargo nextest run                   # Run all tests (must pass)
-```
-
-### 13.4 Test-First Development (TDD)
-
-> **MANDATORY for all new features and bug fixes:**
-
-**R13.4.1**: **ALL** functional requirements and bug fixes **MUST** follow test-first development:
-
-1. **Write the test first** - Write a test that expresses the desired behavior or exposes the bug
-2. **See it fail** - Run the test and verify it fails for the expected reason
-3. **Implement the fix** - Write the minimal code to make the test pass
-4. **See it pass** - Run the test and verify it passes
-5. **Refactor** - Clean up the code while keeping tests green
-
-**R13.4.2**: This workflow is **non-negotiable** and applies to:
-- New features (e.g., auto-detection of `.ahma` directory)
-- Bug fixes (any deviation from expected behavior)
-- Performance improvements (when testable)
-- Security enhancements (when testable)
-
-**R13.4.3**: Tests are **part of the functional requirements**, not an afterthought.
-
-**R13.4.4**: Code changes without corresponding tests **MUST NOT** be merged unless:
-- The change is purely documentation
-- The change is a trivial typo fix in comments
-- Tests are genuinely impossible (must be justified in code review)
-
-**R13.4.5**: Before considering any work complete, you **MUST** run these quality checks in order:
-1. `cargo clippy` - Verify no warnings or errors
-2. `cargo nextest run` (preferred) or `cargo test` - Verify all tests pass
-3. Only after both pass can work be considered complete
-
-This ensures:
-- Code quality and idiomatic Rust patterns (clippy)
-- No regressions in functionality (nextest)
-- Early detection of issues before they are merged
-
-**Failing to run these checks results in broken builds and wasted time.**
-
----
-
-## 14. Maintenance Notes
-
-> **AI Assistants:** When you modify code or discover issues:
->
-> 1. Update the "Quick Status" table
-> 2. Add to "Known Issues" if new bugs found
-> 3. Update feature tables with status changes
-> 4. **BEFORE stopping work: Run `cargo clippy` then `cargo nextest run` to verify quality`
-> 5. If you change CLI flags, env vars, tool bundles, connection modes, or sandbox behavior,
->    update `skills/ahma/SKILL.md` to keep the agent skill current.
-
-**Last Updated**: 2026-01-18
-
-**Status**: Living Document - Update with every architectural decision or significant change
-
----
-
-## 15. Agent Skills
+## 10. Agent Skills (R-SK)
 
 This section specifies requirements for the AI agent skill files (`SKILL.md`) bundled with
 Ahma. Skills are machine-readable guides that help AI coding assistants use Ahma effectively.
@@ -2374,35 +1751,10 @@ snippets rather than prose paragraphs. Link to `docs/` for deep dives.
 | CLI Reference | `serve`/`tool` subcommand synopsis |
 | Troubleshooting | Common errors and fixes |
 
-### R-SK5 — Currency requirement
-
-Skills are **living documents**. When any of the following change, the relevant skill MUST be
-updated in the same PR or commit:
-
-- CLI flags or subcommands (`ahma_mcp/src/shell/cli.rs`)
-- Environment variables (`ahma_mcp/src/config/`)
-- Tool bundle names or contents (`ahma_mcp/src/mcp_service/bundle_registry.rs`)
-- Built-in tool signatures (`run_terminal_command`, `status`, `await`, `cancel`)
-- Connection modes or HTTP endpoints (`ahma_http_bridge/`)
-- Sandbox scope semantics (`ahma_core/src/sandbox/`)
-- Live-log monitoring configuration
-
-### R-SK6 — CI / pre-commit validation
-
-The skill symlink MUST resolve at the repo root. A CI or pre-push check MUST assert:
-
-```bash
-# Cross-platform (macOS readlink does not support -f)
-test -L .agents/skills/ahma/SKILL.md && cat .agents/skills/ahma/SKILL.md > /dev/null
-```
-
-If the symlink does not exist or does not resolve, the check fails.
-
-### R-SK7 — No duplication with AGENTS.md
-
-`skills/ahma/SKILL.md` targets **AI agents using Ahma**. `AGENTS.md` targets **AI contributors
-developing Ahma**. Do not copy developer-only content (testing rules, cross-platform checklist,
-commit format) into the skill, and do not copy agent usage recipes into AGENTS.md.
+> Keeping `skills/ahma/SKILL.md` current with the product surface it documents (currency
+> requirement, CI validation of the symlink, and its division of labor with `AGENTS.md`) is
+> a maintenance-process concern, not skill product behavior — that content now lives in
+> [AGENTS.md](AGENTS.md) §1 and §3 (formerly R-SK5/R-SK6/R-SK7 here).
 
 ### R-SK8 — Running standard skills
 
@@ -2438,7 +1790,7 @@ Ahma does not only *ship* skills — it can *run* any skill that follows the
 
 ---
 
-## 16. Future Work
+## 11. Future Work
 
 ### v0.8 — Discovery, Observability, Economics
 
@@ -2455,4 +1807,39 @@ Ahma does not only *ship* skills — it can *run* any skill that follows the
 |------|------|-------|
 | Security | **OS keyring integration** (`keyring` crate) — store API keys in system credential store instead of env vars | macOS Keychain, GNOME Secrets, Windows Credential Manager |
 | Config | **Encrypted secrets at rest** in `~/.ahma/config.toml` (age encryption) | Fallback when OS keyring is unavailable |
+
+---
+
+## 12. Removed Features & Deferred Decisions
+
+### 12.1 Removed: orphaned incubating crates (`ahma_decompose`, `ahma_worker`, `ahma_renewal`)
+
+These three AGPL-3.0-or-later crates were removed from the workspace because nothing in the
+shipped product invoked them:
+
+- **`ahma_renewal`** — renewal contract for long-running tasks. Had zero dependents and no SPEC.
+- **`ahma_worker`** — ephemeral worker code synthesis. Had zero dependents.
+- **`ahma_decompose`** — local-LLM decompose orchestration. Had zero dependents; self-flagged for deprecation in its own `lib.rs`.
+
+The related `tool_type: decompose`/`worker` handler stubs inside `ahma_mcp` and the
+`.ahma/decompose.json` example are tracked separately. The sources remain in git history if
+these roadmap features are revived; recover them from the commit that deleted the crate
+directories.
+
+### 12.2 TODO: Python bindings (former `ahma_py` crate)
+
+The `ahma_py` crate has been removed from the workspace and the source files deleted. Before removal it served as the project's Python bindings (PyO3) to expose `ahma_core` to Python consumers and provided build notes for producing a wheel. Key points captured from the crate's source before deletion:
+
+- Purpose: Python bindings for `ahma_core` via PyO3; intended to publish an `ahma-py` wheel for Jupyter/FastAPI/Streamlit use-cases.
+- AGPL separation: planned separate `ahma_py_agpl` distribution for bindings that expose AGPL-licensed crates (e.g., `ahma_decompose`, `ahma_worker`).
+- Build hints (from removed crate): use `maturin` to build/develop the wheel; example commands were included in the crate docs.
+- Implementation notes: some APIs were stubs that returned errors when AGPL dependencies were not present (explicitly instructing the integrator to add the AGPL crate if they accept those terms).
+
+Deferred action items (documented TODO):
+
+1. Re-evaluate packaging and licensing approach for Python bindings (single wheel vs. split permissive/AGPL wheels).
+2. If re-introducing bindings: add `pyo3` and `maturin` build guidance to workspace docs, update `workspace.dependencies` or document build-time requirements, and gate AGPL features behind a separate crate/package.
+3. Preserve a record of the removed crate in the git history and reference the commit that deleted `ahma_py` for future restoration.
+
+The deleted crate files were under `ahma_py/` prior to removal. Check the git history if you need the original sources.
 
