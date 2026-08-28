@@ -1,9 +1,10 @@
 use super::fs::get_workspace_dir;
 use ahma_common::fs_lock::FsLock;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 /// Cached binary paths to avoid redundant builds across tests.
@@ -198,7 +199,7 @@ pub fn build_binary_cached(package: &str, binary: &str) -> PathBuf {
     // ── Fast-path: per-process in-memory cache ──────────────────────────
     // If this process has already verified/built this binary, skip everything.
     {
-        let cache_guard = cache.lock().unwrap();
+        let cache_guard = cache.lock();
         if cache_guard.contains_key(&key) {
             return binary_path;
         }
@@ -223,7 +224,7 @@ pub fn build_binary_cached(package: &str, binary: &str) -> PathBuf {
 
     // Re-check under the filesystem lock: another process may have built
     // the binary while we were waiting.
-    let mut cache_guard = cache.lock().unwrap();
+    let mut cache_guard = cache.lock();
     if cache_guard.contains_key(&key) {
         return binary_path;
     }

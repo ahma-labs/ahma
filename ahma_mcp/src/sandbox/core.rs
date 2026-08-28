@@ -225,8 +225,8 @@ fn canonicalize_with_fallback(full_path: &Path) -> PathBuf {
 
 /// The security context for the Ahma session.
 pub struct Sandbox {
-    pub(super) scopes: std::sync::RwLock<Vec<PathBuf>>,
-    pub(super) read_scopes: std::sync::RwLock<Vec<PathBuf>>,
+    pub(super) scopes: parking_lot::RwLock<Vec<PathBuf>>,
+    pub(super) read_scopes: parking_lot::RwLock<Vec<PathBuf>>,
     pub(super) mode: SandboxMode,
     pub(super) no_temp_files: bool,
     /// When true, the canonical temp directory is preserved across scope updates.
@@ -265,7 +265,7 @@ pub struct Sandbox {
     /// the allow-listed, SSRF-guarded proxy (R-NET enforcement). `None` leaves the
     /// blanket `(allow network*)` rule (advisory tier / restriction off). Set after
     /// the proxy binds its port; behind a lock because it is installed post-construction.
-    pub(super) egress_proxy_addr: std::sync::RwLock<Option<std::net::SocketAddr>>,
+    pub(super) egress_proxy_addr: parking_lot::RwLock<Option<std::net::SocketAddr>>,
     /// The scope commit latch and roots-received flag, modeled as an explicit
     /// state machine (SPEC R23). Owns the one-shot lock semantics and the memory
     /// ordering that the commit decision must not be reordered past the scopes
@@ -282,7 +282,7 @@ pub struct Sandbox {
     /// Narrowing happens at most once per session: the second call is a no-op,
     /// so a later tool call naming a *different* project cannot re-point the
     /// writable scope (R5.1.1 — one commit, never re-derived).
-    pub(super) narrowed_to: std::sync::RwLock<Option<PathBuf>>,
+    pub(super) narrowed_to: parking_lot::RwLock<Option<PathBuf>>,
 }
 
 /// Outcome of a scope commit ([`Sandbox::commit_scopes`] /
@@ -332,8 +332,8 @@ impl ContainerNarrowing {
 impl Clone for Sandbox {
     fn clone(&self) -> Self {
         Self {
-            scopes: std::sync::RwLock::new(self.scopes.read().unwrap().clone()),
-            read_scopes: std::sync::RwLock::new(self.read_scopes.read().unwrap().clone()),
+            scopes: parking_lot::RwLock::new(self.scopes.read().clone()),
+            read_scopes: parking_lot::RwLock::new(self.read_scopes.read().clone()),
             mode: self.mode,
             no_temp_files: self.no_temp_files,
             tmp_access: self.tmp_access,
@@ -343,10 +343,10 @@ impl Clone for Sandbox {
             explicit_scopes: self.explicit_scopes,
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
-            egress_proxy_addr: std::sync::RwLock::new(*self.egress_proxy_addr.read().unwrap()),
+            egress_proxy_addr: parking_lot::RwLock::new(*self.egress_proxy_addr.read()),
             scope_lock: self.scope_lock.clone(),
             container_root: self.container_root.clone(),
-            narrowed_to: std::sync::RwLock::new(self.narrowed_to.read().unwrap().clone()),
+            narrowed_to: parking_lot::RwLock::new(self.narrowed_to.read().clone()),
         }
     }
 }
@@ -354,8 +354,8 @@ impl Clone for Sandbox {
 impl std::fmt::Debug for Sandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sandbox")
-            .field("scopes", &self.scopes.read().unwrap())
-            .field("read_scopes", &self.read_scopes.read().unwrap())
+            .field("scopes", &self.scopes.read())
+            .field("read_scopes", &self.read_scopes.read())
             .field("mode", &self.mode)
             .field("no_temp_files", &self.no_temp_files)
             .field("tmp_access", &self.tmp_access)
@@ -367,7 +367,7 @@ impl std::fmt::Debug for Sandbox {
             .field("package_cache_write", &self.package_cache_write)
             .field("scope_lock", &self.scope_lock)
             .field("container_root", &self.container_root)
-            .field("narrowed_to", &self.narrowed_to.read().unwrap())
+            .field("narrowed_to", &self.narrowed_to.read())
             .finish()
     }
 }
@@ -395,8 +395,8 @@ impl Sandbox {
         };
 
         Ok(Self {
-            scopes: std::sync::RwLock::new(canonicalized),
-            read_scopes: std::sync::RwLock::new(read_scopes),
+            scopes: parking_lot::RwLock::new(canonicalized),
+            read_scopes: parking_lot::RwLock::new(read_scopes),
             mode,
             no_temp_files,
             tmp_access,
@@ -406,13 +406,13 @@ impl Sandbox {
             explicit_scopes: false,
             livelog,
             package_cache_write: true,
-            egress_proxy_addr: std::sync::RwLock::new(None),
+            egress_proxy_addr: parking_lot::RwLock::new(None),
             // A fresh sandbox has received nothing from any client, so
             // `scope_source()` never reports `roots/list` for a scope that
             // never saw roots.
             scope_lock: super::scope_lock::ScopeLock::new(),
             container_root: None,
-            narrowed_to: std::sync::RwLock::new(None),
+            narrowed_to: parking_lot::RwLock::new(None),
         })
     }
 
@@ -420,9 +420,8 @@ impl Sandbox {
     /// Seatbelt). Called once at server startup after the proxy binds. `None`
     /// disables the network-deny rule (restriction off).
     pub fn set_egress_proxy_addr(&self, addr: Option<std::net::SocketAddr>) {
-        if let Ok(mut guard) = self.egress_proxy_addr.write() {
-            *guard = addr;
-        }
+        let mut guard = self.egress_proxy_addr.write();
+        *guard = addr;
     }
 
     /// Override the package-cache-write flag.
@@ -478,7 +477,7 @@ impl Sandbox {
     #[must_use]
     pub fn with_persistent_scopes(mut self, write: Vec<PathBuf>, read: Vec<PathBuf>) -> Self {
         if !write.is_empty() {
-            let mut scopes = self.scopes.write().unwrap();
+            let mut scopes = self.scopes.write();
             for p in &write {
                 if !scopes.contains(p) {
                     scopes.push(p.clone());
@@ -486,7 +485,7 @@ impl Sandbox {
             }
         }
         if !read.is_empty() {
-            let mut reads = self.read_scopes.write().unwrap();
+            let mut reads = self.read_scopes.write();
             for p in &read {
                 if !reads.contains(p) {
                     reads.push(p.clone());
@@ -585,7 +584,7 @@ impl Sandbox {
         }
 
         {
-            let mut current_read_scopes = self.read_scopes.write().unwrap();
+            let mut current_read_scopes = self.read_scopes.write();
             // The livelog read set is recomputed from the new write scopes, so it
             // replaces the prior value wholesale — re-add granted read-only scopes
             // afterwards so they too survive the roots/list update.
@@ -599,7 +598,7 @@ impl Sandbox {
             }
         }
 
-        let mut current_scopes = self.scopes.write().unwrap();
+        let mut current_scopes = self.scopes.write();
         *current_scopes = canonicalized;
         Ok(())
     }
@@ -632,7 +631,7 @@ impl Sandbox {
 
     /// The child the container was narrowed to, once it has been.
     pub fn narrowed_to(&self) -> Option<PathBuf> {
-        self.narrowed_to.read().unwrap().clone()
+        self.narrowed_to.read().clone()
     }
 
     /// Narrow a container-root scope to the one project subtree `requested`
@@ -670,14 +669,14 @@ impl Sandbox {
             return None;
         }
         // Cheap pre-check outside the write lock; re-checked under it below.
-        if self.narrowed_to.read().unwrap().is_some() {
+        if self.narrowed_to.read().is_some() {
             return None;
         }
 
         let child_name = container_child_name(&container, requested)?;
         let child = container.join(&child_name);
 
-        let mut narrowed = self.narrowed_to.write().unwrap();
+        let mut narrowed = self.narrowed_to.write();
         // Two concurrent first tool calls both pass the pre-check; the one that
         // gets here second must not re-point the scope (R5.1.1).
         if narrowed.is_some() {
@@ -685,7 +684,7 @@ impl Sandbox {
         }
 
         {
-            let mut scopes = self.scopes.write().unwrap();
+            let mut scopes = self.scopes.write();
             // `canonicalize_scopes` deliberately keeps both the canonical path
             // and its pre-symlink alias (`/private/var/...` and `/var/...` on
             // macOS) so either spelling validates. Narrowing has to replace
@@ -707,7 +706,7 @@ impl Sandbox {
             *scopes = narrowed_scopes;
         }
         {
-            let mut reads = self.read_scopes.write().unwrap();
+            let mut reads = self.read_scopes.write();
             if !reads.contains(&container) {
                 reads.push(container.clone());
             }
@@ -739,10 +738,10 @@ impl Sandbox {
     /// (the container root) is what gets reported, which is also what arms the
     /// R5.2.8 working-directory refusal.
     ///
-    /// `Pending` is the honest answer for a scope that has no provenance yet —
-    /// nothing explicit, no usable roots, no container. `Elicited` is not
-    /// derivable from these flags; a caller holding richer provenance should
-    /// render that instead.
+    /// `Unestablished` is the honest answer for a scope that has no provenance
+    /// yet — nothing explicit, no usable roots, no container. `Elicited` and
+    /// `PendingTui` are not derivable from these flags; a caller holding richer
+    /// provenance should render those instead.
     pub fn scope_source(&self) -> ScopeSource {
         if self.has_explicit_scopes() {
             ScopeSource::Explicit
@@ -751,7 +750,7 @@ impl Sandbox {
         } else if self.container_root.is_some() {
             ScopeSource::Container
         } else {
-            ScopeSource::Pending
+            ScopeSource::Unestablished
         }
     }
 
@@ -808,12 +807,12 @@ impl Sandbox {
 
     /// Get the allowed scopes.
     pub fn scopes(&self) -> ScopesGuard<'_> {
-        ScopesGuard(self.scopes.read().unwrap())
+        ScopesGuard(self.scopes.read())
     }
 
     /// Get the read-only scopes (for --livelog symlink targets).
     pub fn read_scopes(&self) -> Vec<PathBuf> {
-        self.read_scopes.read().unwrap().clone()
+        self.read_scopes.read().clone()
     }
 
     /// Whether kernel enforcement is active. `--no-sandbox` maps to
@@ -825,8 +824,8 @@ impl Sandbox {
     /// Canonical human-readable scope summary with provenance (SPEC R5.4).
     /// Every surface that shows scope renders through this one path.
     pub fn scope_text(&self, source: ScopeSource) -> String {
-        let writes = self.scopes.read().unwrap().clone();
-        let reads = self.read_scopes.read().unwrap().clone();
+        let writes = self.scopes.read().clone();
+        let reads = self.read_scopes.read().clone();
         ScopeView {
             write_scopes: &writes,
             read_scopes: &reads,
@@ -840,8 +839,8 @@ impl Sandbox {
     /// Structured scope summary for the `notifications/sandbox/configured`
     /// payload and any machine-readable surface (SPEC R5.4).
     pub fn scope_json(&self, source: ScopeSource) -> serde_json::Value {
-        let writes = self.scopes.read().unwrap().clone();
-        let reads = self.read_scopes.read().unwrap().clone();
+        let writes = self.scopes.read().clone();
+        let reads = self.read_scopes.read().clone();
         let mut v = ScopeView {
             write_scopes: &writes,
             read_scopes: &reads,

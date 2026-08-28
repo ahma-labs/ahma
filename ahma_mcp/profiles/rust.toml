@@ -7,6 +7,22 @@
 name = "rust"
 description = "Rust toolchain: cargo registry/git caches, rustup toolchains"
 
+# What enabling this costs, shown beside the profile by `ahma permissions list`
+# (SPEC R-PERM.5.2). This one is not generic hardening advice — it is the named
+# residual risk of R-HANDOFF.8, and it is stated here rather than in the docs
+# because a grant whose consequence is invisible is not meaningfully refusable.
+#
+# The cargo registry and git caches are machine-global: every project on this
+# machine shares them. Cargo genuinely needs write access (it extracts .crate
+# archives into registry/src and materialises git dependencies), so this is a
+# real requirement, not an oversight. The consequence follows directly.
+cost = """the cargo registry and git caches are shared by every project on this machine, and \
+this profile makes them writable. An agent working in one project can edit the extracted source \
+of a cached crate, and that edited code is then compiled and executed — as a build script or proc \
+macro — the next time you build an unrelated project. Turn it off with `--no-package-cache-write` \
+(or `[sandbox] package_cache_write = false`), which downgrades these caches to read-only and \
+leaves the toolchain runnable (SPEC R-HANDOFF.8)."""
+
 # Paths this profile asserts must NEVER become writable.
 #
 # Not a mechanism — the backends are allow-lists, so a path is unwritable simply

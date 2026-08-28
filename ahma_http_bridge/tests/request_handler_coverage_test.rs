@@ -416,10 +416,12 @@ async fn run_task_vault_inheritance_and_staged_delete(mode: TransportMode) {
         .to_path_buf();
     let tools_dir = workspace_root.join(".ahma");
     if !tools_dir.exists() {
-        eprintln!(
-            "WARNING  skipping task-vault inheritance test: tools dir missing at {}",
+        // The workspace's own `.ahma/` is checked in, so on CI this cannot be
+        // missing without something being wrong with the checkout.
+        common::skip_or_fail(&format!(
+            "task-vault inheritance test: tools dir missing at {}",
             tools_dir.display()
-        );
+        ));
         return;
     }
 
@@ -476,18 +478,9 @@ async fn run_task_vault_inheritance_and_staged_delete(mode: TransportMode) {
     }
 
     let Some((_server, mcp)) = server_and_client else {
-        let in_ci =
-            std::env::var("CI").is_ok() || std::env::var("AHMA_TEST_FAIL_ON_SETUP_ERROR").is_ok();
-        if in_ci {
-            panic!(
-                "task-vault inheritance test: setup failed in CI — aborting: {}",
-                last_error
-            );
-        }
-        eprintln!(
-            "WARNING  skipping task-vault inheritance test: setup failed: {}",
-            last_error
-        );
+        common::skip_or_fail(&format!(
+            "task-vault inheritance test: setup failed: {last_error}"
+        ));
         return;
     };
 

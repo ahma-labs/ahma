@@ -409,6 +409,51 @@ jobs:
             -p ahma_tui -p ahma_bin \
             -E 'not (test(kotlin) or test(android))'
 
+      # The `simplify` feature ships in every release binary (`ahma_bin`'s default
+      # feature set, see the release-build step below) but was tested by nothing:
+      # every nextest invocation above — and the coverage job — passes
+      # --no-default-features, so ~96 unit tests under ahma_mcp/src/simplify/ and
+      # the whole simplify_report_integration_test (required-features = ["simplify"])
+      # never ran, and the code was excluded from the coverage report. The shipped
+      # binary was not the tested binary.
+      #
+      # Linux only: the analyser is pure Rust over rust-code-analysis, with no
+      # platform-specific behaviour to catch on the other legs, and the feature
+      # pulls a heavy dependency tree the Windows leg does not need in its budget.
+      - name: Cargo Nextest (simplify feature, Linux only)
+        if: matrix.test_mode == 'full' && runner.os == 'Linux' && runner.arch == 'X64'
+        timeout-minutes: 20
+        run: |
+          echo "--- Testing the simplify feature that ships in release binaries"
+          cargo nextest run --profile ci --locked --no-fail-fast \
+            -p ahma_mcp --features simplify \
+            -E 'not (test(kotlin) or test(android))'
+
+      # Evidence, not a gate. SPEC R6.3.3 is open because a windows-latest run
+      # proved the AppContainer grant DACL does not take effect — an in-scope
+      # write is denied along with an out-of-scope one — and the only artefact
+      # anyone has is the string "Access to the path '...' is denied", which
+      # names no path, does not say whether the ACE was ever written, and does
+      # not say which SID the child ran as. Nobody can debug that, and nobody
+      # has a Windows box to attach to.
+      #
+      # `appcontainer_dacl_diagnostics` dumps `icacls` for the scope and every
+      # ancestor, the derived container SID, the child's own `whoami /groups`
+      # and `$env:TEMP`, and the full stdout/stderr — enough to tell the five
+      # live hypotheses apart. continue-on-error because the point is to get a
+      # dump out of a *failing* configuration; making it fatal would just stop
+      # the run before it printed anything useful.
+      #
+      # Delete this step when R6.3.3 closes.
+      - name: AppContainer diagnostics (Windows only, evidence not a gate)
+        if: matrix.test_mode == 'full' && runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          cargo nextest run --profile ci --locked --no-default-features \
+            --run-ignored only --success-output immediate \
+            -p ahma_mcp -E 'test(appcontainer_dacl_diagnostics)'
+
       - name: Cargo Nextest (Landlock red-team, Linux only)
         if: matrix.test_mode == 'full' && runner.os == 'Linux'
         timeout-minutes: 10
@@ -426,17 +471,19 @@ jobs:
           cargo test --locked --no-default-features -p ahma_bin --no-run
           cargo test --locked --no-default-features -p ahma_http_bridge --no-run
 
-      - name: Cargo Clippy
+      # --all-targets rather than the previous `--locked` / `--tests` pair: that
+      # pair covered lib + tests but not examples or benches, so a broken example
+      # only showed up in the PR fast tier (which does run --all-targets) and a
+      # direct push to main missed it. Both feature configurations are linted
+      # because `simplify` ships in release binaries while every test invocation
+      # runs --no-default-features.
+      - name: Cargo Clippy (default features)
         if: runner.os == 'Linux' && runner.arch == 'X64'
-        run: cargo clippy --locked
+        run: cargo clippy --all-targets --locked
 
       - name: Cargo Clippy (no-default-features)
         if: runner.os == 'Linux' && runner.arch == 'X64'
-        run: cargo clippy --no-default-features --locked
-
-      - name: Cargo Clippy Tests
-        if: runner.os == 'Linux' && runner.arch == 'X64'
-        run: cargo clippy --tests --locked
+        run: cargo clippy --all-targets --no-default-features --locked
 
       - name: Cargo Doc
         if: runner.os == 'Linux' && runner.arch == 'X64'

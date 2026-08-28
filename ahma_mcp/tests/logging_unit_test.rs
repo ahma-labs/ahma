@@ -138,6 +138,10 @@ fn test_unwritable_directory_detection() {
         // Root bypasses DAC permission checks (CAP_DAC_OVERRIDE), so the
         // read-only premise below doesn't hold — skip rather than fail.
         if unsafe { libc::geteuid() } == 0 {
+            // Stays an unconditional skip: root bypasses the permission bits
+            // this asserts about, so there is nothing to observe. An environment
+            // fact, not a failure of ahma's machinery — see
+            // `ahma_test_support::skip` for the distinction.
             eprintln!("skipping: running as root, directory permissions are not enforced");
             return;
         }

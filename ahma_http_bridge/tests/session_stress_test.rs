@@ -41,9 +41,17 @@ fn test_file_uri(relative_path: &str) -> (String, PathBuf) {
         let full = format!("{}/ahma_test/{}", tmp, relative_path);
         (format!("file:///{}", full), PathBuf::from(&full))
     }
+    // The Unix arm used to hardcode `/tmp`, which is not the temp directory on
+    // macOS (`/var/folders/...`) — so the fixture named a path unrelated to the
+    // one the same file resolves correctly a few lines below via
+    // `test_temp_path`. Both arms now come from `std::env::temp_dir()`; the
+    // remaining difference is only the `file://` form, which genuinely differs
+    // (Windows needs the extra slash before the drive letter).
     #[cfg(not(windows))]
     {
-        let full = format!("/tmp/ahma_test/{}", relative_path);
+        let tmp = std::env::temp_dir();
+        let tmp = tmp.to_string_lossy();
+        let full = format!("{}/ahma_test/{}", tmp.trim_end_matches('/'), relative_path);
         (format!("file://{}", full), PathBuf::from(&full))
     }
 }

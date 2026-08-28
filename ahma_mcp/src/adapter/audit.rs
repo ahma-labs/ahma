@@ -63,11 +63,38 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt as _;
 
 /// File name of the execution audit log inside the project log directory.
 pub const AUDIT_LOG_FILE_NAME: &str = "audit.jsonl";
+
+/// Rotate the audit log once it passes this size.
+///
+/// 64 MiB: large enough that a normal working day never rotates (a busy session
+/// produced ~2.5 MB), small enough that one file stays readable by ordinary
+/// tools. See [`AuditLog::rotate_if_needed`] for why rotation and pruning are
+/// different things.
+pub const MAX_AUDIT_LOG_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How many rotated generations to keep behind the live file.
+pub const AUDIT_LOG_GENERATIONS: u32 = 4;
+
+/// Bytes to write between size checks.
+///
+/// The size check is a `metadata()` syscall, and this sits on the hot path of
+/// every command; paying it per event to detect a condition that needs megabytes
+/// of writing to become true is the wrong trade. At 1 MiB the check costs one
+/// syscall per ~1 MiB of audit output and the log can overshoot
+/// [`MAX_AUDIT_LOG_BYTES`] by at most that much before rotating — a bound, which
+/// is the whole point, rather than an exact ceiling.
+const ROTATION_CHECK_INTERVAL_BYTES: u64 = 1024 * 1024;
+
+/// Bytes appended since the last size check. Process-wide: the log is a single
+/// file per project and every writer shares it, so a per-`AuditLog` counter
+/// would let N writers each get most of the way to a check and none arrive.
+static BYTES_SINCE_ROTATION_CHECK: AtomicU64 = AtomicU64::new(0);
 
 /// Upper bound on a recorded argument summary.
 ///
@@ -301,6 +328,18 @@ impl AuditLog {
         // The directory is missing at most once per process, and this sits on the
         // hot path of every command — creating it eagerly would spend two
         // syscalls on every event to save one on the first.
+        // Only ask the filesystem how big the log is once per
+        // `ROTATION_CHECK_INTERVAL_BYTES` written, not once per event. A
+        // `metadata()` call on every command would be exactly the per-event
+        // syscall the `create_dir_all` comment below refuses to pay, for a
+        // condition that can only become true after megabytes of writing.
+        if BYTES_SINCE_ROTATION_CHECK.fetch_add(line.len() as u64, Ordering::Relaxed)
+            + line.len() as u64
+            >= ROTATION_CHECK_INTERVAL_BYTES
+        {
+            BYTES_SINCE_ROTATION_CHECK.store(0, Ordering::Relaxed);
+            Self::rotate_if_needed(&self.path).await;
+        }
         let mut file = match Self::open_for_append(&self.path).await {
             Ok(file) => file,
             Err(first_err) => {
@@ -325,6 +364,54 @@ impl AuditLog {
             .append(true)
             .open(path)
             .await
+    }
+
+    /// Rotate the audit log to `audit.jsonl.1` once it exceeds
+    /// [`MAX_AUDIT_LOG_BYTES`], keeping [`AUDIT_LOG_GENERATIONS`] behind it.
+    ///
+    /// **Rotation, never deletion of the newest record.** The retention sweep is
+    /// deliberately forbidden from touching this file
+    /// (`the_audit_log_is_not_swept_by_log_retention`), because an audit trail
+    /// that quietly loses its tail is worse than none — it is still believed.
+    /// But "never pruned" was being read as "never bounded", and it is not the
+    /// same claim: one session on a busy workspace produced a 2.5 MB
+    /// `audit.jsonl` in a day, and nothing stopped that growing without limit on
+    /// a long-lived daemon. Rotation preserves every record that fits in the
+    /// retained generations while bounding any single file, so the invariant the
+    /// test protects still holds — what it forbids is silent loss, not an
+    /// ordered move.
+    ///
+    /// Best-effort and never fatal: a rotation that fails leaves the log
+    /// appending to the current file, which is the safe direction.
+    async fn rotate_if_needed(path: &Path) {
+        let Ok(meta) = tokio::fs::metadata(path).await else {
+            return; // No file yet, or unreadable — nothing to rotate.
+        };
+        if meta.len() < MAX_AUDIT_LOG_BYTES {
+            return;
+        }
+
+        // Drop the oldest generation, then shift the rest down. Done oldest-first
+        // so no rename can overwrite a generation that has not been moved yet.
+        let numbered = |n: u32| path.with_extension(format!("jsonl.{n}"));
+        let oldest = numbered(AUDIT_LOG_GENERATIONS);
+        let _ = tokio::fs::remove_file(&oldest).await;
+        for n in (1..AUDIT_LOG_GENERATIONS).rev() {
+            let _ = tokio::fs::rename(numbered(n), numbered(n + 1)).await;
+        }
+        if let Err(e) = tokio::fs::rename(path, numbered(1)).await {
+            tracing::warn!(
+                audit_log = %path.display(),
+                error = %e,
+                "audit log could not be rotated; it will keep growing"
+            );
+        } else {
+            tracing::info!(
+                audit_log = %path.display(),
+                "audit log rotated at {MAX_AUDIT_LOG_BYTES} bytes; \
+                 {AUDIT_LOG_GENERATIONS} generation(s) retained"
+            );
+        }
     }
 
     /// Append one event, degrading gracefully.
@@ -674,13 +761,71 @@ mod tests {
         }
     }
 
+    /// Rotation moves records; it must never lose the ones it moves.
+    ///
+    /// This is the other half of `the_audit_log_is_not_swept_by_log_retention`
+    /// below, and the pair is the point: pruning drops records, rotation
+    /// relocates them. Bounding one file's size is compatible with keeping every
+    /// record, so "never pruned" never implied "never bounded" — that reading
+    /// was an unexamined consequence, and it left the log growing without limit
+    /// on a long-lived daemon.
+    #[tokio::test]
+    async fn rotation_moves_records_rather_than_dropping_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(AUDIT_LOG_FILE_NAME);
+
+        // A log already past the threshold, with a record we can look for again.
+        let marker = "{\"needle\":\"must-survive-rotation\"}\n";
+        let mut body = String::with_capacity(MAX_AUDIT_LOG_BYTES as usize + 64);
+        body.push_str(marker);
+        while body.len() < MAX_AUDIT_LOG_BYTES as usize {
+            body.push_str("{\"filler\":true}\n");
+        }
+        tokio::fs::write(&path, &body).await.unwrap();
+
+        AuditLog::rotate_if_needed(&path).await;
+
+        let rotated = path.with_extension("jsonl.1");
+        assert!(
+            rotated.exists(),
+            "the oversized log must be moved aside, not truncated in place"
+        );
+        assert!(
+            !path.exists() || tokio::fs::metadata(&path).await.unwrap().len() == 0,
+            "the live log starts fresh after rotation"
+        );
+        let moved = tokio::fs::read_to_string(&rotated).await.unwrap();
+        assert!(
+            moved.contains("must-survive-rotation"),
+            "every record in the rotated file must still be there — rotation relocates, \
+             it does not prune (see AuditLog::rotate_if_needed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_log_under_the_threshold_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(AUDIT_LOG_FILE_NAME);
+        tokio::fs::write(&path, b"{\"small\":true}\n")
+            .await
+            .unwrap();
+
+        AuditLog::rotate_if_needed(&path).await;
+
+        assert!(path.exists(), "an ordinary log is not rotated");
+        assert!(
+            !path.with_extension("jsonl.1").exists(),
+            "rotating early would scatter a day's records across files for no reason"
+        );
+    }
+
     /// The audit log lives next to `operations/` so it inherits the same
     /// per-project isolation — but it must *not* inherit the retention sweep.
     ///
     /// `cleanup_old_logs` deletes managed rolling logs older than 24h and
-    /// `cleanup_old_spills_once` prunes `operations/`.  Neither may touch
+    /// `cleanup_old_spills_once` prunes `operations/`. Neither may touch
     /// `audit.jsonl`: a trail that silently deletes its own oldest entries is not
-    /// an audit trail, it is a log.  If someone later broadens the retention
+    /// an audit trail, it is a log. If someone later broadens the retention
     /// predicate, this fires.
     #[test]
     fn the_audit_log_is_not_swept_by_log_retention() {

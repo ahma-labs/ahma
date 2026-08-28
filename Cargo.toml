@@ -61,6 +61,16 @@ futures = "0.3.32"
 hmac = "0.13.0"
 landlock = "0.4.7"
 opentelemetry = { version = "0.32.0", features = ["trace"] }
+# Locks that cannot be poisoned.
+#
+# std's Mutex/RwLock return a Result whose Err means "a thread panicked while
+# holding this", and the workspace's answer at ~260 call sites was `.unwrap()` —
+# so one panic anywhere under a lock turned a degraded server into a permanently
+# broken one: every subsequent request panicked on the poisoned lock, including
+# the request paths that had nothing to do with the original fault. parking_lot
+# has no poisoning, so the failure mode does not exist rather than being handled
+# at every call site. Already in the tree via crossterm; MIT OR Apache-2.0.
+parking_lot = "0.12.5"
 # Windows-only kernel binding crate (only fetched when compiling for Windows)
 libc = "0.2"
 windows-sys = { version = "0.61.2", features = [

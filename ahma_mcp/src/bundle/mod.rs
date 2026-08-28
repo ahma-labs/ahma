@@ -1,32 +1,37 @@
-//! # Bundle Signing and Supply-Chain Auditor
+//! # Bundle Supply-Chain Audit, and a Content Checksum
 //!
-//! Closes the "plugin marketplace contains malware" risk by inverting the
-//! default: third-party MTDF tool bundles require explicit `--allow-unsigned`
-//! to load.  First-party bundles shipped with ahma are always trusted.
+//! A bundle is a directory of MTDF `*.json` tool definitions. Loading one means
+//! letting somebody else define the commands ahma will run, so the interesting
+//! question is what the tools *do* — which is what [`audit_bundle`] answers, by
+//! scanning for embedded secrets, prompt-injection payloads in `description` /
+//! `hints`, path arguments missing `format: "path"`, and exfiltration-shaped
+//! command patterns.
 //!
-//! ## Signing model
+//! ## What is not here
 //!
-//! A bundle is a directory or `.tar.gz` archive of `.ahma/*.json` files.
-//! The bundle manifest (`bundle.json`) records:
+//! This header used to describe a signing model: an ed25519 signature over a
+//! canonical manifest, verification against a trusted key ring in
+//! `~/.ahma/keys/trusted/`, and third-party bundles requiring `--allow-unsigned`
+//! to load. **None of that exists.** There is no signature, no key ring, no
+//! `--allow-unsigned` flag, and no load-time gate: nothing in ahma refuses to
+//! load a bundle on trust grounds. [`index::BundleIndex`] parses an index format
+//! that no code path consults.
 //!
-//! - `name`, `version`, `author`
-//! - SHA-256 digest of every included JSON file
-//! - An ed25519 signature over the canonical manifest (JSON-deterministic)
+//! What does exist is [`checksum::BundleChecksummer`] / [`BundleVerifier`], a
+//! SHA-256 content manifest that detects **corruption** — and cannot detect
+//! tampering, because the manifest is unsigned and travels inside the bundle it
+//! describes. See that module's header for the full statement.
 //!
-//! Verification checks the signature against the trusted key ring
-//! (`~/.ahma/keys/trusted/`).
-//!
-//! ## Supply-chain audit
-//!
-//! `ahma bundle audit <path>` scans a bundle directory for:
-//! - Known-suspicious MTDF patterns (e.g. `command: "curl"` + `subcommand` with
-//!   `url` args → potential data exfiltration).
-//! - Embedded secrets (API key patterns, AWS credential patterns).
-//! - Prompt-injection payloads in `description` or `hints` fields.
-//! - Missing `format: "path"` on path arguments (sandbox escape vector).
+//! The design is recorded in SPEC.md §11 as the v0.8 signed bundle index and is
+//! worth building. Describing it in the present tense while it did not exist was
+//! the actual hazard: a reader auditing ahma's supply-chain story found a
+//! paragraph saying signatures were checked against a key ring, and no reason to
+//! look further.
 
+pub mod checksum;
 pub mod index;
-pub mod signing;
 
+pub use checksum::{
+    BundleAuditResult, BundleAuditSeverity, BundleChecksummer, BundleVerifier, audit_bundle,
+};
 pub use index::BundleIndex;
-pub use signing::{BundleAuditResult, BundleAuditSeverity, BundleSigner, BundleVerifier};

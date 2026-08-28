@@ -1,0 +1,152 @@
+# The ignored tests — the half of the Definition of Done that CI never ran.
+#
+# AGENTS.md §1 step 4 requires `cargo nextest run --workspace --run-ignored all`
+# before anyone claims "all green". The merge gate in build.yml ran
+# `--run-ignored only` exactly once: Linux, filtered to two Landlock red-team
+# tests. Everything else marked `#[ignore]` was executed by no workflow at all:
+#
+#   ahma_http_bridge  bridge_stress_tests            4  concurrent tool calls, high-volume requests
+#   ahma_http_bridge  session_stress_test            3  concurrent session create/terminate, many scopes
+#   ahma_http_bridge  sandbox_roots_handshake_stress 1  handshake state-machine race
+#   ahma_mcp          latency_guard_test             2  dispatch latency, per-line streaming throughput
+#
+# The two latency guards are the *only* thing defending SPEC R3.1's ~6 ms
+# dispatch claim and ahma_mcp/SPEC.md's "5000 lines under 10 s" streaming claim.
+# A regression in either landed silently. The stress suites are the only coverage
+# of the concurrency invariants in ahma_http_bridge/SPEC.md RB.3 and SPEC R10.
+#
+# Why a separate workflow rather than another step in build.yml:
+#
+# * These are slow and deliberately load-heavy. On the PR/merge path they would
+#   compete with the very scheduling they are measuring, on the 2-CPU runners
+#   whose contention the stress tests exist to provoke — the timing guards would
+#   be measuring the runner, not ahma.
+# * A merge gate should stay fast. Running here means a stress regression is
+#   found within a day and attributed to a commit range, without every land
+#   waiting on it.
+#
+# It still runs on every push to `main`, so a regression is attributable to one
+# merge rather than to a night's worth of them; the nightly schedule is the
+# backstop for a quiet day and for flakiness that only shows up over repeats.
+name: Ignored Tests
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 04:20 UTC daily — off the peak hours when hosted runners queue longest.
+    - cron: "20 4 * * *"
+  workflow_dispatch:
+
+# One run at a time per ref: two concurrent runs would contend for the same
+# runners and make the timing guards measure that contention.
+concurrency:
+  group: ignored-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTUP_MAX_RETRIES: 10
+  CARGO_TERM_COLOR: always
+  CARGO_PAGER: cat
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_NET_RETRY: 10
+  RUSTFLAGS: -C debuginfo=0 --cfg reqwest_unstable
+  RUST_BACKTRACE: 1
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  job-ignored-tests:
+    name: Ignored Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      # Never fail-fast: a macOS timing blip must not hide a real Linux stress
+      # failure, which is exactly the information this workflow exists to produce.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Cache Cargo registry and git
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-${{ runner.arch }}-
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache: false
+
+      - name: Set up sccache (ghac)
+        uses: ./.github/actions/sccache-ghac
+        with:
+          extra-tools: nextest
+
+      - name: Add Cargo Bin to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build ahma binary (required by integration tests)
+        run: cargo build --locked --no-default-features -p ahma_bin
+
+      # `--run-ignored all` rather than `only`: the ignored tests share fixtures
+      # and helpers with their non-ignored siblings, so running the whole set is
+      # what AGENTS.md asks for and what a developer runs locally. Kotlin/Android
+      # are excluded here exactly as in build.yml — they have their own job.
+      #
+      # The `ci` profile's throttling and retries apply (see .config/nextest.toml):
+      # every suite here crosses a process boundary, which is the mechanism that
+      # earns a retry. A genuinely broken test still fails all attempts.
+      # Mirrors build.yml's main nextest invocation (no -p / --workspace, so cargo
+      # resolves `default-members` — every crate but xtask) and adds
+      # `--run-ignored all`. Kotlin/Android are excluded here exactly as there;
+      # they have their own job. ahma_tui/ahma_bin are not re-run with default
+      # features the way build.yml does, because neither has an ignored test —
+      # that leg would cost 20 minutes to add nothing.
+      #
+      # --success-output immediate overrides the `ci` profile's `never` so the
+      # guards' measurements reach the log. A latency guard that only reports
+      # pass/fail tells you the bound was not crossed; the number tells you it is
+      # drifting toward it, which is the whole reason to run these on a schedule.
+      - name: Cargo Nextest (--run-ignored all)
+        timeout-minutes: 60
+        run: |
+          set -o pipefail
+          cargo nextest run --profile ci --locked --no-default-features \
+            --run-ignored all --no-fail-fast --success-output immediate \
+            -E 'not (test(kotlin) or test(android))' 2>&1 | tee nextest.log
+
+      # Lift the guards' own `println!` measurements into the job summary, so a
+      # trend is readable from the run list without opening logs. `if: always()`
+      # because a failing run is exactly when the numbers are wanted.
+      - name: Report latency and throughput measurements
+        if: always()
+        run: |
+          {
+            echo "### Latency / throughput guards (${{ matrix.os }})"
+            echo ""
+            if grep -q 'GUARD ' nextest.log 2>/dev/null; then
+              echo '```'
+              grep -h 'GUARD ' nextest.log | sed 's/.*GUARD /  /' | sort -u
+              echo '```'
+            else
+              echo "_No measurements captured — the guards did not run._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify sccache (ghac)
+        if: always()
+        uses: ./.github/actions/sccache-verify
+        with:
+          label: Ignored Tests

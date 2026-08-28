@@ -286,7 +286,7 @@ async fn test_service_with_configs() {
     .await
     .unwrap();
 
-    assert!(service.configs.read().unwrap().contains_key("test_tool"));
+    assert!(service.configs.read().contains_key("test_tool"));
 }
 
 #[test]
@@ -437,14 +437,8 @@ async fn test_service_with_tool_configs() {
         .await
         .expect("Failed to create test service with configs");
 
-    assert!(service.configs.read().unwrap().contains_key("cargo"));
-    let cargo_config = service
-        .configs
-        .read()
-        .unwrap()
-        .get("cargo")
-        .cloned()
-        .unwrap();
+    assert!(service.configs.read().contains_key("cargo"));
+    let cargo_config = service.configs.read().get("cargo").cloned().unwrap();
     assert_eq!(cargo_config.name, "cargo");
     assert!(cargo_config.subcommand.is_some());
 }

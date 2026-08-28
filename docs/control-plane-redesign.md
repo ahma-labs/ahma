@@ -1,6 +1,11 @@
 # Ahma Control Plane Redesign Plan
 
-This document tracks the step-by-step execution of turning `ahma tui` into a thin-client control plane and moving the agent harness/MCP client management to the `ahma serve` daemon.
+**Status**: Complete — every phase below is landed. Retained as the design record: it
+explains why `ahma tui` is a thin client over the `ahma serve` daemon rather than owning
+the agent loop itself. For the current behaviour see [tui.md](tui.md) and
+`ahma_tui/SPEC.md`.
+
+This document tracked the step-by-step execution of turning `ahma tui` into a thin-client control plane and moving the agent harness/MCP client management to the `ahma serve` daemon.
 
 ## Execution Checklist
 
@@ -36,4 +41,9 @@ This document tracks the step-by-step execution of turning `ahma tui` into a thi
 ---
 
 ## Log of Completed Work
-*(Add dated logs here as items are completed.)*
+
+The checklist above is the log: every item shipped. The
+commit history under `ahma_tui/` and `ahma_common/src/daemon_hub.rs` carries the
+detail. This section was never filled in while the work was in flight, and an empty
+"add logs here" heading on a finished document reads as work still pending — which
+is why the status line above now says otherwise.

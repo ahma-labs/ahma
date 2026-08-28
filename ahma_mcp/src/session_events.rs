@@ -15,8 +15,9 @@
 //! that still support logging render it today; when the mirror stops earning
 //! its keep, dropping it is a one-line change here.
 
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 
 use ahma_common::session_event::{
     MESSAGE_METHOD, SESSION_EVENT_METHOD, SessionEventKind, event_params,
@@ -56,7 +57,7 @@ impl SessionEventSender {
 
     /// Emit one event (canonical notification + logging mirror), best-effort.
     pub async fn emit(&self, kind: SessionEventKind, detail: serde_json::Value) {
-        let peer = self.peer.read().unwrap().clone();
+        let peer = self.peer.read().clone();
         let Some(peer) = peer else {
             tracing::debug!(kind = kind.as_str(), "session event dropped: no MCP peer");
             return;

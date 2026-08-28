@@ -87,7 +87,7 @@ async fn maybe_start_egress_proxy(
     if !config.restrict_network {
         return None;
     }
-    // Windows AppContainer and the egress proxy cannot both be in effect
+    // AppContainer isolation and the egress proxy cannot both be in effect
     // (SPEC R6.3.3.1a). An AppContainer blocks loopback unless the container is
     // registered with `CheckNetIsolation LoopbackExempt`, and this proxy binds
     // 127.0.0.1 — so a sandboxed child cannot reach it.
@@ -99,16 +99,25 @@ async fn maybe_start_egress_proxy(
     // capability. The restriction would be broken *and* unenforced, and the
     // interactive-approval path (R-WEB.16.8) could never fire to explain why.
     //
+    // The condition is whether AppContainer is *actually in the spawn path*, not
+    // whether this is Windows. Those were the same thing when this check was
+    // written and stopped being the same thing in #558, which disabled the
+    // container without telling this function. For the whole interval a Windows
+    // operator who asked for --restrict-network was refused, and told the reason
+    // was an AppContainer that was no longer being created — so they had neither a
+    // filesystem boundary nor an egress one, which is exactly the state SPEC R7
+    // exists to make impossible. One predicate now answers for both sites.
+    //
     // Non-fatal, matching the proxy-start failure below: the server still runs. What
     // it must never do is let the operator believe egress is gated when it is not.
-    if cfg!(target_os = "windows") {
+    if crate::sandbox::windows::appcontainer_spawn_enabled() {
         tracing::error!(
-            "--restrict-network is NOT in effect this session. On Windows every command is \
-             launched into an AppContainer (SPEC R6.3.3), which blocks loopback — so the egress \
-             proxy would be unreachable by the very subprocesses it exists to gate, and network \
-             egress would be unrestricted for any tool that opens its own socket. Pick one: run \
-             without --restrict-network (AppContainer filesystem isolation stays), or disable the \
-             sandbox with --disable-sandbox to get proxy-based egress gating without it."
+            "--restrict-network is NOT in effect this session. Every command is launched into a \
+             Windows AppContainer (SPEC R6.3.3), which blocks loopback — so the egress proxy \
+             would be unreachable by the very subprocesses it exists to gate, and network egress \
+             would be unrestricted for any tool that opens its own socket. Pick one: run without \
+             --restrict-network (AppContainer filesystem isolation stays), or disable the sandbox \
+             with --disable-sandbox to get proxy-based egress gating without it."
         );
         return None;
     }
@@ -1372,7 +1381,8 @@ async fn run_as_frontend_and_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
     use tempfile::tempdir;
 
     /// Serializes tests that mutate process-global environment variables
@@ -1645,7 +1655,7 @@ mod tests {
 
     #[test]
     fn test_is_server_child_via_config_flag() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         // SAFETY: test-only; ENV_MUTEX serializes env access in this module.
         let prev = std::env::var("AHMA_SERVER_CHILD").ok();
         unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
@@ -1670,7 +1680,7 @@ mod tests {
 
     #[test]
     fn test_is_server_child_via_env_var() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let prev = std::env::var("AHMA_SERVER_CHILD").ok();
         // SAFETY: test-only; ENV_MUTEX held.
         unsafe { std::env::set_var("AHMA_SERVER_CHILD", "1") };
@@ -1692,7 +1702,7 @@ mod tests {
 
     #[test]
     fn test_is_server_child_unset_and_flag_false() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let prev = std::env::var("AHMA_SERVER_CHILD").ok();
         // SAFETY: test-only; ENV_MUTEX held.
         unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
@@ -2256,7 +2266,7 @@ mod tests {
     fn test_net_approval() -> crate::egress::NetApprovalContext {
         crate::egress::NetApprovalContext {
             coordinator: Arc::new(ahma_common::net_approval::NetApprovalCoordinator::new()),
-            peer: Arc::new(std::sync::RwLock::new(None)),
+            peer: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -2279,15 +2289,27 @@ mod tests {
         );
     }
 
-    /// On Windows, `restrict_network=true` deliberately returns `None` (SPEC
-    /// R6.3.3.1a: AppContainer blocks loopback, so the proxy would be unreachable
-    /// by the very subprocesses it exists to gate). This is the Windows-side
-    /// counterpart to the non-Windows tests below, which assert the proxy
-    /// *does* start — a property that does not hold, and cannot be observed,
-    /// on this platform.
-    #[cfg(windows)]
+    /// The egress proxy is refused when — and only when — AppContainer isolation
+    /// is genuinely in the spawn path (SPEC R6.3.3.1a: an AppContainer blocks
+    /// loopback, so the proxy would be unreachable by the very subprocesses it
+    /// exists to gate).
+    ///
+    /// This asserts the *predicate*, not the platform. The previous version of
+    /// this test asserted `#[cfg(windows)] => None`, which pinned the behaviour in
+    /// place after #558 disabled the container: Windows kept refusing
+    /// `--restrict-network` for a reason that had stopped being true, and the test
+    /// certified it. Keying on `appcontainer_spawn_enabled()` means the day that
+    /// flips to `true`, this expectation flips with it — and until then Windows
+    /// gets the same egress gating as everywhere else.
     #[tokio::test]
-    async fn test_maybe_start_egress_proxy_on_windows_returns_none() {
+    async fn test_egress_proxy_refusal_tracks_appcontainer_not_the_platform() {
+        assert!(
+            !crate::sandbox::windows::appcontainer_spawn_enabled(),
+            "appcontainer_spawn_enabled() is true, so this test's sibling — the \
+             proxy-does-start assertions below — no longer describes any platform. \
+             Re-key them on the predicate before flipping it (SPEC R6.3.3.1a)."
+        );
+
         let tmp = tempdir().unwrap();
         let sb = make_test_sandbox(tmp.path());
         let cfg = AppConfig {
@@ -2298,13 +2320,21 @@ mod tests {
 
         let proxy = maybe_start_egress_proxy(&cfg, &sb, test_net_approval()).await;
         assert!(
-            proxy.is_none(),
-            "AppContainer and the egress proxy are mutually exclusive (R6.3.3.1a): \
-             restrict_network=true must not start a proxy no subprocess can reach"
+            proxy.is_some(),
+            "with AppContainer out of the spawn path there is nothing blocking loopback, \
+             so --restrict-network must take effect rather than being refused (SPEC R7: \
+             ahma never silently disables enforcement, and never refuses it for a reason \
+             that does not apply)"
         );
     }
 
-    #[cfg(not(windows))]
+    // The four "proxy does start" tests below were `#[cfg(not(windows))]` for as
+    // long as `maybe_start_egress_proxy` refused on Windows unconditionally. It
+    // now refuses only when AppContainer is genuinely in the spawn path, so they
+    // describe every platform and are gated on none. If AppContainer is ever
+    // re-enabled, the assertion at the top of
+    // `test_egress_proxy_refusal_tracks_appcontainer_not_the_platform` fires and
+    // says so, rather than these four failing with no explanation.
     #[tokio::test]
     async fn test_maybe_start_egress_proxy_on_empty_allow_starts_proxy() {
         let tmp = tempdir().unwrap();
@@ -2325,7 +2355,6 @@ mod tests {
         assert!(proxy.local_addr.ip().is_loopback());
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_maybe_start_egress_proxy_on_with_allowlist_starts_proxy() {
         let tmp = tempdir().unwrap();
@@ -2345,7 +2374,6 @@ mod tests {
         assert!(!proxy.allows("elsewhere.example"));
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn profile_hosts_seed_the_allowlist() {
         // The wiring test for the whole feature: `--restrict-network` with *no*
@@ -2379,7 +2407,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn operator_allow_composes_with_profile_hosts_at_the_proxy() {
         // Guards the natural-but-wrong implementation: "if the operator wrote an
@@ -2409,7 +2436,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn withholding_profile_hosts_leaves_the_operators_own_list_intact() {
         // `[network] profile_hosts = false` is a hardening knob, not a kill

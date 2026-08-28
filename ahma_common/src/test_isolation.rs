@@ -52,7 +52,8 @@ pub fn test_run_discriminator() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
 
     /// Serializes env-var mutation across tests in this module.
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -87,7 +88,7 @@ mod tests {
 
     #[test]
     fn detects_nextest_env() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.lock();
         let _iso = EnvVarGuard::unset("AHMA_TEST_ISOLATION");
         let _next = EnvVarGuard::set("NEXTEST", "1");
         assert!(spawned_under_test_harness());
@@ -95,7 +96,7 @@ mod tests {
 
     #[test]
     fn detects_explicit_isolation_env() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.lock();
         let _next = EnvVarGuard::unset("NEXTEST");
         let _iso = EnvVarGuard::set("AHMA_TEST_ISOLATION", "1");
         assert!(spawned_under_test_harness());
@@ -103,7 +104,7 @@ mod tests {
 
     #[test]
     fn false_outside_any_test_harness() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.lock();
         let _iso = EnvVarGuard::unset("AHMA_TEST_ISOLATION");
         let _next = EnvVarGuard::unset("NEXTEST");
         assert!(!spawned_under_test_harness());
@@ -111,14 +112,14 @@ mod tests {
 
     #[test]
     fn discriminator_prefers_run_id_and_stays_short() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.lock();
         let _id = EnvVarGuard::set("NEXTEST_RUN_ID", "a1b2c3d4-5678-90ab-cdef-1234567890ab");
         assert_eq!(test_run_discriminator(), "a1b2c3d4");
     }
 
     #[test]
     fn discriminator_falls_back_to_pid() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.lock();
         let _id = EnvVarGuard::unset("NEXTEST_RUN_ID");
         assert_eq!(test_run_discriminator(), std::process::id().to_string());
     }

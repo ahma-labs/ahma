@@ -1460,9 +1460,7 @@ mod tests {
     fn save_writes_to_home_seam_and_reloads() {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: debug-only test seam; nextest isolates each test in its own process.
-        let _home = crate::HOME_SEAM_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _home = crate::HOME_SEAM_GUARD.lock();
         unsafe {
             std::env::set_var("AHMA_TEST_HOME", dir.path());
         }

@@ -1298,7 +1298,13 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
 
     match result {
         Ok(output) => {
-            println!("{}", output);
+            // Not `println!` (SPEC R5.6.1): the hook's stdout is a pipe to the
+            // editor's hook engine, not a terminal, and `println!` panics
+            // unconditionally on a write error — a broken pipe here (Windows OS
+            // error 232, EPIPE on Unix) would kill the hook with a stack trace
+            // instead of a log line. This is the same reasoning the file already
+            // applies to `write_exec_output` a few hundred lines up.
+            crate::utils::stdio::emit_stdout_text(&format!("{output}\n"))?;
             Ok(())
         }
         // The sandbox initialized successfully (the `initialize_sandbox` arms
@@ -1856,9 +1862,16 @@ fn install_grouped_hook(
 ) -> Result<()> {
     let root = ensure_root_object(document)?;
     let hooks = ensure_child_object(root, "hooks")?;
+    let Some(entry) = managed_group_entry(platform, scope, env) else {
+        anyhow::bail!(
+            "{} does not use the grouped hook format; it has its own installer. This is a \
+             wiring bug in ahma, not a problem with your configuration — please report it.",
+            platform.label()
+        );
+    };
     let entries = ensure_child_array(hooks, platform.event_key())?;
     entries.retain(|entry| !is_managed_group_entry(entry));
-    entries.push(managed_group_entry(platform, scope, env));
+    entries.push(entry);
     Ok(())
 }
 
@@ -1971,22 +1984,39 @@ fn codex_group_entry(scope: HookScope, env: &HookEnvironment) -> Value {
     )
 }
 
-fn managed_group_entry(platform: HookPlatform, scope: HookScope, env: &HookEnvironment) -> Value {
+/// The managed hook entry for a platform that uses the *grouped* hook format.
+///
+/// `None` for a platform that does not, which today is Cursor and Copilot — they
+/// have their own installers (`install_cursor_hook`, `install_copilot_hook`).
+///
+/// A `Result`-shaped answer rather than `unreachable!`, because the premise is a
+/// claim about *external* tools' file formats. `unreachable!` is right for an
+/// invariant this code enforces; here the invariant belongs to editors that ship
+/// on their own schedule, and a new `HookPlatform` routed through the grouped
+/// installer would have panicked the CLI on a wrong guess about somebody else's
+/// JSON.
+fn managed_group_entry(
+    platform: HookPlatform,
+    scope: HookScope,
+    env: &HookEnvironment,
+) -> Option<Value> {
     match platform {
-        HookPlatform::Claude => {
-            single_command_group_entry(platform, scope, env, "Bash", "Routing Bash through ahma")
-        }
-        HookPlatform::Antigravity => single_command_group_entry(
+        HookPlatform::Claude => Some(single_command_group_entry(
+            platform,
+            scope,
+            env,
+            "Bash",
+            "Routing Bash through ahma",
+        )),
+        HookPlatform::Antigravity => Some(single_command_group_entry(
             platform,
             scope,
             env,
             "run_command",
             "Routing run_command through ahma",
-        ),
-        HookPlatform::Codex => codex_group_entry(scope, env),
-        HookPlatform::Cursor | HookPlatform::Copilot => {
-            unreachable!("Cursor/Copilot do not use grouped hooks")
-        }
+        )),
+        HookPlatform::Codex => Some(codex_group_entry(scope, env)),
+        HookPlatform::Cursor | HookPlatform::Copilot => None,
     }
 }
 
@@ -3033,8 +3063,8 @@ mod tests {
     // Env-var serialization guard. `AHMA_HOOKS` / `AHMA_DISABLE_HOOKS` are
     // process-global; serialize the tests that mutate them and restore after.
     // ----------------------------------------------------------------------
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static ENV_LOCK: std::sync::LazyLock<parking_lot::Mutex<()>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(()));
 
     struct EnvGuard {
         hooks: Option<String>,
@@ -3821,7 +3851,8 @@ mod tests {
     #[test]
     fn test_claude_group_command_is_self_contained_user_absolute() {
         let env = test_env();
-        let entry = managed_group_entry(HookPlatform::Claude, HookScope::User, &env);
+        let entry = managed_group_entry(HookPlatform::Claude, HookScope::User, &env)
+            .expect("Claude uses the grouped hook format");
         let handler = &entry["hooks"][0];
         let command = handler["command"].as_str().unwrap();
         assert!(command.contains("bin space"), "absolute path: {command}");
@@ -3837,7 +3868,8 @@ mod tests {
     #[test]
     fn test_claude_group_command_is_self_contained_project_path_lookup() {
         let env = test_env();
-        let entry = managed_group_entry(HookPlatform::Claude, HookScope::Project, &env);
+        let entry = managed_group_entry(HookPlatform::Claude, HookScope::Project, &env)
+            .expect("Claude uses the grouped hook format");
         let command = entry["hooks"][0]["command"].as_str().unwrap();
         assert!(
             command.starts_with("ahma hooks exec"),
@@ -3887,7 +3919,8 @@ mod tests {
     #[test]
     fn test_managed_group_entry_claude_matcher_bash() {
         let env = test_env();
-        let entry = managed_group_entry(HookPlatform::Claude, HookScope::User, &env);
+        let entry = managed_group_entry(HookPlatform::Claude, HookScope::User, &env)
+            .expect("Claude uses the grouped hook format");
         assert_eq!(entry["matcher"].as_str(), Some("Bash"));
         assert!(is_managed_group_entry(&entry));
     }
@@ -3895,8 +3928,23 @@ mod tests {
     #[test]
     fn test_managed_group_entry_antigravity_matcher_run_command() {
         let env = test_env();
-        let entry = managed_group_entry(HookPlatform::Antigravity, HookScope::User, &env);
+        let entry = managed_group_entry(HookPlatform::Antigravity, HookScope::User, &env)
+            .expect("Antigravity uses the grouped hook format");
         assert_eq!(entry["matcher"].as_str(), Some("run_command"));
+    }
+
+    /// The two platforms with their own installers return `None` rather than
+    /// panicking. Asserted so a future platform added to the grouped path has to
+    /// decide which format it uses, instead of finding out from a CLI panic.
+    #[test]
+    fn platforms_with_their_own_installers_have_no_grouped_entry() {
+        let env = test_env();
+        for platform in [HookPlatform::Cursor, HookPlatform::Copilot] {
+            assert!(
+                managed_group_entry(platform, HookScope::User, &env).is_none(),
+                "{platform:?} installs its hook through its own writer, not the grouped one"
+            );
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -4029,7 +4077,7 @@ mod tests {
     // ----------------------------------------------------------------------
     #[test]
     fn test_is_ahma_hooks_active_env_off_overrides_active_configs() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock();
         let _restore = EnvGuard::capture();
         unsafe {
             std::env::set_var("AHMA_HOOKS", "off");
@@ -4041,7 +4089,7 @@ mod tests {
 
     #[test]
     fn test_is_ahma_hooks_active_env_on_overrides_no_configs() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock();
         let _restore = EnvGuard::capture();
         unsafe {
             std::env::set_var("AHMA_HOOKS", "on");
@@ -4052,7 +4100,7 @@ mod tests {
 
     #[test]
     fn test_is_ahma_hooks_active_disable_alias() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock();
         let _restore = EnvGuard::capture();
         unsafe {
             std::env::remove_var("AHMA_HOOKS");
@@ -4063,7 +4111,7 @@ mod tests {
 
     #[test]
     fn test_describe_activation_env_reasons() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock();
         let _restore = EnvGuard::capture();
 
         unsafe {
@@ -4090,7 +4138,7 @@ mod tests {
 
     #[test]
     fn test_describe_activation_auto_active_reason() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock();
         let _restore = EnvGuard::capture();
         unsafe {
             std::env::remove_var("AHMA_HOOKS");

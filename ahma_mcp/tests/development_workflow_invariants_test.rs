@@ -103,7 +103,11 @@ fn test_json_tool_configuration_count_invariant() {
 
     for dir in &[ahma_dir, examples_dir] {
         if !dir.exists() {
-            println!("WARNING️  Directory {:?} not found - skipping", dir);
+            // `.ahma/` is checked in; if it is gone on CI the workspace layout
+            // this test asserts about no longer holds.
+            ahma_test_support::skip::skip_or_fail(&format!(
+                "workspace directory {dir:?} not found"
+            ));
             continue;
         }
 

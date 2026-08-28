@@ -853,7 +853,7 @@ enum ElicitReply {
 /// answers each `create_elicitation` call with the next scripted reply.
 struct ScriptedElicitClient {
     capable: bool,
-    replies: Arc<std::sync::Mutex<std::collections::VecDeque<ElicitReply>>>,
+    replies: Arc<parking_lot::Mutex<std::collections::VecDeque<ElicitReply>>>,
 }
 
 impl ClientHandler for ScriptedElicitClient {
@@ -875,7 +875,6 @@ impl ClientHandler for ScriptedElicitClient {
         let reply = self
             .replies
             .lock()
-            .unwrap()
             .pop_front()
             .unwrap_or(ElicitReply::Decline);
         let (action, content) = match reply {
@@ -915,7 +914,7 @@ async fn wire_elicit_service(
 
     let client_handler = ScriptedElicitClient {
         capable,
-        replies: Arc::new(std::sync::Mutex::new(replies.into_iter().collect())),
+        replies: Arc::new(parking_lot::Mutex::new(replies.into_iter().collect())),
     };
 
     let (client_result, server_result) = tokio::join!(
@@ -930,13 +929,13 @@ async fn wire_elicit_service(
     // stores the `Peer` handle on `AhmaMcpService.peer` via `on_initialized`).
     // Poll briefly for it before handing control back to the test.
     for _ in 0..200 {
-        if svc.peer.read().unwrap().is_some() {
+        if svc.peer.read().is_some() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert!(
-        svc.peer.read().unwrap().is_some(),
+        svc.peer.read().is_some(),
         "peer handshake did not complete in time"
     );
 

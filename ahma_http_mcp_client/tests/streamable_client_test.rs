@@ -16,9 +16,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ─── Mock server plumbing ────────────────────────────────────────────────────
@@ -47,7 +47,7 @@ async fn mock_post(State(st): State<MockState>, Json(body): Json<Value>) -> Resp
 
     // A client roots/list *response* carries result.roots and no method.
     if method.is_empty() && body.pointer("/result/roots").is_some() {
-        *st.roots_answer.lock().expect("lock") = Some(body);
+        *st.roots_answer.lock() = Some(body);
         return StatusCode::ACCEPTED.into_response();
     }
 
@@ -64,7 +64,7 @@ async fn mock_post(State(st): State<MockState>, Json(body): Json<Value>) -> Resp
         }
         "notifications/initialized" => {
             let connected = st.sse_connected.load(Ordering::SeqCst);
-            let mut guard = st.sse_ready_at_initialized.lock().expect("lock");
+            let mut guard = st.sse_ready_at_initialized.lock();
             if guard.is_none() {
                 *guard = Some(connected);
             }
@@ -142,10 +142,7 @@ async fn mock_sse(State(st): State<MockState>) -> Response {
 
 async fn mock_delete(State(st): State<MockState>, headers: HeaderMap) -> StatusCode {
     if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
-        st.deleted_sessions
-            .lock()
-            .expect("lock")
-            .push(sid.to_string());
+        st.deleted_sessions.lock().push(sid.to_string());
     }
     StatusCode::OK
 }
@@ -207,7 +204,6 @@ async fn handshake_opens_sse_before_initialized_and_answers_roots() {
     let recorded = state
         .sse_ready_at_initialized
         .lock()
-        .expect("lock")
         .expect("notifications/initialized must have been received");
     assert!(
         recorded,
@@ -218,7 +214,6 @@ async fn handshake_opens_sse_before_initialized_and_answers_roots() {
     let answer = state
         .roots_answer
         .lock()
-        .expect("lock")
         .clone()
         .expect("roots/list must be answered");
     assert_eq!(
@@ -316,7 +311,7 @@ async fn connect_minimal_skips_sse_and_roots() {
         "minimal connect must not open an SSE stream"
     );
     assert!(
-        state.roots_answer.lock().expect("lock").is_none(),
+        state.roots_answer.lock().is_none(),
         "minimal connect must not answer roots/list"
     );
 
@@ -554,7 +549,7 @@ async fn delete_session_sends_delete_with_session_header() {
     client.delete_session(TestTimeouts::scale_secs(2)).await;
 
     assert_eq!(
-        state.deleted_sessions.lock().expect("lock").as_slice(),
+        state.deleted_sessions.lock().as_slice(),
         &["to-delete".to_string()]
     );
 

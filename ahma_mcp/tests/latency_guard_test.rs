@@ -7,6 +7,11 @@
 //! per-line lock turning quadratic), not millisecond drift.
 //!
 //! Note: commands are spawned directly through the sandboxed process path.
+//!
+//! Each guard prints one line prefixed [`GUARD_MARKER`]. The `Ignored Tests`
+//! workflow greps for it and lifts the measurements into the job summary, so a
+//! number drifting toward its bound is visible before it crosses — a guard that
+//! only reports pass/fail tells you the bound was not crossed *this time*.
 
 use ahma_mcp::adapter::Adapter;
 use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
@@ -15,6 +20,10 @@ use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+/// Prefix on every measurement line. Grepped by
+/// `.github/workflows/ignored-tests.yml`; keep the two in step.
+const GUARD_MARKER: &str = "GUARD";
 
 fn build_adapter(scope: std::path::PathBuf) -> (Arc<Adapter>, Arc<OperationMonitor>) {
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
@@ -103,7 +112,9 @@ async fn async_echo_end_to_end_latency_guard() {
     timings.sort();
     let median = timings[RUNS / 2];
     let worst = *timings.last().unwrap();
-    println!("async echo latency: median={median:?} worst={worst:?} all={timings:?}");
+    println!(
+        "{GUARD_MARKER} async echo latency: median={median:?} worst={worst:?} all={timings:?}"
+    );
 
     // Direct spawn of a non-interactive shell is single-digit milliseconds;
     // the full pipeline (sandbox wrap, monitor, streaming, history) should
@@ -151,7 +162,7 @@ async fn streaming_5000_lines_throughput_guard() {
         .expect("operation should finish within 30s")
         .expect("operation should be in history");
     let elapsed = start.elapsed();
-    println!("5000-line streaming completed in {elapsed:?}");
+    println!("{GUARD_MARKER} 5000-line streaming completed in {elapsed:?}");
 
     let stdout = op
         .result

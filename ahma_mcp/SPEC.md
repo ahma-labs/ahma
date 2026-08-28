@@ -17,7 +17,12 @@
 - **Kernel Sandbox**: Implements path-validation rules and platform-specific kernel sandboxing (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows).
 - **Built-in tools**: Provides core internal tools `status`, `await`, `cancel`, and `run_terminal_command` regardless of external configuration.
 - **No runtime tool reload**: tool definitions are read once at startup (plus a one-shot load of a connecting client's `<root>/.ahma/`) and are never re-read from disk while the server runs. The tools directory is inside the sandbox scope and therefore agent-writable, and MTDF `command` is a free-form string, so a watcher would let a sandboxed agent repoint an approved tool name at an arbitrary command. The deliberate, auditable reload path is the `restart` builtin.
-- **Supply Chain Audit**: Implements `ahma bundle audit/sign/verify` commands to scan tool definitions for security risks.
+- **Supply Chain Audit**: Implements `ahma bundle audit` to scan tool definitions for security
+  risks, and `ahma bundle checksum`/`verify` to record and re-check a SHA-256 content manifest.
+  The manifest is an integrity check against corruption and **must not** be described as a
+  signature on any surface: it is unsigned and travels inside the bundle it describes, so anyone
+  who can alter a bundle file can regenerate it. Tamper-evidence needs the detached-signature
+  scheme SPEC.md §11 tracks as the v0.8 signed bundle index, which is not implemented.
 
 ## 3. Non-Functional Requirements
 

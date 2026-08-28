@@ -157,6 +157,78 @@ if [[ "$EDITION_OVERRIDE_FAIL" -ne 0 ]]; then
 fi
 echo "OK No per-crate edition/rust-version overrides"
 
+echo "=== Guardrail: no println!/print! on the protocol path (SPEC R5.6.1) ==="
+# `println!` panics unconditionally on a write error. In stdio server mode and on
+# the terminal-hook path, stdout is a PIPE the peer may close during shutdown —
+# a broken pipe (EPIPE, or Windows OS error 232) then kills the process with a
+# stack trace instead of a log line. `crate::utils::stdio::emit_stdout_notification`
+# / `emit_stdout_text` classify that error instead. `println!` stays fine in CLI
+# mode, where stdout is a terminal, which is why this is scoped to the modules
+# that only ever run under a protocol peer rather than applied workspace-wide.
+#
+# This was documented in SPEC R5.6.1, in AGENTS.md, and in the stdio module's own
+# header — and a `println!` on the hook execution path survived all three,
+# because nothing checked. Hence a check.
+PROTOCOL_DIRS=(
+  ahma_mcp/src/mcp_service
+  ahma_mcp/src/adapter
+  ahma_mcp/src/sandbox
+  ahma_mcp/src/livelog
+  ahma_mcp/src/output_optimizer
+  ahma_http_bridge/src
+)
+STDOUT_VIOLATIONS=$(grep -rn --include='*.rs' -E '(^|[^a-z_])print(ln)?!' "${PROTOCOL_DIRS[@]}" 2>/dev/null \
+  | grep -v 'eprintln!' | grep -v 'eprint!' || true)
+if [[ -n "$STDOUT_VIOLATIONS" ]]; then
+  echo ""
+  echo "FAIL println!/print! found on a protocol-path module:"
+  echo "$STDOUT_VIOLATIONS"
+  echo ""
+  echo "  These write to a pipe the peer can close. Use:"
+  echo "    crate::utils::stdio::emit_stdout_notification(json)  # JSON-RPC"
+  echo "    crate::utils::stdio::emit_stdout_text(text)          # raw output"
+  exit 1
+fi
+echo "OK No println!/print! on the protocol path"
+
+echo "=== Guardrail: no Result-shaped use of a parking_lot guard ==="
+# `parking_lot`'s `lock()`/`read()`/`write()` return the guard directly, not a
+# `Result` — there is no poisoning. Code written against `std::sync` treats them
+# as a `Result`, and that mistake only shows up where the code is *compiled*.
+#
+# Both times it bit, it bit in platform-gated code a developer on another OS
+# cannot build: once under `#[cfg(target_os = "windows")]` (found by hand), once
+# under `#[cfg(target_os = "linux")]` (found by CI, after the local suite,
+# clippy, and a full `--run-ignored all` run were all green on macOS). A grep is
+# the only check that sees every `#[cfg]` arm at once.
+#
+# Only Result-*only* consumers are flagged. `.map`/`.unwrap_or` are ambiguous —
+# a guard derefs to its inner value, so `guard.map(..)` is legal when that value
+# is an `Option` — and flagging them would train people to ignore this.
+LOCK_RESULT_MISUSE=$(
+  grep -rnE '\.(lock|read|write)\(\)[[:space:]]*(\.ok\(\)|\.map_err\(|\.is_ok\(\)|\.is_err\(\))' \
+    --include='*.rs' ahma_*/src 2>/dev/null | grep -v 'tokio::sync' || true
+  # `.ok()` etc. on the line after a trailing `.read()` / `.lock()`.
+  grep -rn -A1 -E '\.(lock|read|write)\(\)$' --include='*.rs' ahma_*/src 2>/dev/null \
+    | grep -E '^[^ ]+-[0-9]+-[[:space:]]*(\.ok\(\)|\.map_err\(|\.is_ok\(\)|\.is_err\(\))' || true
+  # `if let Ok(g) = x.lock()` / `match x.lock() {` without a leading deref.
+  grep -rnE 'if let Ok\([^)]*\)[[:space:]]*=[^;]*\.(lock|read|write)\(\)' \
+    --include='*.rs' ahma_*/src 2>/dev/null | grep -v 'tokio::sync' || true
+  grep -rnE 'match[[:space:]]+[^*{]*\.(lock|read|write)\(\)[[:space:]]*\{' \
+    --include='*.rs' ahma_*/src 2>/dev/null | grep -v 'tokio::sync' || true
+)
+if [[ -n "$LOCK_RESULT_MISUSE" ]]; then
+  echo ""
+  echo "FAIL A parking_lot guard is being used as if it were a Result:"
+  echo "$LOCK_RESULT_MISUSE"
+  echo ""
+  echo "  parking_lot locks cannot be poisoned, so lock()/read()/write() hand back the"
+  echo "  guard directly. Drop the .ok()/.unwrap()/if-let-Ok and use the guard, or"
+  echo "  deref it first (\`match *x.read() { .. }\`)."
+  exit 1
+fi
+echo "OK No Result-shaped use of a parking_lot guard"
+
 echo "=== Guardrail: lint recurring test patterns ===" 
 ./scripts/lint_test_paths.sh
 

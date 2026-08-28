@@ -770,20 +770,30 @@ async fn red_team_spawned_child_landlock_enforced_from_worker_thread() {
 /// blocking depends entirely on the kernel-level sandbox wrapping the spawned
 /// shell. Linux (Landlock) and macOS (Seatbelt) run and enforce it.
 ///
-/// **Windows status: implemented, unproven.** AppContainer spawn isolation now
-/// exists (`sandbox/windows.rs`: per-session container SID, scope DACL grants,
-/// `STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` spawn through
-/// the `ahma.exe` launcher). It was written and type-checked on a non-Windows
-/// host and has **never been executed**, so nothing yet demonstrates that it
-/// blocks this escape. The `ignore` therefore stays: per AGENTS.md it comes off
-/// when R6.3.3 lands *and Windows CI proves it*, and only the second half is
-/// outstanding. The next person to touch this should run it on a `windows-latest`
-/// runner, and if it passes, delete the `cfg_attr` and flip SPEC R6.3.3 to done.
+/// **Windows status: implemented, executed, disproven.** AppContainer spawn
+/// isolation exists (`sandbox/windows.rs`: per-session container SID, scope DACL
+/// grants, `STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` spawn
+/// through the `ahma.exe` launcher) — and a `windows-latest` run showed the
+/// scoped grant does not take effect: an in-scope write is denied along with an
+/// out-of-scope one. So the path is switched off
+/// (`windows::appcontainer_spawn_enabled` is `false`) and Windows currently has
+/// **no** OS-enforced path boundary at all, which is why this escape is not
+/// blocked there.
+///
+/// An earlier version of this comment said the code had "never been executed"
+/// and that "only the second half is outstanding". Both were true when written
+/// and stopped being true when CI ran it; the correction matters because the old
+/// wording implies the mechanism probably works and is merely unverified.
+///
+/// The `ignore` comes off when a `windows-latest` run shows the boundary holding
+/// in both directions — see `appcontainer_dacl_diagnostics`, which dumps the
+/// evidence needed to find out why it does not.
 #[tokio::test]
 #[cfg_attr(
     target_os = "windows",
-    ignore = "AppContainer spawn isolation (SPEC R6.3.3) is implemented but has never been \
-              executed; remove this ignore once a windows-latest CI run proves it"
+    ignore = "AppContainer spawn isolation (SPEC R6.3.3) is implemented but was disproven on \
+              windows-latest CI and is switched off, so Windows has no path boundary to \
+              enforce this; remove once a CI run shows the boundary holding both ways"
 )]
 async fn red_team_command_write_escape_blocked() {
     init_test_logging();

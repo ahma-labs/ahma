@@ -293,7 +293,8 @@ pub fn enforce_landlock_sandbox(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
     use tempfile::tempdir;
 
     /// The ruleset must build cleanly when a proxy port is supplied — the TCP
@@ -404,7 +405,7 @@ mod tests {
     /// points at an existing directory.
     #[test]
     fn ruleset_fd_grants_package_cache_write_rules_when_cache_exists() {
-        let _guard = LANDLOCK_ENV_MUTEX.lock().unwrap();
+        let _guard = LANDLOCK_ENV_MUTEX.lock();
         let cargo_home_dir = tempdir().unwrap();
         let _restore = EnvVarRestore::set("CARGO_HOME", cargo_home_dir.path());
 
@@ -434,7 +435,7 @@ mod tests {
     /// command has to *run*, and Landlock's read set does not include `Execute`.
     #[test]
     fn ruleset_fd_grants_profile_rules_when_home_has_toolchain_dirs() {
-        let _guard = LANDLOCK_ENV_MUTEX.lock().unwrap();
+        let _guard = LANDLOCK_ENV_MUTEX.lock();
         let home_dir = tempdir().unwrap();
         std::fs::create_dir_all(home_dir.path().join(".cargo")).unwrap();
         std::fs::create_dir_all(home_dir.path().join(".rustup")).unwrap();

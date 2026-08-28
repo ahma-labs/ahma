@@ -17,8 +17,8 @@
 //! profile) are unaffected. On Linux/Windows the list is unused because reads
 //! are already scoped to the sandbox.
 
+use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 
 static CREDENTIAL_READ_DENIES: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 
@@ -190,33 +190,28 @@ pub fn effective_credential_read_denies(
 
 /// Install the effective credential-read deny set (called once at startup).
 pub fn set_credential_read_denies(paths: Vec<PathBuf>) {
-    if let Ok(mut guard) = CREDENTIAL_READ_DENIES.write() {
-        *guard = paths;
-    }
+    let mut guard = CREDENTIAL_READ_DENIES.write();
+    *guard = paths;
 }
 
 /// The currently-installed deny set (empty if none installed).
 pub fn credential_read_denies() -> Vec<PathBuf> {
-    CREDENTIAL_READ_DENIES
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_default()
+    CREDENTIAL_READ_DENIES.read().clone()
 }
 
 /// Install whether sandboxed tools may access the macOS keychain (called once at
 /// startup with the resolved `[sandbox] allow_keychain` value). See
 /// [`KEYCHAIN_ACCESS_ALLOWED`].
 pub fn set_keychain_access_allowed(allowed: bool) {
-    if let Ok(mut guard) = KEYCHAIN_ACCESS_ALLOWED.write() {
-        *guard = allowed;
-    }
+    let mut guard = KEYCHAIN_ACCESS_ALLOWED.write();
+    *guard = allowed;
 }
 
 /// Whether sandboxed tools may access the macOS keychain (`false` until installed
 /// at startup). Read by the Seatbelt profile builder to decide whether to emit the
 /// keychain write / security-prefs allow rules.
 pub fn keychain_access_allowed() -> bool {
-    KEYCHAIN_ACCESS_ALLOWED.read().map(|g| *g).unwrap_or(false)
+    *KEYCHAIN_ACCESS_ALLOWED.read()
 }
 
 #[cfg(test)]

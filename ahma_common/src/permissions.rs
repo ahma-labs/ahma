@@ -37,10 +37,10 @@
 //! question ladder (R-PERM.3), and it lives with the broker. This module is the
 //! ledger: it answers "what has been granted, and where is it written down".
 
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -412,7 +412,7 @@ impl SessionGrants {
     /// Record the user's session-tier answer. `allowed = false` records a denial,
     /// which suppresses re-asking just as firmly as an approval does.
     pub fn record(&self, kind: GrantKind, subject: &str, access: Option<&str>, allowed: bool) {
-        self.inner.lock().unwrap().insert(
+        self.inner.lock().insert(
             (kind, subject.to_string(), access.map(str::to_string)),
             allowed,
         );
@@ -424,7 +424,6 @@ impl SessionGrants {
     pub fn lookup(&self, kind: GrantKind, subject: &str, access: Option<&str>) -> Option<bool> {
         self.inner
             .lock()
-            .unwrap()
             .get(&(kind, subject.to_string(), access.map(str::to_string)))
             .copied()
     }
@@ -439,14 +438,13 @@ impl SessionGrants {
     pub fn forget(&self, kind: GrantKind, subject: &str, access: Option<&str>) {
         self.inner
             .lock()
-            .unwrap()
             .remove(&(kind, subject.to_string(), access.map(str::to_string)));
     }
 
     /// Every session-tier answer recorded so far, as ledger rows, so that
     /// `permissions list` can show in-memory grants alongside persisted ones.
     pub fn records(&self) -> Vec<GrantRecord> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let mut rows: Vec<GrantRecord> = inner
             .iter()
             .filter(|(_, allowed)| **allowed)

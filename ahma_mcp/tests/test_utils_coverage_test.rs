@@ -5,7 +5,8 @@
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::test_utils::{self, strip_ansi};
-use std::sync::{LazyLock, Mutex};
+use parking_lot::Mutex;
+use std::sync::LazyLock;
 
 static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -471,7 +472,7 @@ fn test_get_binary_path_default_target_dir() {
 
 #[test]
 fn test_get_binary_path_with_absolute_cargo_target_dir() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock();
     let temp_dir = tempfile::tempdir().unwrap();
     let abs_target = temp_dir.path().join("custom_target");
     std::fs::create_dir_all(&abs_target).unwrap();
@@ -505,7 +506,7 @@ fn test_get_binary_path_with_absolute_cargo_target_dir() {
 
 #[test]
 fn test_get_binary_path_with_relative_cargo_target_dir() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock();
     let workspace = test_utils::fs::get_workspace_dir();
     let saved = std::env::var("CARGO_TARGET_DIR").ok();
     unsafe {

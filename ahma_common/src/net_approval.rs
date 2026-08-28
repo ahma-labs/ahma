@@ -31,9 +31,9 @@
 //! [`begin`]: NetApprovalCoordinator::begin
 //! [`resolve`]: NetApprovalCoordinator::resolve
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -133,7 +133,7 @@ impl NetApprovalCoordinator {
     /// for it is already in flight.
     pub fn begin(&self, domain: &str, target: &str) -> Option<NetApprovalRequest> {
         let domain = norm(domain);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if inner.session_grants.contains(&domain)
             || inner.session_denies.contains(&domain)
             || inner.active_domains.contains(&domain)
@@ -154,7 +154,7 @@ impl NetApprovalCoordinator {
     /// Resolve a decision with the human's answer. First-answer-wins and
     /// idempotent.
     pub fn resolve(&self, decision_id: &str, decision: NetApprovalDecision) -> NetResolveOutcome {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if inner.resolved.contains(decision_id) {
             return NetResolveOutcome::AlreadyResolved;
         }
@@ -186,7 +186,7 @@ impl NetApprovalCoordinator {
     /// session set, so a future request may re-ask. Returns the request if it
     /// was in flight.
     pub fn cancel(&self, decision_id: &str) -> Option<NetApprovalRequest> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let req = inner.in_flight.remove(decision_id);
         if let Some(r) = &req {
             inner.active_domains.remove(&r.domain);
@@ -197,51 +197,27 @@ impl NetApprovalCoordinator {
 
     /// Whether `domain` was granted for this session.
     pub fn is_session_granted(&self, domain: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .session_grants
-            .contains(&norm(domain))
+        self.inner.lock().session_grants.contains(&norm(domain))
     }
 
     /// Whether `domain` was denied for this session.
     pub fn is_session_denied(&self, domain: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .session_denies
-            .contains(&norm(domain))
+        self.inner.lock().session_denies.contains(&norm(domain))
     }
 
     /// Snapshot of the domains granted for this session.
     pub fn session_grants(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .session_grants
-            .iter()
-            .cloned()
-            .collect()
+        self.inner.lock().session_grants.iter().cloned().collect()
     }
 
     /// Snapshot of the domains denied for this session.
     pub fn session_denies(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .session_denies
-            .iter()
-            .cloned()
-            .collect()
+        self.inner.lock().session_denies.iter().cloned().collect()
     }
 
     /// Whether `decision_id` is still awaiting an answer.
     pub fn is_in_flight(&self, decision_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .in_flight
-            .contains_key(decision_id)
+        self.inner.lock().in_flight.contains_key(decision_id)
     }
 }
 

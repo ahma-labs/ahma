@@ -184,7 +184,7 @@ impl AhmaMcpService {
         // gating client like Cursor approved the call itself); a decline, timeout,
         // or transport error never persists.
         let human_approved = {
-            let peer = self.peer.read().unwrap().clone();
+            let peer = self.peer.read().clone();
             match peer {
                 None => true, // no peer to ask; pre-existing trust model
                 Some(peer) => match peer

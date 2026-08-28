@@ -5,10 +5,10 @@
 //! Extracted from `cli/mod.rs` to keep each file focused and manageable.
 
 use super::{
-    AppConfig, BundleArgs, BundleAuditArgs, BundleCommand, BundleSignArgs, BundleVerifyArgs,
-    InfoArgs, LogsArgs, LogsCommand, PermissionsArgs, PermissionsCommand, PromptsArgs,
-    PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs, SettingsCommand, SettingsOriginCtx,
-    WebArgs, WebCommand,
+    AppConfig, BundleArgs, BundleAuditArgs, BundleChecksumArgs, BundleChecksumVerifyArgs,
+    BundleCommand, InfoArgs, LogsArgs, LogsCommand, PermissionsArgs, PermissionsCommand,
+    PromptsArgs, PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs, SettingsCommand,
+    SettingsOriginCtx, WebArgs, WebCommand,
 };
 use crate::shell::{list_tools, resolution};
 use anyhow::{Context, Result};
@@ -116,21 +116,74 @@ fn render_settings_origin(
         }
         (false, None) => out.push_str("# User settings file: <no home directory found>\n"),
     }
-    out.push_str(
-        "# Project-tier settings (<workspace>/.ahma/settings.toml, R-CFG3) are not yet consulted.\n\n",
-    );
+    match &ctx.project {
+        Some(project) if !project.keys.is_empty() => {
+            let _ = writeln!(
+                out,
+                "# Project settings file: {} ({} preference key(s); security-tier keys are \
+                 refused there per R-CFG2.2)",
+                project.path.display(),
+                project.keys.len()
+            );
+        }
+        Some(project) => {
+            let _ = writeln!(
+                out,
+                "# Project settings file: {} (sets nothing that applies)",
+                project.path.display()
+            );
+        }
+        None if ctx.no_settings => {}
+        None => out.push_str("# Project settings file: none found\n"),
+    }
+    if let Some(project) = &ctx.project
+        && let Ok(load) = ahma_common::config::load_project_settings(&project.path)
+        && load.has_rejections()
+    {
+        // Named here as well as warned at startup: someone running
+        // `settings show --origin` is asking why a key did not take effect, and
+        // this is the surface that should answer.
+        if !load.rejected_security.is_empty() {
+            let _ = writeln!(
+                out,
+                "#   refused (security-tier, R-CFG2.2): {}",
+                load.rejected_security.join(", ")
+            );
+        }
+        if !load.rejected_unknown.is_empty() {
+            let _ = writeln!(
+                out,
+                "#   refused (unrecognised): {}",
+                load.rejected_unknown.join(", ")
+            );
+        }
+    }
+    out.push('\n');
 
     let user_label = file_path
         .map(|p| format!("user ({})", p.display()))
         .unwrap_or_else(|| "user".to_string());
+    let project_label = ctx
+        .project
+        .as_ref()
+        .map(|p| format!("project ({})", p.path.display()))
+        .unwrap_or_else(|| "project".to_string());
     for row in rows {
         let cli_value = ctx
             .cli_overrides
             .iter()
             .find(|(k, _)| *k == row.key)
             .map(|(_, v)| v);
+        // Precedence order, highest first (R-CFG1.1): cli > project > user >
+        // default. Rendered in that order so the report cannot disagree with the
+        // resolution it describes.
+        let project_sets = ctx
+            .project
+            .as_ref()
+            .is_some_and(|p| p.keys.iter().any(|k| k == row.key));
         let (value, source) = match cli_value {
             Some(v) => (v.as_str(), "cli"),
+            None if project_sets => (row.value.as_str(), project_label.as_str()),
             None if file_sets_key(file_toml, row.key) => (row.value.as_str(), user_label.as_str()),
             None => (row.value.as_str(), "default"),
         };
@@ -214,9 +267,20 @@ fn run_settings_show(origin: bool, origin_ctx: &SettingsOriginCtx) -> Result<()>
     } else {
         origin_ctx.settings_path.clone().or_else(settings_path)
     };
-    let s = match &file_path {
+    let user = match &file_path {
         Some(p) => AhmaSettings::load_from(p),
         None => AhmaSettings::default(),
+    };
+    // Layer the project file exactly as startup does (R-CFG3), or this report
+    // would name `project` as a source while printing the user's value — which
+    // is worse than not reporting the source at all. The comment above used to
+    // claim parity with startup; this is what makes it true again.
+    let s = match &origin_ctx.project {
+        Some(project) => match ahma_common::config::load_project_settings(&project.path) {
+            Ok(load) => ahma_common::config::merge_project_over_user(&user, &load.accepted),
+            Err(_) => user,
+        },
+        None => user,
     };
     let rows = setting_rows(&s, &AhmaSettings::default());
 
@@ -764,8 +828,12 @@ fn print_profiles(settings: &ahma_common::config::AhmaSettings) {
 
     print_network_host_summary(settings);
 
-    if let Some(note) = crate::sandbox::profiles::macos_read_disclosure() {
-        println!("  ⚠ {note}");
+    let enforcement = crate::sandbox::profiles::platform_enforcement();
+    if !enforcement.is_empty() {
+        println!("  What this platform's kernel does NOT enforce:");
+        for note in &enforcement.notes {
+            println!("    - {note}");
+        }
         println!();
     }
 }
@@ -778,6 +846,10 @@ fn print_profile_entry(
 ) {
     use crate::sandbox::profiles::ProfileAccess;
     println!("  • {} — {}", profile.name, profile.description);
+    // R-PERM.5.2: the cost travels with the profile, not with the documentation.
+    if let Some(cost) = &profile.cost {
+        println!("      cost: {cost}");
+    }
     for r in rules.iter().filter(|r| r.profile == profile.name) {
         let access = match r.access {
             ProfileAccess::Ro => "read",
@@ -1216,8 +1288,7 @@ pub(crate) fn run_prompts_command(args: PromptsArgs) -> Result<()> {
 
 fn audit_bundle_command(audit_args: BundleAuditArgs) -> Result<()> {
     println!("Auditing bundle: {}", audit_args.path.display());
-    let result =
-        crate::bundle::signing::audit_bundle(&audit_args.path).context("Bundle audit failed")?;
+    let result = crate::bundle::audit_bundle(&audit_args.path).context("Bundle audit failed")?;
 
     println!(
         "Files checked: {} | Findings: {}",
@@ -1245,37 +1316,50 @@ fn audit_bundle_command(audit_args: BundleAuditArgs) -> Result<()> {
     anyhow::bail!("Bundle audit found critical issues.")
 }
 
-fn verify_bundle_command(verify_args: BundleVerifyArgs) -> Result<()> {
-    println!("Verifying bundle: {}", verify_args.path.display());
-    let verifier = crate::bundle::BundleVerifier::new(
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".ahma")
-            .join("keys")
-            .join("trusted"),
+/// The one sentence every checksum result carries.
+///
+/// Printed on success *and* on failure, because the failure case is where a user
+/// is most likely to reach for a stronger reading of what the command does. Kept
+/// in one constant so the two paths cannot drift into saying different things.
+const CHECKSUM_SCOPE_NOTE: &str = "Note: this is a corruption check, not a signature. The manifest is unsigned and \
+     lives inside the bundle, so anyone who can edit a bundle file can also rewrite \
+     the manifest.";
+
+fn verify_bundle_command(verify_args: BundleChecksumVerifyArgs) -> Result<()> {
+    println!(
+        "Checking bundle against its manifest: {}",
+        verify_args.path.display()
     );
-    match verifier.verify(&verify_args.path)? {
+    match crate::bundle::BundleVerifier::new().verify(&verify_args.path)? {
         true => {
-            println!("PASS Bundle verification passed.");
+            println!("PASS Every file matches the manifest.");
+            println!("{CHECKSUM_SCOPE_NOTE}");
             Ok(())
         }
-        false => anyhow::bail!("FAIL Bundle verification failed."),
+        false => {
+            println!("{CHECKSUM_SCOPE_NOTE}");
+            anyhow::bail!("FAIL Bundle does not match its manifest.")
+        }
     }
 }
 
-fn sign_bundle_command(sign_args: BundleSignArgs) -> Result<()> {
-    println!("Signing bundle: {}", sign_args.path.display());
-    let digests =
-        crate::bundle::BundleSigner::sign(&sign_args.path).context("Bundle signing failed")?;
-    println!("Manifest written with {} file hashes.", digests.len());
+fn checksum_bundle_command(args: BundleChecksumArgs) -> Result<()> {
+    println!("Checksumming bundle: {}", args.path.display());
+    let digests = crate::bundle::BundleChecksummer::write_manifest(&args.path)
+        .context("Writing the bundle manifest failed")?;
+    println!(
+        "Manifest written with {} SHA-256 file checksum(s).",
+        digests.len()
+    );
+    println!("{CHECKSUM_SCOPE_NOTE}");
     Ok(())
 }
 
 pub(crate) fn dispatch_bundle_command(args: BundleArgs) -> Result<()> {
     match args.command {
         BundleCommand::Audit(audit_args) => audit_bundle_command(audit_args),
+        BundleCommand::Checksum(args) => checksum_bundle_command(args),
         BundleCommand::Verify(verify_args) => verify_bundle_command(verify_args),
-        BundleCommand::Sign(sign_args) => sign_bundle_command(sign_args),
     }
 }
 
@@ -1571,7 +1655,8 @@ pub(crate) fn check_stdio_not_interactive() -> Result<()> {
 mod tests {
     use super::*;
     use crate::shell::list_tools::OutputFormat;
-    use std::sync::{LazyLock, Mutex, MutexGuard};
+    use parking_lot::{Mutex, MutexGuard};
+    use std::sync::LazyLock;
     use tempfile::TempDir;
 
     // Serialise every test that mutates process-global env (AHMA_TEST_HOME) or
@@ -1592,7 +1677,7 @@ mod tests {
 
     impl<'a> HomeGuard<'a> {
         fn new(home: &std::path::Path) -> Self {
-            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = ENV_MUTEX.lock();
             let prev = std::env::var_os("AHMA_TEST_HOME");
             // SAFETY: guarded by ENV_MUTEX; the only env mutators in this module
             // hold the same lock, and nextest isolates each binary in a process.
@@ -1816,6 +1901,7 @@ mod tests {
             no_settings: false,
             settings_path: None,
             cli_overrides: vec![("tools.timeout_secs", "30".to_string())],
+            project: None,
         };
         let path = std::path::Path::new("settings.toml");
         let out = render_settings_origin(&rows, Some(path), Some(&file_toml), &ctx);
@@ -1852,6 +1938,7 @@ mod tests {
             no_settings: false,
             settings_path: Some(file),
             cli_overrides: vec![],
+            project: None,
         };
         run_settings_command(
             SettingsArgs {
@@ -1919,7 +2006,7 @@ mod tests {
     fn prompts_init_project_writes_relative_dir() {
         let tmp = TempDir::new().unwrap();
         // Serialise on the env mutex because set_current_dir is process-global.
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_MUTEX.lock();
         let prev_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
         let result = run_prompts_command(PromptsArgs {
@@ -1938,7 +2025,7 @@ mod tests {
     fn prompts_show_loads_local_and_global_overrides() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_MUTEX.lock();
 
         // Global prompts file (valid override) under the test home.
         let prev_home = std::env::var_os("AHMA_TEST_HOME");
@@ -2180,9 +2267,9 @@ mod tests {
         )
         .unwrap();
 
-        // Sign produces a manifest.
+        // Checksumming produces a manifest.
         dispatch_bundle_command(BundleArgs {
-            command: BundleCommand::Sign(BundleSignArgs {
+            command: BundleCommand::Checksum(BundleChecksumArgs {
                 path: tmp.path().to_path_buf(),
             }),
         })
@@ -2191,7 +2278,7 @@ mod tests {
 
         // Verify passes against the freshly-written manifest.
         dispatch_bundle_command(BundleArgs {
-            command: BundleCommand::Verify(BundleVerifyArgs {
+            command: BundleCommand::Verify(BundleChecksumVerifyArgs {
                 path: tmp.path().to_path_buf(),
             }),
         })
@@ -2199,14 +2286,17 @@ mod tests {
     }
 
     #[test]
-    fn bundle_sign_missing_dir_errors() {
+    fn bundle_checksum_missing_dir_errors() {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("does-not-exist");
         let err = dispatch_bundle_command(BundleArgs {
-            command: BundleCommand::Sign(BundleSignArgs { path: missing }),
+            command: BundleCommand::Checksum(BundleChecksumArgs { path: missing }),
         })
         .unwrap_err();
-        assert!(err.to_string().contains("signing failed"));
+        assert!(
+            err.to_string().contains("manifest failed"),
+            "the error must name what actually failed; got: {err}"
+        );
     }
 
     #[test]
@@ -2214,38 +2304,44 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // No manifest present → verify() returns Ok(false) → command bails.
         let err = dispatch_bundle_command(BundleArgs {
-            command: BundleCommand::Verify(BundleVerifyArgs {
+            command: BundleCommand::Verify(BundleChecksumVerifyArgs {
                 path: tmp.path().to_path_buf(),
             }),
         })
         .unwrap_err();
-        assert!(err.to_string().contains("verification failed"));
+        assert!(
+            err.to_string().contains("does not match its manifest"),
+            "got: {err}"
+        );
     }
 
     #[test]
-    fn bundle_verify_tampered_file_fails() {
+    fn bundle_verify_changed_file_fails() {
         let tmp = TempDir::new().unwrap();
         let tool = tmp.path().join("tool.json");
         std::fs::write(&tool, r#"{"name":"t","description":"d","command":"echo"}"#).unwrap();
         dispatch_bundle_command(BundleArgs {
-            command: BundleCommand::Sign(BundleSignArgs {
+            command: BundleCommand::Checksum(BundleChecksumArgs {
                 path: tmp.path().to_path_buf(),
             }),
         })
         .unwrap();
-        // Mutate the file after signing so the hash no longer matches.
+        // Mutate the file after checksumming so the digest no longer matches.
         std::fs::write(
             &tool,
             r#"{"name":"t","description":"changed","command":"echo"}"#,
         )
         .unwrap();
         let err = dispatch_bundle_command(BundleArgs {
-            command: BundleCommand::Verify(BundleVerifyArgs {
+            command: BundleCommand::Verify(BundleChecksumVerifyArgs {
                 path: tmp.path().to_path_buf(),
             }),
         })
         .unwrap_err();
-        assert!(err.to_string().contains("verification failed"));
+        assert!(
+            err.to_string().contains("does not match its manifest"),
+            "got: {err}"
+        );
     }
 
     // ── bundle: audit ────────────────────────────────────────────────────────

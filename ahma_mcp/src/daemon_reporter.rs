@@ -1304,12 +1304,12 @@ mod tests {
     // uses the Known-Folder API and ignores env vars, so these write-path tests
     // are genuinely Unix-only.)
     #[cfg(unix)]
-    static HOME_ENV_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static HOME_ENV_MUTEX: std::sync::LazyLock<parking_lot::Mutex<()>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(()));
 
     #[cfg(unix)]
     fn with_home<R>(home: &std::path::Path, f: impl FnOnce() -> R) -> R {
-        let _guard = HOME_ENV_MUTEX.lock().unwrap();
+        let _guard = HOME_ENV_MUTEX.lock();
         let prev = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", home) };
         let out = f();
@@ -1406,7 +1406,7 @@ mod tests {
     // env var on drop.
 
     #[cfg(unix)]
-    static DAEMON_SOCK_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static DAEMON_SOCK_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     #[cfg(unix)]
     static DAEMON_SOCK_COUNTER: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
@@ -1482,7 +1482,7 @@ mod tests {
         use ahma_common::scope_grant::{GrantCoordinator, GrantDecision, GrantReason};
 
         // Serialize: the socket path is global state shared by the whole process.
-        let _lock = DAEMON_SOCK_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = DAEMON_SOCK_MUTEX.lock();
 
         // Unique short socket path under the system temp dir (kept short to stay
         // under the platform's sockaddr_un path limit).

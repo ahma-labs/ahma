@@ -286,8 +286,8 @@ pub async fn notify_stderr_denial(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::path::PathBuf;
-    use std::sync::Mutex;
 
     /// Records every delivered violation so wiring can be asserted.
     #[derive(Debug, Default)]
@@ -307,10 +307,7 @@ mod tests {
         ) {
             // Exercise the same dedup the real notifiers use.
             if let Some(req) = self.coordinator.begin(path, access, reason, tool) {
-                self.seen
-                    .lock()
-                    .unwrap()
-                    .push((req.path, req.access, req.reason));
+                self.seen.lock().push((req.path, req.access, req.reason));
             }
         }
     }
@@ -336,7 +333,7 @@ mod tests {
         }
         .into();
         notify_pre_exec(Some(&notifier), &err, "run_terminal_command").await;
-        let seen = rec.seen.lock().unwrap();
+        let seen = rec.seen.lock();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, PathBuf::from("/out/of/scope/dir"));
         assert_eq!(seen[0].1, ScopeAccess::Rw);
@@ -349,7 +346,7 @@ mod tests {
         let notifier: Arc<dyn ScopeGrantNotifier> = rec.clone();
         let err = anyhow::anyhow!("some unrelated failure");
         notify_pre_exec(Some(&notifier), &err, "tool").await;
-        assert!(rec.seen.lock().unwrap().is_empty());
+        assert!(rec.seen.lock().is_empty());
     }
 
     #[tokio::test]
@@ -364,7 +361,7 @@ mod tests {
             "error: failed to create directory `/opt/out/of/scope/cache`: Read-only file system";
         notify_stderr_denial(&sandbox, Some(&notifier), stderr, "", "sccache").await;
 
-        let seen = rec.seen.lock().unwrap();
+        let seen = rec.seen.lock();
         assert_eq!(seen.len(), 1, "an out-of-scope denial is offered");
         assert_eq!(seen[0].0, PathBuf::from("/opt/out/of/scope/cache"));
         assert_eq!(seen[0].1, ScopeAccess::Rw);
@@ -390,7 +387,7 @@ mod tests {
         let stderr = format!("cat: {}: Permission denied", in_scope.display());
         notify_stderr_denial(&sandbox, Some(&notifier), &stderr, "", "cat").await;
         assert!(
-            rec.seen.lock().unwrap().is_empty(),
+            rec.seen.lock().is_empty(),
             "in-scope denials must not raise a grant prompt"
         );
     }
@@ -491,7 +488,7 @@ mod tests {
             "error writing `/opt/ext/sccache/0/object.o`: Operation not permitted (os error 1)";
         notify_stderr_denial(&sandbox, Some(&notifier), stderr, "", "sccache").await;
 
-        let seen = rec.seen.lock().unwrap();
+        let seen = rec.seen.lock();
         assert_eq!(seen.len(), 1);
         assert_eq!(
             seen[0].0,

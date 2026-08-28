@@ -257,7 +257,8 @@ fn system_directories_are_left_alone() {
 #[cfg(target_os = "windows")]
 mod appcontainer {
     use ahma_mcp::sandbox::windows::{
-        check_windows_sandbox_available, cleanup_windows_sandbox, plan_windows_sandboxed_spawn,
+        appcontainer_name_for_scope, check_windows_sandbox_available, cleanup_windows_sandbox,
+        plan_windows_sandboxed_spawn,
     };
     use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     use std::path::PathBuf;
@@ -325,6 +326,136 @@ mod appcontainer {
             result.is_err(),
             "a spawn with no write scope must be refused, never run unconfined"
         );
+    }
+
+    /// Not a test — an evidence dump for the R6.3.3 DACL failure.
+    ///
+    /// A `windows-latest` run proved the scoped grant does not take effect: a
+    /// write *inside* the locked scope is denied along with one outside it. No
+    /// root-cause analysis exists, because the only artefact anyone has is the
+    /// string `Access to the path '...' is denied` — which does not say which
+    /// path, whether the ACE was ever written, or which SID the child actually
+    /// ran as. Guessing from that is how a fix gets pushed five times.
+    ///
+    /// So this asserts almost nothing and prints everything the five live
+    /// hypotheses need in order to be told apart:
+    ///
+    /// 1. **Ancestor access.** The ACE is added to the leaf scope only
+    ///    (`grant_scopes`). The scope here is a `tempfile::tempdir()` under
+    ///    `%TEMP%`, i.e. under the user profile, on which the container SID
+    ///    holds nothing. `icacls` on each ancestor settles it.
+    /// 2. **DACL re-inheritance.** `set_path_ace` passes neither `PROTECTED_`
+    ///    nor `UNPROTECTED_DACL_SECURITY_INFORMATION` — deliberate, and reasoned
+    ///    about in that function, but exactly the kind of thing that silently
+    ///    no-ops. `icacls` on the scope shows whether the ACE persisted at all.
+    /// 3. **Capability mismatch.** `CreateAppContainerProfile` is called with
+    ///    zero capabilities while the launcher passes `WinCapabilityInternetClient`
+    ///    at spawn. `whoami /groups` from inside shows what the token really has.
+    /// 4. **`%TEMP%` redirect** interacting with a scope that is itself under
+    ///    `%TEMP%` — the child's own view of `$env:TEMP` is printed.
+    /// 5. **The denial is not the target file at all** but the launcher's handle
+    ///    inheritance or stdio redirection. The full stdout/stderr is printed.
+    ///
+    /// It goes through `plan_windows_sandboxed_spawn` **directly** rather than
+    /// `Sandbox::create_shell_command`, because the latter now consults
+    /// `appcontainer_spawn_enabled()` — which is `false` — and would quietly
+    /// exercise the Job-Object-only path instead. A diagnostic that measures the
+    /// wrong thing is worse than none.
+    ///
+    /// Run by the `AppContainer diagnostics` job in build.yml, which is
+    /// `continue-on-error` precisely because this is meant to produce evidence
+    /// on a red run, not to gate anything.
+    #[ignore = "diagnostic evidence dump for the R6.3.3 DACL failure; run explicitly"]
+    #[tokio::test]
+    async fn appcontainer_dacl_diagnostics() {
+        use std::process::Command;
+
+        fn show(label: &str, program: &str, args: &[&str]) {
+            let out = Command::new(program).args(args).output();
+            println!("---- {label}: {program} {args:?}");
+            match out {
+                Ok(o) => {
+                    println!("{}", String::from_utf8_lossy(&o.stdout));
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    if !err.trim().is_empty() {
+                        println!("[stderr] {err}");
+                    }
+                }
+                Err(e) => println!("[could not run: {e}]"),
+            }
+        }
+
+        let scope = tempfile::tempdir().unwrap();
+        let scope_path = scope.path().to_path_buf();
+        let target = scope_path.join("in_scope.txt");
+
+        println!("==== AppContainer DACL diagnostics (SPEC R6.3.3) ====");
+        println!("scope: {}", scope_path.display());
+        println!(
+            "container name derived for this scope: {}",
+            appcontainer_name_for_scope(&scope_path)
+        );
+
+        // Build the plan: this is what creates the profile and writes the ACEs.
+        let plan = match plan_windows_sandboxed_spawn(
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                format!(
+                    "$ErrorActionPreference='Continue'; \
+                     Write-Output \"TEMP=$env:TEMP\"; \
+                     whoami /groups; \
+                     Set-Content -LiteralPath '{}' -Value 'ok'; \
+                     Write-Output \"exists=$(Test-Path -LiteralPath '{}')\"",
+                    target.display(),
+                    target.display()
+                ),
+            ],
+            std::slice::from_ref(&scope_path),
+            &[],
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("PLAN FAILED before any spawn: {e:#}");
+                println!("(hypothesis 2 or 3: the grant itself errored — see the message above)");
+                return;
+            }
+        };
+        println!("launcher: {}", plan.launcher.display());
+        println!("env overrides: {:?}", plan.env);
+
+        // Hypothesis 1 and 2: did the ACE land, and is the ancestor chain reachable?
+        let mut ancestors: Vec<&std::path::Path> = scope_path.ancestors().collect();
+        ancestors.reverse();
+        for a in ancestors {
+            show(
+                &format!("icacls {}", a.display()),
+                "icacls",
+                &[&a.to_string_lossy()],
+            );
+        }
+
+        // Run it. The child prints its own token groups and TEMP (3 and 4).
+        let mut cmd = tokio::process::Command::new(&plan.launcher);
+        cmd.args(&plan.args);
+        for (k, v) in &plan.env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().await;
+        match output {
+            Ok(o) => {
+                println!("---- child exit: {:?}", o.status.code());
+                println!("---- child stdout:\n{}", String::from_utf8_lossy(&o.stdout));
+                println!("---- child stderr:\n{}", String::from_utf8_lossy(&o.stderr));
+            }
+            Err(e) => println!("---- spawn failed: {e}"),
+        }
+        println!("---- in-scope file exists afterwards: {}", target.exists());
+
+        cleanup_windows_sandbox();
+        println!("==== end diagnostics ====");
     }
 
     /// **R6.3.3, the gate.** A shell redirect outside the scope must be stopped by

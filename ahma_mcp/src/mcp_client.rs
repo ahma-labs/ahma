@@ -658,7 +658,8 @@ mod tests {
 
     // ── Env redirection helper (serializes HOME-touching tests) ───────────────
 
-    use std::sync::{LazyLock, Mutex, MutexGuard};
+    use parking_lot::{Mutex, MutexGuard};
+    use std::sync::LazyLock;
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     /// Redirects the platform "home" lookup (`std::env::home_dir`) to a temp
@@ -673,7 +674,7 @@ mod tests {
 
     impl HomeGuard {
         fn set(path: &Path) -> Self {
-            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = ENV_MUTEX.lock();
             let prev_home = std::env::var_os("HOME");
             let prev_userprofile = std::env::var_os("USERPROFILE");
             let prev_ahma_test_home = std::env::var_os("AHMA_TEST_HOME");

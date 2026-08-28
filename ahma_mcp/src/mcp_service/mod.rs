@@ -55,6 +55,7 @@ pub use types::{
 };
 
 use chrono::Utc;
+use parking_lot::RwLock;
 use rmcp::{
     handler::server::ServerHandler,
     model::{
@@ -67,7 +68,7 @@ use rmcp::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, RwLock,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 use tracing;
@@ -150,7 +151,8 @@ pub struct AhmaMcpService {
     /// `.ahma/` differs from the currently-loaded one and reload is needed.
     pub current_tools_dir: Arc<RwLock<Option<std::path::PathBuf>>>,
     /// Registered handlers for extension tool types (e.g. decompose)
-    pub extension_handlers: Arc<std::sync::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>>>,
+    pub extension_handlers:
+        Arc<parking_lot::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>>>,
     /// Custom file operations backend.
     pub file_ops_provider: Arc<dyn FileOpsProvider>,
     /// Custom web page fetcher.
@@ -186,7 +188,7 @@ pub struct AhmaMcpService {
     /// Operation ids whose `tool_call` was written to the vault audit log;
     /// the audit subscriber records the matching `tool_complete` on the
     /// terminal event and removes the id.
-    pub vault_audited_ops: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pub vault_audited_ops: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// All external MCP servers (HTTP and stdio) for agent tool routing.
     pub mcp_connections: Arc<tokio::sync::RwLock<crate::mcp_client::McpConnectionManager>>,
     /// Session-scoped web-egress approvals (R-WEB.5). Holds the domains granted or
@@ -201,7 +203,7 @@ pub struct AhmaMcpService {
     /// it as [`ahma_common::daemon_hub::ClientMsg::WebApprovalRequested`] and routes
     /// the TUI's answer back into `web_approval`. `None` ⇒ no TUI surface wired.
     pub web_approval_tx: Arc<
-        std::sync::Mutex<
+        parking_lot::Mutex<
             Option<
                 tokio::sync::mpsc::UnboundedSender<ahma_common::web_approval::WebApprovalRequest>,
             >,
@@ -256,8 +258,8 @@ impl AhmaMcpService {
     pub(crate) fn force_progress_notifications_override(&self) -> bool {
         self.app_config
             .read()
-            .ok()
-            .and_then(|cfg| cfg.as_ref().map(|c| c.force_progress_notifications))
+            .as_ref()
+            .map(|c| c.force_progress_notifications)
             .unwrap_or(false)
     }
 
@@ -335,18 +337,18 @@ impl AhmaMcpService {
     /// [`Self::invalidate_config_tools_cache`] drops it (every `configs`
     /// writer must call it — [`Self::update_tools`] does).
     fn visible_config_tools(&self) -> Vec<Tool> {
-        if let Some(cached) = self.config_tools_cache.read().unwrap().as_ref() {
+        if let Some(cached) = self.config_tools_cache.read().as_ref() {
             return cached.as_ref().clone();
         }
         let tools: Vec<Tool> = {
-            let configs_lock = self.configs.read().unwrap();
+            let configs_lock = self.configs.read();
             configs_lock
                 .values()
                 .filter(|config| self.is_config_visible_to_client(config))
                 .flat_map(|config| self.create_tools_from_config(config))
                 .collect()
         };
-        *self.config_tools_cache.write().unwrap() = Some(Arc::new(tools.clone()));
+        *self.config_tools_cache.write() = Some(Arc::new(tools.clone()));
         tools
     }
 
@@ -354,7 +356,7 @@ impl AhmaMcpService {
     /// rebuilds it from the current `configs`. Must accompany every mutation
     /// of [`Self::configs`].
     fn invalidate_config_tools_cache(&self) {
-        *self.config_tools_cache.write().unwrap() = None;
+        *self.config_tools_cache.write() = None;
     }
 
     /// The built-in tools every session exposes, before per-client config
@@ -520,8 +522,8 @@ impl AhmaMcpService {
         let cfg_root = self
             .app_config
             .read()
-            .ok()
-            .and_then(|cfg| cfg.as_ref().and_then(|c| c.task_vault.clone()));
+            .as_ref()
+            .and_then(|c| c.task_vault.clone());
 
         if cfg_root.is_some() {
             return cfg_root;
@@ -545,7 +547,7 @@ impl AhmaMcpService {
     }
 
     fn store_peer_handle_if_unset(&self, peer: &Peer<RoleServer>) {
-        let mut peer_guard = self.peer.write().unwrap();
+        let mut peer_guard = self.peer.write();
         if peer_guard.is_none() {
             *peer_guard = Some(peer.clone());
             tracing::info!("Successfully captured MCP peer handle for async notifications.");
@@ -675,8 +677,15 @@ impl AhmaMcpService {
         // Track the id so the vault audit subscriber records the matching
         // tool_complete when the operation's terminal event arrives.  Sync
         // paths call emit_vault_tool_complete directly, which removes the id.
-        if let Ok(mut set) = self.vault_audited_ops.lock() {
-            set.insert(operation_id.to_string());
+        // Scoped, not a bare `let`: this guard must be dropped before the
+        // `.await` below. A `parking_lot` guard is `!Send` (as std's is), so
+        // holding one across an await point makes the whole future `!Send` and
+        // the service stops compiling — which is the compiler catching the
+        // deadlock risk rather than the risk reaching production.
+        {
+            self.vault_audited_ops
+                .lock()
+                .insert(operation_id.to_string());
         }
         if let Err(e) =
             Self::append_tool_call_event(&audit_log_path, operation_id, tool_name, args_summary)
@@ -691,8 +700,11 @@ impl AhmaMcpService {
             return;
         };
         // Sync paths complete directly — drop any pending subscriber tracking.
-        if let Ok(mut set) = self.vault_audited_ops.lock() {
-            set.remove(operation_id);
+        // Scoped so the guard is released before the `.await`: a `parking_lot`
+        // guard is `!Send`, so holding one across an await point would make this
+        // whole future `!Send`.
+        {
+            self.vault_audited_ops.lock().remove(operation_id);
         }
         if let Err(e) =
             Self::append_tool_complete_event(&audit_log_path, operation_id, success, duration_ms)
@@ -809,11 +821,8 @@ impl AhmaMcpService {
             monitor_rate_limit_seconds: crate::log_monitor::DEFAULT_RATE_LIMIT_SECONDS,
             app_config: Arc::new(RwLock::new(None)),
             current_tools_dir: Arc::new(RwLock::new(None)),
-            extension_handlers: Arc::new(std::sync::RwLock::new(
-                types::get_global_extension_handlers()
-                    .read()
-                    .unwrap()
-                    .clone(),
+            extension_handlers: Arc::new(parking_lot::RwLock::new(
+                types::get_global_extension_handlers().read().clone(),
             )),
             file_ops_provider: Arc::new(DefaultFileOpsProvider),
             web_page_fetcher: Arc::new(DefaultWebPageFetcher),
@@ -833,12 +842,12 @@ impl AhmaMcpService {
             )),
             todo_list: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             progress_push,
-            vault_audited_ops: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            vault_audited_ops: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             mcp_connections: Arc::new(tokio::sync::RwLock::new(
                 crate::mcp_client::McpConnectionManager::default(),
             )),
             web_approval: Arc::new(ahma_common::web_approval::WebApprovalCoordinator::new()),
-            web_approval_tx: Arc::new(std::sync::Mutex::new(None)),
+            web_approval_tx: Arc::new(parking_lot::Mutex::new(None)),
             grant_coordinator: Arc::new(RwLock::new(None)),
         };
         service.spawn_vault_audit_subscriber();
@@ -864,11 +873,7 @@ impl AhmaMcpService {
                     continue;
                 }
                 let op_id = event.operation_id().to_string();
-                let audited = service
-                    .vault_audited_ops
-                    .lock()
-                    .map(|mut set| set.remove(&op_id))
-                    .unwrap_or(false);
+                let audited = service.vault_audited_ops.lock().remove(&op_id);
                 if !audited {
                     continue;
                 }
@@ -907,14 +912,14 @@ impl AhmaMcpService {
         &self,
         tx: tokio::sync::mpsc::UnboundedSender<ahma_common::web_approval::WebApprovalRequest>,
     ) {
-        *self.web_approval_tx.lock().unwrap() = Some(tx);
+        *self.web_approval_tx.lock() = Some(tx);
     }
 
     /// Store the AppConfig that constructed this service so runtime events
     /// (such as `roots/list` arrival) can rediscover per-client `.ahma/` dirs.
     pub fn set_app_config(&self, config: Arc<crate::shell::cli::AppConfig>) {
         if let Some(dir) = config.tools_dir.clone() {
-            *self.current_tools_dir.write().unwrap() = Some(dir);
+            *self.current_tools_dir.write() = Some(dir);
         }
         if let Ok(mut opt) = self.output_optimizer.try_lock() {
             opt.enabled = config.minimize_tokens;
@@ -927,15 +932,12 @@ impl AhmaMcpService {
         if let Ok(mut guard) = self.harness_guard.try_lock() {
             guard.enabled = true;
         }
-        *self.app_config.write().unwrap() = Some(config);
+        *self.app_config.write() = Some(config);
     }
 
     /// Register an extension handler for custom tool routing.
     pub fn register_extension_handler(&self, name: String, handler: Arc<dyn ExtensionToolHandler>) {
-        self.extension_handlers
-            .write()
-            .unwrap()
-            .insert(name, handler);
+        self.extension_handlers.write().insert(name, handler);
     }
 
     fn leaf_subcommands(
@@ -1117,7 +1119,7 @@ impl AhmaMcpService {
     /// owned config and (for flattened subcommand names) the resolved
     /// subcommand path.
     fn find_tool_config(&self, tool_name: &str) -> Option<(ToolConfig, Option<String>)> {
-        let configs_lock = self.configs.read().unwrap();
+        let configs_lock = self.configs.read();
         if let Some(config) = configs_lock.get(tool_name) {
             Some((config.clone(), None))
         } else {
@@ -1832,7 +1834,7 @@ impl AhmaMcpService {
 
         // Assemble the known-tool set (hard-coded + configured) for name healing.
         let known = Self::HARDCODED_TOOLS.to_vec();
-        let configs_lock = self.configs.read().unwrap();
+        let configs_lock = self.configs.read();
         let config_names: Vec<String> = configs_lock.keys().cloned().collect();
         drop(configs_lock);
         let mut known_str: Vec<&str> = known;
@@ -1985,7 +1987,7 @@ impl AhmaMcpService {
     }
 
     fn fallback_llm_provider(&self) -> crate::config::LlmProviderConfig {
-        let configs_lock = self.configs.read().unwrap();
+        let configs_lock = self.configs.read();
         let mut found_provider = None;
         for config in configs_lock.values() {
             if let Some(livelog) = &config.livelog {
@@ -2121,7 +2123,7 @@ impl AhmaMcpService {
         if config.tool_type != Some(crate::config::ToolType::Extension) {
             return None;
         }
-        let handlers = self.extension_handlers.read().unwrap();
+        let handlers = self.extension_handlers.read();
         for key in config.extra.keys() {
             if handlers.contains_key(key) {
                 return Some(key.clone());
@@ -2139,7 +2141,7 @@ impl AhmaMcpService {
     ) -> Result<CallToolResult, McpError> {
         let handler_opt = self
             .get_extension_key(&config)
-            .and_then(|key| self.extension_handlers.read().unwrap().get(&key).cloned());
+            .and_then(|key| self.extension_handlers.read().get(&key).cloned());
         if let Some(handler) = handler_opt {
             return handler
                 .call(
@@ -2504,7 +2506,7 @@ impl AhmaMcpService {
             .map(|s| s.to_string())
             .collect();
 
-        let configs_lock = self.configs.read().unwrap();
+        let configs_lock = self.configs.read();
         for config in configs_lock.values() {
             if self.is_config_visible_to_client(config) {
                 names.push(config.name.clone());
@@ -2520,7 +2522,7 @@ impl AhmaMcpService {
     /// ahma peer converges even if it missed the `grant_pending` event.
     /// (`reconnects` is owned by the stdio proxy, which overlays it in transit.)
     fn enrich_heartbeat(&self, payload: &mut ahma_common::keepalive::HeartbeatPayload) {
-        if let Some(coordinator) = self.grant_coordinator.read().unwrap().as_ref() {
+        if let Some(coordinator) = self.grant_coordinator.read().as_ref() {
             payload.pending_grants = coordinator.pending_count() as u32;
         }
     }
@@ -2528,7 +2530,7 @@ impl AhmaMcpService {
 
 impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
     async fn send_standard_ping(&self) -> anyhow::Result<()> {
-        let peer_opt = self.peer.read().unwrap().clone();
+        let peer_opt = self.peer.read().clone();
         if let Some(peer) = peer_opt {
             peer.send_request(rmcp::model::ServerRequest::PingRequest(Default::default()))
                 .await?;
@@ -2541,7 +2543,7 @@ impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
         mut payload: ahma_common::keepalive::HeartbeatPayload,
     ) -> anyhow::Result<()> {
         self.enrich_heartbeat(&mut payload);
-        let peer_opt = self.peer.read().unwrap().clone();
+        let peer_opt = self.peer.read().clone();
         if let Some(peer) = peer_opt {
             let params = serde_json::to_value(payload)?;
 
@@ -3257,11 +3259,7 @@ mod tests {
     }
 
     fn insert_config(service: &AhmaMcpService, config: ToolConfig) {
-        service
-            .configs
-            .write()
-            .unwrap()
-            .insert(config.name.clone(), config);
+        service.configs.write().insert(config.name.clone(), config);
         // Direct `configs` writers must invalidate the tools/list cache,
         // exactly as `update_tools` does.
         service.invalidate_config_tools_cache();
@@ -3960,7 +3958,7 @@ mod tests {
     async fn emit_vault_tool_call_is_noop_without_vault() {
         let service = make_service().await;
         service.emit_vault_tool_call("op1", "tool", "args").await;
-        assert!(service.vault_audited_ops.lock().unwrap().is_empty());
+        assert!(service.vault_audited_ops.lock().is_empty());
     }
 
     #[tokio::test]
@@ -3971,10 +3969,10 @@ mod tests {
         service.set_app_config(Arc::new(app_config_with_vault(vault.clone())));
 
         service.emit_vault_tool_call("op1", "tool", "argsum").await;
-        assert!(service.vault_audited_ops.lock().unwrap().contains("op1"));
+        assert!(service.vault_audited_ops.lock().contains("op1"));
 
         service.emit_vault_tool_complete("op1", true, 10).await;
-        assert!(!service.vault_audited_ops.lock().unwrap().contains("op1"));
+        assert!(!service.vault_audited_ops.lock().contains("op1"));
 
         let content = tokio::fs::read_to_string(vault.join("audit.jsonl"))
             .await
@@ -4084,7 +4082,7 @@ mod tests {
         };
         service.set_app_config(Arc::new(cfg));
 
-        assert_eq!(*service.current_tools_dir.read().unwrap(), Some(tools_dir));
+        assert_eq!(*service.current_tools_dir.read(), Some(tools_dir));
         assert!(service.output_optimizer.lock().await.enabled);
         assert!(service.harness_guard.lock().await.enabled);
     }
@@ -4485,7 +4483,7 @@ mod tests {
         assert_eq!(payload.pending_grants, 0, "no coordinator wired → 0");
 
         let coordinator = Arc::new(ahma_common::scope_grant::GrantCoordinator::new());
-        *service.grant_coordinator.write().unwrap() = Some(coordinator.clone());
+        *service.grant_coordinator.write() = Some(coordinator.clone());
         let tmp = tempfile::tempdir().unwrap();
         coordinator
             .begin(

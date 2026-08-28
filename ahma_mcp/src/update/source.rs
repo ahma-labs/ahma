@@ -130,10 +130,11 @@ fn which_command(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::LazyLock;
     use tempfile::tempdir;
 
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -158,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_required_rustflags_sets_reqwest_unstable() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         // With no pre-existing RUSTFLAGS the flag should be set.
         // SAFETY: test-only; single-threaded by nextest process isolation.
         unsafe { std::env::remove_var("RUSTFLAGS") };
@@ -171,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_required_rustflags_appends_to_existing() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         // SAFETY: test-only; single-threaded by nextest process isolation.
         unsafe { std::env::set_var("RUSTFLAGS", "-C opt-level=2") };
         let flags = required_rustflags();
@@ -188,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_required_rustflags_no_duplicate() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         // SAFETY: test-only; single-threaded by nextest process isolation.
         unsafe { std::env::set_var("RUSTFLAGS", "--cfg reqwest_unstable") };
         let flags = required_rustflags();
@@ -226,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_which_command_finds_file_on_path() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let saved_path = std::env::var_os("PATH");
 
         let dir = tempdir().unwrap();
@@ -267,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_which_command_none_when_path_empty() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let saved_path = std::env::var_os("PATH");
 
         let dir = tempdir().unwrap(); // empty dir, no matching file
@@ -290,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_which_cargo_uses_which_command() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let saved_path = std::env::var_os("PATH");
 
         let dir = tempdir().unwrap();

@@ -203,7 +203,7 @@ pub struct Session {
     /// Monotonically increasing per-session SSE event ID counter.
     event_id_counter: AtomicU64,
     /// Bounded ring buffer of recent SSE events for `Last-Event-Id` replay.
-    event_history: std::sync::Mutex<VecDeque<(u64, String)>>,
+    event_history: parking_lot::Mutex<VecDeque<(u64, String)>>,
 
     /// Client info sent in initialize request
     pub client_info: Mutex<Option<Value>>,
@@ -352,7 +352,7 @@ impl Session {
     /// Returns the assigned event ID.
     pub fn assign_event_id(&self, msg: &str) -> u64 {
         let id = self.event_id_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut history = self.event_history.lock().unwrap();
+        let mut history = self.event_history.lock();
         history.push_back((id, msg.to_string()));
         if history.len() > EVENT_HISTORY_CAPACITY {
             history.pop_front();
@@ -362,7 +362,7 @@ impl Session {
 
     /// Return events with ID > `last_id` from the replay buffer.
     pub fn replay_events_after(&self, last_id: u64) -> Vec<(u64, String)> {
-        let history = self.event_history.lock().unwrap();
+        let history = self.event_history.lock();
         history
             .iter()
             .filter(|(id, _)| *id > last_id)
@@ -1097,7 +1097,7 @@ impl SessionManager {
             handshake_timeout,
             lagged_events: AtomicU64::new(0),
             event_id_counter: AtomicU64::new(0),
-            event_history: std::sync::Mutex::new(VecDeque::new()),
+            event_history: parking_lot::Mutex::new(VecDeque::new()),
             client_info: Mutex::new(None),
             capabilities: Mutex::new(None),
             routed_requests: Arc::new(DashMap::new()),
@@ -1718,7 +1718,7 @@ mod session_logic_tests {
             handshake_timeout,
             lagged_events: AtomicU64::new(0),
             event_id_counter: AtomicU64::new(0),
-            event_history: std::sync::Mutex::new(VecDeque::new()),
+            event_history: parking_lot::Mutex::new(VecDeque::new()),
             client_info: Mutex::new(None),
             capabilities: Mutex::new(None),
             routed_requests: Arc::new(DashMap::new()),
@@ -2394,13 +2394,13 @@ mod session_logic_tests {
     /// ends so the bridge's stdout reader does not see EOF (which would mark the
     /// session terminated) and stdin writes never block.
     struct DuplexPeerFactory {
-        peer_ends: std::sync::Mutex<Vec<(tokio::io::DuplexStream, tokio::io::DuplexStream)>>,
+        peer_ends: parking_lot::Mutex<Vec<(tokio::io::DuplexStream, tokio::io::DuplexStream)>>,
     }
 
     impl DuplexPeerFactory {
         fn new() -> Self {
             Self {
-                peer_ends: std::sync::Mutex::new(Vec::new()),
+                peer_ends: parking_lot::Mutex::new(Vec::new()),
             }
         }
     }
@@ -2409,10 +2409,7 @@ mod session_logic_tests {
         fn create(&self) -> crate::peer::BoxFuture<anyhow::Result<PeerStreams>> {
             let (bridge_stdin, peer_reader) = tokio::io::duplex(8192);
             let (peer_writer, bridge_stdout) = tokio::io::duplex(8192);
-            self.peer_ends
-                .lock()
-                .unwrap()
-                .push((peer_reader, peer_writer));
+            self.peer_ends.lock().push((peer_reader, peer_writer));
             Box::pin(async move {
                 Ok(PeerStreams {
                     stdin: Box::new(bridge_stdin),
@@ -2516,16 +2513,16 @@ mod session_logic_tests {
     /// `exit_cause` channel is handed back so the test can play the role of the
     /// exit monitor.
     struct DyingPeerFactory {
-        peer_end: std::sync::Mutex<Option<tokio::io::DuplexStream>>,
-        cause_tx: std::sync::Mutex<Option<oneshot::Sender<String>>>,
+        peer_end: parking_lot::Mutex<Option<tokio::io::DuplexStream>>,
+        cause_tx: parking_lot::Mutex<Option<oneshot::Sender<String>>>,
     }
 
     impl PeerFactory for DyingPeerFactory {
         fn create(&self) -> crate::peer::BoxFuture<anyhow::Result<PeerStreams>> {
             let (bridge_end, peer_end) = tokio::io::duplex(8192);
-            *self.peer_end.lock().unwrap() = Some(peer_end);
+            *self.peer_end.lock() = Some(peer_end);
             let (cause_tx, cause_rx) = oneshot::channel();
-            *self.cause_tx.lock().unwrap() = Some(cause_tx);
+            *self.cause_tx.lock() = Some(cause_tx);
             let (bridge_read, bridge_write) = tokio::io::split(bridge_end);
             Box::pin(async move {
                 Ok(PeerStreams {
@@ -2545,8 +2542,8 @@ mod session_logic_tests {
     #[tokio::test]
     async fn peer_death_cause_reaches_pending_request_error() {
         let factory = Arc::new(DyingPeerFactory {
-            peer_end: std::sync::Mutex::new(None),
-            cause_tx: std::sync::Mutex::new(None),
+            peer_end: parking_lot::Mutex::new(None),
+            cause_tx: parking_lot::Mutex::new(None),
         });
         let config = SessionManagerConfig {
             server_command: "unused".to_string(),
@@ -2564,11 +2561,11 @@ mod session_logic_tests {
 
         // Play the exit monitor: classify the death, THEN let the bridge see
         // the pipe EOF (the order the race can also produce in production).
-        let cause_tx = factory.cause_tx.lock().unwrap().take().unwrap();
+        let cause_tx = factory.cause_tx.lock().take().unwrap();
         cause_tx
             .send("killed by SIGKILL (possible OOM-kill or code-signing kill).".to_string())
             .unwrap();
-        drop(factory.peer_end.lock().unwrap().take());
+        drop(factory.peer_end.lock().take());
 
         let response = tokio::time::timeout(Duration::from_secs(5), rx)
             .await

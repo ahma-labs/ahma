@@ -74,8 +74,15 @@ mod mode_flags {
     ///
     /// Reads stderr line-by-line until the bridge emits `AHMA_BOUND_PORT=<port>`,
     /// which is written via `eprintln!` immediately after binding (independent of
-    /// `RUST_LOG` level).  No timing luck required: we block until we see the
-    /// sentinel or a 30-second deadline expires.
+    /// `RUST_LOG` level).
+    ///
+    /// platform-only: the deadline below is only checked *between* lines, and
+    /// `BufReader::lines()` blocks indefinitely on a server that emits nothing.
+    /// On the 3-5x slower Windows runner that is a plausible hang rather than a
+    /// failure, and a hang costs the whole 40-minute job. The gate is a
+    /// concession to that, not a claim that the behaviour is Unix-specific —
+    /// removing it needs the read made genuinely bounded first (a reader thread
+    /// with a channel recv_timeout, as `common/server.rs` does).
     #[cfg(unix)]
     #[test]
     fn test_mode_http_explicit() {
@@ -704,7 +711,6 @@ mod tools_dir_flag {
 // HTTP Mode Specific Tests
 // ============================================================================
 
-#[cfg(unix)]
 mod http_mode {
     use super::*;
 

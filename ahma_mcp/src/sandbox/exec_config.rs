@@ -85,8 +85,8 @@
 //! refused immediately there. `deny_write_globs_reflects_a_repository_created_after_the_previous_resolution`
 //! pins the behaviour.
 
+use parking_lot::RwLock;
 use std::path::{Component, Path, PathBuf};
-use std::sync::RwLock;
 
 /// Operator opt-ins that remove a path from the [`ExecConfigClass::DenyWrite`]
 /// set — both the write-tool guard and the macOS Seatbelt deny rules.
@@ -115,16 +115,15 @@ impl HandoffAllowances {
     /// The installed process-global policy (everything denied until startup
     /// installs it).
     pub fn current() -> Self {
-        HANDOFF_ALLOWANCES.read().map(|g| *g).unwrap_or_default()
+        *HANDOFF_ALLOWANCES.read()
     }
 }
 
 /// Install the operator escape-hatch policy (called once at startup with the
 /// resolved flag/settings values). See [`HandoffAllowances`].
 pub fn set_handoff_allowances(allowances: HandoffAllowances) {
-    if let Ok(mut guard) = HANDOFF_ALLOWANCES.write() {
-        *guard = allowances;
-    }
+    let mut guard = HANDOFF_ALLOWANCES.write();
+    *guard = allowances;
 }
 
 /// How a write to an auto-executing configuration path should be handled.

@@ -112,6 +112,9 @@ fn test_validate_path_symlink_traversal() {
     match std::os::windows::fs::symlink_dir(&outside_target, &symlink) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Stays an unconditional skip: creating a symlink on Windows needs
+            // a privilege the runner may not hold. An environment fact rather
+            // than a failure of ahma's machinery — see `ahma_test_support::skip`.
             println!("Skipping: Windows requires Developer Mode or Admin rights for symlinks");
             return;
         }

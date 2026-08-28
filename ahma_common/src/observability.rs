@@ -346,7 +346,8 @@ mod tests {
         let _guard = TelemetryGuard::none(); // should be a no-op, trivially droppable
     }
 
-    use std::sync::{LazyLock, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
 
     /// Serializes every test that reads or writes process environment variables,
     /// since env is process-global and these tests run in the same binary.
@@ -368,7 +369,7 @@ mod tests {
 
     #[test]
     fn from_env_service_name_overridden_by_env_var() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let prior_name = snapshot("OTEL_SERVICE_NAME");
         let prior_endpoint = snapshot("OTEL_EXPORTER_OTLP_ENDPOINT");
 
@@ -390,7 +391,7 @@ mod tests {
 
     #[test]
     fn from_env_endpoint_enables_tracing() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let prior_name = snapshot("OTEL_SERVICE_NAME");
         let prior_endpoint = snapshot("OTEL_EXPORTER_OTLP_ENDPOINT");
 
@@ -450,7 +451,7 @@ mod tests {
 
     #[test]
     fn env_traceparent_valid_value_is_returned() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let prior = snapshot("TRACEPARENT");
 
         // Valid W3C traceparent: "00-" + 32 hex trace id + "-" + 16 hex span id
@@ -467,7 +468,7 @@ mod tests {
 
     #[test]
     fn env_traceparent_too_short_is_none() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let prior = snapshot("TRACEPARENT");
 
         // Starts with "00-" but well under 55 chars -> rejected.
@@ -490,7 +491,7 @@ mod tests {
 
     #[test]
     fn env_traceparent_unset_is_none() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let prior = snapshot("TRACEPARENT");
 
         // SAFETY: serialized by ENV_MUTEX.

@@ -22,6 +22,7 @@ pub mod settings_editor;
 pub mod startup_notices;
 pub mod state;
 pub mod task_tree;
+mod terminal_guard;
 pub mod theme;
 pub mod ui;
 
@@ -39,7 +40,7 @@ use anyhow::Result;
 /// first to call `remove_var` unsets it for both. Taking this lock costs
 /// nothing under nextest and makes the suite correct under either runner.
 #[cfg(test)]
-pub static HOME_SEAM_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub static HOME_SEAM_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// CLI-resolved token/context preferences for the local-LLM chat agent.
 ///

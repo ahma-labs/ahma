@@ -1,6 +1,6 @@
 use anyhow::Result;
+use parking_lot::RwLock;
 use std::path::Path;
-use std::sync::RwLock;
 
 use super::core::Sandbox;
 use super::types::SandboxMode;
@@ -16,9 +16,8 @@ static SECRET_ENV_ALLOW: RwLock<Vec<String>> = RwLock::new(Vec::new());
 /// Install the passthrough allowlist from `[sandbox] env_allow`. Called once at
 /// startup. Names are stored as-is; matching is case-insensitive.
 pub fn set_secret_env_allow(allow: Vec<String>) {
-    if let Ok(mut guard) = SECRET_ENV_ALLOW.write() {
-        *guard = allow;
-    }
+    let mut guard = SECRET_ENV_ALLOW.write();
+    *guard = allow;
 }
 
 /// Return `true` if `name` looks like it holds a secret and should be scrubbed
@@ -250,10 +249,7 @@ where
 /// — or inherit a poisoned `BASH_ENV`/`LD_PRELOAD` and run attacker code on
 /// every tool call.
 pub fn scrub_secret_env(cmd: &mut tokio::process::Command, context: &str) {
-    let allow = SECRET_ENV_ALLOW
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let allow = SECRET_ENV_ALLOW.read().clone();
     let scrubbed = secret_env_keys(std::env::vars().map(|(k, _)| k), &allow);
     if !scrubbed.is_empty() {
         tracing::debug!(
@@ -280,9 +276,8 @@ static EGRESS_PROXY_ENV: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new())
 /// Called once at server startup when `--restrict-network` is on. Passing an empty
 /// vec (the default) leaves subprocess egress unrestricted.
 pub fn set_egress_proxy_env(vars: Vec<(String, String)>) {
-    if let Ok(mut guard) = EGRESS_PROXY_ENV.write() {
-        *guard = vars;
-    }
+    let mut guard = EGRESS_PROXY_ENV.write();
+    *guard = vars;
 }
 
 /// Inject the egress-proxy variables into `cmd`. A no-op when restriction is off.
@@ -291,10 +286,7 @@ pub fn set_egress_proxy_env(vars: Vec<(String, String)>) {
 /// SSRF-guarded proxy. (A tool that ignores the proxy variables is not contained
 /// by this alone — see the network-restriction limitations in the README.)
 pub fn apply_egress_proxy_env(cmd: &mut tokio::process::Command) {
-    let vars = EGRESS_PROXY_ENV
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let vars = EGRESS_PROXY_ENV.read().clone();
     apply_proxy_vars(cmd, &vars);
 }
 
@@ -417,24 +409,62 @@ impl Sandbox {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // Windows: `base_command` still gives every spawn the Job Object
-            // process-tree containment applied at startup (R6.3.2), plus the
-            // secret/code-injection env scrub and egress-proxy variables.
-            //
-            // AppContainer spawn isolation (R6.3.3) exists in `super::windows`
-            // (`plan_windows_sandboxed_spawn`) but is deliberately NOT wired in
-            // here yet: a windows-latest CI run proved its grant DACL does not
-            // take effect — every subprocess spawned through the launcher was
-            // denied even inside its own locked scope, timing out or failing
-            // basic tool calls (`writes_outside_the_scope_are_blocked_and_
-            // inside_still_work`, `cleanup_revokes_and_a_fresh_session_regrants`,
-            // both now `#[ignore]`d with the failure). Routing every Windows
-            // spawn through a containment layer that fails-broken rather than
-            // fails-safe is worse than not routing it at all, per AGENTS.md:
-            // "don't mark R6.3.3 done until Windows CI proves it" — remove this
-            // comment and call `plan_windows_sandboxed_spawn` here once it does.
-            Ok(self.base_command(program, args, working_dir))
+            self.windows_family_command(program, args, working_dir)
         }
+    }
+
+    /// The spawn path for every platform that is neither Linux nor macOS — in
+    /// practice Windows.
+    ///
+    /// `base_command` already gives each spawn the Job Object process-tree
+    /// containment applied at startup (R6.3.2), the secret/code-injection env
+    /// scrub, and the egress-proxy variables. What it does not give is a
+    /// filesystem boundary; that is AppContainer's job (R6.3.3), and AppContainer
+    /// is currently switched off — see `windows::appcontainer_spawn_enabled`,
+    /// which is the single place that verdict is recorded, because the egress
+    /// proxy in `shell/modes/server.rs` has to agree with it (R6.3.3.1a) and once
+    /// did not.
+    ///
+    /// **Why this is a separate function rather than an inline `#[cfg]` block.**
+    /// A body inside `#[cfg(not(any(linux, macos)))]` is compiled by nothing a
+    /// developer on Linux or macOS can run — not `cargo check`, not clippy, not a
+    /// cross-check, because the dependency tree's native build scripts (`ring`,
+    /// `aws-lc-sys`) need a Windows C toolchain. The one place it is compiled is
+    /// the Windows CI leg, which is the slowest feedback loop in the project. Out
+    /// here the code type-checks on every platform on every build, and only the
+    /// one-line call site is Windows-only. That matters most for the branch that
+    /// is currently unreachable: the `true` arm below is the code a future change
+    /// will switch on, and it must not be the first time anyone finds out it does
+    /// not compile.
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "type-checked on every platform, called only off Linux/macOS"
+        )
+    )]
+    fn windows_family_command(
+        &self,
+        program: &str,
+        args: &[String],
+        working_dir: &Path,
+    ) -> Result<tokio::process::Command> {
+        if super::windows::appcontainer_spawn_enabled() {
+            let write_scopes = self.scopes().to_vec();
+            let plan = super::windows::plan_windows_sandboxed_spawn(
+                program,
+                args,
+                &write_scopes,
+                &self.read_scopes(),
+            )?;
+            let mut cmd =
+                self.base_command(&plan.launcher.to_string_lossy(), &plan.args, working_dir);
+            for (key, value) in &plan.env {
+                cmd.env(key, value);
+            }
+            return Ok(cmd);
+        }
+        Ok(self.base_command(program, args, working_dir))
     }
 
     /// Build a Landlock ruleset fd from the sandbox's *current* scopes for
@@ -453,12 +483,7 @@ impl Sandbox {
         // R-NET: when the guarded egress proxy is active, confine the child's
         // outbound TCP to the proxy port (Landlock ≥ 6.7). `None` leaves network
         // unrestricted (restriction off / advisory tier).
-        let connect_tcp_port = self
-            .egress_proxy_addr
-            .read()
-            .ok()
-            .and_then(|g| *g)
-            .map(|addr| addr.port());
+        let connect_tcp_port = self.egress_proxy_addr.read().map(|addr| addr.port());
         let fd = super::landlock::landlock_ruleset_fd(
             &scopes,
             &self.read_scopes(),

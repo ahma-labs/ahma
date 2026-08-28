@@ -135,20 +135,17 @@ pub trait ExtensionToolHandler: Send + Sync {
 }
 
 static GLOBAL_EXTENSION_HANDLERS: std::sync::LazyLock<
-    std::sync::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+    parking_lot::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
 
 /// Register an extension handler globally so that new MCP service instances can retrieve it.
 pub fn register_global_extension_handler(name: String, handler: Arc<dyn ExtensionToolHandler>) {
-    GLOBAL_EXTENSION_HANDLERS
-        .write()
-        .unwrap()
-        .insert(name, handler);
+    GLOBAL_EXTENSION_HANDLERS.write().insert(name, handler);
 }
 
 /// Retrieve the global map of extension handlers.
 pub fn get_global_extension_handlers()
--> &'static std::sync::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>> {
+-> &'static parking_lot::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>> {
     &GLOBAL_EXTENSION_HANDLERS
 }
 

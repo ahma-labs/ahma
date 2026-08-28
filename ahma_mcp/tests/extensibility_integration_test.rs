@@ -1,10 +1,11 @@
 use anyhow::Result;
+use parking_lot::Mutex;
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ahma_harness_tools::{DirEntryInfo, GrepMatch, WebFetchResult};
 use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
@@ -100,7 +101,7 @@ impl CommandExecutor for MockCommandExecutor {
         working_dir: &Path,
     ) -> Result<tokio::process::Command> {
         let cmd_str = format!("{} {}", program, args.join(" "));
-        self.executed_commands.lock().unwrap().push(cmd_str);
+        self.executed_commands.lock().push(cmd_str);
 
         // Redirect execution to `echo 'Intercepted!'`
         DefaultCommandExecutor.build_command(
@@ -257,7 +258,7 @@ async fn test_custom_command_executor_extensibility() -> Result<()> {
 
     // Verify that the command string we intercepted was recorded
     {
-        let recorded = executed_commands.lock().unwrap();
+        let recorded = executed_commands.lock();
         assert!(!recorded.is_empty());
         assert!(
             recorded[0].contains("cargo --version"),

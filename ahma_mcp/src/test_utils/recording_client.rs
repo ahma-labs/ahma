@@ -14,7 +14,8 @@
 //! with [`crate::test_utils::in_process`] to assert on delivered notifications
 //! without spawning a subprocess.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::ErrorData as McpError;
@@ -46,21 +47,13 @@ impl ProgressLog {
     }
 
     fn record(&self, params: ProgressNotificationParam) {
-        self.inner
-            .seen
-            .lock()
-            .expect("progress log poisoned")
-            .push(params);
+        self.inner.seen.lock().push(params);
         self.inner.arrived.notify_waiters();
     }
 
     /// Every notification received so far, in arrival order.
     pub fn all(&self) -> Vec<ProgressNotificationParam> {
-        self.inner
-            .seen
-            .lock()
-            .expect("progress log poisoned")
-            .clone()
+        self.inner.seen.lock().clone()
     }
 
     /// Notifications addressed to one progress token.
@@ -75,11 +68,7 @@ impl ProgressLog {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner
-            .seen
-            .lock()
-            .expect("progress log poisoned")
-            .is_empty()
+        self.inner.seen.lock().is_empty()
     }
 
     /// Wait until a notification satisfying `predicate` arrives.

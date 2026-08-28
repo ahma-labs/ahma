@@ -17,6 +17,7 @@ path = "src/lib.rs"
 
 
 [dependencies]
+parking_lot.workspace = true
 ahma_common = { path = "../ahma_common" }
 ahma_harness_tools = { path = "../ahma_harness_tools" }
 ahma_http_bridge = { path = "../ahma_http_bridge" }

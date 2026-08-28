@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-echo "🔍 Checking for improper CARGO_TARGET_DIR usage in tests..."
+echo "Checking for improper CARGO_TARGET_DIR usage in tests..."
 
 # Find all Rust test files
 VIOLATIONS=0
@@ -26,7 +26,7 @@ while IFS= read -r file; do
     fi
 done < <(find . -path "*/tests/*.rs" -o -name "*_test.rs" -o -name "test_*.rs" | grep -v target)
 
-echo "🔍 Checking timeout literals in handshake-critical integration tests..."
+echo "Checking timeout literals in handshake-critical integration tests..."
 for file in \
     "./ahma_http_bridge/tests/handshake_timeout_test.rs" \
     "./ahma_http_bridge/tests/http_bridge_integration_test.rs"
@@ -40,7 +40,7 @@ do
     fi
 done
 
-echo "🔍 Checking shared custom server spawn usage in HTTP bridge integration test..."
+echo "Checking shared custom server spawn usage in HTTP bridge integration test..."
 HTTP_BRIDGE_TEST="./ahma_http_bridge/tests/http_bridge_integration_test.rs"
 if [[ -f "$HTTP_BRIDGE_TEST" ]] && ! rg -q 'spawn_server_guard_with_config' "$HTTP_BRIDGE_TEST"; then
     echo "FAIL VIOLATION: $HTTP_BRIDGE_TEST"

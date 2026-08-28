@@ -27,6 +27,16 @@ pub enum BridgeError {
         max: usize,
     },
 
+    /// Operator configuration the bridge cannot start with.
+    ///
+    /// Distinct from the runtime variants above because the remedy is different:
+    /// nothing is wrong with the machine or the peer, a flag value is wrong, and
+    /// the message must name it. Previously such a case (an unusable
+    /// `--rate-limit-rps` / `--rate-limit-burst` pair) was an `.expect()` that
+    /// panicked with a message naming neither value.
+    #[error("Invalid configuration: {0}")]
+    Config(String),
+
     /// Protocol or communication failure with subprocess
     #[error("Communication error: {0}")]
     Communication(String),

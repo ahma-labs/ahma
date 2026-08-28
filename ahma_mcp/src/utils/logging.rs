@@ -5,10 +5,11 @@
 
 use ahma_common::observability::{ObservabilityConfig, TelemetryGuard};
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use std::{
     io::stderr,
     path::{Path, PathBuf},
-    sync::{Mutex, Once, OnceLock},
+    sync::{Once, OnceLock},
 };
 use tracing_subscriber::{
     EnvFilter,
@@ -35,9 +36,8 @@ static FILE_LOG_FLUSH_GUARD: Mutex<Option<tracing_appender::non_blocking::Worker
 /// after this, further log lines may be dropped — call only on the way out
 /// (panic hook, abnormal-exit paths).
 pub fn flush_file_log() {
-    if let Ok(mut guard) = FILE_LOG_FLUSH_GUARD.lock() {
-        drop(guard.take());
-    }
+    let mut guard = FILE_LOG_FLUSH_GUARD.lock();
+    drop(guard.take());
 }
 
 /// Chain a panic hook that flushes the file log after the default hook has
@@ -423,7 +423,6 @@ pub fn init_logging_with_observability(
 
     Ok(PENDING_GUARD
         .lock()
-        .unwrap()
         .take()
         .unwrap_or_else(TelemetryGuard::none))
 }
@@ -470,7 +469,7 @@ fn do_setup_logging(
         let config = observability.unwrap_or_else(|| ObservabilityConfig::from_env("ahma_mcp"));
         ahma_common::observability::create_otel_layer(&config)
     };
-    *PENDING_GUARD.lock().unwrap() = Some(guard);
+    *PENDING_GUARD.lock() = Some(guard);
 
     let file_appender_opt = if log_to_file {
         try_create_file_appender()
@@ -492,7 +491,7 @@ fn do_setup_logging(
         // Keep the writer's flush guard reachable so a panic can flush the
         // buffered tail (SPEC R-SIGN.5) — a leaked guard could never be
         // dropped, so the final lines before an abnormal exit were lost.
-        *FILE_LOG_FLUSH_GUARD.lock().unwrap() = Some(guard);
+        *FILE_LOG_FLUSH_GUARD.lock() = Some(guard);
         install_panic_flush_hook();
         log_traceparent();
         disclose_log_location_once();
@@ -838,7 +837,7 @@ mod tests {
 
     #[test]
     fn test_detect_log_role_from_startup_server_child_env() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let prev = std::env::var("AHMA_SERVER_CHILD").ok();
         unsafe {
             std::env::set_var("AHMA_SERVER_CHILD", "1");
@@ -916,7 +915,7 @@ mod tests {
 
     #[test]
     fn test_prepare_bridge_capture_files_idempotent_does_not_duplicate_header() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let temp = tempdir().unwrap();
         let prev = std::env::current_dir().unwrap();
         let temp_canon = dunce::canonicalize(temp.path()).unwrap();
@@ -940,7 +939,7 @@ mod tests {
 
     #[test]
     fn test_bridge_capture_paths_live_under_project_log_dir() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let temp = tempdir().unwrap();
         let prev = std::env::current_dir().unwrap();
         let temp_canon = dunce::canonicalize(temp.path()).unwrap();
@@ -971,7 +970,7 @@ mod tests {
 
     #[test]
     fn test_try_create_file_appender_returns_some_for_writeable_cwd() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let temp = tempdir().unwrap();
         let prev = std::env::current_dir().unwrap();
         let temp_canon = dunce::canonicalize(temp.path()).unwrap();

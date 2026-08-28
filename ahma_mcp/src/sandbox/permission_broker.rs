@@ -44,8 +44,9 @@
 //! most once per `(path, access)` per session — the [`GrantCoordinator`] gate —
 //! because a question the user already answered is not a question, it is nagging.
 
+use parking_lot::{Mutex, RwLock};
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -160,14 +161,14 @@ impl PermissionBroker {
 
     /// Install rung 1 once the MCP peer is known.
     pub fn set_elicitation_surface(&self, surface: Arc<dyn ElicitationSurface>) {
-        *self.elicitation.write().unwrap() = Some(surface);
+        *self.elicitation.write() = Some(surface);
     }
 
     /// Install the session-health event sink (#485). Like the elicitation
     /// surface, the production sink shares the service's peer slot and is
     /// installed at build time.
     pub fn set_session_events(&self, sink: Arc<dyn crate::session_events::SessionEventSink>) {
-        *self.session_events.write().unwrap() = Some(sink);
+        *self.session_events.write() = Some(sink);
     }
 
     /// Fire a session-health event, if a sink is installed. Detached and
@@ -177,7 +178,7 @@ impl PermissionBroker {
         kind: ahma_common::session_event::SessionEventKind,
         detail: serde_json::Value,
     ) {
-        if let Some(sink) = self.session_events.read().unwrap().as_ref() {
+        if let Some(sink) = self.session_events.read().as_ref() {
             sink.emit_event(kind, detail);
         }
     }
@@ -190,25 +191,24 @@ impl PermissionBroker {
 
     /// Rung 1 is usable when a surface is installed and it has not been demoted.
     fn harness_available(&self) -> bool {
-        self.elicitation.read().unwrap().is_some()
-            && *self.harness.lock().unwrap() != HarnessState::Demoted
+        self.elicitation.read().is_some() && *self.harness.lock() != HarnessState::Demoted
     }
 
     /// Run the ladder for an already-deduped request. Returns where it landed.
     async fn ask(&self, req: ScopeGrantRequest) -> AskedAt {
         // ── Rung 1: the harness ───────────────────────────────────────────────
         if self.harness_available() {
-            let surface = self.elicitation.read().unwrap().clone();
+            let surface = self.elicitation.read().clone();
             if let Some(surface) = surface {
                 match surface.ask(&req).await {
                     ElicitOutcome::Answered(decision) => {
-                        *self.harness.lock().unwrap() = HarnessState::Proven;
+                        *self.harness.lock() = HarnessState::Proven;
                         self.apply(&req, decision);
                         return AskedAt::Harness;
                     }
                     ElicitOutcome::Failed(why) => {
                         // One strike. The surface is broken, not the user.
-                        *self.harness.lock().unwrap() = HarnessState::Demoted;
+                        *self.harness.lock() = HarnessState::Demoted;
                         tracing::warn!(
                             "The MCP client could not be asked for permission ({why}); it will \
                              not be asked again this session. Falling back to the ahma TUI, or \
@@ -441,7 +441,7 @@ rmcp::elicit_safe!(GrantForm);
 #[async_trait]
 impl ElicitationSurface for PeerElicitationSurface {
     async fn ask(&self, req: &ScopeGrantRequest) -> ElicitOutcome {
-        let peer = self.peer.read().unwrap().clone();
+        let peer = self.peer.read().clone();
         let Some(peer) = peer else {
             return ElicitOutcome::Unavailable;
         };
@@ -570,7 +570,7 @@ mod tests {
     impl ElicitationSurface for ScriptedHarness {
         async fn ask(&self, _req: &ScopeGrantRequest) -> ElicitOutcome {
             self.asks.fetch_add(1, Ordering::SeqCst);
-            let mut q = self.outcome.lock().unwrap();
+            let mut q = self.outcome.lock();
             if q.is_empty() {
                 ElicitOutcome::Unavailable
             } else {
@@ -626,7 +626,7 @@ mod tests {
             kind: ahma_common::session_event::SessionEventKind,
             detail: serde_json::Value,
         ) {
-            self.events.lock().unwrap().push((kind, detail));
+            self.events.lock().push((kind, detail));
         }
     }
 
@@ -645,7 +645,7 @@ mod tests {
         // and no second grant_pending.
         violate(&broker, "/opt/cache").await;
 
-        let events = sink.events.lock().unwrap();
+        let events = sink.events.lock();
         let pending: Vec<_> = events
             .iter()
             .filter(|(k, _)| *k == SessionEventKind::GrantPending)

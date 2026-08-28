@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use ahma_common::timeouts::TestTimeouts;
+pub use ahma_test_support::skip::skip_or_fail;
 
 pub mod client;
 pub mod protocol;
@@ -62,7 +63,9 @@ pub async fn setup_test_mcp_for_tools(
         return Some((server, mcp));
     }
 
-    eprintln!("WARNING  missing required tools, skipping: {:?}", missing);
+    // Fatal on CI: the tools this asks for are ones the workspace builds, so
+    // their absence there is a regression, not a local environment quirk.
+    skip_or_fail(&format!("required tools not available: {missing:?}"));
     None
 }
 
@@ -98,7 +101,11 @@ pub async fn setup_test_mcp(
         let server = match spawn_test_server().await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("WARNING  setup_test_mcp: server spawn failed: {}", e);
+                // Previously an unconditional skip, while the handshake failure
+                // twenty lines below was fatal on CI. A server that will not
+                // spawn is at least as much of a regression as one that will not
+                // handshake; the difference was an oversight, not a decision.
+                skip_or_fail(&format!("setup_test_mcp: server spawn failed: {e}"));
                 return None;
             }
         };
@@ -120,21 +127,13 @@ pub async fn setup_test_mcp(
             );
         }
     }
-    // In CI (or when AHMA_TEST_FAIL_ON_SETUP_ERROR is set) a persistent handshake
-    // failure is a real regression, not a local infrastructure hiccup; panic so the
-    // build fails visibly instead of silently skipping the test.
-    let in_ci =
-        std::env::var("CI").is_ok() || std::env::var("AHMA_TEST_FAIL_ON_SETUP_ERROR").is_ok();
-    if in_ci {
-        panic!(
-            "setup_test_mcp: handshake failed in CI — aborting: {}",
-            last_error
-        );
-    }
-    eprintln!(
-        "WARNING  setup_test_mcp: skipping due to persistent handshake failure: {}",
-        last_error
-    );
+    // A persistent handshake failure is a real regression on CI, not a local
+    // infrastructure hiccup. This verdict used to be spelled out here, which is
+    // why the six other bail-outs around it never got it; it now comes from
+    // `ahma_test_support::skip`, which every skip site calls.
+    skip_or_fail(&format!(
+        "setup_test_mcp: persistent handshake failure: {last_error}"
+    ));
     None
 }
 

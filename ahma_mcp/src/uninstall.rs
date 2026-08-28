@@ -1199,7 +1199,8 @@ mod tests {
 
     // ── Env-serialized helpers ────────────────────────────────────────────────
 
-    use std::sync::{LazyLock, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
 
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -1580,7 +1581,7 @@ mod tests {
 
     #[test]
     fn uninstall_mcp_config_collects_removed_names() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let tmp = tempdir()?;
         let prev = set_home(tmp.path());
         write_json(
@@ -1616,7 +1617,7 @@ mod tests {
 
     #[test]
     fn uninstall_agent_skills_removes_skill_dir() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let tmp = tempdir()?;
         let prev = set_home(tmp.path());
         let skill_dirs = crate::setup::skill_install_dirs(tmp.path());
@@ -1637,7 +1638,7 @@ mod tests {
 
     #[test]
     fn uninstall_agent_skills_dry_run_keeps_dir() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let tmp = tempdir()?;
         let prev = set_home(tmp.path());
         let skill_dirs = crate::setup::skill_install_dirs(tmp.path());
@@ -1656,7 +1657,7 @@ mod tests {
 
     #[test]
     fn purge_ahma_dir_removes_data_and_empty_sandbox() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let tmp = tempdir()?;
         let prev = set_home(tmp.path());
         let ahma_dir = tmp.path().join(".ahma");
@@ -1676,7 +1677,7 @@ mod tests {
 
     #[test]
     fn purge_ahma_dir_keeps_nonempty_sandbox() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let tmp = tempdir()?;
         let prev = set_home(tmp.path());
         let sandbox = tmp.path().join("sandbox");
@@ -1692,7 +1693,7 @@ mod tests {
 
     #[test]
     fn purge_ahma_dir_dry_run_keeps_everything() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let tmp = tempdir()?;
         let prev = set_home(tmp.path());
         let ahma_dir = tmp.path().join(".ahma");
@@ -1712,7 +1713,7 @@ mod tests {
     /// otherwise an inherited variable decides which binary gets removed.
     #[test]
     fn resolve_install_dir_ignores_retired_env() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let tmp = tempdir()?;
         let prev = std::env::var_os("AHMA_INSTALL_DIR");
         // SAFETY: test-only, serialized via ENV_MUTEX.
@@ -1821,7 +1822,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn execute_actions_dry_run_dispatches_all() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let tmp = tempdir()?;
         let prev = set_home(tmp.path());
         // Seed a cursor MCP config so the MCP branch finds something.

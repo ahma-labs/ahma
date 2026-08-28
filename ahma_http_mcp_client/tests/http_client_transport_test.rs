@@ -29,7 +29,7 @@ mod transport_construction {
 
     #[test]
     fn new_transport_without_oauth_succeeds() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("no_token.json");
         unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
@@ -44,7 +44,7 @@ mod transport_construction {
 
     #[test]
     fn new_transport_with_oauth_credentials_succeeds() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("oauth_token.json");
         unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
@@ -67,7 +67,7 @@ mod transport_construction {
     #[test]
     fn new_transport_with_partial_oauth_creates_without_oauth_client() {
         // Only client_id provided, no secret - should create transport without oauth_client
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("partial_oauth.json");
         unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
@@ -85,7 +85,7 @@ mod transport_construction {
 
     #[test]
     fn new_transport_with_invalid_url_fails() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         // The URL parsing happens before transport construction,
         // so we test what happens with a valid URL but invalid structure
         let url = Url::parse("http://localhost:8080/mcp").unwrap();
@@ -102,7 +102,7 @@ mod token_persistence {
 
     #[test]
     fn load_token_handles_malformed_json() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("malformed.json");
 
@@ -124,7 +124,7 @@ mod token_persistence {
 
     #[test]
     fn load_token_handles_empty_file() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("empty.json");
 
@@ -144,7 +144,7 @@ mod token_persistence {
 
     #[test]
     fn token_file_in_nonexistent_directory_created_on_save() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("deep/nested/dir/token.json");
 
@@ -171,7 +171,7 @@ mod http_transport_send {
 
     #[tokio::test]
     async fn send_without_token_returns_missing_token_error() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("no_token.json");
         // Ensure no token file exists
@@ -207,7 +207,7 @@ mod http_transport_send {
 
     #[tokio::test]
     async fn send_with_token_makes_authenticated_request() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("valid_token.json");
 
@@ -261,7 +261,7 @@ mod http_transport_send {
 
     #[tokio::test]
     async fn send_handles_http_error_response() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("token_for_error.json");
 
@@ -309,7 +309,7 @@ mod http_transport_send {
 
     #[tokio::test]
     async fn send_handles_network_timeout() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("token_timeout.json");
 
@@ -362,7 +362,7 @@ mod http_transport_send {
 
     #[tokio::test]
     async fn send_handles_invalid_json_response() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("token_invalid_resp.json");
 
@@ -407,7 +407,7 @@ mod http_transport_send {
     async fn send_handles_empty_response_body() {
         // Setup with guard in sync block to avoid holding across await
         let token_path_str = {
-            let _guard = token_env_guard().lock().unwrap();
+            let _guard = token_env_guard().lock();
             let tmp = tempdir().unwrap();
             let token_path = tmp.path().join("token_empty.json");
 
@@ -454,7 +454,7 @@ mod http_transport_send {
             "Empty response should be ok for notifications"
         );
 
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         unsafe { env::remove_var(TOKEN_PATH_ENV) };
         // Clean up token file
         let _ = std::fs::remove_file(&token_path_str);
@@ -464,7 +464,7 @@ mod http_transport_send {
     /// Consolidates the former per-status copies (400/401/403/404/502/503/504).
     #[tokio::test]
     async fn send_handles_http_error_statuses() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("token_error_statuses.json");
 
@@ -533,7 +533,7 @@ mod transport_lifecycle {
     async fn close_succeeds() {
         // Setup with guard in sync block
         let (url, _tmp) = {
-            let _guard = token_env_guard().lock().unwrap();
+            let _guard = token_env_guard().lock();
             let tmp = tempdir().unwrap();
             let token_path = tmp.path().join("close_test.json");
             unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
@@ -546,7 +546,7 @@ mod transport_lifecycle {
         let result = transport.close().await;
         assert!(result.is_ok(), "Close should succeed");
 
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         unsafe { env::remove_var(TOKEN_PATH_ENV) };
     }
 
@@ -554,7 +554,7 @@ mod transport_lifecycle {
     async fn receive_returns_none_when_channel_empty() {
         // Setup with guard in sync block
         let (url, _tmp) = {
-            let _guard = token_env_guard().lock().unwrap();
+            let _guard = token_env_guard().lock();
             let tmp = tempdir().unwrap();
             let token_path = tmp.path().join("receive_test.json");
             unsafe { env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap()) };
@@ -578,7 +578,7 @@ mod transport_lifecycle {
 
     #[tokio::test]
     async fn receive_gets_message_from_channel() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("receive_message.json");
 
@@ -644,7 +644,7 @@ mod channel_error_tests {
 
     #[tokio::test]
     async fn send_continues_when_response_channel_full() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("channel_full.json");
 
@@ -705,7 +705,7 @@ mod concurrency_tests {
 
     #[tokio::test]
     async fn concurrent_sends_maintain_ordering() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("concurrent.json");
 
@@ -767,7 +767,7 @@ mod concurrency_tests {
 
     #[tokio::test]
     async fn large_payload_send_succeeds() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("large_payload.json");
 
@@ -856,7 +856,7 @@ mod oauth_flow_tests {
 
     #[tokio::test]
     async fn ensure_authenticated_with_valid_token_succeeds() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("valid_auth_token.json");
 
@@ -885,7 +885,7 @@ mod oauth_flow_tests {
 
     #[tokio::test]
     async fn ensure_authenticated_without_token_or_oauth_fails() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("no_token_no_oauth.json");
 
@@ -916,7 +916,7 @@ mod oauth_callback_server_tests {
     #[tokio::test]
     async fn oauth_client_configuration() {
         // Test that OAuth client can be configured correctly
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("oauth_config.json");
 
@@ -950,7 +950,7 @@ mod sse_integration_tests {
         // In a real implementation, the transport would connect to an SSE endpoint
         // and receive the initial message with the RPC endpoint URL
 
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("sse_test.json");
 
@@ -1032,7 +1032,7 @@ mod sse_integration_tests {
         // Simulate receiving JSON-RPC notifications via SSE
         // This tests the streaming aspect of SSE for server-to-client messages
 
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("sse_notifications.json");
 
@@ -1094,7 +1094,7 @@ mod sse_integration_tests {
         // Simulate SSE reconnection behavior when connection drops
         // This tests resilience requirements from SPEC.md (future feature)
 
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("sse_reconnect.json");
 

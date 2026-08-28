@@ -490,7 +490,8 @@ fn print_restart_hint() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
 
     // Serialize env-var-mutating tests so they don't race each other.
     // SAFETY: all env-var writes/removes are performed while holding this lock;
@@ -1088,7 +1089,7 @@ mod tests {
     /// else — the value is reported as "set" (so it can be warned about) but never used.
     #[test]
     fn install_dir_ignores_retired_env_var() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let temp_dir = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("AHMA_INSTALL_DIR");
         // SAFETY: guarded by ENV_MUTEX; nextest isolates each test binary.
@@ -1123,7 +1124,7 @@ mod tests {
     /// when the retired variable is also set.
     #[test]
     fn install_dir_flag_wins_over_retired_env_var() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let env_dir = tempfile::tempdir().unwrap();
         let flag_dir = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("AHMA_INSTALL_DIR");
@@ -1153,7 +1154,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_dry_run_without_explicit_install_dir() {
         // args.install_dir = None → resolve_install_dir falls back to the default.
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let args = UpdateArgs {
             reference: Some("main".to_string()),
             install_dir: None,
@@ -1181,7 +1182,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_run_release_update_warns_on_retired_env_vars() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         // SAFETY: guarded by ENV_MUTEX.
         unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
         unsafe { std::env::set_var("AHMA_INSECURE_SKIP_SIGNATURE", "1") };
@@ -1228,7 +1229,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_run_release_update_tagged_release_match_arm() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
 

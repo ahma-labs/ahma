@@ -13,9 +13,10 @@
 //!   * the **live sandbox is never widened** (R5.1 lock-once) — the grant is a
 //!     promise about the future, not a hole in the present.
 
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use ahma_common::config::{AhmaSettings, ScopeAccess};
 use ahma_common::scope_grant::{GrantCoordinator, GrantDecision, ScopeGrantRequest};
@@ -46,7 +47,7 @@ impl ScriptedHarness {
 impl ElicitationSurface for ScriptedHarness {
     async fn ask(&self, _req: &ScopeGrantRequest) -> ElicitOutcome {
         self.asks.fetch_add(1, Ordering::SeqCst);
-        let mut q = self.outcomes.lock().unwrap();
+        let mut q = self.outcomes.lock();
         if q.is_empty() {
             ElicitOutcome::Unavailable
         } else {

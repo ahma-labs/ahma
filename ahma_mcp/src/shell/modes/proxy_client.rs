@@ -1065,10 +1065,21 @@ async fn run_proxy_client_http(
     let sse_protocol_version = protocol_version.clone();
     tokio::spawn(async move {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "mcp-session-id",
-            reqwest::header::HeaderValue::from_str(&sse_session_id).unwrap(),
-        );
+        // Fallible, not `.unwrap()`: `sse_session_id` is whatever the *bridge*
+        // returned in `Mcp-Session-Id`, so a byte outside visible ASCII would
+        // panic this detached task rather than surface anywhere a caller could
+        // see it. The protocol-version header two lines down already handled the
+        // identical construction with `if let Ok`; this one did not, which is
+        // the tell rather than a decision.
+        let Ok(session_header) = reqwest::header::HeaderValue::from_str(&sse_session_id) else {
+            tracing::error!(
+                session_id = %sse_session_id,
+                "bridge returned a session id that is not a valid HTTP header value; \
+                 cannot open the SSE stream for it"
+            );
+            return;
+        };
+        headers.insert("mcp-session-id", session_header);
         headers.insert(
             reqwest::header::ACCEPT,
             reqwest::header::HeaderValue::from_static("text/event-stream"),
@@ -1207,10 +1218,11 @@ async fn run_proxy_client_http(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use rmcp::service::{RoleClient, RxJsonRpcMessage};
     use std::collections::VecDeque;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
 
     /// Serializes access to the process-wide `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS`
     /// env var so the deadline-resolution tests do not race each other.
@@ -1222,7 +1234,7 @@ mod tests {
     /// resolved deadline so assertions run *outside* the lock (avoids poisoning
     /// the mutex on assertion failure).
     fn deadline_with_env(value: Option<&str>) -> Option<Duration> {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let saved = std::env::var_os(DEADLINE_ENV_KEY);
         // SAFETY: test-only; ENV_MUTEX serializes env access in this module.
         unsafe {
@@ -1382,9 +1394,7 @@ mod tests {
                 if fail_send {
                     return Err(std::io::Error::other("simulated stdio write failure"));
                 }
-                sent.lock()
-                    .unwrap()
-                    .push(serde_json::to_value(item).unwrap());
+                sent.lock().push(serde_json::to_value(item).unwrap());
                 Ok(())
             }
         }
@@ -1468,9 +1478,7 @@ mod tests {
                     Err(std::io::Error::other(send_error_text))
                 } else {
                     if let Some(sent) = sent {
-                        sent.lock()
-                            .unwrap()
-                            .push(serde_json::to_value(item).unwrap());
+                        sent.lock().push(serde_json::to_value(item).unwrap());
                     }
                     Ok(())
                 }
@@ -1564,7 +1572,7 @@ mod tests {
         );
         // Both requests were attempted → the session survived the first failure.
         assert_eq!(state.attempts.load(Ordering::SeqCst), 2);
-        let sent = state.sent.lock().unwrap();
+        let sent = state.sent.lock();
         assert_eq!(sent.len(), 1, "expected one relayed error, got {sent:?}");
         assert_eq!(sent[0]["id"], serde_json::json!(1));
         assert_eq!(sent[0]["error"]["code"], serde_json::json!(-32002));
@@ -1596,7 +1604,7 @@ mod tests {
             MAX_CONSECUTIVE_FORWARD_FAILURES as usize
         );
         assert_eq!(
-            state.sent.lock().unwrap().len(),
+            state.sent.lock().len(),
             MAX_CONSECUTIVE_FORWARD_FAILURES as usize
         );
     }
@@ -1675,7 +1683,7 @@ mod tests {
             // and request(4) forwarded normally after reconnect — and nothing
             // else: session events must never leak upstream to the bridge.
             assert_eq!(fresh_attempts.load(Ordering::SeqCst), 3);
-            let sent = sent.lock().unwrap();
+            let sent = sent.lock();
             let error_count = sent.iter().filter(|m| m.get("error").is_some()).count();
             assert_eq!(error_count, 3, "expected 3 relayed errors, got {sent:?}");
             // Session-health disclosure (#485): exactly one `reconnected`
@@ -1782,7 +1790,7 @@ mod tests {
             let result =
                 run_transport_proxy(stdio, dead_client, "test", None, &mut reconnect, None).await;
             assert!(result.is_ok());
-            let sent = sent.lock().unwrap();
+            let sent = sent.lock();
             let events: Vec<_> = sent
                 .iter()
                 .filter(|m| {
@@ -1981,7 +1989,7 @@ mod tests {
         let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(result.is_ok(), "the session must survive the relayed error");
 
-        let sent = state.sent.lock().unwrap();
+        let sent = state.sent.lock();
         assert_eq!(sent.len(), 1, "expected one relayed error, got {sent:?}");
         assert_eq!(
             sent[0]["id"],
@@ -2078,7 +2086,7 @@ mod tests {
             );
 
             // Replayed initialize, the resent request(1), then request(2).
-            let fresh_sent = fresh_sent.lock().unwrap();
+            let fresh_sent = fresh_sent.lock();
             assert_eq!(fresh_sent.len(), 3, "expected 3 sends, got {fresh_sent:?}");
             assert_eq!(fresh_sent[0]["method"], serde_json::json!("initialize"));
             assert_eq!(
@@ -2088,7 +2096,7 @@ mod tests {
             );
             assert_eq!(fresh_sent[2]["id"], serde_json::json!(2));
 
-            let sent = sent.lock().unwrap();
+            let sent = sent.lock();
             assert_eq!(
                 sent.iter().filter(|m| m.get("error").is_some()).count(),
                 0,
@@ -2142,7 +2150,7 @@ mod tests {
             2,
             "both messages must be attempted without an early reconnect"
         );
-        let sent = state.sent.lock().unwrap();
+        let sent = state.sent.lock();
         assert_eq!(sent.len(), 2, "expected 2 relayed errors, got {sent:?}");
         assert!(
             sent.iter()
@@ -2290,7 +2298,7 @@ mod tests {
 
         // initialize + notifications/initialized + the roots/list answer.
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
-        let sent = sent.lock().unwrap();
+        let sent = sent.lock();
         assert_eq!(sent.len(), 3, "expected 3 sends, got {sent:?}");
         assert_eq!(sent[0]["method"], serde_json::json!("initialize"));
         assert_eq!(
@@ -2405,7 +2413,7 @@ mod tests {
             "bridge responded → Ok(true), got {result:?}"
         );
 
-        let sent = state.sent.lock().unwrap();
+        let sent = state.sent.lock();
         assert_eq!(sent.len(), 1, "bridge message must be forwarded to stdio");
         assert_eq!(sent[0]["id"], serde_json::json!(1));
         assert_eq!(sent[0]["result"], serde_json::json!({}));
@@ -2438,11 +2446,7 @@ mod tests {
             matches!(result, Ok(false)),
             "no bridge response → Ok(false), got {result:?}"
         );
-        assert_eq!(
-            state.sent.lock().unwrap().len(),
-            0,
-            "no messages should be sent"
-        );
+        assert_eq!(state.sent.lock().len(), 0, "no messages should be sent");
         assert_eq!(
             state.closed.load(Ordering::SeqCst),
             0,
@@ -2482,7 +2486,7 @@ mod tests {
             "stdio write failure must not mark bridge_responded, got {result:?}"
         );
         assert_eq!(
-            state.sent.lock().unwrap().len(),
+            state.sent.lock().len(),
             0,
             "failed send must not be recorded"
         );
@@ -2570,7 +2574,7 @@ mod tests {
             "request was forwarded"
         );
         assert_eq!(
-            state.sent.lock().unwrap().len(),
+            state.sent.lock().len(),
             0,
             "no bridge message was ever relayed to stdio"
         );
@@ -2605,7 +2609,7 @@ mod tests {
             "gives up after MAX_CONSECUTIVE_FORWARD_FAILURES; 4th notification never tried"
         );
         assert_eq!(
-            state.sent.lock().unwrap().len(),
+            state.sent.lock().len(),
             0,
             "notifications have no id, so no error can be relayed to stdio"
         );

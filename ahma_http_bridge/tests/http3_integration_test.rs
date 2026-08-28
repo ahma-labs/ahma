@@ -251,14 +251,13 @@ async fn run_mcp_tools_list(mode: TransportMode) {
     match init {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            eprintln!("WARNING  run_mcp_tools_list: handshake failed: {e}. Skipping.");
+            common::skip_or_fail(&format!("run_mcp_tools_list: handshake failed: {e}"));
             return;
         }
         Err(_) => {
-            eprintln!(
-                "WARNING  run_mcp_tools_list: handshake timed out after {:?}. Skipping.",
-                init_timeout
-            );
+            common::skip_or_fail(&format!(
+                "run_mcp_tools_list: handshake timed out after {init_timeout:?}"
+            ));
             return;
         }
     }

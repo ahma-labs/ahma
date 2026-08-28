@@ -243,6 +243,11 @@ async fn timed_request_with_session(
 
 macro_rules! setup_fast_error_test {
     ($client:ident) => {
+        // Stays an unconditional skip, deliberately: running inside another
+        // kernel sandbox is a fact about the environment, not a failure of
+        // ahma's machinery, and the strict-sandbox server this needs genuinely
+        // cannot be built there. `skip_or_fail` is for the other kind — see
+        // `ahma_test_support::skip`.
         if should_skip_in_nested_sandbox() {
             eprintln!("Skipping strict sandbox fast-error test in nested sandbox environment");
             return;
@@ -260,7 +265,7 @@ macro_rules! setup_fast_error_test {
         let $session = match initialize_session(&$client).await {
             Some(id) => id,
             None => {
-                eprintln!("WARNING️  Could not initialize session, skipping test");
+                common::skip_or_fail("could not initialize a session");
                 return;
             }
         };

@@ -15,9 +15,23 @@
 //!
 //! The `generation` counter binds in-flight decisions to the session lifetime so
 //! a stale answer can be rejected (R5.3.5).
+//!
+//! ## Status: not wired to a live server
+//!
+//! Nothing outside this file's own tests calls into this module. The commit path
+//! a running ahma actually uses is `ahma_mcp::sandbox::Sandbox::commit_scopes`
+//! over the two-atomic `ScopeLock`, which has no pending state, no generation
+//! counter, and no sharing across sessions — this type is its intended
+//! replacement, not a component of it.
+//!
+//! That is stated here because "complete and unit-tested" reads as "works", and
+//! the distance between the two is the whole subject of SPEC R5.3.6's status
+//! note. Replacing `ScopeLock` means changing the one mechanism R5.1.1 requires
+//! to have exactly one door to "scope locked", so it is not something to wire in
+//! halfway: a partial integration is a second door.
 
+use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use crate::scope_decision::{ScopeDelta, classify_scope_change};
 
@@ -99,7 +113,7 @@ impl WorkspaceScope {
     /// evaluated against it through the normal downgrade gate — same is a
     /// no-op, narrower applies, wider requires consent.
     pub fn commit(&self, proposed: Vec<PathBuf>, source: ScopeSourceToken) -> CommitOutcome {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if let State::Pending {
             scopes,
             source: pending_source,
@@ -155,7 +169,7 @@ impl WorkspaceScope {
         source: ScopeSourceToken,
     ) -> CommitOutcome {
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             match &inner.state {
                 State::Terminated => return CommitOutcome::Terminated,
                 State::Awaiting => {
@@ -191,7 +205,7 @@ impl WorkspaceScope {
     /// (R5.3.6). Returns the established scope, or `None` when nothing was
     /// pending (already active, still awaiting, or terminated).
     pub fn promote_pending(&self) -> Option<Vec<PathBuf>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if let State::Pending { scopes, source } = &inner.state {
             let scopes = scopes.clone();
             inner.state = State::Active {
@@ -206,13 +220,13 @@ impl WorkspaceScope {
 
     /// True while a TUI-only answer is parked awaiting the next IDE session.
     pub fn is_pending(&self) -> bool {
-        matches!(self.inner.lock().unwrap().state, State::Pending { .. })
+        matches!(self.inner.lock().state, State::Pending { .. })
     }
 
     /// The parked pending write roots, if any (shown as *pending* — R5.3.6
     /// requires this state to be visible, never silently treated as active).
     pub fn pending_scopes(&self) -> Option<Vec<PathBuf>> {
-        match &self.inner.lock().unwrap().state {
+        match &self.inner.lock().state {
             State::Pending { scopes, .. } => Some(scopes.clone()),
             _ => None,
         }
@@ -226,7 +240,7 @@ impl WorkspaceScope {
         scopes: Vec<PathBuf>,
         source: ScopeSourceToken,
     ) -> CommitOutcome {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if matches!(inner.state, State::Terminated) {
             return CommitOutcome::Terminated;
         }
@@ -239,7 +253,7 @@ impl WorkspaceScope {
 
     /// The currently committed write roots, if active.
     pub fn scopes(&self) -> Option<Vec<PathBuf>> {
-        match &self.inner.lock().unwrap().state {
+        match &self.inner.lock().state {
             State::Active { scopes, .. } => Some(scopes.clone()),
             _ => None,
         }
@@ -247,7 +261,7 @@ impl WorkspaceScope {
 
     /// The provenance token of the committed scope, if active.
     pub fn source(&self) -> Option<ScopeSourceToken> {
-        match &self.inner.lock().unwrap().state {
+        match &self.inner.lock().state {
             State::Active { source, .. } => Some(source),
             _ => None,
         }
@@ -255,19 +269,19 @@ impl WorkspaceScope {
 
     /// True once a scope has been established (and not terminated).
     pub fn is_active(&self) -> bool {
-        matches!(self.inner.lock().unwrap().state, State::Active { .. })
+        matches!(self.inner.lock().state, State::Active { .. })
     }
 
     /// The current generation. Bumped on [`Self::terminate`]; used to reject
     /// stale elicitation answers (R5.3.5).
     pub fn generation(&self) -> u64 {
-        self.inner.lock().unwrap().generation
+        self.inner.lock().generation
     }
 
     /// Terminate the workspace scope and bump the generation. Subsequent commits
     /// return [`CommitOutcome::Terminated`].
     pub fn terminate(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.state = State::Terminated;
         inner.generation += 1;
     }

@@ -80,10 +80,9 @@ async fn run_per_client_tools_dir_discovery(transport: TransportMode) {
     let server = match spawn_server_guard_strict_roots(bridge_tools_dir.path()).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "WARNING  per_client_tools_dir_test: server spawn failed, skipping: {}",
-                e
-            );
+            common::skip_or_fail(&format!(
+                "per_client_tools_dir_test: server spawn failed: {e}"
+            ));
             return;
         }
     };

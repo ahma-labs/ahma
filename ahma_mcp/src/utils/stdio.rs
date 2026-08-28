@@ -49,15 +49,38 @@ pub fn emit_stdout_notification(json: &str) -> io::Result<()> {
     // path — see emit_sandbox_notification_via_peer — but several lifecycle
     // emits run during shutdown when no peer is available and fall back here.)
     let framed = format!("\n{}\n", json);
+    write_stdout(&framed, "notification")
+}
 
-    fn write_framed<W: Write>(mut w: W, framed: &str) -> io::Result<()> {
-        match w.write_all(framed.as_bytes()) {
+/// Write arbitrary text to stdout with the same broken-pipe handling.
+///
+/// The sibling of [`emit_stdout_notification`] for payloads that are not
+/// JSON-RPC and must not be framed with surrounding newlines — currently the
+/// wrapped command's own output on the terminal-hook execution path, which is
+/// read by the editor's hook engine through a pipe. That call site used
+/// `println!`, which is the exact macro the module header explains must not be
+/// used on a pipe: it panics unconditionally on a write error, and a hook whose
+/// consumer has gone away then dies with a stack trace instead of a log line.
+///
+/// Returns `Ok(())` on success or broken pipe, `Err` on any other I/O error.
+pub fn emit_stdout_text(text: &str) -> io::Result<()> {
+    write_stdout(text, "output")
+}
+
+/// One `write_all` of `payload`, classifying the error per SPEC R5.6.1.
+///
+/// A single `write_all` rather than several: on a Windows pipe shared with other
+/// writers, separate calls can interleave with a concurrent write and corrupt
+/// the line.
+fn write_stdout(payload: &str, what: &str) -> io::Result<()> {
+    fn write_to<W: Write>(mut w: W, payload: &str, what: &str) -> io::Result<()> {
+        match w.write_all(payload.as_bytes()) {
             Ok(()) => {
                 let _ = w.flush();
                 Ok(())
             }
             Err(e) if is_broken_pipe(&e) => {
-                tracing::debug!("stdout pipe closed (broken pipe) — notification not delivered");
+                tracing::debug!("stdout pipe closed (broken pipe) — {what} not delivered");
                 Ok(())
             }
             Err(e) => {
@@ -68,9 +91,9 @@ pub fn emit_stdout_notification(json: &str) -> io::Result<()> {
     }
 
     if let Some(saved_stdout) = super::stdio_redirect::get_saved_stdout() {
-        write_framed(saved_stdout, &framed)
+        write_to(saved_stdout, payload, what)
     } else {
-        write_framed(io::stdout().lock(), &framed)
+        write_to(io::stdout().lock(), payload, what)
     }
 }
 
@@ -102,5 +125,13 @@ mod tests {
     fn test_emit_stdout_notification_success() {
         let json = r#"{"jsonrpc":"2.0","method":"test"}"#;
         assert!(emit_stdout_notification(json).is_ok());
+    }
+
+    #[test]
+    fn emit_stdout_text_does_not_frame_its_payload() {
+        // The notification form wraps in newlines so a line-oriented reader can
+        // find it; command output must arrive byte-for-byte as the command
+        // produced it, so the two cannot share one entry point.
+        assert!(emit_stdout_text("plain output\n").is_ok());
     }
 }

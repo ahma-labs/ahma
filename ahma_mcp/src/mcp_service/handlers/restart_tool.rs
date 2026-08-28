@@ -47,7 +47,7 @@ impl AhmaMcpService {
         crate::warn_retired_env("AHMA_UNIX_SOCKET");
 
         let socket_path = {
-            let app_config_guard = self.app_config.read().unwrap();
+            let app_config_guard = self.app_config.read();
             app_config_guard
                 .as_ref()
                 .map(|config| config.unix_socket_path.clone())
@@ -61,7 +61,7 @@ impl AhmaMcpService {
         };
 
         let http_url = {
-            let app_config_guard = self.app_config.read().unwrap();
+            let app_config_guard = self.app_config.read();
             if let Some(ref config) = *app_config_guard {
                 format!("http://{}:{}", config.http_host, config.http_port)
             } else {
@@ -402,7 +402,7 @@ mod tests {
         );
         // Reaching this line at all proves the handler did not take the exit path.
         assert!(
-            service.peer.read().unwrap().is_none(),
+            service.peer.read().is_none(),
             "no peer is attached, so there is no session a tools/list_changed could reach"
         );
     }

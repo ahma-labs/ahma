@@ -51,7 +51,7 @@ async fn test_flattened_tool_calling() -> Result<()> {
 
     // 3. Verify that the flattened tools appear in list_tools
     let tools = mcp.client.list_all_tools().await.map_err(|e| {
-        eprintln!("WARNING  test_flattened_tool_calling: list_tools failed: {e}. Skipping.");
+        eprintln!("test_flattened_tool_calling: list_tools failed: {e}");
         e
     })?;
     let tool_names: Vec<_> = tools.iter().map(|t| t.name.as_ref() as &str).collect();
@@ -72,7 +72,7 @@ async fn test_flattened_tool_calling() -> Result<()> {
         .with_arguments(json!({}).as_object().unwrap().clone());
 
     let result = mcp.client.call_tool(params).await.map_err(|e| {
-        eprintln!("WARNING  test_flattened_tool_calling: call_tool failed: {e}. Skipping.");
+        eprintln!("test_flattened_tool_calling: call_tool failed: {e}");
         e
     })?;
 

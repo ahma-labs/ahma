@@ -6,11 +6,12 @@
 
 use crate::utils::time;
 use ahma_common::event_dispatcher::{EventDispatcher, OperationEvent};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 use tokio::sync::{
@@ -182,7 +183,7 @@ pub struct SharedTail(Arc<Mutex<VecDeque<String>>>);
 impl SharedTail {
     /// Append a line, evicting the oldest once [`MAX_TAIL_LINES`] is reached.
     pub fn push_line(&self, line: String) {
-        let mut tail = self.0.lock().unwrap();
+        let mut tail = self.0.lock();
         if tail.len() >= MAX_TAIL_LINES {
             tail.pop_front();
         }
@@ -191,21 +192,21 @@ impl SharedTail {
 
     /// A point-in-time copy of the buffered lines.
     pub fn snapshot(&self) -> VecDeque<String> {
-        self.0.lock().unwrap().clone()
+        self.0.lock().clone()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.lock().unwrap().is_empty()
+        self.0.lock().is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.0.lock().unwrap().len()
+        self.0.lock().len()
     }
 }
 
 impl Serialize for SharedTail {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let tail = self.0.lock().unwrap();
+        let tail = self.0.lock();
         serializer.collect_seq(tail.iter())
     }
 }
@@ -234,12 +235,12 @@ impl ActivityStamp {
 
     /// The stamped time.
     pub fn get(&self) -> SystemTime {
-        *self.0.lock().unwrap()
+        *self.0.lock()
     }
 
     /// Overwrite the stamp.
     pub fn set(&self, t: SystemTime) {
-        *self.0.lock().unwrap() = t;
+        *self.0.lock() = t;
     }
 
     /// Reset the stamp to now (proof of life).

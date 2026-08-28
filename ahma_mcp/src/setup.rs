@@ -1589,14 +1589,15 @@ mod tests {
 
     // ─── env seam helper (AHMA_TEST_HOME redirects ahma_home_dir in debug) ─────
 
-    use std::sync::{LazyLock, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
 
     static SETUP_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     /// Run `f` with `AHMA_TEST_HOME` pointed at `home`, restoring the prior value
     /// afterwards. Serialized so concurrent tests don't clobber the env var.
     fn with_test_home<R>(home: &Path, f: impl FnOnce() -> R) -> R {
-        let _guard = SETUP_ENV_MUTEX.lock().unwrap();
+        let _guard = SETUP_ENV_MUTEX.lock();
         let prev = std::env::var_os("AHMA_TEST_HOME");
         // SAFETY: test-only; SETUP_ENV_MUTEX serializes env access in this module.
         unsafe { std::env::set_var("AHMA_TEST_HOME", home) };

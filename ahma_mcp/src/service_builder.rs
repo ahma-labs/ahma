@@ -253,7 +253,7 @@ impl<'a> ServiceBuilder<'a> {
             broker.set_session_events(Arc::new(crate::session_events::SessionEventSender::new(
                 service.peer.clone(),
             )));
-            *service.grant_coordinator.write().unwrap() = Some(broker.coordinator().clone());
+            *service.grant_coordinator.write() = Some(broker.coordinator().clone());
         }
 
         Ok(BuiltService {

@@ -21,6 +21,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ahma_test_support::scripts::multiline_script_command;
 use anyhow::Result;
 use serde_json::json;
 use tempfile::tempdir;
@@ -259,7 +260,6 @@ async fn test_livelog_handler_clean_response_no_alert() {
 ///
 /// This validates that the pipeline keeps running and recording alerts after
 /// the first alert is delivered — a subtle regression risk.
-#[cfg(unix)]
 #[tokio::test]
 async fn test_livelog_handler_multiple_alerts_pipeline_continues() {
     init_test_logging();
@@ -279,14 +279,18 @@ async fn test_livelog_handler_multiple_alerts_pipeline_continues() {
     let sandbox = test_sandbox(temp_dir.path());
     let monitor = test_monitor();
 
-    // printf emits three lines; chunk_max_lines=1 → three chunks → three LLM calls.
+    // Three lines; chunk_max_lines=1 → three chunks → three LLM calls.
+    //
+    // Was `printf` with embedded \n, which is not a PowerShell builtin — so this
+    // test carried a `#[cfg(unix)]` for a reason that had nothing to do with what
+    // it asserts (that the pipeline keeps running after the first alert). Windows
+    // lost the coverage to a command choice. `multiline_script_command` supplies
+    // both shells' forms, per SPEC R6.3.8.
+    let (source_command, source_args) =
+        multiline_script_command(temp_dir.path(), "three_errors", &["err1", "err2", "err3"]);
     let config = make_tool_config(
         "test-livelog",
-        make_livelog_config(
-            "printf",
-            vec!["err1\\nerr2\\nerr3\\n".to_string()],
-            &server.uri(),
-        ),
+        make_livelog_config(&source_command, source_args, &server.uri()),
     );
 
     let op_id = handle_livelog_start(
@@ -317,7 +321,6 @@ async fn test_livelog_handler_multiple_alerts_pipeline_continues() {
 ///
 /// Two chunks are produced (two lines, chunk_max_lines=1) but only the first
 /// should trigger an alert; the second is silenced by the cooldown window.
-#[cfg(unix)]
 #[tokio::test]
 async fn test_livelog_handler_cooldown_suppresses_second_alert() {
     init_test_logging();
@@ -335,11 +338,11 @@ async fn test_livelog_handler_cooldown_suppresses_second_alert() {
     let sandbox = test_sandbox(temp_dir.path());
     let monitor = test_monitor();
 
-    let mut livelog = make_livelog_config(
-        "printf",
-        vec!["line1\\nline2\\n".to_string()],
-        &server.uri(),
-    );
+    // Two lines, via the cross-platform helper rather than `printf` — see the
+    // sibling test above for why this is not a `#[cfg(unix)]` test.
+    let (source_command, source_args) =
+        multiline_script_command(temp_dir.path(), "two_lines", &["line1", "line2"]);
+    let mut livelog = make_livelog_config(&source_command, source_args, &server.uri());
     livelog.cooldown_seconds = 300; // very long cooldown
 
     let config = make_tool_config("test-livelog", livelog);

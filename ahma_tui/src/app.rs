@@ -41,17 +41,18 @@ async fn run_ratatui(
     use std::io;
     use std::time::Duration;
 
+    // The teardown counterparts of these (LeaveAlternateScreen, DisableMouseCapture,
+    // DisableBracketedPaste, PopKeyboardEnhancementFlags, disable_raw_mode) are
+    // deliberately not imported here: they belong to `terminal_guard`, which owns
+    // the single restore path. Undoing the setup from two places is how the panic
+    // path came to be missed.
     use crossterm::{
         event::{
-            DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-            Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+            EnableBracketedPaste, EnableMouseCapture, Event, EventStream, KeyboardEnhancementFlags,
             PushKeyboardEnhancementFlags,
         },
         execute,
-        terminal::{
-            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-            supports_keyboard_enhancement,
-        },
+        terminal::{EnterAlternateScreen, enable_raw_mode, supports_keyboard_enhancement},
     };
     use futures::StreamExt;
     use ratatui::{Terminal, backend::CrosstermBackend};
@@ -168,6 +169,12 @@ async fn run_ratatui(
 
     // ── Terminal setup ───────────────────────────────────────────────────────
     enable_raw_mode()?;
+    // Arm the restore *immediately*, before the rest of the setup. From here on
+    // every exit path — normal, `?`, or panic — puts the terminal back; see
+    // `terminal_guard`. Armed before `execute!` rather than after, because a
+    // failure partway through the setup used to return `Err` with raw mode
+    // already on.
+    let terminal_guard = crate::terminal_guard::TerminalGuard::arm();
     let mut stdout = io::stdout();
     // Bracketed paste makes the terminal deliver a paste as a single `Event::Paste`
     // (interior newlines included) instead of a stream of keystrokes. Without it, a
@@ -189,6 +196,9 @@ async fn run_ratatui(
             stdout,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
+        // Tell the guard only once the push has actually succeeded: popping a
+        // flag that was never pushed unbalances crossterm's stack.
+        terminal_guard.set_keyboard_enhanced(true);
     }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -339,17 +349,12 @@ async fn run_ratatui(
     .await;
 
     // ── Always restore terminal ───────────────────────────────────────────────
-    let _ = disable_raw_mode();
-    if keyboard_enhanced {
-        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    }
-    let _ = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste,
-    );
-    let _ = terminal.show_cursor();
+    // One restore path, shared with the guard's `Drop` and its panic hook, so a
+    // crash cannot leave the user in raw mode on the alternate screen with the
+    // panic message written somewhere they cannot see (ahma_tui/SPEC.md §3).
+    // Explicit here rather than left to the drop at end of scope so the terminal
+    // is back to normal before anything else this function might print.
+    terminal_guard.restore();
 
     loop_result
 }
@@ -5269,9 +5274,7 @@ mod tests {
         use crate::state::AppState;
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: debug-only test seam; nextest isolates each test in its own process.
-        let _home = crate::HOME_SEAM_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _home = crate::HOME_SEAM_GUARD.lock();
         unsafe {
             std::env::set_var("AHMA_TEST_HOME", dir.path());
         }
@@ -5323,9 +5326,7 @@ mod tests {
     fn persist_selected_model_writes_and_clears_agent_settings() {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: debug-only test seam; nextest isolates each test in its own process.
-        let _home = crate::HOME_SEAM_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _home = crate::HOME_SEAM_GUARD.lock();
         unsafe {
             std::env::set_var("AHMA_TEST_HOME", dir.path());
         }
@@ -5966,7 +5967,7 @@ mod tests {
         use crate::startup_notices::{Level, TEST_GUARD, drain, push};
         use crate::state::AppState;
 
-        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_GUARD.lock();
         let _ = drain();
         push(Level::Info, "quietly reused the running server");
         push(Level::Warn, "Restarted the running ahma server");

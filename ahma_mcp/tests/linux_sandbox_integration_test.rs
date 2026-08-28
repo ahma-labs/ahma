@@ -424,7 +424,7 @@ fn test_landlock_works_with_bash() {
 
     // Check if bash exists
     if !Path::new("/bin/bash").exists() {
-        eprintln!("Skipping test: /bin/bash not found");
+        ahma_test_support::skip::skip_or_fail_missing("/bin/bash");
         return;
     }
 

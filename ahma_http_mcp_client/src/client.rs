@@ -42,6 +42,19 @@ type ConfiguredOAuthClient = oauth2::Client<
     oauth2::EndpointSet,
 >;
 
+/// The loopback port the OAuth provider redirects back to.
+///
+/// Fixed rather than ephemeral because it is baked into the redirect URI
+/// registered with the provider: an ephemeral port would not match, and the
+/// provider would refuse the redirect. One constant so the URI advertised in
+/// `set_redirect_uri` and the address actually bound cannot drift apart.
+const OAUTH_CALLBACK_PORT: u16 = 8080;
+
+/// The address [`OAUTH_CALLBACK_PORT`] is bound on. Loopback only: the callback
+/// carries an authorization code, and there is no reason for any other host to
+/// be able to reach it.
+const OAUTH_CALLBACK_ADDR: &str = "127.0.0.1:8080";
+
 const TOKEN_FILE_NAME: &str = "mcp_http_token.json";
 /// Environment variable to override the token storage path.
 const TOKEN_PATH_ENV: &str = "AHMA_HTTP_CLIENT_TOKEN_PATH";
@@ -114,8 +127,9 @@ impl HttpMcpTransport {
                 .set_token_uri(TokenUrl::new(
                     "https://auth.atlassian.com/oauth/token".to_string(),
                 )?);
-            client =
-                client.set_redirect_uri(RedirectUrl::new("http://localhost:8080".to_string())?);
+            client = client.set_redirect_uri(RedirectUrl::new(format!(
+                "http://localhost:{OAUTH_CALLBACK_PORT}"
+            ))?);
             Some(client)
         } else {
             None
@@ -286,10 +300,40 @@ impl HttpMcpTransport {
         Ok(stored_token)
     }
 
+    /// Bind the registered callback address and wait for the provider's redirect.
+    ///
+    /// The port is fixed because it is part of the redirect URI registered with
+    /// the OAuth provider (see [`OAUTH_CALLBACK_ADDR`]) — it cannot be ephemeral
+    /// in production. The bind is therefore the one step that can fail for a
+    /// reason entirely outside ahma, so it says so: `Address already in use` on
+    /// its own gives a user no way to connect the failure to whatever else is
+    /// holding 8080.
     async fn listen_for_callback_async(&self) -> Result<(String, CsrfToken)> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
-        info!("Listening on http://127.0.0.1:8080 for OAuth callback.");
+        let listener = tokio::net::TcpListener::bind(OAUTH_CALLBACK_ADDR)
+            .await
+            .map_err(|e| {
+                McpHttpError::Auth(format!(
+                    "cannot listen on http://{OAUTH_CALLBACK_ADDR} for the OAuth callback: {e}. \
+                     This address is fixed because it is the redirect URI registered with the \
+                     provider. Stop whatever is using the port and retry."
+                ))
+            })?;
+        info!("Listening on http://{OAUTH_CALLBACK_ADDR} for OAuth callback.");
+        Self::accept_callback(listener).await
+    }
 
+    /// The callback protocol itself, on an already-bound listener.
+    ///
+    /// Split from [`Self::listen_for_callback_async`] so it can be exercised on
+    /// an ephemeral port. Its test used to drive the real
+    /// `listen_for_callback_async`, and therefore the real 8080: on any machine
+    /// where something else held that port the test did not fail, it *hung* —
+    /// the client half blocked in `read_to_end` against a stranger's socket
+    /// until nextest killed the process at 120s. That is a test which reports
+    /// "timed out" for a condition that has nothing to do with the code under
+    /// test, and it would have made the new `--run-ignored all` workflow flaky
+    /// on any runner with a busy 8080.
+    async fn accept_callback(listener: tokio::net::TcpListener) -> Result<(String, CsrfToken)> {
         let (mut stream, _) = listener.accept().await?;
 
         let (reader, mut writer) = tokio::io::split(&mut stream);
@@ -471,7 +515,7 @@ mod tests {
 
     #[test]
     fn load_token_returns_none_when_override_missing() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("custom_token.json");
         unsafe {
@@ -488,7 +532,7 @@ mod tests {
 
     #[test]
     fn save_token_round_trips_via_override_path() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("custom_token.json");
         unsafe {
@@ -516,7 +560,7 @@ mod tests {
 
     #[test]
     fn token_file_path_uses_env_override() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let custom_path = "/custom/path/token.json";
         unsafe {
             env::set_var(TOKEN_PATH_ENV, custom_path);
@@ -532,7 +576,7 @@ mod tests {
 
     #[test]
     fn token_file_path_uses_home_dir_default() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         unsafe {
             env::remove_var(TOKEN_PATH_ENV);
         }
@@ -544,7 +588,7 @@ mod tests {
 
     #[test]
     fn save_token_creates_parent_directories() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("nested/deep/token.json");
         unsafe {
@@ -629,21 +673,19 @@ mod tests {
         HttpMcpTransport::new(url, None, None).unwrap()
     }
 
-    async fn drive_callback_client(request_line: &str) -> String {
+    /// Send one HTTP request line to an already-bound loopback listener.
+    ///
+    /// Takes the port rather than assuming 8080: the listener under test is now
+    /// bound on an ephemeral port, so there is a specific socket to talk to and
+    /// no connect-retry loop is needed. The old version dialled the fixed 8080
+    /// and retried for four seconds, which meant that on a machine where some
+    /// other process held that port it connected to *that* and then blocked
+    /// forever in `read_to_end`.
+    async fn drive_callback_client(port: u16, request_line: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = {
-            let mut attempt = 0;
-            loop {
-                match tokio::net::TcpStream::connect("127.0.0.1:8080").await {
-                    Ok(s) => break s,
-                    Err(_) if attempt < 200 => {
-                        attempt += 1;
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    }
-                    Err(e) => panic!("failed to connect to loopback listener: {e}"),
-                }
-            }
-        };
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the listener is already bound before this is called");
         stream.write_all(request_line.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
         let mut buf = Vec::new();
@@ -651,32 +693,55 @@ mod tests {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    // The OAuth callback listener binds the fixed production port 127.0.0.1:8080,
-    // so these three scenarios cannot run concurrently (nextest schedules each
-    // #[test] in its own process, and an in-process mutex can't serialize across
-    // processes). They are folded into one sequential test: each call drops its
-    // listener before the next binds, and tokio sets SO_REUSEADDR so rebinding
-    // 8080 in turn succeeds.
+    /// Bind an ephemeral loopback listener and report the port it actually got.
+    async fn ephemeral_listener() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding an ephemeral loopback port cannot fail");
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    /// Drive [`HttpMcpTransport::accept_callback`] against one ephemeral
+    /// listener and return its verdict alongside the HTTP response the browser
+    /// would have seen.
+    async fn run_callback(request_line: &str) -> (Result<(String, CsrfToken)>, String) {
+        let (listener, port) = ephemeral_listener().await;
+        let server_fut = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            HttpMcpTransport::accept_callback(listener),
+        );
+        let (server_res, response) =
+            tokio::join!(server_fut, drive_callback_client(port, request_line));
+        (
+            server_res.expect("the client half connects immediately; this cannot time out"),
+            response,
+        )
+    }
+
+    // These three scenarios each get their own ephemeral listener, so they no
+    // longer contend for anything and no longer need to be one sequential test.
+    // They are kept together only because they are three cases of one behaviour.
+    //
+    // Previously they drove the real `listen_for_callback_async`, which binds the
+    // production port 127.0.0.1:8080. That made the test hostage to whatever else
+    // was on the machine: with 8080 taken, the client half connected to the
+    // stranger's socket and blocked in `read_to_end` until nextest killed the
+    // process at 120 s. Not a failure — a hang, reported as a timeout, on a
+    // condition unrelated to the code under test. Found by running the
+    // `--run-ignored all` half of the Definition of Done, which nothing had.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn listen_for_callback_async_scenarios() {
-        let _guard = token_env_guard().lock().unwrap();
-        let tmp = tempdir().unwrap();
+        let _guard = token_env_guard().lock();
 
         // 1. Happy path: both code and state present.
         {
-            let transport = isolated_transport(&tmp.path().join("listen_ok.json"));
-            let server_fut = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                transport.listen_for_callback_async(),
-            );
-            let client_fut = drive_callback_client(
+            let (result, response) = run_callback(
                 "GET /?code=the_code&state=the_state HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            );
-            let (server_res, response) = tokio::join!(server_fut, client_fut);
-            let (code, state) = server_res
-                .expect("listener should not time out")
-                .expect("listener should return Ok with code/state");
+            )
+            .await;
+            let (code, state) = result.expect("listener should return Ok with code/state");
             assert_eq!(code, "the_code");
             assert_eq!(state.secret(), "the_state");
             assert!(response.contains("200 OK"), "response was: {response:?}");
@@ -688,17 +753,9 @@ mod tests {
 
         // 2. Missing code → error.
         {
-            let transport = isolated_transport(&tmp.path().join("listen_no_code.json"));
-            let server_fut = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                transport.listen_for_callback_async(),
-            );
-            let client_fut =
-                drive_callback_client("GET /?state=only_state HTTP/1.1\r\nHost: localhost\r\n\r\n");
-            let (server_res, _response) = tokio::join!(server_fut, client_fut);
-            let err = server_res
-                .expect("listener should not time out")
-                .expect_err("listener should error when code is missing");
+            let (result, _response) =
+                run_callback("GET /?state=only_state HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+            let err = result.expect_err("listener should error when code is missing");
             assert!(
                 err.to_string().contains("Missing auth code"),
                 "unexpected error: {err}"
@@ -707,17 +764,9 @@ mod tests {
 
         // 3. Missing state → error.
         {
-            let transport = isolated_transport(&tmp.path().join("listen_no_state.json"));
-            let server_fut = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                transport.listen_for_callback_async(),
-            );
-            let client_fut =
-                drive_callback_client("GET /?code=only_code HTTP/1.1\r\nHost: localhost\r\n\r\n");
-            let (server_res, _response) = tokio::join!(server_fut, client_fut);
-            let err = server_res
-                .expect("listener should not time out")
-                .expect_err("listener should error when state is missing");
+            let (result, _response) =
+                run_callback("GET /?code=only_code HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+            let err = result.expect_err("listener should error when state is missing");
             assert!(
                 err.to_string().contains("Missing state"),
                 "unexpected error: {err}"
@@ -732,7 +781,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn ensure_authenticated_short_circuits_with_stored_token() {
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("stored.json");
         unsafe {
@@ -771,7 +820,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("send_token.json");
         unsafe {
@@ -831,7 +880,7 @@ mod tests {
         use rmcp::service::TxJsonRpcMessage;
         use rmcp::transport::Transport;
 
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let mut transport = isolated_transport(&tmp.path().join("absent.json"));
 
@@ -865,7 +914,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _guard = token_env_guard().lock().unwrap();
+        let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let token_path = tmp.path().join("err_token.json");
         unsafe {

@@ -70,6 +70,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "rcgen",
  "serde",
  "serde_json",
@@ -97,6 +98,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures",
+ "parking_lot",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -128,6 +130,7 @@ version = "0.19.4"
 dependencies = [
  "ahma_common",
  "ahma_mcp",
+ "ahma_test_support",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -149,6 +152,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "owo-colors",
+ "parking_lot",
  "quinn",
  "rcgen",
  "reqwest 0.13.4",
@@ -187,6 +191,7 @@ dependencies = [
  "dirs",
  "futures",
  "oauth2",
+ "parking_lot",
  "reqwest 0.13.4",
  "rmcp",
  "serde",
@@ -244,6 +249,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "pulldown-cmark",
  "quick-xml",
  "rand 0.10.1",
@@ -278,6 +284,9 @@ dependencies = [
 [[package]]
 name = "ahma_test_support"
 version = "0.19.4"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "ahma_tui"
@@ -297,6 +306,7 @@ dependencies = [
  "dunce",
  "futures",
  "libc",
+ "parking_lot",
  "ratatui",
  "reqwest 0.13.4",
  "rmcp",

@@ -495,7 +495,9 @@ Capture full logs (`<cmd> 2>&1 | tee …`) and reduce concurrency to a single te
 
 ### Windows
 
-Job Object enforcement is done; **AppContainer spawn isolation is still pending**, so out-of-scope writes are not yet OS-blocked on Windows — don't mark R6.3 done until Windows CI proves it. `red_team_command_write_escape_blocked` is `#[cfg_attr(windows, ignore)]` for exactly this reason; remove the ignore only when R6.3.3 lands.
+Job Object enforcement is done. **AppContainer spawn isolation is written, was executed on `windows-latest`, and was disproved**: the scoped grant does not take effect, so a write *inside* the locked scope is denied along with one outside it. It is switched off — see `sandbox::windows::appcontainer_spawn_enabled`, the single place that verdict lives — so Windows currently has no OS filesystem boundary in either direction. Don't mark R6.3 done until a `windows-latest` run shows the boundary holding *both* ways; "blocks everything" is the failure mode, not the goal. `red_team_command_write_escape_blocked` is `#[cfg_attr(windows, ignore)]` for exactly this reason.
+
+No root cause is known, and the only artefact so far is `Access to the path '...' is denied`, which names no path. Read the `AppContainer diagnostics` step's output (`appcontainer_dacl_diagnostics`, run on every Windows CI leg) before changing anything in `sandbox/windows.rs` — it dumps `icacls` for the scope and each ancestor, the container SID, and the child's own token groups.
 
 - Root checks use `is_filesystem_root()` — never compare to `Path::new("/")`; `C:\` and UNC roots differ.
 - Shell invocation goes through `platform_shell_program()` (`shell_pool.rs`). Do **not** reintroduce `is_shell_program_invocation()` — it caused a double `-c` bug.

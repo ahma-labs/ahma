@@ -262,8 +262,8 @@ impl AhmaMcpService {
         timeout_override.unwrap_or_else(|| {
             self.app_config
                 .read()
-                .ok()
-                .and_then(|cfg| cfg.as_ref().map(|c| c.await_timeout_secs))
+                .as_ref()
+                .map(|c| c.await_timeout_secs)
                 .unwrap_or_else(ahma_common::config::default_await_timeout_secs)
         })
     }
@@ -281,8 +281,8 @@ impl AhmaMcpService {
         let override_secs = self
             .app_config
             .read()
-            .ok()
-            .and_then(|cfg| cfg.as_ref().and_then(|c| c.request_budget_override_secs));
+            .as_ref()
+            .and_then(|c| c.request_budget_override_secs);
         match override_secs {
             Some(secs) => std::time::Duration::from_secs(secs),
             None => client_type.request_budget(),

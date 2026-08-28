@@ -29,9 +29,29 @@ pub enum ScopeSource {
     /// inventing one at all, so there is no longer any such thing as a default
     /// scope — only a container the user named.
     Container,
-    /// Established by the TUI with no live IDE session; applied to the next
-    /// attaching session (SPEC R5.3.6).
-    Pending,
+    /// No provenance yet: nothing explicit, no usable roots, no container root.
+    ///
+    /// A scope in this state is not a scope anyone chose, so surfaces that would
+    /// act on the user's behalf must refuse rather than proceed — see
+    /// `handlers::working_directory`, which will not substitute it.
+    ///
+    /// **Distinct from [`ScopeSource::PendingTui`], deliberately.** One variant
+    /// named `Pending` used to carry both meanings: `Sandbox::scope_source`
+    /// derived it as this residual, while the doc comment described it as
+    /// R5.3.6's TUI-parked answer. They are opposites — "nobody has said
+    /// anything" versus "a human chose this and it applies at the next attach" —
+    /// and collapsing them meant R5.3.6, once wired, would silently inherit the
+    /// working-directory refusal that only the residual case deserves.
+    Unestablished,
+    /// A scope a user established from the TUI while no IDE session was live.
+    /// It is shown as pending and applied when the next session attaches to this
+    /// workspace instance (SPEC R5.3.6).
+    ///
+    /// **Not yet reachable**: `WorkspaceScope::commit_pending`, which produces
+    /// this state, has no production caller. The variant exists so the display
+    /// vocabulary is complete and so the meaning above cannot be conflated with
+    /// [`ScopeSource::Unestablished`] again.
+    PendingTui,
 }
 
 impl ScopeSource {
@@ -43,7 +63,10 @@ impl ScopeSource {
             ScopeSource::RootsList => "roots/list",
             ScopeSource::Elicited => "elicited",
             ScopeSource::Container => "container",
-            ScopeSource::Pending => "pending",
+            // The wire vocabulary R5.4 defines has one `pending` token; the two
+            // variants differ in what ahma does about it, not in what the user
+            // is told, and a new token would break every existing parser.
+            ScopeSource::Unestablished | ScopeSource::PendingTui => "pending",
         }
     }
 }
@@ -211,7 +234,7 @@ impl ScopeView<'_> {
         // believes otherwise will make worse decisions about what to keep on this
         // machine than one who knows. Same honesty R7.5 demands when deferring to
         // a host sandbox.
-        if let Some(note) = super::profiles::macos_read_disclosure() {
+        for note in super::profiles::platform_enforcement().notes {
             out.push_str("  note  : ");
             out.push_str(note);
             out.push('\n');
@@ -231,16 +254,40 @@ impl ScopeView<'_> {
         });
         // Machine-readable surfaces get the disclosure too — a TUI or IDE
         // rendering this JSON must be able to show what the text form shows.
-        if let Some(note) = super::profiles::macos_read_disclosure()
+        // Machine-readable surfaces get the disclosure too — a TUI or IDE
+        // rendering this JSON must be able to show what the text form shows.
+        // Add-only (R24.5): `reads_unrestricted` and `platform_note` keep their
+        // meaning for pre-existing readers, and `writes_unrestricted` /
+        // `platform_notes` are new keys an old reader simply ignores.
+        let enforcement = super::profiles::platform_enforcement();
+        if !enforcement.is_empty()
             && let Some(obj) = v.as_object_mut()
         {
-            obj.insert(
-                "reads_unrestricted".to_string(),
-                serde_json::Value::Bool(true),
-            );
+            if enforcement.reads_unrestricted {
+                obj.insert(
+                    "reads_unrestricted".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            if enforcement.writes_unrestricted {
+                obj.insert(
+                    "writes_unrestricted".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
             obj.insert(
                 "platform_note".to_string(),
-                serde_json::Value::String(note.to_string()),
+                serde_json::Value::String(enforcement.notes.join(" ")),
+            );
+            obj.insert(
+                "platform_notes".to_string(),
+                serde_json::Value::Array(
+                    enforcement
+                        .notes
+                        .iter()
+                        .map(|n| serde_json::Value::String((*n).to_string()))
+                        .collect(),
+                ),
             );
         }
         v
@@ -398,7 +445,26 @@ mod tests {
         assert_eq!(ScopeSource::RootsList.as_str(), "roots/list");
         assert_eq!(ScopeSource::Elicited.as_str(), "elicited");
         assert_eq!(ScopeSource::Container.as_str(), "container");
-        assert_eq!(ScopeSource::Pending.as_str(), "pending");
+        // Both pending variants share the one wire token R5.4 defines: they
+        // differ in what ahma does, not in what the user is told, and adding a
+        // token would break every existing parser.
+        assert_eq!(ScopeSource::Unestablished.as_str(), "pending");
+        assert_eq!(ScopeSource::PendingTui.as_str(), "pending");
+    }
+
+    /// The two pending meanings must stay distinct *as values* even though they
+    /// render identically — the whole reason for the split is that one is
+    /// substitutable as a working directory and the other is not.
+    #[test]
+    fn the_two_pending_meanings_are_not_the_same_value() {
+        assert_ne!(
+            ScopeSource::Unestablished,
+            ScopeSource::PendingTui,
+            "\"nobody has said anything yet\" and \"a human chose this at the TUI\" are \
+             opposite claims about provenance; one variant carrying both is how R5.3.6 \
+             would have inherited the working-directory refusal that only the residual \
+             case deserves (SPEC R5.2.8 vs R5.3.6)"
+        );
     }
 
     #[test]

@@ -18,8 +18,9 @@
 //! the listener task is aborted.  This ties the proxy lifetime to the task vault
 //! session.
 
+use parking_lot::RwLock;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ahma_common::net_approval::{NetApprovalCoordinator, NetApprovalDecision, NetResolveOutcome};
@@ -309,7 +310,7 @@ async fn resolve_egress_approval(
         return false;
     };
 
-    let peer_opt = net_approval.peer.read().unwrap().clone();
+    let peer_opt = net_approval.peer.read().clone();
     let elicited: Option<NetApprovalDecision> = match peer_opt {
         None => None,
         Some(peer) => match peer

@@ -56,13 +56,18 @@ async fn bounded_call_tool(
 }
 
 /// Initialise a client against a freshly spawned server and run the
-/// 14-request concurrent batch.  Returns early (test passes trivially) on
-/// server/init failure so as not to break CI when the binary is unavailable.
+/// 14-request concurrent batch.
+///
+/// A spawn failure skips locally and **fails on CI**. It used to return early
+/// unconditionally, "so as not to break CI when the binary is unavailable" — but
+/// CI is where the binary is built as a prerequisite step, so its absence there
+/// is the regression, and a trivially-passing stress test is worse than a
+/// failing one: it reports that the concurrency invariants held.
 async fn run_concurrent_tool_calls(transport: TransportMode) {
     let server = match spawn_test_server().await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("WARNING  Skipping test - failed to spawn server: {}", e);
+            common::skip_or_fail(&format!("failed to spawn server: {e}"));
             return;
         }
     };
@@ -198,7 +203,7 @@ async fn run_high_volume_concurrent_requests(num_requests: usize, transport: Tra
     let server = match spawn_test_server().await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("WARNING  Skipping test - failed to spawn server: {}", e);
+            common::skip_or_fail(&format!("failed to spawn server: {e}"));
             return;
         }
     };

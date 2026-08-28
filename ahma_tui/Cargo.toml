@@ -19,6 +19,7 @@ default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:futures", "dep:tui-textarea"]
 
 [dependencies]
+parking_lot.workspace = true
 ahma_common = { path = "../ahma_common" }
 ahma_http_mcp_client = { path = "../ahma_http_mcp_client" }
 ahma_llm_monitor = { path = "../ahma_llm_monitor" }

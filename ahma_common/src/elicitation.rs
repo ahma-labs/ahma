@@ -15,6 +15,20 @@
 //!    a `conflicted` flag so the bridge can re-confirm.
 //!  - **Dismiss (R5.3.3)**: once resolved, every asked-but-unanswered peer is
 //!    listed for `notifications/cancelled`.
+//!
+//! ## Status: not wired to a live server
+//!
+//! Nothing outside this file's own tests calls into this module. The commit path
+//! a running ahma actually uses is `ahma_mcp::sandbox::Sandbox::commit_scopes`
+//! over the two-atomic `ScopeLock`, which has no pending state, no generation
+//! counter, and no sharing across sessions — this type is its intended
+//! replacement, not a component of it.
+//!
+//! That is stated here because "complete and unit-tested" reads as "works", and
+//! the distance between the two is the whole subject of SPEC R5.3.6's status
+//! note. Replacing `ScopeLock` means changing the one mechanism R5.1.1 requires
+//! to have exactly one door to "scope locked", so it is not something to wire in
+//! halfway: a partial integration is a second door.
 
 use std::path::PathBuf;
 

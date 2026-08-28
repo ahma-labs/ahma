@@ -3,12 +3,13 @@
 //! Contains handlers for executing sequence tools that invoke multiple
 //! other tools in order, both synchronously and asynchronously.
 
+use parking_lot::RwLock;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData as McpError};
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::adapter::Adapter;
@@ -67,7 +68,7 @@ fn get_tool_config(
     configs: &Arc<RwLock<HashMap<String, ToolConfig>>>,
     tool_name: &str,
 ) -> Result<ToolConfig, McpError> {
-    let configs_lock = configs.read().unwrap();
+    let configs_lock = configs.read();
     configs_lock.get(tool_name).cloned().ok_or_else(|| {
         common::mcp_internal(format!(
             "Tool '{}' referenced in sequence step is not configured.",
@@ -530,11 +531,12 @@ mod tests {
     use super::*;
 
     use crate::test_utils::client::create_test_config;
+    use parking_lot::RwLock;
     use rmcp::model::CallToolRequestParams;
     use serde_json::{Map, Value, json};
     use std::collections::HashMap;
     use std::path::Path;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     fn make_test_sequence_step(
         tool: &str,

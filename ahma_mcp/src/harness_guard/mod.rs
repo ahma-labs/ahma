@@ -8,8 +8,8 @@ pub use loop_detector::LoopDetector;
 pub use skill_injector::SkillInjector;
 pub use write_guard::check_write_allowance;
 
+use parking_lot::Mutex;
 use serde_json::{Map, Value};
-use std::sync::Mutex;
 
 /// Outcome of a [`ToolGuard`] inspecting a pending tool call.
 pub enum GuardOutcome {
@@ -107,11 +107,7 @@ impl ToolGuard for LoopGuard {
         args: &mut Map<String, Value>,
     ) -> GuardOutcome {
         let key = Self::args_key(args);
-        let is_loop = self
-            .detector
-            .lock()
-            .map(|d| d.is_loop(name, &key))
-            .unwrap_or(false);
+        let is_loop = self.detector.lock().is_loop(name, &key);
         if is_loop {
             GuardOutcome::Block(
                 "LOOP_DETECTED: This exact call has failed 3 times. The approach is not working.\n\
@@ -125,12 +121,11 @@ impl ToolGuard for LoopGuard {
 
     fn observe(&self, name: &str, args: &Map<String, Value>, failed: bool) {
         let key = Self::args_key(args);
-        if let Ok(mut d) = self.detector.lock() {
-            if failed {
-                d.record_failure(name, &key);
-            } else {
-                d.record_success();
-            }
+        let mut d = self.detector.lock();
+        if failed {
+            d.record_failure(name, &key);
+        } else {
+            d.record_success();
         }
     }
 }

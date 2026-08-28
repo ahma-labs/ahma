@@ -199,7 +199,7 @@ struct HandshakeState {
     sse_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Records the value of `sse_connected` at the instant the server first
     /// received `notifications/initialized`. `None` until that POST arrives.
-    sse_ready_at_initialized: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    sse_ready_at_initialized: std::sync::Arc<parking_lot::Mutex<Option<bool>>>,
 }
 
 async fn handshake_sse(
@@ -251,7 +251,7 @@ async fn handshake_mcp(
             let connected = state
                 .sse_connected
                 .load(std::sync::atomic::Ordering::SeqCst);
-            let mut guard = state.sse_ready_at_initialized.lock().expect("lock");
+            let mut guard = state.sse_ready_at_initialized.lock();
             if guard.is_none() {
                 *guard = Some(connected);
             }
@@ -268,7 +268,7 @@ async fn handshake_mcp(
 fn new_handshake_state() -> HandshakeState {
     HandshakeState {
         sse_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        sse_ready_at_initialized: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        sse_ready_at_initialized: std::sync::Arc::new(parking_lot::Mutex::new(None)),
     }
 }
 
@@ -290,7 +290,7 @@ async fn assert_sse_open_before_initialized(connection: ResolvedConnection, stat
 
     let recorded = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if let Some(v) = *state.sse_ready_at_initialized.lock().expect("lock") {
+            if let Some(v) = *state.sse_ready_at_initialized.lock() {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

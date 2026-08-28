@@ -116,6 +116,10 @@ struct RawHost {
 struct RawProfile {
     name: String,
     description: String,
+    /// See [`SandboxProfile::cost`]. Optional: a profile whose grants are
+    /// confined to its own toolchain has no cross-project consequence to state.
+    #[serde(default)]
+    cost: Option<String>,
     rules: Vec<RawRule>,
     /// Hostnames the toolchain must reach when `--restrict-network` is on.
     ///
@@ -172,6 +176,24 @@ pub struct SandboxProfile {
     pub name: String,
     /// One-line human description, shown by `ahma permissions list`.
     pub description: String,
+    /// What enabling this profile costs, shown beside it wherever it is listed.
+    ///
+    /// R-PERM.5.2: a profile is a pre-answered bundle of grant questions, so the
+    /// display that lists it must also carry what answering "yes" costs. A grant
+    /// the user can see but whose consequence is invisible is not meaningfully
+    /// refusable — which is the whole point R-PERM.5 was written to fix.
+    ///
+    /// The motivating case is R-HANDOFF.8: the `rust` profile grants read-write
+    /// on a *machine-global* cargo cache, so an agent working in project X can
+    /// edit the extracted source of a cached crate and that edited code is
+    /// compiled and executed — as a build script or proc macro — when the user
+    /// later builds unrelated project Y. Until now that appeared only in
+    /// README.md, which is the "you have to read our docs" failure mode
+    /// R-HANDOFF.4 rejects.
+    ///
+    /// Optional: a profile whose grants are confined to its own toolchain has no
+    /// cross-project cost to state, and inventing one would be noise.
+    pub cost: Option<String>,
     /// The rules it contributes, with paths still unresolved.
     rules: Vec<RawRule>,
     /// Paths this profile asserts must never be writable.
@@ -204,6 +226,7 @@ pub fn builtin_profiles() -> &'static [SandboxProfile] {
                 Ok(raw) => Some(SandboxProfile {
                     name: raw.name,
                     description: raw.description,
+                    cost: raw.cost,
                     rules: raw.rules,
                     deny_write: raw.deny_write,
                     hosts: raw.hosts,
@@ -447,26 +470,85 @@ pub fn profile_hosts(enabled: &[String]) -> Vec<ProfileHost> {
     out
 }
 
-/// The disclosure macOS owes its users (SPEC R-PERM.5.1).
+/// What this platform's kernel does *not* enforce, in the honest register R7.5
+/// requires (SPEC R-PERM.5.1, R-HANDOFF.4, R6.2.2, R6.3.9, R6.1.7).
 ///
-/// macOS Seatbelt grants blanket `(allow file-read*)` because APFS firmlinks and
-/// cryptex volumes defeat subpath matching for reads — a sandboxed command's
-/// resolved vnodes simply do not sit under `/usr`, `/System`, and friends. So on
-/// macOS, **writes are kernel-scoped but reads are not**.
+/// Not a grant, so not expressible as a profile — these are the boundaries ahma
+/// draws in its own code and the kernel does not hold. SPEC is explicit that a
+/// user "must be able to learn from ahma itself — not from this document" where
+/// enforcement stops, and until now two of the three could be learned only from
+/// `README.md` and a rustdoc comment.
 ///
-/// That cannot be represented as a profile, because it is not a grant anyone
-/// made. It can, however, be *said out loud* — which is the same honesty R7.5
-/// demands when ahma defers to a host sandbox. A limitation the user cannot see
-/// is a limitation the user cannot compensate for.
-pub fn macos_read_disclosure() -> Option<&'static str> {
+/// A limitation the user cannot see is a limitation the user cannot compensate
+/// for. Each note therefore says what is not enforced *and* what to do instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformEnforcement {
+    /// Reads outside the scope are not stopped by the kernel.
+    pub reads_unrestricted: bool,
+    /// Writes outside the scope are not stopped by the kernel.
+    pub writes_unrestricted: bool,
+    /// One sentence per gap, for display.
+    pub notes: Vec<&'static str>,
+}
+
+impl PlatformEnforcement {
+    /// Whether there is anything to disclose at all.
+    pub fn is_empty(&self) -> bool {
+        self.notes.is_empty()
+    }
+}
+
+/// The disclosure this platform owes its users.
+pub fn platform_enforcement() -> PlatformEnforcement {
+    let mut notes = Vec::new();
+    let mut reads_unrestricted = false;
+    let mut writes_unrestricted = false;
+
     if cfg!(target_os = "macos") {
-        Some(
+        // R6.2.2: Seatbelt grants blanket `(allow file-read*)` because APFS
+        // firmlinks and cryptex volumes defeat subpath matching for reads — a
+        // sandboxed command's resolved vnodes simply do not sit under `/usr`,
+        // `/System`, and friends.
+        reads_unrestricted = true;
+        notes.push(
             "macOS: writes are kernel-scoped to the sandbox, but reads are NOT restricted \
              (a platform limitation — APFS firmlinks defeat read subpath matching). Treat \
              any file this user can read as readable by a sandboxed command.",
-        )
-    } else {
-        None
+        );
+    }
+
+    if cfg!(target_os = "windows") {
+        // R6.3.9: the only mechanism active is the Job Object, which bounds
+        // process lifetime and nothing about paths. AppContainer is switched off
+        // (see `sandbox::windows::appcontainer_spawn_enabled`).
+        reads_unrestricted = true;
+        writes_unrestricted = true;
+        notes.push(
+            "Windows: there is NO kernel filesystem boundary in either direction. Job \
+             Objects bound process lifetime, not paths, and AppContainer isolation is \
+             switched off pending SPEC R6.3.3. The scope below is one ahma honours in its \
+             own path checks; it is not enforced against what a spawned command does with \
+             its own syscalls.",
+        );
+    }
+
+    if cfg!(target_os = "linux") {
+        // R6.1.7 / R-HANDOFF.4: Landlock ABI V1 is additive-allow with no deny
+        // rule and no ordering, so a hole *inside* an allowed subtree cannot be
+        // expressed to the kernel at all.
+        notes.push(
+            "Linux: the workspace is kernel-scoped, but the trust-handoff deny list (git \
+             hook directories, the project's own .ahma/, daemon sockets) is enforced only \
+             in ahma's own file tools — Landlock cannot carve a denied hole inside an \
+             allowed directory. A command run through run_terminal_command can still write \
+             those paths.",
+        );
+    }
+
+    PlatformEnforcement {
+        reads_unrestricted,
+        writes_unrestricted,
+        notes,
     }
 }
 
@@ -735,21 +817,87 @@ mod tests {
         );
     }
 
+    /// R-PERM.5.1 / R-HANDOFF.4: a limitation the user cannot see is one they
+    /// cannot compensate for. Every supported platform has at least one, so an
+    /// empty disclosure is itself the bug.
+    /// R-PERM.5.2: a profile that grants `rw` on a path shared across every
+    /// project on the machine must surface that cross-project consequence and
+    /// its opt-out wherever the profile is listed.
+    ///
+    /// Asserted rather than reviewed, because this is precisely the kind of
+    /// requirement that gets satisfied once and then quietly lost when someone
+    /// adds the next profile. The check is "if you grant a machine-global cache
+    /// read-write, say what it costs" — not "the rust profile has a cost string".
     #[test]
-    fn macos_discloses_that_reads_are_unrestricted() {
-        // R-PERM.5.1: a limitation the user cannot see is one they cannot
-        // compensate for.
-        if cfg!(target_os = "macos") {
-            let text = macos_read_disclosure().expect("macOS must disclose that reads are open");
+    fn a_profile_granting_a_shared_writable_cache_states_its_cost() {
+        for profile in builtin_profiles() {
+            let grants_shared_write = resolved_rules(std::slice::from_ref(&profile.name), true)
+                .iter()
+                .any(|r| r.profile == profile.name && r.access == ProfileAccess::Rw);
+            if !grants_shared_write {
+                continue;
+            }
+            let cost = profile.cost.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "profile '{}' grants write access to a path shared across projects but \
+                     states no `cost`. A grant whose consequence is invisible is not \
+                     meaningfully refusable (SPEC R-PERM.5.2, R-HANDOFF.8).",
+                    profile.name
+                )
+            });
             assert!(
-                text.contains("reads"),
-                "the disclosure says what is not protected"
+                cost.contains("--no-package-cache-write") || cost.contains("[sandbox]"),
+                "profile '{}': the cost must name the way out, or the user learns there \
+                 is a problem and not what to do about it. Got: {cost:?}",
+                profile.name
             );
-            assert!(text.to_lowercase().contains("write"), "…and what still is");
-        } else {
+        }
+    }
+
+    #[test]
+    fn every_platform_discloses_what_its_kernel_does_not_enforce() {
+        let e = platform_enforcement();
+        assert!(
+            !e.is_empty(),
+            "every supported platform has a gap worth stating: macOS reads (R6.2.2), \
+             Windows both directions (R6.3.9), Linux's trust-handoff deny tier (R6.1.7). \
+             An empty disclosure means one of them stopped being told."
+        );
+        for note in &e.notes {
             assert!(
-                macos_read_disclosure().is_none(),
-                "other platforms scope reads properly and have nothing to disclose"
+                note.len() > 60,
+                "a disclosure has to say what is not enforced AND what to do about it; \
+                 {note:?} is too short to do both"
+            );
+        }
+    }
+
+    #[test]
+    fn the_disclosure_matches_this_platform() {
+        let e = platform_enforcement();
+        if cfg!(target_os = "macos") {
+            assert!(e.reads_unrestricted, "macOS reads are not kernel-scoped");
+            assert!(
+                !e.writes_unrestricted,
+                "macOS writes ARE kernel-scoped — claiming otherwise would understate \
+                 the protection as badly as overstating it"
+            );
+            assert!(e.notes.iter().any(|n| n.contains("macOS")));
+        } else if cfg!(target_os = "windows") {
+            assert!(
+                e.reads_unrestricted && e.writes_unrestricted,
+                "Windows has no kernel filesystem boundary in either direction while \
+                 AppContainer is switched off (R6.3.9)"
+            );
+        } else if cfg!(target_os = "linux") {
+            assert!(
+                !e.reads_unrestricted && !e.writes_unrestricted,
+                "Linux scopes both directions (R6.1.6); the gap is the deny tier, not \
+                 the scope"
+            );
+            assert!(
+                e.notes.iter().any(|n| n.contains("run_terminal_command")),
+                "the Linux note must name the bypass, not just the mechanism"
             );
         }
     }

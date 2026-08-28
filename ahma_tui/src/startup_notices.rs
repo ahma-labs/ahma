@@ -18,7 +18,8 @@
 //! state exists, and because a `std::process::exec` self-restart discards
 //! anything held in a local (the restarted process re-reports for itself).
 
-use std::sync::{Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::OnceLock;
 
 /// How loudly a startup notice should be shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,17 +52,13 @@ pub fn push(level: Level, message: impl Into<String>) {
         Level::Warn => tracing::warn!("{}", message),
     }
     // A poisoned lock must not take the TUI down over a status message.
-    if let Ok(mut buf) = buffer().lock() {
-        buf.push(Notice { level, message });
-    }
+    let mut buf = buffer().lock();
+    buf.push(Notice { level, message });
 }
 
 /// Take everything recorded so far, leaving the buffer empty.
 pub fn drain() -> Vec<Notice> {
-    buffer()
-        .lock()
-        .map(|mut buf| std::mem::take(&mut *buf))
-        .unwrap_or_default()
+    std::mem::take(&mut *buffer().lock())
 }
 
 /// Serializes tests that exercise the process-global buffer. Without it, two
@@ -78,7 +75,7 @@ mod tests {
     /// so a second reader does not replay them.
     #[test]
     fn push_then_drain_returns_in_order_and_empties() {
-        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_GUARD.lock();
         let _ = drain();
         push(Level::Info, "first");
         push(Level::Warn, "second");

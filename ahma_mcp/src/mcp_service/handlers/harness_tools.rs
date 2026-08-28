@@ -161,7 +161,7 @@ impl AhmaMcpService {
         // yields `Some(decision)` to resolve synchronously; `None` means no MCP
         // surface can prompt (no peer, or the client lacks the elicitation
         // capability) and we fall through to the TUI hub path below.
-        let peer = self.peer.read().unwrap().clone();
+        let peer = self.peer.read().clone();
         let elicited: Option<WebApprovalDecision> = match peer {
             None => None,
             // SPEC R5.3.1 binds *every* elicitation, not just the scope one: wait
@@ -243,7 +243,7 @@ impl AhmaMcpService {
         // leave the decision in flight so the TUI answer resolves it; the
         // coordinator's dedup means the retry re-checks the session grant rather
         // than raising a second modal.
-        let tx = self.web_approval_tx.lock().unwrap().clone();
+        let tx = self.web_approval_tx.lock().clone();
         if let Some(tx) = tx
             && tx.send(req.clone()).is_ok()
         {

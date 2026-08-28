@@ -143,20 +143,44 @@ pub struct SandboxScopeSummary {
     #[serde(default, deserialize_with = "lenient")]
     pub source: String,
     /// Present (`true`) on platforms where reads are not kernel-scoped
-    /// (macOS; SPEC R-PERM.5.1).
+    /// (macOS, R6.2.2; Windows while AppContainer is off, R6.3.9).
     #[serde(
         default,
         deserialize_with = "lenient",
         skip_serializing_if = "Option::is_none"
     )]
     pub reads_unrestricted: Option<bool>,
-    /// Human-readable disclosure accompanying `reads_unrestricted`.
+    /// Present (`true`) on platforms where *writes* are not kernel-scoped either
+    /// — currently only Windows, where the Job Object bounds process lifetime
+    /// and nothing about paths (SPEC R6.3.9).
+    ///
+    /// Added alongside `reads_unrestricted` rather than folded into it: a client
+    /// that renders "reads are open" very differently from "there is no boundary
+    /// at all" needs to tell those apart, and on macOS only the first is true.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub writes_unrestricted: Option<bool>,
+    /// Human-readable disclosure accompanying the two flags above — every note
+    /// for this platform, joined. Kept for readers that predate
+    /// [`platform_notes`](Self::platform_notes).
     #[serde(
         default,
         deserialize_with = "lenient",
         skip_serializing_if = "Option::is_none"
     )]
     pub platform_note: Option<String>,
+    /// The same disclosures, one per gap, so a renderer can list them rather
+    /// than showing one run-on paragraph. Add-only per R24.5: a pre-R-PERM.5.1
+    /// reader ignores it and still gets `platform_note`.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub platform_notes: Option<Vec<String>>,
     /// Which sandbox is actually protecting the user (`ahma` |
     /// `ahma_nested_in_host` | `deferred_to_host` | `disabled`; SPEC R5.4).
     #[serde(
@@ -325,7 +349,9 @@ mod tests {
                 tmp: true,
                 source: "roots/list".into(),
                 reads_unrestricted: Some(true),
+                writes_unrestricted: None,
                 platform_note: Some("note".into()),
+                platform_notes: Some(vec!["note".into()]),
                 active: Some("ahma".into()),
                 active_disclosure: Some("disclosure".into()),
                 host: None,

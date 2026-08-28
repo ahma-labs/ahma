@@ -22,7 +22,8 @@
 //! For purely local state that is *not* observed across tasks, use the simpler
 //! [`StateMachine`] (a `Mutex` plus a transition closure).
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard};
+use std::sync::Arc;
 use tokio::sync::watch;
 
 /// A value used as the state of a finite state machine.
@@ -269,7 +270,7 @@ impl<S> StateMachine<S> {
     /// Use this for simple reads or checks that don't require complex transitions.
     /// For transitions, prefer `transition`.
     pub fn lock(&self) -> MutexGuard<'_, S> {
-        self.state.lock().unwrap()
+        self.state.lock()
     }
 
     /// Perform an atomic transition on the state.
@@ -279,7 +280,7 @@ impl<S> StateMachine<S> {
     ///
     /// Returns the result of the closure.
     pub fn transition<R>(&self, f: impl FnOnce(&mut S) -> R) -> R {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         f(&mut *state)
     }
 }

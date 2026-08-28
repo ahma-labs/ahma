@@ -356,7 +356,12 @@ async fn test_sequence_failure_with_filesystem_markers() -> Result<()> {
         .any(|t| t.name.as_ref() as &str == "marker_sequence");
 
     if !has_marker_seq {
-        eprintln!("marker_sequence not loaded, skipping filesystem marker test");
+        // The fixture that defines `marker_sequence` is checked in, so on CI its
+        // absence means the tools directory was not loaded — which is the thing
+        // this test exists to exercise, not a reason to pass.
+        ahma_test_support::skip::skip_or_fail(
+            "marker_sequence tool not loaded; nothing to exercise",
+        );
         mcp.client.cancel().await?;
         return Ok(());
     }

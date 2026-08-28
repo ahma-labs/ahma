@@ -76,12 +76,34 @@
 //! * **Only the internet-client capability is granted.** No private-network, no
 //!   documents/pictures library, no removable storage.
 //!
-//! ## Verification status
+//! ## Verification status: executed, and **disproven**
 //!
-//! Written on macOS; type-checked against `windows-sys` for `x86_64-pc-windows-msvc`;
-//! **never executed**. SPEC R6.3.3 stays open until a `windows-latest` CI run proves
-//! it, and `red_team_command_write_escape_blocked` stays `#[cfg_attr(windows, ignore)]`
-//! until then.
+//! This was written on macOS and type-checked against `windows-sys`. It has since
+//! been executed on a `windows-latest` runner, and the run showed the scoped
+//! grant does **not** take effect: a write *inside* the locked scope is denied
+//! along with one outside it. A boundary that denies everything proves nothing —
+//! it is the exact failure mode the gate test's own docstring warns against — so
+//! the spawn path is switched off rather than shipped broken. See
+//! [`appcontainer_spawn_enabled`], which is the single place that verdict lives,
+//! and `sandbox/command.rs`, which reads it.
+//!
+//! Everything below therefore compiles and is unit-tested, and none of it is
+//! reachable in production. That is deliberate while a fix is in flight; if it
+//! stops being in flight, this note is the place to say so.
+//!
+//! **No root cause is known.** Every artefact so far is the string
+//! `Access to the path '...' is denied`, which names no path, does not say
+//! whether the ACE was ever written, and does not say which SID the child ran
+//! as. `windows_sandbox_integration_test::appcontainer::appcontainer_dacl_diagnostics`
+//! exists to produce that evidence — `icacls` for the scope and every ancestor,
+//! the container SID, the child's own token groups and `$env:TEMP` — and the
+//! `AppContainer diagnostics` step in `build.yml` runs it on every Windows leg.
+//! Read that output before changing anything here.
+//!
+//! SPEC R6.3.3 stays open, R6.3.9's disclosure stays as written, and
+//! `red_team_command_write_escape_blocked` stays `#[cfg_attr(windows, ignore)]`
+//! until a `windows-latest` run shows the in-scope write *and* read succeeding
+//! and the out-of-scope pair blocked.
 
 use super::error::SandboxError;
 use std::path::{Path, PathBuf};
@@ -483,6 +505,32 @@ pub fn check_windows_sandbox_available() -> Result<(), SandboxError> {
     }
 }
 
+/// Whether Windows command spawns are **actually** routed through AppContainer
+/// isolation (SPEC R6.3.3).
+///
+/// This is the single source of truth for that question, and it exists because the
+/// answer was previously re-derived in two places that then disagreed.
+/// `sandbox/command.rs` decides whether to build a [`WindowsSpawnPlan`];
+/// `shell/modes/server.rs` decides whether the guarded egress proxy can be reached
+/// by a sandboxed child (R6.3.3.1a — an AppContainer blocks loopback, so the proxy
+/// and the container are mutually exclusive). When `command.rs` disabled the
+/// AppContainer path in #558 and `server.rs` did not, Windows lost the filesystem
+/// boundary *and* kept refusing `--restrict-network`, while telling the operator
+/// that "every command is launched into an AppContainer" — a claim that had stopped
+/// being true. Two consumers, one fact: they read it here.
+///
+/// Currently `false` on every platform. On Windows it stays `false` until a
+/// `windows-latest` CI run demonstrates the R6.3.3 boundary in both directions —
+/// an in-scope write and read succeeding *and* the out-of-scope pair blocked. A
+/// containment layer that fails **broken** rather than **safe** is worse than none:
+/// the last run denied writes inside the locked scope as well as outside it.
+///
+/// Flipping this to `true` on Windows re-enables the container spawn path and
+/// re-disables `--restrict-network` there, together and by construction.
+pub const fn appcontainer_spawn_enabled() -> bool {
+    false
+}
+
 /// Prepare an AppContainer for `write_scopes`/`read_scopes` and describe how to
 /// launch `program` inside it.
 ///
@@ -609,13 +657,7 @@ pub fn enforce_windows_sandbox(_roots: &[PathBuf]) -> Result<(), SandboxError> {
 pub fn cleanup_windows_sandbox() {
     #[cfg(target_os = "windows")]
     {
-        let session = {
-            let mut guard = match APPCONTAINER_SESSION.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.take()
-        };
+        let session = APPCONTAINER_SESSION.lock().take();
         if let Some(session) = session {
             session.revoke_grants();
             session.delete_profile();
@@ -811,8 +853,8 @@ impl AppContainerSession {
 }
 
 #[cfg(target_os = "windows")]
-static APPCONTAINER_SESSION: std::sync::Mutex<Option<AppContainerSession>> =
-    std::sync::Mutex::new(None);
+static APPCONTAINER_SESSION: parking_lot::Mutex<Option<AppContainerSession>> =
+    parking_lot::Mutex::new(None);
 
 /// Grant `session.sid` access to every scope in `wanted` that is not already
 /// covered by AppContainer's default `ALL APPLICATION PACKAGES` read+execute,
@@ -879,10 +921,7 @@ fn ensure_appcontainer(
     })?;
     let name = appcontainer_name_for_scope(primary);
 
-    let mut guard = match APPCONTAINER_SESSION.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut guard = APPCONTAINER_SESSION.lock();
 
     // Everything the container must reach, with the access it needs. Write scopes
     // come first so that a path appearing in both lists keeps the stronger grant.

@@ -812,10 +812,24 @@ pub struct SandboxSettings {
     /// Default: empty list
     pub working_dirs: Vec<PathBuf>,
     /// Allow package-manager caches (cargo registry/git, etc.) to be written inside
-    /// the sandbox.  Grants write access only to the subdirs that package managers
-    /// need when fetching new dependencies; sensitive config and binaries remain
-    /// read-only.  Disable with `--no-package-cache-write` when you want the
-    /// strictest possible isolation.
+    /// the sandbox. Grants write access only to the subdirs package managers need
+    /// when fetching dependencies; sensitive config and binaries stay read-only.
+    ///
+    /// **Turning this off is the mitigation for one named risk, not generic
+    /// hardening** (SPEC R-HANDOFF.8). These caches are machine-global: an agent
+    /// working in one project can edit the extracted source of a cached crate,
+    /// and that edited code is compiled and executed — as a build script or proc
+    /// macro — the next time the user builds an unrelated project. No sandbox
+    /// rule is broken at any step; the write is legitimate and the execution
+    /// happens in another session, in another project, possibly weeks later.
+    ///
+    /// `--no-package-cache-write` downgrades those rules to read+execute rather
+    /// than dropping them, so the toolchain stays runnable and only its caches
+    /// become read-only.
+    ///
+    /// This used to read "disable when you want the strictest possible isolation",
+    /// which SPEC names as the wrong framing: it describes a preference dial,
+    /// leaving a user with no way to know what they are actually trading.
     /// Default: `true`
     #[serde(default = "default_true")]
     pub package_cache_write: bool,
@@ -3496,5 +3510,578 @@ mod removed_key_compat_tests {
         let s = AhmaSettings::parse("[tools]\nhot_reload = true\nforce_sync = true\n")
             .expect("a retired key must not make the settings file unparseable");
         assert!(s.tools.force_sync, "sibling keys must still apply");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trust tiers (SPEC R-CFG2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Which trust tier a settings key belongs to (SPEC R-CFG2.1).
+///
+/// The distinction exists for exactly one reason: `<workspace>/.ahma/settings.toml`
+/// travels with a repository, so anyone who can send you a clone can propose
+/// values for it. A cloned repository must not be able to weaken the sandbox that
+/// is about to contain it — the `.vscode/tasks.json` attack class — so
+/// Security-tier keys are ignored from that file and reported (R-CFG2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTier {
+    /// Weakens or shapes the security boundary. Never honored from a project file.
+    Security,
+    /// Everything else: timeouts, bundles, logging, labels, transport tuning.
+    Preference,
+}
+
+/// Whole tables whose every key is Security-tier.
+///
+/// Table granularity rather than per-field metadata, because that is the
+/// granularity the rejection actually operates at: the project file is parsed to
+/// a `toml::Value` and filtered *before* deserialization, so a key that never
+/// reaches a Rust field still has to be classified. It is also the safer default
+/// — a new key added to `[sandbox]` is Security-tier without anyone remembering,
+/// which is the direction an omission should fail in.
+const SECURITY_TABLES: &[&str] = &[
+    // Scopes, temp access, package-cache write, task vault, the trust-handoff
+    // escape hatches, the credential deny set — all of R-CFG2.1's named list.
+    "sandbox",
+    // Token, token path, rate limits.
+    "auth",
+    // Egress policy for ahma's own HTTP tools; a project file must not be able
+    // to add a domain to `always_allow` (SPEC R-WEB).
+    "web",
+    // Subprocess egress restriction and its allowlist.
+    "network",
+    // The grant ledger itself. A project file proposing grants would be the
+    // whole R5.4.5 gate bypassed in one line.
+    "permissions",
+];
+
+/// Individual Security-tier keys inside otherwise-Preference tables.
+///
+/// Kept short on purpose: a table that accumulates these is a table that should
+/// be split.
+const SECURITY_KEYS: &[(&str, &str)] = &[
+    // R-CFG2.1 names session isolation and the socket path is what selects it:
+    // a project file pointing the bridge at another socket redirects every tool
+    // call to a server it chose.
+    ("http", "unix_socket_path"),
+];
+
+/// The tier of `table.key`, or `None` if the key is not known to this build.
+///
+/// `None` is not "Preference by default": an unknown key in a project file is
+/// reported and dropped, because a build that does not recognise a key cannot
+/// know whether honoring it would be safe.
+pub fn settings_tier(table: &str, key: &str) -> Option<SettingsTier> {
+    if SECURITY_TABLES.contains(&table) {
+        return Some(SettingsTier::Security);
+    }
+    if SECURITY_KEYS.contains(&(table, key)) {
+        return Some(SettingsTier::Security);
+    }
+    if known_settings_keys().contains(&(table.to_string(), key.to_string()))
+        || OPTIONAL_PREFERENCE_KEYS.contains(&(table, key))
+    {
+        return Some(SettingsTier::Preference);
+    }
+    None
+}
+
+/// Preference-tier keys that [`known_settings_keys`] cannot see.
+///
+/// TOML has no null, so `toml` omits an `Option` field that is `None` — and every
+/// key here is `None` in a default `AhmaSettings`, which is exactly why deriving
+/// the set from the defaults misses them. Listing them by hand is the small cost
+/// of not adding a schema dependency to the foundation crate; both halves of
+/// `optional_preference_keys_are_real_and_still_optional` keep the list honest,
+/// by proving each name deserializes *and* that it is still absent from the
+/// derived set (so an entry cannot rot into redundancy when a field stops being
+/// optional).
+///
+/// Security-tier optional keys need no entry: their whole table is Security, or
+/// they are named in [`SECURITY_KEYS`].
+const OPTIONAL_PREFERENCE_KEYS: &[(&str, &str)] = &[
+    ("tools", "request_budget_override_secs"),
+    ("tools", "tools_dir"),
+    ("agent", "provider"),
+    ("agent", "model"),
+    ("agent", "provider_url"),
+];
+
+/// Every `(table, key)` a default [`AhmaSettings`] serialises to.
+///
+/// Derived from the type rather than hand-listed, so it cannot drift: adding a
+/// field makes it known and removing one makes it unknown, with nobody needing
+/// to remember. It is also what makes "unrecognised key" a real answer rather
+/// than "any key in a table I know about" — R-CFG6.2 requires unknown keys be
+/// reported, and that needs the actual field set.
+fn known_settings_keys() -> &'static std::collections::HashSet<(String, String)> {
+    static KEYS: std::sync::OnceLock<std::collections::HashSet<(String, String)>> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let mut out = std::collections::HashSet::new();
+        // Serialising the defaults cannot fail for any value the type can hold.
+        if let Ok(toml::Value::Table(tables)) = toml::Value::try_from(AhmaSettings::default()) {
+            for (table, contents) in tables {
+                if let Some(keys) = contents.as_table() {
+                    for key in keys.keys() {
+                        out.insert((table.clone(), key.clone()));
+                    }
+                }
+            }
+        }
+        out
+    })
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    /// Every key a default `AhmaSettings` serialises must have a tier.
+    ///
+    /// The same drift discipline `retired_env_drift_test` established for
+    /// environment variables: the classification is data, and data goes stale
+    /// silently unless something reads it back. Adding a settings key without
+    /// classifying it fails here rather than being quietly honored from a
+    /// project file.
+    #[test]
+    fn every_settings_key_has_a_tier() {
+        let value = toml::Value::try_from(AhmaSettings::default())
+            .expect("default settings must serialise");
+        let table = value.as_table().expect("settings serialise to a table");
+
+        let mut unclassified = Vec::new();
+        for (table_name, contents) in table {
+            let Some(keys) = contents.as_table() else {
+                // A top-level scalar would be a settings key with no table; the
+                // schema has none today, and one appearing is worth failing on.
+                unclassified.push(table_name.clone());
+                continue;
+            };
+            for key in keys.keys() {
+                if settings_tier(table_name, key).is_none() {
+                    unclassified.push(format!("{table_name}.{key}"));
+                }
+            }
+        }
+
+        assert!(
+            unclassified.is_empty(),
+            "settings keys with no trust tier: {unclassified:?}\n\
+             Add the table to SECURITY_TABLES, or the key to SECURITY_KEYS. Preference-tier \
+             keys are derived from the type itself, so this can only fail for a key in a \
+             table that is neither. A key with no tier cannot be safely read from a project \
+             settings file (SPEC R-CFG2.2), so it is dropped — which is safe, but silent \
+             if nobody notices."
+        );
+    }
+
+    #[test]
+    fn the_named_security_settings_are_security_tier() {
+        // Spot-checks straight from R-CFG2.1's own list, so a refactor that
+        // reshuffles tables cannot silently demote one of them.
+        for (table, key) in [
+            ("sandbox", "disable"),
+            ("sandbox", "scopes"),
+            ("sandbox", "working_dirs"),
+            ("sandbox", "tmp_access"),
+            ("sandbox", "package_cache_write"),
+            ("sandbox", "task_vault"),
+            ("sandbox", "defer"),
+            ("auth", "require_token"),
+            ("auth", "require_token_path"),
+            ("auth", "rate_limit_rps"),
+            ("http", "unix_socket_path"),
+        ] {
+            assert_eq!(
+                settings_tier(table, key),
+                Some(SettingsTier::Security),
+                "{table}.{key} shapes the security boundary (SPEC R-CFG2.1)"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_preferences_are_not_security_tier() {
+        for (table, key) in [
+            ("tools", "timeout_secs"),
+            ("tools", "tool_bundles"),
+            ("tools", "tools_dir"),
+            ("logging", "target"),
+            ("instance", "label"),
+            ("http", "handshake_timeout_secs"),
+        ] {
+            assert_eq!(
+                settings_tier(table, key),
+                Some(SettingsTier::Preference),
+                "{table}.{key} is a preference; classifying it Security would make a \
+                 project file unable to set anything useful, which is how a security \
+                 tier gets disabled wholesale"
+            );
+        }
+    }
+
+    /// Both halves matter. The first proves the listed names are real keys — a
+    /// typo here would silently classify a nonexistent key. The second proves
+    /// they are still optional: if a field stops being `Option`, the derived set
+    /// starts covering it and the entry becomes dead weight that outlives its
+    /// reason.
+    #[test]
+    fn optional_preference_keys_are_real_and_still_optional() {
+        for (table, key) in OPTIONAL_PREFERENCE_KEYS {
+            let doc = format!("[{table}]\n{key} = \"probe\"\n");
+            let parsed: Result<AhmaSettings, _> = toml::from_str(&doc);
+            let numeric = format!("[{table}]\n{key} = 1\n");
+            let parsed_numeric: Result<AhmaSettings, _> = toml::from_str(&numeric);
+            assert!(
+                parsed.is_ok() || parsed_numeric.is_ok(),
+                "{table}.{key} is listed as an optional preference key but no \
+                 AhmaSettings accepts it — the name is wrong or the field is gone"
+            );
+            assert!(
+                !known_settings_keys().contains(&((*table).to_string(), (*key).to_string())),
+                "{table}.{key} now serialises by default, so the derived set already \
+                 covers it — remove it from OPTIONAL_PREFERENCE_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_has_no_tier() {
+        assert_eq!(
+            settings_tier("sandbox", "invented_by_an_attacker"),
+            Some(SettingsTier::Security),
+            "an unknown key in a security table is still security-tier — the table is \
+             what makes it dangerous, not the name"
+        );
+        assert_eq!(settings_tier("not_a_table", "whatever"), None);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Project settings file (SPEC R-CFG3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a project settings file contributed, and what was refused.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ProjectSettingsLoad {
+    /// The Preference-tier keys that survived, as a TOML table ready to merge.
+    pub accepted: toml::Table,
+    /// `table.key` names rejected because they are Security-tier (R-CFG2.2).
+    pub rejected_security: Vec<String>,
+    /// `table.key` names this build does not recognise.
+    pub rejected_unknown: Vec<String>,
+}
+
+impl ProjectSettingsLoad {
+    /// Whether anything was refused, i.e. whether the caller owes a `warn`.
+    pub fn has_rejections(&self) -> bool {
+        !self.rejected_security.is_empty() || !self.rejected_unknown.is_empty()
+    }
+}
+
+/// The project settings file for a workspace: `<workspace>/.ahma/settings.toml`.
+pub fn project_settings_path(tools_dir: &Path) -> PathBuf {
+    tools_dir.join("settings.toml")
+}
+
+/// Read a project settings file and strip everything it may not set.
+///
+/// **Why this filters TOML rather than deserializing first.** A cloned
+/// repository can propose any content here, so the file is untrusted input.
+/// Deserializing into `AhmaSettings` and then trying to undo the Security-tier
+/// fields would mean reconstructing which ones were *present* — serde cannot
+/// distinguish "absent" from "set to the default" for a plain field — and any
+/// key that failed to reconstruct would be honored. Filtering the parsed table
+/// first inverts that: a key is dropped unless it is positively known to be
+/// Preference-tier, so an omission fails closed.
+///
+/// R-CFG2.2 requires rejected keys be reported at `warn` with their names; that
+/// is the caller's job, from [`ProjectSettingsLoad::rejected_security`], because
+/// this function has no opinion about how a surface logs.
+///
+/// Read failures are not errors — a missing project file is the normal case, and
+/// `PermissionDenied` gets the same treatment [`AhmaSettings::load_from_result`]
+/// gives it and for the same reason (R5.4.8). A file that exists, is readable,
+/// and does not **parse** is an error, per R-CFG6.1.
+pub fn load_project_settings(path: &Path) -> Result<ProjectSettingsLoad, String> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProjectSettingsLoad::default());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            warn!(
+                "project settings file {} is not readable ({e}); ignoring it",
+                path.display()
+            );
+            return Ok(ProjectSettingsLoad::default());
+        }
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+
+    let parsed: toml::Table = toml::from_str(&contents).map_err(|e| {
+        format!(
+            "failed to parse project settings file {}: {e}",
+            path.display()
+        )
+    })?;
+
+    let mut load = ProjectSettingsLoad::default();
+    for (table_name, contents) in parsed {
+        let Some(keys) = contents.as_table() else {
+            load.rejected_unknown.push(table_name);
+            continue;
+        };
+        let mut kept = toml::Table::new();
+        for (key, value) in keys {
+            match settings_tier(&table_name, key) {
+                Some(SettingsTier::Preference) => {
+                    kept.insert(key.clone(), value.clone());
+                }
+                Some(SettingsTier::Security) => {
+                    load.rejected_security.push(format!("{table_name}.{key}"));
+                }
+                None => load.rejected_unknown.push(format!("{table_name}.{key}")),
+            }
+        }
+        if !kept.is_empty() {
+            load.accepted.insert(table_name, toml::Value::Table(kept));
+        }
+    }
+    Ok(load)
+}
+
+/// Merge an accepted project table over user settings (SPEC R-CFG3.2).
+///
+/// Per-key scalar override, and **list-valued keys replace rather than
+/// concatenate**, so the effective value of any key is always attributable to
+/// exactly one source. Concatenation would produce a value neither file
+/// contains, which no `--origin` output could honestly explain.
+pub fn merge_project_over_user(user: &AhmaSettings, project: &toml::Table) -> AhmaSettings {
+    let Ok(toml::Value::Table(mut base)) = toml::Value::try_from(user) else {
+        // Serialising settings cannot fail for any value the type can hold; if it
+        // somehow does, the user settings stand rather than being replaced.
+        warn!("could not serialise user settings for project merge; ignoring project file");
+        return user.clone();
+    };
+
+    for (table_name, project_table) in project {
+        let Some(project_keys) = project_table.as_table() else {
+            continue;
+        };
+        match base.get_mut(table_name).and_then(|v| v.as_table_mut()) {
+            Some(base_keys) => {
+                for (key, value) in project_keys {
+                    base_keys.insert(key.clone(), value.clone());
+                }
+            }
+            None => {
+                base.insert(table_name.clone(), project_table.clone());
+            }
+        }
+    }
+
+    match toml::Value::Table(base).try_into() {
+        Ok(merged) => merged,
+        Err(e) => {
+            // A project file can put a string where a number belongs. That is the
+            // project file's error, not a reason to lose the user's settings.
+            warn!("project settings produced an unusable configuration ({e}); ignoring them");
+            user.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod project_settings_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_project(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("settings.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        path
+    }
+
+    /// R-CFG8.2 red team. This is the whole reason the tier exists: a cloned
+    /// repository must not be able to weaken the sandbox that is about to
+    /// contain it.
+    #[test]
+    fn a_project_file_cannot_weaken_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_project(
+            dir.path(),
+            r#"
+[sandbox]
+disable = true
+scopes = ["/"]
+tmp_access = true
+package_cache_write = true
+
+[auth]
+require_token = "attacker-chosen"
+
+[network]
+allow = ["evil.example"]
+
+[tools]
+timeout_secs = 42
+"#,
+        );
+
+        let load = load_project_settings(&path).expect("a well-formed file parses");
+
+        for refused in [
+            "sandbox.disable",
+            "sandbox.scopes",
+            "sandbox.tmp_access",
+            "sandbox.package_cache_write",
+            "auth.require_token",
+            "network.allow",
+        ] {
+            assert!(
+                load.rejected_security.iter().any(|k| k == refused),
+                "{refused} must be refused from a project file and named in the warning \
+                 (SPEC R-CFG2.2); rejected: {:?}",
+                load.rejected_security
+            );
+        }
+        assert!(
+            !load.accepted.contains_key("sandbox"),
+            "not one sandbox key may survive; accepted: {:?}",
+            load.accepted
+        );
+
+        // …and the Preference-tier key it also set is still honored, or the tier
+        // would be a ban rather than a boundary.
+        let merged = merge_project_over_user(&AhmaSettings::default(), &load.accepted);
+        assert_eq!(merged.tools.timeout_secs, 42);
+        assert!(
+            !merged.sandbox.disable,
+            "the sandbox must be exactly as the user left it"
+        );
+    }
+
+    #[test]
+    fn preference_keys_override_user_settings_per_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_project(
+            dir.path(),
+            "[tools]\ntimeout_secs = 7\n[instance]\nlabel = \"from-project\"\n",
+        );
+        let load = load_project_settings(&path).unwrap();
+
+        let mut user = AhmaSettings::default();
+        user.tools.timeout_secs = 999;
+        user.tools.await_timeout_secs = 111;
+
+        let merged = merge_project_over_user(&user, &load.accepted);
+        assert_eq!(merged.tools.timeout_secs, 7, "project overrides user");
+        assert_eq!(
+            merged.tools.await_timeout_secs, 111,
+            "a key the project did not set keeps the user's value — merging is \
+             per-key, not per-table"
+        );
+        assert_eq!(merged.instance.label, "from-project");
+    }
+
+    /// R-CFG3.2: lists replace, never concatenate. A concatenated value belongs
+    /// to neither file, so no `--origin` output could attribute it honestly.
+    #[test]
+    fn list_valued_keys_replace_rather_than_concatenate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_project(dir.path(), "[tools]\ntool_bundles = [\"git\"]\n");
+        let load = load_project_settings(&path).unwrap();
+
+        let mut user = AhmaSettings::default();
+        user.tools.tool_bundles = vec!["rust".into(), "python".into()];
+
+        let merged = merge_project_over_user(&user, &load.accepted);
+        assert_eq!(
+            merged.tools.tool_bundles,
+            vec!["git".to_string()],
+            "the project's list replaces the user's outright"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_project_file_is_an_error_not_a_silent_default() {
+        // R-CFG6.1: a file that can be read but not parsed must never quietly
+        // change behaviour by falling back.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_project(dir.path(), "this is : not [[[ valid toml");
+        assert!(load_project_settings(&path).is_err());
+    }
+
+    /// R-CFG5.3: the documented precedence and the implemented precedence must
+    /// be the same, over every source pair, with at least one Preference and one
+    /// Security key.
+    ///
+    /// The CLI rung is covered by the flag-override tests in `shell::cli`; what
+    /// can only be checked here is that project-over-user holds for a Preference
+    /// key and *never* holds for a Security one, in every combination of which
+    /// file sets what.
+    #[test]
+    fn precedence_matrix_project_over_user() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Case 1: only the user sets it → user wins by default.
+        let mut user = AhmaSettings::default();
+        user.tools.timeout_secs = 100;
+        user.sandbox.tmp_access = true;
+        let empty = load_project_settings(&write_project(dir.path(), "")).unwrap();
+        let merged = merge_project_over_user(&user, &empty.accepted);
+        assert_eq!(merged.tools.timeout_secs, 100);
+        assert!(merged.sandbox.tmp_access);
+
+        // Case 2: both set it → project wins for Preference, user wins for Security.
+        let both = load_project_settings(&write_project(
+            dir.path(),
+            "[tools]\ntimeout_secs = 200\n[sandbox]\ntmp_access = false\n",
+        ))
+        .unwrap();
+        let merged = merge_project_over_user(&user, &both.accepted);
+        assert_eq!(
+            merged.tools.timeout_secs, 200,
+            "project overrides user for a Preference key (R-CFG1.1)"
+        );
+        assert!(
+            merged.sandbox.tmp_access,
+            "the project file must NOT be able to change a Security key in either \
+             direction — not even to a *narrower* value. Honouring a narrowing would \
+             mean the tier depends on the value, and the next value is a widening \
+             (R-CFG2.2)"
+        );
+
+        // Case 3: only the project sets it → project over the compiled-in default.
+        let only_project =
+            load_project_settings(&write_project(dir.path(), "[tools]\ntimeout_secs = 300\n"))
+                .unwrap();
+        let merged = merge_project_over_user(&AhmaSettings::default(), &only_project.accepted);
+        assert_eq!(merged.tools.timeout_secs, 300);
+    }
+
+    #[test]
+    fn a_missing_project_file_is_the_normal_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = load_project_settings(&dir.path().join("settings.toml")).unwrap();
+        assert!(load.accepted.is_empty());
+        assert!(!load.has_rejections());
+    }
+
+    #[test]
+    fn unknown_keys_are_dropped_and_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_project(dir.path(), "[tools]\nnot_a_real_key = 1\n");
+        let load = load_project_settings(&path).unwrap();
+        assert!(
+            load.rejected_unknown
+                .iter()
+                .any(|k| k == "tools.not_a_real_key"),
+            "an unrecognised key is reported, not silently ignored: {load:?}"
+        );
     }
 }

@@ -871,8 +871,7 @@ pub async fn run_daemon_at(socket_path: PathBuf) -> Result<()> {
                     info!("ahma daemon: idle timeout, exiting");
                     // Unlink the socket file FIRST so late arrivals get ENOENT
                     // (clean start) instead of ECONNREFUSED (ambiguous stale).
-                    #[cfg(unix)]
-                    let _ = std::fs::remove_file(&idle_socket_path);
+                    crate::fs_lock::remove_stale_socket(&idle_socket_path);
                     std::process::exit(0);
                 }
             }
@@ -1012,7 +1011,7 @@ async fn bind_unix(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
                     Err(_) => {
                         // Stale socket file — unlink and retry.
                         debug!("ahma daemon: removing stale socket at {}", path.display());
-                        let _ = std::fs::remove_file(path);
+                        crate::fs_lock::remove_stale_socket(path);
                         // Small delay before retry to avoid tight loop on weird FS.
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
@@ -1047,7 +1046,7 @@ async fn try_bind_unix(path: &std::path::Path) -> Result<Option<tokio::net::Unix
                     Err(_) => {
                         // Stale socket file — remove and retry.
                         debug!("ahma hub: removing stale socket at {}", path.display());
-                        let _ = std::fs::remove_file(path);
+                        crate::fs_lock::remove_stale_socket(path);
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
@@ -1196,10 +1195,7 @@ where
         ClientMsg::Shutdown => {
             info!("daemon: shutdown requested, exiting");
             if let Some(ref path) = hub.socket_path {
-                #[cfg(unix)]
-                let _ = std::fs::remove_file(path);
-                #[cfg(not(unix))]
-                let _ = path;
+                crate::fs_lock::remove_stale_socket(path);
             }
             std::process::exit(0);
         }
@@ -2464,14 +2460,14 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Serializes env-var mutation across the env-dependent unit tests below.
-    static ENV_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static ENV_MUTEX: std::sync::LazyLock<parking_lot::Mutex<()>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(()));
 
     // ── daemon_port / default_socket_path (env-driven) ────────────────────────
 
     #[test]
     fn daemon_port_default_and_override() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         let prev = std::env::var_os("AHMA_DAEMON_PORT");
         let prev_iso = std::env::var_os("AHMA_TEST_ISOLATION");
         let prev_nextest = std::env::var_os("NEXTEST");
@@ -2523,7 +2519,7 @@ mod tests {
     /// must still resolve a private per-run socket, never the live daemon's.
     #[test]
     fn default_socket_path_private_under_test_harness() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         if SOCKET_PATH_OVERRIDE.get().is_some() {
             return;
         }
@@ -2557,7 +2553,7 @@ mod tests {
 
     #[test]
     fn default_socket_path_returns_env_var_path() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         // A CLI override (process-wide OnceLock) takes precedence over the env
         // var; if some other test installed one, this assertion does not apply.
         if SOCKET_PATH_OVERRIDE.get().is_some() {

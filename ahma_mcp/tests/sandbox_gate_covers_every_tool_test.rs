@@ -98,10 +98,7 @@ async fn server_without_a_settled_scope(
         http_port: unused_local_port()?,
         ..Default::default()
     };
-    *mcp.service
-        .app_config
-        .write()
-        .expect("app_config lock poisoned") = Some(Arc::new(config));
+    *mcp.service.app_config.write() = Some(Arc::new(config));
 
     Ok(mcp)
 }

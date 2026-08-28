@@ -126,7 +126,7 @@ pub fn spawn_keepalive_task<T: KeepAlive + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     use tokio::sync::mpsc;
 
     struct MockKeepAlive {
@@ -153,12 +153,12 @@ mod tests {
             if self.fail_sends {
                 return Err(anyhow::anyhow!("send failed"));
             }
-            self.heartbeats_sent.lock().unwrap().push(payload);
+            self.heartbeats_sent.lock().push(payload);
             Ok(())
         }
 
         fn time_since_last_received(&self) -> Duration {
-            *self.time_since_last_received.lock().unwrap()
+            *self.time_since_last_received.lock()
         }
 
         fn heartbeat_timeout(&self) -> Duration {
@@ -230,7 +230,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(11)).await;
         tokio::task::yield_now().await;
 
-        let heartbeats = heartbeats_sent.lock().unwrap();
+        let heartbeats = heartbeats_sent.lock();
         assert!(
             !heartbeats.is_empty(),
             "enhanced heartbeat should have been sent"
@@ -277,7 +277,7 @@ mod tests {
             "standard ping should have been sent"
         );
         assert!(
-            heartbeats_sent.lock().unwrap().is_empty(),
+            heartbeats_sent.lock().is_empty(),
             "no enhanced heartbeat should be sent"
         );
     }
@@ -319,7 +319,7 @@ mod tests {
             "no standard ping should be sent"
         );
         assert!(
-            heartbeats_sent.lock().unwrap().is_empty(),
+            heartbeats_sent.lock().is_empty(),
             "no enhanced heartbeat should be sent"
         );
     }
@@ -342,7 +342,7 @@ mod tests {
             fail_sends: false,
         });
 
-        *time_since_last_received.lock().unwrap() = Duration::from_millis(20);
+        *time_since_last_received.lock() = Duration::from_millis(20);
 
         let last_sent_signal = Arc::new(AtomicU64::new(0));
         spawn_keepalive_task(
@@ -439,7 +439,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(21)).await;
         tokio::task::yield_now().await;
 
-        let heartbeats = heartbeats_sent.lock().unwrap();
+        let heartbeats = heartbeats_sent.lock();
         assert!(
             heartbeats.is_empty(),
             "heartbeat should be skipped because of rate limiting"

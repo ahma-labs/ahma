@@ -169,7 +169,8 @@ fn sha256_hex(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
     use tempfile::tempdir;
 
     // Serialize env-var-touching tests so they don't race each other.
@@ -180,7 +181,7 @@ mod tests {
 
     #[test]
     fn skip_verify_false_when_unset() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
         assert!(!should_skip_verify());
@@ -188,7 +189,7 @@ mod tests {
 
     #[test]
     fn skip_verify_truthy_values() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
         for val in ["1", "true", "yes", "on"] {
             unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", val) };
@@ -202,7 +203,7 @@ mod tests {
 
     #[test]
     fn skip_verify_falsy_values() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
         for val in ["0", "false", "no", "off"] {
             unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", val) };
@@ -216,7 +217,7 @@ mod tests {
 
     #[test]
     fn skip_verify_trims_whitespace() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
         unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", " 1 ") };
         assert!(should_skip_verify());
@@ -225,7 +226,7 @@ mod tests {
 
     #[test]
     fn skip_verify_legacy_var_honored() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
         unsafe { std::env::set_var("AHMA_INSECURE_SKIP_SIGNATURE", "1") };
         assert!(should_skip_verify());
@@ -275,7 +276,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_artifact_ok_when_skip_env_set() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
         // Path need not exist — we return before reading it.
         let result = verify_artifact(std::path::Path::new("/nonexistent/artifact")).await;
@@ -293,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn run_cli_errors_on_missing_artifact() {
         use std::path::PathBuf;
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
         let args = VerifyArgs {
@@ -313,7 +314,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_self_ok_when_skip_env_set() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
         unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
         let result = verify_self().await;
@@ -331,7 +332,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_cli_ok_with_existing_artifact_and_skip_env() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
         unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
 
@@ -359,7 +360,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_cli_self_check_uses_current_exe_and_ignores_path() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
         unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
 
@@ -383,7 +384,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_cli_self_check_with_no_path_uses_current_exe() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
         unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
         let args = VerifyArgs {

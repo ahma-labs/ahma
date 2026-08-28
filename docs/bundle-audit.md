@@ -1,4 +1,4 @@
-# Bundle Signing and Supply-Chain Audit
+# Bundle Checksums and Supply-Chain Audit
 
 > **Experimental** — introduced in v0.7.
 
@@ -43,22 +43,44 @@ FAIL Bundle audit found critical issues.
 
 ## Creating a content manifest
 
-Before distributing a bundle, sign it (creates a content-hash manifest):
+Before distributing a bundle, checksum it:
 
 ```bash
-ahma bundle sign /path/to/bundle-dir
+ahma bundle checksum /path/to/bundle-dir
 # Creates: /path/to/bundle-dir/bundle.manifest.json
 ```
 
-The manifest records the djb2 content hash of every `.json` file in the directory.
+The manifest records the SHA-256 of every `.json` file in the directory, except
+its own (a file cannot contain its own digest). `ahma bundle sign` still works as
+a deprecated alias.
 
-## Verifying a bundle
+## Checking a bundle against its manifest
 
 ```bash
 ahma bundle verify /path/to/bundle-dir
-# PASS: all file hashes match the manifest
-# FAIL: one or more files have been modified since signing
+# PASS: every file matches the manifest
+# FAIL: one or more files differ from the manifest
 ```
+
+> **This is a corruption check, not a signature — and the distinction is not a
+> technicality.**
+>
+> The manifest is unsigned and lives *inside the bundle it describes*. Anyone who
+> can change a bundle file can re-run `ahma bundle checksum` in the same motion,
+> and `verify` will report PASS. What the check catches is a truncated download, a
+> botched copy, a file that changed when nobody meant it to. What it cannot catch
+> is anybody who meant it.
+>
+> Tamper-evidence requires a detached signature verified against a key the
+> attacker cannot write. That is the roadmap item below; it is not implemented, so
+> `verify` passing is not grounds for trusting a bundle whose origin you do not
+> already trust. Run `ahma bundle audit` — which inspects what the tools actually
+> *do* — rather than treating a manifest match as clearance.
+>
+> Earlier releases named this `sign`/`verify`, described the digest as SHA-256
+> while computing a 64-bit DJB2 string hash, and carried a "trusted key ring"
+> path that nothing read. The mechanism has not become weaker; the description
+> has become accurate.
 
 ## First-party bundle index
 
@@ -66,10 +88,10 @@ Ahma ships a built-in index at `assets/bundle-index.json` that lists all first-p
 
 Third-party bundles not in the index require explicit `ahma bundle audit` before use.
 
-## Programmatic use (`ahma_core`)
+## Programmatic use (`ahma_mcp`)
 
 ```rust
-use ahma_core::{audit_bundle, BundleAuditSeverity, BundleSigner, BundleVerifier};
+use ahma_mcp::bundle::{audit_bundle, BundleAuditSeverity, BundleChecksummer, BundleVerifier};
 use std::path::Path;
 
 // Audit
@@ -80,17 +102,22 @@ if !result.passed {
     }
 }
 
-// Sign
-BundleSigner::sign(Path::new("/path/to/bundle"))?;
+// Write the SHA-256 content manifest
+BundleChecksummer::write_manifest(Path::new("/path/to/bundle"))?;
 
-// Verify
-let verifier = BundleVerifier::new("/home/user/.ahma/keys/trusted");
-let ok = verifier.verify(Path::new("/path/to/bundle"))?;
+// Re-hash and compare against it. `ok == true` means nothing was corrupted;
+// it does not mean the bundle is the one its author published.
+let ok = BundleVerifier::new().verify(Path::new("/path/to/bundle"))?;
 ```
 
 ## Roadmap
 
-Full asymmetric (ed25519) signing of bundles, integration with a hosted first-party index, and `--allow-unsigned` flag are planned for a later release.
+Real signing — a detached signature over the manifest, verified against a trusted
+key the bundle cannot supply — is tracked in SPEC.md §11 as the v0.8 signed bundle
+index. Until it lands, nothing in ahma provides tamper-evidence for a bundle;
+`ahma bundle audit` (which reads what the tools do) is the control that exists.
+Integration with a hosted first-party index and an `--allow-unsigned` flag follow
+from it.
 
 ## See also
 

@@ -1,9 +1,16 @@
-//! First-party signed bundle index.
+//! Parser for the first-party bundle index format.
 //!
-//! The bundle index is a JSON file (published at a well-known URL) that lists
-//! known MTDF tool bundles with their names, versions, descriptions, and content
-//! hashes.  Ahma checks the index when loading third-party bundles and rejects
-//! any bundle not in the index unless `--allow-unsigned` is set.
+//! The bundle index is a JSON file listing known MTDF tool bundles with their
+//! names, versions, descriptions, and content hashes.
+//!
+//! **Not yet wired to anything.** This module previously documented itself as
+//! "Ahma checks the index when loading third-party bundles and rejects any bundle
+//! not in the index unless `--allow-unsigned` is set". No such check exists, no
+//! `--allow-unsigned` flag exists, and [`BundleIndex`] has no caller outside this
+//! file — it is a parser waiting for the gate SPEC.md §11 describes. Stated here
+//! rather than left implied, because a reader who takes the old wording at face
+//! value concludes ahma has a trust boundary around bundle loading that it does
+//! not have.
 //!
 //! ## Index format
 //!

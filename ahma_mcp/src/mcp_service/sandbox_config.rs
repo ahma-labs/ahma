@@ -152,7 +152,7 @@ impl AhmaMcpService {
     /// Updates the tool configurations and notifies clients.
     pub async fn update_tools(&self, new_configs: HashMap<String, ToolConfig>) {
         {
-            let mut configs_lock = self.configs.write().unwrap();
+            let mut configs_lock = self.configs.write();
             *configs_lock = new_configs;
         }
         self.invalidate_config_tools_cache();
@@ -160,7 +160,7 @@ impl AhmaMcpService {
         // Notify clients that the tool list has changed.
         // Clone peer outside the lock before async call to avoid holding guard across .await
         let peer_opt = {
-            let peer_lock = self.peer.read().unwrap();
+            let peer_lock = self.peer.read();
             peer_lock.clone()
         };
 
@@ -267,7 +267,6 @@ impl AhmaMcpService {
         let already_loaded = self
             .current_tools_dir
             .read()
-            .unwrap()
             .as_ref()
             .map(|p| p == &candidate)
             .unwrap_or(false);
@@ -279,7 +278,7 @@ impl AhmaMcpService {
             return;
         }
 
-        let app_config = match self.app_config.read().unwrap().clone() {
+        let app_config = match self.app_config.read().clone() {
             Some(c) => c,
             None => {
                 tracing::debug!(
@@ -317,7 +316,7 @@ impl AhmaMcpService {
             Ok(new_configs) => {
                 let count = new_configs.len();
                 self.update_tools(new_configs).await;
-                *self.current_tools_dir.write().unwrap() = Some(candidate.clone());
+                *self.current_tools_dir.write() = Some(candidate.clone());
                 tracing::info!(
                     "Loaded {} tool configs from per-client {}",
                     count,
@@ -895,7 +894,7 @@ mod tests {
         service.maybe_load_per_client_tools(None).await;
 
         assert!(
-            service.configs.read().unwrap().is_empty(),
+            service.configs.read().is_empty(),
             "configs should be untouched when discovery_root is None"
         );
     }
@@ -911,7 +910,7 @@ mod tests {
             .await;
 
         assert!(
-            service.configs.read().unwrap().is_empty(),
+            service.configs.read().is_empty(),
             "configs should be untouched when .ahma directory is absent"
         );
     }
@@ -932,7 +931,7 @@ mod tests {
             .await;
 
         assert!(
-            service.configs.read().unwrap().is_empty(),
+            service.configs.read().is_empty(),
             "configs should be untouched when .ahma is a file, not a directory"
         );
     }
@@ -955,14 +954,14 @@ mod tests {
         .unwrap();
 
         // Mark the .ahma directory as already loaded.
-        *service.current_tools_dir.write().unwrap() = Some(ahma_dir.clone());
+        *service.current_tools_dir.write() = Some(ahma_dir.clone());
 
         service
             .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
             .await;
 
         assert!(
-            !service.configs.read().unwrap().contains_key("skip_tool"),
+            !service.configs.read().contains_key("skip_tool"),
             "skip_tool must NOT be loaded because the directory is already loaded"
         );
     }
@@ -988,7 +987,7 @@ mod tests {
             .await;
 
         assert!(
-            !service.configs.read().unwrap().contains_key("no_cfg_tool"),
+            !service.configs.read().contains_key("no_cfg_tool"),
             "tool should NOT be loaded when app_config is absent"
         );
     }
@@ -1017,11 +1016,11 @@ mod tests {
             .await;
 
         assert!(
-            service.configs.read().unwrap().contains_key("pclient"),
+            service.configs.read().contains_key("pclient"),
             "per-client tool 'pclient' should be present after successful load"
         );
         assert_eq!(
-            service.current_tools_dir.read().unwrap().as_deref(),
+            service.current_tools_dir.read().as_deref(),
             Some(ahma_dir.as_path()),
             "current_tools_dir should point to the .ahma directory that was just loaded"
         );
@@ -1067,7 +1066,7 @@ mod tests {
             .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
             .await;
 
-        let configs = service.configs.read().unwrap();
+        let configs = service.configs.read();
         assert!(
             configs.contains_key("operator_tool"),
             "the explicitly-configured --tools-dir must survive per-client discovery"
@@ -1118,7 +1117,7 @@ mod tests {
             .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
             .await;
 
-        let configs = service.configs.read().unwrap();
+        let configs = service.configs.read();
         let shared = configs
             .get("shared_name")
             .expect("operator tool must exist");
@@ -1157,7 +1156,7 @@ mod tests {
             .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
             .await;
 
-        let configs = service.configs.read().unwrap();
+        let configs = service.configs.read();
         let git = configs.get("git").expect("bundled git tool must exist");
         assert_ne!(
             git.description, "HIJACKED",
@@ -1200,7 +1199,7 @@ mod tests {
             .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
             .await;
 
-        let configs = service.configs.read().unwrap();
+        let configs = service.configs.read();
         assert!(
             !configs.contains_key("status"),
             "a reserved name must never be redefinable from the workspace"

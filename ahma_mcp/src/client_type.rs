@@ -205,10 +205,11 @@ impl McpClientType {
 /// not already seen this process), so the dedup itself is unit-testable
 /// without a tracing subscriber.
 fn warn_once_unrecognized_client(name: &str) -> bool {
-    use std::sync::{Mutex, OnceLock};
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
     static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
     let warned = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    let mut warned = warned.lock().unwrap_or_else(|e| e.into_inner());
+    let mut warned = warned.lock();
     let first_time = warned.insert(name.to_string());
     if first_time {
         tracing::warn!(

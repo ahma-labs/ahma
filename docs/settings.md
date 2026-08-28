@@ -226,12 +226,52 @@ ahma permissions list           # every grant, with where it came from
 ahma permissions revoke ...     # previews the change; --yes applies it
 ```
 
-Two `[sandbox]` keys are worth knowing:
+## Project settings (`<workspace>/.ahma/settings.toml`)
+
+A repository can carry its own settings file next to its tool definitions. It is
+read whenever ahma finds that workspace's `.ahma` directory, and it overrides
+`~/.ahma/settings.toml` per key — scalars replace scalars, and **lists replace
+lists rather than concatenating**, so any effective value is attributable to
+exactly one file.
+
+**It may set preference-tier keys only.** This file travels with the repository,
+so anyone who can send you a clone can propose values for it — and a cloned
+repository must not be able to weaken the sandbox that is about to contain it.
+Everything in `[sandbox]`, `[auth]`, `[web]`, `[network]` and `[permissions]`,
+plus `http.unix_socket_path`, is refused there and reported by name at startup.
+Set those in `~/.ahma/settings.toml` or on the command line, where they are yours.
+
+`ahma settings show --origin` labels each key `cli`, `project (<path>)`,
+`user (<path>)` or `default`, and lists whatever the project file asked for and
+did not get:
+
+```
+# Project settings file: /path/to/repo/.ahma/settings.toml (1 preference key(s); …)
+#   refused (security-tier, R-CFG2.2): auth.require_token, sandbox.disable
+#   refused (unrecognised): tools.not_a_key
+tools.timeout_secs                            = 4242  # project (/path/to/repo/.ahma/settings.toml)
+sandbox.disable                               = false  # default
+```
+
+`--no-settings` ignores **both** files for the invocation.
+
+Three `[sandbox]` keys are worth knowing:
 
 - **`profiles`** — the shipped toolchain carve-outs (`rust`, `node`, `go`,
   `common`). These used to be hard-coded in the sandbox backends, invisible and
-  un-refusable; they are now data you can inspect and disable. Set to `[]` for the
-  strictest isolation.
+  un-refusable; they are now data you can inspect and disable. Set to `[]` to
+  enable none of them.
+- **`package_cache_write`** (default `true`) — whether package-manager caches
+  (the cargo registry and git caches, and their equivalents) are writable. Set it
+  to `false`, or pass `--no-package-cache-write`, and they drop to read-only while
+  the toolchain stays runnable.
+
+  This is not a general hardening dial; it is the mitigation for one named risk.
+  Those caches are shared by every project on the machine, so an agent working in
+  one project can edit a cached crate's extracted source, and that code then runs
+  — as a build script or proc macro — the next time you build an unrelated
+  project. No sandbox rule is broken at any step. `ahma permissions list` states
+  this cost beside the `rust` profile that creates it (SPEC R-HANDOFF.8).
 - **`persistent_scopes`** — the directories you have granted, surviving every
   `roots/list` update. Written by `ahma sandbox grant` or by an approved prompt,
   never by a sandboxed command (this file is outside every sandbox scope, by

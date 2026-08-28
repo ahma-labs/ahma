@@ -38,7 +38,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -125,7 +126,7 @@ impl RenewalWatcher {
     /// `token` is the `CancellationToken` from the existing `Operation`; the
     /// watcher cancels it when the renewal deadline is exceeded.
     pub fn register(&self, op_id: &str, tool_name: &str, token: CancellationToken) {
-        let mut ops = self.ops.write().unwrap();
+        let mut ops = self.ops.write();
         ops.insert(
             op_id.to_string(),
             WatchedOp {
@@ -139,13 +140,13 @@ impl RenewalWatcher {
 
     /// Deregister a completed or cancelled operation.
     pub fn deregister(&self, op_id: &str) {
-        let mut ops = self.ops.write().unwrap();
+        let mut ops = self.ops.write();
         ops.remove(op_id);
     }
 
     /// Record a checkpoint for an operation (resets the renewal timer).
     pub fn checkpoint(&self, op_id: &str) {
-        let mut ops = self.ops.write().unwrap();
+        let mut ops = self.ops.write();
         if let Some(op) = ops.get_mut(op_id) {
             op.last_checkpoint = Instant::now();
         }
@@ -158,7 +159,7 @@ impl RenewalWatcher {
         let mut to_halt = vec![];
 
         {
-            let ops = self.ops.read().unwrap();
+            let ops = self.ops.read();
             for (op_id, op) in ops.iter() {
                 let since_checkpoint = op.last_checkpoint.elapsed();
                 if since_checkpoint > self.cfg.renew_after {
@@ -176,7 +177,7 @@ impl RenewalWatcher {
 
             // Cancel the operation.
             {
-                let ops = self.ops.read().unwrap();
+                let ops = self.ops.read();
                 if let Some(op) = ops.get(&op_id) {
                     warn!(
                         "Renewal contract: halting {op_id} ({tool_name}) after {}s unattended",

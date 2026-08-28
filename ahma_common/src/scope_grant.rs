@@ -38,9 +38,9 @@
 //!    a near-simultaneous double-approve from two surfaces harmless.
 //!    [`resolve`]: GrantCoordinator::resolve
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -175,7 +175,7 @@ impl GrantCoordinator {
     ) -> Option<ScopeGrantRequest> {
         let canonical = canonicalize_best_effort(path);
         let key = (canonical.clone(), access);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if inner.dismissed.contains(&key) || inner.active_keys.contains(&key) {
             return None;
         }
@@ -210,7 +210,7 @@ impl GrantCoordinator {
         tool: Option<String>,
     ) -> Option<ScopeGrantRequest> {
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             let key = (canonicalize_best_effort(path), access);
             inner.dismissed.remove(&key);
         }
@@ -225,7 +225,7 @@ impl GrantCoordinator {
     /// grant additionally dismisses the *other* access variant for the same path
     /// (granting rw subsumes a pending ro need, and vice-versa).
     pub fn resolve(&self, decision_id: &str, decision: GrantDecision) -> GrantResolveOutcome {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if inner.resolved.contains(decision_id) {
             return GrantResolveOutcome::AlreadyResolved;
         }
@@ -260,7 +260,7 @@ impl GrantCoordinator {
     /// is *not* dismissed — a future trip may legitimately re-ask). Returns the
     /// request if it was in flight.
     pub fn cancel(&self, decision_id: &str) -> Option<ScopeGrantRequest> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let req = inner.in_flight.remove(decision_id);
         if let Some(r) = &req {
             inner.active_keys.remove(&(r.path.clone(), r.access));
@@ -273,27 +273,17 @@ impl GrantCoordinator {
     /// session-health disclosure (#485): the `grant_pending` event and the
     /// heartbeat `pending_grants` count. Order is unspecified.
     pub fn pending(&self) -> Vec<ScopeGrantRequest> {
-        self.inner
-            .lock()
-            .unwrap()
-            .in_flight
-            .values()
-            .cloned()
-            .collect()
+        self.inner.lock().in_flight.values().cloned().collect()
     }
 
     /// Number of decisions currently awaiting an answer.
     pub fn pending_count(&self) -> usize {
-        self.inner.lock().unwrap().in_flight.len()
+        self.inner.lock().in_flight.len()
     }
 
     /// Whether `decision_id` is still awaiting an answer.
     pub fn is_in_flight(&self, decision_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .in_flight
-            .contains_key(decision_id)
+        self.inner.lock().in_flight.contains_key(decision_id)
     }
 }
 

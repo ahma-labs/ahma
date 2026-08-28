@@ -71,7 +71,7 @@ impl Sandbox {
 
     fn get_macos_scope_rules(&self) -> String {
         let mut rules = String::new();
-        for scope in self.scopes.read().unwrap().iter() {
+        for scope in self.scopes.read().iter() {
             rules.push_str(&format!(
                 "(allow file-read* (subpath \"{}\"))\n(allow file-write* (subpath \"{}\"))\n",
                 scope.display(),
@@ -105,7 +105,7 @@ impl Sandbox {
     /// a *network* operation, so `(allow network*)` here would otherwise let the
     /// connection through no matter what the network rules said.
     fn get_macos_network_rules(&self) -> String {
-        match *self.egress_proxy_addr.read().unwrap() {
+        match *self.egress_proxy_addr.read() {
             None => "(allow network*)\n".to_string(),
             Some(addr) => format!(
                 "(allow network*)\n\

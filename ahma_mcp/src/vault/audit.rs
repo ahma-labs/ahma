@@ -9,12 +9,20 @@
 //!
 //! Each line is a JSON object: `{"timestamp":"…","kind":{"type":"…",…}}`.
 //!
-//! ## OpenTelemetry bridging
+//! ## OpenTelemetry: reserved, not implemented
 //!
-//! When an OTel span context is active, the `trace_id` / `span_id` fields are
-//! included in the event automatically (if the `otel` feature flag is set).
-//! For now the implementation ships the raw JSONL without OTel integration;
-//! the field placeholders are present so tooling can pick them up later.
+//! `trace_id` is a reserved field and is **always `None`**. Nothing populates
+//! it: there is no OTel bridging here, no `otel` feature flag gating it, and no
+//! correlation between an event and any span.
+//!
+//! Stated as a negative because the heading used to read "OpenTelemetry
+//! bridging" and describe the wiring in the present tense ("the fields are
+//! included automatically"), with the qualification several lines later. A
+//! reader scanning for whether ahma correlates audit events with traces got the
+//! wrong answer from the heading alone. The field stays so the wire format does
+//! not have to change when someone threads `TRACEPARENT` through
+//! (`ahma_common::observability` already initialises the subscriber); until then
+//! it is a placeholder, and calling it one is the whole point of this note.
 
 use std::path::{Path, PathBuf};
 

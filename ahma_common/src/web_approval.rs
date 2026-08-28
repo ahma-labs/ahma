@@ -40,9 +40,9 @@
 //! [`begin`]: WebApprovalCoordinator::begin
 //! [`resolve`]: WebApprovalCoordinator::resolve
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -164,7 +164,7 @@ impl WebApprovalCoordinator {
         tool: Option<String>,
     ) -> Option<WebApprovalRequest> {
         let domain = norm(domain);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if inner.session_grants.contains(&domain)
             || inner.session_denies.contains(&domain)
             || inner.active_domains.contains(&domain)
@@ -187,7 +187,7 @@ impl WebApprovalCoordinator {
     /// idempotent: a second call for the same `decision_id` returns
     /// [`WebResolveOutcome::AlreadyResolved`].
     pub fn resolve(&self, decision_id: &str, decision: WebApprovalDecision) -> WebResolveOutcome {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if inner.resolved.contains(decision_id) {
             return WebResolveOutcome::AlreadyResolved;
         }
@@ -224,7 +224,7 @@ impl WebApprovalCoordinator {
     /// domain is *not* added to any session set, so a future request may re-ask.
     /// Returns the request if it was in flight.
     pub fn cancel(&self, decision_id: &str) -> Option<WebApprovalRequest> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let req = inner.in_flight.remove(decision_id);
         if let Some(r) = &req {
             inner.active_domains.remove(&r.domain);
@@ -236,34 +236,18 @@ impl WebApprovalCoordinator {
     /// Snapshot of the domains granted for this session, to pass as `session_grants`
     /// to [`crate::web_policy::WebPolicy::decide`].
     pub fn session_grants(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .session_grants
-            .iter()
-            .cloned()
-            .collect()
+        self.inner.lock().session_grants.iter().cloned().collect()
     }
 
     /// Snapshot of the domains denied for this session, to pass as `session_denies`
     /// to [`crate::web_policy::WebPolicy::decide`].
     pub fn session_denies(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .session_denies
-            .iter()
-            .cloned()
-            .collect()
+        self.inner.lock().session_denies.iter().cloned().collect()
     }
 
     /// Whether `decision_id` is still awaiting an answer.
     pub fn is_in_flight(&self, decision_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .in_flight
-            .contains_key(decision_id)
+        self.inner.lock().in_flight.contains_key(decision_id)
     }
 }
 

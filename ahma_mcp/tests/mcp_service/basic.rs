@@ -180,7 +180,7 @@ mod mcp_service_tests {
             .expect("Failed to create test service");
 
         // Verify the service has the expected initial state
-        assert!(service.peer.read().unwrap().is_none());
+        assert!(service.peer.read().is_none());
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod mcp_service_tests {
         // Test that service was created successfully with empty config
         // The actual list_tools call requires complex MCP context setup
         // which is better tested in integration tests
-        assert!(service.configs.read().unwrap().is_empty());
+        assert!(service.configs.read().is_empty());
     }
 
     // NOTE: the former `test_service_with_tool_configs` (a minimal
@@ -231,7 +231,7 @@ mod mcp_service_tests {
 
         // AhmaMcpService uses RwLock internally — verify reads work
         {
-            let _guard = service.configs.read().unwrap();
+            let _guard = service.configs.read();
         }
         // Confirm Send bound is satisfied by wrapping in Arc
         let _ = Arc::new(service);

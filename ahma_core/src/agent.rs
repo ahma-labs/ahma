@@ -1358,8 +1358,9 @@ async fn finish_with_limit_summary(
 /// setup every time and forfeits HTTP keep-alive reuse entirely; sharing one
 /// client per base URL keeps connections warm across the agent loop's many
 /// sequential tool calls. `reqwest::Client` clones are cheap `Arc` handles.
-static HTTP_CLIENT_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, reqwest::Client>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static HTTP_CLIENT_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<HashMap<String, reqwest::Client>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// Return the effective request base URL and a cached `reqwest::Client` for an
 /// MCP bridge `base_url`. `unix://<path>` URLs (Unix only) yield a client
@@ -1377,7 +1378,7 @@ pub fn cached_http_client(base_url: &str) -> Result<(String, reqwest::Client), S
         base_url.to_string()
     };
 
-    let mut cache = HTTP_CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = HTTP_CLIENT_CACHE.lock();
     if let Some(client) = cache.get(base_url) {
         return Ok((request_base, client.clone()));
     }
@@ -1453,8 +1454,8 @@ async fn get_or_create_external_session(
 /// `max_sessions` cap within a normal chat turn. This cache lets any caller
 /// in the process reuse the same session for the same (url, workspace)
 /// instead (SPEC ahma_tui R25).
-static SESSION_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<(String, PathBuf), String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static SESSION_CACHE: std::sync::LazyLock<parking_lot::Mutex<HashMap<(String, PathBuf), String>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// Drop a cached session for (url, workspace_root) so the next
 /// `get_or_create_session` call negotiates a fresh one. Call this when a
@@ -1463,7 +1464,6 @@ static SESSION_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<(String, Path
 pub fn invalidate_cached_session(url: &str, workspace_root: &std::path::Path) {
     SESSION_CACHE
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .remove(&(url.to_string(), workspace_root.to_path_buf()));
 }
 
@@ -1493,12 +1493,7 @@ pub async fn get_or_create_session(
     }
 
     let cache_key = (url.to_string(), mcp.workspace_root.clone());
-    if let Some(sid) = SESSION_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&cache_key)
-        .cloned()
-    {
+    if let Some(sid) = SESSION_CACHE.lock().get(&cache_key).cloned() {
         return Ok(sid);
     }
 
@@ -1530,10 +1525,7 @@ pub async fn get_or_create_session(
         .map_err(|e| format!("{e:#}"))?;
     let sid = session.session_id().to_string();
 
-    SESSION_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(cache_key, sid.clone());
+    SESSION_CACHE.lock().insert(cache_key, sid.clone());
 
     Ok(sid)
 }
@@ -1927,7 +1919,7 @@ async fn build_agent_run_context(
     let mcp_connections = service.mcp_connections.read().await.clone();
 
     let local_mcp_base_url = {
-        let app_config_guard = service.app_config.read().unwrap();
+        let app_config_guard = service.app_config.read();
         let app_config_ref = app_config_guard.as_ref().map(|arc| arc.as_ref());
         get_mcp_base_url(app_config_ref)
     };

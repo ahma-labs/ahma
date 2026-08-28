@@ -1188,9 +1188,14 @@ pub struct Cli {
     pub no_temp_files: bool,
 
     /// Disable write access to package-manager caches (cargo registry/git, etc.).
-    /// By default, ahma grants write access to these subdirs so that agents can
-    /// fetch new dependency versions.  Sensitive paths (bin, config.toml,
-    /// credentials.toml) are always kept read-only.
+    /// By default ahma grants write access to these subdirs so agents can fetch new
+    /// dependency versions; sensitive paths (bin, config.toml, credentials.toml) stay
+    /// read-only either way. This flag is the mitigation for a specific risk, not a
+    /// general hardening dial: those caches are shared by every project on the machine,
+    /// so an agent working in one project can edit a cached crate's extracted source and
+    /// that code then runs — as a build script or proc macro — when you build an
+    /// unrelated project later. Passing this downgrades the caches to read-only and
+    /// leaves the toolchain runnable (SPEC R-HANDOFF.8).
     #[arg(long = "no-package-cache-write", global = true)]
     pub no_package_cache_write: bool,
 
@@ -1316,7 +1321,7 @@ pub enum Subcommands {
     Tui(TuiArgs),
     /// Local TLS certificate management: init, rotate, and check status.
     Tls(TlsArgs),
-    /// Bundle management: audit and verify MTDF tool bundles.
+    /// Bundle management: audit MTDF tool bundles for supply-chain risks, and record or check a SHA-256 content manifest.
     Bundle(BundleArgs),
     /// LLM provider management: add, list, test, and remove named providers.
     Llm(LlmArgs),
@@ -1557,12 +1562,31 @@ pub struct SettingsOriginCtx {
     /// `(dotted settings key, rendered value)` for each CLI flag passed this
     /// invocation that overrides a settings key (e.g. `("tools.timeout_secs", "30")`).
     pub cli_overrides: Vec<(&'static str, String)>,
+    /// The project settings file consulted this invocation, and the keys it
+    /// actually contributed (SPEC R-CFG3). `None` when there is no `.ahma`
+    /// directory, or under `--no-settings`.
+    ///
+    /// Only the *accepted* keys are recorded: a Security-tier key in that file
+    /// did not take effect, so listing it as a source would be the opposite of
+    /// provenance. Its rejection is reported at `warn` at startup instead
+    /// (R-CFG2.2).
+    pub project: Option<ProjectOrigin>,
+}
+
+/// Where a project settings file was, and which keys survived its trust filter.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectOrigin {
+    /// Absolute path to `<workspace>/.ahma/settings.toml`.
+    pub path: PathBuf,
+    /// Dotted keys (`tools.timeout_secs`) the project file actually set.
+    pub keys: Vec<String>,
 }
 
 /// Build the [`SettingsOriginCtx`] for this invocation by mapping every
 /// settings-overriding CLI flag that was explicitly passed to the dotted
 /// settings key it overrides.
 pub fn settings_origin_ctx(cli: &Cli) -> SettingsOriginCtx {
+    let project = project_origin(cli);
     let mut cli_overrides: Vec<(&'static str, String)> = Vec::new();
     collect_boolean_flag_overrides(cli, &mut cli_overrides);
     collect_option_overrides(cli, &mut cli_overrides);
@@ -1570,7 +1594,32 @@ pub fn settings_origin_ctx(cli: &Cli) -> SettingsOriginCtx {
         no_settings: cli.no_settings,
         settings_path: cli.settings_path.clone(),
         cli_overrides,
+        project,
     }
+}
+
+/// Locate the project settings file for this invocation and list the keys it
+/// contributes, for `settings show --origin`.
+///
+/// Reads the same file `load_settings` does, through the same filter, so the
+/// report cannot claim a source the resolution did not use. A read or parse
+/// failure yields `None` here rather than aborting: `settings show` is a
+/// diagnostic, and the startup path already fails closed on the same file.
+fn project_origin(cli: &Cli) -> Option<ProjectOrigin> {
+    if cli.no_settings {
+        return None;
+    }
+    let tools_dir = crate::shell::resolution::normalize_tools_dir(cli.tools_dir.clone())?;
+    let path = ahma_common::config::project_settings_path(&tools_dir);
+    let load = ahma_common::config::load_project_settings(&path).ok()?;
+    let mut keys: Vec<String> = load
+        .accepted
+        .iter()
+        .filter_map(|(table, v)| v.as_table().map(|t| (table, t)))
+        .flat_map(|(table, t)| t.keys().map(move |k| format!("{table}.{k}")))
+        .collect();
+    keys.sort();
+    Some(ProjectOrigin { path, keys })
 }
 
 fn collect_boolean_flag_overrides(cli: &Cli, out: &mut Vec<(&'static str, String)>) {
@@ -2146,10 +2195,15 @@ pub enum BundleCommand {
     /// Audit a bundle directory. Scans all JSON files for secrets, missing path
     /// validation, prompt-injection payloads, and other security risks.
     Audit(BundleAuditArgs),
-    /// Verify a bundle directory against its content manifest.
-    Verify(BundleVerifyArgs),
-    /// Create a content manifest for a bundle directory.
-    Sign(BundleSignArgs),
+    /// Write a SHA-256 content manifest for a bundle directory. This is a
+    /// corruption check, not a signature: the manifest is unsigned and lives
+    /// inside the bundle, so anyone who can edit a bundle file can rewrite it
+    /// too. Was `ahma bundle sign`, which claimed more than it did.
+    #[command(alias = "sign")]
+    Checksum(BundleChecksumArgs),
+    /// Re-hash a bundle directory and compare it against its content manifest.
+    /// Detects corruption; see `checksum` for what it does not detect.
+    Verify(BundleChecksumVerifyArgs),
 }
 
 /// Arguments for `ahma bundle audit <path>`.
@@ -2165,16 +2219,16 @@ pub struct BundleAuditArgs {
 
 /// Arguments for `ahma bundle verify <path>`.
 #[derive(Parser, Debug)]
-pub struct BundleVerifyArgs {
-    /// Path to the bundle directory to verify.
+pub struct BundleChecksumVerifyArgs {
+    /// Path to the bundle directory to check against its manifest.
     #[arg(value_name = "PATH")]
     pub path: PathBuf,
 }
 
-/// Arguments for `ahma bundle sign <path>`.
+/// Arguments for `ahma bundle checksum <path>`.
 #[derive(Parser, Debug)]
-pub struct BundleSignArgs {
-    /// Path to the bundle directory to sign.
+pub struct BundleChecksumArgs {
+    /// Path to the bundle directory to checksum.
     #[arg(value_name = "PATH")]
     pub path: PathBuf,
 }
@@ -2366,11 +2420,94 @@ fn extract_tool_fields(cmd: &Subcommands) -> ToolFields {
     }
 }
 
-/// Load `AhmaSettings` from the path determined by the CLI flags.
+/// Load `AhmaSettings` from the path determined by the CLI flags, then layer the
+/// project settings file over it (SPEC R-CFG3).
 ///
-/// Respects `--no-settings` (skip loading entirely) and `--settings-path`
-/// (load from an alternate path instead of `~/.ahma/settings.toml`).
+/// Respects `--no-settings`, which disables **both** files for the invocation
+/// (R-CFG3.3), and `--settings-path` (an alternate user file).
+///
+/// The project half is `<workspace>/.ahma/settings.toml`, found in the directory
+/// [`crate::shell::resolution::normalize_tools_dir`] already identifies — the
+/// same `.ahma` the tool definitions come from, which is R-CFG3.1's trigger. It
+/// contributes **Preference-tier keys only**: the file travels with a
+/// repository, so anyone who can send a clone can propose values for it, and a
+/// cloned repository must not be able to weaken the sandbox that is about to
+/// contain it (R-CFG2.2).
 pub fn load_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
+    let user = load_user_settings(cli);
+    if cli.no_settings {
+        return user;
+    }
+    apply_project_settings(cli, user)
+}
+
+/// Layer `<workspace>/.ahma/settings.toml` over already-resolved user settings.
+fn apply_project_settings(
+    cli: &Cli,
+    user: ahma_common::config::AhmaSettings,
+) -> ahma_common::config::AhmaSettings {
+    use ahma_common::config::{
+        load_project_settings, merge_project_over_user, project_settings_path,
+    };
+
+    let Some(tools_dir) = crate::shell::resolution::normalize_tools_dir(cli.tools_dir.clone())
+    else {
+        return user;
+    };
+    let path = project_settings_path(&tools_dir);
+
+    let load = match load_project_settings(&path) {
+        Ok(load) => load,
+        Err(e) => {
+            // R-CFG6.1 applies to this file too: readable but unparseable must
+            // abort, or a corrupt project file quietly changes behaviour.
+            eprintln!(
+                "ahma: fatal: {e}\n\
+                 Fix or delete the file; it may set preference-tier keys only."
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // R-CFG2.2 requires the ignored keys be reported by name. A silent drop
+    // would leave an author editing a file that does nothing, concluding ahma is
+    // broken rather than that the key is refused by design.
+    if !load.rejected_security.is_empty() {
+        tracing::warn!(
+            "ignoring security-tier keys in the project settings file {}: {}. \
+             These may be set only in ~/.ahma/settings.toml or on the command line — a \
+             repository must not be able to widen the sandbox that contains it (SPEC \
+             R-CFG2.2).",
+            path.display(),
+            load.rejected_security.join(", ")
+        );
+    }
+    if !load.rejected_unknown.is_empty() {
+        tracing::warn!(
+            "ignoring unrecognised keys in the project settings file {}: {}",
+            path.display(),
+            load.rejected_unknown.join(", ")
+        );
+    }
+
+    if load.accepted.is_empty() {
+        return user;
+    }
+    tracing::info!(
+        "applied project settings from {} ({} key(s))",
+        path.display(),
+        load.accepted
+            .values()
+            .filter_map(|v| v.as_table())
+            .map(|t| t.len())
+            .sum::<usize>()
+    );
+    merge_project_over_user(&user, &load.accepted)
+}
+
+/// The user-tier half of [`load_settings`]: `~/.ahma/settings.toml` or
+/// `--settings-path`.
+fn load_user_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
     use ahma_common::config::{AhmaSettings, settings_path};
     if cli.no_settings {
         tracing::debug!("--no-settings: using compiled-in defaults");
@@ -2922,8 +3059,9 @@ pub fn env_flag_enabled(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::io::{IsTerminal, Write};
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::LazyLock;
     use tempfile::tempdir;
 
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -2936,14 +3074,14 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_unset() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_UNSET") };
         assert!(!env_flag_enabled("AHMA_TEST_FLAG_UNSET"));
     }
 
     #[test]
     fn test_env_flag_enabled_empty() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         unsafe { std::env::set_var("AHMA_TEST_FLAG_EMPTY", "") };
         let result = env_flag_enabled("AHMA_TEST_FLAG_EMPTY");
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_EMPTY") };
@@ -2952,7 +3090,7 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_whitespace_only() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         unsafe { std::env::set_var("AHMA_TEST_FLAG_WS", "   ") };
         let result = env_flag_enabled("AHMA_TEST_FLAG_WS");
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_WS") };
@@ -2961,7 +3099,7 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_true() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         for val in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "ON"] {
             unsafe { std::env::set_var("AHMA_TEST_FLAG_VAL", val) };
             let result = env_flag_enabled("AHMA_TEST_FLAG_VAL");
@@ -2972,7 +3110,7 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_false() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         for val in ["0", "false", "no", "off", "x", ""] {
             if val.is_empty() {
                 continue;
@@ -2992,7 +3130,7 @@ mod tests {
     /// `no_sandbox` must stay `false` when the flag is absent.
     #[test]
     fn disable_sandbox_env_var_is_ignored() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         unsafe { std::env::set_var("AHMA_DISABLE_SANDBOX", "1") };
         // A default invocation with no --no-sandbox flag and default settings.
@@ -3068,7 +3206,7 @@ mod tests {
     /// The `--no-sandbox` flag is still honored (the supported override).
     #[test]
     fn no_sandbox_flag_is_honored() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         unsafe { std::env::remove_var("AHMA_DISABLE_SANDBOX") };
         let cli = Cli::parse_from(["ahma", "--no-sandbox", "serve", "stdio"]);
@@ -3152,7 +3290,7 @@ mod tests {
 
     #[test]
     fn test_resolve_sandbox_policy_strict_by_default() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         unsafe { std::env::remove_var("AHMA_DISABLE_SANDBOX") };
         let cfg = make_cfg();
@@ -3838,7 +3976,7 @@ mod tests {
 
     #[test]
     fn test_app_config_env_flag_via_helper() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         unsafe { std::env::set_var("AHMA_TEST_CFG_FLAG", "yes") };
         assert!(AppConfig::env_flag("AHMA_TEST_CFG_FLAG"));
         unsafe { std::env::remove_var("AHMA_TEST_CFG_FLAG") };
@@ -4373,7 +4511,7 @@ mod tests {
 
     #[test]
     fn test_parse_sandbox_settings_from_settings() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
         let mut s = ahma_common::config::AhmaSettings::default();
@@ -4394,7 +4532,7 @@ mod tests {
 
     #[test]
     fn test_parse_sandbox_settings_cli_overrides_and_pkg_cache_flag() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         let cli = Cli::parse_from([
             "ahma",
@@ -4457,7 +4595,7 @@ mod tests {
 
     #[test]
     fn test_parse_auth_settings_from_settings() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         let cli = Cli::parse_from(["ahma", "serve", "http"]);
         let mut s = ahma_common::config::AhmaSettings::default();
@@ -4476,7 +4614,7 @@ mod tests {
 
     #[test]
     fn test_parse_auth_settings_empty_token_path_is_none() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         let cli = Cli::parse_from(["ahma", "serve", "http"]);
         let s = ahma_common::config::AhmaSettings::default();
@@ -4493,7 +4631,7 @@ mod tests {
 
     #[test]
     fn test_parse_auth_settings_cli_overrides() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         let cli = Cli::parse_from([
             "ahma",
@@ -4594,7 +4732,7 @@ mod tests {
 
     #[test]
     fn test_resolve_sandbox_scopes_cli_expands_tilde() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let home = dirs::home_dir().expect("home dir");
         let cli = Cli::parse_from(["ahma", "--sandbox-scope", "~/foo", "serve", "stdio"]);
         let s = ahma_common::config::AhmaSettings::default();
@@ -4604,7 +4742,7 @@ mod tests {
 
     #[test]
     fn test_resolve_sandbox_scopes_cli_settings_fallback() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let home = dirs::home_dir().expect("home dir");
         let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
         let mut s = ahma_common::config::AhmaSettings::default();
@@ -4615,7 +4753,7 @@ mod tests {
 
     #[test]
     fn test_resolve_working_dirs_cli_expands_tilde() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let home = dirs::home_dir().expect("home dir");
         let cli = Cli::parse_from(["ahma", "--working-dir", "~/wd", "serve", "stdio"]);
         let s = ahma_common::config::AhmaSettings::default();
@@ -4625,7 +4763,7 @@ mod tests {
 
     #[test]
     fn test_resolve_working_dirs_cli_settings_fallback() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
         let mut s = ahma_common::config::AhmaSettings::default();
         s.sandbox.working_dirs = vec![PathBuf::from("/abs/wd")];
@@ -4638,7 +4776,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_unix_socket_path_cli_flag_wins() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let cli = Cli::parse_from(["ahma", "--unix-socket-path", "/x/y.sock", "serve", "stdio"]);
         let s = ahma_common::config::AhmaSettings::default();
         assert_eq!(unix_socket_path_from_cli(&cli, &s), "/x/y.sock");
@@ -4647,7 +4785,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_unix_socket_path_serve_unix_socket_path() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let cli = Cli::parse_from(["ahma", "serve", "unix", "--socket-path", "/a/b.sock"]);
         let s = ahma_common::config::AhmaSettings::default();
         assert_eq!(unix_socket_path_from_cli(&cli, &s), "/a/b.sock");
@@ -4656,7 +4794,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_unix_socket_path_serve_unix_settings_fallback() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let cli = Cli::parse_from(["ahma", "serve", "unix"]);
         let mut s = ahma_common::config::AhmaSettings::default();
         s.http.unix_socket_path = Some("/from/settings.sock".to_string());
@@ -4666,7 +4804,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_unix_socket_path_default_when_unset() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         let cli = Cli::parse_from(["ahma", "serve", "http"]);
         let s = ahma_common::config::AhmaSettings::default();
         assert_eq!(unix_socket_path_from_cli(&cli, &s), "/tmp/ahma.sock");
@@ -4676,7 +4814,7 @@ mod tests {
 
     #[test]
     fn test_build_app_config_defaults_with_no_settings() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
         let cli = Cli::parse_from(["ahma", "--no-settings", "serve", "stdio"]);
@@ -4692,7 +4830,7 @@ mod tests {
 
     #[test]
     fn test_build_app_config_threads_cli_flags() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
         let cli = Cli::parse_from([
@@ -4722,7 +4860,7 @@ mod tests {
 
     #[test]
     fn test_build_app_config_explicit_tools_dir() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         init_test();
         unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
         let tmp = tempdir().unwrap();

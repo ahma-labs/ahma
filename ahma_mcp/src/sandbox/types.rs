@@ -7,7 +7,7 @@ pub enum SandboxMode {
 }
 
 /// A guard that holds a read lock on the sandbox scopes.
-pub struct ScopesGuard<'a>(pub(super) std::sync::RwLockReadGuard<'a, Vec<PathBuf>>);
+pub struct ScopesGuard<'a>(pub(super) parking_lot::RwLockReadGuard<'a, Vec<PathBuf>>);
 
 impl std::ops::Deref for ScopesGuard<'_> {
     type Target = [PathBuf];

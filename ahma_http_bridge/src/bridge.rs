@@ -697,7 +697,7 @@ fn build_mcp_router(
     quic_info: Option<&QuicInfo>,
     rate_limit_rps: u64,
     rate_limit_burst: u32,
-) -> Router {
+) -> Result<Router> {
     // /health is intentionally outside auth + rate-limit layers: load-balancer
     // probes must never be blocked or throttled. /restart is NOT exempt — it
     // kills the whole bridge, so it goes through bearer auth and rate limiting
@@ -724,14 +724,26 @@ fn build_mcp_router(
 
     // Apply per-IP rate limiting to MCP routes only, when configured.
     let mcp_routes = if rate_limit_rps > 0 {
-        let governor_conf = Arc::new(
-            GovernorConfigBuilder::default()
-                .per_second(rate_limit_rps)
-                .burst_size(rate_limit_burst)
-                .key_extractor(SmartIpKeyExtractor)
-                .finish()
-                .expect("Invalid rate-limit configuration"),
-        );
+        // Both values come from operator configuration (`--rate-limit-rps` /
+        // `--rate-limit-burst`), so an invalid combination is a typo, not a bug.
+        // `.expect()` turned that typo into a panic with a message that named
+        // neither value; the operator saw a backtrace where they should have
+        // seen which number was wrong.
+        let governor_conf = match GovernorConfigBuilder::default()
+            .per_second(rate_limit_rps)
+            .burst_size(rate_limit_burst)
+            .key_extractor(SmartIpKeyExtractor)
+            .finish()
+        {
+            Some(conf) => Arc::new(conf),
+            None => {
+                return Err(crate::error::BridgeError::Config(format!(
+                    "--rate-limit-rps {rate_limit_rps} with --rate-limit-burst \
+                     {rate_limit_burst} was rejected. Both must be non-zero, and the burst \
+                     must be at least as large as the per-second rate."
+                )));
+            }
+        };
         mcp_routes.layer(GovernorLayer::new(governor_conf))
     } else {
         mcp_routes
@@ -739,7 +751,7 @@ fn build_mcp_router(
 
     let base = exempt_routes.merge(mcp_routes).layer(cors);
 
-    if let Some(qi) = quic_info {
+    Ok(if let Some(qi) = quic_info {
         let alt_svc = HeaderValue::from_str(&qi.alt_svc_header)
             .unwrap_or_else(|_| HeaderValue::from_static(""));
         base.layer(SetResponseHeaderLayer::overriding(
@@ -749,7 +761,7 @@ fn build_mcp_router(
         .layer(TraceLayer::new_for_http())
     } else {
         base.layer(TraceLayer::new_for_http())
-    }
+    })
 }
 
 /// Serve a single accepted TCP stream over HTTP/2-only or auto HTTP/1.1+HTTP/2.
@@ -867,7 +879,7 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
         quic_info.as_ref(),
         config.rate_limit_rps,
         config.rate_limit_burst,
-    );
+    )?;
 
     // Print QUIC startup markers *before* AHMA_BOUND_PORT so parsers see them in order.
     print_quic_info(&quic_info, config.enable_quic, local_addr);
@@ -1042,7 +1054,7 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
         None,
         config.rate_limit_rps,
         config.rate_limit_burst,
-    );
+    )?;
 
     // Remove a stale socket file from a previous run — but never a live one
     // (SPEC R-ISO.2). Abstract sockets start with '\0' and have no file.
@@ -1088,7 +1100,7 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
         if let Some(owned) = owned_socket_identity
             && unix_socket_identity(&socket_path_for_shutdown) == Some(owned)
         {
-            let _ = std::fs::remove_file(&raw_socket_path_for_shutdown);
+            ahma_common::fs_lock::remove_stale_socket(&raw_socket_path_for_shutdown);
         }
         std::process::exit(0);
     });
@@ -1293,7 +1305,7 @@ async fn handle_restart(
         if let ListenerKind::Unix(ref path) = listener_kind
             && !path.starts_with('\0')
         {
-            let _ = std::fs::remove_file(path);
+            ahma_common::fs_lock::remove_stale_socket(path);
         }
         std::process::exit(0);
     });
