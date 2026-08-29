@@ -1450,6 +1450,19 @@ async fn run_session_operation(
     }
     spill_writer.finish().await;
 
+    finalize_session_result(exec_result, &collected, session_id, op_id, monitor).await
+}
+
+/// Turn the terminal result of a session-protocol command into the final
+/// monitor status update and the `(outcome, exit_code)` pair the caller
+/// reports to the audit log.
+async fn finalize_session_result(
+    exec_result: anyhow::Result<i32>,
+    collected: &BoundedLineCollector,
+    session_id: &str,
+    op_id: &str,
+    monitor: &Arc<OperationMonitor>,
+) -> (audit::Outcome, Option<i32>) {
     match exec_result {
         Ok(exit_code) => {
             let final_output = json!({
@@ -1766,6 +1779,78 @@ fn capability_enforcing_layer() -> sandbox::EnforcingLayer {
     }
 }
 
+/// Diagnose a failed streaming operation's stdout/stderr and surface whatever
+/// remediation applies: an out-of-scope sandbox grant, a build-contamination
+/// hint, or a non-path capability denial disclosure. Best-effort — each check
+/// is independent and only appends an operation alert when it matches.
+#[allow(clippy::too_many_arguments)]
+async fn record_failure_diagnostics(
+    sandbox: &Arc<sandbox::Sandbox>,
+    scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
+    op_monitor: &Arc<OperationMonitor>,
+    op_id: &str,
+    tool: &str,
+    stdout_str: &str,
+    stderr_str: &str,
+) {
+    sandbox::grant_channel::notify_stderr_denial(
+        sandbox,
+        scope_grant_notifier,
+        stderr_str,
+        stdout_str,
+        tool,
+    )
+    .await;
+
+    // An out-of-scope runtime denial cannot be returned as a typed McpError on
+    // the async path (the result is delivered later as text), so attach the
+    // grant -> restart -> retry remediation as an operation alert. Mirrors the
+    // typed `RuntimeDenial` the sync path returns.
+    if let Some(hit) = sandbox::scan_denial_streams(stderr_str, stdout_str)
+        && !sandbox.is_path_in_scope(&hit.path)
+    {
+        // The alert below is transient; this line is the durable copy of the
+        // same structured denial (SPEC R5.4.7).
+        audit::record_sandbox_denial(Some(op_id), &hit.path, hit.access.label(), tool).await;
+        let remediation = sandbox::grant_channel::runtime_denial_remediation(&hit.path, hit.access);
+        tracing::warn!(
+            "Operation {} hit an out-of-scope sandbox denial on {}: {}",
+            op_id,
+            hit.path.display(),
+            remediation
+        );
+        op_monitor.append_alert(op_id, remediation).await;
+    }
+
+    // The grant flow above only fires for *out-of-scope* denials. The
+    // sibling failure — an in-scope EPERM from macOS provenance/sccache
+    // contamination — produces no kernel event and would otherwise surface
+    // as a bare `os error 1`. Diagnose it and attach the remediation as an
+    // alert so the user gets an actionable line, not an errno.
+    if let Some(hint) = sandbox::build_diagnostics::diagnose(stderr_str) {
+        tracing::warn!(
+            "Operation {} failed with sandbox build contamination ({:?}): {}",
+            op_id,
+            hint.kind,
+            hint.remediation
+        );
+        op_monitor.append_alert(op_id, hint.remediation).await;
+    }
+
+    // A non-path capability denial (the sandbox refused the OS credential
+    // store, not a filesystem path) has no path to grant, so the scans above
+    // cannot help. Turn the opaque failure into the two-door disclosure.
+    if let Some(cap) = sandbox::scan_capability_denial(stderr_str) {
+        let disclosure = sandbox::capability_denial_disclosure(cap, capability_enforcing_layer());
+        tracing::warn!(
+            "Operation {} hit a capability denial ({:?}); surfacing disclosure",
+            op_id,
+            cap
+        );
+        op_monitor.append_alert(op_id, disclosure).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finalize_streaming_operation(
     child: &mut tokio::process::Child,
@@ -1795,64 +1880,16 @@ async fn finalize_streaming_operation(
     // not name; scan stderr and (best-effort) offer to grant an out-of-scope path.
     // This is the async-path twin of the scan in `execute_sync_in_dir`.
     if !success {
-        sandbox::grant_channel::notify_stderr_denial(
+        record_failure_diagnostics(
             sandbox,
             scope_grant_notifier,
-            &stderr_str,
-            &stdout_str,
+            op_monitor,
+            op_id,
             tool,
+            &stdout_str,
+            &stderr_str,
         )
         .await;
-
-        // An out-of-scope runtime denial cannot be returned as a typed McpError on
-        // the async path (the result is delivered later as text), so attach the
-        // grant -> restart -> retry remediation as an operation alert. Mirrors the
-        // typed `RuntimeDenial` the sync path returns.
-        if let Some(hit) = sandbox::scan_denial_streams(&stderr_str, &stdout_str)
-            && !sandbox.is_path_in_scope(&hit.path)
-        {
-            // The alert below is transient; this line is the durable copy of the
-            // same structured denial (SPEC R5.4.7).
-            audit::record_sandbox_denial(Some(op_id), &hit.path, hit.access.label(), tool).await;
-            let remediation =
-                sandbox::grant_channel::runtime_denial_remediation(&hit.path, hit.access);
-            tracing::warn!(
-                "Operation {} hit an out-of-scope sandbox denial on {}: {}",
-                op_id,
-                hit.path.display(),
-                remediation
-            );
-            op_monitor.append_alert(op_id, remediation).await;
-        }
-
-        // The grant flow above only fires for *out-of-scope* denials. The
-        // sibling failure — an in-scope EPERM from macOS provenance/sccache
-        // contamination — produces no kernel event and would otherwise surface
-        // as a bare `os error 1`. Diagnose it and attach the remediation as an
-        // alert so the user gets an actionable line, not an errno.
-        if let Some(hint) = sandbox::build_diagnostics::diagnose(&stderr_str) {
-            tracing::warn!(
-                "Operation {} failed with sandbox build contamination ({:?}): {}",
-                op_id,
-                hint.kind,
-                hint.remediation
-            );
-            op_monitor.append_alert(op_id, hint.remediation).await;
-        }
-
-        // A non-path capability denial (the sandbox refused the OS credential
-        // store, not a filesystem path) has no path to grant, so the scans above
-        // cannot help. Turn the opaque failure into the two-door disclosure.
-        if let Some(cap) = sandbox::scan_capability_denial(&stderr_str) {
-            let disclosure =
-                sandbox::capability_denial_disclosure(cap, capability_enforcing_layer());
-            tracing::warn!(
-                "Operation {} hit a capability denial ({:?}); surfacing disclosure",
-                op_id,
-                cap
-            );
-            op_monitor.append_alert(op_id, disclosure).await;
-        }
     }
 
     let final_output = json!({

@@ -59,6 +59,84 @@ IMPORTANT: Respond ONLY with valid JSON — no other text, no markdown, no expla
   Issue found    : {\"issue\":true,\"level\":\"FATAL|ERROR|WARN\",\"summary\":\"one sentence\",\
 \"exception_class\":\"optional.FullyQualifiedClass\",\"top_frame\":\"optional File.kt:42\"}";
 
+/// Compile the optional pre-filter regex once. An invalid pattern is
+/// non-fatal: log it and let every line through rather than aborting
+/// monitoring.
+fn resolve_prefilter(op_id: &str, pattern: Option<&str>) -> Option<regex::Regex> {
+    pattern.and_then(|pat| match regex::Regex::new(pat) {
+        Ok(re) => Some(re),
+        Err(e) => {
+            warn!(
+                "livelog[{}]: invalid prefilter_regex {:?}: {} — sending all lines to the LLM",
+                op_id, pat, e
+            );
+            None
+        }
+    })
+}
+
+/// Best-effort buffer clear (e.g. `adb logcat -c`) so stale crashes from a
+/// previous run are not replayed as fresh alerts. Skipped when the caller
+/// passed `clear: false` or the tool defines no `clear_command`.
+async fn run_clear_command_if_requested(
+    op_id: &str,
+    config: &LivelogConfig,
+    runtime: &LivelogRuntime,
+    sandbox: &Arc<Sandbox>,
+    working_dir: &std::path::Path,
+) {
+    if !runtime.clear {
+        return;
+    }
+    let Some(clear_args) = config.clear_command.as_deref() else {
+        return;
+    };
+    let mut cmd = match sandbox.create_command(&config.source_command, clear_args, working_dir) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            warn!("livelog[{}]: failed to create clear command: {}", op_id, e);
+            return;
+        }
+    };
+    apply_env(&mut cmd, &runtime.env);
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    match cmd.status().await {
+        Ok(status) => debug!("livelog[{}]: clear command exited with {}", op_id, status),
+        Err(e) => warn!("livelog[{}]: clear command failed: {}", op_id, e),
+    }
+}
+
+/// Create and spawn the source process (e.g. `adb logcat`, `ssh … tail -f …`)
+/// with piped stdout/stderr for line-by-line reading. Any failure is logged
+/// and yields `None`.
+fn spawn_source_process(
+    op_id: &str,
+    config: &LivelogConfig,
+    runtime: &LivelogRuntime,
+    sandbox: &Arc<Sandbox>,
+    working_dir: &std::path::Path,
+) -> Option<tokio::process::Child> {
+    let mut cmd =
+        match sandbox.create_command(&config.source_command, &runtime.source_args, working_dir) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                warn!("livelog[{}]: failed to create command: {}", op_id, e);
+                return None;
+            }
+        };
+    apply_env(&mut cmd, &runtime.env);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    match cmd.spawn() {
+        Ok(child) => Some(child),
+        Err(e) => {
+            warn!("livelog[{}]: failed to spawn source process: {}", op_id, e);
+            None
+        }
+    }
+}
+
 /// Run the live-log pipeline until cancelled or the source process exits.
 ///
 /// # Arguments
@@ -93,61 +171,12 @@ pub async fn run_livelog_pipeline(
 
     // Compile the optional pre-filter once. An invalid pattern is non-fatal:
     // log it and let every line through rather than aborting monitoring.
-    let prefilter = config.prefilter_regex.as_deref().and_then(|pat| {
-        match regex::Regex::new(pat) {
-            Ok(re) => Some(re),
-            Err(e) => {
-                warn!(
-                    "livelog[{}]: invalid prefilter_regex {:?}: {} — sending all lines to the LLM",
-                    op_id, pat, e
-                );
-                None
-            }
-        }
-    });
+    let prefilter = resolve_prefilter(op_id, config.prefilter_regex.as_deref());
 
-    // Best-effort buffer clear (e.g. `adb logcat -c`) so stale crashes from a
-    // previous run are not replayed as fresh alerts. Skipped when the caller
-    // passed `clear: false` or the tool defines no `clear_command`.
-    if runtime.clear
-        && let Some(clear_args) = config.clear_command.as_deref()
-    {
-        match sandbox.create_command(&config.source_command, clear_args, working_dir) {
-            Ok(mut cmd) => {
-                apply_env(&mut cmd, &runtime.env);
-                cmd.stdout(std::process::Stdio::null());
-                cmd.stderr(std::process::Stdio::null());
-                match cmd.status().await {
-                    Ok(status) => {
-                        debug!("livelog[{}]: clear command exited with {}", op_id, status)
-                    }
-                    Err(e) => warn!("livelog[{}]: clear command failed: {}", op_id, e),
-                }
-            }
-            Err(e) => warn!("livelog[{}]: failed to create clear command: {}", op_id, e),
-        }
-    }
+    run_clear_command_if_requested(op_id, config, runtime, sandbox, working_dir).await;
 
-    let cmd_result =
-        sandbox.create_command(&config.source_command, &runtime.source_args, working_dir);
-
-    let mut child = match cmd_result {
-        Ok(mut cmd) => {
-            apply_env(&mut cmd, &runtime.env);
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
-            match cmd.spawn() {
-                Ok(child) => child,
-                Err(e) => {
-                    warn!("livelog[{}]: failed to spawn source process: {}", op_id, e);
-                    return;
-                }
-            }
-        }
-        Err(e) => {
-            warn!("livelog[{}]: failed to create command: {}", op_id, e);
-            return;
-        }
+    let Some(mut child) = spawn_source_process(op_id, config, runtime, sandbox, working_dir) else {
+        return;
     };
 
     info!(
@@ -441,6 +470,45 @@ async fn process_new_bytes(
     cleaned
 }
 
+/// Open `file_path` and seek to its current end, returning the open file and
+/// starting byte offset for tailing. Any failure is logged and yields `None`.
+async fn open_file_and_seek_to_end(
+    op_id: &str,
+    file_path: &std::path::Path,
+) -> Option<(tokio::fs::File, u64)> {
+    let mut file = match tokio::fs::File::open(file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(
+                "file_monitor[{}]: failed to open file {:?}: {}",
+                op_id, file_path, e
+            );
+            return None;
+        }
+    };
+
+    let pos = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(e) => {
+            warn!(
+                "file_monitor[{}]: failed to read metadata for {:?}: {}",
+                op_id, file_path, e
+            );
+            return None;
+        }
+    };
+
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(pos)).await {
+        warn!(
+            "file_monitor[{}]: failed to seek file {:?}: {}",
+            op_id, file_path, e
+        );
+        return None;
+    }
+
+    Some((file, pos))
+}
+
 /// Run the file-log tailing pipeline, reading from the file as it grows.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_file_monitor_pipeline(
@@ -469,35 +537,9 @@ pub async fn run_file_monitor_pipeline(
     );
 
     // Open the file and seek to the end
-    let mut file = match tokio::fs::File::open(&file_path).await {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(
-                "file_monitor[{}]: failed to open file {:?}: {}",
-                op_id, file_path, e
-            );
-            return;
-        }
-    };
-
-    let mut pos = match file.metadata().await {
-        Ok(m) => m.len(),
-        Err(e) => {
-            warn!(
-                "file_monitor[{}]: failed to read metadata for {:?}: {}",
-                op_id, file_path, e
-            );
-            return;
-        }
-    };
-
-    if let Err(e) = file.seek(std::io::SeekFrom::Start(pos)).await {
-        warn!(
-            "file_monitor[{}]: failed to seek file {:?}: {}",
-            op_id, file_path, e
-        );
+    let Some((mut file, mut pos)) = open_file_and_seek_to_end(op_id, &file_path).await else {
         return;
-    }
+    };
 
     let chunk_max_lines = 50;
     let chunk_max_duration = Duration::from_secs(30);

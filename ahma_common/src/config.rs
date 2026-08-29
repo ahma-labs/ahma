@@ -3618,20 +3618,28 @@ const OPTIONAL_PREFERENCE_KEYS: &[(&str, &str)] = &[
 fn known_settings_keys() -> &'static std::collections::HashSet<(String, String)> {
     static KEYS: std::sync::OnceLock<std::collections::HashSet<(String, String)>> =
         std::sync::OnceLock::new();
-    KEYS.get_or_init(|| {
-        let mut out = std::collections::HashSet::new();
-        // Serialising the defaults cannot fail for any value the type can hold.
-        if let Ok(toml::Value::Table(tables)) = toml::Value::try_from(AhmaSettings::default()) {
-            for (table, contents) in tables {
-                if let Some(keys) = contents.as_table() {
-                    for key in keys.keys() {
-                        out.insert((table.clone(), key.clone()));
-                    }
-                }
-            }
+    KEYS.get_or_init(compute_known_settings_keys)
+}
+
+/// Compute the `(table, key)` set backing [`known_settings_keys`].
+///
+/// Split out so the guard clauses below stay flat: a nested `if let` inside a
+/// `for` inside a nested `if let` is the same logic, just harder to scan.
+fn compute_known_settings_keys() -> std::collections::HashSet<(String, String)> {
+    let mut out = std::collections::HashSet::new();
+    // Serialising the defaults cannot fail for any value the type can hold.
+    let Ok(toml::Value::Table(tables)) = toml::Value::try_from(AhmaSettings::default()) else {
+        return out;
+    };
+    for (table, contents) in tables {
+        let Some(keys) = contents.as_table() else {
+            continue;
+        };
+        for key in keys.keys() {
+            out.insert((table.clone(), key.clone()));
         }
-        out
-    })
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3828,6 +3836,15 @@ pub fn load_project_settings(path: &Path) -> Result<ProjectSettingsLoad, String>
         )
     })?;
 
+    Ok(classify_project_settings(parsed))
+}
+
+/// Sort a parsed project settings table into accepted/rejected keys by tier.
+///
+/// Split out of [`load_project_settings`] so that function reads as a linear
+/// read-then-parse-then-classify sequence instead of interleaving file I/O
+/// concerns with the per-key tier classification loop.
+fn classify_project_settings(parsed: toml::Table) -> ProjectSettingsLoad {
     let mut load = ProjectSettingsLoad::default();
     for (table_name, contents) in parsed {
         let Some(keys) = contents.as_table() else {
@@ -3850,7 +3867,7 @@ pub fn load_project_settings(path: &Path) -> Result<ProjectSettingsLoad, String>
             load.accepted.insert(table_name, toml::Value::Table(kept));
         }
     }
-    Ok(load)
+    load
 }
 
 /// Merge an accepted project table over user settings (SPEC R-CFG3.2).
@@ -3859,6 +3876,13 @@ pub fn load_project_settings(path: &Path) -> Result<ProjectSettingsLoad, String>
 /// concatenate**, so the effective value of any key is always attributable to
 /// exactly one source. Concatenation would produce a value neither file
 /// contains, which no `--origin` output could honestly explain.
+/// Insert each `project_keys` entry into `base_keys`, overwriting by key.
+fn overlay_table_keys(base_keys: &mut toml::Table, project_keys: &toml::Table) {
+    for (key, value) in project_keys {
+        base_keys.insert(key.clone(), value.clone());
+    }
+}
+
 pub fn merge_project_over_user(user: &AhmaSettings, project: &toml::Table) -> AhmaSettings {
     let Ok(toml::Value::Table(mut base)) = toml::Value::try_from(user) else {
         // Serialising settings cannot fail for any value the type can hold; if it
@@ -3872,11 +3896,7 @@ pub fn merge_project_over_user(user: &AhmaSettings, project: &toml::Table) -> Ah
             continue;
         };
         match base.get_mut(table_name).and_then(|v| v.as_table_mut()) {
-            Some(base_keys) => {
-                for (key, value) in project_keys {
-                    base_keys.insert(key.clone(), value.clone());
-                }
-            }
+            Some(base_keys) => overlay_table_keys(base_keys, project_keys),
             None => {
                 base.insert(table_name.clone(), project_table.clone());
             }

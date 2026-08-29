@@ -86,21 +86,41 @@ fn configure_mcp(
             merge_codex_toml(&path, build_codex_toml_value(transport))?;
         }
         McpConfigFormat::Json(servers_key) => {
-            let entry = if platform == Platform::ClaudeDesktop {
-                // Claude Desktop's entry omits the `"type"` wrapper field.
-                build_claude_desktop_mcp_entry(transport, home)
-            } else if platform.sends_roots_list() {
-                servers_entry.clone()
-            } else {
-                // No roots/list means ahma cannot discover the workspace, so the
-                // entry has to carry the scope explicitly.
-                scoped_servers_entry.clone()
-            };
+            let entry = select_mcp_json_entry(
+                platform,
+                transport,
+                servers_entry,
+                scoped_servers_entry,
+                home,
+            );
             merge_mcp_json(&path, servers_key, entry)?;
         }
     }
 
     Ok(Some(platform.mcp_display_name()))
+}
+
+/// Choose which JSON MCP entry shape a platform gets: Claude Desktop's
+/// type-less entry, the plain entry for platforms that answer `roots/list`,
+/// or the scope-carrying entry for platforms that don't (see
+/// `build_scoped_servers_entry` for why the scope can't be injected here).
+fn select_mcp_json_entry(
+    platform: Platform,
+    transport: &str,
+    servers_entry: &serde_json::Value,
+    scoped_servers_entry: &serde_json::Value,
+    home: &Path,
+) -> serde_json::Value {
+    if platform == Platform::ClaudeDesktop {
+        // Claude Desktop's entry omits the `"type"` wrapper field.
+        build_claude_desktop_mcp_entry(transport, home)
+    } else if platform.sends_roots_list() {
+        servers_entry.clone()
+    } else {
+        // No roots/list means ahma cannot discover the workspace, so the
+        // entry has to carry the scope explicitly.
+        scoped_servers_entry.clone()
+    }
 }
 
 async fn execute_actions(
@@ -132,13 +152,10 @@ async fn execute_actions(
 /// global. When MCP is selected, the connection transport is requested as a
 /// follow-up detail of that action.
 pub async fn run(args: SetupArgs) -> Result<()> {
-    let interactive = !args.auto && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let interactive = is_interactive_session(&args);
 
     if interactive {
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("  Ahma Setup Wizard");
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!();
+        print_wizard_banner();
     }
 
     // Question 1: which actions to perform.
@@ -167,13 +184,30 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     execute_actions(&actions, &platforms, transport, interactive).await?;
 
     if interactive {
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("  Setup Completed!");
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!();
+        print_wizard_footer();
     }
 
     Ok(())
+}
+
+/// Whether the wizard should ask questions interactively: not `--auto`, and
+/// both stdin/stdout are attached to a real terminal (not piped/redirected).
+fn is_interactive_session(args: &SetupArgs) -> bool {
+    !args.auto && io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn print_wizard_banner() {
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  Ahma Setup Wizard");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!();
+}
+
+fn print_wizard_footer() {
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  Setup Completed!");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!();
 }
 
 /// Actions selected when the user accepts the default (presses Enter

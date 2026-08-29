@@ -109,6 +109,36 @@ fn render_settings_origin(
     out.push_str(
         "# Sources: cli = command-line flag  user = settings file  default = compiled-in\n",
     );
+    write_settings_origin_header(&mut out, file_path, ctx);
+    out.push('\n');
+
+    let user_label = file_path
+        .map(|p| format!("user ({})", p.display()))
+        .unwrap_or_else(|| "user".to_string());
+    let project_label = ctx
+        .project
+        .as_ref()
+        .map(|p| format!("project ({})", p.path.display()))
+        .unwrap_or_else(|| "project".to_string());
+    for row in rows {
+        // Precedence order, highest first (R-CFG1.1): cli > project > user >
+        // default. Rendered in that order so the report cannot disagree with the
+        // resolution it describes.
+        let (value, source) = resolve_row_source(row, file_toml, ctx, &user_label, &project_label);
+        let _ = writeln!(out, "{:<45} = {}  # {}", row.key, value, source);
+    }
+    out
+}
+
+/// Write the `--origin` report's descriptive header: which settings file(s)
+/// were consulted for this invocation, and any project-file keys rejected per
+/// R-CFG2.2. Self-contained — independent of the per-row rendering below it.
+fn write_settings_origin_header(
+    out: &mut String,
+    file_path: Option<&std::path::Path>,
+    ctx: &SettingsOriginCtx,
+) {
+    use std::fmt::Write as _;
     match (ctx.no_settings, file_path) {
         (true, _) => out.push_str("# --no-settings: settings files are ignored this invocation.\n"),
         (false, Some(p)) => {
@@ -158,38 +188,32 @@ fn render_settings_origin(
             );
         }
     }
-    out.push('\n');
+}
 
-    let user_label = file_path
-        .map(|p| format!("user ({})", p.display()))
-        .unwrap_or_else(|| "user".to_string());
-    let project_label = ctx
+/// Resolve one settings row's effective display value and source label, in
+/// R-CFG1.1 precedence order (highest first): cli > project > user > default.
+fn resolve_row_source<'a>(
+    row: &'a SettingRow,
+    file_toml: Option<&toml::Value>,
+    ctx: &'a SettingsOriginCtx,
+    user_label: &'a str,
+    project_label: &'a str,
+) -> (&'a str, &'a str) {
+    let cli_value = ctx
+        .cli_overrides
+        .iter()
+        .find(|(k, _)| *k == row.key)
+        .map(|(_, v)| v);
+    let project_sets = ctx
         .project
         .as_ref()
-        .map(|p| format!("project ({})", p.path.display()))
-        .unwrap_or_else(|| "project".to_string());
-    for row in rows {
-        let cli_value = ctx
-            .cli_overrides
-            .iter()
-            .find(|(k, _)| *k == row.key)
-            .map(|(_, v)| v);
-        // Precedence order, highest first (R-CFG1.1): cli > project > user >
-        // default. Rendered in that order so the report cannot disagree with the
-        // resolution it describes.
-        let project_sets = ctx
-            .project
-            .as_ref()
-            .is_some_and(|p| p.keys.iter().any(|k| k == row.key));
-        let (value, source) = match cli_value {
-            Some(v) => (v.as_str(), "cli"),
-            None if project_sets => (row.value.as_str(), project_label.as_str()),
-            None if file_sets_key(file_toml, row.key) => (row.value.as_str(), user_label.as_str()),
-            None => (row.value.as_str(), "default"),
-        };
-        let _ = writeln!(out, "{:<45} = {}  # {}", row.key, value, source);
+        .is_some_and(|p| p.keys.iter().any(|k| k == row.key));
+    match cli_value {
+        Some(v) => (v.as_str(), "cli"),
+        None if project_sets => (row.value.as_str(), project_label),
+        None if file_sets_key(file_toml, row.key) => (row.value.as_str(), user_label),
+        None => (row.value.as_str(), "default"),
     }
-    out
 }
 
 /// `ahma settings init`: write a defaults file and tell the user where it went.

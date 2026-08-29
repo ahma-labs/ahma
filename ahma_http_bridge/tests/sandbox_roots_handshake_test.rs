@@ -260,53 +260,72 @@ async fn handle_sse_event(
     roots_answered: &mut bool,
     configured_seen: &mut bool,
 ) -> Option<Result<(), String>> {
-    let method = value.get("method").and_then(|m| m.as_str());
-
-    if method == Some("notifications/sandbox/failed") {
-        let error = value
-            .get("params")
-            .and_then(|p| p.get("error"))
-            .and_then(|e| e.as_str())
-            .unwrap_or("unknown");
-        return Some(Err(format!("Sandbox configuration failed: {}", error)));
-    }
-
-    if method == Some("notifications/sandbox/configured") {
-        *configured_seen = true;
-        if *roots_answered {
-            return Some(Ok(()));
+    match value.get("method").and_then(|m| m.as_str()) {
+        Some("notifications/sandbox/failed") => Some(Err(sandbox_failed_error_message(&value))),
+        Some("notifications/sandbox/configured") => {
+            *configured_seen = true;
+            roots_answered.then_some(Ok(()))
         }
-        return None;
-    }
-
-    if method == Some("roots/list") {
-        let id = match value.get("id").cloned() {
-            Some(id) => id,
-            None => return Some(Err("roots/list must include id".to_string())),
-        };
-        let roots_json: Vec<Value> = root_uris
-            .iter()
-            .map(|uri| json!({"uri": uri, "name": "root"}))
-            .collect();
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {"roots": roots_json}
-        });
-        if let Err(e) = send_mcp_request(client, base_url, &response, Some(session_id))
+        Some("roots/list") => {
+            answer_roots_list_message(
+                value,
+                client,
+                base_url,
+                session_id,
+                root_uris,
+                roots_answered,
+                configured_seen,
+            )
             .await
-            .map(|_| ())
-        {
-            return Some(Err(e));
         }
-        *roots_answered = true;
-        if *configured_seen {
-            return Some(Ok(()));
-        }
-        return None;
+        _ => None,
     }
+}
 
-    None
+/// Extract the human-readable error carried by a `notifications/sandbox/failed` event.
+fn sandbox_failed_error_message(value: &Value) -> String {
+    let error = value
+        .get("params")
+        .and_then(|p| p.get("error"))
+        .and_then(|e| e.as_str())
+        .unwrap_or("unknown");
+    format!("Sandbox configuration failed: {}", error)
+}
+
+/// Answer a `roots/list` server request over the SSE session's POST channel and
+/// update the handshake flags. Returns `Some(result)` once both `roots/list` has
+/// been answered and `notifications/sandbox/configured` has been observed
+/// (tracked in `configured_seen`), or `None` to keep reading the stream.
+async fn answer_roots_list_message(
+    value: Value,
+    client: &Client,
+    base_url: &str,
+    session_id: &str,
+    root_uris: &[String],
+    roots_answered: &mut bool,
+    configured_seen: &mut bool,
+) -> Option<Result<(), String>> {
+    let id = match value.get("id").cloned() {
+        Some(id) => id,
+        None => return Some(Err("roots/list must include id".to_string())),
+    };
+    let roots_json: Vec<Value> = root_uris
+        .iter()
+        .map(|uri| json!({"uri": uri, "name": "root"}))
+        .collect();
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {"roots": roots_json}
+    });
+    if let Err(e) = send_mcp_request(client, base_url, &response, Some(session_id))
+        .await
+        .map(|_| ())
+    {
+        return Some(Err(e));
+    }
+    *roots_answered = true;
+    configured_seen.then_some(Ok(()))
 }
 
 async fn open_roots_sse_stream(

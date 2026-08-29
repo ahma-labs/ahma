@@ -964,22 +964,20 @@ where
     Ok(bridge_responded)
 }
 
-async fn run_proxy_client_http(
-    base_url: &str,
+/// Perform the HTTP `initialize` handshake: receive the client's `initialize`
+/// request from stdio (bounded by `handshake_deadline`), POST it to the
+/// bridge, forward the response back to stdio, and return the negotiated
+/// session id and protocol version — every subsequent request on this
+/// connection must echo both.
+async fn perform_http_initialize(
+    client: &reqwest::Client,
+    mcp_url: &str,
+    stdio: &mut PatchedStdioTransport,
     handshake_deadline: Option<Duration>,
-) -> Result<bool> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .context("Failed to build HTTP client for stdio proxy")?;
-
-    let mcp_url = format!("{}/mcp", base_url.trim_end_matches('/'));
-
-    let mut stdio = PatchedStdioTransport::new_stdio();
-
-    // 1. Handshake / Initialize — bounded by the handshake deadline so a
-    // connection that is spawned and abandoned (no `initialize` ever sent)
-    // exits rather than parking on stdin forever and piling up.
+) -> Result<(String, String)> {
+    // Bounded by the handshake deadline so a connection that is spawned and
+    // abandoned (no `initialize` ever sent) exits rather than parking on
+    // stdin forever and piling up.
     let first_recv = stdio.receive();
     let init_msg = match handshake_deadline {
         Some(deadline) => match tokio::time::timeout(deadline, first_recv).await {
@@ -1003,7 +1001,7 @@ async fn run_proxy_client_http(
     let init_val = serde_json::to_value(&init_msg)?;
 
     let response = client
-        .post(&mcp_url)
+        .post(mcp_url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::ACCEPT, "application/json")
         .json(&init_val)
@@ -1047,97 +1045,105 @@ async fn run_proxy_client_http(
         .await
         .context("Failed to forward initialize response to stdio")?;
 
-    // The bridge successfully responded to initialize — it is alive and communicating.
-    let bridge_responded = true;
+    Ok((session_id, protocol_version))
+}
 
-    tracing::info!(
-        url = %mcp_url,
-        session_id = %session_id,
-        "Proxy connected to bridge via HTTP"
-    );
-
-    // 2. Start SSE listener in background
-    let (sse_tx, mut sse_rx) = mpsc::channel::<TxJsonRpcMessage<RoleServer>>(100);
-    let sse_client = client.clone();
-    let sse_url = mcp_url.clone();
-    let sse_session_id = session_id.clone();
-
-    let sse_protocol_version = protocol_version.clone();
-    tokio::spawn(async move {
-        let mut headers = reqwest::header::HeaderMap::new();
-        // Fallible, not `.unwrap()`: `sse_session_id` is whatever the *bridge*
-        // returned in `Mcp-Session-Id`, so a byte outside visible ASCII would
-        // panic this detached task rather than surface anywhere a caller could
-        // see it. The protocol-version header two lines down already handled the
-        // identical construction with `if let Ok`; this one did not, which is
-        // the tell rather than a decision.
-        let Ok(session_header) = reqwest::header::HeaderValue::from_str(&sse_session_id) else {
-            tracing::error!(
-                session_id = %sse_session_id,
-                "bridge returned a session id that is not a valid HTTP header value; \
-                 cannot open the SSE stream for it"
-            );
-            return;
-        };
-        headers.insert("mcp-session-id", session_header);
-        headers.insert(
-            reqwest::header::ACCEPT,
-            reqwest::header::HeaderValue::from_static("text/event-stream"),
+/// Background task body: open the bridge's SSE stream for `session_id` and
+/// forward every `data:` line that parses as a JSON-RPC message onto
+/// `sse_tx`. Runs until the stream ends, the connection fails, or the
+/// receiving end of `sse_tx` is dropped.
+async fn run_http_sse_listener(
+    client: reqwest::Client,
+    url: String,
+    session_id: String,
+    protocol_version: String,
+    sse_tx: mpsc::Sender<TxJsonRpcMessage<RoleServer>>,
+) {
+    let mut headers = reqwest::header::HeaderMap::new();
+    // Fallible, not `.unwrap()`: `session_id` is whatever the *bridge*
+    // returned in `Mcp-Session-Id`, so a byte outside visible ASCII would
+    // panic this detached task rather than surface anywhere a caller could
+    // see it. The protocol-version header below already handles the
+    // identical construction with `if let Ok`; this one did not, which is
+    // the tell rather than a decision.
+    let Ok(session_header) = reqwest::header::HeaderValue::from_str(&session_id) else {
+        tracing::error!(
+            session_id = %session_id,
+            "bridge returned a session id that is not a valid HTTP header value; \
+             cannot open the SSE stream for it"
         );
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(&sse_protocol_version) {
-            headers.insert(ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER, v);
-        }
+        return;
+    };
+    headers.insert("mcp-session-id", session_header);
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("text/event-stream"),
+    );
+    if let Ok(v) = reqwest::header::HeaderValue::from_str(&protocol_version) {
+        headers.insert(ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER, v);
+    }
 
-        let res = match sse_client.get(&sse_url).headers(headers).send().await {
-            Ok(r) => r,
+    let res = match client.get(&url).headers(headers).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(url = %url, error = %e, "Proxy SSE connection failed");
+            return;
+        }
+    };
+
+    if !res.status().is_success() {
+        tracing::error!(
+            url = %url,
+            status = %res.status(),
+            "Proxy SSE stream returned non-success status"
+        );
+        return;
+    }
+
+    let mut stream = res.bytes_stream();
+    let mut buffer = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
             Err(e) => {
-                tracing::error!(url = %sse_url, error = %e, "Proxy SSE connection failed");
-                return;
+                tracing::error!(url = %url, error = %e, "Proxy SSE stream error");
+                break;
             }
         };
 
-        if !res.status().is_success() {
-            tracing::error!(
-                url = %sse_url,
-                status = %res.status(),
-                "Proxy SSE stream returned non-success status"
-            );
-            return;
-        }
+        let text = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&text);
 
-        let mut stream = res.bytes_stream();
-        let mut buffer = String::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(url = %sse_url, error = %e, "Proxy SSE stream error");
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer.drain(..=pos).collect::<String>();
+            let line_trimmed = line.trim();
+            if let Some(data) = line_trimmed.strip_prefix("data:") {
+                let data = data.trim();
+                if !data.is_empty()
+                    && let Ok(msg) = serde_json::from_str::<TxJsonRpcMessage<RoleServer>>(data)
+                    && sse_tx.send(msg).await.is_err()
+                {
+                    tracing::info!(url = %url, "Proxy SSE forward channel closed");
                     break;
                 }
-            };
-
-            let text = String::from_utf8_lossy(&chunk);
-            buffer.push_str(&text);
-
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer.drain(..=pos).collect::<String>();
-                let line_trimmed = line.trim();
-                if let Some(data) = line_trimmed.strip_prefix("data:") {
-                    let data = data.trim();
-                    if !data.is_empty()
-                        && let Ok(msg) = serde_json::from_str::<TxJsonRpcMessage<RoleServer>>(data)
-                        && sse_tx.send(msg).await.is_err()
-                    {
-                        tracing::info!(url = %sse_url, "Proxy SSE forward channel closed");
-                        break;
-                    }
-                }
             }
         }
-        tracing::info!(url = %sse_url, "Proxy SSE stream ended");
-    });
+    }
+    tracing::info!(url = %url, "Proxy SSE stream ended");
+}
 
-    // 3. Stdio loop
+/// Pump messages between stdio and the bridge until stdio hits EOF or the SSE
+/// channel closes: client→bridge messages are POSTed to the bridge and (for
+/// requests) their response forwarded back to stdio; bridge→client SSE
+/// messages are forwarded to stdio directly.
+async fn run_http_proxy_loop(
+    stdio: &mut PatchedStdioTransport,
+    client: &reqwest::Client,
+    mcp_url: &str,
+    session_id: &str,
+    protocol_version: &str,
+    sse_rx: &mut mpsc::Receiver<TxJsonRpcMessage<RoleServer>>,
+) -> Result<()> {
     loop {
         tokio::select! {
             stdio_msg = stdio.receive() => {
@@ -1147,19 +1153,19 @@ async fn run_proxy_client_http(
                         session_id = %session_id,
                         "Proxy exiting: stdio EOF (Cursor client disconnected)"
                     );
-                    break;
+                    return Ok(());
                 };
 
                 let val = serde_json::to_value(&msg)?;
                 let has_id = val.get("id").is_some();
                 let is_request = val.get("method").is_some();
 
-                let mut req = client.post(&mcp_url)
+                let mut req = client.post(mcp_url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .header("mcp-session-id", &session_id)
+                    .header("mcp-session-id", session_id)
                     .header(
                         ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER,
-                        &protocol_version,
+                        protocol_version,
                     )
                     .json(&val);
 
@@ -1193,12 +1199,58 @@ async fn run_proxy_client_http(
                         session_id = %session_id,
                         "Proxy exiting: SSE channel closed"
                     );
-                    break;
+                    return Ok(());
                 };
                 stdio.send(msg).await?;
             }
         }
     }
+}
+
+async fn run_proxy_client_http(
+    base_url: &str,
+    handshake_deadline: Option<Duration>,
+) -> Result<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .context("Failed to build HTTP client for stdio proxy")?;
+
+    let mcp_url = format!("{}/mcp", base_url.trim_end_matches('/'));
+
+    let mut stdio = PatchedStdioTransport::new_stdio();
+
+    let (session_id, protocol_version) =
+        perform_http_initialize(&client, &mcp_url, &mut stdio, handshake_deadline).await?;
+
+    // The bridge successfully responded to initialize — it is alive and communicating.
+    let bridge_responded = true;
+
+    tracing::info!(
+        url = %mcp_url,
+        session_id = %session_id,
+        "Proxy connected to bridge via HTTP"
+    );
+
+    // Start the SSE listener in the background.
+    let (sse_tx, mut sse_rx) = mpsc::channel::<TxJsonRpcMessage<RoleServer>>(100);
+    tokio::spawn(run_http_sse_listener(
+        client.clone(),
+        mcp_url.clone(),
+        session_id.clone(),
+        protocol_version.clone(),
+        sse_tx,
+    ));
+
+    run_http_proxy_loop(
+        &mut stdio,
+        &client,
+        &mcp_url,
+        &session_id,
+        &protocol_version,
+        &mut sse_rx,
+    )
+    .await?;
 
     let _ = client
         .delete(&mcp_url)

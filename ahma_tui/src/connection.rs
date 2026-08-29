@@ -101,6 +101,23 @@ async fn resolve_explicit(url: &str) -> Result<ResolvedConnection> {
     )
 }
 
+/// Try to upgrade `candidate` to HTTP/3, logging and returning the upgraded
+/// connection when the server advertises QUIC over a persisted TLS cert;
+/// otherwise returns `candidate` unchanged.
+async fn upgrade_if_available(candidate: ResolvedConnection) -> ResolvedConnection {
+    match try_upgrade_to_http3(&candidate).await {
+        Some(upgraded) => {
+            tracing::info!(
+                "TUI: upgraded to {} ({})",
+                upgraded.transport_label(),
+                upgraded.display_url
+            );
+            upgraded
+        }
+        None => candidate,
+    }
+}
+
 async fn resolve_default_candidates() -> Result<ResolvedConnection> {
     let candidates = default_candidates();
     let mut errors: Vec<String> = Vec::new();
@@ -114,15 +131,7 @@ async fn resolve_default_candidates() -> Result<ResolvedConnection> {
                 candidate.display_url
             );
             // Try to upgrade TCP connections to HTTP/3 when QUIC is available.
-            if let Some(upgraded) = try_upgrade_to_http3(candidate).await {
-                tracing::info!(
-                    "TUI: upgraded to {} ({})",
-                    upgraded.transport_label(),
-                    upgraded.display_url
-                );
-                return Ok(upgraded);
-            }
-            return Ok(candidate.clone());
+            return Ok(upgrade_if_available(candidate.clone()).await);
         }
         errors.push(candidate.display_url.clone());
     }
@@ -130,18 +139,8 @@ async fn resolve_default_candidates() -> Result<ResolvedConnection> {
     // Try starting our own server
     tracing::info!("TUI: No server found. Starting a background server...");
     match start_background_server().await {
-        Ok(candidate) => {
-            // Try to upgrade TCP connections to HTTP/3 when QUIC is available.
-            if let Some(upgraded) = try_upgrade_to_http3(&candidate).await {
-                tracing::info!(
-                    "TUI: upgraded to {} ({})",
-                    upgraded.transport_label(),
-                    upgraded.display_url
-                );
-                return Ok(upgraded);
-            }
-            return Ok(candidate);
-        }
+        // Try to upgrade TCP connections to HTTP/3 when QUIC is available.
+        Ok(candidate) => return Ok(upgrade_if_available(candidate).await),
         Err(e) => {
             errors.push(format!("start server error: {e}"));
         }
@@ -535,66 +534,84 @@ async fn handle_existing_candidate(
     };
 
     if client_is_newer {
-        // Restarting a server this TUI did not start is a side effect on
-        // someone else's session (an IDE may be attached to it) — say so.
-        crate::startup_notices::push(
-            crate::startup_notices::Level::Warn,
-            format!(
-                "Restarted the running ahma server: it was v{bridge_version} and this TUI is \
-                 v{client_version}. Any editor session attached to it reconnects to the new server."
-            ),
-        );
-
-        let _ = trigger_candidate_restart(candidate).await;
-
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(2) {
-            if get_candidate_version(candidate).await.is_none() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        Ok(None)
+        restart_stale_bridge(candidate, client_version, &bridge_version).await
     } else {
-        if std::env::var("AHMA_RESTARTED").is_err() {
-            // exec() replaces this process image, so a notice pushed here would
-            // be discarded with it. The restarted process reports instead, via
-            // the AHMA_RESTARTED marker it is launched with (see below).
-            tracing::info!(
-                "TUI version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
-                client_version,
-                bridge_version
-            );
+        self_restart_for_newer_bridge(client_version, &bridge_version)
+    }
+}
 
-            let exe = std::env::current_exe()?;
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            let mut cmd = std::process::Command::new(exe);
-            cmd.args(&args);
-            cmd.env("AHMA_RESTARTED", "1");
+/// The running bridge is older than this client: restart it, then wait
+/// briefly for it to go down so the caller doesn't race the old process for
+/// the socket/port.
+async fn restart_stale_bridge(
+    candidate: &ResolvedConnection,
+    client_version: &str,
+    bridge_version: &str,
+) -> Result<Option<()>> {
+    // Restarting a server this TUI did not start is a side effect on
+    // someone else's session (an IDE may be attached to it) — say so.
+    crate::startup_notices::push(
+        crate::startup_notices::Level::Warn,
+        format!(
+            "Restarted the running ahma server: it was v{bridge_version} and this TUI is \
+             v{client_version}. Any editor session attached to it reconnects to the new server."
+        ),
+    );
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                let err = cmd.exec();
-                Err(anyhow::anyhow!("Failed to re-exec TUI process: {}", err))
-            }
-            #[cfg(not(unix))]
-            {
-                let mut child = cmd
-                    .stdin(std::process::Stdio::inherit())
-                    .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::inherit())
-                    .spawn()?;
-                let status = child.wait()?;
-                std::process::exit(status.code().unwrap_or(0));
-            }
-        } else {
-            bail!(
-                "Version mismatch: TUI version (v{}) is older than running bridge version (v{}). Please update TUI binary.",
-                client_version,
-                bridge_version
-            );
+    let _ = trigger_candidate_restart(candidate).await;
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        if get_candidate_version(candidate).await.is_none() {
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(None)
+}
+
+/// This client is older than the running bridge: self-restart (re-exec) so
+/// the TUI upgrades to match, or bail if that was already tried once
+/// (AHMA_RESTARTED) and the mismatch persists.
+fn self_restart_for_newer_bridge(client_version: &str, bridge_version: &str) -> Result<Option<()>> {
+    if std::env::var("AHMA_RESTARTED").is_ok() {
+        bail!(
+            "Version mismatch: TUI version (v{}) is older than running bridge version (v{}). Please update TUI binary.",
+            client_version,
+            bridge_version
+        );
+    }
+
+    // exec() replaces this process image, so a notice pushed here would
+    // be discarded with it. The restarted process reports instead, via
+    // the AHMA_RESTARTED marker it is launched with (see below).
+    tracing::info!(
+        "TUI version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
+        client_version,
+        bridge_version
+    );
+
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&args);
+    cmd.env("AHMA_RESTARTED", "1");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        Err(anyhow::anyhow!("Failed to re-exec TUI process: {}", err))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut child = cmd
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()?;
+        let status = child.wait()?;
+        std::process::exit(status.code().unwrap_or(0));
     }
 }
 
@@ -628,46 +645,51 @@ fn spawn_server_process(exe: &std::path::Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Ensure a local server is running by probing available local transports.
-/// If none is reachable, spawns a background `ahma serve unix` (on macOS/Linux)
-/// or `ahma serve http` (on Windows) and polls until healthy.
-pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Result<()> {
-    let client_version = env!("CARGO_PKG_VERSION");
-    // Pre-flight the scope candidate with the same hard rejections the server
-    // will apply (must exist — never created here — and no $HOME / ancestors /
-    // filesystem root, SPEC R5.2.4). Without this, `ahma tui /typo/path`
-    // silently materialised the typo as a sandbox root, and `ahma tui` from
-    // `$HOME` started a bridge whose every per-session subprocess then died on
-    // the rejection — far from the cause. Failing here names the problem at
-    // launch. The path is a deliberate human choice (the launch directory or an
-    // explicit argument), which is why it may become an explicit scope at all.
-    let path_to_use = match scope_path {
-        Some(p) => Some(ahma_mcp::sandbox::preflight_scope_candidate(p)?),
+/// Pre-flight the scope candidate with the same hard rejections the server
+/// will apply (must exist — never created here — and no $HOME / ancestors /
+/// filesystem root, SPEC R5.2.4). Without this, `ahma tui /typo/path`
+/// silently materialised the typo as a sandbox root, and `ahma tui` from
+/// `$HOME` started a bridge whose every per-session subprocess then died on
+/// the rejection — far from the cause. Failing here names the problem at
+/// launch. The path is a deliberate human choice (the launch directory or an
+/// explicit argument), which is why it may become an explicit scope at all.
+fn resolve_scope_path(scope_path: Option<&std::path::Path>) -> Result<Option<PathBuf>> {
+    match scope_path {
+        Some(p) => Ok(Some(ahma_mcp::sandbox::preflight_scope_candidate(p)?)),
         None => match std::env::current_dir() {
-            Ok(cwd) => Some(ahma_mcp::sandbox::preflight_scope_candidate(&cwd)?),
-            Err(_) => None,
+            Ok(cwd) => Ok(Some(ahma_mcp::sandbox::preflight_scope_candidate(&cwd)?)),
+            Err(_) => Ok(None),
         },
-    };
-    let candidates = default_candidates();
-    for candidate in &candidates {
+    }
+}
+
+/// Probe `candidates` in order and, for the first one that responds, decide
+/// (via [`handle_existing_candidate`]) whether it's safe to reuse. Only the
+/// first responsive candidate is consulted — matching the original
+/// probe-then-decide-once behaviour rather than trying every candidate.
+async fn try_reuse_existing_server(
+    candidates: &[ResolvedConnection],
+    client_version: &str,
+    path_to_use: Option<&std::path::Path>,
+) -> Result<bool> {
+    for candidate in candidates {
         if let Some(health) = get_candidate_health(candidate).await {
-            if let Some(()) = handle_existing_candidate(
+            let reused = handle_existing_candidate(
                 candidate,
                 client_version,
                 health.version,
                 health.default_sandbox_scope.as_deref(),
-                path_to_use.as_deref(),
+                path_to_use,
             )
-            .await?
-            {
-                return Ok(());
-            }
-            break;
+            .await?;
+            return Ok(reused.is_some());
         }
     }
+    Ok(false)
+}
 
-    let exe = std::env::current_exe()?;
-
+/// Build the `ahma serve ...` argv for a background server scoped to `path_to_use`.
+fn build_spawn_args(path_to_use: Option<&std::path::Path>) -> Vec<String> {
     let mut args = Vec::new();
     args.push("serve".to_string());
     #[cfg(unix)]
@@ -675,7 +697,7 @@ pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Resu
     #[cfg(not(unix))]
     args.push("http".to_string());
 
-    if let Some(ref path) = path_to_use {
+    if let Some(path) = path_to_use {
         args.push("--sandbox-scope".to_string());
         args.push(path.to_string_lossy().into_owned());
     }
@@ -684,7 +706,41 @@ pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Resu
     // bridge also self-terminates when the TUI disconnects.
     args.push("--idle-timeout".to_string());
     args.push(AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS.to_string());
+    args
+}
 
+/// Poll `candidates` until one responds healthy or `timeout` elapses.
+async fn wait_for_any_healthy(candidates: &[ResolvedConnection], timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        for candidate in candidates {
+            if probe_candidate(candidate).await {
+                tracing::info!(
+                    "Background server started and healthy at {}",
+                    candidate.display_url
+                );
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Ensure a local server is running by probing available local transports.
+/// If none is reachable, spawns a background `ahma serve unix` (on macOS/Linux)
+/// or `ahma serve http` (on Windows) and polls until healthy.
+pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Result<()> {
+    let client_version = env!("CARGO_PKG_VERSION");
+    let path_to_use = resolve_scope_path(scope_path)?;
+    let candidates = default_candidates();
+
+    if try_reuse_existing_server(&candidates, client_version, path_to_use.as_deref()).await? {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe()?;
+    let args = build_spawn_args(path_to_use.as_deref());
     let args_slices: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
     tracing::info!(
@@ -694,18 +750,8 @@ pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Resu
     );
     spawn_server_process(&exe, &args_slices)?;
 
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(2) {
-        for candidate in &candidates {
-            if probe_candidate(candidate).await {
-                tracing::info!(
-                    "Background server started and healthy at {}",
-                    candidate.display_url
-                );
-                return Ok(());
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    if wait_for_any_healthy(&candidates, Duration::from_secs(2)).await {
+        return Ok(());
     }
 
     bail!("Failed to start background server within 2 seconds")

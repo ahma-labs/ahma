@@ -14,7 +14,8 @@ use crate::mcp_service::{ActiveAgentSession, get_global_prompt_runner};
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use ahma_common::config::settings_path;
 use ahma_common::daemon_hub::{
-    ClientMsg, DaemonEvent, DaemonMsg, connect_to_daemon, ensure_daemon_running, recv_msg, send_msg,
+    ClientMsg, DaemonEvent, DaemonMsg, DaemonStream, connect_to_daemon, ensure_daemon_running,
+    recv_msg, send_msg,
 };
 use ahma_common::scope_grant::{
     GrantCoordinator, GrantResolveOutcome, ScopeGrantRequest, persist_grant,
@@ -273,59 +274,15 @@ async fn run_reporter_loop(
         // while we are replaying the initial snapshot.
         let mut event_rx = monitor.subscribe_events();
 
-        // ── Replay completed operations ───────────────────────────────────────
+        // ── Replay completed and active operations ────────────────────────────
+        // A send failure here means the connection dropped mid-replay; go
+        // back to the top of the outer loop and reconnect.
         let completed_ops = monitor.get_completed_operations().await;
-        let mut replayed_completed = false;
-        for op in &completed_ops {
-            let started_ev = ClientMsg::Event {
-                payload: op_started_event(op, &scope, &label),
-            };
-            if send_msg(&mut writer, &started_ev).await.is_err() {
-                replayed_completed = true;
-                break;
-            }
-            let duration_ms = op
-                .end_time
-                .and_then(|end| end.duration_since(op.start_time).ok())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let finished_ev = ClientMsg::Event {
-                payload: DaemonEvent::OpFinished {
-                    id: op.id.clone(),
-                    status: status_label(op.state),
-                    result_summary: result_summary_from(op),
-                    duration_ms,
-                    ended_epoch_ms: op.end_time.and_then(epoch_ms),
-                    // Replayed completions carry their exit code too, so a
-                    // late-attaching TUI shows `exit 101`, not a bare "failed".
-                    exit_code: op.result.as_ref().and_then(exit_code_from_value),
-                    // Replay carries denials too, so a TUI opened after the fact
-                    // still sees which path was refused (SPEC R-PERM.7).
-                    denial: denial_from_operation(op),
-                },
-            };
-            if send_msg(&mut writer, &finished_ev).await.is_err() {
-                replayed_completed = true;
-                break;
-            }
-        }
-        if replayed_completed {
+        if !replay_completed_operations(&mut writer, &completed_ops, &scope, &label).await {
             continue;
         }
-
-        // ── Replay active operations ──────────────────────────────────────────
         let active_ops = monitor.get_all_active_operations().await;
-        let mut replayed_active = false;
-        for op in &active_ops {
-            let started_ev = ClientMsg::Event {
-                payload: op_started_event(op, &scope, &label),
-            };
-            if send_msg(&mut writer, &started_ev).await.is_err() {
-                replayed_active = true;
-                break;
-            }
-        }
-        if replayed_active {
+        if !replay_active_operations(&mut writer, &active_ops, &scope, &label).await {
             continue;
         }
 
@@ -409,124 +366,14 @@ async fn run_reporter_loop(
 
                 // 3. Incoming messages from daemon hub
                 daemon_msg = recv_msg::<_, DaemonMsg>(&mut reader) => {
-                    match daemon_msg {
-                        Ok(DaemonMsg::Ping { seq }) => {
-                            debug!("daemon_reporter: received ping seq={seq}");
-                            if let Err(e) = send_msg(&mut writer, &ClientMsg::Pong { seq }).await {
-                                debug!("daemon_reporter: pong send failed ({e}), reconnecting");
-                                closed = true;
-                            }
-                        }
-                        Ok(DaemonMsg::RunPrompt { messages, system_prompt, provider, model }) => {
-                            info!(
-                                provider = ?provider,
-                                model = ?model,
-                                messages = messages.len(),
-                                "daemon_reporter: RunPrompt received"
-                            );
-                            if let Some(runner) = get_global_prompt_runner() {
-                                let runner = runner.clone();
-                                let hub_tx = hub_tx.clone();
-                                let session = session.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = runner.run_prompt(messages, system_prompt, provider, model, hub_tx.clone(), session).await {
-                                        let _ = hub_tx.send(ClientMsg::AgentError { error: e }).await;
-                                    } else {
-                                        let _ = hub_tx.send(ClientMsg::AgentDone).await;
-                                    }
-                                });
-                            } else {
-                                warn!("daemon_reporter: RunPrompt received but no prompt runner is registered");
-                                let _ = hub_tx.send(ClientMsg::AgentError {
-                                    error: "No prompt runner registered on this instance".to_string()
-                                }).await;
-                            }
-                        }
-                        Ok(DaemonMsg::SubmitApproval { id, approved }) => {
-                            debug!("daemon_reporter: received SubmitApproval id={id:?} approved={approved}");
-                            let mut session_guard = session.lock().await;
-                            if let Some(ref call_id) = id {
-                                if let Some(tx) = session_guard.approvals.remove(call_id) {
-                                    let _ = tx.send(approved);
-                                } else {
-                                    debug!("daemon_reporter: received SubmitApproval for unknown call_id={call_id}");
-                                }
-                            } else if let Some(tx) = session_guard.approval_tx.take() {
-                                let _ = tx.send(approved);
-                            } else {
-                                debug!("daemon_reporter: received SubmitApproval but no approval sender pending");
-                            }
-                        }
-                        Ok(DaemonMsg::SubmitScopeGrant { decision_id, decision }) => {
-                            debug!("daemon_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?}");
-                            if let Some(coord) = &grant_coordinator {
-                                match coord.resolve(&decision_id, decision) {
-                                    GrantResolveOutcome::Persist { path, access, tool } => {
-                                        persist_resolved_grant(&path, access, tool);
-                                        // Dismiss any twin modal on other TUIs.
-                                        let _ = send_msg(&mut writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
-                                    }
-                                    GrantResolveOutcome::Denied { .. } => {
-                                        let _ = send_msg(&mut writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
-                                    }
-                                    GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
-                                }
-                            }
-                        }
-                        Ok(DaemonMsg::ReRaiseScopeGrant { path, access }) => {
-                            debug!("daemon_reporter: received ReRaiseScopeGrant path={path} access={access}");
-                            if let Some(coord) = &grant_coordinator {
-                                let access = match access.as_str() {
-                                    "rw" => ahma_common::config::ScopeAccess::Rw,
-                                    _ => ahma_common::config::ScopeAccess::Ro,
-                                };
-                                // reopen() clears the session's ask-once memo for
-                                // this (path, access) first: the memo stops ahma
-                                // nagging, and a person picking a denied row and
-                                // confirming is not ahma nagging (SPEC R-PERM.7.1).
-                                match coord.reopen(
-                                    std::path::Path::new(&path),
-                                    access,
-                                    ahma_common::scope_grant::GrantReason::StderrHeuristic,
-                                    Some("re-raised from the TUI".to_string()),
-                                ) {
-                                    Some(req) => {
-                                        let _ = send_msg(&mut writer, &ClientMsg::ScopeGrantRequested { request: req }).await;
-                                    }
-                                    // Already in flight — the modal the user wants
-                                    // is on screen already.
-                                    None => debug!("daemon_reporter: re-raise skipped, question already in flight"),
-                                }
-                            }
-                        }
-                        Ok(DaemonMsg::SubmitWebApproval { decision_id, decision }) => {
-                            debug!("daemon_reporter: received SubmitWebApproval id={decision_id} decision={decision:?}");
-                            if let Some(coord) = &web_coordinator {
-                                // resolve() applies the session grant/deny in-memory;
-                                // Persist additionally writes always_allow. Every
-                                // terminal outcome dismisses twin modals on other TUIs.
-                                match coord.resolve(&decision_id, decision) {
-                                    WebResolveOutcome::Persist { domain } => {
-                                        persist_resolved_web_allow(&domain);
-                                        let _ = send_msg(&mut writer, &ClientMsg::WebApprovalResolved { decision_id }).await;
-                                    }
-                                    WebResolveOutcome::AllowOnce { .. }
-                                    | WebResolveOutcome::AllowSession { .. }
-                                    | WebResolveOutcome::Denied { .. } => {
-                                        let _ = send_msg(&mut writer, &ClientMsg::WebApprovalResolved { decision_id }).await;
-                                    }
-                                    WebResolveOutcome::AlreadyResolved | WebResolveOutcome::Unknown => {}
-                                }
-                            }
-                        }
-                        Ok(msg) => {
-                            debug!("daemon_reporter: ignored unexpected DaemonMsg: {:?}", msg);
-                        }
-                        Err(e) => {
-                            debug!("daemon_reporter: read error or EOF ({e}), reconnecting");
-                            closed = true;
-                        }
-                    }
+                    closed = handle_daemon_msg(
+                        daemon_msg,
+                        &mut writer,
+                        &hub_tx,
+                        &session,
+                        grant_coordinator.as_ref(),
+                        web_coordinator.as_ref(),
+                    ).await;
                 }
             }
         }
@@ -534,6 +381,243 @@ async fn run_reporter_loop(
         // Back-off before reconnect attempt.
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = next_backoff_secs(backoff_secs);
+    }
+}
+
+/// Replay a batch of completed operations' `OpStarted`/`OpFinished` events to a
+/// freshly (re)connected hub, so a late-attaching TUI sees prior history.
+/// Stops at the first send failure — the caller reconnects in that case.
+/// Returns `true` when every operation replayed successfully.
+async fn replay_completed_operations(
+    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    completed_ops: &[Operation],
+    scope: &str,
+    label: &str,
+) -> bool {
+    for op in completed_ops {
+        let started_ev = ClientMsg::Event {
+            payload: op_started_event(op, scope, label),
+        };
+        if send_msg(writer, &started_ev).await.is_err() {
+            return false;
+        }
+        let duration_ms = op
+            .end_time
+            .and_then(|end| end.duration_since(op.start_time).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let finished_ev = ClientMsg::Event {
+            payload: DaemonEvent::OpFinished {
+                id: op.id.clone(),
+                status: status_label(op.state),
+                result_summary: result_summary_from(op),
+                duration_ms,
+                ended_epoch_ms: op.end_time.and_then(epoch_ms),
+                // Replayed completions carry their exit code too, so a
+                // late-attaching TUI shows `exit 101`, not a bare "failed".
+                exit_code: op.result.as_ref().and_then(exit_code_from_value),
+                // Replay carries denials too, so a TUI opened after the fact
+                // still sees which path was refused (SPEC R-PERM.7).
+                denial: denial_from_operation(op),
+            },
+        };
+        if send_msg(writer, &finished_ev).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Replay a batch of active operations' `OpStarted` events (no `OpFinished` —
+/// they haven't finished yet). Same stop-on-failure contract as
+/// [`replay_completed_operations`].
+async fn replay_active_operations(
+    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    active_ops: &[Operation],
+    scope: &str,
+    label: &str,
+) -> bool {
+    for op in active_ops {
+        let started_ev = ClientMsg::Event {
+            payload: op_started_event(op, scope, label),
+        };
+        if send_msg(writer, &started_ev).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Handle one message received from the daemon hub (the reporter loop's
+/// "incoming messages from daemon hub" select arm). Returns `true` when the
+/// connection should be treated as closed — the caller sets `closed = true`
+/// and the outer loop reconnects.
+async fn handle_daemon_msg(
+    daemon_msg: anyhow::Result<DaemonMsg>,
+    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    hub_tx: &tokio::sync::mpsc::Sender<ClientMsg>,
+    session: &Arc<tokio::sync::Mutex<ActiveAgentSession>>,
+    grant_coordinator: Option<&Arc<GrantCoordinator>>,
+    web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
+) -> bool {
+    match daemon_msg {
+        Ok(DaemonMsg::Ping { seq }) => {
+            debug!("daemon_reporter: received ping seq={seq}");
+            if let Err(e) = send_msg(writer, &ClientMsg::Pong { seq }).await {
+                debug!("daemon_reporter: pong send failed ({e}), reconnecting");
+                return true;
+            }
+            false
+        }
+        Ok(DaemonMsg::RunPrompt {
+            messages,
+            system_prompt,
+            provider,
+            model,
+        }) => {
+            info!(
+                provider = ?provider,
+                model = ?model,
+                messages = messages.len(),
+                "daemon_reporter: RunPrompt received"
+            );
+            if let Some(runner) = get_global_prompt_runner() {
+                let runner = runner.clone();
+                let hub_tx = hub_tx.clone();
+                let session = session.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = runner
+                        .run_prompt(
+                            messages,
+                            system_prompt,
+                            provider,
+                            model,
+                            hub_tx.clone(),
+                            session,
+                        )
+                        .await
+                    {
+                        let _ = hub_tx.send(ClientMsg::AgentError { error: e }).await;
+                    } else {
+                        let _ = hub_tx.send(ClientMsg::AgentDone).await;
+                    }
+                });
+            } else {
+                warn!("daemon_reporter: RunPrompt received but no prompt runner is registered");
+                let _ = hub_tx
+                    .send(ClientMsg::AgentError {
+                        error: "No prompt runner registered on this instance".to_string(),
+                    })
+                    .await;
+            }
+            false
+        }
+        Ok(DaemonMsg::SubmitApproval { id, approved }) => {
+            debug!("daemon_reporter: received SubmitApproval id={id:?} approved={approved}");
+            let mut session_guard = session.lock().await;
+            if let Some(ref call_id) = id {
+                if let Some(tx) = session_guard.approvals.remove(call_id) {
+                    let _ = tx.send(approved);
+                } else {
+                    debug!(
+                        "daemon_reporter: received SubmitApproval for unknown call_id={call_id}"
+                    );
+                }
+            } else if let Some(tx) = session_guard.approval_tx.take() {
+                let _ = tx.send(approved);
+            } else {
+                debug!("daemon_reporter: received SubmitApproval but no approval sender pending");
+            }
+            false
+        }
+        Ok(DaemonMsg::SubmitScopeGrant {
+            decision_id,
+            decision,
+        }) => {
+            debug!(
+                "daemon_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?}"
+            );
+            if let Some(coord) = grant_coordinator {
+                match coord.resolve(&decision_id, decision) {
+                    GrantResolveOutcome::Persist { path, access, tool } => {
+                        persist_resolved_grant(&path, access, tool);
+                        // Dismiss any twin modal on other TUIs.
+                        let _ =
+                            send_msg(writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
+                    }
+                    GrantResolveOutcome::Denied { .. } => {
+                        let _ =
+                            send_msg(writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
+                    }
+                    GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
+                }
+            }
+            false
+        }
+        Ok(DaemonMsg::ReRaiseScopeGrant { path, access }) => {
+            debug!("daemon_reporter: received ReRaiseScopeGrant path={path} access={access}");
+            if let Some(coord) = grant_coordinator {
+                let access = match access.as_str() {
+                    "rw" => ahma_common::config::ScopeAccess::Rw,
+                    _ => ahma_common::config::ScopeAccess::Ro,
+                };
+                // reopen() clears the session's ask-once memo for
+                // this (path, access) first: the memo stops ahma
+                // nagging, and a person picking a denied row and
+                // confirming is not ahma nagging (SPEC R-PERM.7.1).
+                match coord.reopen(
+                    std::path::Path::new(&path),
+                    access,
+                    ahma_common::scope_grant::GrantReason::StderrHeuristic,
+                    Some("re-raised from the TUI".to_string()),
+                ) {
+                    Some(req) => {
+                        let _ = send_msg(writer, &ClientMsg::ScopeGrantRequested { request: req })
+                            .await;
+                    }
+                    // Already in flight — the modal the user wants
+                    // is on screen already.
+                    None => debug!("daemon_reporter: re-raise skipped, question already in flight"),
+                }
+            }
+            false
+        }
+        Ok(DaemonMsg::SubmitWebApproval {
+            decision_id,
+            decision,
+        }) => {
+            debug!(
+                "daemon_reporter: received SubmitWebApproval id={decision_id} decision={decision:?}"
+            );
+            if let Some(coord) = web_coordinator {
+                // resolve() applies the session grant/deny in-memory;
+                // Persist additionally writes always_allow. Every
+                // terminal outcome dismisses twin modals on other TUIs.
+                match coord.resolve(&decision_id, decision) {
+                    WebResolveOutcome::Persist { domain } => {
+                        persist_resolved_web_allow(&domain);
+                        let _ =
+                            send_msg(writer, &ClientMsg::WebApprovalResolved { decision_id }).await;
+                    }
+                    WebResolveOutcome::AllowOnce { .. }
+                    | WebResolveOutcome::AllowSession { .. }
+                    | WebResolveOutcome::Denied { .. } => {
+                        let _ =
+                            send_msg(writer, &ClientMsg::WebApprovalResolved { decision_id }).await;
+                    }
+                    WebResolveOutcome::AlreadyResolved | WebResolveOutcome::Unknown => {}
+                }
+            }
+            false
+        }
+        Ok(msg) => {
+            debug!("daemon_reporter: ignored unexpected DaemonMsg: {:?}", msg);
+            false
+        }
+        Err(e) => {
+            debug!("daemon_reporter: read error or EOF ({e}), reconnecting");
+            true
+        }
     }
 }
 
@@ -763,27 +847,11 @@ fn denial_from_operation(op: &Operation) -> Option<ahma_common::daemon_hub::OpDe
     denial_from_text(&result_summary_from(op)?)
 }
 
+/// The result summary for a (possibly still-active) operation. Delegates to
+/// [`summary_from_value`] — the same extraction-and-clip logic the live event
+/// path uses, so replay and live events never disagree on wording or length.
 fn result_summary_from(op: &Operation) -> Option<String> {
-    let result = op.result.as_ref()?;
-    let summary = if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
-        msg.to_string()
-    } else if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
-        err.to_string()
-    } else if let Some(err_obj) = result
-        .get("error")
-        .and_then(|v| v.get("message"))
-        .and_then(|v| v.as_str())
-    {
-        err_obj.to_string()
-    } else {
-        serde_json::to_string(result).unwrap_or_default()
-    };
-
-    if summary.len() > 200 {
-        Some(format!("{}...", &summary[..197]))
-    } else {
-        Some(summary)
-    }
+    summary_from_value(op.result.as_ref()?)
 }
 
 #[cfg(test)]

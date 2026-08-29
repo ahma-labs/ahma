@@ -244,12 +244,13 @@ fn uninstall_mcp_config(platforms: &[Platform], dry_run: bool) -> Result<Vec<&'s
     let mut removed = Vec::new();
 
     for platform in platforms.iter().copied().filter(|p| p.supports_mcp()) {
-        if let Some(name) = remove_platform_mcp(platform, &home, dry_run)? {
-            if dry_run {
-                println!("[dry-run] Would remove Ahma MCP entry from {}", name);
-            }
-            removed.push(name);
+        let Some(name) = remove_platform_mcp(platform, &home, dry_run)? else {
+            continue;
+        };
+        if dry_run {
+            println!("[dry-run] Would remove Ahma MCP entry from {}", name);
         }
+        removed.push(name);
     }
 
     Ok(removed)
@@ -454,21 +455,7 @@ pub fn remove_claude_plugin(home: &Path, dry_run: bool, interactive: bool) -> Re
         .join("cache")
         .join("local")
         .join("ahma");
-
-    if plugins_dir.exists() {
-        if dry_run {
-            println!("[dry-run] Would remove {}", plugins_dir.display());
-        } else {
-            std::fs::remove_dir_all(&plugins_dir)
-                .with_context(|| format!("Failed to remove {}", plugins_dir.display()))?;
-            if interactive {
-                println!(
-                    "✓ Removed Claude Code plugin cache {}",
-                    plugins_dir.display()
-                );
-            }
-        }
-    }
+    remove_claude_plugin_cache_dir(&plugins_dir, dry_run, interactive)?;
 
     // Remove from installed_plugins.json
     let plugins_json = home
@@ -481,6 +468,33 @@ pub fn remove_claude_plugin(home: &Path, dry_run: bool, interactive: bool) -> Re
     let settings_path = home.join(".claude").join("settings.json");
     disable_claude_plugin(&settings_path, "ahma@local", dry_run)?;
 
+    Ok(())
+}
+
+/// Remove the Claude Code plugin cache directory tree, if present.
+///
+/// Split out of [`remove_claude_plugin`] so the exists/dry-run/interactive
+/// checks read as guard clauses instead of a nested if/else.
+fn remove_claude_plugin_cache_dir(
+    plugins_dir: &Path,
+    dry_run: bool,
+    interactive: bool,
+) -> Result<()> {
+    if !plugins_dir.exists() {
+        return Ok(());
+    }
+    if dry_run {
+        println!("[dry-run] Would remove {}", plugins_dir.display());
+        return Ok(());
+    }
+    std::fs::remove_dir_all(plugins_dir)
+        .with_context(|| format!("Failed to remove {}", plugins_dir.display()))?;
+    if interactive {
+        println!(
+            "✓ Removed Claude Code plugin cache {}",
+            plugins_dir.display()
+        );
+    }
     Ok(())
 }
 

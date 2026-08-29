@@ -287,25 +287,36 @@ async fn handle_routed_sampling_request(
         Ok(Ok(response)) => {
             let mut final_response = response;
             final_response["id"] = original_id;
-            if is_sse {
-                if let Some(session) = session_manager.get_session(session_id) {
-                    let (id, json_str) = session_sse_event(&session, &final_response);
-                    with_session_header(sse_single_event_response_with_id(id, json_str), session_id)
-                } else {
-                    with_session_header(
-                        sse_single_event_response_with_id(1, serialize_sse_data(&final_response)),
-                        session_id,
-                    )
-                }
-            } else {
-                with_session_header(json_response(final_response), session_id)
-            }
+            encode_routed_response(session_manager, session_id, is_sse, &final_response)
         }
         Ok(Err(_)) => error_response(original_id, -32603, "Routed request sender dropped"),
         Err(_) => {
             target_session.routed_requests.remove(&routed_id);
             error_response(original_id, -32002, "Request timed out on the client side")
         }
+    }
+}
+
+/// Encode the response routed back from the target session, matching the
+/// original caller's transport, and attach the session header either way.
+fn encode_routed_response(
+    session_manager: &SessionManager,
+    session_id: &str,
+    is_sse: bool,
+    response: &Value,
+) -> Response {
+    if !is_sse {
+        return with_session_header(json_response(response.clone()), session_id);
+    }
+    match session_manager.get_session(session_id) {
+        Some(session) => {
+            let (id, json_str) = session_sse_event(&session, response);
+            with_session_header(sse_single_event_response_with_id(id, json_str), session_id)
+        }
+        None => with_session_header(
+            sse_single_event_response_with_id(1, serialize_sse_data(response)),
+            session_id,
+        ),
     }
 }
 
@@ -862,19 +873,10 @@ async fn handle_client_response(
         let id_str = id_val
             .as_str()
             .map_or_else(|| id_val.to_string(), str::to_string);
-        if let Some(session) = session_manager.get_session(session_id) {
-            if let Some((_, sender)) = session.routed_requests.remove(&id_str) {
-                let _ = sender.send(payload.clone());
-                return with_session_header(
-                    json_response_with_status(StatusCode::ACCEPTED, serde_json::json!({})),
-                    session_id,
-                );
-            }
-            if let Some((_, method)) = session.pending_client_requests.remove(&id_str)
-                && method == ROOTS_LIST_METHOD
-            {
-                is_roots_list = true;
-            }
+        match match_client_response_id(session_manager, session_id, &id_str, payload) {
+            ClientResponseMatch::Routed(response) => return response,
+            ClientResponseMatch::RootsList => is_roots_list = true,
+            ClientResponseMatch::None => {}
         }
     }
 
@@ -908,6 +910,47 @@ async fn handle_client_response(
         json_response_with_status(StatusCode::ACCEPTED, serde_json::json!({})),
         session_id,
     )
+}
+
+/// Outcome of matching a client response's `id` against session bookkeeping.
+enum ClientResponseMatch {
+    /// The id resolved a pending routed sampling request: `payload` was
+    /// already delivered to its waiter, and the response for the caller is
+    /// ready to return directly.
+    Routed(Response),
+    /// The id resolved a pending `roots/list` request the bridge sent to the
+    /// client — the caller should attempt to lock the sandbox from `result`.
+    RootsList,
+    /// The id matched no pending request the bridge is tracking.
+    None,
+}
+
+/// Look up `id_str` against the session's pending routed and client requests.
+///
+/// Both checks are made under a single session lookup so a routed match and a
+/// `roots/list` match can never be evaluated against different sessions.
+fn match_client_response_id(
+    session_manager: &SessionManager,
+    session_id: &str,
+    id_str: &str,
+    payload: &Value,
+) -> ClientResponseMatch {
+    let Some(session) = session_manager.get_session(session_id) else {
+        return ClientResponseMatch::None;
+    };
+    if let Some((_, sender)) = session.routed_requests.remove(id_str) {
+        let _ = sender.send(payload.clone());
+        return ClientResponseMatch::Routed(with_session_header(
+            json_response_with_status(StatusCode::ACCEPTED, serde_json::json!({})),
+            session_id,
+        ));
+    }
+    if let Some((_, method)) = session.pending_client_requests.remove(id_str)
+        && method == ROOTS_LIST_METHOD
+    {
+        return ClientResponseMatch::RootsList;
+    }
+    ClientResponseMatch::None
 }
 
 /// Returns true if the sandbox should be locked based on the roots list.
@@ -1130,15 +1173,7 @@ async fn forward_request(
             handle_roots_list_response(session_manager, session_id, method, &response).await;
             mark_session_initialized(session_manager, session_id, is_initialized_notification)
                 .await;
-            let encoded = match sse_subscription {
-                Some((session, rx)) => {
-                    Sse::new(build_interleaved_sse_stream(session, rx, response))
-                        .keep_alive(KeepAlive::default())
-                        .into_response()
-                }
-                None if mode == ResponseMode::Sse => StatusCode::ACCEPTED.into_response(),
-                None => json_response(response),
-            };
+            let encoded = encode_forwarded_response(sse_subscription, mode, response);
             with_session_header(encoded, session_id)
         }
         // A per-request timeout is recoverable ON BOTH TRANSPORTS (SPEC
@@ -1165,6 +1200,33 @@ async fn forward_request(
                 &format!("Failed to send request: {}", e),
             )
         }
+    }
+}
+
+/// A session's broadcast subscription, captured before a request is
+/// forwarded so events queued while it is in flight are not missed.
+type SseSubscription = (
+    Arc<crate::session::Session>,
+    tokio::sync::broadcast::Receiver<(u64, String)>,
+);
+
+/// Encode a successfully forwarded request's response for the wire.
+///
+/// `sse_subscription` is `Some` exactly when the caller is on the SSE
+/// transport and the subscription was captured before the request was sent
+/// (see the guard in [`forward_request`]); this stays a pure encode step over
+/// that already-resolved state.
+fn encode_forwarded_response(
+    sse_subscription: Option<SseSubscription>,
+    mode: ResponseMode,
+    response: Value,
+) -> Response {
+    match sse_subscription {
+        Some((session, rx)) => Sse::new(build_interleaved_sse_stream(session, rx, response))
+            .keep_alive(KeepAlive::default())
+            .into_response(),
+        None if mode == ResponseMode::Sse => StatusCode::ACCEPTED.into_response(),
+        None => json_response(response),
     }
 }
 

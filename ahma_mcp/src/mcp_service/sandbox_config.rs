@@ -461,85 +461,15 @@ impl AhmaMcpService {
         // stray client re-emit) lands here directly, and without this check the
         // client's answer would replace an operator-chosen scope — exactly the
         // client-widens-operator-scope path R5.2.2 exists to block.
-        {
-            let sandbox = self.adapter.sandbox();
-            if sandbox.has_explicit_scopes() && !sandbox.scopes().is_empty() {
-                match sandbox.commit_existing_scopes() {
-                    crate::sandbox::ScopeCommit::AlreadyCommitted => {
-                        tracing::warn!(
-                            "roots/list(_changed) for an already-committed explicit scope - \
-                             ignoring (SPEC R5.2.2)"
-                        );
-                        return;
-                    }
-                    crate::sandbox::ScopeCommit::Applied => {
-                        tracing::info!(
-                            "Explicit sandbox scope committed without querying roots/list \
-                             (SPEC R5.2.2): {:?}",
-                            sandbox.scopes()
-                        );
-                    }
-                }
-                if !self.enforce_committed_scopes() {
-                    return;
-                }
-                self.announce_committed_scope(peer, None).await;
-                return;
-            }
+        if self.try_commit_explicit_scope(peer).await {
+            return;
         }
-
-        // Handshake-class deadline: this bounds a scope-negotiation round-trip, so
-        // it must NOT use `SseStream` (a long-poll request ceiling that its own
-        // docs forbid for handshake/readiness waits).
-        let timeout_duration = TestTimeouts::get(TimeoutCategory::Handshake);
-        tracing::info!(timeout = ?timeout_duration, "Requesting roots/list from client...");
 
         // Attempt roots/list; fall back to pre-configured scopes on timeout or error
         // so that clients that don't support roots/list (e.g. Antigravity) still work
         // when --sandbox-scope was provided at startup.
-        // Both failure arms normalize to an error string and share one
-        // fallback: with pre-configured scopes the failure is downgraded and
-        // configuration proceeds against them; otherwise `sandbox/failed` is
-        // emitted and configuration aborts.
-        let roots = match tokio::time::timeout(timeout_duration, peer.list_roots()).await {
-            Ok(Ok(result)) => result.roots,
-            Ok(Err(e)) => {
-                match self
-                    .roots_list_failure_fallback(
-                        peer,
-                        &format!(
-                            "roots/list returned error ({}); using pre-configured scopes",
-                            e
-                        ),
-                        &format!("Failed to request roots/list: {}", e),
-                        &e.to_string(),
-                    )
-                    .await
-                {
-                    Some(roots) => roots,
-                    None => return,
-                }
-            }
-            Err(_) => {
-                let timeout_message = format!(
-                    "Timeout waiting for roots/list response after {:?}",
-                    timeout_duration
-                );
-                match self
-                    .roots_list_failure_fallback(
-                        peer,
-                        &format!("{timeout_message}; using pre-configured scopes"),
-                        &format!(
-                            "{timeout_message}. This may indicate a stdio communication issue."
-                        ),
-                        &timeout_message,
-                    )
-                    .await
-                {
-                    Some(roots) => roots,
-                    None => return,
-                }
-            }
+        let Some(roots) = self.request_roots_with_fallback(peer).await else {
+            return;
         };
         tracing::debug!("roots/list returned {} roots", roots.len());
 
@@ -564,9 +494,107 @@ impl AhmaMcpService {
         }
 
         // Remember the first client root so we can look for `<root>/.ahma`
-        // AFTER the scopes vec is moved into `apply_and_enforce_scopes`.
+        // AFTER the scopes vec is moved into `commit_scopes_or_defer`.
         let client_root: Option<PathBuf> = new_scopes.first().cloned();
 
+        if !self.commit_scopes_or_defer(new_scopes, peer).await {
+            return;
+        }
+
+        self.announce_committed_scope(peer, client_root).await;
+    }
+
+    /// SPEC R5.2.2 explicit-scope fast path: if the sandbox was given an
+    /// explicit scope (`--sandbox-scope`, `--working-directories`, task
+    /// vault), commit it without querying `roots/list` at all — that scope
+    /// must never be widened or replaced by a client's answer. Returns
+    /// `true` when this path applied and the caller must return immediately
+    /// (already committed-and-announced, or a repeat call correctly
+    /// ignored); `false` when there is no explicit scope, so the normal
+    /// `roots/list` flow should proceed.
+    async fn try_commit_explicit_scope(&self, peer: &Peer<RoleServer>) -> bool {
+        let sandbox = self.adapter.sandbox();
+        if !sandbox.has_explicit_scopes() || sandbox.scopes().is_empty() {
+            return false;
+        }
+        match sandbox.commit_existing_scopes() {
+            crate::sandbox::ScopeCommit::AlreadyCommitted => {
+                tracing::warn!(
+                    "roots/list(_changed) for an already-committed explicit scope - \
+                     ignoring (SPEC R5.2.2)"
+                );
+                return true;
+            }
+            crate::sandbox::ScopeCommit::Applied => {
+                tracing::info!(
+                    "Explicit sandbox scope committed without querying roots/list \
+                     (SPEC R5.2.2): {:?}",
+                    sandbox.scopes()
+                );
+            }
+        }
+        if !self.enforce_committed_scopes() {
+            return true;
+        }
+        self.announce_committed_scope(peer, None).await;
+        true
+    }
+
+    /// Requests `roots/list` under the handshake-class deadline (must NOT use
+    /// `SseStream` — a long-poll ceiling its own docs forbid for
+    /// handshake/readiness waits) and falls back to pre-configured scopes on
+    /// timeout or error. Both failure arms normalize to an error string and
+    /// share one fallback: with pre-configured scopes the failure is
+    /// downgraded and configuration proceeds against them; otherwise
+    /// `sandbox/failed` is emitted and `None` tells the caller to abort.
+    async fn request_roots_with_fallback(
+        &self,
+        peer: &Peer<RoleServer>,
+    ) -> Option<Vec<rmcp::model::Root>> {
+        let timeout_duration = TestTimeouts::get(TimeoutCategory::Handshake);
+        tracing::info!(timeout = ?timeout_duration, "Requesting roots/list from client...");
+
+        match tokio::time::timeout(timeout_duration, peer.list_roots()).await {
+            Ok(Ok(result)) => Some(result.roots),
+            Ok(Err(e)) => {
+                self.roots_list_failure_fallback(
+                    peer,
+                    &format!(
+                        "roots/list returned error ({}); using pre-configured scopes",
+                        e
+                    ),
+                    &format!("Failed to request roots/list: {}", e),
+                    &e.to_string(),
+                )
+                .await
+            }
+            Err(_) => {
+                let timeout_message = format!(
+                    "Timeout waiting for roots/list response after {:?}",
+                    timeout_duration
+                );
+                self.roots_list_failure_fallback(
+                    peer,
+                    &format!("{timeout_message}; using pre-configured scopes"),
+                    &format!("{timeout_message}. This may indicate a stdio communication issue."),
+                    &timeout_message,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Commits `new_scopes` when the client provided usable `file://` roots;
+    /// otherwise falls back to any pre-configured scopes (container root, or
+    /// defer-mode seeds), or defers configuration entirely when neither is
+    /// available. Returns `true` when the caller should proceed to announce
+    /// the committed scope, `false` when it must return immediately (already
+    /// handled, or deliberately deferred).
+    async fn commit_scopes_or_defer(
+        &self,
+        new_scopes: Vec<PathBuf>,
+        peer: &Peer<RoleServer>,
+    ) -> bool {
         if !new_scopes.is_empty() {
             // `commit_scopes` claims the one-shot latch and replaces the scopes
             // as a single operation (SPEC R5.1.1); a concurrent or repeat
@@ -576,33 +604,10 @@ impl AhmaMcpService {
                 "Attempting to commit sandbox scopes with {} paths",
                 new_scopes.len()
             );
-            if !self.apply_and_enforce_scopes(new_scopes, peer).await {
-                return;
-            }
-        } else if !self.adapter.sandbox().scopes().is_empty() {
-            // Client provided no usable file:// roots but we have pre-configured
-            // scopes (the container root, or defer-mode seeds). Commit them as
-            // they stand.
-            match self.adapter.sandbox().commit_existing_scopes() {
-                crate::sandbox::ScopeCommit::AlreadyCommitted => {
-                    tracing::warn!(
-                        "Pre-configured scopes present but the sandbox is already committed - \
-                         ignoring repeat configuration (SPEC R5.2.2)"
-                    );
-                    return;
-                }
-                crate::sandbox::ScopeCommit::Applied => {}
-            }
-            tracing::info!(
-                "No usable roots from roots/list; committed pre-configured scopes: {:?}",
-                self.adapter.sandbox().scopes()
-            );
-            // Defer mode skips platform enforcement at startup, so this commit is
-            // the first chance to apply the process-level defense-in-depth layer.
-            if !self.enforce_committed_scopes() {
-                return;
-            }
-        } else {
+            return self.apply_and_enforce_scopes(new_scopes, peer).await;
+        }
+
+        if self.adapter.sandbox().scopes().is_empty() {
             // Client returned an empty roots list and there are no pre-configured scopes.
             // Do NOT emit notifications/sandbox/configured here: emitting it would mark the
             // sandbox as "ready" with zero scope, which causes every tool call to fail with a
@@ -614,10 +619,29 @@ impl AhmaMcpService {
                  Fix: open a workspace folder so the client can provide workspace roots, \
                  or pass --sandbox-scope <path> / --sandbox to ahma."
             );
-            return;
+            return false;
         }
 
-        self.announce_committed_scope(peer, client_root).await;
+        // Client provided no usable file:// roots but we have pre-configured
+        // scopes (the container root, or defer-mode seeds). Commit them as
+        // they stand.
+        match self.adapter.sandbox().commit_existing_scopes() {
+            crate::sandbox::ScopeCommit::AlreadyCommitted => {
+                tracing::warn!(
+                    "Pre-configured scopes present but the sandbox is already committed - \
+                     ignoring repeat configuration (SPEC R5.2.2)"
+                );
+                return false;
+            }
+            crate::sandbox::ScopeCommit::Applied => {}
+        }
+        tracing::info!(
+            "No usable roots from roots/list; committed pre-configured scopes: {:?}",
+            self.adapter.sandbox().scopes()
+        );
+        // Defer mode skips platform enforcement at startup, so this commit is
+        // the first chance to apply the process-level defense-in-depth layer.
+        self.enforce_committed_scopes()
     }
 
     /// Post-commit follow-through, shared by every commit path: anchor the log

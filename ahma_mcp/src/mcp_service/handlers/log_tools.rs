@@ -361,6 +361,38 @@ async fn canonicalize_dunce(path: PathBuf) -> std::io::Result<PathBuf> {
         .map_err(std::io::Error::other)?
 }
 
+/// Resolves the symlink target and approval status for a single log-directory
+/// entry already known to be a symlink. Split out of `collect_log_sources` so
+/// the caller's loop body reads as a flat sequence of steps rather than a
+/// three-level-deep `if let` chain.
+///
+/// A target that resolves inside `canonical_log_dir` (ahma's own rolling-log
+/// symlinks, e.g. `ahma.log` → `ahma.log.2026-06-15`) is always approved,
+/// regardless of sandbox scope — it was created by ahma's own rotation code,
+/// not an external actor. A target that escapes the log directory falls back
+/// to the sandbox scope/exception check. A target that can't be read or
+/// canonicalized is reported (when known) but not approved.
+async fn resolve_symlink_approval(
+    path: &Path,
+    log_dir: &Path,
+    canonical_log_dir: &Path,
+    scopes: &[PathBuf],
+    exceptions: &[PathBuf],
+) -> (Option<String>, bool) {
+    let Ok(target) = tokio::fs::read_link(path).await else {
+        return (None, false);
+    };
+    let symlink_target = Some(target.display().to_string());
+
+    let Ok(canonical_target) = canonicalize_dunce(log_dir.join(&target)).await else {
+        return (symlink_target, false);
+    };
+
+    let is_approved = canonical_target.starts_with(canonical_log_dir)
+        || crate::sandbox::is_target_allowed(&canonical_target, scopes, exceptions);
+    (symlink_target, is_approved)
+}
+
 /// Scans the log directory and returns metadata for each log file.
 async fn collect_log_sources(
     log_dir: &Path,
@@ -388,31 +420,11 @@ async fn collect_log_sources(
         };
 
         let is_symlink = meta.file_type().is_symlink();
-        let mut symlink_target = None;
-        let mut is_approved = true;
-
-        if is_symlink {
-            if let Ok(target) = tokio::fs::read_link(&path).await {
-                symlink_target = Some(target.display().to_string());
-                if let Ok(canonical_target) = canonicalize_dunce(log_dir.join(&target)).await {
-                    // Symlink pointing within the managed log directory is always
-                    // approved — apply the sandbox check only for targets that escape it.
-                    if canonical_target.starts_with(&canonical_log_dir) {
-                        is_approved = true;
-                    } else {
-                        is_approved = crate::sandbox::is_target_allowed(
-                            &canonical_target,
-                            scopes,
-                            exceptions,
-                        );
-                    }
-                } else {
-                    is_approved = false;
-                }
-            } else {
-                is_approved = false;
-            }
-        }
+        let (symlink_target, is_approved) = if is_symlink {
+            resolve_symlink_approval(&path, log_dir, &canonical_log_dir, scopes, exceptions).await
+        } else {
+            (None, true)
+        };
 
         // For size/modified use the real file metadata (follows symlink).
         let Ok(real_meta) = tokio::fs::metadata(&path).await else {

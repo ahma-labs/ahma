@@ -129,81 +129,12 @@ pub struct TreeOptions<'a> {
 
 /// Build the renderable rows for the current frame.
 pub fn build_rows(ops: &[Operation], opts: &TreeOptions<'_>) -> Vec<TreeRow> {
-    // ── 1. Dedup: the TUI's own server can be visible twice — through its hub
-    // registration (instance_id = Some) and through the direct MCP status poll
-    // (instance_id = None). Prefer the hub copy, which carries instance
-    // grouping metadata.
-    let hub_ids: HashSet<&str> = ops
-        .iter()
-        .filter(|o| o.instance_id.is_some())
-        .map(|o| o.id.as_str())
-        .collect();
-    let visible: Vec<usize> = ops
-        .iter()
-        .enumerate()
-        .filter(|(_, o)| o.instance_id.is_some() || !hub_ids.contains(o.id.as_str()))
-        .map(|(i, _)| i)
-        .collect();
-
-    // ── 2. Which instances pass the project filter?
-    let instance_visible = |info: &InstanceInfo| -> bool {
-        opts.show_all
-            || match opts.project_root {
-                Some(root) => scope_matches_project(&info.scope, root),
-                None => true,
-            }
-    };
-    let shown_instances: Vec<&InstanceInfo> = {
-        let mut v: Vec<&InstanceInfo> = opts
-            .instances
-            .iter()
-            .filter(|i| instance_visible(i))
-            .collect();
-        v.sort_by(|a, b| {
-            display_label(a)
-                .cmp(&display_label(b))
-                .then(a.id.cmp(&b.id))
-        });
-        v
-    };
+    let visible = dedup_visible_ops(ops);
+    let shown_instances = filter_shown_instances(opts);
     let shown_ids: HashSet<&str> = shown_instances.iter().map(|i| i.id.as_str()).collect();
+    let groups = bucket_ops_by_group(ops, &visible, &shown_ids, opts.show_all);
+    let ordered = order_groups(&shown_instances, &shown_ids, &groups);
 
-    // ── 3. Bucket operations by group (instance id or LOCAL_GROUP).
-    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
-    for &i in &visible {
-        let op = &ops[i];
-        match op.instance_id.as_deref() {
-            Some(gid) => {
-                // Ops from instances that are not registered any more (or are
-                // filtered out) are shown only in show_all mode, under their
-                // remembered id, so nothing silently disappears mid-session.
-                if shown_ids.contains(gid) || opts.show_all {
-                    groups.entry(gid).or_default().push(i);
-                }
-            }
-            None => groups.entry(LOCAL_GROUP).or_default().push(i),
-        }
-    }
-
-    // Instances first (sorted), then any orphaned groups, then local ops.
-    let mut ordered: Vec<(String, Option<&InstanceInfo>)> = Vec::new();
-    for info in &shown_instances {
-        ordered.push((info.id.clone(), Some(info)));
-    }
-    let mut orphans: Vec<&str> = groups
-        .keys()
-        .copied()
-        .filter(|g| *g != LOCAL_GROUP && !shown_ids.contains(g))
-        .collect();
-    orphans.sort_unstable();
-    for gid in orphans {
-        ordered.push((gid.to_string(), None));
-    }
-    if groups.contains_key(LOCAL_GROUP) {
-        ordered.push((LOCAL_GROUP.to_string(), None));
-    }
-
-    // ── 4. Emit rows.
     let mut rows = Vec::new();
     for (gid, info) in &ordered {
         let mut member_idx: Vec<usize> = groups.get(gid.as_str()).cloned().unwrap_or_default();
@@ -221,14 +152,7 @@ pub fn build_rows(ops: &[Operation], opts: &TreeOptions<'_>) -> Vec<TreeRow> {
 
         let inst_key = format!("inst:{gid}");
         let inst_collapsed = opts.collapsed.contains(&inst_key);
-        let (label, detail) = match info {
-            Some(info) => (
-                display_label(info),
-                format!("{} · {}", info.mode, short_path(&info.scope)),
-            ),
-            None if gid == LOCAL_GROUP => ("this terminal (you)".to_string(), String::new()),
-            None => (format!("instance {gid}"), "disconnected".to_string()),
-        };
+        let (label, detail) = instance_label_detail(gid, *info);
         rows.push(TreeRow {
             kind: RowKind::Instance {
                 group_id: gid.clone(),
@@ -248,6 +172,109 @@ pub fn build_rows(ops: &[Operation], opts: &TreeOptions<'_>) -> Vec<TreeRow> {
     rows
 }
 
+/// The TUI's own server can be visible twice — through its hub registration
+/// (instance_id = Some) and through the direct MCP status poll
+/// (instance_id = None). Prefer the hub copy, which carries instance
+/// grouping metadata; returns the indices into `ops` that should be shown.
+fn dedup_visible_ops(ops: &[Operation]) -> Vec<usize> {
+    let hub_ids: HashSet<&str> = ops
+        .iter()
+        .filter(|o| o.instance_id.is_some())
+        .map(|o| o.id.as_str())
+        .collect();
+    ops.iter()
+        .enumerate()
+        .filter(|(_, o)| o.instance_id.is_some() || !hub_ids.contains(o.id.as_str()))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Which instances pass the project filter, sorted for display order.
+fn filter_shown_instances<'a>(opts: &TreeOptions<'a>) -> Vec<&'a InstanceInfo> {
+    let instance_visible = |info: &InstanceInfo| -> bool {
+        opts.show_all
+            || match opts.project_root {
+                Some(root) => scope_matches_project(&info.scope, root),
+                None => true,
+            }
+    };
+    let mut v: Vec<&InstanceInfo> = opts
+        .instances
+        .iter()
+        .filter(|i| instance_visible(i))
+        .collect();
+    v.sort_by(|a, b| {
+        display_label(a)
+            .cmp(&display_label(b))
+            .then(a.id.cmp(&b.id))
+    });
+    v
+}
+
+/// Bucket operations by group (instance id or [`LOCAL_GROUP`]). Ops from
+/// instances that are not registered any more (or are filtered out) are
+/// shown only in show_all mode, under their remembered id, so nothing
+/// silently disappears mid-session.
+fn bucket_ops_by_group<'a>(
+    ops: &'a [Operation],
+    visible: &[usize],
+    shown_ids: &HashSet<&str>,
+    show_all: bool,
+) -> HashMap<&'a str, Vec<usize>> {
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for &i in visible {
+        let op = &ops[i];
+        match op.instance_id.as_deref() {
+            Some(gid) => {
+                if shown_ids.contains(gid) || show_all {
+                    groups.entry(gid).or_default().push(i);
+                }
+            }
+            None => groups.entry(LOCAL_GROUP).or_default().push(i),
+        }
+    }
+    groups
+}
+
+/// Order groups for display: instances first (already sorted), then any
+/// orphaned groups (an instance no longer registered, or filtered out but
+/// still holding ops), then local ops last.
+fn order_groups<'a>(
+    shown_instances: &[&'a InstanceInfo],
+    shown_ids: &HashSet<&str>,
+    groups: &HashMap<&str, Vec<usize>>,
+) -> Vec<(String, Option<&'a InstanceInfo>)> {
+    let mut ordered: Vec<(String, Option<&InstanceInfo>)> = Vec::new();
+    for info in shown_instances {
+        ordered.push((info.id.clone(), Some(*info)));
+    }
+    let mut orphans: Vec<&str> = groups
+        .keys()
+        .copied()
+        .filter(|g| *g != LOCAL_GROUP && !shown_ids.contains(g))
+        .collect();
+    orphans.sort_unstable();
+    for gid in orphans {
+        ordered.push((gid.to_string(), None));
+    }
+    if groups.contains_key(LOCAL_GROUP) {
+        ordered.push((LOCAL_GROUP.to_string(), None));
+    }
+    ordered
+}
+
+/// Label/detail text for an instance header row.
+fn instance_label_detail(gid: &str, info: Option<&InstanceInfo>) -> (String, String) {
+    match info {
+        Some(info) => (
+            display_label(info),
+            format!("{} · {}", info.mode, short_path(&info.scope)),
+        ),
+        None if gid == LOCAL_GROUP => ("this terminal (you)".to_string(), String::new()),
+        None => (format!("instance {gid}"), "disconnected".to_string()),
+    }
+}
+
 /// Emit the operations of one instance group: session groups, parent/child
 /// nesting, and the expanded op's inline output.
 fn emit_group_ops(
@@ -257,84 +284,7 @@ fn emit_group_ops(
     opts: &TreeOptions<'_>,
     rows: &mut Vec<TreeRow>,
 ) {
-    let by_id: HashMap<&str, usize> = member_idx
-        .iter()
-        .map(|&i| (ops[i].id.as_str(), i))
-        .collect();
-
-    // parent op index (in `ops`) → children; sessions keyed separately.
-    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut sessions: Vec<(String, Vec<usize>)> = Vec::new(); // insertion-ordered
-    let mut roots: Vec<usize> = Vec::new();
-
-    for &i in member_idx {
-        match ops[i].parent_id.as_deref() {
-            Some(p) if by_id.contains_key(p) => children.entry(by_id[p]).or_default().push(i),
-            Some(p) if p.starts_with("session:") => {
-                match sessions.iter_mut().find(|(k, _)| k == p) {
-                    Some((_, v)) => v.push(i),
-                    None => sessions.push((p.to_string(), vec![i])),
-                }
-            }
-            _ => roots.push(i),
-        }
-    }
-
-    fn emit_op(
-        ops: &[Operation],
-        i: usize,
-        depth: u8,
-        children: &HashMap<usize, Vec<usize>>,
-        opts: &TreeOptions<'_>,
-        rows: &mut Vec<TreeRow>,
-    ) {
-        let expanded = opts.expanded_op == Some(ops[i].id.as_str());
-        rows.push(TreeRow {
-            kind: RowKind::Op {
-                op_index: i,
-                expanded,
-            },
-            depth,
-        });
-        if expanded {
-            let op = &ops[i];
-            let tail: Vec<&String> = op
-                .stdout_tail
-                .iter()
-                .rev()
-                .take(EXPANDED_TAIL_LINES)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            if tail.is_empty() {
-                if let Some(summary) = &op.result_summary {
-                    rows.push(TreeRow {
-                        kind: RowKind::Output {
-                            op_index: i,
-                            text: summary.clone(),
-                        },
-                        depth: depth + 1,
-                    });
-                }
-            } else {
-                for line in tail {
-                    rows.push(TreeRow {
-                        kind: RowKind::Output {
-                            op_index: i,
-                            text: line.clone(),
-                        },
-                        depth: depth + 1,
-                    });
-                }
-            }
-        }
-        if let Some(kids) = children.get(&i) {
-            for &k in kids {
-                emit_op(ops, k, depth + 1, children, opts, rows);
-            }
-        }
-    }
+    let (children, sessions, roots) = bucket_group_ops(ops, member_idx);
 
     for i in roots {
         emit_op(ops, i, 1, &children, opts, rows);
@@ -360,6 +310,107 @@ fn emit_group_ops(
         for i in members {
             emit_op(ops, i, 2, &children, opts, rows);
         }
+    }
+}
+
+/// Bucket one group's operation indices into parent→children edges, session
+/// groups (insertion-ordered), and root ops (no known parent in this group).
+#[allow(clippy::type_complexity)]
+fn bucket_group_ops(
+    ops: &[Operation],
+    member_idx: &[usize],
+) -> (
+    HashMap<usize, Vec<usize>>,
+    Vec<(String, Vec<usize>)>,
+    Vec<usize>,
+) {
+    let by_id: HashMap<&str, usize> = member_idx
+        .iter()
+        .map(|&i| (ops[i].id.as_str(), i))
+        .collect();
+
+    // parent op index (in `ops`) → children; sessions keyed separately.
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut sessions: Vec<(String, Vec<usize>)> = Vec::new(); // insertion-ordered
+    let mut roots: Vec<usize> = Vec::new();
+
+    for &i in member_idx {
+        match ops[i].parent_id.as_deref() {
+            Some(p) if by_id.contains_key(p) => children.entry(by_id[p]).or_default().push(i),
+            Some(p) if p.starts_with("session:") => {
+                match sessions.iter_mut().find(|(k, _)| k == p) {
+                    Some((_, v)) => v.push(i),
+                    None => sessions.push((p.to_string(), vec![i])),
+                }
+            }
+            _ => roots.push(i),
+        }
+    }
+
+    (children, sessions, roots)
+}
+
+/// Emit one operation row, its expanded output tail (if any), and its
+/// children, recursively.
+fn emit_op(
+    ops: &[Operation],
+    i: usize,
+    depth: u8,
+    children: &HashMap<usize, Vec<usize>>,
+    opts: &TreeOptions<'_>,
+    rows: &mut Vec<TreeRow>,
+) {
+    let expanded = opts.expanded_op == Some(ops[i].id.as_str());
+    rows.push(TreeRow {
+        kind: RowKind::Op {
+            op_index: i,
+            expanded,
+        },
+        depth,
+    });
+    if expanded {
+        push_expanded_output(&ops[i], i, depth, rows);
+    }
+    if let Some(kids) = children.get(&i) {
+        for &k in kids {
+            emit_op(ops, k, depth + 1, children, opts, rows);
+        }
+    }
+}
+
+/// Push the inline output-tail rows for an expanded operation: the last
+/// [`EXPANDED_TAIL_LINES`] stdout lines, or the terminal result summary when
+/// there is no tail (the op finished before ever streaming output).
+fn push_expanded_output(op: &Operation, op_index: usize, depth: u8, rows: &mut Vec<TreeRow>) {
+    let tail: Vec<&String> = op
+        .stdout_tail
+        .iter()
+        .rev()
+        .take(EXPANDED_TAIL_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if tail.is_empty() {
+        if let Some(summary) = &op.result_summary {
+            rows.push(TreeRow {
+                kind: RowKind::Output {
+                    op_index,
+                    text: summary.clone(),
+                },
+                depth: depth + 1,
+            });
+        }
+        return;
+    }
+    for line in tail {
+        rows.push(TreeRow {
+            kind: RowKind::Output {
+                op_index,
+                text: line.clone(),
+            },
+            depth: depth + 1,
+        });
     }
 }
 

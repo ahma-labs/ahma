@@ -1132,13 +1132,22 @@ fn prune_profile(
 
     for name in prunable {
         let dir = profile.join(name);
-        if !dir.is_dir() {
-            continue;
+        if dir.is_dir() {
+            prune_dir_older_than(&dir, cutoff, opts, report);
         }
-        for candidate in read_dir_sorted(&dir) {
-            if candidate.modified < cutoff {
-                remove_candidate(&candidate, opts, report);
-            }
+    }
+}
+
+/// Remove immediate children of `dir` last modified before `cutoff`.
+fn prune_dir_older_than(
+    dir: &Path,
+    cutoff: std::time::SystemTime,
+    opts: &CleanOpts,
+    report: &mut CleanReport,
+) {
+    for candidate in read_dir_sorted(dir) {
+        if candidate.modified < cutoff {
+            remove_candidate(&candidate, opts, report);
         }
     }
 }
@@ -1150,20 +1159,34 @@ fn enforce_size_budget(
     opts: &CleanOpts,
     report: &mut CleanReport,
 ) {
-    let mut current = dir_size(target_dir).saturating_sub(if opts.dry_run {
-        // Nothing was actually deleted in a dry run, so discount what the age pass claimed
-        // in order to model the real post-clean size.
+    // Nothing was actually deleted in a dry run, so discount what the age pass claimed in
+    // order to model the real post-clean size.
+    let discount = if opts.dry_run {
         report.bytes_reclaimed
     } else {
         0
-    });
+    };
+    let mut current = dir_size(target_dir).saturating_sub(discount);
     if current <= budget_bytes {
         return;
     }
 
-    // The size pass may remove artifacts the current build still wants. That is the explicit
-    // bargain of a hard ceiling, so it spans the full prunable set rather than the narrow
-    // default one.
+    for candidate in size_budget_candidates(target_dir) {
+        if current <= budget_bytes {
+            break;
+        }
+        let size = candidate.size;
+        remove_candidate(&candidate, opts, report);
+        current = current.saturating_sub(size);
+    }
+}
+
+/// All removal candidates across every profile dir's prunable subdirectories, oldest first.
+///
+/// The size pass may remove artifacts the current build still wants. That is the explicit
+/// bargain of a hard ceiling, so it spans the full prunable set rather than the narrow
+/// default one.
+fn size_budget_candidates(target_dir: &Path) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for profile in discover_profile_dirs(target_dir) {
         for name in ["incremental", "deps", "build", ".fingerprint", "examples"] {
@@ -1174,15 +1197,7 @@ fn enforce_size_budget(
         }
     }
     candidates.sort_by_key(|c| c.modified);
-
-    for candidate in candidates {
-        if current <= budget_bytes {
-            break;
-        }
-        let size = candidate.size;
-        remove_candidate(&candidate, opts, report);
-        current = current.saturating_sub(size);
-    }
+    candidates
 }
 
 /// Immediate children of `dir` as removal candidates, in a deterministic order.

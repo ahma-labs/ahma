@@ -490,6 +490,67 @@ async fn init_mcp_session(
     StreamableHttpMcpClient::connect(connector, opts).await
 }
 
+/// Build a `SandboxScopeInfo` from a `notifications/sandbox/configured`
+/// `params` payload.
+///
+/// The server nests the full ScopeView under `params.scope` (SPEC R5.4: "the
+/// configured notification carries the complete scope and its provenance").
+/// Older emitters put `active`/`host`/`active_disclosure` at the top level of
+/// params, so fall back there field-by-field.
+fn parse_sandbox_scope(params: Option<&Value>) -> crate::state::SandboxScopeInfo {
+    let scope_obj = params.and_then(|p| p.get("scope"));
+    let field = |key: &str| -> Option<&Value> {
+        scope_obj
+            .and_then(|s| s.get(key))
+            .or_else(|| params.and_then(|p| p.get(key)))
+    };
+    let str_field = |key: &str| field(key).and_then(Value::as_str).map(str::to_string);
+    let paths_field = |key: &str| -> Vec<String> {
+        field(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    crate::state::SandboxScopeInfo {
+        write: paths_field("write"),
+        read: paths_field("read"),
+        tmp: field("tmp").and_then(Value::as_bool).unwrap_or(false),
+        // A notification with no scope payload comes from a server that
+        // only emits it after enforcing — assume enforced there rather
+        // than rendering a false "DISABLED".
+        enforced: field("enforced").and_then(Value::as_bool).unwrap_or(true),
+        source: str_field("source"),
+        active: str_field("active"),
+        host: str_field("host"),
+        disclosure: str_field("active_disclosure"),
+        platform_note: str_field("platform_note"),
+    }
+}
+
+/// Map the active-sandbox token (plus, for host-relative modes, the host
+/// name) to a compact status-bar label. Missing params (older servers, or
+/// the bare notification) => LOCKED, preserving backward compatibility.
+fn sandbox_status_label(active: Option<&str>, host: Option<&str>) -> String {
+    match active {
+        Some("ahma_nested_in_host") => match host {
+            Some(h) => format!("NESTED: {h}"),
+            None => "NESTED".to_string(),
+        },
+        Some("deferred_to_host") => match host {
+            Some(h) => format!("DEFERRED: {h}"),
+            None => "DEFERRED".to_string(),
+        },
+        Some("disabled") => "UNSANDBOXED".to_string(),
+        _ => "LOCKED".to_string(),
+    }
+}
+
 /// Translate one server-pushed notification into `SourceEvent`s. `roots/list`
 /// is answered by the shared client's SSE listener before it reaches here, so
 /// this only reacts to the sandbox lifecycle notifications.
@@ -514,60 +575,12 @@ async fn handle_notification(value: &Value, tx: &mpsc::Sender<SourceEvent>) {
 
     if method == Some(SANDBOX_CONFIGURED_METHOD) {
         debug!("Sandbox configured successfully!");
-        let params = value.get("params");
-        // The server nests the full ScopeView under `params.scope` (SPEC R5.4:
-        // "the configured notification carries the complete scope and its
-        // provenance"). Older emitters put `active`/`host`/`active_disclosure`
-        // at the top level of params, so fall back there field-by-field.
-        let scope_obj = params.and_then(|p| p.get("scope"));
-        let field = |key: &str| -> Option<&Value> {
-            scope_obj
-                .and_then(|s| s.get(key))
-                .or_else(|| params.and_then(|p| p.get(key)))
-        };
-        let str_field = |key: &str| field(key).and_then(Value::as_str).map(str::to_string);
-        let paths_field = |key: &str| -> Vec<String> {
-            field(key)
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-
-        let scope = crate::state::SandboxScopeInfo {
-            write: paths_field("write"),
-            read: paths_field("read"),
-            tmp: field("tmp").and_then(Value::as_bool).unwrap_or(false),
-            // A notification with no scope payload comes from a server that
-            // only emits it after enforcing — assume enforced there rather
-            // than rendering a false "DISABLED".
-            enforced: field("enforced").and_then(Value::as_bool).unwrap_or(true),
-            source: str_field("source"),
-            active: str_field("active"),
-            host: str_field("host"),
-            disclosure: str_field("active_disclosure"),
-            platform_note: str_field("platform_note"),
-        };
+        let scope = parse_sandbox_scope(value.get("params"));
 
         // Map the active-sandbox token to a compact status-bar label. Missing
         // params (older servers, or the bare notification) => LOCKED, preserving
         // backward compatibility.
-        let status = match scope.active.as_deref() {
-            Some("ahma_nested_in_host") => match scope.host.as_deref() {
-                Some(h) => format!("NESTED: {h}"),
-                None => "NESTED".to_string(),
-            },
-            Some("deferred_to_host") => match scope.host.as_deref() {
-                Some(h) => format!("DEFERRED: {h}"),
-                None => "DEFERRED".to_string(),
-            },
-            Some("disabled") => "UNSANDBOXED".to_string(),
-            _ => "LOCKED".to_string(),
-        };
+        let status = sandbox_status_label(scope.active.as_deref(), scope.host.as_deref());
         let not_sole_authority = matches!(
             scope.active.as_deref(),
             Some("ahma_nested_in_host") | Some("deferred_to_host") | Some("disabled")
@@ -719,37 +732,36 @@ fn parse_op_status(op_val: &Value) -> OpStatus {
     }
 }
 
-fn parse_op_times(op_val: &Value, op: &mut Operation) {
-    let mut started_dt = None;
-    if let Some(st_str) = op_val.get("start_time").and_then(|v| v.as_str())
-        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(st_str)
-    {
-        let s_dt = dt.with_timezone(&chrono::Local);
-        started_dt = Some(s_dt);
-        op.started_time = s_dt;
+/// Parse an RFC-3339 timestamp field off `op_val`, converted to local time.
+fn parse_rfc3339_field(op_val: &Value, key: &str) -> Option<chrono::DateTime<chrono::Local>> {
+    let raw = op_val.get(key).and_then(|v| v.as_str())?;
+    let dt = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    Some(dt.with_timezone(&chrono::Local))
+}
 
-        let now_local = chrono::Local::now();
-        if now_local >= s_dt {
-            let diff = now_local.signed_duration_since(s_dt);
-            let diff_secs = diff.num_seconds().max(0) as u64;
-            op.started_at = Some(std::time::Instant::now() - Duration::from_secs(diff_secs));
-        }
+fn parse_op_times(op_val: &Value, op: &mut Operation) {
+    let Some(s_dt) = parse_rfc3339_field(op_val, "start_time") else {
+        return;
+    };
+    op.started_time = s_dt;
+
+    let now_local = chrono::Local::now();
+    if now_local >= s_dt {
+        let diff_secs = now_local.signed_duration_since(s_dt).num_seconds().max(0) as u64;
+        op.started_at = Some(std::time::Instant::now() - Duration::from_secs(diff_secs));
     }
 
-    if let Some(et_str) = op_val.get("end_time").and_then(|v| v.as_str())
-        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(et_str)
-    {
-        let e_dt = dt.with_timezone(&chrono::Local);
-        if let Some(s_dt) = started_dt
-            && e_dt >= s_dt
-        {
-            let duration = e_dt.signed_duration_since(s_dt);
-            let duration_ms = duration.num_milliseconds().max(0) as u64;
-            op.duration_ms = Some(duration_ms);
-            if let Some(start_inst) = op.started_at {
-                op.completed_at = Some(start_inst + Duration::from_millis(duration_ms));
-            }
-        }
+    let Some(e_dt) = parse_rfc3339_field(op_val, "end_time") else {
+        return;
+    };
+    if e_dt < s_dt {
+        return;
+    }
+
+    let duration_ms = e_dt.signed_duration_since(s_dt).num_milliseconds().max(0) as u64;
+    op.duration_ms = Some(duration_ms);
+    if let Some(start_inst) = op.started_at {
+        op.completed_at = Some(start_inst + Duration::from_millis(duration_ms));
     }
 }
 
