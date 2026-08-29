@@ -113,7 +113,7 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FALSE,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FALSE, HANDLE,
     HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, S_OK, SetHandleInformation, TRUE,
     WAIT_OBJECT_0,
 };
