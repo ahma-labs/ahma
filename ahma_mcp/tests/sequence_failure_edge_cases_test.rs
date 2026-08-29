@@ -309,6 +309,20 @@ async fn test_sequence_failure_with_filesystem_markers() -> Result<()> {
     let _ = std::fs::remove_file(&step1_marker);
     let _ = std::fs::remove_file(&step3_marker);
 
+    // `touch` doesn't exist on Windows' PowerShell; use the platform-appropriate
+    // empty-file-creation command (see file_tools_integration_test.rs for the
+    // same idiom).
+    let touch_cmd = |path: &std::path::Path| -> String {
+        if cfg!(windows) {
+            format!(
+                "New-Item -Path '{}' -ItemType File -Force | Out-Null",
+                path.display()
+            )
+        } else {
+            format!("touch {}", path.display())
+        }
+    };
+
     // Dynamically create marker_sequence with paths inside the sandbox scope
     let marker_sequence_config = format!(
         r#"{{
@@ -324,7 +338,7 @@ async fn test_sequence_failure_with_filesystem_markers() -> Result<()> {
             "tool": "run_terminal_command",
             "subcommand": "default",
             "description": "Step 1: create first marker",
-            "args": {{"command": "touch {}"}}
+            "args": {{"command": "{}"}}
         }},
         {{
             "tool": "fail_tool",
@@ -335,12 +349,12 @@ async fn test_sequence_failure_with_filesystem_markers() -> Result<()> {
             "tool": "run_terminal_command",
             "subcommand": "default",
             "description": "Step 3: should NOT create this marker",
-            "args": {{"command": "touch {}"}}
+            "args": {{"command": "{}"}}
         }}
     ]
 }}"#,
-        step1_marker.display(),
-        step3_marker.display()
+        touch_cmd(&step1_marker).replace('\\', "\\\\"),
+        touch_cmd(&step3_marker).replace('\\', "\\\\")
     );
     fs::write(
         tools_dir.join("marker_sequence.json"),

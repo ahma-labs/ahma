@@ -170,6 +170,14 @@ mod tests {
     use super::*;
     use parking_lot::Mutex;
 
+    /// `std::panic::set_hook`/`take_hook` are process-global, and libtest runs
+    /// `#[test]` functions concurrently on separate threads within one process.
+    /// Without this, two hook-installing tests running at the same moment can
+    /// grab *each other's* mid-swap hook instead of the real previous one,
+    /// breaking the chain both tests assert on. Held for the whole
+    /// take_hook/set_hook/…/set_hook(saved) window in each test below.
+    static HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// The bytes crossterm emits are terminal-control sequences, so the readable
     /// assertion is "did the sequence for X get written", not an exact string.
     fn rendered(keyboard_enhanced: bool) -> String {
@@ -178,7 +186,23 @@ mod tests {
         String::from_utf8(buf).expect("crossterm emits ASCII escape sequences")
     }
 
+    // Windows-only: `execute!`'s `queue()` decides ANSI-vs-WinAPI per
+    // `Command::is_ansi_code_supported()` — a global, real-console probe
+    // (`crossterm::ansi_support::supports_ansi()`) that ignores which `Write`
+    // target was actually passed in. On a headless CI runner (no real console
+    // attached to the test process) that probe returns false, so crossterm
+    // issues real WinAPI console calls instead of writing ANSI bytes to our
+    // `Vec<u8>` — and those calls fail ("Initial console modes not set",
+    // "Keyboard progressive enhancement not implemented for the legacy Windows
+    // API") because there is no real console to operate on. This cannot be
+    // routed around from the test side; same category as
+    // `red_team_command_write_escape_blocked`'s windows-only ignore.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "crossterm's ANSI-vs-WinAPI probe checks the \
+        real console, not our Vec<u8> writer, and fails without one on headless CI"
+    )]
     fn the_restore_sequence_undoes_every_part_of_the_setup() {
         let seq = rendered(false);
         // `?1049l` leaves the alternate screen, `?1000l`/`?1006l` disable mouse
@@ -198,7 +222,14 @@ mod tests {
         }
     }
 
+    // See the comment on `the_restore_sequence_undoes_every_part_of_the_setup`:
+    // same crossterm real-console-probe limitation on headless CI.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "crossterm's ANSI-vs-WinAPI probe checks the \
+        real console, not our Vec<u8> writer, and fails without one on headless CI"
+    )]
     fn the_keyboard_flag_is_popped_only_when_it_was_pushed() {
         // Crossterm's pop is `CSI <`. Popping a flag that was never pushed
         // unbalances its stack, which is why the guard tracks the push result
@@ -269,6 +300,7 @@ mod tests {
 
     #[test]
     fn the_panic_hook_restores_before_deferring_to_the_previous_hook() {
+        let _hook_lock = HOOK_TEST_LOCK.lock();
         let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
 
         let previous: PanicHook = {
@@ -306,6 +338,7 @@ mod tests {
 
     #[test]
     fn the_panic_hook_restores_at_most_once() {
+        let _hook_lock = HOOK_TEST_LOCK.lock();
         let restores = Arc::new(AtomicBool::new(false));
         let count = Arc::new(Mutex::new(0usize));
         let previous: PanicHook = Box::new(|_| {});
