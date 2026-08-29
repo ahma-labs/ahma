@@ -871,6 +871,9 @@ pub async fn run_daemon_at(socket_path: PathBuf) -> Result<()> {
                     info!("ahma daemon: idle timeout, exiting");
                     // Unlink the socket file FIRST so late arrivals get ENOENT
                     // (clean start) instead of ECONNREFUSED (ambiguous stale).
+                    // Unix-only: non-unix platforms bind via TCP (see `bind_tcp`
+                    // above), so there is no socket file to unlink.
+                    #[cfg(unix)]
                     crate::fs_lock::remove_stale_socket(&idle_socket_path);
                     std::process::exit(0);
                 }
