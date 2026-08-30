@@ -38,7 +38,14 @@ enum HooksDecision {
     /// Allow the command through without modification (passthrough to default terminal).
     AllowUnchanged,
     /// Allow with a rewritten command that routes through ahma's kernel sandbox.
-    AllowRewrite(Value),
+    /// `wrapped_command` is the literal rewritten command string (before it was
+    /// merged into `updated_input`) — kept alongside so a platform's hook
+    /// output builder can derive a stable match pattern from it (see
+    /// `build_antigravity_permission_override`) without re-parsing JSON.
+    AllowRewrite {
+        updated_input: Value,
+        wrapped_command: String,
+    },
     /// **Fail closed (pending consent)**: ahma cannot sandbox this command and
     /// the user has not consented to unsandboxed execution this session. The
     /// command is DENIED with an actionable message (R5.5.3).
@@ -1651,8 +1658,11 @@ fn compute_exec_decision_internal(
 
     match build_wrapped_shell_command(scope, env, &cwd, &args.command) {
         Ok(wrapped) => {
-            let updated = updated_tool_input(&args.tool_input, wrapped, &args.arg_key);
-            HooksDecision::AllowRewrite(updated)
+            let updated = updated_tool_input(&args.tool_input, wrapped.clone(), &args.arg_key);
+            HooksDecision::AllowRewrite {
+                updated_input: updated,
+                wrapped_command: wrapped,
+            }
         }
         // ahma cannot build the sandbox wrapper — fail closed unless consented (R5.5.3).
         Err(e) => {
@@ -1701,7 +1711,7 @@ fn updated_tool_input(tool_input: &Map<String, Value>, command: String, key: &st
 fn build_cursor_hook_output(decision: HooksDecision) -> Value {
     match decision {
         HooksDecision::AllowUnchanged => json!({"permission": "allow"}),
-        HooksDecision::AllowRewrite(updated_input) => json!({
+        HooksDecision::AllowRewrite { updated_input, .. } => json!({
             "permission": "allow",
             "updated_input": updated_input,
         }),
@@ -1742,9 +1752,22 @@ fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
         HooksDecision::AllowUnchanged => json!({
             "decision": "allow",
         }),
-        HooksDecision::AllowRewrite(updated_input) => json!({
+        HooksDecision::AllowRewrite {
+            updated_input,
+            wrapped_command,
+        } => json!({
             "decision": "allow",
             "overwrite": updated_input,
+            // R5.4.2 correction of record: agy's `command(...)` allow-cache keys
+            // on the exact literal command, but every ahma-wrapped invocation
+            // carries a unique `--payload-base64` blob. Without this, agy
+            // re-prompts for every distinct underlying command, forever — a
+            // rewriting hook is expected to self-register a pattern covering
+            // its own rewrites via `permissionOverrides` (agy's own PreToolUse
+            // contract), rather than relying on the user's "always allow" cache
+            // (which keys on the same unique-per-call string and never matches
+            // twice).
+            "permissionOverrides": [build_antigravity_permission_override(&wrapped_command)],
         }),
         HooksDecision::AllowWithWarning { user_message, .. } => json!({
             "decision": "allow",
@@ -1761,13 +1784,51 @@ fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
     }
 }
 
+/// Builds an agy `permissionOverrides` pattern (`command(<regex>)`) that
+/// matches ANY ahma-wrapped shell command of this shape, regardless of its
+/// `--payload-base64` value.
+///
+/// `wrapped_command` is one concrete instance, e.g.
+/// `ahma hooks run-shell --payload-base64 <blob> --wrapped-by ahma-hooks-wrapper-v1`
+/// (or the same with a quoted absolute binary path at `HookScope::User`). The
+/// `--payload-base64`/`--wrapped-by` flags are literal and always present —
+/// only the argument between them varies per call — so everything up to and
+/// including `--payload-base64` and everything from `--wrapped-by` onward is
+/// regex-escaped and kept verbatim; the varying payload argument between them
+/// becomes `.*`.
+///
+/// Falls back to a fully-escaped literal match (today's narrower, per-call
+/// behaviour) if the expected markers are not found, rather than panicking —
+/// this runs synchronously inside a hook response to an external agent tool
+/// call, so it must never crash the invocation it is trying to allow.
+fn build_antigravity_permission_override(wrapped_command: &str) -> String {
+    const PAYLOAD_FLAG: &str = "--payload-base64";
+    const WRAPPED_BY_FLAG: &str = "--wrapped-by";
+
+    let pattern = (|| {
+        let payload_flag_end = wrapped_command.find(PAYLOAD_FLAG)? + PAYLOAD_FLAG.len();
+        let wrapped_by_start =
+            wrapped_command[payload_flag_end..].find(WRAPPED_BY_FLAG)? + payload_flag_end;
+        let prefix = &wrapped_command[..payload_flag_end];
+        let suffix = &wrapped_command[wrapped_by_start..];
+        Some(format!(
+            "{}.*{}",
+            regex::escape(prefix),
+            regex::escape(suffix)
+        ))
+    })()
+    .unwrap_or_else(|| regex::escape(wrapped_command));
+
+    format!("command({pattern})")
+}
+
 fn build_structured_hook_output(decision: HooksDecision) -> Value {
     let hook_specific = match decision {
         HooksDecision::AllowUnchanged => json!({
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
         }),
-        HooksDecision::AllowRewrite(updated_input) => json!({
+        HooksDecision::AllowRewrite { updated_input, .. } => json!({
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
             "updatedInput": updated_input.clone(),
@@ -2739,6 +2800,79 @@ mod tests {
         assert!(command.contains(WRAPPED_BY_MARKER));
     }
 
+    /// R5.4.2 correction of record: agy's `PreToolUse` `command(...)` allow-cache
+    /// keys on the exact literal command, but every ahma-wrapped invocation
+    /// carries a unique `--payload-base64` blob (it encodes the underlying
+    /// command). Without a wildcard `permissionOverrides` entry, the user is
+    /// re-prompted for every distinct command they run, forever. Verified via
+    /// agy's own embedded `PreToolUse` contract docs and `regexp.QuoteMeta`/
+    /// `regexp.Compile`/`MatchString` symbols in the shipped `agy` binary, plus
+    /// a real `command(\./generate-swift-bindings\.sh)` (regex-escaped) entry
+    /// found in a live `~/.gemini/antigravity-cli/settings.json`.
+    #[test]
+    fn test_antigravity_permission_override_matches_any_payload() {
+        let env = test_env();
+        let make_output = |command: &str| {
+            let input = json!({
+                "cwd": "/tmp/project",
+                "tool_input": { "CommandLine": command }
+            });
+            let decision =
+                compute_exec_decision_internal(&input, HookScope::Project, &env, true, false, None);
+            build_exec_output(decision, HookPlatform::Antigravity)
+        };
+
+        let output_a = make_output("cargo test");
+        let output_b = make_output("cargo build --release");
+
+        let overrides = output_a["permissionOverrides"]
+            .as_array()
+            .expect("Antigravity rewrite must self-register a permission override");
+        assert_eq!(overrides.len(), 1);
+        let pattern = overrides[0].as_str().unwrap();
+        assert!(pattern.starts_with("command("));
+        assert!(pattern.ends_with(')'));
+        let inner = &pattern["command(".len()..pattern.len() - 1];
+        let re = regex::Regex::new(inner).expect("override must be a valid regex");
+
+        let wrapped_a = output_a["overwrite"]["CommandLine"].as_str().unwrap();
+        let wrapped_b = output_b["overwrite"]["CommandLine"].as_str().unwrap();
+        assert_ne!(
+            wrapped_a, wrapped_b,
+            "the two commands must actually produce distinct payloads"
+        );
+        assert!(re.is_match(wrapped_a), "must match payload from command A");
+        assert!(re.is_match(wrapped_b), "must match payload from command B");
+
+        // The pattern itself must be identical across calls — a shifting pattern
+        // would never accumulate into a durable allow rule.
+        assert_eq!(output_b["permissionOverrides"][0].as_str(), Some(pattern));
+
+        // Sanity: it must not degenerate into matching an unrelated command.
+        assert!(!re.is_match("rm -rf /"));
+    }
+
+    #[test]
+    fn test_antigravity_permission_override_covers_absolute_binary_scope() {
+        let env = test_env();
+        let input = json!({
+            "cwd": "/tmp/project",
+            "tool_input": { "CommandLine": "cargo test" }
+        });
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
+        let output = build_exec_output(decision, HookPlatform::Antigravity);
+
+        let pattern = output["permissionOverrides"][0].as_str().unwrap();
+        let inner = &pattern["command(".len()..pattern.len() - 1];
+        let re = regex::Regex::new(inner).expect("override must be a valid regex");
+        let wrapped = output["overwrite"]["CommandLine"].as_str().unwrap();
+        assert!(re.is_match(wrapped));
+        // User scope quotes the absolute binary path — confirm it is present
+        // (unescaped literally) rather than the bare `ahma` PATH lookup.
+        assert!(wrapped.contains(&env.current_exe.to_string_lossy().to_string()));
+    }
+
     #[test]
     fn test_exec_response_allows_non_shell_tools_without_warning() {
         // Non-shell tools (editFiles, createFile, etc.) have no `command` field.
@@ -3514,7 +3648,10 @@ mod tests {
     #[test]
     fn test_build_cursor_hook_output_allow_rewrite() {
         let updated = json!({"command": "wrapped"});
-        let out = build_cursor_hook_output(HooksDecision::AllowRewrite(updated));
+        let out = build_cursor_hook_output(HooksDecision::AllowRewrite {
+            updated_input: updated,
+            wrapped_command: "wrapped".to_string(),
+        });
         assert_eq!(out["permission"].as_str(), Some("allow"));
         assert_eq!(out["updated_input"]["command"].as_str(), Some("wrapped"));
     }
@@ -3544,7 +3681,10 @@ mod tests {
     #[test]
     fn test_build_structured_hook_output_allow_rewrite_sets_both_keys() {
         let updated = json!({"command": "wrapped"});
-        let out = build_structured_hook_output(HooksDecision::AllowRewrite(updated));
+        let out = build_structured_hook_output(HooksDecision::AllowRewrite {
+            updated_input: updated,
+            wrapped_command: "wrapped".to_string(),
+        });
         let hs = &out["hookSpecificOutput"];
         assert_eq!(hs["updatedInput"]["command"].as_str(), Some("wrapped"));
         assert_eq!(hs["modifiedArgs"]["command"].as_str(), Some("wrapped"));
@@ -4112,7 +4252,7 @@ mod tests {
         });
         let decision =
             compute_exec_decision_internal(&input, HookScope::Project, &env, true, false, None);
-        assert!(matches!(decision, HooksDecision::AllowRewrite(_)));
+        assert!(matches!(decision, HooksDecision::AllowRewrite { .. }));
     }
 
     #[test]
@@ -4150,7 +4290,7 @@ mod tests {
         // No host → ahma stays authoritative and wraps the command in its sandbox.
         let decision =
             compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
-        assert!(matches!(decision, HooksDecision::AllowRewrite(_)));
+        assert!(matches!(decision, HooksDecision::AllowRewrite { .. }));
     }
 
     #[test]
@@ -4196,7 +4336,7 @@ mod tests {
         let input = json!({"tool_input": {"command": "ls"}});
         let decision =
             compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
-        assert!(matches!(decision, HooksDecision::AllowRewrite(_)));
+        assert!(matches!(decision, HooksDecision::AllowRewrite { .. }));
     }
 
     // ----------------------------------------------------------------------
