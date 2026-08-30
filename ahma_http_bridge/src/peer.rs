@@ -130,6 +130,20 @@ impl PeerFactory for SubprocessPeerFactory {
                 // a test exits early or a session is dropped unexpectedly.
                 .kill_on_drop(true);
 
+            // Deliberately NOT `.process_group(0)`, unlike every command spawn
+            // (SPEC R-PROC.2). The distinction is what the child *is*: a command
+            // spawn owns a tree (`sandbox-exec → sh → cargo → rustc`) that only
+            // a group kill reaches, whereas this child is a single long-lived
+            // `ahma serve` that reaps its own command trees on the way down —
+            // its adapter, shell sessions and livelog sources are each wrapped
+            // in a `ProcessGroupGuard`. So killing the direct child here is
+            // sufficient, and its descendants are not ours to signal.
+            //
+            // Keeping it in our process group is also the safer half of a real
+            // trade-off: there is no parent-death watchdog, so a peer in its own
+            // group would survive a SIGKILL of this bridge as an orphan, where
+            // one sharing our group still receives the terminal's signals.
+
             // Stripping NEXTEST above must not strip endpoint isolation
             // (SPEC R-ISO.1): if this bridge is itself test-owned, the peer
             // must inherit that fact explicitly or it would resolve the

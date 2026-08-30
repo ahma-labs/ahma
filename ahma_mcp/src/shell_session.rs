@@ -32,12 +32,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::sandbox::Sandbox;
-use crate::shell_pool::platform_shell_program;
+use crate::shell_pool::{ProcessGroupGuard, kill_process_tree, platform_shell_program};
 
 /// One persistent shell process.
 #[derive(Debug)]
 struct ShellSession {
-    child: tokio::process::Child,
+    child: ProcessGroupGuard,
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
 }
@@ -61,12 +61,19 @@ impl ShellSession {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn().context("failed to spawn session shell")?;
+        let child = cmd.spawn().context("failed to spawn session shell")?;
+        // A session shell is long-lived and runs whatever the agent asks of it,
+        // so it is the worst place to orphan a tree: `sh → cargo → rustc` all
+        // outlive a bare `kill_on_drop`, which signals only the direct child.
+        // `create_command` already made it a process-group leader.
+        let mut child = ProcessGroupGuard::new(child);
         let stdin = child
+            .child_mut()
             .stdin
             .take()
             .context("session shell stdin unavailable")?;
         let stdout = child
+            .child_mut()
             .stdout
             .take()
             .context("session shell stdout unavailable")?;
@@ -148,7 +155,11 @@ impl ShellSession {
     }
 
     async fn kill(&mut self) {
-        let _ = self.child.kill().await;
+        // The shared chokepoint: `kill(-pgid)` then a bounded reap, so the
+        // shell's descendants go with it instead of surviving as orphans.
+        if !kill_process_tree(self.child.child_mut()).await {
+            tracing::warn!("session shell did not reap cleanly after kill");
+        }
     }
 }
 
@@ -231,8 +242,11 @@ impl ShellSessionManager {
     ///
     /// Safe to call from a cancel branch where the per-session mutex may be held
     /// by a suspended `execute_streaming` future.  When all Arc references drop
-    /// (including the exec future's internal reference), `kill_on_drop(true)` on
-    /// the child process ensures the shell and its children are killed.
+    /// (including the exec future's internal reference), the session's
+    /// [`ProcessGroupGuard`] issues `kill(-pgid)` so the shell **and its whole
+    /// descendant tree** die. `kill_on_drop` alone would not do this — it
+    /// signals the direct child only, leaving `cargo`/`rustc` grandchildren
+    /// running.
     ///
     /// Returns `true` if the session existed.
     pub async fn remove_session(&self, session_id: &str) -> bool {

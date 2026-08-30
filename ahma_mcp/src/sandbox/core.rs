@@ -944,10 +944,7 @@ impl Sandbox {
     }
 
     fn is_path_allowed(&self, canonical: &Path, scopes_guard: &[PathBuf]) -> bool {
-        let canonical_stripped = strip_extended_prefix(canonical);
-        scopes_guard
-            .iter()
-            .any(|scope| canonical_stripped.starts_with(strip_extended_prefix(scope)))
+        path_within_scopes(canonical, scopes_guard)
     }
 
     fn check_security_policies(&self, original_path: &Path, canonical: &Path) -> Result<()> {
@@ -983,6 +980,20 @@ impl Sandbox {
 /// Windows `std::fs::canonicalize` may add or omit `\\?\` depending on
 /// the input form.  Stripping before `starts_with` comparisons lets paths
 /// referring to the same location compare equal.
+/// Whether an **already-canonical** path sits inside any of `scopes`.
+///
+/// The single spelling of scope membership, shared by [`Sandbox::validate_path`]
+/// / [`Sandbox::is_path_in_scope`] and by
+/// [`super::exec_config::grantable_git_dirs`], which needs the same answer
+/// without holding a `Sandbox`. Callers that start from a user-supplied path
+/// must canonicalize first — this does no I/O.
+pub(super) fn path_within_scopes(canonical: &Path, scopes: &[PathBuf]) -> bool {
+    let canonical_stripped = strip_extended_prefix(canonical);
+    scopes
+        .iter()
+        .any(|scope| canonical_stripped.starts_with(strip_extended_prefix(scope)))
+}
+
 fn strip_extended_prefix(path: &Path) -> PathBuf {
     #[cfg(target_os = "windows")]
     if let Some(stripped) = path.as_os_str().to_string_lossy().strip_prefix(r"\\?\") {

@@ -44,8 +44,39 @@ fn build_landlock_ruleset(
         .create()
         .context("Failed to create Landlock ruleset instance")?;
 
-    // Add sandbox scopes
-    for scope in scopes {
+    // Add sandbox scopes, plus any out-of-scope git storage that has *earned* a
+    // grant (a linked worktree's `<main>/.git` and `<main>/.git/worktrees/<id>`).
+    //
+    // `grantable_git_dirs` — not `resolve_git_dirs` — because the `.git` pointer
+    // file naming those directories lives inside the workspace and is therefore
+    // agent-writable. The permissive resolver is correct for deny rules and a
+    // sandbox escape for allow rules: `gitdir: /` would add `/` here with
+    // `AccessFs::from_all`.
+    //
+    // R6.1.7 / R-HANDOFF.4: Landlock ABI V1 is additive-allow with no deny rule
+    // and no ordering, so a granted git dir's `hooks/` is writable from
+    // `run_terminal_command` on Linux. That is the platform's already-stated
+    // limit — disclosed by `profiles::platform_enforcement` — and not something
+    // this ruleset can carve out. Refusing unverified dirs is what bounds it.
+    let mut all_scopes = scopes.to_vec();
+    let grants = super::exec_config::grantable_git_dirs(scopes, scopes);
+    for refusal in &grants.refused {
+        tracing::warn!(
+            "sandbox: refusing to grant git dir {} — {}",
+            refusal.path.display(),
+            refusal.reason
+        );
+    }
+    for git_dir in grants.rule_paths() {
+        if !all_scopes.contains(&git_dir) {
+            tracing::warn!(
+                "sandbox: granting read/write to git storage outside the workspace scope: {}",
+                git_dir.display()
+            );
+            all_scopes.push(git_dir);
+        }
+    }
+    for scope in &all_scopes {
         ruleset = ruleset
             .add_rule(PathBeneath::new(
                 PathFd::new(scope).context("Failed to open sandbox scope for Landlock")?,

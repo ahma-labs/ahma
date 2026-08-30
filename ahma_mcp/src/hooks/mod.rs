@@ -1286,6 +1286,46 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         &crate::adapter::ExecutionMode::Synchronous,
     );
 
+    // Cancelling the hook must take the whole command tree with it. Dropping the
+    // `execute_sync_in_dir` future drops the `ProcessGroupGuard` inside
+    // `run_sync_prepared`, whose `Drop` issues `kill(-pgid)` — that is what reaps
+    // `sandbox-exec → sh → cargo → cargo-nextest` instead of orphaning it.
+    //
+    // Then die the way we were asked to. `tokio::signal` replaces the process-wide
+    // disposition and never restores it, so simply returning here would leave this
+    // process permanently deaf to SIGTERM — a harness trying to clean the hook up
+    // would have to escalate to SIGKILL, and a `Ctrl-C` while we were still writing
+    // output would do nothing. Restoring `SIG_DFL` and re-raising exits with the
+    // conventional `128 + signo` status instead.
+    #[cfg(unix)]
+    let result = {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigint = signal(SignalKind::interrupt()).ok();
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+
+        tokio::select! {
+            res = adapter.execute_sync_in_dir(
+                crate::shell_pool::platform_shell_program(),
+                Some(adapter_args),
+                &payload.cwd,
+                timeout,
+                Some(&subcommand_config),
+            ) => res,
+            _ = async {
+                match &mut sigint {
+                    Some(s) => s.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => die_by_signal(libc::SIGINT),
+            _ = async {
+                match &mut sigterm {
+                    Some(s) => s.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => die_by_signal(libc::SIGTERM),
+        }
+    };
+    #[cfg(not(unix))]
     let result = adapter
         .execute_sync_in_dir(
             crate::shell_pool::platform_shell_program(),
@@ -1326,6 +1366,29 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // MCP grant/restart tools).
         Err(e) => report_shell_execution_error(e),
     }
+}
+
+/// Terminate this process with `signo` the way it would have terminated had the
+/// signal never been intercepted.
+///
+/// `tokio::signal` installs a process-wide handler that it never uninstalls, so
+/// a hook that merely *returns* after catching SIGINT/SIGTERM stays deaf to them
+/// for the rest of its life. Restoring `SIG_DFL` and re-raising gives the parent
+/// the conventional "died from signal N" status and keeps `Ctrl-C` working for
+/// whatever the hook does next.
+///
+/// Diverges — the return type only exists so this can sit in a `select!` arm
+/// alongside the command's own `Result`.
+#[cfg(unix)]
+fn die_by_signal(signo: i32) -> Result<String> {
+    // SAFETY: both calls are async-signal-safe libc primitives operating on this
+    // process's own disposition; `raise` does not return for a default-fatal
+    // signal, and the `unreachable` below covers the case where it somehow does.
+    unsafe {
+        libc::signal(signo, libc::SIG_DFL);
+        libc::raise(signo);
+    }
+    unreachable!("raising signal {signo} with SIG_DFL restored must terminate the process")
 }
 
 /// Turn a failed hooked-shell-command execution into its final `Result`.

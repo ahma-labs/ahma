@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::core::Sandbox;
 
@@ -28,13 +28,15 @@ impl Sandbox {
         let wd_str = working_dir.to_string_lossy();
         let scope_rules = self.get_macos_scope_rules();
         let read_scopes_rules = self.get_macos_read_scopes_rules();
+        let git_resolution_roots = self.git_resolution_roots(working_dir);
+        let git_dir_rules = self.get_macos_git_dir_rules(&git_resolution_roots);
         let system_rules = self.get_macos_system_rules();
         let credential_deny_rules = self.get_macos_credential_deny_rules();
         let keychain_rules = self.get_macos_keychain_rules();
         let profile_rules = self.get_macos_profile_rules();
         let temp_rules = self.get_macos_temp_rules();
         let network_rules = self.get_macos_network_rules();
-        let exec_config_deny_rules = self.get_macos_exec_config_deny_rules(working_dir);
+        let exec_config_deny_rules = self.get_macos_exec_config_deny_rules(&git_resolution_roots);
 
         let profile = format!(
             r#"(version 1)
@@ -42,7 +44,7 @@ impl Sandbox {
 (allow process*)
 (allow signal)
 (allow sysctl-read)
-{system_rules}{credential_deny_rules}{keychain_rules}{profile_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
+{system_rules}{git_dir_rules}{credential_deny_rules}{keychain_rules}{profile_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
 (allow file-write* (subpath "{working_dir}"))
 {temp_rules}(allow file-read* (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))
@@ -60,6 +62,7 @@ impl Sandbox {
             profile_rules = profile_rules,
             scope_rules = scope_rules,
             read_scopes_rules = read_scopes_rules,
+            git_dir_rules = git_dir_rules,
             temp_rules = temp_rules,
             exec_config_deny_rules = exec_config_deny_rules,
             network_rules = network_rules,
@@ -67,6 +70,73 @@ impl Sandbox {
 
         tracing::debug!("Generated macOS Sandbox (Seatbelt) profile:\n{}", profile);
         profile
+    }
+
+    /// The roots git-directory resolution scans: every active scope **plus** the
+    /// command's working directory.
+    ///
+    /// Resolving from `working_dir` alone silently produces nothing whenever a
+    /// command runs below the repository root — `cargo test` in `<wt>/crate_a`,
+    /// or any tool call that passes a `working_directory`. That took the
+    /// worktree grant *and* the `<git_dir>/hooks` deny with it, so both were
+    /// blind in exactly the same place. Landlock already resolves from the
+    /// scopes; this brings Seatbelt in line.
+    fn git_resolution_roots(&self, working_dir: &Path) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = self.scopes.read().to_vec();
+        let wd = dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+        if !roots.contains(&wd) {
+            roots.push(wd);
+        }
+        roots
+    }
+
+    /// Emit allow rules for the git directories that govern these roots and have
+    /// **earned** a grant (see [`super::exec_config::grantable_git_dirs`]).
+    ///
+    /// Only directories outside every scope produce a rule; an in-scope `.git` is
+    /// already covered by `{scope_rules}`, so an ordinary repository adds nothing
+    /// here at all.
+    ///
+    /// **Emitted before `{credential_deny_rules}`**, not after. These rules name
+    /// a path resolved from a pointer file the workspace can write, so under
+    /// SBPL's last-match-wins they must be the *first* filesystem word spoken,
+    /// never the last: every deny in the profile — credential dirs, the SSH
+    /// private-key regex, container sockets, `<git_dir>/hooks` — has to outrank
+    /// them. `git_dir_allow_rules_come_before_credential_denies` asserts the byte
+    /// offsets.
+    fn get_macos_git_dir_rules(&self, roots: &[PathBuf]) -> String {
+        let scopes = self.scopes.read().to_vec();
+        let grants = super::exec_config::grantable_git_dirs(roots, &scopes);
+
+        // R7: a boundary decision is never silent, in either direction.
+        for refusal in &grants.refused {
+            tracing::warn!(
+                "sandbox: refusing to grant git dir {} — {}{}",
+                refusal.path.display(),
+                refusal.reason,
+                refusal
+                    .pointer
+                    .as_ref()
+                    .map(|p| format!(" (named by {})", p.display()))
+                    .unwrap_or_default()
+            );
+        }
+
+        let mut rules = String::new();
+        for grant in grants.granted.iter().filter(|g| g.needs_rule()) {
+            tracing::warn!(
+                "sandbox: granting read/write to git storage outside the workspace scope: {} \
+                 (verified: {:?}). Git operations in this worktree write there.",
+                grant.path.display(),
+                grant.basis
+            );
+            rules.push_str(&format!(
+                "(allow file-read* (subpath \"{}\"))\n(allow file-write* (subpath \"{}\"))\n",
+                grant.path.display(),
+                grant.path.display()
+            ));
+        }
+        rules
     }
 
     fn get_macos_scope_rules(&self) -> String {
@@ -195,20 +265,32 @@ impl Sandbox {
     /// never fires on a read of `/private/tmp/…`. Uncanonicalizable paths fall
     /// back to the raw path rather than being dropped — a deny that cannot be
     /// resolved yet must not fail open.
-    fn get_macos_exec_config_deny_rules(&self, working_dir: &Path) -> String {
+    fn get_macos_exec_config_deny_rules(&self, roots: &[PathBuf]) -> String {
         let mut rules = String::new();
 
-        // Canonicalize the root before deriving paths from it: `<ws>/.ahma`
-        // usually does not exist yet, so it cannot be canonicalized itself, and a
-        // rule naming `/tmp/ws/.ahma` would never fire against `/private/tmp/ws`.
-        let root = dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
-        let git_dirs = super::exec_config::resolve_git_dirs(&root);
-        for deny in super::exec_config::deny_write_globs(&root, &git_dirs) {
-            let canonical = dunce::canonicalize(&deny).unwrap_or(deny);
-            rules.push_str(&format!(
-                "(deny file-write* (subpath \"{}\"))\n",
-                canonical.display()
-            ));
+        // Roots are already canonicalized by `git_resolution_roots`, which matters
+        // because `<ws>/.ahma` usually does not exist yet and so cannot be
+        // canonicalized itself — a rule naming `/tmp/ws/.ahma` would never fire
+        // against `/private/tmp/ws`.
+        //
+        // Note this resolution stays **permissive** (`resolve_git_dirs`, which
+        // follows any `gitdir:` pointer) while the *allow* side demands a verified
+        // back-reference. That asymmetry is deliberate: an unverifiable pointer
+        // should still contribute a deny, and must never contribute a grant.
+        let mut emitted: Vec<PathBuf> = Vec::new();
+        for root in roots {
+            let git_dirs = super::exec_config::resolve_git_dirs(root);
+            for deny in super::exec_config::deny_write_globs(root, &git_dirs) {
+                let canonical = dunce::canonicalize(&deny).unwrap_or(deny);
+                if emitted.contains(&canonical) {
+                    continue;
+                }
+                rules.push_str(&format!(
+                    "(deny file-write* (subpath \"{}\"))\n",
+                    canonical.display()
+                ));
+                emitted.push(canonical);
+            }
         }
 
         let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
@@ -358,6 +440,7 @@ impl Sandbox {
 mod tests {
     use super::super::core::Sandbox;
     use super::super::types::SandboxMode;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     /// The generated Seatbelt profile keeps the blanket network allow when no
@@ -750,6 +833,236 @@ mod tests {
                 missing.display()
             )),
             "an uncanonicalizable deny path must still be emitted (raw), got:\n{profile}"
+        );
+    }
+
+    /// Lay out `<root>/main` as a repo with a linked worktree `<root>/wt`, the
+    /// way `git worktree add` actually does — including the `gitdir`
+    /// back-reference in `<main>/.git/worktrees/wt` that names `<wt>/.git`.
+    ///
+    /// That back-reference is not decoration: it is the evidence
+    /// `grantable_git_dirs` requires before widening the sandbox, and a fixture
+    /// without it is not a worktree, it is a forgery.
+    fn worktree_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let shared_git = root.join("main/.git");
+        let wt_meta = shared_git.join("worktrees/wt");
+        std::fs::create_dir_all(&wt_meta).unwrap();
+        std::fs::create_dir_all(shared_git.join("hooks")).unwrap();
+        std::fs::write(shared_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(wt_meta.join("commondir"), "../..\n").unwrap();
+
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_meta.display())).unwrap();
+        std::fs::write(
+            wt_meta.join("gitdir"),
+            format!("{}\n", wt.join(".git").display()),
+        )
+        .unwrap();
+        (wt, wt_meta, shared_git)
+    }
+
+    /// When sandboxing a git worktree, the governing git directories (the worktree's
+    /// private gitdir and the common git dir) must be granted file-write* permissions
+    /// so git index/ref updates work, while the hooks directory remains strictly
+    /// denied afterwards (last-match-wins).
+    #[test]
+    fn worktree_git_dirs_allowed_and_hooks_denied() {
+        let tmp = tempdir().unwrap();
+        let (wt, wt_meta, shared_git) = worktree_fixture(tmp.path());
+
+        let sb = Sandbox::new(vec![wt.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let profile = sb.generate_seatbelt_profile_test(&wt);
+
+        let canonical_shared = dunce::canonicalize(&shared_git).unwrap();
+        let canonical_wt_meta = dunce::canonicalize(&wt_meta).unwrap();
+
+        // 1. Both git storage dirs must be allowed for write:
+        let allow_shared = format!(
+            "(allow file-write* (subpath \"{}\"))",
+            canonical_shared.display()
+        );
+        let allow_wt_meta = format!(
+            "(allow file-write* (subpath \"{}\"))",
+            canonical_wt_meta.display()
+        );
+        assert!(
+            profile.contains(&allow_shared),
+            "common git dir must be allowed for writes in worktree sandbox:\n{profile}"
+        );
+        assert!(
+            profile.contains(&allow_wt_meta),
+            "worktree gitdir must be allowed for writes in worktree sandbox:\n{profile}"
+        );
+
+        // 2. Hooks must be denied:
+        let deny_hooks = format!(
+            "(deny file-write* (subpath \"{}\"))",
+            canonical_shared.join("hooks").display()
+        );
+        assert!(
+            profile.contains(&deny_hooks),
+            "git hooks must be denied:\n{profile}"
+        );
+
+        // 3. Deny must come after allow (last-match-wins):
+        let allow_pos = profile.find(&allow_shared).unwrap();
+        let deny_pos = profile.find(&deny_hooks).unwrap();
+        assert!(
+            deny_pos > allow_pos,
+            "hooks deny rule must come after git dir allow rule:\n{profile}"
+        );
+    }
+
+    /// The escape this whole mechanism exists to prevent, asserted at the level
+    /// that actually reaches the kernel.
+    ///
+    /// `<ws>/sub/.git` is an ordinary text file inside the workspace, so an agent
+    /// may write it. If its `gitdir:` line were trusted, `gitdir: /` would put
+    /// `(allow file-write* (subpath "/"))` in the next profile — a total escape
+    /// bought with a write the sandbox permits.
+    #[test]
+    fn poisoned_gitdir_pointer_emits_no_allow_rule() {
+        let tmp = tempdir().unwrap();
+        let ws = dunce::canonicalize(tmp.path()).unwrap();
+        let sub = ws.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // A directory that exists, is outside the scope, and is dressed up to
+        // look like a git dir — because "looks like a git dir" is not evidence.
+        let victim = ws.parent().unwrap().join("ahma-poisoned-gitdir-victim");
+        std::fs::create_dir_all(victim.join("hooks")).unwrap();
+        std::fs::write(victim.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(sub.join(".git"), format!("gitdir: {}\n", victim.display())).unwrap();
+
+        let sb = Sandbox::new(vec![ws.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let profile = sb.generate_seatbelt_profile_test(&ws);
+        let canonical = dunce::canonicalize(&victim).unwrap();
+        std::fs::remove_dir_all(&victim).ok();
+
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                canonical.display()
+            )),
+            "an unverified gitdir pointer must not widen the sandbox:\n{profile}"
+        );
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-read* (subpath \"{}\"))",
+                canonical.display()
+            )),
+            "nor grant reads:\n{profile}"
+        );
+        // The deny side must be unaffected — it deliberately follows pointers it
+        // cannot verify, because an extra deny is harmless.
+        assert!(
+            profile.contains(&format!(
+                "(deny file-write* (subpath \"{}\"))",
+                canonical.join("hooks").display()
+            )),
+            "the hooks deny must still be emitted for the unverified dir:\n{profile}"
+        );
+    }
+
+    /// A git-dir allow names a path resolved from a file the workspace can write,
+    /// so under last-match-wins it has to be the *first* filesystem word spoken,
+    /// never the last. Emitted after the credential denies, `gitdir: ~/.aws` would
+    /// re-open a directory the profile had just denied.
+    #[test]
+    fn git_dir_allow_rules_come_before_credential_denies() {
+        use super::super::credential_reads::set_credential_read_denies;
+        let tmp = tempdir().unwrap();
+        let (wt, _, shared_git) = worktree_fixture(tmp.path());
+
+        let secret = tmp.path().join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        set_credential_read_denies(vec![secret.clone()]);
+        let sb = Sandbox::new(vec![wt.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let profile = sb.generate_seatbelt_profile_test(&wt);
+        set_credential_read_denies(Vec::new());
+
+        let git_allow = profile
+            .find(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                dunce::canonicalize(&shared_git).unwrap().display()
+            ))
+            .unwrap_or_else(|| panic!("git dir allow missing:\n{profile}"));
+        let credential_deny = profile
+            .find(&format!(
+                "(deny file-read* (subpath \"{}\"))",
+                dunce::canonicalize(&secret).unwrap().display()
+            ))
+            .unwrap_or_else(|| panic!("credential deny missing:\n{profile}"));
+
+        assert!(
+            credential_deny > git_allow,
+            "credential denies ({credential_deny}) must outrank git dir allows \
+             ({git_allow}):\n{profile}"
+        );
+    }
+
+    /// Resolving from the working directory alone produced nothing whenever a
+    /// command ran below the repository root — `cargo test` in `<wt>/crate_a` —
+    /// silently taking both the grant and the `<git_dir>/hooks` deny with it.
+    #[test]
+    fn git_dir_rules_resolve_from_scope_when_cwd_is_a_subdirectory() {
+        let tmp = tempdir().unwrap();
+        let (wt, _, shared_git) = worktree_fixture(tmp.path());
+        let subdir = wt.join("crate_a");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let sb = Sandbox::new(vec![wt.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let canonical_shared = dunce::canonicalize(&shared_git).unwrap();
+        let allow = format!(
+            "(allow file-write* (subpath \"{}\"))",
+            canonical_shared.display()
+        );
+        let deny_hooks = format!(
+            "(deny file-write* (subpath \"{}\"))",
+            canonical_shared.join("hooks").display()
+        );
+
+        for cwd in [&wt, &subdir] {
+            let profile = sb.generate_seatbelt_profile_test(cwd);
+            assert!(
+                profile.contains(&allow),
+                "git dir allow must survive cwd={}:\n{profile}",
+                cwd.display()
+            );
+            assert!(
+                profile.contains(&deny_hooks),
+                "hooks deny must survive cwd={}:\n{profile}",
+                cwd.display()
+            );
+        }
+    }
+
+    /// An ordinary repository's `.git` is already inside the scope, so the scope
+    /// rules cover it. Emitting a second allow would be pure noise — and noise in
+    /// a security profile is how a rule nobody reads gets added later.
+    #[test]
+    fn plain_repo_emits_no_git_dir_allow_rules() {
+        let tmp = tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+
+        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let profile = sb.generate_seatbelt_profile_test(&root);
+
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                root.join(".git").display()
+            )),
+            "an in-scope .git needs no rule of its own:\n{profile}"
+        );
+        assert!(
+            profile.contains(&format!(
+                "(deny file-write* (subpath \"{}\"))",
+                root.join(".git/hooks").display()
+            )),
+            "but its hooks are still denied:\n{profile}"
         );
     }
 }

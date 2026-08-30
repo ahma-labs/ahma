@@ -79,6 +79,13 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
 }
 ```
 
+> **Git worktrees.** Inside a linked worktree the repository's git storage sits outside the
+> workspace, so ahma grants `<main>/.git` and `<main>/.git/worktrees/<name>` read/write — but only
+> when the git dir names the worktree back through the `gitdir` back-reference git itself writes.
+> An unverifiable `gitdir:` pointer is refused and logged. Writes to `<git_dir>/hooks` remain
+> denied, kernel-enforced on macOS and application-layer only on Linux
+> ([security sandbox](security-sandbox.md)).
+
 **Antigravity / LM Studio** (same entry, minus the `"type"` field these clients do not accept):
 
 ```json

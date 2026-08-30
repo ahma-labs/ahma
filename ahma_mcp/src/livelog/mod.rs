@@ -33,6 +33,7 @@ use crate::{
 };
 
 use crate::operation_monitor::OperationMonitor;
+use crate::shell_pool::{ProcessGroupGuard, kill_process_tree};
 
 /// Apply caller-resolved environment variables to a sandboxed command.
 fn apply_env(cmd: &mut tokio::process::Command, env: &[(String, String)]) {
@@ -116,7 +117,7 @@ fn spawn_source_process(
     runtime: &LivelogRuntime,
     sandbox: &Arc<Sandbox>,
     working_dir: &std::path::Path,
-) -> Option<tokio::process::Child> {
+) -> Option<ProcessGroupGuard> {
     let mut cmd =
         match sandbox.create_command(&config.source_command, &runtime.source_args, working_dir) {
             Ok(cmd) => cmd,
@@ -129,7 +130,11 @@ fn spawn_source_process(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     match cmd.spawn() {
-        Ok(child) => Some(child),
+        // A log source is typically a pipeline (`adb logcat | grep …`), so the
+        // interesting processes are grandchildren. `kill_on_drop` would signal
+        // only the direct child and leave them streaming; the guard sends
+        // `kill(-pgid)`, and `create_command` already made this a group leader.
+        Ok(child) => Some(ProcessGroupGuard::new(child)),
         Err(e) => {
             warn!("livelog[{}]: failed to spawn source process: {}", op_id, e);
             None
@@ -184,8 +189,8 @@ pub async fn run_livelog_pipeline(
         op_id, config.source_command, runtime.source_args
     );
 
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
+    let stdout = child.child_mut().stdout.take().expect("stdout was piped");
+    let stderr = child.child_mut().stderr.take().expect("stderr was piped");
 
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
@@ -240,7 +245,9 @@ pub async fn run_livelog_pipeline(
             // Cancellation has priority over everything else.
             _ = cancellation_token.cancelled() => {
                 info!("livelog[{}]: cancelled, killing source process", op_id);
-                let _ = child.kill().await;
+                if !kill_process_tree(child.child_mut()).await {
+                    warn!("livelog[{}]: source process did not reap cleanly", op_id);
+                }
                 break;
             }
 
@@ -298,7 +305,7 @@ pub async fn run_livelog_pipeline(
         }
     }
 
-    let _ = child.wait().await;
+    let _ = child.child_mut().wait().await;
     info!("livelog[{}]: pipeline finished", op_id);
 }
 

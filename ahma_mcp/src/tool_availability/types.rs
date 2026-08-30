@@ -7,6 +7,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{SubcommandConfig, ToolConfig};
+use crate::shell_pool::{ProcessGroupGuard, kill_process_tree};
 use crate::tool_availability::{DisabledSubcommand, DisabledTool};
 
 fn find_subcommand_mut_in<'a>(
@@ -104,9 +105,70 @@ impl ProbePlan {
             }
         };
         command.kill_on_drop(true);
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
 
         let timeout_duration = Duration::from_millis(self.timeout_ms);
-        let result = timeout(timeout_duration, command.output()).await;
+
+        // Spawn rather than `timeout(d, command.output())`. On expiry that form
+        // drops the `output()` future, and `kill_on_drop` then signals only the
+        // direct child — orphaning any descendants a probe command spawned. An
+        // availability probe is exactly the kind of thing that shells out, so
+        // the leak is real; route the kill through the shared chokepoint, which
+        // takes down the group and confirms the reap.
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                return (
+                    1,
+                    String::new(),
+                    format!("Failed to spawn sandboxed command: {e}"),
+                );
+            }
+        };
+        let mut guard = ProcessGroupGuard::new(child);
+
+        // Read both pipes concurrently with the wait, not after it: a probe that
+        // fills a pipe buffer would otherwise deadlock against its own timeout.
+        // (`wait_with_output` would do this for us but consumes the child, which
+        // would hand the process to a future we are about to drop.)
+        let stdout = guard.child_mut().stdout.take();
+        let stderr = guard.child_mut().stderr.take();
+        let readers = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            if let Some(mut s) = stdout {
+                let _ = s.read_to_end(&mut out).await;
+            }
+            if let Some(mut s) = stderr {
+                let _ = s.read_to_end(&mut err).await;
+            }
+            (out, err)
+        });
+
+        let result = match timeout(timeout_duration, guard.child_mut().wait()).await {
+            Ok(Ok(status)) => {
+                let (stdout, stderr) = readers.await.unwrap_or_default();
+                Ok(Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                }))
+            }
+            Ok(Err(e)) => {
+                readers.abort();
+                Ok(Err(e))
+            }
+            Err(elapsed) => {
+                if !kill_process_tree(guard.child_mut()).await {
+                    warn!("availability probe timed out but its process did not reap cleanly");
+                }
+                readers.abort();
+                Err(elapsed)
+            }
+        };
 
         self.process_direct_output(result)
     }
@@ -242,6 +304,82 @@ impl ProbeOutcome {
         debug!(
             "Probe success for {:?} (exit {:?}) stdout: {} stderr: {}",
             self.plan.target, self.exit_code, stdout, stderr,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::{Sandbox, SandboxMode};
+
+    /// A probe that times out must take its **whole process tree** with it.
+    ///
+    /// The previous shape — `timeout(d, command.output())` — dropped the
+    /// `output()` future on expiry, and `kill_on_drop` then signalled only the
+    /// direct child. A probe command that had spawned anything (and shelling out
+    /// is what probes do) leaked it: the grandchild kept running with nobody
+    /// left holding a handle to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_probe_does_not_orphan_its_grandchildren() {
+        let temp = tempfile::tempdir().unwrap();
+        let pidfile = temp.path().join("grandchild.pid");
+
+        let sandbox = Sandbox::new(
+            vec![temp.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // Record a long-lived grandchild's pid, then block so the probe is still
+        // running when the timeout fires.
+        let plan = ProbePlan {
+            target: ProbeTarget::Tool {
+                name: "orphan_probe".to_string(),
+            },
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("sleep 120 & echo $! > {}; wait", pidfile.display()),
+            ],
+            working_dir: temp.path().to_path_buf(),
+            success_codes: vec![0],
+            timeout_ms: 1_500,
+            install_instructions: None,
+        };
+
+        let (exit_code, _stdout, stderr) = plan.execute_direct(&sandbox).await;
+
+        assert_eq!(exit_code, -1, "the probe must report a timeout: {stderr}");
+        assert!(
+            stderr.contains("timed out"),
+            "timeout must be named in stderr, got: {stderr}"
+        );
+
+        let gpid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild pid file should have been written")
+            .trim()
+            .parse()
+            .expect("grandchild pid should parse");
+
+        // The group kill is synchronous with the reap, so by the time
+        // `execute_direct` returned the grandchild is already gone. Allow a
+        // couple of polls anyway — signal delivery is not instantaneous.
+        let mut dead = false;
+        for _ in 0..50 {
+            if unsafe { libc::kill(gpid, 0) } != 0 {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            dead,
+            "a timed-out probe must not leave its grandchild (pid {gpid}) running"
         );
     }
 }

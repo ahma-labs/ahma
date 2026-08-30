@@ -230,6 +230,13 @@ impl McpConnectionManager {
         let mut cmd = Command::new(command);
         cmd.args(args);
         cmd.kill_on_drop(true);
+        // Deliberately NOT `.process_group(0)` (cf. SPEC R-PROC.2, which governs
+        // command spawns). An external MCP server is one long-lived process that
+        // owns whatever it spawns, not a tree we own; rmcp's `TokioChildProcess`
+        // takes the `Child` from us, so we could not group-kill it on drop even
+        // if we wanted to. Putting it in its own group would therefore buy no
+        // tree teardown while costing it the terminal signals it currently
+        // receives by sharing ours.
         // Defense in depth: stamp the spawn-depth backstop so that if a
         // self-referential MCP server ever slips past `is_self_ahma_serve`
         // (e.g. an explicit entry in mcp-clients.toml), the chain self-limits at

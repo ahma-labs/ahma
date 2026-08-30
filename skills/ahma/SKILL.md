@@ -330,6 +330,22 @@ Supported Hook Platforms:
 > [!NOTE]
 > **Hooks + MCP are complementary, not redundant.** Running both the terminal hooks and the ahma MCP server for the same client is **supported and safe** — they sandbox different command streams. The MCP server sandboxes the named tools the agent calls explicitly (`run_terminal_command`, file-tools, git, …); the hooks sandbox the shell commands the agent runs through its *native* terminal/Bash tool, which never pass through MCP. A command is only ever wrapped once (already-wrapped and MCP tool calls pass through untouched). The only tradeoff is a small per-command sandbox cold-start from hooks — if your agent only ever uses ahma's MCP tools and never its native terminal, you can drop hooks with `ahma hooks uninstall --scope user`.
 
+> [!NOTE]
+> **Git worktrees.** When a command runs inside a linked worktree, its git storage lives outside the
+> workspace (`<main>/.git` and `<main>/.git/worktrees/<name>`), so the sandbox would otherwise fail
+> every commit with `EPERM`. Ahma grants those two directories read/write — but only after the git
+> dir *proves it already knows about this workspace*, via the `gitdir` back-reference `git worktree
+> add` writes (or `core.worktree` for `git init --separate-git-dir`). A `.git` pointer file that
+> names a directory which does not name it back is refused and logged; the pointer file lives inside
+> the workspace, so its contents are not evidence on their own.
+>
+> Writes to `<git_dir>/hooks` stay denied. **How that denial is enforced depends on the platform**
+> (SPEC R-HANDOFF.4): kernel-enforced on macOS, where Seatbelt's last-match-wins denies subtract
+> from an allowed subtree; **application-layer only on Linux**, because Landlock cannot carve a
+> denied hole inside an allowed directory (R6.1.7) — so on Linux a shell command run through
+> `run_terminal_command` can still write a hook; and not enforced at all on Windows. `ahma status`
+> reports the active platform's limits.
+
 ---
 
 ## Live Log Monitoring

@@ -62,7 +62,7 @@ pub use types::{AsyncExecOptions, ExecutionMode};
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use crate::retry::{self, RetryConfig};
 use crate::sandbox;
-use crate::shell_pool::{ShellPoolManager, kill_process_tree};
+use crate::shell_pool::{ProcessGroupGuard, ShellPoolManager, kill_process_tree};
 use ahma_common::event_dispatcher::{EventDispatcher, OperationEvent};
 use anyhow::Result;
 use serde_json::{Map, Value, json};
@@ -575,12 +575,13 @@ impl Adapter {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let mut child = match cmd.spawn() {
+        let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
             }
         };
+        let mut guard = ProcessGroupGuard::new(child);
 
         // Read stdout/stderr concurrently with `wait()` (not after `wait()`
         // returns) so a chatty child can't fill the pipe buffer and deadlock —
@@ -590,9 +591,9 @@ impl Adapter {
         // child instead of letting us route the kill through the shared
         // `kill_process_tree` chokepoint below, so `child` has to stay owned
         // here.
-        let (stdout_task, stderr_task) = Self::spawn_output_reader_tasks(&mut child);
+        let (stdout_task, stderr_task) = Self::spawn_output_reader_tasks(guard.child_mut());
 
-        let wait_res = tokio::time::timeout(timeout, child.wait()).await;
+        let wait_res = tokio::time::timeout(timeout, guard.child_mut().wait()).await;
 
         let output = match wait_res {
             Err(_) => {
@@ -601,7 +602,7 @@ impl Adapter {
                 // (`shell_pool::kill_process_tree`) the async streaming path
                 // uses, which additionally confirms the reap and supports
                 // Windows Job Objects.
-                if !kill_process_tree(&mut child).await {
+                if !kill_process_tree(guard.child_mut()).await {
                     tracing::warn!(
                         "run_sync_prepared: operation {} timed out but its process did not reap cleanly",
                         op_id
@@ -622,6 +623,7 @@ impl Adapter {
                 return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
             }
             Ok(Ok(status)) => {
+                let _ = guard.disarm();
                 // The child has exited, so its pipes are at (or imminently
                 // reaching) EOF; these joins are not a second wait for the
                 // process itself.
@@ -1562,7 +1564,7 @@ async fn execute_with_streaming(
     proc_cmd.stdout(std::process::Stdio::piped());
     proc_cmd.stderr(std::process::Stdio::piped());
 
-    let mut child = match proc_cmd.spawn() {
+    let child = match proc_cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             fail_operation_with_error(op_monitor, op_id, format!("Failed to spawn process: {}", e))
@@ -1570,9 +1572,10 @@ async fn execute_with_streaming(
             return (audit::Outcome::Failed, None);
         }
     };
+    let mut guard = ProcessGroupGuard::new(child);
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    let stdout = guard.child_mut().stdout.take().expect("stdout piped");
+    let stderr = guard.child_mut().stderr.take().expect("stderr piped");
 
     let mut stdout_reader = BufReader::new(stdout).lines();
     let mut stderr_reader = BufReader::new(stderr).lines();
@@ -1602,7 +1605,7 @@ async fn execute_with_streaming(
     // quiet we ask whether its process *tree* is still burning CPU, and treat
     // that as proof of life. Sampling is deferred until the operation is actually
     // silent, so a chatty command never pays for it.
-    let child_pid = child.id();
+    let child_pid = guard.child_ref().id();
     let mut last_output_at = tokio::time::Instant::now();
     let mut last_cpu_ms: Option<u64> = None;
     let cpu_probe_after = cpu_probe_threshold(op_monitor.idle_timeout());
@@ -1615,7 +1618,7 @@ async fn execute_with_streaming(
             // Check cancellation
             _ = cancellation_token.cancelled() => {
                 tracing::info!("Operation {} cancelled during streaming", op_id);
-                if !kill_process_tree(&mut child).await {
+                if !kill_process_tree(guard.child_mut()).await {
                     tracing::warn!("Operation {} cancelled but its process did not reap cleanly", op_id);
                 }
                 spill.finish().await;
@@ -1626,7 +1629,7 @@ async fn execute_with_streaming(
             // Timeout
             _ = tokio::time::sleep_until(timeout_deadline) => {
                 tracing::warn!("Operation {} timed out during streaming", op_id);
-                if !kill_process_tree(&mut child).await {
+                if !kill_process_tree(guard.child_mut()).await {
                     tracing::warn!("Operation {} timed out but its process did not reap cleanly", op_id);
                 }
                 spill.finish().await;
@@ -1643,13 +1646,26 @@ async fn execute_with_streaming(
 
                 // Silent for a while? Ask whether the process tree is still working
                 // before the idle watchdog is allowed to call it wedged.
+                //
+                // The kill decision is NOT made here. `OperationMonitor::check_timeouts`
+                // owns the idle watchdog and measures it from `last_activity`; this
+                // loop's only job is to feed that clock proof of life it cannot see
+                // for itself. A second watchdog with its own clock would not just be
+                // redundant, it would be wrong: `last_output_at` is a monotonic
+                // `Instant`, so it misses the suspend forgiveness `note_monitor_tick`
+                // applies, and a laptop sleep would reap a healthy operation.
                 if let Some(probe_after) = cpu_probe_after
                     && last_output_at.elapsed() >= probe_after
                     && let Some(pid) = child_pid
+                    // `process_tree_cpu_ms` answers `None` only when the pid is gone;
+                    // where the platform cannot report CPU it answers `Some(0)`, which
+                    // reads here as "no proof of life" and lets the watchdog run. That
+                    // is the documented floor, not a silent kill.
                     && let Some(cpu_ms) = crate::utils::process_cpu::process_tree_cpu_ms(pid)
                 {
-                    // Only a *rise* counts. A tree pinned on a lock or a denied write
-                    // holds its CPU total flat, and must still be reaped.
+                    // Only a *rise* counts, and the first sample is a baseline rather
+                    // than evidence: a tree pinned on a lock or a denied write holds
+                    // its accumulated total flat, and must still be reaped.
                     if last_cpu_ms.is_some_and(|prev| cpu_ms > prev) {
                         tracing::debug!(
                             "Operation {}: silent for {}s but its process tree consumed CPU \
@@ -1667,13 +1683,27 @@ async fn execute_with_streaming(
 
             // Read stderr line
             result = stderr_reader.next_line() => {
-                last_output_at = tokio::time::Instant::now();
+                // EOF is not output. A child that closes its pipes but keeps
+                // running yields `Ok(None)` immediately and forever; treating
+                // that as activity would hold the CPU probe permanently off.
+                //
+                // Real output also drops the CPU baseline, so the next quiet
+                // stretch measures a rise from *its own* start. Carrying a
+                // sample across an intervening chatty period would compare
+                // against a stale total and fabricate proof of life.
+                if matches!(result, Ok(Some(_))) {
+                    last_output_at = tokio::time::Instant::now();
+                    last_cpu_ms = None;
+                }
                 handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, op_id, op_monitor, output_optimizer, &mut spill).await;
             }
 
             // Read stdout line
             result = stdout_reader.next_line() => {
-                last_output_at = tokio::time::Instant::now();
+                if matches!(result, Ok(Some(_))) {
+                    last_output_at = tokio::time::Instant::now();
+                    last_cpu_ms = None;
+                }
                 handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, op_id, op_monitor, output_optimizer, &mut spill).await;
             }
         }
@@ -1681,7 +1711,7 @@ async fn execute_with_streaming(
         // Check if the child process has exited
         // We use try_wait() to avoid blocking — if streams are closed the process may
         // have already exited.
-        match child.try_wait() {
+        match guard.child_mut().try_wait() {
             Ok(Some(_status)) => {
                 drain_remaining_stream_lines(
                     &mut stderr_reader,
@@ -1708,6 +1738,7 @@ async fn execute_with_streaming(
     }
 
     spill.finish().await;
+    let mut child = guard.disarm().unwrap();
 
     finalize_streaming_operation(
         &mut child,

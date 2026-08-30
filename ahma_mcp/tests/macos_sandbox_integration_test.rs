@@ -463,3 +463,232 @@ fn test_credential_read_deny_is_kernel_enforced() {
         String::from_utf8_lossy(&allowed.stderr),
     );
 }
+
+/// Verify that real git operations inside a git worktree succeed under macOS Seatbelt,
+/// while writes to .git/hooks in the common repository remain strictly blocked by the kernel.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_worktree_git_operations_are_allowed_and_hooks_denied_in_kernel() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+
+    let tmp = TempDir::new().expect("temp dir");
+    let main_repo = tmp.path().join("main");
+    std::fs::create_dir_all(&main_repo).unwrap();
+
+    // 1. Initialize git repo in main_repo
+    let run_git = |dir: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed in {}: {}",
+            args,
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    run_git(&main_repo, &["init", "-b", "main"]);
+    run_git(&main_repo, &["config", "user.name", "Test"]);
+    run_git(&main_repo, &["config", "user.email", "test@example.com"]);
+    std::fs::write(main_repo.join("file.txt"), "initial").unwrap();
+    run_git(&main_repo, &["add", "file.txt"]);
+    run_git(&main_repo, &["commit", "-m", "initial commit"]);
+
+    // 2. Create git worktree
+    let wt = tmp.path().join("wt");
+    run_git(
+        &main_repo,
+        &["worktree", "add", "-b", "feature", wt.to_str().unwrap()],
+    );
+
+    // 3. Create sandbox scoped to the worktree
+    let sandbox = Sandbox::new(
+        vec![wt.clone()],
+        SandboxMode::Strict,
+        false, // no_temp_files
+        false, // livelog
+        false, // tmp_access
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(&wt);
+
+    // 4. Test: Sandboxed git commit inside worktree MUST succeed
+    std::fs::write(wt.join("feature.txt"), "feature work").unwrap();
+    let add_out = Command::new("sandbox-exec")
+        .args(["-p", &profile, "git", "add", "feature.txt"])
+        .current_dir(&wt)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("run git add inside sandbox");
+    assert!(
+        add_out.status.success(),
+        "git add inside worktree sandbox should succeed, stderr: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
+    let commit_out = Command::new("sandbox-exec")
+        .args(["-p", &profile, "git", "commit", "-m", "worktree commit"])
+        .current_dir(&wt)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("run git commit inside sandbox");
+    assert!(
+        commit_out.status.success(),
+        "git commit inside worktree sandbox should succeed, stderr: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
+
+    // 4b. The same, with the command's cwd *below* the worktree root — the shape
+    // every `cargo -p` / `working_directory` tool call actually takes. Resolving
+    // git dirs from the working directory alone silently produced no rules here,
+    // so the grant (and the hooks deny) vanished exactly where real work happens.
+    let subdir = wt.join("crate_a");
+    std::fs::create_dir_all(&subdir).unwrap();
+    std::fs::write(subdir.join("lib.rs"), "// work").unwrap();
+    let sub_profile = sandbox.generate_seatbelt_profile_test(&subdir);
+    let sub_commit = Command::new("sandbox-exec")
+        .args([
+            "-p",
+            &sub_profile,
+            "/bin/sh",
+            "-c",
+            "git add . && git commit -m 'from a subdirectory'",
+        ])
+        .current_dir(&subdir)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("run git commit from a worktree subdirectory inside sandbox");
+    assert!(
+        sub_commit.status.success(),
+        "git commit from a worktree SUBDIRECTORY should succeed, stderr: {}",
+        String::from_utf8_lossy(&sub_commit.stderr)
+    );
+
+    // 5. Test: Sandboxed write to .git/hooks in main_repo MUST fail (EPERM)
+    let hook_path = main_repo.join(".git/hooks/pre-commit");
+    let hook_write_out = Command::new("sandbox-exec")
+        .args([
+            "-p",
+            &profile,
+            "/bin/sh",
+            "-c",
+            &format!("echo 'malicious' > {}", hook_path.display()),
+        ])
+        .current_dir(&wt)
+        .output()
+        .expect("run hook write attempt inside sandbox");
+    assert!(
+        !hook_write_out.status.success(),
+        "writing to .git/hooks from worktree sandbox must be blocked by kernel sandbox!"
+    );
+    assert!(
+        !hook_path.exists(),
+        ".git/hooks/pre-commit must not have been created!"
+    );
+}
+
+/// The sandbox escape this mechanism exists to prevent, proven against the real
+/// kernel rather than against the profile text.
+///
+/// `<ws>/sub/.git` is an ordinary text file inside the workspace, so a sandboxed
+/// command may write it — that write is *supposed* to succeed. What must not
+/// follow is the next command inheriting write access to whatever that file
+/// names. Before the back-reference check, `gitdir: <victim>` put
+/// `(allow file-write* (subpath "<victim>"))` into the following profile.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_poisoned_gitdir_pointer_cannot_widen_sandbox_in_kernel() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+
+    let tmp = TempDir::new().expect("temp dir");
+    let root = dunce::canonicalize(tmp.path()).unwrap();
+    let ws = root.join("ws");
+    let sub = ws.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    // Outside the scope, and dressed up to look like a git directory — because
+    // "looks like a git dir" is a shape, and a shape is forgeable.
+    let victim = root.join("victim");
+    std::fs::create_dir_all(victim.join("hooks")).unwrap();
+    std::fs::write(victim.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let victim_file = victim.join("stolen.txt");
+
+    // `no_temp_files` for the same reason `test_credential_read_deny_is_kernel_enforced`
+    // uses it: `TempDir` lives under `/var/folders`, and the default temp rules
+    // grant that whole subtree — which would let the "escape" succeed for a
+    // reason that has nothing to do with git dirs.
+    let sandbox = Sandbox::new(
+        vec![ws.clone()],
+        SandboxMode::Strict,
+        true,  // no_temp_files
+        false, // livelog
+        false, // tmp_access
+    )
+    .expect("build sandbox");
+
+    // Step 1: the poisoning write is inside the workspace and must be permitted.
+    let poison = Command::new("sandbox-exec")
+        .args([
+            "-p",
+            &sandbox.generate_seatbelt_profile_test(&ws),
+            "/bin/sh",
+            "-c",
+            &format!(
+                "echo 'gitdir: {}' > {}",
+                victim.display(),
+                sub.join(".git").display()
+            ),
+        ])
+        .current_dir(&ws)
+        .output()
+        .expect("run poisoning write inside sandbox");
+    assert!(
+        poison.status.success(),
+        "writing a file inside the workspace must still be allowed, stderr: {}",
+        String::from_utf8_lossy(&poison.stderr)
+    );
+
+    // Step 2: the *next* command must not have gained anything by it.
+    let escape = Command::new("sandbox-exec")
+        .args([
+            "-p",
+            &sandbox.generate_seatbelt_profile_test(&ws),
+            "/bin/sh",
+            "-c",
+            &format!("echo owned > {}", victim_file.display()),
+        ])
+        .current_dir(&ws)
+        .output()
+        .expect("run escape attempt inside sandbox");
+
+    assert!(
+        !escape.status.success(),
+        "an unverified `gitdir:` pointer must not grant write access outside the \
+         workspace — the kernel allowed the write, stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&escape.stdout),
+        String::from_utf8_lossy(&escape.stderr),
+    );
+    assert!(
+        !victim_file.exists(),
+        "the out-of-scope file must not have been created"
+    );
+}

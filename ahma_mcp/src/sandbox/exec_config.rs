@@ -387,6 +387,17 @@ pub fn deny_write_globs_with(
 /// whose `commondir` file names the shared git dir where the hooks actually
 /// live; that is resolved too. Returned paths are canonicalized and absolute.
 pub fn resolve_git_dirs(workspace_root: &Path) -> Vec<PathBuf> {
+    resolve_git_dirs_detailed(workspace_root)
+        .into_iter()
+        .map(|d| d.path)
+        .collect()
+}
+
+/// [`resolve_git_dirs`] retaining **how** each directory was reached.
+///
+/// The provenance is what [`grantable_git_dirs`] verifies against; the deny side
+/// throws it away. One traversal feeds both so the two sets can never drift.
+fn resolve_git_dirs_detailed(workspace_root: &Path) -> Vec<ResolvedGitDir> {
     let root = dunce::canonicalize(workspace_root).unwrap_or_else(|_| normalize(workspace_root));
     let mut out = Vec::new();
     let mut budget = SCAN_ENTRY_BUDGET;
@@ -476,7 +487,7 @@ async fn collect_git_dir_async(dir: &Path, out: &mut Vec<PathBuf>) {
         return;
     };
     if meta.is_dir() {
-        push_unique(out, canonical_or_async(&dot_git).await);
+        push_unique_path(out, canonical_or_async(&dot_git).await);
         return;
     }
     let Ok(contents) = tokio::fs::read_to_string(&dot_git).await else {
@@ -489,9 +500,9 @@ async fn collect_git_dir_async(dir: &Path, out: &mut Vec<PathBuf>) {
     if let Ok(common) = tokio::fs::read_to_string(target.join("commondir")).await
         && let Some(resolved) = resolve_relative(common.trim(), &target)
     {
-        push_unique(out, canonical_or_async(&resolved).await);
+        push_unique_path(out, canonical_or_async(&resolved).await);
     }
-    push_unique(out, target);
+    push_unique_path(out, target);
 }
 
 async fn canonical_or_async(p: &Path) -> PathBuf {
@@ -501,14 +512,282 @@ async fn canonical_or_async(p: &Path) -> PathBuf {
     }
 }
 
+/// How a git directory was reached. Retained by [`resolve_git_dirs_detailed`]
+/// so the **grant** side can demand evidence the **deny** side does not need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitDirOrigin {
+    /// `<dir>/.git` is a real directory, so it sits inside the tree we scanned.
+    Direct,
+    /// `<dir>/.git` is a `gitdir:` pointer *file* at this path. The file is
+    /// inside the workspace, so its contents are agent-controlled.
+    Pointer { dot_git_file: PathBuf },
+    /// Reached by following `commondir` out of an already-resolved git dir.
+    CommonDir { via: PathBuf },
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedGitDir {
+    path: PathBuf,
+    origin: GitDirOrigin,
+}
+
+/// Why a git directory may be granted filesystem access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantBasis {
+    /// Already inside a sandbox scope — nothing is widened, and no rule is
+    /// needed because the scope rules already cover it.
+    InScope,
+    /// A linked worktree whose git dir names our `.git` pointer file back.
+    WorktreeBackref,
+    /// A `--separate-git-dir` repository whose `core.worktree` names us back.
+    SeparateGitDirBackref,
+    /// The common git dir of an already-verified worktree git dir.
+    CommonDirOfVerified,
+}
+
+/// A git directory that may be granted access, and why.
+#[derive(Debug, Clone)]
+pub struct GitDirGrant {
+    pub path: PathBuf,
+    pub basis: GrantBasis,
+}
+
+impl GitDirGrant {
+    /// Whether this grant needs a kernel rule of its own. `InScope` dirs are
+    /// already covered by the scope rules, so emitting one would be noise.
+    pub fn needs_rule(&self) -> bool {
+        self.basis != GrantBasis::InScope
+    }
+}
+
+/// A git directory that was resolved but **refused** a grant, with the reason.
+#[derive(Debug, Clone)]
+pub struct GitDirRefusal {
+    pub path: PathBuf,
+    /// The `.git` pointer file that named it, when there was one.
+    pub pointer: Option<PathBuf>,
+    pub reason: &'static str,
+}
+
+/// Outcome of [`grantable_git_dirs`].
+#[derive(Debug, Clone, Default)]
+pub struct GitDirGrants {
+    pub granted: Vec<GitDirGrant>,
+    pub refused: Vec<GitDirRefusal>,
+}
+
+impl GitDirGrants {
+    /// Just the paths that need a kernel allow rule, in resolution order.
+    pub fn rule_paths(&self) -> Vec<PathBuf> {
+        self.granted
+            .iter()
+            .filter(|g| g.needs_rule())
+            .map(|g| g.path.clone())
+            .collect()
+    }
+}
+
+mod refusals {
+    pub const NO_BACKREF: &str = "the directory does not name this workspace back (no `gitdir` \
+         back-reference and no `core.worktree`), so the `gitdir:` pointer is unverifiable";
+    pub const BACKREF_MISMATCH: &str =
+        "the directory's `gitdir` back-reference names a different worktree";
+    pub const COMMONDIR_UNVERIFIED: &str =
+        "its worktree git dir was not itself verified, so `commondir` cannot be trusted";
+    pub const COMMONDIR_INCONSISTENT: &str =
+        "the common dir does not link back to the worktree git dir that named it";
+    pub const NOT_A_REPOSITORY: &str = "the common dir has no `HEAD`, so it is not a git directory";
+}
+
+/// The git directories that may be **granted** filesystem access, as opposed to
+/// the permissive set [`resolve_git_dirs`] returns for **deny** rules.
+///
+/// # These two sets are not the same set, and must never be conflated
+///
+/// [`resolve_git_dirs`] follows any `gitdir:` pointer it finds, deliberately: a
+/// pointer that lies only ever adds a harmless *extra deny*, and refusing to
+/// follow it would weaken the hook protection that is the whole point of
+/// R-HANDOFF.2. Granting on the same input inverts the trust. The `.git` pointer
+/// file lives **inside the workspace**, so an agent can write it, and
+/// `gitdir: /` would otherwise hand back `(allow file-write* (subpath "/"))` —
+/// a complete escape bought with a two-line file write the sandbox permits.
+///
+/// # The check is a capability, not a heuristic
+///
+/// "Does it look like a git directory?" is not a defence: an agent can create
+/// `HEAD` and `objects/`. Instead a git dir outside every scope must **prove it
+/// already knows about this workspace**, using a back-reference git itself
+/// writes:
+///
+/// * a linked worktree — `git worktree add` writes
+///   `<main>/.git/worktrees/<id>/gitdir` containing the absolute path of the
+///   worktree's own `.git` file;
+/// * `git init --separate-git-dir` — the relocated dir's `config` carries
+///   `core.worktree = <repo>`.
+///
+/// Both live **outside** the workspace, so forging one requires write access to
+/// the very directory being requested. The check therefore cannot be
+/// bootstrapped by an agent confined to the workspace.
+///
+/// Everything fails closed, and every refusal is reported rather than dropped —
+/// R7 forbids silently narrowing enforcement as much as silently widening it.
+pub fn grantable_git_dirs(roots: &[PathBuf], scopes: &[PathBuf]) -> GitDirGrants {
+    let mut out = GitDirGrants::default();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut resolved: Vec<ResolvedGitDir> = Vec::new();
+    for root in roots {
+        for dir in resolve_git_dirs_detailed(root) {
+            if !resolved.iter().any(|d| d.path == dir.path) {
+                resolved.push(dir);
+            }
+        }
+    }
+
+    // Two passes: a `commondir` grant is only as good as the worktree git dir it
+    // was reached through, and that dir may be resolved after it.
+    for dir in resolved
+        .iter()
+        .filter(|d| !matches!(d.origin, GitDirOrigin::CommonDir { .. }))
+    {
+        if seen.contains(&dir.path) {
+            continue;
+        }
+        seen.push(dir.path.clone());
+        match classify_grant(dir, scopes) {
+            Ok(basis) => out.granted.push(GitDirGrant {
+                path: dir.path.clone(),
+                basis,
+            }),
+            Err(reason) => out.refused.push(GitDirRefusal {
+                path: dir.path.clone(),
+                pointer: pointer_of(dir),
+                reason,
+            }),
+        }
+    }
+
+    for dir in &resolved {
+        let GitDirOrigin::CommonDir { via } = &dir.origin else {
+            continue;
+        };
+        if seen.contains(&dir.path) {
+            continue;
+        }
+        seen.push(dir.path.clone());
+        match classify_common_dir(&dir.path, via, scopes, &out.granted) {
+            Ok(basis) => out.granted.push(GitDirGrant {
+                path: dir.path.clone(),
+                basis,
+            }),
+            Err(reason) => out.refused.push(GitDirRefusal {
+                path: dir.path.clone(),
+                pointer: Some(via.clone()),
+                reason,
+            }),
+        }
+    }
+
+    out
+}
+
+fn pointer_of(dir: &ResolvedGitDir) -> Option<PathBuf> {
+    match &dir.origin {
+        GitDirOrigin::Pointer { dot_git_file } => Some(dot_git_file.clone()),
+        GitDirOrigin::CommonDir { via } => Some(via.clone()),
+        GitDirOrigin::Direct => None,
+    }
+}
+
+fn classify_grant(dir: &ResolvedGitDir, scopes: &[PathBuf]) -> Result<GrantBasis, &'static str> {
+    if super::core::path_within_scopes(&dir.path, scopes) {
+        return Ok(GrantBasis::InScope);
+    }
+    let GitDirOrigin::Pointer { dot_git_file } = &dir.origin else {
+        // A plain `.git` *directory* outside every scope was reached by scanning
+        // a root that is itself outside the scopes. Nothing vouches for it.
+        return Err(refusals::NO_BACKREF);
+    };
+    if let Ok(backref) = std::fs::read_to_string(dir.path.join("gitdir")) {
+        let claimed = canonical_or(Path::new(backref.trim()));
+        return if claimed == canonical_or(dot_git_file) {
+            Ok(GrantBasis::WorktreeBackref)
+        } else {
+            Err(refusals::BACKREF_MISMATCH)
+        };
+    }
+    // `--separate-git-dir`: the relocated dir's config names the working tree.
+    let worktree_parent = dot_git_file.parent().map(canonical_or);
+    if let (Some(parent), Some(declared)) = (worktree_parent, core_worktree_of(&dir.path))
+        && declared == parent
+    {
+        return Ok(GrantBasis::SeparateGitDirBackref);
+    }
+    Err(refusals::NO_BACKREF)
+}
+
+fn classify_common_dir(
+    common: &Path,
+    via: &Path,
+    scopes: &[PathBuf],
+    granted: &[GitDirGrant],
+) -> Result<GrantBasis, &'static str> {
+    if super::core::path_within_scopes(common, scopes) {
+        return Ok(GrantBasis::InScope);
+    }
+    // `commondir` lives *inside* the worktree git dir, so it inherits that dir's
+    // trust — and nothing more. If that dir was refused, so is this one.
+    if !granted.iter().any(|g| g.path == via) {
+        return Err(refusals::COMMONDIR_UNVERIFIED);
+    }
+    // Self-consistency: the common dir must own the worktree git dir that named
+    // it. Cheap, and it stops a verified worktree's `commondir` from being
+    // repointed at an unrelated tree.
+    let owns_via = via
+        .file_name()
+        .map(|name| canonical_or(&common.join("worktrees").join(name)) == canonical_or(via))
+        .unwrap_or(false);
+    if !owns_via {
+        return Err(refusals::COMMONDIR_INCONSISTENT);
+    }
+    if !common.join("HEAD").exists() {
+        return Err(refusals::NOT_A_REPOSITORY);
+    }
+    Ok(GrantBasis::CommonDirOfVerified)
+}
+
+/// `core.worktree` from a git config file, if present. A deliberately small
+/// line scan rather than a config parser: this is a *verification*, so anything
+/// it fails to understand simply fails closed.
+fn core_worktree_of(git_dir: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(git_dir.join("config")).ok()?;
+    let mut in_core = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_core = section.trim().eq_ignore_ascii_case("core");
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("worktree") {
+            return Some(canonical_or(Path::new(value.trim())));
+        }
+    }
+    None
+}
+
 /// Resolve `<dir>/.git` (directory or `gitdir:` pointer file) into `out`.
-fn collect_git_dir(dir: &Path, out: &mut Vec<PathBuf>) {
+fn collect_git_dir(dir: &Path, out: &mut Vec<ResolvedGitDir>) {
     let dot_git = dir.join(".git");
     let Ok(meta) = std::fs::metadata(&dot_git) else {
         return;
     };
     if meta.is_dir() {
-        push_unique(out, canonical_or(&dot_git));
+        push_unique(out, canonical_or(&dot_git), GitDirOrigin::Direct);
         return;
     }
     let Ok(contents) = std::fs::read_to_string(&dot_git) else {
@@ -517,15 +796,28 @@ fn collect_git_dir(dir: &Path, out: &mut Vec<PathBuf>) {
     let Some(target) = parse_gitdir_pointer(&contents, dir) else {
         return;
     };
+    let dot_git = canonical_or(&dot_git);
     let target = canonical_or(&target);
     // A worktree's gitdir names `<main>/.git/worktrees/<name>`; the hooks live in
     // the common dir it points at, so defend both.
     if let Ok(common) = std::fs::read_to_string(target.join("commondir"))
         && let Some(resolved) = resolve_relative(common.trim(), &target)
     {
-        push_unique(out, canonical_or(&resolved));
+        push_unique(
+            out,
+            canonical_or(&resolved),
+            GitDirOrigin::CommonDir {
+                via: target.clone(),
+            },
+        );
     }
-    push_unique(out, target);
+    push_unique(
+        out,
+        target,
+        GitDirOrigin::Pointer {
+            dot_git_file: dot_git,
+        },
+    );
 }
 
 /// Parse the body of a `.git` pointer file. Pure — split out so the pointer
@@ -557,7 +849,15 @@ fn canonical_or(p: &Path) -> PathBuf {
     dunce::canonicalize(p).unwrap_or_else(|_| normalize(p))
 }
 
-fn push_unique(out: &mut Vec<PathBuf>, p: PathBuf) {
+fn push_unique(out: &mut Vec<ResolvedGitDir>, path: PathBuf, origin: GitDirOrigin) {
+    if !out.iter().any(|d| d.path == path) {
+        out.push(ResolvedGitDir { path, origin });
+    }
+}
+
+/// Provenance-free variant for the async deny-only resolver, which never grants
+/// and so has nothing to verify.
+fn push_unique_path(out: &mut Vec<PathBuf>, p: PathBuf) {
     if !out.contains(&p) {
         out.push(p);
     }
@@ -1165,5 +1465,320 @@ mod tests {
             sync_dirs.contains(&dunce::canonicalize(&alt).unwrap()),
             "{sync_dirs:?}"
         );
+    }
+
+    // ── Grant-side verification (`grantable_git_dirs`) ───────────────────────
+    //
+    // The threat these cover: `<ws>/sub/.git` is an ordinary text file inside the
+    // workspace, so an agent may write it. If a `gitdir:` pointer in it were
+    // trusted, `gitdir: /` would buy `(allow file-write* (subpath "/"))` on the
+    // next spawn — a complete escape for the price of a permitted two-line write.
+
+    /// Build `<root>/main` as a repo with a linked worktree `<root>/wt`, exactly
+    /// as `git worktree add` lays it out: the worktree's `.git` file points at
+    /// `<main>/.git/worktrees/wt`, and that directory points *back* via `gitdir`.
+    fn worktree_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let shared = root.join("main/.git");
+        std::fs::create_dir_all(shared.join("hooks")).unwrap();
+        std::fs::write(shared.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let wt_meta = shared.join("worktrees/wt");
+        std::fs::create_dir_all(&wt_meta).unwrap();
+        std::fs::write(wt_meta.join("commondir"), "../..\n").unwrap();
+
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_meta.display())).unwrap();
+        // The back-reference git writes: the absolute path of `<wt>/.git`.
+        std::fs::write(
+            wt_meta.join("gitdir"),
+            format!("{}\n", wt.join(".git").display()),
+        )
+        .unwrap();
+        (wt, wt_meta, shared)
+    }
+
+    fn granted_paths(g: &GitDirGrants) -> Vec<PathBuf> {
+        g.granted.iter().map(|x| x.path.clone()).collect()
+    }
+
+    #[test]
+    fn real_worktree_backref_is_grantable() {
+        let tmp = tempdir().unwrap();
+        let (wt, wt_meta, shared) = worktree_fixture(tmp.path());
+        let scopes = vec![dunce::canonicalize(&wt).unwrap()];
+
+        let grants = grantable_git_dirs(&scopes, &scopes);
+        let paths = granted_paths(&grants);
+
+        assert!(
+            paths.contains(&dunce::canonicalize(&wt_meta).unwrap()),
+            "a worktree gitdir naming us back must be granted: {grants:?}"
+        );
+        assert!(
+            paths.contains(&dunce::canonicalize(&shared).unwrap()),
+            "the common dir of a verified worktree gitdir must be granted: {grants:?}"
+        );
+        assert!(
+            grants.refused.is_empty(),
+            "nothing should be refused: {grants:?}"
+        );
+    }
+
+    #[test]
+    fn poisoned_gitdir_pointer_to_root_is_not_grantable() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let sub = ws.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: /\n").unwrap();
+        let scopes = vec![dunce::canonicalize(&ws).unwrap()];
+
+        let grants = grantable_git_dirs(&scopes, &scopes);
+
+        assert!(
+            grants.rule_paths().is_empty(),
+            "`gitdir: /` must never produce an allow rule: {grants:?}"
+        );
+        assert!(
+            grants.refused.iter().any(|r| r.path == Path::new("/")),
+            "the refusal must be reported, not silently dropped: {grants:?}"
+        );
+    }
+
+    #[test]
+    fn poisoned_gitdir_pointer_to_home_credential_dir_is_not_grantable() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let sub = ws.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // A directory that plainly exists and is plainly not ours.
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir_all(victim.join("hooks")).unwrap();
+        std::fs::write(victim.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(sub.join(".git"), format!("gitdir: {}\n", victim.display())).unwrap();
+        let scopes = vec![dunce::canonicalize(&ws).unwrap()];
+
+        let grants = grantable_git_dirs(&scopes, &scopes);
+
+        assert!(
+            grants.rule_paths().is_empty(),
+            "looking like a git dir (HEAD, hooks/) is not evidence: {grants:?}"
+        );
+    }
+
+    #[test]
+    fn worktree_backref_naming_a_different_worktree_is_refused() {
+        let tmp = tempdir().unwrap();
+        let (wt, wt_meta, _) = worktree_fixture(tmp.path());
+        // Repoint the back-reference at somebody else's worktree.
+        std::fs::write(
+            wt_meta.join("gitdir"),
+            format!("{}\n", tmp.path().join("other/.git").display()),
+        )
+        .unwrap();
+        let scopes = vec![dunce::canonicalize(&wt).unwrap()];
+
+        let grants = grantable_git_dirs(&scopes, &scopes);
+
+        assert!(
+            grants.rule_paths().is_empty(),
+            "a mismatched back-reference must refuse: {grants:?}"
+        );
+        assert!(
+            grants
+                .refused
+                .iter()
+                .any(|r| r.reason == refusals::BACKREF_MISMATCH),
+            "the mismatch must be named as the reason: {grants:?}"
+        );
+    }
+
+    #[test]
+    fn separate_git_dir_with_core_worktree_backref_is_grantable() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let alt = tmp.path().join("git-alt");
+        std::fs::create_dir_all(alt.join("hooks")).unwrap();
+        std::fs::write(repo.join(".git"), format!("gitdir: {}\n", alt.display())).unwrap();
+        std::fs::write(
+            alt.join("config"),
+            format!("[core]\n\tbare = false\n\tworktree = {}\n", repo.display()),
+        )
+        .unwrap();
+        let scopes = vec![dunce::canonicalize(&repo).unwrap()];
+
+        let grants = grantable_git_dirs(&scopes, &scopes);
+
+        assert!(
+            granted_paths(&grants).contains(&dunce::canonicalize(&alt).unwrap()),
+            "`core.worktree` naming us back is a valid back-reference: {grants:?}"
+        );
+    }
+
+    #[test]
+    fn separate_git_dir_without_backref_is_refused() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let alt = tmp.path().join("git-alt");
+        std::fs::create_dir_all(alt.join("hooks")).unwrap();
+        std::fs::write(repo.join(".git"), format!("gitdir: {}\n", alt.display())).unwrap();
+        // `core.worktree` names somebody else.
+        std::fs::write(
+            alt.join("config"),
+            format!(
+                "[core]\n\tworktree = {}\n",
+                tmp.path().join("elsewhere").display()
+            ),
+        )
+        .unwrap();
+        let scopes = vec![dunce::canonicalize(&repo).unwrap()];
+
+        let grants = grantable_git_dirs(&scopes, &scopes);
+
+        assert!(
+            grants.rule_paths().is_empty(),
+            "a `core.worktree` pointing elsewhere is not a back-reference: {grants:?}"
+        );
+    }
+
+    #[test]
+    fn commondir_hop_requires_self_consistency() {
+        let tmp = tempdir().unwrap();
+        let (wt, wt_meta, _) = worktree_fixture(tmp.path());
+        // A verified worktree gitdir whose `commondir` names an unrelated tree.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            wt_meta.join("commondir"),
+            format!("{}\n", elsewhere.display()),
+        )
+        .unwrap();
+        let scopes = vec![dunce::canonicalize(&wt).unwrap()];
+
+        let grants = grantable_git_dirs(&scopes, &scopes);
+
+        assert!(
+            granted_paths(&grants).contains(&dunce::canonicalize(&wt_meta).unwrap()),
+            "the worktree gitdir itself still verifies: {grants:?}"
+        );
+        assert!(
+            !granted_paths(&grants).contains(&dunce::canonicalize(&elsewhere).unwrap()),
+            "a common dir that does not own the gitdir naming it must be refused: {grants:?}"
+        );
+    }
+
+    #[test]
+    fn commondir_of_an_unverified_gitdir_is_refused() {
+        let tmp = tempdir().unwrap();
+        let (wt, wt_meta, shared) = worktree_fixture(tmp.path());
+        // Break the worktree gitdir's own proof; the commondir hop must not
+        // survive it, even though `<shared>` is a perfectly real git dir.
+        std::fs::remove_file(wt_meta.join("gitdir")).unwrap();
+        let scopes = vec![dunce::canonicalize(&wt).unwrap()];
+
+        let grants = grantable_git_dirs(&scopes, &scopes);
+
+        assert!(
+            grants.rule_paths().is_empty(),
+            "commondir inherits the trust of the dir it came from, and no more: {grants:?}"
+        );
+        assert!(
+            grants
+                .refused
+                .iter()
+                .any(|r| r.path == dunce::canonicalize(&shared).unwrap()
+                    && r.reason == refusals::COMMONDIR_UNVERIFIED),
+            "the reason must say the parent was unverified: {grants:?}"
+        );
+    }
+
+    #[test]
+    fn in_scope_git_dir_is_granted_without_a_backref_and_emits_no_rule() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+        let scopes = vec![dunce::canonicalize(&ws).unwrap()];
+
+        let grants = grantable_git_dirs(&scopes, &scopes);
+
+        assert_eq!(
+            grants.granted.len(),
+            1,
+            "the ordinary repository's own .git is granted: {grants:?}"
+        );
+        assert_eq!(grants.granted[0].basis, GrantBasis::InScope);
+        assert!(
+            grants.rule_paths().is_empty(),
+            "an in-scope git dir is already covered by the scope rules — emitting a \
+             rule for it would be noise: {grants:?}"
+        );
+    }
+
+    /// **Do not "tidy" this away.** The deny side must keep following pointers it
+    /// cannot verify: an unverifiable pointer should still contribute a
+    /// `<git_dir>/hooks` deny, and must never contribute a grant. Pointing
+    /// `resolve_git_dirs` at the strict resolver would silently weaken
+    /// R-HANDOFF.2 while every grant test kept passing.
+    #[test]
+    fn deny_resolution_still_follows_unverified_pointers() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let sub = ws.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let unverified = tmp.path().join("unverified");
+        std::fs::create_dir_all(unverified.join("hooks")).unwrap();
+        std::fs::write(
+            sub.join(".git"),
+            format!("gitdir: {}\n", unverified.display()),
+        )
+        .unwrap();
+        let scopes = vec![dunce::canonicalize(&ws).unwrap()];
+
+        let deny_dirs = resolve_git_dirs(&ws);
+        let grants = grantable_git_dirs(&scopes, &scopes);
+        let canonical = dunce::canonicalize(&unverified).unwrap();
+
+        assert!(
+            deny_dirs.contains(&canonical),
+            "the deny resolver must still reach it: {deny_dirs:?}"
+        );
+        assert!(
+            deny_write_globs_with(&ws, &deny_dirs, HandoffAllowances::default())
+                .contains(&canonical.join("hooks")),
+            "and must still deny its hooks"
+        );
+        assert!(
+            !grants.rule_paths().contains(&canonical),
+            "while the grant resolver refuses it: {grants:?}"
+        );
+    }
+
+    // ── `resolve_relative`: the function that accepts the attacker's path ────
+
+    #[test]
+    fn resolve_relative_accepts_absolute_targets_verbatim() {
+        let base = ws();
+        let abs = test_abs(&["elsewhere", "git"]);
+        assert_eq!(
+            resolve_relative(&abs.to_string_lossy(), &base),
+            Some(abs.clone())
+        );
+    }
+
+    #[test]
+    fn resolve_relative_collapses_dot_dot_traversal() {
+        let base = test_abs(&["work", "repo", "sub"]);
+        assert_eq!(
+            resolve_relative("../../../etc", &base),
+            Some(test_abs(&["etc"]))
+        );
+    }
+
+    #[test]
+    fn resolve_relative_rejects_an_empty_target() {
+        assert_eq!(resolve_relative("", &ws()), None);
     }
 }

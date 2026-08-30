@@ -118,6 +118,17 @@ mod unix {
     use std::time::{Duration, Instant};
 
     /// Sends SIGKILL to the child's process group on demand.
+    ///
+    /// The PTY child is a `std::process::Child` (rebuilt as a std `Command` so
+    /// its stdio can be the PTY slave fd), so it cannot go through
+    /// [`kill_process_tree`], which takes a `tokio::process::Child`. It routes
+    /// through the same underlying primitive instead — this used to be its own
+    /// copy of the syscall pair, which made the "single chokepoint" claim on
+    /// `kill_process_tree` untrue.
+    ///
+    /// Unlike `kill_process_tree` there is no bounded reap here: the child is
+    /// owned by the blocking waiter thread spawned in `setup_pty`, which is what
+    /// observes the exit and reports it over `exit_tx`.
     struct PtyChildKiller {
         pid: i32,
     }
@@ -126,10 +137,7 @@ mod unix {
         fn kill(&self) {
             // The child called setsid(), so its pid is also its process-group
             // id — kill the whole group to take down shell descendants.
-            unsafe {
-                libc::kill(-self.pid, libc::SIGKILL);
-                libc::kill(self.pid, libc::SIGKILL);
-            }
+            crate::shell_pool::signal_process_group_kill(self.pid);
         }
     }
 

@@ -101,6 +101,32 @@ impl ShellPoolManager {
 /// SIGKILL; bounding the reap keeps the caller from blocking forever on it.
 pub const KILL_REAP_GRACE: Duration = Duration::from_secs(5);
 
+/// `SIGKILL` the process group led by `pgid_leader`, then the leader itself.
+///
+/// The one place the group-kill syscall pair is written. [`kill_process_tree`],
+/// [`ProcessGroupGuard`]'s `Drop`, and the PTY path (`adapter::pty_exec`, whose
+/// child is a `std::process::Child` and so cannot use `kill_process_tree`) all
+/// route through this — otherwise "the cross-crate chokepoint for process-group
+/// teardown" below would be three separate implementations wearing one name, and
+/// a fix to the ordering or signal choice would land in only one of them.
+///
+/// `pgid_leader` **must** be the pid of a process-group leader — a child spawned
+/// with `.process_group(0)`, or one that called `setsid()`. For any other pid
+/// `kill(-pid)` simply fails with `ESRCH`.
+///
+/// Sends to the group first, then to the leader directly: the second call is
+/// redundant on Unix once the group signal lands, and is kept because it is the
+/// one that still works if the child never became a group leader.
+#[cfg(unix)]
+pub fn signal_process_group_kill(pgid_leader: i32) {
+    // SAFETY: `kill` is async-signal-safe and takes no memory from us; an
+    // invalid pid is reported as ESRCH rather than being undefined.
+    unsafe {
+        libc::kill(-pgid_leader, libc::SIGKILL);
+        libc::kill(pgid_leader, libc::SIGKILL);
+    }
+}
+
 /// Kill a spawned command and its entire process group, then **verify** the
 /// direct child was reaped within [`KILL_REAP_GRACE`].
 ///
@@ -122,10 +148,7 @@ pub const KILL_REAP_GRACE: Duration = Duration::from_secs(5);
 pub async fn kill_process_tree(child: &mut tokio::process::Child) -> bool {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
-        // Negative pid targets the process group led by the child.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
+        signal_process_group_kill(pid as i32);
     }
     // `start_kill` sends SIGKILL to the direct child (idempotent on Unix after the
     // group kill); the bounded `wait` confirms the reap rather than blocking
@@ -144,6 +167,72 @@ pub async fn kill_process_tree(child: &mut tokio::process::Child) -> bool {
                 KILL_REAP_GRACE.as_secs_f64()
             );
             false
+        }
+    }
+}
+
+/// RAII guard that wraps a spawned [`tokio::process::Child`].
+///
+/// If dropped before the child is explicitly disarmed or reaped (for example
+/// when an async task is cancelled, dropped, or timed out during signal handling),
+/// its [`Drop`] implementation immediately issues a process-group `SIGKILL`
+/// (`kill(-pgid)`) so grandchildren such as `sh → cargo → cargo-nextest → test_bin`
+/// are never orphaned in the background.
+///
+/// # The child must be a process-group leader
+///
+/// Same precondition as [`kill_process_tree`], and it is **not** checked: the
+/// child has to have been spawned with `.process_group(0)`. Without it `pid` is
+/// not a process-group id, `kill(-pid)` fails with `ESRCH`, and the guard
+/// degrades — silently — into killing nothing at all while still looking like
+/// protection. Every ahma spawn path satisfies this via
+/// `Sandbox::base_command`, which sets `.process_group(0)` and
+/// `.kill_on_drop(true)` for every command it builds (SPEC R-PROC.2).
+///
+/// # Platforms
+///
+/// The group kill is Unix-only. On Windows `Drop` falls back to `start_kill()`
+/// on the direct child; descendants are reaped by the Job Object the spawn path
+/// attaches, not by this guard.
+///
+/// # Double-kill is not a hazard here
+///
+/// After a `wait()` (which [`kill_process_tree`] performs) tokio fuses the child
+/// and `Child::id()` returns `None`, so a `Drop` following an explicit reap
+/// signals nothing. That is what keeps this guard from firing `kill(-pid)` at a
+/// pid the OS may already have recycled.
+#[derive(Debug)]
+pub struct ProcessGroupGuard {
+    child: Option<tokio::process::Child>,
+}
+
+impl ProcessGroupGuard {
+    pub fn new(child: tokio::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    pub fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child.as_mut().expect("child exists")
+    }
+
+    pub fn child_ref(&self) -> &tokio::process::Child {
+        self.child.as_ref().expect("child exists")
+    }
+
+    /// Disarm the guard and return the inner child once reaped or completed.
+    pub fn disarm(mut self) -> Option<tokio::process::Child> {
+        self.child.take()
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                signal_process_group_kill(pid as i32);
+            }
+            let _ = child.start_kill();
         }
     }
 }
@@ -264,6 +353,63 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(KILL_REAP_GRACE.as_secs()),
             "reap should be near-instant for a killable child, took {elapsed:?}"
+        );
+    }
+
+    /// Regression: when ProcessGroupGuard is dropped (e.g. on async cancellation
+    /// or signal handling), it must immediately kill the entire process group,
+    /// preventing orphaned grandchildren like `cargo nextest` from staying alive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_guard_kills_grandchildren_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 60 & echo $! > {}; wait", pidfile.display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = cmd.spawn().expect("spawn sh");
+        let guard = ProcessGroupGuard::new(child);
+
+        // Wait for the grandchild pid to be recorded.
+        let mut gpid = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile)
+                && let Ok(p) = s.trim().parse::<i32>()
+            {
+                gpid = Some(p);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let gpid = gpid.expect("grandchild pid file should be written");
+
+        assert_eq!(
+            unsafe { libc::kill(gpid, 0) },
+            0,
+            "grandchild should be alive before guard drop"
+        );
+
+        // Drop guard without manual kill_process_tree
+        drop(guard);
+
+        // The grandchild must be dead
+        let mut dead = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(gpid, 0) } != 0 {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            dead,
+            "ProcessGroupGuard drop must take down grandchildren via process-group kill"
         );
     }
 }
