@@ -524,6 +524,93 @@ async fn setup_mcp_config(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct McpConfigDrift {
+    pub platform_name: &'static str,
+    pub config_path: PathBuf,
+    pub is_toml: bool,
+    pub servers_key: &'static str,
+    pub recommended_json: Option<serde_json::Value>,
+    pub recommended_toml: Option<toml::Value>,
+}
+
+impl McpConfigDrift {
+    pub fn apply_update(&self) -> Result<()> {
+        if self.is_toml {
+            if let Some(ref val) = self.recommended_toml {
+                merge_codex_toml(&self.config_path, val.clone())?;
+            }
+        } else if let Some(ref val) = self.recommended_json {
+            merge_mcp_json(&self.config_path, self.servers_key, val.clone())?;
+        }
+        Ok(())
+    }
+}
+
+pub fn detect_mcp_config_drifts() -> Vec<McpConfigDrift> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+
+    let servers_entry = build_mcp_servers_entry("stdio");
+    let scoped_servers_entry = build_scoped_servers_entry("stdio", &home);
+    let mut drifts = Vec::new();
+
+    for platform in PLATFORMS.iter().copied().filter(|p| p.supports_mcp()) {
+        let Some((path, format)) = platform.mcp_config(&home) else {
+            continue;
+        };
+        if !path.exists() {
+            continue;
+        }
+
+        match format {
+            McpConfigFormat::Toml => {
+                let codex_toml = build_codex_toml_value("stdio");
+                if let Ok(content) = std::fs::read_to_string(&path)
+                    && let Ok(toml_val) = toml::from_str::<toml::Value>(&content)
+                    && let Some(existing) = toml_val.get("mcp_servers").and_then(|s| s.get("Ahma"))
+                    && existing != &codex_toml
+                {
+                    drifts.push(McpConfigDrift {
+                        platform_name: platform.label(),
+                        config_path: path,
+                        is_toml: true,
+                        servers_key: "mcp_servers",
+                        recommended_json: None,
+                        recommended_toml: Some(codex_toml),
+                    });
+                }
+            }
+            McpConfigFormat::Json(servers_key) => {
+                let rec_entry = select_mcp_json_entry(
+                    platform,
+                    "stdio",
+                    &servers_entry,
+                    &scoped_servers_entry,
+                    &home,
+                );
+                if let Ok(content) = std::fs::read_to_string(&path)
+                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+                    && let Some(existing) = json.get(servers_key).and_then(|s| s.get("Ahma"))
+                    && existing != &rec_entry
+                {
+                    drifts.push(McpConfigDrift {
+                        platform_name: platform.label(),
+                        config_path: path,
+                        is_toml: false,
+                        servers_key,
+                        recommended_json: Some(rec_entry),
+                        recommended_toml: None,
+                    });
+                }
+            }
+        }
+    }
+
+    drifts
+}
+
 pub(crate) fn merge_mcp_json(
     path: &Path,
     servers_key: &str,
@@ -550,6 +637,28 @@ pub(crate) fn merge_mcp_json(
     }
 
     let servers_obj = obj.get_mut(servers_key).unwrap().as_object_mut().unwrap();
+    let old_val = servers_obj.get("Ahma");
+    let has_changed = old_val != Some(&value);
+
+    // If the configuration file exists and the Ahma entry is changed, create a backup
+    if path.exists() && has_changed {
+        let backup_path = PathBuf::from(format!("{}.bak", path.display()));
+        if let Err(e) = std::fs::copy(path, &backup_path) {
+            tracing::warn!(
+                "Could not create backup of {} at {}: {}",
+                path.display(),
+                backup_path.display(),
+                e
+            );
+        } else {
+            tracing::info!(
+                "Created backup of {} at {}",
+                path.display(),
+                backup_path.display()
+            );
+        }
+    }
+
     servers_obj.insert("Ahma".to_string(), value);
 
     if let Some(parent) = path.parent() {
@@ -619,6 +728,27 @@ fn merge_codex_toml(path: &Path, value: toml::Value) -> Result<()> {
         .unwrap()
         .as_table_mut()
         .unwrap();
+    let old_val = mcp_servers.get("Ahma");
+    let has_changed = old_val != Some(&value);
+
+    if path.exists() && has_changed {
+        let backup_path = PathBuf::from(format!("{}.bak", path.display()));
+        if let Err(e) = std::fs::copy(path, &backup_path) {
+            tracing::warn!(
+                "Could not create backup of {} at {}: {}",
+                path.display(),
+                backup_path.display(),
+                e
+            );
+        } else {
+            tracing::info!(
+                "Created backup of {} at {}",
+                path.display(),
+                backup_path.display()
+            );
+        }
+    }
+
     mcp_servers.insert("Ahma".to_string(), value);
 
     if let Some(parent) = path.parent() {
@@ -1789,6 +1919,89 @@ mod tests {
     async fn test_prompt_yes_no_setup_eof_is_false() -> Result<()> {
         // EOF / empty line is treated as "no".
         assert!(!prompt_yes_no_setup("Proceed? [y/N]: ").await?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_mcp_json_creates_backup_when_updating() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("mcp.json");
+        let initial = serde_json::json!({
+            "mcpServers": {
+                "Ahma": {
+                    "command": "ahma",
+                    "args": ["serve", "stdio"]
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&initial)?)?;
+
+        let updated = serde_json::json!({
+            "command": "ahma",
+            "args": ["serve", "stdio", "--sandbox", "--sandbox-scope", "/tmp/sandbox"]
+        });
+
+        merge_mcp_json(&path, "mcpServers", updated)?;
+
+        let backup_path = PathBuf::from(format!("{}.bak", path.display()));
+        assert!(backup_path.exists(), "Backup file must be created");
+        let backup_content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(backup_path)?)?;
+        assert_eq!(
+            backup_content["mcpServers"]["Ahma"]["args"],
+            serde_json::json!(["serve", "stdio"])
+        );
+
+        let current_content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(
+            current_content["mcpServers"]["Ahma"]["args"],
+            serde_json::json!([
+                "serve",
+                "stdio",
+                "--sandbox",
+                "--sandbox-scope",
+                "/tmp/sandbox"
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mcp_config_drift_apply_update() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("mcp.json");
+        let initial = serde_json::json!({
+            "mcpServers": {
+                "Ahma": {
+                    "command": "ahma",
+                    "args": ["serve", "stdio"]
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&initial)?)?;
+
+        let drift = McpConfigDrift {
+            platform_name: "Test Platform",
+            config_path: path.clone(),
+            is_toml: false,
+            servers_key: "mcpServers",
+            recommended_json: Some(serde_json::json!({
+                "command": "ahma",
+                "args": ["serve", "stdio", "--sandbox"]
+            })),
+            recommended_toml: None,
+        };
+
+        drift.apply_update()?;
+
+        let backup_path = PathBuf::from(format!("{}.bak", path.display()));
+        assert!(backup_path.exists());
+        let updated: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        assert_eq!(
+            updated["mcpServers"]["Ahma"]["args"],
+            serde_json::json!(["serve", "stdio", "--sandbox"])
+        );
         Ok(())
     }
 }

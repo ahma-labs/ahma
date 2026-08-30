@@ -1529,7 +1529,13 @@ struct ExtractedToolArgs {
 }
 
 fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
-    let Some(raw_args) = input.get("tool_input").or_else(|| input.get("toolArgs")) else {
+    let Some(raw_args) = input
+        .get("tool_input")
+        .or_else(|| input.get("toolArgs"))
+        .or_else(|| input.get("toolCall").and_then(|tc| tc.get("args")))
+        .or_else(|| input.get("tool_call").and_then(|tc| tc.get("args")))
+    else {
+        // Not a shell tool invocation — allow through without modification
         return Ok(None);
     };
 
@@ -1658,10 +1664,10 @@ fn compute_exec_decision_internal(
 fn build_exec_output(decision: HooksDecision, platform: HookPlatform) -> Value {
     match platform {
         HookPlatform::Cursor => build_cursor_hook_output(decision),
-        HookPlatform::Claude
-        | HookPlatform::Codex
-        | HookPlatform::Copilot
-        | HookPlatform::Antigravity => build_structured_hook_output(decision),
+        HookPlatform::Antigravity => build_antigravity_hook_output(decision),
+        HookPlatform::Claude | HookPlatform::Codex | HookPlatform::Copilot => {
+            build_structured_hook_output(decision)
+        }
     }
 }
 
@@ -1669,7 +1675,15 @@ fn extract_command_cwd(input: &Value, tool_input: &Map<String, Value>) -> Result
     if let Some(cwd) = tool_input
         .get("working_directory")
         .and_then(Value::as_str)
+        .or_else(|| tool_input.get("Cwd").and_then(Value::as_str))
+        .or_else(|| tool_input.get("cwd").and_then(Value::as_str))
         .or_else(|| input.get("cwd").and_then(Value::as_str))
+        .or_else(|| {
+            input
+                .get("workspacePaths")
+                .and_then(|p| p.get(0))
+                .and_then(Value::as_str)
+        })
     {
         return Ok(cwd.to_string());
     }
@@ -1719,6 +1733,30 @@ fn build_cursor_hook_output(decision: HooksDecision) -> Value {
             "permission": "deny",
             "user_message": user_message,
             "agent_message": agent_message,
+        }),
+    }
+}
+
+fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
+    match decision {
+        HooksDecision::AllowUnchanged => json!({
+            "decision": "allow",
+        }),
+        HooksDecision::AllowRewrite(updated_input) => json!({
+            "decision": "allow",
+            "overwrite": updated_input,
+        }),
+        HooksDecision::AllowWithWarning { user_message, .. } => json!({
+            "decision": "allow",
+            "reason": user_message,
+        }),
+        HooksDecision::DeferToHost { user_message, .. } => json!({
+            "decision": "allow",
+            "reason": user_message,
+        }),
+        HooksDecision::DenyPendingConsent { user_message, .. } => json!({
+            "decision": "deny",
+            "reason": user_message,
         }),
     }
 }
@@ -2665,7 +2703,8 @@ mod tests {
         let decision =
             compute_exec_decision_internal(&input, HookScope::Project, &env, true, false, None);
         let output = build_exec_output(decision, HookPlatform::Antigravity);
-        let updated = &output["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(output["decision"].as_str(), Some("allow"));
+        let updated = &output["overwrite"];
         let command = updated["CommandLine"].as_str().unwrap();
         assert!(command.starts_with("ahma hooks run-shell"));
         assert!(command.contains(WRAPPED_BY_MARKER));
@@ -2673,6 +2712,31 @@ mod tests {
             updated["description"].as_str(),
             Some("Run specific test binary")
         );
+    }
+
+    #[test]
+    fn test_exec_response_supports_antigravity_toolcall_input() {
+        let env = test_env();
+        let input = json!({
+            "toolCall": {
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "echo hello",
+                    "Cwd": "/tmp/project"
+                }
+            },
+            "stepIdx": 1,
+            "workspacePaths": ["/tmp/project"]
+        });
+
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::Project, &env, true, false, None);
+        let output = build_exec_output(decision, HookPlatform::Antigravity);
+        assert_eq!(output["decision"].as_str(), Some("allow"));
+        let updated = &output["overwrite"];
+        let command = updated["CommandLine"].as_str().unwrap();
+        assert!(command.starts_with("ahma hooks run-shell"));
+        assert!(command.contains(WRAPPED_BY_MARKER));
     }
 
     #[test]

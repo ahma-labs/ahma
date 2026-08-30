@@ -337,7 +337,22 @@ async fn warn_if_running_binary_differs(install_dir: &std::path::Path) {
 }
 
 async fn maybe_run_setup_wizard(args: &UpdateArgs, binary_path: &Path) -> Result<()> {
+    let drifts = crate::setup::detect_mcp_config_drifts();
+
     if args.dry_run {
+        if !drifts.is_empty() {
+            println!(
+                "[dry-run] Detected {} outdated MCP configuration(s) that would be updated with backups (.bak):",
+                drifts.len()
+            );
+            for drift in &drifts {
+                println!(
+                    "  - {} ({})",
+                    drift.platform_name,
+                    drift.config_path.display()
+                );
+            }
+        }
         if args.install_hooks {
             println!(
                 "[dry-run] Would run {} setup --hooks --auto",
@@ -350,6 +365,38 @@ async fn maybe_run_setup_wizard(args: &UpdateArgs, binary_path: &Path) -> Result
     if args.install_hooks {
         run_setup_hooks_only_auto(binary_path).await?;
         return Ok(());
+    }
+
+    if !drifts.is_empty() && can_prompt_for_setup() {
+        println!();
+        println!("Detected outdated MCP server configuration(s):");
+        for drift in &drifts {
+            println!(
+                "  - {} ({})",
+                drift.platform_name,
+                drift.config_path.display()
+            );
+        }
+        if prompt_yes_no(
+            "Update outdated MCP configuration(s) and create backups (.bak)? [Y/n]: ",
+            true,
+        )
+        .await?
+        {
+            for drift in &drifts {
+                if let Err(e) = drift.apply_update() {
+                    eprintln!(
+                        "Warning: failed to update MCP config for {}: {e}",
+                        drift.platform_name
+                    );
+                } else {
+                    println!(
+                        "✓ Updated and backed up MCP config for {}",
+                        drift.platform_name
+                    );
+                }
+            }
+        }
     }
 
     if !can_prompt_for_setup() {

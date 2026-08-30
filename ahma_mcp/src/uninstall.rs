@@ -324,6 +324,9 @@ pub fn remove_mcp_entry(path: &Path, servers_key: &str, dry_run: bool) -> Result
         return Ok(());
     }
 
+    let backup_path = PathBuf::from(format!("{}.bak", path.display()));
+    let _ = std::fs::copy(path, &backup_path);
+
     let mut file = std::fs::File::create(path)
         .with_context(|| format!("Failed to write {}", path.display()))?;
     serde_json::to_writer_pretty(&mut file, &config)

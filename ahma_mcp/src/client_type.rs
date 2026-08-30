@@ -52,7 +52,14 @@ impl McpClientType {
     pub fn from_client_name(name: &str) -> Self {
         let name_lower = name.to_lowercase();
 
-        if name_lower.contains("ahma") {
+        if name_lower.contains("antigravity") || name_lower.starts_with("local-agent-mode") {
+            McpClientType::Antigravity
+        } else if name_lower == "ahma"
+            || name_lower.starts_with("ahma-")
+            || name_lower.starts_with("ahma_")
+            || name_lower.contains("ahma-cli")
+            || name_lower.contains("ahma-ide")
+        {
             McpClientType::Ahma
         } else if name_lower.contains("cursor") {
             McpClientType::Cursor
@@ -66,8 +73,8 @@ impl McpClientType {
             McpClientType::LmStudio
         } else if name_lower.contains("ollama") {
             McpClientType::Ollama
-        } else if name_lower.contains("antigravity") {
-            McpClientType::Antigravity
+        } else if name_lower.contains("ahma") {
+            McpClientType::Ahma
         } else {
             McpClientType::Unknown
         }
@@ -412,6 +419,10 @@ mod tests {
         );
         assert_eq!(
             McpClientType::from_client_name("Antigravity"),
+            McpClientType::Antigravity
+        );
+        assert_eq!(
+            McpClientType::from_client_name("local-agent-mode-Ahma"),
             McpClientType::Antigravity
         );
     }
