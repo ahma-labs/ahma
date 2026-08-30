@@ -889,7 +889,7 @@ fn components(path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::path_helpers::test_abs;
+    use crate::test_utils::path_helpers::{test_abs, test_root};
     use tempfile::tempdir;
 
     fn ws() -> PathBuf {
@@ -1539,8 +1539,12 @@ mod tests {
             grants.rule_paths().is_empty(),
             "`gitdir: /` must never produce an allow rule: {grants:?}"
         );
+        // The pointer text says `/`; what it *resolves* to is the filesystem
+        // root of the platform under test — `C:\` on Windows. Compare against
+        // `test_root()`: a hardcoded `Path::new("/")` here fails on Windows even
+        // though the refusal was recorded correctly.
         assert!(
-            grants.refused.iter().any(|r| r.path == Path::new("/")),
+            grants.refused.iter().any(|r| r.path == test_root()),
             "the refusal must be reported, not silently dropped: {grants:?}"
         );
     }
