@@ -85,8 +85,15 @@ fn budget() -> Duration {
 async fn server_without_a_settled_scope(
     unreachable_socket: &Path,
 ) -> Result<InProcessMcp<RecordingClient>> {
+    // Deliberately an unrecognized client name, not "cursor": this test's
+    // subject is the sandbox gate, which every built-in must pass through
+    // regardless of who's asking — including `read_file`/`write_file`/etc,
+    // which a client with native file tools (Cursor among them) no longer
+    // even sees advertised (see `harness_tool_client_gating_test`). Using a
+    // recognized-but-natives-having client name here would make `MUST_BE_GATED`
+    // silently stop covering those six tools.
     let mcp = create_in_process_mcp_with_client(
-        RecordingClient::new("cursor"),
+        RecordingClient::new("unrecognized-test-client"),
         HashMap::new(),
         Vec::new(), // no scope — and the client offers none
     )

@@ -355,20 +355,6 @@ impl AhmaMcpService {
             .ok_or_else(|| mcp_invalid_params("'content' is required"))?;
 
         let path_ref = Path::new(path);
-        let is_guard_active = {
-            if let Ok(guard) = self.harness_guard.try_lock() {
-                guard.enabled
-            } else {
-                false
-            }
-        };
-
-        if is_guard_active
-            && let Err(err_msg) = crate::harness_guard::check_write_allowance(path_ref)
-        {
-            return Err(mcp_internal(err_msg));
-        }
-
         let narrowing = self.narrow_container_for(path_ref);
         let scopes = self.adapter.sandbox().scopes().to_vec();
 

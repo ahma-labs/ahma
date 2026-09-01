@@ -1115,6 +1115,40 @@ impl AhmaMcpService {
         true
     }
 
+    /// Harness file tools that duplicate a capability every IDE-shaped client
+    /// already ships natively (Claude Code's Read/Write/Edit/Glob/Grep, Cursor's
+    /// and VS Code's equivalents). Advertising them unconditionally cost a real
+    /// incident: a Claude Code plan-mode subagent that lacked native `Write`
+    /// found `write_file` via tool search and called it — ahma refused (the
+    /// target path was outside the sandbox scope), but a subsequent "always
+    /// allow" click would have made that silent. Withholding them from clients
+    /// with natives closes that path and drops seven redundant tools from
+    /// those clients' context; ahma's own agent loop, the TUI, and any client
+    /// without native file tools keep the full set.
+    const HARNESS_FILE_TOOLS: &'static [&'static str] = &[
+        "read_file",
+        "write_file",
+        "replace_in_file",
+        "list_dir",
+        "file_search",
+        "grep_search",
+        "todo_write",
+    ];
+
+    /// Returns true if a hard-coded harness tool should be exposed to `client_type`.
+    /// Only [`Self::HARNESS_FILE_TOOLS`] are gated; everything else (the shell/
+    /// operation tools, `agent`, `fetch_webpage`, `sandbox_grant`, `log_monitor`,
+    /// …) has no native equivalent in any harness and stays visible everywhere.
+    fn is_harness_tool_visible_to_client(name: &str, client_type: McpClientType) -> bool {
+        if !Self::HARNESS_FILE_TOOLS.contains(&name) {
+            return true;
+        }
+        !matches!(
+            client_type,
+            McpClientType::ClaudeDesktop | McpClientType::Cursor | McpClientType::VSCode
+        )
+    }
+
     /// Resolves a `tools/call` tool name to its config, returning the
     /// owned config and (for flattened subcommand names) the resolved
     /// subcommand path.
@@ -1426,8 +1460,10 @@ impl ServerHandler for AhmaMcpService {
                   Results include a bounded stdout/stderr window plus an `output_file` path holding the \
                   COMPLETE output of the operation; when the inline output is marked truncated, read or \
                   grep that file instead of re-running the command. \
-                  For read-only file inspection (read, grep, glob, replace) keep using the IDE's native \
-                  file tools — that is what they are for.".to_string();
+                  For reading, searching, and editing files (read, grep, glob, edit) keep using the \
+                  IDE's native file tools — that is what they are for; ahma withholds its own \
+                  read_file/write_file/replace_in_file/list_dir/file_search/grep_search from clients \
+                  that already have native equivalents.".to_string();
 
         let mut tools_capability = ToolsCapability::default();
         tools_capability.list_changed = Some(true);
@@ -1599,14 +1635,16 @@ impl ServerHandler for AhmaMcpService {
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         self.last_received_signal.store(
             ahma_common::keepalive::current_timestamp_ms(),
             std::sync::atomic::Ordering::Relaxed,
         );
         async move {
+            let client_type = McpClientType::from_peer(&context.peer);
             let mut tools = self.builtin_tools();
+            tools.retain(|tool| Self::is_harness_tool_visible_to_client(&tool.name, client_type));
             tools.extend(self.visible_config_tools());
 
             let external_mgr = self.mcp_connections.read().await;

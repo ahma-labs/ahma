@@ -468,31 +468,42 @@ compensate for the specific weaknesses of small local LLMs. These models typical
 fail at **tool orchestration** (choosing the right tool, formatting arguments correctly,
 recovering from errors) rather than **coding ability**.
 
-### 4.1 Write-Guard Enforcement
+### 4.1 Write-Guard Enforcement — implemented, then removed
 
-**Mechanism:** Intercept MCP `tools/call` requests at the adapter layer:
+**Status: removed.** This was implemented as `harness_guard::write_guard`, but —
+contrary to this section's `--small-model-harness` framing — it was wired to the
+same `harness_guard.enabled` flag as the universally-on self-correction guards
+(name/argument healing, failure-loop detection), not gated on
+`small_model_harness` at all. So it blocked `write_file` overwrites for every
+client, including frontier models with no small-LLM overwrite problem, and it
+contradicted `write_file`'s own advertised "(create or overwrite)" contract. It
+was removed once `write_file`/`replace_in_file` were also gated away from
+clients with native file tools (Claude Code, Cursor, VS Code) — the guard was
+protecting a tool surface those clients no longer even see.
 
-- If the model calls `write_file` targeting a file that **already exists**, reject
-  the call with a structured error:
-  ```json
-  {
-    "error": "FILE_EXISTS: Use replace_in_file for existing files. write_file is for new files only.",
-    "hint": "Call replace_in_file with old_string/new_string to edit the specific section."
-  }
-  ```
+The original mechanism, for reference: intercept MCP `tools/call` requests at
+the adapter layer, and if the model called `write_file` targeting a file that
+**already exists**, reject the call with a structured error:
+```json
+{
+  "error": "FILE_EXISTS: Use replace_in_file for existing files. write_file is for new files only.",
+  "hint": "Call replace_in_file with old_string/new_string to edit the specific section."
+}
+```
 
-- Force edit tools to use **exact string replacement** (`old_string` → `new_string`)
-  rather than line-number-based edits. Small LLMs cannot count lines accurately, but
-  they excel at pattern matching for `str.replace()`.
+**Still relevant, not removed:** forcing edit tools toward **exact string
+replacement** (`old_string` → `new_string`) rather than line-number-based edits
+remains a reasonable small-model accommodation — small LLMs cannot count lines
+accurately, but they excel at pattern matching for `str.replace()`. That is a
+property of `replace_in_file`'s own interface, not of the removed write-guard,
+and needs no gating.
 
-**Why it's critical:** This single invariant prevents the most common catastrophic
-failure mode of small models: silently overwriting an entire file when they meant to
-change one function. Inbar's research found this was one of the highest-impact
-interventions.
-
-**Implementation:** In the MCP tool handler for `write_file` in
-`ahma_mcp/src/mcp_service/handlers/harness_tools.rs`. Check if the target path
-exists before proceeding.
+**Why it seemed critical:** the goal — preventing a small model from silently
+overwriting an entire file when it meant to change one function (Inbar's
+research found this one of the highest-impact interventions) — is real for the
+population `--small-model-harness` targets. A future re-implementation should
+gate on that flag specifically, rather than on the shared self-correction
+switch, so it doesn't reach clients it was never meant for.
 
 ### 4.2 Anti-Thrashing Loop Detector
 
@@ -859,17 +870,16 @@ The harness integrates at the MCP tool-call boundary:
 ```
                     ┌─────────────────────────┐
   incoming tool     │  1. Loop detection       │  (NEW: LoopDetector)
-  call from LLM ───>│  2. Write guard check    │  (NEW: if write_file + exists → reject)
-                    │  3. Format healing       │  (NEW: fix malformed JSON args)
+  call from LLM ───>│  2. Format healing       │  (NEW: fix malformed JSON args)
                     └────────────┬────────────┘
                                  │
                     ┌────────────▼────────────┐
-  execute tool      │  4. Normal MCP dispatch  │  (existing: tool handler)
+  execute tool      │  3. Normal MCP dispatch  │  (existing: tool handler)
                     └────────────┬────────────┘
                                  │
                     ┌────────────▼────────────┐
-  tool result       │  5. Record success/fail  │  (NEW: update LoopDetector)
-  ─────────────────>│  6. Skill injection      │  (NEW: inject contextual guidance)
+  tool result       │  4. Record success/fail  │  (NEW: update LoopDetector)
+  ─────────────────>│  5. Skill injection      │  (NEW: inject contextual guidance)
                     └─────────────────────────┘
 ```
 
@@ -982,11 +992,10 @@ For an agent implementing this plan:
 - [ ] Add `--minimize-tokens` CLI flag and config
 - [ ] Create `ahma_mcp/src/harness_guard/mod.rs` with feature flag gate
 - [ ] Implement `LoopDetector` (§4.2) — ~30 lines
-- [ ] Implement write guard in `write_file` handler (§4.1) — ~15 lines
+- [x] Implement write guard in `write_file` handler (§4.1) — then removed, see §4.1
 - [ ] Add `--small-model-harness` CLI flag and config
 - [ ] Add unit tests for all new components
 - [ ] Integration test: verify `--minimize-tokens` reduces output for `cargo build`
-- [ ] Integration test: verify `--small-model-harness` rejects write-to-existing-file
 
 ## Appendix B: Estimated Total Implementation Size
 

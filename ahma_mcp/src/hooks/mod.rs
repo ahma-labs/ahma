@@ -1708,6 +1708,18 @@ fn updated_tool_input(tool_input: &Map<String, Value>, command: String, key: &st
     Value::Object(updated)
 }
 
+// NOTE: unlike `build_structured_hook_output` (Claude/Codex/Copilot), this
+// function still returns `"permission": "allow"` on every non-deny branch,
+// including the two (`AllowWithWarning`, `DeferToHost`) where ahma is not
+// actually the control for the call. That mirrors a real over-approval bug
+// found in Claude Code's `permissionDecision` field, but fixing it here is
+// deliberately deferred: this codebase has no verified evidence of Cursor's
+// own `preToolUse` contract supporting an "ask"/undecided outcome the way
+// Claude Code's optional `permissionDecision` does (only the Antigravity
+// `command(<regex>)` allow-cache behavior is verified against the shipped
+// binary, per SPEC.md R5.4.2) — omitting `permission` here could as easily
+// default-deny or error as fall through to a prompt. Fix once that contract
+// is confirmed from Cursor's own documentation or a captured session.
 fn build_cursor_hook_output(decision: HooksDecision) -> Value {
     match decision {
         HooksDecision::AllowUnchanged => json!({"permission": "allow"}),
@@ -1747,6 +1759,12 @@ fn build_cursor_hook_output(decision: HooksDecision) -> Value {
     }
 }
 
+// NOTE: same deferral as `build_cursor_hook_output` above — agy's own
+// `PreToolUse` contract has only been reverse-engineered for the
+// `permissionOverrides`/allow-cache behavior (SPEC.md R5.4.2), not for
+// whether an undecided `decision` falls through to agy's own prompt rather
+// than defaulting to deny. Don't drop `"decision": "allow"` here without
+// confirming that first.
 fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
     match decision {
         HooksDecision::AllowUnchanged => json!({
@@ -1823,10 +1841,20 @@ fn build_antigravity_permission_override(wrapped_command: &str) -> String {
 }
 
 fn build_structured_hook_output(decision: HooksDecision) -> Value {
+    // `permissionDecision: "allow"` is an explicit grant that bypasses Claude
+    // Code's own permission system (settings.json rules, then a prompt) for
+    // this call. That is correct ONLY when ahma itself is the substitute
+    // control — `AllowRewrite`, where the command now runs inside ahma's own
+    // sandbox and the wrapped form is opaque enough that re-prompting on it
+    // every time would be pure friction — and for `DenyPendingConsent`, an
+    // explicit refusal. Every other branch means ahma is NOT the control for
+    // this call (hooks inactive or already-wrapped, a fail-open with no
+    // sandbox at all under R5.5.3 session consent, or a host sandbox doing the
+    // enforcing instead) and must omit the field so Claude Code's normal
+    // permission flow decides, rather than being silently force-approved.
     let hook_specific = match decision {
         HooksDecision::AllowUnchanged => json!({
             "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
         }),
         HooksDecision::AllowRewrite { updated_input, .. } => json!({
             "hookEventName": "PreToolUse",
@@ -1834,24 +1862,24 @@ fn build_structured_hook_output(decision: HooksDecision) -> Value {
             "updatedInput": updated_input.clone(),
             "modifiedArgs": updated_input,
         }),
-        // Fail open: allow the original (unsandboxed) command, but surface the
-        // warning to the agent (and a system message where the client shows it).
+        // Fail open (R5.5.3): the command is running with NO ahma sandbox at
+        // all, under one-time session consent — surface the warning, but let
+        // Claude Code's own permission system still have its say.
         HooksDecision::AllowWithWarning {
             user_message,
             agent_message,
         } => json!({
             "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
             "agentMessage": agent_message,
             "systemMessage": user_message,
         }),
-        // Deferred to the host sandbox: allow unchanged, disclose loudly (R7).
+        // Deferred to the host sandbox (R7): the host, not ahma, is the
+        // control here — disclose loudly, but don't also force-approve.
         HooksDecision::DeferToHost {
             user_message,
             agent_message,
         } => json!({
             "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
             "agentMessage": agent_message,
             "systemMessage": user_message,
         }),
@@ -2875,9 +2903,11 @@ mod tests {
 
     #[test]
     fn test_exec_response_allows_non_shell_tools_without_warning() {
-        // Non-shell tools (editFiles, createFile, etc.) have no `command` field.
-        // The hook must exit 0 and return an allow response so VS Code does not
-        // show "warning from pre tool use hook".
+        // Non-shell tools (editFiles, createFile, etc.) have no `command` field,
+        // so they resolve to `AllowUnchanged` — ahma isn't controlling this
+        // call at all. The hook must exit 0 and never deny; it must NOT also
+        // force-approve on VS Code's behalf (`permissionDecision` omitted), so
+        // VS Code's own permission flow decides.
         let env = test_env();
 
         for (tool_name, tool_input) in [
@@ -2894,11 +2924,11 @@ mod tests {
             let decision =
                 compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
             let output = build_exec_output(decision, HookPlatform::Copilot);
-            // Must return allow with no input modification
-            assert_eq!(
-                output["hookSpecificOutput"]["permissionDecision"].as_str(),
-                Some("allow"),
-                "{tool_name} should be allowed"
+            assert!(
+                output["hookSpecificOutput"]
+                    .get("permissionDecision")
+                    .is_none(),
+                "{tool_name} should not be force-approved by ahma"
             );
             assert!(
                 output["hookSpecificOutput"]["updatedInput"].is_null(),
@@ -2917,9 +2947,10 @@ mod tests {
             None,
         );
         let output = build_exec_output(decision, HookPlatform::Copilot);
-        assert_eq!(
-            output["hookSpecificOutput"]["permissionDecision"].as_str(),
-            Some("allow")
+        assert!(
+            output["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none()
         );
     }
 
@@ -3669,13 +3700,28 @@ mod tests {
 
     // ----------------------------------------------------------------------
     // build_structured_hook_output (all decision arms)
+    //
+    // Only `AllowRewrite` (ahma is substituting its own sandbox for the call)
+    // and `DenyPendingConsent` carry an explicit `permissionDecision`. Claude
+    // Code treats an explicit `"allow"` as bypassing its own permission system
+    // for that call (settings.json rules, then prompt) — appropriate only when
+    // ahma is actually providing the control. `AllowUnchanged` (hooks inactive,
+    // or the command is already wrapped), `AllowWithWarning` (the fail-open
+    // path after session consent — genuinely running with NO sandbox at all,
+    // R5.5.3), and `DeferToHost` (a host sandbox is the control, not ahma) must
+    // omit it so Claude Code's own permission flow runs instead of being
+    // silently force-approved.
     // ----------------------------------------------------------------------
     #[test]
     fn test_build_structured_hook_output_allow_unchanged() {
         let out = build_structured_hook_output(HooksDecision::AllowUnchanged);
         let hs = &out["hookSpecificOutput"];
         assert_eq!(hs["hookEventName"].as_str(), Some("PreToolUse"));
-        assert_eq!(hs["permissionDecision"].as_str(), Some("allow"));
+        assert!(
+            hs.get("permissionDecision").is_none(),
+            "AllowUnchanged must not force-approve: ahma isn't controlling this call \
+             (hooks inactive, or the command is already wrapped) — got {hs:?}"
+        );
     }
 
     #[test]
@@ -3688,6 +3734,10 @@ mod tests {
         let hs = &out["hookSpecificOutput"];
         assert_eq!(hs["updatedInput"]["command"].as_str(), Some("wrapped"));
         assert_eq!(hs["modifiedArgs"]["command"].as_str(), Some("wrapped"));
+        // The one branch where explicit allow is earning its keep: ahma IS the
+        // substitute sandbox here, and the wrapped command is opaque enough
+        // that re-prompting on it every time would be pure friction.
+        assert_eq!(hs["permissionDecision"].as_str(), Some("allow"));
     }
 
     #[test]
@@ -3697,9 +3747,41 @@ mod tests {
             agent_message: "agent".to_string(),
         });
         let hs = &out["hookSpecificOutput"];
-        assert_eq!(hs["permissionDecision"].as_str(), Some("allow"));
+        assert!(
+            hs.get("permissionDecision").is_none(),
+            "AllowWithWarning is the fail-open path — the command is running with \
+             NO ahma sandbox at all, so Claude Code's own permission system must \
+             still run rather than being force-approved — got {hs:?}"
+        );
         assert_eq!(hs["agentMessage"].as_str(), Some("agent"));
         assert_eq!(hs["systemMessage"].as_str(), Some("sys"));
+    }
+
+    #[test]
+    fn test_build_structured_hook_output_defer_to_host() {
+        let out = build_structured_hook_output(HooksDecision::DeferToHost {
+            user_message: "sys".to_string(),
+            agent_message: "agent".to_string(),
+        });
+        let hs = &out["hookSpecificOutput"];
+        assert!(
+            hs.get("permissionDecision").is_none(),
+            "DeferToHost means the HOST sandbox is the control, not ahma — ahma \
+             must not also force-approve on top of it — got {hs:?}"
+        );
+        assert_eq!(hs["agentMessage"].as_str(), Some("agent"));
+        assert_eq!(hs["systemMessage"].as_str(), Some("sys"));
+    }
+
+    #[test]
+    fn test_build_structured_hook_output_deny_pending_consent_still_denies() {
+        let out = build_structured_hook_output(HooksDecision::DenyPendingConsent {
+            user_message: "sys".to_string(),
+            agent_message: "agent".to_string(),
+        });
+        let hs = &out["hookSpecificOutput"];
+        assert_eq!(hs["permissionDecision"].as_str(), Some("deny"));
+        assert_eq!(hs["permissionDecisionReason"].as_str(), Some("sys"));
     }
 
     // ----------------------------------------------------------------------
@@ -4307,15 +4389,15 @@ mod tests {
     }
 
     #[test]
-    fn test_defer_to_host_structured_output_allows() {
+    fn test_defer_to_host_structured_output_runs_command_unchanged() {
+        // Deferral semantics for the `permissionDecision` field itself are
+        // covered by `test_build_structured_hook_output_defer_to_host` above
+        // (must be omitted — the host sandbox is the control, not ahma). This
+        // test covers the other half: no rewrite happens.
         let out = build_structured_hook_output(HooksDecision::DeferToHost {
             user_message: "msg".to_string(),
             agent_message: "agent".to_string(),
         });
-        assert_eq!(
-            out["hookSpecificOutput"]["permissionDecision"].as_str(),
-            Some("allow")
-        );
         assert!(out["hookSpecificOutput"].get("updatedInput").is_none());
     }
 

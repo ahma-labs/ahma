@@ -576,6 +576,30 @@ async fn write_file_success() {
     assert_eq!(text, "File written");
 }
 
+/// `write_file`'s own description says "(create or overwrite)" — this asserts
+/// the handler actually honours that against a real, already-existing file on
+/// disk (the harness guard used to hard-block this with a `FILE_EXISTS`
+/// error, contradicting the tool's advertised contract).
+#[tokio::test]
+async fn write_file_overwrites_an_existing_file() {
+    let svc = make_service_with(
+        Arc::new(MockFileOpsProvider::default()),
+        Arc::new(MockWebPageFetcher::default()),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let existing = dir.path().join("already-here.txt");
+    std::fs::write(&existing, "old content").unwrap();
+
+    let args = make_args(&[
+        ("path", json!(existing.to_str().unwrap())),
+        ("content", json!("new content")),
+    ]);
+    let result = svc.handle_write_file(args).await.unwrap();
+    let text = result.content[0].as_text().unwrap().text.as_str();
+    assert_eq!(text, "File written");
+}
+
 #[tokio::test]
 async fn write_file_provider_error_becomes_mcp_error() {
     let svc = make_service_with(

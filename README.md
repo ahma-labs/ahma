@@ -336,7 +336,7 @@ For commands run during this project, prefer ahma's `run_terminal_command` (via 
 - the output should be watched for errors mid-run — set `monitor_level` to get pushed alerts
 - multiple independent commands should run concurrently — each gets its own operation_id
 
-For read-only file inspection (read, grep, glob, find, replace-in-file) keep using the IDE's native file tools — they are faster and cheaper than going through MCP.
+For reading, searching, and editing files (read, grep, glob, find, edit) keep using the IDE's native file tools — they are faster and cheaper than going through MCP. Clients with native file tools (Claude Code, Cursor, VS Code) don't see ahma's `read_file`/`write_file`/`replace_in_file`/`list_dir`/`file_search`/`grep_search` in `tools/list` at all; those stay available only to clients without native equivalents (ahma's own agent loop, the TUI).
 
 The downstream effect: `cargo`, `git`, `pytest`, build scripts, formatters, and long log tails go through ahma; file reads and edits stay on native tooling.
 ```
