@@ -18,71 +18,58 @@ pub fn find_subcommand_config_from_args(
     }
 
     let subcommand_path = subcommand_name.unwrap_or_else(|| "default".to_string());
-    let subcommand_parts: Vec<&str> = subcommand_path.split('_').collect();
+    let top_level = tool_config.subcommand.as_ref()?;
 
     tracing::debug!(
-        "Finding subcommand for tool '{}': path='{}', parts={:?}, has_subcommands={}",
+        "Finding subcommand for tool '{}': path='{}', has_subcommands=true",
         tool_config.name,
         subcommand_path,
-        subcommand_parts,
-        tool_config.subcommand.is_some()
     );
 
-    let mut current_subcommands = tool_config.subcommand.as_ref()?;
-    let mut found_subcommand: Option<&SubcommandConfig> = None;
+    let (found, mut name_parts) = find_subcommand_in_level(top_level, &subcommand_path)?;
+
     let mut command_parts = vec![tool_config.command.clone()];
+    command_parts.append(&mut name_parts);
 
-    for (i, part) in subcommand_parts.iter().enumerate() {
-        tracing::debug!(
-            "Searching for subcommand part '{}' (index {}/{}) in {} candidates",
-            part,
-            i,
-            subcommand_parts.len() - 1,
-            current_subcommands.len()
-        );
+    Some((found, command_parts))
+}
 
-        if let Some(sub) = current_subcommands
-            .iter()
-            .find(|s| s.name == *part && s.enabled)
-        {
-            tracing::debug!(
-                "Found matching subcommand: name='{}', enabled={}",
-                sub.name,
-                sub.enabled
-            );
-
-            if sub.name != "default" {
-                command_parts.push(sub.name.clone());
-            }
-
-            if i == subcommand_parts.len() - 1 {
-                found_subcommand = Some(sub);
-                break;
-            }
-
-            if let Some(nested) = &sub.subcommand {
-                current_subcommands = nested;
-            } else {
-                tracing::debug!(
-                    "Subcommand '{}' has no nested subcommands, but path continues",
-                    sub.name
-                );
-                return None; // More parts in name, but no more nested subcommands
-            }
+/// Resolves `remaining` against one level of sibling `subcommands`.
+///
+/// Tries the **whole** remaining path as a single leaf name first. This is what makes
+/// a flat config authored with pre-joined names work — `.ahma/gh.json`'s 13
+/// subcommands are a single-level list named `"pr_create"`, `"run_watch"`,
+/// `"workflow_view"`, … (no nested `"pr"`/`"run"`/`"workflow"` parents), and the
+/// schema/advertisement path (`schema.rs`) already treats each as one opaque leaf, so
+/// dispatch must match it the same way rather than assuming every `_` is a nesting
+/// boundary. Only when the whole-path match fails does this split off the first
+/// `_`-delimited token and descend into a nested `subcommand` list, for genuinely
+/// hierarchical configs (e.g. `cargo`'s `nextest_run`, a `nextest` parent with a
+/// nested `run`).
+fn find_subcommand_in_level<'a>(
+    subcommands: &'a [SubcommandConfig],
+    remaining: &str,
+) -> Option<(&'a SubcommandConfig, Vec<String>)> {
+    if let Some(sub) = subcommands
+        .iter()
+        .find(|s| s.name == remaining && s.enabled)
+    {
+        let parts = if sub.name == "default" {
+            Vec::new()
         } else {
-            tracing::debug!(
-                "Subcommand part '{}' not found. Available: {:?}",
-                part,
-                current_subcommands
-                    .iter()
-                    .map(|s| &s.name)
-                    .collect::<Vec<_>>()
-            );
-            return None; // Subcommand part not found
-        }
+            vec![sub.name.clone()]
+        };
+        return Some((sub, parts));
     }
 
-    found_subcommand.map(|sc| (sc, command_parts))
+    let (first, rest) = remaining.split_once('_')?;
+    let sub = subcommands.iter().find(|s| s.name == first && s.enabled)?;
+    let nested = sub.subcommand.as_ref()?;
+    let (leaf, mut nested_parts) = find_subcommand_in_level(nested, rest)?;
+
+    let mut parts = vec![sub.name.clone()];
+    parts.append(&mut nested_parts);
+    Some((leaf, parts))
 }
 
 #[cfg(test)]
@@ -226,6 +213,34 @@ mod tests {
         let (sub, parts) = result.unwrap();
         assert_eq!(sub.name, "leaf");
         assert_eq!(parts, vec!["tool", "top", "mid", "leaf"]);
+    }
+
+    /// Reproduces a real dispatch failure: `.ahma/gh.json` authors its 13 subcommands
+    /// as a *flat* list whose `name` already contains an underscore (`"pr_create"`,
+    /// `"run_watch"`, `"workflow_view"`, …) rather than genuine nested levels (a `"pr"`
+    /// parent with `"create"` as a nested child). The schema/advertisement path
+    /// (`schema.rs`) treats `"pr_create"` as one opaque leaf name and happily
+    /// advertises `gh_pr_create` as a tool, but this function used to split every
+    /// `_` unconditionally and look for a sibling literally named `"pr"` — which does
+    /// not exist — so every `gh_*` tool call failed with "Subcommand ... not found or
+    /// invalid" even though the config plainly lists it. The whole remaining path must
+    /// be tried as a single leaf name before splitting on `_`.
+    #[test]
+    fn test_find_subcommand_flat_underscore_name() {
+        let subcommands = vec![
+            make_subcommand("pr_create", true),
+            make_subcommand("run_watch", true),
+        ];
+        let config = make_tool_config("gh", Some(subcommands));
+
+        let result = find_subcommand_config_from_args(&config, Some("pr_create".to_string()));
+        assert!(
+            result.is_some(),
+            "a flat, underscore-containing subcommand name must resolve as one leaf"
+        );
+        let (sub, parts) = result.unwrap();
+        assert_eq!(sub.name, "pr_create");
+        assert_eq!(parts, vec!["gh", "pr_create"]);
     }
 
     #[test]
