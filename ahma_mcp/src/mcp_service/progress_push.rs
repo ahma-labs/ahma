@@ -141,7 +141,7 @@ impl ProgressPushRouter {
     /// No-ops once the operation is no longer active. This is a *separate*
     /// task from the one waiting on the operation (`Drop` cannot await, so
     /// restoration is spawned — see `ProgressRedirect`), racing against the
-    /// forwarder's own [`Self::claim_terminal`] for the same terminal event.
+    /// forwarder's own `claim_terminal` for the same terminal event.
     /// Checking `targets` for "is there still an entry to restore onto"
     /// doesn't resolve that race: if this task runs *before* the forwarder's
     /// claim, the entry is still present and gets overwritten with the

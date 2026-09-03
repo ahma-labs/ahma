@@ -9,7 +9,7 @@
 //! - **Cursor**: Believed to log errors for progress notifications with unknown
 //!   tokens, even when the server correctly uses the client-provided
 //!   `progressToken` — asserted, not measured (see
-//!   [`McpClientType::supports_progress`] for why it can't be). To avoid noisy
+//!   [`McpClientType::supports_progress`](crate::client_type::McpClientType::supports_progress) for why it can't be). To avoid noisy
 //!   error logs in Cursor, ahma skips sending progress notifications for this
 //!   client by default; `tools.force_progress_notifications` overrides it.
 //!
@@ -143,7 +143,7 @@ impl McpClientType {
     /// is exactly as reliable as the guess that produced it: wrong for any
     /// client whose name doesn't match, silently, forever.
     ///
-    /// The real answer is [`AhmaMcpService::push_channel_open`]: when a live
+    /// The real answer is `AhmaMcpService::push_channel_open`: when a live
     /// push channel is confirmed, `await` verifies liveness directly with
     /// periodic pings instead of guessing a deadline for it up front (SPEC
     /// R2.6.5.3), and this budget is not consulted at all. This value is only
@@ -157,7 +157,6 @@ impl McpClientType {
     /// `tools.request_budget_override_secs` / `--request-budget-secs` (SPEC
     /// R2.6.5.2) rather than ahma guessing on their behalf.
     ///
-    /// [`AhmaMcpService::push_channel_open`]: crate::mcp_service::AhmaMcpService::push_channel_open
     pub fn request_budget(&self) -> std::time::Duration {
         const FALLBACK_REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
         FALLBACK_REQUEST_BUDGET

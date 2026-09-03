@@ -107,7 +107,7 @@ impl WorkspaceScope {
 
     /// The single commit point (R5.1.1). See [`CommitOutcome`].
     ///
-    /// A commit made while a TUI-only answer is parked ([`State::Pending`],
+    /// A commit made while a TUI-only answer is parked ([`CommitOutcome::Pending`],
     /// R5.3.6) is the moment "the next IDE session attaches": the pending scope
     /// is applied (promoted to active) first, and the proposed scope is then
     /// evaluated against it through the normal downgrade gate — same is a

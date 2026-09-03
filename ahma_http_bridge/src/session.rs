@@ -826,6 +826,75 @@ fn handle_sandbox_notification(session: &Arc<Session>, value: &Value) {
 ///
 /// Routes JSON-RPC responses to waiting callers; broadcasts all other messages
 /// (notifications) to SSE subscribers and drives sandbox state transitions.
+/// The bare MCP `ping` the subprocess sends mid-`await` to verify the client
+/// is still there (SPEC R2.6.5.3).
+const PING_METHOD: &str = "ping";
+
+/// Answer a subprocess-initiated `ping` on the client's behalf **iff** this
+/// session holds a live push channel (an open SSE stream), otherwise leave it
+/// unanswered so the subprocess's probe times out (SPEC R2.6.5.3).
+///
+/// Why the bridge answers instead of forwarding: the ping cannot reach the
+/// real client through ahma's own stdio proxy while the `await` that sent it
+/// is in flight — rmcp's streamable-HTTP client awaits each POST inline, so
+/// nothing pushed over SSE is relayed until the `tools/call` response lands.
+/// Forwarding therefore timed out the probe against a perfectly healthy
+/// client ~25s into every long `await`, which the subprocess then reported as
+/// a timeout. The live SSE stream *is* the liveness the probe was meant to
+/// verify: when the client dies, its proxy exits, the stream closes, the
+/// subscriber count drops to zero, and the next probe correctly goes
+/// unanswered.
+///
+/// Synchronous on purpose — it runs inside the I/O loop's line dispatch. The
+/// sender mutex is only ever held for a clone, so `try_lock` is expected to
+/// succeed; if it does not (or the channel is momentarily full) the send is
+/// retried on a task when a runtime is available.
+fn answer_subprocess_ping(session: &Arc<Session>, id: Value) {
+    let subscribers = session.broadcast_tx.receiver_count();
+    if subscribers == 0 {
+        warn!(
+            session_id = %session.id,
+            "Subprocess liveness ping left unanswered: no SSE subscriber, so there is \
+             no live push channel to vouch for the client (SPEC R2.6.5.3)"
+        );
+        return;
+    }
+    let answer = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}});
+    let json_str = match serde_json::to_string(&answer) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(session_id = %session.id, "Failed to serialize ping answer: {e}");
+            return;
+        }
+    };
+    debug!(
+        session_id = %session.id,
+        subscribers,
+        "Answering subprocess liveness ping on the client's behalf (live push channel)"
+    );
+    if let Ok(sender) = session.sender.try_lock()
+        && sender.try_send(json_str.clone()).is_ok()
+    {
+        return;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let session = Arc::clone(session);
+        handle.spawn(async move {
+            if let Err(e) = session
+                .send_serialized_to_subprocess(json_str, "Failed to answer liveness ping")
+                .await
+            {
+                warn!(session_id = %session.id, "Ping answer not delivered: {e}");
+            }
+        });
+    } else {
+        warn!(
+            session_id = %session.id,
+            "Ping answer not delivered: subprocess channel busy and no runtime to retry on"
+        );
+    }
+}
+
 fn dispatch_subprocess_line(session: &Arc<Session>, line: &str, colored_output: bool) {
     debug!(session_id = %session.id, "Received from subprocess: {}", line);
 
@@ -852,19 +921,34 @@ fn dispatch_subprocess_line(session: &Arc<Session>, line: &str, colored_output: 
         }
     };
 
-    // Route to waiting caller if this is a response to a pending request
+    // A message with a `method` is a request or notification the subprocess
+    // is sending; only a message *without* one can be a response. The id
+    // spaces are independent — the subprocess numbers its own requests from 0
+    // (rmcp), the client numbers its own — so a subprocess request can carry
+    // the id of a client call still pending here. Matching on the id alone
+    // consumed that request as the pending call's "response": the caller got
+    // a body with no `result`, and the request itself was never delivered.
+    let method = value.get("method").and_then(|m| m.as_str());
     if let Some(id) = value.get("id") {
         let id_str = id.as_str().map_or_else(|| id.to_string(), str::to_string);
-        if let Some(sender) = take_pending_request(&session.pending_requests, &id_str) {
-            let _ = sender.send(value);
-            return;
-        }
-
-        // Store server-to-client request method name to validate response routing
-        if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
-            session
-                .pending_client_requests
-                .insert(id_str, method.to_string());
+        match method {
+            None => {
+                // Route to waiting caller if this is a response to a pending request
+                if let Some(sender) = take_pending_request(&session.pending_requests, &id_str) {
+                    let _ = sender.send(value);
+                    return;
+                }
+            }
+            Some(PING_METHOD) => {
+                answer_subprocess_ping(session, id.clone());
+                return;
+            }
+            Some(method) => {
+                // Store server-to-client request method name to validate response routing
+                session
+                    .pending_client_requests
+                    .insert(id_str, method.to_string());
+            }
         }
     }
 
@@ -2219,6 +2303,111 @@ mod session_logic_tests {
                 .get("srv-7")
                 .map(|m| m.value().clone()),
             Some("roots/list".to_string())
+        );
+    }
+
+    /// REGRESSION (SPEC R2.6.5.3): the subprocess mints its own ids for the
+    /// requests it sends (rmcp counts from 0), the client mints its own for the
+    /// requests it sends, and the two counters are independent — so a
+    /// subprocess *request* can carry the same id as a client request the
+    /// bridge is still waiting on. Matching on the id alone consumed the
+    /// subprocess's request as the pending call's response: the caller got a
+    /// message with no `result`, and the request itself vanished. A message
+    /// with a `method` is a request, never a response, whatever its id.
+    #[test]
+    fn dispatch_never_mistakes_a_subprocess_request_for_a_response_with_the_same_id() {
+        let (session, _rx) = make_test_session();
+        let mut sub = session.subscribe();
+        let (tx, mut resp_rx) = oneshot::channel();
+        session.pending_requests.insert("5".to_string(), tx);
+
+        dispatch_subprocess_line(
+            &session,
+            &json!({"jsonrpc": "2.0", "id": 5, "method": "elicitation/create", "params": {}})
+                .to_string(),
+            false,
+        );
+
+        assert!(
+            session.pending_requests.contains_key("5"),
+            "the client's pending call must survive a subprocess request with the same id"
+        );
+        assert!(
+            resp_rx.try_recv().is_err(),
+            "a request must never be delivered as the response to a pending call"
+        );
+        assert_eq!(
+            session
+                .pending_client_requests
+                .get("5")
+                .map(|m| m.value().clone()),
+            Some("elicitation/create".to_string()),
+            "the request is a server-to-client request and must be tracked as one"
+        );
+        let (_, msg) = sub
+            .try_recv()
+            .expect("the request must reach the client over SSE");
+        assert!(msg.contains("elicitation/create"));
+    }
+
+    /// SPEC R2.6.5.3: the subprocess's mid-`await` liveness `ping` is answered
+    /// by the bridge on the client's behalf **iff** the session holds a live
+    /// push channel. Forwarding it to the client cannot work through the
+    /// stdio proxy: rmcp's streamable-HTTP client awaits each POST inline, so
+    /// while the `await` request is in flight nothing the bridge pushes is
+    /// relayed, and the probe times out against a perfectly healthy client.
+    /// The live SSE stream is the signal the probe was meant to verify.
+    #[test]
+    fn dispatch_answers_a_subprocess_ping_while_a_push_channel_is_open() {
+        let (session, mut rx) = make_test_session();
+        let mut sub = session.subscribe();
+        // The pending-call collision from the test above, on the ping path: the
+        // answer must go back even when the ping's id shadows a pending call.
+        let (tx, mut resp_rx) = oneshot::channel();
+        session.pending_requests.insert("9".to_string(), tx);
+
+        dispatch_subprocess_line(
+            &session,
+            &json!({"jsonrpc": "2.0", "id": 9, "method": "ping"}).to_string(),
+            false,
+        );
+
+        let answer = rx
+            .try_recv()
+            .expect("the ping must be answered to the subprocess");
+        let answer: Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(answer["id"], 9);
+        assert!(
+            answer.get("result").is_some() && answer.get("error").is_none(),
+            "a live push channel means the client is reachable: {answer}"
+        );
+        assert!(
+            sub.try_recv().is_err(),
+            "an answered ping is not also forwarded — the client would answer a \
+             second time into a request nobody is waiting on"
+        );
+        assert!(session.pending_requests.contains_key("9"));
+        assert!(resp_rx.try_recv().is_err());
+    }
+
+    /// The complement: with no SSE subscriber there is no live channel, so the
+    /// probe must be left to time out — that is the "client gone" verdict the
+    /// subprocess's `await` ends the wait on. Answering here would report a
+    /// vanished client as alive.
+    #[test]
+    fn dispatch_leaves_a_subprocess_ping_unanswered_with_no_push_channel() {
+        let (session, mut rx) = make_test_session();
+        assert_eq!(session.broadcast_tx.receiver_count(), 0);
+
+        dispatch_subprocess_line(
+            &session,
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}).to_string(),
+            false,
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no push channel: the ping must not be answered on the client's behalf"
         );
     }
 

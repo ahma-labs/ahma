@@ -93,6 +93,85 @@ pub fn test_sandbox_exec_available() -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// Whether **this process** is already confined by a macOS Seatbelt profile —
+/// asked of the kernel directly via `sandbox_check(getpid(), NULL, …)`, the
+/// same call Chromium and others use. No subprocess, no filesystem probe.
+///
+/// This is the cheap half of nested-Seatbelt detection (SPEC R7.6): a process
+/// that is not confined cannot be refused a nested profile, so the subprocess
+/// probe in [`test_sandbox_exec_available`] only ever runs when this says
+/// `true`. Every child of a confined process inherits the confinement — that
+/// is what makes deferring to the outer sandbox safe in kind.
+#[cfg(target_os = "macos")]
+pub fn process_is_seatbelt_confined() -> bool {
+    // SANDBOX_CHECK_NO_REPORT: answer without logging a violation.
+    const SANDBOX_CHECK_NO_REPORT: libc::c_int = 0x0002;
+    unsafe extern "C" {
+        // libsystem_sandbox: `int sandbox_check(pid_t pid, const char *operation,
+        // int type, ...)`. With a NULL operation it reports whether the process
+        // is sandboxed at all: 1 when confined, 0 when not, -1 on error.
+        fn sandbox_check(
+            pid: libc::pid_t,
+            operation: *const libc::c_char,
+            type_: libc::c_int,
+            ...
+        ) -> libc::c_int;
+    }
+    // SAFETY: plain FFI query on our own pid with a NULL operation, which the
+    // documented calling convention permits; no pointers are retained.
+    let rc = unsafe {
+        sandbox_check(
+            std::process::id() as libc::pid_t,
+            std::ptr::null(),
+            SANDBOX_CHECK_NO_REPORT,
+        )
+    };
+    rc == 1
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_is_seatbelt_confined() -> bool {
+    false
+}
+
+/// The outer sandbox ahma must defer to because macOS refuses to nest its
+/// Seatbelt profile inside it (SPEC R7.6), or `None` when ahma can enforce.
+///
+/// Both halves of the proof are required, and the verdict is cached for the
+/// life of the process (confinement is irrevocable, so it cannot change):
+///
+/// 1. [`process_is_seatbelt_confined`] — the kernel says this process is
+///    inside a profile. Cheap, and `false` for the overwhelming majority of
+///    processes, which therefore never pay for step 2.
+/// 2. [`test_sandbox_exec_available`] — a nested `sandbox-exec` is actually
+///    *refused* (`sandbox_apply: Operation not permitted`). Measured on
+///    macOS 26: the kernel denies a nested profile whenever the outer profile
+///    denies anything at all — `(allow default)` plus a single `deny` of an
+///    unrelated path is enough — so every real sandbox, ahma's own included,
+///    forbids nesting. Only a no-op `(allow default)` outer profile permits
+///    it, and in that case ahma keeps enforcing.
+///
+/// The host is named when it can be (SPEC R7.1): ahma's own `run_terminal_command`
+/// stamps its children, so the dogfooding case — ahma's test suite, or a nested
+/// `ahma serve`, run *through* ahma — reports "ahma" rather than "an outer
+/// sandbox".
+pub fn nested_seatbelt_denial() -> Option<super::host_detect::HostSandbox> {
+    static VERDICT: std::sync::OnceLock<Option<super::host_detect::HostSandbox>> =
+        std::sync::OnceLock::new();
+    *VERDICT.get_or_init(|| {
+        if !process_is_seatbelt_confined() {
+            return None;
+        }
+        match test_sandbox_exec_available() {
+            Err(SandboxError::NestedSandboxDetected) => Some(
+                super::host_detect::detect_host_sandbox()
+                    .unwrap_or(super::host_detect::HostSandbox::Unidentified),
+            ),
+            _ => None,
+        }
+    })
+}
+
 pub fn exit_with_sandbox_error(error: &SandboxError) -> ! {
     eprintln!("\n\u{274c} SECURITY ERROR: Cannot start MCP server\n");
     eprintln!("Reason: {}\n", error);

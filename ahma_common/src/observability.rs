@@ -3,9 +3,26 @@
 //! Provides a single source of truth for tracing/metrics setup used by
 //! both `ahma_mcp` and `ahma_http_bridge`.
 //!
+//! ## Feature-gated: `otel`
+//!
+//! The OpenTelemetry SDK subtree (`opentelemetry`, `opentelemetry-otlp`,
+//! `opentelemetry_sdk`, `tracing-opentelemetry` — ~200 crates transitively) is
+//! compiled only when this crate's `otel` feature is enabled. It is off by
+//! default, so it costs nothing in a normal developer build, test, or clippy
+//! cycle; `ahma_bin --features otel` turns it on (forwarded through
+//! `ahma_mcp`/`ahma_http_bridge`), and CI builds/tests that flavour separately
+//! and ships it in release binaries. See
+//! `docs/build-and-test-performance.md`.
+//!
+//! Every function here keeps the **same public signature** regardless of the
+//! feature: without `otel`, [`create_otel_layer`] is a hard no-op even if an
+//! endpoint is configured, and the `record_*`/`current_traceparent` helpers
+//! return their empty value. Callers therefore never need their own
+//! `#[cfg(feature = "otel")]`.
+//!
 //! ## Design
 //!
-//! Tracing is opt-in: pass `--opentelemetry <endpoint>` (or set
+//! Tracing is opt-in at runtime too: pass `--opentelemetry <endpoint>` (or set
 //! `OTEL_EXPORTER_OTLP_ENDPOINT`) to activate export.  When neither is
 //! provided the pipeline uses a no-op tracer — zero runtime overhead.
 //!
@@ -97,6 +114,7 @@ impl TelemetryGuard {
         Self { _inner: None }
     }
 
+    #[cfg(feature = "otel")]
     fn with_guard(guard: ObservabilityGuard) -> Self {
         Self {
             _inner: Some(Box::new(guard)),
@@ -108,18 +126,22 @@ impl TelemetryGuard {
 // OTEL initialization
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider as _;
+#[cfg(feature = "otel")]
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{
-    Resource,
-    trace::{self as sdktrace, SdkTracerProvider},
-};
+#[cfg(feature = "otel")]
+use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
+#[cfg(feature = "otel")]
+use tracing_subscriber::Layer as _;
 
 /// Internal guard that holds the tracer provider and shuts it down on drop.
+#[cfg(feature = "otel")]
 struct ObservabilityGuard {
     tracer_provider: SdkTracerProvider,
 }
 
+#[cfg(feature = "otel")]
 impl Drop for ObservabilityGuard {
     fn drop(&mut self) {
         if let Err(e) = self.tracer_provider.shutdown() {
@@ -130,25 +152,34 @@ impl Drop for ObservabilityGuard {
     }
 }
 
+/// A type-erased [`tracing_subscriber::Layer`], so the return type of
+/// [`create_otel_layer`] does not depend on whether the `otel` feature is
+/// enabled (the real layer's concrete type, `OpenTelemetryLayer<S, Tracer>`,
+/// only exists when it is).
+pub type BoxedTracingLayer<S> = Box<dyn tracing_subscriber::Layer<S> + Send + Sync>;
+
 /// Build an OpenTelemetry tracing layer and start exporting spans.
 ///
-/// Returns `(None, no-op guard)` when `config.endpoint` is `None`, or when
-/// the OTLP exporter cannot be built (error is printed to stderr rather than
-/// propagating so that the server always starts, just without telemetry).
+/// Returns `(None, no-op guard)` when `config.endpoint` is `None`, when the
+/// OTLP exporter cannot be built (error is printed to stderr rather than
+/// propagating so that the server always starts, just without telemetry), or
+/// unconditionally when this crate's `otel` feature is disabled.
 ///
 /// The caller **must** keep the returned [`TelemetryGuard`] alive until
 /// shutdown to ensure all buffered spans are flushed.
 ///
 /// The layer is generic over the subscriber type `S` to compose cleanly with
 /// [`tracing_subscriber::registry()`] chains.
+#[cfg(feature = "otel")]
 pub fn create_otel_layer<S>(
     config: &ObservabilityConfig,
-) -> (
-    Option<tracing_opentelemetry::OpenTelemetryLayer<S, sdktrace::Tracer>>,
-    TelemetryGuard,
-)
+) -> (Option<BoxedTracingLayer<S>>, TelemetryGuard)
 where
-    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    S: tracing::Subscriber
+        + for<'span> tracing_subscriber::registry::LookupSpan<'span>
+        + Send
+        + Sync
+        + 'static,
 {
     let endpoint = match &config.endpoint {
         Some(ep) => ep.clone(),
@@ -184,7 +215,7 @@ where
     opentelemetry::global::set_tracer_provider(provider.clone());
 
     let tracer = provider.tracer(config.service_name.clone());
-    let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let layer = tracing_opentelemetry::layer().with_tracer(tracer).boxed();
 
     let guard = TelemetryGuard::with_guard(ObservabilityGuard {
         tracer_provider: provider,
@@ -193,17 +224,37 @@ where
     (Some(layer), guard)
 }
 
+/// `otel`-disabled flavour: a hard no-op regardless of `config`. See the
+/// module-level "Feature-gated" section — callers never need their own
+/// `#[cfg(feature = "otel")]` because this keeps the same signature.
+#[cfg(not(feature = "otel"))]
+pub fn create_otel_layer<S>(
+    _config: &ObservabilityConfig,
+) -> (Option<BoxedTracingLayer<S>>, TelemetryGuard)
+where
+    S: tracing::Subscriber
+        + for<'span> tracing_subscriber::registry::LookupSpan<'span>
+        + Send
+        + Sync
+        + 'static,
+{
+    (None, TelemetryGuard::none())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Cross-process context propagation helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Extract the W3C `traceparent` string from the current tracing span.
 ///
-/// Returns `None` when no active span exists or the span does not carry
-/// a valid OTEL `SpanContext`.
+/// Returns `None` when no active span exists, the span does not carry a
+/// valid OTEL `SpanContext`, or this crate's `otel` feature is disabled
+/// (there is then no OTEL layer installed to attach a `SpanContext` in the
+/// first place).
 ///
 /// The returned string is ready to be injected as the `TRACEPARENT` environment
 /// variable into a child process so that it can resume the trace.
+#[cfg(feature = "otel")]
 pub fn current_traceparent() -> Option<String> {
     use opentelemetry::trace::TraceContextExt as _;
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -224,6 +275,12 @@ pub fn current_traceparent() -> Option<String> {
     }
 }
 
+/// `otel`-disabled flavour: always `None` (see the doc comment above).
+#[cfg(not(feature = "otel"))]
+pub fn current_traceparent() -> Option<String> {
+    None
+}
+
 /// Read `TRACEPARENT` from the process environment (set by the HTTP bridge when
 /// spawning this subprocess).  Returns the raw W3C traceparent string, if present.
 ///
@@ -236,13 +293,15 @@ pub fn env_traceparent() -> Option<String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Metrics helpers — available whenever opentelemetry base is compiled
+// Metrics helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Record a tool call outcome in the global OTEL meter.
 ///
-/// When no meter provider is registered (observability disabled) this is a
-/// no-op; no overhead is incurred on the hot path.
+/// When no meter provider is registered (observability disabled), or when
+/// this crate's `otel` feature is disabled, this is a no-op; no overhead is
+/// incurred on the hot path.
+#[cfg(feature = "otel")]
 pub fn record_tool_call(tool_name: &str, outcome: ToolCallOutcome, duration_ms: u64) {
     use opentelemetry::{KeyValue, global};
 
@@ -262,7 +321,12 @@ pub fn record_tool_call(tool_name: &str, outcome: ToolCallOutcome, duration_ms: 
     );
 }
 
+/// `otel`-disabled flavour: no-op.
+#[cfg(not(feature = "otel"))]
+pub fn record_tool_call(_tool_name: &str, _outcome: ToolCallOutcome, _duration_ms: u64) {}
+
 /// Record a sandbox gating failure (tool call rejected before sandbox is ready).
+#[cfg(feature = "otel")]
 pub fn record_sandbox_gating_failure() {
     use opentelemetry::global;
     global::meter("ahma")
@@ -270,6 +334,10 @@ pub fn record_sandbox_gating_failure() {
         .build()
         .add(1, &[]);
 }
+
+/// `otel`-disabled flavour: no-op.
+#[cfg(not(feature = "otel"))]
+pub fn record_sandbox_gating_failure() {}
 
 /// Possible outcomes for a tool call, used as a metric attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +414,31 @@ mod tests {
         let _guard = TelemetryGuard::none(); // should be a no-op, trivially droppable
     }
 
+    /// The `otel` feature gate must not change `create_otel_layer`'s public
+    /// signature — only whether it can ever return a real layer. With the
+    /// feature off, a configured endpoint must still yield a hard no-op
+    /// (there is no OTEL SDK compiled in to build a layer from). With the
+    /// feature on, the same configured endpoint must yield a real layer.
+    #[test]
+    fn create_otel_layer_respects_the_otel_feature_gate() {
+        let cfg = ObservabilityConfig::default().with_endpoint(Some("http://127.0.0.1:4318"));
+        let (layer, _guard): (
+            Option<BoxedTracingLayer<tracing_subscriber::Registry>>,
+            TelemetryGuard,
+        ) = create_otel_layer(&cfg);
+
+        #[cfg(feature = "otel")]
+        assert!(
+            layer.is_some(),
+            "otel feature enabled: a configured endpoint must build a real layer"
+        );
+        #[cfg(not(feature = "otel"))]
+        assert!(
+            layer.is_none(),
+            "otel feature disabled: create_otel_layer must be a hard no-op regardless of config"
+        );
+    }
+
     use parking_lot::Mutex;
     use std::sync::LazyLock;
 
@@ -420,6 +513,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "otel")]
     fn create_otel_layer_with_endpoint_builds_layer_and_guard() {
         // The batch HTTP exporter is constructed lazily and does NOT connect on
         // build, so this succeeds even without a live collector. This also
@@ -438,6 +532,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "otel")]
     fn create_otel_layer_trims_trailing_slash_endpoint() {
         // Endpoint with a trailing slash must still build successfully.
         let cfg = ObservabilityConfig {

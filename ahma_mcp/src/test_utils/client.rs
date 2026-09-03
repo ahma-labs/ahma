@@ -70,19 +70,6 @@ fn get_test_binary_path() -> PathBuf {
         .clone()
 }
 
-fn build_cargo_run_command(workspace_dir: &Path) -> Command {
-    let mut cmd = Command::new("cargo");
-    cmd.arg("run")
-        .arg("--manifest-path")
-        .arg(workspace_dir.join("Cargo.toml"))
-        .arg("--package")
-        .arg("ahma_mcp")
-        .arg("--bin")
-        .arg("ahma")
-        .arg("--");
-    cmd
-}
-
 fn use_prebuilt_binary() -> bool {
     let path = get_test_binary_path();
     !path.as_os_str().is_empty() && path.exists()
@@ -205,10 +192,15 @@ impl ClientBuilder {
         let command = if use_prebuilt_binary() {
             Command::new(get_test_binary_path())
         } else {
-            eprintln!(
-                "Warning: Using slow 'cargo run' path. Run 'cargo build' first for faster tests."
-            );
-            build_cargo_run_command(&workspace_dir)
+            // No prebuilt binary: build it through the shared harness helper (cross-
+            // process lock, never rebuilds a fresh binary). The previous fallback ran
+            // `cargo run --package ahma_mcp --bin ahma`, a target that stopped existing
+            // when the binary moved to `ahma_bin`, so every test that reached it failed
+            // with "no bin target named ahma" instead of building anything.
+            let binary =
+                tokio::task::spawn_blocking(|| super::cli::build_binary_cached("ahma_bin", "ahma"))
+                    .await?;
+            Command::new(binary)
         };
 
         let fut = self.run_command(command, &working_dir);

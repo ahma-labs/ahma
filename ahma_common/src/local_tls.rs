@@ -114,7 +114,7 @@ impl LocalTlsConfig {
 /// if either file is missing.
 ///
 /// Also logs a warning when the certificate is approaching its rotation window
-/// (age > [`ROTATION_WARNING_DAYS`]).
+/// (age > `ROTATION_WARNING_DAYS`).
 pub fn provision_if_needed(config: &LocalTlsConfig) -> Result<LocalTlsCerts> {
     if config.exists() {
         let certs = load_certs(config)?;
@@ -146,7 +146,7 @@ pub fn load_certs(config: &LocalTlsConfig) -> Result<LocalTlsCerts> {
     Ok(LocalTlsCerts { cert_der, key_der })
 }
 
-/// Returns `true` when the certificate file is older than [`ROTATION_WARNING_DAYS`] days.
+/// Returns `true` when the certificate file is older than `ROTATION_WARNING_DAYS` days.
 ///
 /// Returns `false` if the cert does not exist (no rotation needed for something that
 /// hasn't been generated yet).

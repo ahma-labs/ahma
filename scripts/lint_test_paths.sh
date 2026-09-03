@@ -12,7 +12,7 @@ VIOLATIONS=0
 # Search for CARGO_TARGET_DIR outside of test_utils::cli
 while IFS= read -r file; do
     # Skip the allowed files
-    if [[ "$file" == *"ahma_mcp/src/test_utils.rs" || "$file" == *"ahma_mcp/tests/test_utils_coverage_test.rs" ]]; then
+    if [[ "$file" == *"ahma_mcp/src/test_utils.rs" || "$file" == *"ahma_mcp/tests/e2e/test_utils_coverage_test.rs" ]]; then
         continue
     fi
     
@@ -28,8 +28,8 @@ done < <(find . -path "*/tests/*.rs" -o -name "*_test.rs" -o -name "test_*.rs" |
 
 echo "Checking timeout literals in handshake-critical integration tests..."
 for file in \
-    "./ahma_http_bridge/tests/handshake_timeout_test.rs" \
-    "./ahma_http_bridge/tests/http_bridge_integration_test.rs"
+    "./ahma_http_bridge/tests/e2e/handshake_timeout_test.rs" \
+    "./ahma_http_bridge/tests/e2e/http_bridge_integration_test.rs"
 do
     if [[ -f "$file" ]] && rg -q 'Duration::from_(secs|millis)\([0-9]+\)' "$file"; then
         echo "FAIL VIOLATION: $file"
@@ -41,7 +41,7 @@ do
 done
 
 echo "Checking shared custom server spawn usage in HTTP bridge integration test..."
-HTTP_BRIDGE_TEST="./ahma_http_bridge/tests/http_bridge_integration_test.rs"
+HTTP_BRIDGE_TEST="./ahma_http_bridge/tests/e2e/http_bridge_integration_test.rs"
 if [[ -f "$HTTP_BRIDGE_TEST" ]] && ! rg -q 'spawn_server_guard_with_config' "$HTTP_BRIDGE_TEST"; then
     echo "FAIL VIOLATION: $HTTP_BRIDGE_TEST"
     echo "   Missing shared custom server startup helper usage"

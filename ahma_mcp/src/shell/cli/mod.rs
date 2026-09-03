@@ -210,9 +210,9 @@ pub struct AppConfig {
     pub run_tool_args: Vec<String>,
 
     // ── task vault ───────────────────────────────────────────────────────────
-    /// Task vault root to use as sandbox scope (--task-vault <path>).
-    /// When set, the sandbox scope is set to <vault>/workdir/ and an audit
-    /// log is initialized at <vault>/audit.jsonl.
+    /// Task vault root to use as sandbox scope (--task-vault `<path>`).
+    /// When set, the sandbox scope is set to `<vault>/workdir/` and an audit
+    /// log is initialized at `<vault>/audit.jsonl`.
     pub task_vault: Option<PathBuf>,
 
     // ── HTTP authentication / rate limiting / daemon ────────────────────────
@@ -917,10 +917,12 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in hooks mode");
             crate::hooks::run(args, cfg).await
         }
-        #[cfg(feature = "simplify")]
-        Subcommands::Simplify(args) => {
-            tracing::info!("Running in simplify mode");
-            crate::simplify::run(args)
+        Subcommands::Simplify(_) => {
+            anyhow::bail!(
+                "simplify is provided by the ahma_bin crate (optional dependency ahma_simplify, \
+                 cargo feature `simplify`, on by default). \
+                 If you are running a custom binary, dispatch to ahma_simplify::run(args)."
+            )
         }
         Subcommands::Update(args) => {
             tracing::info!("Running in update mode");
@@ -1153,8 +1155,8 @@ pub struct Cli {
     /// Run this server session inside a task vault (a per-task isolated
     /// directory containing inputs, workdir, outputs, trash, and audit logs).
     /// Enforces the "dedicated folder per task" security principle by restricting
-    /// the sandbox scope to <vault>/workdir/, initializing an audit log at
-    /// <vault>/audit.jsonl, and routing deletions to <vault>/trash/. The vault
+    /// the sandbox scope to `<vault>/workdir/`, initializing an audit log at
+    /// `<vault>/audit.jsonl`, and routing deletions to `<vault>/trash/`. The vault
     /// layout is created at PATH if it does not already exist.
     #[arg(long = "task-vault", value_name = "PATH", global = true)]
     pub task_vault: Option<PathBuf>,
@@ -1328,8 +1330,13 @@ pub enum Subcommands {
     /// Manage terminal hooks for external AI tools.
     Hooks(crate::hooks::HooksArgs),
     /// Analyze source code complexity and generate a simplicity report.
-    #[cfg(feature = "simplify")]
-    Simplify(crate::simplify::SimplifyArgs),
+    ///
+    /// Implemented by the `ahma_simplify` crate and dispatched by `ahma_bin`
+    /// (cargo feature `simplify`, on by default; `--no-default-features` drops
+    /// it and the subcommand then fails with a clear error). The argument
+    /// struct lives in `ahma_common` so this engine crate can list the
+    /// subcommand without depending on the analysis toolchain.
+    Simplify(ahma_common::simplify_args::SimplifyArgs),
     /// Download or build and install ahma.
     Update(crate::update::UpdateArgs),
     /// Verify an artifact's GitHub Build Provenance Attestation (Sigstore SLSA Level 3).
@@ -2270,7 +2277,7 @@ pub struct LlmAddArgs {
     /// (native Messages API).
     #[arg(long, default_value = "openai")]
     pub kind: String,
-    /// Base URL of the API (OpenAI-compatible root, or https://api.anthropic.com/v1).
+    /// Base URL of the API (OpenAI-compatible root, or <https://api.anthropic.com/v1>).
     #[arg(long)]
     pub base_url: String,
     /// Default model to use with this provider (e.g. "llama3.2", "claude-opus-4-8").
@@ -3938,6 +3945,34 @@ mod tests {
         } else {
             panic!("expected update subcommand");
         }
+    }
+
+    /// `simplify` is always a known subcommand of the engine's parser even though
+    /// the analyzer itself is an optional dependency of `ahma_bin` — a lean binary
+    /// must reject it with a clear error, not with clap's "unrecognized subcommand".
+    #[test]
+    fn test_cli_parse_simplify_is_always_listed() {
+        let cli = Cli::try_parse_from(["ahma", "simplify", ".", "--ai-fix", "2"]).unwrap();
+        match cli.command {
+            Subcommands::Simplify(args) => {
+                assert_eq!(args.directory, std::path::PathBuf::from("."));
+                assert_eq!(args.ai_fix, Some(2));
+            }
+            other => panic!("expected simplify subcommand, got {other:?}"),
+        }
+    }
+
+    /// The engine crate does not link the analyzer; dispatching `simplify` here
+    /// names the crate and feature that do.
+    #[tokio::test]
+    async fn test_dispatch_simplify_points_at_ahma_bin() {
+        let cli = Cli::try_parse_from(["ahma", "simplify", "."]).unwrap();
+        let err = dispatch_subcommand(cli.command, AppConfig::default())
+            .await
+            .expect_err("engine crate must not run simplify itself");
+        let msg = err.to_string();
+        assert!(msg.contains("ahma_simplify"), "{msg}");
+        assert!(msg.contains("`simplify`"), "{msg}");
     }
 
     #[test]

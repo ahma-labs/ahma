@@ -33,7 +33,7 @@ pub fn set_secret_env_allow(allow: Vec<String>) {
 /// (embeds user:password in the URL). `DATABASE_URL` is a substring marker so
 /// the common `TEST_DATABASE_URL` / `POSTGRES_DATABASE_URL` spellings match too.
 ///
-/// This is deliberately *separate* from [`is_code_injection_env_name`]: the
+/// This is deliberately *separate* from `is_code_injection_env_name`: the
 /// reason differs (secrecy vs. arbitrary code execution) and so does the
 /// matching (heuristic substrings vs. exact names).
 pub fn is_secret_env_name(name: &str) -> bool {
@@ -225,7 +225,7 @@ pub fn is_stripped_env_name(name: &str) -> bool {
 }
 
 /// Given an iterator of environment variable names and an allowlist, return the
-/// names that must be scrubbed: matching [`is_stripped_env_name`] and not
+/// names that must be scrubbed: matching `is_stripped_env_name` and not
 /// allow-listed (case-insensitive exact match). Pure — the unit of behaviour
 /// under test. The operator's `[sandbox] env_allow` applies uniformly to both
 /// strip lists, so someone who genuinely needs `NODE_OPTIONS` or
@@ -337,6 +337,19 @@ impl Sandbox {
             .env_remove(ahma_common::process_guard::SPAWN_DEPTH_ENV)
             .env_remove("AHMA_RESTARTED");
 
+        // Stamp the child with *which* ahma sandboxed it (SPEC R7.6). A nested
+        // ahma inside this command — the test suite, or an `ahma serve` run
+        // through `run_terminal_command` — reads it to name the outer sandbox
+        // it must defer to, instead of reporting "an outer sandbox". Only set
+        // when this sandbox is really the one confining the child; a deferring
+        // sandbox passes the outer marker through untouched.
+        if self.outer_sandbox.is_none() {
+            cmd.env(
+                super::host_detect::OUTER_SANDBOX_PID_ENV,
+                std::process::id().to_string(),
+            );
+        }
+
         // Scrub secret-bearing environment variables so a sandboxed (or
         // prompt-injected) tool cannot read the server's credentials out of its
         // own process environment and exfiltrate them. The kernel sandbox
@@ -397,6 +410,19 @@ impl Sandbox {
 
         #[cfg(target_os = "macos")]
         {
+            // SPEC R7.6: this process is itself inside a Seatbelt profile that
+            // refuses nesting, so `sandbox-exec` would only fail with an opaque
+            // `sandbox_apply: Operation not permitted`. Run the command bare —
+            // still inside the outer kernel boundary, which every child of a
+            // confined process inherits — as disclosed at construction.
+            if let Some(host) = self.outer_sandbox {
+                tracing::debug!(
+                    outer = host.label(),
+                    "Spawning without sandbox-exec: deferring to the outer Seatbelt sandbox (SPEC R7.6)"
+                );
+                return Ok(self.base_command(program, args, working_dir));
+            }
+
             // On macOS, wrap each command with sandbox-exec
             let mut full_command = vec![program.to_string()];
             full_command.extend(args.iter().cloned());

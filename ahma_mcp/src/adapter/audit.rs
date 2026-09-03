@@ -74,7 +74,7 @@ pub const AUDIT_LOG_FILE_NAME: &str = "audit.jsonl";
 ///
 /// 64 MiB: large enough that a normal working day never rotates (a busy session
 /// produced ~2.5 MB), small enough that one file stays readable by ordinary
-/// tools. See [`AuditLog::rotate_if_needed`] for why rotation and pruning are
+/// tools. See `AuditLog::rotate_if_needed` for why rotation and pruning are
 /// different things.
 pub const MAX_AUDIT_LOG_BYTES: u64 = 64 * 1024 * 1024;
 

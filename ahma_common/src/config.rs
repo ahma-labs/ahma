@@ -451,7 +451,7 @@ impl AhmaConfig {
 /// no way to accidentally honor it. Returning that bit is what lets tests assert
 /// the contract without scraping log output.
 ///
-/// Enforced generically by `ahma_mcp/tests/retired_env_drift_test.rs`, which
+/// Enforced generically by `ahma_mcp/tests/unit/retired_env_drift_test.rs`, which
 /// fails if any production source reads a name the docs list as retired.
 pub fn warn_retired_env(name: &str) -> bool {
     if std::env::var_os(name).is_some() {
@@ -545,7 +545,7 @@ pub fn default_mutex_groups() -> Vec<MutexGroupConfig> {
 /// LM Studio local-server provider defaults.
 ///
 /// LM Studio exposes an OpenAI-compatible API on localhost via its built-in
-/// **Local Server** (Developer tab → Start Server). Set [`model`] to the model
+/// **Local Server** (Developer tab → Start Server). Set [`LmStudioSettings::model`] to the model
 /// identifier of whichever model you have loaded in LM Studio (shown next to the
 /// loaded model, e.g. `openai/gpt-oss-20b`).
 ///
@@ -1544,7 +1544,7 @@ impl AhmaSettings {
     /// compiled-in defaults are returned, so a settings file corrupted while a
     /// long-running process (TUI, daemon) is live cannot hard-kill it. The
     /// **fail-closed** behavior required at startup (R-CFG6.1) is implemented by
-    /// the startup resolution path via [`load_from_result`], which surfaces the
+    /// the startup resolution path via [`Self::load_from_result`], which surfaces the
     /// error so the launcher can abort before the sandbox is built.
     pub fn load_from(path: &Path) -> Self {
         match Self::load_from_result(path) {

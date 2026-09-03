@@ -34,6 +34,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_PAGER: cat
   CARGO_INCREMENTAL: 0
+  # Both profile lines must stay equal to each other and to build.yml (see the note there).
+  CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
   CARGO_NET_RETRY: 10
   # MUST match build.yml's env exactly, or this tier gets 0% Rust cache hits. This one variable
@@ -80,11 +82,10 @@ jobs:
       # This restore yielded `Cache hits rate (Rust) 0.00 %` -- 924 Rust misses, 0 hits, with all
       # 413 hits being C/C++ and assembler at 100% -- until the missing
       # CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG was added to this workflow's env above. See the
-      # comment there for the mechanism. The flag differences between this tier's
-      # `cargo clippy --all-targets` / `cargo nextest --no-default-features` and build.yml's
-      # command set were investigated and are NOT the cause: build.yml's own Linux/X64 leg reads
-      # this same entry and got 96.26% Rust, so the entry is good and the reader was wrong.
-      # If Rust hit rate here ever returns to ~0, suspect a new one-sided env var first.
+      # comment there for the mechanism. Feature flags matter for the same reason: this tier
+      # and build.yml now both build the single canonical flavour (default features), so the
+      # objects are byte-identical inputs and the hashes line up. If Rust hit rate here ever
+      # returns to ~0, suspect a new one-sided env var or a one-sided feature flag first.
       - name: Restore Cargo registry and git
         uses: actions/cache/restore@v5
         with:
@@ -111,7 +112,7 @@ jobs:
         uses: ./.github/actions/sccache-ghac
         with:
           mode: read-only
-          extra-tools: nextest,cargo-deny
+          extra-tools: nextest,cargo-deny,cargo-hakari
 
       - name: Configure deterministic tooling env
         run: |
@@ -138,13 +139,24 @@ jobs:
       - name: Cargo deny check
         run: cargo deny check
 
+      # Also lock-file-only, also seconds: workspace-hack/ must match the dependency graph
+      # (otherwise `-p <crate>` builds stop sharing the workspace build's artifacts — the
+      # target-dir bloat this workspace was reorganised to stop) and the graph must carry
+      # exactly one rustls crypto provider. Neither is checked by any compile step, and the
+      # pre-push guardrail that runs this locally is opt-in.
+      - name: Dependency graph invariants
+        run: bash ./scripts/check-dependency-graph.sh
+
       - name: Cargo Clippy
         run: cargo clippy --all-targets --locked
 
       # The `smoke` nextest profile (.config/nextest.toml) excludes the subprocess-spawning
       # integration suite and Android/Kotlin tests, so this runs fast and fully parallel.
       - name: Cargo Nextest (smoke)
-        run: cargo nextest run --profile smoke --locked --no-default-features
+        # Default features: the one canonical flavour (see build.yml). Read-only sccache
+        # mode means this tier can only hit objects build.yml produced -- same flavour or
+        # zero hits.
+        run: cargo nextest run --profile smoke --locked
 
       # Verifies the backend and the hit rate, but cannot fail on "misses without writes": this
       # tier is READ_ONLY, so writing nothing is the intended behaviour, and the action skips

@@ -364,7 +364,7 @@ mod tests {
     ///
     /// The complementary half of the requirement — that a tool-set change *within* a
     /// live session does send `notifications/tools/list_changed` — is covered by
-    /// `AhmaMcpService::update_tools` (see `tests/update_tools_unit_test.rs`).
+    /// `AhmaMcpService::update_tools` (see `tests/e2e/update_tools_unit_test.rs`).
     #[tokio::test]
     async fn handle_restart_sends_no_notification_and_does_not_exit_under_test_isolation() {
         let (service, _temp_dir) = build_test_service().await.unwrap();

@@ -26,7 +26,7 @@ struct SettingRow {
     default: String,
 }
 
-/// Flatten the displayed subset of [`AhmaSettings`] into dotted-key rows.
+/// Flatten the displayed subset of [`AhmaSettings`](ahma_common::config::AhmaSettings) into dotted-key rows.
 ///
 /// Single source of truth for *which* settings both `settings show` variants
 /// print, so the plain and `--origin` outputs can never drift apart.

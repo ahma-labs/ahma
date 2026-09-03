@@ -15,22 +15,21 @@ yanked = "warn"
 unused-ignored-advisory = "warn"
 ignore = [
     # rsa 0.9.x has a timing side-channel in private-key operations (Marvin Attack).
-    # No patch is available. Our exposure is read-only: sigstore-verification →
-    # sigstore → openidconnect uses rsa only for JWT *signature verification*
-    # (public-key operations), never decryption with a private key.  The attack
-    # surface is therefore not present in ahma's execution path.
+    # No patch is available. Our exposure is read-only: sigstore → openidconnect
+    # uses rsa only for JWT *signature verification* (public-key operations),
+    # never decryption with a private key.  The attack surface is therefore not
+    # present in ahma's execution path.
+    #
+    # sigstore only pulls openidconnect because its own `verify` feature enables
+    # `fulcio` → `oauth`; ahma enables neither and signs nothing.  Drop this entry
+    # if sigstore ever stops chaining those features together.
     { id = "RUSTSEC-2023-0071", reason = "rsa used for public-key JWT verify only via openidconnect; no private-key ops in this path; no fix available upstream" },
 
-    # proc-macro-error 1.x is unmaintained. No fix available.
-    # Pulled transitively: sigstore-verification → sigstore → json-syntax →
-    # locspan-derive → proc-macro-error.  This is a build-time procedural macro
-    # crate; it has no runtime attack surface.
-    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is a build-time-only proc-macro dep via sigstore transitive chain; unmaintained but no runtime exposure; no fix available upstream" },
-
-    # smallstr 0.3.1 is unmaintained. No fix available.
-    # Pulled transitively: sigstore-verification → sigstore → json-syntax → smallstr.
-    # Read-only serialization dep via sigstore; no fix available upstream.
-    { id = "RUSTSEC-2026-0215", reason = "smallstr is an unmaintained transitive dep via sigstore; read-only use; no fix available upstream" },
+    # RUSTSEC-2024-0370 (proc-macro-error) and RUSTSEC-2026-0215 (smallstr) were
+    # ignored here until v0.19.8.  Both arrived through
+    # sigstore-verification → sigstore 0.13 → json-syntax; moving `ahma verify` to
+    # `sigstore` 0.14 directly removed that whole subtree, so the ignores are gone
+    # rather than merely re-justified.
 ]
 
 # ---------------------------------------------------------------------------

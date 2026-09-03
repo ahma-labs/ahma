@@ -473,7 +473,7 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
 /// would dump the entire CLI banner as the "Hook blocked with message" payload.
 /// Instead, detect a `hooks exec` invocation from the raw argv and emit a concise
 /// fail-open `allow` decision so the user's terminal is never wedged by ahma's
-/// own breakage (the same fail-open philosophy [`run_exec`] uses for malformed
+/// own breakage (the same fail-open philosophy `run_exec` uses for malformed
 /// stdin payloads).
 ///
 /// Returns `true` when it handled the invocation (the caller must then exit 0
@@ -2124,7 +2124,7 @@ fn grouped_hook_installed(document: &Value, platform: HookPlatform) -> bool {
 /// runs just their `command`. A split `command` + `args` entry then runs bare
 /// `ahma` with no subcommand, which dumps the CLI usage banner and exits
 /// non-zero; the editor surfaces that as a hard "Hook blocked with message:
-/// <banner>" on every shell command. Codex, Claude and Antigravity share this
+/// `<banner>`" on every shell command. Codex, Claude and Antigravity share this
 /// grouped format, so they all build the command the same self-contained way
 /// (differing only in the tool-name `matcher` and the status message).
 fn single_command_group_entry(

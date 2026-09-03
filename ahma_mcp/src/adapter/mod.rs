@@ -39,7 +39,7 @@
 //!   multi-line arguments, ensuring they are automatically cleaned up even if
 //!   an operation times out or is cancelled.
 //! - **Auditability**: every execution path writes a `tool_call` to the
-//!   append-only [`audit`] log *before* spawning, and exactly one matching
+//!   append-only [`audit`](crate::adapter::audit) log *before* spawning, and exactly one matching
 //!   `tool_complete` on every terminal path. Output tells you what a command
 //!   printed; the audit log is what tells you that it happened.
 
@@ -339,7 +339,7 @@ impl Adapter {
 
     /// Validate a working directory against the sandbox scope, raising a scope-grant
     /// prompt (best-effort, never blocking the error) when it is rejected as
-    /// out-of-scope. Returns the same `Result` as [`Sandbox::validate_path`] so
+    /// out-of-scope. Returns the same `Result` as [`Sandbox::validate_path`](crate::sandbox::Sandbox::validate_path) so
     /// callers keep failing closed.
     async fn validate_working_dir(
         &self,

@@ -174,7 +174,7 @@ PROTOCOL_DIRS=(
   ahma_mcp/src/adapter
   ahma_mcp/src/sandbox
   ahma_mcp/src/livelog
-  ahma_mcp/src/output_optimizer
+  ahma_output_optimizer/src
   ahma_http_bridge/src
 )
 STDOUT_VIOLATIONS=$(grep -rn --include='*.rs' -E '(^|[^a-z_])print(ln)?!' "${PROTOCOL_DIRS[@]}" 2>/dev/null \
@@ -238,8 +238,79 @@ bash ./scripts/check-license-boundaries.sh
 echo "=== Guardrail: workspace cargo check ==="
 cargo check --workspace --locked
 
-echo "=== Guardrail: cargo smoke test scope (ahma package) ==="
-cargo test -p ahma_mcp --test tool_tests tool_execution_integration_test::test_cargo_check_dry_run -- --nocapture
+echo "=== Guardrail: dependency graph invariants (hakari in sync, one crypto provider) ==="
+# Shared with Fast Tier CI so a PR cannot land a stale workspace-hack/ or a second
+# rustls crypto provider; see the script for the rationale of each invariant.
+bash ./scripts/check-dependency-graph.sh
+
+echo "=== Guardrail: integration tests live in per-harness-class binaries ==="
+# Every top-level tests/*.rs file is its own statically-linked executable carrying
+# the full dependency closure, relinked for every feature flavour CI builds. The
+# integration tests are therefore grouped into ONE binary per harness class
+# (see the layout table in .config/nextest.toml), and nextest's throttle/retry
+# filters key off those binary names. Cargo turns every `tests/*.rs` AND every
+# `tests/*/main.rs` into a test target, so both shapes are checked: a new one of
+# either would both bring back the per-file link cost and escape the structural
+# filters. Only the roots listed here may exist.
+ALLOWED_TEST_ROOTS=(
+  ahma_mcp/tests/unit/main.rs
+  ahma_mcp/tests/e2e/main.rs
+  ahma_mcp/tests/latency_guard_test.rs                # all #[ignore]; ignored-tests.yml targets it
+  ahma_simplify/tests/integration/main.rs
+  ahma_http_bridge/tests/e2e/main.rs
+  ahma_http_bridge/tests/unit/main.rs
+  ahma_http_bridge/tests/stress/main.rs
+  ahma_tui/tests/connection/main.rs
+  ahma_core/tests/integration/main.rs
+  ahma_http_mcp_client/tests/integration/main.rs
+  ahma_llm_monitor/tests/integration/main.rs
+)
+LAYOUT_VIOLATIONS=""
+while IFS= read -r test_root; do
+  test_root="${test_root#./}"
+  allowed=0
+  for ok in "${ALLOWED_TEST_ROOTS[@]}"; do
+    if [[ "$test_root" == "$ok" ]]; then
+      allowed=1
+      break
+    fi
+  done
+  if [[ "$allowed" -ne 1 ]]; then
+    LAYOUT_VIOLATIONS+="$test_root"$'\n'
+  fi
+done < <({
+  find . -mindepth 3 -maxdepth 3 -type f -path '*/tests/*.rs' -not -path './target/*'
+  find . -mindepth 4 -maxdepth 4 -type f -path '*/tests/*/main.rs' -not -path './target/*'
+} | sort)
+if [[ -n "$LAYOUT_VIOLATIONS" ]]; then
+  echo ""
+  echo "FAIL New integration test root file(s) found:"
+  printf '%s' "$LAYOUT_VIOLATIONS"
+  echo ""
+  echo "  Each tests/*.rs or tests/*/main.rs is a separate executable that relinks the"
+  echo "  whole dependency closure and dodges the binary_id() throttle/retry filters in"
+  echo "  .config/nextest.toml. Put the test in the binary for its harness class:"
+  echo "    spawns a process / mixed harness -> tests/e2e/<name>.rs    + 'mod <name>;' in tests/e2e/main.rs"
+  echo "    in-process or pure-unit          -> tests/unit/<name>.rs   + 'mod <name>;' in tests/unit/main.rs"
+  echo "    #[ignore] stress (bridge)        -> tests/stress/<name>.rs + 'mod <name>;' in tests/stress/main.rs"
+  echo "  Declare the mod alphabetically; test names are unchanged, so -E 'test(...)' filters"
+  echo "  keep working. A genuinely new harness class needs a new root file here AND a"
+  echo "  matching override in .config/nextest.toml."
+  exit 1
+fi
+echo "OK Only the per-harness-class test roots exist under tests/"
+
+echo "=== Guardrail: cargo smoke test scope (ahma_mcp::unit binary) ==="
+# A deliberately tiny in-process test so a broken unit binary (a missing `mod`
+# line, a dev-dependency dropped from Cargo.toml) fails here rather than on CI.
+# The previous incarnation named a test path that did not exist, so `cargo test`
+# matched nothing and exited 0 — a silent no-op for its whole life.
+#
+# Workspace-level, not `-p ahma_mcp`: with the workspace-hack in place a `-p` build
+# resolves the same third-party features as the workspace build, and ahma_mcp has
+# no features of its own any more (simplify moved to the ahma_simplify crate) —
+# but `--workspace` is what CI runs, so it is what the smoke test must exercise.
+cargo nextest run --workspace --test unit -E 'test(test_classify_ref_branch_and_release)' --no-fail-fast
 
 echo "=== Guardrail: nextest diagnostics config ==="
 if ! grep -q 'success-output = "immediate"' .config/nextest.toml; then
@@ -255,19 +326,22 @@ echo "OK Nextest diagnostics config looks good"
 echo "=== Guardrail: nextest override ordering (narrow before broad) ==="
 # nextest resolves each setting from the FIRST matching override in file order,
 # not the most specific one. A narrow binary_id() override listed BELOW the
-# broad package() override it refines is silently dead config — this is how the
-# bridge_stress_tests slow-timeouts stopped applying. Assert the order holds.
-for profile in default ci; do
+# broad override it refines is silently dead config — this is how the bridge
+# stress slow-timeouts stopped applying. The filters are disjoint today, but the
+# stress override is kept ABOVE the e2e one so a future broadening of the e2e
+# filter (e.g. back to `~ahma_http_bridge::`) cannot swallow it. Assert the
+# order holds in every profile that defines both.
+for profile in default ci coverage; do
   narrow=$(grep -n "^\[\[profile\.${profile}\.overrides\]\]" -A1 .config/nextest.toml \
-    | grep 'binary_id(ahma_http_bridge::bridge_stress_tests)' | head -1 | cut -d- -f1)
+    | grep 'binary_id(ahma_http_bridge::stress)' | head -1 | cut -d- -f1)
   broad=$(grep -n "^\[\[profile\.${profile}\.overrides\]\]" -A1 .config/nextest.toml \
-    | grep 'package(ahma_http_bridge)' | head -1 | cut -d- -f1)
+    | grep 'binary_id(ahma_http_bridge::e2e)' | head -1 | cut -d- -f1)
   if [ -z "$narrow" ] || [ -z "$broad" ]; then
-    echo "FAIL profile.${profile}: expected both a bridge_stress_tests and a package(ahma_http_bridge) override"
+    echo "FAIL profile.${profile}: expected both a binary_id(ahma_http_bridge::stress) and a binary_id(ahma_http_bridge::e2e) override"
     exit 1
   fi
   if [ "$narrow" -gt "$broad" ]; then
-    echo "FAIL profile.${profile}: binary_id(ahma_http_bridge::bridge_stress_tests) (line $narrow) must come BEFORE package(ahma_http_bridge) (line $broad)"
+    echo "FAIL profile.${profile}: binary_id(ahma_http_bridge::stress) (line $narrow) must come BEFORE binary_id(ahma_http_bridge::e2e) (line $broad)"
     echo "     nextest takes the first matching override per setting, so the narrow one is dead where it is."
     exit 1
   fi
@@ -277,8 +351,10 @@ echo "OK Nextest override ordering is narrow-before-broad"
 echo "=== Guardrail: subprocess/network suites may retry on CI ==="
 # RETRY POLICY (see .config/nextest.toml header): every suite that crosses a
 # process or network boundary gets retries on the CI + coverage profiles, so a
-# scheduler stall on a cold 2-CPU runner cannot redden main on its own.
-for filter in 'package(ahma_http_bridge)' 'binary_id(~ahma_mcp::)' 'binary_id(~ahma_tui::)'; do
+# scheduler stall on a cold 2-CPU runner cannot redden main on its own. The
+# in-process binaries (ahma_mcp::unit, ahma_http_bridge::unit) must NOT appear
+# here — a flake there is a real bug.
+for filter in 'binary_id(ahma_http_bridge::e2e)' 'binary_id(ahma_http_bridge::stress)' 'binary_id(ahma_mcp::e2e)' 'binary_id(ahma_tui::connection)'; do
   for profile in ci coverage; do
     if ! awk -v f="$filter" -v p="\\\\[\\\\[profile.${profile}.overrides\\\\]\\\\]" '
       $0 ~ p {inblock=1; hasfilter=0; next}
@@ -293,6 +369,13 @@ for filter in 'package(ahma_http_bridge)' 'binary_id(~ahma_mcp::)' 'binary_id(~a
   done
 done
 echo "OK Subprocess/network suites carry retries on ci and coverage"
+for filter in 'binary_id(ahma_mcp::unit)' 'binary_id(ahma_http_bridge::unit)'; do
+  if grep -q "filter = \"${filter}\"" .config/nextest.toml; then
+    echo "FAIL .config/nextest.toml has an override for '${filter}' — the in-process binaries must stay unthrottled and retry-free (see RETRY POLICY)"
+    exit 1
+  fi
+done
+echo "OK In-process binaries carry no override"
 
 echo "=== Guardrail: target directory stale cache auto-clean ==="
 cargo xtask clean-stale --max-age-days 3 --max-size-gb 30

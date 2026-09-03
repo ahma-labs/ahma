@@ -19,61 +19,46 @@ path = "src/lib.rs"
 [dependencies]
 parking_lot.workspace = true
 ahma_common = { path = "../ahma_common" }
+ahma_bundle = { path = "../ahma_bundle" }
+ahma_harness_guard = { path = "../ahma_harness_guard" }
 ahma_harness_tools = { path = "../ahma_harness_tools" }
 ahma_http_bridge = { path = "../ahma_http_bridge" }
 ahma_http_mcp_client = { path = "../ahma_http_mcp_client" }
 ahma_llm_monitor = { path = "../ahma_llm_monitor" }
+ahma_log_monitor = { path = "../ahma_log_monitor" }
+ahma_output_optimizer = { path = "../ahma_output_optimizer" }
+ahma_update = { path = "../ahma_update" }
+ahma_vault = { path = "../ahma_vault" }
 anyhow.workspace = true
 async-trait.workspace = true
 base64 = "0.22"
 chrono.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
-directories.workspace = true
 dirs.workspace = true
 dunce.workspace = true
-flate2 = "1.1"
 futures.workspace = true
-opentelemetry-otlp = { workspace = true }
-opentelemetry.workspace = true
-opentelemetry_sdk = { workspace = true }
-opener = { version = "0.8", optional = true }
-pulldown-cmark = { version = "0.13", optional = true }
-quick-xml = { version = "0.41", optional = true }
 rand = "0.10.1"
 regex.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls", "http2", "http3"] }
 rmcp.workspace = true
-rust-code-analysis = { package = "rust-code-analysis-code-split", version = "0.0.26-cs.0", optional = true }
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-ring = { version = "0.17", features = ["std"] }
-sha2 = "0.11.0"
 # Cross-platform process-tree CPU sampling for the operation liveness watchdog:
 # "no output" is not "no progress" (a `| tail` pipeline buffers, a compile is silent),
 # so the watchdog asks whether the process tree is still burning CPU before killing it.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
-sigstore-verification = { version = "0.2", default-features = false, features = [
-	"rustls",
-] }
-tar = "0.4"
 tempfile.workspace = true
-# Only `deflate` is used: we extract our own release .zip (produced by `7z a`,
-# which emits deflate) and write deflate zips in tests. zip's default features
-# additionally pull in bzip2, aes-crypto, lzma, zstd, xz, ppmd and deflate64 —
-# dead weight, and bzip2's licence is not on the `cargo deny` allow-list.
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 thiserror.workspace = true
 tokio-util.workspace = true
-tokio = "1.53.1"
+tokio.workspace = true
 toml.workspace = true
 tracing-appender.workspace = true
-tracing-opentelemetry = { workspace = true }
 tracing-subscriber.workspace = true
 tracing.workspace = true
 url.workspace = true
-walkdir = { version = "2.5", optional = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
@@ -88,28 +73,31 @@ libc.workspace = true
 ahma_test_support = { path = "../ahma_test_support" }
 futures.workspace = true
 tempfile.workspace = true
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
 
 [features]
-# Selects the Android/Kotlin test group in CI (`--features android`).
-# Gates no library code; retained solely as the CI test selector.
-android = []
-# Code complexity analysis: depends on rust-code-analysis,
-# so it stays behind a feature gate for lean builds.
-simplify = [
-	"dep:opener",
-	"dep:pulldown-cmark",
-	"dep:quick-xml",
-	"dep:rust-code-analysis",
-	"dep:walkdir",
-]
-default = ["android"]
-
-# Integration tests that require non-default features
-[[test]]
-name = "simplify_report_integration_test"
-required-features = ["simplify"]
+# Deliberately almost no features — this crate has exactly one flavour by
+# default. A feature is part of a crate's fingerprint even when it gates
+# nothing, so any feature on the workspace's critical-path crate that one
+# invocation enables and another does not (`cargo build` vs
+# `cargo build -p ahma_mcp`) forces a second compile of ahma_mcp and a second
+# link of every one of its test binaries. Two features used to live here:
+#   - a no-op `android = []` that CI toggled to *select* the Android/Kotlin test
+#     group — select test groups with a nextest filter
+#     (`-E 'test(kotlin) or test(android)'`), never with a feature;
+#   - `simplify`, the code-complexity analyzer and its rust-code-analysis tree —
+#     now the `ahma_simplify` crate, an optional dependency of `ahma_bin` only.
+#
+# `otel` is the one deliberate exception: it forwards to `ahma_common/otel`
+# (the ~200-crate OpenTelemetry SDK subtree), off by default so it costs
+# nothing on a normal dev/test/clippy cycle. Unlike `android`/`simplify`
+# above it cannot be pushed out to `ahma_bin` — the code that calls
+# `ahma_common::observability::create_otel_layer` lives inside this crate
+# (`src/utils/logging.rs`), not in an optional sibling crate — so this crate
+# does pay a second flavour, but only when CI or a release build asks for it.
+default = []
+otel = ["ahma_common/otel"]
 
 # Tool configuration examples
 [[example]]

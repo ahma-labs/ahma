@@ -2,9 +2,9 @@
 //!
 //! This module provides two small pieces of execution infrastructure:
 //!
-//! * [`platform_shell_program`] — the shell binary used for command execution
+//! * [`platform_shell_program`](crate::shell_pool::platform_shell_program) — the shell binary used for command execution
 //!   (`powershell` on Windows, `bash` elsewhere).
-//! * [`ShellPoolConfig`] / [`ShellPoolManager`] — the shared default command
+//! * [`ShellPoolConfig`](crate::shell_pool::ShellPoolConfig) / [`ShellPoolManager`](crate::shell_pool::ShellPoolManager) — the shared default command
 //!   timeout consumed by the [`Adapter`](crate::adapter::Adapter).
 //!
 //! ## Historical note

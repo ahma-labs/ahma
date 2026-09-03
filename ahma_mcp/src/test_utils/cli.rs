@@ -159,7 +159,7 @@ pub fn get_binary_path(_package: &str, binary: &str) -> PathBuf {
 ///
 /// To eliminate that class of bug, the first call per process **rebuilds the
 /// binary only when it is stale** — missing, or older than the newest workspace
-/// source file (see [`binary_needs_build`]). A fresh binary is used as-is.
+/// source file (see `stale_reason`). A fresh binary is used as-is.
 ///
 /// Critically, we do **not** rebuild a binary that is already up to date. CI
 /// builds the binary with specific flags (e.g. `--no-default-features`, which

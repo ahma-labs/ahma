@@ -5,7 +5,7 @@ resolver = "3"
 # default-members equals members (minus dev-only xtask): a plain `cargo build`
 # builds the whole product. The permissive crates (MIT OR Apache-2.0) form the
 # embeddable engine; the AGPL-3.0-or-later crates are the end-user product
-# surface. ahma_bin gates vault/simplify behind cargo features.
+# surface. ahma_bin gates simplify behind a cargo feature (on by default).
 default-members = [
     # Permissive crates (MIT OR Apache-2.0)
     "ahma_mcp",
@@ -15,6 +15,13 @@ default-members = [
     "ahma_common",
     "ahma_llm_monitor",
     "ahma_core",
+    "ahma_bundle",
+    "ahma_update",
+    "ahma_vault",
+    "ahma_log_monitor",
+    "ahma_harness_guard",
+    "ahma_output_optimizer",
+    "ahma_simplify",
     "ahma_test_support",
     "ahma_harness_tools",
     # AGPL-3.0-or-later crates (end-user product surface)
@@ -31,11 +38,22 @@ members = [
     "ahma_common",
     "ahma_llm_monitor",
     "ahma_core",
+    "ahma_bundle",
+    "ahma_update",
+    "ahma_vault",
+    "ahma_log_monitor",
+    "ahma_harness_guard",
+    "ahma_output_optimizer",
+    "ahma_simplify",
     "ahma_test_support",
     "ahma_harness_tools",
     # AGPL-3.0-or-later crates (end-user product surface)
     "ahma_tui",
     "ahma_bin",
+    # cargo-hakari workspace-hack: pins one third-party feature set for every
+    # invocation so `-p` builds reuse the workspace build's artifacts. Managed by
+    # `cargo hakari generate`; see .config/hakari.toml for the measurements.
+    "workspace-hack",
     # dev-only workspace automation (not published, not in default-members)
     "xtask",
 ]
@@ -54,7 +72,6 @@ async-trait = "0.1.89"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.5"
-directories = "6.0"
 dirs = "6.0"
 dunce = "1.0"
 futures = "0.3.32"

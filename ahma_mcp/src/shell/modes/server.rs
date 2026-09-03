@@ -1098,7 +1098,7 @@ fn bridge_unhealthy_error(stderr_path: &std::path::Path, timeout: Duration) -> a
 ///
 /// It is a well-known singleton *by design*: several MCP clients share one bridge
 /// daemon. That sharing is exactly why a test must never resolve it — see
-/// [`is_test_isolated`] and [`default_socket_path`].
+/// [`is_test_isolated`] and `default_socket_path`.
 pub const GLOBAL_SOCKET_PATH: &str = "/tmp/ahma.sock";
 
 /// True when this process is running under the test harness.

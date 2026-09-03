@@ -39,11 +39,11 @@
 //! ## Where the server's allowlist comes from
 //!
 //! For `--restrict-network` (the MCP server path, as opposed to a vault's own
-//! file) the allowlist is the union computed by [`host_grants::EgressGrants`]:
+//! file) the allowlist is the union computed by [`host_grants::EgressGrants`](crate::egress::host_grants::EgressGrants):
 //! the operator's `[network] allow` plus the hostnames each **enabled sandbox
 //! profile** declares for its toolchain. Read that module first — it explains why
 //! restriction stayed unused without it, and why the default is still off.
-//! [`host_pattern::HostPattern`] is the single matcher both paths share.
+//! [`host_pattern::HostPattern`](crate::egress::host_pattern::HostPattern) is the single matcher both paths share.
 //!
 //! ## Environment variables injected into sandboxed subprocesses
 //!

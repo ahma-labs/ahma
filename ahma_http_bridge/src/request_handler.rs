@@ -76,17 +76,24 @@ fn request_timeout_response(
     session_id: &str,
     payload: &Value,
     mode: ResponseMode,
+    window: Duration,
 ) -> Response {
     let id = payload_id(payload);
+    // SPEC R2.6.5.4: state the wait that was applied. An `await` asked for more
+    // than this window is cut here, and the caller must be able to see that
+    // the number that elapsed is the bridge's, not the one it requested.
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {
             "code": -32002,
-            "message": "Operation still running: the bridge wait window elapsed \
-                        before the tool returned. The operation continues in the \
-                        background — await again or wait for the completion \
-                        notification."
+            "message": format!(
+                "Operation still running: the bridge wait window ({}s) elapsed \
+                 before the tool returned. The operation continues in the \
+                 background — await again or wait for the completion \
+                 notification.",
+                window.as_secs()
+            )
         }
     });
     match mode {
@@ -1188,7 +1195,13 @@ async fn forward_request(
                  recoverable timeout (session preserved)"
             );
             with_session_header(
-                request_timeout_response(session_manager, session_id, payload, mode),
+                request_timeout_response(
+                    session_manager,
+                    session_id,
+                    payload,
+                    mode,
+                    request_timeout,
+                ),
                 session_id,
             )
         }

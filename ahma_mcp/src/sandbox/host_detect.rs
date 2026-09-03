@@ -16,9 +16,20 @@
 
 use std::path::Path;
 
+/// Marker ahma stamps on every command it runs inside its own kernel sandbox:
+/// the pid of the ahma that applied the sandbox. It is how a nested ahma — the
+/// test suite or an `ahma serve` started *through* `run_terminal_command` —
+/// knows the outer sandbox it must defer to is ahma's, and can say so
+/// (SPEC R7.1, R7.6) instead of reporting "an outer sandbox". A marker, not
+/// configuration: ahma sets it, nothing reads it as a setting.
+pub const OUTER_SANDBOX_PID_ENV: &str = "AHMA_OUTER_SANDBOX_PID";
+
 /// An outer sandbox ahma may be running nested inside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostSandbox {
+    /// Another ahma's kernel sandbox — this process was spawned by an outer
+    /// `run_terminal_command` (named via [`OUTER_SANDBOX_PID_ENV`]).
+    Ahma,
     /// Cursor's agent sandbox (named via `CURSOR_SANDBOX` / `CURSOR_AGENT`).
     Cursor,
     /// Claude Code's Bash sandbox (named via `CLAUDECODE` / `CLAUDE_CODE_ENTRYPOINT`).
@@ -35,6 +46,7 @@ impl HostSandbox {
     /// Human-readable label for log lines and user-facing disclosure.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Ahma => "an outer ahma",
             Self::Cursor => "Cursor",
             Self::ClaudeCode => "Claude Code",
             Self::VsCode => "VS Code",
@@ -50,6 +62,14 @@ impl HostSandbox {
     /// loud disclosure so the user is never left with a diagnosis and no fix.
     pub fn remediation(self) -> &'static str {
         match self {
+            Self::Ahma => {
+                "This process was started by an outer ahma `run_terminal_command`, whose kernel \
+                 sandbox already confines every write it makes — macOS refuses to nest a second \
+                 Seatbelt profile inside it, so the inner ahma cannot enforce a tighter scope \
+                 and defers to the outer one. That is expected when ahma's own test suite or a \
+                 nested `ahma serve` runs through ahma. For ahma's own enforcement, start this \
+                 process from a plain terminal instead."
+            }
             Self::ClaudeCode => {
                 "To make ahma the sole sandbox: run ahma as a configured MCP server \
                  (Claude Code does NOT sandbox MCP servers — only its Bash tool), rather than \
@@ -86,6 +106,11 @@ impl HostSandbox {
 /// pure and unit-testable without touching the real process environment.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostSignals {
+    /// [`OUTER_SANDBOX_PID_ENV`] is set: an outer ahma's sandbox spawned us.
+    /// Matched first — it is the most specific signal there is, and an outer
+    /// ahma is itself usually running inside one of the IDEs below, whose
+    /// markers it inherits and passes on.
+    pub ahma: bool,
     /// `CURSOR_SANDBOX` or `CURSOR_AGENT` is set.
     pub cursor: bool,
     /// A Claude Code marker is present (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`).
@@ -107,6 +132,9 @@ pub struct HostSignals {
 /// Classify host signals into a single [`HostSandbox`], most-specific first.
 /// Pure: depends only on its input.
 pub fn classify(signals: &HostSignals) -> Option<HostSandbox> {
+    if signals.ahma {
+        return Some(HostSandbox::Ahma);
+    }
     if signals.cursor {
         return Some(HostSandbox::Cursor);
     }
@@ -128,9 +156,11 @@ pub fn classify(signals: &HostSignals) -> Option<HostSandbox> {
 /// Gather host signals from the current process environment (and a couple of
 /// cheap marker-file stats). Does not run the subprocess nesting probe — callers
 /// that want it can set [`HostSignals::nested_probe`] from
-/// [`super::prerequisites`] and re-[`classify`].
+/// `super::prerequisites` and re-[`classify`].
 pub fn signals_from_env() -> HostSignals {
     let env_set = |k: &str| std::env::var_os(k).is_some();
+
+    let ahma = env_set(OUTER_SANDBOX_PID_ENV);
 
     let cursor = env_set("CURSOR_SANDBOX") || env_set("CURSOR_AGENT");
 
@@ -144,6 +174,7 @@ pub fn signals_from_env() -> HostSignals {
     let docker = env_set("container") || Path::new("/.dockerenv").exists();
 
     HostSignals {
+        ahma,
         cursor,
         claude_code,
         vscode,
@@ -217,6 +248,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(classify(&s), Some(HostSandbox::ClaudeCode));
+    }
+
+    /// SPEC R7.1 / R7.6: an outer ahma is the most specific host there is —
+    /// it usually runs inside one of the IDEs, inherits their markers, and
+    /// passes them on to the command it sandboxes. The nested ahma must name
+    /// ahma, not the IDE two levels up.
+    #[test]
+    fn ahma_wins_over_every_ide_marker() {
+        let s = HostSignals {
+            ahma: true,
+            cursor: true,
+            claude_code: true,
+            vscode: true,
+            docker: true,
+            nested_probe: true,
+        };
+        assert_eq!(classify(&s), Some(HostSandbox::Ahma));
+        assert_eq!(HostSandbox::Ahma.label(), "an outer ahma");
+        assert!(
+            HostSandbox::Ahma
+                .remediation()
+                .contains("run_terminal_command"),
+            "the remediation must name the path that produced the nesting"
+        );
     }
 
     #[test]

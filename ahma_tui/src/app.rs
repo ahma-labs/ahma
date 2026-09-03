@@ -4507,7 +4507,7 @@ async fn run_text_stub(connection: &ResolvedConnection) -> Result<()> {
 /// this too, which inverted the standard's meaning: a user asking for no colour
 /// got ASCII glyphs *and* a fully coloured UI, since nothing here ever consulted
 /// it when choosing styles. Colour is [`no_color`]'s business; glyphs are this
-/// function's. See https://no-color.org.
+/// function's. See <https://no-color.org>.
 fn detect_unicode() -> bool {
     !std::env::var("TERM")
         .unwrap_or_default()

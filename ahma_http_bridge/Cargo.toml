@@ -21,9 +21,6 @@ chrono.workspace = true
 clap = { workspace = true, features = ["derive"] }
 dashmap = "6.2"
 futures.workspace = true
-opentelemetry-otlp = { workspace = true }
-opentelemetry.workspace = true
-opentelemetry_sdk = { workspace = true }
 owo-colors = "4.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -50,14 +47,27 @@ base64 = "0.22"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http-body-util = "0.1"
-quinn = "0.11"
-rcgen = "0.14.8"
+# `quinn` and `rcgen` both default to the `ring` crypto provider. `aws-lc-rs` is already
+# mandatory (rustls' default; sigstore/tough accept nothing else; reqwest's `http3` feature
+# selects `quinn/rustls-aws-lc-rs` itself), so their defaults would link a *second* provider
+# into every binary. One provider per workspace; guarded by the
+# `test_single_rustls_crypto_provider_invariant` test.
+quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 rustls = "0.23"
 rustls-pki-types = "1"
-tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing.workspace = true
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[features]
+# See ahma_mcp/Cargo.toml's `otel` comment — same rationale. This crate calls
+# `ahma_common::observability::create_otel_layer` from `src/main.rs` (the
+# standalone `ahma_http_bridge` binary used by e2e tests) and
+# `current_traceparent` from `src/peer.rs`, so it forwards rather than
+# staying feature-free.
+otel = ["ahma_common/otel"]
 
 [dev-dependencies]
 ahma_mcp = { path = "../ahma_mcp" }

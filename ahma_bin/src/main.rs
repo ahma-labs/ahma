@@ -134,8 +134,37 @@ async fn main() -> Result<()> {
             tracing::info!("Starting TUI hub daemon");
             ahma_common::daemon_hub::run_daemon().await
         }
+        Subcommands::Simplify(simplify_args) => {
+            tracing::info!("Running in simplify mode");
+            dispatch_simplify(simplify_args)
+        }
         other => dispatch_subcommand(other, cfg).await,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// simplify subcommand (cargo feature `simplify`, on by default)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `ahma simplify`: code complexity analysis from the `ahma_simplify` crate.
+///
+/// The subcommand is always present in the CLI parser (its clap arguments live in
+/// `ahma_common::simplify_args`, so `ahma_mcp` stays feature-free — one flavour),
+/// but the analysis engine is only linked when this binary is built with the
+/// `simplify` feature. Built with `--no-default-features`, the command fails
+/// with a message naming the feature instead of silently doing nothing.
+#[cfg(feature = "simplify")]
+fn dispatch_simplify(args: ahma_common::simplify_args::SimplifyArgs) -> Result<()> {
+    ahma_simplify::run(args)
+}
+
+#[cfg(not(feature = "simplify"))]
+fn dispatch_simplify(_args: ahma_common::simplify_args::SimplifyArgs) -> Result<()> {
+    anyhow::bail!(
+        "`ahma simplify` is not available: this ahma binary was built without the `simplify` \
+         cargo feature (it is on by default; `--no-default-features` drops it). \
+         Rebuild with `cargo build -p ahma_bin` or `cargo build -p ahma_bin --features simplify`."
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -372,5 +401,41 @@ fn check_powershell_available() {
             );
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A binary built without the `simplify` feature must still parse the
+    /// subcommand and then fail with an error that names the feature, so a user
+    /// (or an agent following the `/ahma simplify` skill) learns to rebuild
+    /// rather than seeing clap's "unrecognized subcommand".
+    #[cfg(not(feature = "simplify"))]
+    #[test]
+    fn simplify_without_feature_names_the_feature() {
+        let cli = Cli::try_parse_from(["ahma", "simplify", "."]).unwrap();
+        let Subcommands::Simplify(args) = cli.command else {
+            panic!("simplify must parse even without the feature");
+        };
+        let msg = dispatch_simplify(args)
+            .expect_err("lean build must not pretend to analyze")
+            .to_string();
+        assert!(msg.contains("`simplify`"), "{msg}");
+        assert!(msg.contains("--no-default-features"), "{msg}");
+    }
+
+    /// With the feature on, the subcommand parses into the same `SimplifyArgs`
+    /// the analyzer consumes; the dispatch is a plain hand-off to `ahma_simplify`.
+    #[cfg(feature = "simplify")]
+    #[test]
+    fn simplify_with_feature_parses_analyzer_args() {
+        let cli = Cli::try_parse_from(["ahma", "simplify", ".", "--limit", "3"]).unwrap();
+        let Subcommands::Simplify(args) = cli.command else {
+            panic!("expected simplify subcommand");
+        };
+        let args: ahma_simplify::SimplifyArgs = args;
+        assert_eq!(args.limit, 3);
     }
 }

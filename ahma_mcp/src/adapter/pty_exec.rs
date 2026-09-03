@@ -121,7 +121,7 @@ mod unix {
     ///
     /// The PTY child is a `std::process::Child` (rebuilt as a std `Command` so
     /// its stdio can be the PTY slave fd), so it cannot go through
-    /// [`kill_process_tree`], which takes a `tokio::process::Child`. It routes
+    /// [`kill_process_tree`](crate::shell_pool::kill_process_tree), which takes a `tokio::process::Child`. It routes
     /// through the same underlying primitive instead — this used to be its own
     /// copy of the syscall pair, which made the "single chokepoint" claim on
     /// `kill_process_tree` untrue.

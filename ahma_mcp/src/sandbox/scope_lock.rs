@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Observable lifecycle of the sandbox scope lock.
 ///
-/// Derived from the latches inside [`ScopeLock`]; `Committed` takes precedence
+/// Derived from the latches inside `ScopeLock`; `Committed` takes precedence
 /// over the roots-received flag, so once locked the state stays `Committed`
 /// regardless of any later negotiation bookkeeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,7 +7,7 @@
 //!   operation if the daemon is unavailable or crashes.
 //! * **Self-healing**: reconnects automatically with exponential back-off
 //!   (initial 5 s, cap 30 s) when the daemon connection is lost.
-//! * **Low overhead**: polls [`OperationMonitor`] every 2 seconds and diffs
+//! * **Low overhead**: polls [`OperationMonitor`](crate::operation_monitor::OperationMonitor) every 2 seconds and diffs
 //!   the snapshot — no changes means no wire traffic.
 
 use crate::mcp_service::{ActiveAgentSession, get_global_prompt_runner};
@@ -41,7 +41,7 @@ pub struct GrantReporting {
 
 /// The shared web-approval plumbing handed to the reporter (SPEC R-WEB.6). Parallel
 /// to [`GrantReporting`]: `coordinator` is the same
-/// [`WebApprovalCoordinator`](ahma_common::web_approval::WebApprovalCoordinator) the
+/// [`WebApprovalCoordinator`] the
 /// MCP service consults on every `fetch_webpage`, so a TUI answer routed back here
 /// takes effect for the live session. `req_rx` receives fresh requests to forward
 /// to the hub as [`ClientMsg::WebApprovalRequested`].
@@ -652,9 +652,9 @@ fn op_started_event(op: &Operation, scope: &str, origin: &str) -> DaemonEvent {
     }
 }
 
-/// Map a unified [`OperationEvent`] to the hub wire event, or `None` for
+/// Map a unified [`OperationEvent`](ahma_common::event_dispatcher::OperationEvent) to the hub wire event, or `None` for
 /// events the hub does not carry (Progress, McpNotification).
-/// Map a unified [`OperationEvent`] to the hub wire event.
+/// Map a unified [`OperationEvent`](ahma_common::event_dispatcher::OperationEvent) to the hub wire event.
 ///
 /// `origin` is the identity of the session that owns this instance — `cursor`,
 /// `claude-code`, `tui`, `cli`. Stamped here because this is the only layer that

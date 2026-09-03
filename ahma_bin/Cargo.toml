@@ -56,17 +56,33 @@ name = "ahma"
 path = "src/main.rs"
 
 [features]
-# Batteries-included default: all features compiled in.
+# Batteries-included default: all *stable* features compiled in.
 # Users building a lean binary can use --no-default-features.
 default = ["simplify"]
-# Code complexity analysis (`ahma simplify ...`).
-simplify = ["ahma_mcp/simplify"]
-# Everything, including incubating features (now same as default).
-full = ["simplify"]
+# Code complexity analysis (`ahma simplify ...`): links the `ahma_simplify` crate
+# and its rust-code-analysis toolchain into this binary. The feature lives HERE
+# and only here — `ahma_mcp` must keep a single feature flavour (see
+# docs/build-and-test-performance.md), so the subcommand is always listed by the
+# CLI parser and a binary built without the feature reports a clear error.
+simplify = ["dep:ahma_simplify"]
+# OpenTelemetry distributed tracing/metrics export (`ahma serve --opentelemetry
+# <url>`). Off by default: it pulls in the ~200-crate OpenTelemetry SDK
+# subtree, which most builds never use. CI builds and tests this flavour
+# separately and release archives ship a binary built with it (see
+# docs/build-and-test-performance.md, "OpenTelemetry" finding, and
+# ahma_common/Cargo.toml's `otel` feature comment). Forwards through
+# `ahma_mcp/otel`, which forwards to `ahma_common/otel`; Cargo unifies that
+# single `ahma_common` instance across this whole build, so `ahma_http_bridge`
+# (a transitive dependency, embedded rather than depended-on directly here)
+# picks it up too without ahma_bin needing its own edge to it.
+otel = ["ahma_mcp/otel"]
+# Everything, including incubating features (now same as default plus otel).
+full = ["simplify", "otel"]
 
 [dependencies]
 ahma_mcp = { path = "../ahma_mcp" }
 ahma_core = { path = "../ahma_core" }
+ahma_simplify = { path = "../ahma_simplify", optional = true }
 ahma_tui = { path = "../ahma_tui" }
 ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true
@@ -78,6 +94,7 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 toml.workspace = true
 tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 tempfile.workspace = true

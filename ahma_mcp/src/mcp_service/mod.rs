@@ -116,7 +116,7 @@ pub struct AhmaMcpService {
     pub adapter: Arc<Adapter>,
     pub operation_monitor: Arc<crate::operation_monitor::OperationMonitor>,
     /// Tool configurations, keyed by tool name. Writers MUST invalidate
-    /// [`Self::invalidate_config_tools_cache`] after mutating (as
+    /// `Self::invalidate_config_tools_cache` after mutating (as
     /// [`Self::update_tools`] does), or `tools/list` serves stale entries.
     pub configs: Arc<RwLock<HashMap<String, ToolConfig>>>,
     /// Lazily-built builtin `Tool` list. The builtin set and every builtin
@@ -296,11 +296,11 @@ impl AhmaMcpService {
     }
 
     /// Every tool available to this session, in `ToolInfo` form: the built-ins
-    /// from [`Self::builtin_tools`], then per-client config tools, then
+    /// from `Self::builtin_tools`, then per-client config tools, then
     /// external MCP tools.
     ///
     /// This is the toolset handed to ahma's own agent loop, so it withholds
-    /// [`AGENT_LOOP_DENIED_BUILTINS`]. Everything else is shared with
+    /// `AGENT_LOOP_DENIED_BUILTINS`. Everything else is shared with
     /// `list_tools` by construction rather than by hand.
     pub async fn get_all_available_tools(&self) -> Vec<crate::mcp_client::ToolInfo> {
         let mut tools: Vec<crate::mcp_client::ToolInfo> = self

@@ -143,8 +143,9 @@ pub mod hooks;
 pub mod livelog;
 /// LLM Completion Service provider.
 pub mod llm_service;
-/// Live log monitoring for streaming processes.
-pub mod log_monitor;
+/// Live log monitoring for streaming processes (the `ahma_log_monitor` crate,
+/// re-exported so `ahma_mcp::log_monitor::…` paths keep working).
+pub use ahma_log_monitor as log_monitor;
 /// MCP client connection manager and auto-discovery.
 pub mod mcp_client;
 /// MCP server implementation.
@@ -170,9 +171,6 @@ pub mod shell;
 pub mod shell_pool;
 /// Persistent stateful shell sessions (`session_id`).
 pub mod shell_session;
-/// Code complexity analysis and simplification tooling.
-#[cfg(feature = "simplify")]
-pub mod simplify;
 /// Terminal output helpers for callbacks.
 pub mod terminal_output;
 /// Tool availability checks and guidance.
@@ -204,21 +202,25 @@ pub mod validation;
 /// Egress sandbox: per-task HTTP proxy with domain allowlist.
 pub mod egress;
 
-/// Bundle signing and supply-chain auditor.
-pub mod bundle;
+/// Bundle supply-chain auditor and content checksum (the `ahma_bundle` crate,
+/// re-exported so `ahma_mcp::bundle::…` paths keep working).
+pub use ahma_bundle as bundle;
 
-/// Token minimization and output optimization.
-pub mod output_optimizer;
+/// Token minimization and output optimization (the `ahma_output_optimizer`
+/// crate, re-exported so `ahma_mcp::output_optimizer::…` paths keep working).
+pub use ahma_output_optimizer as output_optimizer;
 
-/// Harness guards and small-model adaptations.
-pub mod harness_guard;
+/// Harness guards and small-model adaptations (the `ahma_harness_guard` crate,
+/// re-exported so `ahma_mcp::harness_guard::…` paths keep working).
+pub use ahma_harness_guard as harness_guard;
 
 // Test utilities
 /// Test helpers for integration and unit tests.
 pub mod test_utils;
 
-/// Task vault: audit logging and trash.
-pub mod vault;
+/// Task vault: audit logging and trash (the `ahma_vault` crate, re-exported so
+/// `ahma_mcp::vault::…` paths keep working).
+pub use ahma_vault as vault;
 
 // Re-export main types for easier use
 pub use adapter::Adapter;

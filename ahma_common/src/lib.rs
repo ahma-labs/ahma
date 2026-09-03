@@ -43,6 +43,8 @@ pub const BUILD_ID: &str = env!("AHMA_BUILD_ID");
 
 pub mod config;
 pub mod daemon_hub;
+/// SHA-256 hex digests, one encoder for every `SHA256SUMS`-style surface.
+pub mod digest;
 pub mod elicitation;
 pub mod event_dispatcher;
 pub mod file_uri;
@@ -65,6 +67,9 @@ pub mod sandbox_state;
 pub mod scope_decision;
 pub mod scope_grant;
 pub mod session_event;
+/// clap arguments for `ahma simplify`, shared by the CLI parser (`ahma_mcp`) and
+/// the analysis engine (`ahma_simplify`) so neither depends on the other.
+pub mod simplify_args;
 pub mod skills;
 pub mod sse;
 pub mod state_machine;

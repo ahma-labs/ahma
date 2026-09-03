@@ -22,13 +22,16 @@ anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1.53.1", features = ["full"] }
+# Curated from what src/ actually uses (sync, net, time, spawn, select!, fs, main/test)
+# on top of the workspace list — `"full"` bypassed the workspace's feature curation.
+tokio = { workspace = true, features = ["sync", "net", "time"] }
 tracing.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls"] }
 uuid.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["tokio"] }

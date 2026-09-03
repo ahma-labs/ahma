@@ -8,65 +8,44 @@ allowed — the rationale must live in the repo, not only in the GitHub UI.
 
 ---
 
-## `tough` < 0.22.0 — TUF delegation flaws (2 × high)
+## `tough` < 0.22.0 — TUF delegation flaws (2 × high) — **RESOLVED in v0.19.8**
 
 | | |
 |---|---|
 | **Alerts** | GHSA — "Missing Delegated Metadata Validation"; "Delegated Roles have a Signature Threshold Bypass" |
-| **Crate** | `tough` (locked `0.21.0`) |
+| **Crate** | `tough` (was locked `0.21.0`, now `0.22.0`) |
 | **Fixed in** | `tough` `0.22.0` |
-| **Status** | **Accepted (tolerable risk)** — no clean upstream fix available |
+| **Status** | **Resolved** — the blocking dependency was removed rather than waited on |
 | **First flagged** | 2026-06-18 |
+| **Closed** | 2026-09-03 |
 
-### Dependency path
+### Why it was stuck, and how it was unstuck
 
-```
-ahma_mcp
-  └─ sigstore-verification 0.2.8   (latest published)
-       └─ sigstore 0.13.0          (req: sigstore ^0.13)
-            └─ tough 0.21.0        (req: tough ^0.21)
-```
+`tough 0.22.0` is only reachable through `sigstore 0.14`, and the old path went
+`ahma_update → sigstore-verification 0.2.8 → sigstore ^0.13 → tough ^0.21`. No
+published `sigstore-verification` depends on `sigstore ^0.14`, so neither
+`cargo update --precise` nor `[patch.crates-io]` could satisfy the `^0.21`
+requirement with a `0.22.x` crate — the register's original closing condition
+("wait for a `sigstore-verification` release on `sigstore ^0.14`") never came.
 
-### Why we cannot simply bump
-
-`tough 0.22.0` is only pulled in by `sigstore 0.14.0` (`tough ^0.22`). Reaching
-`sigstore 0.14` requires `sigstore-verification` to depend on `sigstore ^0.14`, but
-**no published `sigstore-verification` does** — `0.2.8` (latest) still pins
-`sigstore ^0.13`, which pins `tough ^0.21`. A `cargo update` / `--precise` bump is
-therefore rejected by the resolver, and a `[patch.crates-io]` cannot satisfy the
-`^0.21` requirement with a `0.22.x` crate.
-
-The only way to force `tough 0.22` today is to vendor/fork `sigstore-verification`
-onto `sigstore 0.14` and adapt to the 0.13→0.14 API changes — adding maintained
-third-party code and an upgrade-risk surface. We judged that worse than the residual
-risk below.
-
-### Why the residual risk is tolerable
-
-The vulnerable code (`tough`'s TUF delegated-metadata / signature-threshold handling)
-is reachable **only** through the self-update attestation path:
-
-- `ahma_mcp::update::verify::verify_artifact` → `sigstore_verification::verify_github_attestation`
-- invoked solely by the `ahma update` and `ahma verify` subcommands.
-
-It is **not** part of the MCP server, the sandbox, or any normal runtime path. To
-exploit it an attacker would have to subvert the **Sigstore public-good TUF CDN**
-(`tuf-repo-cdn.sigstore.dev`) — its delegated role metadata — at the moment a user
-runs an attested update, in order to defeat provenance verification. That is a narrow,
-high-capability attack against an occasional, user-initiated, opt-in operation.
-
-Mitigations already in place: release artifacts are additionally checksum-verified
-(`update::install::verify_file_checksum`), and `ahma update` only writes within the
-sandbox.
-
-### Closing condition
-
-Close (and bump) as soon as **`sigstore-verification` publishes a release depending on
-`sigstore ^0.14`** (which brings `tough ^0.22`). Action then:
+The wrapper was dropped instead: `ahma verify` / `ahma update` now implement GitHub
+Build Provenance verification directly on `sigstore` 0.14 (see
+[release-signing.md](release-signing.md) and `ahma_update/src/verify.rs`), which
+brings `tough 0.22.0` with it. Verify with:
 
 ```bash
-cargo update -p sigstore-verification   # pull the sigstore-0.14 release
-cargo tree -i tough                      # confirm tough >= 0.22.0
+cargo tree -i tough      # tough v0.22.0 └── sigstore v0.14.0
 ```
 
-Then drop this entry. Upstream to watch: <https://crates.io/crates/sigstore-verification>.
+The same change removed the transitive crates behind **RUSTSEC-2024-0370**
+(`proc-macro-error`) and **RUSTSEC-2026-0215** (`smallstr`), whose `deny.toml`
+ignores were deleted.
+
+### Still open: RUSTSEC-2023-0071 (`rsa` Marvin Attack)
+
+`sigstore`'s own `verify` feature enables `fulcio` → `oauth` → `openidconnect`,
+which is the only reason `rsa` is in the graph. ahma signs nothing and never
+performs an RSA private-key operation; `openidconnect` uses `rsa` for public-key
+JWT signature verification only. The `deny.toml` ignore stays until `sigstore`
+stops chaining those features, or `openidconnect` moves off `rsa`. Upstream to
+watch: <https://github.com/sigstore/sigstore-rs>.

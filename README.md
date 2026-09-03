@@ -321,6 +321,7 @@ Issues and pull requests are welcome. This project is AI friendly and provides t
 
 - **`AGENTS.md`/`CLAUDE.md`**: Instructions for AI agents to use the MCP server to contribute to the project.
 - **`SPEC.md`**: This is the **single source of truth** for the project requirements. AI keeps it up to date as you work on the project.
+- **[docs/build-and-test-performance.md](docs/build-and-test-performance.md)**: why `target/` used to grow to tens of GB, what the build/test layout does about it, and the measurements behind the rules in `AGENTS.md`.
 
 ## Working well with Claude (Sonnet / Opus)
 
@@ -356,9 +357,16 @@ Ahma uses a dual-tier licensing model to keep the core library reusable while en
 | Crate | License | Why it is here |
 |---|---|---|
 | `ahma_mcp` | MIT OR Apache-2.0 | Core MCP service, sandbox, and command execution |
+| `ahma_bundle` | MIT OR Apache-2.0 | Tool-bundle supply-chain audit and content checksum (`ahma bundle`) |
 | `ahma_common` | MIT OR Apache-2.0 | Shared runtime types and configuration |
 | `ahma_llm_monitor` | MIT OR Apache-2.0 | Log-monitoring and LLM client support |
+| `ahma_harness_guard` | MIT OR Apache-2.0 | Small-model harness guards (argument healing, loop detection, skill injection) |
+| `ahma_log_monitor` | MIT OR Apache-2.0 | Live log monitor: level detection, redaction, context snapshots (`monitor_level`) |
+| `ahma_output_optimizer` | MIT OR Apache-2.0 | Token-economy output optimizer (dedup, truncation, pressure governor) |
+| `ahma_simplify` | MIT OR Apache-2.0 | Code complexity analysis (`ahma simplify`); optional in `ahma_bin`, feature `simplify` (default on) |
 | `ahma_test_support` | MIT OR Apache-2.0 | Test helpers for workspace crates |
+| `ahma_update` | MIT OR Apache-2.0 | Self-update: release download, Sigstore verification (`ahma verify`), git installs |
+| `ahma_vault` | MIT OR Apache-2.0 | Task vault: isolated per-task directories, two-phase trash, audit log |
 | `generate_tool_schema` | MIT OR Apache-2.0 | Schema generation utility |
 | `ahma_tui` | AGPL-3.0-or-later | Terminal dashboard and approval flow |
 | `ahma_bin` | AGPL-3.0-or-later | Shipped `ahma` binary |

@@ -9,12 +9,12 @@
 //! In-memory locks (`Mutex`, `Semaphore`, `OnceLock`) only serialise within a
 //! single OS process.  Several ahma subsystems need cross-process coordination:
 //!
-//! * **Test infrastructure** ([`build_binary_cached`]): `cargo nextest` runs
+//! * **Test infrastructure** (`build_binary_cached`, in `ahma_mcp`): `cargo nextest` runs
 //!   each test in its own process, so an in-memory cache cannot prevent N
 //!   processes from spawning N concurrent `cargo build` subprocesses for the
 //!   same binary.
 //!
-//! * **Command mutex groups** ([`CommandMutexRegistry`]): each MCP session,
+//! * **Command mutex groups** (`CommandMutexRegistry`, in `ahma_mcp`): each MCP session,
 //!   hook invocation, and TUI instance creates its own in-memory registry,
 //!   so two sessions on the same workspace can run `cargo build` concurrently
 //!   — the exact contention the registry was designed to prevent.

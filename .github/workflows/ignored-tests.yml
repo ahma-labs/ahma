@@ -5,10 +5,13 @@
 # `--run-ignored only` exactly once: Linux, filtered to two Landlock red-team
 # tests. Everything else marked `#[ignore]` was executed by no workflow at all:
 #
-#   ahma_http_bridge  bridge_stress_tests            4  concurrent tool calls, high-volume requests
-#   ahma_http_bridge  session_stress_test            3  concurrent session create/terminate, many scopes
-#   ahma_http_bridge  sandbox_roots_handshake_stress 1  handshake state-machine race
-#   ahma_mcp          latency_guard_test             2  dispatch latency, per-line streaming throughput
+#   ahma_http_bridge::stress  bridge_stress_tests            4  concurrent tool calls, high-volume requests
+#   ahma_http_bridge::stress  session_stress_test            3  concurrent session create/terminate, many scopes
+#   ahma_http_bridge::stress  sandbox_roots_handshake_stress 1  handshake state-machine race
+#   ahma_mcp::latency_guard_test                            2  dispatch latency, per-line streaming throughput
+#
+# (The three bridge suites are modules of the single `stress` test binary; the
+# names above are module prefixes that `-E 'test(...)'` still matches.)
 #
 # The two latency guards are the *only* thing defending SPEC R3.1's ~6 ms
 # dispatch claim and ahma_mcp/SPEC.md's "5000 lines under 10 s" streaming claim.
@@ -49,8 +52,13 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_PAGER: cat
   CARGO_INCREMENTAL: 0
+  # Must match build.yml's env exactly (sccache keys on the whole rustc invocation; this
+  # workflow previously lacked CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG and so could never
+  # share a single Rust object with the main matrix). See the note in build.yml.
+  CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
   CARGO_NET_RETRY: 10
+  CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: false
   RUSTFLAGS: -C debuginfo=0 --cfg reqwest_unstable
   RUST_BACKTRACE: 1
   RUSTC_WRAPPER: sccache
@@ -98,7 +106,7 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build ahma binary (required by integration tests)
-        run: cargo build --locked --no-default-features -p ahma_bin
+        run: cargo build --locked -p ahma_bin
 
       # `--run-ignored all` rather than `only`: the ignored tests share fixtures
       # and helpers with their non-ignored siblings, so running the whole set is
@@ -123,7 +131,7 @@ jobs:
         timeout-minutes: 60
         run: |
           set -o pipefail
-          cargo nextest run --profile ci --locked --no-default-features \
+          cargo nextest run --profile ci --locked \
             --run-ignored all --no-fail-fast --success-output immediate \
             -E 'not (test(kotlin) or test(android))' 2>&1 | tee nextest.log
 

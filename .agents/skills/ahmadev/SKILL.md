@@ -405,7 +405,9 @@ git bisect good <good-ref>     # default: last release tag
 #   125      => SKIP this commit (e.g. it does not compile)
 git bisect run bash -c '
   cargo build --locked -q 2>/dev/null || exit 125
-  cargo nextest run --no-default-features -E "test(<narrow_repro>)" 2>/dev/null
+  # Default features = the one canonical flavour (AGENTS.md §1); a feature flag here
+  # would compile a second copy of the workspace at every bisect step.
+  cargo nextest run -E "test(<narrow_repro>)" 2>/dev/null
 '
 # git prints: "<sha> is the first bad commit"
 git bisect reset    # (the trap also does this)
@@ -546,7 +548,7 @@ happy-path smoke tests. Before writing tests for a file:
    - Every early return / guard clause
    - Boundary conditions: empty input, None, max-size, zero timeout
    - Env-var-gated behavior (use the `ENV_MUTEX` + `unsafe { std::env::set_var }` pattern
-     from `ahma_mcp/src/update/source.rs` to serialize env-var-touching tests)
+     from `ahma_update/src/source.rs` to serialize env-var-touching tests)
 
 A file previously at 20% should be at ≥80% when you are done with it. A small file at 0%
 should be at 100%. Stopping at 50% is not acceptable unless the remaining lines require
@@ -630,7 +632,7 @@ yourself. The agent fan-out IS the work.
 
    | File | Current % | Lines uncovered | Target % | Why chosen |
    |------|-----------|-----------------|----------|------------|
-   | ahma_mcp/src/update/mod.rs | 9% | 275 | ≥80% | update flow, wide blast radius |
+   | ahma_update/src/lib.rs | 9% | 275 | ≥80% | update flow, wide blast radius |
    | ... | | | | |
 
    Total the "lines uncovered" column. That is the impact of this PR.
@@ -817,7 +819,7 @@ Only deviate from this rule when the user explicitly specifies a different versi
 
 > **Why no quality pipeline?** `/ahmadev bump` intentionally skips `cargo fmt`, `cargo nextest run`, and `cargo clippy` because the xtask command only edits version-bearing strings and ensures they are internally consistent. Running the full test suite here would be a poor cost/benefit trade-off — do that in the natural course of testing your other work.
 
-> **Stale-binary note:** A bump changes `CARGO_PKG_VERSION`, which can make integration tests that spawn the `ahma` binary fail against a stale `target/debug/ahma` (e.g. the `/health` semver assertion in `ahma_http_bridge`). The test harness now self-heals: `build_binary_cached` (in `ahma_mcp::test_utils::cli`) rebuilds the binary when it is **stale** — older than the newest workspace source file — so `cargo nextest run` no longer requires a manual `cargo build -p ahma_bin` first. A binary that is already fresh is used as-is and never rebuilt, so a build made with specific flags (e.g. CI's `--no-default-features`) keeps its feature set. If you ever bypass the harness, build the binary yourself before spawning it.
+> **Stale-binary note:** A bump changes `CARGO_PKG_VERSION`, which can make integration tests that spawn the `ahma` binary fail against a stale `target/debug/ahma` (e.g. the `/health` semver assertion in `ahma_http_bridge`). The test harness now self-heals: `build_binary_cached` (in `ahma_mcp::test_utils::cli`) rebuilds the binary when it is **stale** — older than the newest workspace source file — so `cargo nextest run` no longer requires a manual `cargo build -p ahma_bin` first. A binary that is already fresh is used as-is and never rebuilt. CI and the harness both build with default features — the single canonical flavour (AGENTS.md §1) — so the harness's own `cargo build --bin ahma` never flips a feature set. If you ever bypass the harness, build the binary yourself before spawning it.
 
 ### Failure recovery
 

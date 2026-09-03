@@ -72,9 +72,11 @@ pub fn build_quic_tls_config(cert: &SelfSignedCert) -> Result<Arc<rustls::Server
     let key_der = PrivateKeyDer::try_from(cert.key_der.clone())
         .map_err(|e| anyhow::anyhow!("Invalid private key DER: {}", e))?;
 
-    // Explicitly select the ring crypto provider to avoid ambiguity when both
-    // `ring` and `aws-lc-rs` features are enabled by transitive dependencies.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    // `aws-lc-rs` is the workspace's only rustls crypto provider (see the `quinn`/`rcgen`
+    // notes in Cargo.toml). It is still named explicitly rather than relying on
+    // `ServerConfig::builder()`'s process default, so this config does not depend on
+    // whether some other component installed a provider first.
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("Failed to build TLS server config with TLS 1.3")?
@@ -97,11 +99,11 @@ pub fn build_quic_tls_config(cert: &SelfSignedCert) -> Result<Arc<rustls::Server
 mod tests {
     use super::*;
 
-    /// Install the ring crypto provider as process default if not already set.
+    /// Install the aws-lc-rs crypto provider as process default if not already set.
     /// `build_quic_tls_config` passes the provider explicitly, so this is only a
     /// defensive no-op guard; harmless if a provider is already installed.
     fn ensure_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
 
     #[test]

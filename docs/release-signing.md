@@ -23,8 +23,9 @@ GitHub Actions: build.yml
           - Rekor transparency log entry
                 │
                 ▼
-        ahma_mcp::update::verify::verify_artifact(path)
-          (single Rust implementation used by ahma verify and ahma update)
+        ahma_update::verify::verify_artifact(path)
+          (single Rust implementation used by ahma verify and ahma update,
+           built directly on the `sigstore` crate)
 ```
 
 Every release archive and raw binary is attested by `actions/attest-build-provenance`.
@@ -50,7 +51,7 @@ Attestations are stored in GitHub's Attestation API, queryable by artifact SHA-2
 
 ## How `ahma update` and `ahma verify` work
 
-The single Rust verification module is `ahma_mcp/src/update/verify.rs`.
+The single Rust verification module is `ahma_update/src/verify.rs`.
 It is called from three places:
 
 1. **`ahma verify <path>`** — explicit CLI verification of any file.
@@ -62,8 +63,43 @@ The verification flow:
 1. Compute the artifact's SHA-256 digest.
 2. Call the GitHub Attestation API:
    `GET /repos/paulirotta/ahma/attestations/sha256:{digest}`
-3. Verify the returned Sigstore bundle against GitHub's trust root (Fulcio + Rekor).
-4. Confirm the certificate's identity encodes `paulirotta/ahma` as the issuing workflow.
+3. For each Sigstore bundle returned, require the signed in-toto statement to list
+   that digest among its subjects. (A release attests the archive **and** the raw
+   binary in one statement, so `ahma verify --self` matches a later subject than
+   `ahma update` does. Both are accepted; a bundle for some other artifact is
+   rejected here, before any network round trip to the trust root.)
+4. Verify the bundle against the public-good Sigstore trust root, fetched over TUF:
+   the signing certificate must chain to a Fulcio CA, its embedded Signed
+   Certificate Timestamp must verify against the CT-log keys, and the DSSE
+   signature must verify over the envelope's pre-authentication encoding.
+5. Enforce the identity policy — all three of:
+   - OIDC issuer (Fulcio OID `…57264.1.1`) is `https://token.actions.githubusercontent.com`,
+   - workflow repository (OID `…57264.1.5`) is exactly `paulirotta/ahma`,
+   - the certificate SAN (`build_signer_uri`) is under `https://github.com/paulirotta/ahma/`.
+6. Bind the Rekor transparency-log entry to the bundle: it must record this payload
+   hash, this signature and this signing certificate, and its `integratedTime` must
+   fall inside the certificate's ~10-minute validity window.
+
+Any one attestation satisfying all of the above verifies the artifact; if none does,
+the error lists why each was rejected.
+
+### Implementation notes
+
+Verification is implemented on the [`sigstore`](https://crates.io/crates/sigstore)
+crate (0.14) directly — `sigstore::bundle::verify::Verifier` plus the policy types in
+`sigstore::bundle::verify::policy`. There is no wrapper crate: the previous
+`sigstore-verification` dependency was removed in v0.19.8, which also removed
+`oci-client`, `json-syntax`, an extra `syn` major and two `deny.toml` advisory
+exceptions (see [security-advisories.md](security-advisories.md) and
+[build-and-test-performance.md](build-and-test-performance.md)).
+
+Two checks are performed by `ahma_update` rather than by `sigstore`, because
+`sigstore` 0.14 cannot complete them for GitHub-issued bundles — the subject binding
+(step 3), because `sigstore` inspects only `subject[0]`, and the transparency-log
+binding (step 6), because `sigstore` recomputes Rekor's `envelopeHash` by
+re-serialising the parsed envelope, which does not round-trip. `ahma_update/src/verify.rs`
+documents exactly which upstream error is tolerated, and what it re-establishes
+before doing so. Both replacements are stricter than the checks they stand in for.
 
 ## Out-of-band verification
 

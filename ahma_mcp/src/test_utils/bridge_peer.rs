@@ -13,8 +13,8 @@
 //!
 //! | Type | Use-case |
 //! |------|----------|
-//! | [`NullPeerFactory`] | Lifecycle / state-machine tests. The peer side is a silent sink; the bridge I/O loop sees EOF and stops quickly. Equivalent to using `echo` as the subprocess. |
-//! | [`InProcessMcpPeerFactory`] | Full protocol tests. The peer side is a real [`AhmaMcpService`] wired through a `tokio::io::duplex` channel. |
+//! | [`NullPeerFactory`](crate::test_utils::bridge_peer::NullPeerFactory) | Lifecycle / state-machine tests. The peer side is a silent sink; the bridge I/O loop sees EOF and stops quickly. Equivalent to using `echo` as the subprocess. |
+//! | [`InProcessMcpPeerFactory`](crate::test_utils::bridge_peer::InProcessMcpPeerFactory) | Full protocol tests. The peer side is a real [`AhmaMcpService`](crate::mcp_service::AhmaMcpService) wired through a `tokio::io::duplex` channel. |
 //!
 //! Both types are `Send + Sync + 'static` and can be stored as
 //! `Arc<dyn PeerFactory>` inside [`SessionManagerConfig::peer_factory`].

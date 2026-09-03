@@ -11,7 +11,7 @@
 //!    caller-supplied roots (same JSON-RPC id),
 //! 5. only then `tools/call` — and a `tools/call` before the sandbox lock
 //!    settles returns HTTP 409 with JSON-RPC `-32001`, which callers poll or
-//!    retry through per their [`ConflictRetryPolicy`].
+//!    retry through per their [`ConflictRetryPolicy`](crate::streamable::ConflictRetryPolicy).
 //!
 //! What genuinely differs per consumer stays parameterized:
 //! `clientInfo.name`/`version` (the server keys `supports_progress` and

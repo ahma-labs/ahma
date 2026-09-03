@@ -26,17 +26,16 @@
 //! ## What [`GrantCoordinator`] guarantees
 //!
 //!  - **Dedup / debounce**: a given `(canonical_path, access)` is asked **at most
-//!    once** per session. The same path trips the kernel many times; [`begin`]
-//!    gates so only the first trip fans out a prompt.
-//!    [`begin`]: GrantCoordinator::begin
+//!    once** per session. The same path trips the kernel many times;
+//!    [`begin`](GrantCoordinator::begin) gates so only the first trip fans out a prompt.
 //!  - **No re-ask loops**: after a Deny *or* a grant the `(path, access)` is added
 //!    to a session dismiss list. A grant cannot widen the live session, so the path
 //!    keeps tripping — suppressing the re-ask is what stops an ask→deny→ask storm.
 //!  - **First-answer-wins**: when the same decision is fanned to several surfaces,
-//!    the first answer resolves it; later answers are no-ops ([`resolve`] is
-//!    idempotent). Combined with [`crate::config::GrantOutcome::Updated`] this makes
-//!    a near-simultaneous double-approve from two surfaces harmless.
-//!    [`resolve`]: GrantCoordinator::resolve
+//!    the first answer resolves it; later answers are no-ops
+//!    ([`resolve`](GrantCoordinator::resolve) is idempotent). Combined with
+//!    [`crate::config::GrantOutcome::Updated`] this makes a near-simultaneous
+//!    double-approve from two surfaces harmless.
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};

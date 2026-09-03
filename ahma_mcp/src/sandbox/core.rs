@@ -16,7 +16,7 @@ use super::types::{SandboxMode, ScopesGuard};
 ///
 /// These approvals are stored *outside* any workspace scope so a sandboxed
 /// agent cannot grant itself access to out-of-scope log targets by writing the
-/// file — the same reasoning as [`ahma_core`-style] tool-approval grants.
+/// file — the same reasoning as `ahma_core`-style tool-approval grants.
 /// Exceptions are keyed by workspace root:
 ///
 /// ```json
@@ -236,7 +236,7 @@ pub struct Sandbox {
     /// `roots ∪ {sandbox_dir}` rather than discarding the secondary scope.
     pub(super) scratch_dir: Option<PathBuf>,
     /// User-granted external directories (writable) that survive `roots/list`
-    /// replacement, just like [`sandbox_dir`](Self::sandbox_dir). These come from
+    /// replacement, just like [`Self::scratch_dir`]. These come from
     /// `[sandbox].persistent_scopes` with `access = "rw"` (e.g. an sccache cache
     /// outside the workspace) and are re-appended on every `update_scopes` call.
     pub(super) persistent_write_scopes: Vec<PathBuf>,
@@ -283,6 +283,13 @@ pub struct Sandbox {
     /// so a later tool call naming a *different* project cannot re-point the
     /// writable scope (R5.1.1 — one commit, never re-derived).
     pub(super) narrowed_to: parking_lot::RwLock<Option<PathBuf>>,
+    /// `Some(host)` when this process is itself inside a macOS Seatbelt profile
+    /// that refuses to nest ahma's own (SPEC R7.6). Commands then spawn bare —
+    /// still inside the outer kernel boundary — and every scope surface reports
+    /// `DeferredToHost`. Decided once, at construction, from the kernel's own
+    /// answer plus a refused nesting probe; never from environment markers
+    /// alone. Always `None` off macOS: Landlock and Job Objects nest fine.
+    pub(super) outer_sandbox: Option<super::host_detect::HostSandbox>,
 }
 
 /// Outcome of a scope commit ([`Sandbox::commit_scopes`] /
@@ -347,6 +354,7 @@ impl Clone for Sandbox {
             scope_lock: self.scope_lock.clone(),
             container_root: self.container_root.clone(),
             narrowed_to: parking_lot::RwLock::new(self.narrowed_to.read().clone()),
+            outer_sandbox: self.outer_sandbox,
         }
     }
 }
@@ -394,6 +402,22 @@ impl Sandbox {
             Default::default()
         };
 
+        // SPEC R7.6: decide *here*, once, whether this process can apply its own
+        // Seatbelt profile at all. Doing it at the first spawn instead would
+        // surface as an opaque `sandbox_apply: Operation not permitted` from
+        // the child — the failure that hid this for the in-process test suite,
+        // which never goes through the server's startup probe.
+        let outer_sandbox = super::prerequisites::nested_seatbelt_denial();
+        if let Some(host) = outer_sandbox {
+            tracing::warn!(
+                "{} (SPEC R7.6: macOS refuses to nest a Seatbelt profile inside one that \
+                 denies anything; ahma's own scope{} is validated in-process but not \
+                 kernel-enforced — the outer sandbox's boundary is.)",
+                ActiveSandbox::DeferredToHost(host).disclosure_line(),
+                super::error::format_scopes(&canonicalized)
+            );
+        }
+
         Ok(Self {
             scopes: parking_lot::RwLock::new(canonicalized),
             read_scopes: parking_lot::RwLock::new(read_scopes),
@@ -413,7 +437,25 @@ impl Sandbox {
             scope_lock: super::scope_lock::ScopeLock::new(),
             container_root: None,
             narrowed_to: parking_lot::RwLock::new(None),
+            outer_sandbox,
         })
+    }
+
+    /// The outer sandbox this instance defers to because the kernel refuses to
+    /// nest ahma's own inside it (SPEC R7.6), or `None` when ahma enforces.
+    pub fn deferred_to_outer_sandbox(&self) -> Option<super::host_detect::HostSandbox> {
+        self.outer_sandbox
+    }
+
+    /// Which sandbox is actually protecting this instance's spawns (SPEC R5.4,
+    /// R7): the deferral verdict when there is one, else the host-detection /
+    /// confinement probes. Every surface that discloses the sandbox state must
+    /// derive it from here so logs, clients, and the TUI agree.
+    pub fn active_sandbox(&self) -> ActiveSandbox {
+        match self.outer_sandbox {
+            Some(host) => ActiveSandbox::DeferredToHost(host),
+            None => ActiveSandbox::observe(self.is_enforced()),
+        }
     }
 
     /// Install the guarded egress-proxy address for R-NET enforcement (macOS
@@ -471,7 +513,7 @@ impl Sandbox {
     /// `write` paths join the writable scope set; `read` paths join the read-only
     /// set. Both are folded into the live scopes immediately — so the very first
     /// platform enforcement (Landlock at startup / Seatbelt per-command) already
-    /// includes them — and stored so [`update_scopes`](Self::update_scopes)
+    /// includes them — and stored so [`Self::commit_scopes`]
     /// re-appends them after every `roots/list` replacement. Paths must already be
     /// canonicalized by the caller.
     #[must_use]
@@ -818,7 +860,7 @@ impl Sandbox {
     /// Whether kernel enforcement is active. `--no-sandbox` maps to
     /// [`SandboxMode::Test`], in which scope is resolved but never enforced.
     pub fn is_enforced(&self) -> bool {
-        !self.is_test_mode()
+        !self.is_test_mode() && self.outer_sandbox.is_none()
     }
 
     /// Canonical human-readable scope summary with provenance (SPEC R5.4).
@@ -853,7 +895,7 @@ impl Sandbox {
         // SPEC R5.4: carry the active-sandbox state (including whether ahma is
         // nested inside a host sandbox) so clients like the TUI can render the
         // effective posture and its remediation without a separate query.
-        let active = ActiveSandbox::observe(self.is_enforced());
+        let active = self.active_sandbox();
         if let serde_json::Value::Object(map) = &mut v {
             map.insert("active".into(), serde_json::json!(active.token()));
             map.insert(

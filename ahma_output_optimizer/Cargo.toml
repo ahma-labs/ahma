@@ -1,0 +1,12 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+name = "ahma_output_optimizer"
+description = "Token-economy output optimizer for ahma tool results: ANSI stripping, line deduplication, repeat fingerprinting, exit-code-aware truncation and context-window pressure governance (MIT OR Apache-2.0)."
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+workspace-hack = { version = "0.1", path = "../workspace-hack" }

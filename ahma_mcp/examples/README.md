@@ -86,8 +86,8 @@ To add a new tool configuration:
    name = "newtool"
    path = "examples/newtool.rs"
    ```
-4. Add tests in `tests/tool_config_schema_validation_test.rs`
-5. Add execution tests in `tests/tool_examples_execution_test.rs`
+4. Add tests in `tests/unit/tool_config_schema_validation_test.rs`
+5. Add execution tests in `tests/unit/tool_examples_execution_test.rs`
 
 ## See Also
 

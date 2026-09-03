@@ -1,6 +1,6 @@
 //! Transport-agnostic MCP peer factory abstraction (P6).
 //!
-//! [`PeerFactory`] is the "port" for per-session MCP peer creation in the HTTP
+//! [`PeerFactory`](crate::peer_factory::PeerFactory) is the "port" for per-session MCP peer creation in the HTTP
 //! bridge.  Moving this type from `ahma_http_bridge::peer` to `ahma_common`
 //! severs the test-time back-edge that existed when `ahma_mcp::test_utils`
 //! needed to import it from the bridge crate.

@@ -179,8 +179,8 @@ To add a new tool configuration:
 
 1. Create the JSON file in `ahma/examples/configs/`
 2. Add a corresponding example in `ahma/examples/toolname.rs`
-3. Add tests in `ahma/tests/tool_config_schema_validation_test.rs`
-4. Add execution tests in `ahma/tests/tool_examples_execution_test.rs`
+3. Add tests in `ahma_mcp/tests/unit/tool_config_schema_validation_test.rs`
+4. Add execution tests in `ahma_mcp/tests/unit/tool_examples_execution_test.rs`
 5. Update `ahma/Cargo.toml` with example declaration
 6. Run all tests: `cargo nextest run --workspace`
 

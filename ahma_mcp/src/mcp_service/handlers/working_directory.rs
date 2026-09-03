@@ -117,7 +117,7 @@ impl WorkingDirectory {
 /// Three outcomes, in order:
 /// 1. caller named a directory → use it, disclose nothing;
 /// 2. omitted, and the scope came from the container root → refuse (see
-///    [`no_working_directory_error`]);
+///    `no_working_directory_error`);
 /// 3. omitted otherwise → substitute, and say so in the result.
 pub fn resolve(
     sandbox: &Sandbox,

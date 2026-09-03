@@ -3,7 +3,7 @@
 //! This module is the Windows counterpart to `landlock.rs` (Linux) and
 //! `seatbelt.rs` (macOS). It supplies the two halves of SPEC R6.3:
 //!
-//! * **R6.3.2 — process-tree lifetime.** [`enforce_windows_sandbox`] assigns the
+//! * **R6.3.2 — process-tree lifetime.** [`enforce_windows_sandbox`](crate::sandbox::windows::enforce_windows_sandbox) assigns the
 //!   server process to a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so
 //!   no tool subprocess outlives the server. This restricts *nothing* by path.
 //! * **R6.3.3 — the filesystem boundary.** Every tool subprocess is launched into
@@ -27,7 +27,7 @@
 //! spawned directly either: it is wrapped in `sandbox-exec`, which applies the
 //! profile and then execs the real program. Here the wrapper is **`ahma.exe`
 //! itself**, re-entered with a reserved first argument
-//! ([`LAUNCHER_ARGV0`]). The launcher applies the AppContainer attribute, spawns
+//! ([`LAUNCHER_ARGV0`](crate::sandbox::windows::LAUNCHER_ARGV0)). The launcher applies the AppContainer attribute, spawns
 //! the real program with `CreateProcessW`, keeps it in a kill-on-close job, waits,
 //! and exits with the child's exit code. Standard handles are inherited straight
 //! through, so the pipes tokio created are the pipes the real program writes to and
@@ -45,10 +45,10 @@
 //! read/write/execute/delete, read scopes get read/execute. This **mutates the
 //! user's filesystem ACLs**, so every grant is recorded and reverted:
 //!
-//! * [`AppContainerSession`] holds the grant list and revokes on
-//!   [`cleanup_windows_sandbox`] (session teardown).
+//! * `AppContainerSession` (Windows-only) holds the grant list and revokes on
+//!   [`cleanup_windows_sandbox`](crate::sandbox::windows::cleanup_windows_sandbox) (session teardown).
 //! * Before mutating, the grant list is journalled to
-//!   `%LOCALAPPDATA%\ahma\appcontainer-grants\<pid>.grants`. [`enforce_windows_sandbox`]
+//!   `%LOCALAPPDATA%\ahma\appcontainer-grants\<pid>.grants`. [`enforce_windows_sandbox`](crate::sandbox::windows::enforce_windows_sandbox)
 //!   sweeps that directory at startup and revokes any journal whose owning process
 //!   is gone, so a `SIGKILL`/crash/power-loss leaves at most one stale ACE until the
 //!   next run, not forever.
@@ -84,7 +84,7 @@
 //! along with one outside it. A boundary that denies everything proves nothing —
 //! it is the exact failure mode the gate test's own docstring warns against — so
 //! the spawn path is switched off rather than shipped broken. See
-//! [`appcontainer_spawn_enabled`], which is the single place that verdict lives,
+//! [`appcontainer_spawn_enabled`](crate::sandbox::windows::appcontainer_spawn_enabled), which is the single place that verdict lives,
 //! and `sandbox/command.rs`, which reads it.
 //!
 //! Everything below therefore compiles and is unit-tested, and none of it is

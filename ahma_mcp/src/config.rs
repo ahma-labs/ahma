@@ -835,7 +835,7 @@ async fn overlay_untrusted_tool_dir(dir: &Path, configs: &mut HashMap<String, To
 /// last-one-wins precedence among themselves and over the built-in bundles.
 /// `untrusted_dir` is a workspace directory discovered from a connecting client's
 /// roots: it is additive only and can never shadow an existing name — see
-/// [`overlay_untrusted_tool_dir`] for why.
+/// `overlay_untrusted_tool_dir` for why.
 pub async fn load_tool_configs_with_untrusted_overlay(
     config: &crate::shell::cli::AppConfig,
     trusted_dirs: &[&Path],

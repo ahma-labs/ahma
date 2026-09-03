@@ -1,0 +1,53 @@
+# This file contains settings for `cargo hakari`.
+# See https://docs.rs/cargo-hakari/latest/cargo_hakari/config for a full list of options.
+#
+# WHY THIS EXISTS — read before removing.
+#
+# Cargo unifies third-party features per *invocation*, not per workspace. So
+# `cargo build -p ahma_core` resolves tokio/reqwest/rmcp/... with a smaller
+# feature set than `cargo build` (which also sees every other member's deps and
+# dev-deps), and cargo fingerprints those as different crates. Measured on a
+# fully-built tree with no source changes:
+#
+#   cargo build -p ahma_core                 recompiled ~70 third-party crates
+#   cargo build -p ahma_common               recompiled ~75 (incl. aws-lc-rs, ring)
+#   cargo test --no-run -p ahma_mcp          recompiled ~40
+#   -> target/ grew from 9.4 GB to 18 GB from ordinary per-crate commands.
+#
+# The workspace-hack crate depends on the UNION of every member's third-party
+# features, and every member depends on it, so every invocation — whole
+# workspace or a single `-p` — resolves to the same feature set and reuses the
+# same artifacts. That is the whole trick; it changes nothing at runtime.
+#
+# Maintenance: after editing any Cargo.toml dependency, run
+#     cargo hakari generate && cargo hakari manage-deps
+# CI runs `cargo hakari verify` (scripts/check-guardrails.sh) so drift fails fast.
+
+hakari-package = "workspace-hack"
+
+# Format version for hakari's output. Version 4 requires cargo-hakari 0.9.22 or above.
+dep-format-version = "4"
+
+# Matches `resolver = "3"` in the root Cargo.toml (identical to v2 from hakari's
+# point of view; edition-2024 members require it).
+resolver = "3"
+
+# Platforms developers and CI actually build on. Features that differ only on
+# other targets are not unified, which keeps platform-specific deps (landlock,
+# windows-sys) out of the hack on the platforms that do not need them.
+platforms = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+# xtask is dev-only automation with its own HTTP stack (ureq). Unifying it would
+# drag ureq/webpki-roots feature choices into every product crate's build.
+# ahma_test_support has no dependencies at all.
+[traversal-excludes]
+workspace-members = ["xtask", "ahma_test_support"]
+
+# Neither crate should carry a `workspace-hack` dependency line.
+[final-excludes]
+workspace-members = ["xtask", "ahma_test_support"]

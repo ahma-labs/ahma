@@ -152,7 +152,7 @@ pub fn set_log_dir_from_scope(dir: PathBuf) {
 /// 2. `AHMA_LOG_DIR` env var (deprecated)
 /// 3. `[logging] dir` in `~/.ahma/settings.toml`
 /// 4. Primary sandbox scope `<scope>/logs` (set after `roots/list`)
-/// 5. `<workspace-root>/logs` if writable — see [`log_anchor_dir`]
+/// 5. `<workspace-root>/logs` if writable — see `log_anchor_dir`
 /// 6. `~/.ahma/logs/<project-namespace>` — a per-project subdirectory, not one
 ///    shared flat file: the sandbox already enforces per-project isolation on
 ///    disk, and a single shared log would quietly undo that at the

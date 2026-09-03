@@ -37,6 +37,8 @@
 pub mod client;
 /// Error types for HTTP MCP client operations.
 pub mod error;
+/// `oauth2` HTTP adapter over the workspace `reqwest` client.
+pub mod oauth_http;
 /// Shared MCP Streamable-HTTP client (handshake, SSE, roots, 409 gate).
 pub mod streamable;
 /// Unix domain socket MCP transport (Unix only).

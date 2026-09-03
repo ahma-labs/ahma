@@ -9,7 +9,7 @@
 //! bookkeeping that looks perfectly correct from the server's side while the
 //! client sees silence and eventually drops the transport.
 //!
-//! [`RecordingClient`] is a real [`ClientHandler`], so it exercises the same
+//! [`RecordingClient`](crate::test_utils::recording_client::RecordingClient) is a real [`ClientHandler`](rmcp::handler::client::ClientHandler), so it exercises the same
 //! serialization, dispatch, and peer plumbing a production client does. Pair it
 //! with [`crate::test_utils::in_process`] to assert on delivered notifications
 //! without spawning a subprocess.

@@ -8,7 +8,7 @@
 //! ## Semantics, stated precisely
 //!
 //! A pattern is one of three forms. Both the pattern and the candidate are
-//! normalised first (see [`normalize`]): ASCII-lowercased, with a single trailing
+//! normalised first (see `normalize`): ASCII-lowercased, with a single trailing
 //! root dot removed.
 //!
 //! | Form | Matches | Does **not** match |
@@ -29,7 +29,7 @@
 //!   bug in this exact code is `candidate.ends_with(suffix)`, which happily lets
 //!   `evilcrates.io` satisfy a rule written for `crates.io` — an attacker
 //!   registers the concatenation and the allowlist hands them the traffic.
-//!   [`wildcard_must_not_match_a_concatenated_lookalike`] is the regression test.
+//!   `wildcard_must_not_match_a_concatenated_lookalike` is the regression test.
 //!
 //! ## Non-ASCII is rejected, not transformed
 //!

@@ -68,17 +68,17 @@ impl Client {
         let command = if let Some(binary) = resolve_prebuilt_ahma_mcp_binary().await {
             Command::new(binary)
         } else {
-            eprintln!(
-                "Warning: Using slow 'cargo run' path. Run 'cargo build -p ahma_mcp --bin ahma' first for faster tests."
-            );
-            let mut cmd = Command::new("cargo");
-            cmd.arg("run")
-                .arg("--package")
-                .arg("ahma_mcp")
-                .arg("--bin")
-                .arg("ahma")
-                .arg("--");
-            cmd
+            // No prebuilt binary: build (or refresh) it through the shared harness
+            // helper, which serialises across test processes and never flips the
+            // feature set of a fresh binary. This used to shell out to
+            // `cargo run --package ahma_mcp --bin ahma`, a target that stopped
+            // existing when the binary moved to `ahma_bin` — every caller that
+            // reached this branch failed with "no bin target named ahma".
+            let binary = tokio::task::spawn_blocking(|| {
+                crate::test_utils::cli::build_binary_cached("ahma_bin", "ahma")
+            })
+            .await?;
+            Command::new(binary)
         };
 
         let client = ()

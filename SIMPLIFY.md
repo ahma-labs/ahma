@@ -32,11 +32,15 @@ simplify(directory=".", ai_fix=1)
 
 ## Installation
 
-`ahma simplify` is built into the `ahma` binary — no separate install needed.
+`ahma simplify` is built into the `ahma` binary — no separate install needed. The analyzer
+lives in its own crate, `ahma_simplify`, which the `ahma` binary (`ahma_bin`) links through
+its `simplify` cargo feature. That feature is **on by default**; a binary built with
+`--no-default-features` still lists the subcommand but fails with a message naming the
+feature when it is run.
 
 **Quick install (Linux/macOS):**
 ```bash
-cargo install --git https://github.com/paulirotta/ahma ahma_mcp --bin ahma --root ~/.local --locked --force
+cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked --force
 ```
 
 Or after `ahma` is installed: `ahma update`
@@ -48,13 +52,18 @@ irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 |
 
 **From source:**
 ```bash
-cargo build --release -p ahma_mcp
+cargo build --release -p ahma_bin
 ```
 
-The `simplify` feature is enabled by default. To build without it (smaller binary):
+The `simplify` feature is enabled by default. To build without it (smaller binary, no
+`rust-code-analysis` toolchain compiled in):
 ```bash
-cargo build --release -p ahma_mcp --no-default-features
+cargo build --release -p ahma_bin --no-default-features
 ```
+
+To use the analyzer as a library in your own Rust code, depend on the `ahma_simplify` crate
+(MIT OR Apache-2.0) directly: `ahma_simplify::run(SimplifyArgs)` is the same entry point the
+CLI calls.
 
 ---
 

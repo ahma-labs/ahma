@@ -8,29 +8,57 @@
 # un-throttled subprocess tests to run concurrently, starving the scheduler, and
 # producing SSE handshake timeouts (the classic "works on M5, breaks on CI" pattern).
 #
-# Current approach uses STRUCTURAL filters (package / binary_id) so every test in
-# scope is automatically covered without maintaining a name list.
+# Current approach uses STRUCTURAL filters (binary_id) so every test in scope is
+# automatically covered without maintaining a name list. That only works because
+# the integration tests are grouped into ONE BINARY PER HARNESS CLASS: everything
+# that forks a process lives in a binary whose name says so, and nothing else does.
+#
+# TEST BINARY LAYOUT (one root file per binary, `tests/<binary>/main.rs`, which
+# cargo names after its directory; the former per-file binaries are `mod`s next
+# to it, e.g. tests/e2e/foo.rs):
+#
+#   ahma_mcp::unit          tests/unit/main.rs   pure-unit + in-process (create_in_process_mcp_*,
+#                                                McpClientFixture, RecordingClient). No subprocess.
+#   ahma_mcp::e2e           tests/e2e/main.rs    everything that spawns `ahma`/`generate-tool-schema`
+#                                                (ClientBuilder, Command::new, build_binary_cached),
+#                                                the OS-gated kernel-sandbox suites, and every file
+#                                                whose harness is mixed — conservative: mixed stays
+#                                                throttled.
+#   ahma_mcp::latency_guard_test                 #[ignore] wall-clock benchmarks (ignored-tests.yml).
+#   ahma_http_bridge::e2e   tests/e2e/main.rs    spawns an ahma HTTP server subprocess per test.
+#   ahma_http_bridge::unit  tests/unit/main.rs   SessionManager-direct and in-process bridge tests.
+#   ahma_http_bridge::stress tests/stress/main.rs #[ignore] stress suites (ignored-tests.yml).
+#   ahma_tui::connection    tests/connection/main.rs  in-process bridge + real loopback sockets.
+#   ahma_core::integration, ahma_http_mcp_client::integration, ahma_llm_monitor::integration,
+#   ahma_simplify::integration
+#                           tests/integration/main.rs  pure filesystem/logic and wiremock-backed.
+#
+# nextest runs EVERY test in its own process, so merging files into one binary
+# changes nothing about isolation (env::set_var, statics, #[serial] are all
+# process-local). What it changes is link time (one link per harness class
+# instead of one per file) and filter precision (below).
 #
 # THROTTLING POLICY:
 #
-#   ahma_http_bridge
-#     ALL tests in this package spawn an ahma HTTP server subprocess.
-#     Covered by: package(ahma_http_bridge)
+#   binary_id(ahma_http_bridge::e2e)     spawns an ahma HTTP server subprocess
+#   binary_id(ahma_http_bridge::stress)  same, fanned out; #[ignore]
+#   binary_id(ahma_mcp::e2e)             spawns `ahma serve stdio`, handshakes over pipes
+#   binary_id(ahma_mcp::latency_guard_test)  wall-clock benchmarks; must not share the
+#                                        scheduler with a subprocess storm
 #
-#   ahma_mcp integration tests
-#     Integration test binaries have binary_id "ahma_mcp::<file-name>".
-#     Many of them spawn ahma subprocess. Throttle all of them.
-#     Covered by: binary_id(~ahma_mcp::)
-#     NOT matched: the lib unit test binary "ahma_mcp" (no :: separator).
-#     That binary runs in parallel — it is in-process and fast.
+#   Everything else — every lib unit-test binary (no `::` in the binary_id),
+#   ahma_mcp::unit, ahma_http_bridge::unit, ahma_tui::connection, and the
+#   `::integration` binaries — runs with full parallelism; no throttle needed.
 #
-#   Everything else
-#     Runs with full parallelism; no throttle needed.
-#
-# ADDING A NEW SUBPROCESS-SPAWNING TEST:
-#   - In ahma_http_bridge/tests/:  nothing to do, package filter covers it.
-#   - In ahma_mcp/tests/:          nothing to do, binary_id filter covers it.
-#   - In a NEW package:            add a package() or binary_id() filter below.
+# ADDING A NEW INTEGRATION TEST:
+#   - Never add a new tests/*.rs or tests/*/main.rs file (scripts/check-guardrails.sh
+#     rejects both). Add a module under the matching harness-class directory and
+#     declare it in that binary's main.rs, alphabetically:
+#       spawns a process / mixed  ->  tests/e2e/<name>.rs   + `mod <name>;` in tests/e2e/main.rs
+#       in-process or pure-unit   ->  tests/unit/<name>.rs  + `mod <name>;` in tests/unit/main.rs
+#       #[ignore] stress          ->  tests/stress/<name>.rs (ahma_http_bridge)
+#     The binary_id filters below then cover it automatically.
+#   - In a NEW package: add a binary_id() filter below for its subprocess binary.
 #     Do NOT add individual test() name overrides — they break as the codebase grows.
 #
 # ---------------------------------------------------------------------------
@@ -45,23 +73,31 @@
 #
 # Consequence: **narrow overrides must be listed ABOVE the broad ones they
 # refine**, or their settings are silently dead config. This bit us — the
-# `bridge_stress_tests` overrides sat below `package(ahma_http_bridge)` and
-# asked for slow-timeouts (240s on dev, a reduced 240s backstop on CI) that
-# never took effect, because the package override defined `slow-timeout` first.
-# Both are now ordered narrow-first.
+# bridge stress overrides sat below `package(ahma_http_bridge)` and asked for
+# slow-timeouts (240s on dev, a reduced 240s backstop on CI) that never took
+# effect, because the package override defined `slow-timeout` first.
+#
+# The filters below are now all disjoint binary_id() matches, so no override
+# refines another — but the stress override is still kept ABOVE the e2e one in
+# every profile, and scripts/check-guardrails.sh asserts that order, so that a
+# future broadening of the e2e filter (e.g. back to `~ahma_http_bridge::`)
+# cannot silently swallow the stress settings again.
 #
 # ---------------------------------------------------------------------------
 # RETRY POLICY — which tests may retry on CI, and why that is not bug-hiding.
 # ---------------------------------------------------------------------------
 #
-# Retries are granted STRUCTURALLY, by the same package/binary_id filters used
-# for throttling, to every suite whose tests cross a PROCESS or NETWORK boundary
+# Retries are granted STRUCTURALLY, by the same binary_id filters used for
+# throttling, to every suite whose tests cross a PROCESS or NETWORK boundary
 # and therefore depend on OS scheduling:
 #
-#   package(ahma_http_bridge)   spawns an ahma HTTP server subprocess
-#   binary_id(~ahma_mcp::)      spawns `ahma serve stdio`, handshakes over pipes
-#   binary_id(~ahma_tui::)      binds real loopback TCP/QUIC/Unix sockets and
-#                               asserts against wall-clock timeouts
+#   binary_id(ahma_http_bridge::e2e)     spawns an ahma HTTP server subprocess
+#   binary_id(ahma_http_bridge::stress)  same
+#   binary_id(ahma_mcp::e2e)             spawns `ahma serve stdio`, handshakes over pipes
+#   binary_id(ahma_tui::connection)      binds real loopback TCP/QUIC/Unix sockets and
+#                                        asserts against wall-clock timeouts
+#   binary_id(ahma_mcp::latency_guard_test)  asserts against wall-clock budgets — the
+#                                        same scheduler dependence as ahma_tui::connection
 #
 # These are the suites that produce the "works on M-series, times out on a cold
 # 2-CPU Windows runner" flake this file's header describes. A retry only rescues
@@ -72,6 +108,10 @@
 #   - Every lib unit test binary (no `::` in the binary_id). These are
 #     in-process and deterministic; if one is flaky that is a real bug and the
 #     retry would mask it.
+#   - ahma_mcp::unit and ahma_http_bridge::unit — same reasoning; the whole point
+#     of splitting them out of the e2e binaries is that they no longer inherit a
+#     retry grant they never earned.
+#   - ahma_simplify::integration — pure-unit.
 #   - wiremock/MockServer-backed suites (ahma_llm_monitor, ahma_http_mcp_client)
 #     — in-process mocks, no subprocess, no scheduling dependence.
 #   - ahma_core — pure filesystem and logic.
@@ -89,9 +129,9 @@
 # Default profile (developer machines — threads-required throttle, no global cap)
 # ---------------------------------------------------------------------------
 #
-# Note: `threads-required` is set on subprocess-heavy test packages to
+# Note: `threads-required` is set on subprocess-heavy test binaries to
 # throttle concurrent subprocess count.  This prevents IPC pipe back-pressure
-# and SSE handshake timeouts that occur when all bridge / ahma_mcp integration
+# and SSE handshake timeouts that occur when all bridge / ahma_mcp e2e
 # tests run simultaneously.  It is NOT a global `test-threads` cap — other
 # tests (unit tests, etc.) still run with full parallelism.
 
@@ -100,31 +140,26 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 failure-output = "immediate"
 success-output = "immediate"
 
-# Bridge tests spawn server subprocesses and need longer slow-timeout headroom
+# Bridge e2e tests spawn server subprocesses and need longer slow-timeout headroom
 # even on fast developer machines under load.
 # threads-required = 4 caps concurrent bridge tests at (num-cpus / 4) without
 # adding a global test-threads limit, preventing IPC pipe starvation.
 # Using 4 (not 2) so that on a 10-CPU machine only ~2 bridge tests run at once;
 # this prevents handshake timeouts when --run-ignored all adds extra load.
 #
-# P5 NOTE: As bridge tests migrate to the in-process harness (spawn_in_process_server /
-# setup_in_process_mcp), the subprocess count drops and this throttle can be relaxed.
-# Target: keep threads-required = 4 for the subprocess smoke suite, but exclude
-# the in-process test binary from throttling once it is split into its own file
-# (e.g. `ahma_http_bridge::in_process_*`).
 # Stress tests fan out concurrent PowerShell spawns.  Even at the reduced
 # Windows CI count (3 requests) the join_all wall-time can exceed 120 s on a
-# cold 2-CPU runner.  Grant extra headroom via a more specific filter.
+# cold 2-CPU runner.  Grant extra headroom via the stress binary's own override.
 #
-# MUST stay above the package(ahma_http_bridge) override — see OVERRIDE ORDER
-# in the header. It previously sat below it, so this 240s never applied.
+# MUST stay above the ahma_http_bridge::e2e override — see OVERRIDE ORDER
+# in the header.
 [[profile.default.overrides]]
-filter = "binary_id(ahma_http_bridge::bridge_stress_tests)"
+filter = "binary_id(ahma_http_bridge::stress)"
 threads-required = 4
 slow-timeout = { period = "240s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-filter = "package(ahma_http_bridge)"
+filter = "binary_id(ahma_http_bridge::e2e)"
 threads-required = 4
 slow-timeout = { period = "120s", terminate-after = 2 }
 
@@ -134,11 +169,18 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 # action), which also retired the drop-order deadlock its notify thread could
 # form under load. Reload happens only through the explicit `restart` tool.
 
-# Many ahma_mcp integration test binaries spawn ahma subprocess.
-# Throttle all integration tests (binary_id "ahma_mcp::*") to prevent
+# The ahma_mcp e2e binary spawns ahma subprocesses. Throttle it to prevent
 # scheduler starvation when running concurrently with bridge tests.
+# ahma_mcp::unit is deliberately NOT matched: it is in-process and fast.
 [[profile.default.overrides]]
-filter = "binary_id(~ahma_mcp::)"
+filter = "binary_id(ahma_mcp::e2e)"
+threads-required = 2
+
+# Latency guards (all #[ignore]; run via --run-ignored all) measure dispatch
+# latency and streaming throughput against wall-clock budgets. Keep them off a
+# saturated scheduler so they measure ahma, not the machine.
+[[profile.default.overrides]]
+filter = "binary_id(ahma_mcp::latency_guard_test)"
 threads-required = 2
 
 # ---------------------------------------------------------------------------
@@ -155,26 +197,25 @@ retries = 0
 
 # Stress tests fan out concurrent PowerShell spawns.  Even at the reduced
 # Windows CI count (3 requests), an SSE handshake that stalls (e.g. the
-# sandbox-configured notification is delayed) can block until the package-level
+# sandbox-configured notification is delayed) can block until the e2e-level
 # 360s hard kill (period * terminate-after = 180 * 2) fires with no diagnostic.
 # The per-test initialize_with_roots call is now wrapped in a 60s timeout so
 # the test skips gracefully.  This override reduces the nextest backstop from
 # 360s to 240s as a secondary safety net.
 #
-# MUST stay above the package(ahma_http_bridge) override — see OVERRIDE ORDER
-# in the header. It previously sat below it, so this reduced backstop never
-# applied; the package-level 180s won and the hard kill stayed at 360s.
+# MUST stay above the ahma_http_bridge::e2e override — see OVERRIDE ORDER
+# in the header.
 [[profile.ci.overrides]]
-filter = "binary_id(ahma_http_bridge::bridge_stress_tests)"
+filter = "binary_id(ahma_http_bridge::stress)"
 threads-required = 2
 slow-timeout = { period = "120s", terminate-after = 2 }
 retries = 2
 
-# Every test in ahma_http_bridge spawns a server subprocess.
+# Every test in the bridge e2e binary spawns a server subprocess.
 # threads-required = 2 with test-threads = 2 => only 1 bridge test at a time.
 # This prevents port conflicts, CPU starvation, and SSE handshake timeouts.
 #
-# retries: per the RETRY POLICY in the header — every test in this package
+# retries: per the RETRY POLICY in the header — every test in this binary
 # crosses a process boundary and completes an HTTP/SSE handshake against it, so
 # all of them are exposed to the same 2-CPU-Windows scheduling stalls. This was
 # previously granted only to bridge_stress_tests, which left the rest of the
@@ -183,15 +224,14 @@ retries = 2
 # (4344/4345 passed), and the very next run over a superset of the same commits
 # passed on the same Windows runner.
 [[profile.ci.overrides]]
-filter = "package(ahma_http_bridge)"
+filter = "binary_id(ahma_http_bridge::e2e)"
 threads-required = 2
 slow-timeout = { period = "180s", terminate-after = 2 }
 retries = 2
 
-# Many ahma_mcp integration test binaries spawn ahma subprocess.
-# Throttle all integration tests (binary_id "ahma_mcp::*") to 1 at a time.
-# The main lib test binary ("ahma_mcp", no :: separator) is NOT matched and
-# runs in parallel with other non-subprocess tests.
+# The ahma_mcp e2e binary spawns ahma subprocesses. Throttle it to 1 at a time.
+# ahma_mcp::unit and the lib test binary ("ahma_mcp", no :: separator) are NOT
+# matched and run in parallel with other non-subprocess tests.
 #
 # retries: these tests spawn `ahma serve stdio` and complete an MCP handshake
 # over pipes. On the slow 2-CPU Windows runner that startup/handshake
@@ -200,7 +240,14 @@ retries = 2
 # exactly period*terminate-after). Retries only rescue a flake; a genuinely
 # broken test still fails every attempt, so this never hides real bugs.
 [[profile.ci.overrides]]
-filter = "binary_id(~ahma_mcp::)"
+filter = "binary_id(ahma_mcp::e2e)"
+threads-required = 2
+retries = 2
+
+# Latency guards assert against wall-clock budgets on a shared 2-CPU runner —
+# the same scheduler dependence the RETRY POLICY grants ahma_tui::connection.
+[[profile.ci.overrides]]
+filter = "binary_id(ahma_mcp::latency_guard_test)"
 threads-required = 2
 retries = 2
 
@@ -212,7 +259,7 @@ retries = 2
 # mechanism the RETRY POLICY covers. The lib unit binary ("ahma_tui", no ::)
 # is deliberately NOT matched.
 [[profile.ci.overrides]]
-filter = "binary_id(~ahma_tui::)"
+filter = "binary_id(ahma_tui::connection)"
 retries = 2
 
 
@@ -234,32 +281,46 @@ failure-output = "immediate"
 success-output = "never"
 retries = 0
 
-# Bridge tests spawn server subprocesses. Under coverage, binary loading and
-# IPC are substantially slower. threads-required = 2 with test-threads = num-cpus
-# (= 2 on CI) means only 1 bridge test runs at a time — preventing scheduler
-# starvation and fast-error assertion breaches.
+# Bridge e2e/stress tests spawn server subprocesses. Under coverage, binary
+# loading and IPC are substantially slower. threads-required = 2 with
+# test-threads = num-cpus (= 2 on CI) means only 1 bridge test runs at a time —
+# preventing scheduler starvation and fast-error assertion breaches.
 #
 # retries: same RETRY POLICY as the ci profile, and if anything more warranted —
 # llvm-cov instrumentation makes exactly the process/IPC overhead these tests
 # depend on 2-4x worse. A retry re-runs the binary and its counters merge into
 # the same report, so this does not distort coverage.
+#
+# MUST stay above the ahma_http_bridge::e2e override — see OVERRIDE ORDER.
 [[profile.coverage.overrides]]
-filter = "package(ahma_http_bridge)"
+filter = "binary_id(ahma_http_bridge::stress)"
 threads-required = 2
 slow-timeout = { period = "600s", terminate-after = 2 }
 retries = 2
 
-# Many ahma_mcp integration test binaries spawn ahma subprocess.
+[[profile.coverage.overrides]]
+filter = "binary_id(ahma_http_bridge::e2e)"
+threads-required = 2
+slow-timeout = { period = "600s", terminate-after = 2 }
+retries = 2
+
+# The ahma_mcp e2e binary spawns ahma subprocesses.
 # Same throttle as CI — prevents concurrent subprocess starvation.
 [[profile.coverage.overrides]]
-filter = "binary_id(~ahma_mcp::)"
+filter = "binary_id(ahma_mcp::e2e)"
+threads-required = 2
+retries = 2
+
+# Latency guards — wall-clock budgets. See the ci profile's equivalent override.
+[[profile.coverage.overrides]]
+filter = "binary_id(ahma_mcp::latency_guard_test)"
 threads-required = 2
 retries = 2
 
 # TUI connection tests — real loopback sockets with wall-clock timeouts.
 # See the ci profile's equivalent override.
 [[profile.coverage.overrides]]
-filter = "binary_id(~ahma_tui::)"
+filter = "binary_id(ahma_tui::connection)"
 retries = 2
 
 
@@ -270,16 +331,17 @@ retries = 2
 #
 # Purpose: sub-6-minute fast feedback on every PR iteration push. This is NOT full
 # coverage — the full cross-platform matrix at the MERGE GATE (build.yml on merge_group)
-# is the authority. Smoke deliberately EXCLUDES the subprocess-spawning integration tests
-# (which fork `ahma serve` and complete an MCP handshake over pipes — the slow, throttled,
-# occasionally-flaky suite) and the Android/Kotlin tests. What remains — every crate's lib
-# unit tests, the ahma_mcp lib unit binary (no `::`), and all in-process tests in other
-# packages — runs with FULL parallelism (no subprocess throttle needed), catching compile
-# errors and logic regressions fast. The merge gate catches the rest before anything lands.
+# is the authority. Smoke deliberately EXCLUDES the subprocess-spawning e2e/stress
+# binaries (which fork `ahma serve` and complete an MCP handshake over pipes — the slow,
+# throttled, occasionally-flaky suites) and the Android/Kotlin tests. What remains —
+# every crate's lib unit tests, ahma_mcp::unit, ahma_http_bridge::unit, and the
+# in-process integration binaries of the other packages — runs with FULL parallelism
+# (no subprocess throttle needed), catching compile errors and logic regressions fast.
+# The merge gate catches the rest before anything lands.
 #
 # default-filter is applied automatically; the fast-tier job just runs `--profile smoke`.
 [profile.smoke]
-default-filter = "not (package(ahma_http_bridge) or binary_id(~ahma_mcp::) or test(kotlin) or test(android))"
+default-filter = "not (binary_id(ahma_http_bridge::e2e) or binary_id(ahma_http_bridge::stress) or binary_id(ahma_mcp::e2e) or test(kotlin) or test(android))"
 slow-timeout = { period = "60s", terminate-after = 2 }
 failure-output = "immediate"
 success-output = "never"

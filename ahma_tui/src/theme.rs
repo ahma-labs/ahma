@@ -26,7 +26,7 @@ impl Theme {
     }
 
     /// Construct with an explicit colour decision — used at startup so
-    /// `NO_COLOR` is honoured (https://no-color.org).
+    /// `NO_COLOR` is honoured (<https://no-color.org>).
     pub fn with_color(unicode: bool, color: bool) -> Self {
         Self { unicode, color }
     }

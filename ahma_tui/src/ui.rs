@@ -419,7 +419,7 @@ fn draw_expanded_window(
 ///
 /// Shows the complete identity (title, real command, cwd, instance, origin),
 /// the outcome (status, exit code, duration), alerts, and a scrollable view of
-/// the buffered output tail. Scroll state lives in [`OperationDetailState`];
+/// the buffered output tail. Scroll state lives in [`OperationDetailState`](crate::state::OperationDetailState);
 /// the max offset is published through `state.detail_max_scroll` so the key
 /// handlers can clamp without re-rendering.
 #[cfg(feature = "tui")]
@@ -980,7 +980,7 @@ fn max_header_workspace_len(width: u16) -> usize {
 }
 
 /// Total number of external MCP tools, without materialising the formatted,
-/// sorted tool-name list ([`McpConnectionManager::aggregate_tools`]) — this
+/// sorted tool-name list ([`McpConnectionManager::aggregate_tools`](ahma_mcp::mcp_client::McpConnectionManager::aggregate_tools)) — this
 /// runs on every rendered frame, where only the count matters.
 #[cfg(feature = "tui")]
 fn external_tool_count(state: &AppState) -> usize {

@@ -18,7 +18,16 @@ SPEC, not here and not only in code.
 * Rust 2024 Edition (MSRV in `Cargo.toml`, currently 1.93+).
 * Standard cargo commands. Package names use **underscores** (`-p ahma_http_bridge`, not `ahma-http-bridge`).
 * Prefer `cargo nextest run` over `cargo test`.
-* Incubating features are quarantined behind non-default features (`simplify`, `full`) — test them directly with `-p`.
+* **One canonical build flavour: default features, whole workspace.** `cargo build`,
+  `cargo nextest run`, `cargo clippy --all-targets` and `cargo doc` with no feature flags and no
+  `-p` are the only invocations that share artifacts with each other and with CI. `simplify`
+  is a default feature of `ahma_bin`, so the workspace build already compiles and tests it.
+  Do **not** run `-p <crate> --features …` or `--no-default-features` "to test a flavour":
+  every distinct feature set is a separate copy of every affected artifact in `target/`
+  (see [Target Directory & Cache Management](#target-directory--cache-management)). To run a
+  subset of tests, filter by name (`cargo nextest run -E 'test(livelog)'`) or by binary
+  (`--test unit`), never by feature. The lean `--no-default-features` build is proven to
+  compile by CI's clippy step, in check mode, which is all it needs.
 
 ```bash
 # Update stable toolchain
@@ -43,6 +52,18 @@ Before you claim "all green" and stop work, run:
    what broke main (#470): `zip 8.6`'s default features silently pulled in `bzip2`,
    whose licence is not on the allow-list. A new transitive dep arrives with a licence you did
    not choose, so the advisories subset proves nothing about it.
+7. **If you touched any `[dependencies]`/`[dev-dependencies]` section:**
+   `cargo hakari generate && cargo hakari manage-deps` — regenerates `workspace-hack/`, the
+   crate that pins one third-party feature set for every invocation. `cargo hakari verify`
+   runs in `scripts/check-dependency-graph.sh` (called by the pre-push guardrails and by
+   Fast Tier CI), so a stale hack fails before it lands. Install once with
+   `cargo install cargo-hakari --locked`.
+8. **If you added a dependency that touches TLS** (anything with a `rustls`, `rcgen`,
+   `quinn` or `*-tls` feature): the same script also checks that `aws-lc-rs` is the *only*
+   rustls crypto provider in the product graph. `ring` is a second provider (another
+   native build, another copy of every primitive in every binary) and only ever arrives
+   through a dependency's *default* features — turn them off, as `ahma_http_bridge/Cargo.toml`
+   does for `quinn` and `rcgen`. Never carry both.
 
 If an ignored test can't run (missing platform prerequisite) or is broken, say so in the PR
 with a repro — don't quietly drop it.
@@ -104,12 +125,44 @@ When configuring an IDE (VS Code, Cursor, Claude Code, Antigravity) to use the l
 
 ### Target Directory & Cache Management
 
+**Why `target/` grows without bound — read this before adding a feature flag or a test file.**
+Cargo hashes *features, every profile setting, compile mode (check/build/test/doc), target
+kind and rustc version* into each artifact's file name, and never garbage-collects `target/`.
+Every distinct combination is therefore a **parallel copy** that coexists forever with the
+others. (`RUSTFLAGS`/`--cfg` are the other failure mode: they are *not* in the file name, so
+changing them rebuilds everything **in place** — a time cost rather than a disk cost.) Measured
+on this workspace, 2026-09: a clean `cargo build` + `cargo test --no-run` was 9.4 GB; running
+`cargo build -p ahma_core`, `-p ahma_common`, `test -p ahma_mcp`, `-p ahma_mcp --features
+simplify`, `-p xtask` and `clippy --all-targets` afterwards — no source change — took it to
+18 GB, because each `-p` invocation unified third-party features differently and recompiled
+70–200 crates into new file names. The three multipliers, and the rule that neutralises each:
+
+| Multiplier | Rule |
+|---|---|
+| Feature flavours of workspace crates (`--no-default-features`, `--features x`, a no-op feature used as a CI test selector) | **One canonical flavour** (default features) for every build/test/clippy/doc invocation, locally and in CI. Select tests by name/binary, never by feature. |
+| Third-party feature unification differing between `-p X` and the workspace build | **`workspace-hack/` (cargo-hakari)** pins the union of features for every invocation. Regenerate after any dependency edit (Definition of Done step 7). |
+| One statically-linked executable per `tests/*.rs` file (143 executables = 3.2 GB, each re-linked per flavour, each with its own `incremental/` session) | **One test binary per harness class per crate** (`tests/unit.rs`, `tests/e2e.rs`, …); new integration tests are a `mod` inside one of them, never a new top-level `tests/*.rs` file — enforced by `scripts/check-guardrails.sh`. |
+
+Full analysis, measurements and the industry references behind these rules:
+[docs/build-and-test-performance.md](docs/build-and-test-performance.md).
+
 The workspace profile is configured (`[profile.dev]` and `[profile.test]`) to strip dependency
 debug symbols (`debug = 0` for `package."*"`) while preserving fast line-table debug info
-(`debug = 1`) for workspace code. Deliberately does **not** raise dependency `opt-level`: that
-trades a real, repeated compile-time cost (no benefit on CI's fresh, non-incremental builds) for
-a runtime speedup only local dev sessions actually reuse — it once pushed the Windows CI job over
-its 40-minute budget. To keep `target/` bloat bounded during long development sessions:
+(`debug = 1`) for workspace code. `dev` and `test` **must stay identical**: a profile
+difference is a second copy of every workspace crate (CI sets `CARGO_PROFILE_DEV_DEBUG` and
+`CARGO_PROFILE_TEST_DEBUG` to the same value for exactly this reason). Deliberately does
+**not** raise dependency `opt-level`: that trades a real, repeated compile-time cost (no
+benefit on CI's fresh, non-incremental builds) for a runtime speedup only local dev sessions
+actually reuse — it once pushed the Windows CI job over its 40-minute budget.
+
+Machine-specific limits (`[build] jobs = N` for a small ARM board, `RUSTC_WRAPPER = "sccache"`)
+belong in that machine's `~/.cargo/config.toml`, never in the repo's `.cargo/config.toml`: a
+repo-level `jobs = 4` once capped every 10-core developer machine at 40 % on every compile.
+On macOS, add each clone's `target/` to *System Settings → Spotlight → Search Privacy*:
+Spotlight re-indexes every rebuilt object file, and during a large build `mds_stores` +
+`mdworker` were observed consuming three to four cores.
+
+To keep `target/` bloat bounded during long development sessions:
 
 * `cargo xtask clean-stale` (default) prunes `target/*/incremental/` sessions older than 3 days,
   plus coverage counters (`*.profraw`/`*.profdata`) and `target/tmp/` at any age. It leaves
@@ -176,6 +229,7 @@ When modifying code or discovering issues:
 2. Add to "Known Issues" if new bugs are discovered.
 3. Update feature tables with status changes.
 4. **BEFORE stopping work:** run `cargo fmt --all && cargo clippy --all-targets && cargo nextest run`.
+   If you edited a dependency list, also `cargo hakari generate && cargo hakari manage-deps`.
 5. `skills/ahma/SKILL.md` is a **living document** — update it in the same PR/commit whenever
    you change: CLI flags or subcommands (`ahma_mcp/src/shell/cli.rs`), environment variables
    (`ahma_mcp/src/config/`), tool bundle names or contents
@@ -203,6 +257,41 @@ stability: GitHub runners have 2 cores, every spawned subprocess burns scheduler
 Decision rule: *Can this test be written without forking a process?* If yes, do that.
 
 ⚠️ **`ClientBuilder`/`Client::start_process*` spawn a subprocess** — tests built on them are E2E. Using them for integration tests causes CI timeouts on 2-CPU runners.
+
+### Test Binary Layout — One Binary per Harness Class
+
+Every top-level `tests/*.rs` file is its own crate and its own statically-linked executable
+(~20–60 MB each here, plus an `incremental/` session), re-linked for every build flavour.
+With 127 such files the suite was 3.2 GB of executables and ~130 link steps per flavour. The
+suite is therefore organised as **a few root files per crate, one per harness class**, and
+each former file is a `mod` inside one of them:
+
+| Crate | Root files (`tests/<name>.rs` + `tests/<name>/`) |
+|---|---|
+| `ahma_mcp` | `unit` (pure logic + in-process MCP), `e2e` (spawns the `ahma` binary; OS-gated sandbox suites live here behind their `#![cfg]`), `latency_guard_test` (all `#[ignore]` benchmarks) |
+| `ahma_http_bridge` | `unit` (`SessionManager`/in-process), `e2e` (spawns a bridge server), `stress` (all `#[ignore]`) |
+| `ahma_tui` | `connection` |
+| `ahma_core`, `ahma_http_mcp_client`, `ahma_llm_monitor`, `ahma_simplify` | `integration` |
+
+Rules:
+* **Add a new integration test as `tests/<root>/<topic>.rs` plus a `mod <topic>;` line in the
+  matching root file.** Never add a new top-level `tests/*.rs` file; `scripts/check-guardrails.sh`
+  rejects one that is not on its allowlist.
+* Put it in the binary that matches its harness: if it spawns the `ahma` binary or a bridge
+  server it is `e2e`, otherwise `unit`. `.config/nextest.toml` throttles and grants CI retries
+  **by binary id** (`binary_id(ahma_mcp::e2e)`, `binary_id(ahma_http_bridge::e2e)`), so a
+  subprocess test filed under `unit` runs unthrottled and will flake on 2-CPU runners, and a
+  unit test filed under `e2e` is needlessly serialised.
+* Shared helpers: `ahma_mcp` keeps them in `src/test_utils` (compiled once into the rlib).
+  `ahma_http_bridge`'s `tests/common/` cannot move into `src/` — it uses `ahma_mcp`, which
+  depends on `ahma_http_bridge` (a dev-dependency cycle) — but it is now compiled once per root
+  binary instead of once per file, which is the same win.
+* Under `cargo nextest` every test is its own process, so merging files changes nothing about
+  isolation (`env::set_var`, statics, `#[serial]` are all process-local). Plain `cargo test`
+  shares a process across the whole binary; that is one more reason it is not the supported
+  runner here.
+* Test *names* are the stable interface for CI selection (`-E 'test(kotlin) or test(android)'`,
+  `test(appcontainer_dacl_diagnostics)`); a file move must not rename a test function.
 
 ### Choosing the Right In-Process Helper
 
@@ -239,7 +328,7 @@ fs::write(&test_file, "test content").unwrap();
 
 ### CLI Binary Integration Tests
 
-All binaries (`ahma`, `generate-tool-schema`) **must** have integration tests covering `--help`, `--version`, and basic functionality (e.g. in `ahma/tests/cli_binary_integration_test.rs`).
+All binaries (`ahma`, `generate-tool-schema`) **must** have integration tests covering `--help`, `--version`, and basic functionality (e.g. in `ahma_mcp/tests/e2e/cli_binary_integration_test.rs`).
 
 ### Centralized Binary Path Resolution (R-TEST-PATH)
 
@@ -259,7 +348,7 @@ All binary path resolution in tests **MUST** use centralized helpers:
 
 - **Every test uses `tempfile::tempdir()`.** Never create files in the repo tree.
 - **Never hardcode timeouts.** Windows runners are 3–5× slower. Use `ahma_common::timeouts::{TestTimeouts, TimeoutCategory}` — semantic categories (`Handshake`, `ToolCall`, `SandboxReady`, …), `scale_secs()`, `poll_interval()`.
-- **Retries are granted by mechanism, not by incident.** A suite gets `retries` on the `ci`/`coverage` profiles when its tests cross a **process or network boundary** and so depend on OS scheduling — today `package(ahma_http_bridge)`, `binary_id(~ahma_mcp::)`, `binary_id(~ahma_tui::)`. Lib unit tests never do: an in-process test that flakes is a real bug, and a retry would hide it. Add a new suite by structural filter, and justify it by the boundary it crosses, not by "it failed once". Full rationale in `.config/nextest.toml`; both rules are enforced by `scripts/check-guardrails.sh`.
+- **Retries are granted by mechanism, not by incident.** A suite gets `retries` on the `ci`/`coverage` profiles when its tests cross a **process or network boundary** and so depend on OS scheduling — today `binary_id(ahma_http_bridge::e2e)`, `binary_id(ahma_http_bridge::stress)`, `binary_id(ahma_mcp::e2e)`, `binary_id(ahma_mcp::latency_guard_test)` (asserts wall-clock budgets), `binary_id(ahma_tui::connection)`. The `unit`/`integration` binaries and lib unit tests never do: an in-process test that flakes is a real bug, and a retry would hide it. Add a new suite by structural filter, and justify it by the boundary it crosses, not by "it failed once". Full rationale in `.config/nextest.toml`; both rules are enforced by `scripts/check-guardrails.sh`.
 - **In `.config/nextest.toml`, list narrow overrides above the broad ones they refine.** nextest resolves each setting from the **first** matching override in file order — not the most specific. A `binary_id()` override sitting below the `package()` override it refines is silently dead config.
 - **Never hardcode `/tmp`, `/var/folders`, `/dev/null`.** Use `test_utils::path_helpers`: `test_temp_path`, `test_out_of_scope_path`, `test_blocked_device_path`, `test_abs`, `test_root`.
 - **Never hardcode `/bin/sh`, `/bin/bash`, or bash redirection** (`>&2`, `2>&1`) in command strings sent through the tool pipeline — on Windows the shell is PowerShell.
@@ -481,6 +570,8 @@ Capture full logs (`<cmd> 2>&1 | tee …`) and reduce concurrency to a single te
 - **R-GUARD.1**: Pre-commit and pre-push guardrail script: `./scripts/check-guardrails.sh`.
 - **R-GUARD.2**: Guardrail scripts **must** reject newly added literal `Duration::from_secs(...)` / `Duration::from_millis(...)` patterns in timeout-sensitive handshake/bridge integration tests (`scripts/lint_test_paths.sh`).
 - **R-GUARD.3**: Guardrail scripts **should** verify that custom HTTP bridge integration tests use shared startup helpers from `tests/common/server.rs`.
+- **R-GUARD.4**: Guardrail scripts **must** run `scripts/check-dependency-graph.sh` (`cargo hakari verify` plus the single-crypto-provider check), so a dependency edit that was not followed by `cargo hakari generate && cargo hakari manage-deps`, or that drags `ring` back in through a default feature, fails before push. Fast Tier CI runs the same script on every PR.
+- **R-GUARD.5**: Guardrail scripts **must** reject a new top-level `tests/*.rs` file that is not on the per-crate root-binary allowlist (see [Test Binary Layout](#test-binary-layout--one-binary-per-harness-class)).
 
 ---
 

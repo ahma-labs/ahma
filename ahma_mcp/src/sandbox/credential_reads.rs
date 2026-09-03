@@ -1,7 +1,7 @@
 //! macOS credential-read deny list.
 //!
 //! On macOS the Seatbelt profile grants sandboxed commands global file-*read*
-//! access (an APFS firmlink / cryptex workaround — see [`super::seatbelt`]).
+//! access (an APFS firmlink / cryptex workaround — see `super::seatbelt`).
 //! Write access stays scoped, but *reads* are wide open, so a prompt-injected or
 //! malicious tool could `cat` the user's credentials and exfiltrate them.
 //!
@@ -44,7 +44,7 @@ static KEYCHAIN_ACCESS_ALLOWED: RwLock<bool> = RwLock::new(false);
 /// **absent** (git-over-ssh and `gh` need them) and can be added via
 /// `[sandbox] deny_credential_reads`. `~/Library/Keychains` is likewise absent —
 /// it is governed by the dedicated `[sandbox] allow_keychain` toggle (default on;
-/// see [`KEYCHAIN_ACCESS_ALLOWED`]) which re-adds it to the deny set when disabled.
+/// see `KEYCHAIN_ACCESS_ALLOWED`) which re-adds it to the deny set when disabled.
 const DEFAULT_DENY_RELATIVE: [&str; 7] = [
     ".ahma", // ahma's own bearer token, TLS keys, and scope-grant store
     ".aws",
@@ -105,7 +105,7 @@ pub fn container_socket_deny_regexes(home: &Path) -> Vec<String> {
 /// Anchored regex matching SSH **private** key material in `~/.ssh` (`id_rsa`,
 /// `id_ed25519`, `id_ecdsa_sk`, …).
 ///
-/// `~/.ssh` as a whole is deliberately absent from [`DEFAULT_DENY_RELATIVE`] so
+/// `~/.ssh` as a whole is deliberately absent from `DEFAULT_DENY_RELATIVE` so
 /// that git-over-ssh keeps working, but that left the private keys themselves
 /// readable under the blanket macOS `(allow file-read*)`. Denying only the
 /// `id_*` files keeps `known_hosts` and `config` readable — which is what the
@@ -201,7 +201,7 @@ pub fn credential_read_denies() -> Vec<PathBuf> {
 
 /// Install whether sandboxed tools may access the macOS keychain (called once at
 /// startup with the resolved `[sandbox] allow_keychain` value). See
-/// [`KEYCHAIN_ACCESS_ALLOWED`].
+/// `KEYCHAIN_ACCESS_ALLOWED`.
 pub fn set_keychain_access_allowed(allowed: bool) {
     let mut guard = KEYCHAIN_ACCESS_ALLOWED.write();
     *guard = allowed;

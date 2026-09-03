@@ -78,9 +78,9 @@ pub fn scan_denial_streams(stderr: &str, stdout: &str) -> Option<DenialHit> {
 ///
 /// Two shapes are recognised:
 ///  1. **Single line** — the denial keyword and the path are on the same line
-///     (Seatbelt audit lines, `cat: /p: Permission denied`, …). See [`scan_line`].
+///     (Seatbelt audit lines, `cat: /p: Permission denied`, …). See `scan_line`.
 ///  2. **Multi-line** — the path is on one line and the denial keyword on a later
-///     line within [`MULTILINE_LOOKBACK`] (the cargo/anyhow `Caused by:` form).
+///     line within `MULTILINE_LOOKBACK` (the cargo/anyhow `Caused by:` form).
 pub fn scan_denial(stderr: &str) -> Option<DenialHit> {
     // The most recent line that carried an absolute path but no denial keyword,
     // plus how many lines ago it was seen, so a later keyword-only line can be

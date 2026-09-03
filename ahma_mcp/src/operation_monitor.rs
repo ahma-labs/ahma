@@ -315,7 +315,7 @@ impl Operation {
     /// This is the single guarded entry point for changing an operation's state.
     /// It enforces the monitor's core invariant — **the first terminal writer
     /// wins** — by rejecting any transition out of an already-terminal state
-    /// (returning [`InvalidTransition`]) rather than silently overwriting it. On
+    /// (returning [`InvalidTransition`](ahma_common::state_machine::InvalidTransition)) rather than silently overwriting it. On
     /// success it sets the state and, for a terminal target, stamps `end_time`.
     /// Transition-specific side effects (result payload, cancellation-token
     /// signalling, history move) remain the caller's responsibility.

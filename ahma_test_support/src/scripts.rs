@@ -12,7 +12,7 @@
 //! SPEC R6.3.8 requires such tests to supply both forms "using a uniform helper
 //! method … to ensure consistency and prevent platform-specific leaks". This is
 //! that helper. It was previously a private copy inside
-//! `ahma_mcp/tests/log_monitor_integration_test.rs`, which is the shape the
+//! `ahma_mcp/tests/unit/log_monitor_integration_test.rs`, which is the shape the
 //! requirement exists to prevent — one file obeying a rule that binds all of
 //! them (AGENTS.md).
 //!

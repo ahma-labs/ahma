@@ -81,7 +81,7 @@ pub fn mcp_internal(message: impl Into<String>) -> McpError {
 
 /// Builds the MCP error for a failed synchronous tool execution.
 ///
-/// See [`denial_aware_error`] for the `sandbox_denial` payload.
+/// See `denial_aware_error` for the `sandbox_denial` payload.
 pub fn execution_error(e: &anyhow::Error) -> McpError {
     denial_aware_error("Synchronous execution failed", e)
 }

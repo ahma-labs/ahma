@@ -1,0 +1,14 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+name = "ahma_log_monitor"
+description = "Live log monitor for streaming process output: log-level detection, secret redaction, ring-buffered context snapshots and rate-limited alerts, as used by ahma's run_terminal_command monitor_level (MIT OR Apache-2.0)."
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+regex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }

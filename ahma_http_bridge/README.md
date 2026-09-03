@@ -328,4 +328,4 @@ Security tests verify that sandbox escape attempts fail:
 - Absolute path escapes (`/etc/passwd`)
 - Command injection via path
 
-See `tests/sandbox_security_test.rs` and `ahma/tests/sandbox_security_red_team_test.rs`.
+See `tests/unit/sandbox_security_test.rs` and `ahma_mcp/tests/e2e/sandbox_security_red_team_test.rs`.

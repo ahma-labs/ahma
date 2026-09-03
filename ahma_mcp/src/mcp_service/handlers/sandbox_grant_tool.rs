@@ -99,7 +99,7 @@ impl AhmaMcpService {
     /// Handle a `sandbox_grant` call. See the module docs for the security model.
     ///
     /// `client_type` distinguishes the autonomous in-process agent
-    /// ([`McpClientType::Ahma`], which auto-approves its own tool calls) from
+    /// ([`McpClientType::Ahma`](crate::client_type::McpClientType::Ahma), which auto-approves its own tool calls) from
     /// external clients (Cursor, VS Code, …) that gate each tool call behind a
     /// human. For the autonomous agent, `confirm: true` must **not** self-persist
     /// — the request is routed to the human approval surface instead — so the

@@ -16,7 +16,7 @@
 - **Daemon Hub**: Shared state and lifecycle for the HTTP bridge daemon, including process-group spawning so a terminated hub does not orphan its children.
 - **Transport Support**: `local_tls` self-signed certificate generation, `keepalive` for long-lived HTTP/SSE connections, `file_uri` construction and parsing, and the transport-agnostic `peer_factory` abstraction.
 - **Consent and Approval**: `hook_consent` and `net_approval` record user consent decisions; `elicitation` carries MCP elicitation request/response types.
-- **Observability**: OpenTelemetry tracing initialisation helpers.
+- **Observability**: OpenTelemetry tracing initialisation helpers (`observability`), compiled only under this crate's `otel` cargo feature (off by default — see `Cargo.toml`). Every function keeps the same public signature regardless of the feature: without it, `create_otel_layer`/`current_traceparent`/`record_tool_call`/`record_sandbox_gating_failure` are hard no-ops, so dependent crates never need their own `#[cfg(feature = "otel")]`.
 
 ## 3. Non-Functional Requirements
 

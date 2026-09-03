@@ -388,7 +388,7 @@ impl Sandbox {
     /// On macOS the *read* rules are largely redundant: `get_macos_system_rules`
     /// already grants blanket `file-read*` because APFS firmlinks defeat read
     /// subpath matching (a platform limitation disclosed by
-    /// [`profiles::macos_read_disclosure`]). They are emitted anyway, so the two
+    /// [`crate::sandbox::profiles::PlatformEnforcement::reads_unrestricted`]). They are emitted anyway, so the two
     /// backends express the same profile identically and a future macOS that can
     /// scope reads gets correct behavior for free rather than a silent hole.
     ///

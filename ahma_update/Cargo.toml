@@ -1,0 +1,59 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+name = "ahma_update"
+description = "Self-update engine for the ahma binary: GitHub release lookup and download, Sigstore/SLSA attestation verification (`ahma verify`), archive extraction, and `cargo install` from a Git ref (MIT OR Apache-2.0)."
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ahma_common = { path = "../ahma_common" }
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+dunce.workspace = true
+flate2 = "1.1"
+regex.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+base64 = "0.22"
+# GitHub Build Provenance verification (`ahma verify`, `ahma update`) runs on
+# `sigstore` directly — see ahma_update/src/verify.rs and docs/release-signing.md.
+# `verify` + `sigstore-trust-root` is the minimal set that gives us
+# `bundle::verify::Verifier` and the public-good TUF trust root; `cosign`,
+# `registry`/`oci`, `sign` and `mock-client` are deliberately off.  (`verify`
+# still drags in `fulcio`→`oauth`→`openidconnect` through sigstore's own feature
+# graph; that edge is upstream's, not ours.)
+sigstore = { version = "0.14", default-features = false, features = [
+	"verify",
+	"sigstore-trust-root",
+	"rustls-tls",
+] }
+# Pinned to the major `sigstore` 0.14 itself uses, so the certificate types in
+# our `VerificationPolicy` impl are the same types its verifier passes us.
+x509-cert = "0.2"
+# `sha2` 0.10 (not the workspace's 0.11): `Verifier::verify_digest` takes a
+# `sha2` 0.10 `Sha256`, and we re-derive the transparency-log payload hash.
+sha2 = "0.10"
+# GitHub serves out-of-band attestation bundles Snappy-compressed (`.json.sn`).
+snap = "1"
+tar = "0.4"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "time"] }
+tracing.workspace = true
+# Only `deflate` is used: we extract our own release .zip (produced by `7z a`,
+# which emits deflate) and write deflate zips in tests. zip's default features
+# additionally pull in bzip2, aes-crypto, lzma, zstd, xz, ppmd and deflate64 —
+# dead weight, and bzip2's licence is not on the `cargo deny` allow-list.
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+parking_lot.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+wiremock = "0.6"
+tracing-subscriber.workspace = true

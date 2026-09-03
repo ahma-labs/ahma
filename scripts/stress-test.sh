@@ -80,7 +80,7 @@ echo
 
 # Step 1: Build the project
 echo -e "${CYAN}Building project (release mode)...${NC}"
-cargo build --release -p ahma_mcp --bin ahma 2>&1 | tail -5
+cargo build --release -p ahma_bin --bin ahma 2>&1 | tail -5
 echo -e "${GREEN}OK Build complete${NC}"
 echo
 
@@ -189,27 +189,32 @@ if $QUICK_MODE; then
     TEST_FILTER="-E test(test_concurrent_tool_calls)"
 else
     echo -e "${YELLOW}📝 Full mode: running all stress tests${NC}"
-    TEST_FILTER="--run-ignored"
+    TEST_FILTER=""
 fi
 
+# All bridge stress suites live in the single `stress` test binary
+# (ahma_http_bridge/tests/stress.rs -> tests/stress/{bridge_stress_tests,
+# session_stress_test,sandbox_roots_handshake_stress_test}.rs); every test in it
+# is #[ignore], so select by --run-ignored and narrow with -E 'test(...)'.
 echo
-echo -e "${CYAN}═══ Session Stress Tests (session_stress_test.rs) ═══${NC}"
+echo -e "${CYAN}═══ Session Stress Tests (tests/stress/session_stress_test.rs) ═══${NC}"
 echo
-cargo nextest run -p ahma-http-bridge --test session_stress_test 2>&1 || {
+cargo nextest run -p ahma_http_bridge --test stress --run-ignored only -E 'test(session_stress_test)' 2>&1 || {
     echo -e "${YELLOW}WARNING️  Some session stress tests may have failed${NC}"
 }
 
 echo
-echo -e "${CYAN}═══ Handshake State Machine Tests ═══${NC}"
+echo -e "${CYAN}═══ Handshake State Machine Tests (tests/stress/sandbox_roots_handshake_stress_test.rs) ═══${NC}"
 echo
-cargo nextest run -p ahma-http-bridge --test handshake_state_machine_test 2>&1 || {
+cargo nextest run -p ahma_http_bridge --test stress --run-ignored only -E 'test(sandbox_roots_handshake_stress_test)' 2>&1 || {
     echo -e "${YELLOW}WARNING️  Some handshake tests may have failed${NC}"
 }
 
 echo
-echo -e "${CYAN}═══ Concurrent Tool Call Tests (normally ignored) ═══${NC}"
+echo -e "${CYAN}═══ Concurrent Tool Call Tests (tests/stress/bridge_stress_tests.rs) ═══${NC}"
 echo
-cargo nextest run -p ahma-http-bridge --test sse_tool_integration_test $TEST_FILTER 2>&1 || {
+# shellcheck disable=SC2086
+cargo nextest run -p ahma_http_bridge --test stress --run-ignored only -E 'test(bridge_stress_tests)' $TEST_FILTER 2>&1 || {
     echo -e "${YELLOW}WARNING️  Some concurrent tool tests may have failed${NC}"
 }
 

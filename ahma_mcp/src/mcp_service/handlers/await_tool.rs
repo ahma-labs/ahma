@@ -139,15 +139,44 @@ async fn probe_client_liveness(
     }
 }
 
+/// Why a bounded wait ended without the awaited future resolving.
+///
+/// The two are reported differently on purpose (SPEC R2.6.5.4): a deadline
+/// means the requested time passed; a failed probe means the wait was cut
+/// short — possibly a long way short — and the result must say how much time
+/// actually passed and why, never the requested figure as if it had elapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitEnded {
+    /// The requested timeout expired.
+    Deadline,
+    /// A liveness probe went unanswered (SPEC R2.6.5.3): the client is
+    /// presumed gone, so there is nobody to hand the result to.
+    ClientUnresponsive,
+}
+
+impl WaitEnded {
+    /// The reason stated in the result when the wait was cut short by a probe.
+    fn explanation(self) -> Option<&'static str> {
+        match self {
+            WaitEnded::Deadline => None,
+            WaitEnded::ClientUnresponsive => Some(
+                "The wait ended because the client stopped answering liveness probes \
+                 (SPEC R2.6.5.3), not because the requested timeout expired: ahma \
+                 assumed nobody was left to receive the result.",
+            ),
+        }
+    }
+}
+
 /// Waits for `fut` up to `total_timeout`. When `probe_peer` is `Some`,
 /// periodically (every `probe_interval`, each probe bounded by
 /// `probe_timeout`) probes the client's liveness while waiting and returns
-/// early — as a timeout, since the caller-facing outcome is the same soft
-/// "still running" message either way — the moment a probe fails, rather than
-/// only ever bailing at a single fixed guessed duration regardless of whether
-/// the connection is actually still healthy (SPEC R2.6.5.3). When
-/// `probe_peer` is `None` this is a plain bounded wait, identical to the
-/// pre-R2.6.5.3 behavior.
+/// early — as a soft timeout, since the operation keeps running either way —
+/// the moment a probe fails, rather than only ever bailing at a single fixed
+/// guessed duration regardless of whether the connection is actually still
+/// healthy (SPEC R2.6.5.3). The [`WaitEnded`] reason travels with the error so
+/// the result can say which of the two happened. When `probe_peer` is `None`
+/// this is a plain bounded wait, identical to the pre-R2.6.5.3 behavior.
 ///
 /// `probe_interval`/`probe_timeout` are parameters rather than baked-in
 /// constants so tests can exercise the loop's logic (deadline math, probe
@@ -159,14 +188,14 @@ async fn wait_with_optional_probe<F, T>(
     probe_interval: std::time::Duration,
     probe_timeout: std::time::Duration,
     fut: F,
-) -> Result<T, ()>
+) -> Result<T, WaitEnded>
 where
     F: std::future::Future<Output = T>,
 {
     let Some(peer) = probe_peer else {
         return tokio::time::timeout(total_timeout, fut)
             .await
-            .map_err(|_| ());
+            .map_err(|_| WaitEnded::Deadline);
     };
 
     let deadline = tokio::time::Instant::now() + total_timeout;
@@ -175,20 +204,20 @@ where
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Err(());
+            return Err(WaitEnded::Deadline);
         }
         let slice = (deadline - now).min(probe_interval);
         match tokio::time::timeout(slice, &mut fut).await {
             Ok(value) => return Ok(value),
             Err(_) => {
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(());
+                    return Err(WaitEnded::Deadline);
                 }
                 if !probe_client_liveness(peer, probe_timeout).await {
-                    tracing::debug!(
+                    tracing::warn!(
                         "Liveness probe failed mid-await; treating client as unresponsive (SPEC R2.6.5.3)"
                     );
-                    return Err(());
+                    return Err(WaitEnded::ClientUnresponsive);
                 }
             }
         }
@@ -423,9 +452,15 @@ impl AhmaMcpService {
 
         match wait_result {
             Ok(contents) => Ok(build_completion_result(contents, wait_start)),
-            Err(_) => {
-                self.handle_await_timeout(wait_start, timeout_seconds, &pending_ops, clamp_note)
-                    .await
+            Err(ended) => {
+                self.handle_await_timeout(
+                    wait_start,
+                    timeout_seconds,
+                    &pending_ops,
+                    clamp_note,
+                    ended,
+                )
+                .await
             }
         }
     }
@@ -436,6 +471,7 @@ impl AhmaMcpService {
         timeout_seconds: f64,
         pending_ops: &[Operation],
         clamp_note: Option<String>,
+        ended: WaitEnded,
     ) -> Result<CallToolResult, McpError> {
         let elapsed = wait_start.elapsed();
         let still_running: Vec<Operation> = self
@@ -455,6 +491,7 @@ impl AhmaMcpService {
             pending_ops.len(),
             &still_running,
             &remediation_steps,
+            ended,
         );
         if let Some(note) = clamp_note {
             message.push_str(&note);
@@ -539,22 +576,20 @@ impl AhmaMcpService {
                 "Operation {} completed but no result available",
                 op_id
             ))),
-            Err(_) => {
+            Err(ended) => {
                 let tool = self
                     .operation_monitor
                     .get_operation(&op_id)
                     .await
                     .map(|op| format!(" ({})", op.tool_name))
                     .unwrap_or_default();
-                Ok(common::text_result(format!(
-                    "Timeout waiting for operation {op_id} after {timeout_secs}s.\n\n\
-                    The operation {op_id}{tool} is still running.\n\n\
-                    {}{}",
-                    soft_timeout_notice(
-                        SoftTimeoutSubject::One,
-                        &format!(" with `id: \"{op_id}\"`")
-                    ),
-                    clamp_note.unwrap_or_default()
+                Ok(common::text_result(format_specific_timeout_message(
+                    &op_id,
+                    &tool,
+                    timeout_secs,
+                    wait_start.elapsed(),
+                    ended,
+                    clamp_note,
                 )))
             }
         }
@@ -594,7 +629,7 @@ impl AhmaMcpService {
         timeout_duration: std::time::Duration,
         pending_ops: &[Operation],
         probe_peer: Option<&rmcp::service::Peer<rmcp::service::RoleServer>>,
-    ) -> Result<Vec<ContentBlock>, ()> {
+    ) -> Result<Vec<ContentBlock>, WaitEnded> {
         wait_with_optional_probe(
             timeout_duration,
             probe_peer,
@@ -869,6 +904,39 @@ fn soft_timeout_notice(subject: SoftTimeoutSubject, resume_hint: &str) -> String
     )
 }
 
+/// The by-`id` soft-timeout result (SPEC R2.5.1, R2.6.5.4).
+///
+/// The headline states the time that **actually passed** — whole seconds,
+/// rounded down, so it can never exceed the wall clock — and, when the wait
+/// was cut short by a failed liveness probe, says so and states the requested
+/// figure separately. The old text printed the requested timeout as if it had
+/// elapsed: an `await` for 1500s that a probe ended after 79s reported
+/// "after 1500s", which no reader could reconcile with the clock.
+fn format_specific_timeout_message(
+    op_id: &str,
+    tool: &str,
+    requested_secs: u64,
+    elapsed: std::time::Duration,
+    ended: WaitEnded,
+    clamp_note: Option<String>,
+) -> String {
+    let waited = elapsed.as_secs().min(requested_secs);
+    let headline = match ended {
+        WaitEnded::Deadline => format!("Timeout waiting for operation {op_id} after {waited}s."),
+        WaitEnded::ClientUnresponsive => format!(
+            "Stopped waiting for operation {op_id} after {waited}s (requested {requested_secs}s). {}",
+            ended.explanation().unwrap_or_default()
+        ),
+    };
+    format!(
+        "{headline}\n\n\
+        The operation {op_id}{tool} is still running.\n\n\
+        {}{}",
+        soft_timeout_notice(SoftTimeoutSubject::One, &format!(" with `id: \"{op_id}\"`")),
+        clamp_note.unwrap_or_default()
+    )
+}
+
 fn format_timeout_error_message(
     elapsed: std::time::Duration,
     timeout_seconds: f64,
@@ -876,15 +944,30 @@ fn format_timeout_error_message(
     pending_count: usize,
     still_running: &[Operation],
     remediation_steps: &[String],
+    ended: WaitEnded,
 ) -> String {
+    // SPEC R2.6.5.4: the headline states the time that actually passed. A
+    // probe-ended wait is "stopped", not "timed out" — it may be a long way
+    // short of the configured figure, and the reason is stated right after.
+    let headline = match ended {
+        WaitEnded::Deadline => format!(
+            "Wait operation timed out after {:.2}s (configured timeout: {:.0}s).",
+            elapsed.as_secs_f64(),
+            timeout_seconds
+        ),
+        WaitEnded::ClientUnresponsive => format!(
+            "Wait operation stopped after {:.2}s of the configured {:.0}s timeout. {}",
+            elapsed.as_secs_f64(),
+            timeout_seconds,
+            ended.explanation().unwrap_or_default()
+        ),
+    };
     let mut error_message = format!(
-        "Wait operation timed out after {:.2}s (configured timeout: {:.0}s).\n\n\
+        "{headline}\n\n\
         Progress: {}/{} operations completed during await.\n\
         Still running: {} operations.\n\n\
         {}\n\n\
         Suggestions:",
-        elapsed.as_secs_f64(),
-        timeout_seconds,
         completed_during_wait,
         pending_count,
         still_running.len(),
@@ -1078,17 +1161,72 @@ mod tests {
     #[test]
     fn test_format_timeout_error_message_basic() {
         let elapsed = std::time::Duration::from_secs(30);
-        let msg = format_timeout_error_message(elapsed, 60.0, 1, 3, &[], &[]);
+        let msg = format_timeout_error_message(elapsed, 60.0, 1, 3, &[], &[], WaitEnded::Deadline);
         assert!(msg.contains("timed out"));
         assert!(msg.contains("1/3"));
         assert!(msg.contains("60"));
+    }
+
+    /// SPEC R2.6.5.4: a probe-ended wait is not a timeout and must not be
+    /// described as one — it states the time that passed and the reason.
+    #[test]
+    fn test_format_timeout_error_message_probe_ended_states_the_reason() {
+        let elapsed = std::time::Duration::from_secs(25);
+        let msg = format_timeout_error_message(
+            elapsed,
+            540.0,
+            0,
+            1,
+            &[],
+            &[],
+            WaitEnded::ClientUnresponsive,
+        );
+        assert!(msg.contains("stopped after 25.00s"), "{msg}");
+        assert!(!msg.contains("timed out after"), "{msg}");
+        assert!(msg.contains("liveness probes"), "{msg}");
+        assert!(msg.contains("NOT been cancelled"), "{msg}");
+    }
+
+    /// SPEC R2.6.5.4 on the by-`id` path: the headline never exceeds the wall
+    /// clock, and a probe-ended wait names the requested figure separately.
+    #[test]
+    fn test_format_specific_timeout_message_never_claims_time_that_did_not_pass() {
+        let probe_ended = format_specific_timeout_message(
+            "op-7",
+            " (run_terminal_command)",
+            1500,
+            std::time::Duration::from_secs_f64(79.6),
+            WaitEnded::ClientUnresponsive,
+            None,
+        );
+        assert!(probe_ended.contains("after 79s"), "{probe_ended}");
+        assert!(probe_ended.contains("requested 1500s"), "{probe_ended}");
+        assert!(!probe_ended.contains("after 1500s"), "{probe_ended}");
+        assert!(probe_ended.contains("liveness probes"), "{probe_ended}");
+        assert!(probe_ended.contains("op-7 (run_terminal_command) is still running"));
+
+        // A deadline that fired a few ms late still reports the requested figure.
+        let deadline = format_specific_timeout_message(
+            "op-8",
+            "",
+            1,
+            std::time::Duration::from_millis(1004),
+            WaitEnded::Deadline,
+            Some("\n\nNote: capped.".to_string()),
+        );
+        assert!(
+            deadline.contains("Timeout waiting for operation op-8 after 1s."),
+            "{deadline}"
+        );
+        assert!(deadline.ends_with("Note: capped."), "{deadline}");
+        assert!(!deadline.contains("liveness"), "{deadline}");
     }
 
     #[test]
     fn test_format_timeout_error_message_with_running_ops() {
         let ops = vec![make_op("op1", "cargo_build", OperationStatus::InProgress)];
         let elapsed = std::time::Duration::from_secs(10);
-        let msg = format_timeout_error_message(elapsed, 30.0, 0, 1, &ops, &[]);
+        let msg = format_timeout_error_message(elapsed, 30.0, 0, 1, &ops, &[], WaitEnded::Deadline);
         assert!(msg.contains("op1"));
         assert!(msg.contains("cargo_build"));
         assert!(msg.contains("Still running"));
@@ -1098,7 +1236,15 @@ mod tests {
     fn test_format_timeout_error_message_with_suggestions() {
         let elapsed = std::time::Duration::from_secs(5);
         let suggestions = vec!["• Try again".to_string()];
-        let msg = format_timeout_error_message(elapsed, 10.0, 0, 1, &[], &suggestions);
+        let msg = format_timeout_error_message(
+            elapsed,
+            10.0,
+            0,
+            1,
+            &[],
+            &suggestions,
+            WaitEnded::Deadline,
+        );
         assert!(msg.contains("Try again"));
     }
 
@@ -1469,7 +1615,7 @@ mod tests {
         ];
         let start = Instant::now();
         let result = service
-            .handle_await_timeout(start, 60.0, &pending, None)
+            .handle_await_timeout(start, 60.0, &pending, None, WaitEnded::Deadline)
             .await
             .unwrap();
         let text = result.content.first().unwrap().as_text().unwrap();
@@ -1774,6 +1920,8 @@ mod budget_tests {
 #[cfg(test)]
 mod liveness_probe_tests {
     use super::*;
+    use crate::AhmaMcpService;
+    use crate::operation_monitor::{Operation, OperationStatus};
     use crate::test_utils::in_process::create_in_process_mcp_empty;
 
     #[tokio::test]
@@ -1878,15 +2026,185 @@ mod liveness_probe_tests {
         )
         .await;
 
-        assert!(
-            result.is_err(),
-            "a probe against a closed connection must fail, not hang forever"
+        assert_eq!(
+            result,
+            Err(WaitEnded::ClientUnresponsive),
+            "a probe against a closed connection must fail, not hang forever — and \
+             the failure must be distinguishable from the deadline"
         );
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "must bail out on the first failed probe, nowhere near the 30s \
              deadline: {:?}",
             start.elapsed()
+        );
+    }
+
+    fn probing_caller(peer: rmcp::service::Peer<rmcp::service::RoleServer>) -> AwaitCaller {
+        AwaitCaller {
+            peer: Some(peer),
+            progress_token: None,
+            client_type: Some(crate::client_type::McpClientType::ClaudeDesktop),
+            push_channel_open: true,
+        }
+    }
+
+    fn result_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect()
+    }
+
+    async fn add_running_op(service: &AhmaMcpService, id: &str) {
+        let mut op = Operation::new(
+            id.to_string(),
+            "run_terminal_command".to_string(),
+            String::new(),
+            None,
+        );
+        op.state = OperationStatus::InProgress;
+        service.operation_monitor.add_operation(op).await;
+    }
+
+    /// REGRESSION (dogfooding, 2026-09): `await` with `timeout_seconds: 1500` on
+    /// a running operation came back after roughly a minute saying "Timeout
+    /// waiting for operation … after 1500s". The wait had ended on a failed
+    /// liveness probe (SPEC R2.6.5.3), but the text reported the *requested*
+    /// number as if that much time had passed — a claim no reader could
+    /// reconcile with the clock. A wait that ends early must say how long it
+    /// actually lasted, what was asked for, and why it stopped.
+    ///
+    /// `start_paused`: the real 20s probe interval is auto-advanced, so the test
+    /// costs no wall-clock time; the closed client makes the first probe fail.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_ended_wait_reports_the_time_that_passed_not_the_requested_timeout() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_running_op(&service, "op_probe_1").await;
+
+        let mut mcp = create_in_process_mcp_empty()
+            .await
+            .expect("in-process pair");
+        let peer = mcp._server.peer().clone();
+        mcp.client.close().await.expect("close client");
+
+        let mut args = serde_json::Map::new();
+        args.insert("id".to_string(), serde_json::json!("op_probe_1"));
+        args.insert("timeout_seconds".to_string(), serde_json::json!(1500));
+        let params = CallToolRequestParams::new("await").with_arguments(args);
+        let start = Instant::now();
+        let result = service
+            .handle_await_for_caller(params, probing_caller(peer))
+            .await
+            .expect("a soft timeout is a result, never an error");
+        let waited = start.elapsed().as_secs();
+        assert!(
+            waited < 1500,
+            "the probe must end the wait long before the deadline, waited {waited}s"
+        );
+
+        let text = result_text(&result);
+        assert!(
+            !text.contains("after 1500s"),
+            "must never claim the requested 1500s elapsed when it did not: {text}"
+        );
+        assert!(
+            text.contains(&format!("after {waited}s")),
+            "must state the time that actually passed ({waited}s): {text}"
+        );
+        assert!(
+            text.contains("requested 1500s"),
+            "must state what was asked for, so the gap is visible: {text}"
+        );
+        assert!(
+            text.contains("liveness probe"),
+            "must say why the wait ended — a failed liveness probe, not expiry: {text}"
+        );
+        assert!(
+            text.contains("still running") && text.contains("NOT been cancelled"),
+            "SPEC R2.5.1: the work survives the ended wait: {text}"
+        );
+        assert!(
+            text.contains("op_probe_1") && text.contains("run_terminal_command"),
+            "the operation and its tool must be named: {text}"
+        );
+    }
+
+    /// The tool-filter path ends the same way and must give the same account.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_ended_filter_wait_says_why_it_stopped() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_running_op(&service, "op_probe_2").await;
+
+        let mut mcp = create_in_process_mcp_empty()
+            .await
+            .expect("in-process pair");
+        let peer = mcp._server.peer().clone();
+        mcp.client.close().await.expect("close client");
+
+        let params = CallToolRequestParams::new("await");
+        let result = service
+            .handle_await_for_caller(params, probing_caller(peer))
+            .await
+            .expect("a soft timeout is a result, never an error");
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("liveness probe"),
+            "the reason the wait stopped must be stated: {text}"
+        );
+        assert!(
+            !text.contains("timed out after 540"),
+            "the wait did not run to its 540s deadline and must not say so: {text}"
+        );
+        assert!(text.contains("NOT been cancelled"), "{text}");
+    }
+
+    /// The other half of the report: an operation that completes part-way
+    /// through a long explicit wait must come back as its result, promptly,
+    /// through the probing path — never as a timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_during_a_long_probed_wait_returns_the_result() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_running_op(&service, "op_probe_3").await;
+
+        let mcp = create_in_process_mcp_empty()
+            .await
+            .expect("in-process pair");
+        let peer = mcp._server.peer().clone();
+
+        let mon = service.operation_monitor.clone();
+        let completer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(79)).await;
+            mon.update_status(
+                "op_probe_3",
+                OperationStatus::Completed,
+                Some(serde_json::json!({"ok": true})),
+            )
+            .await;
+        });
+
+        let mut args = serde_json::Map::new();
+        args.insert("id".to_string(), serde_json::json!("op_probe_3"));
+        args.insert("timeout_seconds".to_string(), serde_json::json!(1500));
+        let params = CallToolRequestParams::new("await").with_arguments(args);
+        let start = Instant::now();
+        let result = service
+            .handle_await_for_caller(params, probing_caller(peer))
+            .await
+            .expect("completion is a result");
+        completer.await.unwrap();
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("Completed") && !text.contains("Timeout"),
+            "a completion during the wait is the result, not a timeout: {text}"
+        );
+        let waited = start.elapsed().as_secs();
+        assert!(
+            (79..100).contains(&waited),
+            "must return as soon as the operation completed (~79s), waited {waited}s"
         );
     }
 }

@@ -34,7 +34,7 @@
 //! Nor is macOS's blanket `(allow file-read*)`. That is a platform *limitation*
 //! (APFS firmlinks defeat subpath matching for reads), not a grant, so it cannot
 //! be expressed as one — it is disclosed instead (R-PERM.5.1,
-//! [`macos_read_disclosure`]).
+//! [`PlatformEnforcement::reads_unrestricted`](crate::sandbox::profiles::PlatformEnforcement::reads_unrestricted)).
 
 use std::path::{Path, PathBuf};
 

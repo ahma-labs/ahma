@@ -1,7 +1,7 @@
 //! Post-execution observation for the deferred-host hook path.
 //!
 //! When ahma's terminal hook detects a host sandbox (Cursor/VS Code/Docker) it
-//! [defers to the host](super::defer_to_host_decision) (SPEC R7): the command
+//! defers to the host (`super::defer_to_host_decision`, SPEC R7): the command
 //! runs unchanged inside the host's kernel sandbox and ahma does **not** re-wrap
 //! it. The cost of that honesty is a blind spot — if the *host* sandbox then
 //! denies a write (the classic `aws-lc-sys` build-script copy into the host's

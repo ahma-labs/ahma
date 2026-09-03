@@ -15,7 +15,15 @@ PERMISSIVE_CRATES=(
   ahma_http_bridge
   ahma_http_mcp_client
   ahma_llm_monitor
+  ahma_bundle
+  ahma_update
+  ahma_vault
+  ahma_log_monitor
+  ahma_harness_guard
+  ahma_output_optimizer
+  ahma_simplify
   ahma_test_support
+  ahma_harness_tools
   generate_tool_schema
 )
 

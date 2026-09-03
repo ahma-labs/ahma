@@ -1,4 +1,4 @@
-//! Native Anthropic Messages API (`POST /v1/messages`) support for [`LlmClient`].
+//! Native Anthropic Messages API (`POST /v1/messages`) support for [`crate::client::LlmClient`].
 //!
 //! ahma speaks the OpenAI chat-completion message shape internally as a lingua
 //! franca (see [`crate::client::ChatMessage::as_openai_message`]).  The

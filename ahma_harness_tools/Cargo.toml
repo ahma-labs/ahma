@@ -22,6 +22,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net"] }
 walkdir = "2.5"
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 tempfile.workspace = true

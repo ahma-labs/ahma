@@ -95,7 +95,7 @@ pub use exec_config::{
     resolve_git_dirs, set_handoff_allowances,
 };
 pub use grant_channel::{HubGrantNotifier, LoggingGrantNotifier, ScopeGrantNotifier};
-pub use host_detect::{HostSandbox, detect_host_sandbox};
+pub use host_detect::{HostSandbox, OUTER_SANDBOX_PID_ENV, detect_host_sandbox};
 #[cfg(target_os = "linux")]
 pub use landlock::{
     apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_ruleset_fd,
@@ -105,7 +105,8 @@ pub use permission_broker::{
     hook_fail_closed_message,
 };
 pub use prerequisites::{
-    check_sandbox_prerequisites, exit_with_sandbox_error, test_sandbox_exec_available,
+    check_sandbox_prerequisites, exit_with_sandbox_error, nested_seatbelt_denial,
+    process_is_seatbelt_confined, test_sandbox_exec_available,
 };
 pub use scope_lock::ScopeLockState;
 pub use scopes::{normalize_path_lexically, preflight_scope_candidate};

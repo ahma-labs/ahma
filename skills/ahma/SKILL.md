@@ -186,6 +186,10 @@ when you want to continue other work in parallel.
 `timeout_seconds` is optional (default `540`, or `tools.await_timeout_secs` / `--await-timeout`).
 The timeout is **soft**: it ends your wait, it does not cancel the operation. On timeout the
 reply says so — call `await` again with the same `id` to keep waiting, or `cancel` to stop the work.
+A wait can also end **early**, before `timeout_seconds`, if ahma's liveness probe of your
+connection goes unanswered; the reply then says "Stopped waiting … after Ns (requested Ms)" with
+the seconds that actually passed and why. Treat it exactly like a timeout: the operation is still
+running — `await` it again.
 
 ### `cancel` — Cancel a running operation
 
@@ -259,9 +263,16 @@ Ahma enforces **kernel-level** filesystem boundaries set once at startup.
 Adds `/tmp` (or `%TEMP%` on Windows) to the scope. Required for compilers, build tools.
 
 ### Nested Sandbox Detection
-If running inside Cursor, VS Code, or Docker, Ahma auto-disables its internal sandbox
-(outer sandbox already provides protection). Use `--no-sandbox` flag to suppress
-the warning message.
+Ahma detects an outer sandbox (Cursor, VS Code, Docker, or another ahma) and always
+says which sandbox is actually protecting you. Terminal hooks defer to the host; the
+MCP server keeps enforcing on top of it — except on macOS, where Seatbelt cannot nest:
+an ahma that is itself inside a Seatbelt profile (typically ahma running ahma — this
+test suite or a nested `ahma serve` through `run_terminal_command`) defers to that
+outer sandbox and reports `deferred_to_host`, naming "an outer ahma" when the outer
+ahma stamped it (`AHMA_OUTER_SANDBOX_PID`, a marker ahma sets, not a setting). Commands
+still run, confined by the outer boundary. Nothing to configure; to get ahma's own
+enforcement, start it from a plain terminal instead. `--no-sandbox` is the explicit
+"defer to the outer sandbox" switch on every platform.
 
 ### Platform Enforcement
 - **Linux**: Landlock LSM (requires kernel 5.13+)
@@ -553,8 +564,14 @@ Check the `--sandbox-scope` CLI flag, or set `[sandbox] container_root` in `~/.a
 
 > **Tool installs (`cargo install` / `cargo binstall`, `npm i -g`, …)**: These write into `~/.cargo/bin` and update an install manifest (`~/.cargo/.crates.toml`), which are read-only by default, so they fail with `Operation not permitted (os error 1)`.  This is expected — there is no special flag.  ahma detects the denied path and returns a `sandbox_denial` error: call the `sandbox_grant` tool with the named path (preview, then `confirm: true`), run the `restart` tool to apply, then re-run the command.  In a hooked native terminal the recovery is the CLI equivalent: `ahma sandbox grant <path>`, then re-run.  To avoid grants entirely, install into the workspace: `cargo install --root <workspace>/.tools`.
 
-**Nested sandbox warning**: Ahma detected an outer sandbox (Cursor, VS Code, Docker).
-Internal sandbox auto-disabled. Use `--no-sandbox` flag to suppress the warning.
+**"ahma is DEFERRING to … sandbox"**: Ahma is inside an outer sandbox it cannot nest its
+own inside (macOS Seatbelt refuses nesting; "an outer ahma" means ahma is running ahma).
+Commands still run, confined by the outer sandbox. Expected when running ahma's test
+suite or a nested `ahma serve` through `run_terminal_command`; for ahma's own
+enforcement, start it from a plain terminal.
+
+**`sandbox-exec: sandbox_apply: Operation not permitted`** from a command: an older ahma
+built in-process inside an outer Seatbelt sandbox, before it learned to defer; update ahma.
 
 **Tool still running**: Use `status(operation_id)` to check, or `cancel(operation_id)`.
 
@@ -831,6 +848,13 @@ Language names are case-insensitive and expand to their extensions automatically
 or `--tools git,simplify`.
 
 **Via CLI:** `ahma simplify` is the subcommand. Run `ahma simplify --help` to verify.
+
+**Build requirement:** the analyzer is the `ahma_simplify` crate, compiled into the `ahma`
+binary through the `simplify` cargo feature of `ahma_bin`. It is **on by default** (release
+binaries and `cargo build -p ahma_bin` have it); a binary built with `--no-default-features`
+still lists the subcommand but `ahma simplify …` then exits with an error naming the missing
+feature. If you see that error, rebuild with the default features — do not fall back to
+heuristics.
 
 ### CRITICAL: Fail-Closed Rule
 

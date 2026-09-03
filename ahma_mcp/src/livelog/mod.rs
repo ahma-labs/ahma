@@ -635,8 +635,8 @@ pub async fn run_file_monitor_pipeline(
 // ===========================================================================
 // Unit tests for private helpers (`process_new_bytes`, `push_if_match`,
 // `apply_env`).  Integration-level tests for the two public pipelines live in
-// `ahma_mcp/tests/livelog_pipeline_test.rs` and
-// `ahma_mcp/tests/livelog_file_monitor_test.rs`.
+// `ahma_mcp/tests/unit/livelog_pipeline_test.rs` and
+// `ahma_mcp/tests/unit/livelog_file_monitor_test.rs`.
 // ===========================================================================
 
 #[cfg(test)]

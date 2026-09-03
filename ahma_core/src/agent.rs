@@ -1882,8 +1882,8 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
     }
 }
 
-/// Build the per-run agent context shared by [`CorePromptRunner::run_prompt`]
-/// and [`CorePromptRunner::run_prompt_to_completion`]: resolve the LLM client,
+/// Build the per-run agent context shared by `CorePromptRunner::run_prompt`
+/// and `CorePromptRunner::run_prompt_to_completion`: resolve the LLM client,
 /// gather the active service's tools, and assemble the [`McpChatConfig`].
 /// `max_turns_override` replaces the configured default when `Some`.
 async fn build_agent_run_context(

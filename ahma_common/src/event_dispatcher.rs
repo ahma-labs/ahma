@@ -5,7 +5,7 @@
 //! events via a `tokio::sync::broadcast` channel, so any number of independent
 //! subscribers can react to the same event stream:
 //!
-//! - **[`OperationMonitor`]** — persists state and signals completion watches
+//! - **`OperationMonitor`** (in `ahma_mcp`) — persists state and signals completion watches
 //! - **MCP push** — forwards JSON-RPC notifications to the connected client
 //! - **Vault audit** — writes immutable audit records
 //! - **Metrics / observability** — increments counters, records histograms

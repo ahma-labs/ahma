@@ -220,6 +220,12 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_PAGER: cat
   CARGO_INCREMENTAL: 0
+  # dev and test profiles MUST be identical. Cargo hashes every profile setting into an
+  # artifact's file name, so `cargo build -p ahma_bin` (dev profile) and `cargo nextest run`
+  # (test profile) compiled every workspace crate TWICE when only the test profile had
+  # debug=0. Keep both lines, and keep them equal; a one-sided value silently doubles the
+  # workspace compile in every job and halves the sccache hit rate.
+  CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
   CARGO_NET_RETRY: 10
   CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: false
@@ -383,13 +389,35 @@ jobs:
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: cargo fmt --all --check
 
+      # ONE CANONICAL FLAVOUR: default features, everywhere that produces test binaries.
+      #
+      # This job used to build THREE flavours of the workspace crates in one run:
+      #   1. `--no-default-features` for the main nextest run,
+      #   2. default features for `-p ahma_tui -p ahma_bin` (which enabled
+      #      ahma_mcp's former `simplify` feature via ahma_bin's default), and
+      #   3. `-p ahma_mcp --features simplify` on Linux.
+      # (`simplify` is the ahma_simplify crate, an optional dependency of ahma_bin only.
+      # ahma_mcp carries exactly one cargo feature, `otel`, off by default here — it gets
+      # its own dedicated build/clippy/nextest steps below rather than joining this main
+      # run, since it is a deliberate second flavour, not the canonical one.)
+      # A feature set is part of every artifact's file-name hash, so each flavour compiled
+      # ahma_mcp (the critical-path crate) again and re-linked every one of its test
+      # binaries again, and none of those objects could be shared through sccache. On a
+      # developer machine the same three commands took `target/` from 9.4 GB to 18 GB
+      # with no source change.
+      #
+      # Windows was already paying for the heavy `simplify` tree in flavour 2, so making
+      # default features the single flavour adds no compile work on any leg -- it only
+      # removes work. The lean `--no-default-features` build is still proven to compile
+      # by the clippy step below (check mode, no codegen, no link), which is all it needs.
+      # The shipped binary is now the tested binary on every platform.
       - name: Build ahma binary (required by integration tests)
         if: matrix.test_mode == 'full'
-        run: cargo build --locked --no-default-features -p ahma_bin
+        run: cargo build --locked -p ahma_bin
 
       - name: Cargo Nextest (excluding Android/Kotlin tests)
         if: matrix.test_mode == 'full'
-        timeout-minutes: 40
+        timeout-minutes: 45
         run: |
           echo "--- cargo --version" && cargo --version
           echo "--- cargo nextest --version" && cargo nextest --version
@@ -398,36 +426,9 @@ jobs:
           # cancelling at the first failure.  Without it, a platform with several
           # independent failures (notably Windows) only reveals one per CI round,
           # turning stabilization into a slow whack-a-mole across many pushes.
-          cargo nextest run --profile ci --locked --no-default-features --no-fail-fast -E 'not (test(kotlin) or test(android))'
-
-      - name: Cargo Nextest (AGPL product crates)
-        if: matrix.test_mode == 'full'
-        timeout-minutes: 20
-        run: |
-          echo "--- Testing AGPL product crates"
-          cargo nextest run --profile ci --locked \
-            -p ahma_tui -p ahma_bin \
-            -E 'not (test(kotlin) or test(android))'
-
-      # The `simplify` feature ships in every release binary (`ahma_bin`'s default
-      # feature set, see the release-build step below) but was tested by nothing:
-      # every nextest invocation above — and the coverage job — passes
-      # --no-default-features, so ~96 unit tests under ahma_mcp/src/simplify/ and
-      # the whole simplify_report_integration_test (required-features = ["simplify"])
-      # never ran, and the code was excluded from the coverage report. The shipped
-      # binary was not the tested binary.
-      #
-      # Linux only: the analyser is pure Rust over rust-code-analysis, with no
-      # platform-specific behaviour to catch on the other legs, and the feature
-      # pulls a heavy dependency tree the Windows leg does not need in its budget.
-      - name: Cargo Nextest (simplify feature, Linux only)
-        if: matrix.test_mode == 'full' && runner.os == 'Linux' && runner.arch == 'X64'
-        timeout-minutes: 20
-        run: |
-          echo "--- Testing the simplify feature that ships in release binaries"
-          cargo nextest run --profile ci --locked --no-fail-fast \
-            -p ahma_mcp --features simplify \
-            -E 'not (test(kotlin) or test(android))'
+          # ahma_simplify is a default-member of the workspace, so its unit and
+          # integration tests run here regardless of ahma_bin's `simplify` feature.
+          cargo nextest run --profile ci --locked --no-fail-fast -E 'not (test(kotlin) or test(android))'
 
       # Evidence, not a gate. SPEC R6.3.3 is open because a windows-latest run
       # proved the AppContainer grant DACL does not take effect — an in-scope
@@ -450,7 +451,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 10
         run: |
-          cargo nextest run --profile ci --locked --no-default-features \
+          cargo nextest run --profile ci --locked \
             --run-ignored only --success-output immediate \
             -p ahma_mcp -E 'test(appcontainer_dacl_diagnostics)'
 
@@ -459,7 +460,7 @@ jobs:
         timeout-minutes: 10
         run: |
           echo "--- Running ignored Landlock red-team tests (they self-skip when Landlock is unavailable)"
-          cargo nextest run --profile ci --locked --no-default-features --run-ignored only \
+          cargo nextest run --profile ci --locked --run-ignored only \
             -p ahma_mcp \
             -E 'test(red_team_global_read_access_blocked) or test(red_team_livelog_symlink_read_allowed)'
 
@@ -468,15 +469,16 @@ jobs:
         timeout-minutes: 25
         run: |
           echo "--- ARM64 smoke: compile-only validation of key crates (no test execution)"
-          cargo test --locked --no-default-features -p ahma_bin --no-run
-          cargo test --locked --no-default-features -p ahma_http_bridge --no-run
+          # Same (default) flavour as every other leg so the objects are cache-shareable.
+          cargo test --locked -p ahma_bin -p ahma_http_bridge --no-run
 
       # --all-targets rather than the previous `--locked` / `--tests` pair: that
       # pair covered lib + tests but not examples or benches, so a broken example
       # only showed up in the PR fast tier (which does run --all-targets) and a
-      # direct push to main missed it. Both feature configurations are linted
-      # because `simplify` ships in release binaries while every test invocation
-      # runs --no-default-features.
+      # direct push to main missed it. Both feature configurations are linted:
+      # default is the canonical (tested, shipped) flavour, and the
+      # --no-default-features pass is the ONLY place the lean build is proven to
+      # compile -- check mode, so it costs no codegen and no links.
       - name: Cargo Clippy (default features)
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: cargo clippy --all-targets --locked
@@ -484,6 +486,26 @@ jobs:
       - name: Cargo Clippy (no-default-features)
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: cargo clippy --all-targets --no-default-features --locked
+
+      # `otel` (ahma_common/Cargo.toml) gates the ~200-crate OpenTelemetry SDK subtree,
+      # off by default so it costs nothing on the canonical flavour above. It forwards
+      # through ahma_mcp/otel and ahma_http_bridge/otel (see their Cargo.tomls) — the
+      # only three workspace crates it touches, so scope both the clippy pass and the
+      # actual test run to them rather than re-running the whole ~4700-test suite a
+      # second time. Linux-only, same as the no-default-features pass above: it is a
+      # CI-only flavour (release binaries also build it; see job-release-binaries),
+      # not something every platform leg needs to prove independently.
+      - name: Cargo Clippy (otel feature)
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: cargo clippy --all-targets --features otel --locked
+
+      - name: Cargo Nextest (otel feature)
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        timeout-minutes: 20
+        run: |
+          cargo nextest run --profile ci --locked --features otel --no-fail-fast \
+            -p ahma_common -p ahma_mcp -p ahma_http_bridge \
+            -E 'not (test(kotlin) or test(android))'
 
       - name: Cargo Doc
         if: runner.os == 'Linux' && runner.arch == 'X64'
@@ -605,8 +627,8 @@ jobs:
       #   Path Validation Error: Path(s) specified in the action for caching do(es) not exist,
       #   hence no cache is being saved.
       # and correspondingly no `gradle-*` entry has ever appeared in `gh cache list`. The paths
-      # never materialise because the tests this job runs (`-p ahma_mcp --features android -E
-      # 'test(kotlin) or test(android)'`) do not drive a Gradle build of test-data/, so neither
+      # never materialise because the tests this job runs (`-p ahma_mcp -E 'test(kotlin) or
+      # test(android)'`) do not drive a Gradle build of test-data/, so neither
       # ~/.gradle nor app/build/* is ever populated. Restoring could not hit either, since
       # nothing was ever stored. They were pure warning noise plus the false impression that
       # Gradle work was cached.
@@ -654,8 +676,12 @@ jobs:
 
       - name: Run Android/Kotlin nextest only
         run: |
-          # Run ONLY kotlin/android tests (feature-gated and name-filtered for clarity)
-          cargo nextest run --profile ci --locked -p ahma_mcp --features android -E 'test(kotlin) or test(android)'
+          # Run ONLY kotlin/android tests, selected by NAME. This used to pass
+          # `--features android`, a no-op feature that gated no code: it existed only as a
+          # test selector, but a feature is part of a crate's fingerprint, so it forced a
+          # second compile of ahma_mcp and a second link of every ahma_mcp test binary --
+          # none of which could hit the sccache objects the main matrix had just written.
+          cargo nextest run --profile ci --locked -p ahma_mcp -E 'test(kotlin) or test(android)'
 
       - name: Verify sccache (ghac)
         if: always()
@@ -729,14 +755,15 @@ jobs:
           [ -x "$HOME/.cargo/bin/cargo-ndk" ] || cargo install cargo-ndk
 
       - name: Build ahma binary (required by integration tests)
-        run: cargo build --locked --no-default-features -p ahma_bin
+        run: cargo build --locked -p ahma_bin
 
       - name: Generate coverage report
         timeout-minutes: 40
         run: |
           # Run the instrumented test suite ONCE, deferring report generation so we can
           # emit several report formats from the same profdata without re-running tests.
-          cargo llvm-cov nextest --no-report --profile coverage --locked --no-default-features -E 'not (test(kotlin) or test(android))'
+          # Default features: coverage measures the shipped feature set (simplify included).
+          cargo llvm-cov nextest --no-report --profile coverage --locked -E 'not (test(kotlin) or test(android))'
 
           # 1. Full line-by-line HTML for humans drilling into a specific file.
           cargo llvm-cov report --html --output-dir ./coverage
@@ -1032,17 +1059,22 @@ jobs:
         with:
           tool: cross
 
+      # --features otel adds to (not replaces) the crate's `default` set, so this still
+      # ships `simplify` too. otel is off by default for local/dev builds (see
+      # ahma_common/Cargo.toml's `otel` feature comment) but the published release
+      # binary carries it, since a user who wants tracing shouldn't have to build from
+      # source to get it.
       - name: Build release binaries (native)
         if: "!matrix.use_cross"
         run: |
-          cargo build --release --locked --target ${{ matrix.target }} -p ahma_bin
+          cargo build --release --locked --target ${{ matrix.target }} -p ahma_bin --features otel
 
       - name: Build release binaries (cross-compiled)
         if: matrix.use_cross
         run: |
           # Disable sccache for cross builds (incompatible with cross's Docker containers)
           unset RUSTC_WRAPPER
-          cross build --release --locked --target ${{ matrix.target }} -p ahma_bin
+          cross build --release --locked --target ${{ matrix.target }} -p ahma_bin --features otel
 
       - name: Package release binaries
         id: package

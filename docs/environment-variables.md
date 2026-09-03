@@ -21,7 +21,7 @@
 > cannot accidentally honor one. Every surface calls it rather than re-reading the variable.
 >
 > **The tables below are enforced, not just documentation.**
-> `ahma_mcp/tests/retired_env_drift_test.rs` parses every RETIRED table here and fails the
+> `ahma_mcp/tests/unit/retired_env_drift_test.rs` parses every RETIRED table here and fails the
 > build if any production source reads one of these names directly. Adding a row extends the
 > guard automatically. This exists because the tables and the code had genuinely drifted:
 > `AHMA_PREFER_MUSL` was listed as retired while `ahma update` still honored it, and
@@ -165,6 +165,7 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_SERVER_CHILD` | Parent bridge process | Tells a child subprocess it was spawned by a parent bridge. Equivalent to `--server-child` flag. |
 | `AHMA_MCP_ARGS` | HTTP bridge | Passes resolved tool configuration to the per-session subprocess. |
 | `AHMA_RESTARTED` | `re_exec_current_process()` | Prevents infinite re-exec loops during version-mismatch auto-restart. |
+| `AHMA_OUTER_SANDBOX_PID` | Every command ahma runs inside its kernel sandbox | The pid of the ahma that sandboxed the command. A nested ahma (ahma's test suite or `ahma serve` run through `run_terminal_command`) reads it only to *name* the outer sandbox it defers to on macOS, where Seatbelt cannot nest (SPEC R7.6). A marker, not a setting. |
 
 ---
 
@@ -198,7 +199,7 @@ These are standard ecosystem variables that Ahma reads but does not define:
 | `PATH` | Executable search path |
 | `NO_COLOR` | Any non-empty value suppresses colour in the TUI (https://no-color.org). Styles keep bold/dim emphasis; only hues are dropped. Glyph choice is separate — it follows `TERM` |
 | `TERM` | `dumb` selects ASCII fallbacks for box-drawing and status glyphs |
-| `OTEL_*` / `TRACEPARENT` | OpenTelemetry distributed tracing |
+| `OTEL_*` / `TRACEPARENT` | OpenTelemetry distributed tracing. Requires a binary built with the `otel` cargo feature (off by default; release binaries ship it — see `ahma_common/Cargo.toml`'s `otel` feature comment). Without it these variables, and `--opentelemetry <url>`, are accepted but produce no export |
 
 ---
 

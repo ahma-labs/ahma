@@ -552,7 +552,7 @@ where
 
 /// Resolve the frontend handshake deadline: the internal
 /// `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS` override if set (testing), otherwise
-/// [`FRONTEND_HANDSHAKE_DEADLINE_SECS`]. A value of `0` disables the deadline
+/// [`FRONTEND_HANDSHAKE_DEADLINE_SECS`](ahma_common::timeouts::FRONTEND_HANDSHAKE_DEADLINE_SECS). A value of `0` disables the deadline
 /// (returns `None`).
 fn frontend_handshake_deadline() -> Option<Duration> {
     let secs = std::env::var("AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS")

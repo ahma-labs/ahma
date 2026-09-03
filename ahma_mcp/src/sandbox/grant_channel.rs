@@ -61,7 +61,7 @@ pub(crate) fn grant_dir_for(path: &Path) -> PathBuf {
 /// the supported grant -> restart -> retry loop using the MCP tools, so the sync
 /// error payload and the async operation alert phrase the recovery identically.
 ///
-/// References [`grant_dir_for`] so the suggested grant path matches what the
+/// References `grant_dir_for` so the suggested grant path matches what the
 /// approval prompt offers (a file's parent directory, so one grant covers the
 /// whole cache rather than re-prompting per file).
 pub fn runtime_denial_remediation(path: &Path, access: ScopeAccess) -> String {

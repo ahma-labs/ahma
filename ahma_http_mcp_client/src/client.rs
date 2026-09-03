@@ -5,10 +5,11 @@
 //! providers.
 
 use crate::error::{McpHttpError, Result};
+use crate::oauth_http::OAuthHttpClient;
 use ahma_common::state_machine::StateMachine;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
-    Scope, TokenResponse, TokenUrl, basic::BasicClient,
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl, basic::BasicClient,
 };
 use rmcp::{
     RoleClient,
@@ -275,8 +276,30 @@ impl HttpMcpTransport {
             return Err(McpHttpError::Auth("CSRF token mismatch".to_string()));
         }
 
-        // Use oauth2's bundled reqwest client which implements AsyncHttpClient
-        let http_client = oauth2::reqwest::Client::new();
+        let stored_token = self
+            .exchange_authorization_code(oauth_client, code, pkce_verifier)
+            .await?;
+
+        save_token(&stored_token)?;
+
+        Ok(stored_token)
+    }
+
+    /// Redeem an authorization code at the provider's token endpoint.
+    ///
+    /// The request goes out through this transport's own `reqwest::Client`
+    /// (via [`OAuthHttpClient`]) rather than a client bundled with `oauth2`, so
+    /// the token exchange shares the MCP traffic's TLS/HTTP configuration and
+    /// no second HTTP stack is linked in. Split from the interactive flow so
+    /// the one network hop that needs no browser can be tested against a mock
+    /// token endpoint.
+    async fn exchange_authorization_code(
+        &self,
+        oauth_client: &ConfiguredOAuthClient,
+        code: String,
+        pkce_verifier: PkceCodeVerifier,
+    ) -> Result<StoredToken> {
+        let http_client = OAuthHttpClient::from(self.client.clone());
         let token_result = oauth_client
             .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(pkce_verifier)
@@ -284,7 +307,7 @@ impl HttpMcpTransport {
             .await
             .map_err(|e| McpHttpError::OAuth2(format!("{:?}", e)))?;
 
-        let stored_token = StoredToken {
+        Ok(StoredToken {
             access_token: token_result.access_token().secret().to_string(),
             refresh_token: token_result
                 .refresh_token()
@@ -293,11 +316,7 @@ impl HttpMcpTransport {
             scopes: token_result
                 .scopes()
                 .map(|s| s.iter().map(|sc| sc.to_string()).collect()),
-        };
-
-        save_token(&stored_token)?;
-
-        Ok(stored_token)
+        })
     }
 
     /// Bind the registered callback address and wait for the provider's redirect.
@@ -655,6 +674,64 @@ mod tests {
         assert_eq!(cloned.refresh_token, token.refresh_token);
         assert_eq!(cloned.expires_in, token.expires_in);
         assert_eq!(cloned.scopes, token.scopes);
+    }
+
+    /// The token endpoint is the only network hop in the OAuth flow that does
+    /// not involve a browser, so it is the one that can be driven end to end
+    /// against wiremock. It proves the exchange goes out through the
+    /// transport's own reqwest client (no `oauth2::reqwest`), carries the
+    /// authorization-code grant and PKCE verifier, and lands in a `StoredToken`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn exchange_authorization_code_posts_grant_through_transport_client() {
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = token_env_guard().lock();
+        let tmp = tempdir().unwrap();
+        let transport = isolated_transport(&tmp.path().join("exchange.json"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code=the_code"))
+            .and(body_string_contains("code_verifier="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "issued_access",
+                "token_type": "bearer",
+                "expires_in": 1234,
+                "refresh_token": "issued_refresh",
+                "scope": "read:me offline_access"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let oauth_client = BasicClient::new(ClientId::new("cid".into()))
+            .set_client_secret(ClientSecret::new("secret".into()))
+            .set_auth_uri(AuthUrl::new(format!("{}/authorize", server.uri())).unwrap())
+            .set_token_uri(TokenUrl::new(format!("{}/oauth/token", server.uri())).unwrap())
+            .set_redirect_uri(RedirectUrl::new("http://localhost:8080".into()).unwrap());
+
+        let (_challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+        let token = transport
+            .exchange_authorization_code(&oauth_client, "the_code".to_string(), verifier)
+            .await
+            .expect("token exchange succeeds against the mock endpoint");
+
+        assert_eq!(token.access_token, "issued_access");
+        assert_eq!(token.refresh_token.as_deref(), Some("issued_refresh"));
+        assert_eq!(token.expires_in, Some(1234));
+        assert_eq!(
+            token.scopes,
+            Some(vec!["read:me".to_string(), "offline_access".to_string()])
+        );
+
+        unsafe {
+            env::remove_var(TOKEN_PATH_ENV);
+        }
     }
 
     #[test]

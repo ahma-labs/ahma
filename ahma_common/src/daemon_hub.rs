@@ -929,7 +929,7 @@ impl Drop for EmbeddedHub {
 /// Returns `Ok(Some(hub))` when the server is bound and running.
 /// Returns `Ok(None)` when another server (a running TUI or standalone
 /// `ahma daemon`) already owns the socket — the caller should fall back to
-/// [`spawn_daemon_source`] (subscriber mode).
+/// `spawn_daemon_source` in `ahma_tui` (subscriber mode).
 /// Returns `Err` only for unexpected OS errors (e.g. permission denied).
 pub async fn try_start_hub_server() -> Result<Option<EmbeddedHub>> {
     try_start_hub_server_at(default_socket_path()).await
