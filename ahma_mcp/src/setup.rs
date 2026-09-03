@@ -168,18 +168,8 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     }
 
     // Question 2: which platforms to apply the per-platform actions to.
-    let platforms = if actions.iter().any(|a| a.is_platform_specific()) {
-        select_platforms(&actions, interactive)
-    } else {
-        Vec::new()
-    };
-
-    // The MCP transport is a required detail of the MCP action only.
-    let transport = if actions.contains(&SetupAction::Mcp) && interactive {
-        prompt_transport()
-    } else {
-        "stdio"
-    };
+    let platforms = select_platforms_for(&actions, interactive);
+    let transport = select_transport_for(&actions, interactive);
 
     execute_actions(&actions, &platforms, transport, interactive).await?;
 
@@ -188,6 +178,25 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Question 2, skipped entirely when nothing selected is per-platform: TLS and
+/// skills are global, so asking "on which platforms?" for them is noise.
+fn select_platforms_for(actions: &[SetupAction], interactive: bool) -> Vec<Platform> {
+    if !actions.iter().any(|a| a.is_platform_specific()) {
+        return Vec::new();
+    }
+    select_platforms(actions, interactive)
+}
+
+/// The connection transport is a required detail of the MCP action alone, and is
+/// only ever asked for — every non-interactive path takes the stdio default.
+fn select_transport_for(actions: &[SetupAction], interactive: bool) -> &'static str {
+    if interactive && actions.contains(&SetupAction::Mcp) {
+        prompt_transport()
+    } else {
+        "stdio"
+    }
 }
 
 /// Whether the wizard should ask questions interactively: not `--auto`, and
@@ -554,61 +563,149 @@ pub fn detect_mcp_config_drifts() -> Vec<McpConfigDrift> {
 
     let servers_entry = build_mcp_servers_entry("stdio");
     let scoped_servers_entry = build_scoped_servers_entry("stdio", &home);
-    let mut drifts = Vec::new();
 
-    for platform in PLATFORMS.iter().copied().filter(|p| p.supports_mcp()) {
-        let Some((path, format)) = platform.mcp_config(&home) else {
-            continue;
-        };
-        if !path.exists() {
-            continue;
-        }
-
-        match format {
-            McpConfigFormat::Toml => {
-                let codex_toml = build_codex_toml_value("stdio");
-                if let Ok(content) = std::fs::read_to_string(&path)
-                    && let Ok(toml_val) = toml::from_str::<toml::Value>(&content)
-                    && let Some(existing) = toml_val.get("mcp_servers").and_then(|s| s.get("Ahma"))
-                    && existing != &codex_toml
-                {
-                    drifts.push(McpConfigDrift {
-                        platform_name: platform.label(),
-                        config_path: path,
-                        is_toml: true,
-                        servers_key: "mcp_servers",
-                        recommended_json: None,
-                        recommended_toml: Some(codex_toml),
-                    });
+    PLATFORMS
+        .iter()
+        .copied()
+        .filter(|p| p.supports_mcp())
+        .filter_map(|platform| {
+            let (path, format) = platform.mcp_config(&home)?;
+            if !path.exists() {
+                return None;
+            }
+            match format {
+                McpConfigFormat::Toml => {
+                    detect_toml_drift(platform, path, build_codex_toml_value("stdio"))
+                }
+                McpConfigFormat::Json(servers_key) => {
+                    let recommended = select_mcp_json_entry(
+                        platform,
+                        "stdio",
+                        &servers_entry,
+                        &scoped_servers_entry,
+                        &home,
+                    );
+                    detect_json_drift(platform, path, servers_key, recommended)
                 }
             }
-            McpConfigFormat::Json(servers_key) => {
-                let rec_entry = select_mcp_json_entry(
-                    platform,
-                    "stdio",
-                    &servers_entry,
-                    &scoped_servers_entry,
-                    &home,
-                );
-                if let Ok(content) = std::fs::read_to_string(&path)
-                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-                    && let Some(existing) = json.get(servers_key).and_then(|s| s.get("Ahma"))
-                    && existing != &rec_entry
-                {
-                    drifts.push(McpConfigDrift {
-                        platform_name: platform.label(),
-                        config_path: path,
-                        is_toml: false,
-                        servers_key,
-                        recommended_json: Some(rec_entry),
-                        recommended_toml: None,
-                    });
-                }
-            }
-        }
+        })
+        .collect()
+}
+
+/// Drift for one Codex-style TOML config, or `None` when there is nothing to
+/// update: the file is unreadable or unparseable, carries no Ahma entry at all
+/// (setup never wrote one, so drift correction has nothing to correct), or the
+/// entry already matches `recommended`.
+fn detect_toml_drift(
+    platform: Platform,
+    path: PathBuf,
+    recommended: toml::Value,
+) -> Option<McpConfigDrift> {
+    let content = std::fs::read_to_string(&path).ok()?;
+    let parsed = toml::from_str::<toml::Value>(&content).ok()?;
+    let existing = parsed.get("mcp_servers")?.get("Ahma")?;
+    if existing == &recommended {
+        return None;
     }
+    Some(McpConfigDrift {
+        platform_name: platform.label(),
+        config_path: path,
+        is_toml: true,
+        servers_key: "mcp_servers",
+        recommended_json: None,
+        recommended_toml: Some(recommended),
+    })
+}
 
-    drifts
+/// Drift for one JSON MCP config. Same "nothing to update" cases as
+/// [`detect_toml_drift`].
+fn detect_json_drift(
+    platform: Platform,
+    path: PathBuf,
+    servers_key: &'static str,
+    recommended: serde_json::Value,
+) -> Option<McpConfigDrift> {
+    let content = std::fs::read_to_string(&path).ok()?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    let existing = parsed.get(servers_key)?.get("Ahma")?;
+    if existing == &recommended {
+        return None;
+    }
+    Some(McpConfigDrift {
+        platform_name: platform.label(),
+        config_path: path,
+        is_toml: false,
+        servers_key,
+        recommended_json: Some(recommended),
+        recommended_toml: None,
+    })
+}
+
+/// Copy `path` to `<path>.bak` before setup rewrites it in place.
+///
+/// Only a *changed* Ahma entry in an *existing* file earns a backup, so
+/// re-running setup with matching config leaves no new `.bak` behind
+/// (idempotence). A failed copy is a warning, not an error: losing the backup
+/// must not stop setup from writing a working config.
+fn backup_config_before_change(path: &Path, has_changed: bool) {
+    if !has_changed || !path.exists() {
+        return;
+    }
+    let backup_path = PathBuf::from(format!("{}.bak", path.display()));
+    match std::fs::copy(path, &backup_path) {
+        Ok(_) => tracing::info!(
+            "Created backup of {} at {}",
+            path.display(),
+            backup_path.display()
+        ),
+        Err(e) => tracing::warn!(
+            "Could not create backup of {} at {}: {}",
+            path.display(),
+            backup_path.display(),
+            e
+        ),
+    }
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create directory {}", parent.display()))
+}
+
+/// Read `path` as a JSON object. An absent file, unparseable content, or a
+/// non-object root all yield an empty object: a client config ahma cannot
+/// understand is replaced rather than allowed to block setup. An I/O error on a
+/// file that *does* exist is propagated, because silently discarding a config we
+/// were merely unable to read would destroy user data.
+fn load_json_object(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    })
+}
+
+/// The `servers_key` sub-object of `root`, created (or replaced, if the key
+/// holds something that is not an object) so the caller can insert into it.
+fn json_servers_map_mut<'a>(
+    root: &'a mut serde_json::Map<String, serde_json::Value>,
+    servers_key: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let slot = root
+        .entry(servers_key.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !slot.is_object() {
+        *slot = serde_json::Value::Object(serde_json::Map::new());
+    }
+    slot.as_object_mut()
+        .expect("slot was just normalised to an object")
 }
 
 pub(crate) fn merge_mcp_json(
@@ -616,56 +713,18 @@ pub(crate) fn merge_mcp_json(
     servers_key: &str,
     value: serde_json::Value,
 ) -> Result<()> {
-    let mut config = if path.exists() {
-        let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
-    } else {
-        serde_json::Value::Object(serde_json::Map::new())
-    };
+    let mut config = load_json_object(path)?;
 
-    if !config.is_object() {
-        config = serde_json::Value::Object(serde_json::Map::new());
-    }
+    // Only the "Ahma" key is ours; every other key in the file is the user's and
+    // is carried through untouched.
+    let servers = json_servers_map_mut(&mut config, servers_key);
+    let has_changed = servers.get("Ahma") != Some(&value);
+    backup_config_before_change(path, has_changed);
+    servers.insert("Ahma".to_string(), value);
 
-    let obj = config.as_object_mut().unwrap();
-    if !obj.contains_key(servers_key) || !obj.get(servers_key).unwrap().is_object() {
-        obj.insert(
-            servers_key.to_string(),
-            serde_json::Value::Object(serde_json::Map::new()),
-        );
-    }
-
-    let servers_obj = obj.get_mut(servers_key).unwrap().as_object_mut().unwrap();
-    let old_val = servers_obj.get("Ahma");
-    let has_changed = old_val != Some(&value);
-
-    // If the configuration file exists and the Ahma entry is changed, create a backup
-    if path.exists() && has_changed {
-        let backup_path = PathBuf::from(format!("{}.bak", path.display()));
-        if let Err(e) = std::fs::copy(path, &backup_path) {
-            tracing::warn!(
-                "Could not create backup of {} at {}: {}",
-                path.display(),
-                backup_path.display(),
-                e
-            );
-        } else {
-            tracing::info!(
-                "Created backup of {} at {}",
-                path.display(),
-                backup_path.display()
-            );
-        }
-    }
-
-    servers_obj.insert("Ahma".to_string(), value);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut file = std::fs::File::create(path)?;
+    ensure_parent_dir(path)?;
+    let mut file = std::fs::File::create(path)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     serde_json::to_writer_pretty(&mut file, &config)?;
     Ok(())
 }
@@ -703,73 +762,55 @@ fn build_codex_toml_value(transport: &str) -> toml::Value {
     toml::Value::Table(table)
 }
 
+/// TOML counterpart of [`load_json_object`], with the same fallback rules.
+fn load_toml_table(path: &Path) -> Result<toml::map::Map<String, toml::Value>> {
+    if !path.exists() {
+        return Ok(toml::map::Map::new());
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(match toml::from_str::<toml::Value>(&content) {
+        Ok(toml::Value::Table(table)) => table,
+        _ => toml::map::Map::new(),
+    })
+}
+
+/// TOML counterpart of [`json_servers_map_mut`]. Codex's key is fixed, so unlike
+/// the JSON side there is nothing to parameterise.
+fn toml_mcp_servers_map_mut(
+    root: &mut toml::map::Map<String, toml::Value>,
+) -> &mut toml::map::Map<String, toml::Value> {
+    let slot = root
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if !slot.is_table() {
+        *slot = toml::Value::Table(toml::map::Map::new());
+    }
+    slot.as_table_mut()
+        .expect("slot was just normalised to a table")
+}
+
 fn merge_codex_toml(path: &Path, value: toml::Value) -> Result<()> {
-    let mut config = if path.exists() {
-        let content = std::fs::read_to_string(path)?;
-        toml::from_str(&content).unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()))
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
+    let mut config = load_toml_table(path)?;
 
-    if !config.is_table() {
-        config = toml::Value::Table(toml::map::Map::new());
-    }
-
-    let table = config.as_table_mut().unwrap();
-    if !table.contains_key("mcp_servers") || !table.get("mcp_servers").unwrap().is_table() {
-        table.insert(
-            "mcp_servers".to_string(),
-            toml::Value::Table(toml::map::Map::new()),
-        );
-    }
-
-    let mcp_servers = table
-        .get_mut("mcp_servers")
-        .unwrap()
-        .as_table_mut()
-        .unwrap();
-    let old_val = mcp_servers.get("Ahma");
-    let has_changed = old_val != Some(&value);
-
-    if path.exists() && has_changed {
-        let backup_path = PathBuf::from(format!("{}.bak", path.display()));
-        if let Err(e) = std::fs::copy(path, &backup_path) {
-            tracing::warn!(
-                "Could not create backup of {} at {}: {}",
-                path.display(),
-                backup_path.display(),
-                e
-            );
-        } else {
-            tracing::info!(
-                "Created backup of {} at {}",
-                path.display(),
-                backup_path.display()
-            );
-        }
-    }
-
+    // Only `mcp_servers.Ahma` is ours; the rest of Codex's config is untouched.
+    let mcp_servers = toml_mcp_servers_map_mut(&mut config);
+    let has_changed = mcp_servers.get("Ahma") != Some(&value);
+    backup_config_before_change(path, has_changed);
     mcp_servers.insert("Ahma".to_string(), value);
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let content = toml::to_string_pretty(&config)?;
-    std::fs::write(path, content)?;
-    Ok(())
+    ensure_parent_dir(path)?;
+    let content = toml::to_string_pretty(&toml::Value::Table(config))?;
+    std::fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
 
 async fn setup_terminal_hooks(platforms: &[Platform], interactive: bool) -> Result<()> {
-    let mut hook_platforms = Vec::new();
-    let mut names = Vec::new();
-
-    for platform in platforms.iter().copied().filter(|p| p.supports_hooks()) {
-        if let Some(hook_platform) = platform.hook_platform() {
-            hook_platforms.push(hook_platform);
-            names.push(platform.label());
-        }
-    }
+    let (hook_platforms, names): (Vec<_>, Vec<_>) = platforms
+        .iter()
+        .copied()
+        .filter(|p| p.supports_hooks())
+        .filter_map(|p| p.hook_platform().map(|hook| (hook, p.label())))
+        .unzip();
 
     if hook_platforms.is_empty() {
         return Ok(());
@@ -1963,6 +2004,49 @@ mod tests {
                 "--sandbox-scope",
                 "/tmp/sandbox"
             ])
+        );
+        Ok(())
+    }
+
+    /// Re-running setup over an already-correct file must be a no-op on disk:
+    /// no `.bak` is left behind, and the user's other keys survive.
+    #[test]
+    fn test_merge_mcp_json_unchanged_entry_writes_no_backup() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("mcp.json");
+        let entry = build_mcp_servers_entry("stdio");
+
+        merge_mcp_json(&path, "mcpServers", entry.clone())?;
+        merge_mcp_json(&path, "mcpServers", entry.clone())?;
+
+        let backup_path = PathBuf::from(format!("{}.bak", path.display()));
+        assert!(
+            !backup_path.exists(),
+            "an unchanged Ahma entry must not produce a backup"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(parsed["mcpServers"]["Ahma"], entry);
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_codex_toml_unchanged_entry_writes_no_backup() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("config.toml");
+        let value = build_codex_toml_value("stdio");
+
+        merge_codex_toml(&path, value.clone())?;
+        merge_codex_toml(&path, value)?;
+
+        let backup_path = PathBuf::from(format!("{}.bak", path.display()));
+        assert!(
+            !backup_path.exists(),
+            "an unchanged Ahma entry must not produce a backup"
+        );
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(
+            parsed["mcp_servers"]["Ahma"]["command"].as_str(),
+            Some("ahma")
         );
         Ok(())
     }

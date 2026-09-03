@@ -14,14 +14,15 @@ use crate::mcp_service::{ActiveAgentSession, get_global_prompt_runner};
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use ahma_common::config::settings_path;
 use ahma_common::daemon_hub::{
-    ClientMsg, DaemonEvent, DaemonMsg, DaemonStream, connect_to_daemon, ensure_daemon_running,
-    recv_msg, send_msg,
+    ClientMsg, DaemonChatMessage, DaemonEvent, DaemonMsg, DaemonStream, connect_to_daemon,
+    ensure_daemon_running, recv_msg, send_msg,
 };
 use ahma_common::scope_grant::{
-    GrantCoordinator, GrantResolveOutcome, ScopeGrantRequest, persist_grant,
+    GrantCoordinator, GrantDecision, GrantResolveOutcome, ScopeGrantRequest, persist_grant,
 };
 use ahma_common::web_approval::{
-    WebApprovalCoordinator, WebApprovalRequest, WebResolveOutcome, persist_web_allow,
+    WebApprovalCoordinator, WebApprovalDecision, WebApprovalRequest, WebResolveOutcome,
+    persist_web_allow,
 };
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -460,165 +461,199 @@ async fn handle_daemon_msg(
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
     web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
 ) -> bool {
-    match daemon_msg {
-        Ok(DaemonMsg::Ping { seq }) => {
+    let msg = match daemon_msg {
+        Ok(msg) => msg,
+        Err(e) => {
+            debug!("daemon_reporter: read error or EOF ({e}), reconnecting");
+            return true;
+        }
+    };
+
+    match msg {
+        DaemonMsg::Ping { seq } => {
             debug!("daemon_reporter: received ping seq={seq}");
             if let Err(e) = send_msg(writer, &ClientMsg::Pong { seq }).await {
                 debug!("daemon_reporter: pong send failed ({e}), reconnecting");
                 return true;
             }
-            false
         }
-        Ok(DaemonMsg::RunPrompt {
+        DaemonMsg::RunPrompt {
             messages,
             system_prompt,
             provider,
             model,
-        }) => {
-            info!(
-                provider = ?provider,
-                model = ?model,
-                messages = messages.len(),
-                "daemon_reporter: RunPrompt received"
-            );
-            if let Some(runner) = get_global_prompt_runner() {
-                let runner = runner.clone();
-                let hub_tx = hub_tx.clone();
-                let session = session.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = runner
-                        .run_prompt(
-                            messages,
-                            system_prompt,
-                            provider,
-                            model,
-                            hub_tx.clone(),
-                            session,
-                        )
-                        .await
-                    {
-                        let _ = hub_tx.send(ClientMsg::AgentError { error: e }).await;
-                    } else {
-                        let _ = hub_tx.send(ClientMsg::AgentDone).await;
-                    }
-                });
-            } else {
-                warn!("daemon_reporter: RunPrompt received but no prompt runner is registered");
-                let _ = hub_tx
-                    .send(ClientMsg::AgentError {
-                        error: "No prompt runner registered on this instance".to_string(),
-                    })
-                    .await;
-            }
-            false
-        }
-        Ok(DaemonMsg::SubmitApproval { id, approved }) => {
-            debug!("daemon_reporter: received SubmitApproval id={id:?} approved={approved}");
-            let mut session_guard = session.lock().await;
-            if let Some(ref call_id) = id {
-                if let Some(tx) = session_guard.approvals.remove(call_id) {
-                    let _ = tx.send(approved);
-                } else {
-                    debug!(
-                        "daemon_reporter: received SubmitApproval for unknown call_id={call_id}"
-                    );
-                }
-            } else if let Some(tx) = session_guard.approval_tx.take() {
-                let _ = tx.send(approved);
-            } else {
-                debug!("daemon_reporter: received SubmitApproval but no approval sender pending");
-            }
-            false
-        }
-        Ok(DaemonMsg::SubmitScopeGrant {
+        } => spawn_prompt_run(messages, system_prompt, provider, model, hub_tx, session).await,
+        DaemonMsg::SubmitApproval { id, approved } => deliver_approval(id, approved, session).await,
+        DaemonMsg::SubmitScopeGrant {
             decision_id,
             decision,
-        }) => {
-            debug!(
-                "daemon_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?}"
-            );
-            if let Some(coord) = grant_coordinator {
-                match coord.resolve(&decision_id, decision) {
-                    GrantResolveOutcome::Persist { path, access, tool } => {
-                        persist_resolved_grant(&path, access, tool);
-                        // Dismiss any twin modal on other TUIs.
-                        let _ =
-                            send_msg(writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
-                    }
-                    GrantResolveOutcome::Denied { .. } => {
-                        let _ =
-                            send_msg(writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
-                    }
-                    GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
-                }
-            }
-            false
+        } => resolve_scope_grant(decision_id, decision, writer, grant_coordinator).await,
+        DaemonMsg::ReRaiseScopeGrant { path, access } => {
+            re_raise_scope_grant(&path, &access, writer, grant_coordinator).await
         }
-        Ok(DaemonMsg::ReRaiseScopeGrant { path, access }) => {
-            debug!("daemon_reporter: received ReRaiseScopeGrant path={path} access={access}");
-            if let Some(coord) = grant_coordinator {
-                let access = match access.as_str() {
-                    "rw" => ahma_common::config::ScopeAccess::Rw,
-                    _ => ahma_common::config::ScopeAccess::Ro,
-                };
-                // reopen() clears the session's ask-once memo for
-                // this (path, access) first: the memo stops ahma
-                // nagging, and a person picking a denied row and
-                // confirming is not ahma nagging (SPEC R-PERM.7.1).
-                match coord.reopen(
-                    std::path::Path::new(&path),
-                    access,
-                    ahma_common::scope_grant::GrantReason::StderrHeuristic,
-                    Some("re-raised from the TUI".to_string()),
-                ) {
-                    Some(req) => {
-                        let _ = send_msg(writer, &ClientMsg::ScopeGrantRequested { request: req })
-                            .await;
-                    }
-                    // Already in flight — the modal the user wants
-                    // is on screen already.
-                    None => debug!("daemon_reporter: re-raise skipped, question already in flight"),
-                }
-            }
-            false
-        }
-        Ok(DaemonMsg::SubmitWebApproval {
+        DaemonMsg::SubmitWebApproval {
             decision_id,
             decision,
-        }) => {
-            debug!(
-                "daemon_reporter: received SubmitWebApproval id={decision_id} decision={decision:?}"
-            );
-            if let Some(coord) = web_coordinator {
-                // resolve() applies the session grant/deny in-memory;
-                // Persist additionally writes always_allow. Every
-                // terminal outcome dismisses twin modals on other TUIs.
-                match coord.resolve(&decision_id, decision) {
-                    WebResolveOutcome::Persist { domain } => {
-                        persist_resolved_web_allow(&domain);
-                        let _ =
-                            send_msg(writer, &ClientMsg::WebApprovalResolved { decision_id }).await;
-                    }
-                    WebResolveOutcome::AllowOnce { .. }
-                    | WebResolveOutcome::AllowSession { .. }
-                    | WebResolveOutcome::Denied { .. } => {
-                        let _ =
-                            send_msg(writer, &ClientMsg::WebApprovalResolved { decision_id }).await;
-                    }
-                    WebResolveOutcome::AlreadyResolved | WebResolveOutcome::Unknown => {}
-                }
-            }
-            false
-        }
-        Ok(msg) => {
-            debug!("daemon_reporter: ignored unexpected DaemonMsg: {:?}", msg);
-            false
-        }
-        Err(e) => {
-            debug!("daemon_reporter: read error or EOF ({e}), reconnecting");
-            true
-        }
+        } => resolve_web_approval(decision_id, decision, writer, web_coordinator).await,
+        other => debug!("daemon_reporter: ignored unexpected DaemonMsg: {:?}", other),
     }
+    false
+}
+
+/// `RunPrompt`: hand the turn to the registered prompt runner on a detached
+/// task, reporting its outcome back to the hub. An instance with no runner
+/// registered answers with an `AgentError` rather than going silent.
+async fn spawn_prompt_run(
+    messages: Vec<DaemonChatMessage>,
+    system_prompt: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    hub_tx: &tokio::sync::mpsc::Sender<ClientMsg>,
+    session: &Arc<tokio::sync::Mutex<ActiveAgentSession>>,
+) {
+    info!(
+        provider = ?provider,
+        model = ?model,
+        messages = messages.len(),
+        "daemon_reporter: RunPrompt received"
+    );
+    let Some(runner) = get_global_prompt_runner() else {
+        warn!("daemon_reporter: RunPrompt received but no prompt runner is registered");
+        let _ = hub_tx
+            .send(ClientMsg::AgentError {
+                error: "No prompt runner registered on this instance".to_string(),
+            })
+            .await;
+        return;
+    };
+    let runner = runner.clone();
+    let hub_tx = hub_tx.clone();
+    let session = session.clone();
+    tokio::spawn(async move {
+        let outcome = runner
+            .run_prompt(
+                messages,
+                system_prompt,
+                provider,
+                model,
+                hub_tx.clone(),
+                session,
+            )
+            .await;
+        let done = match outcome {
+            Ok(_) => ClientMsg::AgentDone,
+            Err(e) => ClientMsg::AgentError { error: e },
+        };
+        let _ = hub_tx.send(done).await;
+    });
+}
+
+/// `SubmitApproval`: wake the waiter registered for this call id, or — when the
+/// daemon sent no id — the single pending session-level waiter.
+async fn deliver_approval(
+    id: Option<String>,
+    approved: bool,
+    session: &Arc<tokio::sync::Mutex<ActiveAgentSession>>,
+) {
+    debug!("daemon_reporter: received SubmitApproval id={id:?} approved={approved}");
+    let mut session_guard = session.lock().await;
+    let Some(call_id) = id else {
+        match session_guard.approval_tx.take() {
+            Some(tx) => {
+                let _ = tx.send(approved);
+            }
+            None => {
+                debug!("daemon_reporter: received SubmitApproval but no approval sender pending")
+            }
+        }
+        return;
+    };
+    match session_guard.approvals.remove(&call_id) {
+        Some(tx) => {
+            let _ = tx.send(approved);
+        }
+        None => debug!("daemon_reporter: received SubmitApproval for unknown call_id={call_id}"),
+    }
+}
+
+/// `SubmitScopeGrant`: resolve the decision against the coordinator, persisting
+/// an approved grant. Every *terminal* outcome then dismisses any twin modal on
+/// other TUIs; an already-resolved or unknown decision id changes nothing.
+async fn resolve_scope_grant(
+    decision_id: String,
+    decision: GrantDecision,
+    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    grant_coordinator: Option<&Arc<GrantCoordinator>>,
+) {
+    debug!("daemon_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?}");
+    let Some(coord) = grant_coordinator else {
+        return;
+    };
+    match coord.resolve(&decision_id, decision) {
+        GrantResolveOutcome::Persist { path, access, tool } => {
+            persist_resolved_grant(&path, access, tool)
+        }
+        GrantResolveOutcome::Denied { .. } => {}
+        GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => return,
+    }
+    let _ = send_msg(writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
+}
+
+/// `ReRaiseScopeGrant`: reopen a question this session already refused, because
+/// the user explicitly asked for it from a denied operation row (SPEC
+/// R-PERM.7.1). `reopen()` clears the session's ask-once memo for this
+/// (path, access) first: the memo stops ahma nagging, and a person picking a
+/// denied row and confirming is not ahma nagging.
+async fn re_raise_scope_grant(
+    path: &str,
+    access: &str,
+    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    grant_coordinator: Option<&Arc<GrantCoordinator>>,
+) {
+    debug!("daemon_reporter: received ReRaiseScopeGrant path={path} access={access}");
+    let Some(coord) = grant_coordinator else {
+        return;
+    };
+    let access = match access {
+        "rw" => ahma_common::config::ScopeAccess::Rw,
+        _ => ahma_common::config::ScopeAccess::Ro,
+    };
+    match coord.reopen(
+        std::path::Path::new(path),
+        access,
+        ahma_common::scope_grant::GrantReason::StderrHeuristic,
+        Some("re-raised from the TUI".to_string()),
+    ) {
+        Some(request) => {
+            let _ = send_msg(writer, &ClientMsg::ScopeGrantRequested { request }).await;
+        }
+        // Already in flight — the modal the user wants is on screen already.
+        None => debug!("daemon_reporter: re-raise skipped, question already in flight"),
+    }
+}
+
+/// `SubmitWebApproval`: resolve the decision against the coordinator, which
+/// applies a session grant/deny in-memory; `Persist` additionally writes
+/// `always_allow`. Every *terminal* outcome then dismisses twin modals on other
+/// TUIs; an already-resolved or unknown decision id changes nothing.
+async fn resolve_web_approval(
+    decision_id: String,
+    decision: WebApprovalDecision,
+    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
+) {
+    debug!("daemon_reporter: received SubmitWebApproval id={decision_id} decision={decision:?}");
+    let Some(coord) = web_coordinator else {
+        return;
+    };
+    match coord.resolve(&decision_id, decision) {
+        WebResolveOutcome::Persist { domain } => persist_resolved_web_allow(&domain),
+        WebResolveOutcome::AllowOnce { .. }
+        | WebResolveOutcome::AllowSession { .. }
+        | WebResolveOutcome::Denied { .. } => {}
+        WebResolveOutcome::AlreadyResolved | WebResolveOutcome::Unknown => return,
+    }
+    let _ = send_msg(writer, &ClientMsg::WebApprovalResolved { decision_id }).await;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

@@ -665,27 +665,34 @@ fn precise_pin_resolvable(
 /// the crate are present in the tree.
 fn pin_skipped_dependencies(root: &Path, rows: &[Row]) {
     println!("Pinning skipped/unsafe dependencies to current versions in Cargo.lock…");
-    let mut args = vec!["update".to_string(), "--offline".to_string()];
-    let mut count = 0;
-    for row in rows {
-        if row.status.starts_with("skipped:") {
-            args.push("-p".to_string());
-            args.push(format!("{}@{}", row.name, row.old_ver));
-            args.push("--precise".to_string());
-            args.push(row.old_ver.clone());
-            count += 1;
-        }
-    }
-    if count == 0 {
+    let skipped: Vec<&Row> = rows
+        .iter()
+        .filter(|row| row.status.starts_with("skipped:"))
+        .collect();
+    if skipped.is_empty() {
         return;
     }
-    println!("  Batch-pinning {count} skipped dependencies offline…");
-    let status = std::process::Command::new("cargo")
+    println!(
+        "  Batch-pinning {} skipped dependencies offline…",
+        skipped.len()
+    );
+
+    let mut args = vec!["update".to_string(), "--offline".to_string()];
+    for row in skipped {
+        args.extend([
+            "-p".to_string(),
+            format!("{}@{}", row.name, row.old_ver),
+            "--precise".to_string(),
+            row.old_ver.clone(),
+        ]);
+    }
+
+    let offline_succeeded = std::process::Command::new("cargo")
         .args(&args)
         .current_dir(root)
-        .status();
-
-    if status.is_err() || matches!(status.as_ref().map(|s| s.success()), Ok(false)) {
+        .status()
+        .is_ok_and(|s| s.success());
+    if !offline_succeeded {
         // Fallback without --offline if offline fails
         let mut online_args = args;
         online_args.remove(1); // remove "--offline"
@@ -1061,15 +1068,11 @@ fn is_profile_dir(p: &Path) -> bool {
 }
 
 fn discover_profile_dirs(target_dir: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
     let Ok(entries) = fs::read_dir(target_dir) else {
-        return found;
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
+    let mut found = Vec::new();
+    for path in child_dirs(entries) {
         if is_profile_dir(&path) {
             found.push(path);
         } else {
@@ -1081,14 +1084,18 @@ fn discover_profile_dirs(target_dir: &Path) -> Vec<PathBuf> {
 }
 
 fn collect_nested_profile_dirs(path: &Path, found: &mut Vec<PathBuf>) {
-    if let Ok(nested) = fs::read_dir(path) {
-        for sub in nested.flatten() {
-            let sub_path = sub.path();
-            if sub_path.is_dir() && is_profile_dir(&sub_path) {
-                found.push(sub_path);
-            }
-        }
-    }
+    let Ok(nested) = fs::read_dir(path) else {
+        return;
+    };
+    found.extend(child_dirs(nested).filter(|sub| is_profile_dir(sub)));
+}
+
+/// The subdirectories of an already-opened directory, unreadable entries skipped.
+fn child_dirs(entries: fs::ReadDir) -> impl Iterator<Item = PathBuf> {
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
 }
 
 fn remove_coverage_counters(dir: &Path, opts: &CleanOpts, report: &mut CleanReport) {

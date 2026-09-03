@@ -191,22 +191,26 @@ impl ChatHistory {
 
     /// Locate the latest `User` entry and set its `duration_ms` based on `started_at` elapsed time.
     pub fn finish_user_timing(&mut self) {
-        for entry in self.entries.iter_mut().rev() {
-            if let ChatEntry::User {
+        let latest_user = self.entries.iter_mut().rev().find_map(|entry| match entry {
+            ChatEntry::User {
                 started_at,
                 duration_ms,
                 ..
-            } = entry
-            {
-                if duration_ms.is_none()
-                    && let Some(start) = started_at
-                {
-                    *duration_ms = Some(start.elapsed().as_millis() as u64);
-                    self.generation = self.generation.wrapping_add(1);
-                }
-                break;
-            }
+            } => Some((started_at, duration_ms)),
+            _ => None,
+        });
+        // Nothing to time: no user turn yet, already timed, or never started.
+        let Some((started_at, duration_ms)) = latest_user else {
+            return;
+        };
+        if duration_ms.is_some() {
+            return;
         }
+        let Some(start) = started_at else {
+            return;
+        };
+        *duration_ms = Some(start.elapsed().as_millis() as u64);
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn len(&self) -> usize {
@@ -421,6 +425,19 @@ impl CommandNavigator {
         nav
     }
 
+    /// Does `cmd` match the palette query? `query` must already be lowercased.
+    /// Matching is a substring test over both the command and its description,
+    /// plus one alias: `/quit` also answers to a prefix of "exit".
+    fn command_matches(cmd: &NavCommand, query: &str) -> bool {
+        let query_no_slash = query.trim_start_matches('/');
+        let is_exit_alias = cmd.command == "/quit"
+            && !query_no_slash.is_empty()
+            && "exit".starts_with(query_no_slash);
+        cmd.command.to_lowercase().contains(query)
+            || cmd.description.to_lowercase().contains(query)
+            || is_exit_alias
+    }
+
     /// Rebuild completions from builtins + dynamic `/run <tool>` and skill
     /// entries.
     pub fn refresh_completions(&mut self, tools: &[String]) {
@@ -437,17 +454,10 @@ impl CommandNavigator {
         if self.input.is_empty() {
             self.completions = cmds;
         } else {
-            let q = self.input.to_lowercase();
-            let q_clean = q.trim_start_matches('/');
+            let query = self.input.to_lowercase();
             self.completions = cmds
                 .into_iter()
-                .filter(|c| {
-                    c.command.to_lowercase().contains(&q)
-                        || c.description.to_lowercase().contains(&q)
-                        || (c.command == "/quit"
-                            && !q_clean.is_empty()
-                            && "exit".starts_with(q_clean))
-                })
+                .filter(|c| Self::command_matches(c, &query))
                 .collect();
         }
         self.selected = self.selected.min(self.completions.len().saturating_sub(1));
@@ -2099,6 +2109,18 @@ fn handle_word_fit(current_line_len: &mut usize, lines: &mut usize, word_len: us
     }
 }
 
+/// Account for a single space: it either fits on the current line or closes it
+/// and is swallowed by the wrap (a wrapped line does not start with a space).
+#[cfg(feature = "tui")]
+fn handle_space_fit(current_line_len: &mut usize, lines: &mut usize, width: usize) {
+    if *current_line_len < width {
+        *current_line_len += 1;
+    } else {
+        *lines += 1;
+        *current_line_len = 0;
+    }
+}
+
 #[cfg(feature = "tui")]
 fn count_wrapped_lines(line: &str, width: usize) -> usize {
     let width = width.max(1);
@@ -2109,17 +2131,11 @@ fn count_wrapped_lines(line: &str, width: usize) -> usize {
     let mut current_line_len = 0;
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
-        if c != ' ' {
+        if c == ' ' {
+            handle_space_fit(&mut current_line_len, &mut lines, width);
+        } else {
             let word_len = parse_word_len(c, &mut chars);
             handle_word_fit(&mut current_line_len, &mut lines, word_len, width);
-            continue;
-        }
-        // A space either fits on the current line or wraps it.
-        if current_line_len < width {
-            current_line_len += 1;
-        } else {
-            lines += 1;
-            current_line_len = 0;
         }
     }
     if current_line_len > 0 {
@@ -2373,42 +2389,51 @@ impl AppState {
         incoming.iter().cloned().collect()
     }
 
+    /// Merge `op` into the already-known `existing`, yielding an activity-ring
+    /// event only when the merge crosses from live to terminal — so a repeated
+    /// poll of an already-finished op does not re-announce it.
+    fn merge_and_detect_finish(existing: &mut Operation, op: Operation) -> Option<OpEvent> {
+        let was_terminal = existing.status.is_terminal();
+        Self::merge_operation(existing, op);
+        (!was_terminal && existing.status.is_terminal()).then(|| OpEvent {
+            timestamp: chrono::Local::now(),
+            kind: OpEventKind::Finished(existing.status.clone()),
+            op_id: existing.id.clone(),
+            title: existing.display_name(),
+            instance: existing.instance_label.clone(),
+            duration_ms: existing.duration_ms,
+        })
+    }
+
+    /// The activity-ring event for an op seen for the very first time: `Started`
+    /// for a live op, `Finished` for one that arrives already terminal (e.g. a
+    /// hub replay) — stamped with the op's own start time, not now.
+    fn first_sight_event(op: &Operation) -> OpEvent {
+        OpEvent {
+            timestamp: op.started_time,
+            kind: if op.status.is_terminal() {
+                OpEventKind::Finished(op.status.clone())
+            } else {
+                OpEventKind::Started
+            },
+            op_id: op.id.clone(),
+            title: op.display_name(),
+            instance: op.instance_label.clone(),
+            duration_ms: op.duration_ms,
+        }
+    }
+
     pub fn upsert_operation(&mut self, op: Operation) {
         let id = op.id.clone();
-        // Feed the monitor activity ring exactly once per transition: Started
-        // on first sight of a live op, Finished when a merge crosses from
-        // live to terminal (or when an op is first seen already terminal,
-        // e.g. a hub replay — stamped with the op's own start time, not now).
+        // Feed the monitor activity ring exactly once per transition.
         let event = match self
             .operations
             .iter_mut()
             .find(|o| o.id == op.id && o.instance_id == op.instance_id)
         {
-            Some(existing) => {
-                let was_terminal = existing.status.is_terminal();
-                Self::merge_operation(existing, op);
-                (!was_terminal && existing.status.is_terminal()).then(|| OpEvent {
-                    timestamp: chrono::Local::now(),
-                    kind: OpEventKind::Finished(existing.status.clone()),
-                    op_id: existing.id.clone(),
-                    title: existing.display_name(),
-                    instance: existing.instance_label.clone(),
-                    duration_ms: existing.duration_ms,
-                })
-            }
+            Some(existing) => Self::merge_and_detect_finish(existing, op),
             None => {
-                let event = OpEvent {
-                    timestamp: op.started_time,
-                    kind: if op.status.is_terminal() {
-                        OpEventKind::Finished(op.status.clone())
-                    } else {
-                        OpEventKind::Started
-                    },
-                    op_id: op.id.clone(),
-                    title: op.display_name(),
-                    instance: op.instance_label.clone(),
-                    duration_ms: op.duration_ms,
-                };
+                let event = Self::first_sight_event(&op);
                 self.operations.push(op);
                 Some(event)
             }

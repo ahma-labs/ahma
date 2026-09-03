@@ -56,6 +56,20 @@ Ensure `~/.local/bin` is on your PATH:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+> **macOS: re-sign after any `cargo install`.** `cargo install` (unlike `ahma update` or
+> `scripts/install.sh`) leaves the binary with a bare ad-hoc linker signature. On Apple
+> Silicon, ad-hoc-signed code pages that get evicted under memory pressure fail
+> re-validation on fault-in and the kernel `SIGKILL`s every future launch — silently,
+> before ahma's own code (or its error handling) ever runs; the shell just reports
+> `killed`. Harden it once, immediately after installing:
+> ```bash
+> codesign --force --sign - --options runtime ~/.local/bin/ahma
+> ```
+> If you're already hitting silent `Killed: 9` / exit 137 on an existing install, this
+> same command fixes it in place — no reinstall needed. See [R-SIGN in
+> SPEC.md](../SPEC.md#r-sign-binary-code-signing--in-progress-macos-runtime-stability-windowslinux-distribution-only)
+> for the full failure mode.
+
 ### Windows (PowerShell 5.1+)
 
 **Latest release (prebuilt binary):**
@@ -90,6 +104,8 @@ cd ahma
 cargo build --release -p ahma_bin
 mv target/release/ahma ~/.local/bin/
 ```
+
+macOS: re-sign it (see the note above) — `codesign --force --sign - --options runtime ~/.local/bin/ahma`.
 
 **Windows (PowerShell)**
 

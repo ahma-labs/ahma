@@ -539,28 +539,32 @@ pub fn default_socket_path() -> PathBuf {
         ));
     }
 
-    #[cfg(unix)]
-    {
-        // Prefer XDG_RUNTIME_DIR on Linux (per-user, tmpfs, auto-cleaned).
-        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-            let dir = PathBuf::from(xdg).join("ahma");
-            let _ = std::fs::create_dir_all(&dir);
-            return dir.join("daemon.sock");
-        }
-        // Fall back to ~/.ahma/daemon.sock (macOS + Linux without XDG).
-        if let Some(home) = crate::config::ahma_home_dir() {
-            let dir = home.join(".ahma");
-            let _ = std::fs::create_dir_all(&dir);
-            return dir.join("daemon.sock");
-        }
-        PathBuf::from("/tmp/ahma-daemon.sock")
-    }
+    platform_default_socket_path()
+}
 
-    #[cfg(not(unix))]
-    {
-        // On Windows the path is unused; callers use the TCP address.
-        PathBuf::from("unused-on-windows")
-    }
+/// Step 3 of [`default_socket_path`]'s resolution order: the platform default,
+/// ignoring every override. Creates the parent directory as a side effect so the
+/// returned path is immediately bindable.
+#[cfg(unix)]
+fn platform_default_socket_path() -> PathBuf {
+    // Prefer XDG_RUNTIME_DIR on Linux (per-user, tmpfs, auto-cleaned), then
+    // ~/.ahma (macOS + Linux without XDG).
+    let dir = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .map(|xdg| PathBuf::from(xdg).join("ahma"))
+        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")));
+
+    let Some(dir) = dir else {
+        return PathBuf::from("/tmp/ahma-daemon.sock");
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("daemon.sock")
+}
+
+/// On Windows the path is unused; callers use the TCP address.
+#[cfg(not(unix))]
+fn platform_default_socket_path() -> PathBuf {
+    PathBuf::from("unused-on-windows")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -601,6 +605,34 @@ async fn try_connect() -> bool {
     connect_to_daemon().await.is_ok()
 }
 
+/// Spawn `ahma daemon` as a detached child and return as soon as the fork
+/// succeeded — readiness is the caller's concern.
+///
+/// Uses the current executable so this works regardless of `PATH`.
+///
+/// Intentionally detached (SPEC R-PROC.3): this daemon must outlive us, so it
+/// deliberately does NOT set `kill_on_drop`. `process_group(0)` is used here for
+/// the opposite reason to an owned child (R-PROC.2) — `setpgid(0,0)` puts the
+/// daemon in its own group so it is *not* killed when the spawning terminal/IDE
+/// exits, rather than so it can be reaped with us.
+fn spawn_detached_daemon() -> Result<()> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ahma"));
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    if let Err(e) = cmd.spawn() {
+        bail!("Failed to spawn ahma daemon: {e}");
+    }
+    debug!("daemon_hub: spawned ahma daemon from {:?}", exe);
+    Ok(())
+}
+
 /// Ensure a hub daemon is running, starting one if necessary.
 ///
 /// * Fast path: daemon already up — returns immediately.
@@ -614,33 +646,7 @@ pub async fn ensure_daemon_running() -> Result<()> {
         return Ok(());
     }
 
-    // Spawn the daemon as a detached child — use the current executable so
-    // this works regardless of PATH.
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ahma"));
-    let mut cmd = tokio::process::Command::new(&exe);
-    cmd.arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    // Intentionally detached (SPEC R-PROC.3): this daemon must outlive us, so it
-    // deliberately does NOT set kill_on_drop. `process_group(0)` is used here for
-    // the opposite reason to an owned child (R-PROC.2) — setpgid(0,0) puts the
-    // daemon in its own group so it is *not* killed when the spawning
-    // terminal/IDE exits, rather than so it can be reaped with us.
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
-
-    match cmd.spawn() {
-        Ok(_child) => {
-            debug!("daemon_hub: spawned ahma daemon from {:?}", exe);
-        }
-        Err(e) => {
-            bail!("Failed to spawn ahma daemon: {e}");
-        }
-    }
+    spawn_detached_daemon()?;
 
     // Poll until connected (max ~1 s).
     for attempt in 1..=20u32 {
@@ -775,30 +781,43 @@ impl DaemonHub {
     async fn record_op_event(&self, instance_id: &str, payload: &DaemonEvent) {
         match payload {
             DaemonEvent::OpStarted { id, .. } => {
-                let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
-                let mut hist = self.op_history.lock().await;
-                let inst = hist.entry(instance_id.to_string()).or_default();
-                inst.insert(
-                    id.clone(),
-                    OpSnapshot {
-                        seq,
-                        started: payload.clone(),
-                        finished: None,
-                    },
-                );
-                if inst.len() > MAX_OPS_PER_INSTANCE {
-                    Self::evict_oldest_finished(inst);
-                }
+                self.record_op_started(instance_id, id, payload).await
             }
             DaemonEvent::OpFinished { id, .. } => {
-                let mut hist = self.op_history.lock().await;
-                if let Some(inst) = hist.get_mut(instance_id)
-                    && let Some(snap) = inst.get_mut(id)
-                {
-                    snap.finished = Some(payload.clone());
-                }
+                self.record_op_finished(instance_id, id, payload).await
             }
             _ => {}
+        }
+    }
+
+    /// Retain `started` as the new head of `op_id`'s history, enforcing the
+    /// per-instance retention cap.
+    async fn record_op_started(&self, instance_id: &str, op_id: &str, started: &DaemonEvent) {
+        let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
+        let mut hist = self.op_history.lock().await;
+        let inst = hist.entry(instance_id.to_string()).or_default();
+        inst.insert(
+            op_id.to_string(),
+            OpSnapshot {
+                seq,
+                started: started.clone(),
+                finished: None,
+            },
+        );
+        if inst.len() > MAX_OPS_PER_INSTANCE {
+            Self::evict_oldest_finished(inst);
+        }
+    }
+
+    /// Attach the terminal event to `op_id`'s retained snapshot. An op whose
+    /// `OpStarted` was never seen (or was already evicted) has nothing to
+    /// attach to and is ignored.
+    async fn record_op_finished(&self, instance_id: &str, op_id: &str, finished: &DaemonEvent) {
+        let mut hist = self.op_history.lock().await;
+        if let Some(inst) = hist.get_mut(instance_id)
+            && let Some(snap) = inst.get_mut(op_id)
+        {
+            snap.finished = Some(finished.clone());
         }
     }
 

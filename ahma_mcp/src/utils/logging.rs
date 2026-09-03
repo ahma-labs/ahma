@@ -282,14 +282,8 @@ fn is_log_dir_gitignored(repo_root: &Path, log_dir: &Path) -> bool {
     }
     let mut dir = log_dir.parent().map(Path::to_path_buf);
     while let Some(d) = dir {
-        let candidate = d.join(".gitignore");
-        if let Ok(contents) = std::fs::read_to_string(&candidate) {
-            for line in contents.lines() {
-                let pattern = line.trim().trim_start_matches('/').trim_end_matches('/');
-                if pattern == dir_name && !pattern.is_empty() && !line.trim().starts_with('#') {
-                    return true;
-                }
-            }
+        if gitignore_covers_dir_name(&d.join(".gitignore"), dir_name) {
+            return true;
         }
         if d == repo_root {
             break;
@@ -297,6 +291,23 @@ fn is_log_dir_gitignored(repo_root: &Path, log_dir: &Path) -> bool {
         dir = d.parent().map(Path::to_path_buf);
     }
     false
+}
+
+/// Does the `.gitignore` at `gitignore` carry a bare directory-name line
+/// matching `dir_name`? Recognises the three spellings the caller cares about
+/// (`logs`, `/logs`, `logs/`) and skips comments. A missing or unreadable file
+/// is simply "no match" — this is a best-effort check, not a gate.
+///
+/// `dir_name` is always non-empty (the caller returns early otherwise), so an
+/// empty pattern can never match it.
+fn gitignore_covers_dir_name(gitignore: &Path, dir_name: &str) -> bool {
+    let Ok(contents) = std::fs::read_to_string(gitignore) else {
+        return false;
+    };
+    contents.lines().any(|line| {
+        let line = line.trim();
+        !line.starts_with('#') && line.trim_start_matches('/').trim_end_matches('/') == dir_name
+    })
 }
 
 static LOG_LOCATION_DISCLOSED: Once = Once::new();

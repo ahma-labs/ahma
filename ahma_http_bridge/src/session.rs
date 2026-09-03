@@ -822,13 +822,90 @@ fn handle_sandbox_notification(session: &Arc<Session>, value: &Value) {
     }
 }
 
-/// Process a single line received from subprocess stdout.
-///
-/// Routes JSON-RPC responses to waiting callers; broadcasts all other messages
-/// (notifications) to SSE subscribers and drives sandbox state transitions.
 /// The bare MCP `ping` the subprocess sends mid-`await` to verify the client
 /// is still there (SPEC R2.6.5.3).
 const PING_METHOD: &str = "ping";
+
+/// The map key for a JSON-RPC id already known to be present: the raw string
+/// for a string id, its JSON rendering otherwise (ids may legitimately be
+/// numbers). Deliberately *not* [`extract_request_id`], which maps a `null` id
+/// to `None`; here a `null` id keys as `"null"`, matches no registered pending
+/// request, and so falls through to the broadcast — the behaviour the inline
+/// version in [`dispatch_subprocess_line`] has always had.
+fn json_id_key(id: &Value) -> String {
+    id.as_str().map_or_else(|| id.to_string(), str::to_string)
+}
+
+/// Timestamp prefix shared by the colored frame echoes.
+fn echo_timestamp() -> String {
+    format!("[{}]", Local::now().format("%H:%M:%S%.3f"))
+}
+
+/// Render one frame for the colored echo: pretty-printed when it parses as
+/// JSON, verbatim otherwise.
+fn format_frame_for_echo(line: &str) -> String {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| line.to_string())
+}
+
+/// Echo a frame read from the peer's stdout (green).
+fn echo_stdout_frame(session_id: &str, line: &str) {
+    eprintln!(
+        "{} {} {}\n{}",
+        echo_timestamp(),
+        format!("[{}]", &session_id[..8]).green(),
+        "← STDOUT:".green(),
+        format_frame_for_echo(line).green()
+    );
+}
+
+/// Echo a frame written to the peer's stdin (cyan).
+fn echo_stdin_frame(session_id: &str, msg: &str) {
+    eprintln!(
+        "{} {} {}\n{}",
+        echo_timestamp(),
+        format!("[{}]", &session_id[..8]).cyan(),
+        "→ STDIN:".cyan(),
+        format_frame_for_echo(msg).cyan()
+    );
+}
+
+/// Echo a line read from the peer's stderr (red tag, dimmed body).
+fn echo_stderr_line(session_id: &str, line: &str) {
+    eprintln!(
+        "{} {} {}\n{}",
+        echo_timestamp(),
+        format!("[{}]", &session_id[..8]).red(),
+        "STDERR:".yellow(),
+        format_frame_for_echo(line).dimmed()
+    );
+}
+
+/// Write one newline-delimited frame to the peer's stdin and flush it.
+///
+/// Each stage is logged with its own message before the error is handed back,
+/// so the caller only has to decide to stop the I/O loop.
+async fn write_frame_to_peer(
+    stdin: &mut (dyn AsyncWrite + Send + Unpin + 'static),
+    session_id: &str,
+    msg: &str,
+) -> std::io::Result<()> {
+    if let Err(e) = stdin.write_all(msg.as_bytes()).await {
+        error!(session_id = %session_id, "Failed to write to stdin: {}", e);
+        return Err(e);
+    }
+    if let Err(e) = stdin.write_all(b"\n").await {
+        error!(session_id = %session_id, "Failed to write newline to stdin: {}", e);
+        return Err(e);
+    }
+    if let Err(e) = stdin.flush().await {
+        error!(session_id = %session_id, "Failed to flush stdin: {}", e);
+        return Err(e);
+    }
+    Ok(())
+}
 
 /// Answer a subprocess-initiated `ping` on the client's behalf **iff** this
 /// session holds a live push channel (an open SSE stream), otherwise leave it
@@ -872,90 +949,80 @@ fn answer_subprocess_ping(session: &Arc<Session>, id: Value) {
         subscribers,
         "Answering subprocess liveness ping on the client's behalf (live push channel)"
     );
+    deliver_ping_answer(session, json_str);
+}
+
+/// Hand a serialized ping answer to the subprocess.
+///
+/// The fast path is a `try_lock` + `try_send` from this synchronous context;
+/// the sender mutex is only ever held for a clone, so it is expected to
+/// succeed. If either declines (or the channel is momentarily full) the send is
+/// retried on a task, when a runtime is available.
+fn deliver_ping_answer(session: &Arc<Session>, json_str: String) {
     if let Ok(sender) = session.sender.try_lock()
         && sender.try_send(json_str.clone()).is_ok()
     {
         return;
     }
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let session = Arc::clone(session);
-        handle.spawn(async move {
-            if let Err(e) = session
-                .send_serialized_to_subprocess(json_str, "Failed to answer liveness ping")
-                .await
-            {
-                warn!(session_id = %session.id, "Ping answer not delivered: {e}");
-            }
-        });
-    } else {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
         warn!(
             session_id = %session.id,
             "Ping answer not delivered: subprocess channel busy and no runtime to retry on"
         );
+        return;
+    };
+    let session = Arc::clone(session);
+    handle.spawn(async move {
+        if let Err(e) = session
+            .send_serialized_to_subprocess(json_str, "Failed to answer liveness ping")
+            .await
+        {
+            warn!(session_id = %session.id, "Ping answer not delivered: {e}");
+        }
+    });
+}
+
+/// How one JSON-RPC frame read from the subprocess must be routed.
+///
+/// A frame carrying a `method` is a request or notification the subprocess is
+/// *sending*; only a frame **without** one can be a response. The two id spaces
+/// are independent — the subprocess numbers its own requests from 0 (rmcp), the
+/// client numbers its own — so a subprocess request can carry the id of a
+/// client call still pending here. Classifying on the id alone consumed that
+/// request as the pending call's "response": the caller got a body with no
+/// `result`, and the request itself was never delivered.
+enum SubprocessFrame {
+    /// No `id`: a notification. Broadcast only.
+    Notification,
+    /// `id`, no `method`: a response to a request the bridge may be holding.
+    Response { id: String },
+    /// The subprocess's liveness `ping` (SPEC R2.6.5.3), answered by the bridge.
+    Ping { id: Value },
+    /// `id` plus `method`: a server → client request, forwarded to the client.
+    Request { id: String, method: String },
+}
+
+/// Classify a parsed subprocess frame. A `method` that is present but is not a
+/// string counts as absent, exactly as the original `as_str()` test did.
+fn classify_subprocess_frame(value: &Value) -> SubprocessFrame {
+    let Some(id) = value.get("id") else {
+        return SubprocessFrame::Notification;
+    };
+    match value.get("method").and_then(Value::as_str) {
+        None => SubprocessFrame::Response {
+            id: json_id_key(id),
+        },
+        Some(PING_METHOD) => SubprocessFrame::Ping { id: id.clone() },
+        Some(method) => SubprocessFrame::Request {
+            id: json_id_key(id),
+            method: method.to_string(),
+        },
     }
 }
 
-fn dispatch_subprocess_line(session: &Arc<Session>, line: &str, colored_output: bool) {
-    debug!(session_id = %session.id, "Received from subprocess: {}", line);
-
-    if colored_output {
-        let timestamp = format!("[{}]", Local::now().format("%H:%M:%S%.3f"));
-        let display = serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-            .unwrap_or_else(|| line.to_string());
-        eprintln!(
-            "{} {} {}\n{}",
-            timestamp,
-            format!("[{}]", &session.id[..8]).green(),
-            "← STDOUT:".green(),
-            display.green()
-        );
-    }
-
-    let value = match serde_json::from_str::<Value>(line) {
-        Ok(v) => v,
-        Err(_) => {
-            warn!(session_id = %session.id, "Failed to parse JSON from subprocess: {}", line);
-            return;
-        }
-    };
-
-    // A message with a `method` is a request or notification the subprocess
-    // is sending; only a message *without* one can be a response. The id
-    // spaces are independent — the subprocess numbers its own requests from 0
-    // (rmcp), the client numbers its own — so a subprocess request can carry
-    // the id of a client call still pending here. Matching on the id alone
-    // consumed that request as the pending call's "response": the caller got
-    // a body with no `result`, and the request itself was never delivered.
-    let method = value.get("method").and_then(|m| m.as_str());
-    if let Some(id) = value.get("id") {
-        let id_str = id.as_str().map_or_else(|| id.to_string(), str::to_string);
-        match method {
-            None => {
-                // Route to waiting caller if this is a response to a pending request
-                if let Some(sender) = take_pending_request(&session.pending_requests, &id_str) {
-                    let _ = sender.send(value);
-                    return;
-                }
-            }
-            Some(PING_METHOD) => {
-                answer_subprocess_ping(session, id.clone());
-                return;
-            }
-            Some(method) => {
-                // Store server-to-client request method name to validate response routing
-                session
-                    .pending_client_requests
-                    .insert(id_str, method.to_string());
-            }
-        }
-    }
-
-    // Drive sandbox state machine for lifecycle notifications
-    handle_sandbox_notification(session, &value);
-
-    // Broadcast to SSE subscribers
+/// Broadcast a frame verbatim to the session's SSE subscribers, noting when
+/// there are none — the event is then dropped because the stream is not open.
+fn broadcast_to_subscribers(session: &Arc<Session>, value: &Value, line: &str) {
     let receiver_count = session.broadcast_tx.receiver_count();
     if receiver_count == 0 {
         warn!(
@@ -968,6 +1035,50 @@ fn dispatch_subprocess_line(session: &Arc<Session>, line: &str, colored_output: 
     }
     let id = session.assign_event_id(line);
     let _ = session.broadcast_tx.send((id, line.to_string()));
+}
+
+/// Process a single line received from subprocess stdout.
+///
+/// Routes JSON-RPC responses to waiting callers; broadcasts everything else
+/// (notifications and server → client requests) to SSE subscribers and drives
+/// sandbox state transitions.
+fn dispatch_subprocess_line(session: &Arc<Session>, line: &str, colored_output: bool) {
+    debug!(session_id = %session.id, "Received from subprocess: {}", line);
+
+    if colored_output {
+        echo_stdout_frame(&session.id, line);
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        warn!(session_id = %session.id, "Failed to parse JSON from subprocess: {}", line);
+        return;
+    };
+
+    match classify_subprocess_frame(&value) {
+        SubprocessFrame::Response { id } => {
+            // Route to the waiting caller; a response whose id we are not
+            // holding still falls through to the broadcast below.
+            if let Some(sender) = take_pending_request(&session.pending_requests, &id) {
+                let _ = sender.send(value);
+                return;
+            }
+        }
+        SubprocessFrame::Ping { id } => {
+            answer_subprocess_ping(session, id);
+            return;
+        }
+        SubprocessFrame::Request { id, method } => {
+            // Remember the server → client request's method name so the
+            // client's eventual response can be routed against it.
+            session.pending_client_requests.insert(id, method);
+        }
+        SubprocessFrame::Notification => {}
+    }
+
+    // Drive sandbox state machine for lifecycle notifications
+    handle_sandbox_notification(session, &value);
+
+    broadcast_to_subscribers(session, &value, line);
 }
 
 impl SessionManager {
@@ -1069,37 +1180,83 @@ impl SessionManager {
         }
     }
 
+    /// Minimum age a session must have reached, with no SSE receiver attached,
+    /// before it may be evicted: a younger one may simply not have opened its
+    /// stream yet.
+    const MIN_IDLE_BEFORE_EVICTION: Duration = Duration::from_secs(5);
+
+    /// Whether `session` is eligible for eviction — nobody is listening to it
+    /// and it is old enough that nobody plausibly still will.
+    fn is_evictable(session: &Session) -> bool {
+        session.sse_receivers() == 0
+            && session.created_at.elapsed() >= Self::MIN_IDLE_BEFORE_EVICTION
+    }
+
     /// Evict the oldest session that has 0 active SSE receivers for at least 5s to accommodate a new session.
     pub async fn evict_oldest_inactive_session(&self) -> bool {
-        let mut oldest: Option<(String, Instant)> = None;
-        let min_idle_duration = Duration::from_secs(5);
-        for entry in self.sessions.iter() {
-            let session_id = entry.key();
-            let session = entry.value();
-            if session.sse_receivers() == 0 && session.created_at.elapsed() >= min_idle_duration {
-                let created = session.created_at;
-                match oldest {
-                    None => oldest = Some((session_id.clone(), created)),
-                    Some((_, ref old_created)) if created < *old_created => {
-                        oldest = Some((session_id.clone(), created));
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // `min_by_key` returns the *first* of equally old candidates, which is
+        // the tie-break the hand-rolled scan this replaced also had. The map
+        // reference is dropped at the end of the statement, before
+        // `terminate_session` reaches back into the map.
+        let oldest = self
+            .sessions
+            .iter()
+            .filter(|entry| Self::is_evictable(entry.value()))
+            .min_by_key(|entry| entry.value().created_at)
+            .map(|entry| entry.key().clone());
 
-        if let Some((evict_id, _)) = oldest {
-            tracing::info!(
-                session_id = %evict_id,
-                "Evicting oldest inactive session (0 SSE receivers for >5s) to accommodate new session"
-            );
-            let _ = self
-                .terminate_session(&evict_id, SessionTerminationReason::Timeout)
-                .await;
-            true
-        } else {
-            false
+        let Some(evict_id) = oldest else {
+            return false;
+        };
+
+        tracing::info!(
+            session_id = %evict_id,
+            "Evicting oldest inactive session (0 SSE receivers for >5s) to accommodate new session"
+        );
+        let _ = self
+            .terminate_session(&evict_id, SessionTerminationReason::Timeout)
+            .await;
+        true
+    }
+
+    /// Make room for one more session under `max_sessions`: prune what is
+    /// already dead, then evict the oldest unobserved session, and fail only
+    /// when neither frees a slot.
+    async fn ensure_session_capacity(&self) -> Result<()> {
+        if self.sessions.len() < self.config.max_sessions {
+            return Ok(());
         }
+        self.prune_stale_sessions().await;
+        if self.sessions.len() < self.config.max_sessions {
+            return Ok(());
+        }
+        if self.evict_oldest_inactive_session().await {
+            return Ok(());
+        }
+        Err(BridgeError::SessionLimitExceeded {
+            max: self.config.max_sessions,
+        })
+    }
+
+    /// Open the peer's stdio streams — via the injected factory when there is
+    /// one, otherwise via the default [`SubprocessPeerFactory`] built from the
+    /// config fields. `PeerFactory::create` returns `anyhow::Result` (P6), so
+    /// the failure is converted to [`BridgeError::ServerProcess`] here.
+    async fn create_peer_streams(&self) -> Result<PeerStreams> {
+        let streams = match &self.config.peer_factory {
+            Some(factory) => factory.create().await,
+            None => {
+                SubprocessPeerFactory::new(
+                    self.config.server_command.clone(),
+                    self.config.server_args.clone(),
+                    self.config.enable_colored_output,
+                )
+                .with_default_sandbox_scope(self.config.default_scope.clone())
+                .create()
+                .await
+            }
+        };
+        streams.map_err(|e| BridgeError::ServerProcess(e.to_string()))
     }
 
     /// Initializes a new session and establishes a peer connection for it.
@@ -1117,46 +1274,18 @@ impl SessionManager {
     ///   the `Mcp-Session-Id` header for all subsequent requests.
     /// * `Err(BridgeError)`: If the peer connection could not be established.
     pub async fn create_session(&self) -> Result<String> {
-        let mut current_count = self.sessions.len();
-        if current_count >= self.config.max_sessions {
-            self.prune_stale_sessions().await;
-            current_count = self.sessions.len();
-            if current_count >= self.config.max_sessions
-                && !self.evict_oldest_inactive_session().await
-            {
-                return Err(BridgeError::SessionLimitExceeded {
-                    max: self.config.max_sessions,
-                });
-            }
-        }
+        self.ensure_session_capacity().await?;
 
         let session_id = Uuid::new_v4().to_string();
         info!(session_id = %session_id, "Creating new session");
 
-        // Create peer streams — either via the injected factory or via the
-        // default SubprocessPeerFactory built from config fields.
-        // PeerFactory::create now returns anyhow::Result (P6); convert to BridgeError.
         let PeerStreams {
             stdin,
             stdout,
             stderr,
             shutdown_fn,
             exit_cause,
-        } = match &self.config.peer_factory {
-            Some(factory) => factory
-                .create()
-                .await
-                .map_err(|e| BridgeError::ServerProcess(e.to_string()))?,
-            None => SubprocessPeerFactory::new(
-                self.config.server_command.clone(),
-                self.config.server_args.clone(),
-                self.config.enable_colored_output,
-            )
-            .with_default_sandbox_scope(self.config.default_scope.clone())
-            .create()
-            .await
-            .map_err(|e| BridgeError::ServerProcess(e.to_string()))?,
-        };
+        } = self.create_peer_streams().await?;
 
         // Message channel: bridge request handlers → I/O task
         let (tx, rx) = mpsc::channel::<String>(100);
@@ -1576,24 +1705,10 @@ impl SessionManager {
 
                     // Echo STDIN in cyan if colored output is enabled
                     if colored_output {
-                        let timestamp = format!("[{}]", Local::now().format("%H:%M:%S%.3f"));
-                        let display = serde_json::from_str::<Value>(&msg)
-                            .ok()
-                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                            .unwrap_or_else(|| msg.clone());
-                        eprintln!("{} {} {}\n{}", timestamp, format!("[{}]", &session.id[..8]).cyan(), "→ STDIN:".cyan(), display.cyan());
+                        echo_stdin_frame(&session.id, &msg);
                     }
 
-                    if let Err(e) = stdin.write_all(msg.as_bytes()).await {
-                        error!(session_id = %session.id, "Failed to write to stdin: {}", e);
-                        break;
-                    }
-                    if let Err(e) = stdin.write_all(b"\n").await {
-                        error!(session_id = %session.id, "Failed to write newline to stdin: {}", e);
-                        break;
-                    }
-                    if let Err(e) = stdin.flush().await {
-                        error!(session_id = %session.id, "Failed to flush stdin: {}", e);
+                    if write_frame_to_peer(&mut *stdin, &session.id, &msg).await.is_err() {
                         break;
                     }
                 }
@@ -1625,16 +1740,9 @@ impl SessionManager {
                     }
                 } => {
                     match result {
-                        Ok(Some(line)) if !line.is_empty() => {
-                            let timestamp = format!("[{}]", Local::now().format("%H:%M:%S%.3f"));
-                            let display = serde_json::from_str::<Value>(&line)
-                                .ok()
-                                .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                                .unwrap_or_else(|| line.clone());
-                            eprintln!("{} {} {}\n{}", timestamp, format!("[{}]", &session.id[..8]).red(), "STDERR:".yellow(), display.dimmed());
-                        }
-                        Ok(Some(_)) => {} // Empty line
-                        Ok(None) => {} // stderr closed
+                        Ok(Some(line)) if !line.is_empty() => echo_stderr_line(&session.id, &line),
+                        // An empty line, or stderr closed: nothing to echo.
+                        Ok(Some(_) | None) => {}
                         Err(e) => {
                             error!(session_id = %session.id, "Failed to read stderr: {}", e);
                         }

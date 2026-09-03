@@ -1652,31 +1652,44 @@ fn collect_boolean_flag_overrides(cli: &Cli, out: &mut Vec<(&'static str, String
     }
 }
 
+/// Record `key` as CLI-overridden with a bare TOML scalar, if the flag was passed.
+fn push_scalar_override<T: std::fmt::Display>(
+    out: &mut Vec<(&'static str, String)>,
+    key: &'static str,
+    value: Option<T>,
+) {
+    if let Some(v) = value {
+        out.push((key, v.to_string()));
+    }
+}
+
+/// Record `key` as CLI-overridden with a quoted TOML string, if the flag was passed.
+fn push_quoted_override(
+    out: &mut Vec<(&'static str, String)>,
+    key: &'static str,
+    value: Option<&str>,
+) {
+    if let Some(v) = value {
+        out.push((key, format!("{v:?}")));
+    }
+}
+
 fn collect_option_overrides(cli: &Cli, out: &mut Vec<(&'static str, String)>) {
-    if let Some(v) = cli.timeout {
-        out.push(("tools.timeout_secs", v.to_string()));
-    }
-    if let Some(v) = cli.monitor_rate_limit {
-        out.push(("logging.monitor_rate_limit_secs", v.to_string()));
-    }
-    if let Some(v) = cli.handshake_timeout {
-        out.push(("http.handshake_timeout_secs", v.to_string()));
-    }
-    if let Some(p) = &cli.require_token_path {
-        out.push((
-            "auth.require_token_path",
-            format!("{:?}", p.display().to_string()),
-        ));
-    }
-    if let Some(v) = cli.rate_limit_rps {
-        out.push(("auth.rate_limit_rps", v.to_string()));
-    }
-    if let Some(v) = cli.rate_limit_burst {
-        out.push(("auth.rate_limit_burst", v.to_string()));
-    }
-    if let Some(l) = &cli.instance_label {
-        out.push(("instance.label", format!("{l:?}")));
-    }
+    let token_path = cli
+        .require_token_path
+        .as_ref()
+        .map(|p| p.display().to_string());
+    push_scalar_override(out, "tools.timeout_secs", cli.timeout);
+    push_scalar_override(
+        out,
+        "logging.monitor_rate_limit_secs",
+        cli.monitor_rate_limit,
+    );
+    push_scalar_override(out, "http.handshake_timeout_secs", cli.handshake_timeout);
+    push_quoted_override(out, "auth.require_token_path", token_path.as_deref());
+    push_scalar_override(out, "auth.rate_limit_rps", cli.rate_limit_rps);
+    push_scalar_override(out, "auth.rate_limit_burst", cli.rate_limit_burst);
+    push_quoted_override(out, "instance.label", cli.instance_label.as_deref());
 }
 
 // ── sandbox scope grants ─────────────────────────────────────────────────────
@@ -2476,9 +2489,29 @@ fn apply_project_settings(
         }
     };
 
-    // R-CFG2.2 requires the ignored keys be reported by name. A silent drop
-    // would leave an author editing a file that does nothing, concluding ahma is
-    // broken rather than that the key is refused by design.
+    warn_rejected_project_keys(&path, &load);
+
+    if load.accepted.is_empty() {
+        return user;
+    }
+    tracing::info!(
+        "applied project settings from {} ({} key(s))",
+        path.display(),
+        load.accepted
+            .values()
+            .filter_map(|v| v.as_table())
+            .map(|t| t.len())
+            .sum::<usize>()
+    );
+    merge_project_over_user(&user, &load.accepted)
+}
+
+/// Report, by name, every project-settings key that was refused.
+///
+/// R-CFG2.2 requires the ignored keys be reported by name. A silent drop would
+/// leave an author editing a file that does nothing, concluding ahma is broken
+/// rather than that the key is refused by design.
+fn warn_rejected_project_keys(path: &Path, load: &ahma_common::config::ProjectSettingsLoad) {
     if !load.rejected_security.is_empty() {
         tracing::warn!(
             "ignoring security-tier keys in the project settings file {}: {}. \
@@ -2496,20 +2529,6 @@ fn apply_project_settings(
             load.rejected_unknown.join(", ")
         );
     }
-
-    if load.accepted.is_empty() {
-        return user;
-    }
-    tracing::info!(
-        "applied project settings from {} ({} key(s))",
-        path.display(),
-        load.accepted
-            .values()
-            .filter_map(|v| v.as_table())
-            .map(|t| t.len())
-            .sum::<usize>()
-    );
-    merge_project_over_user(&user, &load.accepted)
 }
 
 /// The user-tier half of [`load_settings`]: `~/.ahma/settings.toml` or
@@ -2990,19 +3009,7 @@ pub fn build_app_config_with_settings(
         list_format: tool.list_format,
         run_tool: tool.run_tool,
         run_tool_args: tool.run_tool_args,
-        task_vault: {
-            // Security-tier: AHMA_TASK_VAULT retired — warn and ignore.
-            warn_retired_security_env!("AHMA_TASK_VAULT");
-            cli.task_vault
-                .as_deref()
-                .map(ahma_common::config::expand_home)
-                .or_else(|| {
-                    s.sandbox
-                        .task_vault
-                        .as_deref()
-                        .map(ahma_common::config::expand_home)
-                })
-        },
+        task_vault: resolve_task_vault(cli, &s),
         require_token,
         require_token_path,
         rate_limit_rps,
@@ -3013,6 +3020,17 @@ pub fn build_app_config_with_settings(
         is_server_child: cli.server_child || std::env::var("AHMA_SERVER_CHILD").is_ok(),
         settings_origin: settings_origin_ctx(cli),
     }
+}
+
+/// Resolve the task-vault root: `--task-vault` first, then `[sandbox] task_vault`,
+/// with `~` expanded either way.
+fn resolve_task_vault(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> Option<PathBuf> {
+    // Security-tier: AHMA_TASK_VAULT retired — warn and ignore.
+    warn_retired_security_env!("AHMA_TASK_VAULT");
+    cli.task_vault
+        .as_deref()
+        .or(s.sandbox.task_vault.as_deref())
+        .map(ahma_common::config::expand_home)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -166,27 +166,33 @@ fn write_settings_origin_header(
         None if ctx.no_settings => {}
         None => out.push_str("# Project settings file: none found\n"),
     }
-    if let Some(project) = &ctx.project
-        && let Ok(load) = ahma_common::config::load_project_settings(&project.path)
-        && load.has_rejections()
-    {
-        // Named here as well as warned at startup: someone running
-        // `settings show --origin` is asking why a key did not take effect, and
-        // this is the surface that should answer.
-        if !load.rejected_security.is_empty() {
-            let _ = writeln!(
-                out,
-                "#   refused (security-tier, R-CFG2.2): {}",
-                load.rejected_security.join(", ")
-            );
-        }
-        if !load.rejected_unknown.is_empty() {
-            let _ = writeln!(
-                out,
-                "#   refused (unrecognised): {}",
-                load.rejected_unknown.join(", ")
-            );
-        }
+    write_settings_origin_rejections(out, ctx);
+}
+
+/// Name the project-file keys that were refused (R-CFG2.2), if any.
+///
+/// Reported here as well as warned at startup: someone running
+/// `settings show --origin` is asking why a key did not take effect, and this is
+/// the surface that should answer.
+fn write_settings_origin_rejections(out: &mut String, ctx: &SettingsOriginCtx) {
+    use std::fmt::Write as _;
+    let Some(project) = &ctx.project else { return };
+    let Ok(load) = ahma_common::config::load_project_settings(&project.path) else {
+        return;
+    };
+    if !load.rejected_security.is_empty() {
+        let _ = writeln!(
+            out,
+            "#   refused (security-tier, R-CFG2.2): {}",
+            load.rejected_security.join(", ")
+        );
+    }
+    if !load.rejected_unknown.is_empty() {
+        let _ = writeln!(
+            out,
+            "#   refused (unrecognised): {}",
+            load.rejected_unknown.join(", ")
+        );
     }
 }
 
@@ -291,21 +297,20 @@ fn run_settings_show(origin: bool, origin_ctx: &SettingsOriginCtx) -> Result<()>
     } else {
         origin_ctx.settings_path.clone().or_else(settings_path)
     };
-    let user = match &file_path {
+    let mut s = match &file_path {
         Some(p) => AhmaSettings::load_from(p),
         None => AhmaSettings::default(),
     };
     // Layer the project file exactly as startup does (R-CFG3), or this report
     // would name `project` as a source while printing the user's value — which
     // is worse than not reporting the source at all. The comment above used to
-    // claim parity with startup; this is what makes it true again.
-    let s = match &origin_ctx.project {
-        Some(project) => match ahma_common::config::load_project_settings(&project.path) {
-            Ok(load) => ahma_common::config::merge_project_over_user(&user, &load.accepted),
-            Err(_) => user,
-        },
-        None => user,
-    };
+    // claim parity with startup; this is what makes it true again. An unreadable
+    // project file leaves the user's settings standing, as startup does.
+    if let Some(project) = &origin_ctx.project
+        && let Ok(load) = ahma_common::config::load_project_settings(&project.path)
+    {
+        s = ahma_common::config::merge_project_over_user(&s, &load.accepted);
+    }
     let rows = setting_rows(&s, &AhmaSettings::default());
 
     if !origin {
@@ -583,21 +588,27 @@ fn run_sandbox_list(file: &std::path::Path) -> Result<()> {
         return Ok(());
     }
     for s in scopes {
-        println!("• {}  ({})", s.path.display(), s.access.label());
-        if let Some(by) = &s.granted_by {
-            println!("    granted by: {by}");
-        }
-        if let Some(at) = &s.granted_at {
-            println!("    granted on: {at}");
-        }
-        if let Some(note) = &s.note {
-            println!("    note:       {note}");
-        }
+        print_persistent_scope(s);
     }
     println!();
     println!("These survive every roots/list update. Use `ahma sandbox grant|revoke` (or");
     println!("edit the file directly) to change them; restart the server to apply.");
     Ok(())
+}
+
+/// Print one persistent grant: its path and access, then whichever provenance
+/// fields the grant actually carries.
+fn print_persistent_scope(s: &ahma_common::config::PersistentScope) {
+    println!("• {}  ({})", s.path.display(), s.access.label());
+    if let Some(by) = &s.granted_by {
+        println!("    granted by: {by}");
+    }
+    if let Some(at) = &s.granted_at {
+        println!("    granted on: {at}");
+    }
+    if let Some(note) = &s.note {
+        println!("    note:       {note}");
+    }
 }
 
 fn run_sandbox_revoke(file: &std::path::Path, dir: PathBuf) -> Result<()> {

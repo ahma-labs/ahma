@@ -489,67 +489,78 @@ fn approve_symlink(state: &mut crate::state::AppState) {
     }
 }
 
+/// Maximise/restore the focused pane. Enter on the log pane and `z` on any
+/// zoomable pane both land here.
+#[cfg(feature = "tui")]
+fn toggle_focused_pane_zoom(state: &mut crate::state::AppState) {
+    if state.zoomed.is_some() {
+        state.zoomed = None;
+    } else if state.focus.is_zoomable() {
+        state.zoomed = Some(state.focus);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn open_log_switcher(state: &mut crate::state::AppState) {
+    state.open_log_files_modal(0);
+    // Proactively request logs list refresh when modal is opened
+    if let Some(ref tx) = state.mcp_source_tx {
+        let _ = tx.try_send(crate::mcp_source::McpSourceCommand::RefreshLogs);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn close_log_switcher(state: &mut crate::state::AppState) {
+    if state.log_files_selected().is_some() {
+        state.close_modal();
+    }
+}
+
+/// Move the log-switcher selection one row up or down, clamped to the modal's
+/// range. Index `log_files.len()` is a valid selection (the trailing row), so
+/// the forward bound is the length itself.
+#[cfg(feature = "tui")]
+fn move_log_files_selection(state: &mut crate::state::AppState, forward: bool) {
+    let Some(sel) = state.log_files_selected() else {
+        return;
+    };
+    if forward {
+        if sel < state.log_files.len() {
+            state.set_log_files_selected(sel + 1);
+        }
+    } else if sel > 0 {
+        state.set_log_files_selected(sel - 1);
+    }
+}
+
 #[cfg(feature = "tui")]
 fn handle_log_monitor_action(
     action: &crate::keymap::Action,
     state: &mut crate::state::AppState,
 ) -> bool {
     use crate::keymap::Action;
+    // Thin dispatch table: every arm delegates, so adding an action never
+    // deepens this function.
     match action {
         Action::ToggleWrap => {
             state.log_wrap_enabled = !state.log_wrap_enabled;
-            true
         }
-        Action::ToggleZoom => {
-            // Maximise/restore the focused pane. Enter on the log pane and
-            // `z` on any zoomable pane both land here.
-            if state.zoomed.is_some() {
-                state.zoomed = None;
-            } else if state.focus.is_zoomable() {
-                state.zoomed = Some(state.focus);
-            }
-            true
-        }
-        Action::OpenLogSwitcher => {
-            state.open_log_files_modal(0);
-            // Proactively request logs list refresh when modal is opened
-            if let Some(ref tx) = state.mcp_source_tx {
-                let _ = tx.try_send(crate::mcp_source::McpSourceCommand::RefreshLogs);
-            }
-            true
-        }
-        Action::CloseLogSwitcher => {
-            if state.log_files_selected().is_some() {
-                state.close_modal();
-            }
-            true
-        }
-        Action::SubmitLogSwitcher => {
-            submit_log_switcher(state);
-            true
-        }
+        Action::ToggleZoom => toggle_focused_pane_zoom(state),
+        Action::OpenLogSwitcher => open_log_switcher(state),
+        Action::CloseLogSwitcher => close_log_switcher(state),
+        Action::SubmitLogSwitcher => submit_log_switcher(state),
+        // The guards matter: without them Up/Down would be swallowed here
+        // instead of falling through to the other panes' handlers.
         Action::Up if state.log_files_selected().is_some() => {
-            if let Some(sel) = state.log_files_selected()
-                && sel > 0
-            {
-                state.set_log_files_selected(sel - 1);
-            }
-            true
+            move_log_files_selection(state, false)
         }
         Action::Down if state.log_files_selected().is_some() => {
-            if let Some(sel) = state.log_files_selected()
-                && sel < state.log_files.len()
-            {
-                state.set_log_files_selected(sel + 1);
-            }
-            true
+            move_log_files_selection(state, true)
         }
-        Action::ApproveSymlink => {
-            approve_symlink(state);
-            true
-        }
-        _ => false,
+        Action::ApproveSymlink => approve_symlink(state),
+        _ => return false,
     }
+    true
 }
 
 #[cfg(feature = "tui")]
@@ -2281,29 +2292,42 @@ fn find_user_skill(
 fn list_skills(state: &mut crate::state::AppState) {
     let workspace = std::path::Path::new(&state.workspace);
     let set = ahma_common::skills::discover_skills(workspace);
-    let mut msg = String::new();
 
-    if set.skills.is_empty() {
-        msg.push_str("No Agent Skills found. Searched:\n");
-        for root in ahma_common::skills::skill_roots(workspace) {
-            msg.push_str(&format!("- {}\n", root.display()));
-        }
+    let mut msg = if set.skills.is_empty() {
+        format_searched_roots(workspace)
     } else {
-        msg.push_str("Available Agent Skills — invoke with `/<name> [args]`:\n");
-        for s in &set.skills {
-            let note = if s.user_invocable {
-                ""
-            } else {
-                " (not user-invocable)"
-            };
-            msg.push_str(&format!("- **/{}**{note} — {}\n", s.name, s.description));
-        }
-    }
+        format_discovered_skills(&set.skills)
+    };
     for e in &set.invalid {
         msg.push_str(&format!("\n⚠ Skipped {}: {}", e.path.display(), e.reason));
     }
 
     push_assistant_message(state, msg.trim_end().to_string());
+}
+
+/// The "nothing found" body: name every directory that was searched, so an
+/// empty listing is diagnosable rather than mysterious.
+#[cfg(feature = "tui")]
+fn format_searched_roots(workspace: &std::path::Path) -> String {
+    let mut msg = String::from("No Agent Skills found. Searched:\n");
+    for root in ahma_common::skills::skill_roots(workspace) {
+        msg.push_str(&format!("- {}\n", root.display()));
+    }
+    msg
+}
+
+#[cfg(feature = "tui")]
+fn format_discovered_skills(skills: &[ahma_common::skills::Skill]) -> String {
+    let mut msg = String::from("Available Agent Skills — invoke with `/<name> [args]`:\n");
+    for s in skills {
+        let note = if s.user_invocable {
+            ""
+        } else {
+            " (not user-invocable)"
+        };
+        msg.push_str(&format!("- **/{}**{note} — {}\n", s.name, s.description));
+    }
+    msg
 }
 
 /// Inject the skill's SKILL.md instructions as the LLM payload for this turn
@@ -2814,6 +2838,51 @@ fn handle_agent_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
     false
 }
 
+/// Append one chat entry's markdown rendering to `md`.
+#[cfg(feature = "tui")]
+fn push_entry_markdown(md: &mut String, entry: &crate::state::ChatEntry) {
+    match entry {
+        crate::state::ChatEntry::User { text, .. } => {
+            md.push_str("## User\n\n");
+            md.push_str(text);
+            md.push_str("\n\n");
+        }
+        crate::state::ChatEntry::Thinking { content, .. } => {
+            md.push_str("## Thinking\n\n");
+            for line in content.lines() {
+                md.push_str("> ");
+                md.push_str(line);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+        crate::state::ChatEntry::Assistant { content, .. } => {
+            md.push_str("## Assistant\n\n");
+            md.push_str(content);
+            md.push_str("\n\n");
+        }
+        crate::state::ChatEntry::ToolCall {
+            name, args, result, ..
+        } => {
+            md.push_str(&format!("## Tool `{name}`\n\n"));
+            md.push_str(&format!("Args: `{args}`\n\n"));
+            if let Some(result) = result {
+                md.push_str(&format!("Result:\n\n```\n{}\n```\n\n", result));
+            }
+        }
+    }
+}
+
+/// Render the whole transcript as a markdown document.
+#[cfg(feature = "tui")]
+fn chat_to_markdown(chat: &crate::state::ChatHistory) -> String {
+    let mut md = String::from("# ahma chat export\n\n");
+    for entry in chat.entries() {
+        push_entry_markdown(&mut md, entry);
+    }
+    md
+}
+
 #[cfg(feature = "tui")]
 fn handle_export_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if cmd != "/export markdown" {
@@ -2832,40 +2901,7 @@ fn handle_export_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     ));
 
-    let mut md = String::from("# ahma chat export\n\n");
-    for entry in state.chat.entries() {
-        match entry {
-            crate::state::ChatEntry::User { text, .. } => {
-                md.push_str("## User\n\n");
-                md.push_str(text);
-                md.push_str("\n\n");
-            }
-            crate::state::ChatEntry::Thinking { content, .. } => {
-                md.push_str("## Thinking\n\n");
-                for line in content.lines() {
-                    md.push_str("> ");
-                    md.push_str(line);
-                    md.push('\n');
-                }
-                md.push('\n');
-            }
-            crate::state::ChatEntry::Assistant { content, .. } => {
-                md.push_str("## Assistant\n\n");
-                md.push_str(content);
-                md.push_str("\n\n");
-            }
-            crate::state::ChatEntry::ToolCall {
-                name, args, result, ..
-            } => {
-                md.push_str(&format!("## Tool `{name}`\n\n"));
-                md.push_str(&format!("Args: `{args}`\n\n"));
-                if let Some(result) = result {
-                    md.push_str(&format!("Result:\n\n```\n{}\n```\n\n", result));
-                }
-            }
-        }
-    }
-
+    let md = chat_to_markdown(&state.chat);
     match std::fs::write(&file, md) {
         Ok(_) => push_assistant_message(state, format!("Exported chat to `{}`", file.display())),
         Err(e) => push_assistant_message(state, format!("Export failed: {e}")),
@@ -3588,6 +3624,56 @@ fn handle_model_refreshed(
     }
 }
 
+/// Build the pending window that will execute one decomposed step. A step is
+/// either a shell command or an LLM call, and that single flag decides the
+/// label, the payload and whether a model is recorded.
+#[cfg(feature = "tui")]
+fn window_from_step(
+    win_id: usize,
+    step: &crate::llm_bridge::ParsedStep,
+    state: &crate::state::AppState,
+) -> crate::state::TuiWindow {
+    let is_cli = step.r#type.as_str() == "shell_command";
+
+    let (label, command, llm_model) = if is_cli {
+        (
+            format!(
+                "Command: {} in {}",
+                step.command.as_deref().unwrap_or(&step.task),
+                crate::ui::shorten_path(&state.workspace, 20)
+            ),
+            step.command.clone().unwrap_or_else(|| step.task.clone()),
+            None,
+        )
+    } else {
+        (
+            format!("LLM Call (model: {})", state.selected_model()),
+            step.instructions
+                .clone()
+                .unwrap_or_else(|| step.task.clone()),
+            Some(state.selected_model()),
+        )
+    };
+
+    crate::state::TuiWindow {
+        id: win_id,
+        label,
+        status: crate::state::WindowStatus::Pending,
+        content: vec![format!("Task: {}", step.task)],
+        collapsed: false,
+        finished_at: None,
+        duration_ms: None,
+        last_output_at: None,
+        is_cli,
+        command,
+        working_dir: state.workspace.clone(),
+        llm_model,
+        visible: true,
+        abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        op_id: None,
+    }
+}
+
 #[cfg(feature = "tui")]
 fn handle_decomposed_event(
     steps: Vec<crate::llm_bridge::ParsedStep>,
@@ -3597,46 +3683,7 @@ fn handle_decomposed_event(
         let win_id = state.next_window_id;
         state.next_window_id = (state.next_window_id + 1) % 100;
 
-        let is_cli = step.r#type.as_str() == "shell_command";
-
-        let label = if is_cli {
-            format!(
-                "Command: {} in {}",
-                step.command.as_deref().unwrap_or(&step.task),
-                crate::ui::shorten_path(&state.workspace, 20)
-            )
-        } else {
-            format!("LLM Call (model: {})", state.selected_model())
-        };
-
-        let command = if is_cli {
-            step.command.clone().unwrap_or(step.task.clone())
-        } else {
-            step.instructions.clone().unwrap_or(step.task.clone())
-        };
-
-        let w = crate::state::TuiWindow {
-            id: win_id,
-            label,
-            status: crate::state::WindowStatus::Pending,
-            content: vec![format!("Task: {}", step.task)],
-            collapsed: false,
-            finished_at: None,
-            duration_ms: None,
-            last_output_at: None,
-            is_cli,
-            command,
-            working_dir: state.workspace.clone(),
-            llm_model: if is_cli {
-                None
-            } else {
-                Some(state.selected_model())
-            },
-            visible: true,
-            abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            op_id: None,
-        };
-
+        let w = window_from_step(win_id, &step, state);
         state.windows.push(w);
         if state.windows.len() > 100 {
             state.windows.remove(0);
@@ -4572,19 +4619,21 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
         *guard = Some(abort_tx);
     }
 
+    // Without a bridge there is nowhere to send the task's output, so both
+    // branches below would be no-ops. Bail once instead of twice.
+    let Some(tx) = bridge_tx else {
+        return;
+    };
+
     if is_cli {
-        if let Some(tx) = bridge_tx {
-            spawn_window_cli_task(win_id, command, working_dir, abort_rx, tx);
-        }
+        spawn_window_cli_task(win_id, command, working_dir, abort_rx, tx);
     } else {
-        if let Some(tx) = bridge_tx {
-            let mcp = if state.mcp_enabled {
-                Some(mcp_chat_config(state))
-            } else {
-                None
-            };
-            spawn_window_llm_task(win_id, base_url, model, command, mcp, abort_rx, tx);
-        }
+        let mcp = if state.mcp_enabled {
+            Some(mcp_chat_config(state))
+        } else {
+            None
+        };
+        spawn_window_llm_task(win_id, base_url, model, command, mcp, abort_rx, tx);
     }
 }
 

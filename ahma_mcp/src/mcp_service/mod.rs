@@ -877,19 +877,26 @@ impl AhmaMcpService {
                 if !audited {
                     continue;
                 }
-                use ahma_common::event_dispatcher::OperationEvent;
-                let (success, duration_ms) = match event.as_ref() {
-                    OperationEvent::Completed { duration_ms, .. } => (true, *duration_ms),
-                    OperationEvent::Failed { duration_ms, .. }
-                    | OperationEvent::Cancelled { duration_ms, .. }
-                    | OperationEvent::TimedOut { duration_ms, .. } => (false, *duration_ms),
-                    _ => (false, 0),
-                };
+                let (success, duration_ms) = Self::vault_audit_outcome(event.as_ref());
                 service
                     .emit_vault_tool_complete(&op_id, success, duration_ms)
                     .await;
             }
         });
+    }
+
+    /// Classifies a terminal operation event for the vault audit log as
+    /// `(success, duration_ms)`. Non-terminal variants never reach here; they
+    /// map to the conservative `(false, 0)`.
+    fn vault_audit_outcome(event: &ahma_common::event_dispatcher::OperationEvent) -> (bool, u64) {
+        use ahma_common::event_dispatcher::OperationEvent;
+        match event {
+            OperationEvent::Completed { duration_ms, .. } => (true, *duration_ms),
+            OperationEvent::Failed { duration_ms, .. }
+            | OperationEvent::Cancelled { duration_ms, .. }
+            | OperationEvent::TimedOut { duration_ms, .. } => (false, *duration_ms),
+            _ => (false, 0),
+        }
     }
 
     /// Sets a custom file operations provider.
@@ -1871,21 +1878,18 @@ impl AhmaMcpService {
         use crate::harness_guard::{GuardContext, GuardOutcome};
 
         // Assemble the known-tool set (hard-coded + configured) for name healing.
-        let known = Self::HARDCODED_TOOLS.to_vec();
-        let configs_lock = self.configs.read();
-        let config_names: Vec<String> = configs_lock.keys().cloned().collect();
-        drop(configs_lock);
-        let mut known_str: Vec<&str> = known;
-        for name in &config_names {
-            known_str.push(name);
-        }
+        // The names are cloned out of the map so the lock is released before the
+        // guard pipeline runs; `known_tools` then borrows from `config_names`.
+        let config_names: Vec<String> = self.configs.read().keys().cloned().collect();
+        let mut known_tools: Vec<&str> = Self::HARDCODED_TOOLS.to_vec();
+        known_tools.extend(config_names.iter().map(String::as_str));
 
         // Run the guard pipeline over a mutable copy, then write any healing back.
         let had_args = tool_args.is_some();
         let mut name = tool_name.to_string();
         let mut args = tool_args.take().unwrap_or_default();
         let ctx = GuardContext {
-            known_tools: &known_str,
+            known_tools: &known_tools,
         };
         let outcome = match self.harness_guard.try_lock() {
             Ok(guard) => guard.inspect(&ctx, &mut name, &mut args),
@@ -2251,24 +2255,19 @@ impl AhmaMcpService {
             return None;
         }
 
-        let arguments = params.arguments.clone().unwrap_or_default();
-        let args_val = serde_json::Value::Object(arguments);
+        let args_val = serde_json::Value::Object(params.arguments.clone().unwrap_or_default());
         Some(match mgr.call_tool(&params.name, args_val).await {
             Ok((output, is_error)) => {
-                if is_error {
-                    Ok(CallToolResult::error(vec![
-                        rmcp::model::ContentBlock::text(output),
-                    ]))
+                let content = vec![rmcp::model::ContentBlock::text(output)];
+                Ok(if is_error {
+                    CallToolResult::error(content)
                 } else {
-                    Ok(CallToolResult::success(vec![
-                        rmcp::model::ContentBlock::text(output),
-                    ]))
-                }
+                    CallToolResult::success(content)
+                })
             }
-            Err(e) => Err(McpError::internal_error(
-                format!("External tool call failed: {e}"),
-                None,
-            )),
+            Err(e) => Err(handlers::common::mcp_internal(format!(
+                "External tool call failed: {e}"
+            ))),
         })
     }
 

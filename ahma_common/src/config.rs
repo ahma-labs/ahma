@@ -70,21 +70,7 @@ pub fn interpolate_env_vars(s: &str) -> Result<String> {
             .find('}')
             .with_context(|| format!("Unclosed '${{{rest}' in config value"))?;
 
-        let placeholder = &rest[..end];
-        // Support `${VAR:-default}`: use `default` when `VAR` is unset or empty,
-        // instead of erroring. A bare `${VAR}` (no `:-`) still errors when unset,
-        // preserving the original fail-loud behaviour for required references.
-        let value = match placeholder.split_once(":-") {
-            Some((var_name, default)) => match std::env::var(var_name) {
-                Ok(v) if !v.is_empty() => v,
-                _ => default.to_string(),
-            },
-            None => std::env::var(placeholder).with_context(|| {
-                format!("Environment variable '{placeholder}' referenced in config is not set")
-            })?,
-        };
-
-        out.push_str(&value);
+        out.push_str(&resolve_placeholder(&rest[..end])?);
         rest = &rest[end + 1..];
     }
 
@@ -95,6 +81,23 @@ pub fn interpolate_env_vars(s: &str) -> Result<String> {
     warn_if_looks_like_literal_secret(&out);
 
     Ok(out)
+}
+
+/// Resolve the body of a single `${…}` placeholder against the process environment.
+///
+/// Supports `${VAR:-default}`: use `default` when `VAR` is unset or empty,
+/// instead of erroring. A bare `${VAR}` (no `:-`) still errors when unset,
+/// preserving the original fail-loud behaviour for required references.
+fn resolve_placeholder(placeholder: &str) -> Result<String> {
+    let Some((var_name, default)) = placeholder.split_once(":-") else {
+        return std::env::var(placeholder).with_context(|| {
+            format!("Environment variable '{placeholder}' referenced in config is not set")
+        });
+    };
+    Ok(match std::env::var(var_name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => default.to_string(),
+    })
 }
 
 /// Warns if a string looks like a well-known literal API-key pattern.
@@ -1693,11 +1696,12 @@ impl AhmaSettings {
     /// comments with the generated documentation. User *values* are always
     /// preserved; user *comments* are not.
     pub fn ensure_current(path: &Path) -> Result<bool> {
-        match std::fs::read_to_string(path) {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let text = Self::default().render_documented();
                 atomic_write_toml(path, &text)?;
-                Ok(true)
+                return Ok(true);
             }
             // `~/.ahma` is intentionally out of sandbox scope (SPEC R5.4.8), so a
             // sandboxed ahma cannot read *or* write it. Do not abort startup
@@ -1709,29 +1713,28 @@ impl AhmaSettings {
                      (expected inside the ahma sandbox, which denies ~/.ahma by design).",
                     path.display()
                 );
-                Ok(false)
+                return Ok(false);
             }
             Err(e) => anyhow::bail!("Failed to read {}: {e}", path.display()),
-            Ok(contents) => {
-                let parsed: Self = match toml::from_str(&contents) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(
-                            "settings file {} does not parse ({e}); leaving it untouched",
-                            path.display()
-                        );
-                        return Ok(false);
-                    }
-                };
-                let text = parsed.render_documented();
-                if text != contents {
-                    atomic_write_toml(path, &text)?;
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
+        };
+
+        let parsed: Self = match toml::from_str(&contents) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "settings file {} does not parse ({e}); leaving it untouched",
+                    path.display()
+                );
+                return Ok(false);
             }
+        };
+
+        let text = parsed.render_documented();
+        if text == contents {
+            return Ok(false);
         }
+        atomic_write_toml(path, &text)?;
+        Ok(true)
     }
 
     /// Render `self` as a fully-documented, minimized `settings.toml`.
@@ -2286,6 +2289,14 @@ fn toml_mutex_groups(v: &[MutexGroupConfig]) -> String {
     format!("[{}]", items.join(", "))
 }
 
+/// Append `key = "value"` to an inline-table field list, but only when the
+/// optional value is set — the rendering side of serde's `skip_serializing_if`.
+fn push_opt_str_field(parts: &mut Vec<String>, key: &str, value: &Option<String>) {
+    if let Some(v) = value {
+        parts.push(format!("{key} = {}", toml_str(v)));
+    }
+}
+
 /// Render persistent scopes as an inline TOML array of inline tables, omitting
 /// the optional fields that are unset (matching serde's `skip_serializing_if`).
 fn toml_persistent_scopes(v: &[PersistentScope]) -> String {
@@ -2302,15 +2313,9 @@ fn toml_persistent_scopes(v: &[PersistentScope]) -> String {
                     })
                 ),
             ];
-            if let Some(g) = &ps.granted_by {
-                parts.push(format!("granted_by = {}", toml_str(g)));
-            }
-            if let Some(a) = &ps.granted_at {
-                parts.push(format!("granted_at = {}", toml_str(a)));
-            }
-            if let Some(n) = &ps.note {
-                parts.push(format!("note = {}", toml_str(n)));
-            }
+            push_opt_str_field(&mut parts, "granted_by", &ps.granted_by);
+            push_opt_str_field(&mut parts, "granted_at", &ps.granted_at);
+            push_opt_str_field(&mut parts, "note", &ps.note);
             format!("{{ {} }}", parts.join(", "))
         })
         .collect();
@@ -3851,23 +3856,35 @@ fn classify_project_settings(parsed: toml::Table) -> ProjectSettingsLoad {
             load.rejected_unknown.push(table_name);
             continue;
         };
-        let mut kept = toml::Table::new();
-        for (key, value) in keys {
-            match settings_tier(&table_name, key) {
-                Some(SettingsTier::Preference) => {
-                    kept.insert(key.clone(), value.clone());
-                }
-                Some(SettingsTier::Security) => {
-                    load.rejected_security.push(format!("{table_name}.{key}"));
-                }
-                None => load.rejected_unknown.push(format!("{table_name}.{key}")),
-            }
-        }
+        let kept = classify_table_keys(&table_name, keys, &mut load);
         if !kept.is_empty() {
             load.accepted.insert(table_name, toml::Value::Table(kept));
         }
     }
     load
+}
+
+/// Classify one table's keys: return the Preference-tier keys to keep, and
+/// record every Security-tier or unrecognised key as a rejection on `load`
+/// (SPEC R-CFG2.2).
+fn classify_table_keys(
+    table_name: &str,
+    keys: &toml::Table,
+    load: &mut ProjectSettingsLoad,
+) -> toml::Table {
+    let mut kept = toml::Table::new();
+    for (key, value) in keys {
+        match settings_tier(table_name, key) {
+            Some(SettingsTier::Preference) => {
+                kept.insert(key.clone(), value.clone());
+            }
+            Some(SettingsTier::Security) => {
+                load.rejected_security.push(format!("{table_name}.{key}"));
+            }
+            None => load.rejected_unknown.push(format!("{table_name}.{key}")),
+        }
+    }
+    kept
 }
 
 /// Merge an accepted project table over user settings (SPEC R-CFG3.2).

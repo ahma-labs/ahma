@@ -248,20 +248,22 @@ impl HookPlatform {
         scope_root.join(self.config_relative_path(scope))
     }
 
+    /// Where this client keeps its hook config, relative to the scope root.
+    ///
+    /// A flat `(platform, scope)` lookup table: the three clients that use one
+    /// path for both scopes say so with `_`, and the two that differ per scope
+    /// have both rows visible side by side rather than in a nested `match`.
     fn config_relative_path(self, scope: HookScope) -> PathBuf {
-        match self {
-            Self::Cursor => PathBuf::from(".cursor/hooks.json"),
-            Self::Claude => PathBuf::from(".claude/settings.json"),
-            Self::Codex => PathBuf::from(".codex/hooks.json"),
-            Self::Copilot => match scope {
-                HookScope::User => PathBuf::from(".copilot/hooks/ahma.json"),
-                HookScope::Project => PathBuf::from(".github/hooks/ahma.json"),
-            },
-            Self::Antigravity => match scope {
-                HookScope::User => PathBuf::from(".gemini/config/hooks.json"),
-                HookScope::Project => PathBuf::from(".agents/hooks.json"),
-            },
-        }
+        let relative = match (self, scope) {
+            (Self::Cursor, _) => ".cursor/hooks.json",
+            (Self::Claude, _) => ".claude/settings.json",
+            (Self::Codex, _) => ".codex/hooks.json",
+            (Self::Copilot, HookScope::User) => ".copilot/hooks/ahma.json",
+            (Self::Copilot, HookScope::Project) => ".github/hooks/ahma.json",
+            (Self::Antigravity, HookScope::User) => ".gemini/config/hooks.json",
+            (Self::Antigravity, HookScope::Project) => ".agents/hooks.json",
+        };
+        PathBuf::from(relative)
     }
 
     fn event_key(self) -> &'static str {

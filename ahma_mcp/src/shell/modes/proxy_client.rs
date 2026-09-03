@@ -1059,29 +1059,9 @@ async fn run_http_sse_listener(
     protocol_version: String,
     sse_tx: mpsc::Sender<TxJsonRpcMessage<RoleServer>>,
 ) {
-    let mut headers = reqwest::header::HeaderMap::new();
-    // Fallible, not `.unwrap()`: `session_id` is whatever the *bridge*
-    // returned in `Mcp-Session-Id`, so a byte outside visible ASCII would
-    // panic this detached task rather than surface anywhere a caller could
-    // see it. The protocol-version header below already handles the
-    // identical construction with `if let Ok`; this one did not, which is
-    // the tell rather than a decision.
-    let Ok(session_header) = reqwest::header::HeaderValue::from_str(&session_id) else {
-        tracing::error!(
-            session_id = %session_id,
-            "bridge returned a session id that is not a valid HTTP header value; \
-             cannot open the SSE stream for it"
-        );
+    let Some(headers) = sse_listener_headers(&session_id, &protocol_version) else {
         return;
     };
-    headers.insert("mcp-session-id", session_header);
-    headers.insert(
-        reqwest::header::ACCEPT,
-        reqwest::header::HeaderValue::from_static("text/event-stream"),
-    );
-    if let Ok(v) = reqwest::header::HeaderValue::from_str(&protocol_version) {
-        headers.insert(ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER, v);
-    }
 
     let res = match client.get(&url).headers(headers).send().await {
         Ok(r) => r,
@@ -1100,7 +1080,30 @@ async fn run_http_sse_listener(
         return;
     }
 
-    let mut stream = res.bytes_stream();
+    pump_sse_stream(res.bytes_stream(), &sse_tx, &url).await;
+    tracing::info!(url = %url, "Proxy SSE stream ended");
+}
+
+/// Reassemble SSE lines across chunk boundaries and forward each JSON-RPC
+/// `data:` payload onto `sse_tx`, until the stream ends, it errors, or the
+/// receiving end of `sse_tx` is dropped.
+///
+/// Stopping on a dropped receiver matters: without it the loop keeps reading
+/// and appending to a buffer that can no longer be drained, so it does useless
+/// work and grows without bound for the remaining life of the stream.
+///
+/// Generic over the chunk and error types so it can be driven from a plain
+/// in-memory stream in tests; `run_http_sse_listener` passes
+/// `reqwest::Response::bytes_stream()`.
+async fn pump_sse_stream<S, B, E>(
+    mut stream: S,
+    sse_tx: &mpsc::Sender<TxJsonRpcMessage<RoleServer>>,
+    url: &str,
+) where
+    S: futures::Stream<Item = std::result::Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
     let mut buffer = String::new();
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
@@ -1111,25 +1114,91 @@ async fn run_http_sse_listener(
             }
         };
 
-        let text = String::from_utf8_lossy(&chunk);
-        buffer.push_str(&text);
-
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer.drain(..=pos).collect::<String>();
-            let line_trimmed = line.trim();
-            if let Some(data) = line_trimmed.strip_prefix("data:") {
-                let data = data.trim();
-                if !data.is_empty()
-                    && let Ok(msg) = serde_json::from_str::<TxJsonRpcMessage<RoleServer>>(data)
-                    && sse_tx.send(msg).await.is_err()
-                {
-                    tracing::info!(url = %url, "Proxy SSE forward channel closed");
-                    break;
-                }
-            }
+        buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()));
+        if forward_buffered_sse_lines(&mut buffer, sse_tx, url).await
+            == ForwardOutcome::ChannelClosed
+        {
+            break;
         }
     }
-    tracing::info!(url = %url, "Proxy SSE stream ended");
+}
+
+/// Build the SSE request headers for `session_id`, or `None` — after logging —
+/// when the bridge handed back a session id that is not a valid HTTP header
+/// value.
+///
+/// Fallible, not `.unwrap()`: `session_id` is whatever the *bridge* returned in
+/// `Mcp-Session-Id`, so a byte outside visible ASCII would panic the detached
+/// listener task rather than surface anywhere a caller could see it. The
+/// protocol-version header already handled the identical construction with
+/// `if let Ok`; the session one did not, which is the tell rather than a
+/// decision.
+fn sse_listener_headers(
+    session_id: &str,
+    protocol_version: &str,
+) -> Option<reqwest::header::HeaderMap> {
+    let Ok(session_header) = reqwest::header::HeaderValue::from_str(session_id) else {
+        tracing::error!(
+            session_id = %session_id,
+            "bridge returned a session id that is not a valid HTTP header value; \
+             cannot open the SSE stream for it"
+        );
+        return None;
+    };
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("mcp-session-id", session_header);
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("text/event-stream"),
+    );
+    if let Ok(v) = reqwest::header::HeaderValue::from_str(protocol_version) {
+        headers.insert(ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER, v);
+    }
+    Some(headers)
+}
+
+/// Whether the SSE forward channel is still usable once a drain pass returns.
+#[derive(Debug, PartialEq, Eq)]
+enum ForwardOutcome {
+    /// Everything currently buffered was forwarded or skipped — keep reading.
+    Continue,
+    /// The receiving end of `sse_tx` is gone. Nothing further can be delivered,
+    /// so the caller must stop reading the stream rather than accumulating a
+    /// buffer it can no longer drain.
+    ChannelClosed,
+}
+
+/// Drain every complete line buffered so far, forwarding each `data:` payload
+/// that parses as a JSON-RPC message onto `sse_tx`. An incomplete trailing line
+/// stays in `buffer` for the next chunk; a line that is not `data:`, is empty,
+/// or does not parse is skipped.
+///
+/// Stops at the first failed send and reports [`ForwardOutcome::ChannelClosed`]
+/// so the caller can shut the listener down. The undrained remainder of
+/// `buffer` is deliberately left alone: there is nowhere to deliver it.
+async fn forward_buffered_sse_lines(
+    buffer: &mut String,
+    sse_tx: &mpsc::Sender<TxJsonRpcMessage<RoleServer>>,
+    url: &str,
+) -> ForwardOutcome {
+    while let Some(pos) = buffer.find('\n') {
+        let line = buffer.drain(..=pos).collect::<String>();
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_str::<TxJsonRpcMessage<RoleServer>>(data) else {
+            continue;
+        };
+        if sse_tx.send(msg).await.is_err() {
+            tracing::info!(url = %url, "Proxy SSE forward channel closed");
+            return ForwardOutcome::ChannelClosed;
+        }
+    }
+    ForwardOutcome::Continue
 }
 
 /// Pump messages between stdio and the bridge until stdio hits EOF or the SSE
@@ -2664,6 +2733,84 @@ mod tests {
             state.sent.lock().len(),
             0,
             "notifications have no id, so no error can be relayed to stdio"
+        );
+    }
+}
+
+// `pump_sse_stream` is cross-platform, so — unlike the `run_transport_proxy`
+// tests above — these are deliberately not gated to Unix.
+#[cfg(test)]
+mod sse_pump_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A server→client notification that round-trips through
+    /// `TxJsonRpcMessage<RoleServer>`. If this ever stops parsing, the
+    /// `forwards_data_lines` test below fails loudly rather than the
+    /// close-detection test silently passing for the wrong reason.
+    const PROGRESS: &str = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"progress":1}}"#;
+
+    /// A stream over `chunks` that records how many it actually yielded, so a
+    /// test can assert the pump *stopped reading* rather than merely stopped
+    /// forwarding.
+    fn counting_stream(
+        chunks: Vec<String>,
+        yielded: Arc<AtomicUsize>,
+    ) -> impl futures::Stream<Item = std::result::Result<Vec<u8>, std::convert::Infallible>> + Unpin
+    {
+        Box::pin(futures::stream::iter(chunks).map(move |c| {
+            yielded.fetch_add(1, Ordering::SeqCst);
+            Ok(c.into_bytes())
+        }))
+    }
+
+    #[tokio::test]
+    async fn pump_reassembles_a_frame_split_across_chunks() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let yielded = Arc::new(AtomicUsize::new(0));
+
+        // Split one `data:` frame mid-JSON so the first chunk contains no
+        // newline at all — the pump must hold it and complete it on the next.
+        let (head, tail) = PROGRESS.split_at(20);
+        let stream = counting_stream(
+            vec![format!("data: {head}"), format!("{tail}\n\n")],
+            yielded.clone(),
+        );
+
+        pump_sse_stream(stream, &tx, "test://sse").await;
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "the frame split across two chunks should have been reassembled and forwarded"
+        );
+        assert_eq!(
+            yielded.load(Ordering::SeqCst),
+            2,
+            "both chunks are consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_stops_reading_once_the_forward_channel_closes() {
+        let (tx, rx) = mpsc::channel(1);
+        // The stdio side is gone: every send from here on fails.
+        drop(rx);
+
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let chunks: Vec<String> = (0..50).map(|_| format!("data: {PROGRESS}\n\n")).collect();
+        let stream = counting_stream(chunks, yielded.clone());
+
+        pump_sse_stream(stream, &tx, "test://sse").await;
+
+        // Reading past the first failed send is pointless work, and — because
+        // the buffer can no longer be drained — it grows without bound for the
+        // rest of the stream's life.
+        let consumed = yielded.load(Ordering::SeqCst);
+        assert_eq!(
+            consumed, 1,
+            "the listener must stop reading as soon as the forward channel \
+             closes, but it consumed {consumed} of 50 chunks"
         );
     }
 }

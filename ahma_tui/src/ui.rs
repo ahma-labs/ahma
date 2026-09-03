@@ -797,6 +797,18 @@ fn draw_zoomed_chat_pane(
 
 #[cfg(feature = "tui")]
 fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme, chat_a: Rect) {
+    let chat_content_area = draw_stacked_panels(frame, state, theme, chat_a);
+    state.chat_area.set(chat_content_area);
+    draw_chat_body(frame, state, theme, chat_content_area);
+}
+
+/// Draw whichever of the scope/tasks/log panes are open, stacked above the
+/// chat, and return the area left over for the chat itself.
+///
+/// The constraints pushed here and the areas consumed below must stay in the
+/// same order — each pane contributes at most one of each, in this sequence.
+#[cfg(feature = "tui")]
+fn draw_stacked_panels(frame: &mut Frame, state: &AppState, theme: &Theme, chat_a: Rect) -> Rect {
     let mut constraints = Vec::new();
     let show_scope = state.scope_window_open;
     let show_tasks = state.tasks_window_open;
@@ -845,9 +857,13 @@ fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme,
         state.log_area.set(Rect::default());
     }
 
-    let chat_content_area = areas[idx];
-    state.chat_area.set(chat_content_area);
+    areas[idx]
+}
 
+/// Split the chat area between the scrolling history and the stack of visible
+/// windows, then draw both.
+#[cfg(feature = "tui")]
+fn draw_chat_body(frame: &mut Frame, state: &AppState, theme: &Theme, chat_content_area: Rect) {
     let visible_count = state.windows.iter().filter(|w| w.visible).count();
     let (history_area, windows_area, layouts) = if visible_count > 0 {
         let max_w_h = chat_content_area.height.saturating_sub(4);
@@ -2461,8 +2477,6 @@ fn draw_task_tree_row(
 
 #[cfg(feature = "tui")]
 fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    use crate::task_tree::{TreeOptions, build_rows};
-
     let focused = state.focus == Focus::OpsDag;
     let border_style = if focused {
         theme.border_focused()
@@ -2485,21 +2499,7 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
 
     state.ops_area.set(area);
 
-    // Rebuild the tree for this frame; key/mouse handlers resolve the
-    // selection through the stored rows.
-    {
-        let rows = build_rows(
-            &state.operations,
-            &TreeOptions {
-                instances: &state.active_instances,
-                project_root: state.project_root.as_deref(),
-                show_all: state.show_all_projects,
-                expanded_op: state.expanded_op.as_deref(),
-                collapsed: &state.collapsed_nodes,
-            },
-        );
-        *state.task_rows.borrow_mut() = rows;
-    }
+    rebuild_task_rows(state);
     let rows = state.task_rows.borrow();
 
     if rows.is_empty() {
@@ -2541,6 +2541,27 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
     }
 
     draw_scrollbar(frame, theme, rows.len(), display_rows, scroll, inner);
+}
+
+/// Rebuild the task tree for this frame and store it on the state. Key and
+/// mouse handlers resolve the selection through the stored rows, so this must
+/// run before anything reads `state.task_rows`. Kept separate so the
+/// `borrow_mut` ends before the render path takes a shared borrow.
+#[cfg(feature = "tui")]
+fn rebuild_task_rows(state: &AppState) {
+    use crate::task_tree::{TreeOptions, build_rows};
+
+    let rows = build_rows(
+        &state.operations,
+        &TreeOptions {
+            instances: &state.active_instances,
+            project_root: state.project_root.as_deref(),
+            show_all: state.show_all_projects,
+            expanded_op: state.expanded_op.as_deref(),
+            collapsed: &state.collapsed_nodes,
+        },
+    );
+    *state.task_rows.borrow_mut() = rows;
 }
 
 /// Adjust the tree's scroll offset so the selected row stays within the
@@ -3096,6 +3117,72 @@ fn build_log_title(state: &AppState) -> String {
     )
 }
 
+/// The rows the log pane draws this frame, in the cheapest form each mode allows.
+///
+/// Wrapped mode must materialise every row up front — the scroll bounds are in
+/// physical rows, which only wrapping can count. Unwrapped mode (the default)
+/// knows the total without formatting anything, so only the rows actually on
+/// screen are formatted and styled; building all 500–2000 buffered lines per
+/// frame and throwing away everything but the visible slice was the log pane's
+/// entire per-frame cost.
+#[cfg(feature = "tui")]
+enum LogRows<'a> {
+    /// Pre-wrapped physical rows, already styled.
+    Wrapped(Vec<Line<'static>>),
+    /// System-log entries surviving the filter, styled on demand.
+    System(Vec<&'a crate::state::LogEntry>),
+    /// Raw lines of the active log file, styled on demand.
+    Raw(&'a [String]),
+}
+
+#[cfg(feature = "tui")]
+impl LogRows<'_> {
+    /// Total row count, for the scroll bounds and the empty-pane check.
+    fn total(&self) -> usize {
+        match self {
+            Self::Wrapped(lines) => lines.len(),
+            Self::System(entries) => entries.len(),
+            Self::Raw(lines) => lines.len(),
+        }
+    }
+
+    /// The at most `height` rows starting at `scroll`, styled for display.
+    fn visible(self, scroll: usize, height: usize, theme: &Theme) -> Vec<Line<'static>> {
+        match self {
+            Self::Wrapped(lines) => lines.into_iter().skip(scroll).take(height).collect(),
+            Self::System(entries) => entries
+                .iter()
+                .skip(scroll)
+                .take(height)
+                .map(|e| system_log_entry_line(e, theme))
+                .collect(),
+            Self::Raw(lines) => lines
+                .iter()
+                .skip(scroll)
+                .take(height)
+                .map(|raw| style_raw_log_line(&raw.replace('\t', "    "), theme))
+                .collect(),
+        }
+    }
+}
+
+/// Pick the row source for the current log mode: wrapping wins, then the
+/// system log's filtered entries, otherwise the active file's raw lines.
+#[cfg(feature = "tui")]
+fn log_rows<'a>(state: &'a AppState, theme: &Theme, width: u16) -> LogRows<'a> {
+    if state.log_wrap_enabled {
+        return LogRows::Wrapped(if state.active_log_file.is_some() {
+            get_file_display_lines(state, theme, width)
+        } else {
+            get_system_display_lines(state, theme, width)
+        });
+    }
+    if state.active_log_file.is_none() {
+        return LogRows::System(state.filtered_log());
+    }
+    LogRows::Raw(&state.active_log_lines)
+}
+
 #[cfg(feature = "tui")]
 fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Log;
@@ -3125,30 +3212,8 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
     frame.render_widget(block, area);
 
-    // Wrapped mode must materialise every row up front — the scroll bounds are
-    // in physical rows, which only wrapping can count. Unwrapped mode (the
-    // default) knows the total without formatting anything, so only the
-    // `inner.height` rows actually on screen are formatted and styled;
-    // building all 500–2000 buffered lines per frame and throwing away
-    // everything but the visible slice was the log pane's entire per-frame
-    // cost.
-    let wrapped_lines = state.log_wrap_enabled.then(|| {
-        if state.active_log_file.is_some() {
-            get_file_display_lines(state, theme, inner.width)
-        } else {
-            get_system_display_lines(state, theme, inner.width)
-        }
-    });
-    // System-log entries surviving the filter (unwrapped path only) — computed
-    // once, used for both the row count and the visible slice.
-    let filtered =
-        (wrapped_lines.is_none() && state.active_log_file.is_none()).then(|| state.filtered_log());
-
-    let total = match (&wrapped_lines, &filtered) {
-        (Some(lines), _) => lines.len(),
-        (None, Some(entries)) => entries.len(),
-        (None, None) => state.active_log_lines.len(),
-    };
+    let rows = log_rows(state, theme, inner.width);
+    let total = rows.total();
     if total == 0 {
         render_empty_log_hint(frame, state, theme, inner);
         return;
@@ -3165,22 +3230,7 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         state.log_scroll.min(max_scroll)
     };
 
-    let visible_lines: Vec<Line<'static>> = match (wrapped_lines, &filtered) {
-        (Some(lines), _) => lines.into_iter().skip(scroll).take(visible_h).collect(),
-        (None, Some(entries)) => entries
-            .iter()
-            .skip(scroll)
-            .take(visible_h)
-            .map(|e| system_log_entry_line(e, theme))
-            .collect(),
-        (None, None) => state
-            .active_log_lines
-            .iter()
-            .skip(scroll)
-            .take(visible_h)
-            .map(|raw| style_raw_log_line(&raw.replace('\t', "    "), theme))
-            .collect(),
-    };
+    let visible_lines = rows.visible(scroll, visible_h, theme);
 
     // One click target per visible row, so a line that is too long for the pane
     // can be opened and read in full. Registered before the paragraph is drawn
@@ -3567,9 +3617,8 @@ fn format_size(bytes: u64) -> String {
 
 #[cfg(feature = "tui")]
 fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let gate = match &state.approval {
-        Some(g) => g,
-        None => return,
+    let Some(gate) = &state.approval else {
+        return;
     };
 
     let countdown = gate
@@ -3620,8 +3669,22 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
 
     if let Some(diff) = &gate.diff {
         lines.push(Line::from(""));
+        // Two prompt lines plus the blank separator are already spoken for.
         let budget = inner.height.saturating_sub(3) as usize;
-        for diff_line in diff.lines().take(budget) {
+        lines.extend(approval_diff_lines(diff, theme, budget));
+    }
+
+    let para = Paragraph::new(Text::from(lines));
+    frame.render_widget(para, inner);
+}
+
+/// Styled diff rows for the approval banner: additions green, removals red,
+/// context plain, capped to `budget` rows.
+#[cfg(feature = "tui")]
+fn approval_diff_lines(diff: &str, theme: &Theme, budget: usize) -> Vec<Line<'static>> {
+    diff.lines()
+        .take(budget)
+        .map(|diff_line| {
             let style = if diff_line.starts_with('+') {
                 theme.success()
             } else if diff_line.starts_with('-') {
@@ -3629,12 +3692,9 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
             } else {
                 theme.normal()
             };
-            lines.push(Line::from(Span::styled(format!("  {}", diff_line), style)));
-        }
-    }
-
-    let para = Paragraph::new(Text::from(lines));
-    frame.render_widget(para, inner);
+            Line::from(Span::styled(format!("  {diff_line}"), style))
+        })
+        .collect()
 }
 
 // ─── Footer ───────────────────────────────────────────────────────────────────
@@ -4068,45 +4128,54 @@ fn build_settings_content_items(
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let is_selected = state.settings_editor.selected_item == i;
-            let item_style = if is_selected {
-                theme.selected_item()
-            } else {
-                theme.normal()
-            };
-
-            let val_string = format_setting_value(&item.value);
-
-            // Distinguish the three kinds of row the panel actually holds.
-            // Without this, a string/numeric row looked identical to a togglable
-            // one and simply swallowed Space — most of the panel read as broken
-            // rather than read-only.
-            let editable = matches!(item.value, crate::settings_editor::SettingValue::Bool(_))
-                && !item.security_tier;
-            let sec_indicator = if item.security_tier {
-                Span::styled(" [locked]", theme.dim())
-            } else if editable {
-                Span::styled(" [space]", theme.dim())
-            } else {
-                Span::styled(" [file]  ", theme.dim())
-            };
-
-            let label_style = if is_selected {
-                theme.title()
-            } else {
-                theme.normal()
-            };
-
-            let line = Line::from(vec![
-                Span::styled(format!("  {: <25}", item.label), label_style),
-                Span::styled(format!("  {: <15}", val_string), theme.success()),
-                sec_indicator,
-                Span::styled(format!("  — {}", item.description), theme.dim()),
-            ]);
-
-            ListItem::new(line).style(item_style)
+            settings_content_item(item, theme, state.settings_editor.selected_item == i)
         })
         .collect()
+}
+
+/// One settings row: label, current value, the row-kind indicator, description.
+#[cfg(feature = "tui")]
+fn settings_content_item(
+    item: &crate::settings_editor::SettingItem,
+    theme: &Theme,
+    is_selected: bool,
+) -> ListItem<'static> {
+    let (label_style, row_style) = if is_selected {
+        (theme.title(), theme.selected_item())
+    } else {
+        (theme.normal(), theme.normal())
+    };
+
+    let line = Line::from(vec![
+        Span::styled(format!("  {: <25}", item.label), label_style),
+        Span::styled(
+            format!("  {: <15}", format_setting_value(&item.value)),
+            theme.success(),
+        ),
+        setting_kind_indicator(item, theme),
+        Span::styled(format!("  — {}", item.description), theme.dim()),
+    ]);
+
+    ListItem::new(line).style(row_style)
+}
+
+/// Distinguish the three kinds of row the panel actually holds. Without this, a
+/// string/numeric row looked identical to a togglable one and simply swallowed
+/// Space — most of the panel read as broken rather than read-only.
+#[cfg(feature = "tui")]
+fn setting_kind_indicator(
+    item: &crate::settings_editor::SettingItem,
+    theme: &Theme,
+) -> Span<'static> {
+    let togglable =
+        matches!(item.value, crate::settings_editor::SettingValue::Bool(_)) && !item.security_tier;
+    if item.security_tier {
+        Span::styled(" [locked]", theme.dim())
+    } else if togglable {
+        Span::styled(" [space]", theme.dim())
+    } else {
+        Span::styled(" [file]  ", theme.dim())
+    }
 }
 
 /// Footer line: status/dirty message on the left, key hints on the right.

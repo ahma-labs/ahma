@@ -897,22 +897,27 @@ async fn fetch_completion(
     }
 }
 
+/// The read-only tools whose results carry the "read before you edit" hint.
+fn is_read_hint_tool(tool_name: &str) -> bool {
+    tool_name == "read_file" || tool_name == "list_dir"
+}
+
+/// Decide which harness hints this batch of tool results is eligible for, as
+/// `(inject_error_hint, inject_read_hint)`. Each hint is offered at most once
+/// per run, so an already-sent hint (`*_hinted`) disqualifies its whole batch.
 fn plan_harness_hints(
     tool_results: &[(String, String, serde_json::Value, bool)],
     error_hinted: bool,
     read_file_hinted: bool,
 ) -> (bool, bool) {
-    let mut inject_error_hint = false;
-    let mut inject_read_hint = false;
-    for (_, tool_name, _, failed) in tool_results {
-        if *failed && !error_hinted {
-            inject_error_hint = true;
-        }
-        if (*tool_name == "read_file" || *tool_name == "list_dir") && !read_file_hinted {
-            inject_read_hint = true;
-        }
-    }
-    (inject_error_hint, inject_read_hint)
+    let any_failed = tool_results.iter().any(|(_, _, _, failed)| *failed);
+    let any_read_tool = tool_results
+        .iter()
+        .any(|(_, tool_name, _, _)| is_read_hint_tool(tool_name));
+    (
+        any_failed && !error_hinted,
+        any_read_tool && !read_file_hinted,
+    )
 }
 
 fn append_hint_to_field(
@@ -939,7 +944,7 @@ fn should_inject_read_hint(
     inject_read_hint: bool,
     read_file_hinted: bool,
 ) -> bool {
-    (tool_name == "read_file" || tool_name == "list_dir") && inject_read_hint && !read_file_hinted
+    is_read_hint_tool(tool_name) && inject_read_hint && !read_file_hinted
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1218,6 +1223,45 @@ async fn dispatch_turn_tool_calls(
     }
 }
 
+/// The run's system prompt: the caller's, with the context strategy's suffix
+/// appended (or promoted to the whole prompt when the caller supplied none).
+fn system_prompt_for_run(
+    system_prompt: Option<String>,
+    mcp: &Option<McpChatConfig>,
+) -> Option<String> {
+    let suffix = mcp
+        .as_ref()
+        .and_then(|cfg| cfg.context_strategy().system_prompt_suffix());
+    let Some(suffix) = suffix else {
+        return system_prompt;
+    };
+    match system_prompt {
+        Some(mut s) => {
+            s.push_str(suffix);
+            Some(s)
+        }
+        None => Some(suffix.trim().to_string()),
+    }
+}
+
+/// Seed the wire-format message list: the system prompt (when present) followed
+/// by the conversation so far.
+fn initial_msg_json(
+    sys_prompt: &Option<String>,
+    messages: &[ChatMessage],
+) -> Vec<serde_json::Value> {
+    let mut msg_json: Vec<serde_json::Value> = Vec::new();
+    if let Some(system) = sys_prompt {
+        msg_json.push(serde_json::json!({"role": "system", "content": system}));
+    }
+    msg_json.extend(
+        messages
+            .iter()
+            .map(|msg| serde_json::json!({"role": msg.role, "content": msg.content})),
+    );
+    msg_json
+}
+
 pub fn spawn_agent_task(
     client: LlmClient,
     messages: Vec<ChatMessage>,
@@ -1228,23 +1272,8 @@ pub fn spawn_agent_task(
     gate: Arc<dyn AgentApprovalGate>,
 ) {
     tokio::spawn(async move {
-        let mut sys_prompt = system_prompt.clone();
-        if let Some(ref cfg) = mcp
-            && let Some(suffix) = cfg.context_strategy().system_prompt_suffix()
-        {
-            match sys_prompt {
-                Some(ref mut s) => s.push_str(suffix),
-                None => sys_prompt = Some(suffix.trim().to_string()),
-            }
-        }
-
-        let mut msg_json: Vec<serde_json::Value> = Vec::new();
-        if let Some(ref system) = sys_prompt {
-            msg_json.push(serde_json::json!({"role": "system", "content": system}));
-        }
-        for msg in &messages {
-            msg_json.push(serde_json::json!({"role": msg.role, "content": msg.content}));
-        }
+        let sys_prompt = system_prompt_for_run(system_prompt, &mcp);
+        let mut msg_json = initial_msg_json(&sys_prompt, &messages);
 
         let tool_defs = prepare_tool_definitions(available_tools);
 
@@ -1283,18 +1312,21 @@ pub fn spawn_agent_task(
             }
         }
 
-        if !completed {
-            finish_with_limit_summary(
-                &client,
-                &mut msg_json,
-                &mcp,
-                &tx,
-                &messages,
-                &sys_prompt,
-                max_turns,
-            )
-            .await;
+        if completed {
+            return;
         }
+
+        // Turn budget exhausted without the model ending its own run.
+        finish_with_limit_summary(
+            &client,
+            &mut msg_json,
+            &mcp,
+            &tx,
+            &messages,
+            &sys_prompt,
+            max_turns,
+        )
+        .await;
     });
 }
 
@@ -2933,6 +2965,64 @@ mod tests {
     #[test]
     fn prepare_tool_definitions_empty_input() {
         assert!(prepare_tool_definitions(Vec::new()).is_empty());
+    }
+
+    // ── system_prompt_for_run / initial_msg_json ──
+
+    fn harness_cfg() -> McpChatConfig {
+        McpChatConfig {
+            base_url: "http://x".into(),
+            workspace_root: PathBuf::from("/tmp"),
+            session_id: None,
+            external_http_servers: BTreeMap::new(),
+            max_turns: 8,
+            tool_approval: false,
+            mcp_connections: ahma_mcp::mcp_client::McpConnectionManager::default(),
+            minimize_tokens: true,
+            small_model_harness: true,
+            context_length: None,
+        }
+    }
+
+    #[test]
+    fn system_prompt_for_run_without_strategy_suffix_is_unchanged() {
+        assert_eq!(
+            system_prompt_for_run(Some("base".to_string()), &None),
+            Some("base".to_string())
+        );
+        assert_eq!(system_prompt_for_run(None, &None), None);
+    }
+
+    #[test]
+    fn system_prompt_for_run_appends_suffix_and_promotes_it_when_alone() {
+        let cfg = Some(harness_cfg());
+        let suffix = harness_cfg()
+            .context_strategy()
+            .system_prompt_suffix()
+            .expect("harness config supplies a suffix");
+
+        let appended = system_prompt_for_run(Some("base".to_string()), &cfg)
+            .expect("caller prompt is preserved");
+        assert_eq!(appended, format!("base{suffix}"));
+
+        let promoted = system_prompt_for_run(None, &cfg).expect("suffix becomes the whole prompt");
+        assert_eq!(promoted, suffix.trim());
+    }
+
+    #[test]
+    fn initial_msg_json_prepends_system_prompt_then_conversation() {
+        let messages = vec![ChatMessage::user("hi"), ChatMessage::user("again")];
+
+        let with_system = initial_msg_json(&Some("sys".to_string()), &messages);
+        assert_eq!(with_system.len(), 3);
+        assert_eq!(with_system[0]["role"], "system");
+        assert_eq!(with_system[0]["content"], "sys");
+        assert_eq!(with_system[1]["content"], "hi");
+        assert_eq!(with_system[2]["content"], "again");
+
+        let without_system = initial_msg_json(&None, &messages);
+        assert_eq!(without_system.len(), 2);
+        assert_eq!(without_system[0]["content"], "hi");
     }
 
     // ── plan_harness_hints ──

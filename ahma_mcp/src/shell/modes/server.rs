@@ -156,6 +156,17 @@ async fn maybe_start_egress_proxy(
     // egress except this proxy address, so a subprocess that ignores HTTP_PROXY
     // still cannot reach the network directly. No-op on other platforms.
     sandbox.set_egress_proxy_addr(Some(proxy.local_addr));
+    disclose_egress_restriction(&grants, proxy.local_addr);
+    Some(proxy)
+}
+
+/// Announce the active egress restriction loudly (SPEC R7): what is reachable,
+/// who granted it, how strongly it is enforced, and how to opt out. Pure
+/// disclosure — no effect on the restriction itself.
+fn disclose_egress_restriction(
+    grants: &crate::egress::EgressGrants,
+    proxy_addr: std::net::SocketAddr,
+) {
     if grants.is_empty() {
         tracing::warn!(
             "NETWORK EGRESS RESTRICTED (--restrict-network): nothing is reachable, so ALL \
@@ -165,30 +176,29 @@ async fn maybe_start_egress_proxy(
              {enforcement}",
             enforcement = network_enforcement_note(),
         );
-    } else {
-        // Every host names the grant behind it (R-PERM.5.2). A merged anonymous
-        // list would tell an operator *that* `proxy.golang.org` is reachable but
-        // not that one line in their settings file removes it — a grant whose
-        // origin is invisible cannot be refused.
-        let opt_out = match grants.contributing_profiles().as_slice() {
-            [] => String::new(),
-            profiles => format!(
-                " Profile-contributed hosts come from: {}; drop them with \
-                 `[network] deny_profile_hosts` (keeps the toolchain's file access) or all of \
-                 them with `[network] profile_hosts = false`.",
-                profiles.join(", ")
-            ),
-        };
-        tracing::warn!(
-            "NETWORK EGRESS RESTRICTED (--restrict-network): sandboxed subprocesses are routed \
-             through a guarded proxy at {addr}. Private/loopback/cloud-metadata targets are \
-             refused. Reachable hosts, and who granted each:\n{disclosure}\n{enforcement}{opt_out}",
-            addr = proxy.local_addr,
-            disclosure = grants.disclosure(),
-            enforcement = network_enforcement_note(),
-        );
+        return;
     }
-    Some(proxy)
+    // Every host names the grant behind it (R-PERM.5.2). A merged anonymous
+    // list would tell an operator *that* `proxy.golang.org` is reachable but
+    // not that one line in their settings file removes it — a grant whose
+    // origin is invisible cannot be refused.
+    let opt_out = match grants.contributing_profiles().as_slice() {
+        [] => String::new(),
+        profiles => format!(
+            " Profile-contributed hosts come from: {}; drop them with \
+             `[network] deny_profile_hosts` (keeps the toolchain's file access) or all of \
+             them with `[network] profile_hosts = false`.",
+            profiles.join(", ")
+        ),
+    };
+    tracing::warn!(
+        "NETWORK EGRESS RESTRICTED (--restrict-network): sandboxed subprocesses are routed \
+         through a guarded proxy at {addr}. Private/loopback/cloud-metadata targets are \
+         refused. Reachable hosts, and who granted each:\n{disclosure}\n{enforcement}{opt_out}",
+        addr = proxy_addr,
+        disclosure = grants.disclosure(),
+        enforcement = network_enforcement_note(),
+    );
 }
 
 /// Disclose how strongly the network restriction is enforced on this platform.
@@ -538,30 +548,40 @@ fn is_global_bridge_url(url: &str) -> bool {
         .is_some_and(|port| port == GLOBAL_HTTP_PORT)
 }
 
+/// Drop the machine-global endpoints from a restart request made by a
+/// test-isolated process.
+///
+/// A test must never shut down a bridge it does not own. A test-spawned ahma is
+/// a freshly built binary, so it carries a different BUILD_ID; pointed at the
+/// machine-global endpoint it decides the running bridge is "stale" and restarts
+/// whatever owns it — the developer's live MCP server, or another application's.
+///
+/// Strips only the *global* endpoints, rather than refusing every restart: a test
+/// driving its own mock bridge on a private socket/port is legitimate. Outside
+/// test isolation both endpoints pass through untouched.
+fn strip_global_endpoints_under_test<'a>(
+    socket_path: Option<&'a str>,
+    http_url: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if !is_test_isolated() {
+        return (socket_path, http_url);
+    }
+    let global_socket = socket_path.is_some_and(|p| p == GLOBAL_SOCKET_PATH);
+    let global_http = http_url.is_some_and(is_global_bridge_url);
+    if global_socket || global_http {
+        tracing::warn!(
+            "Test-isolated process may not restart the shared bridge; ignoring \
+             global endpoints (socket={socket_path:?}, http={http_url:?})"
+        );
+    }
+    (
+        socket_path.filter(|_| !global_socket),
+        http_url.filter(|_| !global_http),
+    )
+}
+
 pub async fn trigger_bridge_restart(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
-    // A test must never shut down a bridge it does not own. A test-spawned ahma is
-    // a freshly built binary, so it carries a different BUILD_ID; pointed at the
-    // machine-global endpoint it decides the running bridge is "stale" and restarts
-    // whatever owns it — the developer's live MCP server, or another application's.
-    //
-    // Strip only the *global* endpoints, rather than refusing every restart: a test
-    // driving its own mock bridge on a private socket/port is legitimate.
-    let (socket_path, http_url) = if is_test_isolated() {
-        let global_socket = socket_path.is_some_and(|p| p == GLOBAL_SOCKET_PATH);
-        let global_http = http_url.is_some_and(is_global_bridge_url);
-        if global_socket || global_http {
-            tracing::warn!(
-                "Test-isolated process may not restart the shared bridge; ignoring \
-                 global endpoints (socket={socket_path:?}, http={http_url:?})"
-            );
-        }
-        (
-            socket_path.filter(|_| !global_socket),
-            http_url.filter(|_| !global_http),
-        )
-    } else {
-        (socket_path, http_url)
-    };
+    let (socket_path, http_url) = strip_global_endpoints_under_test(socket_path, http_url);
 
     #[cfg(unix)]
     if let Some(path) = socket_path
@@ -669,6 +689,18 @@ fn re_exec_current_process() -> Result<()> {
     }
 }
 
+/// True when `client_semver` orders strictly after `bridge_semver`.
+///
+/// A version string either side cannot parse also counts as "client newer": an
+/// unreadable bridge version is not evidence that the running bridge is current,
+/// so the caller restarts it rather than proxying to it.
+fn semver_is_newer(client_semver: &str, bridge_semver: &str) -> bool {
+    match (parse_version(client_semver), parse_version(bridge_semver)) {
+        (Some(c), Some(b)) => c > b,
+        _ => true,
+    }
+}
+
 async fn handle_version_checks(
     _config: &AppConfig,
     is_test: bool,
@@ -709,16 +741,10 @@ async fn handle_version_checks(
         return proxy_to_matching_bridge(socket_path_opt, http_url_opt, &bridge_version_raw).await;
     }
 
-    let c_ver = parse_version(client_semver);
-    let b_ver = parse_version(bridge_semver);
-    let client_is_newer = match (c_ver, b_ver) {
-        (Some(c), Some(b)) => c > b,
-        _ => true,
-    };
-
     // Same semver but different build-id: the bridge is a dev-rebuild peer on the same
     // version; treat it as stale (client binary is "newer" in intent).
-    let client_is_newer = client_is_newer || (same_semver && !same_build);
+    let client_is_newer =
+        semver_is_newer(client_semver, bridge_semver) || (same_semver && !same_build);
 
     reconcile_version_mismatch(
         socket_path_opt,
@@ -748,42 +774,49 @@ async fn proxy_to_matching_bridge(
     let proxy_result =
         crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt, None)
             .await;
-    match proxy_result {
-        // Bridge responded normally — this was a real MCP session that ended cleanly.
-        Ok(true) => Ok(Some(())),
-        result => {
-            // Proxy failed (Err) OR the bridge closed the connection before sending any
-            // response (Ok(false)).  Both indicate a stale / incompatible bridge daemon
-            // that happens to report the same version string.
-            if let Err(ref e) = result {
-                tracing::warn!(
-                    bridge_version = %bridge_version_raw,
-                    error = %e,
-                    "Proxy to same-version bridge failed; bridge may be stale"
-                );
-            } else {
-                tracing::warn!(
-                    bridge_version = %bridge_version_raw,
-                    "Proxy to same-version bridge exited without forwarding any bridge \
-                     response; bridge may be stale (same semver, incompatible binary)"
-                );
-            }
-            if std::env::var("AHMA_RESTARTED").is_err() {
-                tracing::info!(
-                    "Triggering bridge restart and falling back to fresh bridge spawn..."
-                );
-                restart_bridge_server(socket_path_opt, http_url_opt).await;
-                // Return Ok(None) so run_server_mode proceeds to spawn a fresh bridge
-                // and connect to it.
-                Ok(None)
-            } else {
-                Err(anyhow::anyhow!(
-                    "Proxy to same-version bridge (v{bridge_version_raw}) failed after \
-                     restart attempt. Please restart ahma manually: \
-                     `pkill -f 'ahma serve'` then restart your IDE."
-                ))
-            }
-        }
+
+    // Bridge responded normally — this was a real MCP session that ended cleanly.
+    if matches!(proxy_result, Ok(true)) {
+        return Ok(Some(()));
+    }
+
+    // Proxy failed (Err) OR the bridge closed the connection before sending any
+    // response (Ok(false)).  Both indicate a stale / incompatible bridge daemon
+    // that happens to report the same version string.
+    warn_stale_same_version_bridge(&proxy_result, bridge_version_raw);
+
+    if std::env::var("AHMA_RESTARTED").is_ok() {
+        return Err(anyhow::anyhow!(
+            "Proxy to same-version bridge (v{bridge_version_raw}) failed after \
+             restart attempt. Please restart ahma manually: \
+             `pkill -f 'ahma serve'` then restart your IDE."
+        ));
+    }
+
+    tracing::info!("Triggering bridge restart and falling back to fresh bridge spawn...");
+    restart_bridge_server(socket_path_opt, http_url_opt).await;
+    // Return Ok(None) so run_server_mode proceeds to spawn a fresh bridge
+    // and connect to it.
+    Ok(None)
+}
+
+/// Log why a proxy attempt against a same-version bridge is being treated as a
+/// stale daemon: an outright failure and a bridge that hung up without forwarding
+/// anything are different symptoms of the same conclusion, and the operator needs
+/// to see which one happened.
+fn warn_stale_same_version_bridge(proxy_result: &Result<bool>, bridge_version_raw: &str) {
+    if let Err(e) = proxy_result {
+        tracing::warn!(
+            bridge_version = %bridge_version_raw,
+            error = %e,
+            "Proxy to same-version bridge failed; bridge may be stale"
+        );
+    } else {
+        tracing::warn!(
+            bridge_version = %bridge_version_raw,
+            "Proxy to same-version bridge exited without forwarding any bridge \
+             response; bridge may be stale (same semver, incompatible binary)"
+        );
     }
 }
 
@@ -1286,6 +1319,24 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         );
     }
 
+    log_startup_summary(&config, &sandbox, loaded_configs.len());
+
+    if !is_test {
+        return run_as_frontend_and_proxy(&config, socket_path_opt, http_url_opt).await;
+    }
+
+    serve_stdio_until_shutdown(
+        service_handler,
+        adapter,
+        operation_monitor,
+        shutdown_timeout,
+    )
+    .await
+}
+
+/// Disclose which sandbox is authoritative for this session, and what it is
+/// scoped to, before any tool call can be served (SPEC R7). Pure logging.
+fn log_startup_summary(config: &AppConfig, sandbox: &sandbox::Sandbox, loaded_tools: usize) {
     let sandbox_scopes = sandbox
         .scopes()
         .iter()
@@ -1293,23 +1344,32 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         .collect::<Vec<_>>();
     tracing::info!(
         "Startup summary: sandbox_mode={}, sandbox_scopes={:?}, disable_temp_files={}, tools_dir={}, loaded_tools={}",
-        sandbox_mode_name(&sandbox),
+        sandbox_mode_name(sandbox),
         sandbox_scopes,
         sandbox.is_no_temp_files(),
         config
             .tools_dir
             .as_ref()
             .map_or_else(|| "<none>".to_string(), |dir| dir.display().to_string()),
-        loaded_configs.len(),
+        loaded_tools,
     );
+}
 
-    if !is_test {
-        return run_as_frontend_and_proxy(&config, socket_path_opt, http_url_opt).await;
-    }
-
-    use crate::transport_patch::PatchedStdioTransport;
+/// Serve the built MCP service on this process's stdio until the session ends or
+/// a signal arrives, then run the single graceful-shutdown choreography.
+///
+/// The terminal phase of [`run_server_mode`] when this process *is* the server
+/// (server-child or test), as opposed to the frontend that proxies to a detached
+/// bridge. The signal handler is armed only after `serve` has taken stdio, so a
+/// shutdown can never race the transport into existence.
+async fn serve_stdio_until_shutdown(
+    service_handler: crate::mcp_service::AhmaMcpService,
+    adapter: Arc<crate::adapter::Adapter>,
+    operation_monitor: Arc<crate::operation_monitor::OperationMonitor>,
+    shutdown_timeout: Duration,
+) -> Result<()> {
     let service = service_handler
-        .serve(PatchedStdioTransport::new_stdio())
+        .serve(crate::transport_patch::PatchedStdioTransport::new_stdio())
         .await?;
 
     // Spawn graceful shutdown handler for SIGINT/SIGTERM.

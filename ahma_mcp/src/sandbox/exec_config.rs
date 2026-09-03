@@ -288,6 +288,23 @@ fn classify_venv(abs: &Path) -> Option<(ExecConfigClass, &'static str)> {
     None
 }
 
+/// The trailing `<dir>/<file>` pairs that disclose, and why. A table rather
+/// than an if-chain because the pairs are mutually exclusive — at most one row
+/// can match a given path — so this is data, not control flow. Add a rule by
+/// adding a row.
+const DISCLOSE_DIR_FILE: &[(&str, &str, &str)] = &[
+    (".vscode", "tasks.json", reasons::VSCODE_TASKS),
+    (".vscode", "launch.json", reasons::VSCODE_TASKS),
+    (".vscode", "settings.json", reasons::VSCODE_SETTINGS),
+    (".vscode", "mcp.json", reasons::MCP_CONFIG),
+    (".cursor", "mcp.json", reasons::MCP_CONFIG),
+    (".claude", "settings.json", reasons::HARNESS_HOOKS),
+    (".claude", "settings.local.json", reasons::HARNESS_HOOKS),
+    (".cursor", "hooks.json", reasons::HARNESS_HOOKS),
+    (".agents", "hooks.json", reasons::HARNESS_HOOKS),
+    (".codex", "hooks.json", reasons::HARNESS_HOOKS),
+];
+
 /// Editor / harness configuration files that auto-execute. Matched on the
 /// *trailing* `<dir>/<file>` pair so a nested `packages/app/.vscode/tasks.json`
 /// is caught too — VS Code reads multi-root workspaces, and depth is not a
@@ -297,11 +314,7 @@ fn classify_disclose(comps: &[String]) -> Option<(ExecConfigClass, &'static str)
     let last = comps[n - 1].as_str();
 
     // `.cursor/rules/**` — any depth beneath the rules directory.
-    if comps
-        .windows(2)
-        .any(|w| w[0].eq_ignore_ascii_case(".cursor") && w[1].eq_ignore_ascii_case("rules"))
-        && n >= 3
-    {
+    if n >= 3 && has_adjacent_pair(comps, ".cursor", "rules") {
         return Some((ExecConfigClass::Disclose, reasons::CURSOR_RULES));
     }
 
@@ -316,27 +329,18 @@ fn classify_disclose(comps: &[String]) -> Option<(ExecConfigClass, &'static str)
         return None;
     }
     let dir = comps[n - 2].as_str();
+    DISCLOSE_DIR_FILE
+        .iter()
+        .find(|&&(d, f, _)| dir.eq_ignore_ascii_case(d) && last.eq_ignore_ascii_case(f))
+        .map(|&(_, _, reason)| (ExecConfigClass::Disclose, reason))
+}
 
-    let matches = |d: &str, f: &str| dir.eq_ignore_ascii_case(d) && last.eq_ignore_ascii_case(f);
-
-    if matches(".vscode", "tasks.json") || matches(".vscode", "launch.json") {
-        return Some((ExecConfigClass::Disclose, reasons::VSCODE_TASKS));
-    }
-    if matches(".vscode", "settings.json") {
-        return Some((ExecConfigClass::Disclose, reasons::VSCODE_SETTINGS));
-    }
-    if matches(".vscode", "mcp.json") || matches(".cursor", "mcp.json") {
-        return Some((ExecConfigClass::Disclose, reasons::MCP_CONFIG));
-    }
-    if matches(".claude", "settings.json")
-        || matches(".claude", "settings.local.json")
-        || matches(".cursor", "hooks.json")
-        || matches(".agents", "hooks.json")
-        || matches(".codex", "hooks.json")
-    {
-        return Some((ExecConfigClass::Disclose, reasons::HARNESS_HOOKS));
-    }
-    None
+/// Does `comps` contain `first` immediately followed by `second`, compared
+/// ASCII-case-insensitively?
+fn has_adjacent_pair(comps: &[String], first: &str, second: &str) -> bool {
+    comps
+        .windows(2)
+        .any(|w| w[0].eq_ignore_ascii_case(first) && w[1].eq_ignore_ascii_case(second))
 }
 
 /// Concrete subpaths whose writes should be denied by the kernel where the
@@ -412,17 +416,23 @@ fn resolve_git_dirs_detailed(workspace_root: &Path) -> Vec<ResolvedGitDir> {
         if budget == 0 {
             break;
         }
+        // A skipped entry still costs budget: the budget bounds how much of the
+        // directory we look at, not how much of it we descend into.
         budget -= 1;
-        let child = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if SCAN_SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
-            continue;
-        }
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            collect_git_dir(&child, &mut out);
+        if is_scannable_child(&entry.file_name().to_string_lossy())
+            && entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+        {
+            collect_git_dir(&entry.path(), &mut out);
         }
     }
     out
+}
+
+/// Is this directory entry worth looking inside for a nested repository?
+/// Shared by the sync and async resolvers so the skip list cannot drift
+/// between them.
+fn is_scannable_child(name: &str) -> bool {
+    !SCAN_SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(name))
 }
 
 /// `tokio::fs` twin of [`resolve_git_dirs`], for the async write-tool path
@@ -449,9 +459,10 @@ pub async fn resolve_git_dirs_async(workspace_root: &Path) -> Vec<PathBuf> {
         if budget == 0 {
             break;
         }
+        // A skipped entry still costs budget: the budget bounds how much of the
+        // directory we look at, not how much of it we descend into.
         budget -= 1;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if SCAN_SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+        if !is_scannable_child(&entry.file_name().to_string_lossy()) {
             continue;
         }
         if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
@@ -632,8 +643,40 @@ mod refusals {
 /// Everything fails closed, and every refusal is reported rather than dropped —
 /// R7 forbids silently narrowing enforcement as much as silently widening it.
 pub fn grantable_git_dirs(roots: &[PathBuf], scopes: &[PathBuf]) -> GitDirGrants {
+    let resolved = resolved_git_dirs_of(roots);
     let mut out = GitDirGrants::default();
     let mut seen: Vec<PathBuf> = Vec::new();
+
+    // Two passes: a `commondir` grant is only as good as the worktree git dir it
+    // was reached through, and that dir may be resolved after it.
+    for dir in resolved
+        .iter()
+        .filter(|d| !matches!(d.origin, GitDirOrigin::CommonDir { .. }))
+    {
+        if !first_visit(&mut seen, &dir.path) {
+            continue;
+        }
+        let verdict = classify_grant(dir, scopes);
+        record_verdict(&mut out, &dir.path, pointer_of(dir), verdict);
+    }
+
+    for dir in &resolved {
+        let GitDirOrigin::CommonDir { via } = &dir.origin else {
+            continue;
+        };
+        if !first_visit(&mut seen, &dir.path) {
+            continue;
+        }
+        let verdict = classify_common_dir(&dir.path, via, scopes, &out.granted);
+        record_verdict(&mut out, &dir.path, Some(via.clone()), verdict);
+    }
+
+    out
+}
+
+/// Every git dir governing any of `roots`, deduplicated by resolved path and
+/// kept in resolution order (the order the two passes above rely on).
+fn resolved_git_dirs_of(roots: &[PathBuf]) -> Vec<ResolvedGitDir> {
     let mut resolved: Vec<ResolvedGitDir> = Vec::new();
     for root in roots {
         for dir in resolve_git_dirs_detailed(root) {
@@ -642,52 +685,39 @@ pub fn grantable_git_dirs(roots: &[PathBuf], scopes: &[PathBuf]) -> GitDirGrants
             }
         }
     }
+    resolved
+}
 
-    // Two passes: a `commondir` grant is only as good as the worktree git dir it
-    // was reached through, and that dir may be resolved after it.
-    for dir in resolved
-        .iter()
-        .filter(|d| !matches!(d.origin, GitDirOrigin::CommonDir { .. }))
-    {
-        if seen.contains(&dir.path) {
-            continue;
-        }
-        seen.push(dir.path.clone());
-        match classify_grant(dir, scopes) {
-            Ok(basis) => out.granted.push(GitDirGrant {
-                path: dir.path.clone(),
-                basis,
-            }),
-            Err(reason) => out.refused.push(GitDirRefusal {
-                path: dir.path.clone(),
-                pointer: pointer_of(dir),
-                reason,
-            }),
-        }
+/// `true` the first time `path` is offered, `false` on every repeat — so each
+/// resolved git dir is classified exactly once across both passes.
+fn first_visit(seen: &mut Vec<PathBuf>, path: &Path) -> bool {
+    if seen.iter().any(|p| p.as_path() == path) {
+        return false;
     }
+    seen.push(path.to_path_buf());
+    true
+}
 
-    for dir in &resolved {
-        let GitDirOrigin::CommonDir { via } = &dir.origin else {
-            continue;
-        };
-        if seen.contains(&dir.path) {
-            continue;
-        }
-        seen.push(dir.path.clone());
-        match classify_common_dir(&dir.path, via, scopes, &out.granted) {
-            Ok(basis) => out.granted.push(GitDirGrant {
-                path: dir.path.clone(),
-                basis,
-            }),
-            Err(reason) => out.refused.push(GitDirRefusal {
-                path: dir.path.clone(),
-                pointer: Some(via.clone()),
-                reason,
-            }),
-        }
+/// Record one classification verdict. Both passes funnel through here so a
+/// refusal can never be dropped on one path and reported on the other — R7
+/// forbids silently narrowing enforcement as much as silently widening it.
+fn record_verdict(
+    out: &mut GitDirGrants,
+    path: &Path,
+    pointer: Option<PathBuf>,
+    verdict: Result<GrantBasis, &'static str>,
+) {
+    match verdict {
+        Ok(basis) => out.granted.push(GitDirGrant {
+            path: path.to_path_buf(),
+            basis,
+        }),
+        Err(reason) => out.refused.push(GitDirRefusal {
+            path: path.to_path_buf(),
+            pointer,
+            reason,
+        }),
     }
-
-    out
 }
 
 fn pointer_of(dir: &ResolvedGitDir) -> Option<PathBuf> {
@@ -761,23 +791,26 @@ fn classify_common_dir(
 fn core_worktree_of(git_dir: &Path) -> Option<PathBuf> {
     let contents = std::fs::read_to_string(git_dir.join("config")).ok()?;
     let mut in_core = false;
-    for line in contents.lines() {
-        let line = line.trim();
-        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_core = section.trim().eq_ignore_ascii_case("core");
+    for line in contents.lines().map(str::trim) {
+        if let Some(section) = section_header(line) {
+            in_core = section.eq_ignore_ascii_case("core");
             continue;
         }
         if !in_core {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case("worktree") {
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("worktree")
+        {
             return Some(canonical_or(Path::new(value.trim())));
         }
     }
     None
+}
+
+/// `[core]` → `core`, and `None` for any line that is not a section header.
+fn section_header(line: &str) -> Option<&str> {
+    Some(line.strip_prefix('[')?.strip_suffix(']')?.trim())
 }
 
 /// Resolve `<dir>/.git` (directory or `gitdir:` pointer file) into `out`.

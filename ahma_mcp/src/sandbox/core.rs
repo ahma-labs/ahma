@@ -223,6 +223,20 @@ fn canonicalize_with_fallback(full_path: &Path) -> PathBuf {
     scopes::normalize_path_lexically(full_path)
 }
 
+/// Append every path in `additions` that `target` does not already contain,
+/// preserving both the existing order and the order of `additions`.
+///
+/// The de-duplication is exact-equality on the already-canonicalized paths, the
+/// same test the call sites used inline: scope sets are small, and a widening
+/// prefix test here would be a policy change, not a refactor.
+fn append_missing_scopes(target: &mut Vec<PathBuf>, additions: &[PathBuf]) {
+    for path in additions {
+        if !target.contains(path) {
+            target.push(path.clone());
+        }
+    }
+}
+
 /// The security context for the Ahma session.
 pub struct Sandbox {
     pub(super) scopes: parking_lot::RwLock<Vec<PathBuf>>,
@@ -519,20 +533,10 @@ impl Sandbox {
     #[must_use]
     pub fn with_persistent_scopes(mut self, write: Vec<PathBuf>, read: Vec<PathBuf>) -> Self {
         if !write.is_empty() {
-            let mut scopes = self.scopes.write();
-            for p in &write {
-                if !scopes.contains(p) {
-                    scopes.push(p.clone());
-                }
-            }
+            append_missing_scopes(&mut self.scopes.write(), &write);
         }
         if !read.is_empty() {
-            let mut reads = self.read_scopes.write();
-            for p in &read {
-                if !reads.contains(p) {
-                    reads.push(p.clone());
-                }
-            }
+            append_missing_scopes(&mut self.read_scopes.write(), &read);
         }
         self.persistent_write_scopes = write;
         self.persistent_read_scopes = read;
@@ -633,11 +637,7 @@ impl Sandbox {
             if self.livelog && self.mode != SandboxMode::Test {
                 *current_read_scopes = resolve_livelog_scopes(&canonicalized);
             }
-            for dir in &self.persistent_read_scopes {
-                if !current_read_scopes.contains(dir) {
-                    current_read_scopes.push(dir.clone());
-                }
-            }
+            append_missing_scopes(&mut current_read_scopes, &self.persistent_read_scopes);
         }
 
         let mut current_scopes = self.scopes.write();
@@ -915,19 +915,7 @@ impl Sandbox {
     /// path is still resolved to canonical form but never rejected.
     pub fn validate_path(&self, path: &Path) -> Result<PathBuf> {
         if self.is_test_mode() {
-            let canonical = if path.is_absolute() {
-                dunce::canonicalize(path).unwrap_or_else(|_| canonicalize_with_fallback(path))
-            } else {
-                let scopes_guard = self.scopes();
-                if let Some(first_scope) = scopes_guard.first() {
-                    let full = first_scope.join(path);
-                    dunce::canonicalize(&full).unwrap_or_else(|_| canonicalize_with_fallback(&full))
-                } else {
-                    let full = std::env::current_dir().unwrap_or_default().join(path);
-                    dunce::canonicalize(&full).unwrap_or_else(|_| canonicalize_with_fallback(&full))
-                }
-            };
-            return Ok(canonical);
+            return Ok(self.resolve_path_unchecked(path));
         }
 
         let scopes_guard = self.scopes();
@@ -969,6 +957,29 @@ impl Sandbox {
             Ok(canonical) => self.is_path_allowed(&canonical, &scopes_guard),
             Err(_) => false,
         }
+    }
+
+    /// Resolve `path` to canonical form **without any scope check** — the
+    /// `SandboxMode::Test` (`--no-sandbox`) half of [`Self::validate_path`],
+    /// where scope is still resolved but never enforced.
+    ///
+    /// A relative path is joined onto the first scope, or onto the current
+    /// directory when there is no scope at all; unlike [`Self::resolve_path`]
+    /// (the enforcing path) a missing scope is a fallback here, not an error.
+    /// Never call this from an enforcing code path: it cannot reject anything.
+    fn resolve_path_unchecked(&self, path: &Path) -> PathBuf {
+        let full_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            let base = self
+                .scopes()
+                .first()
+                .cloned()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            base.join(path)
+        };
+
+        dunce::canonicalize(&full_path).unwrap_or_else(|_| canonicalize_with_fallback(&full_path))
     }
 
     fn resolve_path(&self, path: &Path, scopes_guard: &[PathBuf]) -> Result<PathBuf> {

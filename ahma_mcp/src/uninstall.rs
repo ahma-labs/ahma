@@ -63,7 +63,7 @@ impl UninstallAction {
 
 /// Runs the uninstall wizard.
 pub async fn run(args: UninstallArgs) -> Result<()> {
-    let interactive = !args.auto && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let interactive = is_interactive_session(&args);
 
     if interactive {
         print_banner("Ahma Uninstall Wizard");
@@ -79,11 +79,7 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     }
 
     // Question 2: which platforms (for per-platform actions).
-    let platforms = if actions.iter().any(|a| a.is_platform_specific()) {
-        select_platforms(&actions, &args.platforms, interactive)
-    } else {
-        Vec::new()
-    };
+    let platforms = select_platforms_for_actions(&actions, &args, interactive);
 
     // Optionally purge the ~/.ahma data directory.
     let purge = should_purge_ahma_dir(&args, &actions, interactive)?;
@@ -95,6 +91,25 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether the wizard may prompt: `--auto` is an explicit "don't ask", and a redirected
+/// stdin or stdout means nobody is there to answer.
+fn is_interactive_session(args: &UninstallArgs) -> bool {
+    !args.auto && io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// The platforms question is only worth asking when a per-platform action (MCP, hooks)
+/// was selected; skills and binary removal are platform-agnostic.
+fn select_platforms_for_actions(
+    actions: &[UninstallAction],
+    args: &UninstallArgs,
+    interactive: bool,
+) -> Vec<Platform> {
+    if !actions.iter().any(|a| a.is_platform_specific()) {
+        return Vec::new();
+    }
+    select_platforms(actions, &args.platforms, interactive)
 }
 
 /// Prints a boxed banner with the given title line (interactive mode only).
@@ -292,34 +307,12 @@ fn remove_platform_mcp(
 /// file stays valid rather than becoming "empty".  Never deletes the file itself.
 /// No-ops gracefully when the file or key is absent.
 pub fn remove_mcp_entry(path: &Path, servers_key: &str, dry_run: bool) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut config: Value =
-        serde_json::from_str(&content).unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
-
-    if !config.is_object() {
-        return Ok(());
-    }
-    let obj = config.as_object_mut().unwrap();
-
-    let Some(servers_val) = obj.get_mut(servers_key) else {
-        return Ok(()); // servers key absent — nothing to do
-    };
-
-    let Some(servers_obj) = servers_val.as_object_mut() else {
+    // `take_json_section_key` intentionally leaves the (possibly now-empty) servers
+    // object in place. `{ "mcpServers": {} }` is the canonical minimal MCP config, so
+    // we keep it rather than pruning the key and risking an "empty" file.
+    let Some(config) = take_json_section_key(path, servers_key, "Ahma")? else {
         return Ok(());
     };
-    if servers_obj.remove("Ahma").is_none() {
-        return Ok(()); // Ahma key already absent
-    }
-    // Intentionally leave the (possibly now-empty) servers object in place.
-    // `{ "mcpServers": {} }` is the canonical minimal MCP config, so we keep it
-    // rather than pruning the key and risking an "empty" file.
-
     if dry_run {
         return Ok(());
     }
@@ -327,11 +320,45 @@ pub fn remove_mcp_entry(path: &Path, servers_key: &str, dry_run: bool) -> Result
     let backup_path = PathBuf::from(format!("{}.bak", path.display()));
     let _ = std::fs::copy(path, &backup_path);
 
-    let mut file = std::fs::File::create(path)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-    serde_json::to_writer_pretty(&mut file, &config)
+    write_json_pretty(path, &config)
+}
+
+/// Remove `key` from the JSON object at `config[section]` in the file at `path`.
+///
+/// The single "remove exactly one Ahma-managed key, and nothing else" primitive shared by
+/// every JSON teardown here ([`remove_mcp_entry`], [`remove_installed_plugin_entry`],
+/// [`disable_claude_plugin`]). It never writes; the caller decides that, because each
+/// caller has its own dry-run message and backup policy.
+///
+/// Returns the mutated document **only** when the file exists, parses as a JSON object,
+/// holds an object at `section`, and that object actually contained `key`. Every other
+/// case returns `None`, which callers treat as "leave the file exactly as it is" — a file
+/// ahma did not change is a file ahma must not rewrite. Unparseable content falls back to
+/// an empty object, which has no `section` and so is one of those no-op cases.
+fn take_json_section_key(path: &Path, section: &str, key: &str) -> Result<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut config: Value =
+        serde_json::from_str(&content).unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+
+    let removed = config
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut(section))
+        .and_then(|section_val| section_val.as_object_mut())
+        .and_then(|section_obj| section_obj.remove(key))
+        .is_some();
+
+    Ok(removed.then_some(config))
+}
+
+/// Write `config` back to `path` as pretty-printed JSON.
+fn write_json_pretty(path: &Path, config: &Value) -> Result<()> {
+    let serialized = serde_json::to_string_pretty(config)
         .with_context(|| format!("Failed to serialize {}", path.display()))?;
-    Ok(())
+    std::fs::write(path, serialized).with_context(|| format!("Failed to write {}", path.display()))
 }
 
 /// Remove `[mcp_servers.Ahma]` from a Codex TOML config.
@@ -348,24 +375,9 @@ pub fn remove_codex_mcp(path: &Path, dry_run: bool) -> Result<()> {
     let mut config: toml::Value =
         toml::from_str(&content).unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
 
-    if !config.is_table() {
-        return Ok(());
+    if !take_codex_ahma_table(&mut config) {
+        return Ok(()); // nothing of ahma's here — leave the file untouched
     }
-    let table = config.as_table_mut().unwrap();
-
-    let Some(mcp_servers) = table.get_mut("mcp_servers") else {
-        return Ok(());
-    };
-    if let Some(mcp_table) = mcp_servers.as_table_mut() {
-        if mcp_table.remove("Ahma").is_none() {
-            return Ok(());
-        }
-        let empty = mcp_table.is_empty();
-        if empty {
-            table.remove("mcp_servers");
-        }
-    }
-
     if dry_run {
         return Ok(());
     }
@@ -374,6 +386,31 @@ pub fn remove_codex_mcp(path: &Path, dry_run: bool) -> Result<()> {
     std::fs::write(path, serialized)
         .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
+}
+
+/// Remove `[mcp_servers.Ahma]` from an already-parsed Codex config, pruning the
+/// `[mcp_servers]` table when Ahma was its last entry.
+///
+/// Returns `true` only when the document actually changed. The TOML counterpart of
+/// [`take_json_section_key`]: same "did anything of ours exist here?" answer, so the
+/// caller's write is likewise guarded by one boolean instead of nested `if let`s.
+fn take_codex_ahma_table(config: &mut toml::Value) -> bool {
+    let Some(table) = config.as_table_mut() else {
+        return false;
+    };
+    let Some(mcp_table) = table
+        .get_mut("mcp_servers")
+        .and_then(|servers| servers.as_table_mut())
+    else {
+        return false;
+    };
+    if mcp_table.remove("Ahma").is_none() {
+        return false;
+    }
+    if mcp_table.is_empty() {
+        table.remove("mcp_servers");
+    }
+    true
 }
 
 // ── Hooks teardown ────────────────────────────────────────────────────────────
@@ -424,22 +461,31 @@ fn uninstall_agent_skills(dry_run: bool, interactive: bool) -> Result<()> {
         .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
     for skill_dir in crate::setup::skill_install_dirs(&home) {
-        if !skill_dir.exists() {
-            continue;
-        }
-        if dry_run {
-            println!("[dry-run] Would remove {}", skill_dir.display());
-            continue;
-        }
-        std::fs::remove_dir_all(&skill_dir)
-            .with_context(|| format!("Failed to remove {}", skill_dir.display()))?;
-        if interactive {
-            println!("✓ Removed agent skill directory {}", skill_dir.display());
-        }
+        remove_dir_tree(&skill_dir, dry_run, interactive, "agent skill directory")?;
     }
 
     remove_claude_plugin(&home, dry_run, interactive)?;
 
+    Ok(())
+}
+
+/// Remove one Ahma-managed directory tree, honouring `dry_run` and reporting it when
+/// `interactive`. `what` names the tree in the success line ("Removed <what> <path>").
+///
+/// Shared by every directory teardown here so the exists / dry-run / report sequence
+/// reads as three guard clauses in one place rather than once per call site.
+fn remove_dir_tree(dir: &Path, dry_run: bool, interactive: bool, what: &str) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    if dry_run {
+        println!("[dry-run] Would remove {}", dir.display());
+        return Ok(());
+    }
+    std::fs::remove_dir_all(dir).with_context(|| format!("Failed to remove {}", dir.display()))?;
+    if interactive {
+        println!("✓ Removed {} {}", what, dir.display());
+    }
     Ok(())
 }
 
@@ -458,7 +504,12 @@ pub fn remove_claude_plugin(home: &Path, dry_run: bool, interactive: bool) -> Re
         .join("cache")
         .join("local")
         .join("ahma");
-    remove_claude_plugin_cache_dir(&plugins_dir, dry_run, interactive)?;
+    remove_dir_tree(
+        &plugins_dir,
+        dry_run,
+        interactive,
+        "Claude Code plugin cache",
+    )?;
 
     // Remove from installed_plugins.json
     let plugins_json = home
@@ -474,57 +525,11 @@ pub fn remove_claude_plugin(home: &Path, dry_run: bool, interactive: bool) -> Re
     Ok(())
 }
 
-/// Remove the Claude Code plugin cache directory tree, if present.
-///
-/// Split out of [`remove_claude_plugin`] so the exists/dry-run/interactive
-/// checks read as guard clauses instead of a nested if/else.
-fn remove_claude_plugin_cache_dir(
-    plugins_dir: &Path,
-    dry_run: bool,
-    interactive: bool,
-) -> Result<()> {
-    if !plugins_dir.exists() {
-        return Ok(());
-    }
-    if dry_run {
-        println!("[dry-run] Would remove {}", plugins_dir.display());
-        return Ok(());
-    }
-    std::fs::remove_dir_all(plugins_dir)
-        .with_context(|| format!("Failed to remove {}", plugins_dir.display()))?;
-    if interactive {
-        println!(
-            "✓ Removed Claude Code plugin cache {}",
-            plugins_dir.display()
-        );
-    }
-    Ok(())
-}
-
 /// Remove `plugin_key` from the `plugins` object in `installed_plugins.json`.
 fn remove_installed_plugin_entry(path: &Path, plugin_key: &str, dry_run: bool) -> Result<()> {
-    if !path.exists() {
+    let Some(config) = take_json_section_key(path, "plugins", plugin_key)? else {
         return Ok(());
-    }
-
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut config: Value = serde_json::from_str(&content)
-        .unwrap_or_else(|_| serde_json::json!({"version": 2, "plugins": {}}));
-
-    let plugins = config
-        .as_object_mut()
-        .and_then(|o| o.get_mut("plugins"))
-        .and_then(|p| p.as_object_mut());
-
-    if let Some(map) = plugins {
-        if map.remove(plugin_key).is_none() {
-            return Ok(());
-        }
-    } else {
-        return Ok(());
-    }
-
+    };
     if dry_run {
         println!(
             "[dry-run] Would remove {} from {}",
@@ -533,38 +538,16 @@ fn remove_installed_plugin_entry(path: &Path, plugin_key: &str, dry_run: bool) -
         );
         return Ok(());
     }
-
-    std::fs::write(path, serde_json::to_string_pretty(&config)?)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
+    write_json_pretty(path, &config)
 }
 
 /// Remove `enabledPlugins[plugin_key]` from Claude Code `settings.json`.
 ///
 /// Only touches `enabledPlugins` — hooks and any other user keys are preserved.
 fn disable_claude_plugin(path: &Path, plugin_key: &str, dry_run: bool) -> Result<()> {
-    if !path.exists() {
+    let Some(config) = take_json_section_key(path, "enabledPlugins", plugin_key)? else {
         return Ok(());
-    }
-
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut config: Value =
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
-
-    let enabled = config
-        .as_object_mut()
-        .and_then(|o| o.get_mut("enabledPlugins"))
-        .and_then(|e| e.as_object_mut());
-
-    if let Some(map) = enabled {
-        if map.remove(plugin_key).is_none() {
-            return Ok(());
-        }
-    } else {
-        return Ok(());
-    }
-
+    };
     if dry_run {
         println!(
             "[dry-run] Would remove enabledPlugins.{} from {}",
@@ -573,10 +556,7 @@ fn disable_claude_plugin(path: &Path, plugin_key: &str, dry_run: bool) -> Result
         );
         return Ok(());
     }
-
-    std::fs::write(path, serde_json::to_string_pretty(&config)?)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
+    write_json_pretty(path, &config)
 }
 
 // ── Binary teardown ───────────────────────────────────────────────────────────

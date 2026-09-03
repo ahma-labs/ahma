@@ -765,73 +765,76 @@ fn parse_op_times(op_val: &Value, op: &mut Operation) {
     }
 }
 
+/// Collect a JSON array field's string elements, skipping non-strings. `None`
+/// when the field is absent or is not an array, so the caller can keep the
+/// existing default rather than overwrite it with an empty list.
+fn string_array_field<C: FromIterator<String>>(op_val: &Value, key: &str) -> Option<C> {
+    let arr = op_val.get(key)?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+    )
+}
+
+/// Parse one `status`-tool content item into an [`Operation`]. `None` when the
+/// item's embedded text is not a JSON object or carries no `id` — the only two
+/// required things. Every other field is optional and falls back to the
+/// `Operation::new` default, so an older or newer server shape still yields a
+/// usable row.
+fn parse_operation(item: &Value) -> Option<Operation> {
+    // The operation is JSON embedded in the item's `text` field.
+    let text = item
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    let op_val: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    if !op_val.is_object() {
+        return None;
+    }
+
+    let id = op_val
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)?;
+    let tool = op_val
+        .get("tool")
+        .or_else(|| op_val.get("tool_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let mut op = Operation::new(id, tool, parse_op_status(&op_val));
+    op.started_at = None; // fallback until parse_op_times fills it in
+    if let Some(cwd) = op_val.get("cwd").and_then(|v| v.as_str()) {
+        op.cwd = Some(cwd.to_string());
+    }
+    if let Some(desc) = op_val.get("description").and_then(|v| v.as_str()) {
+        op.description = desc.to_string();
+    }
+    if let Some(parent) = op_val.get("parent_id").and_then(|v| v.as_str()) {
+        op.parent_id = Some(parent.to_string());
+    }
+
+    parse_op_times(&op_val, &mut op);
+
+    if let Some(lines) = string_array_field(&op_val, "stdout_tail") {
+        op.stdout_tail = lines;
+    }
+    if let Some(alerts) = string_array_field(&op_val, "alerts") {
+        op.alerts = alerts;
+    }
+
+    Some(op)
+}
+
 fn parse_operations(val: &Value) -> Vec<Operation> {
     // The `status` tool returns content items; each is a JSON object
     // describing one operation.  We tolerate many shapes gracefully.
-    let content = match val.pointer("/result/content") {
-        Some(Value::Array(arr)) => arr.clone(),
-        _ => return vec![],
+    let Some(Value::Array(content)) = val.pointer("/result/content") else {
+        return vec![];
     };
-
-    content
-        .iter()
-        .filter_map(|item| {
-            // Try JSON-embedded text first
-            let text = item
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or_default();
-
-            // Try to parse the text as JSON; if it is not a JSON object, skip it.
-            let op_val: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-            if !op_val.is_object() {
-                return None;
-            }
-
-            let id = op_val
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)?;
-
-            let tool = op_val
-                .get("tool")
-                .or_else(|| op_val.get("tool_name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            let status = parse_op_status(&op_val);
-
-            let mut op = Operation::new(id, tool, status);
-            op.started_at = None; // fallback
-            if let Some(cwd) = op_val.get("cwd").and_then(|v| v.as_str()) {
-                op.cwd = Some(cwd.to_string());
-            }
-            if let Some(desc) = op_val.get("description").and_then(|v| v.as_str()) {
-                op.description = desc.to_string();
-            }
-            if let Some(parent) = op_val.get("parent_id").and_then(|v| v.as_str()) {
-                op.parent_id = Some(parent.to_string());
-            }
-
-            parse_op_times(&op_val, &mut op);
-
-            if let Some(arr) = op_val.get("stdout_tail").and_then(|v| v.as_array()) {
-                op.stdout_tail = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-            }
-            if let Some(arr) = op_val.get("alerts").and_then(|v| v.as_array()) {
-                op.alerts = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-            }
-
-            Some(op)
-        })
-        .collect()
+    content.iter().filter_map(parse_operation).collect()
 }
 
 // ─── Utility helpers ──────────────────────────────────────────────────────────

@@ -1477,36 +1477,27 @@ async fn finalize_session_result(
                 "stdout_truncated_bytes": collected.dropped_bytes(),
                 "output_file": spill::operation_spill_path(op_id).to_string_lossy(),
             });
-            let status = if exit_code == 0 {
-                OperationStatus::Completed
+            // Monitor status and audit outcome are two views of one verdict —
+            // decided together so they cannot drift apart.
+            let (status, outcome) = if exit_code == 0 {
+                (OperationStatus::Completed, audit::Outcome::Completed)
             } else {
-                OperationStatus::Failed
+                (OperationStatus::Failed, audit::Outcome::Failed)
             };
             monitor
                 .update_status(op_id, status, Some(final_output))
                 .await;
-            let outcome = if exit_code == 0 {
-                audit::Outcome::Completed
-            } else {
-                audit::Outcome::Failed
-            };
             (outcome, Some(exit_code))
         }
         Err(e) => {
-            let timed_out = e.to_string().contains("timed out");
-            let status = if timed_out {
-                OperationStatus::TimedOut
+            let (status, outcome) = if e.to_string().contains("timed out") {
+                (OperationStatus::TimedOut, audit::Outcome::TimedOut)
             } else {
-                OperationStatus::Failed
+                (OperationStatus::Failed, audit::Outcome::Failed)
             };
             monitor
                 .update_status(op_id, status, Some(Value::String(e.to_string())))
                 .await;
-            let outcome = if timed_out {
-                audit::Outcome::TimedOut
-            } else {
-                audit::Outcome::Failed
-            };
             (outcome, None)
         }
     }

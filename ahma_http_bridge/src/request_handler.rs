@@ -184,35 +184,51 @@ async fn session_name_matches_label(s: &crate::session::Session, target_lower: &
     name.to_lowercase().contains(target_lower)
 }
 
+/// First session in `candidates` that can serve sampling.
+///
+/// `require_label` (already lowercased) additionally constrains the match to a
+/// session whose client name contains that label; `None` accepts any
+/// sampling-capable session.
+async fn first_sampling_session(
+    candidates: &[Arc<crate::session::Session>],
+    require_label: Option<&str>,
+) -> Option<Arc<crate::session::Session>> {
+    for s in candidates {
+        if !session_has_sampling(s).await {
+            continue;
+        }
+        let label_matches = match require_label {
+            Some(label) => session_name_matches_label(s, label).await,
+            None => true,
+        };
+        if label_matches {
+            return Some(s.clone());
+        }
+    }
+    None
+}
+
 async fn find_target_session_for_sampling(
     session_manager: &SessionManager,
     current_session_id: &str,
     target_label: Option<&str>,
 ) -> Option<Arc<crate::session::Session>> {
-    let other_sessions: Vec<Arc<crate::session::Session>> = session_manager
+    let candidates: Vec<Arc<crate::session::Session>> = session_manager
         .get_all_sessions()
         .into_iter()
         .filter(|s| s.id != current_session_id)
         .collect();
+
+    // A label match is preferred; any sampling-capable session is the fallback.
     let target_lower = target_label.map(str::to_lowercase);
-
-    // First pass: find a session with sampling that matches target_label
-    if let Some(target) = &target_lower {
-        for s in &other_sessions {
-            if session_has_sampling(s).await && session_name_matches_label(s, target).await {
-                return Some(s.clone());
-            }
+    if let Some(label) = &target_lower {
+        let labelled = first_sampling_session(&candidates, Some(label)).await;
+        if labelled.is_some() {
+            return labelled;
         }
     }
 
-    // Fallback pass: find any session with sampling
-    for s in &other_sessions {
-        if session_has_sampling(s).await {
-            return Some(s.clone());
-        }
-    }
-
-    None
+    first_sampling_session(&candidates, None).await
 }
 
 async fn handle_routed_sampling_request(
@@ -232,21 +248,16 @@ async fn handle_routed_sampling_request(
         .and_then(|l| l.as_str())
         .map(String::from);
 
-    let target_session = match find_target_session_for_sampling(
-        session_manager,
-        session_id,
-        target_label.as_deref(),
-    )
-    .await
-    {
-        Some(s) => s,
-        None => {
-            let err_msg =
-                "No active IDE session (Cursor, VS Code, etc.) with sampling capability found. \
-                 Make sure your IDE is running and connected to ahma."
-                    .to_string();
-            return error_response(original_id, -32603, &err_msg);
-        }
+    let Some(target_session) =
+        find_target_session_for_sampling(session_manager, session_id, target_label.as_deref())
+            .await
+    else {
+        return error_response(
+            original_id,
+            -32603,
+            "No active IDE session (Cursor, VS Code, etc.) with sampling capability found. \
+             Make sure your IDE is running and connected to ahma.",
+        );
     };
 
     // Acquire a sampling permit (bounded concurrency — default 3 simultaneous requests).
@@ -379,43 +390,47 @@ async fn handle_post_request(
     debug!(method = ?method, session_id = ?session_id, has_id = payload.get("id").is_some(), "Incoming MCP request");
 
     if method == Some("initialize") {
-        if let Some(ref id) = session_id
-            && session_manager.session_exists(id)
-        {
-            let _ = session_manager
-                .terminate_session(
-                    id,
-                    crate::session::SessionTerminationReason::ClientRequested,
-                )
-                .await;
-        }
+        terminate_session_being_reinitialized(&session_manager, session_id.as_deref()).await;
         return handle_initialize(&session_manager, &payload, mode).await;
     }
-    if let Some(session_id) = session_id {
-        if method == Some("sampling/createMessage") {
-            return handle_routed_sampling_request(
-                &session_manager,
-                &session_id,
-                payload,
-                mode == ResponseMode::Sse,
-            )
-            .await;
-        }
-        return handle_existing_session_request(
+
+    let Some(session_id) = session_id else {
+        debug!(
+            "Request without session ID for non-initialize method: {:?}",
+            method
+        );
+        return missing_session_id_response(payload_id(&payload));
+    };
+
+    if method == Some("sampling/createMessage") {
+        return handle_routed_sampling_request(
             &session_manager,
             &session_id,
-            method,
-            &payload,
-            mode,
+            payload,
+            mode == ResponseMode::Sse,
         )
         .await;
     }
 
-    debug!(
-        "Request without session ID for non-initialize method: {:?}",
-        method
-    );
-    missing_session_id_response(payload_id(&payload))
+    handle_existing_session_request(&session_manager, &session_id, method, &payload, mode).await
+}
+
+/// An `initialize` that carries a live session id restarts that session: the
+/// old one is torn down first so the client never ends up with two.
+async fn terminate_session_being_reinitialized(
+    session_manager: &SessionManager,
+    session_id: Option<&str>,
+) {
+    if let Some(id) = session_id
+        && session_manager.session_exists(id)
+    {
+        let _ = session_manager
+            .terminate_session(
+                id,
+                crate::session::SessionTerminationReason::ClientRequested,
+            )
+            .await;
+    }
 }
 
 fn validate_initialize_payload(payload: &Value) -> Option<Response> {
@@ -550,18 +565,27 @@ async fn handle_initialize(
         )
         .await
     {
-        Ok(response) => {
-            let encoded = match mode {
-                ResponseMode::Json => json_response(response),
-                ResponseMode::Sse => {
-                    build_initialize_sse_response(session_manager, &new_session_id, &response)
-                }
-            };
-            with_session_header(encoded, &new_session_id)
-        }
+        Ok(response) => with_session_header(
+            encode_initialize_response(session_manager, &new_session_id, response, mode),
+            &new_session_id,
+        ),
         Err(e) => {
             handle_initialize_error(session_manager, &new_session_id, payload_id(payload), e).await
         }
+    }
+}
+
+/// Encode a successful `initialize` response for the caller's transport
+/// (mirrors [`encode_forwarded_response`] for the forwarding path).
+fn encode_initialize_response(
+    session_manager: &Arc<SessionManager>,
+    session_id: &str,
+    response: Value,
+    mode: ResponseMode,
+) -> Response {
+    match mode {
+        ResponseMode::Json => json_response(response),
+        ResponseMode::Sse => build_initialize_sse_response(session_manager, session_id, &response),
     }
 }
 
@@ -1150,27 +1174,13 @@ async fn forward_request(
         .await;
     }
 
-    // For SSE requests, capture the session and subscribe to its broadcast
-    // channel BEFORE sending, so events published while the subprocess handles
-    // the request are not missed. `payload` is a request (has an `id`) by
-    // construction here — notifications already returned above.
-    let sse_subscription = if mode == ResponseMode::Sse {
-        match session_manager.get_session(session_id) {
-            Some(session) => {
-                let rx = session.subscribe();
-                Some((session, rx))
-            }
-            None => return session_not_found_response(payload_id(payload)),
-        }
-    } else {
-        None
+    // `payload` is a request (has an `id`) by construction here —
+    // notifications already returned above.
+    let Ok(sse_subscription) = capture_sse_subscription(session_manager, session_id, mode) else {
+        return session_not_found_response(payload_id(payload));
     };
 
-    let request_timeout = if method == Some("tools/call") {
-        calculate_tool_timeout(payload, session_manager.tool_call_timeout_secs())
-    } else {
-        Duration::from_secs(session_manager.request_timeout_secs())
-    };
+    let request_timeout = forwarded_request_timeout(session_manager, method, payload);
 
     match session_manager
         .send_request(session_id, payload, Some(request_timeout))
@@ -1223,11 +1233,44 @@ type SseSubscription = (
     tokio::sync::broadcast::Receiver<(u64, String)>,
 );
 
+/// Subscribe to the session's broadcast channel BEFORE a request is sent, so
+/// events published while the subprocess handles it are not missed.
+///
+/// `Ok(None)` on the JSON transport (nothing to interleave); `Err(())` when the
+/// SSE transport names a session that no longer exists, which the caller turns
+/// into a `session_not_found_response`.
+fn capture_sse_subscription(
+    session_manager: &SessionManager,
+    session_id: &str,
+    mode: ResponseMode,
+) -> Result<Option<SseSubscription>, ()> {
+    if mode != ResponseMode::Sse {
+        return Ok(None);
+    }
+    let session = session_manager.get_session(session_id).ok_or(())?;
+    let rx = session.subscribe();
+    Ok(Some((session, rx)))
+}
+
+/// Wait budget for a forwarded request: `tools/call` gets the (per-tool,
+/// ceiling-capped) tool budget, everything else the plain request timeout.
+fn forwarded_request_timeout(
+    session_manager: &SessionManager,
+    method: Option<&str>,
+    payload: &Value,
+) -> Duration {
+    if method == Some("tools/call") {
+        calculate_tool_timeout(payload, session_manager.tool_call_timeout_secs())
+    } else {
+        Duration::from_secs(session_manager.request_timeout_secs())
+    }
+}
+
 /// Encode a successfully forwarded request's response for the wire.
 ///
 /// `sse_subscription` is `Some` exactly when the caller is on the SSE
 /// transport and the subscription was captured before the request was sent
-/// (see the guard in [`forward_request`]); this stays a pure encode step over
+/// (see [`capture_sse_subscription`]); this stays a pure encode step over
 /// that already-resolved state.
 fn encode_forwarded_response(
     sse_subscription: Option<SseSubscription>,

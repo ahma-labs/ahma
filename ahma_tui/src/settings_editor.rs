@@ -154,6 +154,61 @@ impl SettingItem {
     }
 }
 
+// ─── Typed assignment from an edited value ────────────────────────────────────
+
+/// Pull the payload of a `SettingValue` out as the type a settings field wants,
+/// or `None` when the row carries a different variant than the field it targets.
+trait FromSettingValue: Sized {
+    fn from_setting_value(value: &SettingValue) -> Option<Self>;
+}
+
+impl FromSettingValue for bool {
+    fn from_setting_value(value: &SettingValue) -> Option<Self> {
+        match value {
+            SettingValue::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+impl FromSettingValue for u64 {
+    fn from_setting_value(value: &SettingValue) -> Option<Self> {
+        match value {
+            SettingValue::U64(v) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+impl FromSettingValue for u32 {
+    fn from_setting_value(value: &SettingValue) -> Option<Self> {
+        match value {
+            SettingValue::U32(v) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+impl FromSettingValue for String {
+    fn from_setting_value(value: &SettingValue) -> Option<Self> {
+        match value {
+            SettingValue::String(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Assign an edited value into a settings field, ignoring a variant mismatch.
+///
+/// The `apply_*` dispatchers below are index-to-field tables; without this
+/// helper every row repeated the same "match the variant, then assign" nest,
+/// which is what made them the densest functions in the module.
+fn assign_setting<T: FromSettingValue>(target: &mut T, value: &SettingValue) {
+    if let Some(v) = T::from_setting_value(value) {
+        *target = v;
+    }
+}
+
 // ─── Settings editor state ────────────────────────────────────────────────────
 
 /// State for the TUI settings panel overlay.
@@ -652,31 +707,11 @@ impl SettingsEditor {
     fn apply_tool(&mut self, index: usize, value: &SettingValue) {
         let t = &mut self.settings.tools;
         match index {
-            0 => {
-                if let SettingValue::U64(v) = value {
-                    t.timeout_secs = *v;
-                }
-            }
-            1 => {
-                if let SettingValue::Bool(v) = value {
-                    t.force_sync = *v;
-                }
-            }
-            2 => {
-                if let SettingValue::Bool(v) = value {
-                    t.skip_probes = *v;
-                }
-            }
-            3 => {
-                if let SettingValue::Bool(v) = value {
-                    t.minimize_tokens = *v;
-                }
-            }
-            4 => {
-                if let SettingValue::Bool(v) = value {
-                    t.small_model_harness = *v;
-                }
-            }
+            0 => assign_setting(&mut t.timeout_secs, value),
+            1 => assign_setting(&mut t.force_sync, value),
+            2 => assign_setting(&mut t.skip_probes, value),
+            3 => assign_setting(&mut t.minimize_tokens, value),
+            4 => assign_setting(&mut t.small_model_harness, value),
             _ => {}
         }
     }
@@ -702,26 +737,10 @@ impl SettingsEditor {
     fn apply_logging(&mut self, index: usize, value: &SettingValue) {
         let l = &mut self.settings.logging;
         match index {
-            0 => {
-                if let SettingValue::String(v) = value {
-                    l.target = v.clone();
-                }
-            }
-            1 => {
-                if let SettingValue::Bool(v) = value {
-                    l.log_monitor = *v;
-                }
-            }
-            2 => {
-                if let SettingValue::U64(v) = value {
-                    l.monitor_rate_limit_secs = *v;
-                }
-            }
-            3 => {
-                if let SettingValue::String(v) = value {
-                    l.dir = v.clone();
-                }
-            }
+            0 => assign_setting(&mut l.target, value),
+            1 => assign_setting(&mut l.log_monitor, value),
+            2 => assign_setting(&mut l.monitor_rate_limit_secs, value),
+            3 => assign_setting(&mut l.dir, value),
             _ => {}
         }
     }
@@ -729,21 +748,9 @@ impl SettingsEditor {
     fn apply_http(&mut self, index: usize, value: &SettingValue) {
         let h = &mut self.settings.http;
         match index {
-            0 => {
-                if let SettingValue::U64(v) = value {
-                    h.handshake_timeout_secs = *v;
-                }
-            }
-            1 => {
-                if let SettingValue::Bool(v) = value {
-                    h.disable_quic = *v;
-                }
-            }
-            2 => {
-                if let SettingValue::Bool(v) = value {
-                    h.disable_http1_1 = *v;
-                }
-            }
+            0 => assign_setting(&mut h.handshake_timeout_secs, value),
+            1 => assign_setting(&mut h.disable_quic, value),
+            2 => assign_setting(&mut h.disable_http1_1, value),
             _ => {}
         }
     }
@@ -751,16 +758,8 @@ impl SettingsEditor {
     fn apply_auth(&mut self, index: usize, value: &SettingValue) {
         let a = &mut self.settings.auth;
         match index {
-            0 => {
-                if let SettingValue::U64(v) = value {
-                    a.rate_limit_rps = *v;
-                }
-            }
-            1 => {
-                if let SettingValue::U32(v) = value {
-                    a.rate_limit_burst = *v;
-                }
-            }
+            0 => assign_setting(&mut a.rate_limit_rps, value),
+            1 => assign_setting(&mut a.rate_limit_burst, value),
             _ => {}
         }
     }

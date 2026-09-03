@@ -516,6 +516,30 @@ async fn open_file_and_seek_to_end(
     Some((file, pos))
 }
 
+/// Fold freshly-read lines into the analysis chunk, flushing it (and
+/// restarting the time window) each time it reaches `max_lines`.
+///
+/// This is one of the two documented flush triggers — `chunk_max_lines` here,
+/// `chunk_max_seconds` in the caller's poll loop. Keeping it out of the loop
+/// body is what stops the file-growth arm from nesting five levels deep.
+async fn extend_chunk(
+    op_id: &str,
+    ctx: &AnalysisCtx<'_>,
+    new_lines: Vec<String>,
+    chunk: &mut Vec<String>,
+    chunk_start: &mut Instant,
+    last_alert: &mut Option<Instant>,
+    max_lines: usize,
+) {
+    for line_clean in new_lines {
+        chunk.push(line_clean);
+        if chunk.len() >= max_lines {
+            maybe_analyze(op_id, ctx, chunk, last_alert).await;
+            *chunk_start = Instant::now();
+        }
+    }
+}
+
 /// Run the file-log tailing pipeline, reading from the file as it grows.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_file_monitor_pipeline(
@@ -610,14 +634,16 @@ pub async fn run_file_monitor_pipeline(
                     let new_lines =
                         process_new_bytes(&buffer, n, &mut remainder, op_id, monitor.as_ref())
                             .await;
-                    for line_clean in new_lines {
-                        chunk.push(line_clean);
-
-                        if chunk.len() >= chunk_max_lines {
-                            maybe_analyze(op_id, &ctx, &mut chunk, &mut last_alert).await;
-                            chunk_start = Instant::now();
-                        }
-                    }
+                    extend_chunk(
+                        op_id,
+                        &ctx,
+                        new_lines,
+                        &mut chunk,
+                        &mut chunk_start,
+                        &mut last_alert,
+                        chunk_max_lines,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     warn!("file_monitor[{}]: read error: {}", op_id, e);

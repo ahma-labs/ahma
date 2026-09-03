@@ -72,6 +72,8 @@ $env:RUSTFLAGS='--cfg reqwest_unstable'
 cargo install --git https://github.com/paulirotta/ahma --branch <branch-name> ahma_bin --bin ahma --root $HOME\.local --locked --force
 ```
 
+**macOS:** re-sign after the first-time install — `codesign --force --sign - --options runtime "$(command -v ahma)"` — see the note below; `ahma update <branch-name>` does this for you on subsequent updates.
+
 </details>
 
 <details>

@@ -729,21 +729,19 @@ fn build_mcp_router(
         // `.expect()` turned that typo into a panic with a message that named
         // neither value; the operator saw a backtrace where they should have
         // seen which number was wrong.
-        let governor_conf = match GovernorConfigBuilder::default()
+        let governor_conf = GovernorConfigBuilder::default()
             .per_second(rate_limit_rps)
             .burst_size(rate_limit_burst)
             .key_extractor(SmartIpKeyExtractor)
             .finish()
-        {
-            Some(conf) => Arc::new(conf),
-            None => {
-                return Err(crate::error::BridgeError::Config(format!(
+            .map(Arc::new)
+            .ok_or_else(|| {
+                crate::error::BridgeError::Config(format!(
                     "--rate-limit-rps {rate_limit_rps} with --rate-limit-burst \
                      {rate_limit_burst} was rejected. Both must be non-zero, and the burst \
                      must be at least as large as the per-second rate."
-                )));
-            }
-        };
+                ))
+            })?;
         mcp_routes.layer(GovernorLayer::new(governor_conf))
     } else {
         mcp_routes
@@ -831,13 +829,13 @@ fn print_quic_info(quic_info: &Option<QuicInfo>, enable_quic: bool, local_addr: 
     }
 }
 
-/// Serve MCP Streamable HTTP over a TCP socket.
-async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
-    info!("Starting HTTP bridge on {}", config.bind_addr);
-    warn_if_non_loopback(config.bind_addr);
-
+/// Build the per-process bridge state and start the background tasks both
+/// transports need: the idle-session reaper and the SIGHUP token-reload
+/// handler. Everything transport-specific (binding, QUIC, socket cleanup)
+/// stays in the caller.
+fn init_bridge_runtime(config: &BridgeConfig) -> Arc<BridgeState> {
     info!("Session isolation: ENABLED (always-on)");
-    let state = build_bridge_state(&config);
+    let state = build_bridge_state(config);
     if let Some(timeout) = config.idle_timeout_secs
         && timeout > 0
     {
@@ -845,6 +843,15 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
     }
     // Install SIGHUP handler for zero-downtime token rotation.
     maybe_install_sighup_handler(state.clone(), config.require_token_path.clone());
+    state
+}
+
+/// Serve MCP Streamable HTTP over a TCP socket.
+async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
+    info!("Starting HTTP bridge on {}", config.bind_addr);
+    warn_if_non_loopback(config.bind_addr);
+
+    let state = init_bridge_runtime(&config);
 
     // MCP Streamable HTTP transport: single endpoint supporting POST, GET (SSE), DELETE.
     // See: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http
@@ -902,15 +909,14 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
         });
     }
 
-    if config.disable_http1_1 {
-        info!(
+    info!(
+        "{}",
+        if config.disable_http1_1 {
             "Protocol: HTTP/2+ only (HTTP/1.1 disabled; clients may upgrade to HTTP/3 via Alt-Svc)"
-        );
-    } else {
-        info!(
+        } else {
             "Protocol: HTTP/1.1 + HTTP/2 (clients may upgrade to HTTP/3 via Alt-Svc when available)"
-        );
-    }
+        }
+    );
 
     // Spawn graceful shutdown handler (SIGINT/SIGTERM).
     tokio::spawn(async move {
@@ -1009,6 +1015,60 @@ fn unix_socket_identity(socket_path: &str) -> Option<(u64, u64)> {
         .map(|m| (m.dev(), m.ino()))
 }
 
+/// Serve a single accepted Unix-domain-socket stream over auto HTTP/1.1+HTTP/2.
+///
+/// Unlike [`serve_tcp_connection`] there is no `ConnectInfo` to inject: a UDS
+/// peer has no IP address, so per-IP middleware (the rate limiter) simply
+/// never fires on this transport.
+#[cfg(unix)]
+async fn serve_unix_connection(stream: tokio::net::UnixStream, app: Router) {
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let hyper_svc =
+        hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let mut svc = app.clone();
+            async move {
+                use tower::Service;
+                let req = req.map(axum::body::Body::new);
+                svc.call(req).await
+            }
+        });
+    if let Err(e) =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .serve_connection(io, hyper_svc)
+            .await
+    {
+        tracing::debug!("Unix socket HTTP connection closed: {:#}", e);
+    }
+}
+
+/// Terminate every session on SIGINT/SIGTERM, then remove the socket file if
+/// this process still owns it (SPEC R-ISO.3) — if another server has replaced
+/// the path in the meantime, deleting it would orphan *their* live socket.
+///
+/// `owned_socket_identity` is `None` for abstract sockets, which have no file.
+#[cfg(unix)]
+fn spawn_unix_shutdown_handler(
+    state: Arc<BridgeState>,
+    socket_path: String,
+    raw_socket_path: String,
+    owned_socket_identity: Option<(u64, u64)>,
+) {
+    tokio::spawn(async move {
+        await_shutdown_signal().await;
+        info!("Bridge (Unix) received shutdown signal — terminating all sessions.");
+        state
+            .session_manager
+            .terminate_all(crate::session::SessionTerminationReason::Timeout)
+            .await;
+        if let Some(owned) = owned_socket_identity
+            && unix_socket_identity(&socket_path) == Some(owned)
+        {
+            ahma_common::fs_lock::remove_stale_socket(&raw_socket_path);
+        }
+        std::process::exit(0);
+    });
+}
+
 /// Serve MCP Streamable HTTP over a Unix domain socket.
 ///
 /// The socket path may use the `@` prefix for Linux abstract sockets.
@@ -1029,16 +1089,8 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     check_unix_socket_path_length(&socket_path)?;
 
     info!("Starting HTTP bridge on Unix socket: {}", raw_socket_path);
-    info!("Session isolation: ENABLED (always-on)");
 
-    let state = build_bridge_state(&config);
-    if let Some(timeout) = config.idle_timeout_secs
-        && timeout > 0
-    {
-        spawn_idle_timeout_checker(timeout, state.clone());
-    }
-    // Install SIGHUP handler for zero-downtime token rotation.
-    maybe_install_sighup_handler(state.clone(), config.require_token_path.clone());
+    let state = init_bridge_runtime(&config);
 
     // For Unix sockets, CORS origin matching is less meaningful but we still
     // build the layer for middleware compatibility.
@@ -1085,51 +1137,19 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     eprintln!("AHMA_UNIX_SOCKET_PATH={}", raw_socket_path);
 
     // Graceful shutdown: on SIGINT/SIGTERM, terminate all sessions, remove the socket, exit.
-    let socket_path_for_shutdown = socket_path.clone();
-    let raw_socket_path_for_shutdown = raw_socket_path.clone();
-    tokio::spawn(async move {
-        await_shutdown_signal().await;
-        info!("Bridge (Unix) received shutdown signal — terminating all sessions.");
-        shutdown_state
-            .session_manager
-            .terminate_all(crate::session::SessionTerminationReason::Timeout)
-            .await;
-        // Remove the socket file only if it is still the one this process
-        // bound (SPEC R-ISO.3) — if another server has replaced the path in
-        // the meantime, deleting it would orphan *their* live socket.
-        if let Some(owned) = owned_socket_identity
-            && unix_socket_identity(&socket_path_for_shutdown) == Some(owned)
-        {
-            ahma_common::fs_lock::remove_stale_socket(&raw_socket_path_for_shutdown);
-        }
-        std::process::exit(0);
-    });
+    spawn_unix_shutdown_handler(
+        shutdown_state,
+        socket_path.clone(),
+        raw_socket_path.clone(),
+        owned_socket_identity,
+    );
 
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .map_err(|e| BridgeError::HttpServer(format!("Unix accept error: {}", e)))?;
-        let svc = app.clone();
-        tokio::spawn(async move {
-            let io = hyper_util::rt::TokioIo::new(stream);
-            let hyper_svc =
-                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                    let mut svc = svc.clone();
-                    async move {
-                        use tower::Service;
-                        let req = req.map(axum::body::Body::new);
-                        svc.call(req).await
-                    }
-                });
-            if let Err(e) =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(io, hyper_svc)
-                    .await
-            {
-                tracing::debug!("Unix socket HTTP connection closed: {:#}", e);
-            }
-        });
+        tokio::spawn(serve_unix_connection(stream, app.clone()));
     }
 }
 
@@ -1359,12 +1379,9 @@ async fn handle_session_delete(
         return rejection;
     }
     // Get session ID from header
-    let session_id = match session_id_from_headers(&headers) {
-        Some(id) => id.to_string(),
-        None => {
-            warn!("DELETE request without session ID header");
-            return (StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response();
-        }
+    let Some(session_id) = session_id_from_headers(&headers).map(str::to_string) else {
+        warn!("DELETE request without session ID header");
+        return (StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response();
     };
 
     info!(session_id = %session_id, "Session termination requested via HTTP DELETE");
@@ -1472,38 +1489,75 @@ impl<S> Drop for CleanupStream<S> {
     }
 }
 
-async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: HeaderMap) -> Response {
-    if let Some(rejection) = validate_origin(&headers) {
-        return rejection;
+/// Resolve the live session an SSE GET is addressed to, or the response that
+/// rejects the request.
+///
+/// A missing, unknown or terminated session is all one bare 404: returning
+/// 400/501 would let a client probing `GET /mcp` detect that SSE exists here,
+/// which starts an OAuth flow against a bridge that requires no auth.
+///
+/// The rejection is boxed because an `axum` `Response` is large enough that
+/// carrying it inline would make every `Ok` return pay for the error variant
+/// (`clippy::result_large_err`); the caller unboxes it straight into a return.
+fn resolve_sse_session(
+    state: &BridgeState,
+    headers: &HeaderMap,
+) -> std::result::Result<(String, Arc<crate::session::Session>), Box<Response>> {
+    if let Some(rejection) = validate_origin(headers) {
+        return Err(Box::new(rejection));
     }
-    if let Some(rejection) = validate_protocol_version_header(&headers) {
-        return rejection;
+    if let Some(rejection) = validate_protocol_version_header(headers) {
+        return Err(Box::new(rejection));
     }
-    // Get session ID from header - required for SSE
-    // Return 404 (not 400) to hide SSE from clients without a session
-    let session_id = match session_id_from_headers(&headers) {
-        Some(id) => id.to_string(),
-        None => {
-            debug!("SSE request without session ID header - returning 404");
-            // 404 makes clients think SSE doesn't exist, avoiding OAuth probes
-            return StatusCode::NOT_FOUND.into_response();
-        }
-    };
 
+    let Some(session_id) = session_id_from_headers(headers).map(str::to_string) else {
+        debug!("SSE request without session ID header - returning 404");
+        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
+    };
     debug!(session_id = %session_id, "SSE GET request received with session header");
 
-    // Get the session - 404 if not found
-    let session = match state.session_manager.get_session(&session_id) {
-        Some(s) => s,
-        None => {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-    };
-
-    // Check if session is terminated
-    if session.is_terminated() {
-        return StatusCode::NOT_FOUND.into_response();
+    match state.session_manager.get_session(&session_id) {
+        Some(session) if !session.is_terminated() => Ok((session_id, session)),
+        _ => Err(Box::new(StatusCode::NOT_FOUND.into_response())),
     }
+}
+
+/// Announce the newly live SSE push channel to the session and its subprocess.
+async fn signal_sse_connected(
+    state: &BridgeState,
+    session: &crate::session::Session,
+    session_id: &str,
+) {
+    // Mark SSE as connected - if MCP is already initialized, this will trigger roots/list_changed
+    match session.mark_sse_connected().await {
+        // Handshake just reached RootsRequested; auto-lock from default_scope if configured.
+        Ok(true) => {
+            state
+                .session_manager
+                .auto_lock_if_default_scope(session_id)
+                .await
+        }
+        Ok(false) => {}
+        Err(e) => warn!(session_id = %session_id, "Failed to mark SSE connected: {}", e),
+    }
+
+    // Tell the subprocess it now has a live push channel — unconditionally
+    // (unlike `mark_sse_connected`'s handshake transition, which only fires
+    // once), so a reconnect after a dropped stream re-signals it too. A
+    // failed send just leaves the subprocess at its conservative default;
+    // there is no live channel yet to un-signal a stale disconnect, since a
+    // permanent disconnect instead terminates the whole session (and its
+    // subprocess) via `CleanupStream::drop`.
+    if let Err(e) = session.send_push_channel_changed(true).await {
+        warn!(session_id = %session_id, "Failed to notify subprocess of live push channel: {}", e);
+    }
+}
+
+async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: HeaderMap) -> Response {
+    let (session_id, session) = match resolve_sse_session(&state, &headers) {
+        Ok(resolved) => resolved,
+        Err(rejection) => return *rejection,
+    };
 
     info!(session_id = %session_id, "SSE stream opened");
 
@@ -1518,31 +1572,7 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
 
-    // Mark SSE as connected - if MCP is already initialized, this will trigger roots/list_changed
-    match session.mark_sse_connected().await {
-        Ok(true) => {
-            // Handshake just reached RootsRequested; auto-lock from default_scope if configured.
-            state
-                .session_manager
-                .auto_lock_if_default_scope(&session_id)
-                .await;
-        }
-        Ok(false) => {}
-        Err(e) => {
-            warn!(session_id = %session_id, "Failed to mark SSE connected: {}", e);
-        }
-    }
-
-    // Tell the subprocess it now has a live push channel — unconditionally
-    // (unlike `mark_sse_connected`'s handshake transition, which only fires
-    // once), so a reconnect after a dropped stream re-signals it too. A
-    // failed send just leaves the subprocess at its conservative default;
-    // there is no live channel yet to un-signal a stale disconnect, since a
-    // permanent disconnect instead terminates the whole session (and its
-    // subprocess) via `CleanupStream::drop` below.
-    if let Err(e) = session.send_push_channel_changed(true).await {
-        warn!(session_id = %session_id, "Failed to notify subprocess of live push channel: {}", e);
-    }
+    signal_sse_connected(&state, &session, &session_id).await;
 
     // Build replay stream from history (if Last-Event-Id was provided)
     let replay_events = last_event_id
