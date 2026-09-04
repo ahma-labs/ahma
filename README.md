@@ -324,6 +324,7 @@ Issues and pull requests are welcome. This project is AI friendly and provides t
 - **`AGENTS.md`/`CLAUDE.md`**: Instructions for AI agents to use the MCP server to contribute to the project.
 - **`SPEC.md`**: This is the **single source of truth** for the project requirements. AI keeps it up to date as you work on the project.
 - **[docs/build-and-test-performance.md](docs/build-and-test-performance.md)**: why `target/` used to grow to tens of GB, what the build/test layout does about it, and the measurements behind the rules in `AGENTS.md`.
+- **Design records**: completed plans kept for the *why*, not as current documentation — [docs/control-plane-redesign.md](docs/control-plane-redesign.md) (why `ahma tui` is a thin client over the `ahma serve` daemon), [docs/permissions-ux-execution-plan.md](docs/permissions-ux-execution-plan.md) (why the permissions ladder is shaped the way it is), and [docs/token-optimization.md](docs/token-optimization.md) (the small-model harness research, with an implementation-status table).
 
 ## Working well with Claude (Sonnet / Opus)
 

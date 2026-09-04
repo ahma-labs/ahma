@@ -119,21 +119,44 @@ const COMPACTION_INSTRUCTIONS: &str = "You are compacting an earlier portion of 
 /// System-prompt suffix that asks for terse output when minimizing tokens.
 const MINIMIZE_CONCISENESS_RULE: &str = "\n\nRespond concisely. No preamble, no conversational filler. Output only the tool call, code, or bare answer.";
 
-/// Policy controlling how much context is sent to the model: the per-result and
-/// per-conversation character budgets, plus any system-prompt augmentation for
-/// token minimization. This is the single seam for context handling — swap in a
-/// smarter (e.g. real-tokenizer) strategy in future without touching the agent
-/// loop. [`BudgetStrategy`] is the default character-heuristic implementation.
-pub trait ContextStrategy: Send + Sync {
+impl McpChatConfig {
     /// Max characters for a single tool result injected into the conversation.
-    fn tool_result_char_cap(&self) -> usize;
-    /// Total character budget for the whole conversation sent to the model.
-    fn conversation_char_budget(&self) -> usize;
-    /// Optional suffix appended to the system prompt (e.g. a conciseness rule
-    /// when minimizing tokens). `None` leaves the prompt unchanged.
-    fn system_prompt_suffix(&self) -> Option<&'static str> {
-        None
+    ///
+    /// Character budgets are derived from the model's context window (or from
+    /// generous/tight defaults) using a ~4 chars/token heuristic.
+    ///
+    /// This and the three methods below were a `ContextStrategy` trait with a
+    /// single `BudgetStrategy` implementor, reached through a `context_strategy()`
+    /// factory and, for two of the four, a free-function wrapper on top of that
+    /// — four hops from caller to a three-arm `match`. Nothing was ever
+    /// dynamically dispatched: `context_strategy()` returned the concrete type,
+    /// so the trait abstracted nothing at any call boundary. The state it
+    /// carried was a copy of three fields already on this struct.
+    pub fn tool_result_char_cap(&self) -> usize {
+        match self.context_length {
+            // A single tool result may use at most a quarter of the window.
+            Some(tokens) => ((tokens as usize) * CHARS_PER_TOKEN / 4).max(1_000),
+            None if self.small_model_harness => SMALL_MODEL_TOOL_RESULT_CHAR_CAP,
+            None => DEFAULT_TOOL_RESULT_CHAR_CAP,
+        }
     }
+
+    /// Total character budget for the whole conversation sent to the model.
+    pub fn conversation_char_budget(&self) -> usize {
+        match self.context_length {
+            // Keep a quarter of the window free for the model's response.
+            Some(tokens) => ((tokens as usize) * CHARS_PER_TOKEN * 3 / 4).max(4_000),
+            None if self.small_model_harness => SMALL_MODEL_CONVERSATION_CHAR_BUDGET,
+            None => DEFAULT_CONVERSATION_CHAR_BUDGET,
+        }
+    }
+
+    /// Suffix appended to the system prompt when minimizing tokens (a
+    /// conciseness rule). `None` leaves the prompt unchanged.
+    pub fn system_prompt_suffix(&self) -> Option<&'static str> {
+        self.minimize_tokens.then_some(MINIMIZE_CONCISENESS_RULE)
+    }
+
     /// Fraction of the context window (0.0-1.0), measured from the *real*
     /// reported prompt-token usage, at which proactive compaction should
     /// trigger — replacing the oldest non-recent history with a structured
@@ -143,48 +166,9 @@ pub trait ContextStrategy: Send + Sync {
     ///
     /// Quality degrades well before the hard token wall ("lost in the
     /// middle"), and that cliff comes sooner for small/local models than for
-    /// large hosted ones — so the default is deliberately tighter under
+    /// large hosted ones — so the threshold is deliberately tighter under
     /// `small_model_harness`.
-    fn compaction_threshold(&self) -> Option<f32> {
-        None
-    }
-}
-
-/// The default context strategy: character budgets derived from the model's
-/// context window (or generous/tight defaults) using a ~4 chars/token heuristic.
-pub struct BudgetStrategy {
-    /// Model context window in tokens, when known.
-    pub context_length: Option<u32>,
-    /// Tighten budgets for small local models.
-    pub small_model_harness: bool,
-    /// Append the conciseness rule to the system prompt.
-    pub minimize_tokens: bool,
-}
-
-impl ContextStrategy for BudgetStrategy {
-    fn tool_result_char_cap(&self) -> usize {
-        match self.context_length {
-            // A single tool result may use at most a quarter of the window.
-            Some(tokens) => ((tokens as usize) * CHARS_PER_TOKEN / 4).max(1_000),
-            None if self.small_model_harness => SMALL_MODEL_TOOL_RESULT_CHAR_CAP,
-            None => DEFAULT_TOOL_RESULT_CHAR_CAP,
-        }
-    }
-
-    fn conversation_char_budget(&self) -> usize {
-        match self.context_length {
-            // Keep a quarter of the window free for the model's response.
-            Some(tokens) => ((tokens as usize) * CHARS_PER_TOKEN * 3 / 4).max(4_000),
-            None if self.small_model_harness => SMALL_MODEL_CONVERSATION_CHAR_BUDGET,
-            None => DEFAULT_CONVERSATION_CHAR_BUDGET,
-        }
-    }
-
-    fn system_prompt_suffix(&self) -> Option<&'static str> {
-        self.minimize_tokens.then_some(MINIMIZE_CONCISENESS_RULE)
-    }
-
-    fn compaction_threshold(&self) -> Option<f32> {
+    pub fn compaction_threshold(&self) -> Option<f32> {
         // Only meaningful when the window size is actually known — without it
         // there is no denominator to compute a fill fraction against, so the
         // reactive char-budget trim remains the only safety net.
@@ -196,31 +180,6 @@ impl ContextStrategy for BudgetStrategy {
             }
         })
     }
-}
-
-impl McpChatConfig {
-    /// The context strategy for this run. Currently always a [`BudgetStrategy`];
-    /// returning it through the [`ContextStrategy`] trait keeps the agent loop
-    /// decoupled from the concrete choice.
-    pub fn context_strategy(&self) -> BudgetStrategy {
-        BudgetStrategy {
-            context_length: self.context_length,
-            small_model_harness: self.small_model_harness,
-            minimize_tokens: self.minimize_tokens,
-        }
-    }
-}
-
-/// Character cap for a single tool result injected into the conversation.
-/// Thin wrapper over the run's [`ContextStrategy`].
-pub fn tool_result_char_cap(cfg: &McpChatConfig) -> usize {
-    cfg.context_strategy().tool_result_char_cap()
-}
-
-/// Total character budget for the conversation sent to the model.
-/// Thin wrapper over the run's [`ContextStrategy`].
-pub fn conversation_char_budget(cfg: &McpChatConfig) -> usize {
-    cfg.context_strategy().conversation_char_budget()
 }
 
 /// Truncate the middle of `s` to at most `cap` characters, keeping the head
@@ -330,9 +289,7 @@ async fn maybe_compact_conversation(
     if last_prompt_tokens == 0 {
         return;
     }
-    let strategy = cfg.context_strategy();
-    let (Some(threshold), Some(context_length)) =
-        (strategy.compaction_threshold(), cfg.context_length)
+    let (Some(threshold), Some(context_length)) = (cfg.compaction_threshold(), cfg.context_length)
     else {
         return;
     };
@@ -1082,7 +1039,7 @@ pub async fn execute_agent_turn(
 ) -> bool {
     if let Some(cfg) = mcp {
         maybe_compact_conversation(client, msg_json, cfg, *last_prompt_tokens).await;
-        trim_conversation(msg_json, conversation_char_budget(cfg));
+        trim_conversation(msg_json, cfg.conversation_char_budget());
     }
 
     let Some((completion, content_streamed)) = fetch_completion(
@@ -1206,7 +1163,7 @@ async fn dispatch_turn_tool_calls(
         (false, false)
     };
 
-    let result_char_cap = tool_result_char_cap(&mcp_cfg);
+    let result_char_cap = mcp_cfg.tool_result_char_cap();
     for (tool_call_id, tool_name, payload, failed) in tool_results {
         push_tool_message_with_hints(
             msg_json,
@@ -1229,9 +1186,7 @@ fn system_prompt_for_run(
     system_prompt: Option<String>,
     mcp: &Option<McpChatConfig>,
 ) -> Option<String> {
-    let suffix = mcp
-        .as_ref()
-        .and_then(|cfg| cfg.context_strategy().system_prompt_suffix());
+    let suffix = mcp.as_ref().and_then(|cfg| cfg.system_prompt_suffix());
     let Some(suffix) = suffix else {
         return system_prompt;
     };
@@ -1359,7 +1314,7 @@ async fn finish_with_limit_summary(
         )
     }));
     if let Some(cfg) = mcp {
-        trim_conversation(msg_json, conversation_char_budget(cfg));
+        trim_conversation(msg_json, cfg.conversation_char_budget());
     }
 
     match fetch_completion(client, msg_json, &[], mcp, tx, messages, system_prompt).await {
@@ -2129,7 +2084,7 @@ mod tests {
         assert_eq!(cfg.context_length, Some(16_384));
         // And the compaction trigger actually engages with that denominator.
         assert!(
-            cfg.context_strategy().compaction_threshold().is_some(),
+            cfg.compaction_threshold().is_some(),
             "a known context window must enable a compaction threshold"
         );
 
@@ -2167,16 +2122,16 @@ mod tests {
     #[test]
     fn budgets_scale_with_context_length() {
         let cfg = cfg_with(Some(8192), false);
-        assert_eq!(tool_result_char_cap(&cfg), 8192);
-        assert_eq!(conversation_char_budget(&cfg), 24576);
+        assert_eq!(cfg.tool_result_char_cap(), 8192);
+        assert_eq!(cfg.conversation_char_budget(), 24576);
     }
 
     #[test]
     fn small_model_harness_tightens_default_budgets() {
         let small = cfg_with(None, true);
         let normal = cfg_with(None, false);
-        assert!(tool_result_char_cap(&small) < tool_result_char_cap(&normal));
-        assert!(conversation_char_budget(&small) < conversation_char_budget(&normal));
+        assert!(small.tool_result_char_cap() < normal.tool_result_char_cap());
+        assert!(small.conversation_char_budget() < normal.conversation_char_budget());
     }
 
     #[test]
@@ -2255,13 +2210,16 @@ mod tests {
         assert_eq!(msgs, before);
     }
 
+    /// Budgets come from the context window when it is known, and from the
+    /// small-model/default constants when it is not.
+    ///
+    /// The `context_strategy_maps_config_and_wrappers_delegate` test that used
+    /// to sit beside this one asserted only that a wrapper delegated to the
+    /// method it wrapped. It had no behavioural content and went with the
+    /// indirection it existed to describe.
     #[test]
-    fn budget_strategy_budgets_and_suffix() {
-        let default = BudgetStrategy {
-            context_length: None,
-            small_model_harness: false,
-            minimize_tokens: false,
-        };
+    fn budgets_and_suffix_follow_the_window_then_the_flags() {
+        let default = cfg_with(None, false);
         assert_eq!(default.tool_result_char_cap(), DEFAULT_TOOL_RESULT_CHAR_CAP);
         assert_eq!(
             default.conversation_char_budget(),
@@ -2269,11 +2227,8 @@ mod tests {
         );
         assert_eq!(default.system_prompt_suffix(), None);
 
-        let small = BudgetStrategy {
-            context_length: None,
-            small_model_harness: true,
-            minimize_tokens: true,
-        };
+        let mut small = cfg_with(None, true);
+        small.minimize_tokens = true;
         assert_eq!(
             small.tool_result_char_cap(),
             SMALL_MODEL_TOOL_RESULT_CHAR_CAP
@@ -2289,45 +2244,17 @@ mod tests {
         );
 
         // A known context window drives both budgets and overrides the flag.
-        let windowed = BudgetStrategy {
-            context_length: Some(8_192),
-            small_model_harness: true,
-            minimize_tokens: false,
-        };
+        let windowed = cfg_with(Some(8_192), true);
         assert_eq!(windowed.tool_result_char_cap(), 8_192 * CHARS_PER_TOKEN / 4);
         assert_eq!(
             windowed.conversation_char_budget(),
             8_192 * CHARS_PER_TOKEN * 3 / 4
         );
-    }
-
-    #[test]
-    fn context_strategy_maps_config_and_wrappers_delegate() {
-        let cfg = McpChatConfig {
-            base_url: "http://x".into(),
-            workspace_root: PathBuf::from("/tmp"),
-            session_id: None,
-            external_http_servers: BTreeMap::new(),
-            max_turns: 8,
-            tool_approval: false,
-            mcp_connections: ahma_mcp::mcp_client::McpConnectionManager::default(),
-            minimize_tokens: true,
-            small_model_harness: true,
-            context_length: None,
-        };
-        let strat = cfg.context_strategy();
-        assert!(strat.small_model_harness && strat.minimize_tokens);
-        // The free-function wrappers must agree with the strategy.
         assert_eq!(
-            tool_result_char_cap(&cfg),
-            strat.tool_result_char_cap(),
-            "wrapper must delegate"
+            windowed.system_prompt_suffix(),
+            None,
+            "the conciseness suffix follows minimize_tokens, not the window"
         );
-        assert_eq!(
-            conversation_char_budget(&cfg),
-            strat.conversation_char_budget()
-        );
-        assert!(strat.system_prompt_suffix().is_some());
     }
 
     #[tokio::test]
@@ -2829,24 +2756,24 @@ mod tests {
     fn budgets_clamp_to_minimum_for_tiny_context() {
         // 100 tokens * 4 chars / 4 = 100 → clamped up to the 1_000 floor.
         let cfg = cfg_with(Some(100), false);
-        assert_eq!(tool_result_char_cap(&cfg), 1_000);
+        assert_eq!(cfg.tool_result_char_cap(), 1_000);
         // 100 * 4 * 3 / 4 = 300 → clamped up to the 4_000 floor.
-        assert_eq!(conversation_char_budget(&cfg), 4_000);
+        assert_eq!(cfg.conversation_char_budget(), 4_000);
     }
 
     #[test]
     fn budgets_zero_context_uses_floor() {
         let cfg = cfg_with(Some(0), false);
-        assert_eq!(tool_result_char_cap(&cfg), 1_000);
-        assert_eq!(conversation_char_budget(&cfg), 4_000);
+        assert_eq!(cfg.tool_result_char_cap(), 1_000);
+        assert_eq!(cfg.conversation_char_budget(), 4_000);
     }
 
     #[test]
     fn budgets_default_caps_without_context_or_harness() {
         let cfg = cfg_with(None, false);
-        assert_eq!(tool_result_char_cap(&cfg), DEFAULT_TOOL_RESULT_CHAR_CAP);
+        assert_eq!(cfg.tool_result_char_cap(), DEFAULT_TOOL_RESULT_CHAR_CAP);
         assert_eq!(
-            conversation_char_budget(&cfg),
+            cfg.conversation_char_budget(),
             DEFAULT_CONVERSATION_CHAR_BUDGET
         );
     }
@@ -2854,9 +2781,9 @@ mod tests {
     #[test]
     fn budgets_small_harness_specific_caps() {
         let cfg = cfg_with(None, true);
-        assert_eq!(tool_result_char_cap(&cfg), SMALL_MODEL_TOOL_RESULT_CHAR_CAP);
+        assert_eq!(cfg.tool_result_char_cap(), SMALL_MODEL_TOOL_RESULT_CHAR_CAP);
         assert_eq!(
-            conversation_char_budget(&cfg),
+            cfg.conversation_char_budget(),
             SMALL_MODEL_CONVERSATION_CHAR_BUDGET
         );
     }
@@ -2865,8 +2792,8 @@ mod tests {
     fn budgets_context_length_overrides_harness_flag() {
         // When context_length is Some, the harness flag is ignored entirely.
         let cfg = cfg_with(Some(8192), true);
-        assert_eq!(tool_result_char_cap(&cfg), 8192);
-        assert_eq!(conversation_char_budget(&cfg), 24_576);
+        assert_eq!(cfg.tool_result_char_cap(), 8192);
+        assert_eq!(cfg.conversation_char_budget(), 24_576);
     }
 
     // ── truncate_middle ──
@@ -3005,7 +2932,6 @@ mod tests {
     fn system_prompt_for_run_appends_suffix_and_promotes_it_when_alone() {
         let cfg = Some(harness_cfg());
         let suffix = harness_cfg()
-            .context_strategy()
             .system_prompt_suffix()
             .expect("harness config supplies a suffix");
 
@@ -4334,26 +4260,13 @@ mod tests {
 
     #[test]
     fn compaction_threshold_is_none_without_a_known_context_length() {
-        let strategy = BudgetStrategy {
-            context_length: None,
-            small_model_harness: true,
-            minimize_tokens: false,
-        };
-        assert_eq!(strategy.compaction_threshold(), None);
+        assert_eq!(cfg_with(None, true).compaction_threshold(), None);
     }
 
     #[test]
     fn compaction_threshold_is_tighter_for_small_models() {
-        let small = BudgetStrategy {
-            context_length: Some(8_192),
-            small_model_harness: true,
-            minimize_tokens: false,
-        };
-        let normal = BudgetStrategy {
-            context_length: Some(8_192),
-            small_model_harness: false,
-            minimize_tokens: false,
-        };
+        let small = cfg_with(Some(8_192), true);
+        let normal = cfg_with(Some(8_192), false);
         assert_eq!(
             small.compaction_threshold(),
             Some(SMALL_MODEL_COMPACTION_THRESHOLD)

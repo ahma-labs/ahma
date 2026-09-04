@@ -3878,6 +3878,7 @@ const HELP_SINGLE_ROWS: &[(&str, &str)] = &[
     ("/quit", "Quit the application"),
     ("Mouse Click on Xn", "Close/cancel window"),
     ("Mouse Click on Window", "Toggle expand/collapse"),
+    ("Mouse Click on a card", "Open operation details"),
 ];
 
 #[cfg(feature = "tui")]
@@ -5381,6 +5382,58 @@ mod help_reference_tests {
                 );
             }
         }
+    }
+
+    /// Group rows by their section header and count the rows under each.
+    ///
+    /// A blank key is a spacer; a row with a key and no description is a
+    /// section header (see the contract above `HELP_LEFT_ROWS`).
+    fn section_sizes(rows: &[(&str, &str)]) -> std::collections::BTreeMap<String, usize> {
+        let mut sizes = std::collections::BTreeMap::new();
+        let mut current: Option<String> = None;
+        for (key, desc) in rows {
+            if key.is_empty() {
+                continue;
+            }
+            if desc.is_empty() {
+                current = Some((*key).to_string());
+                sizes.entry((*key).to_string()).or_insert(0);
+                continue;
+            }
+            if let Some(header) = &current {
+                *sizes.get_mut(header).expect("header seen first") += 1;
+            }
+        }
+        sizes
+    }
+
+    /// The two layouts must document the same *rows*, not just the same
+    /// slash-commands.
+    ///
+    /// `both_help_layouts_document_the_same_commands` compares command tokens
+    /// only, and passed for a long time while the narrow layout was missing
+    /// `("Click card", "Open operation details")` entirely — a mouse action,
+    /// so it carries no `/command` for that test to notice. Narrow terminals
+    /// were simply never told that clicking a card opens the details.
+    ///
+    /// Sections are compared as a map rather than a sequence: the narrow
+    /// layout deliberately orders them differently, and its wording is
+    /// deliberately longer (its popup is 62 columns with a 24-wide key column,
+    /// against ~49 and 21 per column in the wide one), so neither order nor
+    /// text is asserted here — only that every section exists in both and
+    /// holds the same number of rows.
+    #[test]
+    fn both_help_layouts_document_the_same_rows() {
+        let two_column: Vec<(&str, &str)> = HELP_LEFT_ROWS
+            .iter()
+            .chain(HELP_RIGHT_ROWS.iter())
+            .copied()
+            .collect();
+        assert_eq!(
+            section_sizes(&two_column),
+            section_sizes(HELP_SINGLE_ROWS),
+            "the wide and narrow help layouts document a different set of rows"
+        );
     }
 
     /// The two help layouts document the same commands. They are separate row

@@ -139,14 +139,13 @@ async fn handle_daemon_msg(
             }
             Some(true)
         }
-        applied => {
-            if let Some(event) = applied_to_event(applied)
-                && tx.send(event).await.is_err()
-            {
+        Applied::Event(event) => {
+            if tx.send(event).await.is_err() {
                 return None;
             }
             Some(false)
         }
+        Applied::None => Some(false),
     }
 }
 
@@ -448,54 +447,22 @@ where
 }
 
 /// Result of applying one daemon message to the state.
+///
+/// Only three outcomes are possible, so only three variants exist. This used
+/// to be a fifteen-variant enum shadowing [`SourceEvent`] one variant at a
+/// time, with a companion function that was a fourteen-arm identity map — a
+/// second copy of `SourceEvent`'s shape that had to be updated alongside it,
+/// paying for nothing. `apply_msg` builds the `SourceEvent` directly now.
 enum Applied {
     /// Nothing the TUI needs to react to.
     None,
-    /// The operation list changed — re-emit the merged snapshot.
+    /// The operation list changed — re-emit the merged snapshot. Handled by
+    /// the caller rather than carried as an event, because it needs
+    /// `DaemonState::all_ops()` (and, in [`daemon_source_task`], a prune
+    /// counter) rather than data on the value itself.
     ListChanged,
-    /// A live output line — forward incrementally, do NOT re-emit the list.
-    Output {
-        instance_id: String,
-        op_id: String,
-        line: String,
-        is_stderr: bool,
-    },
-    ChatToken(String),
-    ChatThinking(String),
-    ApprovalRequested {
-        id: String,
-        tool: String,
-        args: String,
-    },
-    ScopeGrantRequested {
-        request: ahma_common::scope_grant::ScopeGrantRequest,
-    },
-    ScopeGrantDismiss {
-        decision_id: String,
-    },
-    WebApprovalRequested {
-        request: ahma_common::web_approval::WebApprovalRequest,
-    },
-    WebApprovalDismiss {
-        decision_id: String,
-    },
-    AgentDone,
-    AgentError(String),
-    Usage {
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        total_tokens: u32,
-    },
-    ToolCallStarted {
-        id: String,
-        name: String,
-        args: String,
-    },
-    ToolCallFinished {
-        id: String,
-        result: String,
-        failed: bool,
-    },
+    /// Forward this event to the TUI as-is.
+    Event(SourceEvent),
 }
 
 impl Applied {
@@ -586,12 +553,12 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 id,
                 line,
                 is_stderr,
-            } => Applied::Output {
-                instance_id,
+            } => Applied::Event(SourceEvent::OperationOutput {
+                instance_id: Some(instance_id),
                 op_id: id,
                 line,
                 is_stderr,
-            },
+            }),
             DaemonEvent::LogLine { .. } => Applied::None, // not yet surfaced in TUI
         },
         DaemonMsg::Ping { .. } => Applied::None, // hub-to-instance ping; no state change for subscribers
@@ -601,102 +568,51 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
         DaemonMsg::ReRaiseScopeGrant { .. } => Applied::None,
         DaemonMsg::RunPrompt { .. } => Applied::None,
         DaemonMsg::SubmitApproval { .. } => Applied::None,
-        DaemonMsg::ScopeGrantDismiss { decision_id } => Applied::ScopeGrantDismiss { decision_id },
+        DaemonMsg::ScopeGrantDismiss { decision_id } => {
+            Applied::Event(SourceEvent::ScopeGrantDismiss { decision_id })
+        }
         DaemonMsg::WebApprovalDismiss { decision_id } => {
-            Applied::WebApprovalDismiss { decision_id }
+            Applied::Event(SourceEvent::WebApprovalDismiss { decision_id })
         }
         // Everything the hub forwards untouched. Kept as one nested match so
         // the relayed set reads as a set: a message added to `HubRelay` shows
         // up here as a missing arm rather than falling through to a default.
-        DaemonMsg::Relay(relay) => match relay {
-            HubRelay::ChatToken { token } => Applied::ChatToken(token),
-            HubRelay::ChatThinking { token } => Applied::ChatThinking(token),
+        DaemonMsg::Relay(relay) => Applied::Event(match relay {
+            HubRelay::ChatToken { token } => SourceEvent::ChatToken { token },
+            HubRelay::ChatThinking { token } => SourceEvent::ChatThinking { token },
             HubRelay::ApprovalRequested { id, tool, args } => {
-                Applied::ApprovalRequested { id, tool, args }
+                SourceEvent::ApprovalRequested { id, tool, args }
             }
-            HubRelay::AgentDone => Applied::AgentDone,
-            HubRelay::AgentError { error } => Applied::AgentError(error),
+            HubRelay::AgentDone => SourceEvent::AgentDone,
+            HubRelay::AgentError { error } => SourceEvent::AgentError { error },
             HubRelay::Usage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
-            } => Applied::Usage {
+            } => SourceEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
             },
             HubRelay::ToolCallStarted { id, name, args } => {
-                Applied::ToolCallStarted { id, name, args }
+                SourceEvent::ToolCallStarted { id, name, args }
             }
             HubRelay::ToolCallFinished { id, result, failed } => {
-                Applied::ToolCallFinished { id, result, failed }
+                SourceEvent::ToolCallFinished { id, result, failed }
             }
-            HubRelay::ScopeGrantRequested { request } => Applied::ScopeGrantRequested { request },
-            HubRelay::WebApprovalRequested { request } => Applied::WebApprovalRequested { request },
-        },
+            HubRelay::ScopeGrantRequested { request } => {
+                SourceEvent::ScopeGrantRequested { request }
+            }
+            HubRelay::WebApprovalRequested { request } => {
+                SourceEvent::WebApprovalRequested { request }
+            }
+        }),
         // Instance-bound; a subscriber never receives it.
         DaemonMsg::SubmitScopeGrant { .. } | DaemonMsg::SubmitWebApproval { .. } => Applied::None,
     }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Translate an [`Applied`] outcome into the [`SourceEvent`] the TUI should
-/// receive, or `None` when nothing should be forwarded.
-///
-/// `Applied::ListChanged` is handled separately by callers because it needs
-/// access to `DaemonState::all_ops()` (and, in [`daemon_source_task`], a
-/// prune counter) rather than data carried on the `Applied` value itself.
-fn applied_to_event(applied: Applied) -> Option<SourceEvent> {
-    match applied {
-        Applied::None | Applied::ListChanged => None,
-        Applied::Output {
-            instance_id,
-            op_id,
-            line,
-            is_stderr,
-        } => Some(SourceEvent::OperationOutput {
-            instance_id: Some(instance_id),
-            op_id,
-            line,
-            is_stderr,
-        }),
-        Applied::ChatToken(token) => Some(SourceEvent::ChatToken { token }),
-        Applied::ChatThinking(token) => Some(SourceEvent::ChatThinking { token }),
-        Applied::ApprovalRequested { id, tool, args } => {
-            Some(SourceEvent::ApprovalRequested { id, tool, args })
-        }
-        Applied::ScopeGrantRequested { request } => {
-            Some(SourceEvent::ScopeGrantRequested { request })
-        }
-        Applied::ScopeGrantDismiss { decision_id } => {
-            Some(SourceEvent::ScopeGrantDismiss { decision_id })
-        }
-        Applied::WebApprovalRequested { request } => {
-            Some(SourceEvent::WebApprovalRequested { request })
-        }
-        Applied::WebApprovalDismiss { decision_id } => {
-            Some(SourceEvent::WebApprovalDismiss { decision_id })
-        }
-        Applied::AgentDone => Some(SourceEvent::AgentDone),
-        Applied::AgentError(error) => Some(SourceEvent::AgentError { error }),
-        Applied::Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-        } => Some(SourceEvent::Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-        }),
-        Applied::ToolCallStarted { id, name, args } => {
-            Some(SourceEvent::ToolCallStarted { id, name, args })
-        }
-        Applied::ToolCallFinished { id, result, failed } => {
-            Some(SourceEvent::ToolCallFinished { id, result, failed })
-        }
-    }
-}
 
 /// Map the hub wire status onto the TUI's display status.
 ///
@@ -1208,18 +1124,18 @@ mod tests {
             },
         );
         match applied {
-            Applied::Output {
+            Applied::Event(SourceEvent::OperationOutput {
                 instance_id,
                 op_id,
                 line,
                 is_stderr,
-            } => {
-                assert_eq!(instance_id, "i1");
+            }) => {
+                assert_eq!(instance_id.as_deref(), Some("i1"));
                 assert_eq!(op_id, "op-1");
                 assert_eq!(line, "compiling...");
                 assert!(!is_stderr);
             }
-            _ => panic!("OpOutput must map to Applied::Output"),
+            _ => panic!("OpOutput must map to SourceEvent::OperationOutput"),
         }
         // Output is NOT accumulated in DaemonState (the TUI app state owns
         // the tail buffer) — the snapshot list stays line-free.
@@ -1400,8 +1316,8 @@ mod tests {
                 token: "hi".to_string(),
             }),
         ) {
-            Applied::ChatToken(t) => assert_eq!(t, "hi"),
-            _ => panic!("ChatToken must map to Applied::ChatToken"),
+            Applied::Event(SourceEvent::ChatToken { token: t }) => assert_eq!(t, "hi"),
+            _ => panic!("ChatToken must map to SourceEvent::ChatToken"),
         }
     }
 
@@ -1416,17 +1332,17 @@ mod tests {
                 total_tokens: 13,
             }),
         ) {
-            Applied::Usage {
+            Applied::Event(SourceEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
-            } => {
+            }) => {
                 assert_eq!(
                     (prompt_tokens, completion_tokens, total_tokens),
                     (10, 3, 13)
                 );
             }
-            _ => panic!("Usage must map to Applied::Usage"),
+            _ => panic!("Usage must map to SourceEvent::Usage"),
         }
     }
 
@@ -1441,11 +1357,11 @@ mod tests {
                 args: "{}".to_string(),
             }),
         ) {
-            Applied::ToolCallStarted { id, name, .. } => {
+            Applied::Event(SourceEvent::ToolCallStarted { id, name, .. }) => {
                 assert_eq!(id, "t1");
                 assert_eq!(name, "read_file");
             }
-            _ => panic!("ToolCallStarted must map to Applied::ToolCallStarted"),
+            _ => panic!("ToolCallStarted must map to SourceEvent::ToolCallStarted"),
         }
         match apply_msg(
             &mut s,
@@ -1455,11 +1371,11 @@ mod tests {
                 failed: false,
             }),
         ) {
-            Applied::ToolCallFinished { id, failed, .. } => {
+            Applied::Event(SourceEvent::ToolCallFinished { id, failed, .. }) => {
                 assert_eq!(id, "t1");
                 assert!(!failed);
             }
-            _ => panic!("ToolCallFinished must map to Applied::ToolCallFinished"),
+            _ => panic!("ToolCallFinished must map to SourceEvent::ToolCallFinished"),
         }
     }
 
@@ -1474,12 +1390,12 @@ mod tests {
                 args: "ls".to_string(),
             }),
         ) {
-            Applied::ApprovalRequested { id, tool, args } => {
+            Applied::Event(SourceEvent::ApprovalRequested { id, tool, args }) => {
                 assert_eq!(id, "a1");
                 assert_eq!(tool, "shell");
                 assert_eq!(args, "ls");
             }
-            _ => panic!("must map to Applied::ApprovalRequested"),
+            _ => panic!("must map to SourceEvent::ApprovalRequested"),
         }
     }
 
@@ -1488,7 +1404,7 @@ mod tests {
         let mut s = DaemonState::new();
         assert!(matches!(
             apply_msg(&mut s, DaemonMsg::Relay(HubRelay::AgentDone)),
-            Applied::AgentDone
+            Applied::Event(SourceEvent::AgentDone)
         ));
     }
 
@@ -1501,8 +1417,8 @@ mod tests {
                 error: "boom".to_string(),
             }),
         ) {
-            Applied::AgentError(e) => assert_eq!(e, "boom"),
-            _ => panic!("must map to Applied::AgentError"),
+            Applied::Event(SourceEvent::AgentError { error: e }) => assert_eq!(e, "boom"),
+            _ => panic!("must map to SourceEvent::AgentError"),
         }
     }
 
@@ -1543,11 +1459,11 @@ mod tests {
                 request: sample_scope_grant(),
             }),
         ) {
-            Applied::ScopeGrantRequested { request } => {
+            Applied::Event(SourceEvent::ScopeGrantRequested { request }) => {
                 assert_eq!(request.decision_id, "d1");
                 assert_eq!(request.access, ahma_common::config::ScopeAccess::Ro);
             }
-            _ => panic!("must map to Applied::ScopeGrantRequested"),
+            _ => panic!("must map to SourceEvent::ScopeGrantRequested"),
         }
     }
 
@@ -1560,8 +1476,10 @@ mod tests {
                 decision_id: "d9".to_string(),
             },
         ) {
-            Applied::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d9"),
-            _ => panic!("must map to Applied::ScopeGrantDismiss"),
+            Applied::Event(SourceEvent::ScopeGrantDismiss { decision_id }) => {
+                assert_eq!(decision_id, "d9")
+            }
+            _ => panic!("must map to SourceEvent::ScopeGrantDismiss"),
         }
     }
 
@@ -1794,8 +1712,8 @@ mod tests {
                 token: "pondering".to_string(),
             }),
         ) {
-            Applied::ChatThinking(t) => assert_eq!(t, "pondering"),
-            _ => panic!("ChatThinking must map to Applied::ChatThinking"),
+            Applied::Event(SourceEvent::ChatThinking { token: t }) => assert_eq!(t, "pondering"),
+            _ => panic!("ChatThinking must map to SourceEvent::ChatThinking"),
         }
     }
 
@@ -1808,12 +1726,12 @@ mod tests {
                 request: sample_web_approval(),
             }),
         ) {
-            Applied::WebApprovalRequested { request } => {
+            Applied::Event(SourceEvent::WebApprovalRequested { request }) => {
                 assert_eq!(request.decision_id, "w1");
                 assert_eq!(request.domain, "api.github.com");
                 assert_eq!(request.tool, Some("fetch_webpage".to_string()));
             }
-            _ => panic!("must map to Applied::WebApprovalRequested"),
+            _ => panic!("must map to SourceEvent::WebApprovalRequested"),
         }
     }
 
@@ -1826,8 +1744,10 @@ mod tests {
                 decision_id: "w9".to_string(),
             },
         ) {
-            Applied::WebApprovalDismiss { decision_id } => assert_eq!(decision_id, "w9"),
-            _ => panic!("must map to Applied::WebApprovalDismiss"),
+            Applied::Event(SourceEvent::WebApprovalDismiss { decision_id }) => {
+                assert_eq!(decision_id, "w9")
+            }
+            _ => panic!("must map to SourceEvent::WebApprovalDismiss"),
         }
     }
 
