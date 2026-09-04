@@ -74,6 +74,7 @@ use std::sync::{
 use tracing;
 use tracing::Instrument as _;
 
+use crate::builtin_tool::BuiltinTool;
 use crate::{
     adapter::Adapter,
     client_type::McpClientType,
@@ -94,21 +95,6 @@ pub(crate) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// single-request budget (R2.6.5) so waiting here can never itself be the thing
 /// that times a request out.
 const SANDBOX_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Built-ins that must answer before the sandbox scope is settled (SPEC R5.1.2).
-///
-/// These are the session's own control surface — they touch no workspace path,
-/// and gating them would be self-defeating: `sandbox_grant` is how a scope gets
-/// widened in the first place, and `status`/`await`/`cancel` must remain usable
-/// to observe and stop work whatever the scope is doing. Everything else waits.
-const SANDBOX_EXEMPT_BUILTINS: &[&str] = &[
-    "status",
-    "await",
-    "cancel",
-    "sandbox_grant",
-    "restart",
-    "todo_write",
-];
 
 /// `AhmaMcpService` is the server handler for the MCP service.
 #[derive(Clone)]
@@ -227,16 +213,6 @@ pub struct AhmaMcpService {
     pub sandbox_config_in_flight: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
-/// Built-ins withheld from [`AhmaMcpService::get_all_available_tools`], the
-/// toolset handed to ahma's own agent loop.
-///
-/// `agent` delegates *to that same loop*, so handing it to the loop would let
-/// the agent recurse into itself. `handle_agent` caps turns within one loop but
-/// nothing caps nesting depth, so the guard has to live here. MCP clients still
-/// get the tool via `list_tools` — the recursion risk is specific to ahma
-/// calling itself.
-const AGENT_LOOP_DENIED_BUILTINS: &[&str] = &["agent"];
-
 /// Project an rmcp [`Tool`] into the `ToolInfo` shape the agent loop consumes.
 fn tool_info_from_tool(tool: Tool) -> crate::mcp_client::ToolInfo {
     crate::mcp_client::ToolInfo {
@@ -327,16 +303,14 @@ impl AhmaMcpService {
     /// external MCP tools.
     ///
     /// This is the toolset handed to ahma's own agent loop, so it withholds
-    /// `AGENT_LOOP_DENIED_BUILTINS`. Everything else is shared with
-    /// `list_tools` by construction rather than by hand.
+    /// the built-ins [`BuiltinTool::is_denied_in_agent_loop`] names. Everything
+    /// else is shared with `list_tools` by construction rather than by hand.
     pub async fn get_all_available_tools(&self) -> Vec<crate::mcp_client::ToolInfo> {
         let mut tools: Vec<crate::mcp_client::ToolInfo> = self
             .builtin_tools()
             .into_iter()
             .filter(|t| {
-                !AGENT_LOOP_DENIED_BUILTINS
-                    .iter()
-                    .any(|denied| t.name == *denied)
+                !BuiltinTool::from_name(&t.name).is_some_and(BuiltinTool::is_denied_in_agent_loop)
             })
             .map(tool_info_from_tool)
             .collect();
@@ -417,108 +391,96 @@ impl AhmaMcpService {
     /// Construct the builtin `Tool` values. Only called once per service, via
     /// the [`Self::builtin_tools`] cache.
     fn build_builtin_tools(&self) -> Vec<Tool> {
-        vec![
-            // Hard-wired await command - always available
-            self_titled_tool(
-                "await",
+        BuiltinTool::ALL
+            .iter()
+            .map(|tool| self.build_builtin_tool(*tool))
+            .collect()
+    }
+
+    /// The description and input schema for one built-in.
+    ///
+    /// Exhaustive on [`BuiltinTool`], which is the point: a tool added to the
+    /// enum without an entry here is a compile error, where the hand-written
+    /// `vec![...]` this replaced could silently omit one.
+    fn build_builtin_tool(&self, tool: BuiltinTool) -> Tool {
+        let (description, input_schema) = match tool {
+            BuiltinTool::Await => (
                 "Block until a started operation completes and return its final result. Operations notify automatically when they finish, so prefer doing other useful work first; reach for `await` only when the next step truly depends on the result.",
                 self.generate_input_schema_for_wait(),
             ),
-            // Hard-wired status command - always available
-            self_titled_tool(
-                "status",
+            BuiltinTool::Status => (
                 "Return a snapshot of active and completed operations without blocking. Completion is pushed via notifications, so this is for ad-hoc inspection rather than polling.",
                 self.generate_input_schema_for_status(),
             ),
-            // Hard-wired run_terminal_command command - always available
-            self_titled_tool(
-                "run_terminal_command",
+            BuiltinTool::RunTerminalCommand => (
                 "Run a shell command inside a kernel-level filesystem sandbox (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows). Returns an operation_id immediately; use `status`, `await`, or `cancel` to manage long-running work. Supports pipes, redirects, environment variables, and full shell syntax. Set `monitor_level` to stream error/warning alerts from stdout or stderr.",
                 self.generate_input_schema_for_run_terminal_command(),
             ),
-            // Hard-wired log inspection tools — always available
-            self_titled_tool(
-                "logs_list",
+            BuiltinTool::LogsList => (
                 "List all log files in the project log directory (`./logs/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.",
                 handlers::log_tools::logs_list_schema(),
             ),
-            self_titled_tool(
-                "logs_approve",
+            BuiltinTool::LogsApprove => (
                 "Approve a blocked out-of-scope log symlink target to allow AI read access.",
                 handlers::log_tools::logs_approve_schema(),
             ),
-            self_titled_tool(
-                "logs_read",
+            BuiltinTool::LogsRead => (
                 "Read lines from a project log file with optional pagination. Sensitive values (tokens, passwords, API keys) are redacted by default. Use `raw: true` only when debugging credential issues.",
                 handlers::log_tools::logs_read_schema(),
             ),
-            self_titled_tool(
-                "logs_search",
+            BuiltinTool::LogsSearch => (
                 "Search a project log file for lines matching a pattern (case-insensitive substring match by default). Returns matching lines with line numbers. Sensitive values are redacted by default.",
                 handlers::log_tools::logs_search_schema(),
             ),
-            self_titled_tool(
-                "restart",
+            BuiltinTool::Restart => (
                 "Force stop and restart the background bridge server, disconnecting all active sessions (including TUI and other IDEs) to apply updates or recover from a bad state.",
                 handlers::restart_tool::restart_schema(),
             ),
-            self_titled_tool(
-                "cancel",
+            BuiltinTool::Cancel => (
                 "Cancel a running background operation by `id`, or cancel EVERY in-flight operation with `all: true`. Each cancellation reaps the operation's full process tree (cargo/rustc/sccache) — the clean way to stop wedged work without killing and restarting the server.",
                 handlers::cancel_tool::cancel_schema(),
             ),
-            self_titled_tool(
-                "sandbox_grant",
+            BuiltinTool::SandboxGrant => (
                 "Propose adding an out-of-scope path as a persistent sandbox root in ~/.ahma/settings.toml. Call this when a command fails with a `sandbox_denial` error. WITHOUT `confirm: true` it only PREVIEWS — it returns the full settings-file path, the exact line it would add, and a risk assessment so you can show the human and get approval first. Catastrophic paths (filesystem root, $HOME, credential dirs, system dirs, workspace parents) are REFUSED even with confirmation. On `confirm: true` it writes the grant; run `restart` to apply, then re-run the blocked command.",
                 handlers::sandbox_grant_tool::sandbox_grant_schema(),
             ),
-            self_titled_tool(
-                "read_file",
+            BuiltinTool::ReadFile => (
                 "Read UTF-8 text from a scoped file, with optional line slicing.",
                 handlers::harness_tools::read_file_schema(),
             ),
-            self_titled_tool(
-                "list_dir",
+            BuiltinTool::ListDir => (
                 "List entries in a scoped directory with basic metadata.",
                 handlers::harness_tools::list_dir_schema(),
             ),
-            self_titled_tool(
-                "file_search",
+            BuiltinTool::FileSearch => (
                 "Find files by glob pattern inside the sandbox scope.",
                 handlers::harness_tools::file_search_schema(),
             ),
-            self_titled_tool(
-                "grep_search",
+            BuiltinTool::GrepSearch => (
                 "Search file contents by plain text or regex.",
                 handlers::harness_tools::grep_search_schema(),
             ),
-            self_titled_tool(
-                "fetch_webpage",
+            BuiltinTool::FetchWebpage => (
                 "Fetch and extract readable text from an HTTP/HTTPS webpage.",
                 handlers::harness_tools::fetch_webpage_schema(),
             ),
-            self_titled_tool(
-                "write_file",
+            BuiltinTool::WriteFile => (
                 "Write UTF-8 content to a scoped file (create or overwrite).",
                 handlers::harness_tools::write_file_schema(),
             ),
-            self_titled_tool(
-                "replace_in_file",
+            BuiltinTool::ReplaceInFile => (
                 "Replace exact string occurrences in a scoped UTF-8 file.",
                 handlers::harness_tools::replace_in_file_schema(),
             ),
-            self_titled_tool(
-                "agent",
+            BuiltinTool::Agent => (
                 "Delegate a self-contained task to ahma's own agent loop as a sub-agent. ahma runs its full tool-using loop (read/edit files, run commands in the sandbox, search) with the model the user last selected in `ahma tui`, and returns the final answer. Use this to offload a focused sub-task — investigating code, producing a file or report, or answering a question grounded in the workspace — without doing the steps yourself.",
                 handlers::agent_tool::agent_schema(),
             ),
-            self_titled_tool(
-                "todo_write",
+            BuiltinTool::TodoWrite => (
                 "Record or update your task plan as a checklist. Pass the FULL list of steps each time — it replaces the current plan. Use this at the start of any multi-step task, then call it again to mark a step in_progress before you work on it and completed when it's done. Keeps you (and the user) oriented across turns.",
                 handlers::todo_tool::todo_write_schema(),
             ),
-            self_titled_tool(
-                "log_monitor",
+            BuiltinTool::LogMonitor => (
                 "Start a real-time log monitoring session on a file inside the sandbox. Reads new lines as they are written, runs them through the AI for issue detection, and sends alerts.",
                 schema::object_input_schema(
                     {
@@ -550,7 +512,8 @@ impl AhmaMcpService {
                     &["file_path"],
                 ),
             ),
-        ]
+        };
+        self_titled_tool(tool.name(), description, input_schema)
     }
 
     fn task_vault_root(&self) -> Option<PathBuf> {
@@ -1107,24 +1070,11 @@ impl AhmaMcpService {
         None
     }
 
-    /// Names that are always hard-wired in the protocol layer and must not
-    /// appear in user/bundled configs (we skip duplicates here).
-    ///
-    /// A cheap `&'static [&'static str]` alias for
-    /// [`crate::constants::BUILTIN_TOOL_NAMES`]. Both use sites — the filter
-    /// below and `harness_guard_preprocess`, the latter inside per-call name
-    /// healing — need the names as a slice repeatedly, whereas
-    /// [`Self::builtin_tools`] rebuilds full `Tool` values (including JSON
-    /// schemas) on every call. `hardcoded_tools_match_builtin_tools` asserts
-    /// the two still agree, so a name added to `builtin_tools()` alone fails
-    /// CI instead of silently under-filtering and under-healing.
-    const HARDCODED_TOOLS: &'static [&'static str] = crate::constants::BUILTIN_TOOL_NAMES;
-
     /// Returns true if a configured tool should be exposed to the client
     /// given the current disclosure state. Centralises the filter so
     /// `list_tools()` and `list_tool_names()` cannot drift apart.
     fn is_config_visible_to_client(&self, config: &ToolConfig) -> bool {
-        if Self::HARDCODED_TOOLS.contains(&config.name.as_str()) {
+        if BuiltinTool::from_name(&config.name).is_some() {
             return false;
         }
         if !config.enabled {
@@ -1134,32 +1084,13 @@ impl AhmaMcpService {
         true
     }
 
-    /// Harness file tools that duplicate a capability every IDE-shaped client
-    /// already ships natively (Claude Code's Read/Write/Edit/Glob/Grep, Cursor's
-    /// and VS Code's equivalents). Advertising them unconditionally cost a real
-    /// incident: a Claude Code plan-mode subagent that lacked native `Write`
-    /// found `write_file` via tool search and called it — ahma refused (the
-    /// target path was outside the sandbox scope), but a subsequent "always
-    /// allow" click would have made that silent. Withholding them from clients
-    /// with natives closes that path and drops seven redundant tools from
-    /// those clients' context; ahma's own agent loop, the TUI, and any client
-    /// without native file tools keep the full set.
-    const HARNESS_FILE_TOOLS: &'static [&'static str] = &[
-        "read_file",
-        "write_file",
-        "replace_in_file",
-        "list_dir",
-        "file_search",
-        "grep_search",
-        "todo_write",
-    ];
-
     /// Returns true if a hard-coded harness tool should be exposed to `client_type`.
-    /// Only [`Self::HARNESS_FILE_TOOLS`] are gated; everything else (the shell/
+    /// Only the tools [`BuiltinTool::is_harness_file_tool`] names are gated;
+    /// everything else (the shell/
     /// operation tools, `agent`, `fetch_webpage`, `sandbox_grant`, `log_monitor`,
     /// …) has no native equivalent in any harness and stays visible everywhere.
     fn is_harness_tool_visible_to_client(name: &str, client_type: McpClientType) -> bool {
-        if !Self::HARNESS_FILE_TOOLS.contains(&name) {
+        if !BuiltinTool::from_name(name).is_some_and(BuiltinTool::is_harness_file_tool) {
             return true;
         }
         !matches!(
@@ -1723,7 +1654,8 @@ impl ServerHandler for AhmaMcpService {
             // tools and `run_terminal_command` did; only those two had it.
             // `tools/list` deliberately does NOT wait: a client must be able to
             // discover tools while the scope is still being decided.
-            if !SANDBOX_EXEMPT_BUILTINS.contains(&tool_name.as_ref()) {
+            let builtin = BuiltinTool::from_name(tool_name.as_ref());
+            if !builtin.is_some_and(BuiltinTool::is_sandbox_exempt) {
                 self.guard_sandbox_ready_for_tool_calls().await?;
             }
 
@@ -1791,87 +1723,91 @@ impl AhmaMcpService {
         run_params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        match tool_name {
-            "status" => {
+        let Some(builtin) = BuiltinTool::from_name(tool_name) else {
+            return self.dispatch_configured_tool(run_params, context).await;
+        };
+        match builtin {
+            BuiltinTool::Status => {
                 self.handle_status(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "await" => {
+            BuiltinTool::Await => {
                 let mut caller = handlers::await_tool::AwaitCaller::from_context(&context);
                 caller.push_channel_open = self.push_channel_open();
                 self.handle_await_for_caller(run_params, caller).await
             }
-            "run_terminal_command" => self.handle_run_terminal_command(run_params, context).await,
-            "cancel" => {
+            BuiltinTool::RunTerminalCommand => {
+                self.handle_run_terminal_command(run_params, context).await
+            }
+            BuiltinTool::Cancel => {
                 self.handle_cancel(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "sandbox_grant" => {
+            BuiltinTool::SandboxGrant => {
                 let client_type = McpClientType::from_peer(&context.peer);
                 self.handle_sandbox_grant(run_params.arguments.unwrap_or_default(), client_type)
                     .await
             }
-            "logs_list" => {
+            BuiltinTool::LogsList => {
                 self.handle_logs_list(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "logs_approve" => {
+            BuiltinTool::LogsApprove => {
                 self.handle_logs_approve(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "logs_read" => {
+            BuiltinTool::LogsRead => {
                 self.handle_logs_read(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "logs_search" => {
+            BuiltinTool::LogsSearch => {
                 self.handle_logs_search(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "restart" => {
+            BuiltinTool::Restart => {
                 self.handle_restart(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "read_file" => {
+            BuiltinTool::ReadFile => {
                 self.handle_read_file(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "list_dir" => {
+            BuiltinTool::ListDir => {
                 self.handle_list_dir(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "file_search" => {
+            BuiltinTool::FileSearch => {
                 self.handle_file_search(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "grep_search" => {
+            BuiltinTool::GrepSearch => {
                 self.handle_grep_search(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "fetch_webpage" => {
+            BuiltinTool::FetchWebpage => {
                 self.handle_fetch_webpage(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "write_file" => {
+            BuiltinTool::WriteFile => {
                 self.handle_write_file(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "replace_in_file" => {
+            BuiltinTool::ReplaceInFile => {
                 self.handle_replace_in_file(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "agent" => {
+            BuiltinTool::Agent => {
                 self.handle_agent(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "todo_write" => {
+            BuiltinTool::TodoWrite => {
                 self.handle_todo_write(run_params.arguments.unwrap_or_default())
                     .await
             }
-            "log_monitor" => {
+            BuiltinTool::LogMonitor => {
                 self.handle_log_monitor(run_params.arguments.unwrap_or_default(), context)
                     .await
             }
-            _ => self.dispatch_configured_tool(run_params, context).await,
         }
     }
     /// Heals the tool name and arguments via the harness guard, and checks for
@@ -1891,7 +1827,7 @@ impl AhmaMcpService {
         // before the guard pipeline runs and no per-call allocation is needed;
         // `known_tools` then borrows from `config_names`.
         let config_names = self.config_tool_names();
-        let mut known_tools: Vec<&str> = Self::HARDCODED_TOOLS.to_vec();
+        let mut known_tools: Vec<&str> = BuiltinTool::names().collect();
         known_tools.extend(config_names.iter().map(String::as_str));
 
         // Run the guard pipeline over a mutable copy, then write any healing back.
@@ -2531,13 +2467,11 @@ impl AhmaMcpService {
     ///
     /// This is useful for testing and introspection.
     pub fn list_tool_names(&self) -> Vec<String> {
-        // `HARDCODED_TOOLS` is asserted (in `hardcoded_tools_match_builtin_tools`)
-        // to match `builtin_tools()` exactly, and is far cheaper than rebuilding
-        // every builtin's JSON schema just to read the names.
-        let mut names: Vec<String> = Self::HARDCODED_TOOLS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        // Reading the names off the enum is far cheaper than rebuilding every
+        // builtin's JSON schema just to list them, and cannot disagree with
+        // what `builtin_tools()` constructs — both are driven by the same
+        // `BuiltinTool::ALL`.
+        let mut names: Vec<String> = BuiltinTool::names().map(str::to_string).collect();
 
         let configs_lock = self.configs.read();
         for config in configs_lock.values() {
@@ -3492,37 +3426,39 @@ mod tests {
         assert!(service.is_config_visible_to_client(&normal));
     }
 
-    /// Guards against the exact drift this was hand-fixed twice for: someone
-    /// adds/renames a builtin in `builtin_tools()` (the canonical list) and
-    /// forgets the separately hand-maintained `HARDCODED_TOOLS` constant, so
-    /// dedup filtering and harness-guard name healing silently fall out of
-    /// sync with the actual tool set.
+    /// Every built-in is advertised, exactly once, titled with its own name.
+    ///
+    /// The name half of this test used to compare `builtin_tools()` against a
+    /// separately hand-maintained `HARDCODED_TOOLS` list, because the two had
+    /// drifted twice. Both are now driven by `BuiltinTool::ALL` and the
+    /// construction match is exhaustive, so the compiler enforces that half and
+    /// only the observable shape is worth asserting here.
     #[tokio::test]
-    async fn hardcoded_tools_match_builtin_tools() {
+    async fn every_builtin_is_advertised_once_and_titled_with_its_name() {
         let service = make_service().await;
-        let builtin_names: std::collections::HashSet<String> = service
-            .builtin_tools()
-            .into_iter()
-            .map(|t| t.name.into_owned())
-            .collect();
-        let hardcoded_names: std::collections::HashSet<String> = AhmaMcpService::HARDCODED_TOOLS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(
-            builtin_names, hardcoded_names,
-            "HARDCODED_TOOLS has drifted from builtin_tools() — keep them in sync"
-        );
+        let advertised: Vec<Tool> = service.builtin_tools();
 
-        // Every advertised tool carries a title, and it is the tool's own name.
-        // Checking only the names left this unguarded: a mistyped title would
-        // have shipped a display name that matched no tool.
-        for tool in service.builtin_tools() {
+        assert_eq!(
+            advertised.len(),
+            BuiltinTool::ALL.len(),
+            "one advertised tool per variant"
+        );
+        for (tool, builtin) in advertised.iter().zip(BuiltinTool::ALL) {
+            assert_eq!(
+                &*tool.name,
+                builtin.name(),
+                "advertised tools follow BuiltinTool::ALL order"
+            );
             assert_eq!(
                 tool.title.as_deref(),
-                Some(tool.name.as_ref()),
+                Some(builtin.name()),
                 "builtin `{}` must be titled with its own name",
-                tool.name
+                builtin.name()
+            );
+            assert!(
+                tool.description.as_ref().is_some_and(|d| !d.is_empty()),
+                "builtin `{}` must carry a description",
+                builtin.name()
             );
         }
     }
@@ -3885,7 +3821,8 @@ mod tests {
             .collect();
 
         for name in &client_builtins {
-            let denied = AGENT_LOOP_DENIED_BUILTINS.contains(&name.as_str());
+            let denied =
+                BuiltinTool::from_name(name).is_some_and(BuiltinTool::is_denied_in_agent_loop);
             assert_eq!(
                 agent_tools.contains(name),
                 !denied,

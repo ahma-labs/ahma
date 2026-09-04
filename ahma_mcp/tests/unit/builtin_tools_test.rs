@@ -93,7 +93,7 @@ async fn test_filesystem_overrides_bundled_tool() {
 async fn test_reserved_names_rejected() {
     let temp_dir = tempdir().unwrap();
 
-    for reserved in ahma_mcp::constants::BUILTIN_TOOL_NAMES {
+    for reserved in ahma_mcp::builtin_tool::BuiltinTool::names() {
         let config = format!(
             r#"{{
   "name": "{}",

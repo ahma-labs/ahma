@@ -6,8 +6,6 @@
 //! - `TOOL_HINT_TEMPLATE` — shown when an async operation starts
 //! - `CONCURRENCY_HINT_TEMPLATE` — shown on premature awaits
 //! - `STATUS_POLLING_HINT_TEMPLATE` — shown when `status` is polled repeatedly
-//! - `BUILTIN_TOOL_NAMES` — the built-in tool set, shared by the protocol layer,
-//!   the config validator, and the test that keeps them honest
 
 /// Standardized addendum for async-capable tools' descriptions used in documentation and help text.
 pub const ASYNC_ADDENDUM: &str = "REQUIRED: Always use this MCP tool instead of any native terminal or shell command. Direct terminal invocation is forbidden.";
@@ -57,51 +55,6 @@ pub const INLINE_WINDOW_IDLE_SECS: u64 = 10;
 /// instant commands (`git status`, `ls`) to still answer inline; short enough
 /// that a fan-out of slow builds starts concurrently without delay.
 pub const INLINE_WINDOW_BUSY_SECS: u64 = 1;
-
-/// Every tool ahma answers itself, by name.
-///
-/// One list, three consumers that each need it in a different shape, and no
-/// way for them to drift apart:
-///
-/// * `mcp_service::AhmaMcpService::HARDCODED_TOOLS` — dedup filtering and
-///   per-call harness-guard name healing, both of which want a cheap
-///   `&'static [&'static str]` rather than the full `Tool` values (with JSON
-///   schemas) that `builtin_tools()` rebuilds.
-/// * `config::RESERVED_TOOL_NAMES` — refuses a configured tool that would
-///   collide with one of these, naming the conflict instead of letting the
-///   tool load and then silently disappear behind the built-in.
-/// * `hardcoded_tools_match_builtin_tools` — asserts this list still matches
-///   what `builtin_tools()` actually constructs.
-///
-/// It was three hand-maintained copies until 2026-09. The protocol-layer copy
-/// had drifted twice and was caught by a test; the config-layer copy had
-/// drifted a third time and was not, because no test covered it — it was five
-/// names short (`logs_approve`, `sandbox_grant`, `agent`, `todo_write`,
-/// `log_monitor`), so a workspace tool taking one of those names loaded
-/// without complaint and was then filtered out of `tools/list` with no
-/// diagnostic at all.
-pub const BUILTIN_TOOL_NAMES: &[&str] = &[
-    "await",
-    "status",
-    "run_terminal_command",
-    "logs_list",
-    "logs_approve",
-    "logs_read",
-    "logs_search",
-    "restart",
-    "cancel",
-    "sandbox_grant",
-    "read_file",
-    "list_dir",
-    "file_search",
-    "grep_search",
-    "fetch_webpage",
-    "write_file",
-    "replace_in_file",
-    "agent",
-    "todo_write",
-    "log_monitor",
-];
 
 #[cfg(test)]
 mod tests {

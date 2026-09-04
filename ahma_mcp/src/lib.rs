@@ -122,8 +122,9 @@
 // Public modules
 /// Core adapter for tool execution.
 pub mod adapter;
-mod check_service_ext;
 /// Client helpers for talking to Ahma.
+pub mod builtin_tool;
+mod check_service_ext;
 pub mod client;
 /// Client type helpers and compatibility flags.
 pub mod client_type;

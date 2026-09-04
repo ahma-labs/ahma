@@ -44,12 +44,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{collections::HashMap, path::Path};
 
-/// Names a configured tool may not take, because ahma answers them itself.
-///
-/// Derived from [`crate::constants::BUILTIN_TOOL_NAMES`] rather than retyped:
-/// the hand-maintained copy this replaced was five names short of the actual
-/// built-in set.
-const RESERVED_TOOL_NAMES: &[&str] = crate::constants::BUILTIN_TOOL_NAMES;
 const TOOL_CONFIG_READ_MAX_ATTEMPTS: usize = 8;
 const TOOL_CONFIG_READ_BACKOFF_MS: u64 = 40;
 
@@ -605,8 +599,9 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Whether a configured tool may not take this name, because ahma answers it.
 fn is_reserved_tool_name(name: &str) -> bool {
-    RESERVED_TOOL_NAMES.contains(&name)
+    crate::builtin_tool::BuiltinTool::from_name(name).is_some()
 }
 
 fn builtin_tool_configs(config: &crate::shell::cli::AppConfig) -> Vec<(String, &'static str)> {
@@ -688,7 +683,7 @@ fn validate_tool_name(name: &str, source: &str) -> anyhow::Result<()> {
         anyhow::bail!(
             "Tool name '{}' conflicts with a hardcoded system tool. Reserved tool names: {:?}. Please rename your tool in {}",
             name,
-            RESERVED_TOOL_NAMES,
+            crate::builtin_tool::BuiltinTool::names().collect::<Vec<_>>(),
             source
         );
     }
