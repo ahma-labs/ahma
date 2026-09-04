@@ -41,6 +41,10 @@ pub struct OpWireIdentity {
     pub command: Option<String>,
     /// Which attached session initiated it.
     pub origin: Option<String>,
+    /// The start record was reconstructed from the terminal event: the outcome
+    /// is true, the tool/command/working directory are unknown. Rendered as
+    /// such rather than as blanks (SPEC R24.8).
+    pub partial: bool,
 }
 
 pub use crate::mcp_source::SourceEvent;
@@ -183,6 +187,7 @@ impl DaemonState {
         op.title = identity.title;
         op.command = identity.command;
         op.origin = identity.origin;
+        op.partial = identity.partial;
         if op.cwd.is_none() {
             op.cwd = identity.cwd;
         }
@@ -467,6 +472,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 cwd,
                 command,
                 origin,
+                partial,
             } => {
                 state.on_op_started(
                     &instance_id,
@@ -481,6 +487,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                         cwd,
                         command,
                         origin,
+                        partial,
                     },
                 );
                 Applied::ListChanged
@@ -612,6 +619,9 @@ mod tests {
             scope: "/test".to_string(),
             label: label.to_string(),
             client: None,
+            session_id: None,
+            client_pid: None,
+            ended_epoch_ms: None,
         }
     }
 
@@ -1003,6 +1013,7 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
                 },
             },
         );
@@ -1070,6 +1081,7 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
                 },
             },
         );
@@ -1504,6 +1516,7 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
                 },
             },
         )
@@ -1880,6 +1893,8 @@ mod tests {
                 scope: "/test".to_string(),
                 label: "IntegrationInstance".to_string(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -1909,6 +1924,7 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
                 },
             },
         )

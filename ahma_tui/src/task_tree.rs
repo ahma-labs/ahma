@@ -444,6 +444,9 @@ mod tests {
             scope: scope.into(),
             label: label.into(),
             client: client.map(String::from),
+            session_id: None,
+            client_pid: None,
+            ended_epoch_ms: None,
         }
     }
 

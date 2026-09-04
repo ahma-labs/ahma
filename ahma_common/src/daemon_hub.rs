@@ -95,6 +95,22 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// once exceeded the oldest *finished* op is dropped (running ops are kept).
 const MAX_OPS_PER_INSTANCE: usize = 500;
 
+/// Bounded output lines retained per operation, replayed to a late subscriber
+/// so a TUI opened mid-build shows what the command has been printing rather
+/// than an empty pane. Matches `ahma_mcp::operation_monitor::MAX_TAIL_LINES`,
+/// which is the window the producing side keeps.
+pub const MAX_TAIL_LINES: usize = 100;
+
+/// How long a finished operation — and an instance that has since
+/// disconnected — stays replayable (SPEC R-DAEMON.7). One hour is what a
+/// developer means by "what just happened".
+pub const HISTORY_REPLAY_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Ceiling on retained operations across every instance, live or ended. The
+/// per-instance cap alone is unbounded in the number of instances, and a hook
+/// registers one instance per hooked command.
+const MAX_RETAINED_OPS: usize = 2000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Protocol types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,6 +174,25 @@ pub struct InstanceInfo {
     /// client has attached or when the instance predates this field.
     #[serde(default)]
     pub client: Option<String>,
+    /// The MCP session this instance serves (the bridge's `Mcp-Session-Id`).
+    ///
+    /// Three Claude Code windows open on one repository register with the same
+    /// pid-less identity — same `client`, same `label`, same `scope` — so
+    /// without this they are indistinguishable, and the daemon-minted `id`
+    /// changes on every reconnect-to-relabel, which reshuffles them in any view
+    /// that sorts by it. The session id is stable for the life of the session,
+    /// so the hub keys an instance's identity off it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Pid of the client-facing frontend process (the one the editor spawned),
+    /// as opposed to `pid`, which is the worker that executes the tools.
+    #[serde(default)]
+    pub client_pid: Option<u32>,
+    /// When this instance disconnected (Unix epoch, milliseconds), for an
+    /// instance retained only so its recent operations still have somewhere to
+    /// belong. `None` for a live instance.
+    #[serde(default)]
+    pub ended_epoch_ms: Option<u64>,
 }
 
 /// An operation event forwarded from an instance to the daemon.
@@ -199,6 +234,14 @@ pub enum DaemonEvent {
         /// user's own TUI commands and stay readable.
         #[serde(default)]
         origin: Option<String>,
+        /// True when this start record was **reconstructed** from the
+        /// operation's terminal event, because the original was never seen or
+        /// had aged out — a hook whose command outlived a daemon restart, say.
+        /// The outcome is true; the preamble (tool, command, working directory)
+        /// is genuinely unknown, and a reader must say so rather than render
+        /// blanks as fact.
+        #[serde(default)]
+        partial: bool,
     },
     OpFinished {
         id: String,
@@ -346,6 +389,15 @@ pub enum ClientMsg {
         /// MCP client identity (`clientInfo.name`), when already known.
         #[serde(default)]
         client: Option<String>,
+        /// The MCP session this instance serves. Re-registering with the same
+        /// value re-uses the instance id the hub already assigned, so a
+        /// reconnect-to-relabel does not look like one instance leaving and a
+        /// different one arriving.
+        #[serde(default)]
+        session_id: Option<String>,
+        /// Pid of the client-facing frontend process.
+        #[serde(default)]
+        client_pid: Option<u32>,
     },
     /// An operation event from a registered instance.
     Event { payload: DaemonEvent },
@@ -878,10 +930,72 @@ struct OpSnapshot {
     seq: u64,
     started: DaemonEvent,
     finished: Option<DaemonEvent>,
+    /// The last [`MAX_TAIL_LINES`] output lines, replayed after `started` so a
+    /// subscriber that attaches mid-operation sees what it has been printing.
+    /// Bounded on purpose: this is a window, not a log — the complete output
+    /// lives in the operation's own output file.
+    tail: std::collections::VecDeque<(String, bool)>,
+    /// When this op reached a terminal state (Unix epoch, milliseconds), for
+    /// the replay window. Taken from the wire event when it carries one, and
+    /// from the hub's own clock when it does not — a cancellation has no exit
+    /// code and need not carry an end time, but it still has to age out.
+    /// `None` while the op is still running.
+    finished_at_ms: Option<u64>,
 }
 
 /// Per-instance operation history, keyed by op id.
 type InstanceOpHistory = std::collections::HashMap<String, OpSnapshot>;
+
+/// Wall-clock milliseconds since the Unix epoch.
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The operation id an event refers to, if it is about an operation at all.
+fn op_id_of(event: &DaemonEvent) -> Option<String> {
+    match event {
+        DaemonEvent::OpStarted { id, .. }
+        | DaemonEvent::OpFinished { id, .. }
+        | DaemonEvent::OpOutput { id, .. } => Some(id.clone()),
+        DaemonEvent::LogLine { .. } => None,
+    }
+}
+
+/// Rebuild the `OpStarted` an orphaned terminal event never had.
+///
+/// The title is the one thing a reader needs and the one thing the terminal
+/// event carries (its result summary); the start time is derived from the end
+/// time and the duration, both of which are on the wire. Everything else is
+/// left empty rather than guessed.
+fn synthetic_started(
+    op_id: &str,
+    finished: &DaemonEvent,
+    duration_ms: u64,
+    ended_epoch_ms: Option<u64>,
+) -> DaemonEvent {
+    let summary = match finished {
+        DaemonEvent::OpFinished { result_summary, .. } => result_summary.clone(),
+        _ => None,
+    };
+    DaemonEvent::OpStarted {
+        id: op_id.to_string(),
+        tool_name: String::new(),
+        description: summary.clone().unwrap_or_default(),
+        scope: String::new(),
+        parent_id: None,
+        started_epoch_ms: ended_epoch_ms.map(|e| e.saturating_sub(duration_ms)),
+        title: summary,
+        cwd: None,
+        command: None,
+        origin: None,
+        // The whole point of this record: it was reconstructed, and a reader
+        // must not present its blanks as fact.
+        partial: true,
+    }
+}
 
 /// Internal shared state for the running daemon.
 #[derive(Debug, Clone)]
@@ -917,6 +1031,18 @@ struct DaemonHub {
     connection_count: Arc<AtomicUsize>,
     socket_path: Option<PathBuf>,
     pending_approvals: Arc<Mutex<std::collections::HashMap<String, PendingApproval>>>,
+    /// `session_id` → the instance id first assigned to it, so a re-register
+    /// keeps its identity (and its retained history) instead of arriving as a
+    /// stranger.
+    session_ids: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Instances that have disconnected but whose operations are still inside
+    /// the replay window, stamped with when they went (SPEC R-DAEMON.7).
+    ///
+    /// History used to be dropped the instant an instance disconnected, which
+    /// made a whole class of work invisible: a hooked command is an instance
+    /// that lives for the length of one command, so by the time anyone looked
+    /// at the TUI it had always already gone.
+    ended_instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
     /// What to run when a client sends [`ClientMsg::Shutdown`]. `None` means
     /// the historical behaviour: unlink our socket and `exit(0)`.
     exit_hook: parking_lot::Mutex<Option<ExitHook>>,
@@ -935,6 +1061,8 @@ impl DaemonHub {
                 connection_count: Arc::new(AtomicUsize::new(0)),
                 socket_path,
                 pending_approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                session_ids: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                ended_instances: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 exit_hook: parking_lot::Mutex::new(None),
             },
             rx,
@@ -955,8 +1083,8 @@ impl DaemonHub {
     }
 
     /// Record an operation event so it can be replayed to subscribers that join
-    /// later. Only `OpStarted`/`OpFinished` carry replayable state; other events
-    /// (streaming output, log lines) are live-only and ignored here.
+    /// later: `OpStarted`, a bounded window of the output that followed it, and
+    /// the terminal `OpFinished`. Log lines are live-only.
     async fn record_op_event(&self, instance_id: &str, payload: &DaemonEvent) {
         match payload {
             DaemonEvent::OpStarted { id, .. } => {
@@ -965,7 +1093,28 @@ impl DaemonHub {
             DaemonEvent::OpFinished { id, .. } => {
                 self.record_op_finished(instance_id, id, payload).await
             }
-            _ => {}
+            DaemonEvent::OpOutput {
+                id,
+                line,
+                is_stderr,
+            } => {
+                self.record_op_output(instance_id, id, line, *is_stderr)
+                    .await
+            }
+            DaemonEvent::LogLine { .. } => {}
+        }
+    }
+
+    /// Append one output line to `op_id`'s retained window, evicting the oldest
+    /// once [`MAX_TAIL_LINES`] is reached. Output for an op the hub never saw
+    /// start is dropped: it has no row to belong to.
+    async fn record_op_output(&self, instance_id: &str, op_id: &str, line: &str, is_stderr: bool) {
+        let mut hist = self.op_history.lock().await;
+        if let Some(snap) = hist.get_mut(instance_id).and_then(|i| i.get_mut(op_id)) {
+            if snap.tail.len() >= MAX_TAIL_LINES {
+                snap.tail.pop_front();
+            }
+            snap.tail.push_back((line.to_string(), is_stderr));
         }
     }
 
@@ -981,6 +1130,8 @@ impl DaemonHub {
                 seq,
                 started: started.clone(),
                 finished: None,
+                tail: std::collections::VecDeque::new(),
+                finished_at_ms: None,
             },
         );
         if inst.len() > MAX_OPS_PER_INSTANCE {
@@ -988,20 +1139,74 @@ impl DaemonHub {
         }
     }
 
-    /// Attach the terminal event to `op_id`'s retained snapshot. An op whose
-    /// `OpStarted` was never seen (or was already evicted) has nothing to
-    /// attach to and is ignored.
+    /// Attach the terminal event to `op_id`'s retained snapshot.
+    ///
+    /// An op whose `OpStarted` the hub never saw — because it was evicted, or
+    /// because the daemon restarted while the op was running — is reconstructed
+    /// from the terminal event alone and flagged `partial`. Dropping it instead
+    /// (the old behaviour) lost the outcome of exactly the work a user is most
+    /// likely to ask about, and left the instance's tallies wrong.
     async fn record_op_finished(&self, instance_id: &str, op_id: &str, finished: &DaemonEvent) {
+        let DaemonEvent::OpFinished {
+            duration_ms,
+            ended_epoch_ms,
+            ..
+        } = finished
+        else {
+            return;
+        };
         let mut hist = self.op_history.lock().await;
-        if let Some(inst) = hist.get_mut(instance_id)
-            && let Some(snap) = inst.get_mut(op_id)
-        {
-            snap.finished = Some(finished.clone());
+        let inst = hist.entry(instance_id.to_string()).or_default();
+        match inst.get_mut(op_id) {
+            Some(snap) => {
+                snap.finished = Some(finished.clone());
+                snap.finished_at_ms = Some(ended_epoch_ms.unwrap_or_else(now_epoch_ms));
+            }
+            None => {
+                let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
+                inst.insert(
+                    op_id.to_string(),
+                    OpSnapshot {
+                        seq,
+                        started: synthetic_started(op_id, finished, *duration_ms, *ended_epoch_ms),
+                        finished: Some(finished.clone()),
+                        tail: std::collections::VecDeque::new(),
+                        finished_at_ms: Some(ended_epoch_ms.unwrap_or_else(now_epoch_ms)),
+                    },
+                );
+                if inst.len() > MAX_OPS_PER_INSTANCE {
+                    Self::evict_oldest_finished(inst);
+                }
+            }
         }
     }
 
-    /// Snapshot the retained op events for every instance, ordered for replay
-    /// (each op's `OpStarted` first, then its `OpFinished` if present).
+    /// Every instance a subscriber should know about: those attached now, plus
+    /// those retained inside the replay window so their operations have a
+    /// section to belong to. An ended instance carries `ended_epoch_ms`, which
+    /// is how a reader tells the two apart.
+    async fn instance_snapshot(&self) -> Vec<InstanceInfo> {
+        let mut out: Vec<InstanceInfo> = self.instances.lock().await.values().cloned().collect();
+        let live: std::collections::HashSet<String> = out.iter().map(|i| i.id.clone()).collect();
+        out.extend(
+            self.ended_instances
+                .lock()
+                .await
+                .values()
+                .filter(|i| !live.contains(&i.id))
+                .cloned(),
+        );
+        out
+    }
+
+    /// Snapshot the retained op events for every instance, ordered for replay:
+    /// each op's `OpStarted`, then the output window that followed it, then its
+    /// `OpFinished` if it has one.
+    ///
+    /// The output is replayed as ordinary `OpOutput` events rather than a new
+    /// message or a field on `OpStarted`: every subscriber already appends
+    /// those to the right pane, so replay is byte-for-byte the shape the live
+    /// stream has, and there is no second code path to keep in step (R24.5).
     async fn replay_events(&self) -> Vec<DaemonMsg> {
         let hist = self.op_history.lock().await;
         let mut snaps: Vec<(String, OpSnapshot)> = hist
@@ -1011,10 +1216,21 @@ impl DaemonHub {
         snaps.sort_by_key(|(_, s)| s.seq);
         let mut out = Vec::with_capacity(snaps.len() * 2);
         for (instance_id, snap) in snaps {
+            let op_id = op_id_of(&snap.started).unwrap_or_default();
             out.push(DaemonMsg::Event {
                 instance_id: instance_id.clone(),
                 payload: snap.started,
             });
+            for (line, is_stderr) in snap.tail {
+                out.push(DaemonMsg::Event {
+                    instance_id: instance_id.clone(),
+                    payload: DaemonEvent::OpOutput {
+                        id: op_id.clone(),
+                        line,
+                        is_stderr,
+                    },
+                });
+            }
             if let Some(finished) = snap.finished {
                 out.push(DaemonMsg::Event {
                     instance_id,
@@ -1023,6 +1239,51 @@ impl DaemonHub {
             }
         }
         out
+    }
+
+    /// Drop retained operations that have aged out of the replay window, and
+    /// any instance retained only for them; then enforce the global ceiling by
+    /// evicting oldest-finished-first across every instance.
+    async fn prune_history(&self, now_ms: u64) {
+        let cutoff = now_ms.saturating_sub(HISTORY_REPLAY_WINDOW.as_millis() as u64);
+        let mut hist = self.op_history.lock().await;
+        for ops in hist.values_mut() {
+            // A finished op ages out of the window; one still running never
+            // does, however long it takes.
+            ops.retain(|_, snap| snap.finished_at_ms.is_none_or(|ended| ended >= cutoff));
+        }
+        hist.retain(|_, ops| !ops.is_empty());
+
+        let mut total: usize = hist.values().map(|o| o.len()).sum();
+        while total > MAX_RETAINED_OPS {
+            let oldest = hist
+                .iter()
+                .flat_map(|(inst, ops)| {
+                    ops.iter()
+                        .filter(|(_, s)| s.finished.is_some())
+                        .map(move |(op, s)| (s.seq, inst.clone(), op.clone()))
+                })
+                .min();
+            let Some((_, inst, op)) = oldest else { break };
+            if let Some(ops) = hist.get_mut(&inst) {
+                ops.remove(&op);
+                if ops.is_empty() {
+                    hist.remove(&inst);
+                }
+            }
+            total -= 1;
+        }
+
+        // An instance retained only so its operations had somewhere to belong
+        // goes with the last of them.
+        let live: std::collections::HashSet<String> = hist.keys().cloned().collect();
+        let mut ended = self.ended_instances.lock().await;
+        ended.retain(|id, info| {
+            live.contains(id)
+                || info
+                    .ended_epoch_ms
+                    .is_some_and(|ended_at| ended_at >= cutoff)
+        });
     }
 }
 
@@ -1324,16 +1585,22 @@ where
             scope,
             label,
             client,
+            session_id,
+            client_pid,
         } => {
             serve_instance(
                 &mut reader,
                 &mut writer,
                 &hub,
-                pid,
-                mode,
-                scope,
-                label,
-                client,
+                Registration {
+                    pid,
+                    mode,
+                    scope,
+                    label,
+                    client,
+                    session_id,
+                    client_pid,
+                },
             )
             .await
         }
@@ -1341,8 +1608,7 @@ where
         ClientMsg::Subscribe => serve_subscriber(&mut writer, &hub).await,
 
         ClientMsg::ListInstances => {
-            let instances: Vec<InstanceInfo> =
-                hub.instances.lock().await.values().cloned().collect();
+            let instances = hub.instance_snapshot().await;
             let _ = send_msg(&mut writer, &DaemonMsg::InstanceList { instances }).await;
             // One-shot query — connection closes after response.
         }
@@ -1531,28 +1797,55 @@ async fn resolve_target(hub: &DaemonHub, target: Option<&str>) -> Option<String>
 /// Serve a registered ahma instance: register it, then exchange events and
 /// liveness pings until it disconnects, finally cleaning up its state.
 #[allow(clippy::too_many_arguments)]
-async fn serve_instance<R, W>(
-    reader: &mut BufReader<R>,
-    writer: &mut W,
-    hub: &Arc<DaemonHub>,
+/// The fields an instance announces when it registers.
+struct Registration {
     pid: u32,
     mode: String,
     scope: String,
     label: String,
     client: Option<String>,
+    session_id: Option<String>,
+    client_pid: Option<u32>,
+}
+
+async fn serve_instance<R, W>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    hub: &Arc<DaemonHub>,
+    reg: Registration,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let id = uuid_v4();
+    // One session keeps one instance id for its whole life. An instance
+    // re-registers whenever it learns something about itself (its client's
+    // name, its committed sandbox scope), and a fresh id each time made that
+    // look like a departure and an arrival: collapse state and selection keyed
+    // on the id were lost, and any view sorting by id reshuffled.
+    let id = match reg.session_id.as_deref() {
+        Some(session) => hub
+            .session_ids
+            .lock()
+            .await
+            .entry(session.to_string())
+            .or_insert_with(uuid_v4)
+            .clone(),
+        None => uuid_v4(),
+    };
+    // A session that comes back is live again, not history.
+    hub.ended_instances.lock().await.remove(&id);
     let info = InstanceInfo {
         id: id.clone(),
-        pid,
-        mode,
-        scope,
-        label,
-        client,
+        pid: reg.pid,
+        mode: reg.mode,
+        scope: reg.scope,
+        label: reg.label,
+        client: reg.client,
+        session_id: reg.session_id,
+        client_pid: reg.client_pid,
+        ended_epoch_ms: None,
     };
+    let pid = reg.pid;
     hub.instances.lock().await.insert(id.clone(), info.clone());
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DaemonMsg>(100);
@@ -1659,10 +1952,18 @@ async fn serve_instance<R, W>(
         }
     }
 
-    hub.instances.lock().await.remove(&id);
+    let departed = hub.instances.lock().await.remove(&id);
     hub.instance_txs.lock().await.remove(&id);
-    hub.op_history.lock().await.remove(&id);
     hub.pending_approvals.lock().await.remove(&id);
+    // The operation history deliberately stays (SPEC R-DAEMON.7): it ages out
+    // of the replay window instead, so work done by a session that has since
+    // closed — or by a hook, which is an instance for the length of one
+    // command — is still there when someone opens a TUI a minute later.
+    if let Some(mut info) = departed {
+        info.ended_epoch_ms = Some(now_epoch_ms());
+        hub.ended_instances.lock().await.insert(id.clone(), info);
+    }
+    hub.prune_history(now_epoch_ms()).await;
     let _ = hub
         .broadcast
         .send(DaemonMsg::InstanceUnregistered { id: id.clone() });
@@ -1676,7 +1977,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     // Send current instance list, then stream events.
-    let instances: Vec<InstanceInfo> = hub.instances.lock().await.values().cloned().collect();
+    let instances = hub.instance_snapshot().await;
     if let Err(e) = send_msg(writer, &DaemonMsg::InstanceList { instances }).await {
         debug!("daemon: subscriber write failed: {e}");
         return;
@@ -1792,11 +2093,83 @@ mod tests {
             cwd: Some("/ws".into()),
             command: Some("cargo build".into()),
             origin: Some("cursor".into()),
+            partial: false,
         };
         let json = serde_json::to_string(&new).unwrap();
         let old: OldOpStarted = serde_json::from_str(&json).expect("old readers still parse");
         assert_eq!(old.id, "op_1");
         assert_eq!(old.tool_name, "run_terminal_command");
+    }
+
+    /// A daemon left running across an upgrade is the reader that decides
+    /// (R24.5), so a `Register` carrying the session fields must still parse
+    /// into one that has never heard of them.
+    #[test]
+    fn an_old_reader_ignores_the_new_registration_fields() {
+        #[derive(serde::Deserialize)]
+        struct OldRegister {
+            pid: u32,
+            mode: String,
+            scope: String,
+            label: String,
+        }
+
+        let msg = ClientMsg::Register {
+            pid: 4242,
+            mode: "stdio".into(),
+            scope: "/ws".into(),
+            label: "ahma".into(),
+            client: Some("claude-code".into()),
+            session_id: Some("sess-1".into()),
+            client_pid: Some(99),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains("\"session_id\":\"sess-1\"") && json.contains("\"client_pid\":99"),
+            "the new fields must actually be on the wire: {json}"
+        );
+        let old: OldRegister = serde_json::from_str(&json).expect("old daemons still parse");
+        assert_eq!(old.pid, 4242);
+        assert_eq!(old.mode, "stdio");
+        assert_eq!(old.scope, "/ws");
+        assert_eq!(old.label, "ahma");
+    }
+
+    /// ...and the reverse: an instance built before these fields existed still
+    /// registers against a new daemon.
+    #[test]
+    fn a_new_reader_accepts_a_registration_without_the_session_fields() {
+        let old_json = serde_json::json!({
+            "type": "Register",
+            "pid": 7,
+            "mode": "stdio",
+            "scope": "/ws",
+            "label": "ahma"
+        })
+        .to_string();
+        match serde_json::from_str::<ClientMsg>(&old_json).expect("old Register still parses") {
+            ClientMsg::Register {
+                session_id,
+                client_pid,
+                client,
+                ..
+            } => {
+                assert_eq!(session_id, None);
+                assert_eq!(client_pid, None);
+                assert_eq!(client, None);
+            }
+            other => panic!("expected Register, got {other:?}"),
+        }
+
+        let old_instance = serde_json::json!({
+            "id": "i1", "pid": 7, "mode": "stdio", "scope": "/ws", "label": "ahma"
+        })
+        .to_string();
+        let info: InstanceInfo =
+            serde_json::from_str(&old_instance).expect("old InstanceInfo still parses");
+        assert_eq!(info.session_id, None);
+        assert_eq!(info.client_pid, None);
+        assert_eq!(info.ended_epoch_ms, None);
     }
 
     /// An *old* event must deserialize into a *new* reader, with the new fields
@@ -1937,6 +2310,8 @@ mod tests {
             scope: "/test".to_string(),
             label: "TestLabel".to_string(),
             client: None,
+            session_id: None,
+            client_pid: None,
         };
         let mut buf = Vec::<u8>::new();
         send_msg(&mut buf, &msg).await.unwrap();
@@ -1956,6 +2331,7 @@ mod tests {
                 scope,
                 label,
                 client,
+                ..
             } => {
                 assert_eq!(pid, 42);
                 assert_eq!(mode, "stdio");
@@ -2022,6 +2398,7 @@ mod tests {
             cwd: None,
             command: None,
             origin: None,
+            partial: false,
         };
         let json = serde_json::to_string(&ev).unwrap();
         let back: DaemonEvent = serde_json::from_str(&json).unwrap();
@@ -2048,6 +2425,9 @@ mod tests {
                 scope: "/project".to_string(),
                 label: "Cursor".to_string(),
                 client: None,
+                session_id: None,
+                client_pid: None,
+                ended_epoch_ms: None,
             }],
         };
         let mut buf = Vec::<u8>::new();
@@ -2080,6 +2460,7 @@ mod tests {
                 cwd: None,
                 command: None,
                 origin: None,
+                partial: false,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -2337,6 +2718,8 @@ mod tests {
                 scope: "/test/scope".to_string(),
                 label: "TestInstance".to_string(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -2366,6 +2749,7 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
                 },
             },
         )
@@ -2447,6 +2831,8 @@ mod tests {
                 scope: "/project".to_string(),
                 label: "HttpBridge".to_string(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -2522,6 +2908,7 @@ mod tests {
                 cwd: None,
                 command: None,
                 origin: None,
+                partial: false,
             },
         )
         .await;
@@ -2551,6 +2938,7 @@ mod tests {
                 cwd: None,
                 command: None,
                 origin: None,
+                partial: false,
             },
         )
         .await;
@@ -2618,6 +3006,7 @@ mod tests {
                 cwd: None,
                 command: None,
                 origin: None,
+                partial: false,
             },
         )
         .await;
@@ -2883,6 +3272,7 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
                 },
             )
             .await;
@@ -2919,6 +3309,7 @@ mod tests {
                 cwd: None,
                 command: None,
                 origin: None,
+                partial: false,
             },
         )
         .await;
@@ -2957,6 +3348,7 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
                 },
             )
             .await;
@@ -2969,69 +3361,37 @@ mod tests {
         );
     }
 
+    /// Superseded contract. A terminal event for an op the hub never saw used
+    /// to be dropped; it is now reconstructed (see
+    /// `finished_without_started_is_retained_as_partial`), because the outcome
+    /// is real even when the preamble is gone. What must still hold: the
+    /// reconstruction is a *separate* row and never corrupts a live one.
     #[tokio::test]
-    async fn record_op_finished_for_unknown_op_is_ignored() {
+    async fn a_finish_for_another_op_never_terminates_the_running_one() {
         let (hub, _rx) = DaemonHub::new(None);
+        hub.record_op_event("i1", &started_ev("real")).await;
+        hub.record_op_event("i1", &finished_ev("other", Some(now_epoch_ms())))
+            .await;
 
-        // OpFinished for a never-started op on an unknown instance is a no-op.
-        hub.record_op_event(
-            "i1",
-            &DaemonEvent::OpFinished {
-                id: "ghost".into(),
-                status: OpStatus::Failed,
-                result_summary: None,
-                duration_ms: 0,
-                ended_epoch_ms: None,
-                exit_code: None,
-                denial: None,
-            },
-        )
-        .await;
-        assert!(hub.replay_events().await.is_empty());
-
-        // OpFinished for a different id than the started one leaves it running.
-        hub.record_op_event(
-            "i1",
-            &DaemonEvent::OpStarted {
-                id: "real".into(),
-                tool_name: "t".into(),
-                description: "d".into(),
-                scope: "/w".into(),
-                parent_id: None,
-                started_epoch_ms: None,
-                title: None,
-                cwd: None,
-                command: None,
-                origin: None,
-            },
-        )
-        .await;
-        hub.record_op_event(
-            "i1",
-            &DaemonEvent::OpFinished {
-                id: "other".into(),
-                status: OpStatus::Failed,
-                result_summary: None,
-                duration_ms: 0,
-                ended_epoch_ms: None,
-                exit_code: None,
-                denial: None,
-            },
-        )
-        .await;
         let replay = hub.replay_events().await;
-        assert_eq!(
-            replay.len(),
-            1,
-            "only the started op replays; the mismatched finish is ignored"
+        let real_finished = replay.iter().any(|m| {
+            matches!(m, DaemonMsg::Event { payload: DaemonEvent::OpFinished { id, .. }, .. } if id == "real")
+        });
+        assert!(
+            !real_finished,
+            "the running op must stay running: {replay:?}"
         );
-        assert!(matches!(
-            &replay[0],
-            DaemonMsg::Event {
-                payload: DaemonEvent::OpStarted { id, .. },
-                ..
-            } if id == "real"
-        ));
+        let other_rows = replay
+            .iter()
+            .filter(|m| {
+                matches!(m, DaemonMsg::Event { payload, .. }
+                    if op_id_of(payload).as_deref() == Some("other"))
+            })
+            .count();
+        assert_eq!(
+            other_rows, 2,
+            "the orphan gets its own started+finished pair"
+        );
     }
 
     // ── resolve_target ────────────────────────────────────────────────────────
@@ -3059,9 +3419,297 @@ mod tests {
                 scope: "/w".into(),
                 label: "L".into(),
                 client: None,
+                session_id: None,
+                client_pid: None,
+                ended_epoch_ms: None,
             },
         );
         assert_eq!(resolve_target(&hub, None).await, Some("only".to_string()));
+    }
+
+    // ── retention: output tails, ended instances, window and cap ──────────────
+
+    /// Helper: a minimal started event for retention tests.
+    fn started_ev(id: &str) -> DaemonEvent {
+        DaemonEvent::OpStarted {
+            id: id.into(),
+            tool_name: "run_terminal_command".into(),
+            description: "d".into(),
+            scope: "/w".into(),
+            parent_id: None,
+            started_epoch_ms: None,
+            title: Some(format!("cmd {id}")),
+            cwd: None,
+            command: None,
+            origin: None,
+            partial: false,
+        }
+    }
+
+    /// Helper: a terminal event that ended `ago_ms` milliseconds ago.
+    fn finished_ev(id: &str, ended_epoch_ms: Option<u64>) -> DaemonEvent {
+        DaemonEvent::OpFinished {
+            id: id.into(),
+            status: OpStatus::Completed,
+            result_summary: Some("ok".into()),
+            duration_ms: 5,
+            ended_epoch_ms,
+            exit_code: Some(0),
+            denial: None,
+        }
+    }
+
+    /// The retained output window is bounded: it is what a late subscriber
+    /// needs to see, not a log (SPEC R-DAEMON.7).
+    #[tokio::test]
+    async fn op_output_tail_is_bounded_to_max_tail_lines() {
+        let (hub, _rx) = DaemonHub::new(None);
+        hub.record_op_event("i1", &started_ev("op-1")).await;
+        for n in 0..(MAX_TAIL_LINES * 2) {
+            hub.record_op_event(
+                "i1",
+                &DaemonEvent::OpOutput {
+                    id: "op-1".into(),
+                    line: format!("line {n}"),
+                    is_stderr: false,
+                },
+            )
+            .await;
+        }
+
+        let lines: Vec<String> = hub
+            .replay_events()
+            .await
+            .into_iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Event {
+                    payload: DaemonEvent::OpOutput { line, .. },
+                    ..
+                } => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), MAX_TAIL_LINES, "the window is capped");
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("line {}", MAX_TAIL_LINES * 2 - 1),
+            "the newest line survives"
+        );
+        assert_eq!(
+            lines.first().unwrap(),
+            &format!("line {}", MAX_TAIL_LINES),
+            "the oldest lines are the ones dropped"
+        );
+    }
+
+    /// Replay is the same shape as the live stream — started, then output, then
+    /// finished — so a subscriber needs no second code path for history.
+    #[tokio::test]
+    async fn replay_emits_started_then_tail_then_finished_in_order() {
+        let (hub, _rx) = DaemonHub::new(None);
+        hub.record_op_event("i1", &started_ev("op-1")).await;
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpOutput {
+                id: "op-1".into(),
+                line: "compiling".into(),
+                is_stderr: false,
+            },
+        )
+        .await;
+        hub.record_op_event("i1", &finished_ev("op-1", Some(now_epoch_ms())))
+            .await;
+
+        let kinds: Vec<&'static str> = hub
+            .replay_events()
+            .await
+            .iter()
+            .map(|m| match m {
+                DaemonMsg::Event { payload, .. } => match payload {
+                    DaemonEvent::OpStarted { .. } => "started",
+                    DaemonEvent::OpOutput { .. } => "output",
+                    DaemonEvent::OpFinished { .. } => "finished",
+                    DaemonEvent::LogLine { .. } => "log",
+                },
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["started", "output", "finished"]);
+    }
+
+    /// A hook is an instance for the length of one command. Dropping its
+    /// history when it disconnected made hooked work permanently invisible:
+    /// by the time anyone looked, the instance had always already gone.
+    #[tokio::test]
+    async fn history_survives_unregister_and_the_instance_is_listed_as_ended() {
+        let (hub, _rx) = DaemonHub::new(None);
+        let info = InstanceInfo {
+            id: "i1".into(),
+            pid: 7,
+            mode: "hook".into(),
+            scope: "/w".into(),
+            label: "hook".into(),
+            client: Some("claude-code".into()),
+            session_id: None,
+            client_pid: None,
+            ended_epoch_ms: None,
+        };
+        hub.instances.lock().await.insert("i1".into(), info.clone());
+        hub.record_op_event("i1", &started_ev("op-1")).await;
+        hub.record_op_event("i1", &finished_ev("op-1", Some(now_epoch_ms())))
+            .await;
+
+        // Simulate the teardown serve_instance performs.
+        let mut departed = hub.instances.lock().await.remove("i1").unwrap();
+        departed.ended_epoch_ms = Some(now_epoch_ms());
+        hub.ended_instances
+            .lock()
+            .await
+            .insert("i1".into(), departed);
+        hub.prune_history(now_epoch_ms()).await;
+
+        let listed = hub.instance_snapshot().await;
+        assert_eq!(listed.len(), 1, "the ended instance is still listed");
+        assert!(
+            listed[0].ended_epoch_ms.is_some(),
+            "and is marked as ended, which is how a reader tells it apart"
+        );
+        assert_eq!(
+            hub.replay_events().await.len(),
+            2,
+            "its operations still replay"
+        );
+    }
+
+    /// Finished work ages out of the window; work still running never does,
+    /// however long it takes.
+    #[tokio::test]
+    async fn replay_window_evicts_finished_ops_older_than_the_window() {
+        let (hub, _rx) = DaemonHub::new(None);
+        let now = now_epoch_ms();
+        let long_ago = now - HISTORY_REPLAY_WINDOW.as_millis() as u64 - 60_000;
+
+        hub.record_op_event("i1", &started_ev("old")).await;
+        hub.record_op_event("i1", &finished_ev("old", Some(long_ago)))
+            .await;
+        hub.record_op_event("i1", &started_ev("recent")).await;
+        hub.record_op_event("i1", &finished_ev("recent", Some(now)))
+            .await;
+        hub.record_op_event("i1", &started_ev("still-running"))
+            .await;
+
+        hub.prune_history(now).await;
+
+        let ids: Vec<String> = hub
+            .replay_events()
+            .await
+            .iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Event {
+                    payload: DaemonEvent::OpStarted { id, .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!ids.contains(&"old".to_string()), "aged out: {ids:?}");
+        assert!(ids.contains(&"recent".to_string()), "kept: {ids:?}");
+        assert!(
+            ids.contains(&"still-running".to_string()),
+            "a running op is never pruned by age: {ids:?}"
+        );
+    }
+
+    /// The per-instance cap is unbounded in the number of instances, and a hook
+    /// registers one per hooked command; the global ceiling is what actually
+    /// bounds the daemon's memory.
+    #[tokio::test]
+    async fn global_retention_cap_evicts_oldest_finished_first() {
+        let (hub, _rx) = DaemonHub::new(None);
+        let now = now_epoch_ms();
+        for i in 0..(MAX_RETAINED_OPS + 50) {
+            let inst = format!("hook-{i}");
+            let op = format!("op-{i}");
+            hub.record_op_event(&inst, &started_ev(&op)).await;
+            hub.record_op_event(&inst, &finished_ev(&op, Some(now)))
+                .await;
+        }
+        hub.prune_history(now).await;
+
+        let retained: usize = hub.op_history.lock().await.values().map(|o| o.len()).sum();
+        assert!(
+            retained <= MAX_RETAINED_OPS,
+            "retention must be bounded across instances, kept {retained}"
+        );
+        let ids: Vec<String> = hub
+            .replay_events()
+            .await
+            .iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Event {
+                    payload: DaemonEvent::OpStarted { id, .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ids.contains(&format!("op-{}", MAX_RETAINED_OPS + 49)),
+            "the newest work is what survives"
+        );
+        assert!(!ids.contains(&"op-0".to_string()), "the oldest is evicted");
+    }
+
+    /// An operation whose start the hub never saw still has a real outcome. It
+    /// is reconstructed and flagged, rather than dropped — which used to lose
+    /// exactly the work a user is most likely to ask about.
+    #[tokio::test]
+    async fn finished_without_started_is_retained_as_partial() {
+        let (hub, _rx) = DaemonHub::new(None);
+        let now = now_epoch_ms();
+        hub.record_op_event("i1", &finished_ev("orphan", Some(now)))
+            .await;
+
+        let replay = hub.replay_events().await;
+        let started = replay
+            .iter()
+            .find_map(|m| match m {
+                DaemonMsg::Event {
+                    payload: payload @ DaemonEvent::OpStarted { .. },
+                    ..
+                } => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("a reconstructed start record");
+        match started {
+            DaemonEvent::OpStarted {
+                id,
+                partial,
+                title,
+                started_epoch_ms,
+                ..
+            } => {
+                assert_eq!(id, "orphan");
+                assert!(partial, "the row must admit it was reconstructed");
+                assert_eq!(title.as_deref(), Some("ok"), "outcome text is all we have");
+                assert_eq!(
+                    started_epoch_ms,
+                    Some(now - 5),
+                    "start derived from end minus duration"
+                );
+            }
+            other => panic!("expected OpStarted, got {other:?}"),
+        }
+        assert!(
+            replay.iter().any(|m| matches!(
+                m,
+                DaemonMsg::Event {
+                    payload: DaemonEvent::OpFinished { .. },
+                    ..
+                }
+            )),
+            "and its outcome still replays"
+        );
     }
 
     // ── HubServer bind / already-running / stale ──────────────────────────────
@@ -3145,6 +3793,85 @@ mod tests {
         assert!(sock.exists());
     }
 
+    /// An instance re-registers whenever it learns its client's name or commits
+    /// its sandbox scope. With a fresh id each time, a TUI saw one instance
+    /// leave and a stranger arrive — losing the section's expansion state and
+    /// reshuffling any view sorted by id. The session id keeps it the same
+    /// instance (SPEC R-DAEMON.6).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reregister_with_the_same_session_keeps_the_instance_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("stable.sock");
+        let server = HubServer::bind_at(sock.clone()).await.expect("bind");
+        tokio::spawn(server.serve());
+
+        async fn register_once(sock: &std::path::Path, client: Option<&str>) -> String {
+            let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+            let (r, mut w) = tokio::io::split(stream);
+            let reader = BufReader::new(r);
+            send_msg(
+                &mut w,
+                &ClientMsg::Register {
+                    pid: 11,
+                    mode: "stdio".into(),
+                    scope: "/ws".into(),
+                    label: "ahma".into(),
+                    client: client.map(str::to_string),
+                    session_id: Some("mcp-session-7".into()),
+                    client_pid: Some(4242),
+                },
+            )
+            .await
+            .unwrap();
+            // Observe the registration from a subscriber's point of view.
+            let sub = tokio::net::UnixStream::connect(sock).await.unwrap();
+            let (sr, mut sw) = tokio::io::split(sub);
+            let mut sub_reader = BufReader::new(sr);
+            send_msg(&mut sw, &ClientMsg::ListInstances).await.unwrap();
+            let id = match recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap() {
+                DaemonMsg::InstanceList { instances } => {
+                    let live: Vec<_> = instances
+                        .iter()
+                        .filter(|i| i.ended_epoch_ms.is_none())
+                        .collect();
+                    assert_eq!(live.len(), 1, "one session is one instance: {instances:?}");
+                    assert_eq!(live[0].session_id.as_deref(), Some("mcp-session-7"));
+                    assert_eq!(live[0].client_pid, Some(4242));
+                    live[0].id.clone()
+                }
+                other => panic!("expected InstanceList, got {other:?}"),
+            };
+            // Drop the instance connection so the next registration is a
+            // genuine reconnect-to-relabel.
+            drop(w);
+            drop(reader);
+            id
+        }
+
+        let first = register_once(&sock, None).await;
+        // Wait for the hub to finish tearing the first connection down.
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+            let (r, mut w) = tokio::io::split(stream);
+            let mut reader = BufReader::new(r);
+            send_msg(&mut w, &ClientMsg::ListInstances).await.unwrap();
+            if let DaemonMsg::InstanceList { instances } =
+                recv_msg::<_, DaemonMsg>(&mut reader).await.unwrap()
+                && instances.iter().all(|i| i.ended_epoch_ms.is_some())
+            {
+                break;
+            }
+        }
+        let second = register_once(&sock, Some("claude-code")).await;
+
+        assert_eq!(
+            first, second,
+            "the same session must keep its instance id across a re-register"
+        );
+    }
+
     // ── serve_instance event forwarding ───────────────────────────────────────
 
     #[cfg(unix)]
@@ -3181,6 +3908,8 @@ mod tests {
                 scope: "/w".into(),
                 label: "L".into(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -3374,6 +4103,8 @@ mod tests {
                 scope: "/w".into(),
                 label: "L".into(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -3508,6 +4239,8 @@ mod tests {
                 scope: "/w".into(),
                 label: "L".into(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -3526,6 +4259,7 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
                 },
             },
         )

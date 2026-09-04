@@ -804,6 +804,10 @@ pub struct Operation {
     /// [`OpStatus::Denied`]. Held so the row can name the path and the grant
     /// question can be re-raised for exactly that pair (SPEC R-PERM.7.1).
     pub denial: Option<(String, ahma_common::config::ScopeAccess)>,
+    /// This row was reconstructed from its terminal event alone: the hub never
+    /// saw the operation start (it aged out, or the daemon restarted mid-run).
+    /// Its outcome is real; its command and working directory are unknown.
+    pub partial: bool,
     /// When the most recent live output line arrived (set locally, not from
     /// the wire). Drives the fast-vs-slow cadence of the card's activity panel.
     pub last_output_at: Option<Instant>,
@@ -883,6 +887,7 @@ impl Operation {
             origin: None,
             exit_code: None,
             last_output_at: None,
+            partial: false,
         }
     }
 

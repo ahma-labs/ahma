@@ -65,8 +65,47 @@ pub struct WebApprovalReporting {
 /// (no `UpdateInstance` message), which keeps mixed-version daemons working;
 /// the hub replays this instance's operations to subscribers after the
 /// re-register, so the TUI view stays complete.
-static CLIENT_IDENTITY: std::sync::LazyLock<tokio::sync::watch::Sender<Option<String>>> =
-    std::sync::LazyLock::new(|| tokio::sync::watch::channel(None).0);
+/// What this instance knows about itself, as far as the hub is concerned.
+///
+/// Everything here is learned *after* the process starts and after the reporter
+/// first registers: the client's name arrives with the `initialize` handshake,
+/// the sandbox scope only exists once `roots/list` has been answered and the
+/// scope committed. A change to any field re-registers the instance
+/// (reconnect-to-relabel), which is what keeps the wire field-only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceIdentity {
+    /// `clientInfo.name` from the `initialize` handshake.
+    pub client: Option<String>,
+    /// The **committed** sandbox scope. Registration used to send
+    /// `sandbox_scopes.first()` or `"."` once at process start — before
+    /// `roots/list` — so in the default roots-driven configuration every
+    /// instance advertised `"."`, and a TUI filtering by project matched none
+    /// of them (SPEC R24.3).
+    pub scope: Option<String>,
+    /// The MCP session this instance serves, stable for its whole life.
+    pub session_id: Option<String>,
+    /// Pid of the client-facing frontend process.
+    pub client_pid: Option<u32>,
+}
+
+static INSTANCE_IDENTITY: std::sync::LazyLock<tokio::sync::watch::Sender<InstanceIdentity>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(InstanceIdentity::default()).0);
+
+/// Seed the parts of the identity known at startup (session id, frontend pid).
+pub fn set_initial_identity(session_id: Option<String>, client_pid: Option<u32>) {
+    INSTANCE_IDENTITY.send_if_modified(|cur| {
+        let mut next = cur.clone();
+        if session_id.is_some() {
+            next.session_id = session_id.clone();
+        }
+        if client_pid.is_some() {
+            next.client_pid = client_pid;
+        }
+        let changed = next != *cur;
+        *cur = next;
+        changed
+    });
+}
 
 /// Record the MCP client identity for this instance. Called from
 /// `on_initialized` once `clientInfo.name` is known. Idempotent: setting the
@@ -76,14 +115,38 @@ pub fn set_client_identity(name: impl Into<String>) {
     if name.is_empty() {
         return;
     }
-    CLIENT_IDENTITY.send_if_modified(|cur| {
-        if cur.as_deref() == Some(name.as_str()) {
+    INSTANCE_IDENTITY.send_if_modified(|cur| {
+        if cur.client.as_deref() == Some(name.as_str()) {
             false
         } else {
-            *cur = Some(name);
+            cur.client = Some(name);
             true
         }
     });
+}
+
+/// Record the sandbox scope this instance actually locked (SPEC R5.1's single
+/// commit point is the only caller). Re-registers so the hub — and every TUI
+/// watching it — sees the real scope rather than the placeholder the process
+/// started with.
+pub fn set_committed_scope(scopes: &[std::path::PathBuf]) {
+    let Some(primary) = scopes.first().map(|p| p.display().to_string()) else {
+        return;
+    };
+    INSTANCE_IDENTITY.send_if_modified(|cur| {
+        if cur.scope.as_deref() == Some(primary.as_str()) {
+            false
+        } else {
+            cur.scope = Some(primary);
+            true
+        }
+    });
+}
+
+/// The identity as currently known, for callers that register outside the
+/// reporter loop.
+pub fn current_identity() -> InstanceIdentity {
+    INSTANCE_IDENTITY.borrow().clone()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -222,7 +285,7 @@ async fn run_reporter_loop(
     let mut web_req_rx = web.map(|w| w.req_rx);
     // Watch the client identity: learned after registration (the MCP
     // `initialize` handshake), a change makes us reconnect and re-register.
-    let mut client_rx = CLIENT_IDENTITY.subscribe();
+    let mut identity_rx = INSTANCE_IDENTITY.subscribe();
 
     loop {
         // ── Ensure daemon is running ─────────────────────────────────────────
@@ -254,13 +317,18 @@ async fn run_reporter_loop(
         // ── Register this instance ────────────────────────────────────────────
         // borrow_and_update marks the current identity as seen so the
         // `changed()` select branch only fires on a genuinely new value.
-        let client = client_rx.borrow_and_update().clone();
+        let identity = identity_rx.borrow_and_update().clone();
+        // The committed scope wins over the value this loop started with: the
+        // latter is a placeholder until `roots/list` has been answered.
+        let scope = identity.scope.clone().unwrap_or_else(|| scope.clone());
         let reg = ClientMsg::Register {
             pid,
             mode: mode.clone(),
             scope: scope.clone(),
             label: label.clone(),
-            client,
+            client: identity.client.clone(),
+            session_id: identity.session_id.clone(),
+            client_pid: identity.client_pid,
         };
         if let Err(e) = send_msg(&mut writer, &reg).await {
             debug!("daemon_reporter: register failed ({e})");
@@ -355,12 +423,14 @@ async fn run_reporter_loop(
                     }
                 }
 
-                // 2d. Client identity learned/changed → reconnect so the hub
-                // re-registers this instance with the client name attached
-                // (reconnect-to-relabel; see CLIENT_IDENTITY).
-                changed = client_rx.changed() => {
+                // 2d. Something this instance knows about itself changed — the
+                // client's name, or the sandbox scope it committed → reconnect
+                // so the hub re-registers it with the new value
+                // (reconnect-to-relabel; see INSTANCE_IDENTITY). The instance id
+                // survives because the session id does.
+                changed = identity_rx.changed() => {
                     if changed.is_ok() {
-                        info!("daemon_reporter: MCP client identity learned; re-registering with hub");
+                        info!("daemon_reporter: instance identity changed; re-registering with hub");
                         closed = true;
                     }
                 }
@@ -688,6 +758,7 @@ fn op_started_event(op: &Operation, scope: &str, origin: &str) -> DaemonEvent {
         cwd: op.cwd.clone(),
         command: op.command.clone(),
         origin: Some(origin.to_string()),
+        partial: false,
     }
 }
 
@@ -730,6 +801,7 @@ fn daemon_event_for(
             cwd: cwd.clone(),
             command: command.clone(),
             origin: Some(origin.to_string()),
+            partial: false,
         },
         Ev::OutputLine {
             operation_id,
