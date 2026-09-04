@@ -23,7 +23,7 @@
 //!       "version": "1.0.0",
 //!       "description": "Rust/Cargo build tools",
 //!       "author": "ahma-project",
-//!       "url": "https://github.com/paulirotta/ahma/releases/...",
+//!       "url": "https://github.com/ahma-labs/ahma/releases/...",
 //!       "sha256": "aabbcc..."
 //!     }
 //!   ]

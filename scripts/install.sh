@@ -1,6 +1,6 @@
 #!/bin/bash
 # One-liner installer for ahma
-# Usage: curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
+# Usage: curl -sSf https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash
 #
 # Supported platforms:
 #   - Linux x86_64 (glibc and musl)
@@ -132,7 +132,7 @@ fetch_release_json() {
     if [ -n "$RELEASE_JSON" ]; then
         return
     fi
-    RELEASES_URL="https://api.github.com/repos/paulirotta/ahma/releases/latest"
+    RELEASES_URL="https://api.github.com/repos/ahma-labs/ahma/releases/latest"
     if command -v curl >/dev/null 2>&1; then
         RELEASE_JSON=$(curl -s "$RELEASES_URL")
     elif command -v wget >/dev/null 2>&1; then
@@ -217,7 +217,7 @@ SUMS_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url" | grep "SHA256SUMS
 
 if [ -z "$DOWNLOAD_URL" ]; then
     echo "Error: Could not find release asset '$ASSET_NAME'."
-    echo "Please check https://github.com/paulirotta/ahma/releases for available binaries."
+    echo "Please check https://github.com/ahma-labs/ahma/releases for available binaries."
     exit 1
 fi
 
@@ -303,7 +303,7 @@ else
 fi
 
 # Cryptographic verification: confirm the installed binary has a valid GitHub Build Provenance
-# Attestation (Sigstore SLSA Level 3) from the official paulirotta/ahma CI pipeline.
+# Attestation (Sigstore SLSA Level 3) from the official ahma-labs/ahma CI pipeline.
 # This is the canonical trust check — even if an attacker substituted the release asset,
 # they cannot mint a Fulcio certificate for our workflow's OIDC identity.
 INSTALLED_BIN="$INSTALL_DIR/ahma"

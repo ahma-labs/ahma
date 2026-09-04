@@ -11,7 +11,7 @@ _Use your existing command line workflows through MCP with a repo-scoped sandbox
 
 |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |                                     |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------: |
-| [![CI](https://github.com/paulirotta/ahma/actions/workflows/build.yml/badge.svg)](https://github.com/paulirotta/ahma/actions/workflows/build.yml) [![Coverage Report](https://img.shields.io/badge/Coverage-Report-blue)](https://paulirotta.github.io/ahma/html/) [![Rust Docs](https://img.shields.io/badge/Rust-Docs-blue)](https://paulirotta.github.io/ahma/doc/) [![Code Simplicity](https://img.shields.io/badge/Code-Simplicity-green)](https://paulirotta.github.io/ahma/CODE_SIMPLICITY.html) [![Prebuilt Binaries](https://img.shields.io/badge/Prebuilt-Binaries-blueviolet)](https://github.com/paulirotta/ahma/actions/workflows/build.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) [![License: Per Crate](https://img.shields.io/badge/License-Per--Crate-6f42c1)](#license) [![Rust](https://img.shields.io/badge/Rust-1.93%2B-B7410E.svg)](https://www.rust-lang.org/) | ![Ahma Logo](./assets/ahma.png) |
+| [![CI](https://github.com/ahma-labs/ahma/actions/workflows/build.yml/badge.svg)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml) [![Coverage Report](https://img.shields.io/badge/Coverage-Report-blue)](https://ahma-labs.github.io/ahma/html/) [![Rust Docs](https://img.shields.io/badge/Rust-Docs-blue)](https://ahma-labs.github.io/ahma/doc/) [![Code Simplicity](https://img.shields.io/badge/Code-Simplicity-green)](https://ahma-labs.github.io/ahma/CODE_SIMPLICITY.html) [![Prebuilt Binaries](https://img.shields.io/badge/Prebuilt-Binaries-blueviolet)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) [![License: Per Crate](https://img.shields.io/badge/License-Per--Crate-6f42c1)](#license) [![Rust](https://img.shields.io/badge/Rust-1.93%2B-B7410E.svg)](https://www.rust-lang.org/) | ![Ahma Logo](./assets/ahma.png) |
 
 Ahma is an MCP server for running real project work through existing CLI tools with tighter filesystem boundaries and less blocking. It is aimed at the common case: builds, tests, formatters, git operations, log inspection, and other deterministic command-line tasks that agents already try to run.
 
@@ -20,7 +20,7 @@ Ahma is an MCP server for running real project work through existing CLI tools w
 **Linux / macOS — first-time install**
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
+curl -sSf https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc — reload your shell after
 ```
 
@@ -35,7 +35,7 @@ hand.
 **Windows (PowerShell 5.1+) — first-time install**
 
 ```powershell
-irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.ps1 | iex
 ```
 
 **Update an existing install:**
@@ -58,7 +58,7 @@ The workspace uses `reqwest` with the `http3` feature, so source builds require 
 ```bash
 # First time (no ahma yet)
 RUSTFLAGS='--cfg reqwest_unstable' \
-  cargo install --git https://github.com/paulirotta/ahma --branch <branch-name> ahma_bin --bin ahma --root ~/.local --locked --force
+  cargo install --git https://github.com/ahma-labs/ahma --branch <branch-name> ahma_bin --bin ahma --root ~/.local --locked --force
 export PATH="$HOME/.local/bin:$PATH"
 
 # After ahma is installed — the subcommand handles RUSTFLAGS automatically
@@ -69,7 +69,7 @@ ahma update <branch-name>
 
 ```powershell
 $env:RUSTFLAGS='--cfg reqwest_unstable'
-cargo install --git https://github.com/paulirotta/ahma --branch <branch-name> ahma_bin --bin ahma --root $HOME\.local --locked --force
+cargo install --git https://github.com/ahma-labs/ahma --branch <branch-name> ahma_bin --bin ahma --root $HOME\.local --locked --force
 ```
 
 **macOS:** re-sign after the first-time install — `codesign --force --sign - --options runtime "$(command -v ahma)"` — see the note below; `ahma update <branch-name>` does this for you on subsequent updates.
@@ -94,7 +94,7 @@ ahma setup --auto   # non-interactive defaults
 
 ```bash
 # cargo binstall downloads the CI-built, Sigstore-attested GitHub Release asset — no toolchain, no RUSTFLAGS.
-cargo binstall --git https://github.com/paulirotta/ahma ahma_bin
+cargo binstall --git https://github.com/ahma-labs/ahma ahma_bin
 ahma verify --self   # confirm the SLSA-3 build-provenance attestation (binstall skips the installer's auto-verify)
 ahma setup
 ```
@@ -105,7 +105,7 @@ ahma setup
 # http3/QUIC needs the reqwest_unstable cfg; the curl installer and `ahma update` set it for you,
 # but a bare `cargo install --git` does not read the repo's .cargo/config.toml, so pass it here:
 RUSTFLAGS='--cfg reqwest_unstable' \
-  cargo install --git https://github.com/paulirotta/ahma ahma_bin --locked
+  cargo install --git https://github.com/ahma-labs/ahma ahma_bin --locked
 ahma setup
 ```
 
@@ -164,7 +164,7 @@ If you prefer to build from source (required for Intel Macs, since prebuilt bina
 **Linux / macOS**
 
 ```bash
-git clone https://github.com/paulirotta/ahma.git
+git clone https://github.com/ahma-labs/ahma.git
 cd ahma
 cargo build --release -p ahma_bin
 mkdir -p ~/.local/bin
@@ -175,7 +175,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc — relo
 **Windows (PowerShell)**
 
 ```powershell
-git clone https://github.com/paulirotta/ahma.git
+git clone https://github.com/ahma-labs/ahma.git
 cd ahma
 cargo build --release -p ahma_bin
 Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
@@ -406,7 +406,7 @@ directly, so the result doesn't depend on trusting the artifact you're trying to
 
 ```bash
 gh attestation verify ahma-release-linux-x86_64.tar.gz \
-  --repo paulirotta/ahma
+  --repo ahma-labs/ahma
 ```
 
 Together they protect against:
@@ -422,7 +422,7 @@ Together they protect against:
 Building from source is always an option. AGPL means the source is always
 public and auditable:
 ```bash
-cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked
+cargo install --git https://github.com/ahma-labs/ahma ahma_bin --bin ahma --root ~/.local --locked
 ```
 
 See [docs/release-signing.md](docs/release-signing.md) for the release verification

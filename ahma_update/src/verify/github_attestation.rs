@@ -412,7 +412,7 @@ mod tests {
     use super::*;
 
     /// A real GitHub Build Provenance attestation for ahma v0.19.7, captured from
-    /// `GET /repos/paulirotta/ahma/attestations/sha256:<archive digest>`.
+    /// `GET /repos/ahma-labs/ahma/attestations/sha256:<archive digest>`.
     const BUNDLE: &str = include_str!("../../tests/fixtures/ahma_build_provenance_bundle.json");
     /// sha256 of `ahma-release-linux-x86_64.tar.gz` — subject[0] of the fixture.
     const ARCHIVE_DIGEST: &str = "4bd93abdc592c4fd25428f965e8664fa9de641362f85490006c4b0ff0e5778d2";

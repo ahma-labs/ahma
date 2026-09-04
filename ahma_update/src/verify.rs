@@ -8,7 +8,7 @@
 //! Every release archive and raw binary is attested by [`actions/attest-build-provenance`](
 //! https://github.com/actions/attest-build-provenance) which issues an ephemeral X.509
 //! certificate from Sigstore's Fulcio CA. The certificate is bound to the GitHub Actions
-//! OIDC identity (`paulirotta/ahma` repo, `refs/heads/main`). Every attestation is recorded
+//! OIDC identity (`ahma-labs/ahma` repo, `refs/heads/main`). Every attestation is recorded
 //! in Sigstore's Rekor transparency log.
 //!
 //! ## What is checked
@@ -23,7 +23,7 @@
 //!    trust root's CT-log keys.
 //! 3. The certificate matches the identity policy in this module's `policy`
 //!    submodule: GitHub Actions' OIDC issuer, workflow repository
-//!    `paulirotta/ahma`, and a signer URI under `https://github.com/paulirotta/ahma/`.
+//!    `ahma-labs/ahma`, and a signer URI under `https://github.com/ahma-labs/ahma/`.
 //! 4. The DSSE signature verifies over the envelope's pre-authentication encoding.
 //! 5. The signed in-toto statement lists our artifact's sha256 among its subjects.
 //! 6. The bundle's Rekor transparency-log entry describes this very envelope, and
@@ -54,7 +54,7 @@ use policy::AhmaReleaseIdentity;
 use sigstore::bundle::Bundle;
 use sigstore::bundle::verify::{VerificationError, Verifier};
 
-const OWNER: &str = "paulirotta";
+const OWNER: &str = "ahma-labs";
 const REPO: &str = "ahma";
 
 /// Passed to [`Verifier::verify`] as its `offline` flag.
@@ -107,9 +107,9 @@ const SIGSTORE_TRANSPARENCY_ERROR: &str = "signature transparency materials are 
 #[derive(Args, Debug, Clone)]
 #[command(
     about = "Verify an artifact's GitHub Build Provenance Attestation (Sigstore SLSA Level 3)",
-    long_about = "Verify that an artifact was produced by the official paulirotta/ahma CI pipeline.\n\n\
+    long_about = "Verify that an artifact was produced by the official ahma-labs/ahma CI pipeline.\n\n\
         Uses GitHub's Sigstore-backed Build Provenance Attestations to prove that a binary or \
-        archive was built from the paulirotta/ahma repository on the main branch.\n\n\
+        archive was built from the ahma-labs/ahma repository on the main branch.\n\n\
         Set AHMA_INSECURE_SKIP_VERIFY=1 to skip verification (offline/air-gapped use only).",
     after_help = "EXAMPLES:
   # Verify a downloaded archive
@@ -119,7 +119,7 @@ const SIGSTORE_TRANSPARENCY_ERROR: &str = "signature transparency materials are 
   ahma verify --self
 
   # Out-of-band verification with gh CLI
-  gh attestation verify ahma-release-linux-x86_64.tar.gz --repo paulirotta/ahma"
+  gh attestation verify ahma-release-linux-x86_64.tar.gz --repo ahma-labs/ahma"
 )]
 pub struct VerifyArgs {
     /// Path to the artifact to verify. Omit to verify the running ahma binary.
@@ -130,7 +130,7 @@ pub struct VerifyArgs {
     pub self_check: bool,
 }
 
-/// Verify an artifact was built by the official paulirotta/ahma workflow on main.
+/// Verify an artifact was built by the official ahma-labs/ahma workflow on main.
 ///
 /// Returns `Ok(())` on success. On failure the error message describes exactly what
 /// constraint failed (no attestation, wrong identity, expired cert, network error, etc.)
@@ -179,9 +179,9 @@ async fn verify_artifact_via(client: &reqwest::Client, api_base: &str, path: &Pa
     if bundles.is_empty() {
         bail!(
             "No GitHub Build Provenance attestation found for {} (sha256:{}).\n\
-             This artifact was not produced by the official paulirotta/ahma CI pipeline,\n\
+             This artifact was not produced by the official ahma-labs/ahma CI pipeline,\n\
              or the attestation is not yet available.\n\
-             Out-of-band check: gh attestation verify {} --repo paulirotta/ahma\n\
+             Out-of-band check: gh attestation verify {} --repo ahma-labs/ahma\n\
              Set AHMA_INSECURE_SKIP_VERIFY=1 to bypass (only for offline/air-gapped use).",
             path.display(),
             sha256,
@@ -231,10 +231,10 @@ async fn verify_artifact_via(client: &reqwest::Client, api_base: &str, path: &Pa
 
     bail!(
         "None of the {} GitHub attestation(s) for {} (sha256:{}) satisfies the\n\
-         paulirotta/ahma build-provenance policy. This artifact was not produced by the\n\
+         ahma-labs/ahma build-provenance policy. This artifact was not produced by the\n\
          official CI pipeline, or its attestation is not trustworthy.\n\
          Reasons:\n  - {}\n\
-         Out-of-band check: gh attestation verify {} --repo paulirotta/ahma\n\
+         Out-of-band check: gh attestation verify {} --repo ahma-labs/ahma\n\
          Set AHMA_INSECURE_SKIP_VERIFY=1 to bypass (only for offline/air-gapped use).",
         bundles.len(),
         path.display(),
@@ -672,7 +672,7 @@ mod tests {
     async fn unattested_artifact_reports_no_attestation_found() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path_regex(r"^/repos/paulirotta/ahma/attestations/.*$"))
+            .and(path_regex(r"^/repos/ahma-labs/ahma/attestations/.*$"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
@@ -699,7 +699,7 @@ mod tests {
     async fn api_failure_is_reported_as_a_lookup_failure() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path_regex(r"^/repos/paulirotta/ahma/attestations/.*$"))
+            .and(path_regex(r"^/repos/ahma-labs/ahma/attestations/.*$"))
             .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
             .mount(&server)
             .await;
@@ -733,7 +733,7 @@ mod tests {
         let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         Mock::given(method("GET"))
             .and(path_regex(format!(
-                r"^/repos/paulirotta/ahma/attestations/sha256:{expected}$"
+                r"^/repos/ahma-labs/ahma/attestations/sha256:{expected}$"
             )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "attestations": []
@@ -766,7 +766,7 @@ mod tests {
         let server = MockServer::start().await;
         let bundle: serde_json::Value = serde_json::from_str(BUNDLE).unwrap();
         Mock::given(method("GET"))
-            .and(path_regex(r"^/repos/paulirotta/ahma/attestations/.*$"))
+            .and(path_regex(r"^/repos/ahma-labs/ahma/attestations/.*$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "attestations": [{ "bundle": bundle, "bundle_url": null }]
             })))
@@ -866,7 +866,7 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .with_test_writer()
             .try_init();
-        let url = "https://github.com/paulirotta/ahma/releases/download/v0.19.7/\
+        let url = "https://github.com/ahma-labs/ahma/releases/download/v0.19.7/\
                    ahma-release-linux-x86_64.tar.gz";
         let client = reqwest::Client::builder()
             .user_agent("ahma-updater")

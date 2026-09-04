@@ -1,7 +1,7 @@
 # Session-Health and Pending-Grant Notifications — Design (#485)
 
 **Status:** implemented (P1–P3) — SPEC R8.8; client integration guidance in §7
-**Issue:** [#485](https://github.com/paulirotta/ahma/issues/485)
+**Issue:** [#485](https://github.com/ahma-labs/ahma/issues/485)
 **Related:** #479 (transparent proxy reconnect), SPEC R5.3/R5.4 (grant flow), R8.4 (bridge sessions)
 
 ## 1. Problem

@@ -1227,19 +1227,19 @@ jobs:
           body: |
             ## Ahma ${{ steps.version.outputs.tag }}
 
-            Built from [`main`](https://github.com/paulirotta/ahma/tree/main) via the [CI pipeline](https://github.com/paulirotta/ahma/actions/workflows/build.yml).
+            Built from [`main`](https://github.com/ahma-labs/ahma/tree/main) via the [CI pipeline](https://github.com/ahma-labs/ahma/actions/workflows/build.yml).
 
             ### Install
 
             **Linux / macOS:**
             ```bash
-            curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
+            curl -sSf https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash
             export PATH="$HOME/.local/bin:$PATH"
             ```
 
             **Windows (PowerShell 5.1+):**
             ```powershell
-            irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
+            irm https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.ps1 | iex
             ```
 
             **Update an existing install:**
@@ -1258,7 +1258,7 @@ jobs:
             **Manual out-of-band verification:**
             ```bash
             gh attestation verify ahma-release-linux-x86_64.tar.gz \
-              --repo paulirotta/ahma
+              --repo ahma-labs/ahma
             ```
 
             ### AGPL + SLSA: two-layer supply chain defence
@@ -1271,10 +1271,10 @@ jobs:
 
             Building from auditable source is always an option:
             ```bash
-            cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked
+            cargo install --git https://github.com/ahma-labs/ahma ahma_bin --bin ahma --root ~/.local --locked
             ```
 
-            See [docs/release-signing.md](https://github.com/paulirotta/ahma/blob/main/docs/release-signing.md)
+            See [docs/release-signing.md](https://github.com/ahma-labs/ahma/blob/main/docs/release-signing.md)
             for the trust model and verification details.
           draft: false
           prerelease: false

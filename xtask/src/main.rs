@@ -1634,7 +1634,7 @@ fn fetch_crate_publish_age_days(name: &str, version: &str) -> Result<i64, String
         .get(&url)
         .header(
             "User-Agent",
-            "ahma-xtask/safe-update (https://github.com/paulirotta/ahma)",
+            "ahma-xtask/safe-update (https://github.com/ahma-labs/ahma)",
         )
         .call()
         .map_err(|e| format!("HTTP request failed: {e}"))?;

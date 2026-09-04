@@ -246,7 +246,7 @@ pub async fn print_post_install_details(
     println!("Tip: To verify the installed binary against GitHub's attestation API:");
     println!("  ahma verify --self");
     println!(
-        "  # or: gh attestation verify {} --repo paulirotta/ahma",
+        "  # or: gh attestation verify {} --repo ahma-labs/ahma",
         installed.display()
     );
 

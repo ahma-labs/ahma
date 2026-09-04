@@ -7,14 +7,14 @@ readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
 description = "The ahma binary: wires the MIT ahma_mcp library with the AGPL-licensed feature crates (tui)."
-repository = "https://github.com/paulirotta/ahma"
-homepage = "https://github.com/paulirotta/ahma"
+repository = "https://github.com/ahma-labs/ahma"
+homepage = "https://github.com/ahma-labs/ahma"
 
 # All first-party copyleft crates (ahma_tui) are AGPL-3.0-or-later. The compiled ahma binary is therefore
 # AGPL-3.0-or-later. See README for details.
 
 # ── cargo-binstall: fetch the prebuilt, attested release binary ──────────────
-# Lets `cargo binstall --git https://github.com/paulirotta/ahma ahma_bin` pull the
+# Lets `cargo binstall --git https://github.com/ahma-labs/ahma ahma_bin` pull the
 # CI-built GitHub Release asset instead of compiling from source (no RUSTFLAGS, no
 # toolchain). The release archives are flat (binary `ahma` at the archive root) and
 # named `ahma-release-<platform>.<ext>`, which is not binstall's default triple-based

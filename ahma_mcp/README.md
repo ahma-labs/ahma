@@ -2,7 +2,7 @@
 
 Core library for the ahma server (Ahma), providing tool execution, configuration management, and async orchestration.
 
-For full documentation and architecture details, see the [Ahma Core Documentation](https://paulirotta.github.io/ahma/doc/ahma/index.html).
+For full documentation and architecture details, see the [Ahma Core Documentation](https://ahma-labs.github.io/ahma/doc/ahma/index.html).
 
 ## Features
 

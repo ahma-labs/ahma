@@ -6,7 +6,7 @@ use std::process::Stdio;
 
 use super::install::cargo_install_root;
 
-pub const GIT_REPO_URL: &str = "https://github.com/paulirotta/ahma";
+pub const GIT_REPO_URL: &str = "https://github.com/ahma-labs/ahma";
 
 /// Build the `cargo install` command for a Git branch/ref.
 pub fn build_cargo_install_command(branch: &str, install_dir: &Path) -> Vec<String> {

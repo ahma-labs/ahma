@@ -101,7 +101,7 @@ are auto-approved (no confirmation dialogs). Pairs well with Ahma's kernel sandb
 
 Run the install script to configure Ahma across all supported IDEs at once:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash
 ```
 
 ### 6. Dev containers
@@ -110,7 +110,7 @@ Add to `.devcontainer/devcontainer.json` for Codespaces / container users:
 ```json
 {
   "features": {},
-  "postCreateCommand": "curl -fsSL https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash",
+  "postCreateCommand": "curl -fsSL https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash",
   "customizations": {
     "vscode": {
       "settings": { "chat.mcp.autoStart": true }
@@ -488,7 +488,7 @@ Tool definitions load once at startup — there is no watch mode. After editing 
 | `--monitor-rate-limit` / `logging.monitor_rate_limit_secs` | `60` | Min seconds between log alerts |
 | `RUST_LOG` (env, PLATFORM) | `info` | Log verbosity (e.g., `ahma_mcp=debug`) |
 
-Full reference: [environment-variables.md](https://github.com/paulirotta/ahma/blob/main/docs/environment-variables.md)
+Full reference: [environment-variables.md](https://github.com/ahma-labs/ahma/blob/main/docs/environment-variables.md)
 
 ---
 
@@ -727,7 +727,7 @@ Use this only if `ahma` is not yet installed or `ahma update` itself is broken:
 
 ```bash
 RUSTFLAGS='--cfg reqwest_unstable' \
-  cargo install --git https://github.com/paulirotta/ahma \
+  cargo install --git https://github.com/ahma-labs/ahma \
     --branch feature/update ahma_bin --bin ahma --root ~/.local --locked --force
 export PATH="$HOME/.local/bin:$PATH"
 ```
@@ -736,7 +736,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ```powershell
 $env:RUSTFLAGS='--cfg reqwest_unstable'
-cargo install --git https://github.com/paulirotta/ahma `
+cargo install --git https://github.com/ahma-labs/ahma `
   --branch feature/update ahma_bin --bin ahma --root $HOME\.local --locked --force
 ```
 
@@ -1141,9 +1141,9 @@ ahma simplify . --exclude '**/generated/**,**/vendor/**' --ai-fix 1
 
 ---
 
-**See also**: [security-sandbox.md](https://github.com/paulirotta/ahma/blob/main/docs/security-sandbox.md) ·
-[live-log-monitoring.md](https://github.com/paulirotta/ahma/blob/main/docs/live-log-monitoring.md) ·
-[connection-modes.md](https://github.com/paulirotta/ahma/blob/main/docs/connection-modes.md) ·
-[environment-variables.md](https://github.com/paulirotta/ahma/blob/main/docs/environment-variables.md) ·
-[mtdf-schema.json](https://github.com/paulirotta/ahma/blob/main/docs/mtdf-schema.json) ·
-[SIMPLIFY.md](https://github.com/paulirotta/ahma/blob/main/SIMPLIFY.md)
+**See also**: [security-sandbox.md](https://github.com/ahma-labs/ahma/blob/main/docs/security-sandbox.md) ·
+[live-log-monitoring.md](https://github.com/ahma-labs/ahma/blob/main/docs/live-log-monitoring.md) ·
+[connection-modes.md](https://github.com/ahma-labs/ahma/blob/main/docs/connection-modes.md) ·
+[environment-variables.md](https://github.com/ahma-labs/ahma/blob/main/docs/environment-variables.md) ·
+[mtdf-schema.json](https://github.com/ahma-labs/ahma/blob/main/docs/mtdf-schema.json) ·
+[SIMPLIFY.md](https://github.com/ahma-labs/ahma/blob/main/SIMPLIFY.md)

@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use super::platform::Platform;
 
-pub const GITHUB_REPO: &str = "paulirotta/ahma";
+pub const GITHUB_REPO: &str = "ahma-labs/ahma";
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {

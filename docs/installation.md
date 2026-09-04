@@ -34,14 +34,14 @@ checked-out clone — see [Build from source](#build-from-source-full-checkout) 
 
 ```bash
 RUSTFLAGS='--cfg reqwest_unstable' \
-  cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked --force
+  cargo install --git https://github.com/ahma-labs/ahma ahma_bin --bin ahma --root ~/.local --locked --force
 ```
 
 **Specific branch** (replace `<branch-name>` with a real branch, e.g. `main`):
 
 ```bash
 RUSTFLAGS='--cfg reqwest_unstable' \
-  cargo install --git https://github.com/paulirotta/ahma --branch <branch-name> ahma_bin --bin ahma --root ~/.local --locked --force
+  cargo install --git https://github.com/ahma-labs/ahma --branch <branch-name> ahma_bin --bin ahma --root ~/.local --locked --force
 ```
 
 **Unpushed local checkout:**
@@ -75,7 +75,7 @@ export PATH="$HOME/.local/bin:$PATH"
 **Latest release (prebuilt binary):**
 
 ```powershell
-irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.ps1 | iex
 ```
 
 **Specific branch (builds via Cargo — requires Rust)**, replacing `<branch-name>` with a real branch, e.g. `main`:
@@ -89,7 +89,7 @@ Or invoke Cargo directly:
 
 ```powershell
 $env:RUSTFLAGS='--cfg reqwest_unstable'
-cargo install --git https://github.com/paulirotta/ahma --branch <branch-name> ahma_bin --bin ahma --root $HOME\.local --locked --force
+cargo install --git https://github.com/ahma-labs/ahma --branch <branch-name> ahma_bin --bin ahma --root $HOME\.local --locked --force
 ```
 
 Ensure `$HOME\.local\bin` is on your PATH.
@@ -99,7 +99,7 @@ Ensure `$HOME\.local\bin` is on your PATH.
 **Linux / macOS**
 
 ```bash
-git clone https://github.com/paulirotta/ahma.git
+git clone https://github.com/ahma-labs/ahma.git
 cd ahma
 cargo build --release -p ahma_bin
 mv target/release/ahma ~/.local/bin/
@@ -110,7 +110,7 @@ macOS: re-sign it (see the note above) — `codesign --force --sign - --options 
 **Windows (PowerShell)**
 
 ```powershell
-git clone https://github.com/paulirotta/ahma.git
+git clone https://github.com/ahma-labs/ahma.git
 cd ahma
 cargo build --release -p ahma_bin
 Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
@@ -187,7 +187,7 @@ ahma verify --self
 Or use the `gh` CLI for out-of-band verification:
 
 ```bash
-gh attestation verify ahma-release-linux-x86_64.tar.gz --repo paulirotta/ahma
+gh attestation verify ahma-release-linux-x86_64.tar.gz --repo ahma-labs/ahma
 ```
 
 See [docs/release-signing.md](release-signing.md) for the full trust model.

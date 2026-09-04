@@ -7,7 +7,7 @@ and no embedded public keys in the source tree.
 ## Trust model
 
 ```
-paulirotta/ahma main branch
+ahma-labs/ahma main branch
         │
         ▼
 GitHub Actions: build.yml
@@ -34,7 +34,7 @@ The attestation is:
 - **Keyless**: signed by an ephemeral X.509 certificate from Sigstore's Fulcio CA. The
   certificate is valid for ~10 minutes, exists only for the duration of the workflow run,
   and is cryptographically bound to the workflow's GitHub Actions OIDC identity
-  (`paulirotta/ahma`, `refs/heads/main`). There is no private key to leak or rotate.
+  (`ahma-labs/ahma`, `refs/heads/main`). There is no private key to leak or rotate.
 - **Transparency-logged**: every attestation is recorded in Sigstore's Rekor append-only
   log. Anyone can audit it independently.
 - **Verifiable by standard tooling**: `gh attestation verify`, `cosign verify-attestation`,
@@ -62,7 +62,7 @@ It is called from three places:
 The verification flow:
 1. Compute the artifact's SHA-256 digest.
 2. Call the GitHub Attestation API:
-   `GET /repos/paulirotta/ahma/attestations/sha256:{digest}`
+   `GET /repos/ahma-labs/ahma/attestations/sha256:{digest}`
 3. For each Sigstore bundle returned, require the signed in-toto statement to list
    that digest among its subjects. (A release attests the archive **and** the raw
    binary in one statement, so `ahma verify --self` matches a later subject than
@@ -74,8 +74,8 @@ The verification flow:
    signature must verify over the envelope's pre-authentication encoding.
 5. Enforce the identity policy — all three of:
    - OIDC issuer (Fulcio OID `…57264.1.1`) is `https://token.actions.githubusercontent.com`,
-   - workflow repository (OID `…57264.1.5`) is exactly `paulirotta/ahma`,
-   - the certificate SAN (`build_signer_uri`) is under `https://github.com/paulirotta/ahma/`.
+   - workflow repository (OID `…57264.1.5`) is exactly `ahma-labs/ahma`,
+   - the certificate SAN (`build_signer_uri`) is under `https://github.com/ahma-labs/ahma/`.
 6. Bind the Rekor transparency-log entry to the bundle: it must record this payload
    hash, this signature and this signing certificate, and its `integratedTime` must
    fall inside the certificate's ~10-minute validity window.
@@ -108,14 +108,14 @@ Any user or security team can verify a release artifact without installing ahma:
 **Using the `gh` CLI (recommended):**
 ```bash
 gh attestation verify ahma-release-linux-x86_64.tar.gz \
-  --repo paulirotta/ahma
+  --repo ahma-labs/ahma
 ```
 
 **Using `cosign`:**
 ```bash
 cosign verify-blob \
   --bundle ahma-release-linux-x86_64.tar.gz.sigstore.json \
-  --certificate-identity-regexp '^https://github\.com/paulirotta/ahma/.+@refs/heads/main$' \
+  --certificate-identity-regexp '^https://github\.com/ahma-labs/ahma/.+@refs/heads/main$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ahma-release-linux-x86_64.tar.gz
 ```
@@ -123,7 +123,7 @@ cosign verify-blob \
 **Programmatically** (for CI/CD pipelines):
 ```bash
 # Download and check attestation metadata
-gh api repos/paulirotta/ahma/attestations/sha256:$(sha256sum ahma | awk '{print $1}') \
+gh api repos/ahma-labs/ahma/attestations/sha256:$(sha256sum ahma | awk '{print $1}') \
   | jq '.attestations[0].bundle.verificationMaterial.certificate.rawBytes' | base64 -d | openssl x509 -noout -text
 ```
 
@@ -137,7 +137,7 @@ Fulcio certificate** that:
 
 An attacker who compromises a developer machine gains nothing, because there is no
 long-lived private key anywhere. An attacker who compromises GitHub Actions would need to
-impersonate the exact OIDC identity of `paulirotta/ahma` on `refs/heads/main` — which
+impersonate the exact OIDC identity of `ahma-labs/ahma` on `refs/heads/main` — which
 GitHub's OIDC service refuses to issue outside of a legitimate workflow run.
 
 ## Offline / air-gapped use
@@ -158,7 +158,7 @@ security-tier setting must not be reachable from an environment a config file ca
 
 Alternatively, build from auditable source:
 ```bash
-cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked
+cargo install --git https://github.com/ahma-labs/ahma ahma_bin --bin ahma --root ~/.local --locked
 ```
 
 ## AGPL + Sigstore: two-layer supply chain defence

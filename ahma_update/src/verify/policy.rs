@@ -1,7 +1,7 @@
 //! The certificate identity policy `ahma verify` / `ahma update` enforce.
 //!
 //! A Sigstore signature only says "some Fulcio-certified identity signed this".
-//! The policy is what turns that into "the official `paulirotta/ahma` GitHub
+//! The policy is what turns that into "the official `ahma-labs/ahma` GitHub
 //! Actions pipeline signed this", so it is the part that must not be loose.
 //!
 //! Three independent bindings are required, all of them exact:
@@ -10,9 +10,9 @@
 //!    token issuer. Without this, any Sigstore identity from any issuer that
 //!    happened to mention our repository would pass.
 //! 2. **Workflow repository** (Fulcio OID `1.3.6.1.4.1.57264.1.5`) is exactly
-//!    `paulirotta/ahma`.
+//!    `ahma-labs/ahma`.
 //! 3. **Subject Alternative Name** — the `build_signer_uri` — starts with
-//!    `https://github.com/paulirotta/ahma/`, so the signing workflow lives in
+//!    `https://github.com/ahma-labs/ahma/`, so the signing workflow lives in
 //!    our repository rather than merely being run by it.
 //!
 //! The workflow *file* and *ref* are deliberately not pinned: the previous
@@ -20,7 +20,7 @@
 //! reject already-published releases built by a differently-named workflow.
 //! Everything else is stricter than what came before — `sigstore-verification`
 //! checked only that the certificate's issuer common name looked like Fulcio's
-//! and never bound the certificate to `paulirotta/ahma` at all.
+//! and never bound the certificate to `ahma-labs/ahma` at all.
 
 use sigstore::bundle::verify::policy::{
     AllOf, GitHubWorkflowRepository, OIDCIssuer, PolicyError, VerificationPolicy,
@@ -44,7 +44,7 @@ pub(crate) struct SignerUriUnderRepository {
 impl SignerUriUnderRepository {
     pub(crate) fn new(owner: &str, repo: &str) -> Self {
         Self {
-            // Trailing slash matters: without it `paulirotta/ahma-evil` would
+            // Trailing slash matters: without it `ahma-labs/ahma-evil` would
             // also match.
             prefix: format!("https://github.com/{owner}/{repo}/"),
         }
@@ -114,8 +114,17 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use x509_cert::der::Decode;
 
-    /// The leaf certificate from the real ahma v0.19.7 build-provenance bundle.
-    /// SAN: `https://github.com/paulirotta/ahma/.github/workflows/build.yml@refs/heads/main`.
+    /// The leaf certificate from the real ahma v0.19.7 build-provenance bundle,
+    /// captured before the September 2026 move from `paulirotta/ahma` to
+    /// `ahma-labs/ahma`. SAN:
+    /// `https://github.com/paulirotta/ahma/.github/workflows/build.yml@refs/heads/main`.
+    ///
+    /// Deliberately still tested against its real, pre-migration identity
+    /// (see the two tests below) rather than "fixed" to the current one: it
+    /// is a genuine cryptographic artifact, and no certificate has yet been
+    /// issued for `ahma-labs/ahma` to replace it with. What this fixture
+    /// proves is that the policy correctly accepts a real GitHub-issued
+    /// certificate shape, not that any particular identity is current.
     const BUNDLE: &str = include_str!("../../tests/fixtures/ahma_build_provenance_bundle.json");
 
     fn real_certificate() -> Certificate {
@@ -130,6 +139,7 @@ mod tests {
 
     #[test]
     fn accepts_the_real_ahma_release_certificate() {
+        // Pre-migration identity — see the BUNDLE doc comment above.
         let identity = AhmaReleaseIdentity::new("paulirotta", "ahma");
         identity
             .as_policy()
@@ -139,7 +149,7 @@ mod tests {
 
     #[test]
     fn rejects_a_different_repository() {
-        let identity = AhmaReleaseIdentity::new("paulirotta", "not-ahma");
+        let identity = AhmaReleaseIdentity::new("ahma-labs", "not-ahma");
         let err = identity
             .as_policy()
             .verify(&real_certificate())
@@ -177,8 +187,8 @@ mod tests {
 
     #[test]
     fn signer_uri_prefix_is_not_satisfied_by_a_sibling_repository() {
-        // `paulirotta/ahma-evil` must not match the `paulirotta/ahma` prefix.
-        let policy = SignerUriUnderRepository::new("paulirotta", "ahma-evil");
+        // `ahma-labs/ahma-evil` must not match the `ahma-labs/ahma` prefix.
+        let policy = SignerUriUnderRepository::new("ahma-labs", "ahma-evil");
         policy
             .verify(&real_certificate())
             .expect_err("a sibling repository name must not match");
@@ -186,6 +196,7 @@ mod tests {
 
     #[test]
     fn signer_uri_prefix_accepts_the_real_certificate() {
+        // Pre-migration identity — see the BUNDLE doc comment above.
         SignerUriUnderRepository::new("paulirotta", "ahma")
             .verify(&real_certificate())
             .expect("the release certificate's SAN is under the repository");

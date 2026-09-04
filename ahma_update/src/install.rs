@@ -39,7 +39,7 @@ pub async fn install_release_asset(
     }
 
     // Cryptographic verification: confirm the archive has a valid GitHub Build Provenance
-    // Attestation (Sigstore SLSA Level 3) from the official paulirotta/ahma pipeline.
+    // Attestation (Sigstore SLSA Level 3) from the official ahma-labs/ahma pipeline.
     if !insecure_skip_verify {
         verify::verify_artifact(&archive_path)
             .await
@@ -98,7 +98,7 @@ async fn fetch_archive_checksum(
         .map(|(base, _)| format!("{base}/SHA256SUMS"))
         .unwrap_or_else(|| {
             format!(
-                "https://github.com/paulirotta/ahma/releases/download/{}/SHA256SUMS",
+                "https://github.com/ahma-labs/ahma/releases/download/{}/SHA256SUMS",
                 asset.tag
             )
         });

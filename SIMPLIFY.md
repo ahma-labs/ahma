@@ -40,14 +40,14 @@ feature when it is run.
 
 **Quick install (Linux/macOS):**
 ```bash
-cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked --force
+cargo install --git https://github.com/ahma-labs/ahma ahma_bin --bin ahma --root ~/.local --locked --force
 ```
 
 Or after `ahma` is installed: `ahma update`
 
 **Windows (PowerShell 5.1+):**
 ```powershell
-irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.ps1 | iex
 ```
 
 **From source:**
@@ -222,7 +222,7 @@ When using the `simplify` MCP tool or `/ahma simplify` chat command, follow this
 ## CI Integration
 
 The project itself tracks code simplicity on every push. The CI report is published at:
-[paulirotta.github.io/ahma/CODE_SIMPLICITY.html](https://paulirotta.github.io/ahma/CODE_SIMPLICITY.html)
+[ahma-labs.github.io/ahma/CODE_SIMPLICITY.html](https://ahma-labs.github.io/ahma/CODE_SIMPLICITY.html)
 
 To add simplify to your own CI pipeline:
 

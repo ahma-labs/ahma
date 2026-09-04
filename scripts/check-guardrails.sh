@@ -68,7 +68,7 @@ if [[ -n "$SKILL_LINK_VIOLATIONS" ]]; then
   echo "$SKILL_LINK_VIOLATIONS"
   echo ""
   echo "Replace relative paths with absolute GitHub URLs:"
-  echo "  ](docs/foo.md)  ->  ](https://github.com/paulirotta/ahma/blob/main/docs/foo.md)"
+  echo "  ](docs/foo.md)  ->  ](https://github.com/ahma-labs/ahma/blob/main/docs/foo.md)"
   exit 1
 fi
 echo "OK No relative docs/ links in SKILL.md files"

@@ -488,13 +488,13 @@ consumes CI's measurements and writes the tests.
 ### Where the numbers come from (read the compact summary, never the giant HTML)
 
 CI's `job-coverage` (in `.github/workflows/build.yml`) runs the instrumented suite once and
-publishes three artifacts to GitHub Pages, rooted at `https://paulirotta.github.io/ahma/`:
+publishes three artifacts to GitHub Pages, rooted at `https://ahma-labs.github.io/ahma/`:
 
 | Artifact | URL | Use |
 |----------|-----|-----|
-| **`coverage-lowest.md`** | `https://paulirotta.github.io/ahma/coverage-lowest.md` | **Read this first.** A few-KB markdown table of every workspace file sorted ascending by line coverage, with totals — no source lines. This is the planning input. |
-| `coverage-summary.json` | `https://paulirotta.github.io/ahma/coverage-summary.json` | Same data, machine-readable (`cargo llvm-cov --json --summary-only`), if you want to filter/sort programmatically. |
-| Full line-by-line HTML | `https://paulirotta.github.io/ahma/html/` | Drill into this **per-file** once you have chosen targets. The per-file page shows exactly which lines are red — the input to "close the holes". |
+| **`coverage-lowest.md`** | `https://ahma-labs.github.io/ahma/coverage-lowest.md` | **Read this first.** A few-KB markdown table of every workspace file sorted ascending by line coverage, with totals — no source lines. This is the planning input. |
+| `coverage-summary.json` | `https://ahma-labs.github.io/ahma/coverage-summary.json` | Same data, machine-readable (`cargo llvm-cov --json --summary-only`), if you want to filter/sort programmatically. |
+| Full line-by-line HTML | `https://ahma-labs.github.io/ahma/html/` | Drill into this **per-file** once you have chosen targets. The per-file page shows exactly which lines are red — the input to "close the holes". |
 
 > **Why a compact summary exists.** The raw llvm-cov HTML is tens of MB of per-line markup —
 > useless for planning and ruinous for an LLM's context window. CI therefore also emits the
@@ -543,7 +543,7 @@ happy-path smoke tests. Before writing tests for a file:
 1. **Read the source completely** — understand every function, every error path, every `match`
    arm, every early return.
 2. **Fetch and read the HTML page for that file** to see exactly which lines are red:
-   `https://paulirotta.github.io/ahma/html/<crate>/src/<path>.html`
+   `https://ahma-labs.github.io/ahma/html/<crate>/src/<path>.html`
 3. **Make a list of uncovered behaviors** — every red block is a gap to close.
 4. **Write tests for every item on that list:**
    - Every public function (happy path AND error path)
@@ -627,7 +627,7 @@ yourself. The agent fan-out IS the work.
 
 1. **Fetch and read the compact summary:**
    ```bash
-   curl -fsSL https://paulirotta.github.io/ahma/coverage-lowest.md
+   curl -fsSL https://ahma-labs.github.io/ahma/coverage-lowest.md
    # fallback: gh run download -n coverage-summary  (most recent build.yml run on main)
    ```
 
@@ -1261,9 +1261,9 @@ Three gates, cheapest first:
 ### Verify current state
 
 ```bash
-gh api repos/paulirotta/ahma/branches/main/protection --jq '{required:[.required_status_checks.checks[].context], strict:.required_status_checks.strict, admins:.enforce_admins.enabled, force:.allow_force_pushes.enabled}'
-gh api repos/paulirotta/ahma/rulesets/15266938 --jq '[.rules[].type]'
-gh api repos/paulirotta/ahma --jq '{merge:.allow_merge_commit, rebase:.allow_rebase_merge, squash:.allow_squash_merge, delete:.delete_branch_on_merge}'
+gh api repos/ahma-labs/ahma/branches/main/protection --jq '{required:[.required_status_checks.checks[].context], strict:.required_status_checks.strict, admins:.enforce_admins.enabled, force:.allow_force_pushes.enabled}'
+gh api repos/ahma-labs/ahma/rulesets/15266938 --jq '[.rules[].type]'
+gh api repos/ahma-labs/ahma --jq '{merge:.allow_merge_commit, rebase:.allow_rebase_merge, squash:.allow_squash_merge, delete:.delete_branch_on_merge}'
 ```
 
 > **`--auto` is now safe and real.** `gh pr merge --squash --auto --delete-branch` merges each PR

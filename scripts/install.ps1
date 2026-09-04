@@ -1,5 +1,5 @@
 # One-liner installer for ahma on Windows
-# Usage: irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.ps1 | iex
 #
 # Supported platforms:
 #   - Windows x86_64 (x64)
@@ -83,7 +83,7 @@ if ($shouldVerify) {
 }
 
 # ── Fetch latest release metadata ─────────────────────────────────────────────
-$releasesUrl = "https://api.github.com/repos/paulirotta/ahma/releases/latest"
+$releasesUrl = "https://api.github.com/repos/ahma-labs/ahma/releases/latest"
 Write-Host "Fetching latest release info..."
 
 try {
@@ -130,7 +130,7 @@ $asset = $releaseJson.assets | Where-Object { $_.name -eq $assetName } | Select-
 if (-not $asset) {
     Write-Error @"
 Could not find release asset '$assetName'.
-Please check https://github.com/paulirotta/ahma/releases for available binaries.
+Please check https://github.com/ahma-labs/ahma/releases for available binaries.
 "@
     exit 1
 }
@@ -198,7 +198,7 @@ Actual:   $actualHash
     Write-Host "  Installed ahma.exe"
 
     # Cryptographic verification: confirm the installed binary has a valid GitHub Build Provenance
-    # Attestation (Sigstore SLSA Level 3) from the official paulirotta/ahma CI pipeline.
+    # Attestation (Sigstore SLSA Level 3) from the official ahma-labs/ahma CI pipeline.
     $mcpBin = Join-Path $installDir "ahma.exe"
     if (-not $shouldSkipVerify) {
         Write-Host "Verifying Sigstore Build Provenance Attestation..."

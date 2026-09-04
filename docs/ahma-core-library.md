@@ -9,7 +9,7 @@ primitives as an embeddable Rust library.
 
 ```toml
 [dependencies]
-ahma_core = { git = "https://github.com/paulirotta/ahma.git" }
+ahma_core = { git = "https://github.com/ahma-labs/ahma.git" }
 ```
 
 ## Available primitives (MIT OR Apache-2.0)
