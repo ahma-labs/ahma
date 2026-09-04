@@ -788,9 +788,12 @@ fn check_env_hooks_override() -> Option<(bool, String)> {
 }
 
 fn detect_active_mcp_configs() -> Vec<PathBuf> {
-    // Use `dirs::home_dir()` (not `$HOME`): on Windows `$HOME` is usually unset,
-    // which previously made auto-detection silently report "inactive" there.
-    let Some(home) = dirs::home_dir() else {
+    // Resolve through `ahma_home_dir` (not `$HOME`): on Windows `$HOME` is
+    // usually unset, which previously made auto-detection silently report
+    // "inactive" there. `ahma_home_dir` falls back to `dirs::home_dir`, so that
+    // fix stands, and it additionally honours `AHMA_TEST_HOME` in debug builds
+    // so this detection can be exercised without touching the real home.
+    let Some(home) = ahma_common::config::ahma_home_dir() else {
         return Vec::new();
     };
     detect_active_mcp_configs_in(&home, detect_project_root().ok().as_deref())
@@ -804,26 +807,22 @@ fn detect_active_mcp_configs() -> Vec<PathBuf> {
 /// (`~/.codex/config.toml`) and Antigravity (`~/.gemini/config/mcp_config.json`) —
 /// exactly the clients that get both hooks and an MCP server.
 fn mcp_config_candidates(home: &Path, project_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut paths = vec![
-        // Cursor
-        home.join(".cursor").join("mcp.json"),
-        // Claude Code (`ahma setup` writes the MCP server here)
-        home.join(".claude.json"),
-        // Codex CLI
-        home.join(".codex").join("config.toml"),
-        // Antigravity / Gemini
-        home.join(".gemini").join("config").join("mcp_config.json"),
-        // LM Studio
-        home.join(".lmstudio").join("mcp.json"),
-        // VS Code (GitHub Copilot Chat)
-        home.join("Library/Application Support/Code/User/mcp.json"),
-        home.join(".config/Code/User/mcp.json"),
-        home.join("AppData/Roaming/Code/User/mcp.json"),
-        // Claude Desktop
-        home.join("Library/Application Support/Claude/claude_desktop_config.json"),
-        home.join(".config/Claude/claude_desktop_config.json"),
-        home.join("AppData/Roaming/Claude/claude_desktop_config.json"),
-    ];
+    // Derived from `harness_target`, not listed again here. The per-harness copy
+    // this replaced had already drifted — it omitted Claude Code, Codex and
+    // Antigravity, exactly the clients that get both hooks and an MCP server —
+    // and nothing could catch that, because a list of literals cannot disagree
+    // with anything. Going through `PLATFORMS` means a new harness arrives here
+    // the moment it is added there.
+    let mut paths: Vec<PathBuf> = crate::harness_target::PLATFORMS
+        .iter()
+        .filter_map(|p| p.mcp_config(home).map(|(path, _format)| path))
+        .collect();
+
+    // `mcp_config` gives the running OS's path, which is all setup and uninstall
+    // need. Detection also probes the other OSes' — see
+    // `foreign_os_mcp_config_paths` for why erring wide is the safe direction.
+    paths.extend(crate::harness_target::foreign_os_mcp_config_paths(home));
+
     if let Some(project_root) = project_root {
         paths.push(project_root.join(".vscode").join("mcp.json"));
     }
@@ -4545,5 +4544,72 @@ mod tests {
             1,
             "re-install must not duplicate the managed entry"
         );
+    }
+}
+
+/// The candidate list is now derived; these tests are what stop the derivation
+/// from quietly covering less than the hand-written list it replaced.
+#[cfg(test)]
+mod mcp_config_candidate_coverage {
+    use super::mcp_config_candidates;
+    use std::path::{Path, PathBuf};
+
+    /// Every path the previous hand-maintained list probed, transcribed.
+    ///
+    /// A miss here is not cosmetic: `auto` hook mode decides ahma is inactive
+    /// and passes commands through **unsandboxed**. So the replacement is held
+    /// to covering the original literally, rather than to looking equivalent.
+    const PREVIOUS_LIST: &[&str] = &[
+        ".cursor/mcp.json",
+        ".claude.json",
+        ".codex/config.toml",
+        ".gemini/config/mcp_config.json",
+        ".lmstudio/mcp.json",
+        "Library/Application Support/Code/User/mcp.json",
+        ".config/Code/User/mcp.json",
+        "AppData/Roaming/Code/User/mcp.json",
+        "Library/Application Support/Claude/claude_desktop_config.json",
+        ".config/Claude/claude_desktop_config.json",
+        "AppData/Roaming/Claude/claude_desktop_config.json",
+    ];
+
+    #[test]
+    fn every_previously_probed_path_is_still_probed() {
+        let home = Path::new("/home/u");
+        let got = mcp_config_candidates(home, None);
+        for relative in PREVIOUS_LIST {
+            let want: PathBuf = relative
+                .split('/')
+                .fold(home.to_path_buf(), |p, s| p.join(s));
+            assert!(
+                got.contains(&want),
+                "{} is no longer probed; auto hook mode would call ahma inactive there \
+                 and pass commands through unsandboxed.\nprobed: {got:#?}",
+                want.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_project_local_vscode_config_is_probed_when_a_project_root_is_known() {
+        let home = Path::new("/home/u");
+        let root = Path::new("/work/repo");
+        let without = mcp_config_candidates(home, None);
+        let with = mcp_config_candidates(home, Some(root));
+        let project = root.join(".vscode").join("mcp.json");
+        assert!(!without.contains(&project));
+        assert!(with.contains(&project));
+    }
+
+    /// The derivation must not probe a path twice — a duplicate would double the
+    /// `stat` calls on every hook invocation and make the "active configs"
+    /// report list the same file twice.
+    #[test]
+    fn no_candidate_is_probed_twice() {
+        let mut got = mcp_config_candidates(Path::new("/home/u"), None);
+        let before = got.len();
+        got.sort();
+        got.dedup();
+        assert_eq!(before, got.len(), "duplicate candidate paths: {got:#?}");
     }
 }

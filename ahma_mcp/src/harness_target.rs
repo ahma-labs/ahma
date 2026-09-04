@@ -155,35 +155,78 @@ impl Platform {
 }
 
 /// Claude Desktop's config location relative to the home directory.
+const CLAUDE_DESKTOP_MACOS: &str = "Library/Application Support/Claude/claude_desktop_config.json";
+const CLAUDE_DESKTOP_WINDOWS: &str = "AppData/Roaming/Claude/claude_desktop_config.json";
+const CLAUDE_DESKTOP_LINUX: &str = ".config/Claude/claude_desktop_config.json";
+
+/// Every OS's Claude Desktop config path. See [`foreign_os_mcp_config_paths`].
+const CLAUDE_DESKTOP_ALL: &[&str] = &[
+    CLAUDE_DESKTOP_MACOS,
+    CLAUDE_DESKTOP_WINDOWS,
+    CLAUDE_DESKTOP_LINUX,
+];
+
 fn claude_desktop_relative_path() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "Library/Application Support/Claude/claude_desktop_config.json"
+        CLAUDE_DESKTOP_MACOS
     }
     #[cfg(target_os = "windows")]
     {
-        "AppData/Roaming/Claude/claude_desktop_config.json"
+        CLAUDE_DESKTOP_WINDOWS
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        ".config/Claude/claude_desktop_config.json"
+        CLAUDE_DESKTOP_LINUX
     }
 }
 
 /// VS Code's user MCP config location relative to the home directory.
+const VSCODE_MACOS: &str = "Library/Application Support/Code/User/mcp.json";
+const VSCODE_WINDOWS: &str = "AppData/Roaming/Code/User/mcp.json";
+const VSCODE_LINUX: &str = ".config/Code/User/mcp.json";
+
+/// Every OS's VS Code config path. See [`foreign_os_mcp_config_paths`].
+const VSCODE_ALL: &[&str] = &[VSCODE_MACOS, VSCODE_WINDOWS, VSCODE_LINUX];
+
 fn vscode_relative_path() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "Library/Application Support/Code/User/mcp.json"
+        VSCODE_MACOS
     }
     #[cfg(target_os = "windows")]
     {
-        "AppData/Roaming/Code/User/mcp.json"
+        VSCODE_WINDOWS
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        ".config/Code/User/mcp.json"
+        VSCODE_LINUX
     }
+}
+
+/// The MCP config paths belonging to *other* operating systems.
+///
+/// Setup and uninstall only ever touch the running OS's path, so
+/// [`Platform::mcp_config`] returns that one alone. Hook auto-detection is the
+/// exception and deliberately probes wider: a home directory shared over a
+/// network mount, restored from another machine's backup, or synced by a
+/// dotfiles tool can hold another OS's config, and a config naming ahma still
+/// means ahma is wired up there.
+///
+/// Erring wide is the safe direction here. A path probed and absent costs a
+/// `stat`; a path *not* probed makes `auto` hook mode report "inactive" and pass
+/// commands through **unsandboxed**.
+pub fn foreign_os_mcp_config_paths(home: &Path) -> Vec<PathBuf> {
+    VSCODE_ALL
+        .iter()
+        .filter(|p| **p != vscode_relative_path())
+        .chain(
+            CLAUDE_DESKTOP_ALL
+                .iter()
+                .filter(|p| **p != claude_desktop_relative_path()),
+        )
+        .map(|p| home.join(p))
+        .collect()
 }
 
 #[cfg(test)]

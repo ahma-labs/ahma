@@ -1279,19 +1279,46 @@ where
             decision_id,
             decision,
             target_instance_id,
-        } => route_submit_scope_grant(&hub, decision_id, decision, target_instance_id).await,
+        } => {
+            route_to_instance(
+                &hub,
+                target_instance_id,
+                DaemonMsg::SubmitScopeGrant {
+                    decision_id,
+                    decision,
+                },
+            )
+            .await
+        }
 
         ClientMsg::SubmitWebApproval {
             decision_id,
             decision,
             target_instance_id,
-        } => route_submit_web_approval(&hub, decision_id, decision, target_instance_id).await,
+        } => {
+            route_to_instance(
+                &hub,
+                target_instance_id,
+                DaemonMsg::SubmitWebApproval {
+                    decision_id,
+                    decision,
+                },
+            )
+            .await
+        }
 
         ClientMsg::ReRaiseScopeGrant {
             path,
             access,
             target_instance_id,
-        } => route_reraise_scope_grant(&hub, path, access, target_instance_id).await,
+        } => {
+            route_to_instance(
+                &hub,
+                target_instance_id,
+                DaemonMsg::ReRaiseScopeGrant { path, access },
+            )
+            .await
+        }
 
         _ => {
             debug!("daemon: unexpected message, closing connection");
@@ -1358,55 +1385,24 @@ async fn route_submit_approval(
     }
 }
 
-/// Route a `SubmitScopeGrant` decision back to the instance that raised it.
-async fn route_submit_scope_grant(
+/// Send `msg` to the instance a TUI request targets, if that instance is still
+/// connected.
+///
+/// Every hub → instance route is this: resolve the target, look up its channel,
+/// send. It was written out once per message type, which is three chances to
+/// resolve against one instance and send to another. Silently dropping when the
+/// instance has gone is deliberate and the reason there is no error to return —
+/// a decision for an instance that disconnected has nowhere to be applied, and
+/// the TUI has already closed its modal.
+async fn route_to_instance(
     hub: &Arc<DaemonHub>,
-    decision_id: String,
-    decision: crate::scope_grant::GrantDecision,
     target_instance_id: Option<String>,
+    msg: DaemonMsg,
 ) {
     if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await
         && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
     {
-        let _ = tx
-            .send(DaemonMsg::SubmitScopeGrant {
-                decision_id,
-                decision,
-            })
-            .await;
-    }
-}
-
-/// Route a user-initiated re-raise to the instance that owns the denied path.
-async fn route_reraise_scope_grant(
-    hub: &Arc<DaemonHub>,
-    path: String,
-    access: crate::config::ScopeAccess,
-    target_instance_id: Option<String>,
-) {
-    if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await
-        && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
-    {
-        let _ = tx.send(DaemonMsg::ReRaiseScopeGrant { path, access }).await;
-    }
-}
-
-/// Route a `SubmitWebApproval` decision back to the instance that raised it.
-async fn route_submit_web_approval(
-    hub: &Arc<DaemonHub>,
-    decision_id: String,
-    decision: crate::web_approval::WebApprovalDecision,
-    target_instance_id: Option<String>,
-) {
-    if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await
-        && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
-    {
-        let _ = tx
-            .send(DaemonMsg::SubmitWebApproval {
-                decision_id,
-                decision,
-            })
-            .await;
+        let _ = tx.send(msg).await;
     }
 }
 

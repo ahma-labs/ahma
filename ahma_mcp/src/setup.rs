@@ -557,7 +557,7 @@ impl McpConfigDrift {
 }
 
 pub fn detect_mcp_config_drifts() -> Vec<McpConfigDrift> {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = ahma_common::config::ahma_home_dir() else {
         return Vec::new();
     };
 
@@ -867,7 +867,12 @@ pub(crate) fn skill_install_dirs(home: &Path) -> [PathBuf; 2] {
 }
 
 async fn setup_agent_skills(interactive: bool) -> Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
+    // `ahma_home_dir`, not `dirs::home_dir`: `uninstall_agent_skills` resolves the
+    // same directories through it, and the two must agree or an install/uninstall
+    // pair under `AHMA_TEST_HOME` writes into the real home and removes from the
+    // test one. This is the drift `harness_target`'s module doc describes.
+    let home = ahma_common::config::ahma_home_dir()
+        .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
     for skill_dir in skill_install_dirs(&home) {
         let skill_path = skill_dir.join("SKILL.md");

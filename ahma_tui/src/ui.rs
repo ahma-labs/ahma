@@ -318,10 +318,7 @@ fn draw_collapsed_window(
 /// Milliseconds since the epoch — the clock that drives stateless panels.
 #[cfg(feature = "tui")]
 fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    ahma_common::keepalive::current_timestamp_ms()
 }
 
 /// Activity panel for a running card: dots stream right→left — output flowing
@@ -503,12 +500,10 @@ fn draw_operation_detail(
     );
 
     // Footer: clickable actions on the left, key hints on the right.
-    let is_live = matches!(
-        op.status,
-        crate::state::OpStatus::Running
-            | crate::state::OpStatus::Pending
-            | crate::state::OpStatus::Waiting
-    );
+    // The complement of `is_terminal`, not a third list of variants: an eighth
+    // OpStatus would otherwise have to be added here, in ui.rs, and in
+    // `is_terminal`, with nothing catching a disagreement.
+    let is_live = !op.status.is_terminal();
     let cancel_btn = if is_live { " [Cancel] " } else { "" };
     let pin_btn = if op.pinned { " [Unpin] " } else { " [Pin] " };
     let analyze_btn = " [Analyze] ";

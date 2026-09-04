@@ -2021,18 +2021,9 @@ impl AhmaMcpService {
         &self,
         arguments: &serde_json::Map<String, Value>,
     ) -> crate::config::LlmProviderConfig {
-        let llm_base_url = arguments
-            .get("llm_base_url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let llm_model = arguments
-            .get("llm_model")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let llm_api_key = arguments
-            .get("llm_api_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let llm_base_url = handlers::common::opt_str(arguments, "llm_base_url");
+        let llm_model = handlers::common::opt_str(arguments, "llm_model");
+        let llm_api_key = handlers::common::opt_str(arguments, "llm_api_key");
 
         if let Some(base_url) = llm_base_url
             && let Some(model) = llm_model
@@ -2072,25 +2063,20 @@ impl AhmaMcpService {
     ) -> Result<CallToolResult, McpError> {
         use std::sync::atomic::Ordering;
 
-        let file_path_str = arguments
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                McpError::invalid_params("file_path parameter is required".to_string(), None)
+        let file_path_str = handlers::common::require_str(
+            &arguments,
+            "file_path",
+            "file_path parameter is required",
+        )?;
+
+        let detection_prompt = handlers::common::opt_str(&arguments, "detection_prompt")
+            .unwrap_or_else(|| "Identify errors or warnings".to_string());
+
+        let path = std::path::Path::new(&file_path_str);
+        let safe_path =
+            self.adapter.sandbox().validate_path(path).map_err(|e| {
+                handlers::common::mcp_invalid_params(format!("Invalid file path: {e}"))
             })?;
-
-        let detection_prompt = arguments
-            .get("detection_prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Identify errors or warnings")
-            .to_string();
-
-        let path = std::path::Path::new(file_path_str);
-        let safe_path = self
-            .adapter
-            .sandbox()
-            .validate_path(path)
-            .map_err(|e| McpError::invalid_params(format!("Invalid file path: {}", e), None))?;
 
         let llm_provider = self.parse_llm_provider(&arguments);
 

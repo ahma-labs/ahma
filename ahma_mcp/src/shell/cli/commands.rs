@@ -510,32 +510,41 @@ fn run_sandbox_grant(
     by: Option<String>,
     note: Option<String>,
 ) -> Result<()> {
-    use ahma_common::config::{GrantOutcome, PersistentScope, ScopeAccess};
+    use ahma_common::config::{GrantOutcome, ScopeAccess};
 
     let access = if read_only {
         ScopeAccess::Ro
     } else {
         ScopeAccess::Rw
     };
-    let mut settings = load_sandbox_settings(file)?;
+    let settings = load_sandbox_settings(file)?;
 
     // The catastrophic-path denylist gates *every* write into the ledger,
     // not just the `sandbox_grant` MCP tool (SPEC R-PERM.2). The CLI used
     // to skip it, which meant the safest surface (a human at a terminal)
     // had the weakest guardrail — precisely backwards.
     refuse_denylisted_grant(&dir, &settings)?;
+    drop(settings);
 
-    let scope = PersistentScope {
-        path: dir.clone(),
+    // Write through the shared chokepoint rather than repeating its
+    // load/grant/save here. `persist_grant`'s own documentation claims the CLI
+    // converges on it and `sandbox_grant_tool` says the two share a code path;
+    // until now neither was true, and this is the ledger that decides what the
+    // kernel will let a command touch. A second copy of the write is the last
+    // place that should exist.
+    //
+    // It re-reads the file it was just handed, which is the price of the
+    // chokepoint owning the whole load-modify-save. The denylist gate above
+    // needs the settings first, and `load_sandbox_settings` is the same strict
+    // loader `persist_grant` uses, so the two reads agree.
+    let outcome = ahma_common::scope_grant::persist_grant(
+        file,
+        &dir,
         access,
-        granted_by: by,
-        granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+        by,
+        Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
         note,
-    };
-    let outcome = settings.sandbox.grant_scope(scope);
-    settings
-        .save_to(file)
-        .with_context(|| format!("Failed to write {}", file.display()))?;
+    )?;
 
     audit(
         AuditAction::Grant,

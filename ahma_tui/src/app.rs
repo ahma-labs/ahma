@@ -3226,13 +3226,7 @@ fn run_nav_tool(rest: &str, state: &mut crate::state::AppState) {
         let tx_clone = tx.clone();
         let manager = state.mcp_connections.clone();
         tokio::spawn(async move {
-            let id = format!(
-                "call_{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis()
-            );
+            let id = format!("call_{}", ahma_common::keepalive::current_timestamp_ms());
             let _ = tx_clone
                 .send(crate::llm_bridge::BridgeEvent::ToolCallStarted {
                     id: id.clone(),
@@ -4066,12 +4060,10 @@ fn window_content_for(
     op: &crate::state::Operation,
     unicode: bool,
 ) -> Vec<crate::state::WindowLine> {
-    let is_live = matches!(
-        op.status,
-        crate::state::OpStatus::Running
-            | crate::state::OpStatus::Pending
-            | crate::state::OpStatus::Waiting
-    );
+    // The complement of `is_terminal`, not a third list of variants: an eighth
+    // OpStatus would otherwise have to be added here, in ui.rs, and in
+    // `is_terminal`, with nothing catching a disagreement.
+    let is_live = !op.status.is_terminal();
 
     let mut content = Vec::with_capacity(op.stdout_tail.len() + 3);
     content.push(crate::state::WindowLine::start(format_friendly_start(op)));

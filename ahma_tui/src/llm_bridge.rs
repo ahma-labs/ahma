@@ -232,13 +232,7 @@ pub fn spawn_tool_call_task(
     tx: Sender<BridgeEvent>,
 ) {
     tokio::spawn(async move {
-        let id = format!(
-            "call_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        );
+        let id = format!("call_{}", ahma_common::keepalive::current_timestamp_ms());
         let args_str = serde_json::to_string(&arguments).unwrap_or_default();
         let _ = tx
             .send(BridgeEvent::ToolCallStarted {
