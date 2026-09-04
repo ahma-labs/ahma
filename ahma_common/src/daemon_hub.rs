@@ -244,6 +244,91 @@ pub enum DaemonEvent {
     },
 }
 
+/// The messages the hub forwards verbatim between an instance and the TUIs
+/// watching it.
+///
+/// These used to be written out twice — once in [`ClientMsg`] for the leg into
+/// the hub, once in [`DaemonMsg`] for the leg out — with a hand-written arm in
+/// the hub copying each one across. Two declarations of the same payload drift,
+/// and the copying arm is where the drift shows up: a variant added to one side
+/// and not the other compiles fine and is silently dropped at run time.
+///
+/// Naming the set once removes the possibility. The hub's forwarding is now
+/// `ClientMsg::Relay(r) => DaemonMsg::Relay(r)`, so a message added here is
+/// carried in both directions without the hub being touched at all.
+///
+/// **The wire is unchanged.** `#[serde(untagged)]` on the `Relay` variant of the
+/// two outer enums means these serialize exactly as they did when they were flat
+/// variants — `{"type":"ChatToken","token":"…"}`, not a nested envelope. That is
+/// a requirement, not a nicety: the hub socket has no protocol version (R24.5
+/// evolves it by adding fields), so a daemon left running across an upgrade must
+/// keep understanding a newer instance. `relay_wire_compat` pins the bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum HubRelay {
+    /// Stream a chat token from the instance to the TUI.
+    ChatToken { token: String },
+    /// Stream a reasoning/"thinking" token (rendered in lower contrast by the TUI).
+    ChatThinking { token: String },
+    /// Ask the TUI for approval to execute a tool or elevate.
+    ApprovalRequested {
+        id: String,
+        tool: String,
+        args: String,
+    },
+    /// Raise a "grant access to X?" prompt for an auto-detected out-of-scope
+    /// path. Mirrors [`Self::ApprovalRequested`] but the decision is three-valued
+    /// and the grant is persisted for the next start, never applied to the live
+    /// session (SPEC R5.4.7). The default/Enter choice must be the safe Deny
+    /// (SPEC R5.3.1).
+    ScopeGrantRequested {
+        request: crate::scope_grant::ScopeGrantRequest,
+    },
+    /// Raise an "allow web access to X?" prompt for an unknown domain under a
+    /// `deny` web policy (SPEC R-WEB.6). The parallel of
+    /// [`Self::ScopeGrantRequested`] for network egress; an approval takes effect
+    /// for the session (or is persisted) rather than for a filesystem scope, and
+    /// never retroactively for the request that raised it.
+    WebApprovalRequested {
+        request: crate::web_approval::WebApprovalRequest,
+    },
+    /// A tool-call start, so the TUI can show which tool is running.
+    ToolCallStarted {
+        id: String,
+        name: String,
+        args: String,
+    },
+    /// A tool-call result.
+    ToolCallFinished {
+        id: String,
+        result: String,
+        failed: bool,
+    },
+    /// Token usage for the latest model turn, so the TUI counter updates.
+    /// Carried as plain fields to keep this crate free of an LLM-client dep.
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+    },
+    /// The agent turn is done.
+    AgentDone,
+    /// The agent turn encountered an error.
+    AgentError { error: String },
+}
+
+impl From<HubRelay> for ClientMsg {
+    fn from(relay: HubRelay) -> Self {
+        ClientMsg::Relay(relay)
+    }
+}
+
+impl From<HubRelay> for DaemonMsg {
+    fn from(relay: HubRelay) -> Self {
+        DaemonMsg::Relay(relay)
+    }
+}
+
 /// Message from any client (instance or TUI subscriber) to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -289,23 +374,6 @@ pub enum ClientMsg {
         approved: bool,
         target_instance_id: Option<String>,
     },
-    /// Stream a chat token from the instance to the hub.
-    ChatToken { token: String },
-    /// Stream a reasoning/"thinking" token (rendered in lower contrast by the TUI).
-    ChatThinking { token: String },
-    /// Request approval from the TUI.
-    ApprovalRequested {
-        id: String,
-        tool: String,
-        args: String,
-    },
-    /// An instance asking every TUI to raise a "grant access to X?" prompt for an
-    /// auto-detected out-of-scope path. Mirrors [`Self::ApprovalRequested`] but the
-    /// decision is three-valued and the grant is persisted for the next start, never
-    /// applied to the live session (SPEC R5.4.7).
-    ScopeGrantRequested {
-        request: crate::scope_grant::ScopeGrantRequest,
-    },
     /// A TUI's three-valued answer to a scope-grant prompt, routed back to the
     /// instance that raised it.
     SubmitScopeGrant {
@@ -327,13 +395,6 @@ pub enum ClientMsg {
         access: crate::config::ScopeAccess,
         target_instance_id: Option<String>,
     },
-    /// An instance asking every TUI to raise an "allow web access to X?" prompt for
-    /// an unknown domain under a `deny` web policy (SPEC R-WEB.6). The parallel of
-    /// [`Self::ScopeGrantRequested`] for network egress; the decision takes effect
-    /// for the session (or is persisted) rather than for a filesystem scope.
-    WebApprovalRequested {
-        request: crate::web_approval::WebApprovalRequest,
-    },
     /// A TUI's answer to a web-approval prompt, routed back to the instance that
     /// raised it.
     SubmitWebApproval {
@@ -344,29 +405,11 @@ pub enum ClientMsg {
     /// An instance announcing a web-approval decision is resolved, so the hub can
     /// dismiss the prompt on any other TUI showing the same `decision_id`.
     WebApprovalResolved { decision_id: String },
-    /// Notify that the agent turn is done.
-    AgentDone,
-    /// Notify that the agent turn encountered an error.
-    AgentError { error: String },
-    /// Stream a tool-call start so the TUI can show which tool is running.
-    ToolCallStarted {
-        id: String,
-        name: String,
-        args: String,
-    },
-    /// Stream a tool-call result back to the TUI.
-    ToolCallFinished {
-        id: String,
-        result: String,
-        failed: bool,
-    },
-    /// Report token usage for the latest model turn so the TUI counter updates.
-    /// Carried as plain fields to keep this crate free of an LLM-client dep.
-    Usage {
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        total_tokens: u32,
-    },
+    /// A message the hub forwards to every subscriber untouched. Flattened onto
+    /// the wire, so each [`HubRelay`] variant is its own `"type"` exactly as when
+    /// these were written out here one by one.
+    #[serde(untagged)]
+    Relay(HubRelay),
 }
 
 /// Message from the daemon to a subscriber (TUI).
@@ -387,16 +430,6 @@ pub enum DaemonMsg {
     /// Liveness probe sent from hub to a connected instance.
     /// The instance should respond with a matching [`ClientMsg::Pong`].
     Ping { seq: u32 },
-    /// Live chat token streamed back to the TUI from the daemon's agent loop.
-    ChatToken { token: String },
-    /// Live reasoning/"thinking" token streamed back to the TUI (lower contrast).
-    ChatThinking { token: String },
-    /// Prompt the TUI to request user approval for tool execution or elevation.
-    ApprovalRequested {
-        id: String,
-        tool: String,
-        args: String,
-    },
     /// Forward prompt run command to registered instance.
     RunPrompt {
         messages: Vec<DaemonChatMessage>,
@@ -409,12 +442,6 @@ pub enum DaemonMsg {
         #[serde(default)]
         id: Option<String>,
         approved: bool,
-    },
-    /// Prompt every TUI to raise a "grant access to X?" modal for an auto-detected
-    /// out-of-scope path. The default/Enter choice must be the safe Deny
-    /// (SPEC R5.3.1); the grant is persisted for the next start, never live.
-    ScopeGrantRequested {
-        request: crate::scope_grant::ScopeGrantRequest,
     },
     /// Forward a TUI's scope-grant decision to the registered instance that raised
     /// it, where it is resolved and (if approved) persisted.
@@ -432,13 +459,6 @@ pub enum DaemonMsg {
         path: String,
         access: crate::config::ScopeAccess,
     },
-    /// Prompt every TUI to raise an "allow web access to X?" modal for an unknown
-    /// domain under a `deny` web policy (SPEC R-WEB.6). The default/Enter choice
-    /// must be the safe Deny; an approval takes effect for the session (or is
-    /// persisted), never retroactively for the request that raised it.
-    WebApprovalRequested {
-        request: crate::web_approval::WebApprovalRequest,
-    },
     /// Forward a TUI's web-approval decision to the registered instance that raised
     /// it, where it is resolved and (if approved) applied/persisted.
     SubmitWebApproval {
@@ -448,28 +468,11 @@ pub enum DaemonMsg {
     /// Tell every TUI to dismiss the web-approval modal for `decision_id` (a twin
     /// surface answered, or the instance withdrew it).
     WebApprovalDismiss { decision_id: String },
-    /// Notify TUI that the agent turn is done.
-    AgentDone,
-    /// Notify TUI that the agent turn encountered an error.
-    AgentError { error: String },
-    /// Forward a tool-call start to the TUI (which tool the agent is running).
-    ToolCallStarted {
-        id: String,
-        name: String,
-        args: String,
-    },
-    /// Forward a tool-call result to the TUI.
-    ToolCallFinished {
-        id: String,
-        result: String,
-        failed: bool,
-    },
-    /// Forward token usage for the latest model turn so the TUI counter updates.
-    Usage {
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        total_tokens: u32,
-    },
+    /// A message forwarded from the instance to every subscriber untouched.
+    /// Flattened onto the wire, so each [`HubRelay`] variant is its own `"type"`
+    /// exactly as when these were written out here one by one.
+    #[serde(untagged)]
+    Relay(HubRelay),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1330,12 +1333,12 @@ async fn route_submit_prompt(
 
     if !delivered {
         warn!("daemon: SubmitPrompt could not be routed — no instance available to run it");
-        let _ = hub.broadcast.send(DaemonMsg::AgentError {
+        let _ = hub.broadcast.send(DaemonMsg::Relay(HubRelay::AgentError {
             error: "No ahma instance is available to run the prompt. \
                     Make sure an ahma server is connected (it normally \
                     auto-starts); try reopening the TUI."
                 .to_string(),
-        });
+        }));
     }
 }
 
@@ -1474,52 +1477,56 @@ async fn serve_instance<R, W>(
                         // Liveness confirmed — nothing else to do for now.
                         debug!("daemon: pong received from id={id}");
                     }
-                    Ok(ClientMsg::ChatToken { token }) => {
-                        let _ = hub.broadcast.send(DaemonMsg::ChatToken { token });
-                    }
-                    Ok(ClientMsg::ChatThinking { token }) => {
-                        let _ = hub.broadcast.send(DaemonMsg::ChatThinking { token });
-                    }
-                    Ok(ClientMsg::ApprovalRequested { id: call_id, tool, args }) => {
-                        hub.pending_approvals.lock().await.insert(
-                            id.clone(),
-                            PendingApproval {
-                                id: call_id.clone(),
-                                tool: tool.clone(),
-                                args: args.clone(),
-                            },
-                        );
-                        let _ = hub.broadcast.send(DaemonMsg::ApprovalRequested { id: call_id, tool, args });
-                    }
-                    Ok(ClientMsg::ScopeGrantRequested { request }) => {
-                        let _ = hub.broadcast.send(DaemonMsg::ScopeGrantRequested { request });
-                    }
                     Ok(ClientMsg::ScopeGrantResolved { decision_id }) => {
                         let _ = hub.broadcast.send(DaemonMsg::ScopeGrantDismiss { decision_id });
-                    }
-                    Ok(ClientMsg::WebApprovalRequested { request }) => {
-                        let _ = hub.broadcast.send(DaemonMsg::WebApprovalRequested { request });
                     }
                     Ok(ClientMsg::WebApprovalResolved { decision_id }) => {
                         let _ = hub.broadcast.send(DaemonMsg::WebApprovalDismiss { decision_id });
                     }
-                    Ok(ClientMsg::ToolCallStarted { id: call_id, name, args }) => {
-                        let _ = hub.broadcast.send(DaemonMsg::ToolCallStarted { id: call_id, name, args });
-                    }
-                    Ok(ClientMsg::ToolCallFinished { id: call_id, result, failed }) => {
-                        let _ = hub.broadcast.send(DaemonMsg::ToolCallFinished { id: call_id, result, failed });
-                    }
-                    Ok(ClientMsg::Usage { prompt_tokens, completion_tokens, total_tokens }) => {
-                        let _ = hub.broadcast.send(DaemonMsg::Usage { prompt_tokens, completion_tokens, total_tokens });
-                    }
-                    Ok(ClientMsg::AgentDone) => {
-                        let _ = hub.broadcast.send(DaemonMsg::AgentDone);
-                    }
-                    Ok(ClientMsg::AgentError { error }) => {
-                        let _ = hub.broadcast.send(DaemonMsg::AgentError { error });
+                    // Everything the hub forwards untouched. One arm, so a new
+                    // HubRelay message reaches subscribers without this loop
+                    // being edited — and cannot be half-added.
+                    Ok(ClientMsg::Relay(relay)) => {
+                        // The one relay with a side effect: remember the question
+                        // so a TUI attaching mid-prompt is still shown it.
+                        if let HubRelay::ApprovalRequested { id: call_id, tool, args } = &relay {
+                            hub.pending_approvals.lock().await.insert(
+                                id.clone(),
+                                PendingApproval {
+                                    id: call_id.clone(),
+                                    tool: tool.clone(),
+                                    args: args.clone(),
+                                },
+                            );
+                        }
+                        let _ = hub.broadcast.send(DaemonMsg::Relay(relay));
                     }
                     Ok(ClientMsg::Unregister) | Err(_) => break,
-                    Ok(_) => {} // ignore unexpected messages
+
+                    // The rest are listed rather than swallowed by a catch-all,
+                    // so that adding a ClientMsg variant is a compile error here
+                    // — the previous `Ok(_) => {}` accepted a new message and
+                    // dropped it, which looks exactly like a working relay until
+                    // someone notices the TUI never updates.
+                    //
+                    // A TUI's own requests: answered on the subscriber
+                    // connection, so an instance sending one is a client bug.
+                    Ok(ClientMsg::Register { .. }
+                        | ClientMsg::Subscribe
+                        | ClientMsg::ListInstances
+                        | ClientMsg::Shutdown
+                        | ClientMsg::SubmitPrompt { .. }) => {
+                        debug!("daemon: ignoring subscriber-only message from instance id={id}");
+                    }
+                    // Decisions the hub routes *to* an instance. They arrive on
+                    // the TUI's connection and are forwarded from there; an
+                    // instance never sends one back up its own.
+                    Ok(ClientMsg::SubmitApproval { .. }
+                        | ClientMsg::SubmitScopeGrant { .. }
+                        | ClientMsg::ReRaiseScopeGrant { .. }
+                        | ClientMsg::SubmitWebApproval { .. }) => {
+                        debug!("daemon: ignoring instance-bound decision from instance id={id}");
+                    }
                 }
             }
 
@@ -1589,10 +1596,12 @@ where
             .await
             .values()
             .cloned()
-            .map(|pending| DaemonMsg::ApprovalRequested {
-                id: pending.id,
-                tool: pending.tool,
-                args: pending.args,
+            .map(|pending| {
+                DaemonMsg::Relay(HubRelay::ApprovalRequested {
+                    id: pending.id,
+                    tool: pending.tool,
+                    args: pending.args,
+                })
             }),
     );
     for msg in backlog {
@@ -1791,7 +1800,7 @@ mod tests {
             .expect("broadcast channel open");
 
         match msg {
-            DaemonMsg::AgentError { error } => {
+            DaemonMsg::Relay(HubRelay::AgentError { error }) => {
                 assert!(
                     error.contains("No ahma instance"),
                     "unexpected error text: {error}"
@@ -2069,9 +2078,9 @@ mod tests {
 
         // ClientMsg side (instance → hub, and TUI → hub).
         for msg in [
-            ClientMsg::ScopeGrantRequested {
+            ClientMsg::Relay(HubRelay::ScopeGrantRequested {
                 request: request.clone(),
-            },
+            }),
             ClientMsg::SubmitScopeGrant {
                 decision_id: "dec-42".into(),
                 decision: GrantDecision::GrantRo,
@@ -2088,7 +2097,7 @@ mod tests {
 
         // DaemonMsg side (hub → TUI, and hub → instance).
         for msg in [
-            DaemonMsg::ScopeGrantRequested { request },
+            DaemonMsg::Relay(HubRelay::ScopeGrantRequested { request }),
             DaemonMsg::SubmitScopeGrant {
                 decision_id: "dec-42".into(),
                 decision: GrantDecision::Deny,
@@ -2116,9 +2125,9 @@ mod tests {
 
         // ClientMsg side (instance → hub, and TUI → hub).
         for msg in [
-            ClientMsg::WebApprovalRequested {
+            ClientMsg::Relay(HubRelay::WebApprovalRequested {
                 request: request.clone(),
-            },
+            }),
             ClientMsg::SubmitWebApproval {
                 decision_id: "web-7".into(),
                 decision: WebApprovalDecision::AllowSession,
@@ -2135,7 +2144,7 @@ mod tests {
 
         // DaemonMsg side (hub → TUI, and hub → instance).
         for msg in [
-            DaemonMsg::WebApprovalRequested { request },
+            DaemonMsg::Relay(HubRelay::WebApprovalRequested { request }),
             DaemonMsg::SubmitWebApproval {
                 decision_id: "web-7".into(),
                 decision: WebApprovalDecision::Deny,
@@ -2928,30 +2937,30 @@ mod tests {
         // ChatToken → ChatToken.
         send_msg(
             &mut iw,
-            &ClientMsg::ChatToken {
+            &ClientMsg::Relay(HubRelay::ChatToken {
                 token: "tok".into(),
-            },
+            }),
         )
         .await
         .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::ChatToken { token } => assert_eq!(token, "tok"),
+            DaemonMsg::Relay(HubRelay::ChatToken { token }) => assert_eq!(token, "tok"),
             other => panic!("expected ChatToken, got {other:?}"),
         }
 
         // ApprovalRequested → ApprovalRequested.
         send_msg(
             &mut iw,
-            &ClientMsg::ApprovalRequested {
+            &ClientMsg::Relay(HubRelay::ApprovalRequested {
                 id: "c1".into(),
                 tool: "sh".into(),
                 args: "ls".into(),
-            },
+            }),
         )
         .await
         .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::ApprovalRequested { id, tool, args } => {
+            DaemonMsg::Relay(HubRelay::ApprovalRequested { id, tool, args }) => {
                 assert_eq!(id, "c1");
                 assert_eq!(tool, "sh");
                 assert_eq!(args, "ls");
@@ -2967,11 +2976,14 @@ mod tests {
             reason: GrantReason::StderrHeuristic,
             tool: Some("sccache".into()),
         };
-        send_msg(&mut iw, &ClientMsg::ScopeGrantRequested { request: req })
-            .await
-            .unwrap();
+        send_msg(
+            &mut iw,
+            &ClientMsg::Relay(HubRelay::ScopeGrantRequested { request: req }),
+        )
+        .await
+        .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::ScopeGrantRequested { request } => {
+            DaemonMsg::Relay(HubRelay::ScopeGrantRequested { request }) => {
                 assert_eq!(request.decision_id, "d9")
             }
             other => panic!("expected ScopeGrantRequested, got {other:?}"),
@@ -2994,16 +3006,16 @@ mod tests {
         // ToolCallStarted → ToolCallStarted.
         send_msg(
             &mut iw,
-            &ClientMsg::ToolCallStarted {
+            &ClientMsg::Relay(HubRelay::ToolCallStarted {
                 id: "t1".into(),
                 name: "read_file".into(),
                 args: "{}".into(),
-            },
+            }),
         )
         .await
         .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::ToolCallStarted { id, name, .. } => {
+            DaemonMsg::Relay(HubRelay::ToolCallStarted { id, name, .. }) => {
                 assert_eq!(id, "t1");
                 assert_eq!(name, "read_file");
             }
@@ -3013,16 +3025,16 @@ mod tests {
         // ToolCallFinished → ToolCallFinished.
         send_msg(
             &mut iw,
-            &ClientMsg::ToolCallFinished {
+            &ClientMsg::Relay(HubRelay::ToolCallFinished {
                 id: "t1".into(),
                 result: "ok".into(),
                 failed: false,
-            },
+            }),
         )
         .await
         .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::ToolCallFinished { id, failed, .. } => {
+            DaemonMsg::Relay(HubRelay::ToolCallFinished { id, failed, .. }) => {
                 assert_eq!(id, "t1");
                 assert!(!failed);
             }
@@ -3032,20 +3044,20 @@ mod tests {
         // Usage → Usage.
         send_msg(
             &mut iw,
-            &ClientMsg::Usage {
+            &ClientMsg::Relay(HubRelay::Usage {
                 prompt_tokens: 100,
                 completion_tokens: 20,
                 total_tokens: 120,
-            },
+            }),
         )
         .await
         .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Usage {
+            DaemonMsg::Relay(HubRelay::Usage {
                 prompt_tokens,
                 total_tokens,
                 ..
-            } => {
+            }) => {
                 assert_eq!(prompt_tokens, 100);
                 assert_eq!(total_tokens, 120);
             }
@@ -3056,23 +3068,25 @@ mod tests {
         send_msg(&mut iw, &ClientMsg::Pong { seq: 5 })
             .await
             .unwrap();
-        send_msg(&mut iw, &ClientMsg::AgentDone).await.unwrap();
+        send_msg(&mut iw, &ClientMsg::Relay(HubRelay::AgentDone))
+            .await
+            .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::AgentDone => {}
+            DaemonMsg::Relay(HubRelay::AgentDone) => {}
             other => panic!("expected AgentDone (Pong must not broadcast), got {other:?}"),
         }
 
         // AgentError → AgentError.
         send_msg(
             &mut iw,
-            &ClientMsg::AgentError {
+            &ClientMsg::Relay(HubRelay::AgentError {
                 error: "boom".into(),
-            },
+            }),
         )
         .await
         .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::AgentError { error } => assert_eq!(error, "boom"),
+            DaemonMsg::Relay(HubRelay::AgentError { error }) => assert_eq!(error, "boom"),
             other => panic!("expected AgentError, got {other:?}"),
         }
     }
@@ -3307,5 +3321,271 @@ mod tests {
             }
             other => panic!("expected replayed OpFinished, got {other:?}"),
         }
+    }
+}
+
+/// Golden wire bytes for the messages the hub relays verbatim.
+///
+/// The hub socket carries **no protocol version**: R24.5 lets it evolve by
+/// adding fields, which is why a daemon and an instance from different builds
+/// still understand each other. Restructuring the Rust types is therefore only
+/// safe while the JSON stays identical, and "identical" is not something a
+/// round-trip test can check — a round-trip passes just as happily after the
+/// tag changes, because both ends changed together. These assertions pin the
+/// actual bytes, so a refactor that would strand a running daemon fails here.
+#[cfg(test)]
+mod relay_wire_compat {
+    use super::*;
+    use serde_json::json;
+
+    /// The same payload must appear on the wire whether it is travelling
+    /// instance → hub ([`ClientMsg`]) or hub → TUI ([`DaemonMsg`]). The hub
+    /// forwards these untouched, so any asymmetry would be a bug in itself.
+    fn assert_same_bytes_both_directions(
+        client: ClientMsg,
+        daemon: DaemonMsg,
+        expected: serde_json::Value,
+    ) {
+        assert_eq!(
+            serde_json::to_value(&client).unwrap(),
+            expected,
+            "ClientMsg wire changed"
+        );
+        assert_eq!(
+            serde_json::to_value(&daemon).unwrap(),
+            expected,
+            "DaemonMsg wire changed"
+        );
+        assert_one_tag(&serde_json::to_string(&client).unwrap());
+        assert_one_tag(&serde_json::to_string(&daemon).unwrap());
+    }
+
+    /// Comparing `to_value` is not enough on its own.
+    ///
+    /// A nested envelope emits the tag twice — `{"type":"Relay","type":"…"}` —
+    /// and `serde_json::Value` is a map, so the second key overwrites the first
+    /// and the comparison above passes on a payload no other reader would
+    /// accept. Only the string still has both. Confirmed by removing
+    /// `#[serde(untagged)]` and watching this assertion be the one that fires.
+    fn assert_one_tag(json: &str) {
+        assert!(
+            json.starts_with(r#"{"type":"#),
+            "the tag must lead the object: {json}"
+        );
+        assert_eq!(
+            json.matches(r#""type":"#).count(),
+            1,
+            "exactly one tag belongs on the wire: {json}"
+        );
+    }
+
+    #[test]
+    fn chat_tokens_keep_their_wire_bytes() {
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::ChatToken { token: "hi".into() }),
+            DaemonMsg::Relay(HubRelay::ChatToken { token: "hi".into() }),
+            json!({"type": "ChatToken", "token": "hi"}),
+        );
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::ChatThinking { token: "mm".into() }),
+            DaemonMsg::Relay(HubRelay::ChatThinking { token: "mm".into() }),
+            json!({"type": "ChatThinking", "token": "mm"}),
+        );
+    }
+
+    #[test]
+    fn agent_lifecycle_keeps_its_wire_bytes() {
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::AgentDone),
+            DaemonMsg::Relay(HubRelay::AgentDone),
+            json!({"type": "AgentDone"}),
+        );
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::AgentError {
+                error: "boom".into(),
+            }),
+            DaemonMsg::Relay(HubRelay::AgentError {
+                error: "boom".into(),
+            }),
+            json!({"type": "AgentError", "error": "boom"}),
+        );
+    }
+
+    #[test]
+    fn tool_calls_and_usage_keep_their_wire_bytes() {
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::ToolCallStarted {
+                id: "c1".into(),
+                name: "cargo".into(),
+                args: "{}".into(),
+            }),
+            DaemonMsg::Relay(HubRelay::ToolCallStarted {
+                id: "c1".into(),
+                name: "cargo".into(),
+                args: "{}".into(),
+            }),
+            json!({"type": "ToolCallStarted", "id": "c1", "name": "cargo", "args": "{}"}),
+        );
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::ToolCallFinished {
+                id: "c1".into(),
+                result: "ok".into(),
+                failed: false,
+            }),
+            DaemonMsg::Relay(HubRelay::ToolCallFinished {
+                id: "c1".into(),
+                result: "ok".into(),
+                failed: false,
+            }),
+            json!({"type": "ToolCallFinished", "id": "c1", "result": "ok", "failed": false}),
+        );
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::Usage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+            }),
+            DaemonMsg::Relay(HubRelay::Usage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+            }),
+            json!({"type": "Usage", "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}),
+        );
+    }
+
+    #[test]
+    fn approval_prompts_keep_their_wire_bytes() {
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::ApprovalRequested {
+                id: "a1".into(),
+                tool: "rm".into(),
+                args: "-rf".into(),
+            }),
+            DaemonMsg::Relay(HubRelay::ApprovalRequested {
+                id: "a1".into(),
+                tool: "rm".into(),
+                args: "-rf".into(),
+            }),
+            json!({"type": "ApprovalRequested", "id": "a1", "tool": "rm", "args": "-rf"}),
+        );
+
+        let scope = crate::scope_grant::ScopeGrantRequest {
+            decision_id: "d1".into(),
+            path: std::path::PathBuf::from("/ext"),
+            access: crate::config::ScopeAccess::Rw,
+            reason: crate::scope_grant::GrantReason::StderrHeuristic,
+            tool: Some("sccache".into()),
+        };
+        let expected_scope = serde_json::to_value(&scope).unwrap();
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::ScopeGrantRequested {
+                request: scope.clone(),
+            }),
+            DaemonMsg::Relay(HubRelay::ScopeGrantRequested { request: scope }),
+            json!({"type": "ScopeGrantRequested", "request": expected_scope}),
+        );
+
+        let web = crate::web_approval::WebApprovalRequest {
+            decision_id: "w1".into(),
+            domain: "example.com".into(),
+            url: "https://example.com".into(),
+            tool: None,
+        };
+        let expected_web = serde_json::to_value(&web).unwrap();
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::WebApprovalRequested {
+                request: web.clone(),
+            }),
+            DaemonMsg::Relay(HubRelay::WebApprovalRequested { request: web }),
+            json!({"type": "WebApprovalRequested", "request": expected_web}),
+        );
+    }
+
+    /// The compatibility claim stated directly: a build from *before* the relay
+    /// variants were collapsed must still read what this build writes, and this
+    /// build must still read what it writes.
+    ///
+    /// `LegacyDaemonMsg` is that older reader — the flat shape, transcribed. It
+    /// is deliberately a separate declaration rather than a reference to
+    /// [`DaemonMsg`]: a test that reuses the live type cannot fail, because the
+    /// live type moves with the code. The daemon left running across an upgrade
+    /// does not.
+    #[test]
+    fn a_daemon_from_before_the_collapse_still_reads_and_writes_these() {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(tag = "type")]
+        enum LegacyDaemonMsg {
+            ChatToken {
+                token: String,
+            },
+            AgentDone,
+            ToolCallFinished {
+                id: String,
+                result: String,
+                failed: bool,
+            },
+            /// A variant that was never part of the relay set, to show the two
+            /// shapes still coexist in one stream.
+            ScopeGrantDismiss {
+                decision_id: String,
+            },
+        }
+
+        // New writes → old reads.
+        for (new, expect) in [
+            (
+                DaemonMsg::Relay(HubRelay::ChatToken { token: "hi".into() }),
+                r#"ChatToken { token: "hi" }"#,
+            ),
+            (DaemonMsg::Relay(HubRelay::AgentDone), "AgentDone"),
+            (
+                DaemonMsg::ScopeGrantDismiss {
+                    decision_id: "d1".into(),
+                },
+                r#"ScopeGrantDismiss { decision_id: "d1" }"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&new).unwrap();
+            let old: LegacyDaemonMsg = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("a pre-collapse daemon could not read {json}: {e}"));
+            assert_eq!(format!("{old:?}"), expect);
+        }
+
+        // Old writes → new reads.
+        let legacy = serde_json::to_string(&LegacyDaemonMsg::ToolCallFinished {
+            id: "c1".into(),
+            result: "ok".into(),
+            failed: true,
+        })
+        .unwrap();
+        let now: DaemonMsg = serde_json::from_str(&legacy)
+            .unwrap_or_else(|e| panic!("this build could not read a pre-collapse daemon: {e}"));
+        assert!(matches!(
+            now,
+            DaemonMsg::Relay(HubRelay::ToolCallFinished { failed: true, .. })
+        ));
+    }
+
+    /// Deserialization must also stay put: an old daemon's bytes have to land in
+    /// the right variant, which is the half of compatibility that serialization
+    /// tests cannot see.
+    #[test]
+    fn relayed_bytes_still_deserialize_into_the_right_variant() {
+        let c: ClientMsg = serde_json::from_str(r#"{"type":"ChatToken","token":"hi"}"#).unwrap();
+        assert!(matches!(c, ClientMsg::Relay(HubRelay::ChatToken { ref token }) if token == "hi"));
+        let d: DaemonMsg = serde_json::from_str(r#"{"type":"AgentDone"}"#).unwrap();
+        assert!(matches!(d, DaemonMsg::Relay(HubRelay::AgentDone)));
+        let u: DaemonMsg = serde_json::from_str(
+            r#"{"type":"Usage","prompt_tokens":1,"completion_tokens":2,"total_tokens":3}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            u,
+            DaemonMsg::Relay(HubRelay::Usage {
+                total_tokens: 3,
+                ..
+            })
+        ));
     }
 }

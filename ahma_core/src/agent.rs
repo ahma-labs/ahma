@@ -1,4 +1,4 @@
-use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
+use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage, HubRelay};
 use ahma_http_mcp_client::streamable::{
     ConflictRetryPolicy, ConnectOptions, Connector, StreamableHttpMcpClient, ToolCallOutcome,
 };
@@ -1824,22 +1824,25 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
 
         // Receive events from the agent loop and forward them to the hub daemon
         while let Some(evt) = rx.recv().await {
-            let client_msg = match evt {
-                AgentEvent::Token(t) => ClientMsg::ChatToken { token: t },
-                AgentEvent::Thinking(t) => ClientMsg::ChatThinking { token: t },
-                AgentEvent::Done => ClientMsg::AgentDone,
-                AgentEvent::Error(e) => ClientMsg::AgentError { error: e },
+            // Everything the agent loop emits is relayed to the TUI untouched,
+            // so this maps to `HubRelay` and wraps once at the end rather than
+            // naming `ClientMsg::Relay` on every arm.
+            let relay = match evt {
+                AgentEvent::Token(t) => HubRelay::ChatToken { token: t },
+                AgentEvent::Thinking(t) => HubRelay::ChatThinking { token: t },
+                AgentEvent::Done => HubRelay::AgentDone,
+                AgentEvent::Error(e) => HubRelay::AgentError { error: e },
                 // Tool-call lifecycle events are NOT approval requests — the
                 // approval prompt is raised separately by the HubApprovalGate.
                 // These drive the TUI's live "which tool is running" display and
                 // the token counter, so forward them over their own hub messages.
                 AgentEvent::ToolCallStarted { id, name, args } => {
-                    ClientMsg::ToolCallStarted { id, name, args }
+                    HubRelay::ToolCallStarted { id, name, args }
                 }
                 AgentEvent::ToolCallFinished { id, result, failed } => {
-                    ClientMsg::ToolCallFinished { id, result, failed }
+                    HubRelay::ToolCallFinished { id, result, failed }
                 }
-                AgentEvent::Usage(usage) => ClientMsg::Usage {
+                AgentEvent::Usage(usage) => HubRelay::Usage {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
                     total_tokens: usage.total_tokens,
@@ -1847,10 +1850,11 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
                 // No dedicated hub wire type for this yet — surfaced as a plain
                 // visible chat token so it is never silent, same as the direct
                 // (non-hub) llm_bridge path's dedicated note.
-                AgentEvent::Truncated { reason } => ClientMsg::ChatToken {
+                AgentEvent::Truncated { reason } => HubRelay::ChatToken {
                     token: format!("[{reason}]"),
                 },
             };
+            let client_msg = ClientMsg::from(relay);
 
             if hub_tx.send(client_msg).await.is_err() {
                 break;
@@ -2052,11 +2056,11 @@ impl AgentApprovalGate for HubApprovalGate {
             session_guard.approvals.insert(id.to_string(), tx);
         }
 
-        let msg = ClientMsg::ApprovalRequested {
+        let msg = ClientMsg::Relay(HubRelay::ApprovalRequested {
             id: id.to_string(),
             tool: tool.to_string(),
             args: args.to_string(),
-        };
+        });
         if self.hub_tx.send(msg).await.is_err() {
             let mut session_guard = self.session.lock().await;
             session_guard.approvals.remove(id);
@@ -3808,7 +3812,7 @@ mod tests {
 
         // The gate emits an approval request before awaiting the decision.
         match hub_rx.recv().await.unwrap() {
-            ClientMsg::ApprovalRequested { id, tool, args } => {
+            ClientMsg::Relay(HubRelay::ApprovalRequested { id, tool, args }) => {
                 assert_eq!(id, "id7");
                 assert_eq!(tool, "write_file");
                 assert_eq!(args, "{\"p\":1}");

@@ -1626,6 +1626,19 @@ correct **at startup**, not only for events that happen afterwards.
   conveyed by the reporter **reconnecting and re-registering**
   (reconnect-to-relabel), which also re-replays state, rather than by a new
   `UpdateInstance` message.
+  - **The constraint is on the bytes, not on the Rust types.** Restructuring
+    `ClientMsg`/`DaemonMsg` is permitted whenever the JSON is unchanged, and
+    forbidden whenever it is not — there is no version to negotiate on this
+    socket, so a daemon left running across an upgrade is the reader that
+    decides. `HubRelay` is the worked example: the ten messages the hub forwards
+    verbatim are declared once and embedded in both enums as
+    `#[serde(untagged)] Relay(HubRelay)`, which still serializes as
+    `{"type":"ChatToken","token":"…"}` with no envelope.
+  - A test that only round-trips a message through its own type **cannot**
+    enforce this, because both ends move together; nor can one that compares
+    `serde_json::Value`, because a duplicated tag silently collapses in a map.
+    `daemon_hub::relay_wire_compat` therefore asserts the serialized **string**
+    and reads it back with a separately-declared pre-collapse enum.
 
 - **R24.6 — One task, one row.** An operation visible both through the hub
   (instance-tagged) and through the TUI's direct MCP status poll (untagged)

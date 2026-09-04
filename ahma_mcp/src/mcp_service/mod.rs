@@ -206,7 +206,7 @@ pub struct AhmaMcpService {
     /// the daemon hub (R-WEB.6), set in daemon/server mode. When a `fetch_webpage`
     /// hits an unknown domain and the MCP client cannot do interactive
     /// `elicitation/create`, the request is sent here; the daemon reporter forwards
-    /// it as [`ahma_common::daemon_hub::ClientMsg::WebApprovalRequested`] and routes
+    /// it as `ClientMsg::Relay(HubRelay::WebApprovalRequested)` and routes
     /// the TUI's answer back into `web_approval`. `None` ⇒ no TUI surface wired.
     pub web_approval_tx: Arc<
         parking_lot::Mutex<

@@ -188,7 +188,7 @@ pub struct HubGrantNotifier {
 impl HubGrantNotifier {
     /// Create a hub-delivering notifier sharing `coordinator`, sending fresh
     /// requests on `req_tx` (drained by the daemon reporter and forwarded to the
-    /// hub as `ClientMsg::ScopeGrantRequested`).
+    /// hub as `ClientMsg::Relay(HubRelay::ScopeGrantRequested)`).
     pub fn new(
         coordinator: Arc<GrantCoordinator>,
         req_tx: tokio::sync::mpsc::UnboundedSender<ahma_common::scope_grant::ScopeGrantRequest>,

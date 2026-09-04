@@ -14,8 +14,8 @@ use crate::mcp_service::{ActiveAgentSession, get_global_prompt_runner};
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use ahma_common::config::settings_path;
 use ahma_common::daemon_hub::{
-    ClientMsg, DaemonChatMessage, DaemonEvent, DaemonMsg, DaemonStream, OpStatus as WireStatus,
-    connect_to_daemon, ensure_daemon_running, recv_msg, send_msg,
+    ClientMsg, DaemonChatMessage, DaemonEvent, DaemonMsg, DaemonStream, HubRelay,
+    OpStatus as WireStatus, connect_to_daemon, ensure_daemon_running, recv_msg, send_msg,
 };
 use ahma_common::scope_grant::{
     GrantCoordinator, GrantDecision, GrantResolveOutcome, ScopeGrantRequest, persist_grant,
@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 /// the same instance the [`crate::sandbox::HubGrantNotifier`] uses, so a request it
 /// emits and the answer routed back here resolve against one coordinator (dedup,
 /// first-answer-wins, dismiss). `req_rx` receives fresh requests to forward to the
-/// hub as [`ClientMsg::ScopeGrantRequested`].
+/// hub as `ClientMsg::Relay(HubRelay::ScopeGrantRequested)`.
 pub struct GrantReporting {
     /// Resolves answers and persists approved grants.
     pub coordinator: Arc<GrantCoordinator>,
@@ -45,7 +45,7 @@ pub struct GrantReporting {
 /// [`WebApprovalCoordinator`] the
 /// MCP service consults on every `fetch_webpage`, so a TUI answer routed back here
 /// takes effect for the live session. `req_rx` receives fresh requests to forward
-/// to the hub as [`ClientMsg::WebApprovalRequested`].
+/// to the hub as `ClientMsg::Relay(HubRelay::WebApprovalRequested)`.
 pub struct WebApprovalReporting {
     /// Resolves answers, applies session grants/denies, and persists `always`.
     pub coordinator: Arc<WebApprovalCoordinator>,
@@ -332,7 +332,7 @@ async fn run_reporter_loop(
                 maybe_req = recv_optional_grant(grant_req_rx.as_mut()) => {
                     match maybe_req {
                         Some(req) => {
-                            if send_msg(&mut writer, &ClientMsg::ScopeGrantRequested { request: req }).await.is_err() {
+                            if send_msg(&mut writer, &ClientMsg::Relay(HubRelay::ScopeGrantRequested { request: req })).await.is_err() {
                                 debug!("daemon_reporter: send ScopeGrantRequested failed, reconnecting");
                                 closed = true;
                             }
@@ -346,7 +346,7 @@ async fn run_reporter_loop(
                 maybe_web = recv_optional_web(web_req_rx.as_mut()) => {
                     match maybe_web {
                         Some(request) => {
-                            if send_msg(&mut writer, &ClientMsg::WebApprovalRequested { request }).await.is_err() {
+                            if send_msg(&mut writer, &ClientMsg::Relay(HubRelay::WebApprovalRequested { request })).await.is_err() {
                                 debug!("daemon_reporter: send WebApprovalRequested failed, reconnecting");
                                 closed = true;
                             }
@@ -521,9 +521,9 @@ async fn spawn_prompt_run(
     let Some(runner) = get_global_prompt_runner() else {
         warn!("daemon_reporter: RunPrompt received but no prompt runner is registered");
         let _ = hub_tx
-            .send(ClientMsg::AgentError {
+            .send(ClientMsg::Relay(HubRelay::AgentError {
                 error: "No prompt runner registered on this instance".to_string(),
-            })
+            }))
             .await;
         return;
     };
@@ -542,8 +542,8 @@ async fn spawn_prompt_run(
             )
             .await;
         let done = match outcome {
-            Ok(_) => ClientMsg::AgentDone,
-            Err(e) => ClientMsg::AgentError { error: e },
+            Ok(_) => ClientMsg::Relay(HubRelay::AgentDone),
+            Err(e) => ClientMsg::Relay(HubRelay::AgentError { error: e }),
         };
         let _ = hub_tx.send(done).await;
     });
@@ -625,7 +625,11 @@ async fn re_raise_scope_grant(
         Some("re-raised from the TUI".to_string()),
     ) {
         Some(request) => {
-            let _ = send_msg(writer, &ClientMsg::ScopeGrantRequested { request }).await;
+            let _ = send_msg(
+                writer,
+                &ClientMsg::Relay(HubRelay::ScopeGrantRequested { request }),
+            )
+            .await;
         }
         // Already in flight — the modal the user wants is on screen already.
         None => debug!("daemon_reporter: re-raise skipped, question already in flight"),
@@ -1827,7 +1831,7 @@ mod tests {
             })
             .unwrap();
         match read_client_msg(&mut server_reader).await {
-            ClientMsg::ScopeGrantRequested { request } => {
+            ClientMsg::Relay(HubRelay::ScopeGrantRequested { request }) => {
                 assert_eq!(request.decision_id, "fwd-1");
                 assert_eq!(request.access, ScopeAccess::Rw);
             }
@@ -1838,7 +1842,7 @@ mod tests {
         ping_pong(&mut server_writer, &mut server_reader, 11).await;
 
         // ── 3. Catch-all DaemonMsg (ignored), then confirm loop continues. ───────
-        send_msg(&mut server_writer, &DaemonMsg::AgentDone)
+        send_msg(&mut server_writer, &DaemonMsg::Relay(HubRelay::AgentDone))
             .await
             .expect("send AgentDone");
         ping_pong(&mut server_writer, &mut server_reader, 12).await;

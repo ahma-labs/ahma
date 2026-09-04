@@ -17,8 +17,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use ahma_common::daemon_hub::{
-    ClientMsg, DaemonEvent, DaemonMsg, InstanceInfo, connect_to_daemon, ensure_daemon_running,
-    recv_msg, send_msg,
+    ClientMsg, DaemonEvent, DaemonMsg, HubRelay, InstanceInfo, connect_to_daemon,
+    ensure_daemon_running, recv_msg, send_msg,
 };
 use tokio::{
     io::BufReader,
@@ -599,36 +599,41 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
         // instance that owns the path. A subscriber seeing it has nothing to do
         // — the re-raised question arrives as a normal ScopeGrantRequested.
         DaemonMsg::ReRaiseScopeGrant { .. } => Applied::None,
-        DaemonMsg::ChatToken { token } => Applied::ChatToken(token),
-        DaemonMsg::ChatThinking { token } => Applied::ChatThinking(token),
-        DaemonMsg::ApprovalRequested { id, tool, args } => {
-            Applied::ApprovalRequested { id, tool, args }
-        }
-        DaemonMsg::AgentDone => Applied::AgentDone,
-        DaemonMsg::AgentError { error } => Applied::AgentError(error),
-        DaemonMsg::Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-        } => Applied::Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-        },
-        DaemonMsg::ToolCallStarted { id, name, args } => {
-            Applied::ToolCallStarted { id, name, args }
-        }
-        DaemonMsg::ToolCallFinished { id, result, failed } => {
-            Applied::ToolCallFinished { id, result, failed }
-        }
         DaemonMsg::RunPrompt { .. } => Applied::None,
         DaemonMsg::SubmitApproval { .. } => Applied::None,
-        DaemonMsg::ScopeGrantRequested { request } => Applied::ScopeGrantRequested { request },
         DaemonMsg::ScopeGrantDismiss { decision_id } => Applied::ScopeGrantDismiss { decision_id },
-        DaemonMsg::WebApprovalRequested { request } => Applied::WebApprovalRequested { request },
         DaemonMsg::WebApprovalDismiss { decision_id } => {
             Applied::WebApprovalDismiss { decision_id }
         }
+        // Everything the hub forwards untouched. Kept as one nested match so
+        // the relayed set reads as a set: a message added to `HubRelay` shows
+        // up here as a missing arm rather than falling through to a default.
+        DaemonMsg::Relay(relay) => match relay {
+            HubRelay::ChatToken { token } => Applied::ChatToken(token),
+            HubRelay::ChatThinking { token } => Applied::ChatThinking(token),
+            HubRelay::ApprovalRequested { id, tool, args } => {
+                Applied::ApprovalRequested { id, tool, args }
+            }
+            HubRelay::AgentDone => Applied::AgentDone,
+            HubRelay::AgentError { error } => Applied::AgentError(error),
+            HubRelay::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            } => Applied::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            },
+            HubRelay::ToolCallStarted { id, name, args } => {
+                Applied::ToolCallStarted { id, name, args }
+            }
+            HubRelay::ToolCallFinished { id, result, failed } => {
+                Applied::ToolCallFinished { id, result, failed }
+            }
+            HubRelay::ScopeGrantRequested { request } => Applied::ScopeGrantRequested { request },
+            HubRelay::WebApprovalRequested { request } => Applied::WebApprovalRequested { request },
+        },
         // Instance-bound; a subscriber never receives it.
         DaemonMsg::SubmitScopeGrant { .. } | DaemonMsg::SubmitWebApproval { .. } => Applied::None,
     }
@@ -719,7 +724,7 @@ fn parse_op_status(s: ahma_common::daemon_hub::OpStatus) -> OpStatus {
 mod tests {
     use super::*;
     use crate::state::OpStatus;
-    use ahma_common::daemon_hub::{DaemonEvent, DaemonMsg, InstanceInfo};
+    use ahma_common::daemon_hub::{DaemonEvent, DaemonMsg, HubRelay, InstanceInfo};
 
     fn inst(id: &str, label: &str) -> InstanceInfo {
         InstanceInfo {
@@ -1391,9 +1396,9 @@ mod tests {
         let mut s = DaemonState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::ChatToken {
+            DaemonMsg::Relay(HubRelay::ChatToken {
                 token: "hi".to_string(),
-            },
+            }),
         ) {
             Applied::ChatToken(t) => assert_eq!(t, "hi"),
             _ => panic!("ChatToken must map to Applied::ChatToken"),
@@ -1405,11 +1410,11 @@ mod tests {
         let mut s = DaemonState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::Usage {
+            DaemonMsg::Relay(HubRelay::Usage {
                 prompt_tokens: 10,
                 completion_tokens: 3,
                 total_tokens: 13,
-            },
+            }),
         ) {
             Applied::Usage {
                 prompt_tokens,
@@ -1430,11 +1435,11 @@ mod tests {
         let mut s = DaemonState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::ToolCallStarted {
+            DaemonMsg::Relay(HubRelay::ToolCallStarted {
                 id: "t1".to_string(),
                 name: "read_file".to_string(),
                 args: "{}".to_string(),
-            },
+            }),
         ) {
             Applied::ToolCallStarted { id, name, .. } => {
                 assert_eq!(id, "t1");
@@ -1444,11 +1449,11 @@ mod tests {
         }
         match apply_msg(
             &mut s,
-            DaemonMsg::ToolCallFinished {
+            DaemonMsg::Relay(HubRelay::ToolCallFinished {
                 id: "t1".to_string(),
                 result: "ok".to_string(),
                 failed: false,
-            },
+            }),
         ) {
             Applied::ToolCallFinished { id, failed, .. } => {
                 assert_eq!(id, "t1");
@@ -1463,11 +1468,11 @@ mod tests {
         let mut s = DaemonState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::ApprovalRequested {
+            DaemonMsg::Relay(HubRelay::ApprovalRequested {
                 id: "a1".to_string(),
                 tool: "shell".to_string(),
                 args: "ls".to_string(),
-            },
+            }),
         ) {
             Applied::ApprovalRequested { id, tool, args } => {
                 assert_eq!(id, "a1");
@@ -1482,7 +1487,7 @@ mod tests {
     fn apply_msg_agent_done() {
         let mut s = DaemonState::new();
         assert!(matches!(
-            apply_msg(&mut s, DaemonMsg::AgentDone),
+            apply_msg(&mut s, DaemonMsg::Relay(HubRelay::AgentDone)),
             Applied::AgentDone
         ));
     }
@@ -1492,9 +1497,9 @@ mod tests {
         let mut s = DaemonState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::AgentError {
+            DaemonMsg::Relay(HubRelay::AgentError {
                 error: "boom".to_string(),
-            },
+            }),
         ) {
             Applied::AgentError(e) => assert_eq!(e, "boom"),
             _ => panic!("must map to Applied::AgentError"),
@@ -1534,9 +1539,9 @@ mod tests {
         let mut s = DaemonState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::ScopeGrantRequested {
+            DaemonMsg::Relay(HubRelay::ScopeGrantRequested {
                 request: sample_scope_grant(),
-            },
+            }),
         ) {
             Applied::ScopeGrantRequested { request } => {
                 assert_eq!(request.decision_id, "d1");
@@ -1646,9 +1651,9 @@ mod tests {
             other => panic!("expected OperationOutput, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::ChatToken {
+        tx_b.send(DaemonMsg::Relay(HubRelay::ChatToken {
             token: "tok".to_string(),
-        })
+        }))
         .unwrap();
         match next_ev(&mut rx_s).await {
             SourceEvent::ChatToken { token } => assert_eq!(token, "tok"),
@@ -1656,11 +1661,11 @@ mod tests {
         }
 
         tx_b.send(DaemonMsg::Ping { seq: 3 }).unwrap();
-        tx_b.send(DaemonMsg::ApprovalRequested {
+        tx_b.send(DaemonMsg::Relay(HubRelay::ApprovalRequested {
             id: "a1".to_string(),
             tool: "tool".to_string(),
             args: "args".to_string(),
-        })
+        }))
         .unwrap();
         match next_ev(&mut rx_s).await {
             SourceEvent::ApprovalRequested { id, tool, args } => {
@@ -1671,9 +1676,9 @@ mod tests {
             other => panic!("Ping must be a no-op; got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::ScopeGrantRequested {
+        tx_b.send(DaemonMsg::Relay(HubRelay::ScopeGrantRequested {
             request: sample_scope_grant(),
-        })
+        }))
         .unwrap();
         match next_ev(&mut rx_s).await {
             SourceEvent::ScopeGrantRequested { request } => {
@@ -1691,15 +1696,15 @@ mod tests {
             other => panic!("expected ScopeGrantDismiss, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::AgentDone).unwrap();
+        tx_b.send(DaemonMsg::Relay(HubRelay::AgentDone)).unwrap();
         match next_ev(&mut rx_s).await {
             SourceEvent::AgentDone => {}
             other => panic!("expected AgentDone, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::AgentError {
+        tx_b.send(DaemonMsg::Relay(HubRelay::AgentError {
             error: "boom".to_string(),
-        })
+        }))
         .unwrap();
         match next_ev(&mut rx_s).await {
             SourceEvent::AgentError { error } => assert_eq!(error, "boom"),
@@ -1727,14 +1732,14 @@ mod tests {
         spawn_embedded_hub_source(rx_b, tx_s);
 
         for i in 0..8 {
-            tx_b.send(DaemonMsg::ChatToken {
+            tx_b.send(DaemonMsg::Relay(HubRelay::ChatToken {
                 token: format!("t{i}"),
-            })
+            }))
             .unwrap();
         }
-        tx_b.send(DaemonMsg::ChatToken {
+        tx_b.send(DaemonMsg::Relay(HubRelay::ChatToken {
             token: "final".to_string(),
-        })
+        }))
         .unwrap();
 
         let mut saw_final = false;
@@ -1785,9 +1790,9 @@ mod tests {
         let mut s = DaemonState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::ChatThinking {
+            DaemonMsg::Relay(HubRelay::ChatThinking {
                 token: "pondering".to_string(),
-            },
+            }),
         ) {
             Applied::ChatThinking(t) => assert_eq!(t, "pondering"),
             _ => panic!("ChatThinking must map to Applied::ChatThinking"),
@@ -1799,9 +1804,9 @@ mod tests {
         let mut s = DaemonState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::WebApprovalRequested {
+            DaemonMsg::Relay(HubRelay::WebApprovalRequested {
                 request: sample_web_approval(),
-            },
+            }),
         ) {
             Applied::WebApprovalRequested { request } => {
                 assert_eq!(request.decision_id, "w1");
@@ -1852,18 +1857,18 @@ mod tests {
             other => panic!("expected DaemonHealthChanged, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::ChatThinking {
+        tx_b.send(DaemonMsg::Relay(HubRelay::ChatThinking {
             token: "pondering".to_string(),
-        })
+        }))
         .unwrap();
         match next_ev(&mut rx_s).await {
             SourceEvent::ChatThinking { token } => assert_eq!(token, "pondering"),
             other => panic!("expected ChatThinking, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::WebApprovalRequested {
+        tx_b.send(DaemonMsg::Relay(HubRelay::WebApprovalRequested {
             request: sample_web_approval(),
-        })
+        }))
         .unwrap();
         match next_ev(&mut rx_s).await {
             SourceEvent::WebApprovalRequested { request } => {
@@ -1881,11 +1886,11 @@ mod tests {
             other => panic!("expected WebApprovalDismiss, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::ToolCallStarted {
+        tx_b.send(DaemonMsg::Relay(HubRelay::ToolCallStarted {
             id: "t1".to_string(),
             name: "read_file".to_string(),
             args: "{}".to_string(),
-        })
+        }))
         .unwrap();
         match next_ev(&mut rx_s).await {
             SourceEvent::ToolCallStarted { id, name, .. } => {
@@ -1895,11 +1900,11 @@ mod tests {
             other => panic!("expected ToolCallStarted, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::ToolCallFinished {
+        tx_b.send(DaemonMsg::Relay(HubRelay::ToolCallFinished {
             id: "t1".to_string(),
             result: "ok".to_string(),
             failed: true,
-        })
+        }))
         .unwrap();
         match next_ev(&mut rx_s).await {
             SourceEvent::ToolCallFinished { id, failed, .. } => {
@@ -1909,11 +1914,11 @@ mod tests {
             other => panic!("expected ToolCallFinished, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Usage {
+        tx_b.send(DaemonMsg::Relay(HubRelay::Usage {
             prompt_tokens: 1,
             completion_tokens: 2,
             total_tokens: 3,
-        })
+        }))
         .unwrap();
         match next_ev(&mut rx_s).await {
             SourceEvent::Usage {
@@ -2097,9 +2102,9 @@ mod tests {
 
         send_msg(
             &mut inst_w,
-            &ClientMsg::ChatToken {
+            &ClientMsg::Relay(HubRelay::ChatToken {
                 token: "hi".to_string(),
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2110,9 +2115,9 @@ mod tests {
 
         send_msg(
             &mut inst_w,
-            &ClientMsg::ChatThinking {
+            &ClientMsg::Relay(HubRelay::ChatThinking {
                 token: "pondering".to_string(),
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2123,11 +2128,11 @@ mod tests {
 
         send_msg(
             &mut inst_w,
-            &ClientMsg::ApprovalRequested {
+            &ClientMsg::Relay(HubRelay::ApprovalRequested {
                 id: "a1".to_string(),
                 tool: "shell".to_string(),
                 args: "ls".to_string(),
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2142,9 +2147,9 @@ mod tests {
 
         send_msg(
             &mut inst_w,
-            &ClientMsg::ScopeGrantRequested {
+            &ClientMsg::Relay(HubRelay::ScopeGrantRequested {
                 request: sample_scope_grant(),
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2170,9 +2175,9 @@ mod tests {
 
         send_msg(
             &mut inst_w,
-            &ClientMsg::WebApprovalRequested {
+            &ClientMsg::Relay(HubRelay::WebApprovalRequested {
                 request: sample_web_approval(),
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2198,11 +2203,11 @@ mod tests {
 
         send_msg(
             &mut inst_w,
-            &ClientMsg::ToolCallStarted {
+            &ClientMsg::Relay(HubRelay::ToolCallStarted {
                 id: "t1".to_string(),
                 name: "read_file".to_string(),
                 args: "{}".to_string(),
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2216,11 +2221,11 @@ mod tests {
 
         send_msg(
             &mut inst_w,
-            &ClientMsg::ToolCallFinished {
+            &ClientMsg::Relay(HubRelay::ToolCallFinished {
                 id: "t1".to_string(),
                 result: "ok".to_string(),
                 failed: false,
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2234,11 +2239,11 @@ mod tests {
 
         send_msg(
             &mut inst_w,
-            &ClientMsg::Usage {
+            &ClientMsg::Relay(HubRelay::Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2256,7 +2261,9 @@ mod tests {
             other => panic!("expected Usage, got {other:?}"),
         }
 
-        send_msg(&mut inst_w, &ClientMsg::AgentDone).await.unwrap();
+        send_msg(&mut inst_w, &ClientMsg::Relay(HubRelay::AgentDone))
+            .await
+            .unwrap();
         match next_ev(&mut rx).await {
             SourceEvent::AgentDone => {}
             other => panic!("expected AgentDone, got {other:?}"),
@@ -2264,9 +2271,9 @@ mod tests {
 
         send_msg(
             &mut inst_w,
-            &ClientMsg::AgentError {
+            &ClientMsg::Relay(HubRelay::AgentError {
                 error: "boom".to_string(),
-            },
+            }),
         )
         .await
         .unwrap();
