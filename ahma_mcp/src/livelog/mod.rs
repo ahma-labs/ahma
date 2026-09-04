@@ -51,6 +51,43 @@ fn push_if_match(chunk: &mut Vec<String>, line: String, prefilter: &Option<regex
     }
 }
 
+/// Fold one line read from a source stream into the current chunk.
+///
+/// stdout and stderr are handled identically on purpose: both are appended to
+/// the operation's stdout sink, so the LLM analysing a chunk sees the
+/// interleaved output a human tailing the process would. `stream` names the
+/// source in the log lines and nothing else. The two `select!` arms this
+/// replaced were byte-identical bodies differing only in that label — and only
+/// the stdout one was ever exercised by a test.
+///
+/// Returns `false` once the stream is closed or has errored, which the caller
+/// latches to stop polling it.
+async fn absorb_source_line(
+    result: std::io::Result<Option<String>>,
+    op_id: &str,
+    stream: &str,
+    monitor: &OperationMonitor,
+    chunk: &mut Vec<String>,
+    prefilter: &Option<regex::Regex>,
+) -> bool {
+    match result {
+        Ok(Some(line)) => {
+            debug!("livelog[{}] {}: {}", op_id, stream, line);
+            monitor.append_stdout_line(op_id, line.clone()).await;
+            push_if_match(chunk, line, prefilter);
+            true
+        }
+        Ok(None) => {
+            debug!("livelog[{}]: {} closed", op_id, stream);
+            false
+        }
+        Err(e) => {
+            warn!("livelog[{}]: {} read error: {}", op_id, stream, e);
+            false
+        }
+    }
+}
+
 // JSON output instruction appended to the detection prompt when `structured_output: true`.
 // Modern LLMs follow user-message JSON instructions even when the system prompt specifies a
 // different format, overriding the default "CLEAN or prose" response.
@@ -253,40 +290,16 @@ pub async fn run_livelog_pipeline(
 
             // Read a stderr line (biased first so error output is processed promptly).
             result = stderr_lines.next_line(), if !stderr_closed => {
-                match result {
-                    Ok(Some(line)) => {
-                        debug!("livelog[{}] stderr: {}", op_id, line);
-                        monitor.append_stdout_line(op_id, line.clone()).await;
-                        push_if_match(&mut chunk, line, &prefilter);
-                    }
-                    Ok(None) => {
-                        debug!("livelog[{}]: stderr closed", op_id);
-                        stderr_closed = true;
-                    }
-                    Err(e) => {
-                        warn!("livelog[{}]: stderr read error: {}", op_id, e);
-                        stderr_closed = true;
-                    }
-                }
+                stderr_closed = !absorb_source_line(
+                    result, op_id, "stderr", &monitor, &mut chunk, &prefilter,
+                ).await;
             }
 
             // Read a stdout line.
             result = stdout_lines.next_line(), if !stdout_closed => {
-                match result {
-                    Ok(Some(line)) => {
-                        debug!("livelog[{}] stdout: {}", op_id, line);
-                        monitor.append_stdout_line(op_id, line.clone()).await;
-                        push_if_match(&mut chunk, line, &prefilter);
-                    }
-                    Ok(None) => {
-                        debug!("livelog[{}]: stdout closed", op_id);
-                        stdout_closed = true;
-                    }
-                    Err(e) => {
-                        warn!("livelog[{}]: stdout read error: {}", op_id, e);
-                        stdout_closed = true;
-                    }
-                }
+                stdout_closed = !absorb_source_line(
+                    result, op_id, "stdout", &monitor, &mut chunk, &prefilter,
+                ).await;
             }
 
             // Time-window expiry — flush whatever we have even if the chunk is not full yet.
@@ -676,6 +689,137 @@ mod tests {
         std::sync::Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
             Duration::from_secs(60),
         )))
+    }
+
+    use crate::operation_monitor::Operation;
+
+    // -----------------------------------------------------------------------
+    // absorb_source_line
+    //
+    // The stderr and stdout `select!` arms used to be two byte-identical
+    // bodies. Eighteen pipeline tests existed and every one of them drove the
+    // source process's stdout, so the stderr arm — the one marked `biased`
+    // precisely because error output matters most — had no coverage at all.
+    // These exercise the shared body directly, both labels and all three
+    // outcomes, without needing a process that writes to stderr (which would
+    // mean a shell redirect, and the shell is PowerShell on Windows).
+    // -----------------------------------------------------------------------
+
+    async fn registered_monitor(op_id: &str) -> std::sync::Arc<OperationMonitor> {
+        let monitor = make_monitor();
+        monitor
+            .add_operation(Operation::new_with_timeout(
+                op_id.to_string(),
+                "livelog".to_string(),
+                format!("livelog test op {op_id}"),
+                None,
+                None,
+            ))
+            .await;
+        monitor
+    }
+
+    /// A line from either stream lands in the chunk and in the operation's
+    /// output, and the stream stays open.
+    #[tokio::test]
+    async fn a_line_from_either_stream_is_chunked_and_recorded() {
+        for stream in ["stderr", "stdout"] {
+            let op_id = format!("absorb-{stream}");
+            let monitor = registered_monitor(&op_id).await;
+            let mut chunk = Vec::new();
+
+            let still_open = absorb_source_line(
+                Ok(Some(format!("ERROR from {stream}"))),
+                &op_id,
+                stream,
+                &monitor,
+                &mut chunk,
+                &None,
+            )
+            .await;
+
+            assert!(still_open, "{stream} is still open after a line");
+            assert_eq!(chunk, vec![format!("ERROR from {stream}")]);
+            let recorded = monitor
+                .get_operation(&op_id)
+                .await
+                .expect("operation is registered")
+                .stdout_tail
+                .snapshot();
+            assert!(
+                recorded
+                    .iter()
+                    .any(|l| l == &format!("ERROR from {stream}")),
+                "{stream} output must reach the operation's stdout sink so the \
+                 LLM sees what a human tailing the process would: {recorded:?}"
+            );
+        }
+    }
+
+    /// The prefilter applies to both streams alike.
+    #[tokio::test]
+    async fn a_prefiltered_line_is_still_recorded_but_not_chunked() {
+        let monitor = registered_monitor("absorb-filtered").await;
+        let mut chunk = Vec::new();
+        let prefilter = Some(regex::Regex::new("ERROR").expect("static test regex"));
+
+        let still_open = absorb_source_line(
+            Ok(Some("INFO nothing to see".to_string())),
+            "absorb-filtered",
+            "stderr",
+            &monitor,
+            &mut chunk,
+            &prefilter,
+        )
+        .await;
+
+        assert!(still_open);
+        assert!(chunk.is_empty(), "the prefilter keeps it out of the chunk");
+        assert!(
+            monitor
+                .get_operation("absorb-filtered")
+                .await
+                .expect("operation is registered")
+                .stdout_tail
+                .snapshot()
+                .iter()
+                .any(|l| l == "INFO nothing to see"),
+            "a prefiltered line is still part of the operation's output"
+        );
+    }
+
+    /// EOF and a read error both close the stream, which is what latches the
+    /// `select!` arm off.
+    #[tokio::test]
+    async fn eof_and_read_errors_both_close_the_stream() {
+        let monitor = registered_monitor("absorb-closed").await;
+        let mut chunk = Vec::new();
+
+        assert!(
+            !absorb_source_line(
+                Ok(None),
+                "absorb-closed",
+                "stderr",
+                &monitor,
+                &mut chunk,
+                &None
+            )
+            .await,
+            "EOF closes the stream"
+        );
+        assert!(
+            !absorb_source_line(
+                Err(std::io::Error::other("broken pipe")),
+                "absorb-closed",
+                "stdout",
+                &monitor,
+                &mut chunk,
+                &None,
+            )
+            .await,
+            "a read error closes the stream too, rather than spinning on it"
+        );
+        assert!(chunk.is_empty(), "neither outcome contributes a line");
     }
 
     // -----------------------------------------------------------------------

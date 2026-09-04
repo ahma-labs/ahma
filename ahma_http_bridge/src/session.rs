@@ -862,36 +862,60 @@ fn format_frame_for_echo(line: &str) -> String {
         .unwrap_or_else(|| line.to_string())
 }
 
+/// The session-id prefix used by the colored echoes.
+///
+/// Truncating with `&session_id[..8]` — which all three echoes did
+/// independently — panics on an id shorter than 8 bytes, and on any id whose
+/// eighth byte is not a char boundary. Session ids are UUIDs today, so neither
+/// happens; a test peer, a renamed session, or a future id format is all it
+/// would take. `char_indices` costs nothing here and cannot panic.
+fn short_id(session_id: &str) -> String {
+    let end = session_id
+        .char_indices()
+        .nth(8)
+        .map_or(session_id.len(), |(i, _)| i);
+    format!("[{}]", &session_id[..end])
+}
+
+/// Echo one frame: timestamp, session tag, direction label, body.
+///
+/// The three call sites below differ only in their colours and label, and not
+/// uniformly — stderr styles its tag, label and body three different ways
+/// while the other two use one colour throughout. So the styles stay explicit
+/// per call rather than collapsing into a single `color` parameter, which
+/// would have changed how stderr renders.
+fn echo_frame(
+    tag: impl std::fmt::Display,
+    label: impl std::fmt::Display,
+    body: impl std::fmt::Display,
+) {
+    eprintln!("{} {} {}\n{}", echo_timestamp(), tag, label, body);
+}
+
 /// Echo a frame read from the peer's stdout (green).
 fn echo_stdout_frame(session_id: &str, line: &str) {
-    eprintln!(
-        "{} {} {}\n{}",
-        echo_timestamp(),
-        format!("[{}]", &session_id[..8]).green(),
+    echo_frame(
+        short_id(session_id).green(),
         "← STDOUT:".green(),
-        format_frame_for_echo(line).green()
+        format_frame_for_echo(line).green(),
     );
 }
 
 /// Echo a frame written to the peer's stdin (cyan).
 fn echo_stdin_frame(session_id: &str, msg: &str) {
-    eprintln!(
-        "{} {} {}\n{}",
-        echo_timestamp(),
-        format!("[{}]", &session_id[..8]).cyan(),
+    echo_frame(
+        short_id(session_id).cyan(),
         "→ STDIN:".cyan(),
-        format_frame_for_echo(msg).cyan()
+        format_frame_for_echo(msg).cyan(),
     );
 }
 
 /// Echo a line read from the peer's stderr (red tag, dimmed body).
 fn echo_stderr_line(session_id: &str, line: &str) {
-    eprintln!(
-        "{} {} {}\n{}",
-        echo_timestamp(),
-        format!("[{}]", &session_id[..8]).red(),
+    echo_frame(
+        short_id(session_id).red(),
         "STDERR:".yellow(),
-        format_frame_for_echo(line).dimmed()
+        format_frame_for_echo(line).dimmed(),
     );
 }
 
@@ -2184,6 +2208,22 @@ mod session_logic_tests {
     }
 
     // ── terminated flag / sandbox predicates ─────────────────────────────────
+
+    /// `short_id` replaced three independent `&session_id[..8]` slices. That
+    /// form panics on an id shorter than 8 bytes and on any id whose eighth
+    /// byte falls inside a multi-byte character; ids are UUIDs today, so
+    /// nothing exercised either case, and the echo path has no test seam of
+    /// its own to notice.
+    #[test]
+    fn short_id_truncates_without_panicking_on_awkward_ids() {
+        assert_eq!(short_id("0123456789abcdef"), "[01234567]");
+        assert_eq!(short_id("abcdef01"), "[abcdef01]", "exactly eight");
+        assert_eq!(short_id("short"), "[short]", "shorter than eight");
+        assert_eq!(short_id(""), "[]");
+        // Eight characters, sixteen bytes: the byte-index slice would have
+        // split a character here and panicked.
+        assert_eq!(short_id("ääääääääx"), "[ääääääää]");
+    }
 
     #[test]
     fn terminated_flag_round_trips() {

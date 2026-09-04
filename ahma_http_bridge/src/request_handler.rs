@@ -1362,6 +1362,32 @@ fn session_sse_event(session: &crate::session::Session, value: &Value) -> (u64, 
     (id, json_str)
 }
 
+/// Record a lagged-broadcast gap on the session and render the SSE comment
+/// that discloses it.
+///
+/// Both SSE paths — the live `GET /mcp` stream and the interleaved POST
+/// response — can fall behind the broadcast channel, and both must react
+/// identically: bump the session's counter so the loss is observable, warn with
+/// the running total, and emit an SSE *comment* rather than a synthetic
+/// JSON-RPC frame (see [`broadcast_sse_event_stream`] for why). They were two
+/// character-for-character identical bodies matched against two different
+/// `Lagged` error types, and no test covered either emission — only the
+/// counter. Returning the comment text rather than a built `Event` keeps the
+/// whole behaviour assertable.
+fn record_and_describe_lag(session: &crate::session::Session, n: u64) -> String {
+    session.record_lagged_events(n);
+    let total = session.total_lagged_events();
+    warn!(
+        session_id = %session.id,
+        lagged_count = n,
+        total_lagged = total,
+        "SSE receiver lagged — {} event(s) dropped (total: {})",
+        n,
+        total
+    );
+    format!("lagged: {n} events dropped")
+}
+
 /// Map a session broadcast receiver into a stream of SSE events.
 ///
 /// `Ok` items become id+data events. When the receiver falls behind (broadcast
@@ -1387,21 +1413,9 @@ pub(crate) fn broadcast_sse_event_stream(
                     debug!(session_id = %session.id, event_id = id, "{log_context}: {msg}");
                     Some(Ok::<_, Infallible>(sse_event(id, msg)))
                 }
-                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                    session.record_lagged_events(n);
-                    let total = session.total_lagged_events();
-                    warn!(
-                        session_id = %session.id,
-                        lagged_count = n,
-                        total_lagged = total,
-                        "SSE receiver lagged — {} event(s) dropped (total: {})",
-                        n,
-                        total
-                    );
-                    Some(Ok(
-                        Event::default().comment(format!("lagged: {} events dropped", n))
-                    ))
-                }
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => Some(
+                    Ok(Event::default().comment(record_and_describe_lag(&session, n))),
+                ),
             }
         }
     })
@@ -1437,17 +1451,7 @@ fn build_interleaved_sse_stream(
                 events.push(sse_event(id, msg));
             }
             Err(TryRecvError::Lagged(n)) => {
-                session.record_lagged_events(n);
-                let total = session.total_lagged_events();
-                warn!(
-                    session_id = %session.id,
-                    lagged_count = n,
-                    total_lagged = total,
-                    "SSE receiver lagged — {} event(s) dropped (total: {})",
-                    n,
-                    total
-                );
-                events.push(Event::default().comment(format!("lagged: {} events dropped", n)));
+                events.push(Event::default().comment(record_and_describe_lag(&session, n)));
             }
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
@@ -1994,6 +1998,40 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         assert!(check_session_exists(&mgr, &id, json!(4)).is_none());
+    }
+
+    // ─── lagged broadcast disclosure ────────────────────────────────────
+
+    /// Both SSE paths disclose a dropped-event gap the same way. Before this,
+    /// only `record_lagged_events` itself was covered — the two emission sites
+    /// that call it were not, so a regression in either would have been
+    /// invisible to the suite.
+    #[tokio::test]
+    async fn a_lag_is_counted_and_described_for_the_client() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let session = mgr.get_session(&id).expect("session is live");
+
+        assert_eq!(session.total_lagged_events(), 0);
+
+        assert_eq!(
+            record_and_describe_lag(&session, 3),
+            "lagged: 3 events dropped",
+            "the comment names how many events the client will never see"
+        );
+        assert_eq!(session.total_lagged_events(), 3);
+
+        // A second gap accumulates rather than replacing the first.
+        assert_eq!(
+            record_and_describe_lag(&session, 4),
+            "lagged: 4 events dropped",
+            "each comment reports its own gap, not the running total"
+        );
+        assert_eq!(
+            session.total_lagged_events(),
+            7,
+            "the session counter is cumulative"
+        );
     }
 
     // ─── check_sandbox_lock ─────────────────────────────────────────────
