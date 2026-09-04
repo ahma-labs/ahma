@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::harness_target::{McpConfigFormat, PLATFORMS, Platform};
 use crate::hooks::{HookScope, HooksInstallArgs};
 use crate::shell::cli::SetupArgs;
+use crate::wizard_prompt::{prompt_multi_select, prompt_multi_select_all};
 
 /// The embedded skill content to install globally.
 const SKILL_CONTENT: &str = include_str!("../../skills/ahma/SKILL.md");
@@ -343,83 +344,6 @@ fn select_platforms(actions: &[SetupAction], interactive: bool) -> Vec<Platform>
         .into_iter()
         .filter_map(|i| relevant.get(i).copied())
         .collect()
-}
-
-fn prompt_multi_select(question: &str, options: &[&str], default: &str) -> Vec<usize> {
-    println!("{}", question);
-    for (i, opt) in options.iter().enumerate() {
-        println!("  {}) {}", i + 1, opt);
-    }
-    print!("  Selection [default: {}]: ", default);
-    let _ = io::stdout().flush();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() || input.trim().is_empty() {
-        return parse_selection_string(default, options.len());
-    }
-    parse_selection_string(&input, options.len())
-}
-
-fn default_all_selection(_count: usize) -> String {
-    "all".to_string()
-}
-
-fn parse_selection_string(input: &str, max_val: usize) -> Vec<usize> {
-    let input_trimmed = input.trim();
-    if input_trimmed.eq_ignore_ascii_case("all") {
-        return (0..max_val).collect();
-    }
-
-    // Check if the input is purely numeric digits without any spaces or other separator characters
-    let is_pure_digits =
-        !input_trimmed.is_empty() && input_trimmed.chars().all(|c| c.is_ascii_digit());
-
-    if is_pure_digits && max_val < 10 {
-        parse_digit_sequence(input_trimmed, max_val)
-    } else {
-        parse_separated_list(input_trimmed, max_val)
-    }
-}
-
-fn parse_digit_sequence(input: &str, max_val: usize) -> Vec<usize> {
-    let mut selections = Vec::new();
-    let valid_indices = input
-        .chars()
-        .filter_map(|c| c.to_digit(10))
-        .map(|d| d as usize)
-        .filter(|&n| n >= 1 && n <= max_val)
-        .map(|n| n - 1);
-    for idx in valid_indices {
-        if !selections.contains(&idx) {
-            selections.push(idx);
-        }
-    }
-    selections
-}
-
-fn parse_separated_list(input: &str, max_val: usize) -> Vec<usize> {
-    let mut selections = Vec::new();
-    let normalized = input.replace([',', '.', ';'], " ");
-    let valid_indices = normalized
-        .split_whitespace()
-        .filter_map(|part| part.parse::<usize>().ok())
-        .filter(|&n| n >= 1 && n <= max_val)
-        .map(|n| n - 1);
-    for idx in valid_indices {
-        if !selections.contains(&idx) {
-            selections.push(idx);
-        }
-    }
-    selections
-}
-
-/// Prompt a multi-select that defaults to "all" options. Non-interactive
-/// sessions select everything without prompting.
-fn prompt_multi_select_all(interactive: bool, question: &str, labels: &[&str]) -> Vec<usize> {
-    if !interactive {
-        return (0..labels.len()).collect();
-    }
-    let default = default_all_selection(labels.len());
-    prompt_multi_select(question, labels, &default)
 }
 
 fn mcp_shared_transport_url(transport: &str) -> Option<&'static str> {
@@ -1127,24 +1051,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_parse_selection_string() {
-        assert_eq!(parse_selection_string("all", 5), vec![0, 1, 2, 3, 4]);
-        assert_eq!(parse_selection_string("ALL", 3), vec![0, 1, 2]);
-        assert_eq!(parse_selection_string("135", 5), vec![0, 2, 4]);
-        assert_eq!(parse_selection_string("1 3 5", 5), vec![0, 2, 4]);
-        assert_eq!(parse_selection_string("1,3.5", 5), vec![0, 2, 4]);
-        assert_eq!(parse_selection_string("1;3;5", 5), vec![0, 2, 4]);
-        assert_eq!(parse_selection_string("1, 2 , 3", 3), vec![0, 1, 2]);
-        assert_eq!(parse_selection_string("12", 2), vec![0, 1]);
-        assert_eq!(parse_selection_string("0 1 6", 5), vec![0]);
-    }
-
-    #[test]
-    fn test_default_all_selection() {
-        assert_eq!(default_all_selection(5), "all");
-    }
-
     // ─── Generated configs never carry --tmp or an injected scope ────────────
     //
     // SPEC R5.4.2: these files are *client-owned* — anyone configuring the client
@@ -1527,59 +1433,7 @@ mod tests {
         // Union covers everything (Copilot via hooks, VsCode via mcp).
         assert_eq!(platforms.len(), PLATFORMS.len());
     }
-
-    // ─── prompt_multi_select_all (non-interactive) ────────────────────────────
-
-    #[test]
-    fn test_prompt_multi_select_all_noninteractive_returns_full_range() {
-        let labels = ["a", "b", "c"];
-        let chosen = prompt_multi_select_all(false, "q?", &labels);
-        assert_eq!(chosen, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn test_prompt_multi_select_all_noninteractive_empty_labels() {
-        let chosen = prompt_multi_select_all(false, "q?", &[]);
-        assert!(chosen.is_empty());
-    }
-
-    // ─── parse helpers: extra boundary cases ──────────────────────────────────
-
-    #[test]
-    fn test_parse_selection_string_empty_input() {
-        // Empty (after trim) is not "all", not pure digits -> separated list -> empty.
-        assert!(parse_selection_string("", 5).is_empty());
-        assert!(parse_selection_string("   ", 5).is_empty());
-    }
-
-    #[test]
-    fn test_parse_selection_string_dedups() {
-        // Repeated digits are deduplicated.
-        assert_eq!(parse_selection_string("112233", 5), vec![0, 1, 2]);
-        assert_eq!(parse_selection_string("1 1 2 2", 5), vec![0, 1]);
-    }
-
-    #[test]
-    fn test_parse_selection_string_pure_digits_large_max_uses_separated() {
-        // max_val >= 10 forces the separated-list parser even for pure digits,
-        // so "12" is read as the single number twelve, not 1 and 2.
-        assert_eq!(parse_selection_string("12", 15), vec![11]);
-    }
-
-    #[test]
-    fn test_parse_digit_sequence_filters_out_of_range() {
-        // Only digits within 1..=max survive.
-        assert_eq!(parse_digit_sequence("0192", 5), vec![0, 1]);
-    }
-
-    #[test]
-    fn test_parse_separated_list_ignores_nonnumeric() {
-        assert_eq!(parse_separated_list("1 foo 3 bar", 5), vec![0, 2]);
-        assert!(parse_separated_list("foo bar", 5).is_empty());
-    }
-
     // ─── platform-specific config locations ───────────────────────────────────
-
     #[test]
     fn test_claude_desktop_config_path_points_at_claude() {
         let home = Path::new("/home/tester");

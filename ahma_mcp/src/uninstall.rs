@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use crate::harness_target::{McpConfigFormat, PLATFORMS, Platform};
 use crate::hooks::{HookPlatform, HookScope, HooksUninstallArgs};
 use crate::shell::cli::UninstallArgs;
+use crate::wizard_prompt::prompt_multi_select_all;
 
 // ── Action / platform enum mirrors (private) ─────────────────────────────────
 
@@ -793,72 +794,6 @@ fn prompt_yes_no(prompt: &str) -> Result<bool> {
     let t = input.trim().to_lowercase();
     Ok(t == "y" || t == "yes")
 }
-
-fn prompt_multi_select(question: &str, options: &[&str], default: &str) -> Vec<usize> {
-    println!("{}", question);
-    for (i, opt) in options.iter().enumerate() {
-        println!("  {}) {}", i + 1, opt);
-    }
-    print!("  Selection [default: {}]: ", default);
-    let _ = io::stdout().flush();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() || input.trim().is_empty() {
-        return parse_selection_string(default, options.len());
-    }
-    parse_selection_string(&input, options.len())
-}
-
-fn prompt_multi_select_all(interactive: bool, question: &str, labels: &[&str]) -> Vec<usize> {
-    if !interactive {
-        return (0..labels.len()).collect();
-    }
-    let default = "all".to_string();
-    prompt_multi_select(question, labels, &default)
-}
-
-fn parse_selection_string(input: &str, max_val: usize) -> Vec<usize> {
-    let t = input.trim();
-    if t.eq_ignore_ascii_case("all") {
-        return (0..max_val).collect();
-    }
-    let is_pure_digits = !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
-    if is_pure_digits && max_val < 10 {
-        parse_digit_sequence(t, max_val)
-    } else {
-        parse_separated_list(t, max_val)
-    }
-}
-
-fn parse_digit_sequence(input: &str, max_val: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    for d in input
-        .chars()
-        .filter_map(|c| c.to_digit(10))
-        .map(|d| d as usize)
-    {
-        if d >= 1 && d <= max_val && !out.contains(&(d - 1)) {
-            out.push(d - 1);
-        }
-    }
-    out
-}
-
-fn parse_separated_list(input: &str, max_val: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    let normalized = input.replace([',', '.', ';'], " ");
-    for n in normalized
-        .split_whitespace()
-        .filter_map(|p| p.parse::<usize>().ok())
-        .filter(|&n| n >= 1 && n <= max_val)
-        .map(|n| n - 1)
-    {
-        if !out.contains(&n) {
-            out.push(n);
-        }
-    }
-    out
-}
-
 // ── Platform path helpers (mirrors setup.rs) ──────────────────────────────────
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1180,18 +1115,6 @@ mod tests {
         let platforms = select_platforms(&actions, &["cursor".to_string()], false);
         assert_eq!(platforms.len(), 1);
         assert_eq!(platforms[0].cli_name(), "cursor");
-    }
-
-    #[test]
-    fn parse_selection_string_all() {
-        let result = parse_selection_string("all", 3);
-        assert_eq!(result, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn parse_selection_string_comma_separated() {
-        let result = parse_selection_string("1,3", 4);
-        assert_eq!(result, vec![0, 2]);
     }
 
     // ── Env-serialized helpers ────────────────────────────────────────────────
@@ -1935,52 +1858,7 @@ mod tests {
         assert!(Platform::ClaudeCode.supports_hooks());
     }
 
-    // ── parse helpers additional coverage ─────────────────────────────────────
-
-    #[test]
-    fn parse_digit_sequence_dedups_and_bounds() {
-        // "1123" with max 4 → indices [0,1,2], duplicates ignored, 3 in range.
-        let result = parse_selection_string("1123", 4);
-        assert_eq!(result, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn parse_separated_list_ignores_out_of_range_and_dups() {
-        // max 3 → "1 2 5 2" → [0,1] (5 out of range, second 2 deduped).
-        let result = parse_selection_string("1 2 5 2", 3);
-        assert_eq!(result, vec![0, 1]);
-    }
-
-    #[test]
-    fn parse_selection_string_large_max_uses_separated() {
-        // max_val >= 10 forces the separated-list path even for pure digits.
-        let result = parse_selection_string("12", 20);
-        assert_eq!(result, vec![11]);
-    }
-
-    #[test]
-    fn parse_selection_string_empty_is_empty() {
-        assert!(parse_selection_string("", 4).is_empty());
-        assert!(parse_selection_string("   ", 4).is_empty());
-    }
-
-    #[test]
-    fn parse_selection_string_dotted_and_semicolon_separators() {
-        let result = parse_selection_string("1.3;2", 4);
-        assert_eq!(result, vec![0, 2, 1]);
-    }
-
-    // ── prompt_multi_select_all non-interactive ───────────────────────────────
-
-    #[test]
-    fn prompt_multi_select_all_non_interactive_selects_all() {
-        let labels = ["a", "b", "c"];
-        let result = prompt_multi_select_all(false, "q", &labels);
-        assert_eq!(result, vec![0, 1, 2]);
-    }
-
     // ── print_restart_hints (smoke, no panic) ─────────────────────────────────
-
     #[test]
     fn print_restart_hints_variants_do_not_panic() {
         print_restart_hints(true, &["Cursor", "Claude Code"], false);

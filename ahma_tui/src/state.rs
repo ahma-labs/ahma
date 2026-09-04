@@ -623,14 +623,6 @@ impl Focus {
         order[(pos + order.len() - 1) % order.len()]
     }
 
-    pub fn cycle_next(self) -> Self {
-        self.cycle_next_active(true, true)
-    }
-
-    pub fn cycle_prev(self) -> Self {
-        self.cycle_prev_active(true, true)
-    }
-
     /// Panes that can be maximised to the full screen with `z`.
     pub fn is_zoomable(self) -> bool {
         matches!(self, Self::OpsDag | Self::Log)
@@ -1970,14 +1962,6 @@ impl AppState {
         }
     }
 
-    /// The inline provider picker (mutable), if it is open.
-    pub fn provider_picker_mut(&mut self) -> Option<&mut PickerState> {
-        match &mut self.modal {
-            ModalState::ProviderPicker(p) => Some(p),
-            _ => None,
-        }
-    }
-
     /// Close the provider picker and return its state, if it was open.
     pub fn take_provider_picker(&mut self) -> Option<PickerState> {
         match std::mem::take(&mut self.modal) {
@@ -1986,22 +1970,6 @@ impl AppState {
                 self.modal = other;
                 None
             }
-        }
-    }
-
-    /// The inline model picker, if it is open.
-    pub fn model_picker(&self) -> Option<&PickerState> {
-        match &self.modal {
-            ModalState::ModelPicker(p) => Some(p),
-            _ => None,
-        }
-    }
-
-    /// The inline model picker (mutable), if it is open.
-    pub fn model_picker_mut(&mut self) -> Option<&mut PickerState> {
-        match &mut self.modal {
-            ModalState::ModelPicker(p) => Some(p),
-            _ => None,
         }
     }
 
@@ -3216,11 +3184,11 @@ mod tests {
 
     #[test]
     fn focus_cycles_correctly() {
-        assert_eq!(Focus::Chat.cycle_next(), Focus::OpsDag);
-        assert_eq!(Focus::OpsDag.cycle_next(), Focus::Log);
-        assert_eq!(Focus::Log.cycle_next(), Focus::Chat);
-        assert_eq!(Focus::Log.cycle_prev(), Focus::OpsDag);
-        assert_eq!(Focus::Chat.cycle_prev(), Focus::Log);
+        assert_eq!(Focus::Chat.cycle_next_active(true, true), Focus::OpsDag);
+        assert_eq!(Focus::OpsDag.cycle_next_active(true, true), Focus::Log);
+        assert_eq!(Focus::Log.cycle_next_active(true, true), Focus::Chat);
+        assert_eq!(Focus::Log.cycle_prev_active(true, true), Focus::OpsDag);
+        assert_eq!(Focus::Chat.cycle_prev_active(true, true), Focus::Log);
     }
 
     #[test]

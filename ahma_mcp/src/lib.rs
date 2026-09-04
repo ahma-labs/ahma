@@ -35,6 +35,7 @@
 //!
 //! ```rust,no_run
 //! use ahma_mcp::{Adapter, AhmaMcpService, config::ToolConfig};
+//! use ahma_mcp::adapter::mutex_groups::CommandMutexRegistry;
 //! use ahma_mcp::operation_monitor::{OperationMonitor, MonitorConfig};
 //! use ahma_mcp::shell_pool::{ShellPoolManager, ShellPoolConfig};
 //! use ahma_mcp::sandbox::{Sandbox, SandboxMode};
@@ -52,8 +53,8 @@
 //!
 //!     // 2. Create the execution adapter (with default cargo mutex group)
 //!     let mutex_groups = ahma_common::config::default_mutex_groups();
-//!     let mutex_registry = Arc::new(Adapter::mutex_registry_from(&mutex_groups));
-//!     let adapter = Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox, mutex_registry)?);
+//!     let mutex_registry = Arc::new(CommandMutexRegistry::from_config(&mutex_groups));
+//!     let adapter = Arc::new(Adapter::new_with_registry(monitor.clone(), shell_pool, sandbox, mutex_registry)?);
 //!
 //!     // 3. Initialize the MCP service with your tool configurations
 //!     let configs = Arc::new(HashMap::<String, ToolConfig>::new());
@@ -187,6 +188,8 @@ pub mod update;
 pub mod utils;
 /// Tool configuration validation.
 pub mod validation;
+/// The numeric multi-select prompt shared by the setup and uninstall wizards.
+mod wizard_prompt;
 
 // ── New modules (roadmap milestones) ─────────────────────────────────────────
 //

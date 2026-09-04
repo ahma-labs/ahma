@@ -63,7 +63,7 @@ use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use crate::retry::{self, RetryConfig};
 use crate::sandbox;
 use crate::shell_pool::{ProcessGroupGuard, ShellPoolManager, kill_process_tree};
-use ahma_common::event_dispatcher::{EventDispatcher, OperationEvent};
+use ahma_common::event_dispatcher::EventDispatcher;
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 use std::{
@@ -285,30 +285,6 @@ impl Adapter {
             mutex_registry,
             scope_grant_notifier: None,
         })
-    }
-
-    /// Convenience factory: build a [`CommandMutexRegistry`] from a slice of group configs.
-    ///
-    /// This is the same as calling `CommandMutexRegistry::from_config(groups)` directly.
-    pub fn mutex_registry_from(
-        groups: &[ahma_common::config::MutexGroupConfig],
-    ) -> CommandMutexRegistry {
-        CommandMutexRegistry::from_config(groups)
-    }
-
-    /// Subscribe to the unified operation event stream.
-    ///
-    /// Returns a `broadcast::Receiver` that yields every [`OperationEvent`] emitted
-    /// by this adapter.  Events are wrapped in `Arc` so cloning is cheap.
-    ///
-    /// # Note
-    ///
-    /// Events emitted before this call are not replayed.  Subscribe before triggering
-    /// the operation you want to observe.
-    pub fn subscribe_events(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<std::sync::Arc<OperationEvent>> {
-        self.event_dispatcher.subscribe()
     }
 
     /// Sets a custom command executor on the adapter.

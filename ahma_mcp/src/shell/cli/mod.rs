@@ -3074,13 +3074,6 @@ async fn run_tool_info_mode(args: InfoArgs) -> Result<()> {
     commands::run_tool_info_mode(args).await
 }
 
-/// Read a boolean env var ("1","true","yes","on" → true; anything else → false).
-///
-/// Public for use in tests.
-pub fn env_flag_enabled(name: &str) -> bool {
-    AppConfig::env_flag(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3101,14 +3094,14 @@ mod tests {
     fn test_env_flag_enabled_unset() {
         let _guard = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_UNSET") };
-        assert!(!env_flag_enabled("AHMA_TEST_FLAG_UNSET"));
+        assert!(!AppConfig::env_flag("AHMA_TEST_FLAG_UNSET"));
     }
 
     #[test]
     fn test_env_flag_enabled_empty() {
         let _guard = ENV_MUTEX.lock();
         unsafe { std::env::set_var("AHMA_TEST_FLAG_EMPTY", "") };
-        let result = env_flag_enabled("AHMA_TEST_FLAG_EMPTY");
+        let result = AppConfig::env_flag("AHMA_TEST_FLAG_EMPTY");
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_EMPTY") };
         assert!(!result);
     }
@@ -3117,7 +3110,7 @@ mod tests {
     fn test_env_flag_enabled_whitespace_only() {
         let _guard = ENV_MUTEX.lock();
         unsafe { std::env::set_var("AHMA_TEST_FLAG_WS", "   ") };
-        let result = env_flag_enabled("AHMA_TEST_FLAG_WS");
+        let result = AppConfig::env_flag("AHMA_TEST_FLAG_WS");
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_WS") };
         assert!(!result);
     }
@@ -3127,9 +3120,9 @@ mod tests {
         let _guard = ENV_MUTEX.lock();
         for val in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "ON"] {
             unsafe { std::env::set_var("AHMA_TEST_FLAG_VAL", val) };
-            let result = env_flag_enabled("AHMA_TEST_FLAG_VAL");
+            let result = AppConfig::env_flag("AHMA_TEST_FLAG_VAL");
             unsafe { std::env::remove_var("AHMA_TEST_FLAG_VAL") };
-            assert!(result, "env_flag_enabled({:?}) should be true", val);
+            assert!(result, "AppConfig::env_flag({:?}) should be true", val);
         }
     }
 
@@ -3141,9 +3134,9 @@ mod tests {
                 continue;
             }
             unsafe { std::env::set_var("AHMA_TEST_FLAG_FALSE", val) };
-            let result = env_flag_enabled("AHMA_TEST_FLAG_FALSE");
+            let result = AppConfig::env_flag("AHMA_TEST_FLAG_FALSE");
             unsafe { std::env::remove_var("AHMA_TEST_FLAG_FALSE") };
-            assert!(!result, "env_flag_enabled({:?}) should be false", val);
+            assert!(!result, "AppConfig::env_flag({:?}) should be false", val);
         }
     }
 

@@ -218,11 +218,6 @@ impl ProviderEntry {
             num_ctx: self.num_ctx,
         })
     }
-
-    /// Whether this provider accepts a per-request `num_ctx` override.
-    pub fn supports_num_ctx(&self) -> bool {
-        endpoint_supports_num_ctx(&self.base_url, self.kind)
-    }
 }
 
 /// A `ProviderEntry` with secrets resolved — ready to hand to an HTTP client.

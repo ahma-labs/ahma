@@ -158,6 +158,14 @@ jobs:
         # zero hits.
         run: cargo nextest run --profile smoke --locked
 
+      # nextest cannot run doctests, so every other test step in every tier can be
+      # green while a documented example no longer compiles -- which is exactly how
+      # ahma_mcp's headline "Initializing the Engine" example came to pass a stale
+      # argument to Adapter::new. This is the only step that compiles them.
+      # Seconds, because it builds examples rather than the workspace.
+      - name: Cargo Test (doc examples)
+        run: cargo test --doc --locked
+
       # Verifies the backend and the hit rate, but cannot fail on "misses without writes": this
       # tier is READ_ONLY, so writing nothing is the intended behaviour, and the action skips
       # that particular assertion when it sees SCCACHE_GHA_RW_MODE=READ_ONLY.

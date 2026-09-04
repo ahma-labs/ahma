@@ -47,18 +47,25 @@ Before you claim "all green" and stop work, run:
 3. `cargo nextest run` — run all standard tests.
 4. `cargo nextest run --workspace --run-ignored all` — ignored tests here are expensive stress/regression coverage and latency guards (`latency_guard_test`), not dead weight; they are part of the required set.
 5. `cargo doc --no-deps` — verify docs build.
-6. **If you touched `Cargo.toml`/`Cargo.lock`:** the *full* `cargo deny check`.
+6. `cargo test --doc` — verify the examples in docs still *compile*. This is a
+   separate step because nextest cannot run doctests, so the entire suite and all
+   of CI can be green while a `rust` example no longer builds. That is not
+   hypothetical: `ahma_mcp`'s headline "Initializing the Engine" example passed a
+   stale argument to `Adapter::new` and went unnoticed, because the only runner
+   that would have caught it is not the one anyone runs. Cheap (~1s) — it
+   compiles examples, it does not rebuild the workspace.
+7. **If you touched `Cargo.toml`/`Cargo.lock`:** the *full* `cargo deny check`.
    Not `cargo deny check advisories`. The full check also enforces licences, and a licence is
    what broke main (#470): `zip 8.6`'s default features silently pulled in `bzip2`,
    whose licence is not on the allow-list. A new transitive dep arrives with a licence you did
    not choose, so the advisories subset proves nothing about it.
-7. **If you touched any `[dependencies]`/`[dev-dependencies]` section:**
+8. **If you touched any `[dependencies]`/`[dev-dependencies]` section:**
    `cargo hakari generate && cargo hakari manage-deps` — regenerates `workspace-hack/`, the
    crate that pins one third-party feature set for every invocation. `cargo hakari verify`
    runs in `scripts/check-dependency-graph.sh` (called by the pre-push guardrails and by
    Fast Tier CI), so a stale hack fails before it lands. Install once with
    `cargo install cargo-hakari --locked`.
-8. **If you added a dependency that touches TLS** (anything with a `rustls`, `rcgen`,
+9. **If you added a dependency that touches TLS** (anything with a `rustls`, `rcgen`,
    `quinn` or `*-tls` feature): the same script also checks that `aws-lc-rs` is the *only*
    rustls crypto provider in the product graph. `ring` is a second provider (another
    native build, another copy of every primitive in every binary) and only ever arrives
@@ -140,7 +147,7 @@ simplify`, `-p xtask` and `clippy --all-targets` afterwards — no source change
 | Multiplier | Rule |
 |---|---|
 | Feature flavours of workspace crates (`--no-default-features`, `--features x`, a no-op feature used as a CI test selector) | **One canonical flavour** (default features) for every build/test/clippy/doc invocation, locally and in CI. Select tests by name/binary, never by feature. |
-| Third-party feature unification differing between `-p X` and the workspace build | **`workspace-hack/` (cargo-hakari)** pins the union of features for every invocation. Regenerate after any dependency edit (Definition of Done step 7). |
+| Third-party feature unification differing between `-p X` and the workspace build | **`workspace-hack/` (cargo-hakari)** pins the union of features for every invocation. Regenerate after any dependency edit (Definition of Done step 8). |
 | One statically-linked executable per `tests/*.rs` file (143 executables = 3.2 GB, each re-linked per flavour, each with its own `incremental/` session) | **One test binary per harness class per crate** (`tests/unit.rs`, `tests/e2e.rs`, …); new integration tests are a `mod` inside one of them, never a new top-level `tests/*.rs` file — enforced by `scripts/check-guardrails.sh`. |
 
 Full analysis, measurements and the industry references behind these rules:
