@@ -842,14 +842,17 @@ async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
         }
         #[cfg(unix)]
         Some(ServeTransport::Unix(u)) => {
-            let path = u.socket_path.as_deref().unwrap_or("/tmp/ahma.sock");
+            let path = ahma_common::daemon_hub::mcp_socket_path(u.socket_path.as_deref());
             tracing::info!("Running in Unix socket bridge mode on {}", path);
             modes::run_unix_bridge_mode(cfg).await
         }
         None => {
             #[cfg(unix)]
             {
-                tracing::info!("Running in Unix socket bridge mode on /tmp/ahma.sock");
+                tracing::info!(
+                    "Running in Unix socket bridge mode on {}",
+                    ahma_common::daemon_hub::mcp_socket_path(None)
+                );
                 modes::run_unix_bridge_mode(cfg).await
             }
             #[cfg(not(unix))]
@@ -2338,18 +2341,18 @@ fn unix_socket_path_from_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -
                 .socket_path
                 .clone()
                 .or_else(|| s.http.unix_socket_path.clone())
-                .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
+                .unwrap_or_else(|| ahma_common::daemon_hub::mcp_socket_path(None)),
             _ => s
                 .http
                 .unix_socket_path
                 .clone()
-                .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
+                .unwrap_or_else(|| ahma_common::daemon_hub::mcp_socket_path(None)),
         },
         _ => s
             .http
             .unix_socket_path
             .clone()
-            .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
+            .unwrap_or_else(|| ahma_common::daemon_hub::mcp_socket_path(None)),
     }
 }
 
@@ -4901,7 +4904,12 @@ mod tests {
         let _guard = ENV_MUTEX.lock();
         let cli = Cli::parse_from(["ahma", "serve", "http"]);
         let s = ahma_common::config::AhmaSettings::default();
-        assert_eq!(unix_socket_path_from_cli(&cli, &s), "/tmp/ahma.sock");
+        assert_eq!(
+            unix_socket_path_from_cli(&cli, &s),
+            ahma_common::daemon_hub::mcp_socket_path(None),
+            "with nothing configured the CLI resolves the per-user daemon socket \
+             (SPEC R-DAEMON.2), never the retired machine-global /tmp/ahma.sock"
+        );
     }
 
     // ─── build_app_config ────────────────────────────────────────────────────

@@ -252,7 +252,7 @@ pub fn unix_socket_default_path() -> String {
         .http
         .unix_socket_path
         .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| ahma_mcp::shell::modes::server::GLOBAL_SOCKET_PATH.to_string())
+        .unwrap_or_else(|| ahma_common::daemon_hub::mcp_socket_path(None))
 }
 
 /// Parse a user-supplied `--connect` value into a `ResolvedConnection`.

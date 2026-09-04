@@ -573,7 +573,7 @@ fn strip_global_endpoints_under_test<'a>(
     if !is_test_isolated() {
         return (socket_path, http_url);
     }
-    let global_socket = socket_path.is_some_and(|p| p == GLOBAL_SOCKET_PATH);
+    let global_socket = socket_path.is_some_and(|p| p == global_mcp_socket_path());
     let global_http = http_url.is_some_and(is_global_bridge_url);
     if global_socket || global_http {
         tracing::warn!(
@@ -1134,12 +1134,19 @@ fn bridge_unhealthy_error(stderr_path: &std::path::Path, timeout: Duration) -> a
     )
 }
 
-/// The machine-global bridge socket.
+/// The per-user MCP endpoint the daemon binds (SPEC R-DAEMON.2).
 ///
-/// It is a well-known singleton *by design*: several MCP clients share one bridge
-/// daemon. That sharing is exactly why a test must never resolve it — see
-/// [`is_test_isolated`] and `default_socket_path`.
-pub const GLOBAL_SOCKET_PATH: &str = "/tmp/ahma.sock";
+/// It is a per-user singleton *by design*: several MCP clients share one daemon.
+/// That sharing is exactly why a test must never resolve it — see
+/// [`is_test_isolated`] and [`default_socket_path`]. It used to be the
+/// machine-global `/tmp/ahma.sock`, which every local user could see and, since
+/// nothing owned the path, pre-create; it now lives beside the hub socket in the
+/// 0700 per-user runtime directory.
+pub fn global_mcp_socket_path() -> String {
+    ahma_common::daemon_hub::platform_mcp_socket_path()
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// True when this process is running under the test harness.
 ///
@@ -1164,13 +1171,10 @@ pub fn is_test_isolated() -> bool {
 /// Under test isolation this is a per-process private path, so a test can never
 /// reach — much less restart — a bridge it does not own.
 fn default_socket_path() -> String {
-    if is_test_isolated() {
-        return std::env::temp_dir()
-            .join(format!("ahma-test-{}.sock", std::process::id()))
-            .to_string_lossy()
-            .into_owned();
-    }
-    GLOBAL_SOCKET_PATH.to_string()
+    // One resolver for both rendezvous files (SPEC R-DAEMON.2, R-ISO.1): the
+    // harness fallback keys off the test-run discriminator, not this process's
+    // pid, so a test and the binaries it spawns agree on the same private path.
+    ahma_common::daemon_hub::mcp_socket_path(None)
 }
 
 /// Returns true when the process is running as a server-child subprocess.
@@ -1814,12 +1818,18 @@ mod tests {
             "precondition: unit tests are test-isolated"
         );
         assert_ne!(
-            socket, GLOBAL_SOCKET_PATH,
-            "a test must not resolve the shared bridge socket"
+            socket,
+            global_mcp_socket_path(),
+            "a test must not resolve the shared daemon socket"
         );
+        // Keyed by the test-run discriminator, not this pid: a test and the
+        // binaries it spawns must agree on one private path (SPEC R-ISO.1).
         assert!(
-            socket.contains(&format!("ahma-test-{}", std::process::id())),
-            "expected a per-process private socket, got {socket}"
+            socket.contains(&format!(
+                "ahma-test-mcp-{}",
+                ahma_common::test_isolation::test_run_discriminator()
+            )),
+            "expected the per-run private socket, got {socket}"
         );
         assert_eq!(url, "http://127.0.0.1:3000");
     }
@@ -1830,7 +1840,7 @@ mod tests {
     async fn trigger_bridge_restart_refuses_the_global_endpoints_under_test_isolation() {
         assert!(
             !trigger_bridge_restart(
-                Some(GLOBAL_SOCKET_PATH),
+                Some(&global_mcp_socket_path()),
                 Some(&format!("http://127.0.0.1:{GLOBAL_HTTP_PORT}"))
             )
             .await,

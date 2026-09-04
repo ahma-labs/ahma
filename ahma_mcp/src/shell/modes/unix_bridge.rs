@@ -19,11 +19,11 @@ use std::env;
 /// # Errors
 /// Returns an error if the bridge fails to start.
 pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
-    let socket_path = if config.unix_socket_path.is_empty() {
-        "/tmp/ahma.sock".to_string()
-    } else {
-        config.unix_socket_path.clone()
-    };
+    // Per-user runtime dir, not the retired machine-global /tmp/ahma.sock
+    // (SPEC R-DAEMON.2); an explicit --socket-path still wins.
+    let socket_path = ahma_common::daemon_hub::mcp_socket_path(
+        Some(config.unix_socket_path.as_str()).filter(|p| !p.is_empty()),
+    );
 
     tracing::info!("Starting Unix socket bridge on {}", socket_path);
     tracing::info!("Session isolation: ENABLED (always-on)");

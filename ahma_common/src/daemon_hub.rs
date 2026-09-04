@@ -571,29 +571,164 @@ pub fn default_socket_path() -> PathBuf {
     platform_default_socket_path()
 }
 
+/// The per-user runtime directory holding every daemon rendezvous file
+/// (SPEC R-DAEMON.2): the hub socket, the MCP socket, and on Windows the
+/// endpoint descriptor.
+///
+/// Prefers `$XDG_RUNTIME_DIR/ahma` (per-user, tmpfs, cleaned at logout) and
+/// falls back to `~/.ahma`. Created with mode `0700` as a side effect, so the
+/// returned directory is immediately usable — a shared directory is how a
+/// second local user gets to see, and squat, another user's endpoints.
+#[cfg(unix)]
+pub fn runtime_dir() -> Option<PathBuf> {
+    let dir = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|x| !x.is_empty())
+        .map(|xdg| PathBuf::from(xdg).join("ahma"))
+        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))?;
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Some(dir)
+}
+
+/// Windows counterpart of [`runtime_dir`]: `%LOCALAPPDATA%\ahma\run`, falling
+/// back to `~/.ahma`. Access control comes from the per-user profile ACL rather
+/// than a mode bit.
+#[cfg(not(unix))]
+pub fn runtime_dir() -> Option<PathBuf> {
+    let dir = std::env::var("LOCALAPPDATA")
+        .ok()
+        .filter(|x| !x.is_empty())
+        .map(|local| PathBuf::from(local).join("ahma").join("run"))
+        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
+/// Refuse a runtime directory another local user can reach (SPEC R-DAEMON.2).
+///
+/// The daemon executes shell and build commands on behalf of anything that can
+/// connect to its sockets, so the directory holding them must be the caller's
+/// own and unreachable by group or other — the same rule sshd applies to
+/// `~/.ssh`. A socket chmodded `0600` inside a `0777` directory is still
+/// squattable: another user can unlink the path and bind their own listener
+/// there before the real client connects.
+#[cfg(unix)]
+pub fn verify_runtime_dir_secure(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(dir) else {
+        bail!("cannot stat runtime directory {}", dir.display());
+    };
+    // Our own uid without a `libc` dependency in this crate: a file we just
+    // created is owned by our effective uid by definition, so its `uid()` is
+    // the number to compare the directory against.
+    let probe_path = dir.join(format!(".ahma-owner-probe-{}", std::process::id()));
+    let our_uid = match std::fs::File::create(&probe_path) {
+        Ok(f) => {
+            let uid = f.metadata().ok().map(|m| m.uid());
+            drop(f);
+            let _ = std::fs::remove_file(&probe_path);
+            uid
+        }
+        Err(e) => {
+            bail!(
+                "cannot write inside runtime directory {}: {e}. Fix its ownership \
+                 and permissions (chmod 700), or set XDG_RUNTIME_DIR.",
+                dir.display()
+            );
+        }
+    };
+    if let Some(our_uid) = our_uid
+        && meta.uid() != our_uid
+    {
+        bail!(
+            "runtime directory {} is owned by uid {}, not by this user (uid {}); \
+             refusing to use it. Remove or chown it, or set XDG_RUNTIME_DIR.",
+            dir.display(),
+            meta.uid(),
+            our_uid
+        );
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "runtime directory {} is mode {:o}; it must not be readable or writable by group \
+             or others (0700). Fix with: chmod 700 {}",
+            dir.display(),
+            mode,
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Windows has no mode bits to check; the per-user profile ACL is the boundary.
+#[cfg(not(unix))]
+pub fn verify_runtime_dir_secure(dir: &std::path::Path) -> Result<()> {
+    if !dir.is_dir() {
+        bail!("runtime directory {} does not exist", dir.display());
+    }
+    Ok(())
+}
+
 /// Step 3 of [`default_socket_path`]'s resolution order: the platform default,
 /// ignoring every override. Creates the parent directory as a side effect so the
 /// returned path is immediately bindable.
 #[cfg(unix)]
 fn platform_default_socket_path() -> PathBuf {
-    // Prefer XDG_RUNTIME_DIR on Linux (per-user, tmpfs, auto-cleaned), then
-    // ~/.ahma (macOS + Linux without XDG).
-    let dir = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .map(|xdg| PathBuf::from(xdg).join("ahma"))
-        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")));
-
-    let Some(dir) = dir else {
-        return PathBuf::from("/tmp/ahma-daemon.sock");
-    };
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("daemon.sock")
+    match runtime_dir() {
+        Some(dir) => dir.join("daemon.sock"),
+        None => PathBuf::from("/tmp/ahma-daemon.sock"),
+    }
 }
 
 /// On Windows the path is unused; callers use the TCP address.
 #[cfg(not(unix))]
 fn platform_default_socket_path() -> PathBuf {
     PathBuf::from("unused-on-windows")
+}
+
+/// The per-user MCP endpoint socket, ignoring test isolation and any explicit
+/// override — the path the daemon binds in production.
+///
+/// It lives beside the hub socket in [`runtime_dir`] rather than at the old
+/// machine-global `/tmp/ahma.sock`, which every local user could see and, since
+/// nothing owned the path, pre-create.
+pub fn platform_mcp_socket_path() -> PathBuf {
+    match runtime_dir() {
+        Some(dir) => dir.join("mcp.sock"),
+        None => PathBuf::from("/tmp/ahma-mcp.sock"),
+    }
+}
+
+/// Resolve the MCP endpoint socket path (SPEC R-DAEMON.2).
+///
+/// Resolution order, mirroring [`default_socket_path`] so the two rendezvous
+/// files can never disagree about which run they belong to:
+/// 1. `explicit` — the `--unix-socket-path` flag or `[http] unix_socket_path`.
+/// 2. Under a test harness, a private per-run path keyed by the same
+///    discriminator as the hub socket (SPEC R-ISO.1). Parent and child
+///    processes in one test run therefore agree without plumbing.
+/// 3. [`platform_mcp_socket_path`].
+pub fn mcp_socket_path(explicit: Option<&str>) -> String {
+    if let Some(p) = explicit.filter(|p| !p.is_empty()) {
+        return p.to_string();
+    }
+    if crate::test_isolation::spawned_under_test_harness() {
+        return std::env::temp_dir()
+            .join(format!(
+                "ahma-test-mcp-{}.sock",
+                crate::test_isolation::test_run_discriminator()
+            ))
+            .to_string_lossy()
+            .into_owned();
+    }
+    platform_mcp_socket_path().to_string_lossy().into_owned()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2602,6 +2737,118 @@ mod tests {
         match prev_nextest {
             Some(v) => unsafe { std::env::set_var("NEXTEST", v) },
             None => unsafe { std::env::remove_var("NEXTEST") },
+        }
+    }
+
+    /// R-ISO.1: the MCP endpoint must be per-run private under a harness, and
+    /// must key off the *same* discriminator as the hub socket — a test whose
+    /// frontend and daemon disagree about which run they belong to rendezvouses
+    /// on nothing (or, worse, on the developer's live endpoint).
+    #[test]
+    fn mcp_socket_path_is_private_under_test_harness_and_shares_the_hub_discriminator() {
+        let _g = ENV_MUTEX.lock();
+        let prev_nextest = std::env::var_os("NEXTEST");
+        unsafe { std::env::set_var("NEXTEST", "1") };
+
+        let mcp = PathBuf::from(mcp_socket_path(None));
+        let name = mcp.file_name().unwrap().to_string_lossy().into_owned();
+        let disc = crate::test_isolation::test_run_discriminator();
+        assert_eq!(
+            name,
+            format!("ahma-test-mcp-{disc}.sock"),
+            "harness fallback must be a private per-run MCP socket"
+        );
+        assert!(
+            mcp.starts_with(std::env::temp_dir()),
+            "private MCP socket must live in the temp dir, got {}",
+            mcp.display()
+        );
+        assert!(
+            name.contains(&disc),
+            "MCP socket must carry the same run discriminator the hub socket uses"
+        );
+
+        match prev_nextest {
+            Some(v) => unsafe { std::env::set_var("NEXTEST", v) },
+            None => unsafe { std::env::remove_var("NEXTEST") },
+        }
+    }
+
+    #[test]
+    fn mcp_socket_path_explicit_override_wins() {
+        let _g = ENV_MUTEX.lock();
+        assert_eq!(
+            mcp_socket_path(Some("/run/custom/ahma.sock")),
+            "/run/custom/ahma.sock",
+            "an explicit --unix-socket-path is used verbatim"
+        );
+        // An empty string is "unset" throughout AppConfig, not a path.
+        assert_ne!(mcp_socket_path(Some("")), "");
+    }
+
+    /// The two rendezvous files live side by side, so one `runtime_dir` check
+    /// covers both (SPEC R-DAEMON.2).
+    #[cfg(unix)]
+    #[test]
+    fn mcp_socket_path_lives_beside_the_hub_socket() {
+        let hub = platform_default_socket_path();
+        let mcp = platform_mcp_socket_path();
+        assert_eq!(
+            hub.parent(),
+            mcp.parent(),
+            "hub and MCP sockets must share the per-user runtime directory"
+        );
+        assert_eq!(mcp.file_name().unwrap(), "mcp.sock");
+        assert_ne!(
+            mcp.to_string_lossy(),
+            "/tmp/ahma.sock",
+            "the machine-global socket is retired"
+        );
+    }
+
+    /// A runtime directory another local user can read or write is refused:
+    /// a 0600 socket inside a 0777 directory is still squattable.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_rejects_group_or_other_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("run");
+        std::fs::create_dir(&dir).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        verify_runtime_dir_secure(&dir).expect("0700 owned by us is acceptable");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = verify_runtime_dir_secure(&dir)
+            .expect_err("group/other-readable runtime dir must be refused")
+            .to_string();
+        assert!(err.contains("chmod 700"), "error must name the fix: {err}");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = ENV_MUTEX.lock();
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        let dir = runtime_dir().expect("XDG_RUNTIME_DIR yields a runtime dir");
+        assert_eq!(dir, tmp.path().join("ahma"));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "runtime dir must be created 0700, got {mode:o}"
+        );
+        verify_runtime_dir_secure(&dir).expect("freshly created dir passes its own check");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
         }
     }
 
