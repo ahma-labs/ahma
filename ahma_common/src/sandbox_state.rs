@@ -318,6 +318,7 @@ impl Default for SandboxStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeouts::TestTimeouts;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -463,7 +464,7 @@ mod tests {
             sm_clone.transition_to_active().unwrap();
         });
 
-        let result = timeout(Duration::from_secs(1), sm.wait_for_active()).await;
+        let result = timeout(TestTimeouts::scale_secs(1), sm.wait_for_active()).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().unwrap(), vec![expected]);
     }
@@ -480,7 +481,7 @@ mod tests {
                 .unwrap();
         });
 
-        let result = timeout(Duration::from_secs(1), sm.wait_for_active()).await;
+        let result = timeout(TestTimeouts::scale_secs(1), sm.wait_for_active()).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_err());
     }

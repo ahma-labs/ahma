@@ -395,8 +395,9 @@ mod tests {
     use super::*;
     use crate::operation_monitor::{MonitorConfig, Operation, OperationMonitor, OperationStatus};
     use crate::sandbox::{Sandbox, SandboxMode};
+    use ahma_common::timeouts::TestTimeouts;
     use std::sync::Arc;
-    use std::time::Duration;
+
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -439,7 +440,7 @@ mod tests {
     #[cfg(unix)]
     fn test_monitor() -> Arc<OperationMonitor> {
         Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            Duration::from_secs(30),
+            TestTimeouts::scale_secs(30),
         )))
     }
 

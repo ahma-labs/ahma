@@ -989,6 +989,7 @@ fn format_timeout_error_message(
 mod tests {
     use super::*;
     use crate::operation_monitor::{Operation, OperationStatus};
+    use ahma_common::timeouts::TestTimeouts;
 
     fn make_op(id: &str, tool: &str, status: OperationStatus) -> Operation {
         let mut op = Operation::new(id.to_string(), tool.to_string(), String::new(), None);
@@ -1711,7 +1712,7 @@ mod tests {
     async fn test_spawn_progress_warnings_emits_message() {
         // 0.04s total budget: first message fires at 0.02s (50%, factor 0.5).
         let (handle, mut rx) = spawn_progress_warnings(0.04);
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        let msg = tokio::time::timeout(TestTimeouts::scale_secs(5), rx.recv())
             .await
             .expect("should not time out waiting for a progress message");
         handle.abort();

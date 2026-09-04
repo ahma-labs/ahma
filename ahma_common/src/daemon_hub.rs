@@ -1652,6 +1652,7 @@ fn uuid_v4() -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::timeouts::TestTimeouts;
     // ── Wire compatibility for the R24.7 identity fields ─────────────────────
 
     /// A *new* event must deserialize into an *old* reader.
@@ -1790,7 +1791,7 @@ mod tests {
         .await
         .unwrap();
 
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let msg = tokio::time::timeout(TestTimeouts::scale_secs(2), rx.recv())
             .await
             .expect("AgentError should be broadcast, not dropped")
             .expect("broadcast channel open");
@@ -3214,7 +3215,7 @@ mod tests {
             .unwrap();
 
         let mut line = String::new();
-        let n = tokio::time::timeout(Duration::from_secs(2), crdr.read_line(&mut line))
+        let n = tokio::time::timeout(TestTimeouts::scale_secs(2), crdr.read_line(&mut line))
             .await
             .expect("read should complete promptly")
             .unwrap();

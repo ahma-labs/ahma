@@ -928,6 +928,7 @@ mod tests {
     use crate::operation_monitor::{Operation, OperationStatus};
     use ahma_common::daemon_hub::DaemonEvent;
     use ahma_common::event_dispatcher::OperationEvent;
+    use ahma_common::timeouts::TestTimeouts;
     use serde_json::json;
     use tokio::sync::mpsc;
 
@@ -1641,7 +1642,7 @@ mod tests {
     async fn read_client_msg<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> ClientMsg {
         use tokio::io::AsyncBufReadExt;
         let mut line = String::new();
-        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        let n = tokio::time::timeout(TestTimeouts::scale_secs(5), reader.read_line(&mut line))
             .await
             .expect("timed out waiting for a ClientMsg from the reporter")
             .expect("io error reading ClientMsg");
@@ -1662,14 +1663,16 @@ mod tests {
     ) {
         use tokio::io::AsyncBufReadExt;
         loop {
-            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            let (stream, _) = tokio::time::timeout(TestTimeouts::scale_secs(5), listener.accept())
                 .await
                 .expect("timed out waiting for the reporter to connect")
                 .expect("accept failed");
             let (read_half, write_half) = stream.into_split();
             let mut reader = tokio::io::BufReader::new(read_half);
             let mut line = String::new();
-            match tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line)).await {
+            match tokio::time::timeout(TestTimeouts::scale_secs(5), reader.read_line(&mut line))
+                .await
+            {
                 Ok(Ok(n)) if n > 0 => {
                     let msg: ClientMsg =
                         serde_json::from_str(line.trim()).expect("parse first ClientMsg");
@@ -1712,7 +1715,7 @@ mod tests {
         // ── Seed the monitor: one completed op (replayed as Started+Finished) and
         //    one active op (replayed as Started). ─────────────────────────────────
         let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            Duration::from_secs(60),
+            TestTimeouts::scale_secs(60),
         )));
         monitor
             .add_operation(Operation::new(

@@ -681,13 +681,13 @@ pub async fn run_file_monitor_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use ahma_common::timeouts::TestTimeouts;
 
     use crate::operation_monitor::{MonitorConfig, OperationMonitor};
 
     fn make_monitor() -> std::sync::Arc<OperationMonitor> {
         std::sync::Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            Duration::from_secs(60),
+            TestTimeouts::scale_secs(60),
         )))
     }
 

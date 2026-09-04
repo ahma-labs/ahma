@@ -1750,6 +1750,7 @@ async fn handle_mcp_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -2049,9 +2050,8 @@ for line in sys.stdin:
             .expect("SSE mark should succeed");
 
         // Wait for the subprocess to confirm sandbox configuration (Active state).
-        // Use generous timeout for all platforms (CI environments are slower and more variable).
         tokio::time::timeout(
-            std::time::Duration::from_secs(20),
+            TestTimeouts::get(TimeoutCategory::SandboxReady),
             session.wait_for_sandbox_active(),
         )
         .await
@@ -2265,7 +2265,7 @@ for line in sys.stdin:
 
         // The authoritative `configured` must drive the bridge to Active.
         tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            TestTimeouts::get(TimeoutCategory::SandboxReady),
             session.wait_for_sandbox_active(),
         )
         .await
@@ -2324,7 +2324,7 @@ for line in sys.stdin:
             }
 
             tokio::time::timeout(
-                std::time::Duration::from_secs(15),
+                TestTimeouts::get(TimeoutCategory::SandboxReady),
                 session.wait_for_sandbox_active(),
             )
             .await
@@ -2372,7 +2372,7 @@ for line in sys.stdin:
         session.mark_sse_connected().await.expect("sse mark");
 
         tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            TestTimeouts::get(TimeoutCategory::SandboxReady),
             session.wait_for_sandbox_active(),
         )
         .await
@@ -2824,7 +2824,7 @@ for line in sys.stdin:
         });
 
         // Wait up to 3 seconds for the checker to fire.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(3);
         while !fired.load(std::sync::atomic::Ordering::Relaxed) {
             if tokio::time::Instant::now() > deadline {
                 panic!("idle-timeout checker did not fire within 3 seconds");

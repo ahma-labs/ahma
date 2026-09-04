@@ -367,6 +367,7 @@ pub async fn push_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use serde_json::json;
 
     #[test]
@@ -521,8 +522,8 @@ mod redirect_tests {
     use super::*;
     use crate::client_type::McpClientType;
     use crate::operation_monitor::{MonitorConfig, Operation, OperationStatus};
+    use ahma_common::timeouts::TestTimeouts;
     use rmcp::model::NumberOrString;
-    use std::time::Duration;
 
     fn token(n: i64) -> ProgressToken {
         ProgressToken(NumberOrString::Number(n))
@@ -543,7 +544,7 @@ mod redirect_tests {
             .expect("in-process mcp");
         let peer = mcp._server.peer().clone();
         let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            Duration::from_secs(30),
+            TestTimeouts::scale_secs(30),
         )));
         let router = ProgressPushRouter::new(monitor.clone());
         (peer, monitor, router, mcp)

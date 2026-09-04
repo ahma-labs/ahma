@@ -524,6 +524,7 @@ fn token_file_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahma_common::timeouts::TestTimeouts;
     use std::sync::{Mutex as StdMutex, OnceLock};
     use tempfile::tempdir;
 
@@ -785,7 +786,7 @@ mod tests {
     async fn run_callback(request_line: &str) -> (Result<(String, CsrfToken)>, String) {
         let (listener, port) = ephemeral_listener().await;
         let server_fut = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            TestTimeouts::scale_secs(10),
             HttpMcpTransport::accept_callback(listener),
         );
         let (server_res, response) =
@@ -936,7 +937,7 @@ mod tests {
 
         transport.send(request).await.expect("send should succeed");
 
-        let received = tokio::time::timeout(std::time::Duration::from_secs(5), transport.receive())
+        let received = tokio::time::timeout(TestTimeouts::scale_secs(5), transport.receive())
             .await
             .expect("receive should not time out")
             .expect("a response should be queued");

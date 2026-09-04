@@ -1094,6 +1094,7 @@ fn terminal_event_for(op: &Operation) -> OperationEvent {
 mod tests {
     use super::*;
     use crate::utils::logging::init_test_logging;
+    use ahma_common::timeouts::TestTimeouts;
     use std::time::Duration;
 
     /// This test simulates the race condition where an operation completes
@@ -1103,7 +1104,8 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_fast_completion_race_condition() {
         init_test_logging();
-        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let monitor =
+            OperationMonitor::new(MonitorConfig::with_timeout(TestTimeouts::scale_secs(5)));
         let op_id = "fast_op_1".to_string();
         let op = Operation::new(
             op_id.clone(),
@@ -1151,7 +1153,8 @@ mod tests {
     /// completion evicts the oldest entry rather than growing the map forever.
     #[tokio::test]
     async fn completion_history_evicts_oldest_beyond_the_cap() {
-        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(30)));
+        let monitor =
+            OperationMonitor::new(MonitorConfig::with_timeout(TestTimeouts::scale_secs(30)));
 
         for i in 0..MAX_COMPLETION_HISTORY + 5 {
             let op_id = format!("op_{i}");
@@ -1263,7 +1266,8 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_nonexistent_operation() {
         init_test_logging();
-        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let monitor =
+            OperationMonitor::new(MonitorConfig::with_timeout(TestTimeouts::scale_secs(5)));
 
         // Use a timeout to ensure the test completes quickly
         let wait_result = tokio::time::timeout(
@@ -1294,7 +1298,8 @@ mod tests {
     #[tokio::test]
     async fn test_update_status_ignores_overwrite_of_terminal_state() {
         init_test_logging();
-        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let monitor =
+            OperationMonitor::new(MonitorConfig::with_timeout(TestTimeouts::scale_secs(5)));
         let op_id = "terminal-guard-test".to_string();
 
         monitor
@@ -1351,7 +1356,8 @@ mod tests {
     #[tokio::test]
     async fn test_update_status_blocks_downgrade_while_in_active_map() {
         init_test_logging();
-        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let monitor =
+            OperationMonitor::new(MonitorConfig::with_timeout(TestTimeouts::scale_secs(5)));
         let op_id = "downgrade-guard-test".to_string();
 
         // Insert an operation and manually set it to a terminal state without removing it
@@ -1389,7 +1395,8 @@ mod tests {
     #[tokio::test]
     async fn test_event_propagation_order() {
         init_test_logging();
-        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let monitor =
+            OperationMonitor::new(MonitorConfig::with_timeout(TestTimeouts::scale_secs(5)));
 
         let mut rx = monitor.subscribe_events();
 
@@ -1447,7 +1454,8 @@ mod tests {
     #[tokio::test]
     async fn test_started_event_carries_parent_id() {
         init_test_logging();
-        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let monitor =
+            OperationMonitor::new(MonitorConfig::with_timeout(TestTimeouts::scale_secs(5)));
         let mut rx = monitor.subscribe_events();
 
         let op = Operation::new(
@@ -1473,7 +1481,8 @@ mod tests {
     #[tokio::test]
     async fn test_output_line_streaming_and_upsert_dedup() {
         init_test_logging();
-        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let monitor =
+            OperationMonitor::new(MonitorConfig::with_timeout(TestTimeouts::scale_secs(5)));
         let mut rx = monitor.subscribe_events();
 
         let op_id = "stream-test".to_string();

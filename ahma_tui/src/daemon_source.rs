@@ -641,6 +641,7 @@ mod tests {
     use super::*;
     use crate::state::OpStatus;
     use ahma_common::daemon_hub::{DaemonEvent, DaemonMsg, HubRelay, InstanceInfo};
+    use ahma_common::timeouts::TestTimeouts;
 
     fn inst(id: &str, label: &str) -> InstanceInfo {
         InstanceInfo {
@@ -1168,7 +1169,7 @@ mod tests {
 
     // ── coverage batch: apply_msg arms, DaemonState branches, embedded hub ─────
     async fn next_ev(rx: &mut mpsc::Receiver<SourceEvent>) -> SourceEvent {
-        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        tokio::time::timeout(TestTimeouts::scale_secs(2), rx.recv())
             .await
             .expect("a SourceEvent should arrive within the timeout")
             .expect("the source channel should remain open")
@@ -1662,7 +1663,7 @@ mod tests {
 
         let mut saw_final = false;
         for _ in 0..32 {
-            match tokio::time::timeout(Duration::from_secs(2), rx_s.recv()).await {
+            match tokio::time::timeout(TestTimeouts::scale_secs(2), rx_s.recv()).await {
                 Ok(Some(SourceEvent::ChatToken { token })) if token == "final" => {
                     saw_final = true;
                     break;

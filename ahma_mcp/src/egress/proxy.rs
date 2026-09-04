@@ -524,6 +524,7 @@ async fn handle_plain_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahma_common::timeouts::TestTimeouts;
 
     #[tokio::test]
     async fn proxy_starts_and_binds_port() {
@@ -605,8 +606,6 @@ mod tests {
     // exercised by connecting to a started proxy and sending crafted requests,
     // then asserting on the bytes written back (or the connection being closed).
     // ─────────────────────────────────────────────────────────────────────
-
-    use std::time::Duration;
 
     /// Read one chunk of the proxy's response with a timeout.
     /// Returns the bytes read (may be empty if the proxy closed the connection).
@@ -1021,7 +1020,7 @@ mod tests {
                 .write_all(b"CONNECT nopeer.example:443 HTTP/1.1\r\n\r\n")
                 .await
                 .unwrap();
-            let resp = tokio::time::timeout(Duration::from_secs(5), read_chunk(&mut client))
+            let resp = tokio::time::timeout(TestTimeouts::scale_secs(5), read_chunk(&mut client))
                 .await
                 .expect("must deny immediately, not stall on the elicit timeout");
             let resp_str = String::from_utf8_lossy(&resp);

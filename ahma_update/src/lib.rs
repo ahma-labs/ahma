@@ -396,6 +396,7 @@ fn print_restart_hint() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahma_common::timeouts::TestTimeouts;
     use parking_lot::Mutex;
     use std::sync::LazyLock;
 
@@ -798,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn test_prompt_yes_no_eof_stdin_returns_default_false() {
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            TestTimeouts::scale_secs(3),
             prompt_yes_no("test prompt? ", false),
         )
         .await;
@@ -819,7 +820,7 @@ mod tests {
     #[tokio::test]
     async fn test_prompt_yes_no_eof_stdin_returns_default_true() {
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            TestTimeouts::scale_secs(3),
             prompt_yes_no("test prompt? ", true),
         )
         .await;

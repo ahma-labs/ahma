@@ -1918,6 +1918,7 @@ mod sandbox_configured_parse_tests {
 #[cfg(test)]
 mod session_logic_tests {
     use super::*;
+    use ahma_common::timeouts::TestTimeouts;
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -2072,9 +2073,12 @@ mod session_logic_tests {
         let (session, _rx) = make_test_session();
         session.mark_mcp_initialized().await.unwrap();
         // Already initialized → the early return path (lines 291-293).
-        tokio::time::timeout(Duration::from_secs(1), session.wait_for_mcp_initialized())
-            .await
-            .expect("must return without waiting");
+        tokio::time::timeout(
+            TestTimeouts::scale_secs(1),
+            session.wait_for_mcp_initialized(),
+        )
+        .await
+        .expect("must return without waiting");
     }
 
     #[tokio::test]
@@ -2085,9 +2089,12 @@ mod session_logic_tests {
             tokio::time::sleep(Duration::from_millis(30)).await;
             s2.mark_mcp_initialized().await.unwrap();
         });
-        tokio::time::timeout(Duration::from_secs(2), session.wait_for_mcp_initialized())
-            .await
-            .expect("notify must wake the waiter");
+        tokio::time::timeout(
+            TestTimeouts::scale_secs(2),
+            session.wait_for_mcp_initialized(),
+        )
+        .await
+        .expect("notify must wake the waiter");
         assert!(session.is_mcp_initialized());
     }
 
@@ -2917,7 +2924,7 @@ mod session_logic_tests {
             .unwrap();
         drop(factory.peer_end.lock().take());
 
-        let response = tokio::time::timeout(Duration::from_secs(5), rx)
+        let response = tokio::time::timeout(TestTimeouts::scale_secs(5), rx)
             .await
             .expect("pending request must be answered")
             .expect("error response must be sent, not dropped");

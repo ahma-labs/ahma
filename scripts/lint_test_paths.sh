@@ -40,6 +40,46 @@ do
     fi
 done
 
+echo "Checking timeout literals in in-src #[cfg(test)] modules..."
+# The check above only reaches `tests/*.rs`. Unit tests living in a `#[cfg(test)]`
+# module inside `src/` were invisible to it, and that is where the rule actually
+# broke: four `ahma_http_bridge::bridge` tests waited a literal 15s for the
+# sandbox to settle and timed out on the Windows leg of CI -- in a binary that is
+# deliberately denied retries, because an in-process flake is supposed to be a
+# real bug.
+#
+# Scope is deliberately narrow, so the rule stays true rather than becoming noise:
+#   * only `timeout(...)` calls -- an actual wall-clock wait, not a config value
+#     handed to something under test;
+#   * only >= 1s. A sub-second literal is almost always a negative assertion
+#     ("nothing arrives within 200ms"), and scaling those by the Windows
+#     multiplier would just make the suite slower for no benefit.
+# A longer timeout costs nothing on a green run: it bounds how long a FAILURE
+# takes to surface, and a passing wait returns the moment its condition is met.
+while IFS= read -r file; do
+    # `mod tests` inside src/ only; `tests/` files are covered above.
+    grep -q '^#\[cfg(test)\]' "$file" || continue
+    # `-U` (multiline) is load-bearing: the common shape puts the duration on
+    # the line after `timeout(`, and a line-based match sees neither half.
+    # The leading boundary keeps `with_timeout(Duration::from_secs(3600))` out of
+    # scope: that is a configuration value handed to the code under test, not a
+    # wait, and scaling it would change what the test exercises.
+    # Only the test module, not the whole file: production code may legitimately
+    # hold a literal timeout (it is configuration, not a test's patience).
+    # Test modules sit at the end of the file by convention, so take everything
+    # from the first `#[cfg(test)]` onward.
+    if awk '/^#\[cfg\(test\)\]/{f=1} f' "$file" \
+        | rg -qU '(^|[^A-Za-z0-9_])timeout\(\s*(std::time::)?Duration::from_secs\([1-9][0-9]*\)'; then
+        echo "FAIL VIOLATION: $file"
+        echo "   Literal >=1s Duration passed to timeout() in an in-src test module"
+        echo "   Use ahma_common::timeouts::TestTimeouts::get(TimeoutCategory::_)"
+        echo "   for a semantic wait, or ::scale_secs(n) to keep the current value"
+        echo "   scaled for Windows (4x) and coverage (2x more)."
+        echo ""
+        VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+done < <(find . -path "*/src/*.rs" | grep -v target)
+
 echo "Checking shared custom server spawn usage in HTTP bridge integration test..."
 HTTP_BRIDGE_TEST="./ahma_http_bridge/tests/e2e/http_bridge_integration_test.rs"
 if [[ -f "$HTTP_BRIDGE_TEST" ]] && ! rg -q 'spawn_server_guard_with_config' "$HTTP_BRIDGE_TEST"; then

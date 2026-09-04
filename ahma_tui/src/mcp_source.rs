@@ -887,6 +887,7 @@ async fn call_logs_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahma_common::timeouts::TestTimeouts;
 
     // The SSE framing helpers and encode_file_uri moved to `ahma_common`
     // (`sse` / `file_uri` modules) — their unit tests live there now.
@@ -920,7 +921,7 @@ mod tests {
 
     fn test_client() -> reqwest::Client {
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(TestTimeouts::scale_secs(5))
             .build()
             .expect("client build")
     }

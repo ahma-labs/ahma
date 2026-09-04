@@ -288,6 +288,7 @@ impl<S> StateMachine<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeouts::TestTimeouts;
     use std::sync::Arc;
     use std::thread;
 
@@ -417,7 +418,7 @@ mod tests {
             let _ = go(&obs2);
         });
         let reached = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            TestTimeouts::scale_secs(1),
             obs.wait_until(|s| matches!(s, Light::Green).then_some(())),
         )
         .await;

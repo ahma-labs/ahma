@@ -719,6 +719,7 @@ impl AhmaMcpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahma_common::timeouts::TestTimeouts;
     use tempfile::TempDir;
 
     // ── parse_root_uri_to_scope ──────────────────────────────────────────────
@@ -880,7 +881,7 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::Arc;
 
-        let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
+        let monitor_config = MonitorConfig::with_timeout(TestTimeouts::scale_secs(300));
         let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
         let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
         let sandbox = Arc::new(
@@ -1238,6 +1239,7 @@ mod tests {
 #[cfg(test)]
 mod sandbox_settle_tests {
     use crate::test_utils::client::setup_test_environment;
+    use ahma_common::timeouts::TestTimeouts;
     use std::time::Duration;
 
     #[tokio::test]
@@ -1276,7 +1278,7 @@ mod sandbox_settle_tests {
         assert!(!waiter.is_finished(), "must still be parked");
 
         service.sandbox_config_in_flight.send_replace(false);
-        tokio::time::timeout(Duration::from_secs(2), waiter)
+        tokio::time::timeout(TestTimeouts::scale_secs(2), waiter)
             .await
             .expect("settling must release the waiter")
             .expect("waiter task");
