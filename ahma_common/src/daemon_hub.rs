@@ -917,12 +917,49 @@ where
     R: tokio::io::AsyncRead + Unpin,
     M: for<'de> Deserialize<'de>,
 {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
-        bail!("daemon connection closed (EOF)");
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            bail!("daemon connection closed (EOF)");
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(msg) => return Ok(msg),
+            // A message this build does not know is skipped, not fatal. This
+            // socket has no version to negotiate (R24.5), so a daemon left
+            // running across an upgrade is the reader that decides — and it
+            // used to decide by dropping the connection, which turned every
+            // future message addition into a hard incompatibility. Skipping is
+            // what makes a new variant possible at all.
+            Err(e) if is_unknown_message(&e) => {
+                // Warn, not debug: skipping is deliberate, but a build that
+                // keeps skipping is a version skew somebody should see.
+                let preview: String = line.chars().take(120).collect();
+                warn!("hub: skipping a message this build does not understand ({e}): {preview}");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
-    Ok(serde_json::from_str(line.trim())?)
+}
+
+/// True when a decode failure is "I do not know this message", as opposed to
+/// malformed JSON or a field of the wrong type — which are real protocol
+/// errors and must still close the connection.
+fn is_unknown_message(e: &serde_json::Error) -> bool {
+    e.is_data() && {
+        let msg = e.to_string();
+        // `ClientMsg`/`DaemonMsg` carry an untagged `Relay` variant, so an
+        // unrecognised `"type"` surfaces as "did not match any variant" rather
+        // than "unknown variant"; both mean the same thing here.
+        msg.contains("unknown variant")
+            || msg.contains("did not match any variant")
+            || msg.contains("missing field `type`")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1043,6 +1080,9 @@ struct DaemonHub {
     /// keeps its identity (and its retained history) instead of arriving as a
     /// stranger.
     session_ids: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// `decision_id` → the instance that raised it, so an answer is routed
+    /// back to the session that asked the question.
+    pending_decisions: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Instances that have disconnected but whose operations are still inside
     /// the replay window, stamped with when they went (SPEC R-DAEMON.7).
     ///
@@ -1073,6 +1113,7 @@ impl DaemonHub {
                 socket_path,
                 pending_approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 session_ids: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                pending_decisions: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 ended_instances: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 exit_hook: parking_lot::Mutex::new(None),
                 history: parking_lot::Mutex::new(None),
@@ -1839,9 +1880,15 @@ where
             decision,
             target_instance_id,
         } => {
+            // The instance that raised the question is the one that can apply
+            // the answer; an explicit target is honoured, but never a guess.
+            let target = match instance_for_decision(&hub, &decision_id).await {
+                Some(owner) => Some(owner),
+                None => target_instance_id,
+            };
             route_to_instance(
                 &hub,
-                target_instance_id,
+                target,
                 DaemonMsg::SubmitScopeGrant {
                     decision_id,
                     decision,
@@ -1855,9 +1902,13 @@ where
             decision,
             target_instance_id,
         } => {
+            let target = match instance_for_decision(&hub, &decision_id).await {
+                Some(owner) => Some(owner),
+                None => target_instance_id,
+            };
             route_to_instance(
                 &hub,
-                target_instance_id,
+                target,
                 DaemonMsg::SubmitWebApproval {
                     decision_id,
                     decision,
@@ -1936,7 +1987,17 @@ async fn route_submit_approval(
     approved: bool,
     target_instance_id: Option<String>,
 ) {
-    if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await {
+    // Prefer the instance that raised this exact call's question.
+    let owner = match id.as_deref() {
+        Some(call_id) => instance_for_decision(hub, call_id).await,
+        None => None,
+    };
+    let target = owner.or(target_instance_id);
+    if let Some(tid) = resolve_target(hub, target.as_deref()).await {
+        hub.pending_decisions
+            .lock()
+            .await
+            .retain(|_, owner| owner != &tid);
         hub.pending_approvals.lock().await.remove(&tid);
         if let Some(tx) = hub.instance_txs.lock().await.get(&tid) {
             let _ = tx.send(DaemonMsg::SubmitApproval { id, approved }).await;
@@ -1965,13 +2026,45 @@ async fn route_to_instance(
     }
 }
 
-/// Resolve which instance a TUI request targets: the explicit id when given,
-/// otherwise the first currently-registered instance (`None` if none exist).
+/// Resolve which instance a TUI request targets (SPEC R-DAEMON.6).
+///
+/// An explicit id must name a **live** instance; one that has gone resolves to
+/// nothing rather than falling through to somebody else's session. Without an
+/// explicit id there must be exactly one candidate: the old rule took
+/// `HashMap::keys().next()`, an arbitrary entry, which with one attached client
+/// was right by construction and with several sent a user's answer to a
+/// different window's question.
+///
+/// Hook and TUI instances are not candidates for an untargeted request: a hook
+/// has no agent loop to run a prompt, and the TUI is the thing asking.
 async fn resolve_target(hub: &DaemonHub, target: Option<&str>) -> Option<String> {
+    let instances = hub.instances.lock().await;
     match target {
-        Some(tid) => Some(tid.to_string()),
-        None => hub.instances.lock().await.keys().next().cloned(),
+        Some(tid) => instances.contains_key(tid).then(|| tid.to_string()),
+        None => {
+            let mut candidates: Vec<&InstanceInfo> = instances
+                .values()
+                .filter(|i| i.mode != "hook" && i.mode != "tui")
+                .collect();
+            match candidates.len() {
+                1 => Some(candidates.remove(0).id.clone()),
+                0 => None,
+                n => {
+                    warn!(
+                        "hub: refusing to guess among {n} attached instances for an \
+                         untargeted request; the sender must name one"
+                    );
+                    None
+                }
+            }
+        }
     }
+}
+
+/// Which instance raised `decision_id`, so its answer goes back to the session
+/// that asked rather than to whichever one happens to be first.
+async fn instance_for_decision(hub: &DaemonHub, decision_id: &str) -> Option<String> {
+    hub.pending_decisions.lock().await.get(decision_id).cloned()
 }
 
 /// Serve a registered ahma instance: register it, then exchange events and
@@ -2060,26 +2153,49 @@ async fn serve_instance<R, W>(
                         debug!("daemon: pong received from id={id}");
                     }
                     Ok(ClientMsg::ScopeGrantResolved { decision_id }) => {
+                        hub.pending_decisions.lock().await.remove(&decision_id);
                         let _ = hub.broadcast.send(DaemonMsg::ScopeGrantDismiss { decision_id });
                     }
                     Ok(ClientMsg::WebApprovalResolved { decision_id }) => {
+                        hub.pending_decisions.lock().await.remove(&decision_id);
                         let _ = hub.broadcast.send(DaemonMsg::WebApprovalDismiss { decision_id });
                     }
                     // Everything the hub forwards untouched. One arm, so a new
                     // HubRelay message reaches subscribers without this loop
                     // being edited — and cannot be half-added.
                     Ok(ClientMsg::Relay(relay)) => {
-                        // The one relay with a side effect: remember the question
-                        // so a TUI attaching mid-prompt is still shown it.
-                        if let HubRelay::ApprovalRequested { id: call_id, tool, args } = &relay {
-                            hub.pending_approvals.lock().await.insert(
-                                id.clone(),
-                                PendingApproval {
-                                    id: call_id.clone(),
-                                    tool: tool.clone(),
-                                    args: args.clone(),
-                                },
-                            );
+                        // Relays with a side effect: remember the question so a
+                        // TUI attaching mid-prompt is still shown it, and record
+                        // which instance asked so the answer goes back to that
+                        // session and no other (SPEC R-DAEMON.6).
+                        match &relay {
+                            HubRelay::ApprovalRequested { id: call_id, tool, args } => {
+                                hub.pending_approvals.lock().await.insert(
+                                    id.clone(),
+                                    PendingApproval {
+                                        id: call_id.clone(),
+                                        tool: tool.clone(),
+                                        args: args.clone(),
+                                    },
+                                );
+                                hub.pending_decisions
+                                    .lock()
+                                    .await
+                                    .insert(call_id.clone(), id.clone());
+                            }
+                            HubRelay::ScopeGrantRequested { request } => {
+                                hub.pending_decisions
+                                    .lock()
+                                    .await
+                                    .insert(request.decision_id.clone(), id.clone());
+                            }
+                            HubRelay::WebApprovalRequested { request } => {
+                                hub.pending_decisions
+                                    .lock()
+                                    .await
+                                    .insert(request.decision_id.clone(), id.clone());
+                            }
+                            _ => {}
                         }
                         let _ = hub.broadcast.send(DaemonMsg::Relay(relay));
                     }
@@ -2135,6 +2251,10 @@ async fn serve_instance<R, W>(
     let departed = hub.instances.lock().await.remove(&id);
     hub.instance_txs.lock().await.remove(&id);
     hub.pending_approvals.lock().await.remove(&id);
+    hub.pending_decisions
+        .lock()
+        .await
+        .retain(|_, owner| owner != &id);
     // The operation history deliberately stays (SPEC R-DAEMON.7): it ages out
     // of the replay window instead, so work done by a session that has since
     // closed — or by a hook, which is an instance for the length of one
@@ -2172,7 +2292,7 @@ where
         return;
     }
 
-    stream_subscriber_events(writer, rx).await;
+    stream_subscriber_events(writer, rx, hub).await;
 }
 
 async fn replay_subscriber_backlog<W>(writer: &mut W, hub: &Arc<DaemonHub>) -> Result<(), ()>
@@ -2203,8 +2323,11 @@ where
     Ok(())
 }
 
-async fn stream_subscriber_events<W>(writer: &mut W, mut rx: broadcast::Receiver<DaemonMsg>)
-where
+async fn stream_subscriber_events<W>(
+    writer: &mut W,
+    mut rx: broadcast::Receiver<DaemonMsg>,
+    hub: &Arc<DaemonHub>,
+) where
     W: AsyncWriteExt + Unpin,
 {
     loop {
@@ -2216,12 +2339,33 @@ where
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!("daemon: subscriber lagged by {n} messages");
-                // Continue — lagging is non-fatal.
+                // Continuing from the oldest available message is not enough:
+                // the dropped messages may have included an `OpFinished`, and a
+                // subscriber that misses one shows a spinner that never
+                // resolves. Re-send the authoritative state instead — the same
+                // snapshot a fresh subscriber gets — so the gap is repaired
+                // rather than merely survived.
+                warn!("daemon: subscriber lagged by {n} messages; resynchronising");
+                if resync_subscriber(writer, hub).await.is_err() {
+                    break;
+                }
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+/// Re-send the instance list and the retained history to one subscriber, after
+/// its stream fell behind far enough to drop messages.
+async fn resync_subscriber<W>(writer: &mut W, hub: &Arc<DaemonHub>) -> Result<(), ()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let instances = hub.instance_snapshot().await;
+    send_msg(writer, &DaemonMsg::InstanceList { instances })
+        .await
+        .map_err(|_| ())?;
+    replay_subscriber_backlog(writer, hub).await
 }
 
 // ─── Tiny UUID v4 without the uuid crate ──────────────────────────────────────
@@ -3581,35 +3725,102 @@ mod tests {
 
     // ── resolve_target ────────────────────────────────────────────────────────
 
+    fn instance_with_mode(id: &str, mode: &str) -> InstanceInfo {
+        InstanceInfo {
+            id: id.into(),
+            pid: 1,
+            mode: mode.into(),
+            scope: "/w".into(),
+            label: "L".into(),
+            client: None,
+            session_id: None,
+            client_pid: None,
+            ended_epoch_ms: None,
+        }
+    }
+
+    /// An explicit target must name a live instance. Returning it verbatim let
+    /// a decision be routed at an instance that had already gone — or, worse,
+    /// at an id another session had since been given.
     #[tokio::test]
-    async fn resolve_target_prefers_explicit_then_falls_back_to_first() {
+    async fn resolve_target_explicit_must_name_a_live_instance() {
         let (hub, _rx) = DaemonHub::new(None);
-
-        // No explicit target and no instances → None.
-        assert_eq!(resolve_target(&hub, None).await, None);
-
-        // Explicit target is returned verbatim, even with no instances registered.
         assert_eq!(
-            resolve_target(&hub, Some("explicit")).await,
-            Some("explicit".to_string())
+            resolve_target(&hub, Some("ghost")).await,
+            None,
+            "an id nobody holds resolves to nothing"
         );
 
-        // No explicit target → first registered instance.
-        hub.instances.lock().await.insert(
-            "only".into(),
-            InstanceInfo {
-                id: "only".into(),
-                pid: 1,
-                mode: "stdio".into(),
-                scope: "/w".into(),
-                label: "L".into(),
-                client: None,
-                session_id: None,
-                client_pid: None,
-                ended_epoch_ms: None,
-            },
+        hub.instances
+            .lock()
+            .await
+            .insert("live".into(), instance_with_mode("live", "stdio"));
+        assert_eq!(
+            resolve_target(&hub, Some("live")).await,
+            Some("live".to_string())
         );
-        assert_eq!(resolve_target(&hub, None).await, Some("only".to_string()));
+    }
+
+    /// With one attached client, picking "the first instance" was right by
+    /// construction. With three Claude Code windows it sent one window's answer
+    /// to another window's question; the hub now refuses to guess.
+    #[tokio::test]
+    async fn resolve_target_refuses_to_guess_among_several_instances() {
+        let (hub, _rx) = DaemonHub::new(None);
+        {
+            let mut instances = hub.instances.lock().await;
+            instances.insert("a".into(), instance_with_mode("a", "stdio"));
+            instances.insert("b".into(), instance_with_mode("b", "stdio"));
+        }
+        assert_eq!(
+            resolve_target(&hub, None).await,
+            None,
+            "an untargeted request among several sessions must not be guessed at"
+        );
+    }
+
+    /// Hooks and the TUI are not candidates for an untargeted request: a hook
+    /// has no agent loop to run a prompt, and the TUI is the thing asking. With
+    /// them excluded, one real session is still unambiguous.
+    #[tokio::test]
+    async fn resolve_target_ignores_hook_and_tui_instances() {
+        let (hub, _rx) = DaemonHub::new(None);
+        {
+            let mut instances = hub.instances.lock().await;
+            instances.insert("hook".into(), instance_with_mode("hook", "hook"));
+            instances.insert("tui".into(), instance_with_mode("tui", "tui"));
+            instances.insert("session".into(), instance_with_mode("session", "stdio"));
+        }
+        assert_eq!(
+            resolve_target(&hub, None).await,
+            Some("session".to_string())
+        );
+    }
+
+    /// An answer goes back to the session that asked, not to whichever instance
+    /// happens to be registered.
+    #[tokio::test]
+    async fn a_decision_routes_to_the_instance_that_raised_it() {
+        let (hub, _rx) = DaemonHub::new(None);
+        {
+            let mut instances = hub.instances.lock().await;
+            instances.insert("asker".into(), instance_with_mode("asker", "stdio"));
+            instances.insert("other".into(), instance_with_mode("other", "stdio"));
+        }
+        hub.pending_decisions
+            .lock()
+            .await
+            .insert("decision-1".into(), "asker".into());
+
+        assert_eq!(
+            instance_for_decision(&hub, "decision-1").await,
+            Some("asker".to_string())
+        );
+        assert_eq!(
+            instance_for_decision(&hub, "never-asked").await,
+            None,
+            "an unknown decision id must not fall back to an arbitrary instance"
+        );
     }
 
     // ── retention: output tails, ended instances, window and cap ──────────────
@@ -4005,6 +4216,88 @@ mod tests {
             interrupted.contains(&("in-flight".to_string(), true)),
             "an op still running when the daemon died is closed as interrupted, \
              neither left spinning forever nor called failed: {interrupted:?}"
+        );
+    }
+
+    /// A message a build does not understand is skipped, not fatal.
+    ///
+    /// This socket carries no version (R24.5), so a daemon left running across
+    /// an upgrade is the reader that decides — and it used to decide by
+    /// dropping the connection, which made every future message addition a hard
+    /// incompatibility. Skipping is the property that has to ship *before* any
+    /// new variant can.
+    #[tokio::test]
+    async fn an_unknown_message_type_is_skipped_and_the_next_one_still_arrives() {
+        let wire = concat!(
+            "{\"type\":\"SomethingFromTheFuture\",\"payload\":42}\n",
+            "{\"type\":\"Subscribe\"}\n"
+        );
+        let mut reader = BufReader::new(wire.as_bytes());
+        let msg: ClientMsg = recv_msg(&mut reader)
+            .await
+            .expect("the unknown line must not fail the connection");
+        assert!(
+            matches!(msg, ClientMsg::Subscribe),
+            "the next understood message is delivered, got {msg:?}"
+        );
+    }
+
+    /// Tolerance is for unknown *messages*, not for a broken stream: malformed
+    /// JSON is still an error, or a desynchronised connection would spin
+    /// forever pretending to make progress.
+    #[tokio::test]
+    async fn malformed_json_is_still_an_error() {
+        let mut reader = BufReader::new(&b"{not json at all\n"[..]);
+        assert!(
+            recv_msg::<_, ClientMsg>(&mut reader).await.is_err(),
+            "a broken line is a protocol error, not something to skip"
+        );
+    }
+
+    /// A subscriber that falls far enough behind drops messages — possibly an
+    /// `OpFinished`, which leaves a spinner that never resolves. The hub
+    /// repairs the gap by re-sending the authoritative state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lagging_subscriber_is_resynchronised_rather_than_left_with_a_hole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("lag.sock");
+        let server = HubServer::bind_at(sock.clone()).await.expect("bind");
+        let hub = server.hub.clone();
+        tokio::spawn(server.serve());
+
+        // An operation that ran and finished before anyone subscribed.
+        hub.instances.lock().await.insert(
+            "i1".into(),
+            InstanceInfo {
+                id: "i1".into(),
+                pid: 7,
+                mode: "stdio".into(),
+                scope: "/ws".into(),
+                label: "ahma".into(),
+                client: None,
+                session_id: None,
+                client_pid: None,
+                ended_epoch_ms: None,
+            },
+        );
+        hub.record_op_event("i1", &started_ev("op-1")).await;
+        hub.record_op_event("i1", &finished_ev("op-1", Some(now_epoch_ms())))
+            .await;
+
+        // A resync sends exactly what a fresh subscriber would get.
+        let mut buf: Vec<u8> = Vec::new();
+        resync_subscriber(&mut buf, &hub)
+            .await
+            .expect("resync writes");
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("\"type\":\"InstanceList\""),
+            "resync re-sends the instance list: {text}"
+        );
+        assert!(
+            text.contains("\"kind\":\"OpFinished\""),
+            "and the terminal event the subscriber may have missed: {text}"
         );
     }
 
