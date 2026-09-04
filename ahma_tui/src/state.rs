@@ -713,13 +713,18 @@ pub enum OpStatus {
     /// says which path was refused, and the user can re-raise the grant
     /// question from it (R-PERM.7.1).
     Denied,
+    /// Still running when the daemon watching it went away, and reconstructed
+    /// from the history file at the next start. Distinct from `Failed`: the
+    /// command may well have succeeded, and claiming it failed would be an
+    /// invention (SPEC R-DAEMON.7).
+    Interrupted,
 }
 
 impl OpStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Denied
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Denied | Self::Interrupted
         )
     }
 
@@ -733,9 +738,10 @@ impl OpStatus {
             Self::Failed => "Failed",
             Self::Cancelled => "Cancelled",
             Self::Waiting => "Waiting",
-            // A denial travels the wire as a failure plus a `denial` field, so
-            // the wire word stays "Failed" for pre-upgrade readers (R24.5).
-            Self::Denied => "Failed",
+            // A denial and an interruption travel the wire as a failure plus a
+            // field, so the wire word stays "Failed" for pre-upgrade readers
+            // (R24.5).
+            Self::Denied | Self::Interrupted => "Failed",
         }
     }
 
@@ -749,6 +755,8 @@ impl OpStatus {
                 Self::Cancelled => "⊘",
                 Self::Waiting => "⏸",
                 Self::Denied => "✗",
+                // Not a cross: nobody established that this failed.
+                Self::Interrupted => "⁉",
             }
         } else {
             match self {
@@ -759,6 +767,7 @@ impl OpStatus {
                 Self::Cancelled => "-",
                 Self::Waiting => "|",
                 Self::Denied => "x",
+                Self::Interrupted => "?",
             }
         }
     }

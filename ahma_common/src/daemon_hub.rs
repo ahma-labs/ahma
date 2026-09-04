@@ -272,6 +272,14 @@ pub enum DaemonEvent {
         /// see a failure (R24.5: the wire evolves by adding fields only).
         #[serde(default)]
         denial: Option<OpDenial>,
+        /// The operation did not finish so much as stop being observed: it was
+        /// still running when the daemon that was watching it went away, and
+        /// this record was reconstructed from the history file at the next
+        /// start. Its exit is genuinely unknown — the command may well have
+        /// completed — so a reader must say "interrupted", not "failed".
+        /// `status` stays `Failed` for readers that predate this field.
+        #[serde(default)]
+        interrupted: bool,
     },
     /// A single line of live output from a running operation.
     /// Streamed as the child process produces it, so subscribers (TUI) can
@@ -1046,6 +1054,9 @@ struct DaemonHub {
     /// What to run when a client sends [`ClientMsg::Shutdown`]. `None` means
     /// the historical behaviour: unlink our socket and `exit(0)`.
     exit_hook: parking_lot::Mutex<Option<ExitHook>>,
+    /// Appends operation history to disk so it outlives this process
+    /// (SPEC R-DAEMON.7). `None` keeps history in memory only.
+    history: parking_lot::Mutex<Option<Arc<crate::daemon_history::HistoryWriter>>>,
 }
 
 impl DaemonHub {
@@ -1064,6 +1075,7 @@ impl DaemonHub {
                 session_ids: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 ended_instances: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 exit_hook: parking_lot::Mutex::new(None),
+                history: parking_lot::Mutex::new(None),
             },
             rx,
         )
@@ -1121,6 +1133,33 @@ impl DaemonHub {
     /// Retain `started` as the new head of `op_id`'s history, enforcing the
     /// per-instance retention cap.
     async fn record_op_started(&self, instance_id: &str, op_id: &str, started: &DaemonEvent) {
+        let history = self.history.lock().clone();
+        if let Some(writer) = history {
+            // The instance travels with the record so a replayed op still has a
+            // section to belong to after a restart, when nothing is attached.
+            let instance = self
+                .instances
+                .lock()
+                .await
+                .get(instance_id)
+                .cloned()
+                .unwrap_or_else(|| InstanceInfo {
+                    id: instance_id.to_string(),
+                    pid: 0,
+                    mode: String::new(),
+                    scope: String::new(),
+                    label: String::new(),
+                    client: None,
+                    session_id: None,
+                    client_pid: None,
+                    ended_epoch_ms: None,
+                });
+            writer.record(crate::daemon_history::HistoryRecord::Started {
+                ts: now_epoch_ms(),
+                instance,
+                event: started.clone(),
+            });
+        }
         let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
         let mut hist = self.op_history.lock().await;
         let inst = hist.entry(instance_id.to_string()).or_default();
@@ -1157,6 +1196,22 @@ impl DaemonHub {
         };
         let mut hist = self.op_history.lock().await;
         let inst = hist.entry(instance_id.to_string()).or_default();
+        // One disk write per operation, at the end, carrying the output window
+        // as it finally stood — persisting each line would turn a chatty build
+        // into megabytes for a window that is bounded anyway.
+        let history = self.history.lock().clone();
+        if let Some(writer) = history {
+            let tail = inst
+                .get(op_id)
+                .map(|s| s.tail.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            writer.record(crate::daemon_history::HistoryRecord::Finished {
+                ts: now_epoch_ms(),
+                instance_id: instance_id.to_string(),
+                event: finished.clone(),
+                tail,
+            });
+        }
         match inst.get_mut(op_id) {
             Some(snap) => {
                 snap.finished = Some(finished.clone());
@@ -1178,6 +1233,106 @@ impl DaemonHub {
                     Self::evict_oldest_finished(inst);
                 }
             }
+        }
+    }
+
+    /// Restore history written by a previous daemon (SPEC R-DAEMON.7).
+    ///
+    /// An operation that has a start record but no terminal one was still
+    /// running when that daemon went away. Its real outcome is unknowable — the
+    /// command may well have finished — so it is closed as `interrupted`
+    /// rather than left running forever (a spinner that never resolves) or
+    /// called failed (an invention).
+    async fn load_history(&self, records: Vec<crate::daemon_history::HistoryRecord>) {
+        use crate::daemon_history::HistoryRecord as R;
+        let mut hist = self.op_history.lock().await;
+        let mut ended = self.ended_instances.lock().await;
+        let mut ended_at: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+        for record in records {
+            match record {
+                R::Started {
+                    instance, event, ..
+                } => {
+                    let Some(op_id) = op_id_of(&event) else {
+                        continue;
+                    };
+                    let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
+                    hist.entry(instance.id.clone()).or_default().insert(
+                        op_id,
+                        OpSnapshot {
+                            seq,
+                            started: event,
+                            finished: None,
+                            tail: std::collections::VecDeque::new(),
+                            finished_at_ms: None,
+                        },
+                    );
+                    ended.entry(instance.id.clone()).or_insert(instance);
+                }
+                R::Finished {
+                    ts,
+                    instance_id,
+                    event,
+                    tail,
+                } => {
+                    let Some(op_id) = op_id_of(&event) else {
+                        continue;
+                    };
+                    if let Some(snap) = hist.get_mut(&instance_id).and_then(|i| i.get_mut(&op_id)) {
+                        snap.finished = Some(event);
+                        snap.finished_at_ms = Some(ts);
+                        snap.tail = tail.into_iter().collect();
+                    }
+                }
+                R::InstanceEnded { ts, instance_id } => {
+                    ended_at.insert(instance_id, ts);
+                }
+            }
+        }
+
+        for (id, info) in ended.iter_mut() {
+            // Nothing loaded from disk is attached: this daemon has only just
+            // started. Anything without a recorded end is stamped now, so it
+            // still ages out of the window.
+            info.ended_epoch_ms = Some(
+                ended_at
+                    .get(id)
+                    .copied()
+                    .or(info.ended_epoch_ms)
+                    .unwrap_or_else(now_epoch_ms),
+            );
+        }
+
+        let mut interrupted = 0usize;
+        for ops in hist.values_mut() {
+            for snap in ops.values_mut() {
+                if snap.finished.is_some() {
+                    continue;
+                }
+                let Some(op_id) = op_id_of(&snap.started) else {
+                    continue;
+                };
+                interrupted += 1;
+                snap.finished_at_ms = Some(now_epoch_ms());
+                snap.finished = Some(DaemonEvent::OpFinished {
+                    id: op_id,
+                    // "Failed" is what a reader that predates `interrupted`
+                    // sees; a current one renders the flag instead (R24.5).
+                    status: OpStatus::Failed,
+                    result_summary: Some(
+                        "interrupted: the daemon watching this operation exited".to_string(),
+                    ),
+                    duration_ms: 0,
+                    ended_epoch_ms: snap.finished_at_ms,
+                    exit_code: None,
+                    denial: None,
+                    interrupted: true,
+                });
+            }
+        }
+        if interrupted > 0 {
+            info!("ahma hub: {interrupted} operation(s) restored as interrupted");
         }
     }
 
@@ -1404,6 +1559,31 @@ impl HubServer {
     /// hub is the whole process.
     pub fn set_exit_hook(&self, hook: ExitHook) {
         *self.hub.exit_hook.lock() = Some(hook);
+    }
+
+    /// Load the recent on-disk history and start persisting to it.
+    ///
+    /// Returns the writer so the caller can flush it on the way out; `None`
+    /// when no path is available, in which case history is in-memory only — a
+    /// degraded mode, not a failure.
+    pub async fn attach_history(
+        &self,
+        path: Option<PathBuf>,
+    ) -> Option<Arc<crate::daemon_history::HistoryWriter>> {
+        let path = path?;
+        let cutoff = crate::daemon_history::replay_cutoff_ms(now_epoch_ms());
+        let records = crate::daemon_history::load_recent(&path, cutoff).await;
+        if !records.is_empty() {
+            info!(
+                "ahma hub: restoring {} history record(s) from {}",
+                records.len(),
+                path.display()
+            );
+            self.hub.load_history(records).await;
+        }
+        let writer = Arc::new(crate::daemon_history::HistoryWriter::start(Some(path))?);
+        *self.hub.history.lock() = Some(writer.clone());
+        Some(writer)
     }
 
     /// The standalone `ahma daemon`'s idle policy: exit once nothing has been
@@ -2207,6 +2387,7 @@ mod tests {
             ended_epoch_ms: None,
             exit_code: Some(101),
             denial: None,
+            interrupted: false,
         };
         let back: DaemonEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         match back {
@@ -2493,6 +2674,7 @@ mod tests {
                 ended_epoch_ms: None,
                 exit_code: None,
                 denial: None,
+                interrupted: false,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -2781,6 +2963,7 @@ mod tests {
                     ended_epoch_ms: None,
                     exit_code: None,
                     denial: None,
+                    interrupted: false,
                 },
             },
         )
@@ -2922,6 +3105,7 @@ mod tests {
                 ended_epoch_ms: None,
                 exit_code: None,
                 denial: None,
+                interrupted: false,
             },
         )
         .await;
@@ -3286,6 +3470,7 @@ mod tests {
                     ended_epoch_ms: None,
                     exit_code: None,
                     denial: None,
+                    interrupted: false,
                 },
             )
             .await;
@@ -3456,6 +3641,7 @@ mod tests {
             ended_epoch_ms,
             exit_code: Some(0),
             denial: None,
+            interrupted: false,
         }
     }
 
@@ -3709,6 +3895,116 @@ mod tests {
                 }
             )),
             "and its outcome still replays"
+        );
+    }
+
+    /// The daemon exits when idle, so without a file "what ran twenty minutes
+    /// ago" is answerable only while the process that saw it happen is still
+    /// alive. A fresh daemon must restore the window from disk — including the
+    /// output tail, and including operations that were still running when the
+    /// previous daemon went away (SPEC R-DAEMON.7).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fresh_hub_replays_the_last_hour_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let history = tmp.path().join("history.jsonl");
+
+        // ── Daemon 1: does some work, then goes away mid-operation ───────────
+        {
+            let server = HubServer::bind_at(tmp.path().join("first.sock"))
+                .await
+                .expect("bind");
+            let writer = server
+                .attach_history(Some(history.clone()))
+                .await
+                .expect("history writer");
+            let hub = server.hub.clone();
+            hub.instances.lock().await.insert(
+                "i1".into(),
+                InstanceInfo {
+                    id: "i1".into(),
+                    pid: 7,
+                    mode: "stdio".into(),
+                    scope: "/ws".into(),
+                    label: "ahma".into(),
+                    client: Some("claude-code".into()),
+                    session_id: Some("sess-1".into()),
+                    client_pid: Some(11),
+                    ended_epoch_ms: None,
+                },
+            );
+            hub.record_op_event("i1", &started_ev("done")).await;
+            hub.record_op_event(
+                "i1",
+                &DaemonEvent::OpOutput {
+                    id: "done".into(),
+                    line: "Compiling ahma_core".into(),
+                    is_stderr: false,
+                },
+            )
+            .await;
+            hub.record_op_event("i1", &finished_ev("done", Some(now_epoch_ms())))
+                .await;
+            // ...and one that never finishes: the daemon dies under it.
+            hub.record_op_event("i1", &started_ev("in-flight")).await;
+            writer.flush().await;
+        }
+
+        // ── Daemon 2: a fresh process, nothing attached ──────────────────────
+        let server = HubServer::bind_at(tmp.path().join("second.sock"))
+            .await
+            .expect("bind");
+        server
+            .attach_history(Some(history.clone()))
+            .await
+            .expect("history writer");
+
+        let listed = server.hub.instance_snapshot().await;
+        assert_eq!(listed.len(), 1, "the instance is restored: {listed:?}");
+        assert_eq!(listed[0].client.as_deref(), Some("claude-code"));
+        assert!(
+            listed[0].ended_epoch_ms.is_some(),
+            "restored instances are historic, not attached"
+        );
+
+        let replay = server.hub.replay_events().await;
+        let output: Vec<String> = replay
+            .iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Event {
+                    payload: DaemonEvent::OpOutput { line, .. },
+                    ..
+                } => Some(line.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            output,
+            vec!["Compiling ahma_core".to_string()],
+            "the output window survives the restart"
+        );
+
+        let interrupted: Vec<(String, bool)> = replay
+            .iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Event {
+                    payload:
+                        DaemonEvent::OpFinished {
+                            id, interrupted, ..
+                        },
+                    ..
+                } => Some((id.clone(), *interrupted)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            interrupted.contains(&("done".to_string(), false)),
+            "a completed op replays as completed: {interrupted:?}"
+        );
+        assert!(
+            interrupted.contains(&("in-flight".to_string(), true)),
+            "an op still running when the daemon died is closed as interrupted, \
+             neither left spinning forever nor called failed: {interrupted:?}"
         );
     }
 
@@ -4276,6 +4572,7 @@ mod tests {
                     ended_epoch_ms: None,
                     exit_code: None,
                     denial: None,
+                    interrupted: false,
                 },
             },
         )

@@ -1228,6 +1228,7 @@ fn format_recent_ops(operations: &[crate::state::Operation]) -> String {
                 OpStatus::Cancelled => "cancelled",
                 OpStatus::Waiting => "waiting",
                 OpStatus::Denied => "DENIED (sandbox)",
+                OpStatus::Interrupted => "interrupted (outcome unknown)",
             };
             let name = op.display_name();
             let elapsed = op.elapsed_display();
@@ -3928,7 +3929,9 @@ fn window_status_for(op: &crate::state::Operation) -> crate::state::WindowStatus
         OpStatus::Pending | OpStatus::Waiting => WindowStatus::Pending,
         OpStatus::Succeeded => WindowStatus::Finished,
         OpStatus::Failed | OpStatus::Denied => WindowStatus::Error,
-        OpStatus::Cancelled => WindowStatus::Cancelled,
+        // Cancelled, not Error: an interrupted operation was not observed to
+        // fail, and colouring it red would assert something we do not know.
+        OpStatus::Cancelled | OpStatus::Interrupted => WindowStatus::Cancelled,
     }
 }
 

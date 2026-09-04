@@ -188,6 +188,9 @@ impl Theme {
                 OpStatus::Pending => self.pending(),
                 OpStatus::Waiting => self.waiting(),
                 OpStatus::Cancelled => self.cancelled(),
+                // Dimmed, not red: an interruption is an absence of knowledge,
+                // not an observed failure.
+                OpStatus::Interrupted => self.waiting(),
             }
         })
     }

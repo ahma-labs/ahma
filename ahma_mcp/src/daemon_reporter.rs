@@ -491,6 +491,7 @@ async fn replay_completed_operations(
                 // Replay carries denials too, so a TUI opened after the fact
                 // still sees which path was refused (SPEC R-PERM.7).
                 denial,
+                interrupted: false,
             },
         };
         if send_msg(writer, &finished_ev).await.is_err() {
@@ -832,6 +833,7 @@ fn daemon_event_for(
             // "Completed" without a code is not actionable; `exit 0` is.
             exit_code: exit_code_from_value(result),
             denial: None,
+            interrupted: false,
         },
         Ev::Failed {
             operation_id,
@@ -850,6 +852,7 @@ fn daemon_event_for(
             // A sandbox denial is a different thing from a failure and must say
             // so on every surface (SPEC R-PERM.7).
             denial: denial_from_text(error),
+            interrupted: false,
         },
         Ev::Cancelled {
             operation_id,
@@ -863,6 +866,7 @@ fn daemon_event_for(
             ended_epoch_ms: now_ms,
             exit_code: None,
             denial: None,
+            interrupted: false,
         },
         Ev::TimedOut {
             operation_id,
@@ -875,6 +879,7 @@ fn daemon_event_for(
             ended_epoch_ms: now_ms,
             exit_code: None,
             denial: None,
+            interrupted: false,
         },
         _ => return None,
     })
@@ -1115,6 +1120,7 @@ mod tests {
             result_summary,
             ended_epoch_ms,
             exit_code: None,
+            interrupted: false,
         }) = daemon_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");

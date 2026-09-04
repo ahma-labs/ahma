@@ -79,7 +79,12 @@ impl GroupCounts {
             OpStatus::Running => self.running += 1,
             OpStatus::Pending | OpStatus::Waiting => self.queued += 1,
             OpStatus::Succeeded => self.succeeded += 1,
-            OpStatus::Failed | OpStatus::Cancelled | OpStatus::Denied => self.failed += 1,
+            // An interrupted op is counted with the failures because it did
+            // not finish, and a header that hid it would under-report what the
+            // section contains; the row itself still says "interrupted".
+            OpStatus::Failed | OpStatus::Cancelled | OpStatus::Denied | OpStatus::Interrupted => {
+                self.failed += 1
+            }
         }
     }
 

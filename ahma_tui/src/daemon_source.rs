@@ -217,16 +217,20 @@ impl DaemonState {
         ended_epoch_ms: Option<u64>,
         exit_code: Option<i64>,
         denial: Option<ahma_common::daemon_hub::OpDenial>,
+        interrupted: bool,
     ) {
         if let Some(instance_ops) = self.ops.get_mut(instance_id)
             && let Some(op) = instance_ops.get_mut(op_id)
         {
-            // A denial arrives as status "Failed" plus the denial field (the
-            // wire evolves by adding fields only, R24.5). The richer local
-            // status wins so the row can say `denied: <path>`.
-            op.status = match &denial {
-                Some(_) => OpStatus::Denied,
-                None => parse_op_status(status),
+            // A denial and an interruption both arrive as status "Failed" plus
+            // a field (the wire evolves by adding fields only, R24.5). The
+            // richer local status wins, so the row can say `denied: <path>` or
+            // `interrupted` rather than claiming a failure that may not have
+            // happened.
+            op.status = match (&denial, interrupted) {
+                (Some(_), _) => OpStatus::Denied,
+                (None, true) => OpStatus::Interrupted,
+                (None, false) => parse_op_status(status),
             };
             op.denial = denial.map(|d| (d.path, d.access));
             op.result_summary = result_summary;
@@ -500,6 +504,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 ended_epoch_ms,
                 exit_code,
                 denial,
+                interrupted,
             } => {
                 state.on_op_finished(
                     &instance_id,
@@ -510,6 +515,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                     ended_epoch_ms,
                     exit_code,
                     denial,
+                    interrupted,
                 );
                 Applied::ListChanged
             }
@@ -694,6 +700,7 @@ mod tests {
             None,
             Some(0),
             None,
+            false,
         );
 
         let ops = s.all_ops();
@@ -717,6 +724,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
     }
 
@@ -751,6 +759,7 @@ mod tests {
                 path: "/etc".into(),
                 access: ahma_common::config::ScopeAccess::Rw,
             }),
+            false,
         );
 
         let ops = s.all_ops();
@@ -793,6 +802,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(s.all_ops()[0].status, OpStatus::Failed);
     }
@@ -830,6 +840,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let ops = s.all_ops();
@@ -903,6 +914,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         // Stamp op-2's completion now, then let real time pass past a tiny
@@ -1033,6 +1045,7 @@ mod tests {
                     ended_epoch_ms: None,
                     exit_code: None,
                     denial: None,
+                    interrupted: false,
                 },
             },
         );
@@ -1247,6 +1260,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         s.prune_terminal();
         let ops = s.all_ops();
@@ -1978,6 +1992,7 @@ mod tests {
                     ended_epoch_ms: None,
                     exit_code: None,
                     denial: None,
+                    interrupted: false,
                 },
             },
         )
