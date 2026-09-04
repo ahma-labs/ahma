@@ -719,7 +719,7 @@ impl AhmaMcpService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahma_common::timeouts::TestTimeouts;
+
     use tempfile::TempDir;
 
     // ── parse_root_uri_to_scope ──────────────────────────────────────────────
@@ -881,7 +881,7 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::Arc;
 
-        let monitor_config = MonitorConfig::with_timeout(TestTimeouts::scale_secs(300));
+        let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
         let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
         let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
         let sandbox = Arc::new(

@@ -71,12 +71,12 @@ pub use agent::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahma_common::timeouts::TestTimeouts;
+
     use std::time::Duration;
 
     #[test]
     fn reexported_monitor_config_is_constructible() {
-        let config = MonitorConfig::with_timeout(TestTimeouts::scale_secs(7));
+        let config = MonitorConfig::with_timeout(Duration::from_secs(7));
 
         assert_eq!(config.default_timeout, Duration::from_secs(7));
         assert_eq!(config.shutdown_timeout, Duration::from_secs(30));

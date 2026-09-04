@@ -2045,7 +2045,6 @@ async fn process_streaming_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahma_common::timeouts::TestTimeouts;
 
     /// The CPU liveness probe must always fire *inside* the idle budget.
     ///
@@ -2203,7 +2202,7 @@ mod tests {
     #[test]
     fn test_adapter_new() {
         let monitor = Arc::new(OperationMonitor::new(
-            crate::operation_monitor::MonitorConfig::with_timeout(TestTimeouts::scale_secs(30)),
+            crate::operation_monitor::MonitorConfig::with_timeout(Duration::from_secs(30)),
         ));
         let shell_pool = Arc::new(ShellPoolManager::new(
             crate::shell_pool::ShellPoolConfig::default(),
@@ -2226,7 +2225,7 @@ mod tests {
     #[test]
     fn test_adapter_with_retry_config() {
         let monitor = Arc::new(OperationMonitor::new(
-            crate::operation_monitor::MonitorConfig::with_timeout(TestTimeouts::scale_secs(30)),
+            crate::operation_monitor::MonitorConfig::with_timeout(Duration::from_secs(30)),
         ));
         let shell_pool = Arc::new(ShellPoolManager::new(
             crate::shell_pool::ShellPoolConfig::default(),
@@ -2251,7 +2250,7 @@ mod tests {
     #[test]
     fn test_adapter_sandbox_accessors() {
         let monitor = Arc::new(OperationMonitor::new(
-            crate::operation_monitor::MonitorConfig::with_timeout(TestTimeouts::scale_secs(30)),
+            crate::operation_monitor::MonitorConfig::with_timeout(Duration::from_secs(30)),
         ));
         let shell_pool = Arc::new(ShellPoolManager::new(
             crate::shell_pool::ShellPoolConfig::default(),
@@ -2276,7 +2275,7 @@ mod tests {
     #[tokio::test]
     async fn test_adapter_shutdown_empty() {
         let monitor = Arc::new(OperationMonitor::new(
-            crate::operation_monitor::MonitorConfig::with_timeout(TestTimeouts::scale_secs(30)),
+            crate::operation_monitor::MonitorConfig::with_timeout(Duration::from_secs(30)),
         ));
         let shell_pool = Arc::new(ShellPoolManager::new(
             crate::shell_pool::ShellPoolConfig::default(),
