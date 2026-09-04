@@ -79,12 +79,21 @@ async fn test_filesystem_overrides_bundled_tool() {
     );
 }
 
-/// Verify that reserved tool names (core built-in tools) are rejected from .ahma/ files.
+/// Verify that a workspace tool colliding with a built-in is rejected from
+/// `.ahma/` files.
+///
+/// Iterates **every** built-in name rather than a hand-picked handful. The
+/// hand-picked version of this test covered four names and passed for months
+/// while the reserved list was five names short of the actual built-in set:
+/// a workspace tool named `sandbox_grant` loaded without complaint and was
+/// then dropped from `tools/list` by the dedup filter, so the user got no
+/// error and no tool. Driving the loop from the canonical list means the
+/// coverage cannot fall behind the tool set again.
 #[tokio::test]
 async fn test_reserved_names_rejected() {
     let temp_dir = tempdir().unwrap();
 
-    for reserved in &["await", "status", "run_terminal_command", "cancel"] {
+    for reserved in ahma_mcp::constants::BUILTIN_TOOL_NAMES {
         let config = format!(
             r#"{{
   "name": "{}",
@@ -101,7 +110,7 @@ async fn test_reserved_names_rejected() {
         let result = load_tool_configs(&config, Some(temp_dir.path())).await;
         assert!(
             result.is_err(),
-            "Reserved name '{}' should be rejected",
+            "a workspace tool named '{}' collides with the built-in of that name and must be refused",
             reserved
         );
 

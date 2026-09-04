@@ -246,6 +246,27 @@ fn tool_info_from_tool(tool: Tool) -> crate::mcp_client::ToolInfo {
     }
 }
 
+/// Build a `Tool` whose title is its own name.
+///
+/// Every tool ahma advertises does this — the built-ins below, the
+/// configured tools, the flattened subcommands, and the external MCP tools
+/// it re-exports. MCP treats `title` as a display name that falls back to
+/// `name` when absent, so "title == name" and "no title" render the same;
+/// what the field buys is that a client never has to know about the
+/// fallback. Naming that intent once stops the pair drifting, which the
+/// twenty hand-written `.with_title("<the name again>")` calls this
+/// replaced could not.
+fn self_titled_tool<N, D, S>(name: N, description: D, input_schema: S) -> Tool
+where
+    N: Into<std::borrow::Cow<'static, str>>,
+    D: Into<std::borrow::Cow<'static, str>>,
+    S: Into<std::sync::Arc<rmcp::model::JsonObject>>,
+{
+    let name = name.into();
+    let title = name.to_string();
+    Tool::new(name, description, input_schema).with_title(title)
+}
+
 impl AhmaMcpService {
     /// Whether the bridge in front of this subprocess (if any) currently has
     /// a live push channel open to the real client. See the
@@ -398,140 +419,137 @@ impl AhmaMcpService {
     fn build_builtin_tools(&self) -> Vec<Tool> {
         vec![
             // Hard-wired await command - always available
-            Tool::new(
+            self_titled_tool(
                 "await",
                 "Block until a started operation completes and return its final result. Operations notify automatically when they finish, so prefer doing other useful work first; reach for `await` only when the next step truly depends on the result.",
                 self.generate_input_schema_for_wait(),
-            )
-            .with_title("await"),
+            ),
             // Hard-wired status command - always available
-            Tool::new(
+            self_titled_tool(
                 "status",
                 "Return a snapshot of active and completed operations without blocking. Completion is pushed via notifications, so this is for ad-hoc inspection rather than polling.",
                 self.generate_input_schema_for_status(),
-            )
-            .with_title("status"),
+            ),
             // Hard-wired run_terminal_command command - always available
-            Tool::new(
+            self_titled_tool(
                 "run_terminal_command",
                 "Run a shell command inside a kernel-level filesystem sandbox (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows). Returns an operation_id immediately; use `status`, `await`, or `cancel` to manage long-running work. Supports pipes, redirects, environment variables, and full shell syntax. Set `monitor_level` to stream error/warning alerts from stdout or stderr.",
                 self.generate_input_schema_for_run_terminal_command(),
-            )
-            .with_title("run_terminal_command"),
+            ),
             // Hard-wired log inspection tools — always available
-            Tool::new(
+            self_titled_tool(
                 "logs_list",
                 "List all log files in the project log directory (`./logs/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.",
                 handlers::log_tools::logs_list_schema(),
-            )
-            .with_title("logs_list"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "logs_approve",
                 "Approve a blocked out-of-scope log symlink target to allow AI read access.",
                 handlers::log_tools::logs_approve_schema(),
-            )
-            .with_title("logs_approve"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "logs_read",
                 "Read lines from a project log file with optional pagination. Sensitive values (tokens, passwords, API keys) are redacted by default. Use `raw: true` only when debugging credential issues.",
                 handlers::log_tools::logs_read_schema(),
-            )
-            .with_title("logs_read"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "logs_search",
                 "Search a project log file for lines matching a pattern (case-insensitive substring match by default). Returns matching lines with line numbers. Sensitive values are redacted by default.",
                 handlers::log_tools::logs_search_schema(),
-            )
-            .with_title("logs_search"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "restart",
                 "Force stop and restart the background bridge server, disconnecting all active sessions (including TUI and other IDEs) to apply updates or recover from a bad state.",
                 handlers::restart_tool::restart_schema(),
-            )
-            .with_title("restart"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "cancel",
                 "Cancel a running background operation by `id`, or cancel EVERY in-flight operation with `all: true`. Each cancellation reaps the operation's full process tree (cargo/rustc/sccache) — the clean way to stop wedged work without killing and restarting the server.",
                 handlers::cancel_tool::cancel_schema(),
-            )
-            .with_title("cancel"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "sandbox_grant",
                 "Propose adding an out-of-scope path as a persistent sandbox root in ~/.ahma/settings.toml. Call this when a command fails with a `sandbox_denial` error. WITHOUT `confirm: true` it only PREVIEWS — it returns the full settings-file path, the exact line it would add, and a risk assessment so you can show the human and get approval first. Catastrophic paths (filesystem root, $HOME, credential dirs, system dirs, workspace parents) are REFUSED even with confirmation. On `confirm: true` it writes the grant; run `restart` to apply, then re-run the blocked command.",
                 handlers::sandbox_grant_tool::sandbox_grant_schema(),
-            )
-            .with_title("sandbox_grant"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "read_file",
                 "Read UTF-8 text from a scoped file, with optional line slicing.",
                 handlers::harness_tools::read_file_schema(),
-            )
-            .with_title("read_file"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "list_dir",
                 "List entries in a scoped directory with basic metadata.",
                 handlers::harness_tools::list_dir_schema(),
-            )
-            .with_title("list_dir"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "file_search",
                 "Find files by glob pattern inside the sandbox scope.",
                 handlers::harness_tools::file_search_schema(),
-            )
-            .with_title("file_search"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "grep_search",
                 "Search file contents by plain text or regex.",
                 handlers::harness_tools::grep_search_schema(),
-            )
-            .with_title("grep_search"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "fetch_webpage",
                 "Fetch and extract readable text from an HTTP/HTTPS webpage.",
                 handlers::harness_tools::fetch_webpage_schema(),
-            )
-            .with_title("fetch_webpage"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "write_file",
                 "Write UTF-8 content to a scoped file (create or overwrite).",
                 handlers::harness_tools::write_file_schema(),
-            )
-            .with_title("write_file"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "replace_in_file",
                 "Replace exact string occurrences in a scoped UTF-8 file.",
                 handlers::harness_tools::replace_in_file_schema(),
-            )
-            .with_title("replace_in_file"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "agent",
                 "Delegate a self-contained task to ahma's own agent loop as a sub-agent. ahma runs its full tool-using loop (read/edit files, run commands in the sandbox, search) with the model the user last selected in `ahma tui`, and returns the final answer. Use this to offload a focused sub-task — investigating code, producing a file or report, or answering a question grounded in the workspace — without doing the steps yourself.",
                 handlers::agent_tool::agent_schema(),
-            )
-            .with_title("agent"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "todo_write",
                 "Record or update your task plan as a checklist. Pass the FULL list of steps each time — it replaces the current plan. Use this at the start of any multi-step task, then call it again to mark a step in_progress before you work on it and completed when it's done. Keeps you (and the user) oriented across turns.",
                 handlers::todo_tool::todo_write_schema(),
-            )
-            .with_title("todo_write"),
-            Tool::new(
+            ),
+            self_titled_tool(
                 "log_monitor",
                 "Start a real-time log monitoring session on a file inside the sandbox. Reads new lines as they are written, runs them through the AI for issue detection, and sends alerts.",
                 schema::object_input_schema(
                     {
                         let mut props = serde_json::Map::new();
-                        props.insert("file_path".to_string(), schema::string_property("Path of the log file to monitor (within sandbox scope)"));
-                        props.insert("detection_prompt".to_string(), schema::string_property("Optional prompt guiding AI issue detection"));
-                        props.insert("llm_base_url".to_string(), schema::string_property("Optional custom LLM base URL"));
-                        props.insert("llm_model".to_string(), schema::string_property("Optional custom LLM model"));
-                        props.insert("llm_api_key".to_string(), schema::string_property("Optional custom LLM API key"));
+                        props.insert(
+                            "file_path".to_string(),
+                            schema::string_property(
+                                "Path of the log file to monitor (within sandbox scope)",
+                            ),
+                        );
+                        props.insert(
+                            "detection_prompt".to_string(),
+                            schema::string_property("Optional prompt guiding AI issue detection"),
+                        );
+                        props.insert(
+                            "llm_base_url".to_string(),
+                            schema::string_property("Optional custom LLM base URL"),
+                        );
+                        props.insert(
+                            "llm_model".to_string(),
+                            schema::string_property("Optional custom LLM model"),
+                        );
+                        props.insert(
+                            "llm_api_key".to_string(),
+                            schema::string_property("Optional custom LLM API key"),
+                        );
                         props
                     },
                     &["file_path"],
                 ),
-            )
-            .with_title("log_monitor"),
+            ),
         ]
     }
 
@@ -989,7 +1007,7 @@ impl AhmaMcpService {
         let base_name = &tool_config.name;
         let description = self.tool_description(tool_config, base_name);
         let input_schema = schema::generate_schema_for_tool_config(tool_config);
-        Tool::new(base_name.clone(), description, input_schema).with_title(base_name.clone())
+        self_titled_tool(base_name.clone(), description, input_schema)
     }
 
     fn flattened_subcommand_description(
@@ -1018,7 +1036,7 @@ impl AhmaMcpService {
             tool_config,
             &(sub_path.to_string(), subcommand_config),
         ));
-        Tool::new(flat_name.clone(), description, input_schema).with_title(flat_name)
+        self_titled_tool(flat_name, description, input_schema)
     }
 
     /// Creates MCP Tools from a ToolConfig.
@@ -1092,39 +1110,15 @@ impl AhmaMcpService {
     /// Names that are always hard-wired in the protocol layer and must not
     /// appear in user/bundled configs (we skip duplicates here).
     ///
-    /// This MUST stay in sync with [`Self::builtin_tools`], the canonical
-    /// source of truth for the built-in tool set. It cannot simply be
-    /// derived from `builtin_tools()` because both use sites (below, and
-    /// `harness_guard_preprocess`) need a `&'static [&'static str]`/`&str`
-    /// slice cheaply and repeatedly (the latter inside per-call name
-    /// healing), whereas `builtin_tools()` rebuilds full `Tool` values
-    /// (including JSON schemas) on every call. This list has drifted from
-    /// `builtin_tools()` twice before (see the comment on `builtin_tools`);
-    /// `hardcoded_tools_match_builtin_tools` below asserts the two name sets
-    /// are identical so a third drift fails CI instead of silently
-    /// under-filtering/under-healing tool names.
-    const HARDCODED_TOOLS: &'static [&'static str] = &[
-        "await",
-        "status",
-        "run_terminal_command",
-        "logs_list",
-        "logs_approve",
-        "logs_read",
-        "logs_search",
-        "restart",
-        "cancel",
-        "sandbox_grant",
-        "read_file",
-        "list_dir",
-        "file_search",
-        "grep_search",
-        "fetch_webpage",
-        "write_file",
-        "replace_in_file",
-        "agent",
-        "todo_write",
-        "log_monitor",
-    ];
+    /// A cheap `&'static [&'static str]` alias for
+    /// [`crate::constants::BUILTIN_TOOL_NAMES`]. Both use sites — the filter
+    /// below and `harness_guard_preprocess`, the latter inside per-call name
+    /// healing — need the names as a slice repeatedly, whereas
+    /// [`Self::builtin_tools`] rebuilds full `Tool` values (including JSON
+    /// schemas) on every call. `hardcoded_tools_match_builtin_tools` asserts
+    /// the two still agree, so a name added to `builtin_tools()` alone fails
+    /// CI instead of silently under-filtering and under-healing.
+    const HARDCODED_TOOLS: &'static [&'static str] = crate::constants::BUILTIN_TOOL_NAMES;
 
     /// Returns true if a configured tool should be exposed to the client
     /// given the current disclosure state. Centralises the filter so
@@ -1782,14 +1776,11 @@ fn append_external_mcp_tools(
             _ => serde_json::Map::new(),
         };
         let schema_arc = Arc::new(input_schema);
-        tools.push(
-            Tool::new(
-                ext_tool.name.clone(),
-                description.unwrap_or_default(),
-                schema_arc,
-            )
-            .with_title(ext_tool.name.clone()),
-        );
+        tools.push(self_titled_tool(
+            ext_tool.name.clone(),
+            description.unwrap_or_default(),
+            schema_arc,
+        ));
     }
 }
 
@@ -3521,6 +3512,18 @@ mod tests {
             builtin_names, hardcoded_names,
             "HARDCODED_TOOLS has drifted from builtin_tools() — keep them in sync"
         );
+
+        // Every advertised tool carries a title, and it is the tool's own name.
+        // Checking only the names left this unguarded: a mistyped title would
+        // have shipped a display name that matched no tool.
+        for tool in service.builtin_tools() {
+            assert_eq!(
+                tool.title.as_deref(),
+                Some(tool.name.as_ref()),
+                "builtin `{}` must be titled with its own name",
+                tool.name
+            );
+        }
     }
 
     #[tokio::test]

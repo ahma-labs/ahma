@@ -44,23 +44,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{collections::HashMap, path::Path};
 
-const RESERVED_TOOL_NAMES: &[&str] = &[
-    "await",
-    "status",
-    "run_terminal_command",
-    "cancel",
-    "restart",
-    "logs_list",
-    "logs_read",
-    "logs_search",
-    "read_file",
-    "list_dir",
-    "file_search",
-    "grep_search",
-    "fetch_webpage",
-    "write_file",
-    "replace_in_file",
-];
+/// Names a configured tool may not take, because ahma answers them itself.
+///
+/// Derived from [`crate::constants::BUILTIN_TOOL_NAMES`] rather than retyped:
+/// the hand-maintained copy this replaced was five names short of the actual
+/// built-in set.
+const RESERVED_TOOL_NAMES: &[&str] = crate::constants::BUILTIN_TOOL_NAMES;
 const TOOL_CONFIG_READ_MAX_ATTEMPTS: usize = 8;
 const TOOL_CONFIG_READ_BACKOFF_MS: u64 = 40;
 
