@@ -743,7 +743,7 @@ fn safe_update(args: &[String]) {
     // Discover direct dependency candidates so we know which ones need Cargo.toml updates
     let direct_upgrades: std::collections::HashSet<String> = proposed_upgrades(&root, &opts)
         .into_iter()
-        .map(|(name, _, _)| name)
+        .map(|u| u.name)
         .collect();
 
     // Discover all lockfile upgrades (direct + transitive)
@@ -1335,15 +1335,21 @@ fn evaluate_one_candidate(
 
 fn evaluate_candidates(
     root: &Path,
-    candidates: &[(String, String, String)],
+    candidates: &[Upgrade],
     vulnerable_pairs: &std::collections::HashSet<(String, String)>,
     opts: &SafeUpdateOpts,
 ) -> (Vec<Row>, Vec<Upgrade>) {
     let mut rows = Vec::with_capacity(candidates.len());
     let mut to_apply = Vec::new();
-    for (name, old_ver, new_ver) in candidates {
-        let (row, apply) =
-            evaluate_one_candidate(root, name, old_ver, new_ver, vulnerable_pairs, opts);
+    for candidate in candidates {
+        let (row, apply) = evaluate_one_candidate(
+            root,
+            &candidate.name,
+            &candidate.old_ver,
+            &candidate.new_ver,
+            vulnerable_pairs,
+            opts,
+        );
         rows.push(row);
         if let Some(up) = apply {
             to_apply.push(up);
@@ -1380,14 +1386,14 @@ fn check_prereqs() {
 }
 
 /// Run `cargo upgrade --dry-run` (cargo-edit ≥0.12) and parse its output into
-/// a list of `(name, old_version, new_version)` triples.
+/// a list of [`Upgrade`]s.
 ///
 /// Supports cargo-edit output formats:
 /// - Table (≥0.13): `name old_req compatible latest new_req`
 /// - Legacy arrow: `serde 1.0.210 -> 1.0.215` or `Upgrading serde v1.0.210 -> v1.0.215`
 ///
 /// For safe updates we target the **compatible** column (not `new_req` when it is a major bump).
-fn proposed_upgrades(root: &Path, opts: &SafeUpdateOpts) -> Vec<(String, String, String)> {
+fn proposed_upgrades(root: &Path, opts: &SafeUpdateOpts) -> Vec<Upgrade> {
     let mut cmd = std::process::Command::new("cargo");
     cmd.args([
         "upgrade",
@@ -1420,17 +1426,17 @@ fn proposed_upgrades(root: &Path, opts: &SafeUpdateOpts) -> Vec<(String, String,
     combined
         .lines()
         .filter_map(|line| {
-            upgrade_triple_from_table_line(line, &table_re)
-                .or_else(|| upgrade_triple_from_arrow_line(line, &arrow_re))
+            upgrade_from_table_line(line, &table_re)
+                .or_else(|| upgrade_from_arrow_line(line, &arrow_re))
         })
-        .filter(|(name, _, _)| passes_upgrade_filters(name, opts))
-        .filter(|(name, _, _)| seen.insert(name.clone()))
+        .filter(|u| passes_upgrade_filters(&u.name, opts))
+        .filter(|u| seen.insert(u.name.clone()))
         .collect()
 }
 
 /// Run `cargo update --dry-run` and parse its output to discover upgrades for both direct
 /// and transitive/upstream dependencies.
-fn proposed_lockfile_updates(root: &Path, opts: &SafeUpdateOpts) -> Vec<(String, String, String)> {
+fn proposed_lockfile_updates(root: &Path, opts: &SafeUpdateOpts) -> Vec<Upgrade> {
     let mut cmd = std::process::Command::new("cargo");
     cmd.args(["update", "--dry-run"]).current_dir(root);
 
@@ -1459,10 +1465,14 @@ fn proposed_lockfile_updates(root: &Path, opts: &SafeUpdateOpts) -> Vec<(String,
             if old_ver == new_ver {
                 return None;
             }
-            Some((name, old_ver, new_ver))
+            Some(Upgrade {
+                name,
+                old_ver,
+                new_ver,
+            })
         })
-        .filter(|(name, _, _)| passes_upgrade_filters(name, opts))
-        .filter(|(name, _, _)| seen.insert(name.clone()))
+        .filter(|u| passes_upgrade_filters(&u.name, opts))
+        .filter(|u| seen.insert(u.name.clone()))
         .collect()
 }
 
@@ -1486,10 +1496,7 @@ fn normalize_upgrade_package_name(raw: &str) -> String {
     raw.split(" (").next().unwrap_or(raw).trim().to_string()
 }
 
-fn upgrade_triple_from_table_line(
-    line: &str,
-    re: &regex::Regex,
-) -> Option<(String, String, String)> {
+fn upgrade_from_table_line(line: &str, re: &regex::Regex) -> Option<Upgrade> {
     let line = line.trim();
     if line.is_empty() || should_skip_cargo_upgrade_line(line) {
         return None;
@@ -1501,7 +1508,11 @@ fn upgrade_triple_from_table_line(
     if old_ver == compatible {
         return None;
     }
-    Some((name, old_ver, compatible))
+    Some(Upgrade {
+        name,
+        old_ver,
+        new_ver: compatible,
+    })
 }
 
 fn passes_upgrade_filters(name: &str, opts: &SafeUpdateOpts) -> bool {
@@ -1518,10 +1529,7 @@ fn passes_upgrade_filters(name: &str, opts: &SafeUpdateOpts) -> bool {
     true
 }
 
-fn upgrade_triple_from_arrow_line(
-    line: &str,
-    re: &regex::Regex,
-) -> Option<(String, String, String)> {
+fn upgrade_from_arrow_line(line: &str, re: &regex::Regex) -> Option<Upgrade> {
     let cap = re.captures(line)?;
     let name = cap[1].to_string();
     let old_ver = cap[2].trim_start_matches('v').to_string();
@@ -1529,7 +1537,11 @@ fn upgrade_triple_from_arrow_line(
     if old_ver == new_ver {
         return None;
     }
-    Some((name, old_ver, new_ver))
+    Some(Upgrade {
+        name,
+        old_ver,
+        new_ver,
+    })
 }
 
 /// Return `true` if the semver string has a pre-release component (e.g. `1.0.0-alpha.1`).
@@ -2093,45 +2105,62 @@ mod tests {
         );
     }
 
+    /// Exercises the production parsers on real `cargo upgrade`/`cargo update`
+    /// output.
+    ///
+    /// The version of this test it replaces declared its own copy of the regex
+    /// and reimplemented the parse in the test body, so it asserted only that
+    /// the test agreed with itself — it would have passed unchanged if the
+    /// production function were deleted.
     #[test]
-    fn test_parse_cargo_update_output() {
-        let sample_output = r#"
+    fn arrow_lines_parse_into_upgrades() {
+        let arrow_re =
+            regex::Regex::new(r"(?i)(?:Upgrading\s+)?([a-zA-Z0-9_\-]+)\s+v?(\S+)\s+->\s+v?(\S+)")
+                .unwrap();
+
+        let parsed: Vec<super::Upgrade> = r#"
     Updating bitflags v2.11.1 -> v2.12.1
     Updating cc v1.2.62 -> v1.2.63
     Removing scc v2.4.0
     Adding shlex v2.0.1
-"#;
-        let update_re = regex::Regex::new(
-            r"(?i)^\s*Updating\s+([a-zA-Z0-9_\-]+)\s+v?([^\s]+)\s+->\s+v?([^\s]+)",
-        )
-        .unwrap();
+"#
+        .lines()
+        .filter_map(|line| super::upgrade_from_arrow_line(line, &arrow_re))
+        .collect();
 
-        let parsed: Vec<(String, String, String)> = sample_output
-            .lines()
-            .filter_map(|line| {
-                let cap = update_re.captures(line)?;
-                let name = cap[1].to_string();
-                let old_ver = cap[2].trim_start_matches('v').to_string();
-                let new_ver = cap[3].trim_start_matches('v').to_string();
-                if old_ver == new_ver {
-                    return None;
-                }
-                Some((name, old_ver, new_ver))
-            })
-            .collect();
+        assert_eq!(parsed.len(), 2, "only the two `->` lines are upgrades");
+        assert_eq!(parsed[0].name, "bitflags");
+        assert_eq!(parsed[0].old_ver, "2.11.1");
+        assert_eq!(parsed[0].new_ver, "2.12.1");
+        assert_eq!(parsed[1].name, "cc");
+        assert_eq!(parsed[1].old_ver, "1.2.62");
+        assert_eq!(parsed[1].new_ver, "1.2.63");
+    }
 
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(
-            parsed[0],
-            (
-                "bitflags".to_string(),
-                "2.11.1".to_string(),
-                "2.12.1".to_string()
-            )
+    /// A line whose two versions are equal is not an upgrade.
+    #[test]
+    fn an_unchanged_version_is_not_an_upgrade() {
+        let arrow_re =
+            regex::Regex::new(r"(?i)(?:Upgrading\s+)?([a-zA-Z0-9_\-]+)\s+v?(\S+)\s+->\s+v?(\S+)")
+                .unwrap();
+        assert!(
+            super::upgrade_from_arrow_line("Upgrading serde v1.0.210 -> v1.0.210", &arrow_re)
+                .is_none()
         );
+    }
+
+    /// The table format (cargo-edit ≥0.13) targets the **compatible** column,
+    /// not the latest one, so a safe update never proposes a major bump.
+    #[test]
+    fn table_lines_take_the_compatible_column() {
+        let table_re = regex::Regex::new(r"^(.+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$").unwrap();
+        let up = super::upgrade_from_table_line("serde 1.0.210 1.0.215 2.0.0 ^1.0.215", &table_re)
+            .expect("a table row with a newer compatible version is an upgrade");
+        assert_eq!(up.name, "serde");
+        assert_eq!(up.old_ver, "1.0.210");
         assert_eq!(
-            parsed[1],
-            ("cc".to_string(), "1.2.62".to_string(), "1.2.63".to_string())
+            up.new_ver, "1.0.215",
+            "the compatible column, not the 2.0.0 latest"
         );
     }
 

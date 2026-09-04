@@ -2595,10 +2595,24 @@ fn parse_execution_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
     }
 }
 
-fn parse_sandbox_settings(
-    cli: &Cli,
-    s: &ahma_common::config::AhmaSettings,
-) -> (bool, bool, bool, bool, bool, bool, u64, bool) {
+/// Resolved sandbox- and monitor-tier settings (see [`parse_sandbox_settings`]).
+///
+/// A struct for the same reason [`ExecutionSettings`] is one, only more so: the
+/// tuple this replaced carried **six adjacent `bool`s**, so any two of them
+/// could be transposed and still compile. The test that covers this function
+/// sets every flag to `true`, which cannot see a swap either.
+struct SandboxSettings {
+    no_sandbox: bool,
+    defer_sandbox: bool,
+    tmp_access: bool,
+    use_scratch_dir: bool,
+    no_temp_files: bool,
+    log_monitor: bool,
+    monitor_rate_limit_secs: u64,
+    package_cache_write: bool,
+}
+
+fn parse_sandbox_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> SandboxSettings {
     // Security-tier: AHMA_DISABLE_SANDBOX retired — warn and ignore.
     warn_retired_security_env!("AHMA_DISABLE_SANDBOX");
     let no_sandbox = cli.no_sandbox || s.sandbox.disable;
@@ -2629,7 +2643,7 @@ fn parse_sandbox_settings(
     warn_retired_security_env!("AHMA_NO_PACKAGE_CACHE_WRITE");
     let package_cache_write = !cli.no_package_cache_write && s.sandbox.package_cache_write;
 
-    (
+    SandboxSettings {
         no_sandbox,
         defer_sandbox,
         tmp_access,
@@ -2638,10 +2652,18 @@ fn parse_sandbox_settings(
         log_monitor,
         monitor_rate_limit_secs,
         package_cache_write,
-    )
+    }
 }
 
-fn parse_http_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> (bool, bool, u64) {
+/// Resolved HTTP-tier settings (see [`parse_http_settings`]). Named for the
+/// same reason as its siblings: two adjacent `bool`s transpose silently.
+struct HttpSettings {
+    no_quic: bool,
+    disable_http1_1: bool,
+    handshake_timeout_secs: u64,
+}
+
+fn parse_http_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> HttpSettings {
     // R-CFG1.2: preference-tier env vars are RETIRED — warn and ignore.
     warn_retired_env!("AHMA_DISABLE_QUIC");
     warn_retired_env!("AHMA_DISABLE_HTTP1_1");
@@ -2653,13 +2675,25 @@ fn parse_http_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> (boo
         .handshake_timeout
         .unwrap_or(s.http.handshake_timeout_secs);
 
-    (no_quic, disable_http1_1, handshake_timeout_secs)
+    HttpSettings {
+        no_quic,
+        disable_http1_1,
+        handshake_timeout_secs,
+    }
 }
 
-fn parse_auth_settings(
-    cli: &Cli,
-    s: &ahma_common::config::AhmaSettings,
-) -> (Option<String>, Option<PathBuf>, u64, u32, String) {
+/// Resolved auth- and identity-tier settings (see [`parse_auth_settings`]).
+/// The five members happen to be distinct types today, so the compiler already
+/// refuses a transposition; it is a struct so the four parsers here read alike.
+struct AuthSettings {
+    require_token: Option<String>,
+    require_token_path: Option<PathBuf>,
+    rate_limit_rps: u64,
+    rate_limit_burst: u32,
+    instance_label: String,
+}
+
+fn parse_auth_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> AuthSettings {
     // Security-tier: AHMA_REQUIRE_TOKEN retired — warn and ignore.
     warn_retired_security_env!("AHMA_REQUIRE_TOKEN");
     let require_token = cli
@@ -2691,13 +2725,13 @@ fn parse_auth_settings(
         .clone()
         .unwrap_or_else(|| s.instance.label.clone());
 
-    (
+    AuthSettings {
         require_token,
         require_token_path,
         rate_limit_rps,
         rate_limit_burst,
         instance_label,
-    )
+    }
 }
 
 fn resolve_tool_bundles(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> Vec<String> {
@@ -2936,23 +2970,13 @@ pub fn build_app_config_with_settings(
     // ── Parse settings sections via modular helper functions ─────────────────
     let exec = parse_execution_settings(cli, &s);
 
-    let (
-        no_sandbox,
-        defer_sandbox,
-        tmp_access,
-        use_scratch_dir,
-        no_temp_files,
-        log_monitor,
-        monitor_rate_limit_secs,
-        package_cache_write,
-    ) = parse_sandbox_settings(cli, &s);
+    let sandbox = parse_sandbox_settings(cli, &s);
 
     let idle_timeout_secs = cli.idle_timeout;
 
-    let (no_quic, disable_http1_1, handshake_timeout_secs) = parse_http_settings(cli, &s);
+    let http = parse_http_settings(cli, &s);
 
-    let (require_token, require_token_path, rate_limit_rps, rate_limit_burst, instance_label) =
-        parse_auth_settings(cli, &s);
+    let auth = parse_auth_settings(cli, &s);
 
     // R-CFG1.2: AHMA_MINIMIZE_TOKENS / AHMA_SMALL_MODEL_HARNESS are RETIRED — warn and ignore.
     warn_retired_env!("AHMA_MINIMIZE_TOKENS");
@@ -2975,31 +2999,31 @@ pub fn build_app_config_with_settings(
         small_model_harness,
         mutex_groups,
 
-        no_sandbox,
+        no_sandbox: sandbox.no_sandbox,
         restrict_network: cli.restrict_network || s.network.restrict,
         network_allow: s.network.allow.clone(),
         network_profile_hosts: s.network.profile_hosts,
         network_deny_profile_hosts: s.network.deny_profile_hosts.clone(),
         sandbox_profiles: s.sandbox.profiles.clone(),
         sandbox_scopes,
-        defer_sandbox,
+        defer_sandbox: sandbox.defer_sandbox,
         working_dirs,
         container_root: s.sandbox.container_root.clone(),
         scratch_directory: s.sandbox.scratch_directory.clone(),
-        use_scratch_dir,
-        tmp_access,
-        no_temp_files,
-        log_monitor,
-        monitor_rate_limit_secs,
-        package_cache_write,
+        use_scratch_dir: sandbox.use_scratch_dir,
+        tmp_access: sandbox.tmp_access,
+        no_temp_files: sandbox.no_temp_files,
+        log_monitor: sandbox.log_monitor,
+        monitor_rate_limit_secs: sandbox.monitor_rate_limit_secs,
+        package_cache_write: sandbox.package_cache_write,
         // Loaded from settings.toml (honors --no-settings via `s`); survives
         // roots/list because the subprocess reads it directly, not via the bridge.
         persistent_scopes: s.sandbox.persistent_scopes.clone(),
         http_host: serve.http_host,
         http_port: serve.http_port,
-        no_quic,
-        disable_http1_1,
-        handshake_timeout_secs,
+        no_quic: http.no_quic,
+        disable_http1_1: http.disable_http1_1,
+        handshake_timeout_secs: http.handshake_timeout_secs,
         unix_socket_path: unix_socket_path_from_cli(cli, &s),
         observability: ahma_common::observability::ObservabilityConfig::from_env("ahma_mcp")
             .with_endpoint(cli.opentelemetry.as_deref()),
@@ -3010,11 +3034,11 @@ pub fn build_app_config_with_settings(
         run_tool: tool.run_tool,
         run_tool_args: tool.run_tool_args,
         task_vault: resolve_task_vault(cli, &s),
-        require_token,
-        require_token_path,
-        rate_limit_rps,
-        rate_limit_burst,
-        instance_label,
+        require_token: auth.require_token,
+        require_token_path: auth.require_token_path,
+        rate_limit_rps: auth.rate_limit_rps,
+        rate_limit_burst: auth.rate_limit_burst,
+        instance_label: auth.instance_label,
         idle_timeout_secs,
         max_sessions: cli.max_sessions.unwrap_or(10),
         is_server_child: cli.server_child || std::env::var("AHMA_SERVER_CHILD").is_ok(),
@@ -3157,7 +3181,7 @@ mod tests {
         let resolved = parse_sandbox_settings(&cli, &settings);
         unsafe { std::env::remove_var("AHMA_DISABLE_SANDBOX") };
         assert!(
-            !resolved.0,
+            !resolved.no_sandbox,
             "AHMA_DISABLE_SANDBOX=1 must be ignored; no_sandbox should remain false without --no-sandbox"
         );
     }
@@ -3230,7 +3254,10 @@ mod tests {
         let cli = Cli::parse_from(["ahma", "--no-sandbox", "serve", "stdio"]);
         let settings = ahma_common::config::AhmaSettings::default();
         let resolved = parse_sandbox_settings(&cli, &settings);
-        assert!(resolved.0, "--no-sandbox must set no_sandbox = true");
+        assert!(
+            resolved.no_sandbox,
+            "--no-sandbox must set no_sandbox = true"
+        );
     }
 
     // ─── resolve_sandbox_policy ──────────────────────────────────────────────
@@ -4561,19 +4588,37 @@ mod tests {
         init_test();
         let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
         let mut s = ahma_common::config::AhmaSettings::default();
+        // Alternating values, not all-true: the previous version of this test
+        // set every flag to `true` and asserted their conjunction, so it passed
+        // whether or not each settings key reached the field it names.
         s.sandbox.disable = true;
-        s.sandbox.defer = true;
+        s.sandbox.defer = false;
         s.sandbox.tmp_access = true;
-        s.sandbox.use_scratch_directory = true;
+        s.sandbox.use_scratch_directory = false;
         s.sandbox.disable_temp = true;
-        s.logging.log_monitor = true;
+        s.logging.log_monitor = false;
         s.logging.monitor_rate_limit_secs = 30;
         s.sandbox.package_cache_write = true;
-        let (no_sandbox, defer, tmp, use_dir, no_temp, mon, rate, pkg) =
-            parse_sandbox_settings(&cli, &s);
-        assert!(no_sandbox && defer && tmp && use_dir && no_temp && mon);
-        assert_eq!(rate, 30);
-        assert!(pkg, "package_cache_write follows settings when no CLI flag");
+
+        let resolved = parse_sandbox_settings(&cli, &s);
+
+        assert!(resolved.no_sandbox, "sandbox.disable → no_sandbox");
+        assert!(!resolved.defer_sandbox, "sandbox.defer → defer_sandbox");
+        assert!(resolved.tmp_access, "sandbox.tmp_access → tmp_access");
+        assert!(
+            !resolved.use_scratch_dir,
+            "sandbox.use_scratch_directory → use_scratch_dir"
+        );
+        assert!(
+            resolved.no_temp_files,
+            "sandbox.disable_temp → no_temp_files"
+        );
+        assert!(!resolved.log_monitor, "logging.log_monitor → log_monitor");
+        assert_eq!(resolved.monitor_rate_limit_secs, 30);
+        assert!(
+            resolved.package_cache_write,
+            "package_cache_write follows settings when no CLI flag"
+        );
     }
 
     #[test]
@@ -4594,12 +4639,15 @@ mod tests {
             "stdio",
         ]);
         let s = ahma_common::config::AhmaSettings::default();
-        let (_no_sandbox, defer, tmp, use_dir, no_temp, mon, rate, pkg) =
-            parse_sandbox_settings(&cli, &s);
-        assert!(defer && tmp && use_dir && no_temp && mon);
-        assert_eq!(rate, 15);
+        let resolved = parse_sandbox_settings(&cli, &s);
+        assert!(resolved.defer_sandbox);
+        assert!(resolved.tmp_access);
+        assert!(resolved.use_scratch_dir);
+        assert!(resolved.no_temp_files);
+        assert!(resolved.log_monitor);
+        assert_eq!(resolved.monitor_rate_limit_secs, 15);
         assert!(
-            !pkg,
+            !resolved.package_cache_write,
             "--no-package-cache-write must disable package cache writes"
         );
     }
@@ -4614,9 +4662,9 @@ mod tests {
         s.http.disable_quic = true;
         s.http.disable_http1_1 = true;
         s.http.handshake_timeout_secs = 99;
-        let (no_quic, no_h1, hs) = parse_http_settings(&cli, &s);
-        assert!(no_quic && no_h1);
-        assert_eq!(hs, 99);
+        let resolved = parse_http_settings(&cli, &s);
+        assert!(resolved.no_quic && resolved.disable_http1_1);
+        assert_eq!(resolved.handshake_timeout_secs, 99);
     }
 
     #[test]
@@ -4632,9 +4680,9 @@ mod tests {
             "http",
         ]);
         let s = ahma_common::config::AhmaSettings::default();
-        let (no_quic, no_h1, hs) = parse_http_settings(&cli, &s);
-        assert!(no_quic && no_h1);
-        assert_eq!(hs, 7);
+        let resolved = parse_http_settings(&cli, &s);
+        assert!(resolved.no_quic && resolved.disable_http1_1);
+        assert_eq!(resolved.handshake_timeout_secs, 7);
     }
 
     // ─── parse_auth_settings ─────────────────────────────────────────────────
@@ -4650,12 +4698,12 @@ mod tests {
         s.auth.rate_limit_rps = 50;
         s.auth.rate_limit_burst = 25;
         s.instance.label = "worker-7".to_string();
-        let (tok, tok_path, rps, burst, label) = parse_auth_settings(&cli, &s);
-        assert_eq!(tok.as_deref(), Some("secret"));
-        assert_eq!(tok_path, Some(PathBuf::from("/etc/token")));
-        assert_eq!(rps, 50);
-        assert_eq!(burst, 25);
-        assert_eq!(label, "worker-7");
+        let auth = parse_auth_settings(&cli, &s);
+        assert_eq!(auth.require_token.as_deref(), Some("secret"));
+        assert_eq!(auth.require_token_path, Some(PathBuf::from("/etc/token")));
+        assert_eq!(auth.rate_limit_rps, 50);
+        assert_eq!(auth.rate_limit_burst, 25);
+        assert_eq!(auth.instance_label, "worker-7");
     }
 
     #[test]
@@ -4664,15 +4712,15 @@ mod tests {
         init_test();
         let cli = Cli::parse_from(["ahma", "serve", "http"]);
         let s = ahma_common::config::AhmaSettings::default();
-        let (tok, tok_path, rps, burst, label) = parse_auth_settings(&cli, &s);
-        assert!(tok.is_none());
+        let auth = parse_auth_settings(&cli, &s);
+        assert!(auth.require_token.is_none());
         assert!(
-            tok_path.is_none(),
+            auth.require_token_path.is_none(),
             "an empty require_token_path must resolve to None"
         );
-        assert_eq!(rps, 0);
-        assert_eq!(burst, 10);
-        assert_eq!(label, "ahma");
+        assert_eq!(auth.rate_limit_rps, 0);
+        assert_eq!(auth.rate_limit_burst, 10);
+        assert_eq!(auth.instance_label, "ahma");
     }
 
     #[test]
@@ -4695,12 +4743,12 @@ mod tests {
             "http",
         ]);
         let s = ahma_common::config::AhmaSettings::default();
-        let (tok, tok_path, rps, burst, label) = parse_auth_settings(&cli, &s);
-        assert_eq!(tok.as_deref(), Some("clitoken"));
-        assert_eq!(tok_path, Some(PathBuf::from("/cli/token")));
-        assert_eq!(rps, 3);
-        assert_eq!(burst, 9);
-        assert_eq!(label, "cli-label");
+        let auth = parse_auth_settings(&cli, &s);
+        assert_eq!(auth.require_token.as_deref(), Some("clitoken"));
+        assert_eq!(auth.require_token_path, Some(PathBuf::from("/cli/token")));
+        assert_eq!(auth.rate_limit_rps, 3);
+        assert_eq!(auth.rate_limit_burst, 9);
+        assert_eq!(auth.instance_label, "cli-label");
     }
 
     // ─── resolve_tool_bundles ────────────────────────────────────────────────
