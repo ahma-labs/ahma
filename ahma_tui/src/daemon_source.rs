@@ -20,10 +20,7 @@ use ahma_common::daemon_hub::{
     ClientMsg, DaemonEvent, DaemonMsg, HubRelay, InstanceInfo, connect_to_daemon,
     ensure_daemon_running, recv_msg, send_msg,
 };
-use tokio::{
-    io::BufReader,
-    sync::{broadcast, mpsc},
-};
+use tokio::{io::BufReader, sync::mpsc};
 use tracing::{debug, warn};
 
 use crate::state::{OpStatus, Operation};
@@ -63,46 +60,10 @@ pub fn spawn_daemon_source(tx: mpsc::Sender<SourceEvent>) {
     });
 }
 
-/// Spawn the embedded hub source using a direct in-process broadcast channel.
-///
-/// Unlike [`spawn_daemon_source`], this does not connect via a socket — it
-/// receives [`DaemonMsg`] events pushed directly by the hub running inside
-/// the same TUI process, eliminating the socket round-trip.
-///
-/// Used when the TUI itself starts the hub via
-/// [`ahma_common::daemon_hub::try_start_hub_server`].
-pub fn spawn_embedded_hub_source(
-    mut rx: broadcast::Receiver<DaemonMsg>,
-    tx: mpsc::Sender<SourceEvent>,
-) {
-    tokio::spawn(async move {
-        let _ = tx
-            .send(SourceEvent::DaemonHealthChanged { healthy: true })
-            .await;
-        let mut state = DaemonState::new();
-        loop {
-            match rx.recv().await {
-                Ok(msg) => {
-                    if handle_daemon_msg(&mut state, &tx, msg).await.is_none() {
-                        return; // TUI channel closed
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("embedded_hub_source: lagged {n} messages");
-                    // Non-fatal — continue from the oldest available message.
-                }
-                Err(broadcast::error::RecvError::Closed) => return, // Hub shut down
-            }
-        }
-    });
-}
-
 /// Apply one daemon message to `state` and forward the resulting UI
 /// event(s) on `tx`.
 ///
-/// Shared by [`spawn_embedded_hub_source`] and [`daemon_source_task`], which
-/// otherwise duplicate this instance-change / operation-list-changed
-/// dispatch verbatim.
+/// Used by [`daemon_source_task`] for every message the hub sends.
 ///
 /// Returns `None` when the TUI channel closed (caller should stop
 /// processing). Returns `Some(true)` when the merged operation list changed
@@ -1497,21 +1458,28 @@ mod tests {
         assert!(matches!(a, Applied::None));
     }
 
+    /// Every hub message maps to the UI event the TUI expects.
+    ///
+    /// Drives `handle_daemon_msg` — the fan-out both the socket task and the
+    /// (now removed) in-process source shared — so the mapping is pinned once,
+    /// without a socket.
     #[tokio::test]
-    async fn embedded_hub_source_maps_every_event() {
-        let (tx_b, rx_b) = broadcast::channel::<DaemonMsg>(64);
+    async fn handle_daemon_msg_maps_every_event() {
         let (tx_s, mut rx_s) = mpsc::channel::<SourceEvent>(64);
-        spawn_embedded_hub_source(rx_b, tx_s);
+        let mut st = DaemonState::new();
+        let feed = async |st: &mut DaemonState, msg: DaemonMsg| {
+            handle_daemon_msg(st, &tx_s, msg)
+                .await
+                .expect("TUI channel stays open");
+        };
 
-        match next_ev(&mut rx_s).await {
-            SourceEvent::DaemonHealthChanged { healthy } => assert!(healthy),
-            other => panic!("expected DaemonHealthChanged, got {other:?}"),
-        }
-
-        tx_b.send(DaemonMsg::InstanceList {
-            instances: vec![inst("i1", "IDE")],
-        })
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::InstanceList {
+                instances: vec![inst("i1", "IDE")],
+            },
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::InstancesUpdated { instances } => assert_eq!(instances.len(), 1),
             other => panic!("expected InstancesUpdated, got {other:?}"),
@@ -1521,22 +1489,25 @@ mod tests {
             other => panic!("expected OperationsUpdated, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Event {
-            instance_id: "i1".to_string(),
-            payload: DaemonEvent::OpStarted {
-                id: "op1".to_string(),
-                tool_name: "t".to_string(),
-                description: "d".to_string(),
-                scope: "/s".to_string(),
-                parent_id: None,
-                started_epoch_ms: None,
-                title: None,
-                cwd: None,
-                command: None,
-                origin: None,
+        feed(
+            &mut st,
+            DaemonMsg::Event {
+                instance_id: "i1".to_string(),
+                payload: DaemonEvent::OpStarted {
+                    id: "op1".to_string(),
+                    tool_name: "t".to_string(),
+                    description: "d".to_string(),
+                    scope: "/s".to_string(),
+                    parent_id: None,
+                    started_epoch_ms: None,
+                    title: None,
+                    cwd: None,
+                    command: None,
+                    origin: None,
+                },
             },
-        })
-        .unwrap();
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::OperationsUpdated { ops } => {
                 assert_eq!(ops.len(), 1);
@@ -1546,15 +1517,18 @@ mod tests {
             other => panic!("expected OperationsUpdated, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Event {
-            instance_id: "i1".to_string(),
-            payload: DaemonEvent::OpOutput {
-                id: "op1".to_string(),
-                line: "hello".to_string(),
-                is_stderr: true,
+        feed(
+            &mut st,
+            DaemonMsg::Event {
+                instance_id: "i1".to_string(),
+                payload: DaemonEvent::OpOutput {
+                    id: "op1".to_string(),
+                    line: "hello".to_string(),
+                    is_stderr: true,
+                },
             },
-        })
-        .unwrap();
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::OperationOutput {
                 instance_id,
@@ -1570,22 +1544,28 @@ mod tests {
             other => panic!("expected OperationOutput, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Relay(HubRelay::ChatToken {
-            token: "tok".to_string(),
-        }))
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::Relay(HubRelay::ChatToken {
+                token: "tok".to_string(),
+            }),
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::ChatToken { token } => assert_eq!(token, "tok"),
             other => panic!("expected ChatToken, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Ping { seq: 3 }).unwrap();
-        tx_b.send(DaemonMsg::Relay(HubRelay::ApprovalRequested {
-            id: "a1".to_string(),
-            tool: "tool".to_string(),
-            args: "args".to_string(),
-        }))
-        .unwrap();
+        feed(&mut st, DaemonMsg::Ping { seq: 3 }).await;
+        feed(
+            &mut st,
+            DaemonMsg::Relay(HubRelay::ApprovalRequested {
+                id: "a1".to_string(),
+                tool: "tool".to_string(),
+                args: "args".to_string(),
+            }),
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::ApprovalRequested { id, tool, args } => {
                 assert_eq!(id, "a1");
@@ -1595,10 +1575,13 @@ mod tests {
             other => panic!("Ping must be a no-op; got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Relay(HubRelay::ScopeGrantRequested {
-            request: sample_scope_grant(),
-        }))
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::Relay(HubRelay::ScopeGrantRequested {
+                request: sample_scope_grant(),
+            }),
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::ScopeGrantRequested { request } => {
                 assert_eq!(request.decision_id, "d1");
@@ -1606,34 +1589,43 @@ mod tests {
             other => panic!("expected ScopeGrantRequested, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::ScopeGrantDismiss {
-            decision_id: "d1".to_string(),
-        })
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::ScopeGrantDismiss {
+                decision_id: "d1".to_string(),
+            },
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d1"),
             other => panic!("expected ScopeGrantDismiss, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Relay(HubRelay::AgentDone)).unwrap();
+        feed(&mut st, DaemonMsg::Relay(HubRelay::AgentDone)).await;
         match next_ev(&mut rx_s).await {
             SourceEvent::AgentDone => {}
             other => panic!("expected AgentDone, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Relay(HubRelay::AgentError {
-            error: "boom".to_string(),
-        }))
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::Relay(HubRelay::AgentError {
+                error: "boom".to_string(),
+            }),
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::AgentError { error } => assert_eq!(error, "boom"),
             other => panic!("expected AgentError, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::InstanceUnregistered {
-            id: "i1".to_string(),
-        })
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::InstanceUnregistered {
+                id: "i1".to_string(),
+            },
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::InstancesUpdated { instances } => assert!(instances.is_empty()),
             other => panic!("expected InstancesUpdated, got {other:?}"),
@@ -1644,61 +1636,22 @@ mod tests {
         }
     }
 
+    /// The fan-out reports a closed TUI channel so its caller can stop reading
+    /// the socket, rather than looping on a receiver nobody drains.
     #[tokio::test]
-    async fn embedded_hub_source_recovers_after_lag() {
-        let (tx_b, rx_b) = broadcast::channel::<DaemonMsg>(2);
-        let (tx_s, mut rx_s) = mpsc::channel::<SourceEvent>(256);
-        spawn_embedded_hub_source(rx_b, tx_s);
-
-        for i in 0..8 {
-            tx_b.send(DaemonMsg::Relay(HubRelay::ChatToken {
-                token: format!("t{i}"),
-            }))
-            .unwrap();
-        }
-        tx_b.send(DaemonMsg::Relay(HubRelay::ChatToken {
-            token: "final".to_string(),
-        }))
-        .unwrap();
-
-        let mut saw_final = false;
-        for _ in 0..32 {
-            match tokio::time::timeout(TestTimeouts::scale_secs(2), rx_s.recv()).await {
-                Ok(Some(SourceEvent::ChatToken { token })) if token == "final" => {
-                    saw_final = true;
-                    break;
-                }
-                Ok(Some(_)) => continue,
-                _ => break,
-            }
-        }
-        assert!(
-            saw_final,
-            "embedded hub source must continue past a Lagged error and deliver later tokens"
-        );
-    }
-
-    #[tokio::test]
-    async fn embedded_hub_source_exits_when_tui_channel_closed() {
-        let (tx_b, rx_b) = broadcast::channel::<DaemonMsg>(16);
+    async fn handle_daemon_msg_reports_a_closed_tui_channel() {
         let (tx_s, rx_s) = mpsc::channel::<SourceEvent>(8);
-        spawn_embedded_hub_source(rx_b, tx_s);
-
+        let mut st = DaemonState::new();
         drop(rx_s);
-        tx_b.send(DaemonMsg::InstanceList { instances: vec![] })
-            .unwrap();
-
-        let mut exited = false;
-        for _ in 0..100 {
-            if tx_b.receiver_count() == 0 {
-                exited = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
         assert!(
-            exited,
-            "task must exit (drop its receiver) once the TUI channel is closed"
+            handle_daemon_msg(
+                &mut st,
+                &tx_s,
+                DaemonMsg::InstanceList { instances: vec![] }
+            )
+            .await
+            .is_none(),
+            "a closed TUI channel must be reported, not ignored"
         );
     }
 
@@ -1765,32 +1718,37 @@ mod tests {
         assert!(matches!(a, Applied::None));
     }
 
-    // ── embedded hub: variants not covered by `embedded_hub_source_maps_every_event` ──
+    // ── fan-out: variants not covered by `handle_daemon_msg_maps_every_event` ──
 
     #[tokio::test]
-    async fn embedded_hub_source_maps_remaining_events() {
-        let (tx_b, rx_b) = broadcast::channel::<DaemonMsg>(64);
+    async fn handle_daemon_msg_maps_remaining_events() {
         let (tx_s, mut rx_s) = mpsc::channel::<SourceEvent>(64);
-        spawn_embedded_hub_source(rx_b, tx_s);
+        let mut st = DaemonState::new();
+        let feed = async |st: &mut DaemonState, msg: DaemonMsg| {
+            handle_daemon_msg(st, &tx_s, msg)
+                .await
+                .expect("TUI channel stays open");
+        };
 
-        match next_ev(&mut rx_s).await {
-            SourceEvent::DaemonHealthChanged { healthy } => assert!(healthy),
-            other => panic!("expected DaemonHealthChanged, got {other:?}"),
-        }
-
-        tx_b.send(DaemonMsg::Relay(HubRelay::ChatThinking {
-            token: "pondering".to_string(),
-        }))
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::Relay(HubRelay::ChatThinking {
+                token: "pondering".to_string(),
+            }),
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::ChatThinking { token } => assert_eq!(token, "pondering"),
             other => panic!("expected ChatThinking, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Relay(HubRelay::WebApprovalRequested {
-            request: sample_web_approval(),
-        }))
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::Relay(HubRelay::WebApprovalRequested {
+                request: sample_web_approval(),
+            }),
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::WebApprovalRequested { request } => {
                 assert_eq!(request.decision_id, "w1");
@@ -1798,21 +1756,27 @@ mod tests {
             other => panic!("expected WebApprovalRequested, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::WebApprovalDismiss {
-            decision_id: "w1".to_string(),
-        })
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::WebApprovalDismiss {
+                decision_id: "w1".to_string(),
+            },
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::WebApprovalDismiss { decision_id } => assert_eq!(decision_id, "w1"),
             other => panic!("expected WebApprovalDismiss, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Relay(HubRelay::ToolCallStarted {
-            id: "t1".to_string(),
-            name: "read_file".to_string(),
-            args: "{}".to_string(),
-        }))
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::Relay(HubRelay::ToolCallStarted {
+                id: "t1".to_string(),
+                name: "read_file".to_string(),
+                args: "{}".to_string(),
+            }),
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::ToolCallStarted { id, name, .. } => {
                 assert_eq!(id, "t1");
@@ -1821,12 +1785,15 @@ mod tests {
             other => panic!("expected ToolCallStarted, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Relay(HubRelay::ToolCallFinished {
-            id: "t1".to_string(),
-            result: "ok".to_string(),
-            failed: true,
-        }))
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::Relay(HubRelay::ToolCallFinished {
+                id: "t1".to_string(),
+                result: "ok".to_string(),
+                failed: true,
+            }),
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::ToolCallFinished { id, failed, .. } => {
                 assert_eq!(id, "t1");
@@ -1835,12 +1802,15 @@ mod tests {
             other => panic!("expected ToolCallFinished, got {other:?}"),
         }
 
-        tx_b.send(DaemonMsg::Relay(HubRelay::Usage {
-            prompt_tokens: 1,
-            completion_tokens: 2,
-            total_tokens: 3,
-        }))
-        .unwrap();
+        feed(
+            &mut st,
+            DaemonMsg::Relay(HubRelay::Usage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+            }),
+        )
+        .await;
         match next_ev(&mut rx_s).await {
             SourceEvent::Usage {
                 prompt_tokens,
@@ -1858,9 +1828,8 @@ mod tests {
     // Exercises the actual connect → Subscribe → recv loop in
     // `daemon_source_task`, not just `apply_msg`/`Applied` in isolation. This
     // covers the socket-framed match arms (lines that forward each `Applied`
-    // variant into a `SourceEvent` send) that the pure in-process
-    // `embedded_hub_source_*` tests above cannot reach, because that source
-    // takes a different code path (`spawn_embedded_hub_source`, no socket).
+    // variant into a `SourceEvent` send) that the `handle_daemon_msg` tests
+    // above cannot reach, because they never touch the socket read loop.
     //
     // A second raw connection plays the role of a registered ahma instance,
     // driving the hub exactly the way a real `ahma` process would.
@@ -1868,12 +1837,12 @@ mod tests {
     async fn daemon_source_task_full_round_trip_over_socket() {
         let _isolation_guard = isolate_daemon_socket_for_test();
 
-        let hub = ahma_common::daemon_hub::try_start_hub_server_at(
+        let hub = ahma_common::daemon_hub::HubServer::bind_at(
             ahma_common::daemon_hub::default_socket_path(),
         )
         .await
-        .expect("binding the isolated test socket should not error")
         .expect("this test owns a freshly isolated socket, so bind must succeed");
+        let hub = tokio::spawn(hub.serve());
 
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(64);
         let task = tokio::spawn(daemon_source_task(tx));
@@ -2203,9 +2172,9 @@ mod tests {
             other => panic!("expected AgentError, got {other:?}"),
         }
 
-        // Clean up: stop the subscriber task, then tear down the hub (removes
-        // the socket file via `EmbeddedHub::drop`).
+        // Clean up: stop the subscriber task, then the hub's accept loop. The
+        // socket file lives in this test's isolated directory.
         task.abort();
-        drop(hub);
+        hub.abort();
     }
 }

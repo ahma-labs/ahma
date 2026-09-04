@@ -891,6 +891,17 @@ struct PendingApproval {
     args: String,
 }
 
+/// What the hub does when it is asked to stop.
+///
+/// The hub used to call [`std::process::exit`] from inside a connection
+/// handler. That is correct for the standalone `ahma daemon` and wrong for
+/// anything that hosts the hub alongside something else: the per-user daemon
+/// also owns an MCP endpoint with live sessions and a history file to flush, so
+/// "stop" has to run one shutdown choreography, not `exit(0)` from whichever
+/// task noticed first. The composer installs a hook; with no hook installed the
+/// default is the historical exit.
+type ExitHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct DaemonHub {
     instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
     instance_txs:
@@ -906,6 +917,9 @@ struct DaemonHub {
     connection_count: Arc<AtomicUsize>,
     socket_path: Option<PathBuf>,
     pending_approvals: Arc<Mutex<std::collections::HashMap<String, PendingApproval>>>,
+    /// What to run when a client sends [`ClientMsg::Shutdown`]. `None` means
+    /// the historical behaviour: unlink our socket and `exit(0)`.
+    exit_hook: parking_lot::Mutex<Option<ExitHook>>,
 }
 
 impl DaemonHub {
@@ -921,6 +935,7 @@ impl DaemonHub {
                 connection_count: Arc::new(AtomicUsize::new(0)),
                 socket_path,
                 pending_approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                exit_hook: parking_lot::Mutex::new(None),
             },
             rx,
         )
@@ -1028,129 +1043,139 @@ pub async fn run_daemon() -> Result<()> {
 /// Exposed for testing — callers can pass a temp-directory path to avoid
 /// colliding with a real daemon running on the default socket.
 pub async fn run_daemon_at(socket_path: PathBuf) -> Result<()> {
-    // ── Bind (the mutex): try, handle EADDRINUSE ──────────────────────────────
-    #[cfg(unix)]
-    let listener = bind_unix(&socket_path).await?;
-
-    #[cfg(not(unix))]
-    let listener = bind_tcp().await?;
-
-    info!("ahma daemon: listening on {}", socket_path.display());
-
-    let (hub, _) = DaemonHub::new(Some(socket_path.clone()));
-    let hub = Arc::new(hub);
-
-    // ── Idle-exit watcher ─────────────────────────────────────────────────────
-    let idle_count = hub.connection_count.clone();
-    #[cfg(unix)]
-    let idle_socket_path = socket_path.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            if idle_count.load(Ordering::Relaxed) == 0 {
-                // Wait 60 s with count still at 0.
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                if idle_count.load(Ordering::Relaxed) == 0 {
-                    info!("ahma daemon: idle timeout, exiting");
-                    // Unlink the socket file FIRST so late arrivals get ENOENT
-                    // (clean start) instead of ECONNREFUSED (ambiguous stale).
-                    // Unix-only: non-unix platforms bind via TCP (see `bind_tcp`
-                    // above), so there is no socket file to unlink.
-                    #[cfg(unix)]
-                    crate::fs_lock::remove_stale_socket(&idle_socket_path);
-                    std::process::exit(0);
-                }
-            }
+    let server = match HubServer::bind_at(socket_path).await {
+        Ok(server) => server,
+        Err(HubBindError::AlreadyRunning) => {
+            info!("ahma daemon: another instance is already running, exiting");
+            return Ok(());
         }
-    });
-
-    // ── Accept loop ───────────────────────────────────────────────────────────
-    accept_loop(listener, hub).await
+        Err(HubBindError::Failed(e)) => return Err(e),
+    };
+    server.spawn_standalone_idle_watcher();
+    server.serve().await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Embedded hub — TUI-owned server whose lifecycle matches the TUI process
+// Hub server — bind, serve and stop as three separate steps
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Handle for a hub server running inside the TUI process.
+/// Why [`HubServer::bind_at`] did not produce a server.
+#[derive(Debug)]
+pub enum HubBindError {
+    /// A live hub already owns the rendezvous. There is exactly one hub per
+    /// user by design (SPEC R-DAEMON.1), so this is an ordinary outcome for the
+    /// loser of a startup race, not a failure: connect to the winner instead.
+    AlreadyRunning,
+    /// The bind genuinely failed (permissions, a bad path, a port held by a
+    /// foreign process).
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for HubBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRunning => write!(f, "another ahma hub already owns the rendezvous"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for HubBindError {}
+
+#[cfg(unix)]
+type HubListener = tokio::net::UnixListener;
+#[cfg(not(unix))]
+type HubListener = tokio::net::TcpListener;
+
+/// A bound, not-yet-serving hub.
 ///
-/// The server binds the same Unix socket (macOS/Linux) or TCP loopback port
-/// (Windows) as the standalone `ahma daemon`.  When this handle is dropped the
-/// accept-loop task is aborted and the socket file is removed, so no IPC
-/// resources are left behind after the TUI exits — even on a panic.
-///
-/// Subscribers (ahma instances) see an EOF when the socket is removed and
-/// reconnect cleanly when a new TUI starts.
-pub struct EmbeddedHub {
-    broadcast: broadcast::Sender<DaemonMsg>,
-    abort: tokio::task::AbortHandle,
-    #[cfg(unix)]
+/// Binding, serving and stopping are separate so one process can host the hub
+/// *and* the MCP endpoint on one runtime with a single idle policy and a single
+/// exit path (SPEC R-DAEMON.3). Fused together — as they were, inside
+/// `run_daemon_at` — the hub's own idle timer and its `exit(0)` would race the
+/// MCP endpoint's live sessions.
+pub struct HubServer {
+    listener: HubListener,
+    hub: Arc<DaemonHub>,
     socket_path: PathBuf,
 }
 
-impl EmbeddedHub {
-    /// Subscribe to the event stream **directly** through an in-process
-    /// channel, with no socket round-trip.
-    pub fn subscribe(&self) -> broadcast::Receiver<DaemonMsg> {
-        self.broadcast.subscribe()
-    }
-}
-
-impl Drop for EmbeddedHub {
-    fn drop(&mut self) {
-        // Cancel the accept-loop task first so no new connections arrive
-        // while the socket file is being removed.
-        self.abort.abort();
-        // Best-effort removal — non-fatal if already gone.
+impl HubServer {
+    /// Bind the hub rendezvous at `socket_path` (bind-is-the-mutex).
+    ///
+    /// A stale socket file — one nothing answers on — is removed and the bind
+    /// retried; a **live** one is never stolen (SPEC R-ISO.2), it yields
+    /// [`HubBindError::AlreadyRunning`].
+    pub async fn bind_at(socket_path: PathBuf) -> std::result::Result<Self, HubBindError> {
         #[cfg(unix)]
-        let _ = std::fs::remove_file(&self.socket_path);
+        let listener = bind_unix(&socket_path).await?;
+        #[cfg(not(unix))]
+        let listener = bind_tcp().await?;
+
+        info!("ahma hub: listening on {}", socket_path.display());
+        let (hub, _) = DaemonHub::new(Some(socket_path.clone()));
+        Ok(Self {
+            listener,
+            hub: Arc::new(hub),
+            socket_path,
+        })
     }
-}
 
-/// Attempt to start a hub server embedded in the calling process.
-///
-/// Returns `Ok(Some(hub))` when the server is bound and running.
-/// Returns `Ok(None)` when another server (a running TUI or standalone
-/// `ahma daemon`) already owns the socket — the caller should fall back to
-/// `spawn_daemon_source` in `ahma_tui` (subscriber mode).
-/// Returns `Err` only for unexpected OS errors (e.g. permission denied).
-pub async fn try_start_hub_server() -> Result<Option<EmbeddedHub>> {
-    try_start_hub_server_at(default_socket_path()).await
-}
+    /// Bind at the platform default hub socket.
+    pub async fn bind() -> std::result::Result<Self, HubBindError> {
+        Self::bind_at(default_socket_path()).await
+    }
 
-/// Like [`try_start_hub_server`] but binds at `socket_path` instead of the
-/// platform default.  Exposed for testing.
-pub async fn try_start_hub_server_at(socket_path: PathBuf) -> Result<Option<EmbeddedHub>> {
-    #[cfg(unix)]
-    let listener = match try_bind_unix(&socket_path).await? {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+    /// Live connection count (instances, subscribers and one-shot queries).
+    /// Shared with the caller so a composed daemon can fold it into one idle
+    /// policy alongside its MCP session count.
+    pub fn connection_count(&self) -> Arc<AtomicUsize> {
+        self.hub.connection_count.clone()
+    }
 
-    #[cfg(not(unix))]
-    let listener = match try_bind_tcp().await? {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+    /// The path this server bound, for an identity-checked unlink at shutdown.
+    pub fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
 
-    info!(
-        "ahma hub: embedded server started on {}",
-        socket_path.display()
-    );
+    /// Install what runs when a client sends `Shutdown`. Without one the hub
+    /// unlinks its socket and exits the process, which is right only when the
+    /// hub is the whole process.
+    pub fn set_exit_hook(&self, hook: ExitHook) {
+        *self.hub.exit_hook.lock() = Some(hook);
+    }
 
-    let (hub, _) = DaemonHub::new(Some(socket_path.clone()));
-    let hub = Arc::new(hub);
-    let broadcast = hub.broadcast.clone();
+    /// The standalone `ahma daemon`'s idle policy: exit once nothing has been
+    /// connected for 60 s. A composed daemon does **not** call this — it owns a
+    /// combined policy that also counts live MCP sessions (SPEC R-DAEMON.3).
+    fn spawn_standalone_idle_watcher(&self) {
+        let idle_count = self.hub.connection_count.clone();
+        let socket_path = self.socket_path.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if idle_count.load(Ordering::Relaxed) != 0 {
+                    continue;
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                if idle_count.load(Ordering::Relaxed) == 0 {
+                    info!("ahma daemon: idle timeout, exiting");
+                    // Unlink FIRST so a late arrival gets ENOENT (clean start)
+                    // rather than ECONNREFUSED (ambiguous stale).
+                    #[cfg(unix)]
+                    crate::fs_lock::remove_stale_socket(&socket_path);
+                    #[cfg(not(unix))]
+                    let _ = &socket_path;
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
-    let task = tokio::spawn(accept_loop(listener, hub));
-    let abort = task.abort_handle();
-
-    Ok(Some(EmbeddedHub {
-        broadcast,
-        abort,
-        #[cfg(unix)]
-        socket_path,
-    }))
+    /// Accept and serve until the listener fails.
+    pub async fn serve(self) -> Result<()> {
+        accept_loop(self.listener, self.hub).await
+    }
 }
 
 // ── Unix bind/accept ──────────────────────────────────────────────────────────
@@ -1178,7 +1203,9 @@ pub fn restrict_unix_socket_permissions(path: &std::path::Path) {
 }
 
 #[cfg(unix)]
-async fn bind_unix(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
+async fn bind_unix(
+    path: &std::path::Path,
+) -> std::result::Result<tokio::net::UnixListener, HubBindError> {
     use tokio::net::UnixListener;
     loop {
         match UnixListener::bind(path) {
@@ -1187,57 +1214,25 @@ async fn bind_unix(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
                 return Ok(l);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                // Check if there is actually a live daemon.
+                // Probe before unlinking: a socket someone answers on is a live
+                // server and must never be stolen (SPEC R-ISO.2).
                 match tokio::net::UnixStream::connect(path).await {
-                    Ok(_) => {
-                        // Another daemon won the race. Exit gracefully.
-                        info!("ahma daemon: another instance is already running, exiting");
-                        std::process::exit(0);
-                    }
+                    Ok(_) => return Err(HubBindError::AlreadyRunning),
                     Err(_) => {
-                        // Stale socket file — unlink and retry.
-                        debug!("ahma daemon: removing stale socket at {}", path.display());
-                        crate::fs_lock::remove_stale_socket(path);
-                        // Small delay before retry to avoid tight loop on weird FS.
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            }
-            Err(e) => bail!("ahma daemon: failed to bind unix socket: {e}"),
-        }
-    }
-}
-
-/// Try to bind the Unix socket for the embedded hub.
-/// Returns `None` when another server is already running (caller should subscribe instead).
-#[cfg(unix)]
-async fn try_bind_unix(path: &std::path::Path) -> Result<Option<tokio::net::UnixListener>> {
-    use tokio::net::UnixListener;
-    loop {
-        match UnixListener::bind(path) {
-            Ok(l) => {
-                restrict_unix_socket_permissions(path);
-                return Ok(Some(l));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                match tokio::net::UnixStream::connect(path).await {
-                    Ok(_) => {
-                        // Another server owns the socket — caller should subscribe.
-                        debug!(
-                            "ahma hub: another server already running at {}",
-                            path.display()
-                        );
-                        return Ok(None);
-                    }
-                    Err(_) => {
-                        // Stale socket file — remove and retry.
+                        // Nothing answers — a stale file from a crash or reboot.
                         debug!("ahma hub: removing stale socket at {}", path.display());
                         crate::fs_lock::remove_stale_socket(path);
+                        // Small delay before retry to avoid a tight loop on odd filesystems.
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                return Err(HubBindError::Failed(anyhow::anyhow!(
+                    "ahma hub: failed to bind unix socket {}: {e}",
+                    path.display()
+                )));
+            }
         }
     }
 }
@@ -1261,51 +1256,25 @@ async fn accept_loop(listener: tokio::net::UnixListener, hub: Arc<DaemonHub>) ->
 // ── Windows bind/accept ───────────────────────────────────────────────────────
 
 #[cfg(not(unix))]
-async fn bind_tcp() -> Result<tokio::net::TcpListener> {
+async fn bind_tcp() -> std::result::Result<tokio::net::TcpListener, HubBindError> {
     use tokio::net::TcpListener;
     let port = daemon_port();
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     match TcpListener::bind(addr).await {
         Ok(l) => Ok(l),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // Try connecting to confirm a live daemon.
+            // Try connecting to confirm a live hub rather than a foreign
+            // process squatting the port.
             match tokio::net::TcpStream::connect(addr).await {
-                Ok(_) => {
-                    info!("ahma daemon: another instance is already running, exiting");
-                    std::process::exit(0);
-                }
-                Err(_) => {
-                    bail!("ahma daemon: port {} is in use by another process", port);
-                }
+                Ok(_) => Err(HubBindError::AlreadyRunning),
+                Err(_) => Err(HubBindError::Failed(anyhow::anyhow!(
+                    "ahma hub: port {port} is in use by another process"
+                ))),
             }
         }
-        Err(e) => bail!("ahma daemon: failed to bind TCP socket: {e}"),
-    }
-}
-
-/// Try to bind the TCP loopback port for the embedded hub on Windows.
-/// Returns `None` when another server is already running (caller should subscribe instead).
-#[cfg(not(unix))]
-async fn try_bind_tcp() -> Result<Option<tokio::net::TcpListener>> {
-    use tokio::net::TcpListener;
-    let port = daemon_port();
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    match TcpListener::bind(addr).await {
-        Ok(l) => Ok(Some(l)),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            match tokio::net::TcpStream::connect(addr).await {
-                Ok(_) => {
-                    // Another server owns the port — caller should subscribe.
-                    debug!("ahma hub: another server already running on port {}", port);
-                    Ok(None)
-                }
-                Err(_) => Err(anyhow::anyhow!(
-                    "port {} is in use by another process",
-                    port
-                )),
-            }
-        }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(HubBindError::Failed(anyhow::anyhow!(
+            "ahma hub: failed to bind TCP socket: {e}"
+        ))),
     }
 }
 
@@ -1379,11 +1348,20 @@ where
         }
 
         ClientMsg::Shutdown => {
-            info!("daemon: shutdown requested, exiting");
-            if let Some(ref path) = hub.socket_path {
-                crate::fs_lock::remove_stale_socket(path);
+            info!("daemon: shutdown requested");
+            let hook = hub.exit_hook.lock().clone();
+            match hook {
+                // The composer owns the shutdown choreography (live MCP
+                // sessions to terminate, history to flush, two sockets to
+                // unlink) — it must not be short-circuited from here.
+                Some(hook) => hook("client requested shutdown"),
+                None => {
+                    if let Some(ref path) = hub.socket_path {
+                        crate::fs_lock::remove_stale_socket(path);
+                    }
+                    std::process::exit(0);
+                }
             }
-            std::process::exit(0);
         }
 
         ClientMsg::SubmitPrompt {
@@ -1903,13 +1881,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("regress.sock");
 
-        let hub = try_start_hub_server_at(socket_path.clone())
+        let server = HubServer::bind_at(socket_path.clone())
             .await
-            .unwrap()
-            .expect("embedded hub should bind a fresh socket");
+            .expect("hub should bind a fresh socket");
+        tokio::spawn(server.serve());
 
-        // Subscribe in-process before sending so the broadcast is observed.
-        let mut rx = hub.subscribe();
+        // Subscribe over the socket before sending, so the broadcast is observed.
+        let mut sub = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        send_msg(&mut sub, &ClientMsg::Subscribe).await.unwrap();
+        let mut sub_reader = BufReader::new(sub);
+        // Drain the initial InstanceList so the next read is the AgentError.
+        let _ = recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap();
 
         // Connect as a client and submit a prompt with no instances registered.
         let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
@@ -1926,10 +1908,13 @@ mod tests {
         .await
         .unwrap();
 
-        let msg = tokio::time::timeout(TestTimeouts::scale_secs(2), rx.recv())
-            .await
-            .expect("AgentError should be broadcast, not dropped")
-            .expect("broadcast channel open");
+        let msg = tokio::time::timeout(
+            TestTimeouts::scale_secs(2),
+            recv_msg::<_, DaemonMsg>(&mut sub_reader),
+        )
+        .await
+        .expect("AgentError should be broadcast, not dropped")
+        .expect("subscriber connection open");
 
         match msg {
             DaemonMsg::Relay(HubRelay::AgentError { error }) => {
@@ -3079,58 +3064,85 @@ mod tests {
         assert_eq!(resolve_target(&hub, None).await, Some("only".to_string()));
     }
 
-    // ── EmbeddedHub bind/None/stale/drop ──────────────────────────────────────
+    // ── HubServer bind / already-running / stale ──────────────────────────────
 
+    /// A live hub is never stolen: the loser of a startup race is told so and
+    /// connects to the winner instead of unlinking a socket in use
+    /// (SPEC R-DAEMON.1, R-ISO.2).
     #[cfg(unix)]
     #[tokio::test]
-    async fn embedded_hub_second_bind_returns_none() {
+    async fn bind_hub_reports_already_running_when_a_live_hub_owns_the_path() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("embed.sock");
-        let _hub = try_start_hub_server_at(sock.clone())
+        let first = HubServer::bind_at(sock.clone())
             .await
-            .unwrap()
             .expect("first bind should succeed on a fresh socket");
+        let count = first.connection_count();
+        tokio::spawn(first.serve());
 
-        // A second attempt finds a live server → caller should subscribe instead.
-        let again = try_start_hub_server_at(sock.clone()).await.unwrap();
+        match HubServer::bind_at(sock.clone()).await {
+            Err(HubBindError::AlreadyRunning) => {}
+            Err(HubBindError::Failed(e)) => panic!("expected AlreadyRunning, got failure: {e}"),
+            Ok(_) => panic!("second bind on a live socket must not succeed"),
+        }
         assert!(
-            again.is_none(),
-            "second bind on a live socket must return None"
+            sock.exists(),
+            "the live hub's socket must survive a losing bind attempt"
+        );
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "probe is not a connection"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn embedded_hub_removes_stale_socket_and_binds() {
+    async fn bind_hub_removes_a_stale_socket_and_binds() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("stale_embed.sock");
 
-        // Leave a stale socket file with nothing listening.
+        // Leave a socket file behind with nothing listening on it — what a
+        // crash or a reboot leaves on a filesystem that is not tmpfs.
         {
             let _l = tokio::net::UnixListener::bind(&sock).unwrap();
         }
         assert!(sock.exists());
 
-        let hub = try_start_hub_server_at(sock.clone()).await.unwrap();
-        assert!(
-            hub.is_some(),
-            "a stale socket should be cleaned up and bound successfully"
-        );
+        let server = HubServer::bind_at(sock.clone())
+            .await
+            .expect("a stale socket is cleaned up and bound");
+        assert_eq!(server.socket_path(), sock.as_path());
     }
 
+    /// `Shutdown` must not shortcut a composed daemon's shutdown: with a hook
+    /// installed the hub delegates instead of calling `process::exit`.
     #[cfg(unix)]
     #[tokio::test]
-    async fn embedded_hub_drop_removes_socket_file() {
+    async fn shutdown_message_invokes_exit_hook_instead_of_exiting() {
         let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("droptest.sock");
-        let hub = try_start_hub_server_at(sock.clone())
-            .await
-            .unwrap()
-            .expect("bind");
-        assert!(sock.exists(), "socket file exists while the hub is alive");
+        let sock = tmp.path().join("hook.sock");
+        let server = HubServer::bind_at(sock.clone()).await.expect("bind");
 
-        drop(hub);
-        assert!(!sock.exists(), "socket file is removed on hub drop");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        server.set_exit_hook(Arc::new(move |reason: &str| {
+            let _ = tx.send(reason.to_string());
+        }));
+        tokio::spawn(server.serve());
+
+        let mut client = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        send_msg(&mut client, &ClientMsg::Shutdown).await.unwrap();
+
+        let reason = tokio::time::timeout(crate::timeouts::TestTimeouts::scale_secs(5), rx.recv())
+            .await
+            .expect("exit hook must run instead of exiting the process")
+            .expect("hook sends its reason");
+        assert!(
+            reason.contains("shutdown"),
+            "hook is told why it was called: {reason}"
+        );
+        // The process is still alive, which is the whole point of the hook.
+        assert!(sock.exists());
     }
 
     // ── serve_instance event forwarding ───────────────────────────────────────

@@ -37,14 +37,13 @@ pub async fn run(
     use ratatui::{Terminal, backend::CrosstermBackend};
     use tokio::sync::mpsc;
 
-    use crate::daemon_source::{spawn_daemon_source, spawn_embedded_hub_source};
+    use crate::daemon_source::spawn_daemon_source;
     use crate::keymap::map_key;
     use crate::llm_bridge::{BridgeEvent, spawn_discovery_task};
     use crate::mcp_source::{SourceEvent, spawn_mcp_source};
     use crate::state::AppState;
     use crate::theme::Theme;
     use crate::ui;
-    use ahma_common::daemon_hub::try_start_hub_server;
 
     let unicode = detect_unicode();
     let theme = Theme::with_color(unicode, !no_color());
@@ -116,27 +115,13 @@ pub async fn run(
         mcp_tx.clone(),
         workspace_path,
     ));
-    // Start the hub server inside this TUI process so its lifecycle matches the
-    // TUI — no dangling socket if the TUI crashes. ahma instances connect via
-    // Unix socket (macOS/Linux) or TCP loopback (Windows) using push messaging.
-    // If another TUI or standalone daemon already owns the socket, we fall back
-    // to subscriber mode so both TUI instances still receive events.
-    let _hub = match try_start_hub_server().await {
-        Ok(Some(hub)) => {
-            spawn_embedded_hub_source(hub.subscribe(), mcp_tx.clone());
-            Some(hub)
-        }
-        Ok(None) => {
-            // Another server owns the socket — subscribe instead.
-            debug!("hub: another server already running; connecting as subscriber");
-            spawn_daemon_source(mcp_tx.clone());
-            None
-        }
-        Err(e) => {
-            debug!("hub: could not start embedded server ({e}); no multi-instance aggregation");
-            None
-        }
-    };
+    // The TUI is always a subscriber, never the hub (SPEC R-DAEMON.9). It used
+    // to bind the hub socket itself when it started first, which made the
+    // observability of every other client depend on this window staying open:
+    // quitting the TUI unlinked the socket and every attached instance lost its
+    // event stream until it reconnected. The per-user daemon owns the hub; this
+    // process only watches it, and quitting sends nothing but EOF.
+    spawn_daemon_source(mcp_tx.clone());
 
     // Bridge channel carries both provider discovery results and LLM tokens.
     let (bridge_tx, mut bridge_rx) = mpsc::channel::<BridgeEvent>(512);
