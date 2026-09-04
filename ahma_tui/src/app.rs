@@ -108,7 +108,10 @@ async fn run_ratatui(
         if let Ok(profile) = crate::agent_config::get_profile(&cwd, &profile_name) {
             state.active_profile = Some(profile.name.clone());
             state.current_provider_url = Some(profile.provider_url);
-            state.llm_label = format!("profile:{} / {}", profile.name, profile.model);
+            state.llm_selection = Some(crate::state::LlmSelection::profile(
+                profile.name.clone(),
+                profile.model,
+            ));
         } else {
             // The user asked for a specific profile by name and did not get it;
             // opening as if they had never passed the flag is a surprise.
@@ -632,11 +635,7 @@ fn submit_provider_picker(picker: crate::state::PickerState, state: &mut crate::
     let old_model = state.selected_model();
     state.current_provider_url = Some(base_url.clone());
     state.available_models.clear();
-    state.llm_label = if old_model.is_empty() {
-        name
-    } else {
-        format!("{name} / {old_model}")
-    };
+    state.llm_selection = Some(crate::state::LlmSelection::named(name, old_model));
 
     if let Some(tx) = &state.bridge_tx {
         spawn_model_refresh(base_url, tx.clone());
@@ -661,12 +660,15 @@ fn submit_model_picker(picker: crate::state::PickerState, state: &mut crate::sta
         {
             state.current_provider_url = Some(provider.base_url.clone());
             state.available_models = provider.models.clone();
-            state.llm_label = format!("{provider_name} / {model_name}");
+            state.llm_selection =
+                Some(crate::state::LlmSelection::named(provider_name, model_name));
             save_session(state);
         }
     } else {
-        let provider = provider_label(&state.llm_label);
-        state.llm_label = format!("{provider} / {item}");
+        // Keep whatever provider is already selected and swap only the model.
+        if let Some(sel) = &mut state.llm_selection {
+            sel.model = item.to_string();
+        }
         save_session(state);
     }
 }
@@ -897,13 +899,13 @@ fn reraise_grant_for_selected_op(state: &mut crate::state::AppState) {
 
     send_daemon_msg(ahma_common::daemon_hub::ClientMsg::ReRaiseScopeGrant {
         path: path.clone(),
-        access: access.clone(),
+        access,
         target_instance_id: op.instance_id.clone(),
     });
     state.push_log(LogEntry {
         timestamp: chrono::Local::now(),
         level: LogLevel::Info,
-        message: format!("Asking again for {access} access to {path}…"),
+        message: format!("Asking again for {} access to {path}…", access.short()),
     });
 }
 
@@ -1486,8 +1488,8 @@ fn build_system_prompt(state: &crate::state::AppState) -> String {
         } else {
             format!("Workspace: {}\n", state.workspace)
         },
-        sandbox_line: if !state.sandbox_status.is_empty() && state.sandbox_status != "unknown" {
-            format!("Sandbox: {}\n", state.sandbox_status)
+        sandbox_line: if state.sandbox_status.is_known() {
+            format!("Sandbox: {}\n", state.sandbox_status.label())
         } else {
             String::new()
         },
@@ -2788,7 +2790,7 @@ fn handle_agent_load(cwd: &std::path::Path, name: &str, state: &mut crate::state
         Ok(profile) => {
             state.active_profile = Some(profile.name.clone());
             state.current_provider_url = Some(profile.provider_url);
-            state.llm_label = format!("profile:{name} / {}", profile.model);
+            state.llm_selection = Some(crate::state::LlmSelection::profile(name, profile.model));
             push_assistant_message(state, format!("Loaded profile `{name}`."));
         }
         Err(e) => push_assistant_message(state, format!("Failed to load profile: {e}")),
@@ -3084,12 +3086,14 @@ fn provider_numctx_command(arg: &str, state: &mut crate::state::AppState) {
 /// (`"Provider / Model"`); `None` if nothing is selected yet.
 #[cfg(feature = "tui")]
 fn current_provider_name(state: &crate::state::AppState) -> Option<String> {
-    let label = provider_label(&state.llm_label);
-    if label.is_empty() || label == "no LLM" {
-        None
-    } else {
-        Some(label)
-    }
+    // `provider_name()` is `None` for a profile, so a profile alias can never
+    // reach a caller that wants a registry provider.
+    state
+        .llm_selection
+        .as_ref()
+        .and_then(|s| s.provider_name())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(feature = "tui")]
@@ -3172,7 +3176,14 @@ fn open_model_picker(state: &mut crate::state::AppState) {
 
     let mut picker = PickerState::new("Select model", items);
     let selected_model = state.selected_model();
-    let selected_provider = provider_label(&state.llm_label);
+    let selected_provider = state
+        .llm_selection
+        .as_ref()
+        .map(|s| match &s.provider {
+            crate::state::ProviderRef::Named(n) => n.clone(),
+            crate::state::ProviderRef::Profile(a) => format!("profile:{a}"),
+        })
+        .unwrap_or_default();
     if !selected_model.is_empty() && !selected_provider.is_empty() {
         let exact = format!("{selected_provider} / {selected_model}");
         picker.select_exact(&exact);
@@ -3365,16 +3376,18 @@ fn parse_run_command(rest: &str) -> Result<(&str, serde_json::Value), String> {
 }
 
 fn parse_llm_selection(state: &crate::state::AppState) -> (String, String) {
-    if state.llm_label == "no LLM" || state.llm_label.is_empty() {
+    let Some(selection) = state.llm_selection.as_ref() else {
         return (String::new(), String::new());
-    }
+    };
 
-    let model = state.selected_model();
+    let model = selection.model.clone();
     if let Some(base_url) = &state.current_provider_url {
         return (base_url.clone(), model);
     }
 
-    let provider_name = provider_label(&state.llm_label);
+    // No URL and no registry name (a profile always carries a URL, so this is
+    // the named case) — fall back to the provider's default endpoint.
+    let provider_name = selection.provider_name().unwrap_or_default().to_string();
     let base_url = if provider_name.starts_with("http") {
         provider_name
     } else {
@@ -3394,27 +3407,16 @@ fn default_provider_base_url(provider_name: &str) -> String {
     }
 }
 
-fn provider_label(label: &str) -> String {
-    label
-        .rsplit_once(" / ")
-        .map(|(provider, _)| provider.trim().to_string())
-        .unwrap_or_else(|| label.trim().to_string())
-}
-
 /// Persist the current session config to `.ahma/session.toml`.
 fn save_session(state: &crate::state::AppState) {
     use crate::session_config::TuiSessionConfig;
 
-    let (provider, model) = {
-        let label = &state.llm_label;
-        if let Some(pos) = label.rfind(" / ") {
-            (
-                label[..pos].trim().to_string(),
-                label[pos + 3..].trim().to_string(),
-            )
-        } else {
-            (label.clone(), String::new())
-        }
+    // Straight off the typed selection. Splitting the *display* label here is
+    // what wrote `provider = "no LLM"` and `provider = "profile:<alias>"` into
+    // the user's global settings.
+    let (provider, model) = match state.llm_selection.as_ref() {
+        Some(sel) => (sel.persistable_provider().to_string(), sel.model.clone()),
+        None => (String::new(), String::new()),
     };
 
     let cfg = TuiSessionConfig {
@@ -3563,7 +3565,7 @@ fn handle_providers_discovered(
     state.discovered_providers = providers.clone();
     rebuild_available_providers(state);
 
-    if state.llm_label == "no LLM" {
+    if state.llm_selection.is_none() {
         if let Some(provider) = state.available_providers.first().cloned() {
             auto_select_first_provider(state, &provider);
         }
@@ -3583,7 +3585,10 @@ fn auto_select_first_provider(
     let model = provider.models.first().cloned().unwrap_or_default();
     state.available_models = provider.models.clone();
     state.current_provider_url = Some(provider.base_url.clone());
-    state.llm_label = format!("{} / {}", provider.name, model);
+    state.llm_selection = Some(crate::state::LlmSelection::named(
+        provider.name.clone(),
+        model,
+    ));
     save_session(state);
 }
 
@@ -3600,7 +3605,10 @@ fn refresh_current_provider_models(state: &mut crate::state::AppState, current_u
     state.available_models = provider.models;
     let model = state.selected_model();
     if !model.is_empty() {
-        state.llm_label = format!("{} / {}", provider.name, model);
+        state.llm_selection = Some(crate::state::LlmSelection::named(
+            provider.name.clone(),
+            model,
+        ));
     }
 }
 
@@ -3659,7 +3667,10 @@ fn window_from_step(
         id: win_id,
         label,
         status: crate::state::WindowStatus::Pending,
-        content: vec![format!("Task: {}", step.task)],
+        content: vec![crate::state::WindowLine::start(format!(
+            "Task: {}",
+            step.task
+        ))],
         collapsed: false,
         finished_at: None,
         duration_ms: None,
@@ -3697,7 +3708,7 @@ fn handle_decomposed_event(
 fn handle_window_output_event(window_id: usize, line: String, state: &mut crate::state::AppState) {
     if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
         if w.is_cli {
-            w.content.push(line);
+            w.content.push(crate::state::WindowLine::output(line));
         } else {
             append_multiline_window_output(&mut w.content, &line);
         }
@@ -3708,16 +3719,19 @@ fn handle_window_output_event(window_id: usize, line: String, state: &mut crate:
 /// resulting segment becomes its own entry (continuing the last existing
 /// entry rather than starting a fresh one for the first segment).
 #[cfg(feature = "tui")]
-fn append_multiline_window_output(content: &mut Vec<String>, line: &str) {
-    if content.is_empty() {
-        content.push(String::new());
+fn append_multiline_window_output(content: &mut Vec<crate::state::WindowLine>, line: &str) {
+    use crate::state::LineKind;
+    // Continue the previous line only when it is actually output; appending a
+    // stdout fragment onto the "Starting …" header would corrupt both.
+    if !matches!(content.last().map(|l| &l.kind), Some(LineKind::Output)) {
+        content.push(crate::state::WindowLine::output(String::new()));
     }
     let parts: Vec<&str> = line.split('\n').collect();
     if let Some(last) = content.last_mut() {
-        last.push_str(parts[0]);
+        last.text.push_str(parts[0]);
     }
     for part in parts.iter().skip(1) {
-        content.push(part.to_string());
+        content.push(crate::state::WindowLine::output(*part));
     }
 }
 
@@ -3735,7 +3749,8 @@ fn handle_window_finished_event(
         } else {
             crate::state::WindowStatus::Error
         };
-        w.content.push(summary);
+        w.content
+            .push(crate::state::WindowLine::end(w.status, summary));
         w.finished_at = Some(std::time::Instant::now());
         if !success {
             current_failed = true;
@@ -3791,13 +3806,12 @@ fn request_tool_approval(
     args: String,
     responder: Option<tokio::sync::oneshot::Sender<bool>>,
 ) {
-    let diff = if tool.contains("replace") || tool == "write_file" {
-        serde_json::from_str::<serde_json::Value>(&args)
-            .ok()
-            .and_then(|val| serde_json::to_string_pretty(&val).ok())
-    } else {
-        None
-    };
+    // Both of these ask the shared approvals mechanism. The preview used to be
+    // decided here by a substring guess on the tool name, which could not work
+    // for tools ahma does not define (MTDF custom tools) and defaulted to
+    // hiding the arguments — the unsafe direction for a prompt whose whole job
+    // is to let the operator see what they are authorising.
+    let diff = ahma_core::approvals::argument_preview(&tool, &args);
     let note = ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
     state.request_approval(
         crate::state::ApprovalGate::new(id, tool.clone(), format!("Execute tool {tool}"))
@@ -4017,12 +4031,10 @@ fn format_friendly_start(op: &crate::state::Operation) -> String {
 
 #[cfg(feature = "tui")]
 fn format_friendly_end(op: &crate::state::Operation) -> String {
-    let status_str = match op.status {
-        crate::state::OpStatus::Succeeded => "Finished successfully",
-        crate::state::OpStatus::Failed => "Failed",
-        crate::state::OpStatus::Cancelled => "Cancelled",
-        _ => "Finished",
-    };
+    // Via the shared identity mechanism (SPEC R24.7) rather than a local match:
+    // the local one had a `_` arm that swallowed `Denied` and announced a
+    // refused write as "Finished".
+    let status_str = op.identity().outcome.friendly_phrase();
 
     let duration_str = if let Some(ms) = op.duration_ms {
         if ms < 1000 {
@@ -4050,7 +4062,10 @@ fn format_friendly_end(op: &crate::state::Operation) -> String {
 /// live output tail (streamed as the command runs), and — once terminal —
 /// a separator plus a friendly result line.
 #[cfg(feature = "tui")]
-fn window_content_for(op: &crate::state::Operation, unicode: bool) -> Vec<String> {
+fn window_content_for(
+    op: &crate::state::Operation,
+    unicode: bool,
+) -> Vec<crate::state::WindowLine> {
     let is_live = matches!(
         op.status,
         crate::state::OpStatus::Running
@@ -4059,21 +4074,24 @@ fn window_content_for(op: &crate::state::Operation, unicode: bool) -> Vec<String
     );
 
     let mut content = Vec::with_capacity(op.stdout_tail.len() + 3);
-    content.push(format_friendly_start(op));
+    content.push(crate::state::WindowLine::start(format_friendly_start(op)));
 
     // Live output tail — the command's stdout/stderr as it streams in.
-    content.extend(op.stdout_tail.iter().cloned());
+    content.extend(op.stdout_tail.iter().map(crate::state::WindowLine::output));
 
     if is_live {
-        content.push("____".to_string());
+        content.push(crate::state::WindowLine::live_edge());
     } else {
         let sep = if unicode {
-            "────────────────────────────────────────".to_string()
+            "────────────────────────────────────────"
         } else {
-            "----------------------------------------".to_string()
+            "----------------------------------------"
         };
-        content.push(sep);
-        content.push(format_friendly_end(op));
+        content.push(crate::state::WindowLine::separator(sep));
+        content.push(crate::state::WindowLine::end(
+            window_status_for(op),
+            format_friendly_end(op),
+        ));
     }
     content
 }
@@ -4200,7 +4218,11 @@ fn build_new_window(
 #[cfg(feature = "tui")]
 fn sync_operations_to_windows(state: &mut crate::state::AppState) {
     let mut to_add = Vec::new();
-    let ops = state.operations.clone();
+    // Moved out and put back rather than cloned: this runs on every operation
+    // state change, and each `Operation` carries a stdout tail of up to
+    // STDOUT_TAIL_CAP lines. None of the helpers below read `state.operations`,
+    // so the borrow split costs nothing.
+    let ops = std::mem::take(&mut state.operations);
 
     let multi_instance = has_multiple_instances(&ops);
 
@@ -4216,6 +4238,8 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             to_add.push(w);
         }
     }
+
+    state.operations = ops;
 
     for w in to_add {
         state.windows.push(w);
@@ -4374,7 +4398,7 @@ fn handle_source_sandbox_event(
             state.sandbox_scope = Some(scope);
         }
         SourceEvent::SandboxFailed { error } => {
-            state.sandbox_status = "FAILED".to_string();
+            state.sandbox_status = crate::state::SandboxAuthority::Failed;
             state.sandbox_failed_reason = Some(error.clone());
             state.push_log(crate::state::LogEntry {
                 timestamp: chrono::Local::now(),
@@ -5257,6 +5281,53 @@ mod tests {
     use super::parse_run_command;
     use serde_json::json;
 
+    /// Before the sandbox locks, `sandbox_status` holds the initial `"UNKNOWN"`.
+    /// The guard meant to suppress that from the model's system prompt compared
+    /// against lowercase `"unknown"`, which no producer ever emits — so the
+    /// guard was dead and every pre-lock turn told the model
+    /// `Sandbox: UNKNOWN`, which is noise at best and misleading at worst.
+    #[test]
+    fn system_prompt_omits_the_sandbox_line_until_the_state_is_known() {
+        let state = crate::state::AppState::new("http://localhost:0", "test", true);
+        let prompt = super::build_system_prompt(&state);
+        assert!(
+            !prompt.contains("Sandbox: UNKNOWN"),
+            "an unknown sandbox state must not be announced to the model: {prompt}"
+        );
+    }
+
+    /// A sandbox denial is a first-class outcome, not a flavour of success
+    /// (SPEC R24.7, R-PERM.7). `format_friendly_end` matched three statuses and
+    /// sent everything else to `_ => "Finished"`, so a denied operation's card
+    /// read "Finished in 12ms" — the single worst thing it could say about a
+    /// refused write. The refused path must appear too, or the row does not tell
+    /// the user what to do about it.
+    #[test]
+    fn friendly_end_line_names_a_denial_instead_of_calling_it_finished() {
+        use crate::state::{OpStatus, Operation};
+        let mut op = Operation::new("op-1", "run_terminal_command", OpStatus::Denied);
+        op.duration_ms = Some(12);
+        op.denial = Some((
+            "/etc/hosts".to_string(),
+            ahma_common::config::ScopeAccess::Rw,
+        ));
+
+        let line = super::format_friendly_end(&op);
+
+        assert!(
+            !line.contains("Finished"),
+            "a denial must not be reported as a finish: {line}"
+        );
+        assert!(
+            line.to_lowercase().contains("denied"),
+            "the line must say it was denied: {line}"
+        );
+        assert!(
+            line.contains("/etc/hosts"),
+            "the line must name the refused path: {line}"
+        );
+    }
+
     /// Regression for issue #484: the provider's declared `num_ctx` must be
     /// discoverable from its base URL so `resolve_token_prefs` can populate
     /// `context_length` without an explicit `--context-length` flag.
@@ -6063,7 +6134,7 @@ mod tests {
             },
             &mut state,
         );
-        assert_eq!(state.sandbox_status, "FAILED");
+        assert_eq!(state.sandbox_status, crate::state::SandboxAuthority::Failed);
         assert_eq!(
             state.sandbox_failed_reason.as_deref(),
             Some("no usable roots")
@@ -6269,7 +6340,7 @@ mod tests {
 
             let mut state = AppState::new("http://localhost:3000", "HTTP", true);
             state.workspace = tmp.path().to_string_lossy().into_owned();
-            state.llm_label = "ollama / test-model".to_string();
+            state.llm_selection = Some(crate::state::LlmSelection::named("ollama", "test-model"));
             state.current_provider_url = Some("http://localhost:11434/v1".to_string());
             state
         }

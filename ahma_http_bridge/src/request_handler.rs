@@ -1,7 +1,11 @@
 use crate::bridge::{MCP_SESSION_ID_HEADER, session_id_from_headers};
 use crate::error::BridgeError;
 use crate::session::{McpRoot, SessionManager};
-use ahma_common::mcp_methods::{INITIALIZED_METHOD, ROOTS_LIST_METHOD};
+use ahma_common::mcp_methods::{
+    INITIALIZE_METHOD, INITIALIZED_METHOD, JSONRPC_REQUEST_TIMEOUT, JSONRPC_SANDBOX_FAILED,
+    JSONRPC_SANDBOX_NOT_READY, ROOTS_LIST_CHANGED_METHOD, ROOTS_LIST_METHOD,
+    SAMPLING_CREATE_MESSAGE_METHOD, TOOLS_CALL_METHOD,
+};
 use ahma_common::timeouts::BRIDGE_TOOL_CALL_CEILING_SECS;
 use axum::{
     body::Body,
@@ -86,7 +90,7 @@ fn request_timeout_response(
         "jsonrpc": "2.0",
         "id": id,
         "error": {
-            "code": -32002,
+            "code": JSONRPC_REQUEST_TIMEOUT,
             "message": format!(
                 "Operation still running: the bridge wait window ({}s) elapsed \
                  before the tool returned. The operation continues in the \
@@ -310,7 +314,11 @@ async fn handle_routed_sampling_request(
         Ok(Err(_)) => error_response(original_id, -32603, "Routed request sender dropped"),
         Err(_) => {
             target_session.routed_requests.remove(&routed_id);
-            error_response(original_id, -32002, "Request timed out on the client side")
+            error_response(
+                original_id,
+                JSONRPC_REQUEST_TIMEOUT,
+                "Request timed out on the client side",
+            )
         }
     }
 }
@@ -389,7 +397,7 @@ async fn handle_post_request(
     tracing::Span::current().record("session_id", session_id.as_deref().unwrap_or(""));
     debug!(method = ?method, session_id = ?session_id, has_id = payload.get("id").is_some(), "Incoming MCP request");
 
-    if method == Some("initialize") {
+    if method == Some(INITIALIZE_METHOD) {
         terminate_session_being_reinitialized(&session_manager, session_id.as_deref()).await;
         return handle_initialize(&session_manager, &payload, mode).await;
     }
@@ -402,7 +410,7 @@ async fn handle_post_request(
         return missing_session_id_response(payload_id(&payload));
     };
 
-    if method == Some("sampling/createMessage") {
+    if method == Some(SAMPLING_CREATE_MESSAGE_METHOD) {
         return handle_routed_sampling_request(
             &session_manager,
             &session_id,
@@ -524,10 +532,11 @@ async fn maybe_fail_sandbox_for_rootless_client(
     );
     session_manager.fail_sandbox(
         session_id,
-        "this client did not declare the MCP `roots` capability, so it cannot report a \
-         workspace, and the bridge was started without a fallback scope. Start the bridge \
-         with `--sandbox-scope <project-dir>`, or set `[sandbox] container_root` in \
-         ~/.ahma/settings.toml, or use a client that supports roots/list.",
+        &format!(
+            "this client did not declare the MCP `roots` capability, so it cannot report a \
+             workspace, and the bridge was started without a fallback scope. {}",
+            crate::session::NO_SANDBOX_SCOPE_REMEDIATION
+        ),
     );
 }
 
@@ -604,7 +613,7 @@ async fn create_session_or_error(
                 error_response_with_status(
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
                     request_id,
-                    -32002,
+                    JSONRPC_REQUEST_TIMEOUT,
                     &format!("Failed to create session: {}", e),
                 )
             } else {
@@ -737,7 +746,12 @@ fn build_handshake_timeout_response(
     );
     error!(session_id = %session_id, "Handshake timeout: SSE={}, initialized={}", sse_connected, mcp_initialized);
     with_session_header(
-        error_response_with_status(StatusCode::GATEWAY_TIMEOUT, request_id, -32002, &error_msg),
+        error_response_with_status(
+            StatusCode::GATEWAY_TIMEOUT,
+            request_id,
+            JSONRPC_REQUEST_TIMEOUT,
+            &error_msg,
+        ),
         session_id,
     )
 }
@@ -771,7 +785,7 @@ fn check_sandbox_lock(
                 error_response_with_status(
                     StatusCode::FORBIDDEN,
                     request_id,
-                    -32000,
+                    JSONRPC_SANDBOX_FAILED,
                     &format!("Sandbox configuration failed: {}", error),
                 ),
                 session_id,
@@ -782,7 +796,7 @@ fn check_sandbox_lock(
                 error_response_with_status(
                     StatusCode::FORBIDDEN,
                     request_id,
-                    -32000,
+                    JSONRPC_SANDBOX_FAILED,
                     "Session terminated",
                 ),
                 session_id,
@@ -811,7 +825,7 @@ fn check_sandbox_lock(
         error_response_with_status(
             StatusCode::CONFLICT,
             request_id,
-            -32001,
+            JSONRPC_SANDBOX_NOT_READY,
             get_conflict_message(session_manager.requires_client_roots()),
         ),
         session_id,
@@ -875,7 +889,7 @@ async fn wait_for_initialization(
             error_response_with_status(
                 StatusCode::GATEWAY_TIMEOUT,
                 request_id,
-                -32002,
+                JSONRPC_REQUEST_TIMEOUT,
                 "Timeout waiting for MCP initialization - client must send notifications/initialized first",
             ),
             session_id,
@@ -1059,9 +1073,11 @@ async fn try_lock_sandbox_from_roots(
             );
             session_manager.fail_sandbox(
                 session_id,
-                "Client did not provide roots/list entries. Configure an explicit sandbox \
-                 scope on server startup (e.g. --sandbox-scope /path/to/project) or use a \
-                 client that supports roots/list.",
+                &format!(
+                    "Client did not provide roots/list entries. \
+                     {}",
+                    crate::session::NO_SANDBOX_SCOPE_REMEDIATION
+                ),
             );
             return;
         }
@@ -1259,7 +1275,7 @@ fn forwarded_request_timeout(
     method: Option<&str>,
     payload: &Value,
 ) -> Duration {
-    if method == Some("tools/call") {
+    if method == Some(TOOLS_CALL_METHOD) {
         calculate_tool_timeout(payload, session_manager.tool_call_timeout_secs())
     } else {
         Duration::from_secs(session_manager.request_timeout_secs())
@@ -1473,7 +1489,7 @@ async fn gate_session_request(
     }
 
     // Roots changed check
-    if method == Some("notifications/roots/list_changed")
+    if method == Some(ROOTS_LIST_CHANGED_METHOD)
         && let Some(response) =
             handle_roots_changed_request(session_manager, session_id, request_id.clone()).await
     {
@@ -1481,7 +1497,7 @@ async fn gate_session_request(
     }
 
     // Sandbox gating for tools/call
-    if method == Some("tools/call")
+    if method == Some(TOOLS_CALL_METHOD)
         && let Some(response) = check_sandbox_lock(session_manager, session_id, request_id.clone())
     {
         return Some(response);
@@ -2329,8 +2345,11 @@ mod tests {
         try_lock_sandbox_from_roots(&mgr, &id, &json!({"roots": []})).await;
 
         match mgr.get_session(&id).unwrap().current_sandbox_state() {
+            // Asserting the shared remediation, not a phrase from one copy of
+            // it: the point is that every surface hands out the same advice.
             SandboxState::Failed { error } => assert!(
-                error.contains("roots/list") && error.contains("sandbox scope"),
+                error.contains("roots/list")
+                    && error.contains(crate::session::NO_SANDBOX_SCOPE_REMEDIATION),
                 "the failure must tell the user how to fix it, got: {error}"
             ),
             other => panic!("empty roots must fail the session, got {other:?}"),

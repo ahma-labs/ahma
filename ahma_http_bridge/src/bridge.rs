@@ -452,6 +452,33 @@ fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
         .and_then(extract_bearer_token)
 }
 
+// ─── Transport policy middleware ──────────────────────────────────────────────
+
+/// Axum middleware enforcing the two transport-wide request rules: the
+/// DNS-rebinding `Origin` guard and the `MCP-Protocol-Version` check.
+///
+/// These are the same class of rule as [`bearer_auth_middleware`] — they apply
+/// to every MCP route regardless of what the handler does — but they were the
+/// first two lines of four separate handlers instead. That made the exemptions
+/// accidents of which handler someone remembered to edit rather than a policy:
+/// `/restart` got the origin guard but not the version check, and the
+/// `handle_not_found` fallback got neither, so a route added to
+/// [`build_mcp_router`] silently shipped with no origin check and nothing in the
+/// router said so.
+///
+/// As a layer on `mcp_routes`, `/health`'s exemption is expressed the same way
+/// the auth exemption already is: it lives in `exempt_routes`, outside these
+/// layers.
+async fn transport_policy_middleware(request: axum::extract::Request, next: Next) -> Response {
+    if let Some(rejection) = validate_origin(request.headers()) {
+        return rejection;
+    }
+    if let Some(rejection) = validate_protocol_version_header(request.headers()) {
+        return rejection;
+    }
+    next.run(request).await
+}
+
 // ─── Bearer-token authentication middleware ───────────────────────────────────
 
 /// Axum middleware that enforces a bearer-token check when `BridgeState::require_token`
@@ -720,6 +747,9 @@ fn build_mcp_router(
             state.clone(),
             bearer_auth_middleware,
         ))
+        // Outermost of the two, so a request with a forbidden Origin is refused
+        // before any credential handling happens.
+        .layer(middleware::from_fn(transport_policy_middleware))
         .with_state(state);
 
     // Apply per-IP rate limiting to MCP routes only, when configured.
@@ -1275,9 +1305,6 @@ async fn handle_restart(
     State(state): State<Arc<BridgeState>>,
     request: axum::extract::Request,
 ) -> Response {
-    if let Some(rejection) = validate_origin(request.headers()) {
-        return rejection;
-    }
     let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -1372,12 +1399,6 @@ async fn handle_session_delete(
     State(state): State<Arc<BridgeState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(rejection) = validate_origin(&headers) {
-        return rejection;
-    }
-    if let Some(rejection) = validate_protocol_version_header(&headers) {
-        return rejection;
-    }
     // Get session ID from header
     let Some(session_id) = session_id_from_headers(&headers).map(str::to_string) else {
         warn!("DELETE request without session ID header");
@@ -1503,13 +1524,6 @@ fn resolve_sse_session(
     state: &BridgeState,
     headers: &HeaderMap,
 ) -> std::result::Result<(String, Arc<crate::session::Session>), Box<Response>> {
-    if let Some(rejection) = validate_origin(headers) {
-        return Err(Box::new(rejection));
-    }
-    if let Some(rejection) = validate_protocol_version_header(headers) {
-        return Err(Box::new(rejection));
-    }
-
     let Some(session_id) = session_id_from_headers(headers).map(str::to_string) else {
         debug!("SSE request without session ID header - returning 404");
         return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
@@ -1707,12 +1721,6 @@ async fn handle_mcp_request(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response {
-    if let Some(rejection) = validate_origin(&headers) {
-        return rejection;
-    }
-    if let Some(rejection) = validate_protocol_version_header(&headers) {
-        return rejection;
-    }
     // JSON-RPC batch arrays are not supported (batching was removed from the
     // MCP spec in 2025-06-18). Refusing loudly beats the old behavior, which
     // forwarded the raw array to the subprocess with undefined results.
@@ -2983,6 +2991,9 @@ for line in sys.stdin:
 #[cfg(test)]
 mod transport_guard_tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     #[test]
     fn loopback_origins_are_accepted() {
@@ -3008,6 +3019,82 @@ mod transport_guard_tests {
         ] {
             assert!(!origin_is_loopback(origin), "{origin} must be rejected");
         }
+    }
+
+    /// The origin guard and the protocol-version check are transport-wide rules,
+    /// so they must hold for every route the real router serves — including the
+    /// `handle_not_found` fallback, which got neither while they were the first
+    /// lines of four hand-picked handlers. Built through `build_mcp_router` on
+    /// purpose: the local `create_app` helper assembles its own router, so it
+    /// would not exercise the layer stack that production actually runs.
+    #[tokio::test]
+    async fn transport_policy_applies_to_every_route_in_the_real_router() {
+        let session_manager = Arc::new(SessionManager::new(SessionManagerConfig::default()));
+        let state = Arc::new(BridgeState {
+            session_manager,
+            require_token: ArcSwapOption::new(None),
+            listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
+        });
+        let loopback: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let app = build_mcp_router(state, build_cors_layer(&loopback), None, 0, 0)
+            .expect("router must build");
+
+        // An unknown path is still a route the bridge serves. With a forbidden
+        // Origin it must be refused, not merely 404'd.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/definitely-not-a-route")
+                    .header(axum::http::header::ORIGIN, "http://attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "the fallback route must be covered by the origin guard"
+        );
+
+        // /restart previously got the origin guard but no version check.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/restart")
+                    .header("mcp-protocol-version", "1999-01-01")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "/restart must reject an unsupported protocol version like every other route"
+        );
+
+        // /health stays exempt, the same way it is exempt from bearer auth.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(HEALTH_PATH)
+                    .header(axum::http::header::ORIGIN, "http://attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "load-balancer probes must not be gated by Origin"
+        );
     }
 
     #[test]

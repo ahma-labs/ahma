@@ -1464,7 +1464,7 @@ pub(crate) async fn run_tool_info_mode(args: InfoArgs) -> Result<()> {
             );
         }
     }
-    tools.sort_by_key(|(name, _)| (*name).clone());
+    tools.sort_by(|a, b| a.0.cmp(b.0));
 
     match args.format {
         list_tools::OutputFormat::Text => print_tool_info_text(&tools),

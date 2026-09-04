@@ -14,8 +14,8 @@ use crate::mcp_service::{ActiveAgentSession, get_global_prompt_runner};
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use ahma_common::config::settings_path;
 use ahma_common::daemon_hub::{
-    ClientMsg, DaemonChatMessage, DaemonEvent, DaemonMsg, DaemonStream, connect_to_daemon,
-    ensure_daemon_running, recv_msg, send_msg,
+    ClientMsg, DaemonChatMessage, DaemonEvent, DaemonMsg, DaemonStream, OpStatus as WireStatus,
+    connect_to_daemon, ensure_daemon_running, recv_msg, send_msg,
 };
 use ahma_common::scope_grant::{
     GrantCoordinator, GrantDecision, GrantResolveOutcome, ScopeGrantRequest, persist_grant,
@@ -407,11 +407,12 @@ async fn replay_completed_operations(
             .and_then(|end| end.duration_since(op.start_time).ok())
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        let (result_summary, denial) = summary_and_denial(op);
         let finished_ev = ClientMsg::Event {
             payload: DaemonEvent::OpFinished {
                 id: op.id.clone(),
-                status: status_label(op.state),
-                result_summary: result_summary_from(op),
+                status: wire_status(op.state),
+                result_summary,
                 duration_ms,
                 ended_epoch_ms: op.end_time.and_then(epoch_ms),
                 // Replayed completions carry their exit code too, so a
@@ -419,7 +420,7 @@ async fn replay_completed_operations(
                 exit_code: op.result.as_ref().and_then(exit_code_from_value),
                 // Replay carries denials too, so a TUI opened after the fact
                 // still sees which path was refused (SPEC R-PERM.7).
-                denial: denial_from_operation(op),
+                denial,
             },
         };
         if send_msg(writer, &finished_ev).await.is_err() {
@@ -489,7 +490,7 @@ async fn handle_daemon_msg(
             decision,
         } => resolve_scope_grant(decision_id, decision, writer, grant_coordinator).await,
         DaemonMsg::ReRaiseScopeGrant { path, access } => {
-            re_raise_scope_grant(&path, &access, writer, grant_coordinator).await
+            re_raise_scope_grant(&path, access, writer, grant_coordinator).await
         }
         DaemonMsg::SubmitWebApproval {
             decision_id,
@@ -606,17 +607,16 @@ async fn resolve_scope_grant(
 /// denied row and confirming is not ahma nagging.
 async fn re_raise_scope_grant(
     path: &str,
-    access: &str,
+    access: ahma_common::config::ScopeAccess,
     writer: &mut tokio::io::WriteHalf<DaemonStream>,
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
 ) {
-    debug!("daemon_reporter: received ReRaiseScopeGrant path={path} access={access}");
+    debug!(
+        "daemon_reporter: received ReRaiseScopeGrant path={path} access={}",
+        access.label()
+    );
     let Some(coord) = grant_coordinator else {
         return;
-    };
-    let access = match access {
-        "rw" => ahma_common::config::ScopeAccess::Rw,
-        _ => ahma_common::config::ScopeAccess::Ro,
     };
     match coord.reopen(
         std::path::Path::new(path),
@@ -749,7 +749,7 @@ fn daemon_event_for(
             duration_ms,
         } => DaemonEvent::OpFinished {
             id: operation_id.clone(),
-            status: "Completed".to_string(),
+            status: WireStatus::Completed,
             result_summary: summary_from_value(result),
             duration_ms: *duration_ms,
             ended_epoch_ms: now_ms,
@@ -763,7 +763,7 @@ fn daemon_event_for(
             duration_ms,
         } => DaemonEvent::OpFinished {
             id: operation_id.clone(),
-            status: "Failed".to_string(),
+            status: WireStatus::Failed,
             result_summary: Some(clip_summary(error.clone())),
             duration_ms: *duration_ms,
             ended_epoch_ms: now_ms,
@@ -781,7 +781,7 @@ fn daemon_event_for(
             duration_ms,
         } => DaemonEvent::OpFinished {
             id: operation_id.clone(),
-            status: "Cancelled".to_string(),
+            status: WireStatus::Cancelled,
             result_summary: Some(clip_summary(reason.clone())),
             duration_ms: *duration_ms,
             ended_epoch_ms: now_ms,
@@ -793,7 +793,7 @@ fn daemon_event_for(
             duration_ms,
         } => DaemonEvent::OpFinished {
             id: operation_id.clone(),
-            status: "TimedOut".to_string(),
+            status: WireStatus::TimedOut,
             result_summary: Some("operation timed out".to_string()),
             duration_ms: *duration_ms,
             ended_epoch_ms: now_ms,
@@ -817,7 +817,18 @@ fn exit_code_from_value(result: &serde_json::Value) -> Option<i64> {
 
 /// Extract a short human-readable summary from a result JSON value.
 fn summary_from_value(result: &serde_json::Value) -> Option<String> {
-    let summary = if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+    Some(clip_summary(summary_text_from_value(result)))
+}
+
+/// The same extraction as [`summary_from_value`], **unclipped**.
+///
+/// The clip is a wire-length concern for the human-readable summary; it must not
+/// decide what the denial scanner gets to see. Scanning the clipped text meant a
+/// denial whose path sat past 200 chars — an ordinary amount of build output
+/// before the refusal — degraded into an anonymous failure, losing the path the
+/// whole R-PERM.7 guarantee is about.
+fn summary_text_from_value(result: &serde_json::Value) -> String {
+    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
         msg.to_string()
     } else if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
         err.to_string()
@@ -829,8 +840,7 @@ fn summary_from_value(result: &serde_json::Value) -> Option<String> {
         err_obj.to_string()
     } else {
         serde_json::to_string(result).unwrap_or_default()
-    };
-    Some(clip_summary(summary))
+    }
 }
 
 /// Clip a summary string to a wire-friendly length.
@@ -848,16 +858,19 @@ fn clip_summary(summary: String) -> String {
     }
 }
 
-fn status_label(s: OperationStatus) -> String {
+/// Map the monitor's operation state onto the hub wire enum.
+///
+/// Exhaustive by construction: a new `OperationStatus` variant is a compile
+/// error here rather than a string that silently means nothing downstream.
+fn wire_status(s: OperationStatus) -> WireStatus {
     match s {
-        OperationStatus::Pending => "Pending",
-        OperationStatus::InProgress => "InProgress",
-        OperationStatus::Completed => "Completed",
-        OperationStatus::Failed => "Failed",
-        OperationStatus::Cancelled => "Cancelled",
-        OperationStatus::TimedOut => "TimedOut",
+        OperationStatus::Pending => WireStatus::Pending,
+        OperationStatus::InProgress => WireStatus::InProgress,
+        OperationStatus::Completed => WireStatus::Completed,
+        OperationStatus::Failed => WireStatus::Failed,
+        OperationStatus::Cancelled => WireStatus::Cancelled,
+        OperationStatus::TimedOut => WireStatus::TimedOut,
     }
-    .to_string()
 }
 
 /// Recognise a sandbox denial in a failed operation's text so it can travel the
@@ -870,23 +883,39 @@ fn denial_from_text(text: &str) -> Option<ahma_common::daemon_hub::OpDenial> {
     let hit = crate::sandbox::denial_scan::scan_denial(text)?;
     Some(ahma_common::daemon_hub::OpDenial {
         path: hit.path.display().to_string(),
-        access: match hit.access {
-            ahma_common::config::ScopeAccess::Ro => "ro".to_string(),
-            ahma_common::config::ScopeAccess::Rw => "rw".to_string(),
-        },
+        access: hit.access,
     })
-}
-
-/// The denial carried by a finished operation's recorded result, if any.
-fn denial_from_operation(op: &Operation) -> Option<ahma_common::daemon_hub::OpDenial> {
-    denial_from_text(&result_summary_from(op)?)
 }
 
 /// The result summary for a (possibly still-active) operation. Delegates to
 /// [`summary_from_value`] — the same extraction-and-clip logic the live event
 /// path uses, so replay and live events never disagree on wording or length.
+///
+/// Production replay goes through [`summary_and_denial`], which needs the
+/// unclipped text as well; this remains as the direct expression of the
+/// extract-and-clip contract its tests pin.
+#[cfg(test)]
 fn result_summary_from(op: &Operation) -> Option<String> {
     summary_from_value(op.result.as_ref()?)
+}
+
+/// The clipped summary and the denial for a finished operation, from a single
+/// extraction of its result.
+///
+/// One pass because the extraction falls back to serialising the whole result
+/// JSON — for a completed command, its entire inline output window — and the
+/// two used to compute it independently. The denial is scanned from the *full*
+/// text and the summary clipped afterwards, so the wire-length cap on one
+/// cannot silently discard the other.
+fn summary_and_denial(
+    op: &Operation,
+) -> (Option<String>, Option<ahma_common::daemon_hub::OpDenial>) {
+    let Some(result) = op.result.as_ref() else {
+        return (None, None);
+    };
+    let text = summary_text_from_value(result);
+    let denial = denial_from_text(&text);
+    (Some(clip_summary(text)), denial)
 }
 
 #[cfg(test)]
@@ -1014,7 +1043,7 @@ mod tests {
             panic!("expected OpFinished");
         };
         assert_eq!(id, "op-5");
-        assert_eq!(status, "Completed");
+        assert_eq!(status, WireStatus::Completed);
         assert_eq!(duration_ms, 42);
         assert_eq!(result_summary, Some("ok".into()));
         assert!(
@@ -1038,7 +1067,7 @@ mod tests {
         else {
             panic!("expected OpFinished");
         };
-        assert_eq!(status, "Failed");
+        assert_eq!(status, WireStatus::Failed);
         assert_eq!(result_summary, Some("permission denied".into()));
     }
 
@@ -1057,7 +1086,7 @@ mod tests {
         else {
             panic!("expected OpFinished");
         };
-        assert_eq!(status, "Cancelled");
+        assert_eq!(status, WireStatus::Cancelled);
         assert_eq!(result_summary, Some("user cancelled".into()));
     }
 
@@ -1076,7 +1105,7 @@ mod tests {
         else {
             panic!("expected OpFinished");
         };
-        assert_eq!(status, "TimedOut");
+        assert_eq!(status, WireStatus::TimedOut);
         assert_eq!(result_summary, Some("operation timed out".into()));
         assert_eq!(duration_ms, 30_000);
     }
@@ -1185,16 +1214,88 @@ mod tests {
         assert!(result.ends_with("..."));
     }
 
-    // ── status_label ─────────────────────────────────────────────────────────
+    /// SPEC R-PERM.7: a replayed denial must still arrive as a denial, naming
+    /// the path. It was recovered by re-scanning `result_summary_from`, which is
+    /// clipped to 200 chars — so a denial whose path sits past the clip point
+    /// silently degraded to an anonymous failure, defeating the guarantee the
+    /// call site's own comment claims.
+    #[test]
+    fn denial_is_recovered_even_when_the_path_sits_past_the_summary_clip() {
+        // Push the denial text well past the 200-char clip with leading output.
+        let padding = "compiling some crate that prints a great deal of output\n".repeat(6);
+        let denial_line =
+            "touch: cannot touch '/etc/deep/denied/path': Operation not permitted (os error 1)";
+        let full = format!("{padding}{denial_line}");
+        assert!(full.len() > 200, "the denial must sit past the clip point");
+
+        let result = json!({ "stdout": full });
+        let mut op = Operation::new("id".into(), "tool".into(), "desc".into(), None);
+        op.result = Some(result);
+
+        let (summary, denial) = summary_and_denial(&op);
+        assert!(
+            summary.is_some_and(|s| s.len() <= 204),
+            "the human-readable summary stays clipped"
+        );
+        let denial = denial.expect("a denial past the clip point must still be recovered");
+        assert!(
+            denial.path.contains("/etc"),
+            "the refused path must survive: {}",
+            denial.path
+        );
+    }
+
+    // ── wire_status ──────────────────────────────────────────────────────────
 
     #[test]
-    fn status_label_all_variants() {
-        assert_eq!(status_label(OperationStatus::Pending), "Pending");
-        assert_eq!(status_label(OperationStatus::InProgress), "InProgress");
-        assert_eq!(status_label(OperationStatus::Completed), "Completed");
-        assert_eq!(status_label(OperationStatus::Failed), "Failed");
-        assert_eq!(status_label(OperationStatus::Cancelled), "Cancelled");
-        assert_eq!(status_label(OperationStatus::TimedOut), "TimedOut");
+    fn wire_status_all_variants() {
+        assert_eq!(wire_status(OperationStatus::Pending), WireStatus::Pending);
+        assert_eq!(
+            wire_status(OperationStatus::InProgress),
+            WireStatus::InProgress
+        );
+        assert_eq!(
+            wire_status(OperationStatus::Completed),
+            WireStatus::Completed
+        );
+        assert_eq!(wire_status(OperationStatus::Failed), WireStatus::Failed);
+        assert_eq!(
+            wire_status(OperationStatus::Cancelled),
+            WireStatus::Cancelled
+        );
+        assert_eq!(wire_status(OperationStatus::TimedOut), WireStatus::TimedOut);
+    }
+
+    /// The status field was a `String` carrying these exact words. Typing it
+    /// must not have changed a byte on the socket, or a new client would fail to
+    /// talk to an already-running daemon. This pins the encoding.
+    #[test]
+    fn wire_status_serialises_to_the_historical_strings() {
+        for (status, expected) in [
+            (WireStatus::Pending, "\"Pending\""),
+            (WireStatus::InProgress, "\"InProgress\""),
+            (WireStatus::Completed, "\"Completed\""),
+            (WireStatus::Failed, "\"Failed\""),
+            (WireStatus::Cancelled, "\"Cancelled\""),
+            (WireStatus::TimedOut, "\"TimedOut\""),
+        ] {
+            assert_eq!(serde_json::to_string(&status).unwrap(), expected);
+            let back: WireStatus = serde_json::from_str(expected).unwrap();
+            assert_eq!(back, status);
+        }
+    }
+
+    /// Same guarantee for the denial's access field, which is the one that
+    /// mattered: it was decoded with a `_ => Ro` catch-all, so a refused *write*
+    /// arrived as read-only if the string was ever anything but exactly "rw".
+    #[test]
+    fn denial_access_serialises_to_the_historical_strings() {
+        use ahma_common::config::ScopeAccess;
+        for (access, expected) in [(ScopeAccess::Ro, "\"ro\""), (ScopeAccess::Rw, "\"rw\"")] {
+            assert_eq!(serde_json::to_string(&access).unwrap(), expected);
+            let back: ScopeAccess = serde_json::from_str(expected).unwrap();
+            assert_eq!(back, access);
+        }
     }
 
     // ── result_summary_from ──────────────────────────────────────────────────
@@ -1384,10 +1485,12 @@ mod tests {
         )
         .expect("a kernel denial must be recognised");
         assert!(hit.path.contains("/etc"), "path carried: {}", hit.path);
+        // The field is typed now, so "is it one of the two" is a tautology;
+        // what still needs pinning is the *encoding* the hub wire carries.
+        let encoded = serde_json::to_string(&hit.access).unwrap();
         assert!(
-            hit.access == "rw" || hit.access == "ro",
-            "access is normalised for the wire, got {}",
-            hit.access
+            encoded == "\"rw\"" || encoded == "\"ro\"",
+            "access is normalised for the wire, got {encoded}"
         );
     }
 
@@ -1683,7 +1786,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(id, "comp-1");
-                assert_eq!(status, "Completed");
+                assert_eq!(status, WireStatus::Completed);
                 assert_eq!(result_summary, Some("done".into()));
             }
             other => panic!("expected replayed completed OpFinished, got {other:?}"),

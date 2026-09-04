@@ -46,7 +46,7 @@ pub enum SourceEvent {
         tools: Vec<crate::mcp_connections::ToolInfo>,
     },
     SandboxStatus {
-        status: String,
+        status: crate::state::SandboxAuthority,
     },
     /// The complete scope + provenance carried by `notifications/sandbox/configured`
     /// (SPEC R5.4: every writable root, read root, tmp, enforcement, and source).
@@ -280,7 +280,7 @@ async fn mcp_source_task(
                     if !healthy {
                         mcp_state = None;
                         prev_status_ok = true;
-                        send(&tx, SourceEvent::SandboxStatus { status: "UNKNOWN".to_string() }).await;
+                        send(&tx, SourceEvent::SandboxStatus { status: crate::state::SandboxAuthority::Unknown }).await;
                     } else {
                         // Fresh connection — allow immediate init attempt.
                         init_fail_count = 0;
@@ -309,7 +309,7 @@ async fn mcp_source_task(
                             mcp_state = Some(session);
                         }
                         Err(e) => {
-                            send(&tx, SourceEvent::SandboxStatus { status: "FAILED".to_string() }).await;
+                            send(&tx, SourceEvent::SandboxStatus { status: crate::state::SandboxAuthority::Failed }).await;
                             init_fail_count = init_fail_count.saturating_add(1);
                             let backoff = backoff_secs(init_fail_count);
                             debug!("MCP init failed (attempt {init_fail_count}, retry in {backoff}s): {e:#}");
@@ -332,7 +332,7 @@ async fn mcp_source_task(
                             // Tearing it down here would spawn a fresh session
                             // that races the same handshake and 409s again,
                             // looping forever so no tool call ever runs.
-                            send(&tx, SourceEvent::SandboxStatus { status: "INITIALIZING".to_string() }).await;
+                            send(&tx, SourceEvent::SandboxStatus { status: crate::state::SandboxAuthority::Initializing }).await;
                         }
                         Err(e) => {
                             if prev_status_ok {
@@ -444,7 +444,7 @@ async fn init_mcp_session(
     send(
         &tx,
         SourceEvent::SandboxStatus {
-            status: "INITIALIZING".to_string(),
+            status: crate::state::SandboxAuthority::Initializing,
         },
     )
     .await;
@@ -533,24 +533,6 @@ fn parse_sandbox_scope(params: Option<&Value>) -> crate::state::SandboxScopeInfo
     }
 }
 
-/// Map the active-sandbox token (plus, for host-relative modes, the host
-/// name) to a compact status-bar label. Missing params (older servers, or
-/// the bare notification) => LOCKED, preserving backward compatibility.
-fn sandbox_status_label(active: Option<&str>, host: Option<&str>) -> String {
-    match active {
-        Some("ahma_nested_in_host") => match host {
-            Some(h) => format!("NESTED: {h}"),
-            None => "NESTED".to_string(),
-        },
-        Some("deferred_to_host") => match host {
-            Some(h) => format!("DEFERRED: {h}"),
-            None => "DEFERRED".to_string(),
-        },
-        Some("disabled") => "UNSANDBOXED".to_string(),
-        _ => "LOCKED".to_string(),
-    }
-}
-
 /// Translate one server-pushed notification into `SourceEvent`s. `roots/list`
 /// is answered by the shared client's SSE listener before it reaches here, so
 /// this only reacts to the sandbox lifecycle notifications.
@@ -577,14 +559,15 @@ async fn handle_notification(value: &Value, tx: &mpsc::Sender<SourceEvent>) {
         debug!("Sandbox configured successfully!");
         let scope = parse_sandbox_scope(value.get("params"));
 
-        // Map the active-sandbox token to a compact status-bar label. Missing
-        // params (older servers, or the bare notification) => LOCKED, preserving
-        // backward compatibility.
-        let status = sandbox_status_label(scope.active.as_deref(), scope.host.as_deref());
-        let not_sole_authority = matches!(
+        // Classify the active-sandbox token once, here at the boundary. The
+        // label is derived from this at the render edge — previously the label
+        // *was* the event, and every consumer re-derived the classification from
+        // its text.
+        let status = crate::state::SandboxAuthority::from_token(
             scope.active.as_deref(),
-            Some("ahma_nested_in_host") | Some("deferred_to_host") | Some("disabled")
+            scope.host.as_deref(),
         );
+        let not_sole_authority = !status.is_sole_authority();
         let disclosure_text = scope.disclosure.clone();
         send(tx, SourceEvent::SandboxScope { scope }).await;
         send(tx, SourceEvent::SandboxStatus { status }).await;
@@ -1406,7 +1389,9 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         match rx.try_recv().expect("status event emitted") {
-            SourceEvent::SandboxStatus { status } => assert_eq!(status, "LOCKED"),
+            SourceEvent::SandboxStatus { status } => {
+                assert_eq!(status, crate::state::SandboxAuthority::Locked)
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -1446,7 +1431,9 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         match rx.try_recv().expect("status event emitted") {
-            SourceEvent::SandboxStatus { status } => assert_eq!(status, "LOCKED"),
+            SourceEvent::SandboxStatus { status } => {
+                assert_eq!(status, crate::state::SandboxAuthority::Locked)
+            }
             other => panic!("unexpected: {other:?}"),
         }
         // Sole authority => no disclosure log line.
@@ -1483,7 +1470,9 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         match rx.try_recv().expect("status event emitted") {
-            SourceEvent::SandboxStatus { status } => assert_eq!(status, "UNSANDBOXED"),
+            SourceEvent::SandboxStatus { status } => {
+                assert_eq!(status, crate::state::SandboxAuthority::Unsandboxed)
+            }
             other => panic!("unexpected: {other:?}"),
         }
         match rx.try_recv().expect("disclosure log line emitted") {
@@ -1517,7 +1506,10 @@ mod tests {
         }
         // Second event: the compact status-bar label naming the host.
         match rx.try_recv().expect("status event emitted") {
-            SourceEvent::SandboxStatus { status } => assert_eq!(status, "NESTED: Claude Code"),
+            SourceEvent::SandboxStatus { status } => assert_eq!(
+                status,
+                crate::state::SandboxAuthority::Nested(Some("Claude Code".to_string()))
+            ),
             other => panic!("unexpected: {other:?}"),
         }
         // Third event: the loud remediation surfaced as a warning log line.
@@ -1578,7 +1570,9 @@ mod tests {
             .expect("handshake succeeds");
         assert_eq!(session.session_id(), "session-ok");
         match rx.try_recv().expect("status event") {
-            SourceEvent::SandboxStatus { status } => assert_eq!(status, "INITIALIZING"),
+            SourceEvent::SandboxStatus { status } => {
+                assert_eq!(status, crate::state::SandboxAuthority::Initializing)
+            }
             other => panic!("unexpected first event: {other:?}"),
         }
         handle.abort();

@@ -1589,6 +1589,20 @@ async fn execute_with_streaming(
     still_running_interval.tick().await;
     let mut elapsed_secs = 0;
 
+    // ── Reap ticker ──────────────────────────────────────────────────────────
+    // Once both pipes hit EOF their `next_line()` futures resolve `Ok(None)`
+    // immediately and forever, so an unguarded `select!` over them spins a core
+    // at 100% for as long as the child lives — a child that closes its pipes but
+    // keeps working (a daemonising build, a grandchild holding the tty) does
+    // exactly that. The read arms are therefore disabled at EOF, and this ticker
+    // takes over as the wake source so the loop still reaches `try_wait()`
+    // promptly. It is deliberately much faster than the 10s heartbeat: it bounds
+    // how long a finished operation waits to be noticed.
+    let mut reap_interval = tokio::time::interval(Duration::from_millis(20));
+    reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+
     // ── Liveness watchdog input ──────────────────────────────────────────────
     // The idle watchdog kills an operation that has produced no output for
     // `idle_timeout`. Silence is not a stall: `… | tail` buffers everything until
@@ -1672,8 +1686,12 @@ async fn execute_with_streaming(
                 }
             }
 
+            // Wake the loop while both pipes are at EOF but the child is still
+            // alive, so the `try_wait()` below still runs without spinning.
+            _ = reap_interval.tick(), if stdout_done && stderr_done => {}
+
             // Read stderr line
-            result = stderr_reader.next_line() => {
+            result = stderr_reader.next_line(), if !stderr_done => {
                 // EOF is not output. A child that closes its pipes but keeps
                 // running yields `Ok(None)` immediately and forever; treating
                 // that as activity would hold the CPU probe permanently off.
@@ -1685,15 +1703,19 @@ async fn execute_with_streaming(
                 if matches!(result, Ok(Some(_))) {
                     last_output_at = tokio::time::Instant::now();
                     last_cpu_ms = None;
+                } else {
+                    stderr_done = true;
                 }
                 handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, op_id, op_monitor, output_optimizer, &mut spill).await;
             }
 
             // Read stdout line
-            result = stdout_reader.next_line() => {
+            result = stdout_reader.next_line(), if !stdout_done => {
                 if matches!(result, Ok(Some(_))) {
                     last_output_at = tokio::time::Instant::now();
                     last_cpu_ms = None;
+                } else {
+                    stdout_done = true;
                 }
                 handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, op_id, op_monitor, output_optimizer, &mut spill).await;
             }

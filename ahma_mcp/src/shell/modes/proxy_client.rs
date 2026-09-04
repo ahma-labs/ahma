@@ -377,7 +377,7 @@ async fn relay_forward_failure_to_client<S>(
 {
     let error = recovered.unwrap_or_else(|| {
         serde_json::json!({
-            "code": -32002,
+            "code": ahma_common::mcp_methods::JSONRPC_REQUEST_TIMEOUT,
             "message": GENERIC_FORWARD_FAILURE_MESSAGE,
         })
     });

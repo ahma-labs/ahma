@@ -120,6 +120,42 @@ fn reask_note_for(status: GrantStatus) -> Option<String> {
     }
 }
 
+/// Built-in tools that mutate nothing and take no path, so an argument preview
+/// on their approval prompt would be noise.
+///
+/// Everything *not* on this list previews — see [`shows_argument_preview`].
+const PREVIEW_EXEMPT_TOOLS: &[&str] = &["status", "await", "cancel"];
+
+/// Whether an approval prompt for `tool` should show its arguments.
+///
+/// Defaults to **yes**, and the exemption list is the narrow, known-harmless
+/// case. That direction matters: the operator is being asked to authorise this
+/// call, and the arguments are what the call will actually do. The previous
+/// rule was the other way round — a positive guess,
+/// `tool.contains("replace") || tool == "write_file"`, made inside the shared
+/// approval funnel. Any file-mutating tool that did not match the guess
+/// (`edit_file`, `apply_patch`, `create_file`, `sed`, `mv`) rendered a prompt
+/// with no arguments at all and the operator approved blind — and it could
+/// never be right for MTDF-defined custom tools, whose names ahma cannot know.
+///
+/// Lives here, beside [`reask_note`], so every approval surface asks the same
+/// mechanism instead of pattern-matching a tool name locally.
+pub fn shows_argument_preview(tool: &str) -> bool {
+    !PREVIEW_EXEMPT_TOOLS.contains(&tool)
+}
+
+/// The argument preview for `tool`'s approval prompt: its call arguments,
+/// pretty-printed, or `None` when the tool is exempt or the arguments are not
+/// JSON.
+pub fn argument_preview(tool: &str, args: &str) -> Option<String> {
+    if !shows_argument_preview(tool) {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|val| serde_json::to_string_pretty(&val).ok())
+}
+
 /// Returns `true` if `tool` has been granted "always allow" for `workspace`.
 ///
 /// Never errors: a missing or unreadable ledger simply means "not approved", so
@@ -246,6 +282,43 @@ mod tests {
             classify(&p, Path::new("/ws"), "list_dir"),
             GrantStatus::Unseen
         );
+    }
+
+    /// A file-mutating tool that the old name guess did not match rendered an
+    /// approval prompt with no arguments, so the operator approved blind. The
+    /// default must be to show them.
+    #[test]
+    fn argument_preview_shown_for_tools_the_name_guess_would_have_missed() {
+        for tool in [
+            "edit_file",
+            "apply_patch",
+            "create_file",
+            "sed",
+            "mv",
+            "some_mtdf_custom_tool",
+        ] {
+            assert!(
+                shows_argument_preview(tool),
+                "{tool} must show its arguments on an approval prompt"
+            );
+            assert!(
+                argument_preview(tool, r#"{"path":"/etc/hosts"}"#).is_some(),
+                "{tool} must render an argument preview"
+            );
+        }
+    }
+
+    #[test]
+    fn argument_preview_exempts_the_read_only_builtins() {
+        for tool in PREVIEW_EXEMPT_TOOLS {
+            assert!(!shows_argument_preview(tool));
+            assert!(argument_preview(tool, "{}").is_none());
+        }
+    }
+
+    #[test]
+    fn argument_preview_is_none_for_non_json_arguments() {
+        assert!(argument_preview("write_file", "not json").is_none());
     }
 
     #[test]

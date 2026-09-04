@@ -736,6 +736,16 @@ impl ScopeAccess {
             ScopeAccess::Rw => "read+write",
         }
     }
+
+    /// The compact `"ro"`/`"rw"` spelling — the same token the serde encoding
+    /// uses. For surfaces that render the access in a tight space (a TUI row,
+    /// a denial line) where the prose [`Self::label`] would not fit.
+    pub fn short(self) -> &'static str {
+        match self {
+            ScopeAccess::Ro => "ro",
+            ScopeAccess::Rw => "rw",
+        }
+    }
 }
 
 /// A user-granted, machine-local directory added to the sandbox scope that

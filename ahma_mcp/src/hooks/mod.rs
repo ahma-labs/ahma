@@ -841,7 +841,10 @@ fn detect_active_mcp_configs_in(home: &Path, project_root: Option<&Path>) -> Vec
     for path in mcp_config_candidates(home, project_root) {
         if path.exists()
             && let Ok(content) = std::fs::read_to_string(&path)
-            && content.to_lowercase().contains("ahma")
+            && content
+                .as_bytes()
+                .windows(4)
+                .any(|w| w.eq_ignore_ascii_case(b"ahma"))
         {
             active.push(path);
         }

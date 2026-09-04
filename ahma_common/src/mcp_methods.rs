@@ -20,6 +20,35 @@ pub const INITIALIZED_METHOD: &str = "notifications/initialized";
 /// Server → client request asking for the client's workspace roots.
 pub const ROOTS_LIST_METHOD: &str = "roots/list";
 
+// ── Active-sandbox tokens (SPEC R5.4) ────────────────────────────────────────
+//
+// Emitted by `ahma_mcp::sandbox::display` on the `sandbox/configured`
+// notification and matched by the TUI to decide who is actually enforcing.
+// Named here because that producer and that consumer are in different crates.
+
+/// ahma's own kernel sandbox is the sole authority.
+pub const ACTIVE_SANDBOX_AHMA: &str = "ahma";
+/// ahma is enforcing, nested inside a host sandbox that is also enforcing.
+pub const ACTIVE_SANDBOX_NESTED_IN_HOST: &str = "ahma_nested_in_host";
+/// ahma deferred to the host's sandbox and is NOT enforcing.
+pub const ACTIVE_SANDBOX_DEFERRED_TO_HOST: &str = "deferred_to_host";
+/// No kernel confinement is in effect.
+pub const ACTIVE_SANDBOX_DISABLED: &str = "disabled";
+
+/// Client → server request opening the MCP handshake.
+pub const INITIALIZE_METHOD: &str = "initialize";
+
+/// Client → server request invoking a tool.
+pub const TOOLS_CALL_METHOD: &str = "tools/call";
+
+/// Server → client request asking the client's model to complete a prompt.
+pub const SAMPLING_CREATE_MESSAGE_METHOD: &str = "sampling/createMessage";
+
+/// Client → server notification that the client's roots changed. The bridge
+/// both emits this to its subprocess and matches it from the real client, in
+/// two different files — the exact drift this module exists to prevent.
+pub const ROOTS_LIST_CHANGED_METHOD: &str = "notifications/roots/list_changed";
+
 /// Server → client notification: the sandbox is configured and locked for the
 /// session. Params: [`SandboxLifecycleParams`] (SPEC R5.4 / R5.6).
 pub const SANDBOX_CONFIGURED_METHOD: &str = "notifications/sandbox/configured";
@@ -40,6 +69,26 @@ pub const PUSH_CHANNEL_CHANGED_METHOD: &str = "notifications/ahma/pushChannelCha
 /// Bidirectional ahma-peer keepalive notification. Params:
 /// [`crate::keepalive::HeartbeatPayload`] (SPEC R8.8.4).
 pub const HEARTBEAT_METHOD: &str = "notifications/ahma/heartbeat";
+
+// ── JSON-RPC error codes ─────────────────────────────────────────────────────
+//
+// These live here for the same reason the method names do: each is written by
+// one surface (the HTTP bridge) and matched by another (the stdio proxy, which
+// recovers them from a rendered transport error), in a different crate. Spelled
+// as bare literals at both ends, a change on either side type-checks.
+
+/// `tools/call` arrived before the sandbox scope was locked — the client must
+/// complete the roots exchange first. Paired with HTTP 409; the pair is a SPEC
+/// RB.1.1 hard invariant and tests assert it directly.
+pub const JSONRPC_SANDBOX_NOT_READY: i32 = -32001;
+
+/// The request timed out waiting on the session subprocess or the client.
+/// Paired with HTTP 504 (or 500 on the proxy's generic forward failure).
+pub const JSONRPC_REQUEST_TIMEOUT: i32 = -32002;
+
+/// Sandbox configuration failed, or the session is terminated — the session
+/// will never become usable. Paired with HTTP 403.
+pub const JSONRPC_SANDBOX_FAILED: i32 = -32000;
 
 /// Deserialize a field to its `Default` when the value is missing **or**
 /// malformed, instead of failing the whole payload (lenient parsing — see the

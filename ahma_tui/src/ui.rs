@@ -17,7 +17,7 @@ use ratatui::{
     },
 };
 
-use crate::state::{AppState, ChatEntry, ClickTarget, Focus, NavCommand};
+use crate::state::{AppState, ChatEntry, ClickTarget, Focus, NavCommand, SandboxAuthority};
 use crate::theme::Theme;
 
 // ─── Top-level draw ───────────────────────────────────────────────────────────
@@ -194,18 +194,19 @@ fn window_status_style(status: crate::state::WindowStatus, theme: &Theme) -> Sty
     }
 }
 
-/// Colour for the sandbox status chip. `NESTED: <host>` / `DEFERRED: <host>`
-/// carry a variable host suffix, so match by prefix. Nested/deferred get their
-/// own colour (ahma is not the sole authority — that must not look like
-/// INITIALIZING, which merely means "starting up"); UNSANDBOXED/FAILED are
-/// alarming.
-fn sandbox_status_style(status: &str, theme: &Theme) -> Style {
+/// Colour for the sandbox status chip. Nested/deferred get their own colour
+/// (ahma is not the sole authority — that must not look like INITIALIZING,
+/// which merely means "starting up"); UNSANDBOXED/FAILED are alarming.
+///
+/// Exhaustive on the typed authority: this used to match the *rendered label*
+/// by prefix, so a change to the label's wording silently changed the colour.
+fn sandbox_status_style(status: &SandboxAuthority, theme: &Theme) -> Style {
     match status {
-        "LOCKED" => theme.success(),
-        "INITIALIZING" => theme.pending(),
-        "FAILED" | "UNSANDBOXED" => theme.failed(),
-        s if s.starts_with("NESTED") || s.starts_with("DEFERRED") => theme.host_authority(),
-        _ => theme.unknown_health(),
+        SandboxAuthority::Locked => theme.success(),
+        SandboxAuthority::Initializing => theme.pending(),
+        SandboxAuthority::Failed | SandboxAuthority::Unsandboxed => theme.failed(),
+        SandboxAuthority::Nested(_) | SandboxAuthority::Deferred(_) => theme.host_authority(),
+        SandboxAuthority::Unknown => theme.unknown_health(),
     }
 }
 
@@ -400,7 +401,7 @@ fn draw_expanded_window(
     // Output lines
     for line in &w.content {
         let style = output_line_style(line, theme);
-        content_lines.push(Line::from(Span::styled(line.clone(), style)));
+        content_lines.push(Line::from(Span::styled(line.text.clone(), style)));
     }
 
     // Anchor to the *end* of the output (SPEC R24.8.3). A window is capped at 8
@@ -672,6 +673,13 @@ fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Li
         None => format!("{:?}", op.status),
     };
     lines.push(kv("status", status, theme.op_status_style(&op.status)));
+    // The detail pane is the screen a user opens to find out *why* something
+    // failed, and a denial's whole point is the path it names (SPEC R-PERM.7.1).
+    // Taken from the shared identity mechanism so this pane and the operation
+    // card word it identically.
+    if let ahma_common::op_identity::OpOutcome::Denied { reason } = op.identity().outcome {
+        lines.push(kv("denied", reason, theme.failed()));
+    }
     lines.push(kv(
         "started",
         op.started_time.format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -695,21 +703,23 @@ fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Li
     lines
 }
 
-/// Style for one line of window output, based on well-known status prefixes
-/// ("Starting", "Finished successfully", "Failed", "Cancelled") or separators.
-fn output_line_style(line: &str, theme: &Theme) -> Style {
-    if line.starts_with("Starting") || line.starts_with("Started at") {
-        theme.dim()
-    } else if line.starts_with("Finished successfully") {
-        theme.success()
-    } else if line.starts_with("Failed") {
-        theme.failed()
-    } else if line.starts_with("Cancelled") {
-        theme.cancelled()
-    } else if line.starts_with("──") || line.starts_with("--") {
-        theme.dim()
-    } else {
-        theme.normal()
+/// Style for one line of window content, from its role.
+///
+/// This used to prefix-match the rendered text, so the outcome line's *wording*
+/// decided its colour: a denial (which no prefix covered) was painted as
+/// ordinary output, and a stdout line that merely began with "Failed" was
+/// painted as a terminal failure.
+fn output_line_style(line: &crate::state::WindowLine, theme: &Theme) -> Style {
+    use crate::state::{LineKind, WindowStatus};
+    match &line.kind {
+        LineKind::Start | LineKind::Separator | LineKind::LiveEdge => theme.dim(),
+        LineKind::Output => theme.normal(),
+        LineKind::End(WindowStatus::Finished) => theme.success(),
+        LineKind::End(WindowStatus::Error) => theme.failed(),
+        LineKind::End(WindowStatus::Cancelled) => theme.cancelled(),
+        // Not terminal: an end line reporting a non-terminal status is a
+        // producer bug, so do not dress it up as an outcome.
+        LineKind::End(WindowStatus::Pending | WindowStatus::Running) => theme.normal(),
     }
 }
 
@@ -1059,8 +1069,8 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         }
         None => String::new(),
     };
-    let sandbox_status_part = if !state.sandbox_status.is_empty() {
-        format!(" [{}]", state.sandbox_status)
+    let sandbox_status_part = if state.sandbox_status.is_known() {
+        format!(" [{}]", state.sandbox_status.label())
     } else {
         String::new()
     };
@@ -1084,7 +1094,7 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     let line = Line::from(vec![
         Span::styled(" ahma chat", theme.title()),
         Span::styled(
-            format!("  {}", shorten_llm_label(&state.llm_label)),
+            format!("  {}", shorten_llm_label(&state.llm_label())),
             theme.normal(),
         ),
         Span::styled(mcp_label, theme.dim()),
@@ -1368,7 +1378,7 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
 
 #[cfg(feature = "tui")]
 fn chat_history_hint(state: &AppState) -> &'static str {
-    if state.llm_label == "no LLM" {
+    if state.llm_selection.is_none() {
         if state.unicode {
             "  No LLM configured — use /provider to select one"
         } else {
@@ -1723,7 +1733,7 @@ fn insert_input_cursor(lines: &mut Vec<String>, row: usize, col: usize, unicode:
 }
 
 fn get_input_title_left(state: &AppState, theme: &Theme) -> Line<'static> {
-    if state.llm_label == "no LLM" {
+    if state.llm_selection.is_none() {
         Line::from(Span::styled(
             " ahma: no LLM — /provider to configure ",
             theme.title(),
@@ -1731,7 +1741,7 @@ fn get_input_title_left(state: &AppState, theme: &Theme) -> Line<'static> {
         .left_aligned()
     } else {
         Line::from(Span::styled(
-            format!(" ahma: {} ", state.llm_label),
+            format!(" ahma: {} ", state.llm_label()),
             theme.title(),
         ))
         .left_aligned()
@@ -1862,13 +1872,9 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
 #[cfg(feature = "tui")]
 fn unscoped_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let status = if state.sandbox_status.is_empty() {
-        "UNKNOWN"
-    } else {
-        state.sandbox_status.as_str()
-    };
-    let explanation = match status {
-        "INITIALIZING" => {
+    let status = state.sandbox_status.label();
+    let explanation = match state.sandbox_status {
+        SandboxAuthority::Initializing => {
             "The server is still negotiating scope (roots/list or elicitation). \
              Tool calls are held until it locks."
         }
@@ -2952,7 +2958,11 @@ fn build_tree_op_item(
     // is the row a user acts on, so the affordance belongs on the row.
     let elapsed_part = match (&op.denial, op.exit_code) {
         (Some((path, access)), _) if op.status == crate::state::OpStatus::Denied => {
-            format!("  denied: {} ({access}) · [a] ask", shorten_path(path, 28))
+            format!(
+                "  denied: {} ({}) · [a] ask",
+                shorten_path(path, 28),
+                access.short()
+            )
         }
         (_, Some(code)) if op.status.is_terminal() => {
             format!("  exit {code} · {}", op.elapsed_display())
@@ -3727,6 +3737,154 @@ fn format_help_rows<'a>(
         .collect()
 }
 
+/// The help overlay's rows, as `(left, right)` pairs. Section headers have an
+/// empty right cell; a blank pair is a spacer.
+///
+/// Module-level so the slash commands they advertise can be checked against
+/// `state::SLASH_COMMANDS` — see `help_rows_reference_only_known_commands`.
+const HELP_LEFT_ROWS: &[(&str, &str)] = &[
+    ("GLOBAL", ""),
+    ("q / Ctrl-C", "Quit"),
+    ("Tab / Shift-Tab", "Cycle focus"),
+    ("?", "Toggle this help"),
+    ("Esc / ?", "Close help overlay"),
+    ("", ""),
+    ("CHAT", ""),
+    ("Enter", "Send message"),
+    ("Shift+Enter", "Insert newline"),
+    ("Esc", "Clear current input"),
+    ("Arrows / Home / End", "Move within editor"),
+    ("", ""),
+    ("CHAT INPUT PREFIXES", ""),
+    (
+        "! <command>",
+        "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
+    ),
+    ("# <goal>", "Decompose goal using LLM"),
+    ("/", "Open navigator (from empty input)"),
+    ("", ""),
+    ("PICKERS", ""),
+    ("Type", "Filter providers/models"),
+    ("Up / Down", "Move selection"),
+    ("Enter / Esc", "Choose / cancel"),
+    ("", ""),
+    ("APPROVAL BANNER", ""),
+    ("y", "Approve gate"),
+    ("n", "Reject gate"),
+];
+
+const HELP_RIGHT_ROWS: &[(&str, &str)] = &[
+    ("COMMAND NAVIGATOR (/)", ""),
+    ("Type", "Narrow commands/tools"),
+    ("Tab", "Complete selected command"),
+    ("Enter", "Run selected command"),
+    ("/help, /?", "Show keyboard reference"),
+    ("/run <tool> {json}", "Run tool with JSON args"),
+    ("/skills", "List Agent Skills; run one with /<name> [args]"),
+    ("", ""),
+    ("WINDOW ACTIONS", ""),
+    ("/n", "Restore/expand window n"),
+    ("/xn", "Close/cancel window n"),
+    ("/quit", "Quit the application"),
+    ("Click [xn]", "Close/cancel window"),
+    ("Click [+]/[-]", "Toggle expand/collapse"),
+    ("Click card", "Open operation details"),
+    ("", ""),
+    ("TASKS (tree)", ""),
+    ("j / k", "Select row"),
+    ("Enter", "Open full-screen operation details; fold headers"),
+    (
+        "Space / Click",
+        "Expand task into live/historic output (accordion); fold headers",
+    ),
+    ("f", "Toggle this-project / all-projects filter"),
+    ("c", "Cancel selected"),
+    ("p", "Pin selected"),
+    ("a", "Ask for access (on a denied operation)"),
+    ("/analyze [op_id]", "Ask AI to analyze operation"),
+    ("/log file <path>", "Start log monitoring"),
+    ("/scope", "Show sandbox scope & provenance"),
+    ("", ""),
+    ("LOG", ""),
+    ("/", "Start filter (Esc to clear)"),
+    ("j / k", "Scroll"),
+    ("g / G", "Top / bottom"),
+    ("w", "Toggle line wrap"),
+    ("Enter", "Zoom/restore the pane"),
+    ("l", "Switch log file"),
+    ("Click a line", "Open it full-screen, wrapped"),
+];
+
+const HELP_SINGLE_ROWS: &[(&str, &str)] = &[
+    ("GLOBAL", ""),
+    ("q / Ctrl-C", "Quit"),
+    ("Tab / Shift-Tab", "Cycle focus"),
+    ("?", "Toggle this help"),
+    ("Esc / ? (when help open)", "Close help overlay"),
+    ("", ""),
+    ("CHAT", ""),
+    ("Enter", "Send message"),
+    ("Shift+Enter", "Insert newline"),
+    ("Esc", "Clear current input"),
+    ("Arrow keys / Home / End", "Move within the editor"),
+    ("", ""),
+    ("CHAT INPUT PREFIXES", ""),
+    (
+        "! <command>",
+        "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
+    ),
+    ("# <goal>", "Decompose goal using LLM (e.g. # run tests)"),
+    ("/", "Open command navigator (from empty input)"),
+    ("", ""),
+    ("PICKERS", ""),
+    ("Type", "Filter providers or models"),
+    ("Up / Down", "Move selection"),
+    ("Enter / Esc", "Choose / cancel"),
+    ("", ""),
+    ("TASKS (tree)", ""),
+    ("j / k", "Select row"),
+    ("Enter", "Open full-screen operation details; fold headers"),
+    (
+        "Space / Click",
+        "Expand task into live/historic output (accordion); fold headers",
+    ),
+    ("f", "Toggle this-project / all-projects filter"),
+    ("c", "Cancel selected"),
+    ("p", "Pin selected"),
+    ("a", "Ask for access (on a denied operation)"),
+    ("/analyze [op_id]", "Ask AI to analyze operation"),
+    ("/log file <path>", "Start log monitoring"),
+    ("/scope", "Show sandbox scope & provenance"),
+    ("", ""),
+    ("LOG", ""),
+    ("/", "Start filter (Esc to clear)"),
+    ("j / k", "Scroll"),
+    ("g / G", "Top / bottom"),
+    ("w", "Toggle line wrap"),
+    ("Enter", "Zoom/restore the pane"),
+    ("l", "Switch log file"),
+    ("Click a line", "Open it full-screen, wrapped"),
+    ("", ""),
+    ("APPROVAL BANNER", ""),
+    ("y", "Approve gate"),
+    ("n", "Reject gate"),
+    ("", ""),
+    ("COMMAND NAVIGATOR (/)", ""),
+    ("Type", "Narrow commands and tools"),
+    ("Tab", "Complete selected command"),
+    ("Enter", "Run selected command"),
+    ("/help, /?", "Show keyboard reference"),
+    ("/run <tool> {json}", "Run a tool manually with JSON args"),
+    ("/skills", "List Agent Skills; run one with /<name> [args]"),
+    ("", ""),
+    ("WINDOW ACTIONS", ""),
+    ("/n", "Restore/expand window n (e.g. /3)"),
+    ("/xn", "Close/cancel window n (e.g. /x3)"),
+    ("/quit", "Quit the application"),
+    ("Mouse Click on Xn", "Close/cancel window"),
+    ("Mouse Click on Window", "Toggle expand/collapse"),
+];
+
 #[cfg(feature = "tui")]
 fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let use_two_columns = area.width >= 100;
@@ -3753,148 +3911,11 @@ fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let left_rows: &[(&str, &str)] = &[
-        ("GLOBAL", ""),
-        ("q / Ctrl-C", "Quit"),
-        ("Tab / Shift-Tab", "Cycle focus"),
-        ("?", "Toggle this help"),
-        ("Esc / ?", "Close help overlay"),
-        ("", ""),
-        ("CHAT", ""),
-        ("Enter", "Send message"),
-        ("Shift+Enter", "Insert newline"),
-        ("Esc", "Clear current input"),
-        ("Arrows / Home / End", "Move within editor"),
-        ("", ""),
-        ("CHAT INPUT PREFIXES", ""),
-        (
-            "! <command>",
-            "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
-        ),
-        ("# <goal>", "Decompose goal using LLM"),
-        ("/", "Open navigator (from empty input)"),
-        ("", ""),
-        ("PICKERS", ""),
-        ("Type", "Filter providers/models"),
-        ("Up / Down", "Move selection"),
-        ("Enter / Esc", "Choose / cancel"),
-        ("", ""),
-        ("APPROVAL BANNER", ""),
-        ("y", "Approve gate"),
-        ("n", "Reject gate"),
-    ];
+    let left_rows: &[(&str, &str)] = HELP_LEFT_ROWS;
 
-    let right_rows: &[(&str, &str)] = &[
-        ("COMMAND NAVIGATOR (/)", ""),
-        ("Type", "Narrow commands/tools"),
-        ("Tab", "Complete selected command"),
-        ("Enter", "Run selected command"),
-        ("/help, /?", "Show keyboard reference"),
-        ("/run <tool> {json}", "Run tool with JSON args"),
-        ("/skills", "List Agent Skills; run one with /<name> [args]"),
-        ("", ""),
-        ("WINDOW ACTIONS", ""),
-        ("/n", "Restore/expand window n"),
-        ("/xn", "Close/cancel window n"),
-        ("/quit", "Quit the application"),
-        ("Click [xn]", "Close/cancel window"),
-        ("Click [+]/[-]", "Toggle expand/collapse"),
-        ("Click card", "Open operation details"),
-        ("", ""),
-        ("TASKS (tree)", ""),
-        ("j / k", "Select row"),
-        ("Enter", "Open full-screen operation details; fold headers"),
-        (
-            "Space / Click",
-            "Expand task into live/historic output (accordion); fold headers",
-        ),
-        ("f", "Toggle this-project / all-projects filter"),
-        ("c", "Cancel selected"),
-        ("p", "Pin selected"),
-        ("a", "Ask for access (on a denied operation)"),
-        ("/analyze [op_id]", "Ask AI to analyze operation"),
-        ("/log file <path>", "Start log monitoring"),
-        ("/scope", "Show sandbox scope & provenance"),
-        ("", ""),
-        ("LOG", ""),
-        ("/", "Start filter (Esc to clear)"),
-        ("j / k", "Scroll"),
-        ("g / G", "Top / bottom"),
-        ("w", "Toggle line wrap"),
-        ("Enter", "Zoom/restore the pane"),
-        ("l", "Switch log file"),
-        ("Click a line", "Open it full-screen, wrapped"),
-    ];
+    let right_rows: &[(&str, &str)] = HELP_RIGHT_ROWS;
 
-    let single_rows: &[(&str, &str)] = &[
-        ("GLOBAL", ""),
-        ("q / Ctrl-C", "Quit"),
-        ("Tab / Shift-Tab", "Cycle focus"),
-        ("?", "Toggle this help"),
-        ("Esc / ? (when help open)", "Close help overlay"),
-        ("", ""),
-        ("CHAT", ""),
-        ("Enter", "Send message"),
-        ("Shift+Enter", "Insert newline"),
-        ("Esc", "Clear current input"),
-        ("Arrow keys / Home / End", "Move within the editor"),
-        ("", ""),
-        ("CHAT INPUT PREFIXES", ""),
-        (
-            "! <command>",
-            "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
-        ),
-        ("# <goal>", "Decompose goal using LLM (e.g. # run tests)"),
-        ("/", "Open command navigator (from empty input)"),
-        ("", ""),
-        ("PICKERS", ""),
-        ("Type", "Filter providers or models"),
-        ("Up / Down", "Move selection"),
-        ("Enter / Esc", "Choose / cancel"),
-        ("", ""),
-        ("TASKS (tree)", ""),
-        ("j / k", "Select row"),
-        ("Enter", "Open full-screen operation details; fold headers"),
-        (
-            "Space / Click",
-            "Expand task into live/historic output (accordion); fold headers",
-        ),
-        ("f", "Toggle this-project / all-projects filter"),
-        ("c", "Cancel selected"),
-        ("p", "Pin selected"),
-        ("a", "Ask for access (on a denied operation)"),
-        ("/analyze [op_id]", "Ask AI to analyze operation"),
-        ("/log file <path>", "Start log monitoring"),
-        ("/scope", "Show sandbox scope & provenance"),
-        ("", ""),
-        ("LOG", ""),
-        ("/", "Start filter (Esc to clear)"),
-        ("j / k", "Scroll"),
-        ("g / G", "Top / bottom"),
-        ("w", "Toggle line wrap"),
-        ("Enter", "Zoom/restore the pane"),
-        ("l", "Switch log file"),
-        ("Click a line", "Open it full-screen, wrapped"),
-        ("", ""),
-        ("APPROVAL BANNER", ""),
-        ("y", "Approve gate"),
-        ("n", "Reject gate"),
-        ("", ""),
-        ("COMMAND NAVIGATOR (/)", ""),
-        ("Type", "Narrow commands and tools"),
-        ("Tab", "Complete selected command"),
-        ("Enter", "Run selected command"),
-        ("/help, /?", "Show keyboard reference"),
-        ("/run <tool> {json}", "Run a tool manually with JSON args"),
-        ("/skills", "List Agent Skills; run one with /<name> [args]"),
-        ("", ""),
-        ("WINDOW ACTIONS", ""),
-        ("/n", "Restore/expand window n (e.g. /3)"),
-        ("/xn", "Close/cancel window n (e.g. /x3)"),
-        ("/quit", "Quit the application"),
-        ("Mouse Click on Xn", "Close/cancel window"),
-        ("Mouse Click on Window", "Toggle expand/collapse"),
-    ];
+    let single_rows: &[(&str, &str)] = HELP_SINGLE_ROWS;
 
     // The content is taller than the cap on ordinary terminals, so it scrolls
     // and says so — the scrollbar thumb reaching bottom exactly when the
@@ -4229,7 +4250,7 @@ mod tests {
             id: 0,
             label: "w".into(),
             status,
-            content: vec!["line".into(); content_lines],
+            content: vec![crate::state::WindowLine::output("line"); content_lines],
             collapsed: false,
             finished_at: None,
             duration_ms: None,
@@ -4276,7 +4297,10 @@ mod tests {
         let mut w = layout_window(WindowStatus::Finished, 2);
         w.label = "UNSANDBOXED: pwd in ~/github/ahma".into();
         w.command = "pwd".into();
-        w.content = vec!["/Users/paul/github/ahma".into(), "Finished in 0.0s".into()];
+        w.content = vec![
+            crate::state::WindowLine::output("/Users/paul/github/ahma"),
+            crate::state::WindowLine::end(WindowStatus::Finished, "Finished in 0.0s"),
+        ];
 
         assert!(
             window_has_command_header(&w),
@@ -4337,7 +4361,10 @@ mod tests {
         let mut w = layout_window(WindowStatus::Finished, 0);
         w.label = "UNSANDBOXED: pwd in ~/github/ahma".into();
         w.command = "pwd".into();
-        w.content = vec!["/Users/paul/github/ahma".into(), "Finished in 0.0s".into()];
+        w.content = vec![
+            crate::state::WindowLine::output("/Users/paul/github/ahma"),
+            crate::state::WindowLine::end(WindowStatus::Finished, "Finished in 0.0s"),
+        ];
 
         let h = compute_window_layouts(std::slice::from_ref(&w), 40)[0].height;
         let rows = render_window_rows(&w, 60, h);
@@ -4356,7 +4383,9 @@ mod tests {
         let mut w = layout_window(WindowStatus::Finished, 0);
         w.label = "UNSANDBOXED: ls in ~/github/ahma".into();
         w.command = "ls".into();
-        w.content = (0..40).map(|i| format!("entry-{i}")).collect();
+        w.content = (0..40)
+            .map(|i| crate::state::WindowLine::output(format!("entry-{i}")))
+            .collect();
 
         let h = compute_window_layouts(std::slice::from_ref(&w), 40)[0].height;
         let screen = render_window_rows(&w, 60, h).join("\n");
@@ -4771,7 +4800,7 @@ mod tests {
         use crate::state::AppState;
         let theme = Theme::new(true);
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
-        state.sandbox_status = "INITIALIZING".to_string();
+        state.sandbox_status = SandboxAuthority::Initializing;
 
         let text = scope_window_lines(&state, &theme)
             .iter()
@@ -5292,6 +5321,90 @@ mod tests {
         assert!(
             wrapped.len() > visible_h,
             "old logical-line slice overflows the viewport (clips the bottom)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod help_reference_tests {
+    use super::{HELP_LEFT_ROWS, HELP_RIGHT_ROWS, HELP_SINGLE_ROWS};
+    use crate::state::SLASH_COMMANDS;
+
+    /// Help rows whose left cell starts with "/" but is not a command name:
+    /// input prefixes and positional placeholders. Documented rather than
+    /// silently skipped, so adding one is a deliberate act.
+    const NON_COMMAND_ROWS: &[&str] = &[
+        "/",              // "open navigator from empty input"
+        "/n",             // window index
+        "/xn",            // close window n
+        "/help, /?",      // documents two commands in one row
+        "/<name> [args]", // Agent Skill invocation
+    ];
+
+    /// The command token a help row documents, or `None` if the row is not a
+    /// command row.
+    fn command_of(left: &str) -> Option<String> {
+        if !left.starts_with('/') || NON_COMMAND_ROWS.contains(&left) {
+            return None;
+        }
+        // Strip argument placeholders: "/run <tool> {json}" -> "/run".
+        let base: Vec<&str> = left
+            .split_whitespace()
+            .take_while(|t| !t.starts_with('<') && !t.starts_with('[') && !t.starts_with('{'))
+            .collect();
+        Some(base.join(" "))
+    }
+
+    /// The help overlay must not advertise a command the TUI does not have.
+    ///
+    /// The slash-command surface used to be three hand-kept lists — dispatch,
+    /// the `/` palette, and the help overlay (twice, once per layout) — joined
+    /// by nothing but matching string literals, so they drifted. This pins the
+    /// help against the one list.
+    #[test]
+    fn help_rows_reference_only_known_commands() {
+        let known: Vec<String> = SLASH_COMMANDS
+            .iter()
+            .map(|(c, _)| {
+                c.split_whitespace()
+                    .take_while(|t| {
+                        !t.starts_with('<') && !t.starts_with('[') && !t.starts_with('{')
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+
+        for rows in [HELP_LEFT_ROWS, HELP_RIGHT_ROWS, HELP_SINGLE_ROWS] {
+            for (left, _) in rows {
+                let Some(cmd) = command_of(left) else {
+                    continue;
+                };
+                assert!(
+                    known.iter().any(|k| k == &cmd),
+                    "help advertises `{left}` but `{cmd}` is not in state::SLASH_COMMANDS"
+                );
+            }
+        }
+    }
+
+    /// The two help layouts document the same commands. They are separate row
+    /// tables chosen by terminal width, so a command added to one and not the
+    /// other is invisible at the other size.
+    #[test]
+    fn both_help_layouts_document_the_same_commands() {
+        let two_column: std::collections::BTreeSet<String> = HELP_LEFT_ROWS
+            .iter()
+            .chain(HELP_RIGHT_ROWS.iter())
+            .filter_map(|(l, _)| command_of(l))
+            .collect();
+        let single: std::collections::BTreeSet<String> = HELP_SINGLE_ROWS
+            .iter()
+            .filter_map(|(l, _)| command_of(l))
+            .collect();
+        assert_eq!(
+            two_column, single,
+            "the wide and narrow help layouts document different commands"
         );
     }
 }

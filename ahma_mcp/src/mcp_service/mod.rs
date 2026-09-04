@@ -128,6 +128,12 @@ pub struct AhmaMcpService {
     /// only). Schema generation per config is the expensive part; the cache is
     /// dropped whenever `configs` changes ([`Self::invalidate_config_tools_cache`]).
     config_tools_cache: Arc<RwLock<Option<Arc<Vec<Tool>>>>>,
+    /// Cache of the configured tool *names*, used by the harness guard's
+    /// name-healing pass on every `tools/call`. Rebuilding it there allocated one
+    /// `String` per configured tool per call, though the set only changes when
+    /// `configs` does — so it is dropped by the same
+    /// [`Self::invalidate_config_tools_cache`] that drops the `Tool` list.
+    config_names_cache: Arc<RwLock<Option<Arc<Vec<String>>>>>,
     pub guidance: Arc<Option<GuidanceConfig>>,
     /// When true, forces all operations to run synchronously (overrides async-by-default).
     /// This is set when the --sync CLI flag is used.
@@ -357,6 +363,17 @@ impl AhmaMcpService {
     /// of [`Self::configs`].
     fn invalidate_config_tools_cache(&self) {
         *self.config_tools_cache.write() = None;
+        *self.config_names_cache.write() = None;
+    }
+
+    /// The configured tool names, cached alongside the `Tool` list.
+    fn config_tool_names(&self) -> Arc<Vec<String>> {
+        if let Some(cached) = self.config_names_cache.read().as_ref() {
+            return cached.clone();
+        }
+        let names = Arc::new(self.configs.read().keys().cloned().collect::<Vec<String>>());
+        *self.config_names_cache.write() = Some(names.clone());
+        names
     }
 
     /// The built-in tools every session exposes, before per-client config
@@ -813,6 +830,7 @@ impl AhmaMcpService {
             configs: Arc::new(RwLock::new((*configs).clone())),
             builtin_tools_cache: Arc::new(std::sync::OnceLock::new()),
             config_tools_cache: Arc::new(RwLock::new(None)),
+            config_names_cache: Arc::new(RwLock::new(None)),
             guidance,
             force_synchronous,
             defer_sandbox,
@@ -1878,9 +1896,10 @@ impl AhmaMcpService {
         use crate::harness_guard::{GuardContext, GuardOutcome};
 
         // Assemble the known-tool set (hard-coded + configured) for name healing.
-        // The names are cloned out of the map so the lock is released before the
-        // guard pipeline runs; `known_tools` then borrows from `config_names`.
-        let config_names: Vec<String> = self.configs.read().keys().cloned().collect();
+        // The names come from a cache keyed to `configs`, so the lock is released
+        // before the guard pipeline runs and no per-call allocation is needed;
+        // `known_tools` then borrows from `config_names`.
+        let config_names = self.config_tool_names();
         let mut known_tools: Vec<&str> = Self::HARDCODED_TOOLS.to_vec();
         known_tools.extend(config_names.iter().map(String::as_str));
 

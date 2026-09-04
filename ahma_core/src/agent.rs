@@ -1937,7 +1937,14 @@ async fn build_agent_run_context(
     let num_ctx = conn.num_ctx;
     let client = conn.into_client();
 
-    let available_tools = service.get_all_available_tools().await;
+    // These three are independent — a tool-list assembly, a settings file read and
+    // a lock acquisition — and ran back to back, so every turn paid their latency
+    // in series on the critical path before the model could be called.
+    let (available_tools, settings, mcp_connections) = tokio::join!(
+        service.get_all_available_tools(),
+        ahma_common::config::AhmaSettings::load_async(),
+        async { service.mcp_connections.read().await.clone() },
+    );
 
     let workspace_root = service
         .adapter
@@ -1946,9 +1953,6 @@ async fn build_agent_run_context(
         .first()
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    let settings = ahma_common::config::AhmaSettings::load_async().await;
-    let mcp_connections = service.mcp_connections.read().await.clone();
 
     let local_mcp_base_url = {
         let app_config_guard = service.app_config.read();

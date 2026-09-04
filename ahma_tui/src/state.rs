@@ -326,57 +326,76 @@ pub struct SandboxScopeInfo {
     pub platform_note: Option<String>,
 }
 
-/// The full set of built-in `/` commands.
+/// Every slash command the TUI advertises, as `(command, description)`.
+///
+/// The single list. `builtin_commands()` (the `/` palette) maps it, and
+/// `ui::help_rows_reference_only_known_commands` checks the help overlay against
+/// it, so a command cannot be dispatched, listed and documented from three
+/// hand-kept copies that drift — which is exactly what had happened: `/analyze`
+/// and `/compact` were dispatched and in the help but missing from the palette,
+/// and `/provider add` / `/provider numctx` were in neither, reachable only by
+/// typing them exactly.
+///
+/// `/exit` is deliberately absent: it is handled but not advertised.
+pub const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "show keyboard reference"),
+    ("/?", "show keyboard reference (alias)"),
+    ("/provider", "select LLM provider"),
+    ("/model", "select model for current provider"),
+    (
+        "/minimize on",
+        "enable token minimization (concise prompts, compressed output)",
+    ),
+    ("/minimize off", "disable token minimization (default)"),
+    ("/mcp on", "enable ahma as MCP tool server"),
+    ("/mcp off", "disable ahma MCP tool server"),
+    ("/mcp list", "list configured MCP client servers"),
+    ("/mcp refresh", "refresh tools from configured MCP servers"),
+    ("/mcp add http <url> [name]", "add an HTTP MCP server"),
+    (
+        "/mcp add stdio <cmd> [args] [--name <n>]",
+        "add a stdio MCP server",
+    ),
+    ("/mcp remove <name>", "remove a configured MCP server"),
+    (
+        "/run <tool> {json}",
+        "invoke an ahma tool directly with optional JSON args",
+    ),
+    ("/tools", "list available ahma tools"),
+    ("/skills", "list Agent Skills invocable with /<name>"),
+    ("/tasks", "open tasks view window"),
+    ("/log", "open log view window"),
+    ("/scope", "show the locked sandbox scope and its provenance"),
+    (
+        "/log file <path> [prompt]",
+        "start background log monitor on file",
+    ),
+    ("/approve", "approve pending gate"),
+    ("/reject", "reject pending gate"),
+    ("/clear", "clear chat & finished windows (logs kept)"),
+    ("/agent list", "list saved agent profiles"),
+    (
+        "/agent save <name>",
+        "save current setup as an agent profile",
+    ),
+    ("/agent load <name>", "load an agent profile"),
+    ("/agent delete <name>", "delete an agent profile"),
+    ("/export markdown", "export chat transcript to markdown"),
+    ("/settings", "open settings panel (edit & persist)"),
+    ("/analyze [op_id]", "ask the LLM to analyze an operation"),
+    ("/compact", "compact the chat transcript"),
+    ("/provider add", "add a provider to the registry"),
+    (
+        "/provider numctx",
+        "set the context length for the current provider",
+    ),
+    ("/quit", "quit the application"),
+    // /exit intentionally omitted — still handled, just not advertised
+];
+
 pub fn builtin_commands() -> Vec<NavCommand> {
-    const CMDS: &[(&str, &str)] = &[
-        ("/help", "show keyboard reference"),
-        ("/?", "show keyboard reference (alias)"),
-        ("/provider", "select LLM provider"),
-        ("/model", "select model for current provider"),
-        (
-            "/minimize on",
-            "enable token minimization (concise prompts, compressed output)",
-        ),
-        ("/minimize off", "disable token minimization (default)"),
-        ("/mcp on", "enable ahma as MCP tool server"),
-        ("/mcp off", "disable ahma MCP tool server"),
-        ("/mcp list", "list configured MCP client servers"),
-        ("/mcp refresh", "refresh tools from configured MCP servers"),
-        ("/mcp add http <url> [name]", "add an HTTP MCP server"),
-        (
-            "/mcp add stdio <cmd> [args] [--name <n>]",
-            "add a stdio MCP server",
-        ),
-        ("/mcp remove <name>", "remove a configured MCP server"),
-        (
-            "/run <tool> {json}",
-            "invoke an ahma tool directly with optional JSON args",
-        ),
-        ("/tools", "list available ahma tools"),
-        ("/skills", "list Agent Skills invocable with /<name>"),
-        ("/tasks", "open tasks view window"),
-        ("/log", "open log view window"),
-        ("/scope", "show the locked sandbox scope and its provenance"),
-        (
-            "/log file <path> [prompt]",
-            "start background log monitor on file",
-        ),
-        ("/approve", "approve pending gate"),
-        ("/reject", "reject pending gate"),
-        ("/clear", "clear chat & finished windows (logs kept)"),
-        ("/agent list", "list saved agent profiles"),
-        (
-            "/agent save <name>",
-            "save current setup as an agent profile",
-        ),
-        ("/agent load <name>", "load an agent profile"),
-        ("/agent delete <name>", "delete an agent profile"),
-        ("/export markdown", "export chat transcript to markdown"),
-        ("/settings", "open settings panel (edit & persist)"),
-        ("/quit", "quit the application"),
-        // /exit intentionally omitted — still handled, just not advertised
-    ];
-    CMDS.iter()
+    SLASH_COMMANDS
+        .iter()
         .map(|(command, description)| NavCommand {
             command: (*command).into(),
             description: (*description).into(),
@@ -795,7 +814,7 @@ pub struct Operation {
     /// The path and access a sandbox denial refused, when `status` is
     /// [`OpStatus::Denied`]. Held so the row can name the path and the grant
     /// question can be re-raised for exactly that pair (SPEC R-PERM.7.1).
-    pub denial: Option<(String, String)>,
+    pub denial: Option<(String, ahma_common::config::ScopeAccess)>,
     /// When the most recent live output line arrived (set locally, not from
     /// the wire). Drives the fast-vs-slow cadence of the card's activity panel.
     pub last_output_at: Option<Instant>,
@@ -940,7 +959,9 @@ impl Operation {
             // "failed" says neither (SPEC R24.7, R-PERM.7).
             OpStatus::Denied => OpOutcome::Denied {
                 reason: match &self.denial {
-                    Some((path, access)) => format!("{path} ({access}) outside sandbox scope"),
+                    Some((path, access)) => {
+                        format!("{path} ({}) outside sandbox scope", access.short())
+                    }
                     None => "outside sandbox scope".to_string(),
                 },
             },
@@ -1287,12 +1308,77 @@ impl std::fmt::Display for WindowStatus {
     }
 }
 
+/// What a window content line *is*, rather than what it happens to start with.
+///
+/// The window used to be a `Vec<String>`, so two consumers recovered the
+/// structure by prefix-matching the rendered text — with different,
+/// non-overlapping lists. `output_line_style` keyed off "Starting",
+/// "Finished successfully", "Failed", "Cancelled", "──", "--";
+/// `last_output_line` keyed off `!= "____"`, "Starting ", "Started ", "──",
+/// "--". Neither knew about "Finished" or "Denied", and a stdout line that
+/// merely began with "Failed" was painted as a terminal failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineKind {
+    /// The `Starting <tool> at <time>` header.
+    Start,
+    /// A line of the command's own stdout/stderr.
+    Output,
+    /// The live-edge marker shown while the operation is still running.
+    LiveEdge,
+    /// The rule drawn between the output and the outcome line.
+    Separator,
+    /// The terminal outcome line, carrying the status it reports so the style
+    /// follows the outcome rather than the wording.
+    End(WindowStatus),
+}
+
+/// One line of a window's content, with its role attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowLine {
+    pub kind: LineKind,
+    pub text: String,
+}
+
+impl WindowLine {
+    pub fn start(text: impl Into<String>) -> Self {
+        Self {
+            kind: LineKind::Start,
+            text: text.into(),
+        }
+    }
+    pub fn output(text: impl Into<String>) -> Self {
+        Self {
+            kind: LineKind::Output,
+            text: text.into(),
+        }
+    }
+    /// The marker drawn at the live edge of a running operation's output.
+    pub fn live_edge() -> Self {
+        Self {
+            kind: LineKind::LiveEdge,
+            text: "____".to_string(),
+        }
+    }
+    pub fn separator(text: impl Into<String>) -> Self {
+        Self {
+            kind: LineKind::Separator,
+            text: text.into(),
+        }
+    }
+    pub fn end(status: WindowStatus, text: impl Into<String>) -> Self {
+        Self {
+            kind: LineKind::End(status),
+            text: text.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiWindow {
     pub id: usize,
     pub label: String,
     pub status: WindowStatus,
-    pub content: Vec<String>,
+    pub content: Vec<WindowLine>,
     pub collapsed: bool,
     pub finished_at: Option<std::time::Instant>,
     /// Wall-clock duration of the finished operation, for the collapsed
@@ -1316,14 +1402,12 @@ impl TuiWindow {
     /// a live "what is it doing" tail. Skips the live-edge marker, separators,
     /// and the friendly start line, which carry no activity information.
     pub fn last_output_line(&self) -> Option<&str> {
-        self.content.iter().rev().map(|s| s.trim()).find(|s| {
-            !s.is_empty()
-                && *s != "____"
-                && !s.starts_with("Starting ")
-                && !s.starts_with("Started ")
-                && !s.starts_with("──")
-                && !s.starts_with("--")
-        })
+        self.content
+            .iter()
+            .rev()
+            .filter(|l| l.kind == LineKind::Output)
+            .map(|l| l.text.trim())
+            .find(|t| !t.is_empty())
     }
 }
 
@@ -1358,7 +1442,7 @@ pub struct AppState {
     pub server_healthy: bool,
     pub daemon_healthy: bool,
     pub session_id: Option<String>,
-    pub sandbox_status: String,
+    pub sandbox_status: SandboxAuthority,
     pub workspace: String,
     /// Token/context preferences resolved from CLI flags (`--minimize-tokens`,
     /// `--small-model-harness`, `--context-length`).  Flag values override
@@ -1423,8 +1507,9 @@ pub struct AppState {
     pub chat_input: TextArea<'static>,
     #[cfg(not(feature = "tui"))]
     pub chat_input: (),
-    /// LLM provider label shown in header (e.g. "Ollama / llama3.2").
-    pub llm_label: String,
+    /// What the TUI is pointed at, or `None` for "no LLM". The header label is
+    /// derived from this at render time by [`AppState::llm_label`].
+    pub llm_selection: Option<LlmSelection>,
     /// Concrete provider URL used for API calls and persisted in session config.
     pub current_provider_url: Option<String>,
     pub active_profile: Option<String>,
@@ -1582,6 +1667,159 @@ pub struct AppState {
 }
 
 #[cfg(feature = "tui")]
+/// Which provider a selection came from.
+///
+/// The distinction exists because a profile is *not* a provider name: it is an
+/// alias carrying a URL and a model. Rendering it as `profile:my-profile` in the
+/// header is right; persisting that same text as `[agent].provider` is not, and
+/// that is exactly what happened while the two were one formatted string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRef {
+    /// A provider from the registry, by name.
+    Named(String),
+    /// A saved profile, by alias. Its endpoint travels in
+    /// `AppState::current_provider_url`; there is no registry name to persist.
+    Profile(String),
+}
+
+/// The model the TUI is currently pointed at.
+///
+/// Replaces a formatted `"{provider} / {model}"` string with a `"no LLM"`
+/// sentinel, which six sites re-parsed with `rsplit_once(" / ")` and five
+/// compared against the sentinel — inconsistently, some also checking
+/// `is_empty()`. Two leaks came out of that: `/mcp on` with nothing selected
+/// persisted `[agent].provider = "no LLM"` into the user's global
+/// `~/.ahma/settings.toml` (the file the MCP sub-agent reads), and a loaded
+/// profile persisted `profile:<alias>` as a provider name no registry contains.
+///
+/// `None` *is* "no LLM": the sentinel comparisons become `is_none()`, and the
+/// display label is produced only at the render edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmSelection {
+    pub provider: ProviderRef,
+    pub model: String,
+}
+
+impl LlmSelection {
+    /// A selection made by picking a provider from the registry.
+    pub fn named(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: ProviderRef::Named(provider.into()),
+            model: model.into(),
+        }
+    }
+
+    /// A selection made by loading a saved profile.
+    pub fn profile(alias: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: ProviderRef::Profile(alias.into()),
+            model: model.into(),
+        }
+    }
+
+    /// The header label: `provider / model`, or `profile:alias / model`.
+    pub fn display_label(&self) -> String {
+        match &self.provider {
+            ProviderRef::Named(name) => format!("{name} / {}", self.model),
+            ProviderRef::Profile(alias) => format!("profile:{alias} / {}", self.model),
+        }
+    }
+
+    /// The provider name as it should be *persisted*, or `""` for a profile —
+    /// whose endpoint is persisted as a URL instead. Never an alias, never a
+    /// display sentinel.
+    pub fn persistable_provider(&self) -> &str {
+        match &self.provider {
+            ProviderRef::Named(name) => name,
+            ProviderRef::Profile(_) => "",
+        }
+    }
+
+    /// The registry provider name, when the selection has one. `None` for a
+    /// profile, so callers that need a real provider (the num_ctx picker,
+    /// settings persistence) cannot be handed an alias.
+    pub fn provider_name(&self) -> Option<&str> {
+        match &self.provider {
+            ProviderRef::Named(name) => Some(name),
+            ProviderRef::Profile(_) => None,
+        }
+    }
+}
+
+/// Who is actually enforcing the sandbox for this session, as the TUI knows it.
+///
+/// Previously a formatted `String` ("LOCKED", "NESTED: cursor", …) produced at
+/// the source and re-interpreted downstream by prefix matching — the label was
+/// the interface, so the typed token it was built from had to be recovered from
+/// text. Two bugs came directly from that: the status chip's colour was decided
+/// by `starts_with("NESTED")`, and the system-prompt guard compared against
+/// lowercase `"unknown"` which no producer ever emitted, so the model was told
+/// `Sandbox: UNKNOWN` on every pre-lock turn.
+///
+/// The label is now produced only at the render edge, by [`Self::label`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SandboxAuthority {
+    /// No sandbox report has arrived on this connection yet.
+    #[default]
+    Unknown,
+    /// The server is still negotiating scope; tool calls are held.
+    Initializing,
+    /// ahma's own kernel sandbox is the sole authority.
+    Locked,
+    /// No kernel confinement is in effect.
+    Unsandboxed,
+    /// ahma is enforcing, nested inside the named host sandbox.
+    Nested(Option<String>),
+    /// ahma deferred to the named host sandbox and is NOT enforcing.
+    Deferred(Option<String>),
+    /// Sandbox configuration failed.
+    Failed,
+}
+
+impl SandboxAuthority {
+    /// Classify the wire token from a `sandbox/configured` notification. An
+    /// unknown or absent token means LOCKED, preserving compatibility with
+    /// servers that predate the token (SPEC R5.4).
+    pub fn from_token(active: Option<&str>, host: Option<&str>) -> Self {
+        use ahma_common::mcp_methods as m;
+        match active {
+            Some(m::ACTIVE_SANDBOX_NESTED_IN_HOST) => Self::Nested(host.map(str::to_string)),
+            Some(m::ACTIVE_SANDBOX_DEFERRED_TO_HOST) => Self::Deferred(host.map(str::to_string)),
+            Some(m::ACTIVE_SANDBOX_DISABLED) => Self::Unsandboxed,
+            _ => Self::Locked,
+        }
+    }
+
+    /// The compact status-bar chip text.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Unknown => "UNKNOWN".to_string(),
+            Self::Initializing => "INITIALIZING".to_string(),
+            Self::Locked => "LOCKED".to_string(),
+            Self::Unsandboxed => "UNSANDBOXED".to_string(),
+            Self::Failed => "FAILED".to_string(),
+            Self::Nested(Some(h)) => format!("NESTED: {h}"),
+            Self::Nested(None) => "NESTED".to_string(),
+            Self::Deferred(Some(h)) => format!("DEFERRED: {h}"),
+            Self::Deferred(None) => "DEFERRED".to_string(),
+        }
+    }
+
+    /// Whether ahma is the only thing protecting this session. False for the
+    /// host-relative modes and for no confinement at all — the cases whose
+    /// disclosure must be surfaced loudly (SPEC R7).
+    pub fn is_sole_authority(&self) -> bool {
+        matches!(self, Self::Locked | Self::Initializing | Self::Unknown)
+    }
+
+    /// Whether a sandbox report has actually arrived. Guards surfaces that must
+    /// not assert a sandbox state they do not know — notably the model's system
+    /// prompt, where "UNKNOWN" is worse than silence.
+    pub fn is_known(&self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+}
+
 impl AppState {
     /// Raise an approval gate — the single guarded entry into the
     /// approval-pending state.
@@ -1812,10 +2050,10 @@ impl AppState {
         let session = std::env::current_dir()
             .ok()
             .and_then(|cwd| TuiSessionConfig::load(&cwd).ok().flatten());
-        let llm_label = session
+        let llm_selection = session
             .as_ref()
-            .map(|s| format!("{} / {}", s.provider, s.model))
-            .unwrap_or_else(|| "no LLM".to_string());
+            .filter(|s| !s.provider.trim().is_empty())
+            .map(|s| LlmSelection::named(s.provider.clone(), s.model.clone()));
         let current_provider_url = session.as_ref().and_then(|s| {
             s.provider_url.clone().or_else(|| {
                 if s.provider.starts_with("http") {
@@ -1839,7 +2077,7 @@ impl AppState {
             server_healthy: false,
             daemon_healthy: false,
             session_id: None,
-            sandbox_status: "UNKNOWN".to_string(),
+            sandbox_status: SandboxAuthority::Unknown,
             workspace,
             token_prefs: crate::TokenPrefs::default(),
             minimize_tokens: false,
@@ -1864,7 +2102,7 @@ impl AppState {
             granted_scopes: Vec::new(),
             chat: ChatHistory::default(),
             chat_input: TextArea::default(),
-            llm_label,
+            llm_selection,
             current_provider_url,
             active_profile,
             mcp_enabled,
@@ -2181,10 +2419,19 @@ impl AppState {
     }
 
     pub fn selected_model(&self) -> String {
-        self.llm_label
-            .rsplit_once(" / ")
-            .map(|(_, model)| model.trim().to_string())
+        self.llm_selection
+            .as_ref()
+            .map(|s| s.model.clone())
             .unwrap_or_default()
+    }
+
+    /// The header label for the current selection. `"no LLM"` when there is
+    /// none — a rendering of `None`, not a value anything stores or compares.
+    pub fn llm_label(&self) -> String {
+        self.llm_selection
+            .as_ref()
+            .map(|s| s.display_label())
+            .unwrap_or_else(|| "no LLM".to_string())
     }
 
     /// Append to the monitor activity feed, newest first, bounded.
@@ -2230,16 +2477,34 @@ impl AppState {
         // made one entry span several rendered rows.
     }
 
+    /// Allocation-free substring test for an already-lowercased ASCII needle.
+    ///
+    /// The log filter is typed by a human into a search box, so it is ASCII in
+    /// practice; matching case-insensitively on bytes avoids allocating a
+    /// lowercased copy of every log line on every frame.
+    fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
+        let (h, n) = (haystack.as_bytes(), needle_lower.as_bytes());
+        match n.len() {
+            0 => true,
+            len if len > h.len() => false,
+            len => h.windows(len).any(|w| w.eq_ignore_ascii_case(n)),
+        }
+    }
+
     pub fn filtered_log(&self) -> Vec<&LogEntry> {
         if self.log_filter.is_empty() {
             self.log.iter().collect()
         } else {
+            // One allocation for the needle, none per entry. This runs on every
+            // redraw of the log pane — up to LOG_RING_CAP entries, at animation
+            // frame rate — so the previous `to_lowercase()` per message and per
+            // level label allocated a fresh String for each entry, each frame.
             let q = self.log_filter.to_lowercase();
             self.log
                 .iter()
                 .filter(|e| {
-                    e.message.to_lowercase().contains(&q)
-                        || e.level.label().to_lowercase().contains(&q)
+                    Self::contains_ignore_ascii_case(&e.message, &q)
+                        || Self::contains_ignore_ascii_case(e.level.label(), &q)
                 })
                 .collect()
         }
@@ -3249,17 +3514,25 @@ mod tests {
     fn last_output_line_skips_markers() {
         let mut w = test_window(1, WindowStatus::Running, false);
         w.content = vec![
-            "Started at 06:06:33".into(),
-            "Compiling ahma_core v0.16.1".into(),
-            "____".into(),
+            WindowLine::start("Started at 06:06:33"),
+            WindowLine::output("Compiling ahma_core v0.16.1"),
+            WindowLine::live_edge(),
         ];
         assert_eq!(w.last_output_line(), Some("Compiling ahma_core v0.16.1"));
 
         w.content = vec![
-            "Starting run_terminal_command at 06:06:33".into(),
-            "____".into(),
+            WindowLine::start("Starting run_terminal_command at 06:06:33"),
+            WindowLine::live_edge(),
         ];
         assert_eq!(w.last_output_line(), None);
+
+        // A stdout line that merely *looks* like a marker is still output. The
+        // old prefix filter dropped it.
+        w.content = vec![
+            WindowLine::start("Started at 06:06:33"),
+            WindowLine::output("-- applying migration"),
+        ];
+        assert_eq!(w.last_output_line(), Some("-- applying migration"));
     }
 
     #[test]
@@ -3399,10 +3672,14 @@ mod tests {
         assert_eq!(nav.completions.len(), 1);
         assert_eq!(nav.completions[0].command, "/quit");
 
-        // When input is "ex", should match /quit (via alias) and /export markdown (via prefix)
+        // When input is "ex", should match /quit (via alias) and /export markdown
+        // (via prefix). Membership rather than an exact count: the filter also
+        // matches descriptions, so any command whose description happens to
+        // contain "ex" — "/provider numctx" describes a *context* length —
+        // legitimately joins the list, and asserting a total here just makes the
+        // test fail whenever the command table grows.
         nav.input = "ex".to_string();
         nav.refresh_completions(&tools);
-        assert_eq!(nav.completions.len(), 2);
         assert!(nav.completions.iter().any(|c| c.command == "/quit"));
         assert!(
             nav.completions
@@ -3505,5 +3782,58 @@ mod tests {
         let picker = s.take_provider_picker();
         assert!(picker.is_some());
         assert!(!s.modal_open());
+    }
+}
+
+#[cfg(test)]
+mod llm_selection_tests {
+    use super::{LlmSelection, ProviderRef};
+
+    /// `/mcp on` with nothing selected used to split the display label "no LLM",
+    /// find no " / ", and persist the whole sentinel as
+    /// `[agent].provider = "no LLM"` in the user's global ~/.ahma/settings.toml —
+    /// the file the MCP sub-agent reads. `None` must persist nothing.
+    #[test]
+    fn no_selection_persists_no_provider() {
+        let selection: Option<LlmSelection> = None;
+        let (provider, model) = match selection.as_ref() {
+            Some(s) => (s.persistable_provider().to_string(), s.model.clone()),
+            None => (String::new(), String::new()),
+        };
+        assert_eq!(provider, "");
+        assert_eq!(model, "");
+    }
+
+    /// A loaded profile rendered as `profile:<alias> / <model>`, and splitting
+    /// that label yielded `profile:<alias>` — persisted as a provider name no
+    /// registry contains. A profile carries a URL, not a registry name, so the
+    /// persistable provider must be empty and the URL persisted separately.
+    #[test]
+    fn profile_selection_never_persists_its_alias_as_a_provider() {
+        let selection = LlmSelection::profile("my-profile", "gemma2:latest");
+        assert_eq!(
+            selection.display_label(),
+            "profile:my-profile / gemma2:latest",
+            "the alias is still what the header shows"
+        );
+        assert_eq!(
+            selection.persistable_provider(),
+            "",
+            "but it must never be persisted as a provider name"
+        );
+        assert_eq!(
+            selection.provider_name(),
+            None,
+            "and callers wanting a registry provider must get None"
+        );
+    }
+
+    #[test]
+    fn named_selection_round_trips_provider_and_model() {
+        let selection = LlmSelection::named("Ollama", "llama3.2");
+        assert_eq!(selection.display_label(), "Ollama / llama3.2");
+        assert_eq!(selection.persistable_provider(), "Ollama");
+        assert_eq!(selection.provider_name(), Some("Ollama"));
+        assert_eq!(selection.provider, ProviderRef::Named("Ollama".into()));
     }
 }

@@ -128,10 +128,14 @@ impl ActiveSandbox {
     /// Stable machine-readable token for JSON payloads / logs.
     pub fn token(self) -> &'static str {
         match self {
-            ActiveSandbox::AhmaEnforcing => "ahma",
-            ActiveSandbox::AhmaEnforcingNestedInHost(_) => "ahma_nested_in_host",
-            ActiveSandbox::DeferredToHost(_) => "deferred_to_host",
-            ActiveSandbox::Disabled => "disabled",
+            ActiveSandbox::AhmaEnforcing => ahma_common::mcp_methods::ACTIVE_SANDBOX_AHMA,
+            ActiveSandbox::AhmaEnforcingNestedInHost(_) => {
+                ahma_common::mcp_methods::ACTIVE_SANDBOX_NESTED_IN_HOST
+            }
+            ActiveSandbox::DeferredToHost(_) => {
+                ahma_common::mcp_methods::ACTIVE_SANDBOX_DEFERRED_TO_HOST
+            }
+            ActiveSandbox::Disabled => ahma_common::mcp_methods::ACTIVE_SANDBOX_DISABLED,
         }
     }
 

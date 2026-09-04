@@ -246,7 +246,7 @@ impl DaemonState {
         &mut self,
         instance_id: &str,
         op_id: &str,
-        status_str: &str,
+        status: ahma_common::daemon_hub::OpStatus,
         result_summary: Option<String>,
         duration_ms: u64,
         ended_epoch_ms: Option<u64>,
@@ -261,7 +261,7 @@ impl DaemonState {
             // status wins so the row can say `denied: <path>`.
             op.status = match &denial {
                 Some(_) => OpStatus::Denied,
-                None => parse_op_status(status_str),
+                None => parse_op_status(status),
             };
             op.denial = denial.map(|d| (d.path, d.access));
             op.result_summary = result_summary;
@@ -569,7 +569,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 state.on_op_finished(
                     &instance_id,
                     &id,
-                    &status,
+                    status,
                     result_summary,
                     duration_ms,
                     ended_epoch_ms,
@@ -693,12 +693,21 @@ fn applied_to_event(applied: Applied) -> Option<SourceEvent> {
     }
 }
 
-fn parse_op_status(s: &str) -> OpStatus {
+/// Map the hub wire status onto the TUI's display status.
+///
+/// Exhaustive on purpose: the wire enum gaining a state must be a compile error
+/// here, not a silent fold into `Failed`. `TimedOut` folding into `Failed` is a
+/// deliberate display choice (the TUI has no timeout glyph) — it is now stated
+/// as its own arm rather than hidden in a catch-all, and `Pending`/`InProgress`
+/// are non-terminal and only reachable if a producer mislabels a finish.
+fn parse_op_status(s: ahma_common::daemon_hub::OpStatus) -> OpStatus {
+    use ahma_common::daemon_hub::OpStatus as Wire;
     match s {
-        "Completed" => OpStatus::Succeeded,
-        "Failed" => OpStatus::Failed,
-        "Cancelled" => OpStatus::Cancelled,
-        _ => OpStatus::Failed, // TimedOut → Failed for display
+        Wire::Completed => OpStatus::Succeeded,
+        Wire::Failed => OpStatus::Failed,
+        Wire::Cancelled => OpStatus::Cancelled,
+        Wire::TimedOut => OpStatus::Failed,
+        Wire::Pending | Wire::InProgress => OpStatus::Failed,
     }
 }
 
@@ -786,7 +795,7 @@ mod tests {
         s.on_op_finished(
             "i1",
             "op-1",
-            "Completed",
+            ahma_common::daemon_hub::OpStatus::Completed,
             Some("ok".to_string()),
             100,
             None,
@@ -809,7 +818,7 @@ mod tests {
         s.on_op_finished(
             "i1",
             "nonexistent-op",
-            "Completed",
+            ahma_common::daemon_hub::OpStatus::Completed,
             None,
             0,
             None,
@@ -840,20 +849,23 @@ mod tests {
         s.on_op_finished(
             "i1",
             "op-1",
-            "Failed",
+            ahma_common::daemon_hub::OpStatus::Failed,
             Some("Operation not permitted".into()),
             5,
             None,
             None,
             Some(OpDenial {
                 path: "/etc".into(),
-                access: "rw".into(),
+                access: ahma_common::config::ScopeAccess::Rw,
             }),
         );
 
         let ops = s.all_ops();
         assert_eq!(ops[0].status, OpStatus::Denied);
-        assert_eq!(ops[0].denial, Some(("/etc".into(), "rw".into())));
+        assert_eq!(
+            ops[0].denial,
+            Some(("/etc".into(), ahma_common::config::ScopeAccess::Rw))
+        );
         // The shared identity renderer must say "denied", not "failed".
         let line = ops[0].identity().render(false);
         assert!(line.contains("denied"), "identity line: {line}");
@@ -882,7 +894,7 @@ mod tests {
         s.on_op_finished(
             "i1",
             "op-1",
-            "Failed",
+            ahma_common::daemon_hub::OpStatus::Failed,
             Some("boom".into()),
             5,
             None,
@@ -916,7 +928,16 @@ mod tests {
             None,
             OpWireIdentity::default(),
         );
-        s.on_op_finished("i1", "op-a", "Completed", None, 0, None, None, None);
+        s.on_op_finished(
+            "i1",
+            "op-a",
+            ahma_common::daemon_hub::OpStatus::Completed,
+            None,
+            0,
+            None,
+            None,
+            None,
+        );
 
         let ops = s.all_ops();
         assert_eq!(ops.len(), 2);
@@ -980,7 +1001,16 @@ mod tests {
             None,
             OpWireIdentity::default(),
         );
-        s.on_op_finished("i1", "op-2", "Failed", None, 0, None, None, None);
+        s.on_op_finished(
+            "i1",
+            "op-2",
+            ahma_common::daemon_hub::OpStatus::Failed,
+            None,
+            0,
+            None,
+            None,
+            None,
+        );
 
         // Stamp op-2's completion now, then let real time pass past a tiny
         // retention window — exercises the same "older than retention"
@@ -1103,7 +1133,7 @@ mod tests {
                 instance_id: "i1".to_string(),
                 payload: DaemonEvent::OpFinished {
                     id: "op-1".to_string(),
-                    status: "Completed".to_string(),
+                    status: ahma_common::daemon_hub::OpStatus::Completed,
                     result_summary: Some("success".to_string()),
                     duration_ms: 1200,
                     ended_epoch_ms: None,
@@ -1193,22 +1223,26 @@ mod tests {
 
     // ── parse_op_status ────────────────────────────────────────────────────────
 
+    /// The wire status is a typed enum, so the old "Unknown"/"" cases this test
+    /// used to cover are no longer representable — the mapping is total by
+    /// construction. What remains worth asserting is the deliberate collapses.
     #[test]
     fn parse_op_status_all_variants() {
-        assert_eq!(parse_op_status("Completed"), OpStatus::Succeeded);
-        assert_eq!(parse_op_status("Failed"), OpStatus::Failed);
-        assert_eq!(parse_op_status("Cancelled"), OpStatus::Cancelled);
+        use ahma_common::daemon_hub::OpStatus as Wire;
+        assert_eq!(parse_op_status(Wire::Completed), OpStatus::Succeeded);
+        assert_eq!(parse_op_status(Wire::Failed), OpStatus::Failed);
+        assert_eq!(parse_op_status(Wire::Cancelled), OpStatus::Cancelled);
         assert_eq!(
-            parse_op_status("TimedOut"),
+            parse_op_status(Wire::TimedOut),
             OpStatus::Failed,
-            "TimedOut → Failed"
+            "TimedOut → Failed: the TUI has no timeout glyph"
         );
         assert_eq!(
-            parse_op_status("Unknown"),
+            parse_op_status(Wire::Pending),
             OpStatus::Failed,
-            "Unknown → Failed"
+            "a non-terminal state on a finish message is a producer bug"
         );
-        assert_eq!(parse_op_status(""), OpStatus::Failed, "empty → Failed");
+        assert_eq!(parse_op_status(Wire::InProgress), OpStatus::Failed);
     }
 
     // ── coverage batch: apply_msg arms, DaemonState branches, embedded hub ─────
@@ -1309,7 +1343,16 @@ mod tests {
             None,
             OpWireIdentity::default(),
         );
-        s.on_op_finished("i1", "op-1", "Completed", None, 5, None, None, None);
+        s.on_op_finished(
+            "i1",
+            "op-1",
+            ahma_common::daemon_hub::OpStatus::Completed,
+            None,
+            5,
+            None,
+            None,
+            None,
+        );
         s.prune_terminal();
         let ops = s.all_ops();
         assert_eq!(ops.len(), 1, "recently completed op is retained");
@@ -2018,7 +2061,7 @@ mod tests {
             &ClientMsg::Event {
                 payload: DaemonEvent::OpFinished {
                     id: "op-1".to_string(),
-                    status: "Completed".to_string(),
+                    status: ahma_common::daemon_hub::OpStatus::Completed,
                     result_summary: Some("ok".to_string()),
                     duration_ms: 42,
                     ended_epoch_ms: None,

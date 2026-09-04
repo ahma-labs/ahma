@@ -156,6 +156,40 @@ pub struct OpIdentity<'a> {
     pub outcome: OpOutcome,
 }
 
+impl OpOutcome {
+    /// The outcome as a sentence, for surfaces that narrate rather than tabulate
+    /// (an operation card's end line, a detail header) — the prose counterpart
+    /// of [`OpIdentity::glyph`].
+    ///
+    /// It lives here, beside `glyph` and `render`, because every surface that
+    /// describes an outcome must agree about `Denied`. Spelled locally, each one
+    /// wrote a three-arm match over the *display* status with a `_` fallback,
+    /// and a denial — which is exactly the outcome the user most needs named —
+    /// fell into it and was reported as an ordinary finish (SPEC R24.7,
+    /// R-PERM.7).
+    pub fn friendly_phrase(&self) -> String {
+        match self {
+            // Not terminal: a caller asking for an end phrase while the
+            // operation still runs gets the neutral word, not a verdict.
+            OpOutcome::Running { .. } => "Finished".to_string(),
+            OpOutcome::Denied { reason } => format!("Denied: {reason}"),
+            OpOutcome::Finished {
+                status, exit_code, ..
+            } => match status.as_str() {
+                "Completed" => "Finished successfully".to_string(),
+                "Cancelled" => "Cancelled".to_string(),
+                "TimedOut" => "Timed out".to_string(),
+                // `Failed` and anything a future producer sends. An exit code is
+                // the most precise thing available, so prefer it.
+                _ => match exit_code {
+                    Some(code) => format!("Failed (exit {code})"),
+                    None => "Failed".to_string(),
+                },
+            },
+        }
+    }
+}
+
 impl OpIdentity<'_> {
     /// The status glyph. Deliberately the same three characters everywhere, so a
     /// user learns them once.

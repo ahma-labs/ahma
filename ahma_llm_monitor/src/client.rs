@@ -35,7 +35,15 @@ const LLM_READ_TIMEOUT: Duration = Duration::from_secs(300);
 /// Falls back to a default client if the builder rejects the configuration
 /// (should never happen with static timeouts, but we must not panic at
 /// construction time).
-fn build_http_client() -> Client {
+/// The one HTTP client every [`LlmClient`] shares.
+///
+/// Its configuration is two static timeouts — nothing per-caller — so a client
+/// per `LlmClient` bought nothing and cost a fresh rustls `ClientConfig`, root
+/// store and connection pool each time. Provider discovery builds six clients
+/// concurrently at TUI startup, all pointing at the same localhost endpoints;
+/// sharing one lets them share connections instead of competing pools.
+/// `reqwest::Client` is an `Arc` internally, so cloning is a refcount bump.
+static HTTP_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|| {
     Client::builder()
         .connect_timeout(LLM_CONNECT_TIMEOUT)
         .read_timeout(LLM_READ_TIMEOUT)
@@ -44,6 +52,10 @@ fn build_http_client() -> Client {
             warn!("Failed to build HTTP client with timeouts ({e}); using default client");
             Client::new()
         })
+});
+
+fn build_http_client() -> Client {
+    HTTP_CLIENT.clone()
 }
 
 /// Maximum number of *retries* (extra attempts) on a transient LLM failure.

@@ -461,13 +461,24 @@ pub async fn query_uds_health(path: &str) -> Option<BridgeHealth> {
     parse_health_body(body)
 }
 
-pub async fn query_tcp_health(url: &str) -> Option<BridgeHealth> {
-    let health_url = format!("{}/health", url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
+/// Shared client for the two 200 ms bridge probes below.
+///
+/// Both run in polling loops on the startup critical path — `wait_for_bridge_healthy`
+/// and `wait_for_bridge_to_stop` each iterate dozens of times — and a per-probe
+/// `Client` meant rebuilding a rustls `ClientConfig`, loading the root store and
+/// standing up a fresh pool (and a QUIC endpoint, with http3 enabled) for a single
+/// discarded request. Neither probe varies the configuration, so one client serves
+/// both; cloning is a refcount bump.
+static PROBE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
         .timeout(Duration::from_millis(200))
         .build()
-        .unwrap_or_default();
-    let resp = client.get(&health_url).send().await.ok()?;
+        .unwrap_or_default()
+});
+
+pub async fn query_tcp_health(url: &str) -> Option<BridgeHealth> {
+    let health_url = format!("{}/health", url.trim_end_matches('/'));
+    let resp = PROBE_CLIENT.get(&health_url).send().await.ok()?;
     if resp.status().is_success() {
         let body = resp.text().await.ok()?;
         return parse_health_body(&body);
@@ -527,11 +538,7 @@ pub async fn trigger_uds_restart(path: &str) -> bool {
 
 pub async fn trigger_tcp_restart(url: &str) -> bool {
     let restart_url = format!("{}/restart", url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(200))
-        .build()
-        .unwrap_or_default();
-    if let Ok(resp) = client.post(&restart_url).send().await {
+    if let Ok(resp) = PROBE_CLIENT.post(&restart_url).send().await {
         return resp.status().is_success();
     }
     false

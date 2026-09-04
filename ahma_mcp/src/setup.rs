@@ -871,9 +871,11 @@ async fn setup_agent_skills(interactive: bool) -> Result<()> {
 
     for skill_dir in skill_install_dirs(&home) {
         let skill_path = skill_dir.join("SKILL.md");
-        std::fs::create_dir_all(&skill_dir)
+        tokio::fs::create_dir_all(&skill_dir)
+            .await
             .with_context(|| format!("Failed to create directory {}", skill_dir.display()))?;
-        std::fs::write(&skill_path, SKILL_CONTENT)
+        tokio::fs::write(&skill_path, SKILL_CONTENT)
+            .await
             .with_context(|| format!("Failed to write skill to {}", skill_path.display()))?;
         if interactive {
             println!("✓ Installed ahma skill to {}", skill_path.display());
@@ -906,9 +908,7 @@ async fn prompt_and_backup_prompts_file(
     new_template: &str,
     interactive: bool,
 ) -> Result<()> {
-    use std::fs;
-
-    let current_content = fs::read_to_string(path)?;
+    let current_content = tokio::fs::read_to_string(path).await?;
     if current_content == new_template {
         return Ok(());
     }
@@ -930,11 +930,11 @@ async fn prompt_and_backup_prompts_file(
     }
 
     let backup_path = path.with_extension("toml.bak");
-    if backup_path.exists() {
-        let _ = fs::remove_file(&backup_path);
+    if tokio::fs::try_exists(&backup_path).await.unwrap_or(false) {
+        let _ = tokio::fs::remove_file(&backup_path).await;
     }
-    fs::rename(path, &backup_path)?;
-    fs::write(path, new_template)?;
+    tokio::fs::rename(path, &backup_path).await?;
+    tokio::fs::write(path, new_template).await?;
     println!(
         "✓ Updated ~/.ahma/prompts.toml. Old version backed up to {}",
         backup_path.display()
@@ -945,7 +945,6 @@ async fn prompt_and_backup_prompts_file(
 
 async fn setup_llm_prompts(interactive: bool) -> Result<()> {
     use ahma_common::prompts::AhmaPrompts;
-    use std::fs;
 
     let Some(path) = ahma_common::prompts::global_prompts_path() else {
         return Ok(());
@@ -953,11 +952,11 @@ async fn setup_llm_prompts(interactive: bool) -> Result<()> {
 
     let new_template = AhmaPrompts::generate_template();
 
-    if !path.exists() {
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        fs::write(&path, &new_template)?;
+        tokio::fs::write(&path, &new_template).await?;
         if interactive {
             println!("✓ Created global LLM prompts file at {}", path.display());
             println!();

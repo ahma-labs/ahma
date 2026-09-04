@@ -481,7 +481,7 @@ impl Session {
     async fn send_roots_list_changed(&self) -> Result<()> {
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
-            "method": "notifications/roots/list_changed"
+            "method": ahma_common::mcp_methods::ROOTS_LIST_CHANGED_METHOD
         });
         self.send_to_subprocess(&notification, "Failed to send roots/list_changed")
             .await?;
@@ -510,6 +510,18 @@ impl Session {
             .await
     }
 }
+
+/// What to tell the user when a session cannot get a sandbox scope: the client
+/// reported no roots and no fallback is configured.
+///
+/// One string because the condition has one remedy, and it was previously
+/// spelled three times — twice in `request_handler` and once here — which had
+/// already drifted ("Configure **an** explicit sandbox scope" vs "Configure
+/// explicit sandbox scope"), and only one of the three mentioned the
+/// `[sandbox] container_root` setting. Which advice the user got depended on
+/// which code path happened to fire.
+pub const NO_SANDBOX_SCOPE_REMEDIATION: &str = "Start the bridge with `--sandbox-scope <project-dir>`, or set `[sandbox] container_root` \
+     in ~/.ahma/settings.toml, or use a client that supports roots/list.";
 
 /// Configuration for the `SessionManager`.
 #[derive(Clone)]
@@ -1399,9 +1411,10 @@ impl SessionManager {
                         session_id = %session_id,
                         "Rejecting sandbox lock: client provided no roots and no explicit fallback scope is configured"
                     );
-                    Err(BridgeError::Communication(
-                        "Client did not provide roots/list entries. Configure explicit sandbox scope on server startup (e.g. --sandbox-scope /path/to/project) or use a client that supports roots/list.".to_string()
-                    ))
+                    Err(BridgeError::Communication(format!(
+                        "Client did not provide roots/list entries. \
+                         {NO_SANDBOX_SCOPE_REMEDIATION}"
+                    )))
                 }
             };
         }

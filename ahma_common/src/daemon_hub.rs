@@ -116,9 +116,29 @@ pub struct DaemonChatMessage {
 pub struct OpDenial {
     /// The path the denial referenced, as the scanner found it.
     pub path: String,
-    /// The access the denied operation needed: `"rw"` for a blocked write,
-    /// `"ro"` for a blocked read.
-    pub access: String,
+    /// The access the denied operation needed. Typed rather than a `"ro"`/`"rw"`
+    /// string: this is a permission decision, and the string form was decoded
+    /// with a `_ => Ro` catch-all that silently downgraded a refused *write* to
+    /// read-only. `ScopeAccess` already serialises as exactly `"ro"`/`"rw"`
+    /// (`#[serde(rename_all = "lowercase")]`), so the wire form is unchanged.
+    pub access: crate::config::ScopeAccess,
+}
+
+/// The terminal (or in-flight) state of an operation, as it travels the hub wire.
+///
+/// Serde's default unit-variant encoding makes each variant name its own wire
+/// string — `"Completed"`, `"TimedOut"`, … — which is exactly what the previous
+/// `status: String` field carried, so this is a type change and not a wire
+/// change. Typing it means a new state is a compile error at every consumer
+/// instead of falling into a `_` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
 }
 
 /// Metadata about a registered ahma instance.
@@ -182,8 +202,11 @@ pub enum DaemonEvent {
     },
     OpFinished {
         id: String,
-        /// "Completed", "Failed", "Cancelled", "TimedOut"
-        status: String,
+        /// The terminal state the operation reached. Typed so producer and
+        /// consumer cannot drift: the variant names *are* the wire strings
+        /// (serde's default for a unit enum), so this is the same JSON the
+        /// hand-written `status_label`/`parse_op_status` pair produced.
+        status: OpStatus,
         result_summary: Option<String>,
         duration_ms: u64,
         /// Wall-clock completion time (Unix epoch, milliseconds), for accurate
@@ -300,8 +323,8 @@ pub enum ClientMsg {
     ReRaiseScopeGrant {
         /// The denied path, as carried on the operation that was refused.
         path: String,
-        /// `"ro"` or `"rw"` — the access the denied operation needed.
-        access: String,
+        /// The access the denied operation needed.
+        access: crate::config::ScopeAccess,
         target_instance_id: Option<String>,
     },
     /// An instance asking every TUI to raise an "allow web access to X?" prompt for
@@ -405,7 +428,10 @@ pub enum DaemonMsg {
     /// Ask this instance to re-raise the grant question for a path it already
     /// refused this session, because the user explicitly asked for it from a
     /// denied operation row (SPEC R-PERM.7.1).
-    ReRaiseScopeGrant { path: String, access: String },
+    ReRaiseScopeGrant {
+        path: String,
+        access: crate::config::ScopeAccess,
+    },
     /// Prompt every TUI to raise an "allow web access to X?" modal for an unknown
     /// domain under a `deny` web policy (SPEC R-WEB.6). The default/Enter choice
     /// must be the safe Deny; an approval takes effect for the session (or is
@@ -1352,7 +1378,7 @@ async fn route_submit_scope_grant(
 async fn route_reraise_scope_grant(
     hub: &Arc<DaemonHub>,
     path: String,
-    access: String,
+    access: crate::config::ScopeAccess,
     target_instance_id: Option<String>,
 ) {
     if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await
@@ -1683,7 +1709,7 @@ mod tests {
     fn the_exit_code_round_trips() {
         let ev = DaemonEvent::OpFinished {
             id: "op_1".into(),
-            status: "Failed".into(),
+            status: OpStatus::Failed,
             result_summary: None,
             duration_ms: 10,
             ended_epoch_ms: None,
@@ -1954,7 +1980,7 @@ mod tests {
             instance_id: "inst-2".to_string(),
             payload: DaemonEvent::OpFinished {
                 id: "op-2".to_string(),
-                status: "Completed".to_string(),
+                status: OpStatus::Completed,
                 result_summary: Some("success".to_string()),
                 duration_ms: 1500,
                 ended_epoch_ms: None,
@@ -1973,7 +1999,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(id, "op-2");
-                assert_eq!(status, "Completed");
+                assert_eq!(status, OpStatus::Completed);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -2239,7 +2265,7 @@ mod tests {
             &ClientMsg::Event {
                 payload: DaemonEvent::OpFinished {
                     id: "op-001".to_string(),
-                    status: "Completed".to_string(),
+                    status: OpStatus::Completed,
                     result_summary: Some("success".to_string()),
                     duration_ms: 1200,
                     ended_epoch_ms: None,
@@ -2258,7 +2284,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(id, "op-001");
-                assert_eq!(status, "Completed");
+                assert_eq!(status, OpStatus::Completed);
             }
             other => panic!("expected Event::OpFinished, got {other:?}"),
         }
@@ -2377,7 +2403,7 @@ mod tests {
             "i1",
             &DaemonEvent::OpFinished {
                 id: "op-1".into(),
-                status: "Completed".into(),
+                status: OpStatus::Completed,
                 result_summary: Some("ok".into()),
                 duration_ms: 10,
                 ended_epoch_ms: None,
@@ -2626,7 +2652,7 @@ mod tests {
                 "i1",
                 &DaemonEvent::OpFinished {
                     id,
-                    status: "Completed".into(),
+                    status: OpStatus::Completed,
                     result_summary: None,
                     duration_ms: 1,
                     ended_epoch_ms: None,
@@ -2714,7 +2740,7 @@ mod tests {
             "i1",
             &DaemonEvent::OpFinished {
                 id: "ghost".into(),
-                status: "Failed".into(),
+                status: OpStatus::Failed,
                 result_summary: None,
                 duration_ms: 0,
                 ended_epoch_ms: None,
@@ -2746,7 +2772,7 @@ mod tests {
             "i1",
             &DaemonEvent::OpFinished {
                 id: "other".into(),
-                status: "Failed".into(),
+                status: OpStatus::Failed,
                 result_summary: None,
                 duration_ms: 0,
                 ended_epoch_ms: None,
@@ -3240,7 +3266,7 @@ mod tests {
             &ClientMsg::Event {
                 payload: DaemonEvent::OpFinished {
                     id: "op-A".into(),
-                    status: "Completed".into(),
+                    status: OpStatus::Completed,
                     result_summary: Some("ok".into()),
                     duration_ms: 5,
                     ended_epoch_ms: None,
@@ -3277,7 +3303,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(id, "op-A");
-                assert_eq!(status, "Completed");
+                assert_eq!(status, OpStatus::Completed);
             }
             other => panic!("expected replayed OpFinished, got {other:?}"),
         }
