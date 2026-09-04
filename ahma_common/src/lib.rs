@@ -42,6 +42,7 @@
 pub const BUILD_ID: &str = env!("AHMA_BUILD_ID");
 
 pub mod config;
+pub mod daemon_endpoint;
 pub mod daemon_history;
 pub mod daemon_hub;
 /// SHA-256 hex digests, one encoder for every `SHA256SUMS`-style surface.
