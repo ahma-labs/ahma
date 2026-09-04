@@ -12,12 +12,6 @@ description = "Terminal dashboard and chat interface for ahma."
 name = "ahma_tui"
 path = "src/lib.rs"
 
-[features]
-# Gated as a feature to allow headless/CI builds to compile without heavy terminal UI dependencies (speeding up builds).
-default = ["tui"]
-# Full ratatui terminal UI (disable for headless/CI builds)
-tui = ["dep:ratatui", "dep:crossterm", "dep:futures", "dep:tui-textarea"]
-
 [dependencies]
 parking_lot.workspace = true
 ahma_common = { path = "../ahma_common" }
@@ -28,10 +22,10 @@ ahma_core = { path = "../ahma_core" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono = { workspace = true }
-crossterm = { workspace = true, optional = true }
+crossterm.workspace = true
 dunce.workspace = true
-futures = { workspace = true, optional = true }
-ratatui = { workspace = true, optional = true }
+futures.workspace = true
+ratatui.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -45,7 +39,7 @@ tokio = { workspace = true, features = [
 ] }
 toml.workspace = true
 tracing.workspace = true
-tui-textarea = { workspace = true, optional = true }
+tui-textarea.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

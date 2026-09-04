@@ -5,7 +5,6 @@
 //! above it, the approval banner, the input box, and a footer — then whichever
 //! single overlay is open on top (SPEC R23).
 
-#[cfg(feature = "tui")]
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -23,7 +22,6 @@ use crate::theme::Theme;
 // ─── Top-level draw ───────────────────────────────────────────────────────────
 
 /// Called every redraw tick — the only public entry point in this module.
-#[cfg(feature = "tui")]
 pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // Click targets describe *this* frame's screen and nothing else. They were
     // only ever cleared when an overlay happened to open, so they accumulated
@@ -71,7 +69,6 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
 // ─── Chat layout ──────────────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 struct RenderedWindowLayout {
     orig_idx: usize,
     height: u16,
@@ -87,20 +84,17 @@ struct RenderedWindowLayout {
 /// question (SPEC R24.8.2) — when they disagreed, a window was sized for its
 /// output rows only and then rendered two rows taller, pushing the tail off the
 /// bottom. For a one-line command like `!pwd` that is the entire answer.
-#[cfg(feature = "tui")]
 fn window_has_command_header(w: &crate::state::TuiWindow) -> bool {
     !w.command.is_empty() && w.command != w.label
 }
 
 /// Logical line count [`draw_expanded_window`] renders inside the borders:
 /// the optional command header (2 rows) plus one row per output line.
-#[cfg(feature = "tui")]
 fn expanded_window_line_count(w: &crate::state::TuiWindow) -> usize {
     let header = if window_has_command_header(w) { 2 } else { 0 };
     header + w.content.len()
 }
 
-#[cfg(feature = "tui")]
 fn compute_window_layouts(
     windows: &[crate::state::TuiWindow],
     max_h: u16,
@@ -145,7 +139,6 @@ fn compute_window_layouts(
 
 /// Collapse expanded windows, oldest first, until the total height fits within
 /// `max_h` (or every window is already collapsed). Returns the updated total height.
-#[cfg(feature = "tui")]
 fn collapse_expanded_windows(
     layouts: &mut [RenderedWindowLayout],
     max_h: u16,
@@ -167,7 +160,6 @@ fn collapse_expanded_windows(
 
 /// Hide the oldest windows entirely (after collapsing was not enough) until the
 /// total height fits within `max_h`.
-#[cfg(feature = "tui")]
 fn hide_overflow_windows(layouts: &mut [RenderedWindowLayout], max_h: u16, mut total_h: u16) {
     for l in layouts.iter_mut() {
         if total_h <= max_h {
@@ -182,7 +174,6 @@ fn hide_overflow_windows(layouts: &mut [RenderedWindowLayout], max_h: u16, mut t
     }
 }
 
-#[cfg(feature = "tui")]
 fn window_status_style(status: crate::state::WindowStatus, theme: &Theme) -> Style {
     use crate::state::WindowStatus;
     match status {
@@ -235,7 +226,6 @@ fn format_duration_short(ms: u64) -> String {
     }
 }
 
-#[cfg(feature = "tui")]
 fn append_collapsed_running_spans(
     spans: &mut Vec<Span<'_>>,
     w: &crate::state::TuiWindow,
@@ -261,7 +251,6 @@ fn append_collapsed_running_spans(
     }
 }
 
-#[cfg(feature = "tui")]
 fn append_collapsed_terminal_spans(
     spans: &mut Vec<Span<'_>>,
     w: &crate::state::TuiWindow,
@@ -316,7 +305,6 @@ fn draw_collapsed_window(
 }
 
 /// Milliseconds since the epoch — the clock that drives stateless panels.
-#[cfg(feature = "tui")]
 fn wall_ms() -> u64 {
     ahma_common::keepalive::current_timestamp_ms()
 }
@@ -325,7 +313,6 @@ fn wall_ms() -> u64 {
 /// in from the external process — fast while output is actually arriving,
 /// slow heartbeat when the process is alive but quiet. Seeded per window so
 /// concurrent cards animate independently.
-#[cfg(feature = "tui")]
 fn window_running_panel(w: &crate::state::TuiWindow, unicode: bool) -> String {
     let active = w
         .last_output_at
@@ -339,7 +326,6 @@ fn window_running_panel(w: &crate::state::TuiWindow, unicode: bool) -> String {
     )
 }
 
-#[cfg(feature = "tui")]
 fn build_window_title(w: &crate::state::TuiWindow, width: u16, unicode: bool) -> String {
     let border_width = 2;
     let title_space = (width as usize).saturating_sub(border_width);
@@ -420,7 +406,6 @@ fn draw_expanded_window(
 /// the buffered output tail. Scroll state lives in [`OperationDetailState`](crate::state::OperationDetailState);
 /// the max offset is published through `state.detail_max_scroll` so the key
 /// handlers can clamp without re-rendering.
-#[cfg(feature = "tui")]
 fn draw_operation_detail(
     frame: &mut Frame,
     state: &AppState,
@@ -546,7 +531,6 @@ fn draw_operation_detail(
 /// line (the message) sits *after* the pid/role/timestamp/level preamble, so
 /// what gets cut is exactly what the reader wanted. This shows the line wrapped
 /// and scrollable, reusing the scroll bookkeeping of the operation overlay.
-#[cfg(feature = "tui")]
 fn draw_log_line_detail(
     frame: &mut Frame,
     state: &AppState,
@@ -614,7 +598,6 @@ fn draw_log_line_detail(
 }
 
 /// The scrollable body of the operation detail overlay.
-#[cfg(feature = "tui")]
 fn operation_detail_lines(
     op: &crate::state::Operation,
     theme: &Theme,
@@ -647,7 +630,6 @@ fn operation_detail_lines(
     lines
 }
 
-#[cfg(feature = "tui")]
 fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Line<'static>> {
     let kv = |k: &str, v: String, style: Style| {
         Line::from(vec![
@@ -718,7 +700,6 @@ fn output_line_style(line: &crate::state::WindowLine, theme: &Theme) -> Style {
     }
 }
 
-#[cfg(feature = "tui")]
 fn draw_single_window(
     frame: &mut Frame,
     w: &crate::state::TuiWindow,
@@ -734,7 +715,6 @@ fn draw_single_window(
     }
 }
 
-#[cfg(feature = "tui")]
 fn draw_windows_layout(
     frame: &mut Frame,
     state: &AppState,
@@ -761,7 +741,6 @@ fn draw_windows_layout(
     }
 }
 
-#[cfg(feature = "tui")]
 fn compute_chat_input_height(state: &AppState, full_width: u16) -> u16 {
     let inner_width = full_width.saturating_sub(2);
     let wrapped_line_count = state
@@ -779,7 +758,6 @@ fn compute_chat_input_height(state: &AppState, full_width: u16) -> u16 {
     input_lines + 2 // borders
 }
 
-#[cfg(feature = "tui")]
 fn draw_zoomed_chat_pane(
     frame: &mut Frame,
     state: &AppState,
@@ -800,7 +778,6 @@ fn draw_zoomed_chat_pane(
     }
 }
 
-#[cfg(feature = "tui")]
 fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme, chat_a: Rect) {
     let chat_content_area = draw_stacked_panels(frame, state, theme, chat_a);
     state.chat_area.set(chat_content_area);
@@ -812,7 +789,6 @@ fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme,
 ///
 /// The constraints pushed here and the areas consumed below must stay in the
 /// same order — each pane contributes at most one of each, in this sequence.
-#[cfg(feature = "tui")]
 fn draw_stacked_panels(frame: &mut Frame, state: &AppState, theme: &Theme, chat_a: Rect) -> Rect {
     let mut constraints = Vec::new();
     let show_scope = state.scope_window_open;
@@ -867,7 +843,6 @@ fn draw_stacked_panels(frame: &mut Frame, state: &AppState, theme: &Theme, chat_
 
 /// Split the chat area between the scrolling history and the stack of visible
 /// windows, then draw both.
-#[cfg(feature = "tui")]
 fn draw_chat_body(frame: &mut Frame, state: &AppState, theme: &Theme, chat_content_area: Rect) {
     let visible_count = state.windows.iter().filter(|w| w.visible).count();
     let (history_area, windows_area, layouts) = if visible_count > 0 {
@@ -886,7 +861,6 @@ fn draw_chat_body(frame: &mut Frame, state: &AppState, theme: &Theme, chat_conte
     draw_windows_layout(frame, state, theme, windows_area, &layouts);
 }
 
-#[cfg(feature = "tui")]
 fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
     let approval_h: u16 = if let Some(gate) = &state.approval {
@@ -926,7 +900,6 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     draw_chat_footer(frame, state, theme, footer_a);
 }
 
-#[cfg(feature = "tui")]
 fn get_mcp_label(mcp_enabled: bool, unicode: bool) -> &'static str {
     match (mcp_enabled, unicode) {
         (true, true) => " · MCP ✓",
@@ -935,7 +908,6 @@ fn get_mcp_label(mcp_enabled: bool, unicode: bool) -> &'static str {
     }
 }
 
-#[cfg(feature = "tui")]
 fn get_health_indicator(
     server_healthy: bool,
     unicode: bool,
@@ -952,7 +924,6 @@ fn get_health_indicator(
     }
 }
 
-#[cfg(feature = "tui")]
 fn get_daemon_indicator(
     daemon_healthy: bool,
     unicode: bool,
@@ -972,7 +943,6 @@ fn get_daemon_indicator(
     (daemon_char, daemon_style)
 }
 
-#[cfg(feature = "tui")]
 fn get_mcp_connection_counts(
     servers: &[crate::mcp_connections::McpServerConfig],
 ) -> (usize, usize) {
@@ -989,7 +959,6 @@ fn get_mcp_connection_counts(
     (http_count, stdio_count)
 }
 
-#[cfg(feature = "tui")]
 fn max_header_workspace_len(width: u16) -> usize {
     if width > 120 {
         35
@@ -1003,7 +972,6 @@ fn max_header_workspace_len(width: u16) -> usize {
 /// Total number of external MCP tools, without materialising the formatted,
 /// sorted tool-name list ([`McpConnectionManager::aggregate_tools`](ahma_mcp::mcp_client::McpConnectionManager::aggregate_tools)) — this
 /// runs on every rendered frame, where only the count matters.
-#[cfg(feature = "tui")]
 fn external_tool_count(state: &AppState) -> usize {
     state
         .mcp_connections
@@ -1013,7 +981,6 @@ fn external_tool_count(state: &AppState) -> usize {
         .sum()
 }
 
-#[cfg(feature = "tui")]
 fn format_external_tools_part(state: &AppState) -> String {
     let (http_count, stdio_count) = get_mcp_connection_counts(&state.mcp_connections.servers);
     // Only the count is needed — summing per-server lengths avoids cloning and
@@ -1026,7 +993,6 @@ fn format_external_tools_part(state: &AppState) -> String {
     }
 }
 
-#[cfg(feature = "tui")]
 fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let mcp_label = get_mcp_label(state.mcp_enabled, state.unicode);
     let (health_char, health_style) =
@@ -1116,7 +1082,6 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
 /// Column accounting is by character count (ignoring double-width Unicode
 /// codepoints), which matches typical ASCII/Latin chat content. Called every
 /// frame against the live inner width, so it re-wraps automatically on resize.
-#[cfg(feature = "tui")]
 fn wrap_line_to_rows(line: &ratatui::text::Line<'_>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
 
@@ -1166,7 +1131,6 @@ fn wrap_line_to_rows(line: &ratatui::text::Line<'_>, width: usize) -> Vec<Line<'
 /// Whitespace that fits stays on the line; whitespace that would spill past
 /// the edge is dropped at the wrap point (so the next row does not start
 /// with stray leading spaces).
-#[cfg(feature = "tui")]
 fn wrap_whitespace_segment(
     cur: &mut Vec<(char, Style)>,
     rows: &mut Vec<Vec<(char, Style)>>,
@@ -1183,7 +1147,6 @@ fn wrap_whitespace_segment(
 /// Append a run of non-whitespace cells (a "word") to the row under
 /// construction, wrapping to a new row as needed. Words longer than the
 /// whole width are hard-split across rows.
-#[cfg(feature = "tui")]
 fn wrap_word_segment(
     cur: &mut Vec<(char, Style)>,
     rows: &mut Vec<Vec<(char, Style)>>,
@@ -1207,7 +1170,6 @@ fn wrap_word_segment(
 
 /// Coalesce a row of (char, style) cells into a styled [`Line`], merging runs of
 /// identical styles into single spans.
-#[cfg(feature = "tui")]
 fn cells_to_line(cells: Vec<(char, Style)>) -> Line<'static> {
     if cells.is_empty() {
         return Line::default();
@@ -1229,7 +1191,6 @@ fn cells_to_line(cells: Vec<(char, Style)>) -> Line<'static> {
 }
 
 /// Flatten logical lines into the physical rows they occupy at `width`, in order.
-#[cfg(feature = "tui")]
 fn wrap_lines_to_rows(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
     lines
         .iter()
@@ -1238,14 +1199,12 @@ fn wrap_lines_to_rows(lines: &[Line<'static>], width: usize) -> Vec<Line<'static
 }
 
 /// Number of physical rows a logical [`Line`] occupies when wrapped at `width`.
-#[cfg(feature = "tui")]
 fn line_wrapped_rows(line: &ratatui::text::Line<'_>, width: usize) -> usize {
     wrap_line_to_rows(line, width).len()
 }
 
 /// Total wrapped physical rows for a slice of logical lines at the given width.
 /// Returns 0 for an empty slice (used as a scroll position offset).
-#[cfg(feature = "tui")]
 fn total_wrapped_rows(lines: &[ratatui::text::Line<'_>], width: usize) -> usize {
     lines.iter().map(|l| line_wrapped_rows(l, width)).sum()
 }
@@ -1264,7 +1223,6 @@ fn total_wrapped_rows(lines: &[ratatui::text::Line<'_>], width: usize) -> usize 
 /// the thumb at `position / (content_length - 1 + viewport_content_length)` of the
 /// track. Feed it the position count so "scrolled to the end" paints the thumb
 /// flush against the bottom.
-#[cfg(feature = "tui")]
 fn draw_scrollbar(
     frame: &mut Frame,
     theme: &Theme,
@@ -1291,7 +1249,6 @@ fn draw_scrollbar(
     frame.render_stateful_widget(sb, inner, &mut sb_state);
 }
 
-#[cfg(feature = "tui")]
 fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Chat;
     let border_style = if focused {
@@ -1371,7 +1328,6 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     draw_scrollbar(frame, theme, rows.len(), visible_h, scroll, inner);
 }
 
-#[cfg(feature = "tui")]
 fn chat_history_hint(state: &AppState) -> &'static str {
     if state.llm_selection.is_none() {
         if state.unicode {
@@ -1390,7 +1346,6 @@ fn chat_history_hint(state: &AppState) -> &'static str {
 /// ticking against the wall clock (`started_at` set, `duration_ms` not yet).
 /// While live, the wrapped rows must be rebuilt every frame; the scan itself
 /// is O(entries) with no allocation.
-#[cfg(feature = "tui")]
 fn transcript_is_live(state: &AppState) -> bool {
     state.liveness_state != crate::state::LivenessState::Idle
         || state.chat.entries().iter().any(|e| {
@@ -1405,7 +1360,6 @@ fn transcript_is_live(state: &AppState) -> bool {
         })
 }
 
-#[cfg(feature = "tui")]
 fn build_chat_history_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
@@ -1420,7 +1374,6 @@ fn build_chat_history_lines(state: &AppState, theme: &Theme, width: usize) -> Ve
     lines
 }
 
-#[cfg(feature = "tui")]
 fn push_chat_entry_lines(
     lines: &mut Vec<Line<'static>>,
     entry: &ChatEntry,
@@ -1471,7 +1424,6 @@ fn push_chat_entry_lines(
     }
 }
 
-#[cfg(feature = "tui")]
 fn format_duration(started_at: Option<std::time::Instant>, duration_ms: Option<u64>) -> String {
     if let Some(ms) = duration_ms {
         if ms < 1000 {
@@ -1492,7 +1444,6 @@ fn format_duration(started_at: Option<std::time::Instant>, duration_ms: Option<u
     }
 }
 
-#[cfg(feature = "tui")]
 fn push_user_chat_lines(
     lines: &mut Vec<Line<'static>>,
     text: &str,
@@ -1556,7 +1507,6 @@ fn push_user_chat_lines(
     }
 }
 
-#[cfg(feature = "tui")]
 fn assistant_stream_cursor(streaming: bool, unicode: bool) -> &'static str {
     match (streaming, unicode) {
         (true, true) => "▌",
@@ -1641,7 +1591,6 @@ fn push_thinking_chat_lines(
 /// Build the `ahma` response prefix. While the turn is live the leading glyph is
 /// the random Braille liveness pulse (`state.liveness_glyph`); when complete it
 /// collapses to a space so the column reads ` ahma`.
-#[cfg(feature = "tui")]
 fn assistant_line_prefix(streaming: bool, state: &AppState) -> String {
     let glyph: &str = if streaming {
         &state.liveness_glyph
@@ -1651,7 +1600,6 @@ fn assistant_line_prefix(streaming: bool, state: &AppState) -> String {
     format!("{glyph} ahma ")
 }
 
-#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn push_tool_call_chat_lines(
     lines: &mut Vec<Line<'static>>,
@@ -1685,7 +1633,6 @@ fn push_tool_call_chat_lines(
     }
 }
 
-#[cfg(feature = "tui")]
 fn tool_call_status(
     has_result: bool,
     failed: bool,
@@ -1702,7 +1649,6 @@ fn tool_call_status(
     }
 }
 
-#[cfg(feature = "tui")]
 fn chat_history_scroll_offset(total: usize, visible_h: usize, from_bottom: usize) -> usize {
     if total > visible_h {
         total.saturating_sub(visible_h).saturating_sub(from_bottom)
@@ -1711,7 +1657,6 @@ fn chat_history_scroll_offset(total: usize, visible_h: usize, from_bottom: usize
     }
 }
 
-#[cfg(feature = "tui")]
 fn insert_input_cursor(lines: &mut Vec<String>, row: usize, col: usize, unicode: bool) {
     let cursor = if unicode { '│' } else { '|' };
     if let Some(line) = lines.get_mut(row) {
@@ -1743,7 +1688,6 @@ fn get_input_title_left(state: &AppState, theme: &Theme) -> Line<'static> {
     }
 }
 
-#[cfg(feature = "tui")]
 fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Chat;
     let border_style = if focused {
@@ -1792,7 +1736,6 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
 
 /// Paragraph shown when the chat input is empty: the placeholder hint, with a
 /// leading cursor glyph when focused.
-#[cfg(feature = "tui")]
 fn input_placeholder_paragraph(theme: &Theme, focused: bool, unicode: bool) -> Paragraph<'static> {
     let placeholder = "Type a message... (! UNSANDBOXED cmd · # decompose · / commands)";
     let text = if focused {
@@ -1806,14 +1749,12 @@ fn input_placeholder_paragraph(theme: &Theme, focused: bool, unicode: bool) -> P
 }
 
 /// Paragraph rendering the current (non-empty) chat input lines.
-#[cfg(feature = "tui")]
 fn input_text_paragraph(theme: &Theme, rendered_lines: &[String]) -> Paragraph<'static> {
     let text = rendered_lines.join("\n");
     let style = theme.normal().patch(theme.input_bg());
     Paragraph::new(Span::styled(text, style)).wrap(Wrap { trim: false })
 }
 
-#[cfg(feature = "tui")]
 fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let mode_label = "AHMA";
 
@@ -1864,7 +1805,6 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
 /// (SPEC R5.4(b), R-PERM.5.1). Mirrors the vocabulary of the server's canonical
 /// `ScopeView::render_text` (write/read/tmp/source) so every surface reads the
 /// same, and states who is actually protecting the session (SPEC R7.5).
-#[cfg(feature = "tui")]
 fn unscoped_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let status = state.sandbox_status.label();
@@ -1899,7 +1839,6 @@ fn unscoped_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> 
     lines
 }
 
-#[cfg(feature = "tui")]
 fn scope_authority_spans(
     scope: &crate::state::SandboxScopeInfo,
     theme: &Theme,
@@ -1930,7 +1869,6 @@ fn scope_authority_spans(
     (authority, authority_style, enforcement, enforcement_style)
 }
 
-#[cfg(feature = "tui")]
 fn scope_write_roots_lines(write_roots: &[String], theme: &Theme) -> Vec<Line<'static>> {
     const MAX_ROOTS_SHOWN: usize = 4;
     let mut lines = Vec::new();
@@ -1960,7 +1898,6 @@ fn scope_write_roots_lines(write_roots: &[String], theme: &Theme) -> Vec<Line<'s
     lines
 }
 
-#[cfg(feature = "tui")]
 fn format_scope_read_summary(read_roots: &[String]) -> String {
     if read_roots.is_empty() {
         "(none beyond write roots)".to_string()
@@ -1979,7 +1916,6 @@ fn format_scope_read_summary(read_roots: &[String]) -> String {
     }
 }
 
-#[cfg(feature = "tui")]
 fn scope_granted_lines(granted_scopes: &[(String, String)], theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if !granted_scopes.is_empty() {
@@ -2007,7 +1943,6 @@ fn scope_granted_lines(granted_scopes: &[(String, String)], theme: &Theme) -> Ve
     lines
 }
 
-#[cfg(feature = "tui")]
 fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -2077,7 +2012,6 @@ fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
 /// Height for the `/scope` window: sized to its content (+2 border rows),
 /// never more than half the available area — honest panes (R24.8) budget the
 /// rows the renderer actually draws.
-#[cfg(feature = "tui")]
 fn scope_window_height(content_lines: usize, area: Rect) -> u16 {
     (content_lines as u16 + 2).clamp(4, (area.height / 2).max(4))
 }
@@ -2085,7 +2019,6 @@ fn scope_window_height(content_lines: usize, area: Rect) -> u16 {
 /// The persistent sandbox-scope sub-window, toggled with `/scope`. Informational
 /// only (no focus, no scrolling): the content self-caps and names the overflow.
 /// `lines` is the [`scope_window_lines`] content the layout was budgeted from.
-#[cfg(feature = "tui")]
 fn draw_scope_window(frame: &mut Frame, theme: &Theme, area: Rect, lines: Vec<Line<'static>>) {
     let block = Block::default()
         .title(Span::styled(" Sandbox · scope ", theme.title()))
@@ -2099,12 +2032,10 @@ fn draw_scope_window(frame: &mut Frame, theme: &Theme, area: Rect, lines: Vec<Li
 
 // ─── Navigator overlay ────────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn overlay_bar_cursor(unicode: bool) -> &'static str {
     if unicode { "│" } else { "|" }
 }
 
-#[cfg(feature = "tui")]
 fn render_horizontal_rule(frame: &mut Frame, area: Rect, unicode: bool, theme: &Theme) {
     let sep_char = if unicode { "─" } else { "-" };
     frame.render_widget(
@@ -2116,7 +2047,6 @@ fn render_horizontal_rule(frame: &mut Frame, area: Rect, unicode: bool, theme: &
     );
 }
 
-#[cfg(feature = "tui")]
 fn navigator_list_items(
     completions: &[NavCommand],
     selected: usize,
@@ -2147,7 +2077,6 @@ fn navigator_list_items(
         .collect()
 }
 
-#[cfg(feature = "tui")]
 fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let Some(nav) = state.navigator() else {
         return;
@@ -2214,7 +2143,6 @@ fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
 
 // ─── Inline picker overlay ────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn draw_picker(frame: &mut Frame, picker: &crate::state::PickerState, theme: &Theme, area: Rect) {
     let w = 60u16.min(area.width);
     let max_items = 10u16;
@@ -2295,17 +2223,14 @@ fn draw_picker(frame: &mut Frame, picker: &crate::state::PickerState, theme: &Th
 // ─── Header ───────────────────────────────────────────────────────────────────
 
 /// Approximate characters per token, matching the agent's budget math.
-#[cfg(feature = "tui")]
 const STATUS_CHARS_PER_TOKEN: usize = 4;
 
 /// Estimates a token count from a character count using the
 /// ~[`STATUS_CHARS_PER_TOKEN`] chars/token heuristic.
-#[cfg(feature = "tui")]
 fn estimate_tokens(chars: usize) -> u32 {
     (chars / STATUS_CHARS_PER_TOKEN) as u32
 }
 
-#[cfg(feature = "tui")]
 fn format_tokens_part(state: &AppState) -> String {
     token_status_segment(
         state.token_usage.total_tokens,
@@ -2320,7 +2245,6 @@ fn format_tokens_part(state: &AppState) -> String {
 /// Just the `· NN% ctx` share of [`token_status_segment`], for headers too
 /// narrow to carry the full in/out/total breakdown. Empty when the model's
 /// context window is unknown — a percentage of an unknown whole is noise.
-#[cfg(feature = "tui")]
 fn context_fill_segment(state: &AppState) -> String {
     let Some(window) = state.token_prefs.context_length.filter(|&w| w > 0) else {
         return String::new();
@@ -2339,7 +2263,6 @@ fn context_fill_segment(state: &AppState) -> String {
 
 /// Total characters of the visible conversation — the basis for a token estimate
 /// when the provider does not report usage, and for the context-fill fallback.
-#[cfg(feature = "tui")]
 fn conversation_chars(state: &AppState) -> usize {
     use crate::state::ChatEntry;
     state
@@ -2361,7 +2284,6 @@ fn conversation_chars(state: &AppState) -> usize {
 }
 
 /// Abbreviate a token count (e.g. `1.2k`).
-#[cfg(feature = "tui")]
 fn fmt_token_count(n: u32) -> String {
     if n > 1000 {
         format!("{:.1}k", n as f64 / 1000.0)
@@ -2377,7 +2299,6 @@ fn fmt_token_count(n: u32) -> String {
 ///   return no `usage` still show a counter.
 /// - A best-effort context-window fill `%` when the window is known: exact from
 ///   the last turn's prompt tokens when available, else estimated.
-#[cfg(feature = "tui")]
 fn token_status_segment(
     total_tokens: u32,
     prompt_tokens: u32,
@@ -2416,7 +2337,6 @@ fn token_status_segment(
 
 // ─── Operations DAG ───────────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn draw_task_tree_row(
     frame: &mut Frame,
@@ -2476,7 +2396,6 @@ fn draw_task_tree_row(
     }
 }
 
-#[cfg(feature = "tui")]
 fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::OpsDag;
     let border_style = if focused {
@@ -2548,7 +2467,6 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
 /// mouse handlers resolve the selection through the stored rows, so this must
 /// run before anything reads `state.task_rows`. Kept separate so the
 /// `borrow_mut` ends before the render path takes a shared borrow.
-#[cfg(feature = "tui")]
 fn rebuild_task_rows(state: &AppState) {
     use crate::task_tree::{TreeOptions, build_rows};
 
@@ -2567,7 +2485,6 @@ fn rebuild_task_rows(state: &AppState) {
 
 /// Adjust the tree's scroll offset so the selected row stays within the
 /// visible window, clamped to the available row count.
-#[cfg(feature = "tui")]
 fn compute_ops_scroll(
     selected: usize,
     current_scroll: usize,
@@ -2583,7 +2500,6 @@ fn compute_ops_scroll(
     scroll.min(total_rows.saturating_sub(display_rows))
 }
 
-#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn draw_instance_tree_row(
     frame: &mut Frame,
@@ -2614,7 +2530,6 @@ fn draw_instance_tree_row(
         .push((ClickTarget::TreeRow(row_idx), row_area));
 }
 
-#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn draw_group_tree_row(
     frame: &mut Frame,
@@ -2641,7 +2556,6 @@ fn draw_group_tree_row(
         .push((ClickTarget::TreeRow(row_idx), row_area));
 }
 
-#[cfg(feature = "tui")]
 fn draw_output_tree_row(
     frame: &mut Frame,
     state: &AppState,
@@ -2661,7 +2575,6 @@ fn draw_output_tree_row(
         .push((ClickTarget::TreeRow(row_idx), row_area));
 }
 
-#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn draw_op_tree_row(
     frame: &mut Frame,
@@ -2722,7 +2635,6 @@ fn draw_op_tree_row(
     }
 }
 
-#[cfg(feature = "tui")]
 fn fold_marker(collapsed: bool, unicode: bool) -> &'static str {
     match (collapsed, unicode) {
         (true, true) => "▸",
@@ -2732,7 +2644,6 @@ fn fold_marker(collapsed: bool, unicode: bool) -> &'static str {
     }
 }
 
-#[cfg(feature = "tui")]
 fn selection_marker(selected: bool, unicode: bool) -> &'static str {
     match (selected, unicode) {
         (true, true) => "▶",
@@ -2742,7 +2653,6 @@ fn selection_marker(selected: bool, unicode: bool) -> &'static str {
 }
 
 /// Instance header: `▾ claude-code · stdio · …/github/ahma   2▶ 1⧗ 14✓ 1✗`
-#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn build_instance_row(
     label: &str,
@@ -2804,7 +2714,6 @@ fn build_instance_row(
     Line::from(spans)
 }
 
-#[cfg(feature = "tui")]
 fn instance_tally_spans(
     counts: &crate::task_tree::GroupCounts,
     unicode: bool,
@@ -2837,7 +2746,6 @@ fn instance_tally_spans(
 
 /// Rough width guard: truncate the detail span first, then the label span if
 /// necessary, so the row fits within `width` columns.
-#[cfg(feature = "tui")]
 fn truncate_row_spans_to_width(spans: &mut [Span<'static>], width: usize) {
     let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     if total <= width || width <= 8 {
@@ -2920,7 +2828,6 @@ fn push_dag_metadata_spans(
 
 /// One operation row of the task tree: indent by depth, status glyph, name,
 /// id, elapsed. The owning instance is the header above, so no instance tag.
-#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn build_tree_op_item(
     op: &crate::state::Operation,
@@ -3011,7 +2918,6 @@ fn build_tree_op_item(
 
 // ─── Log pane ─────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn log_filter_indicator(state: &AppState) -> String {
     if state.log_filter_active {
         format!(" filter: {}_", state.log_filter)
@@ -3022,8 +2928,6 @@ fn log_filter_indicator(state: &AppState) -> String {
     }
 }
 
-#[cfg(feature = "tui")]
-#[cfg(feature = "tui")]
 fn get_file_display_lines(state: &AppState, theme: &Theme, inner_width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![];
     let max_width = inner_width.saturating_sub(1) as usize; // leave 1 col margin
@@ -3040,7 +2944,6 @@ fn get_file_display_lines(state: &AppState, theme: &Theme, inner_width: u16) -> 
     lines
 }
 
-#[cfg(feature = "tui")]
 fn get_system_display_lines(
     state: &AppState,
     theme: &Theme,
@@ -3065,7 +2968,6 @@ fn get_system_display_lines(
     lines
 }
 
-#[cfg(feature = "tui")]
 fn render_empty_log_hint(frame: &mut Frame, state: &AppState, theme: &Theme, inner: Rect) {
     state.log_max_scroll.set(0);
     let hint = if state.active_log_file.is_none() {
@@ -3082,7 +2984,6 @@ fn render_empty_log_hint(frame: &mut Frame, state: &AppState, theme: &Theme, inn
 
 /// Title text for the log panel: active file (or "system"), current filter
 /// indicator, and the wrap/zoom toggle states.
-#[cfg(feature = "tui")]
 fn build_log_title(state: &AppState) -> String {
     let log_title = if let Some(ref file) = state.active_log_file {
         format!(" Log: {} ", file)
@@ -3130,7 +3031,6 @@ fn build_log_title(state: &AppState) -> String {
 /// screen are formatted and styled; building all 500–2000 buffered lines per
 /// frame and throwing away everything but the visible slice was the log pane's
 /// entire per-frame cost.
-#[cfg(feature = "tui")]
 enum LogRows<'a> {
     /// Pre-wrapped physical rows, already styled.
     Wrapped(Vec<Line<'static>>),
@@ -3140,7 +3040,6 @@ enum LogRows<'a> {
     Raw(&'a [String]),
 }
 
-#[cfg(feature = "tui")]
 impl LogRows<'_> {
     /// Total row count, for the scroll bounds and the empty-pane check.
     fn total(&self) -> usize {
@@ -3173,7 +3072,6 @@ impl LogRows<'_> {
 
 /// Pick the row source for the current log mode: wrapping wins, then the
 /// system log's filtered entries, otherwise the active file's raw lines.
-#[cfg(feature = "tui")]
 fn log_rows<'a>(state: &'a AppState, theme: &Theme, width: u16) -> LogRows<'a> {
     if state.log_wrap_enabled {
         return LogRows::Wrapped(if state.active_log_file.is_some() {
@@ -3188,7 +3086,6 @@ fn log_rows<'a>(state: &'a AppState, theme: &Theme, width: u16) -> LogRows<'a> {
     LogRows::Raw(&state.active_log_lines)
 }
 
-#[cfg(feature = "tui")]
 fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Log;
     let border_style = if focused {
@@ -3248,7 +3145,6 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
 /// One unwrapped, styled row for a system log entry — the same formatting
 /// [`get_system_display_lines`] applies, for the visible-slice fast path.
-#[cfg(feature = "tui")]
 fn system_log_entry_line(e: &crate::state::LogEntry, theme: &Theme) -> Line<'static> {
     let ts = e.timestamp.format("%H:%M:%S").to_string();
     let level_label = e.level.label();
@@ -3258,7 +3154,6 @@ fn system_log_entry_line(e: &crate::state::LogEntry, theme: &Theme) -> Line<'sta
 
 /// Register a [`ClickTarget::OpenLogLine`] for each rendered log row, carrying
 /// that row's plain text. Blank rows are skipped — there is nothing to open.
-#[cfg(feature = "tui")]
 fn register_log_line_click_targets(state: &AppState, visible_lines: &[Line<'_>], inner: Rect) {
     let mut targets = state.click_targets.borrow_mut();
     for (i, line) in visible_lines.iter().enumerate() {
@@ -3276,7 +3171,6 @@ fn register_log_line_click_targets(state: &AppState, visible_lines: &[Line<'_>],
     }
 }
 
-#[cfg(feature = "tui")]
 fn draw_blocked_symlink_banner(
     frame: &mut Frame,
     _file: &str,
@@ -3337,7 +3231,6 @@ fn draw_blocked_symlink_banner(
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
 }
 
-#[cfg(feature = "tui")]
 fn build_log_file_list_item(
     f: &crate::state::LogFileInfo,
     is_active: bool,
@@ -3377,7 +3270,6 @@ fn build_log_file_list_item(
     ]))
 }
 
-#[cfg(feature = "tui")]
 fn draw_log_files_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let selected = state.log_files_selected().unwrap_or(0);
     let popup = centered_rect(70, 15, area);
@@ -3422,7 +3314,6 @@ fn draw_log_files_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area
 /// The "grant access to X?" overlay raised when a sandboxed command was blocked by
 /// an out-of-scope path (SPEC R5.4.7). The path is shown literally; Deny is the
 /// highlighted default and Enter/Esc deny — widening requires an explicit key.
-#[cfg(feature = "tui")]
 fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let Some(gate) = &state.scope_grant else {
         return;
@@ -3556,7 +3447,6 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
     frame.render_widget(para, inner);
 }
 
-#[cfg(feature = "tui")]
 fn style_raw_log_line<'a>(line: &str, theme: &Theme) -> Line<'a> {
     let line_upper = line.to_uppercase();
     let style = if line_upper.contains("ERROR") || line_upper.contains("ERR") {
@@ -3573,7 +3463,6 @@ fn style_raw_log_line<'a>(line: &str, theme: &Theme) -> Line<'a> {
     Line::from(Span::styled(line.to_string(), style))
 }
 
-#[cfg(feature = "tui")]
 fn style_system_log_line<'a>(line: &str, _ts: &str, level_label: &str, theme: &Theme) -> Line<'a> {
     let style = if level_label.contains("ERR") {
         theme.failed()
@@ -3587,7 +3476,6 @@ fn style_system_log_line<'a>(line: &str, _ts: &str, level_label: &str, theme: &T
     Line::from(Span::styled(line.to_string(), style))
 }
 
-#[cfg(feature = "tui")]
 fn wrap_line(line: &str, max_width: usize) -> Vec<String> {
     if line.is_empty() {
         return vec![String::new()];
@@ -3607,7 +3495,6 @@ fn wrap_line(line: &str, max_width: usize) -> Vec<String> {
     wrapped
 }
 
-#[cfg(feature = "tui")]
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{} B", bytes)
@@ -3620,7 +3507,6 @@ fn format_size(bytes: u64) -> String {
 
 // ─── Approval banner ──────────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let Some(gate) = &state.approval else {
         return;
@@ -3685,7 +3571,6 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
 
 /// Styled diff rows for the approval banner: additions green, removals red,
 /// context plain, capped to `budget` rows.
-#[cfg(feature = "tui")]
 fn approval_diff_lines(diff: &str, theme: &Theme, budget: usize) -> Vec<Line<'static>> {
     diff.lines()
         .take(budget)
@@ -3710,7 +3595,6 @@ fn approval_diff_lines(diff: &str, theme: &Theme, budget: usize) -> Vec<Line<'st
 ///
 /// `key_width` controls the left-column padding so two-column and single-column
 /// layouts can each use the width that fits their available space.
-#[cfg(feature = "tui")]
 fn format_help_rows<'a>(
     rows: &[(&'a str, &'a str)],
     key_width: usize,
@@ -3881,7 +3765,6 @@ const HELP_SINGLE_ROWS: &[(&str, &str)] = &[
     ("Mouse Click on a card", "Open operation details"),
 ];
 
-#[cfg(feature = "tui")]
 fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let use_two_columns = area.width >= 100;
 
@@ -3967,7 +3850,6 @@ fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
 /// Clamp a requested scroll offset so the last row is the last thing shown —
 /// scrolling past the end leaves a blank pane and lies about there being more.
-#[cfg(feature = "tui")]
 fn clamp_scroll(requested: u16, total_rows: usize, visible_h: u16) -> u16 {
     let max = (total_rows as u16).saturating_sub(visible_h);
     requested.min(max)
@@ -4027,14 +3909,12 @@ pub(crate) fn shorten_path(path: &str, max_chars: usize) -> String {
 }
 
 /// Returns a centered `Rect` of the given size within `area`.
-#[cfg(feature = "tui")]
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
-#[cfg(feature = "tui")]
 fn format_setting_value(value: &crate::settings_editor::SettingValue) -> String {
     match value {
         crate::settings_editor::SettingValue::Bool(v) => {
@@ -4052,7 +3932,6 @@ fn format_setting_value(value: &crate::settings_editor::SettingValue) -> String 
     }
 }
 
-#[cfg(feature = "tui")]
 fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let popup = centered_rect(90, 22, area);
     frame.render_widget(Clear, popup);
@@ -4114,7 +3993,6 @@ fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area:
 }
 
 /// One `ListItem` per settings category, highlighting the currently selected one.
-#[cfg(feature = "tui")]
 fn build_settings_sidebar_items(state: &AppState, theme: &Theme) -> Vec<ListItem<'static>> {
     use crate::settings_editor::SettingsCategory;
     SettingsCategory::ALL
@@ -4135,7 +4013,6 @@ fn build_settings_sidebar_items(state: &AppState, theme: &Theme) -> Vec<ListItem
 
 /// One `ListItem` per setting in the selected category: label, current value,
 /// an optional `[locked]` indicator for security-tier settings, and description.
-#[cfg(feature = "tui")]
 fn build_settings_content_items(
     state: &AppState,
     theme: &Theme,
@@ -4151,7 +4028,6 @@ fn build_settings_content_items(
 }
 
 /// One settings row: label, current value, the row-kind indicator, description.
-#[cfg(feature = "tui")]
 fn settings_content_item(
     item: &crate::settings_editor::SettingItem,
     theme: &Theme,
@@ -4179,7 +4055,6 @@ fn settings_content_item(
 /// Distinguish the three kinds of row the panel actually holds. Without this, a
 /// string/numeric row looked identical to a togglable one and simply swallowed
 /// Space — most of the panel read as broken rather than read-only.
-#[cfg(feature = "tui")]
 fn setting_kind_indicator(
     item: &crate::settings_editor::SettingItem,
     theme: &Theme,
@@ -4196,7 +4071,6 @@ fn setting_kind_indicator(
 }
 
 /// Footer line: status/dirty message on the left, key hints on the right.
-#[cfg(feature = "tui")]
 fn settings_footer_line(state: &AppState, theme: &Theme) -> Line<'static> {
     let status_str = if let Some((msg, _)) = &state.settings_editor.status_message {
         msg.clone()
@@ -4217,13 +4091,9 @@ fn settings_footer_line(state: &AppState, theme: &Theme) -> Line<'static> {
 
 // ─── Stub when `tui` feature is disabled ─────────────────────────────────────
 
-/// No-op stub so the crate compiles without the `tui` feature.
-#[cfg(not(feature = "tui"))]
-pub fn draw(_frame: &mut (), _state: &AppState, _theme: &Theme) {}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::text::{Line, Span};
@@ -5089,7 +4959,6 @@ mod tests {
     /// Render `draw_scrollbar` into a test buffer and return, for the scrollbar
     /// column (rightmost), the per-row `(symbol, bg_color)` so tests can inspect
     /// what the thumb/track actually paint.
-    #[cfg(feature = "tui")]
     fn render_scrollbar_column(
         total_len: usize,
         visible_h: usize,

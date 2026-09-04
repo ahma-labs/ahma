@@ -7,9 +7,7 @@ use std::{
 
 use crate::mcp_connections::McpConnectionManager;
 use crate::session_config::TuiSessionConfig;
-#[cfg(feature = "tui")]
 use ratatui::layout::Rect;
-#[cfg(feature = "tui")]
 use tui_textarea::TextArea;
 
 // ─── Ring-buffer capacities ───────────────────────────────────────────────────
@@ -281,7 +279,6 @@ impl ChatHistory {
 /// width, and unicode mode. `None` marks the rows as valid for this frame only —
 /// used while the transcript renders wall-clock/animation content (streaming
 /// cursor, liveness glyph, live elapsed time) that no key can capture.
-#[cfg(feature = "tui")]
 #[derive(Default)]
 pub struct ChatRowsCache {
     pub key: Option<(u64, usize, bool)>,
@@ -1422,10 +1419,7 @@ pub struct AppState {
     /// instant are not re-materialised as windows when a source re-pushes them,
     /// so cleared results stay cleared.
     pub cleared_at: Option<Instant>,
-    #[cfg(feature = "tui")]
     pub window_rects: std::cell::RefCell<Vec<(usize, Rect)>>,
-    #[cfg(not(feature = "tui"))]
-    pub window_rects: std::cell::RefCell<Vec<(usize, ())>>,
 
     // ── Connection ──
     pub server_url: String,
@@ -1495,10 +1489,7 @@ pub struct AppState {
     pub granted_scopes: Vec<(String, String)>,
     pub chat: ChatHistory,
     /// Current text in the multi-line input box.
-    #[cfg(feature = "tui")]
     pub chat_input: TextArea<'static>,
-    #[cfg(not(feature = "tui"))]
-    pub chat_input: (),
     /// What the TUI is pointed at, or `None` for "no LLM". The header label is
     /// derived from this at render time by [`AppState::llm_label`].
     pub llm_selection: Option<LlmSelection>,
@@ -1546,26 +1537,11 @@ pub struct AppState {
     /// switches to monitor mode so the ongoing tasks are immediately visible.
     /// Disarmed by any user input.
     pub auto_view_pending: bool,
-    #[cfg(feature = "tui")]
     pub chat_area: std::cell::Cell<Rect>,
-    #[cfg(not(feature = "tui"))]
-    pub chat_area: std::cell::Cell<()>,
-    #[cfg(feature = "tui")]
     pub log_area: std::cell::Cell<Rect>,
-    #[cfg(not(feature = "tui"))]
-    pub log_area: std::cell::Cell<()>,
-    #[cfg(feature = "tui")]
     pub ops_area: std::cell::Cell<Rect>,
-    #[cfg(not(feature = "tui"))]
-    pub ops_area: std::cell::Cell<()>,
-    #[cfg(feature = "tui")]
     pub chat_input_area: std::cell::Cell<Rect>,
-    #[cfg(not(feature = "tui"))]
-    pub chat_input_area: std::cell::Cell<()>,
-    #[cfg(feature = "tui")]
     pub last_mouse_pos: std::cell::Cell<Option<(u16, u16)>>,
-    #[cfg(not(feature = "tui"))]
-    pub last_mouse_pos: std::cell::Cell<()>,
 
     // --- Animation states ---
     pub chat_scroll_target: std::cell::Cell<f64>,
@@ -1600,20 +1576,11 @@ pub struct AppState {
     /// Cumulative count of log lines received — the frame counter for the log
     /// title's rain panel (fast when lines pour in, still when quiet).
     pub log_lines_total: u64,
-    #[cfg(feature = "tui")]
     pub click_targets: std::cell::RefCell<Vec<(ClickTarget, Rect)>>,
-    #[cfg(not(feature = "tui"))]
-    pub click_targets: std::cell::RefCell<Vec<(ClickTarget, ())>>,
-    #[cfg(feature = "tui")]
     pub ops_list_state: std::cell::RefCell<ratatui::widgets::ListState>,
-    #[cfg(not(feature = "tui"))]
-    pub ops_list_state: std::cell::RefCell<()>,
     /// Wrapped-transcript row cache — see [`ChatRowsCache`]. Interior mutability
     /// because it is filled during rendering, which is pure over `&AppState`.
-    #[cfg(feature = "tui")]
     pub chat_rows_cache: std::cell::RefCell<ChatRowsCache>,
-    #[cfg(not(feature = "tui"))]
-    pub chat_rows_cache: std::cell::RefCell<()>,
 
     // ── Settings editor ──
     pub settings_editor: crate::settings_editor::SettingsEditor,
@@ -1644,21 +1611,11 @@ pub struct AppState {
     pub unicode: bool,
     pub should_quit: bool,
     /// Sender half of the bridge channel; set by app.rs after spawning.
-    #[cfg(feature = "tui")]
     pub bridge_tx: Option<tokio::sync::mpsc::Sender<crate::llm_bridge::BridgeEvent>>,
-    #[cfg(not(feature = "tui"))]
-    pub bridge_tx: Option<()>,
-    #[cfg(feature = "tui")]
     pub mcp_source_tx: Option<tokio::sync::mpsc::Sender<crate::mcp_source::McpSourceCommand>>,
-    #[cfg(not(feature = "tui"))]
-    pub mcp_source_tx: Option<()>,
-    #[cfg(feature = "tui")]
     pub approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
-    #[cfg(not(feature = "tui"))]
-    pub approval_tx: Option<()>,
 }
 
-#[cfg(feature = "tui")]
 /// Which provider a selection came from.
 ///
 /// The distinction exists because a profile is *not* a provider name: it is an
@@ -2091,26 +2048,11 @@ impl AppState {
             project_root: None,
             task_rows: std::cell::RefCell::new(Vec::new()),
             auto_view_pending: true,
-            #[cfg(feature = "tui")]
             chat_area: std::cell::Cell::new(Rect::default()),
-            #[cfg(not(feature = "tui"))]
-            chat_area: std::cell::Cell::new(()),
-            #[cfg(feature = "tui")]
             log_area: std::cell::Cell::new(Rect::default()),
-            #[cfg(not(feature = "tui"))]
-            log_area: std::cell::Cell::new(()),
-            #[cfg(feature = "tui")]
             ops_area: std::cell::Cell::new(Rect::default()),
-            #[cfg(not(feature = "tui"))]
-            ops_area: std::cell::Cell::new(()),
-            #[cfg(feature = "tui")]
             chat_input_area: std::cell::Cell::new(Rect::default()),
-            #[cfg(not(feature = "tui"))]
-            chat_input_area: std::cell::Cell::new(()),
-            #[cfg(feature = "tui")]
             last_mouse_pos: std::cell::Cell::new(None),
-            #[cfg(not(feature = "tui"))]
-            last_mouse_pos: std::cell::Cell::new(()),
             chat_scroll_target: std::cell::Cell::new(0.0),
             chat_scroll_current: std::cell::Cell::new(0.0),
             log_scroll_target: std::cell::Cell::new(0.0),
@@ -2131,18 +2073,9 @@ impl AppState {
             log_wrap_enabled: false,
             zoomed: None,
             log_lines_total: 0,
-            #[cfg(feature = "tui")]
             click_targets: std::cell::RefCell::new(vec![]),
-            #[cfg(not(feature = "tui"))]
-            click_targets: std::cell::RefCell::new(vec![]),
-            #[cfg(feature = "tui")]
             ops_list_state: std::cell::RefCell::new(ratatui::widgets::ListState::default()),
-            #[cfg(not(feature = "tui"))]
-            ops_list_state: std::cell::RefCell::new(()),
-            #[cfg(feature = "tui")]
             chat_rows_cache: std::cell::RefCell::new(ChatRowsCache::default()),
-            #[cfg(not(feature = "tui"))]
-            chat_rows_cache: std::cell::RefCell::new(()),
 
             settings_editor: crate::settings_editor::SettingsEditor::default(),
 
@@ -2160,13 +2093,7 @@ impl AppState {
             unicode,
             should_quit: false,
             bridge_tx: None,
-            #[cfg(feature = "tui")]
             mcp_source_tx: None,
-            #[cfg(not(feature = "tui"))]
-            mcp_source_tx: None,
-            #[cfg(feature = "tui")]
-            approval_tx: None,
-            #[cfg(not(feature = "tui"))]
             approval_tx: None,
         }
     }
@@ -2255,18 +2182,10 @@ impl AppState {
     }
 
     pub fn chat_input_text(&self) -> String {
-        #[cfg(feature = "tui")]
-        {
-            self.chat_input.lines().join("\n")
-        }
-        #[cfg(not(feature = "tui"))]
-        {
-            String::new()
-        }
+        self.chat_input.lines().join("\n")
     }
 
     pub fn chat_input_line_count(&self, width: usize) -> usize {
-        #[cfg(feature = "tui")]
         {
             let mut total = 0;
             for line in self.chat_input.lines() {
@@ -2274,15 +2193,9 @@ impl AppState {
             }
             total.max(1)
         }
-        #[cfg(not(feature = "tui"))]
-        {
-            let _ = width;
-            1
-        }
     }
 }
 
-#[cfg(feature = "tui")]
 fn parse_word_len<I: Iterator<Item = char>>(
     _first_char: char,
     chars: &mut std::iter::Peekable<I>,
@@ -2317,7 +2230,6 @@ fn handle_word_fit(current_line_len: &mut usize, lines: &mut usize, word_len: us
 
 /// Account for a single space: it either fits on the current line or closes it
 /// and is swallowed by the wrap (a wrapped line does not start with a space).
-#[cfg(feature = "tui")]
 fn handle_space_fit(current_line_len: &mut usize, lines: &mut usize, width: usize) {
     if *current_line_len < width {
         *current_line_len += 1;
@@ -2327,7 +2239,6 @@ fn handle_space_fit(current_line_len: &mut usize, lines: &mut usize, width: usiz
     }
 }
 
-#[cfg(feature = "tui")]
 fn count_wrapped_lines(line: &str, width: usize) -> usize {
     let width = width.max(1);
     if line.is_empty() {
@@ -2360,7 +2271,6 @@ impl AppState {
     }
 
     pub fn clear_chat_input(&mut self) {
-        #[cfg(feature = "tui")]
         {
             self.chat_input = TextArea::default();
         }
@@ -2373,16 +2283,11 @@ impl AppState {
     /// user presses Enter to submit. Interior newlines are preserved, so a
     /// multi-line paste becomes multiple input lines (one request, not many).
     pub fn paste_into_chat_input(&mut self, text: &str) {
-        #[cfg(feature = "tui")]
         {
             let trimmed = text.trim_end_matches(['\r', '\n']);
             if !trimmed.is_empty() {
                 self.chat_input.insert_str(trimmed);
             }
-        }
-        #[cfg(not(feature = "tui"))]
-        {
-            let _ = text;
         }
     }
 
@@ -2816,7 +2721,6 @@ mod tests {
     /// indices), and Enter behaves as a single-expand accordion for ops and a
     /// fold toggle for headers (SPEC R24.4).
     #[test]
-    #[cfg(feature = "tui")]
     fn tree_selection_resolves_through_rows_and_toggles_accordion() {
         use crate::task_tree::{RowKind, TreeRow};
         let mut s = AppState::new("http://localhost:3000", "HTTP", true);
@@ -2938,7 +2842,6 @@ mod tests {
     /// Enter drills into the full-screen detail overlay for op rows and keeps
     /// the fold behavior for instance headers.
     #[test]
-    #[cfg(feature = "tui")]
     fn enter_opens_detail_overlay_for_ops_and_folds_headers() {
         use crate::task_tree::{RowKind, TreeRow};
         let mut s = AppState::new("http://localhost:3000", "HTTP", true);
@@ -2987,7 +2890,6 @@ mod tests {
     /// back to flat operation indices, so headless/chat-only flows keep
     /// working.
     #[test]
-    #[cfg(feature = "tui")]
     fn selection_falls_back_to_flat_list_before_first_draw() {
         let mut s = AppState::new("http://localhost:3000", "HTTP", true);
         s.operations
@@ -2998,7 +2900,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "tui")]
     fn paste_strips_trailing_newline_without_submitting() {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         // Pasting "somecommand\n" shows "somecommand" — the trailing newline is
@@ -3008,7 +2909,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "tui")]
     fn paste_strips_trailing_crlf() {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         state.paste_into_chat_input("somecommand\r\n");
@@ -3016,7 +2916,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "tui")]
     fn paste_keeps_interior_newlines_as_multiline_input() {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         // A multi-line paste becomes multiple input lines (a single request),
@@ -3026,7 +2925,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "tui")]
     fn paste_appends_to_existing_input() {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         state.chat_input.insert_str("echo ");
@@ -3035,7 +2933,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "tui")]
     fn paste_of_only_newline_is_noop() {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         state.paste_into_chat_input("\n");
@@ -3043,7 +2940,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "tui")]
     fn test_count_wrapped_lines() {
         assert_eq!(count_wrapped_lines("hello world", 10), 2);
         assert_eq!(count_wrapped_lines("a verylongword", 10), 3);

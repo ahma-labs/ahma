@@ -1,10 +1,8 @@
 //! Semantic colour palette — wraps ratatui `Style` construction so every panel
 //! uses consistent colours without scattering magic constants everywhere.
 
-#[cfg(feature = "tui")]
 use ratatui::style::{Color, Modifier, Style};
 
-#[cfg(feature = "tui")]
 use crate::state::{ActivityStatus, LogLevel, OpStatus};
 
 /// Semantic style provider.  Construct once and share as `&Theme`.
@@ -16,7 +14,6 @@ pub struct Theme {
     pub color: bool,
 }
 
-#[cfg(feature = "tui")]
 impl Theme {
     pub fn new(unicode: bool) -> Self {
         Self {
@@ -232,15 +229,7 @@ impl Theme {
     }
 }
 
-/// Stub used when the `tui` feature is disabled so the crate still compiles.
-#[cfg(not(feature = "tui"))]
-impl Theme {
-    pub fn new(unicode: bool) -> Self {
-        Self { unicode }
-    }
-}
-
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::{ActivityStatus, LogLevel, OpStatus};

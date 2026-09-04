@@ -1,6 +1,5 @@
 //! Maps raw crossterm `KeyEvent`s to semantic `Action`s for the TUI event loop.
 
-#[cfg(feature = "tui")]
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::state::{Focus, ModalState};
@@ -79,7 +78,6 @@ pub enum Action {
 /// 3. Log filter (if active)
 /// 4. Chat input (if in Chat mode and input is focused)
 /// 5. Global / Monitor shortcuts
-#[cfg(feature = "tui")]
 pub fn map_key(key: KeyEvent, focus: Focus, modal: &ModalState, log_filter_active: bool) -> Action {
     // Open overlays take key priority, in this order: navigator > log-file
     // switcher. (Help and the inline pickers are dispatched before map_key is
@@ -106,7 +104,6 @@ pub fn map_key(key: KeyEvent, focus: Focus, modal: &ModalState, log_filter_activ
 
 // ─── Chat input ───────────────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn map_chat_input_key(key: KeyEvent) -> Action {
     use KeyCode::*;
     use KeyModifiers as KM;
@@ -135,7 +132,6 @@ fn map_chat_input_key(key: KeyEvent) -> Action {
 
 // ─── Navigator ────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn map_navigator_key(key: KeyEvent) -> Action {
     use KeyCode::*;
     use KeyModifiers as KM;
@@ -154,7 +150,6 @@ fn map_navigator_key(key: KeyEvent) -> Action {
 
 // ─── Log Switcher Modal ───────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn map_log_modal_key(key: KeyEvent) -> Action {
     use KeyCode::*;
     use KeyModifiers as KM;
@@ -172,7 +167,6 @@ fn map_log_modal_key(key: KeyEvent) -> Action {
 
 /// Keys inside the full-screen operation detail view: close (Esc/q/Enter),
 /// scroll (j/k/arrows, g/G), and cancel the viewed operation (c).
-#[cfg(feature = "tui")]
 fn map_op_detail_key(key: KeyEvent) -> Action {
     use KeyCode::*;
     use KeyModifiers as KM;
@@ -192,7 +186,6 @@ fn map_op_detail_key(key: KeyEvent) -> Action {
 /// Keys for the log-line overlay: the same close/scroll vocabulary as the
 /// operation overlay, minus `c` — there is no operation behind a log line to
 /// cancel, and silently accepting the key would suggest otherwise.
-#[cfg(feature = "tui")]
 fn map_log_line_detail_key(key: KeyEvent) -> Action {
     use KeyCode::*;
     use KeyModifiers as KM;
@@ -205,7 +198,6 @@ fn map_log_line_detail_key(key: KeyEvent) -> Action {
 
 // ─── Global (monitor) keys ───────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
     use KeyCode::*;
     use KeyModifiers as KM;
@@ -261,7 +253,6 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
     }
 }
 
-#[cfg(feature = "tui")]
 fn map_filter_key(key: KeyEvent) -> Action {
     use KeyCode::*;
     use KeyModifiers as KM;
@@ -275,15 +266,9 @@ fn map_filter_key(key: KeyEvent) -> Action {
     }
 }
 
-/// Stub when the `tui` feature is disabled.
-#[cfg(not(feature = "tui"))]
-pub fn map_key(_key: (), _focus: Focus, _modal: &ModalState, _log_filter_active: bool) -> Action {
-    Action::Unknown
-}
-
 // ─── Tests ──────────────────────────────────────────────────────────────────────
 
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::{CommandNavigator, Focus, ModalState};

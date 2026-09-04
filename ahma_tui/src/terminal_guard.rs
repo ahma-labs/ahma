@@ -1,7 +1,7 @@
 //! Undoing what the TUI does to the user's terminal — on every exit path,
 //! including a panic.
 //!
-//! `app::run_ratatui` puts the terminal into raw mode, switches it to the
+//! `app::run` puts the terminal into raw mode, switches it to the
 //! alternate screen, turns on mouse capture and bracketed paste, and (where the
 //! terminal supports it) pushes a Kitty keyboard-protocol flag. All five have to
 //! be undone or the user is left with a shell that echoes nothing, shows the
@@ -29,8 +29,6 @@
 //!
 //! Restoring twice is harmless in principle but is suppressed anyway by a shared
 //! `done` flag, so the keyboard-flag pop cannot unbalance its stack.
-
-#![cfg(feature = "tui")]
 
 use std::io::{self, Write};
 use std::panic::PanicHookInfo;

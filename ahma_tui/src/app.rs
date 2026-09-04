@@ -11,28 +11,8 @@ use crate::connection::ResolvedConnection;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
-/// Launch the TUI.  Restores the terminal on exit (even on error) when the
-/// full ratatui UI is compiled in.
+/// Launch the TUI. Restores the terminal on exit, even on error.
 pub async fn run(
-    connection: &ResolvedConnection,
-    profile: Option<String>,
-    path: Option<std::path::PathBuf>,
-    token_prefs: crate::TokenPrefs,
-) -> Result<()> {
-    #[cfg(feature = "tui")]
-    return run_ratatui(connection, profile, path, token_prefs).await;
-
-    #[cfg(not(feature = "tui"))]
-    {
-        let _ = token_prefs;
-        return run_text_stub(connection).await;
-    }
-}
-
-// ─── Ratatui implementation (feature = "tui") ─────────────────────────────────
-
-#[cfg(feature = "tui")]
-async fn run_ratatui(
     connection: &ResolvedConnection,
     profile_override: Option<String>,
     workspace_path: Option<std::path::PathBuf>,
@@ -364,7 +344,6 @@ async fn run_ratatui(
 
 // ─── Action handler ───────────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppState) {
     use crate::keymap::Action;
     if handle_log_monitor_action(&action, state)
@@ -421,7 +400,6 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
     }
 }
 
-#[cfg(feature = "tui")]
 fn submit_log_switcher(state: &mut crate::state::AppState) {
     let Some(idx) = state.log_files_selected() else {
         return;
@@ -449,7 +427,6 @@ fn submit_log_switcher(state: &mut crate::state::AppState) {
     state.close_modal();
 }
 
-#[cfg(feature = "tui")]
 fn approve_symlink(state: &mut crate::state::AppState) {
     if let Some(ref active_file) = state.active_log_file
         && let Some(info) = state.log_files.iter().find(|f| f.name == *active_file)
@@ -494,7 +471,6 @@ fn approve_symlink(state: &mut crate::state::AppState) {
 
 /// Maximise/restore the focused pane. Enter on the log pane and `z` on any
 /// zoomable pane both land here.
-#[cfg(feature = "tui")]
 fn toggle_focused_pane_zoom(state: &mut crate::state::AppState) {
     if state.zoomed.is_some() {
         state.zoomed = None;
@@ -503,7 +479,6 @@ fn toggle_focused_pane_zoom(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn open_log_switcher(state: &mut crate::state::AppState) {
     state.open_log_files_modal(0);
     // Proactively request logs list refresh when modal is opened
@@ -512,7 +487,6 @@ fn open_log_switcher(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn close_log_switcher(state: &mut crate::state::AppState) {
     if state.log_files_selected().is_some() {
         state.close_modal();
@@ -522,7 +496,6 @@ fn close_log_switcher(state: &mut crate::state::AppState) {
 /// Move the log-switcher selection one row up or down, clamped to the modal's
 /// range. Index `log_files.len()` is a valid selection (the trailing row), so
 /// the forward bound is the length itself.
-#[cfg(feature = "tui")]
 fn move_log_files_selection(state: &mut crate::state::AppState, forward: bool) {
     let Some(sel) = state.log_files_selected() else {
         return;
@@ -536,7 +509,6 @@ fn move_log_files_selection(state: &mut crate::state::AppState, forward: bool) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_log_monitor_action(
     action: &crate::keymap::Action,
     state: &mut crate::state::AppState,
@@ -566,7 +538,6 @@ fn handle_log_monitor_action(
     true
 }
 
-#[cfg(feature = "tui")]
 fn handle_picker_action(
     action: &crate::keymap::Action,
     state: &mut crate::state::AppState,
@@ -589,21 +560,18 @@ fn handle_picker_action(
     true
 }
 
-#[cfg(feature = "tui")]
 fn select_active_picker_prev(state: &mut crate::state::AppState) {
     if let Some(picker) = active_picker_mut(state) {
         picker.select_prev();
     }
 }
 
-#[cfg(feature = "tui")]
 fn select_active_picker_next(state: &mut crate::state::AppState) {
     if let Some(picker) = active_picker_mut(state) {
         picker.select_next();
     }
 }
 
-#[cfg(feature = "tui")]
 fn submit_active_picker(state: &mut crate::state::AppState) {
     if let Some(picker) = state.take_provider_picker() {
         submit_provider_picker(picker, state);
@@ -615,7 +583,6 @@ fn submit_active_picker(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn submit_provider_picker(picker: crate::state::PickerState, state: &mut crate::state::AppState) {
     use crate::llm_bridge::spawn_model_refresh;
 
@@ -644,7 +611,6 @@ fn submit_provider_picker(picker: crate::state::PickerState, state: &mut crate::
     save_session(state);
 }
 
-#[cfg(feature = "tui")]
 fn submit_model_picker(picker: crate::state::PickerState, state: &mut crate::state::AppState) {
     let Some(item) = picker.selected_item() else {
         return;
@@ -673,7 +639,6 @@ fn submit_model_picker(picker: crate::state::PickerState, state: &mut crate::sta
     }
 }
 
-#[cfg(feature = "tui")]
 fn close_active_pickers(state: &mut crate::state::AppState) {
     if matches!(
         state.modal,
@@ -683,7 +648,6 @@ fn close_active_pickers(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_navigation_action(
     action: &crate::keymap::Action,
     state: &mut crate::state::AppState,
@@ -718,7 +682,6 @@ fn handle_navigation_action(
 /// Scroll whichever full-screen detail overlay is open; the max is computed at
 /// draw time and published through `detail_max_scroll`, which both overlays
 /// share (only one can be open at a time).
-#[cfg(feature = "tui")]
 fn scroll_detail_overlay(action: &crate::keymap::Action, state: &mut crate::state::AppState) {
     use crate::keymap::Action;
     use crate::state::ModalState;
@@ -737,7 +700,6 @@ fn scroll_detail_overlay(action: &crate::keymap::Action, state: &mut crate::stat
     }
 }
 
-#[cfg(feature = "tui")]
 fn scroll_focus_up(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
@@ -756,7 +718,6 @@ fn scroll_focus_up(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn scroll_focus_down(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
@@ -783,7 +744,6 @@ fn scroll_focus_down(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn move_focus_to_top(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
@@ -801,7 +761,6 @@ fn move_focus_to_top(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn move_focus_to_bottom(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
@@ -820,7 +779,6 @@ fn move_focus_to_bottom(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_approval_action(
     action: &crate::keymap::Action,
     state: &mut crate::state::AppState,
@@ -840,7 +798,6 @@ fn handle_approval_action(
 /// "Always allow": persist a grant for this tool+workspace (so it is never
 /// re-prompted), then approve this call. Persistence lives outside the sandbox
 /// in `~/.config/ahma/` — see [`ahma_core::approvals`].
-#[cfg(feature = "tui")]
 fn resolve_approval_always(state: &mut crate::state::AppState) {
     use crate::state::{LogEntry, LogLevel};
 
@@ -864,7 +821,6 @@ fn resolve_approval_always(state: &mut crate::state::AppState) {
     resolve_approval(state, true);
 }
 
-#[cfg(feature = "tui")]
 /// Ask again for the path a selected denied operation was refused (SPEC
 /// R-PERM.7.1). This is the escape hatch a denial never had: the row that
 /// records the refusal is the place you answer it from.
@@ -873,7 +829,6 @@ fn resolve_approval_always(state: &mut crate::state::AppState) {
 /// faked locally, so the modal the user answers is the same one the automatic
 /// flow raises, resolves through the same coordinator, and persists through the
 /// same preview-and-approve path.
-#[cfg(feature = "tui")]
 fn reraise_grant_for_selected_op(state: &mut crate::state::AppState) {
     use crate::state::{LogEntry, LogLevel, OpStatus};
 
@@ -924,7 +879,6 @@ fn send_daemon_msg(msg: ahma_common::daemon_hub::ClientMsg) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn resolve_approval(state: &mut crate::state::AppState, approved: bool) {
     use crate::state::{LogEntry, LogLevel};
 
@@ -955,7 +909,6 @@ fn resolve_approval(state: &mut crate::state::AppState, approved: bool) {
     });
 }
 
-#[cfg(feature = "tui")]
 fn handle_operation_action(
     action: &crate::keymap::Action,
     state: &mut crate::state::AppState,
@@ -972,7 +925,6 @@ fn handle_operation_action(
     true
 }
 
-#[cfg(feature = "tui")]
 fn request_cancel_selected_op(state: &mut crate::state::AppState) {
     use crate::state::{LogEntry, LogLevel};
 
@@ -1002,7 +954,6 @@ fn request_cancel_selected_op(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn toggle_selected_op_pin(state: &mut crate::state::AppState) {
     if let Some(idx) = state.selected_op_index()
         && let Some(op) = state.operations.get_mut(idx)
@@ -1011,7 +962,6 @@ fn toggle_selected_op_pin(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_log_filter_action(
     action: &crate::keymap::Action,
     state: &mut crate::state::AppState,
@@ -1047,7 +997,6 @@ fn handle_log_filter_action(
     true
 }
 
-#[cfg(feature = "tui")]
 fn handle_chat_action(action: &crate::keymap::Action, state: &mut crate::state::AppState) -> bool {
     use crate::keymap::Action;
 
@@ -1065,7 +1014,6 @@ fn handle_chat_action(action: &crate::keymap::Action, state: &mut crate::state::
     true
 }
 
-#[cfg(feature = "tui")]
 fn insert_chat_character(c: char, state: &mut crate::state::AppState) {
     if c == '/' && state.chat_input_is_empty() {
         open_navigator(state);
@@ -1074,7 +1022,6 @@ fn insert_chat_character(c: char, state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn backspace_chat_input(state: &mut crate::state::AppState) {
     state.chat_input.input(tui_textarea::Input {
         key: tui_textarea::Key::Backspace,
@@ -1203,7 +1150,6 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
     }
 }
 
-#[cfg(feature = "tui")]
 fn submit_chat_input(state: &mut crate::state::AppState) {
     use crate::state::ChatEntry;
 
@@ -1253,7 +1199,6 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
 }
 
 /// Collect the current conversation and submit it to the daemon LLM loop.
-#[cfg(feature = "tui")]
 fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: String) {
     let messages = collect_chat_history(state)
         .into_iter()
@@ -1283,7 +1228,6 @@ fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: S
     });
 }
 
-#[cfg(feature = "tui")]
 fn format_recent_ops(operations: &[crate::state::Operation]) -> String {
     use crate::state::OpStatus;
     let mut ctx = String::new();
@@ -1315,7 +1259,6 @@ fn format_recent_ops(operations: &[crate::state::Operation]) -> String {
     ctx
 }
 
-#[cfg(feature = "tui")]
 fn format_recent_failures(operations: &[crate::state::Operation]) -> String {
     use crate::state::OpStatus;
     let mut ctx = String::new();
@@ -1362,7 +1305,6 @@ fn format_recent_failures(operations: &[crate::state::Operation]) -> String {
 /// The context block is intentionally short (<500 tokens) so it does not eat
 /// into the user's context window.
 /// Summary of discovered skills for system prompt awareness.
-#[cfg(feature = "tui")]
 fn format_skills_summary(workspace: &str) -> String {
     if workspace.is_empty() {
         return String::new();
@@ -1380,7 +1322,6 @@ fn format_skills_summary(workspace: &str) -> String {
 }
 
 /// Active Agent Skills context in effect for multi-turn sessions (SPEC R-SK8.4).
-#[cfg(feature = "tui")]
 fn format_active_skills(skills: &[ahma_common::skills::Skill]) -> String {
     if skills.is_empty() {
         return String::new();
@@ -1400,7 +1341,6 @@ fn format_active_skills(skills: &[ahma_common::skills::Skill]) -> String {
 
 /// The pieces of a system prompt, assembled by a [`PromptComposer`]. Keeping
 /// them separate lets a composer decide which to include for token economy.
-#[cfg(feature = "tui")]
 struct PromptParts {
     /// Optional per-profile prompt override.
     profile_prompt: String,
@@ -1422,13 +1362,11 @@ struct PromptParts {
 
 /// Strategy for assembling the agent system prompt. Swap implementations to
 /// trade prompt richness for token economy — the seam behind `/minimize`.
-#[cfg(feature = "tui")]
 trait PromptComposer {
     fn compose(&self, parts: &PromptParts) -> String;
 }
 
 /// Join `profile` + `base` + the live-context `ctx` in the canonical layout.
-#[cfg(feature = "tui")]
 fn assemble_prompt(profile: &str, base: &str, ctx: &str) -> String {
     match (profile.is_empty(), ctx.is_empty()) {
         (true, true) => base.to_string(),
@@ -1439,10 +1377,8 @@ fn assemble_prompt(profile: &str, base: &str, ctx: &str) -> String {
 }
 
 /// The default composer: agentic base + profile + the full live-context block.
-#[cfg(feature = "tui")]
 struct FullComposer;
 
-#[cfg(feature = "tui")]
 impl PromptComposer for FullComposer {
     fn compose(&self, p: &PromptParts) -> String {
         let ctx = format!(
@@ -1460,10 +1396,8 @@ impl PromptComposer for FullComposer {
 
 /// The lean composer used under `/minimize`: drops the token-heavy recent-ops
 /// and recent-failures blocks, keeping the base, profile, workspace, sandbox, and skills.
-#[cfg(feature = "tui")]
 struct MinimalComposer;
 
-#[cfg(feature = "tui")]
 impl PromptComposer for MinimalComposer {
     fn compose(&self, p: &PromptParts) -> String {
         let ctx = format!(
@@ -1474,7 +1408,6 @@ impl PromptComposer for MinimalComposer {
     }
 }
 
-#[cfg(feature = "tui")]
 fn build_system_prompt(state: &crate::state::AppState) -> String {
     let parts = PromptParts {
         profile_prompt: profile_field(state, |p| p.system_prompt, String::new()),
@@ -1508,7 +1441,6 @@ fn build_system_prompt(state: &crate::state::AppState) -> String {
     composer.compose(&parts)
 }
 
-#[cfg(feature = "tui")]
 fn collect_chat_history(state: &crate::state::AppState) -> Vec<ahma_llm_monitor::ChatMessage> {
     use crate::state::ChatEntry;
     use ahma_llm_monitor::ChatMessage;
@@ -1534,7 +1466,6 @@ fn collect_chat_history(state: &crate::state::AppState) -> Vec<ahma_llm_monitor:
 
 /// Look up a single field from the active agent profile.
 /// Returns `default` when there is no active profile or the profile cannot be loaded.
-#[cfg(feature = "tui")]
 fn profile_field<T, F>(state: &crate::state::AppState, extract: F, default: T) -> T
 where
     F: FnOnce(crate::agent_config::AgentProfile) -> T,
@@ -1560,7 +1491,6 @@ where
 /// behaviour but not the server's. One variable, one verdict — the replacements are
 /// `--minimize-tokens` / `--small-model-harness` (both already reflected in
 /// `state.token_prefs`) and the matching `[tools]` settings keys.
-#[cfg(feature = "tui")]
 fn resolve_token_prefs(state: &crate::state::AppState) -> (bool, bool, Option<u32>) {
     let settings = ahma_common::config::AhmaSettings::load();
 
@@ -1591,12 +1521,10 @@ fn resolve_token_prefs(state: &crate::state::AppState) -> (bool, bool, Option<u3
 
 /// The configured context window (`num_ctx`) of the provider whose base URL
 /// matches `base_url`, from `~/.ahma/config.toml`.
-#[cfg(feature = "tui")]
 fn provider_num_ctx(base_url: &str) -> Option<u32> {
     ahma_common::config::AhmaConfig::load().num_ctx_for_base_url(base_url)
 }
 
-#[cfg(feature = "tui")]
 fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChatConfig {
     let external_http_servers = state
         .mcp_connections
@@ -1631,7 +1559,6 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_navigator_action(
     action: &crate::keymap::Action,
     state: &mut crate::state::AppState,
@@ -1663,7 +1590,6 @@ fn handle_navigator_action(
     true
 }
 
-#[cfg(feature = "tui")]
 fn mutate_navigator(
     state: &mut crate::state::AppState,
     f: impl FnOnce(&mut crate::state::CommandNavigator),
@@ -1677,7 +1603,6 @@ fn mutate_navigator(
     }
 }
 
-#[cfg(feature = "tui")]
 fn open_navigator(state: &mut crate::state::AppState) {
     let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
     let skills = skill_nav_commands(state);
@@ -1685,7 +1610,6 @@ fn open_navigator(state: &mut crate::state::AppState) {
         crate::state::ModalState::Navigator(crate::state::CommandNavigator::opened(&tools, skills));
 }
 
-#[cfg(feature = "tui")]
 fn refresh_navigator_completions(state: &mut crate::state::AppState) {
     let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
     if let Some(nav) = state.navigator_mut() {
@@ -1693,7 +1617,6 @@ fn refresh_navigator_completions(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn submit_navigator_command(state: &mut crate::state::AppState) {
     let Some(cmd) = state.navigator().map(|n| n.selected_command()) else {
         return;
@@ -1702,7 +1625,6 @@ fn submit_navigator_command(state: &mut crate::state::AppState) {
     dispatch_nav_command(&cmd, state);
 }
 
-#[cfg(feature = "tui")]
 fn handle_settings_key(
     key: crossterm::event::KeyEvent,
     state: &mut crate::state::AppState,
@@ -1742,7 +1664,6 @@ fn handle_settings_key(
     true
 }
 
-#[cfg(feature = "tui")]
 fn handle_help_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
     use crossterm::event::KeyCode;
 
@@ -1789,7 +1710,6 @@ fn handle_help_key(key: crossterm::event::KeyEvent, state: &mut crate::state::Ap
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_picker_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -1826,7 +1746,6 @@ fn handle_picker_key(key: crossterm::event::KeyEvent, state: &mut crate::state::
     }
 }
 
-#[cfg(feature = "tui")]
 fn active_picker_mut(state: &mut crate::state::AppState) -> Option<&mut crate::state::PickerState> {
     match &mut state.modal {
         crate::state::ModalState::ProviderPicker(p) | crate::state::ModalState::ModelPicker(p) => {
@@ -1836,7 +1755,6 @@ fn active_picker_mut(state: &mut crate::state::AppState) -> Option<&mut crate::s
     }
 }
 
-#[cfg(feature = "tui")]
 /// When an approval is pending, a bare `y` / `n` resolves it immediately — no
 /// matter which panel has focus. Without this, the chat input box swallows the
 /// keystroke as typed text (the bug where pressing "y" just sent "y" as a
@@ -1844,7 +1762,6 @@ fn active_picker_mut(state: &mut crate::state::AppState) -> Option<&mut crate::s
 ///
 /// We deliberately bail when a text-entry overlay is active (navigator,
 /// pickers, log filter) so the user can still type a `y`/`n` there.
-#[cfg(feature = "tui")]
 fn handle_approval_key(
     key: crossterm::event::KeyEvent,
     state: &mut crate::state::AppState,
@@ -1875,7 +1792,6 @@ fn handle_approval_key(
 /// Keys for the scope-grant modal. Three-valued and **Enter-safe**: Enter / Esc /
 /// `n` deny (the default), `r` grants read-only, `y` grants read+write. Widening
 /// always requires an explicit non-default key (SPEC R5.3.1).
-#[cfg(feature = "tui")]
 fn handle_scope_grant_key(
     key: crossterm::event::KeyEvent,
     state: &mut crate::state::AppState,
@@ -1906,7 +1822,6 @@ fn handle_scope_grant_key(
 
 /// Resolve the pending scope-grant prompt: send the decision to the daemon (which
 /// resolves + persists for the next start — never the live session) and log it.
-#[cfg(feature = "tui")]
 fn resolve_scope_grant(
     state: &mut crate::state::AppState,
     decision: ahma_common::scope_grant::GrantDecision,
@@ -1953,7 +1868,6 @@ fn resolve_scope_grant(
     });
 }
 
-#[cfg(feature = "tui")]
 fn handle_web_approval_key(
     key: crossterm::event::KeyEvent,
     state: &mut crate::state::AppState,
@@ -1993,7 +1907,6 @@ fn handle_web_approval_key(
 /// Resolve the pending web-approval prompt: send the decision to the daemon (which
 /// applies it to the live session and, for `always`, persists it) and log it. The
 /// request that raised the prompt was already denied, so the user retries it.
-#[cfg(feature = "tui")]
 fn resolve_web_approval(
     state: &mut crate::state::AppState,
     decision: ahma_common::web_approval::WebApprovalDecision,
@@ -2042,7 +1955,6 @@ fn resolve_web_approval(
     });
 }
 
-#[cfg(feature = "tui")]
 fn handle_chat_input_key(
     key: crossterm::event::KeyEvent,
     state: &mut crate::state::AppState,
@@ -2121,7 +2033,6 @@ fn handle_chat_input_key(
     }
 }
 
-#[cfg(feature = "tui")]
 fn textarea_input_from_key_event(key: crossterm::event::KeyEvent) -> tui_textarea::Input {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -2152,7 +2063,6 @@ fn textarea_input_from_key_event(key: crossterm::event::KeyEvent) -> tui_textare
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_window_nav_commands(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if cmd == "/exit" || cmd == "/quit" {
         state.should_quit = true;
@@ -2176,7 +2086,6 @@ fn handle_window_nav_commands(cmd: &str, state: &mut crate::state::AppState) -> 
 }
 
 /// Dispatch a `/command` string from the navigator.
-#[cfg(feature = "tui")]
 fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
     let cmd = cmd.trim();
     if handle_window_nav_commands(cmd, state)
@@ -2210,7 +2119,6 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
 /// [args]` or plain `/<name> [args]` invokes one (SPEC R-SK8). Runs after
 /// every built-in handler so built-in commands always shadow same-named
 /// skills.
-#[cfg(feature = "tui")]
 fn handle_skills_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     let (head, rest) = split_first_token(cmd.trim_start_matches('/'));
 
@@ -2277,7 +2185,6 @@ fn split_first_token(s: &str) -> (&str, &str) {
 }
 
 /// Look up a user-invocable skill by name from the standard discovery roots.
-#[cfg(feature = "tui")]
 fn find_user_skill(
     state: &crate::state::AppState,
     name: &str,
@@ -2290,7 +2197,6 @@ fn find_user_skill(
 
 /// Post the `/skills` listing into the chat, disclosing skipped skill
 /// directories rather than hiding them.
-#[cfg(feature = "tui")]
 fn list_skills(state: &mut crate::state::AppState) {
     let workspace = std::path::Path::new(&state.workspace);
     let set = ahma_common::skills::discover_skills(workspace);
@@ -2309,7 +2215,6 @@ fn list_skills(state: &mut crate::state::AppState) {
 
 /// The "nothing found" body: name every directory that was searched, so an
 /// empty listing is diagnosable rather than mysterious.
-#[cfg(feature = "tui")]
 fn format_searched_roots(workspace: &std::path::Path) -> String {
     let mut msg = String::from("No Agent Skills found. Searched:\n");
     for root in ahma_common::skills::skill_roots(workspace) {
@@ -2318,7 +2223,6 @@ fn format_searched_roots(workspace: &std::path::Path) -> String {
     msg
 }
 
-#[cfg(feature = "tui")]
 fn format_discovered_skills(skills: &[ahma_common::skills::Skill]) -> String {
     let mut msg = String::from("Available Agent Skills — invoke with `/<name> [args]`:\n");
     for s in skills {
@@ -2334,7 +2238,6 @@ fn format_discovered_skills(skills: &[ahma_common::skills::Skill]) -> String {
 
 /// Inject the skill's SKILL.md instructions as the LLM payload for this turn
 /// while the pane displays the typed command (SPEC R-SK8).
-#[cfg(feature = "tui")]
 fn invoke_skill(
     state: &mut crate::state::AppState,
     skill: &ahma_common::skills::Skill,
@@ -2399,7 +2302,6 @@ fn compose_skill_prompt(skill: &ahma_common::skills::Skill, args: &str) -> Strin
 
 /// `/name` navigator entries for the user-invocable Agent Skills discovered
 /// from the standard roots.
-#[cfg(feature = "tui")]
 fn skill_nav_commands(state: &crate::state::AppState) -> Vec<crate::state::NavCommand> {
     ahma_common::skills::discover_skills(std::path::Path::new(&state.workspace))
         .skills
@@ -2417,7 +2319,6 @@ fn skill_nav_commands(state: &crate::state::AppState) -> Vec<crate::state::NavCo
 /// The choice is applied live and persisted to `settings.tools.minimize_tokens`
 /// so the daemon agent loop (which reads settings) and the next session both
 /// honour it. Default is off.
-#[cfg(feature = "tui")]
 fn handle_minimize_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     let Some(rest) = cmd.strip_prefix("/minimize") else {
         return false;
@@ -2449,7 +2350,6 @@ fn handle_minimize_nav_command(cmd: &str, state: &mut crate::state::AppState) ->
 
 /// Apply and persist the token-minimization preference. Updates the live session
 /// (`token_prefs` + the cached display flag) and writes `settings.toml`.
-#[cfg(feature = "tui")]
 fn set_minimize_tokens(state: &mut crate::state::AppState, desired: bool) {
     state.minimize_tokens = desired;
     state.token_prefs.minimize_tokens = Some(desired);
@@ -2471,7 +2371,6 @@ fn set_minimize_tokens(state: &mut crate::state::AppState, desired: bool) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
         "/help" | "/?" => state.modal = crate::state::ModalState::Help,
@@ -2511,7 +2410,6 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
     true
 }
 
-#[cfg(feature = "tui")]
 fn handle_settings_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if cmd != "/settings" {
         return false;
@@ -2525,7 +2423,6 @@ fn handle_settings_nav_command(cmd: &str, state: &mut crate::state::AppState) ->
 /// running operations — switch straight to the monitor task tree so the user
 /// sees what is being done on their behalf without pressing anything. Armed
 /// only until the first keystroke, and only fires while still in chat mode.
-#[cfg(feature = "tui")]
 fn maybe_auto_open_task_view(state: &mut crate::state::AppState) {
     use crate::state::OpStatus;
 
@@ -2551,7 +2448,6 @@ fn maybe_auto_open_task_view(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_mcp_list(state: &mut crate::state::AppState) {
     let servers = state.mcp_connections.list_servers();
     if servers.is_empty() {
@@ -2578,7 +2474,6 @@ fn handle_mcp_list(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_mcp_add_http(rest: &str, state: &mut crate::state::AppState) {
     let mut parts = rest.split_whitespace();
     let Some(url) = parts.next() else {
@@ -2601,7 +2496,6 @@ fn handle_mcp_add_http(rest: &str, state: &mut crate::state::AppState) {
     push_assistant_message(state, format!("Added HTTP MCP server `{name}` -> {url}"));
 }
 
-#[cfg(feature = "tui")]
 fn handle_mcp_add_stdio(rest: &str, state: &mut crate::state::AppState) {
     let mut parts = rest.split_whitespace().peekable();
     let Some(command) = parts.next() else {
@@ -2646,7 +2540,6 @@ fn handle_mcp_add_stdio(rest: &str, state: &mut crate::state::AppState) {
     );
 }
 
-#[cfg(feature = "tui")]
 fn handle_mcp_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if cmd == "/mcp on" {
         set_mcp_enabled(state, true);
@@ -2685,7 +2578,6 @@ fn handle_mcp_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool
     false
 }
 
-#[cfg(feature = "tui")]
 fn handle_mcp_refresh(state: &mut crate::state::AppState) {
     if let Some(tx) = &state.bridge_tx {
         crate::llm_bridge::spawn_external_tools_refresh(state.mcp_connections.clone(), tx.clone());
@@ -2698,7 +2590,6 @@ fn handle_mcp_refresh(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_mcp_remove(rest: &str, state: &mut crate::state::AppState) {
     let name = rest.trim();
     if name.is_empty() {
@@ -2712,7 +2603,6 @@ fn handle_mcp_remove(rest: &str, state: &mut crate::state::AppState) {
     push_assistant_message(state, format!("Removed MCP server `{name}`."));
 }
 
-#[cfg(feature = "tui")]
 fn set_mcp_enabled(state: &mut crate::state::AppState, enabled: bool) {
     state.mcp_enabled = enabled;
     let message = if enabled {
@@ -2724,7 +2614,6 @@ fn set_mcp_enabled(state: &mut crate::state::AppState, enabled: bool) {
     save_session(state);
 }
 
-#[cfg(feature = "tui")]
 fn handle_tools_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if cmd != "/tools" {
         return false;
@@ -2810,7 +2699,6 @@ fn handle_agent_delete(cwd: &std::path::Path, name: &str, state: &mut crate::sta
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_agent_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     let Ok(cwd) = std::env::current_dir() else {
         push_assistant_message(state, "Cannot resolve current working directory.");
@@ -2841,7 +2729,6 @@ fn handle_agent_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
 }
 
 /// Append one chat entry's markdown rendering to `md`.
-#[cfg(feature = "tui")]
 fn push_entry_markdown(md: &mut String, entry: &crate::state::ChatEntry) {
     match entry {
         crate::state::ChatEntry::User { text, .. } => {
@@ -2876,7 +2763,6 @@ fn push_entry_markdown(md: &mut String, entry: &crate::state::ChatEntry) {
 }
 
 /// Render the whole transcript as a markdown document.
-#[cfg(feature = "tui")]
 fn chat_to_markdown(chat: &crate::state::ChatHistory) -> String {
     let mut md = String::from("# ahma chat export\n\n");
     for entry in chat.entries() {
@@ -2885,7 +2771,6 @@ fn chat_to_markdown(chat: &crate::state::ChatHistory) -> String {
     md
 }
 
-#[cfg(feature = "tui")]
 fn handle_export_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if cmd != "/export markdown" {
         return false;
@@ -2911,7 +2796,6 @@ fn handle_export_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
     true
 }
 
-#[cfg(feature = "tui")]
 fn format_tools_list_message(tools: &[crate::mcp_connections::ToolInfo]) -> String {
     if tools.is_empty() {
         return "No tools discovered yet.".to_string();
@@ -2927,7 +2811,6 @@ fn format_tools_list_message(tools: &[crate::mcp_connections::ToolInfo]) -> Stri
     content.trim_end().to_string()
 }
 
-#[cfg(feature = "tui")]
 fn handle_approval_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
         "/approve" => resolve_approval(state, true),
@@ -2938,7 +2821,6 @@ fn handle_approval_nav_command(cmd: &str, state: &mut crate::state::AppState) ->
     true
 }
 
-#[cfg(feature = "tui")]
 fn handle_picker_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
         "/provider" => open_provider_picker(state),
@@ -2954,7 +2836,6 @@ fn handle_picker_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
 /// - `/provider add <name> <base_url> <model> [num_ctx] [api_key]`
 /// - `/provider numctx <tokens|off>` — set the context window for the *current*
 ///   provider (Ollama only; refused for providers that pin context).
-#[cfg(feature = "tui")]
 fn handle_provider_admin_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if let Some(rest) = cmd.strip_prefix("/provider add") {
         provider_add_command(rest.trim(), state);
@@ -2967,7 +2848,6 @@ fn handle_provider_admin_command(cmd: &str, state: &mut crate::state::AppState) 
     false
 }
 
-#[cfg(feature = "tui")]
 fn provider_add_command(args: &str, state: &mut crate::state::AppState) {
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.len() < 3 {
@@ -3035,7 +2915,6 @@ fn provider_add_command(args: &str, state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn provider_numctx_command(arg: &str, state: &mut crate::state::AppState) {
     let Some(name) = current_provider_name(state) else {
         push_assistant_message(
@@ -3084,7 +2963,6 @@ fn provider_numctx_command(arg: &str, state: &mut crate::state::AppState) {
 
 /// The name of the currently-selected provider, derived from the `llm_label`
 /// (`"Provider / Model"`); `None` if nothing is selected yet.
-#[cfg(feature = "tui")]
 fn current_provider_name(state: &crate::state::AppState) -> Option<String> {
     // `provider_name()` is `None` for a profile, so a profile alias can never
     // reach a caller that wants a registry provider.
@@ -3096,7 +2974,6 @@ fn current_provider_name(state: &crate::state::AppState) -> Option<String> {
         .map(str::to_string)
 }
 
-#[cfg(feature = "tui")]
 fn open_provider_picker(state: &mut crate::state::AppState) {
     use crate::state::PickerState;
 
@@ -3148,7 +3025,6 @@ fn open_provider_picker(state: &mut crate::state::AppState) {
     state.modal = crate::state::ModalState::ProviderPicker(picker);
 }
 
-#[cfg(feature = "tui")]
 fn open_model_picker(state: &mut crate::state::AppState) {
     use crate::llm_bridge::spawn_model_refresh;
     use crate::state::PickerState;
@@ -3191,7 +3067,6 @@ fn open_model_picker(state: &mut crate::state::AppState) {
     state.modal = crate::state::ModalState::ModelPicker(picker);
 }
 
-#[cfg(feature = "tui")]
 fn handle_run_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if !cmd.starts_with("/run ") {
         return false;
@@ -3201,7 +3076,6 @@ fn handle_run_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool
     true
 }
 
-#[cfg(feature = "tui")]
 fn run_nav_tool(rest: &str, state: &mut crate::state::AppState) {
     let (tool, arguments) = match parse_run_command(rest) {
         Ok(parsed) => parsed,
@@ -3268,7 +3142,6 @@ fn run_nav_tool(rest: &str, state: &mut crate::state::AppState) {
     );
 }
 
-#[cfg(feature = "tui")]
 fn validate_nav_tool_run(tool: &str, state: &crate::state::AppState) -> Result<(), String> {
     if state.mcp_http_base_url.is_empty() {
         return Err("Cannot run tools because the ahma MCP bridge URL is unavailable.".to_string());
@@ -3281,13 +3154,11 @@ fn validate_nav_tool_run(tool: &str, state: &crate::state::AppState) -> Result<(
     Ok(())
 }
 
-#[cfg(feature = "tui")]
 /// Read the user's persistent scope grants so the `/scope` panel can show
 /// which roots exist because the user granted them. Read-only: the write path
 /// stays with `ahma sandbox grant/revoke`, which gates every write behind the
 /// preview-and-approve exchange and the catastrophic-path denylist (SPEC
 /// R5.4.5) — machinery the TUI must not duplicate half-way.
-#[cfg(feature = "tui")]
 fn load_granted_scopes(state: &mut crate::state::AppState) {
     let settings = ahma_common::config::AhmaSettings::load();
     state.granted_scopes = settings
@@ -3310,7 +3181,6 @@ fn load_granted_scopes(state: &mut crate::state::AppState) {
 /// pane, and the warnings additionally into the chat transcript, which is the
 /// pane that is open by default. A warning the user has to run `/log` to
 /// discover is not much better than one in a file.
-#[cfg(feature = "tui")]
 fn drain_startup_notices(state: &mut crate::state::AppState) {
     use crate::startup_notices::Level;
 
@@ -3435,7 +3305,6 @@ fn save_session(state: &crate::state::AppState) {
 /// Persist the most-recently-selected provider/model to `~/.ahma/settings.toml`
 /// (the `[agent]` section). Empty values clear the field. Best-effort: a save
 /// failure is logged, never surfaced — the per-project session save is primary.
-#[cfg(feature = "tui")]
 fn persist_selected_model_to_settings(provider: &str, model: &str, provider_url: &Option<String>) {
     let mut settings = ahma_common::config::AhmaSettings::load();
     let to_opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
@@ -3459,7 +3328,6 @@ fn persist_selected_model_to_settings(provider: &str, model: &str, provider_url:
 
 // ─── Bridge event handler ─────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn virtual_provider_for_instance(label: &str) -> Option<ahma_llm_monitor::LocalProvider> {
     let normalized = label.to_lowercase();
     if normalized.contains("cursor") {
@@ -3512,7 +3380,6 @@ fn virtual_provider_for_instance(label: &str) -> Option<ahma_llm_monitor::LocalP
     }
 }
 
-#[cfg(feature = "tui")]
 fn rebuild_available_providers(state: &mut crate::state::AppState) {
     let mut combined = state.discovered_providers.clone();
     for inst in &state.active_instances {
@@ -3542,7 +3409,6 @@ fn rebuild_available_providers(state: &mut crate::state::AppState) {
     state.available_providers = combined;
 }
 
-#[cfg(feature = "tui")]
 fn handle_instances_updated(
     instances: Vec<ahma_common::daemon_hub::InstanceInfo>,
     state: &mut crate::state::AppState,
@@ -3551,7 +3417,6 @@ fn handle_instances_updated(
     rebuild_available_providers(state);
 }
 
-#[cfg(feature = "tui")]
 fn handle_providers_discovered(
     providers: Vec<ahma_llm_monitor::LocalProvider>,
     state: &mut crate::state::AppState,
@@ -3571,7 +3436,6 @@ fn handle_providers_discovered(
     }
 }
 
-#[cfg(feature = "tui")]
 fn auto_select_first_provider(
     state: &mut crate::state::AppState,
     provider: &ahma_llm_monitor::LocalProvider,
@@ -3586,7 +3450,6 @@ fn auto_select_first_provider(
     save_session(state);
 }
 
-#[cfg(feature = "tui")]
 fn refresh_current_provider_models(state: &mut crate::state::AppState, current_url: &str) {
     let Some(provider) = state
         .available_providers
@@ -3606,7 +3469,6 @@ fn refresh_current_provider_models(state: &mut crate::state::AppState, current_u
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_model_refreshed(
     base_url: String,
     models: Vec<String>,
@@ -3629,7 +3491,6 @@ fn handle_model_refreshed(
 /// Build the pending window that will execute one decomposed step. A step is
 /// either a shell command or an LLM call, and that single flag decides the
 /// label, the payload and whether a model is recorded.
-#[cfg(feature = "tui")]
 fn window_from_step(
     win_id: usize,
     step: &crate::llm_bridge::ParsedStep,
@@ -3679,7 +3540,6 @@ fn window_from_step(
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_decomposed_event(
     steps: Vec<crate::llm_bridge::ParsedStep>,
     state: &mut crate::state::AppState,
@@ -3698,7 +3558,6 @@ fn handle_decomposed_event(
     run_next_pending_window(state);
 }
 
-#[cfg(feature = "tui")]
 fn handle_window_output_event(window_id: usize, line: String, state: &mut crate::state::AppState) {
     if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
         if w.is_cli {
@@ -3712,7 +3571,6 @@ fn handle_window_output_event(window_id: usize, line: String, state: &mut crate:
 /// Appends `line` to `content`, splitting on embedded newlines so that each
 /// resulting segment becomes its own entry (continuing the last existing
 /// entry rather than starting a fresh one for the first segment).
-#[cfg(feature = "tui")]
 fn append_multiline_window_output(content: &mut Vec<crate::state::WindowLine>, line: &str) {
     use crate::state::LineKind;
     // Continue the previous line only when it is actually output; appending a
@@ -3729,7 +3587,6 @@ fn append_multiline_window_output(content: &mut Vec<crate::state::WindowLine>, l
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_window_finished_event(
     window_id: usize,
     success: bool,
@@ -3759,7 +3616,6 @@ fn handle_window_finished_event(
 
 /// Marks every still-`Pending` window as `Cancelled`, used to cascade a
 /// failure to windows that hadn't started running yet.
-#[cfg(feature = "tui")]
 fn cancel_pending_windows(state: &mut crate::state::AppState) {
     for w in &mut state.windows {
         if w.status == crate::state::WindowStatus::Pending {
@@ -3771,7 +3627,6 @@ fn cancel_pending_windows(state: &mut crate::state::AppState) {
 
 /// Merge freshly discovered external MCP tools into the active tools list,
 /// deduping by name and re-sorting, then notify the user in chat.
-#[cfg(feature = "tui")]
 fn handle_external_tools_refreshed(
     manager: crate::mcp_connections::McpConnectionManager,
     state: &mut crate::state::AppState,
@@ -3792,7 +3647,6 @@ fn handle_external_tools_refreshed(
 /// `AppState::request_approval`. Shared by the daemon-hub (`SourceEvent`)
 /// and in-process (`BridgeEvent`) approval-request paths, which differ only
 /// in whether a responder channel is present.
-#[cfg(feature = "tui")]
 fn request_tool_approval(
     state: &mut crate::state::AppState,
     id: String,
@@ -3815,7 +3669,6 @@ fn request_tool_approval(
     );
 }
 
-#[cfg(feature = "tui")]
 fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate::state::AppState) {
     use crate::llm_bridge::BridgeEvent;
     use crate::state::ChatEntry;
@@ -3949,7 +3802,6 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
     }
 }
 
-#[cfg(feature = "tui")]
 fn clean_up_summary(summary: &str) -> String {
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(summary) {
         if let Some(msg) = val.get("message").and_then(|v| v.as_str()) {
@@ -3999,7 +3851,6 @@ fn extract_args_summary(tool_name: &str, description: &str) -> Option<String> {
     }
 }
 
-#[cfg(feature = "tui")]
 fn format_friendly_start(op: &crate::state::Operation) -> String {
     let time_str = op.started_time.format("%H:%M:%S").to_string();
     // When the wire carried the real command it is already shown in the
@@ -4023,7 +3874,6 @@ fn format_friendly_start(op: &crate::state::Operation) -> String {
     }
 }
 
-#[cfg(feature = "tui")]
 fn format_friendly_end(op: &crate::state::Operation) -> String {
     // Via the shared identity mechanism (SPEC R24.7) rather than a local match:
     // the local one had a `_` arm that swallowed `Denied` and announced a
@@ -4055,7 +3905,6 @@ fn format_friendly_end(op: &crate::state::Operation) -> String {
 /// Build the full window content for an operation: friendly start line,
 /// live output tail (streamed as the command runs), and — once terminal —
 /// a separator plus a friendly result line.
-#[cfg(feature = "tui")]
 fn window_content_for(
     op: &crate::state::Operation,
     unicode: bool,
@@ -4088,7 +3937,6 @@ fn window_content_for(
     content
 }
 
-#[cfg(feature = "tui")]
 fn window_status_for(op: &crate::state::Operation) -> crate::state::WindowStatus {
     use crate::state::{OpStatus, WindowStatus};
     match op.status {
@@ -4102,7 +3950,6 @@ fn window_status_for(op: &crate::state::Operation) -> crate::state::WindowStatus
 
 /// Whether cards from several distinct instances currently interleave. With a
 /// single active instance the per-card instance suffix is pure repetition.
-#[cfg(feature = "tui")]
 fn has_multiple_instances(ops: &[crate::state::Operation]) -> bool {
     let distinct: std::collections::HashSet<&str> = ops
         .iter()
@@ -4114,7 +3961,6 @@ fn has_multiple_instances(ops: &[crate::state::Operation]) -> bool {
 /// The window label: the operation's human title (`display_name`, SPEC R24.7).
 /// The owning instance is appended only when more than one instance is active —
 /// in a single-instance session the suffix would repeat on every card.
-#[cfg(feature = "tui")]
 fn window_label_for(op: &crate::state::Operation, multi_instance: bool) -> String {
     let name = op.display_name();
     match (&op.instance_label, multi_instance) {
@@ -4123,7 +3969,6 @@ fn window_label_for(op: &crate::state::Operation, multi_instance: bool) -> Strin
     }
 }
 
-#[cfg(feature = "tui")]
 fn update_existing_window(
     w: &mut crate::state::TuiWindow,
     op: &crate::state::Operation,
@@ -4149,7 +3994,6 @@ fn update_existing_window(
     w.content = window_content_for(op, unicode);
 }
 
-#[cfg(feature = "tui")]
 fn build_new_window(
     op: &crate::state::Operation,
     state: &mut crate::state::AppState,
@@ -4207,7 +4051,6 @@ fn build_new_window(
     }
 }
 
-#[cfg(feature = "tui")]
 fn sync_operations_to_windows(state: &mut crate::state::AppState) {
     let mut to_add = Vec::new();
     // Moved out and put back rather than cloned: this runs on every operation
@@ -4243,7 +4086,6 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
 
 // ─── Source event handler ────────────────────────────────────────────────────
 
-#[cfg(feature = "tui")]
 fn handle_event_tools_list_updated(
     tools: Vec<crate::mcp_connections::ToolInfo>,
     state: &mut crate::state::AppState,
@@ -4258,7 +4100,6 @@ fn handle_event_tools_list_updated(
     state.tools_list = merged;
 }
 
-#[cfg(feature = "tui")]
 fn handle_event_log_files_updated(
     files: Vec<crate::state::LogFileInfo>,
     state: &mut crate::state::AppState,
@@ -4276,7 +4117,6 @@ fn handle_event_log_files_updated(
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_event_log_lines_updated(
     file: String,
     content: String,
@@ -4304,7 +4144,6 @@ fn handle_event_log_lines_updated(
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate::state::AppState) {
     use crate::mcp_source::SourceEvent;
     match event {
@@ -4377,7 +4216,6 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_source_sandbox_event(
     event: crate::mcp_source::SourceEvent,
     state: &mut crate::state::AppState,
@@ -4407,7 +4245,6 @@ fn handle_source_sandbox_event(
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_source_gate_event(
     event: crate::mcp_source::SourceEvent,
     state: &mut crate::state::AppState,
@@ -4443,7 +4280,6 @@ fn handle_source_gate_event(
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_source_chat_event(
     event: crate::mcp_source::SourceEvent,
     state: &mut crate::state::AppState,
@@ -4502,7 +4338,6 @@ fn handle_source_chat_event(
 
 /// Append one live output line to an operation's tail buffer and refresh the
 /// matching window incrementally — no full window rebuild, no polling delay.
-#[cfg(feature = "tui")]
 fn handle_operation_output(
     state: &mut crate::state::AppState,
     instance_id: Option<String>,
@@ -4551,17 +4386,6 @@ fn handle_operation_output(
 
 // ─── Text stub (no-tui builds) ────────────────────────────────────────────────
 
-#[cfg(not(feature = "tui"))]
-async fn run_text_stub(connection: &ResolvedConnection) -> Result<()> {
-    eprintln!(
-        "ahma tui: full TUI requires the `tui` feature (rebuild with --features tui).\n\
-         Server: {} [{}]",
-        connection.display_url,
-        connection.transport_label()
-    );
-    Ok(())
-}
-
 // ─── Utility ─────────────────────────────────────────────────────────────────
 
 /// Whether to draw box-drawing and status glyphs rather than ASCII fallbacks.
@@ -4602,7 +4426,6 @@ fn http_base_url(connection: &ResolvedConnection) -> String {
     }
 }
 
-#[cfg(feature = "tui")]
 fn run_next_pending_window(state: &mut crate::state::AppState) {
     if let Some(pos) = state
         .windows
@@ -4614,7 +4437,6 @@ fn run_next_pending_window(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
     use crate::llm_bridge::{spawn_window_cli_task, spawn_window_llm_task};
 
@@ -4653,7 +4475,6 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn close_window_by_id(win_id: usize, state: &mut crate::state::AppState) {
     if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
         if let Ok(mut guard) = w.abort_tx.try_lock()
@@ -4692,7 +4513,6 @@ fn parse_monitor_path_and_prompt(rest: &str) -> (String, String) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_log_file_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if !cmd.starts_with("/log file ") {
         return false;
@@ -4736,7 +4556,6 @@ fn handle_log_file_nav_command(cmd: &str, state: &mut crate::state::AppState) ->
     true
 }
 
-#[cfg(feature = "tui")]
 fn handle_analyze_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if cmd == "/analyze" {
         let op_id = state.selected_op().map(|op| op.id.clone());
@@ -4764,7 +4583,6 @@ fn handle_analyze_nav_command(cmd: &str, state: &mut crate::state::AppState) -> 
     false
 }
 
-#[cfg(feature = "tui")]
 fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
     let extracted = {
         let Some(op) = state.operations.iter().find(|o| o.id == op_id) else {
@@ -4854,14 +4672,11 @@ fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
     });
 }
 
-#[cfg(feature = "tui")]
-#[cfg(feature = "tui")]
 #[inline]
 fn inside_rect(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
-#[cfg(feature = "tui")]
 fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::state::AppState) {
     use crate::state::ClickTarget;
     match target {
@@ -4930,14 +4745,12 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
     }
 }
 
-#[cfg(feature = "tui")]
 enum WindowHit {
     Close(usize),
     Toggle(usize),
     Detail(usize),
 }
 
-#[cfg(feature = "tui")]
 fn find_window_rect_hit(
     col: u16,
     row: u16,
@@ -4957,7 +4770,6 @@ fn find_window_rect_hit(
     })
 }
 
-#[cfg(feature = "tui")]
 fn apply_window_hit(hit: Option<WindowHit>, state: &mut crate::state::AppState) -> bool {
     match hit {
         Some(WindowHit::Close(win_id)) => {
@@ -4990,7 +4802,6 @@ fn apply_window_hit(hit: Option<WindowHit>, state: &mut crate::state::AppState) 
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_window_rect_click(col: u16, row: u16, state: &mut crate::state::AppState) -> bool {
     let hit = find_window_rect_hit(col, row, &state.window_rects.borrow());
     apply_window_hit(hit, state)
@@ -4999,7 +4810,6 @@ fn handle_window_rect_click(col: u16, row: u16, state: &mut crate::state::AppSta
 /// The `[+] N` / `[-] N` marker at the left edge of a card's title row —
 /// clicking it toggles expand/collapse rather than drilling into the detail
 /// view. Collapsed cards are one row; expanded cards count only their top row.
-#[cfg(feature = "tui")]
 fn is_collapse_marker_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
     let on_title_row = if rect.height == 1 {
         true
@@ -5012,7 +4822,6 @@ fn is_collapse_marker_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> 
 /// Returns true when the click position falls on the close button area of a window.
 /// Single-height windows use their entire right edge; taller windows require
 /// the click to be on the title row.
-#[cfg(feature = "tui")]
 fn is_close_button_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
     // Wide enough for the explicit "[x99]" close cell plus its margin.
     let in_close_zone = col >= rect.x + rect.width.saturating_sub(6);
@@ -5023,7 +4832,6 @@ fn is_close_button_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> boo
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
     let click_targets = state.click_targets.borrow().clone();
     for (target, rect) in click_targets {
@@ -5054,7 +4862,6 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn scroll_overlay(up: bool, state: &mut crate::state::AppState) -> bool {
     let detail_max = state.detail_max_scroll.get();
     let overlay_scroll = match &mut state.modal {
@@ -5074,7 +4881,6 @@ fn scroll_overlay(up: bool, state: &mut crate::state::AppState) -> bool {
     }
 }
 
-#[cfg(feature = "tui")]
 fn scroll_chat(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) -> bool {
     let chat_area = state.chat_area.get();
     if inside_rect(col, row, chat_area) {
@@ -5091,7 +4897,6 @@ fn scroll_chat(col: u16, row: u16, up: bool, state: &mut crate::state::AppState)
     }
 }
 
-#[cfg(feature = "tui")]
 fn scroll_log(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
     let log_area = state.log_area.get();
     if inside_rect(col, row, log_area) {
@@ -5108,7 +4913,6 @@ fn scroll_log(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) 
     }
 }
 
-#[cfg(feature = "tui")]
 fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
     if scroll_overlay(up, state) || scroll_chat(col, row, up, state) {
         return;
@@ -5145,12 +4949,10 @@ fn determine_scrolled_panel(state: &crate::state::AppState) -> &'static str {
 }
 
 /// Compute the page size for a panel given its rendered height.
-#[cfg(feature = "tui")]
 fn page_size_for_height(height: u16) -> f64 {
     (if height > 2 { height - 2 } else { 10 }) as f64
 }
 
-#[cfg(feature = "tui")]
 fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
     // A full-screen detail overlay captures paging while open.
     if page_overlay_scroll(up, state) {
@@ -5166,7 +4968,6 @@ fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
 
 /// Pages a full-screen detail overlay's scroll offset, if one is open.
 /// Returns `false` (and does nothing) when no overlay is capturing paging.
-#[cfg(feature = "tui")]
 fn page_overlay_scroll(up: bool, state: &mut crate::state::AppState) -> bool {
     let detail_max = state.detail_max_scroll.get();
     let overlay_scroll = match &mut state.modal {
@@ -5187,7 +4988,6 @@ fn page_overlay_scroll(up: bool, state: &mut crate::state::AppState) -> bool {
 }
 
 /// Chat: up scrolls forward (higher offset), down scrolls back.
-#[cfg(feature = "tui")]
 fn page_chat_scroll(up: bool, state: &mut crate::state::AppState) {
     let page_size = page_size_for_height(state.chat_area.get().height);
     let max_scroll = state.chat_max_scroll.get() as f64;
@@ -5201,7 +5001,6 @@ fn page_chat_scroll(up: bool, state: &mut crate::state::AppState) {
 }
 
 /// Log: up scrolls back (lower offset), down scrolls forward.
-#[cfg(feature = "tui")]
 fn page_log_scroll(up: bool, state: &mut crate::state::AppState) {
     let page_size = page_size_for_height(state.log_area.get().height);
     let max_scroll = state.log_max_scroll.get() as f64;
@@ -5224,7 +5023,6 @@ fn page_log_scroll(up: bool, state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn update_scroll_animations(state: &mut crate::state::AppState) {
     // Clamp the animation against the live max so a resize that shrank the
     // content (recomputed in draw as chat_max_scroll) pulls a stale target/offset
@@ -5263,7 +5061,6 @@ fn update_scroll_animations(state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
 fn chat_in_progress(state: &crate::state::AppState) -> bool {
     state.liveness_state != crate::state::LivenessState::Idle
 }
