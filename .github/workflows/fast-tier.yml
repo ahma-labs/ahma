@@ -158,6 +158,18 @@ jobs:
         # zero hits.
         run: cargo nextest run --profile smoke --locked
 
+      # xtask has no coverage from any other invocation here -- it is outside
+      # `default-members`, so fmt/clippy/smoke all resolve past it. A break in
+      # `cargo xtask bump-version` would otherwise reach main unnoticed, which
+      # is exactly what this tier's header says must not happen. build.yml runs
+      # the same step on main and writes the objects, so this read-only tier
+      # hits them instead of compiling xtask cold on every PR. See the note
+      # there for why `-p` rather than `--workspace`.
+      - name: Cargo Clippy + Nextest (xtask)
+        run: |
+          cargo clippy -p xtask --all-targets --locked
+          cargo nextest run -p xtask --locked
+
       # nextest cannot run doctests, so every other test step in every tier can be
       # green while a documented example no longer compiles -- which is exactly how
       # ahma_mcp's headline "Initializing the Engine" example came to pass a stale

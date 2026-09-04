@@ -483,6 +483,24 @@ jobs:
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: cargo clippy --all-targets --locked
 
+      # xtask is not in `default-members`, so every other cargo invocation in this
+      # workflow resolves right past it: it has never been compiled or tested by
+      # CI, and its 21 tests have never run anywhere but a developer's machine.
+      # That matters because `cargo xtask bump-version` is the command that cuts
+      # every release. `-p` rather than `--workspace` on purpose: xtask is
+      # excluded from cargo-hakari, and check-dependency-graph.sh deliberately
+      # scopes the single-crypto-provider ban to `default-members` so xtask can
+      # keep `ring` for `ureq` -- a `--workspace` build would drag that into the
+      # product resolution. This leg writes to the sccache namespace, which is
+      # what lets the same step in fast-tier.yml (read-only) hit rather than
+      # compile ~51 crates cold on every PR.
+      - name: Cargo Clippy + Nextest (xtask)
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        timeout-minutes: 15
+        run: |
+          cargo clippy -p xtask --all-targets --locked
+          cargo nextest run -p xtask --locked
+
       - name: Cargo Clippy (no-default-features)
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: cargo clippy --all-targets --no-default-features --locked

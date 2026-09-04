@@ -28,6 +28,15 @@ SPEC, not here and not only in code.
   subset of tests, filter by name (`cargo nextest run -E 'test(livelog)'`) or by binary
   (`--test unit`), never by feature. The lean `--no-default-features` build is proven to
   compile by CI's clippy step, in check mode, which is all it needs.
+* **The one sanctioned `-p`: `xtask`.** It is not in `default-members`, so no ordinary
+  invocation reaches it — it had zero CI coverage until v0.20.2, and its tests had never
+  run outside a developer's machine, despite `cargo xtask bump-version` being the command
+  that cuts every release. It is also excluded from cargo-hakari on purpose (its `ureq`
+  wants `ring`, which `scripts/check-dependency-graph.sh` bans from the product graph), so
+  `--workspace` is the wrong tool. CI now runs `cargo clippy -p xtask --all-targets` and
+  `cargo nextest run -p xtask`. Don't make a habit of it locally: on a persistent `target/`
+  that invocation forks the dependency resolution and costs a parallel copy of ~45 shared
+  crates. On a fresh CI runner the cost is discarded.
 
 ```bash
 # Update stable toolchain
