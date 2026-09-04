@@ -3809,7 +3809,8 @@ fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
         let left_lines = format_help_rows(left_rows, 21, theme);
         let right_lines = format_help_rows(right_rows, 21, theme);
-        let total = left_lines.len().max(right_lines.len());
+        let total = wrapped_row_count(&left_lines, chunks[0].width)
+            .max(wrapped_row_count(&right_lines, chunks[2].width));
         let scroll = clamp_scroll(state.help_scroll, total, inner.height);
 
         let left_para = Paragraph::new(Text::from(left_lines))
@@ -3829,7 +3830,7 @@ fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         (total, scroll)
     } else {
         let lines = format_help_rows(single_rows, 24, theme);
-        let total = lines.len();
+        let total = wrapped_row_count(&lines, inner.width);
         let scroll = clamp_scroll(state.help_scroll, total, inner.height);
         let para = Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
@@ -3846,6 +3847,21 @@ fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         scroll as usize,
         inner,
     );
+}
+
+/// How many *visual* rows these lines occupy once wrapped to `width`.
+///
+/// The help panes render with `Wrap { trim: false }`, so a row longer than the
+/// pane becomes two or more rows on screen and the scroll offset counts those,
+/// not the logical lines. Clamping against the logical count therefore stopped
+/// scrolling early — by exactly the number of wrapped rows — and the tail of
+/// the narrow layout could not be reached at all: at 70 columns the final
+/// WINDOW ACTIONS section was simply unreachable, however far you scrolled.
+fn wrapped_row_count(lines: &[Line<'_>], width: u16) -> usize {
+    lines
+        .iter()
+        .map(|line| wrap_line_to_rows(line, width as usize).len().max(1))
+        .sum()
 }
 
 /// Clamp a requested scroll offset so the last row is the last thing shown —
@@ -4676,6 +4692,44 @@ mod tests {
 
         assert!(text.contains("Scope not reported"), "{text}");
         assert!(text.contains("still negotiating scope"), "{text}");
+    }
+
+    /// The narrow layout must actually *render* the row it was given, not just
+    /// carry it in the table.
+    ///
+    /// `both_help_layouts_document_the_same_rows` proves the row exists; this
+    /// proves a user at a narrow terminal can reach it. It is now the last row
+    /// of the last section, so it is only visible at maximum scroll — and the
+    /// existing tail test asserts a LOG-section string, which sits well before
+    /// the end in this layout.
+    #[test]
+    fn the_narrow_help_tail_row_is_reachable() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.help_scroll = u16::MAX; // clamped to the true maximum
+        let mut terminal = Terminal::new(TestBackend::new(70, 30)).unwrap();
+        terminal
+            .draw(|frame| draw_help(frame, &state, &theme, Rect::new(0, 0, 70, 30)))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        let last = super::HELP_SINGLE_ROWS
+            .last()
+            .expect("the narrow layout has rows");
+        assert!(
+            screen.contains(last.0),
+            "the final narrow-layout row `{}` must be reachable by scrolling:\n{screen}",
+            last.0
+        );
     }
 
     /// The help overlay is capped shorter than its content, so its tail — the

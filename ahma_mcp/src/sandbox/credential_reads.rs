@@ -29,7 +29,10 @@ static CREDENTIAL_READ_DENIES: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 /// matching the credential-deny-list pattern: in-process embedders and Test-mode
 /// sandboxes (which never emit a Seatbelt profile) are unaffected. On real
 /// startup it is set to the resolved `[sandbox] allow_keychain` value, which
-/// **defaults to `true`** — see [`super::seatbelt`] for the emitted rules.
+/// **defaults to `true`** — see the `sandbox::seatbelt` module for the emitted
+/// rules. (Named rather than linked: that module is `cfg(target_os = "macos")`,
+/// so an intra-doc link to it resolves on macOS and breaks the docs build on
+/// every other platform.)
 ///
 /// The macOS keychain is encrypted at rest, so denying file access to it protects
 /// only against offline theft of the encrypted database, not against secret

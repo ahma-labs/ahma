@@ -43,7 +43,7 @@ Baseline before any change, from a clean tree:
 ### 1. Feature flavours of the workspace crates
 
 `ahma_mcp` had a **no-op default feature `android = []`** used only as a CI test selector
-(`--features android`); `ahma_bin` defaults to `simplify`; `ahma_tui` to `tui`. CI's Linux leg
+(`--features android`); `ahma_bin` defaults to `simplify`; `ahma_tui` defaulted to `tui`, which has since been deleted for the same reason as `android` — it gated a configuration nothing ever compiled (#621). CI's Linux leg
 built three flavours in one job (`--no-default-features`, then `-p ahma_tui -p ahma_bin`
 with defaults, then `-p ahma_mcp --features simplify`), the macOS "android" leg a fourth, and
 AGENTS.md told developers to test quarantined features "directly with `-p`". Each flavour is a

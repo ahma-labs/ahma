@@ -231,6 +231,8 @@ If it prints any `⚠` line, surface it to the human and suggest `/ahmadev gitco
    cargo clippy --tests --allow-dirty --fix
    cargo fmt --all
    cargo nextest run
+   cargo test --doc                      # nextest cannot run doctests
+   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
    ```
 
 4. **Push, open the PR, and view it in the browser:**
@@ -346,6 +348,7 @@ attestation altogether. So a release = landing a version bump on `main`.
    ```
    Then follow **`/ahmadev land` steps 3–7 exactly**: `cargo clippy --allow-dirty --fix`,
    `cargo clippy --tests --allow-dirty --fix`, `cargo fmt --all`, `cargo nextest run`,
+   `cargo test --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items`,
    push, `gh pr create --fill --base main`, `gh pr view --web`,
    `gh pr merge --squash --auto --delete-branch`, `gh pr checks --watch`,
    then `git switch main && git pull --ff-only && git branch -D chore/release-<X.Y.Z>`.
@@ -648,6 +651,8 @@ yourself. The agent fan-out IS the work.
    ```bash
    cargo nextest run  # all tests in the workspace (or scope to touched crates)
    cargo fmt --all && cargo clippy --all-targets
+   cargo test --doc
+   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
    ```
 
 6. **Land via `/ahmadev land`.** PR title: `test: coverage batch — <area> (<N> files, +<M> lines)`.
@@ -1232,7 +1237,7 @@ non-blocking — at the cost of catching Windows/macOS/Android/full-suite breaks
 lands (fix out-of-band, never blocks the features that landed behind it).
 
 Three gates, cheapest first:
-1. **Local** (before push): `cargo clippy --allow-dirty --fix`, then `cargo clippy --tests --allow-dirty --fix`, then `cargo fmt --all`, then `cargo nextest run`.
+1. **Local** (before push): `cargo clippy --allow-dirty --fix`, then `cargo clippy --tests --allow-dirty --fix`, then `cargo fmt --all`, then `cargo nextest run`, then `cargo test --doc`, then `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items`. The last two are easy to skip and are exactly the two CI gates that catch what `nextest` structurally cannot — nextest does not run doctests, and a cached `cargo doc` prints nothing.
 2. **Fast Tier on the PR (~5 min) — the required merge gate.** `fast-tier.yml` runs on
    `pull_request`; `--auto` waits for it. A clean-room re-run of gate 1 (catches uncommitted
    files / stale `Cargo.lock` / dirty-tree bugs).

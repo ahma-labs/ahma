@@ -10,8 +10,8 @@ Status: Design document / Research report — core features implemented
 | `--minimize-tokens` / `--no-minimize-tokens` flags | implemented | `ahma_bin` → `ahma tui`; flag > deprecated env > settings |
 | `--small-model-harness` / `--no-small-model-harness` flags | implemented | same precedence chain |
 | `--context-length <tokens>` | implemented | drives per-tool-result and conversation character budgets (~4 chars/token) |
-| Per-tool-result truncation (head+tail with elision marker) | implemented | `ahma_tui/src/llm_bridge.rs` (`truncate_middle`, `tool_result_char_cap`) |
-| Conversation trimming (system prompt + latest messages preserved) | implemented | `ahma_tui/src/llm_bridge.rs` (`trim_conversation`) |
+| Per-tool-result truncation (head+tail with elision marker) | implemented | `ahma_core/src/agent.rs` (`truncate_middle`, `McpChatConfig::tool_result_char_cap`) |
+| Conversation trimming (system prompt + latest messages preserved) | implemented | `ahma_core/src/agent.rs` (`trim_conversation`, `McpChatConfig::conversation_char_budget`) |
 | Streaming line minimisation (server side) | implemented | `OutputOptimizer::process_streaming_line` in the adapter streaming path |
 | Full-output spill file (escape hatch from truncation) | implemented | `adapter::spill`; `output_file` advertised in results |
 | Remaining proposals in this document | design only | see sections below |

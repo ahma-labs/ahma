@@ -13,6 +13,12 @@ If your main goal is to use ahma with existing tools such as cargo, git, Python,
 ## Two rules to know before you start
 
 - **A workspace's `.ahma/` directory is not agent-writable.** It defines the commands ahma will itself run, so an agent that could write it could define a tool and then call it. Writes there are denied (SPEC R-HANDOFF.7); you author these files yourself.
+- **Twenty names are reserved.** They are the tools ahma answers itself
+  (`run_terminal_command`, `await`, `status`, `cancel`, `restart`,
+  `sandbox_grant`, the four `logs_*`, the six file tools, `fetch_webpage`,
+  `agent`, `todo_write`, `log_monitor`). A config that takes one is refused at
+  load with a message naming the conflict — see
+  [.ahma/README.md](../.ahma/README.md) for the full table.
 - **Changes are not picked up automatically.** ahma does not watch the tool-config directory — a watcher would turn writing a tool definition into *running* it with no user action in between. Reload with the explicit `restart` tool (or restart the server).
 
 ## Where to start

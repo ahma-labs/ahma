@@ -1,7 +1,9 @@
 # AGENTS.md
 
 How to work in this repo and project. **What** the product does and **why** lives in [SPEC.md](SPEC.md)
-(root) and each crate's own `SPEC.md`. If you need to state a product rule, it goes in a
+(root) and each crate's own `SPEC.md` — start a new one from
+[docs/templates/SPEC_TEMPLATE.md](docs/templates/SPEC_TEMPLATE.md), and a design
+plan from [docs/templates/PLAN_TEMPLATE.md](docs/templates/PLAN_TEMPLATE.md). If you need to state a product rule, it goes in a
 SPEC, not here and not only in code.
 
 > **A rule that binds one surface binds all of them.** If you write a constraint as a comment
@@ -55,7 +57,14 @@ Before you claim "all green" and stop work, run:
 2. `cargo clippy --all-targets` — verify zero warnings or errors.
 3. `cargo nextest run` — run all standard tests.
 4. `cargo nextest run --workspace --run-ignored all` — ignored tests here are expensive stress/regression coverage and latency guards (`latency_guard_test`), not dead weight; they are part of the required set.
-5. `cargo doc --no-deps` — verify docs build.
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` —
+   verify docs build *clean*. Both halves are load-bearing. Without
+   `-D warnings` rustdoc only warns and you will not notice; without
+   `--document-private-items` rustdoc never resolves intra-doc links on private
+   items, which is exactly where rot hides — a doc comment on a private fn
+   pointing at a type deleted in the same PR survived a whole release that way
+   (#620). Note a second local `cargo doc` run is *cached* and prints nothing,
+   so a clean re-run proves nothing; CI runs it from scratch.
 6. `cargo test --doc` — verify the examples in docs still *compile*. This is a
    separate step because nextest cannot run doctests, so the entire suite and all
    of CI can be green while a `rust` example no longer builds. That is not
@@ -242,16 +251,16 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 
 When modifying code or discovering issues:
 1. Update the "Quick Status" table in [SPEC.md](SPEC.md).
-2. Add to "Known Issues" if new bugs are discovered.
-3. Update feature tables with status changes.
-4. **BEFORE stopping work:** run `cargo fmt --all && cargo clippy --all-targets && cargo nextest run`.
-   If you edited a dependency list, also `cargo hakari generate && cargo hakari manage-deps`.
-5. `skills/ahma/SKILL.md` is a **living document** — update it in the same PR/commit whenever
-   you change: CLI flags or subcommands (`ahma_mcp/src/shell/cli.rs`), environment variables
-   (`ahma_mcp/src/config/`), tool bundle names or contents
-   (`ahma_mcp/src/mcp_service/bundle_registry.rs`), built-in tool signatures
-   (`run_terminal_command`, `status`, `await`, `cancel`), connection modes or HTTP endpoints
-   (`ahma_http_bridge/`), sandbox scope semantics (`ahma_core/src/sandbox/`), or live-log
+2. Update feature tables with status changes.
+3. **BEFORE stopping work:** run the full Definition of Done above — not just
+   `fmt`/`clippy`/`nextest`. The doc, doctest and ignored-test steps each exist
+   because something shipped broken without them.
+4. `skills/ahma/SKILL.md` is a **living document** — update it in the same PR/commit whenever
+   you change: CLI flags or subcommands (`ahma_mcp/src/shell/cli/`), environment variables
+   (`ahma_mcp/src/config.rs`), tool bundle names or contents
+   (`ahma_mcp/src/mcp_service/bundle_registry.rs`), the built-in tool set
+   (`ahma_mcp/src/builtin_tool.rs`), connection modes or HTTP endpoints
+   (`ahma_http_bridge/`), sandbox scope semantics (`ahma_mcp/src/sandbox/`), or live-log
    monitoring configuration.
 
 ---

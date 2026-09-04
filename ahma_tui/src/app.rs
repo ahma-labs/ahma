@@ -1,8 +1,7 @@
 //! Ratatui event loop and action dispatcher.
 //!
-//! With `--features tui` (the default), [`run`] launches the full ratatui
-//! terminal UI.  Without it, a minimal text stub prints a single status line
-//! and exits — no heartbeat spam.
+//! [`run`] launches the ratatui terminal UI and restores the terminal on the
+//! way out, including on panic.
 
 use anyhow::Result;
 use tracing::debug;

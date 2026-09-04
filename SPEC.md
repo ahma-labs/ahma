@@ -12,7 +12,7 @@
 | Unified Operation Event Stream | tests-pass | Single `OperationEvent` stream (`ahma_common::event_dispatcher`); `OperationMonitor` is the sole lifecycle emitter; subscribers: MCP progress push, daemon hub, vault audit, TUI |
 | Output Spill Files | tests-pass | Complete per-operation output at `<log dir>/operations/<id>.log`; advertised as `output_file` in results; retention-cleaned |
 | Small-Model Context Harness | tests-pass | `ahma tui` budgets tool results + trims conversation for limited-context local models; `--context-length`, `--small-model-harness`/`--no-small-model-harness` |
-| Feature-Gated Incubating Crates | tests-pass | `simplify` (code-complexity analysis) is its own crate, `ahma_simplify`, linked into the `ahma` binary by `ahma_bin`'s `simplify` cargo feature (on by default; `--no-default-features` drops it and the subcommand then fails with a clear error). `ahma_mcp` carries exactly one cargo feature, `otel` (see the row below), and no others. `full` is an alias for `simplify` plus `otel`. vault, decompose, worker, and renewal were fully removed as crates, not feature-gated (see "Removed" below) |
+| Feature-Gated Incubating Crates | tests-pass | `simplify` (code-complexity analysis) is its own crate, `ahma_simplify`, linked into the `ahma` binary by `ahma_bin`'s `simplify` cargo feature (on by default; `--no-default-features` drops it and the subcommand then fails with a clear error). `ahma_mcp` carries exactly one cargo feature, `otel` (see the row below), and no others; `ahma_tui` carries none — its `tui` feature was deleted in v0.20.1 because it gated a configuration nothing ever compiled (`--no-default-features` on that crate produced 184 errors, and `ahma_bin`'s dependency edge re-enabled the feature anyway, so no build ever exercised it). `full` is an alias for `simplify` plus `otel`. vault, decompose, worker, and renewal were fully removed as crates, not feature-gated (see "Removed" below) |
 | OpenTelemetry Export (`otel` feature) | tests-pass | `ahma_common`'s `otel` cargo feature gates the OTLP SDK subtree (`opentelemetry*`/`tracing-opentelemetry`, ~200 crates); off by default, forwarded through `ahma_mcp/otel` and `ahma_http_bridge/otel`, `ahma_bin --features otel` (part of `full`). `ahma_common::observability` keeps the same public API either way — without it, `create_otel_layer`/`current_traceparent`/`record_*` are hard no-ops regardless of `--opentelemetry <url>` or `OTEL_*` env vars. CI builds, clippies, and tests the `otel` flavour separately (Linux leg only) and release binaries ship it |
 | Latency Regression Guards | tests-pass | Ignored benchmarks guard end-to-end dispatch latency and per-line streaming cost (`latency_guard_test`) |
 | Linux Sandbox (Landlock) | tests-pass | Kernel-level FS sandboxing on Linux 5.13+ |
@@ -205,6 +205,25 @@ All operation lifecycle data flows through ONE broadcast stream of
 - **R1.5.4**: The `instructions` field in the MCP `initialize` response contains sandbox routing directives instructing the model to use `run_terminal_command` for all command execution.
 - **R1.5.5**: [REMOVED]
 - **R1.5.6**: [REMOVED]
+
+### R1.5: Built-in Tool Names Are Reserved
+
+* **R1.5.1**: The tools ahma implements itself are declared once
+  (`ahma_mcp/src/builtin_tool.rs`). The protocol dispatch, the client-visibility
+  filter, the harness-guard name healer and the config validator all read that
+  one declaration, and the dispatch match is exhaustive over it — a built-in
+  that is declared but not dispatched fails to compile rather than returning
+  "tool not found".
+* **R1.5.2**: A configured tool **must** be refused at load if its name is one
+  of them, with an error naming the conflict and the file to rename. Silently
+  loading it and then filtering it out of `tools/list` is not acceptable: the
+  user gets neither the tool nor a reason. (This was the behaviour for five of
+  the twenty names until v0.20.1, because the validator's list had drifted from
+  the dispatch table.)
+* **R1.5.3**: Adding a built-in **must** force an explicit answer to whether it
+  is exempt from the sandbox-ready gate (R5.1.2), whether ahma's own agent loop
+  may call it, and whether it is a harness file tool withheld from clients with
+  native equivalents. These are exhaustive matches, not membership lists.
 
 ### R2: Async-First Architecture
 

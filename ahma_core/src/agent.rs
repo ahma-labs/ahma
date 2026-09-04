@@ -265,7 +265,7 @@ pub fn trim_conversation(msg_json: &mut Vec<serde_json::Value>, budget: usize) {
 }
 
 /// Proactively compact the conversation when real reported usage crosses the
-/// context strategy's [`ContextStrategy::compaction_threshold`] — replacing
+/// config's [`McpChatConfig::compaction_threshold`] — replacing
 /// the oldest non-recent history with a structured summary *before* the model
 /// ever runs out of room, rather than reacting after the fact
 /// ([`trim_conversation`]'s hard-drop, which remains the safety net if this

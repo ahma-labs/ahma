@@ -7,12 +7,32 @@ This directory contains tool configuration files for the Ahma server (ahma). The
 AHMA has a three-tier tool model:
 
 ### 1. Core Built-in Tools (always available, no configuration needed)
-- **run_terminal_command** — Execute shell commands in the security sandbox
-- **await** — Wait for async operations to complete
-- **status** — Query operation status without blocking
-- **cancel** — Cancel running operations
 
-These are implemented directly in Rust and cannot be overridden by JSON configurations. Their names are reserved.
+Implemented directly in Rust. **All twenty names below are reserved**: a tool
+config that takes one is refused at load, naming the conflict and asking you to
+rename. (Before v0.20.1 only fifteen were on the reserved list, so a config
+named `sandbox_grant`, `agent`, `todo_write`, `log_monitor` or `logs_approve`
+loaded without complaint and was then silently dropped from `tools/list` — no
+error, no tool. It is now refused properly.)
+
+| Tool | What it does |
+|---|---|
+| `run_terminal_command` | Execute shell commands in the security sandbox |
+| `await` | Block until an async operation completes |
+| `status` | Query operation status without blocking |
+| `cancel` | Cancel running operations |
+| `restart` | Reload tool configs by replacing the server process |
+| `sandbox_grant` | Ask the user to widen the sandbox scope |
+| `logs_list` / `logs_read` / `logs_search` / `logs_approve` | Inspect and approve access to the project log directory |
+| `read_file` / `write_file` / `replace_in_file` / `list_dir` / `file_search` / `grep_search` | Harness file tools — withheld from clients that ship native equivalents |
+| `fetch_webpage` | Fetch a URL through the egress sandbox |
+| `agent` | Run a sub-agent task |
+| `todo_write` | Record a task list |
+| `log_monitor` | Start LLM-backed live log monitoring |
+
+The list is generated from one place in the source (`BuiltinTool::ALL` in
+`ahma_mcp/src/builtin_tool.rs`), so it cannot drift from what the server
+actually answers.
 
 ### 2. Bundled Tool Configs (opt-in via the `--tools` flag)
 Standard tool configurations are compiled into the `ahma` binary. They are only offered to MCP clients when explicitly enabled via `--tools <bundle>` (repeat or comma-separate):

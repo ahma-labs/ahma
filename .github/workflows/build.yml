@@ -525,9 +525,18 @@ jobs:
             -p ahma_common -p ahma_mcp -p ahma_http_bridge \
             -E 'not (test(kotlin) or test(android))'
 
+      # `-D warnings` and `--document-private-items` together, because neither is
+      # enough alone. Without `-D warnings` rustdoc only warns and the job stays
+      # green; without `--document-private-items` rustdoc never resolves links on
+      # private items, which is exactly where the rot was found -- a doc comment on
+      # a private fn pointing at a type deleted in the same PR (#620) went
+      # unnoticed through a full release. Locally a second `cargo doc` run is
+      # cached and prints nothing, so this step is the only place it is checked.
       - name: Cargo Doc
         if: runner.os == 'Linux' && runner.arch == 'X64'
-        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --document-private-items
 
       - name: Upload documentation
         if: runner.os == 'Linux' && runner.arch == 'X64'

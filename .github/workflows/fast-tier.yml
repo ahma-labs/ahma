@@ -178,6 +178,14 @@ jobs:
       - name: Cargo Test (doc examples)
         run: cargo test --doc --locked
 
+      # Doc warnings are a merge gate, not a post-merge discovery. `-D warnings`
+      # with `--document-private-items`: rustdoc skips private items by default,
+      # and that is where intra-doc links rot unseen (see build.yml's note).
+      - name: Cargo Doc (warnings denied)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --document-private-items --locked
+
       # Verifies the backend and the hit rate, but cannot fail on "misses without writes": this
       # tier is READ_ONLY, so writing nothing is the intended behaviour, and the action skips
       # that particular assertion when it sees SCCACHE_GHA_RW_MODE=READ_ONLY.

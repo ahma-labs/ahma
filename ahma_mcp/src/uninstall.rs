@@ -471,7 +471,8 @@ fn uninstall_agent_skills(dry_run: bool, interactive: bool) -> Result<()> {
 }
 
 /// Remove one Ahma-managed directory tree, honouring `dry_run` and reporting it when
-/// `interactive`. `what` names the tree in the success line ("Removed <what> <path>").
+/// `interactive`. `what` names the tree in the success line ("Removed `<what>`
+/// `<path>`").
 ///
 /// Shared by every directory teardown here so the exists / dry-run / report sequence
 /// reads as three guard clauses in one place rather than once per call site.
