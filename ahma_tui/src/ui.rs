@@ -629,7 +629,35 @@ fn operation_detail_lines(
             theme.op_status_style(&op.status),
         )));
     }
+
+    // Identity is the footnote, work is the headline (SPEC R24.8.6): who ran
+    // this, and on what connection, belongs here rather than on a header line
+    // that has to say what is happening.
+    if let Some(footnote) = operation_identity_footnote(op) {
+        lines.push(Line::from(Span::styled(footnote, theme.dim())));
+    }
     lines
+}
+
+/// `via claude-code · pid 4242 · …/github/ahma` — connection debugging, kept
+/// out of the way of the work (SPEC R24.8.6).
+fn operation_identity_footnote(op: &crate::state::Operation) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(origin) = op.origin.as_deref().filter(|o| !o.is_empty()) {
+        parts.push(format!("via {origin}"));
+    } else if let Some(label) = op.instance_label.as_deref().filter(|l| !l.is_empty()) {
+        parts.push(format!("via {label}"));
+    }
+    if let Some(pid) = op.pid {
+        parts.push(format!("pid {pid}"));
+    }
+    if let Some(scope) = op.scope.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(crate::task_tree::short_path(scope));
+    }
+    if op.partial {
+        parts.push("start record not seen".to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Line<'static>> {
@@ -640,13 +668,16 @@ fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Li
         ])
     };
 
-    let mut lines = vec![kv("id", op.id.clone(), theme.normal())];
-    if let Some(instance) = &op.instance_label {
-        lines.push(kv("instance", instance.clone(), theme.normal()));
-    }
-    if let Some(origin) = &op.origin {
-        lines.push(kv("origin", origin.clone(), theme.normal()));
-    }
+    // The work is the headline (SPEC R24.8.6): what ran, first and in full.
+    // This pane used to open with the operation's id and the instance label —
+    // the two things a reader already knows and least needs.
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{} ", op.status.glyph(true)),
+            theme.op_status_style(&op.status),
+        ),
+        Span::styled(op.display_name(), theme.title()),
+    ])];
     let status = match op.exit_code {
         Some(code) => format!("{:?} (exit {code})", op.status),
         None => format!("{:?}", op.status),
@@ -667,9 +698,6 @@ fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Li
     lines.push(kv("duration", op.elapsed_display(), theme.normal()));
     if let Some(cwd) = &op.cwd {
         lines.push(kv("cwd", cwd.clone(), theme.normal()));
-    }
-    if let Some(pid) = op.pid {
-        lines.push(kv("pid", pid.to_string(), theme.normal()));
     }
     if let Some(cmd) = &op.command {
         // The full command, wrapped by the Paragraph — shown in full, this is
@@ -4504,6 +4532,57 @@ mod tests {
     /// A tree taller than its pane scrolls silently unless it says so. The
     /// selected row is kept in view automatically, so without a bar there is no
     /// cue at all that rows exist above or below.
+    #[test]
+    fn the_detail_overlay_carries_the_identity_footnote() {
+        let mut op = crate::state::Operation::new(
+            "op-1",
+            "run_terminal_command",
+            crate::state::OpStatus::Succeeded,
+        );
+        op.title = Some("cargo build".into());
+        op.origin = Some("claude-code".into());
+        op.pid = Some(4242);
+        op.scope = Some("/Users/dev/github/ahma".into());
+
+        let theme = Theme::new(true);
+        let text: String = operation_detail_lines(&op, &theme, 60)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            text.contains("via claude-code"),
+            "who ran it belongs in the detail view: {text}"
+        );
+        assert!(text.contains("pid 4242"), "{text}");
+        assert!(
+            text.contains("cargo build"),
+            "and the work is still the headline: {text}"
+        );
+
+        // An operation reconstructed from its terminal event says so, rather
+        // than presenting its blanks as fact.
+        let mut partial = op.clone();
+        partial.partial = true;
+        let text: String = operation_detail_lines(&partial, &theme, 60)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("start record not seen"), "{text}");
+    }
+
     #[test]
     fn task_tree_shows_a_scrollbar_only_when_it_overflows() {
         use ratatui::Terminal;
