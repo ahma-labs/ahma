@@ -86,7 +86,15 @@ pub fn history_path() -> Option<PathBuf> {
             crate::test_isolation::test_run_discriminator()
         )));
     }
-    crate::config::ahma_home_dir().map(|home| home.join(".ahma").join("history.jsonl"))
+    crate::daemon_hub::runtime_dir().map(|dir| live_history_path(&dir))
+}
+
+/// The history file inside a given runtime directory.
+///
+/// Split out so the path rule is one expression that a test can exercise
+/// without a runtime directory of the machine's choosing.
+fn live_history_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("history.jsonl")
 }
 
 /// The rotated predecessor of `path`.
@@ -414,6 +422,26 @@ mod tests {
             mode, 0o600,
             "history names every command run on the user's behalf"
         );
+    }
+
+    /// The history belongs beside the sockets, in the directory whose
+    /// ownership and mode the daemon actually checks.
+    ///
+    /// It used to resolve to `~/.ahma` unconditionally while the sockets
+    /// resolved to `$XDG_RUNTIME_DIR/ahma`. On any Linux desktop — where that
+    /// variable is set — that split the daemon's state across two directories
+    /// and, worse, put the record of every command every client ran into the
+    /// one of the two that `verify_runtime_dir_secure` never examines. The
+    /// 0700-and-owned guarantee is made about the runtime directory; the file
+    /// has to live inside it to inherit it.
+    #[test]
+    fn the_history_lives_beside_the_sockets() {
+        // Under the harness both resolve privately, so compare the shapes the
+        // production arm produces instead.
+        let dir = tempfile::tempdir().unwrap();
+        let live = live_history_path(dir.path());
+        assert_eq!(live.parent(), Some(dir.path()), "{}", live.display());
+        assert_eq!(live.file_name().unwrap(), "history.jsonl");
     }
 
     #[test]

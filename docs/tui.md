@@ -66,7 +66,8 @@ takes over.
   established its scope yet reads *no scope yet* rather than disappearing.
 - **Recent work survives.** Finished work stays for an hour — including work
   from a session that has since closed, and from a daemon that has since exited,
-  because the daemon writes a bounded history to `~/.ahma/history.jsonl`. An
+  because the daemon writes a bounded history beside its sockets, in the
+  per-user runtime directory. An
   operation that was still running when its daemon went away is shown
   `interrupted`, not failed: nobody established that it failed.
 

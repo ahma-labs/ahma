@@ -1487,7 +1487,12 @@ These three mechanisms together bound how long any abandoned `ahma serve stdio` 
   is an instance for the length of one command, so dropping it on disconnect
   made hooked work invisible by construction — and the instance stays listed
   with `ended_epoch_ms` so its operations have a section to belong to.
-  - On disk: `~/.ahma/history.jsonl` (`0600`), one record per operation edge,
+  - On disk: `history.jsonl` (`0600`) **in the R-DAEMON.2 runtime directory,
+    beside the sockets** — the one directory whose ownership and mode the
+    daemon verifies. It named every command every client ran and used to
+    resolve to `~/.ahma` unconditionally, which on any Linux desktop (where
+    `XDG_RUNTIME_DIR` is set) put it in the one of the two directories that is
+    never checked. One record per operation edge,
     the output window written once at completion, rotated by rename at 8 MiB
     keeping one predecessor. The last hour is replayed at start. A torn final
     line — the normal result of a crash mid-write — and a record from a newer
