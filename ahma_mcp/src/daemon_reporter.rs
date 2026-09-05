@@ -184,14 +184,75 @@ pub fn spawn_reporter(
     label: impl Into<String> + Send + 'static,
     grant: Option<GrantReporting>,
     web: Option<WebApprovalReporting>,
-) {
+) -> ReporterHandle {
     let mode = mode.into();
     let scope = scope.into();
     let label = label.into();
+    let (finished_tx, finished_rx) = tokio::sync::watch::channel(None);
 
     tokio::spawn(async move {
-        run_reporter_loop(monitor, mode, scope, label, grant, web).await;
+        run_reporter_loop(monitor, mode, scope, label, grant, web, finished_tx).await;
     });
+    ReporterHandle { finished_rx }
+}
+
+/// A handle for a caller that must not exit before its work has been reported.
+///
+/// A long-lived server never needs this: it outlives its operations. A hooked
+/// command does — it *is* one operation, and it exits the moment that command
+/// ends, so without waiting the terminal event races process teardown and the
+/// work never appears anywhere (SPEC R-DAEMON.8).
+pub struct ReporterHandle {
+    finished_rx: tokio::sync::watch::Receiver<Option<String>>,
+}
+
+impl ReporterHandle {
+    /// Wait until *any* terminal event has been written to the hub, or `budget`
+    /// elapses. For a process that runs exactly one operation — a hooked
+    /// command — the first one is its own.
+    pub async fn wait_for_any_finished(&mut self, budget: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if self.finished_rx.borrow().is_some() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, self.finished_rx.changed())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    /// Wait until `op_id`'s terminal event has actually been written to the
+    /// hub, or `budget` elapses.
+    ///
+    /// Bounded on purpose, and short: reporting is an observability nicety, and
+    /// a user's hooked command must never be held up by a daemon that is slow,
+    /// absent, or wedged. Returns whether the event made it.
+    pub async fn wait_for_finished(&mut self, op_id: &str, budget: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if self.finished_rx.borrow().as_deref() == Some(op_id) {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, self.finished_rx.changed())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
 }
 
 /// Await the next grant request, or pend forever when there is no receiver — the
@@ -275,6 +336,7 @@ fn next_backoff_secs(current: u64) -> u64 {
 }
 
 /// Main reporter loop.  Runs until the process exits.
+#[allow(clippy::too_many_arguments)]
 async fn run_reporter_loop(
     monitor: Arc<OperationMonitor>,
     mode: String,
@@ -282,6 +344,7 @@ async fn run_reporter_loop(
     label: String,
     grant: Option<GrantReporting>,
     web: Option<WebApprovalReporting>,
+    finished_tx: tokio::sync::watch::Sender<Option<String>>,
 ) {
     let pid = std::process::id();
     let mut backoff_secs: u64 = 1;
@@ -385,11 +448,20 @@ async fn run_reporter_loop(
                             let Some(payload) = daemon_event_for(&event, &scope, &origin) else {
                                 continue;
                             };
+                            // Note the terminal event *after* it is on the wire,
+                            // so a caller waiting for its own operation waits for
+                            // the send, not for the intent to send.
+                            let finished_id = match &payload {
+                                DaemonEvent::OpFinished { id, .. } => Some(id.clone()),
+                                _ => None,
+                            };
                             let client_msg = ClientMsg::Event { payload };
 
                             if let Err(e) = send_msg(&mut writer, &client_msg).await {
                                 debug!("daemon_reporter: send failed ({e}), reconnecting");
                                 closed = true;
+                            } else if let Some(id) = finished_id {
+                                let _ = finished_tx.send(Some(id));
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1779,6 +1851,54 @@ mod tests {
         }
     }
 
+    /// A hooked command must not be held up by observability.
+    ///
+    /// The whole point of the flush budget is that it is bounded: with no
+    /// daemon listening, waiting costs the budget and no more, and the command's
+    /// own result is unaffected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_a_report_gives_up_within_its_budget() {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let mut handle = ReporterHandle { finished_rx: rx };
+
+        let budget = Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let flushed = handle.wait_for_any_finished(budget).await;
+        let waited = started.elapsed();
+
+        assert!(
+            !flushed,
+            "nothing was reported, and that is reported honestly"
+        );
+        assert!(
+            waited >= budget,
+            "it waits for its budget before giving up: {waited:?}"
+        );
+        assert!(
+            waited < budget * 8,
+            "and no longer: a user's command must not wait on a missing daemon ({waited:?})"
+        );
+    }
+
+    /// ...and when the event does land, the wait ends at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_a_report_returns_as_soon_as_it_lands() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let mut handle = ReporterHandle { finished_rx: rx };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(Some("op-1".to_string()));
+        });
+
+        assert!(
+            handle
+                .wait_for_finished("op-1", TestTimeouts::scale_secs(5))
+                .await,
+            "the wait ends on the event, not on the timeout"
+        );
+    }
+
     /// The scope an instance advertises must be the one it actually locked.
     ///
     /// Registration happens at process start, before `roots/list` has been
@@ -1814,6 +1934,7 @@ mod tests {
             "ahma".to_string(),
             None,
             None,
+            tokio::sync::watch::channel(None).0,
         ));
 
         let (_r1, _w1, first) = accept_register(&listener).await;
@@ -1933,6 +2054,7 @@ mod tests {
             "VSCode".to_string(),
             Some(grant),
             None,
+            tokio::sync::watch::channel(None).0,
         ));
 
         // ── Register + replay ────────────────────────────────────────────────────
