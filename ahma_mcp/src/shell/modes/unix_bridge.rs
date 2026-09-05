@@ -93,6 +93,8 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         bound_port_tx: None,
         // Explicitly started bridge: it owns its process (SPEC R-DAEMON.1).
         exit: None,
+        // Session options are a daemon feature (SPEC R-DAEMON.4).
+        session_options: None,
     };
 
     start_bridge(bridge_config).await?;

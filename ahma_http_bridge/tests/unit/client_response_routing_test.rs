@@ -19,6 +19,7 @@ struct FakePeerFactory {
 impl ahma_common::peer_factory::PeerFactory for FakePeerFactory {
     fn create(
         &self,
+        _options: ahma_common::peer_factory::PeerSpawnOptions,
     ) -> ahma_common::peer_factory::BoxFuture<anyhow::Result<ahma_common::peer_factory::PeerStreams>>
     {
         let behavior = self.behavior;

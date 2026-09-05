@@ -585,17 +585,39 @@ pub async fn run_proxy_client(
     http_url: Option<&str>,
     respawn_bridge: Option<BridgeRespawnFn>,
 ) -> Result<bool> {
+    run_proxy_client_with_options(uds_path, http_url, respawn_bridge, "").await
+}
+
+/// As [`run_proxy_client`], carrying this client's per-session options in the
+/// MCP URL's query so the daemon can apply them to this session's worker and no
+/// other (SPEC R-DAEMON.4).
+pub async fn run_proxy_client_with_options(
+    uds_path: Option<&str>,
+    http_url: Option<&str>,
+    respawn_bridge: Option<BridgeRespawnFn>,
+    session_query: &str,
+) -> Result<bool> {
     let handshake_deadline = frontend_handshake_deadline();
+    let mcp_uri = if session_query.is_empty() {
+        "http://localhost/mcp".to_string()
+    } else {
+        format!("http://localhost/mcp?{session_query}")
+    };
 
     #[cfg(unix)]
     if let Some(path) = uds_path {
         tracing::info!(socket = path, "Proxying stdio to Unix Domain Socket");
-        return run_proxy_client_unix(path, handshake_deadline, respawn_bridge).await;
+        return run_proxy_client_unix(path, &mcp_uri, handshake_deadline, respawn_bridge).await;
     }
 
     if let Some(url) = http_url {
         tracing::info!(url = url, "Proxying stdio to HTTP server");
-        return run_proxy_client_http(url, handshake_deadline).await;
+        let url = if session_query.is_empty() {
+            url.to_string()
+        } else {
+            format!("{}?{session_query}", url.trim_end_matches('/'))
+        };
+        return run_proxy_client_http(&url, handshake_deadline).await;
     }
 
     #[cfg(not(unix))]
@@ -607,22 +629,19 @@ pub async fn run_proxy_client(
 #[cfg(unix)]
 async fn run_proxy_client_unix(
     socket_path: &str,
+    mcp_uri: &str,
     handshake_deadline: Option<Duration>,
     respawn_bridge: Option<BridgeRespawnFn>,
 ) -> Result<bool> {
     use ahma_http_mcp_client::unix_client::unix_socket_transport;
 
-    let client_transport = unix_socket_transport(socket_path, "http://localhost/mcp");
+    let client_transport = unix_socket_transport(socket_path, mcp_uri);
     let stdio_transport = PatchedStdioTransport::new_stdio();
 
     tracing::info!(socket = socket_path, "Proxy connected to bridge via UDS");
     let socket_path_owned = socket_path.to_string();
-    let mut reconnect = move || {
-        Ok(unix_socket_transport(
-            &socket_path_owned,
-            "http://localhost/mcp",
-        ))
-    };
+    let mcp_uri_owned = mcp_uri.to_string();
+    let mut reconnect = move || Ok(unix_socket_transport(&socket_path_owned, &mcp_uri_owned));
     let result = run_transport_proxy(
         stdio_transport,
         client_transport,

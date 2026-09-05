@@ -577,7 +577,19 @@ pub struct SessionManagerConfig {
     ///
     /// [`PeerStreams`]: crate::peer::PeerStreams
     pub peer_factory: Option<Arc<dyn PeerFactory>>,
+
+    /// Translates a session's query string into worker arguments.
+    ///
+    /// The allowlist that decides which options exist lives in `ahma_mcp`,
+    /// which depends on this crate; the daemon injects the translator here so
+    /// the dependency does not have to point the other way.
+    pub session_options: Option<SessionOptionTranslator>,
 }
+
+/// Turns a session's URL query into worker arguments, or explains why it will
+/// not (SPEC R-DAEMON.4).
+pub type SessionOptionTranslator =
+    Arc<dyn Fn(&str) -> std::result::Result<Vec<String>, String> + Send + Sync>;
 
 impl Default for SessionManagerConfig {
     /// Production defaults: a subprocess-backed manager (`peer_factory: None`)
@@ -597,6 +609,7 @@ impl Default for SessionManagerConfig {
             tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: DEFAULT_MAX_SESSIONS,
             peer_factory: None,
+            session_options: None,
         }
     }
 }
@@ -1292,9 +1305,12 @@ impl SessionManager {
     /// one, otherwise via the default [`SubprocessPeerFactory`] built from the
     /// config fields. `PeerFactory::create` returns `anyhow::Result` (P6), so
     /// the failure is converted to [`BridgeError::ServerProcess`] here.
-    async fn create_peer_streams(&self) -> Result<PeerStreams> {
+    async fn create_peer_streams(
+        &self,
+        options: crate::peer::PeerSpawnOptions,
+    ) -> Result<PeerStreams> {
         let streams = match &self.config.peer_factory {
-            Some(factory) => factory.create().await,
+            Some(factory) => factory.create(options).await,
             None => {
                 SubprocessPeerFactory::new(
                     self.config.server_command.clone(),
@@ -1302,11 +1318,33 @@ impl SessionManager {
                     self.config.enable_colored_output,
                 )
                 .with_default_sandbox_scope(self.config.default_scope.clone())
-                .create()
+                .create(options)
                 .await
             }
         };
         streams.map_err(|e| BridgeError::ServerProcess(e.to_string()))
+    }
+
+    /// Turn a session's query string into worker arguments, refusing an option
+    /// this build does not know (SPEC R-DAEMON.4).
+    ///
+    /// The allowlist lives in `ahma_mcp`, which depends on this crate, so the
+    /// daemon injects the translator rather than this crate reaching upwards.
+    pub fn worker_args_for_query(&self, query: &str) -> std::result::Result<Vec<String>, String> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        match &self.config.session_options {
+            Some(translate) => translate(query),
+            // No translator installed (an explicitly started bridge): options
+            // are a daemon feature, and silently dropping them would be worse
+            // than saying so.
+            None => Err(
+                "this server does not accept per-session options; they are a feature of the \
+                 ahma daemon"
+                    .to_string(),
+            ),
+        }
     }
 
     /// Initializes a new session and establishes a peer connection for it.
@@ -1324,6 +1362,12 @@ impl SessionManager {
     ///   the `Mcp-Session-Id` header for all subsequent requests.
     /// * `Err(BridgeError)`: If the peer connection could not be established.
     pub async fn create_session(&self) -> Result<String> {
+        self.create_session_with_args(Vec::new()).await
+    }
+
+    /// Create a session whose worker carries `worker_args` — the options this
+    /// client asked for, and nobody else (SPEC R-DAEMON.4).
+    pub async fn create_session_with_args(&self, worker_args: Vec<String>) -> Result<String> {
         self.ensure_session_capacity().await?;
 
         let session_id = Uuid::new_v4().to_string();
@@ -1335,7 +1379,12 @@ impl SessionManager {
             stderr,
             shutdown_fn,
             exit_cause,
-        } = self.create_peer_streams().await?;
+        } = self
+            .create_peer_streams(crate::peer::PeerSpawnOptions {
+                session_id: session_id.clone(),
+                extra_args: worker_args,
+            })
+            .await?;
 
         // Message channel: bridge request handlers → I/O task
         let (tx, rx) = mpsc::channel::<String>(100);
@@ -2777,7 +2826,10 @@ mod session_logic_tests {
     }
 
     impl PeerFactory for DuplexPeerFactory {
-        fn create(&self) -> crate::peer::BoxFuture<anyhow::Result<PeerStreams>> {
+        fn create(
+            &self,
+            _options: crate::peer::PeerSpawnOptions,
+        ) -> crate::peer::BoxFuture<anyhow::Result<PeerStreams>> {
             let (bridge_stdin, peer_reader) = tokio::io::duplex(8192);
             let (peer_writer, bridge_stdout) = tokio::io::duplex(8192);
             self.peer_ends.lock().push((peer_reader, peer_writer));
@@ -2889,7 +2941,10 @@ mod session_logic_tests {
     }
 
     impl PeerFactory for DyingPeerFactory {
-        fn create(&self) -> crate::peer::BoxFuture<anyhow::Result<PeerStreams>> {
+        fn create(
+            &self,
+            _options: crate::peer::PeerSpawnOptions,
+        ) -> crate::peer::BoxFuture<anyhow::Result<PeerStreams>> {
             let (bridge_end, peer_end) = tokio::io::duplex(8192);
             *self.peer_end.lock() = Some(peer_end);
             let (cause_tx, cause_rx) = oneshot::channel();

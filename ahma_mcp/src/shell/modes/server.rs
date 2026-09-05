@@ -1010,12 +1010,15 @@ async fn run_as_frontend(
         })
     };
 
-    // Proceed with proxy setup — map Ok(bool) → Ok(()) since the caller only
-    // cares about success/failure at this final stage.
-    crate::shell::modes::proxy_client::run_proxy_client(
+    // This client's own options travel with its session, so its `--tools` or
+    // `--sandbox-scope` shape its worker and nobody else's (SPEC R-DAEMON.4).
+    let session_query = crate::shell::modes::session_options::session_query_from_config(config);
+
+    crate::shell::modes::proxy_client::run_proxy_client_with_options(
         socket_path_opt,
         http_url_opt,
         Some(respawn_bridge),
+        &session_query,
     )
     .await
     .map(|_| ())

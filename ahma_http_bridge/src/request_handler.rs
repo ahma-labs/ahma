@@ -362,12 +362,24 @@ enum ResponseMode {
 }
 
 /// Handles requests in session isolation mode (JSON transport).
+///
+/// `session_query` is the MCP URL's query, carrying the options this client
+/// asked for. It shapes the session an `initialize` creates and is ignored on
+/// every other request (SPEC R-DAEMON.4).
 pub async fn handle_session_isolated_request(
     session_manager: Arc<SessionManager>,
     headers: HeaderMap,
     payload: Value,
+    session_query: String,
 ) -> Response {
-    handle_post_request(session_manager, headers, payload, ResponseMode::Json).await
+    handle_post_request(
+        session_manager,
+        headers,
+        payload,
+        ResponseMode::Json,
+        session_query,
+    )
+    .await
 }
 
 /// Handles requests in session isolation mode (SSE transport).
@@ -375,8 +387,16 @@ pub async fn handle_session_isolated_request_sse(
     session_manager: Arc<SessionManager>,
     headers: HeaderMap,
     payload: Value,
+    session_query: String,
 ) -> Response {
-    handle_post_request(session_manager, headers, payload, ResponseMode::Sse).await
+    handle_post_request(
+        session_manager,
+        headers,
+        payload,
+        ResponseMode::Sse,
+        session_query,
+    )
+    .await
 }
 
 /// The single shared `POST /mcp` pipeline (SPEC RB.1).
@@ -389,6 +409,7 @@ async fn handle_post_request(
     headers: HeaderMap,
     payload: Value,
     mode: ResponseMode,
+    session_query: String,
 ) -> Response {
     let session_id = session_id_from_headers(&headers).map(String::from);
     let method = payload.get("method").and_then(|m| m.as_str());
@@ -399,7 +420,7 @@ async fn handle_post_request(
 
     if method == Some(INITIALIZE_METHOD) {
         terminate_session_being_reinitialized(&session_manager, session_id.as_deref()).await;
-        return handle_initialize(&session_manager, &payload, mode).await;
+        return handle_initialize(&session_manager, &payload, mode, &session_query).await;
     }
 
     let Some(session_id) = session_id else {
@@ -549,6 +570,7 @@ async fn handle_initialize(
     session_manager: &Arc<SessionManager>,
     payload: &Value,
     mode: ResponseMode,
+    session_query: &str,
 ) -> Response {
     debug!("Processing initialize request (no session ID)");
 
@@ -557,10 +579,11 @@ async fn handle_initialize(
     }
 
     info!("Creating new session for initialize request");
-    let new_session_id = match create_session_or_error(session_manager, payload_id(payload)).await {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
+    let new_session_id =
+        match create_session_or_error(session_manager, payload_id(payload), session_query).await {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
 
     register_session_details(session_manager, &new_session_id, payload).await;
     maybe_fail_sandbox_for_rootless_client(session_manager, &new_session_id, payload).await;
@@ -605,8 +628,24 @@ fn encode_initialize_response(
 async fn create_session_or_error(
     session_manager: &Arc<SessionManager>,
     request_id: Value,
+    session_query: &str,
 ) -> Result<String, Response> {
-    match session_manager.create_session().await {
+    // An option this build does not know is refused rather than ignored: a
+    // client that misspells one should be told, not quietly served something
+    // else (SPEC R-DAEMON.4).
+    let worker_args = match session_manager.worker_args_for_query(session_query) {
+        Ok(args) => args,
+        Err(message) => {
+            warn!("Rejecting session options: {message}");
+            return Err(error_response_with_status(
+                axum::http::StatusCode::BAD_REQUEST,
+                request_id,
+                -32602,
+                &format!("Invalid session options: {message}"),
+            ));
+        }
+    };
+    match session_manager.create_session_with_args(worker_args).await {
         Ok(id) => Ok(id),
         Err(e) => {
             error!("Failed to create session: {}", e);
@@ -1609,7 +1648,10 @@ mod tests {
     /// and the session stays alive (not terminated) for the duration of a test.
     struct KeepAlivePeerFactory;
     impl PeerFactory for KeepAlivePeerFactory {
-        fn create(&self) -> BoxFuture<anyhow::Result<PeerStreams>> {
+        fn create(
+            &self,
+            _options: crate::peer::PeerSpawnOptions,
+        ) -> BoxFuture<anyhow::Result<PeerStreams>> {
             Box::pin(async move {
                 let (bridge_end, peer_end) = tokio::io::duplex(1024);
                 // Leak the peer end so the bridge read side never sees EOF.
@@ -1629,7 +1671,10 @@ mod tests {
     /// A peer factory that always fails to construct.
     struct FailingPeerFactory;
     impl PeerFactory for FailingPeerFactory {
-        fn create(&self) -> BoxFuture<anyhow::Result<PeerStreams>> {
+        fn create(
+            &self,
+            _options: crate::peer::PeerSpawnOptions,
+        ) -> BoxFuture<anyhow::Result<PeerStreams>> {
             Box::pin(async move { Err(anyhow::anyhow!("peer construction failed")) })
         }
     }
@@ -2105,7 +2150,8 @@ mod tests {
     async fn isolated_request_missing_session_is_400() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        let resp = handle_session_isolated_request(mgr, HeaderMap::new(), payload).await;
+        let resp =
+            handle_session_isolated_request(mgr, HeaderMap::new(), payload, String::new()).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32600);
@@ -2116,8 +2162,13 @@ mod tests {
     async fn isolated_request_unknown_session_is_404() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        let resp =
-            handle_session_isolated_request(mgr, headers_with_session("nope"), payload).await;
+        let resp = handle_session_isolated_request(
+            mgr,
+            headers_with_session("nope"),
+            payload,
+            String::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(body_json(resp).await["id"], json!(1));
     }
@@ -2126,7 +2177,9 @@ mod tests {
     async fn isolated_sse_request_missing_session_is_400() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        let resp = handle_session_isolated_request_sse(mgr, HeaderMap::new(), payload).await;
+        let resp =
+            handle_session_isolated_request_sse(mgr, HeaderMap::new(), payload, String::new())
+                .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(resp).await["id"], json!(1));
     }
@@ -2135,8 +2188,13 @@ mod tests {
     async fn isolated_sse_request_unknown_session_is_404() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        let resp =
-            handle_session_isolated_request_sse(mgr, headers_with_session("nope"), payload).await;
+        let resp = handle_session_isolated_request_sse(
+            mgr,
+            headers_with_session("nope"),
+            payload,
+            String::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(body_json(resp).await["id"], json!(1));
     }
@@ -2148,8 +2206,13 @@ mod tests {
     async fn isolated_request_notification_error_carries_null_id_not_absent() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        let resp =
-            handle_session_isolated_request(mgr, headers_with_session("nope"), payload).await;
+        let resp = handle_session_isolated_request(
+            mgr,
+            headers_with_session("nope"),
+            payload,
+            String::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = body_json(resp).await;
         assert!(
@@ -2165,7 +2228,7 @@ mod tests {
     async fn handle_initialize_rejects_invalid_payload() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
-        let resp = handle_initialize(&mgr, &payload, ResponseMode::Json).await;
+        let resp = handle_initialize(&mgr, &payload, ResponseMode::Json, "").await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32602);
     }
@@ -2174,7 +2237,7 @@ mod tests {
     async fn handle_initialize_sse_rejects_invalid_payload() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
-        let resp = handle_initialize(&mgr, &payload, ResponseMode::Sse).await;
+        let resp = handle_initialize(&mgr, &payload, ResponseMode::Sse, "").await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32602);
     }
@@ -2183,8 +2246,13 @@ mod tests {
     async fn isolated_request_initialize_with_stale_session_header_routes_to_initialize() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
-        let resp =
-            handle_session_isolated_request(mgr, headers_with_session("stale-id"), payload).await;
+        let resp = handle_session_isolated_request(
+            mgr,
+            headers_with_session("stale-id"),
+            payload,
+            String::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32602);
     }
@@ -2193,9 +2261,13 @@ mod tests {
     async fn isolated_sse_request_initialize_with_stale_session_header_routes_to_initialize() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
-        let resp =
-            handle_session_isolated_request_sse(mgr, headers_with_session("stale-id"), payload)
-                .await;
+        let resp = handle_session_isolated_request_sse(
+            mgr,
+            headers_with_session("stale-id"),
+            payload,
+            String::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32602);
     }
@@ -2211,6 +2283,7 @@ mod tests {
             mgr.clone(),
             headers_with_session(&existing_id),
             payload,
+            String::new(),
         )
         .await;
         assert!(
@@ -2230,6 +2303,7 @@ mod tests {
             mgr.clone(),
             headers_with_session(&existing_id),
             payload,
+            String::new(),
         )
         .await;
         assert!(
@@ -2243,7 +2317,7 @@ mod tests {
     #[tokio::test]
     async fn create_session_or_error_returns_429_on_limit() {
         let mgr = manager_with(None, 0, 3600, Arc::new(KeepAlivePeerFactory));
-        let err = create_session_or_error(&mgr, json!(2))
+        let err = create_session_or_error(&mgr, json!(2), "")
             .await
             .expect_err("should fail");
         assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -2255,7 +2329,7 @@ mod tests {
     #[tokio::test]
     async fn create_session_or_error_returns_500_on_factory_failure() {
         let mgr = manager_with(None, 10, 3600, Arc::new(FailingPeerFactory));
-        let err = create_session_or_error(&mgr, json!(2))
+        let err = create_session_or_error(&mgr, json!(2), "")
             .await
             .expect_err("should fail");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -2267,7 +2341,7 @@ mod tests {
     #[tokio::test]
     async fn create_session_or_error_ok_returns_id() {
         let mgr = keepalive_manager();
-        let id = create_session_or_error(&mgr, json!(2))
+        let id = create_session_or_error(&mgr, json!(2), "")
             .await
             .expect("should succeed");
         assert!(!id.is_empty());
@@ -2704,7 +2778,8 @@ mod tests {
         let mgr = keepalive_manager();
         // initialize with no session id but invalid params → -32602.
         let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
-        let resp = handle_session_isolated_request(mgr, HeaderMap::new(), payload).await;
+        let resp =
+            handle_session_isolated_request(mgr, HeaderMap::new(), payload, String::new()).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32602);
     }
@@ -2719,7 +2794,9 @@ mod tests {
             "method": "sampling/createMessage",
             "params": {}
         });
-        let resp = handle_session_isolated_request(mgr, headers_with_session(&id), payload).await;
+        let resp =
+            handle_session_isolated_request(mgr, headers_with_session(&id), payload, String::new())
+                .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(
             body_json(resp).await["error"]["message"]
@@ -2739,8 +2816,13 @@ mod tests {
             "method": "sampling/createMessage",
             "params": {}
         });
-        let resp =
-            handle_session_isolated_request_sse(mgr, headers_with_session(&id), payload).await;
+        let resp = handle_session_isolated_request_sse(
+            mgr,
+            headers_with_session(&id),
+            payload,
+            String::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32603);
     }
@@ -3089,7 +3171,9 @@ mod tests {
         let id = mgr.create_session().await.expect("create session");
         let payload =
             json!({"jsonrpc": "2.0", "id": "tc-json", "method": "tools/call", "params": {}});
-        let resp = handle_session_isolated_request(mgr, headers_with_session(&id), payload).await;
+        let resp =
+            handle_session_isolated_request(mgr, headers_with_session(&id), payload, String::new())
+                .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32001);
@@ -3103,8 +3187,13 @@ mod tests {
         let id = mgr.create_session().await.expect("create session");
         let payload =
             json!({"jsonrpc": "2.0", "id": "tc-sse", "method": "tools/call", "params": {}});
-        let resp =
-            handle_session_isolated_request_sse(mgr, headers_with_session(&id), payload).await;
+        let resp = handle_session_isolated_request_sse(
+            mgr,
+            headers_with_session(&id),
+            payload,
+            String::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32001);
@@ -3119,7 +3208,9 @@ mod tests {
         let id = mgr.create_session().await.expect("create session");
         let payload =
             json!({"jsonrpc": "2.0", "id": "hs-json", "method": "tools/call", "params": {}});
-        let resp = handle_session_isolated_request(mgr, headers_with_session(&id), payload).await;
+        let resp =
+            handle_session_isolated_request(mgr, headers_with_session(&id), payload, String::new())
+                .await;
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32002);
@@ -3139,8 +3230,13 @@ mod tests {
         let id = mgr.create_session().await.expect("create session");
         let payload =
             json!({"jsonrpc": "2.0", "id": "hs-sse", "method": "tools/call", "params": {}});
-        let resp =
-            handle_session_isolated_request_sse(mgr, headers_with_session(&id), payload).await;
+        let resp = handle_session_isolated_request_sse(
+            mgr,
+            headers_with_session(&id),
+            payload,
+            String::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32002);
@@ -3370,7 +3466,10 @@ mod tests {
     /// branch in-process without a subprocess.
     struct EchoPeerFactory;
     impl PeerFactory for EchoPeerFactory {
-        fn create(&self) -> BoxFuture<anyhow::Result<PeerStreams>> {
+        fn create(
+            &self,
+            _options: crate::peer::PeerSpawnOptions,
+        ) -> BoxFuture<anyhow::Result<PeerStreams>> {
             Box::pin(async move {
                 let (bridge_end, peer_end) = tokio::io::duplex(64 * 1024);
                 let (peer_read, mut peer_write) = tokio::io::split(peer_end);

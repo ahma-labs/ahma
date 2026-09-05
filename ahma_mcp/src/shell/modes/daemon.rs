@@ -214,6 +214,12 @@ fn build_bridge_config(
         max_sessions: config.max_sessions,
         peer_factory: None,
         bound_port_tx: None,
+        // The daemon owns the option allowlist, so it is the daemon that
+        // teaches the bridge how to read a session's query (SPEC R-DAEMON.4).
+        session_options: Some(Arc::new(|query: &str| {
+            let pairs = super::session_options::parse_session_query(query)?;
+            super::session_options::session_query_to_worker_args(&pairs)
+        })),
         exit: Some(exit.clone()),
     })
 }

@@ -20,7 +20,9 @@ use tracing::info;
 
 // ─── Re-exports from ahma_common (P6) ────────────────────────────────────────
 
-pub use ahma_common::peer_factory::{BoxFuture, PeerFactory, PeerShutdownFn, PeerStreams};
+pub use ahma_common::peer_factory::{
+    BoxFuture, PeerFactory, PeerShutdownFn, PeerSpawnOptions, PeerStreams,
+};
 
 // ─── SubprocessPeerFactory ───────────────────────────────────────────────────
 
@@ -66,20 +68,30 @@ impl SubprocessPeerFactory {
 }
 
 impl PeerFactory for SubprocessPeerFactory {
-    fn create(&self) -> BoxFuture<anyhow::Result<PeerStreams>> {
+    fn create(&self, options: PeerSpawnOptions) -> BoxFuture<anyhow::Result<PeerStreams>> {
         let command = self.command.clone();
         let base_args = self.args.clone();
         let enable_colored_output = self.enable_colored_output;
         let default_sandbox_scope = self.default_sandbox_scope.clone();
 
         Box::pin(async move {
-            // Append the flags the subprocess needs: defer its own sandbox
-            // setup until the bridge sends roots/list_changed, and suppress
-            // the interactive CLI output path.
+            // Append the flags the subprocess needs: this session's own
+            // options, then defer its sandbox setup until the bridge sends
+            // roots/list_changed, and suppress the interactive CLI output path.
             let mut args = base_args;
-            if let Some(ref scope) = default_sandbox_scope {
+            // A per-session scope wins over the manager-wide fallback: it came
+            // from this client, not from whoever started the daemon.
+            let has_session_scope = options.extra_args.iter().any(|a| a == "--sandbox-scope");
+            args.extend(options.extra_args.iter().cloned());
+            if let Some(ref scope) = default_sandbox_scope
+                && !has_session_scope
+            {
                 args.push("--sandbox-scope".to_string());
                 args.push(scope.to_string_lossy().to_string());
+            }
+            if !options.session_id.is_empty() {
+                args.push("--session-id".to_string());
+                args.push(options.session_id.clone());
             }
             args.push("--defer-sandbox".to_string());
             args.push("--server-child".to_string());
@@ -356,6 +368,6 @@ mod tests {
     #[test]
     fn create_returns_a_future() {
         let factory = SubprocessPeerFactory::new("__nonexistent_cmd__", vec![], false);
-        let _fut = factory.create(); // just constructing the future is enough
+        let _fut = factory.create(PeerSpawnOptions::default()); // constructing the future is enough
     }
 }

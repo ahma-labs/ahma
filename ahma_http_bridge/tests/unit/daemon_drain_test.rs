@@ -70,3 +70,98 @@ async fn a_standalone_bridge_has_no_drain_state() {
         "an explicitly started bridge is not part of a daemon's drain"
     );
 }
+
+/// A session's options reach *its* worker and no other (SPEC R-DAEMON.4).
+///
+/// This is the property that replaced process-wide inheritance, where the first
+/// client to start the bridge configured every later one.
+#[tokio::test]
+async fn session_options_reach_only_the_session_that_asked() {
+    use ahma_common::peer_factory::{BoxFuture, PeerFactory, PeerSpawnOptions, PeerStreams};
+    use std::sync::Mutex;
+
+    /// Records what each session's worker would have been spawned with.
+    struct RecordingFactory {
+        seen: Arc<Mutex<Vec<PeerSpawnOptions>>>,
+    }
+
+    impl PeerFactory for RecordingFactory {
+        fn create(&self, options: PeerSpawnOptions) -> BoxFuture<anyhow::Result<PeerStreams>> {
+            self.seen.lock().unwrap().push(options);
+            Box::pin(async move {
+                let (bridge_end, peer_end) = tokio::io::duplex(4096);
+                let (bridge_read, bridge_write) = tokio::io::split(bridge_end);
+                // The peer end is parked: this test is about what the worker
+                // would be spawned with, not about serving a handshake.
+                std::mem::forget(peer_end);
+                Ok(PeerStreams {
+                    stdin: Box::new(bridge_write),
+                    stdout: Box::new(bridge_read),
+                    stderr: None,
+                    shutdown_fn: Some(Box::new(|| Box::pin(async {}))),
+                    exit_cause: None,
+                })
+            })
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let manager = SessionManager::new(SessionManagerConfig {
+        server_command: "echo".to_string(),
+        peer_factory: Some(Arc::new(RecordingFactory { seen: seen.clone() })),
+        session_options: Some(Arc::new(|query: &str| {
+            // The daemon's real translator, so this pins the whole path.
+            let pairs = ahma_mcp::shell::modes::session_options::parse_session_query(query)?;
+            ahma_mcp::shell::modes::session_options::session_query_to_worker_args(&pairs)
+        })),
+        ..Default::default()
+    });
+
+    let args_a = manager
+        .worker_args_for_query("tools=simplify")
+        .expect("known option");
+    let id_a = manager
+        .create_session_with_args(args_a)
+        .await
+        .expect("session A");
+    let id_b = manager
+        .create_session_with_args(Vec::new())
+        .await
+        .expect("session B");
+    assert_ne!(id_a, id_b);
+
+    let recorded = seen.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(
+        recorded[0].extra_args,
+        vec!["--tools".to_string(), "simplify".to_string()],
+        "the asking session's worker gets its options"
+    );
+    assert!(
+        recorded[1].extra_args.is_empty(),
+        "and the next session inherits none of them: {:?}",
+        recorded[1].extra_args
+    );
+    assert_eq!(
+        recorded[0].session_id, id_a,
+        "each worker is told which session it serves, so its hub identity is stable"
+    );
+}
+
+/// A misspelled option is refused before a session exists, rather than being
+/// dropped on the floor.
+#[tokio::test]
+async fn an_unknown_session_option_is_refused() {
+    let manager = SessionManager::new(SessionManagerConfig {
+        server_command: "echo".to_string(),
+        session_options: Some(Arc::new(|query: &str| {
+            let pairs = ahma_mcp::shell::modes::session_options::parse_session_query(query)?;
+            ahma_mcp::shell::modes::session_options::session_query_to_worker_args(&pairs)
+        })),
+        ..Default::default()
+    });
+    let err = manager
+        .worker_args_for_query("tolls=simplify")
+        .expect_err("a typo must not be ignored");
+    assert!(err.contains("tolls"), "{err}");
+}

@@ -206,6 +206,11 @@ pub struct BridgeConfig {
     /// hypothetical restart) will not fire it.
     pub bound_port_tx: Option<tokio::sync::oneshot::Sender<u16>>,
 
+    /// Translates a session's URL query into worker arguments. Set by the
+    /// daemon, which owns the allowlist (SPEC R-DAEMON.4); `None` on an
+    /// explicitly started bridge, which does not accept session options.
+    pub session_options: Option<crate::session::SessionOptionTranslator>,
+
     /// Set when this bridge is hosted by the per-user daemon (SPEC R-DAEMON.3).
     ///
     /// With it, `/restart` and the idle timer ask the composer to stop instead
@@ -239,6 +244,7 @@ impl Default for BridgeConfig {
             max_sessions: DEFAULT_MAX_SESSIONS,
             peer_factory: None,
             bound_port_tx: None,
+            session_options: None,
             exit: None,
         }
     }
@@ -299,6 +305,7 @@ impl Clone for BridgeConfig {
             active_sessions: self.active_sessions.clone(),
             idle_timeout_secs: self.idle_timeout_secs,
             exit: self.exit.clone(),
+            session_options: self.session_options.clone(),
             max_sessions: self.max_sessions,
             peer_factory: self.peer_factory.clone(),
             // oneshot::Sender is not Clone; cloning a BridgeConfig discards the
@@ -737,6 +744,7 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
 
 fn create_session_config(config: &BridgeConfig) -> SessionManagerConfig {
     SessionManagerConfig {
+        session_options: config.session_options.clone(),
         server_command: config.server_command.clone(),
         server_args: config.server_args.clone(),
         default_scope: config.default_sandbox_scope.clone(),
@@ -1840,9 +1848,12 @@ fn origin_is_loopback(origin: &str) -> bool {
 
 async fn handle_mcp_request(
     State(state): State<Arc<BridgeState>>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response {
+    // The query carries this client's own session options (SPEC R-DAEMON.4).
+    let session_query = uri.query().unwrap_or("").to_string();
     // JSON-RPC batch arrays are not supported (batching was removed from the
     // MCP spec in 2025-06-18). Refusing loudly beats the old behavior, which
     // forwarded the raw array to the subprocess with undefined results.
@@ -1857,6 +1868,7 @@ async fn handle_mcp_request(
             state.session_manager.clone(),
             headers,
             payload,
+            session_query,
         )
         .await;
     }
@@ -1865,6 +1877,7 @@ async fn handle_mcp_request(
         state.session_manager.clone(),
         headers,
         payload,
+        session_query,
     )
     .await
 }
@@ -1930,6 +1943,7 @@ mod tests {
             peer_factory: None,
             bound_port_tx: None,
             exit: None,
+            session_options: None,
         };
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(config.server_command, "custom_server");
