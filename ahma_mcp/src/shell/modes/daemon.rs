@@ -104,6 +104,32 @@ pub async fn run_daemon_mode(config: AppConfig) -> Result<()> {
         Err(HubBindError::Failed(e)) => return Err(e),
     };
 
+    // Publish who owns this rendezvous, and hold the lock that says so.
+    //
+    // The hub bind is still the mutex; this is the descriptor a client (or a
+    // person) reads to see which daemon is here, what version it is, and where
+    // it listens. On Windows, where there are no filesystem sockets, it is the
+    // *only* rendezvous — so it is written on every platform rather than
+    // behind a `cfg`, because platform-gated code that no developer machine
+    // ever executes is how it rots (SPEC R-DAEMON.2).
+    let runtime_dir = hub_socket
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let _rendezvous_lock = ahma_common::fs_lock::FsLock::try_acquire(
+        &ahma_common::daemon_endpoint::lock_path(&runtime_dir),
+    )
+    .ok()
+    .flatten();
+    if let Err(e) = ahma_common::daemon_endpoint::write_endpoint(
+        &runtime_dir,
+        &ahma_common::daemon_endpoint::DaemonEndpoint::new(hub_port_of(&hub_socket), 0),
+    ) {
+        // A descriptor that cannot be written costs discovery on Windows and
+        // nothing at all on Unix, where the sockets are the rendezvous.
+        tracing::debug!("ahma daemon: could not publish the endpoint descriptor: {e}");
+    }
+
     let history_writer = hub
         .attach_history(ahma_common::daemon_history::history_path())
         .await;
@@ -171,6 +197,7 @@ pub async fn run_daemon_mode(config: AppConfig) -> Result<()> {
     }
     remove_own_socket(&hub_socket);
     remove_own_socket(std::path::Path::new(&mcp_socket));
+    ahma_common::daemon_endpoint::remove_endpoint(&runtime_dir);
     Ok(())
 }
 
@@ -280,6 +307,21 @@ fn spawn_idle_watcher(
             }
         }
     })
+}
+
+/// The port a hub listens on, where that is meaningful.
+///
+/// Unix sockets have no port; the descriptor still names the daemon, and the
+/// socket paths are the rendezvous there.
+fn hub_port_of(_hub_socket: &std::path::Path) -> u16 {
+    #[cfg(unix)]
+    {
+        0
+    }
+    #[cfg(not(unix))]
+    {
+        ahma_common::daemon_hub::daemon_port()
+    }
 }
 
 /// Remove a socket file this process bound, and only if it is still the one we
