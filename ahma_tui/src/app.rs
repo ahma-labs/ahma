@@ -5154,7 +5154,51 @@ fn chat_in_progress(state: &crate::state::AppState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::parse_run_command;
+    use super::run_unsandboxed_command;
+    use crate::state::AppState;
     use serde_json::json;
+
+    /// The `!` path must actually reach the reporter: a window that reports
+    /// nothing is exactly the invisible local command this was built to retire
+    /// (SPEC R-DAEMON.9).
+    ///
+    /// Asserted through the window rather than the socket because the window is
+    /// where the two halves have to agree — the card the user is looking at and
+    /// the operation the rest of the machine sees are the same command, and the
+    /// id is what says so.
+    #[tokio::test]
+    async fn a_bang_command_is_reported_and_its_window_carries_the_operation_id() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process (SPEC R-ISO.1).
+        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", dir.path().join("d.sock")) };
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.workspace = dir.path().display().to_string();
+
+        // Without a reporter the command still runs; it is simply unreported.
+        run_unsandboxed_command("echo one".to_string(), &mut state);
+        assert_eq!(state.windows.len(), 1);
+        assert!(
+            state.windows[0].op_id.is_none(),
+            "no reporter, no operation id to claim"
+        );
+
+        state.tui_reporter = Some(crate::tui_reporter::spawn_tui_reporter(
+            state.workspace.clone(),
+        ));
+        run_unsandboxed_command("echo two".to_string(), &mut state);
+        let w = state.windows.last().expect("the second window");
+        let op_id = w.op_id.clone().expect("a reported command has an id");
+        assert!(
+            op_id.starts_with("tui_"),
+            "the id must name where the work happened: {op_id}"
+        );
+        assert!(w.is_cli, "and it is still an ordinary CLI window");
+        assert_ne!(
+            state.windows[0].op_id, state.windows[1].op_id,
+            "two commands are two operations"
+        );
+    }
 
     /// Before the sandbox locks, `sandbox_status` holds the initial `"UNKNOWN"`.
     /// The guard meant to suppress that from the model's system prompt compared
