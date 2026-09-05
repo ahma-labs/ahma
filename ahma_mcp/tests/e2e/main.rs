@@ -25,6 +25,7 @@ mod cli_extended_integration_test;
 mod cli_mode_coverage_test;
 mod client_coverage_expansion_test;
 mod config_reload_test;
+mod daemon_lifecycle_test;
 mod direct_stdio_roots_relock_test;
 mod extensibility_integration_test;
 mod external_mcp_routing_test;

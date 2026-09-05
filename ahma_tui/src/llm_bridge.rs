@@ -243,12 +243,18 @@ pub fn spawn_tool_call_task(
             .await;
 
         if is_local_default_server(&mcp.base_url) {
-            let res = crate::connection::ensure_server_running(Some(&mcp.workspace_root)).await;
+            // The chat's tool calls run in an ordinary MCP session on the
+            // per-user daemon, scoped by this TUI's own `roots/list` answer —
+            // not by a server started for this directory (SPEC R-DAEMON.9).
+            let socket = ahma_common::daemon_hub::mcp_socket_path(None);
+            let res =
+                ahma_mcp::shell::modes::daemon_client::ensure_daemon(Some(&socket), None, None)
+                    .await;
             if let Err(e) = res {
                 let _ = tx
                     .send(BridgeEvent::ToolCallFinished {
                         id: id.clone(),
-                        result: format!("Error ensuring bridge server is running: {e}"),
+                        result: format!("Error reaching the ahma daemon: {e}"),
                         failed: true,
                     })
                     .await;
@@ -478,14 +484,60 @@ pub fn spawn_decompose_task(client: LlmClient, goal: String, tx: Sender<BridgeEv
     });
 }
 
+/// Where a `!` command's progress is reported besides the local window.
+///
+/// `Option`-wrapped at the call site rather than baked in, because the same
+/// runner is used by tests that have no daemon and no hub to talk to.
+#[derive(Debug, Clone)]
+pub struct BangReport {
+    pub reporter: crate::tui_reporter::TuiReporter,
+    pub op_id: String,
+}
+
+impl BangReport {
+    fn output(&self, line: &str, is_stderr: bool) {
+        self.reporter
+            .report(ahma_common::daemon_hub::DaemonEvent::OpOutput {
+                id: self.op_id.clone(),
+                line: line.to_string(),
+                is_stderr,
+            });
+    }
+
+    fn finished(
+        &self,
+        status: ahma_common::daemon_hub::OpStatus,
+        summary: &str,
+        exit_code: Option<i64>,
+        started: std::time::Instant,
+    ) {
+        self.reporter
+            .report(ahma_common::daemon_hub::DaemonEvent::OpFinished {
+                id: self.op_id.clone(),
+                status,
+                result_summary: Some(summary.to_string()),
+                duration_ms: started.elapsed().as_millis() as u64,
+                ended_epoch_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as u64),
+                exit_code,
+                denial: None,
+                interrupted: false,
+            });
+    }
+}
+
 pub fn spawn_window_cli_task(
     window_id: usize,
     command_str: String,
     working_dir: String,
     mut abort_rx: tokio::sync::oneshot::Receiver<()>,
     tx: Sender<BridgeEvent>,
+    report: Option<BangReport>,
 ) {
     tokio::spawn(async move {
+        let started = std::time::Instant::now();
         // Shell selection goes through the cross-crate chokepoint
         // (`platform_shell_program`, see AGENTS.md); only the one-shot flags
         // are chosen here.
@@ -510,11 +562,20 @@ pub fn spawn_window_cli_task(
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
+                let summary = format!("Failed to spawn: {e}");
+                if let Some(r) = &report {
+                    r.finished(
+                        ahma_common::daemon_hub::OpStatus::Failed,
+                        &summary,
+                        None,
+                        started,
+                    );
+                }
                 let _ = tx
                     .send(BridgeEvent::WindowFinished {
                         window_id,
                         success: false,
-                        summary: format!("Failed to spawn: {e}"),
+                        summary,
                     })
                     .await;
                 return;
@@ -529,8 +590,12 @@ pub fn spawn_window_cli_task(
         let mut stderr_reader = tokio::io::BufReader::new(stderr).lines();
 
         let tx_clone = tx.clone();
+        let report_out = report.clone();
         let stdout_handle = tokio::spawn(async move {
             while let Ok(Some(line)) = stdout_reader.next_line().await {
+                if let Some(r) = &report_out {
+                    r.output(&line, false);
+                }
                 let _ = tx_clone
                     .send(BridgeEvent::WindowOutput { window_id, line })
                     .await;
@@ -538,8 +603,12 @@ pub fn spawn_window_cli_task(
         });
 
         let tx_clone2 = tx.clone();
+        let report_err = report.clone();
         let stderr_handle = tokio::spawn(async move {
             while let Ok(Some(line)) = stderr_reader.next_line().await {
+                if let Some(r) = &report_err {
+                    r.output(&line, true);
+                }
                 let _ = tx_clone2
                     .send(BridgeEvent::WindowOutput { window_id, line })
                     .await;
@@ -554,6 +623,14 @@ pub fn spawn_window_cli_task(
                 let _ = ahma_mcp::shell_pool::kill_process_tree(&mut child).await;
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
+                if let Some(r) = &report {
+                    r.finished(
+                        ahma_common::daemon_hub::OpStatus::Cancelled,
+                        "Cancelled",
+                        None,
+                        started,
+                    );
+                }
                 let _ = tx.send(BridgeEvent::WindowFinished {
                     window_id,
                     success: false,
@@ -571,6 +648,18 @@ pub fn spawn_window_cli_task(
                         } else {
                             format!("Failed with exit code {:?}", status.code())
                         };
+                        if let Some(r) = &report {
+                            r.finished(
+                                if success {
+                                    ahma_common::daemon_hub::OpStatus::Completed
+                                } else {
+                                    ahma_common::daemon_hub::OpStatus::Failed
+                                },
+                                &summary,
+                                status.code().map(i64::from),
+                                started,
+                            );
+                        }
                         let _ = tx.send(BridgeEvent::WindowFinished {
                             window_id,
                             success,
@@ -578,10 +667,19 @@ pub fn spawn_window_cli_task(
                         }).await;
                     }
                     Err(e) => {
+                        let summary = format!("Execution error: {e}");
+                        if let Some(r) = &report {
+                            r.finished(
+                                ahma_common::daemon_hub::OpStatus::Failed,
+                                &summary,
+                                None,
+                                started,
+                            );
+                        }
                         let _ = tx.send(BridgeEvent::WindowFinished {
                             window_id,
                             success: false,
-                            summary: format!("Execution error: {e}"),
+                            summary,
                         }).await;
                     }
                 }
@@ -661,6 +759,98 @@ pub fn spawn_window_llm_task(
 mod tests {
     use super::*;
 
+    /// A `!` command's whole life reaches the daemon: the lines it printed and
+    /// the code it exited with, not just the fact that it happened.
+    ///
+    /// Without this the unified view could show that the user ran something
+    /// unconfined and nothing about how it went — which is the half that
+    /// matters after the window has scrolled away (SPEC R-DAEMON.9).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reported_window_command_streams_its_output_and_exit_code() {
+        use ahma_common::daemon_hub::{ClientMsg, DaemonEvent, DaemonMsg, HubServer, recv_msg};
+        use ahma_common::timeouts::TestTimeouts;
+
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process (SPEC R-ISO.1).
+        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", dir.path().join("d.sock")) };
+        if let Ok(l) = std::net::TcpListener::bind("127.0.0.1:0")
+            && let Ok(addr) = l.local_addr()
+        {
+            // SAFETY: as above.
+            unsafe { std::env::set_var("AHMA_DAEMON_PORT", addr.port().to_string()) };
+        }
+
+        let hub = HubServer::bind_at(ahma_common::daemon_hub::default_socket_path())
+            .await
+            .expect("this test owns a freshly isolated socket");
+        let hub_task = tokio::spawn(hub.serve());
+
+        let sub = ahma_common::daemon_hub::connect_to_daemon().await.unwrap();
+        let (sr, mut sw) = tokio::io::split(sub);
+        let mut sub_reader = tokio::io::BufReader::new(sr);
+        ahma_common::daemon_hub::send_msg(&mut sw, &ClientMsg::Subscribe)
+            .await
+            .unwrap();
+        let _snapshot = recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap();
+
+        let reporter = crate::tui_reporter::spawn_tui_reporter(dir.path().display().to_string());
+        let op_id = crate::tui_reporter::next_bang_op_id(reporter.session_id());
+        let report = BangReport {
+            reporter: reporter.clone(),
+            op_id: op_id.clone(),
+        };
+        reporter.report(crate::tui_reporter::bang_started(
+            &op_id,
+            "echo hello; exit 3",
+            &dir.path().display().to_string(),
+        ));
+
+        let (_abort_tx, abort_rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        spawn_window_cli_task(
+            7,
+            "echo hello; exit 3".to_string(),
+            dir.path().display().to_string(),
+            abort_rx,
+            tx,
+            Some(report),
+        );
+
+        let mut line = None;
+        let mut exit = None;
+        let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(15);
+        while tokio::time::Instant::now() < deadline && (line.is_none() || exit.is_none()) {
+            let Ok(Ok(msg)) = tokio::time::timeout(
+                TestTimeouts::scale_secs(5),
+                recv_msg::<_, DaemonMsg>(&mut sub_reader),
+            )
+            .await
+            else {
+                break;
+            };
+            if let DaemonMsg::Event { payload, .. } = msg {
+                match payload {
+                    DaemonEvent::OpOutput { id, line: l, .. } if id == op_id => line = Some(l),
+                    DaemonEvent::OpFinished { id, exit_code, .. } if id == op_id => {
+                        exit = exit_code
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        rx.close();
+        hub_task.abort();
+
+        assert_eq!(
+            line.as_deref(),
+            Some("hello"),
+            "the output must reach the hub"
+        );
+        assert_eq!(exit, Some(3), "and so must the exit code");
+    }
+
     /// Regression test (SPEC R-PROC.2): cancelling a window command must reap the
     /// shell's **descendants**, not just the shell.
     ///
@@ -685,6 +875,7 @@ mod tests {
             dir.path().display().to_string(),
             abort_rx,
             tx,
+            None,
         );
 
         let mut gpid = None;

@@ -25,7 +25,7 @@
 | HTTP Bridge Mode | tests-pass | HTTP/SSE proxy for web clients |
 | HTTP Streaming (Streamable HTTP) | tests-pass | POST SSE with event IDs, event history, Last-Event-Id replay, full multiplexing |
 | HTTP/3 (QUIC) Client Preference | tests-pass | All HTTP clients prefer HTTP/3 (QUIC) when server supports it; transparent fallback to HTTP/2 and HTTP/1.1 |
-| Session Isolation (HTTP) | tests-pass | Per-workspace sandbox scope (R5.1), shared by attached sessions, sourced via MCP `roots/list` |
+| Session Isolation (HTTP) | tests-pass | One kernel-sandboxed worker per MCP session, each locking its own scope from its own client's `roots/list` (R5.1, R10.3); per-client options travel with the session (R-DAEMON.4) |
 | Built-in `status` Tool | tests-pass | Non-blocking progress check for async operations |
 | Built-in `await` Tool | tests-pass | Blocking wait for operation completion; soft timeout (R2.5.1); liveness-probed waits are answered by the bridge iff the push channel is live, and a probe-ended wait reports the time that actually passed (R2.6.5.3, R2.6.5.4) |
 | Built-in `cancel` Tool | tests-pass | Cancel running operations |
@@ -45,14 +45,14 @@
 | Logging (File + Stderr) | tests-pass | Daily rolling logs, `--log-to-stderr` for debug |
 | Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
 | TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
-| Live Task Tree (R24) | tests-pass | Project-scoped caller → subtask tree, current at TUI startup via hub replay with true timestamps; accordion drill-in to live/historic output; client identity via reconnect-to-relabel; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
+| Unified Work View (R24, R24.9) | tests-pass | The TUI's home view: one borderless section per client session (hooks and this terminal folded), one open at a time with a 300 ms eased tween, chat on a toggle. Current at startup via daemon replay with true timestamps and the retained output window; ordering independent of activity; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
 | Configuration Standard (R-CFG) | in-progress | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5). Done: Security-tier `AHMA_*` retirement (warn-and-ignore, R-CFG1.2/R-CFG7.1), settings-file/`--no-settings` resolution, settings provenance (`ahma settings show --origin`, R-CFG5.1), trust tiers (`settings_tier`, with a drift test over every key), and the project-tier settings file (R-CFG3: Preference-only, Security keys refused and named). Pending: R-CFG5.2 per-setting startup log lines, R-CFG6.2 unknown-key abort for `[sandbox]`/`[auth]` in the *user* file, R-CFG6.3 permissions warning |
 | Unified Permissions (R-PERM) | tests-pass | One ledger under `~/.ahma` (fs scopes, web domains, tool approvals; legacy `approvals.json` migrated); question ladder (harness elicitation → TUI modal → fail-closed with paste-able remediation); sandbox profiles replace the hard-coded toolchain carve-outs; hooks enabled per client. User guide: `docs/permissions.md` |
 | Trust-Handoff Hardening (R-HANDOFF) | in-progress | Two-tier posture for writes a *trusted, unsandboxed* component executes later (git hook dirs, editor/harness auto-run config, daemon sockets): deny-write where nothing legitimate writes, allow-plus-loud-disclosure where it does. Kernel-enforced on macOS (last-match-wins SBPL denies); **application-layer only on Linux** (Landlock V1 is additive-allow, R6.1.7) and therefore bypassable from `run_terminal_command`; none on Windows yet. Child env strips code-injection and client-redirect vars, keeps `SSH_AUTH_SOCK`. Cross-project package-cache channel disclosed at runtime as the `rust` profile's stated `cost` in `ahma permissions list` (R-HANDOFF.8/R-PERM.5.2), not only in docs. Platform enforcement gaps (macOS reads, Windows both directions, Linux's application-layer-only deny tier) are surfaced on the R5.4 scope surfaces by `sandbox::profiles::platform_enforcement` |
 | Execution Audit Log (R-HANDOFF.10) | tests-pass | Append-only `<log dir>/audit.jsonl` on every execution path (sync, async, PTY, session), in the vault's wire format; `tool_call` before spawn, one `tool_complete` on every terminal path, sandbox denials included; write failures warn and never fail the operation |
 | Profile Network Hosts (R-PERM.5.3) | tests-pass | Sandbox profiles declare the hosts their toolchain needs, each with a reason; union with `[network] allow`, refusable independently of path grants (`[network] profile_hosts` / `deny_profile_hosts`); label-anchored ASCII-only matching. Restriction itself stays opt-in |
 | `ahma setup` / `ahma uninstall` | tests-pass | Interactive wizard installs / removes MCP entries, hooks, skills, binary; symmetric teardown leaves other user config intact |
-| Auto-spawned Bridge Lifecycle | tests-pass | Bridges started by `ahma serve stdio` or `ahma tui` self-terminate after `--idle-timeout` seconds with no connected client; explicitly-started `ahma serve http/unix` remain persistent by default |
+| Single Per-User Daemon (R-DAEMON) | tests-pass | One daemon per user hosts the MCP endpoint and the observability hub, in a 0700 per-user runtime dir (Windows: lock + endpoint file + token, but still on fixed loopback ports — ephemeral-port discovery is unwired and untestable here, R-DAEMON.2). First comer starts it, never from a confined process or a test binary; idle exit needs both halves empty; upgrade drains rather than tearing down other windows' sessions. Workers stay one per session (R5.1). Hooks and the TUI register as instances; bounded output tails and a one-hour `history.jsonl` survive restarts. Explicitly-started `ahma serve http/unix` remain persistent and operator-owned |
 | Binary Code Signing (R-SIGN) | in-progress | macOS ad-hoc binary gets `SIGKILL (Code Signature Invalid)` under heavy-build memory pressure / in-place rebuild → opaque `Connection closed`. Done: atomic out-of-place install + local re-sign in `ahma update` (R-SIGN.2, R-SIGN.1-local); signal-death classification surfaced in the client's JSON-RPC error + panic log-flush (R-SIGN.5). Pending: Developer-ID release signing (R-SIGN.1, blocked on Apple Developer credentials), Windows WDAC/SAC verify (R-SIGN.3) |
 
 ---
@@ -369,7 +369,7 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 
 - **R5.1**: **Per-enforcing-process ownership, lock-once**: A sandbox scope is owned by the **server process that enforces it**, set once for the life of that process and never mutated afterwards (the lock-once invariant). Which process that is depends on the transport, and the two documents describing it previously disagreed; this is the reconciled statement of what is actually built:
   - **Direct stdio** (`ahma serve stdio --server-child`, test harnesses, CLI mode): the server process is the enforcing process; its one scope gates every request it serves.
-  - **HTTP/Unix bridge**: each session gets a **dedicated subprocess**, and that subprocess owns and commits its own scope. Sessions never share a mutable scope object — there is no cross-session scope state to attack — and two clients in different workspaces get two independently locked sandboxes (see R10). When the bridge is started with an explicit `--sandbox-scope`, every session subprocess receives and locks that same operator-chosen value (R5.2.2), which is how the TUI's per-project bridge gives all of its sessions one uniform scope.
+  - **HTTP/Unix bridge**: each session gets a **dedicated subprocess** — spawned by the per-user daemon (R-DAEMON.4) — and that subprocess owns and commits its own scope. Sessions never share a mutable scope object — there is no cross-session scope state to attack — and two clients in different workspaces get two independently locked sandboxes (see R10). When a server is started with an explicit `--sandbox-scope` by an operator, every session subprocess receives and locks that same value (R5.2.2). The **daemon** never carries one: a scope set there would apply to every client, which is what made a TUI's launch directory the default for editor sessions that had nothing to do with it (R-DAEMON.9).
 
   Either way there is exactly one scope per enforcing process and it cannot change while that process lives.
 - **R5.1.1**: **Single commit point**: Every scope commit — derived from `roots/list`, from an explicit flag, from a user elicitation answer, or from the default — **must** go through one atomic compare-and-swap on the instance scope state machine. There is exactly one door to "scope locked"; there is no second path that can set or widen scope after lock. This holds on **both** transports: the HTTP bridge swallows a post-lock `roots/list_changed` (R10.5), and the direct-stdio configuration path (`configure_sandbox_from_roots`, used when a client speaks to `ahma serve stdio` without the bridge) latches the commit once and treats any later `roots/list` / `roots/list_changed` as a tolerated no-op — it does **not** re-request `roots/list` or re-derive scope.
@@ -607,6 +607,7 @@ A "host sandbox" is an outer kernel sandbox ahma is running inside (Cursor, VS C
 - **R7.4**: When `--disable-sandbox` is used, the outer sandbox provides security and ahma's internal sandbox is disabled; the active-sandbox disclosure **must** reflect this (deferred-to-host when a host is detected, otherwise disabled).
 - **R7.5 (honesty limit)**: Detecting a host does **not** prove the host's sandbox is *enabled* (it may be configured off). Disclosure copy **must** therefore state that protection now depends on the host, so a user who disabled the host sandbox is informed rather than surprised.
 - **R7.6 (macOS Seatbelt cannot nest — defer at every execution path, never fail opaquely)**: macOS refuses to apply a Seatbelt profile inside a process that is already confined by one whenever the outer profile denies *anything* — measured on macOS 26: `(allow default)` plus a single `deny` of a nonexistent path is enough for the inner `sandbox-exec` to fail with `sandbox_apply: Operation not permitted`; only a no-op `(allow default)` outer profile permits nesting. Every real sandbox, ahma's own included, therefore forbids it, and no profile ahma could generate changes that. Because every child of a confined process inherits the confinement, running a command *without* ahma's wrapper inside such a process is still kernel-sandboxed — by the outer boundary — and is the correct behaviour. So: ahma **must** decide, when a `Sandbox` is **constructed** (not at the first spawn), whether this process can apply its own profile, using the kernel's own answer (`sandbox_check` on its own pid) confirmed by a refused nesting probe — never environment markers alone (R7.5). When nesting is refused, ahma **must** defer to the outer sandbox on that instance: commands spawn bare, `is_enforced()` is false, every scope surface (R5.4 — startup banner, `sandbox/configured`, `ahma status`, TUI) reports `deferred_to_host`, and the deferral is logged at `warn` with the R7.5 disclosure and remediation. This binds the in-process library path (tests, embedders) exactly as it binds `ahma serve` startup — the failure that motivated it was ahma's own test suite run *through* `run_terminal_command`, whose in-process sandboxes never passed the startup probe and failed with the child's opaque OS error. The outer sandbox **must** be named when it is ahma itself (R7.1): every command ahma sandboxes carries `AHMA_OUTER_SANDBOX_PID=<pid>` (a marker ahma sets, not a setting ahma reads — R-CFG2.3 is unaffected), and a nested ahma that finds it reports "an outer ahma" with remediation that names `run_terminal_command`. `AHMA_PREFER_OWN_SANDBOX` cannot override this — the kernel, not ahma, refuses — and the disclosure says so implicitly by naming the platform rule. A `sandbox-exec` that cannot *execute* at all (missing, or the outer profile SIGKILLs it) remains the R7.3 hard stop: that is not proof of an outer sandbox. Linux Landlock and Windows Job Objects nest fine and are unaffected.
+  - A **confined process must not spawn the per-user daemon** (R-DAEMON.3): a daemon that inherited an outer sandbox would defer every client's enforcement to it, not just its own. Hooks in that state skip registration; a frontend fails loudly with the R7.5 remediation.
 
 ### R-HANDOFF: Trust Handoff — Legitimate Writes That Something Trusted Later Executes
 
@@ -1352,6 +1353,13 @@ ahma --list-tools --http http://localhost:3000
 
 ### R-LIFECYCLE: Auto-Spawned Bridge Self-Termination
 
+> **Superseded for auto-spawned bridges by [R-DAEMON.3](#r-daemon-the-single-per-user-daemon).**
+> Nothing is auto-spawned per client any more: `ahma serve stdio` and `ahma tui`
+> rendezvous on the one per-user daemon, whose lifetime is R-DAEMON.3 (idle
+> across *both* halves, one exit path). What remains true below is the frontend
+> orphan prevention in R-LIFECYCLE.2, and that explicitly started servers have
+> no idle timeout.
+
 Bridges **auto-spawned** by `ahma serve stdio` (proxy mode) or `ahma tui` automatically self-terminate once no MCP client remains connected:
 
 1. Each auto-spawned bridge is started with `--idle-timeout <N>` (default: `AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS = 10`).
@@ -1363,7 +1371,7 @@ Bridges **auto-spawned** by `ahma serve stdio` (proxy mode) or `ahma tui` automa
 
 #### R-LIFECYCLE.2: Frontend (proxy) Orphan Prevention
 
-The IDE-facing `ahma serve stdio` **frontend** process (which proxies stdin/stdout to the auto-spawned bridge) MUST self-terminate when its client connection is abandoned, so that editors that repeatedly spawn MCP servers without reaping them cannot accumulate orphaned processes:
+The IDE-facing `ahma serve stdio` **frontend** process (which proxies stdin/stdout to the per-user daemon, R-DAEMON.1) MUST self-terminate when its client connection is abandoned, so that editors that repeatedly spawn MCP servers without reaping them cannot accumulate orphaned processes:
 
 1. **Stdin EOF** (existing): when the client closes the pipe, the proxy loop exits.
 2. **Parent-death watchdog**: the frontend polls `getppid()`; when it is reparented (parent IDE died) it `process::exit(0)`s within a few seconds. This covers the case where the client is hard-killed without closing stdin. (Unix; the detached bridge/daemon are deliberately **not** watched, since they outlive their spawner by design.)
@@ -1371,11 +1379,176 @@ The IDE-facing `ahma serve stdio` **frontend** process (which proxies stdin/stdo
 
 These three mechanisms together bound how long any abandoned `ahma serve stdio` can live; none of them affect a healthy, actively-used session.
 
+### R-DAEMON: The Single Per-User Daemon
+
+> **Why.** ahma's background presence used to be two independent singletons: an
+> MCP bridge on the machine-global `/tmp/ahma.sock`, and an observability hub on
+> a per-user socket. Two rendezvous points, two lifetimes, no shared identity —
+> so `ahma tui` could end up *being* the hub while a detached bridge served MCP,
+> and quitting that terminal window took the event stream away from three
+> editors that knew nothing about it. Hooked commands reported to neither and
+> were invisible everywhere.
+
+- **R-DAEMON.1 — One daemon per user.** Exactly one ahma daemon per user hosts
+  **both** the MCP endpoint and the observability hub. Every entry point that
+  needs either — an MCP stdio frontend, `ahma tui`, a hooked command —
+  rendezvouses on it and none hosts one itself. An explicitly started
+  `ahma serve http` / `ahma serve unix` is a separate, operator-owned server and
+  is not the daemon.
+  - It is a **control plane**: it executes nothing itself. Tools run in one
+    kernel-sandboxed worker subprocess per MCP session (R5.1, R10.3), because a
+    Landlock ruleset restricts the process that applies it, irreversibly — one
+    process cannot hold two workspace scopes.
+
+- **R-DAEMON.2 — Rendezvous.** A per-user runtime directory
+  (`$XDG_RUNTIME_DIR/ahma`, else `~/.ahma`; `%LOCALAPPDATA%\ahma\run` on
+  Windows), created `0700` and verified to be owned by the caller with no group
+  or other bits before use. It holds `daemon.sock` (the hub, and the mutex) and
+  `mcp.sock`, both `0600`. The machine-global `/tmp/ahma.sock` is retired: every
+  local user could see it and, since nothing owned the path, pre-create it.
+  A `0600` socket inside a lax directory is still squattable, which is why the
+  directory is checked and not merely the socket.
+  - The two sockets are a **pair**. A daemon told to serve an explicit MCP
+    socket derives its hub socket beside it; left on the shared hub it would
+    lose the bind to whichever daemon already held it, stand down, and leave
+    nobody serving the endpoint it was asked for.
+  - **Windows** has no filesystem sockets: `daemon.lock` (a kernel advisory
+    lock, released when its holder dies) is the mutex, and an atomically
+    written `daemon.json` publishes the daemon's ports with a random bearer
+    token that stands in for the mode bits. Liveness is the lock, never a pid
+    probe — a pid can be reused, a lock cannot.
+  - **Not yet done on Windows: ephemeral ports.** The lock, the descriptor and
+    the token are written and tested on every platform, but both listeners
+    still bind the historical fixed loopback ports and discovery still reads
+    those rather than the descriptor — so any local user can still reach them,
+    and the token is the only thing between them and the endpoint. Wiring port
+    `0` blind was refused deliberately: this workspace cannot compile for
+    `x86_64-pc-windows-msvc` (`aws-lc-sys` needs an MSVC toolchain), so the
+    code could not be shown to build, let alone to work, and an untested
+    rendezvous change is how a daemon becomes unreachable on a platform nobody
+    here can debug. Until CI's Windows leg proves it, Windows keeps the fixed
+    ports and this gap is stated rather than papered over.
+
+- **R-DAEMON.3 — Lifetime.** The first comer starts it, detached (R-PROC.3),
+  and **never from a process that is itself confined** (R7.6) — a daemon that
+  inherited an outer sandbox would defer every client's enforcement to it.
+  A test harness never spawns one: `current_exe` inside a test binary is the
+  harness, so spawning it re-runs the tests, which is a fork bomb (R-ISO.1).
+  - It exits when MCP sessions **and** hub connections have both been zero for
+    `[daemon] idle_timeout_secs` (60; 10 under a test harness; `0` never).
+    Counting only sessions would exit while a TUI sat watching an idle project;
+    counting only hub connections would exit mid-build.
+  - Idle exit closes its listeners **first**, re-checks emptiness (a connection
+    accepted in between re-arms it), unlinks only the sockets whose inode it
+    still owns (R-ISO.3), and exits. There is one exit path: sessions
+    terminated, history flushed, sockets removed.
+
+- **R-DAEMON.4 — Sessions and per-session options.** One kernel-sandboxed worker
+  per MCP session, owned by the daemon. Ending a session never affects another.
+  A client's own options (`--tools`, `--sandbox-scope`, `--no-sandbox`, a task
+  vault) travel **with its session** — encoded in the MCP URL's query and
+  applied to that session's worker alone. They were previously baked into the
+  shared bridge by whichever client started it, so a second window's `--tools`
+  was ignored and the first window's `--no-sandbox` unsandboxed everybody.
+  The option list is an allowlist and an unknown name is refused, not ignored.
+  Settings that govern the daemon as a whole — bearer tokens, rate limits,
+  handshake and idle timeouts — are deliberately not settable per session.
+
+- **R-DAEMON.5 — Upgrade by draining.** Version and build id are compared at
+  every connect. A newer client asks the daemon to **drain**: stop accepting new
+  sessions, finish the live ones, then exit, at which point the next client
+  starts the successor. It never tears down sessions that belong to other
+  windows — the old rule ("restart the bridge") did exactly that, mid-command,
+  to every attached editor so that one newly-started client could have a
+  matching binary. A draining daemon answers `initialize` with `503` and
+  `Retry-After`, and says `draining` in `/health`. A skew that survives one
+  replacement is proxied and **disclosed**, never retried: retrying is how
+  several coexisting build ids become a respawn loop.
+
+- **R-DAEMON.6 — Registration and routing.** An instance registers with its
+  `session_id`, `client_pid`, MCP client identity, mode (`stdio` | `hook` |
+  `tui`) and its **committed** sandbox scope, re-registering whenever any of
+  them becomes known — the scope is not knowable until `roots/list` has been
+  answered and the sandbox committed, and advertising a placeholder made every
+  roots-driven instance invisible to a project filter (R24.3). The hub keeps one
+  instance id per `session_id`, so re-registering is not a departure and an
+  arrival.
+  - A decision (tool approval, scope grant, web approval) is routed back to the
+    instance that **raised** it. An untargeted request is routed only when
+    exactly one non-hook, non-tui session is attached; otherwise the hub refuses
+    rather than guessing. Picking "the first instance" was right by construction
+    with one client attached and sent one window's answer to another window's
+    question with several.
+
+- **R-DAEMON.7 — Retention, with bounds.** In memory: ≤ 500 operations per
+  instance (oldest *finished* evicted first, running never), ≤ `MAX_TAIL_LINES`
+  output lines per operation, ≤ 2000 operations across all instances, and a
+  one-hour window. History is **retained when an instance disconnects** — a hook
+  is an instance for the length of one command, so dropping it on disconnect
+  made hooked work invisible by construction — and the instance stays listed
+  with `ended_epoch_ms` so its operations have a section to belong to.
+  - On disk: `history.jsonl` (`0600`) **in the R-DAEMON.2 runtime directory,
+    beside the sockets** — the one directory whose ownership and mode the
+    daemon verifies. It named every command every client ran and used to
+    resolve to `~/.ahma` unconditionally, which on any Linux desktop (where
+    `XDG_RUNTIME_DIR` is set) put it in the one of the two directories that is
+    never checked. One record per operation edge,
+    the output window written once at completion, rotated by rename at 8 MiB
+    keeping one predecessor. The last hour is replayed at start. A torn final
+    line — the normal result of a crash mid-write — and a record from a newer
+    ahma are skipped with a warning, never fatal.
+  - An operation still running when its daemon went away is replayed
+    `interrupted`, not failed: its exit is genuinely unknown, and claiming a
+    failure would be an invention. An operation whose start record was never
+    seen is reconstructed from its terminal event and flagged `partial`, because
+    the outcome is real even when the preamble is gone.
+
+- **R-DAEMON.8 — Hooks are visible.** A hooked command registers as an instance
+  with `mode: "hook"` and streams its operation like any other. It never spawns
+  a daemon — that would put a process launch in front of a user's command — and
+  it waits at most 300 ms for its terminal event to reach the hub before
+  exiting. Both bounds are the point: a hook *is* one operation and exits the
+  moment that command ends, so without the wait the report races process
+  teardown, and with an unbounded wait a wedged daemon would hold up a shell.
+  Registration happens after the R5.5.3 consent decision and cannot change it;
+  the unsandboxed fallback is not reported.
+
+- **R-DAEMON.9 — The TUI is a subscriber.** `ahma tui` never binds the hub and
+  never starts a server — above all not one scoped to its launch directory,
+  which used to become the default scope for every editor session that attached
+  afterwards. It subscribes, registers itself as `mode: "tui"` for its own `!`
+  commands, and opens its chat session like any other client (scope from its own
+  `roots/list`, R5.2.1.1). Quitting sends nothing but EOF.
+  - **A `!` command is reported like any other work, and marked as
+    unconfined.** The TUI opens a second, outgoing connection under a session
+    id stable for its lifetime, and reports `OpStarted` / `OpOutput` /
+    `OpFinished` for every command typed behind `!` — which is what puts them
+    in the history file, in a second TUI, and in the view after a restart.
+    `OpStarted.unsandboxed` is set on exactly these, and every surface that
+    renders an operation **must** say so: the row carries a mark and the detail
+    pane names it. A unified view in which the one command that ran at the
+    user's full privilege looks like all the others is withholding the only
+    thing about it a reader needs.
+  - The reporter **must not** start a daemon (the subscriber already ensures
+    one) and **must not** block the UI: a command runs, and shows its output
+    locally, whether or not the report lands.
+
+- **R-DAEMON.10 — Test isolation.** Every path in R-DAEMON.2, and the history
+  file, resolves under one per-run private location when
+  `spawned_under_test_harness()` (R-ISO.1). A test that wrote the developer's
+  history would also read it back into its own assertions.
+
+- **R-DAEMON.11 — What this deliberately does not do.** The per-workspace
+  `WorkspaceScope` machinery (R5.3.6) stays unwired: the per-session `ScopeLock`
+  remains the single commit door, and the daemon holds no scope state of its
+  own. R5.3.6 warns that a partial wiring is a second door, and this change adds
+  no door.
+
 ### R-ISO: Test/Live Endpoint Isolation
 
 > **Problem (confirmed live failure, 2026-07-14).** The proxy, bridge, and daemon rendezvous on machine-global singleton endpoints (`/tmp/ahma.sock`, `~/.ahma/daemon.sock`, the Windows daemon TCP port). Test isolation existed but was opt-in per spawn site (`AHMA_TEST_ISOLATION`, set only by `test_utils::cli::test_command`); harnesses in other crates spawned the real binary without it. A full `cargo nextest run` therefore unlinked the live `/tmp/ahma.sock` while binding test bridges and dispatched a `RunPrompt` to the live daemon hub — tearing down the developer's active MCP session mid-conversation (surfaced to the client as `-32002` then a full server disconnect).
 
-- **R-ISO.1 (fail-closed test detection).** Any ahma process spawned directly or transitively under a test harness MUST resolve private, test-scoped endpoints instead of the machine-global ones. Detection is `ahma_common::test_isolation::spawned_under_test_harness()`: the explicit `AHMA_TEST_ISOLATION` plumbing variable OR the `NEXTEST` variable that `cargo nextest` exports to every test process (inherited by all children), so a spawn site that forgets the explicit variable can no longer reach live endpoints. Per-run endpoint names that parent and child processes must agree on use `NEXTEST_RUN_ID` (not the PID). Test harnesses that spawn the binary SHOULD still set `AHMA_TEST_ISOLATION=1` explicitly (plain `cargo test` sets no distinctive variable).
+- **R-ISO.1 (fail-closed test detection).** Any ahma process spawned directly or transitively under a test harness MUST resolve private, test-scoped endpoints **and state** instead of the shared ones: the hub socket, the MCP socket and the history file (R-DAEMON.10). A test that wrote the developer's history would also read it back into its own assertions. It MUST also refuse to *spawn* a daemon at all: `current_exe` inside a test binary is the test harness, so spawning it re-runs the tests, each copy spawning again — a fork bomb that empties the machine's process table. Detection is `ahma_common::test_isolation::spawned_under_test_harness()`: the explicit `AHMA_TEST_ISOLATION` plumbing variable OR the `NEXTEST` variable that `cargo nextest` exports to every test process (inherited by all children), so a spawn site that forgets the explicit variable can no longer reach live endpoints. Per-run endpoint names that parent and child processes must agree on use `NEXTEST_RUN_ID` (not the PID). Test harnesses that spawn the binary SHOULD still set `AHMA_TEST_ISOLATION=1` explicitly (plain `cargo test` sets no distinctive variable).
 - **R-ISO.2 (never steal a live socket).** A Unix-socket listener MUST NOT unlink an existing socket file without first probe-connecting it: a successful connection means a live server owns the path and binding MUST fail loudly (naming the conflict and the `--socket-path` remedy); only a refused/absent connection marks the file stale and safe to remove. (The daemon hub's bind-is-the-mutex protocol already satisfies this; the HTTP bridge's Unix listener must too.)
 - **R-ISO.3 (remove only what you own).** On shutdown a server MUST remove its socket file only if the path still refers to the socket it bound (device+inode match). If another process has since replaced the path, deleting it would orphan *that* server's live socket.
 - **R-ISO.4 (regression tests).** Unit tests MUST pin: harness detection via both variables; refusal to bind over a live socket; stale-socket cleanup; and identity-checked shutdown removal.
@@ -1611,23 +1784,30 @@ correct **at startup**, not only for events that happen afterwards.
   from descriptions or naming conventions.
 
 - **R24.2 — Current at startup ("it just works").** On launch the TUI
-  subscribes to the hub daemon, which replays each instance's retained
-  operation history (`OpStarted` + terminal `OpFinished`, bounded per
-  instance) before live events. Replayed events carry wall-clock timestamps
+  subscribes to the daemon, which replays each instance's retained operation
+  history (`OpStarted`, the bounded output window that followed it as ordinary
+  `OpOutput` events, then terminal `OpFinished`) before live events — including
+  the last hour restored from disk for instances that are no longer attached
+  (R-DAEMON.7), so recent work does not disappear because the client that did
+  it has closed. An operation still running when its daemon went away replays
+  `interrupted`. Replayed events carry wall-clock timestamps
   (`started_epoch_ms` / `ended_epoch_ms`) so elapsed/duration displays are
-  **true times, not time-since-receipt**. When the replay reveals live work
-  for the current project from an attached client, the TUI switches to the
-  task view automatically; any user keystroke disarms this auto-switch.
+  **true times, not time-since-receipt**. When the replay reveals live work for
+  the current project from an attached client, the TUI **opens that client's
+  section** automatically — not merely a view of everything, which the user
+  would then have to click into; any user keystroke disarms this auto-open.
 
-- **R24.3 — Project-scoped by default.** The tree shows instances whose
-  sandbox scope covers (or lives inside) the directory the TUI was started in;
+- **R24.3 — Project-scoped by default.** The view shows instances whose
+  **committed** sandbox scope (R-DAEMON.6) covers, or lives inside, the
+  directory the TUI was started in; an instance whose scope is not established
+  yet reads *no scope yet* rather than being filtered out — it is not somewhere
+  else, it is not yet anywhere;
   `f` toggles all projects. Matching is component-boundary path containment in
   either direction. Instances with no operations still render (an idle,
   attached client is information, not noise).
 
-- **R24.4 — Compact tree with accordion drill-in.** One line per task:
-  instance headers (client identity, transport, scope, and parallel-work
-  tallies: running / queued / succeeded / failed), operations beneath them,
+- **R24.4 — Compact tree with accordion drill-in.** Inside the open section
+  (R24.9), one line per task: operations beneath the section header,
   children indented under their parent (session groups, spawned subtasks —
   arbitrary depth). Finished tasks resolve in place to a terminal glyph +
   duration. Space or click on a task expands it inline into its live output
@@ -1636,15 +1816,22 @@ correct **at startup**, not only for events that happen afterwards.
   Enter opens the full-screen operation detail overlay instead.
   Instance and session headers fold/unfold their subtree.
 
-- **R24.5 — Field-only wire evolution.** The task-tree protocol additions
-  (`parent_id`, `started_epoch_ms`, `ended_epoch_ms` on `DaemonEvent`;
-  `client` on `Register`/`InstanceInfo`) are `#[serde(default)]` **field**
+- **R24.5 — Field-only wire evolution.** The protocol additions
+  (`parent_id`, `started_epoch_ms`, `ended_epoch_ms`, `partial`, `interrupted`,
+  `unsandboxed` on `DaemonEvent`; `client`, `session_id`, `client_pid`,
+  `ended_epoch_ms` on `Register`/`InstanceInfo`) are `#[serde(default)]` **field**
   additions — never new message variants — so mixed-version daemon / instance
   / TUI combinations keep interoperating. The MCP client identity
   (`clientInfo.name`, learned at `initialize` — after hub registration) is
   conveyed by the reporter **reconnecting and re-registering**
   (reconnect-to-relabel), which also re-replays state, rather than by a new
   `UpdateInstance` message.
+  - **A reader skips what it does not know.** A message whose `type` this build
+    does not recognise is logged and skipped, never treated as a protocol
+    error: dropping the connection made every future message addition a hard
+    incompatibility on a socket that has no version to negotiate. Malformed
+    JSON is still an error — a desynchronised stream must not pretend to make
+    progress.
   - **The constraint is on the bytes, not on the Rust types.** Restructuring
     `ClientMsg`/`DaemonMsg` is permitted whenever the JSON is unchanged, and
     forbidden whenever it is not — there is no version to negotiate on this
@@ -1672,7 +1859,10 @@ correct **at startup**, not only for events that happen afterwards.
   - `DaemonEvent::OpStarted` carries `title` (a human command summary computed
     **server-side**, which is the only place that knows the command), plus
     `cwd`, the full `command`, and `origin` — which attached session initiated
-    the work (`cursor` | `claude-code` | `tui` | `cli` | `hook` | …).
+    the work (`cursor` | `claude-code` | `tui` | `cli` | `hook` | …). `origin`
+    is the **client's** identity where there is one, not the instance label,
+    which is `ahma` for every session and so tells a reader nothing about which
+    window started the work.
   - `DaemonEvent::OpFinished` carries a numeric `exit_code` in addition to its
     status string, because "failed" without an exit code is not actionable.
   - These are `#[serde(default)]` **field** additions, permitted by R24.5;
@@ -1725,6 +1915,38 @@ correct **at startup**, not only for events that happen afterwards.
     for an instance answers *what was asked and how it went* first — outcome
     tallies and recent operation identities (R24.7) — and demotes transport,
     pid, uuid, and scope to a single dim line for connection debugging.
+
+- **R24.9 — One section per client session; borderless; animated.** The TUI's
+  home view is the work view: what is being done on the user's behalf is what
+  someone opens this window to find out, and chat is a thing they then choose to
+  do (`i` or `/chat`).
+  - **A section per client session**, keyed by `session_id` so it keeps its
+    place and its open/closed state when its instance re-registers
+    (R-DAEMON.6). Hooked commands fold into one section — a hook is an instance
+    per command, so one section each would be a wall of one-line sections — and
+    this TUI's own `!` commands and chat tool calls are one section, *this
+    terminal (you)*. A section's header names its client, its scope, whether
+    something is running, the running/queued/succeeded/failed tallies, and the
+    command it is running or last ran, so a closed section is informative rather
+    than just a name.
+  - **Exactly one section is open**; opening another closes it over a 300 ms
+    eased **layout** tween — heights move, colour does not. Interrupting a
+    movement continues the outgoing section from the height it is currently
+    drawn at rather than snapping back to full height first.
+  - **Ordering is independent of activity.** A section that starts or finishes
+    work must not change position under the cursor; liveness is the glyph and
+    the tallies. Sections order by project, then kind, then client, and *this
+    terminal (you)* is last.
+  - **No box.** A section is a horizontal rule with its name written into it,
+    and the rules are the structure; a border around them is a second frame
+    around a frame. Overlays and modals keep theirs. The scrollbar stays, and
+    obeys R24.8.1.
+  - **One layout function.** The renderer and the hit-test read the same
+    positions, so what is drawn and what is clickable cannot disagree —
+    including mid-animation, when a section is showing fewer rows than it has
+    (R24.8.2). A pane that is closed claims no clicks.
+  - Identity — transport, pids, session id — is the footnote in the detail
+    overlay, never the header (R24.8.6).
 
 #### R25: Tool-call session reuse (TUI chat)
 

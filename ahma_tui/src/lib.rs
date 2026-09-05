@@ -8,6 +8,7 @@
 //!
 //! This crate is licensed under **AGPL-3.0-or-later**.
 
+pub mod accordion;
 pub mod agent_config;
 pub mod app;
 pub mod connection;
@@ -24,7 +25,9 @@ pub mod state;
 pub mod task_tree;
 mod terminal_guard;
 pub mod theme;
+pub mod tui_reporter;
 pub mod ui;
+pub mod work_view;
 
 pub use connection::{ResolvedConnection, ResolvedTransport};
 
@@ -67,27 +70,46 @@ pub async fn run_tui(
     token_prefs: TokenPrefs,
 ) -> Result<()> {
     // Set by the previous process image when it re-exec'd itself to match a
-    // newer running bridge (see connection::handle_existing_candidate). The
+    // newer running daemon (see `daemon_client::ensure_daemon`). The
     // user saw the screen flicker and was never told why; the restarted
     // process is the only one that can still say so.
     if std::env::var("AHMA_RESTARTED").is_ok() {
         startup_notices::push(
             startup_notices::Level::Warn,
-            "This TUI restarted itself to match the newer ahma server already running.",
+            "This TUI restarted itself to match the newer ahma daemon already running.",
         );
     }
 
-    if connect.is_none()
-        && let Err(e) = connection::ensure_server_running(path.as_deref()).await
-    {
-        // Not fatal — resolve_connection re-probes and may still find or start
-        // a server. But it must not be silent: this arm catches the version
-        // mismatch that says "please update TUI binary", the spawn timeout,
-        // and every other reason the usual path did not work.
-        startup_notices::push(
-            startup_notices::Level::Warn,
-            format!("Could not start or reuse a local ahma server: {e:#}"),
-        );
+    // Pre-flight the directory this TUI will answer `roots/list` with, so a
+    // typo or a `$HOME` launch is named here rather than surfacing later as a
+    // per-session sandbox rejection (SPEC R5.2.4, R5.2.1.1).
+    if let Err(e) = connection::preflight_scope(path.as_deref()) {
+        startup_notices::push(startup_notices::Level::Warn, format!("{e:#}"));
+    }
+
+    if connect.is_none() {
+        // Ensure the one per-user daemon exists. The TUI does **not** start a
+        // server of its own, and above all does not start one scoped to its
+        // launch directory: that used to lock every editor session that
+        // arrived afterwards to whichever folder a terminal happened to be in
+        // (SPEC R-DAEMON.9).
+        let socket = ahma_common::daemon_hub::mcp_socket_path(None);
+        match ahma_mcp::shell::modes::daemon_client::ensure_daemon(Some(&socket), None, None).await
+        {
+            Ok(outcome) => {
+                if let Some(notice) = ahma_mcp::shell::modes::daemon_client::disclosure(&outcome) {
+                    startup_notices::push(startup_notices::Level::Warn, notice);
+                }
+            }
+            Err(e) => {
+                // Not fatal — `resolve_connection` re-probes and may still find
+                // one — but never silent.
+                startup_notices::push(
+                    startup_notices::Level::Warn,
+                    format!("Could not reach or start the ahma daemon: {e:#}"),
+                );
+            }
+        }
     }
     let connection = connection::resolve_connection(connect).await?;
     app::run(&connection, profile, path, token_prefs).await

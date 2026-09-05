@@ -49,7 +49,7 @@
 // Previously imported from ahma_http_bridge::peer, which created a test-time
 // back-edge.  ahma_common has no dependency on ahma_http_bridge, so this
 // severs the cycle cleanly.
-use ahma_common::peer_factory::{BoxFuture, PeerFactory, PeerStreams};
+use ahma_common::peer_factory::{BoxFuture, PeerFactory, PeerSpawnOptions, PeerStreams};
 use std::sync::Arc;
 
 // ─── NullPeerFactory ─────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ use std::sync::Arc;
 pub struct NullPeerFactory;
 
 impl PeerFactory for NullPeerFactory {
-    fn create(&self) -> BoxFuture<anyhow::Result<PeerStreams>> {
+    fn create(&self, _options: PeerSpawnOptions) -> BoxFuture<anyhow::Result<PeerStreams>> {
         Box::pin(async move {
             // A duplex pair — when the peer_end is dropped immediately the
             // bridge end sees EOF on reads.
@@ -137,7 +137,7 @@ impl std::fmt::Debug for InProcessMcpPeerFactory {
 }
 
 impl PeerFactory for InProcessMcpPeerFactory {
-    fn create(&self) -> BoxFuture<anyhow::Result<PeerStreams>> {
+    fn create(&self, _options: PeerSpawnOptions) -> BoxFuture<anyhow::Result<PeerStreams>> {
         use crate::adapter::Adapter;
         use crate::mcp_service::{AhmaMcpService, GuidanceConfig};
         use crate::operation_monitor::{MonitorConfig, OperationMonitor};
@@ -289,7 +289,10 @@ mod tests {
     #[tokio::test]
     async fn null_factory_creates_valid_peer_streams() {
         let factory = NullPeerFactory;
-        let streams = factory.create().await.expect("create should succeed");
+        let streams = factory
+            .create(PeerSpawnOptions::default())
+            .await
+            .expect("create should succeed");
         // stdin and stdout are valid (non-null) boxed trait objects
         let _ = streams.stdin;
         let _ = streams.stdout;

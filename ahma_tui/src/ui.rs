@@ -19,6 +19,8 @@ use ratatui::{
 use crate::state::{AppState, ChatEntry, ClickTarget, Focus, NavCommand, SandboxAuthority};
 use crate::theme::Theme;
 
+pub mod work;
+
 // ─── Top-level draw ───────────────────────────────────────────────────────────
 
 /// Called every redraw tick — the only public entry point in this module.
@@ -305,7 +307,7 @@ fn draw_collapsed_window(
 }
 
 /// Milliseconds since the epoch — the clock that drives stateless panels.
-fn wall_ms() -> u64 {
+pub fn wall_ms() -> u64 {
     ahma_common::keepalive::current_timestamp_ms()
 }
 
@@ -627,7 +629,38 @@ fn operation_detail_lines(
             theme.op_status_style(&op.status),
         )));
     }
+
+    // Identity is the footnote, work is the headline (SPEC R24.8.6): who ran
+    // this, and on what connection, belongs here rather than on a header line
+    // that has to say what is happening.
+    if let Some(footnote) = operation_identity_footnote(op) {
+        lines.push(Line::from(Span::styled(footnote, theme.dim())));
+    }
     lines
+}
+
+/// `via claude-code · pid 4242 · …/github/ahma` — connection debugging, kept
+/// out of the way of the work (SPEC R24.8.6).
+fn operation_identity_footnote(op: &crate::state::Operation) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(origin) = op.origin.as_deref().filter(|o| !o.is_empty()) {
+        parts.push(format!("via {origin}"));
+    } else if let Some(label) = op.instance_label.as_deref().filter(|l| !l.is_empty()) {
+        parts.push(format!("via {label}"));
+    }
+    if let Some(pid) = op.pid {
+        parts.push(format!("pid {pid}"));
+    }
+    if let Some(scope) = op.scope.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(crate::task_tree::short_path(scope));
+    }
+    if op.partial {
+        parts.push("start record not seen".to_string());
+    }
+    if op.unsandboxed {
+        parts.push("UNSANDBOXED".to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Line<'static>> {
@@ -638,18 +671,31 @@ fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Li
         ])
     };
 
-    let mut lines = vec![kv("id", op.id.clone(), theme.normal())];
-    if let Some(instance) = &op.instance_label {
-        lines.push(kv("instance", instance.clone(), theme.normal()));
-    }
-    if let Some(origin) = &op.origin {
-        lines.push(kv("origin", origin.clone(), theme.normal()));
-    }
+    // The work is the headline (SPEC R24.8.6): what ran, first and in full.
+    // This pane used to open with the operation's id and the instance label —
+    // the two things a reader already knows and least needs.
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{} ", op.status.glyph(true)),
+            theme.op_status_style(&op.status),
+        ),
+        Span::styled(op.display_name(), theme.title()),
+    ])];
     let status = match op.exit_code {
         Some(code) => format!("{:?} (exit {code})", op.status),
         None => format!("{:?}", op.status),
     };
     lines.push(kv("status", status, theme.op_status_style(&op.status)));
+    // Loud, and second only to the outcome: this command was not confined by
+    // the kernel, and no other line on this pane would tell the reader so
+    // (SPEC R-DAEMON.9).
+    if op.unsandboxed {
+        lines.push(kv(
+            "sandbox",
+            "UNSANDBOXED — ran at your full privilege".to_string(),
+            theme.failed(),
+        ));
+    }
     // The detail pane is the screen a user opens to find out *why* something
     // failed, and a denial's whole point is the path it names (SPEC R-PERM.7.1).
     // Taken from the shared identity mechanism so this pane and the operation
@@ -665,9 +711,6 @@ fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Li
     lines.push(kv("duration", op.elapsed_display(), theme.normal()));
     if let Some(cwd) = &op.cwd {
         lines.push(kv("cwd", cwd.clone(), theme.normal()));
-    }
-    if let Some(pid) = op.pid {
-        lines.push(kv("pid", pid.to_string(), theme.normal()));
     }
     if let Some(cmd) = &op.command {
         // The full command, wrapped by the Paragraph — shown in full, this is
@@ -766,8 +809,8 @@ fn draw_zoomed_chat_pane(
     zoom: Focus,
 ) {
     match zoom {
-        Focus::OpsDag => {
-            state.ops_area.set(chat_a);
+        Focus::Work => {
+            state.work_area.set(chat_a);
             draw_ops_dag(frame, state, theme, chat_a);
         }
         Focus::Log => {
@@ -776,69 +819,6 @@ fn draw_zoomed_chat_pane(
         }
         _ => {}
     }
-}
-
-fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme, chat_a: Rect) {
-    let chat_content_area = draw_stacked_panels(frame, state, theme, chat_a);
-    state.chat_area.set(chat_content_area);
-    draw_chat_body(frame, state, theme, chat_content_area);
-}
-
-/// Draw whichever of the scope/tasks/log panes are open, stacked above the
-/// chat, and return the area left over for the chat itself.
-///
-/// The constraints pushed here and the areas consumed below must stay in the
-/// same order — each pane contributes at most one of each, in this sequence.
-fn draw_stacked_panels(frame: &mut Frame, state: &AppState, theme: &Theme, chat_a: Rect) -> Rect {
-    let mut constraints = Vec::new();
-    let show_scope = state.scope_window_open;
-    let show_tasks = state.tasks_window_open;
-    let show_log = state.log_window_open;
-
-    // Sized to content (honest panes, R24.8: budget the rows the renderer
-    // draws); scope_window_lines caps itself rather than relying on clipping.
-    // Built once here and handed to the renderer — the height calculation and
-    // the draw used to each build their own copy (with their own `Theme`),
-    // every frame the window was open.
-    let scope_lines = show_scope.then(|| scope_window_lines(state, theme));
-    if let Some(lines) = &scope_lines {
-        constraints.push(Constraint::Length(scope_window_height(lines.len(), chat_a)));
-    }
-    if show_tasks {
-        let tasks_h = (chat_a.height / 3).clamp(6, 16);
-        constraints.push(Constraint::Length(tasks_h));
-    }
-    if show_log {
-        let log_h = (chat_a.height / 3).clamp(6, 16);
-        constraints.push(Constraint::Length(log_h));
-    }
-    constraints.push(Constraint::Min(4));
-
-    let areas = Layout::vertical(constraints).split(chat_a);
-    let mut idx = 0;
-    if let Some(lines) = scope_lines {
-        let area = areas[idx];
-        idx += 1;
-        draw_scope_window(frame, theme, area, lines);
-    }
-    if show_tasks {
-        let area = areas[idx];
-        idx += 1;
-        state.ops_area.set(area);
-        draw_ops_dag(frame, state, theme, area);
-    } else {
-        state.ops_area.set(Rect::default());
-    }
-    if show_log {
-        let area = areas[idx];
-        idx += 1;
-        state.log_area.set(area);
-        draw_log(frame, state, theme, area);
-    } else {
-        state.log_area.set(Rect::default());
-    }
-
-    areas[idx]
 }
 
 /// Split the chat area between the scrolling history and the stack of visible
@@ -861,6 +841,13 @@ fn draw_chat_body(frame: &mut Frame, state: &AppState, theme: &Theme, chat_conte
     draw_windows_layout(frame, state, theme, windows_area, &layouts);
 }
 
+/// The main screen: a header bar, the work view, whatever panes are open below
+/// it, and a footer (SPEC R24.9).
+///
+/// The work view is home. Chat is a pane you open, and its input box exists
+/// only while it is open — the old layout drew an input box on every frame,
+/// which made "type a message" the thing the window was for, when what the
+/// window is for is seeing what is being done on your behalf.
 fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
     let approval_h: u16 = if let Some(gate) = &state.approval {
@@ -871,9 +858,13 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         0
     };
 
-    let input_h = compute_chat_input_height(state, full.width);
+    let input_h = if state.chat_open {
+        compute_chat_input_height(state, full.width)
+    } else {
+        0
+    };
 
-    let [header_a, chat_a, approval_a, input_a, footer_a] = Layout::vertical([
+    let [header_a, body_a, approval_a, input_a, footer_a] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
         Constraint::Length(approval_h),
@@ -882,22 +873,67 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     ])
     .areas(full);
 
-    draw_chat_header(frame, state, theme, header_a);
-
     // Clear window_rects at start of drawing
     state.window_rects.borrow_mut().clear();
 
     if let Some(zoom) = state.zoomed {
-        draw_zoomed_chat_pane(frame, state, theme, chat_a, zoom);
+        draw_chat_header(frame, state, theme, header_a);
+        draw_zoomed_chat_pane(frame, state, theme, body_a, zoom);
     } else {
-        draw_unzoomed_chat_layout(frame, state, theme, chat_a);
+        work::draw_work_header(frame, state, theme, header_a);
+        draw_main_body(frame, state, theme, body_a);
     }
 
     if state.approval.is_some() {
         draw_approval(frame, state, theme, approval_a);
     }
-    draw_input_box(frame, state, theme, input_a);
+    if state.chat_open {
+        draw_input_box(frame, state, theme, input_a);
+    } else {
+        // Nothing may claim clicks for a pane that is not on screen.
+        state.chat_input_area.set(Rect::default());
+    }
     draw_chat_footer(frame, state, theme, footer_a);
+}
+
+/// Work view on top, then whichever panes are open beneath it.
+fn draw_main_body(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let mut constraints = vec![Constraint::Min(3)];
+
+    let scope_lines = state
+        .scope_window_open
+        .then(|| scope_window_lines(state, theme));
+    if let Some(lines) = &scope_lines {
+        constraints.push(Constraint::Length(scope_window_height(lines.len(), area)));
+    }
+    if state.log_window_open {
+        constraints.push(Constraint::Length((area.height / 3).clamp(6, 16)));
+    }
+    if state.chat_open {
+        constraints.push(Constraint::Min(4));
+    }
+
+    let areas = Layout::vertical(constraints).split(area);
+    let mut idx = 0;
+
+    work::draw_work_view(frame, state, theme, areas[idx], wall_ms());
+    idx += 1;
+
+    if let Some(lines) = scope_lines {
+        draw_scope_window(frame, theme, areas[idx], lines);
+        idx += 1;
+    }
+    if state.log_window_open {
+        draw_log(frame, state, theme, areas[idx]);
+        idx += 1;
+    }
+    if state.chat_open {
+        let chat_a = areas[idx];
+        state.chat_area.set(chat_a);
+        draw_chat_body(frame, state, theme, chat_a);
+    } else {
+        state.chat_area.set(Rect::default());
+    }
 }
 
 fn get_mcp_label(mcp_enabled: bool, unicode: bool) -> &'static str {
@@ -1759,7 +1795,7 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     let mode_label = "AHMA";
 
     let keys: &[(&str, &str)] = match state.focus {
-        Focus::OpsDag => &[
+        Focus::Work => &[
             ("↑↓", "nav ops"),
             ("Space", "fold/unfold"),
             ("Tab", "cycle panels"),
@@ -1779,7 +1815,8 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
             ("Shift+Enter", "newline"),
             ("/", "commands"),
             ("?", "help"),
-            ("/tasks", "tasks view"),
+            ("/tasks", "focus the work view"),
+            ("/chat", "chat pane"),
             ("/log", "log view"),
             ("/scope", "sandbox"),
             ("/quit", "quit"),
@@ -2397,7 +2434,7 @@ fn draw_task_tree_row(
 }
 
 fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let focused = state.focus == Focus::OpsDag;
+    let focused = state.focus == Focus::Work;
     let border_style = if focused {
         theme.border_focused()
     } else {
@@ -2417,7 +2454,7 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    state.ops_area.set(area);
+    state.work_area.set(area);
 
     rebuild_task_rows(state);
     let rows = state.task_rows.borrow();
@@ -2849,6 +2886,10 @@ fn build_tree_op_item(
         (true, false) => "v ",
         (false, _) => "",
     };
+    // The `!` the user typed, kept on the row it produced. A scan down the work
+    // view is where unconfined work has to be distinguishable from the rest;
+    // the detail pane is a screen too late.
+    let unsandboxed_mark = if op.unsandboxed { "! " } else { "" };
 
     let clean_id_str = op.clean_id();
     let id_part = format!(" [{}]", clean_id_str);
@@ -2872,7 +2913,8 @@ fn build_tree_op_item(
         _ => format!("  {}", op.elapsed_display()),
     };
 
-    let fixed_prefix_len = sel_symbol.len() + indent.len() + expand_mark.len() + 2;
+    let fixed_prefix_len =
+        sel_symbol.len() + indent.len() + expand_mark.len() + unsandboxed_mark.len() + 2;
     let rem_width = width.saturating_sub(fixed_prefix_len);
 
     let display_name = op.display_name();
@@ -2891,6 +2933,7 @@ fn build_tree_op_item(
             format!("{} ", op.status.glyph(state.unicode)),
             theme.op_status_style(&op.status),
         ),
+        Span::styled(unsandboxed_mark, theme.failed()),
         Span::styled(expand_mark, theme.dim()),
     ];
 
@@ -3669,13 +3712,18 @@ const HELP_RIGHT_ROWS: &[(&str, &str)] = &[
     ("Click [+]/[-]", "Toggle expand/collapse"),
     ("Click card", "Open operation details"),
     ("", ""),
-    ("TASKS (tree)", ""),
-    ("j / k", "Select row"),
-    ("Enter", "Open full-screen operation details; fold headers"),
+    ("WORK VIEW", ""),
+    ("j / k / arrows", "Select row"),
     (
-        "Space / Click",
-        "Expand task into live/historic output (accordion); fold headers",
+        "Enter / Click a header",
+        "Open that section, closing the open one",
     ),
+    (
+        "Space / Click a task",
+        "Expand it into live/historic output (one at a time)",
+    ),
+    ("Wheel", "Scroll the view"),
+    ("i, /chat", "Open or close the chat pane"),
     ("f", "Toggle this-project / all-projects filter"),
     ("c", "Cancel selected"),
     ("p", "Pin selected"),
@@ -3720,13 +3768,18 @@ const HELP_SINGLE_ROWS: &[(&str, &str)] = &[
     ("Up / Down", "Move selection"),
     ("Enter / Esc", "Choose / cancel"),
     ("", ""),
-    ("TASKS (tree)", ""),
-    ("j / k", "Select row"),
-    ("Enter", "Open full-screen operation details; fold headers"),
+    ("WORK VIEW", ""),
+    ("j / k / arrows", "Select row"),
     (
-        "Space / Click",
-        "Expand task into live/historic output (accordion); fold headers",
+        "Enter / Click a header",
+        "Open that section, closing the open one",
     ),
+    (
+        "Space / Click a task",
+        "Expand it into live/historic output (one at a time)",
+    ),
+    ("Wheel", "Scroll the view"),
+    ("i, /chat", "Open or close the chat pane"),
     ("f", "Toggle this-project / all-projects filter"),
     ("c", "Cancel selected"),
     ("p", "Pin selected"),
@@ -4498,6 +4551,113 @@ mod tests {
     /// A tree taller than its pane scrolls silently unless it says so. The
     /// selected row is kept in view automatically, so without a bar there is no
     /// cue at all that rows exist above or below.
+    #[test]
+    fn the_detail_overlay_carries_the_identity_footnote() {
+        let mut op = crate::state::Operation::new(
+            "op-1",
+            "run_terminal_command",
+            crate::state::OpStatus::Succeeded,
+        );
+        op.title = Some("cargo build".into());
+        op.origin = Some("claude-code".into());
+        op.pid = Some(4242);
+        op.scope = Some("/Users/dev/github/ahma".into());
+
+        let theme = Theme::new(true);
+        let text: String = operation_detail_lines(&op, &theme, 60)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            text.contains("via claude-code"),
+            "who ran it belongs in the detail view: {text}"
+        );
+        assert!(text.contains("pid 4242"), "{text}");
+        assert!(
+            text.contains("cargo build"),
+            "and the work is still the headline: {text}"
+        );
+
+        // An operation reconstructed from its terminal event says so, rather
+        // than presenting its blanks as fact.
+        let mut partial = op.clone();
+        partial.partial = true;
+        let text: String = operation_detail_lines(&partial, &theme, 60)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("start record not seen"), "{text}");
+    }
+
+    /// A command that ran outside the sandbox must say so on the row *and* in
+    /// the detail pane.
+    ///
+    /// The unified view's promise is that one screen tells you what has been
+    /// happening on this machine. A `!` command ran at the user's full
+    /// privilege; drawing it identically to sandboxed work would keep the one
+    /// fact about it that changes what a reader should think.
+    #[test]
+    fn an_unsandboxed_command_says_so_on_the_row_and_in_the_detail() {
+        let theme = Theme::new(true);
+        let mut op =
+            crate::state::Operation::new("op-1", "shell", crate::state::OpStatus::Succeeded);
+        op.title = Some("rm -rf build".into());
+        op.origin = Some("tui".into());
+        op.unsandboxed = true;
+
+        let flatten = |lines: Vec<Line<'static>>| -> String {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let detail = flatten(operation_detail_lines(&op, &theme, 70));
+        assert!(
+            detail.contains("UNSANDBOXED"),
+            "the detail pane must name it: {detail}"
+        );
+
+        let state = AppState::new("http://localhost:3000", "HTTP", true);
+        let row = flatten(vec![build_tree_op_item(
+            &op, 1, false, false, &state, &theme, 70,
+        )]);
+        assert!(
+            row.contains('!'),
+            "the row a reader scans must carry the mark too: {row}"
+        );
+
+        // ...and a sandboxed command must not be marked, or the mark means
+        // nothing.
+        let mut confined = op.clone();
+        confined.unsandboxed = false;
+        let row = flatten(vec![build_tree_op_item(
+            &confined, 1, false, false, &state, &theme, 70,
+        )]);
+        assert!(!row.contains('!'), "no mark on confined work: {row}");
+        let detail = flatten(operation_detail_lines(&confined, &theme, 70));
+        assert!(!detail.contains("UNSANDBOXED"), "{detail}");
+    }
+
     #[test]
     fn task_tree_shows_a_scrollbar_only_when_it_overflows() {
         use ratatui::Terminal;

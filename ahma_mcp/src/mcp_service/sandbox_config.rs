@@ -190,7 +190,8 @@ impl AhmaMcpService {
     ) -> bool {
         match self.adapter.sandbox().commit_scopes(new_scopes) {
             Ok(crate::sandbox::ScopeCommit::Applied) => {
-                tracing::info!("Sandbox scopes committed successfully")
+                tracing::info!("Sandbox scopes committed successfully");
+                crate::daemon_reporter::publish_committed_scope(self.adapter.sandbox());
             }
             Ok(crate::sandbox::ScopeCommit::AlreadyCommitted) => {
                 tracing::warn!(
@@ -526,6 +527,7 @@ impl AhmaMcpService {
                 return true;
             }
             crate::sandbox::ScopeCommit::Applied => {
+                crate::daemon_reporter::publish_committed_scope(sandbox);
                 tracing::info!(
                     "Explicit sandbox scope committed without querying roots/list \
                      (SPEC R5.2.2): {:?}",
@@ -633,7 +635,9 @@ impl AhmaMcpService {
                 );
                 return false;
             }
-            crate::sandbox::ScopeCommit::Applied => {}
+            crate::sandbox::ScopeCommit::Applied => {
+                crate::daemon_reporter::publish_committed_scope(self.adapter.sandbox());
+            }
         }
         tracing::info!(
             "No usable roots from roots/list; committed pre-configured scopes: {:?}",

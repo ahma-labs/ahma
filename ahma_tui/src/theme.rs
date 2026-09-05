@@ -188,6 +188,9 @@ impl Theme {
                 OpStatus::Pending => self.pending(),
                 OpStatus::Waiting => self.waiting(),
                 OpStatus::Cancelled => self.cancelled(),
+                // Dimmed, not red: an interruption is an absence of knowledge,
+                // not an observed failure.
+                OpStatus::Interrupted => self.waiting(),
             }
         })
     }
@@ -204,6 +207,38 @@ impl Theme {
     }
 
     // ── Border styles ─────────────────────────────────────────────────────────
+
+    // ── The work view's chrome (SPEC R24.9) ─────────────────────────────────
+    //
+    // A rule, not a box: the section headers *are* the structure, so a border
+    // around them would be a second frame drawn around a frame.
+
+    /// The `───` fill of a section rule.
+    pub fn section_rule(&self) -> Style {
+        self.c(Style::default().fg(Color::DarkGray))
+    }
+    /// The part of a rule beside a section that is running something.
+    pub fn section_rule_live(&self) -> Style {
+        self.c(Style::default().fg(Color::Cyan))
+    }
+    /// A section's name.
+    pub fn section_title(&self) -> Style {
+        self.c(Style::default().add_modifier(Modifier::BOLD))
+    }
+    /// The selected section's name.
+    pub fn section_title_selected(&self) -> Style {
+        self.c({
+            Style::default()
+                .bg(Color::Rgb(38, 42, 52))
+                .add_modifier(Modifier::BOLD)
+        })
+    }
+    /// The selected row inside a section. Subtler than `selected_item`, which
+    /// is a bordered pane's highlight; here the whole screen is the view, so a
+    /// heavy bar on every frame is noise.
+    pub fn work_row_selected(&self) -> Style {
+        self.c(Style::default().bg(Color::Rgb(38, 42, 52)))
+    }
 
     pub fn border_focused(&self) -> Style {
         self.c(Style::default().fg(Color::Cyan))

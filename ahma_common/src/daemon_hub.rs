@@ -95,6 +95,22 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// once exceeded the oldest *finished* op is dropped (running ops are kept).
 const MAX_OPS_PER_INSTANCE: usize = 500;
 
+/// Bounded output lines retained per operation, replayed to a late subscriber
+/// so a TUI opened mid-build shows what the command has been printing rather
+/// than an empty pane. Matches `ahma_mcp::operation_monitor::MAX_TAIL_LINES`,
+/// which is the window the producing side keeps.
+pub const MAX_TAIL_LINES: usize = 100;
+
+/// How long a finished operation — and an instance that has since
+/// disconnected — stays replayable (SPEC R-DAEMON.7). One hour is what a
+/// developer means by "what just happened".
+pub const HISTORY_REPLAY_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Ceiling on retained operations across every instance, live or ended. The
+/// per-instance cap alone is unbounded in the number of instances, and a hook
+/// registers one instance per hooked command.
+const MAX_RETAINED_OPS: usize = 2000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Protocol types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,6 +174,25 @@ pub struct InstanceInfo {
     /// client has attached or when the instance predates this field.
     #[serde(default)]
     pub client: Option<String>,
+    /// The MCP session this instance serves (the bridge's `Mcp-Session-Id`).
+    ///
+    /// Three Claude Code windows open on one repository register with the same
+    /// pid-less identity — same `client`, same `label`, same `scope` — so
+    /// without this they are indistinguishable, and the daemon-minted `id`
+    /// changes on every reconnect-to-relabel, which reshuffles them in any view
+    /// that sorts by it. The session id is stable for the life of the session,
+    /// so the hub keys an instance's identity off it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Pid of the client-facing frontend process (the one the editor spawned),
+    /// as opposed to `pid`, which is the worker that executes the tools.
+    #[serde(default)]
+    pub client_pid: Option<u32>,
+    /// When this instance disconnected (Unix epoch, milliseconds), for an
+    /// instance retained only so its recent operations still have somewhere to
+    /// belong. `None` for a live instance.
+    #[serde(default)]
+    pub ended_epoch_ms: Option<u64>,
 }
 
 /// An operation event forwarded from an instance to the daemon.
@@ -199,6 +234,23 @@ pub enum DaemonEvent {
         /// user's own TUI commands and stay readable.
         #[serde(default)]
         origin: Option<String>,
+        /// True when this start record was **reconstructed** from the
+        /// operation's terminal event, because the original was never seen or
+        /// had aged out — a hook whose command outlived a daemon restart, say.
+        /// The outcome is true; the preamble (tool, command, working directory)
+        /// is genuinely unknown, and a reader must say so rather than render
+        /// blanks as fact.
+        #[serde(default)]
+        partial: bool,
+        /// The operation ran **outside** the kernel sandbox, at the user's full
+        /// privilege. Today that is only the TUI's human-typed `!` escape
+        /// (SPEC R-DAEMON.9), and a unified view that drew it like any other
+        /// row would be hiding the one thing about it worth knowing.
+        ///
+        /// Absent means confined: a producer that predates this field had no
+        /// unsandboxed path to report.
+        #[serde(default)]
+        unsandboxed: bool,
     },
     OpFinished {
         id: String,
@@ -229,6 +281,14 @@ pub enum DaemonEvent {
         /// see a failure (R24.5: the wire evolves by adding fields only).
         #[serde(default)]
         denial: Option<OpDenial>,
+        /// The operation did not finish so much as stop being observed: it was
+        /// still running when the daemon that was watching it went away, and
+        /// this record was reconstructed from the history file at the next
+        /// start. Its exit is genuinely unknown — the command may well have
+        /// completed — so a reader must say "interrupted", not "failed".
+        /// `status` stays `Failed` for readers that predate this field.
+        #[serde(default)]
+        interrupted: bool,
     },
     /// A single line of live output from a running operation.
     /// Streamed as the child process produces it, so subscribers (TUI) can
@@ -346,6 +406,15 @@ pub enum ClientMsg {
         /// MCP client identity (`clientInfo.name`), when already known.
         #[serde(default)]
         client: Option<String>,
+        /// The MCP session this instance serves. Re-registering with the same
+        /// value re-uses the instance id the hub already assigned, so a
+        /// reconnect-to-relabel does not look like one instance leaving and a
+        /// different one arriving.
+        #[serde(default)]
+        session_id: Option<String>,
+        /// Pid of the client-facing frontend process.
+        #[serde(default)]
+        client_pid: Option<u32>,
     },
     /// An operation event from a registered instance.
     Event { payload: DaemonEvent },
@@ -571,29 +640,184 @@ pub fn default_socket_path() -> PathBuf {
     platform_default_socket_path()
 }
 
+/// The per-user runtime directory holding every daemon rendezvous file
+/// (SPEC R-DAEMON.2): the hub socket, the MCP socket, and on Windows the
+/// endpoint descriptor.
+///
+/// Prefers `$XDG_RUNTIME_DIR/ahma` (per-user, tmpfs, cleaned at logout) and
+/// falls back to `~/.ahma`. Created with mode `0700` as a side effect, so the
+/// returned directory is immediately usable — a shared directory is how a
+/// second local user gets to see, and squat, another user's endpoints.
+#[cfg(unix)]
+pub fn runtime_dir() -> Option<PathBuf> {
+    let dir = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|x| !x.is_empty())
+        .map(|xdg| PathBuf::from(xdg).join("ahma"))
+        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))?;
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Some(dir)
+}
+
+/// Windows counterpart of [`runtime_dir`]: `%LOCALAPPDATA%\ahma\run`, falling
+/// back to `~/.ahma`. Access control comes from the per-user profile ACL rather
+/// than a mode bit.
+#[cfg(not(unix))]
+pub fn runtime_dir() -> Option<PathBuf> {
+    let dir = std::env::var("LOCALAPPDATA")
+        .ok()
+        .filter(|x| !x.is_empty())
+        .map(|local| PathBuf::from(local).join("ahma").join("run"))
+        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
+/// Refuse a runtime directory another local user can reach (SPEC R-DAEMON.2).
+///
+/// The daemon executes shell and build commands on behalf of anything that can
+/// connect to its sockets, so the directory holding them must be the caller's
+/// own and unreachable by group or other — the same rule sshd applies to
+/// `~/.ssh`. A socket chmodded `0600` inside a `0777` directory is still
+/// squattable: another user can unlink the path and bind their own listener
+/// there before the real client connects.
+#[cfg(unix)]
+pub fn verify_runtime_dir_secure(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(dir) else {
+        bail!("cannot stat runtime directory {}", dir.display());
+    };
+    // Our own uid without a `libc` dependency in this crate: a file we just
+    // created is owned by our effective uid by definition, so its `uid()` is
+    // the number to compare the directory against.
+    let probe_path = dir.join(format!(".ahma-owner-probe-{}", std::process::id()));
+    let our_uid = match std::fs::File::create(&probe_path) {
+        Ok(f) => {
+            let uid = f.metadata().ok().map(|m| m.uid());
+            drop(f);
+            let _ = std::fs::remove_file(&probe_path);
+            uid
+        }
+        Err(e) => {
+            bail!(
+                "cannot write inside runtime directory {}: {e}. Fix its ownership \
+                 and permissions (chmod 700), or set XDG_RUNTIME_DIR.",
+                dir.display()
+            );
+        }
+    };
+    if let Some(our_uid) = our_uid
+        && meta.uid() != our_uid
+    {
+        bail!(
+            "runtime directory {} is owned by uid {}, not by this user (uid {}); \
+             refusing to use it. Remove or chown it, or set XDG_RUNTIME_DIR.",
+            dir.display(),
+            meta.uid(),
+            our_uid
+        );
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "runtime directory {} is mode {:o}; it must not be readable or writable by group \
+             or others (0700). Fix with: chmod 700 {}",
+            dir.display(),
+            mode,
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Windows has no mode bits to check; the per-user profile ACL is the boundary.
+#[cfg(not(unix))]
+pub fn verify_runtime_dir_secure(dir: &std::path::Path) -> Result<()> {
+    if !dir.is_dir() {
+        bail!("runtime directory {} does not exist", dir.display());
+    }
+    Ok(())
+}
+
 /// Step 3 of [`default_socket_path`]'s resolution order: the platform default,
 /// ignoring every override. Creates the parent directory as a side effect so the
 /// returned path is immediately bindable.
 #[cfg(unix)]
 fn platform_default_socket_path() -> PathBuf {
-    // Prefer XDG_RUNTIME_DIR on Linux (per-user, tmpfs, auto-cleaned), then
-    // ~/.ahma (macOS + Linux without XDG).
-    let dir = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .map(|xdg| PathBuf::from(xdg).join("ahma"))
-        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")));
-
-    let Some(dir) = dir else {
-        return PathBuf::from("/tmp/ahma-daemon.sock");
-    };
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("daemon.sock")
+    match runtime_dir() {
+        Some(dir) => dir.join("daemon.sock"),
+        None => PathBuf::from("/tmp/ahma-daemon.sock"),
+    }
 }
 
 /// On Windows the path is unused; callers use the TCP address.
 #[cfg(not(unix))]
 fn platform_default_socket_path() -> PathBuf {
     PathBuf::from("unused-on-windows")
+}
+
+/// The per-user MCP endpoint socket, ignoring test isolation and any explicit
+/// override — the path the daemon binds in production.
+///
+/// It lives beside the hub socket in [`runtime_dir`] rather than at the old
+/// machine-global `/tmp/ahma.sock`, which every local user could see and, since
+/// nothing owned the path, pre-create.
+pub fn platform_mcp_socket_path() -> PathBuf {
+    match runtime_dir() {
+        Some(dir) => dir.join("mcp.sock"),
+        None => PathBuf::from("/tmp/ahma-mcp.sock"),
+    }
+}
+
+/// The hub socket that belongs with `mcp_socket`.
+///
+/// The rendezvous is a **pair**, and the hub half is the mutex: a daemon told
+/// to serve a private MCP socket but left on the shared hub socket would lose
+/// the bind to whichever daemon already held it, stand down, and leave nobody
+/// serving the path its caller asked for. So an explicitly chosen MCP socket
+/// brings its own hub, beside it.
+pub fn hub_socket_beside(mcp_socket: &str) -> PathBuf {
+    let mcp = PathBuf::from(mcp_socket);
+    if mcp == platform_mcp_socket_path() {
+        return platform_default_socket_path();
+    }
+    let dir = mcp.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = mcp
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ahma".to_string());
+    dir.join(format!("{stem}.hub.sock"))
+}
+
+/// Resolve the MCP endpoint socket path (SPEC R-DAEMON.2).
+///
+/// Resolution order, mirroring [`default_socket_path`] so the two rendezvous
+/// files can never disagree about which run they belong to:
+/// 1. `explicit` — the `--unix-socket-path` flag or `[http] unix_socket_path`.
+/// 2. Under a test harness, a private per-run path keyed by the same
+///    discriminator as the hub socket (SPEC R-ISO.1). Parent and child
+///    processes in one test run therefore agree without plumbing.
+/// 3. [`platform_mcp_socket_path`].
+pub fn mcp_socket_path(explicit: Option<&str>) -> String {
+    if let Some(p) = explicit.filter(|p| !p.is_empty()) {
+        return p.to_string();
+    }
+    if crate::test_isolation::spawned_under_test_harness() {
+        return std::env::temp_dir()
+            .join(format!(
+                "ahma-test-mcp-{}.sock",
+                crate::test_isolation::test_run_discriminator()
+            ))
+            .to_string_lossy()
+            .into_owned();
+    }
+    platform_mcp_socket_path().to_string_lossy().into_owned()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -629,6 +853,23 @@ pub async fn connect_to_daemon() -> Result<DaemonStream> {
     }
 }
 
+/// One-shot query of a daemon at an explicit socket: connect, ask for the
+/// instance list, read the answer, hang up.
+///
+/// Takes the path rather than resolving it so a test can address the daemon it
+/// started, and so a diagnostic can address one that is not the default.
+#[cfg(unix)]
+pub async fn list_instances_at(socket_path: &std::path::Path) -> Result<Vec<InstanceInfo>> {
+    let stream = tokio::net::UnixStream::connect(socket_path).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    send_msg(&mut write_half, &ClientMsg::ListInstances).await?;
+    match recv_msg::<_, DaemonMsg>(&mut reader).await? {
+        DaemonMsg::InstanceList { instances } => Ok(instances),
+        other => bail!("expected an instance list, got {other:?}"),
+    }
+}
+
 /// Returns `true` if a daemon is currently accepting connections.
 async fn try_connect() -> bool {
     connect_to_daemon().await.is_ok()
@@ -645,6 +886,18 @@ async fn try_connect() -> bool {
 /// daemon in its own group so it is *not* killed when the spawning terminal/IDE
 /// exits, rather than so it can be reaped with us.
 fn spawn_detached_daemon() -> Result<()> {
+    // Never from a test binary (SPEC R-ISO.1). `current_exe()` inside one is
+    // the *test harness*, not `ahma`, so this would re-run the test binary with
+    // `daemon` as its filter argument. If any test name matches that filter,
+    // each spawned copy re-runs the tests that spawn — a fork bomb that takes
+    // the whole machine's process table with it, which is exactly what happened
+    // the first time a test exercised this path with no daemon running.
+    if crate::test_isolation::spawned_under_test_harness() {
+        bail!(
+            "refusing to spawn a daemon from a test binary: start one explicitly \
+             (`run_daemon_at`/`HubServer::bind_at`) and point the client at its socket"
+        );
+    }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ahma"));
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("daemon")
@@ -722,12 +975,49 @@ where
     R: tokio::io::AsyncRead + Unpin,
     M: for<'de> Deserialize<'de>,
 {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
-        bail!("daemon connection closed (EOF)");
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            bail!("daemon connection closed (EOF)");
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(msg) => return Ok(msg),
+            // A message this build does not know is skipped, not fatal. This
+            // socket has no version to negotiate (R24.5), so a daemon left
+            // running across an upgrade is the reader that decides — and it
+            // used to decide by dropping the connection, which turned every
+            // future message addition into a hard incompatibility. Skipping is
+            // what makes a new variant possible at all.
+            Err(e) if is_unknown_message(&e) => {
+                // Warn, not debug: skipping is deliberate, but a build that
+                // keeps skipping is a version skew somebody should see.
+                let preview: String = line.chars().take(120).collect();
+                warn!("hub: skipping a message this build does not understand ({e}): {preview}");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
-    Ok(serde_json::from_str(line.trim())?)
+}
+
+/// True when a decode failure is "I do not know this message", as opposed to
+/// malformed JSON or a field of the wrong type — which are real protocol
+/// errors and must still close the connection.
+fn is_unknown_message(e: &serde_json::Error) -> bool {
+    e.is_data() && {
+        let msg = e.to_string();
+        // `ClientMsg`/`DaemonMsg` carry an untagged `Relay` variant, so an
+        // unrecognised `"type"` surfaces as "did not match any variant" rather
+        // than "unknown variant"; both mean the same thing here.
+        msg.contains("unknown variant")
+            || msg.contains("did not match any variant")
+            || msg.contains("missing field `type`")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -743,10 +1033,75 @@ struct OpSnapshot {
     seq: u64,
     started: DaemonEvent,
     finished: Option<DaemonEvent>,
+    /// The last [`MAX_TAIL_LINES`] output lines, replayed after `started` so a
+    /// subscriber that attaches mid-operation sees what it has been printing.
+    /// Bounded on purpose: this is a window, not a log — the complete output
+    /// lives in the operation's own output file.
+    tail: std::collections::VecDeque<(String, bool)>,
+    /// When this op reached a terminal state (Unix epoch, milliseconds), for
+    /// the replay window. Taken from the wire event when it carries one, and
+    /// from the hub's own clock when it does not — a cancellation has no exit
+    /// code and need not carry an end time, but it still has to age out.
+    /// `None` while the op is still running.
+    finished_at_ms: Option<u64>,
 }
 
 /// Per-instance operation history, keyed by op id.
 type InstanceOpHistory = std::collections::HashMap<String, OpSnapshot>;
+
+/// Wall-clock milliseconds since the Unix epoch.
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The operation id an event refers to, if it is about an operation at all.
+fn op_id_of(event: &DaemonEvent) -> Option<String> {
+    match event {
+        DaemonEvent::OpStarted { id, .. }
+        | DaemonEvent::OpFinished { id, .. }
+        | DaemonEvent::OpOutput { id, .. } => Some(id.clone()),
+        DaemonEvent::LogLine { .. } => None,
+    }
+}
+
+/// Rebuild the `OpStarted` an orphaned terminal event never had.
+///
+/// The title is the one thing a reader needs and the one thing the terminal
+/// event carries (its result summary); the start time is derived from the end
+/// time and the duration, both of which are on the wire. Everything else is
+/// left empty rather than guessed.
+fn synthetic_started(
+    op_id: &str,
+    finished: &DaemonEvent,
+    duration_ms: u64,
+    ended_epoch_ms: Option<u64>,
+) -> DaemonEvent {
+    let summary = match finished {
+        DaemonEvent::OpFinished { result_summary, .. } => result_summary.clone(),
+        _ => None,
+    };
+    DaemonEvent::OpStarted {
+        id: op_id.to_string(),
+        tool_name: String::new(),
+        description: summary.clone().unwrap_or_default(),
+        scope: String::new(),
+        parent_id: None,
+        started_epoch_ms: ended_epoch_ms.map(|e| e.saturating_sub(duration_ms)),
+        title: summary,
+        cwd: None,
+        command: None,
+        origin: None,
+        // The whole point of this record: it was reconstructed, and a reader
+        // must not present its blanks as fact.
+        partial: true,
+        // Unknown, and "unknown" is not a claim we get to make in the
+        // alarming direction.
+        unsandboxed: false,
+    }
+}
 
 /// Internal shared state for the running daemon.
 #[derive(Debug, Clone)]
@@ -755,6 +1110,17 @@ struct PendingApproval {
     tool: String,
     args: String,
 }
+
+/// What the hub does when it is asked to stop.
+///
+/// The hub used to call [`std::process::exit`] from inside a connection
+/// handler. That is correct for the standalone `ahma daemon` and wrong for
+/// anything that hosts the hub alongside something else: the per-user daemon
+/// also owns an MCP endpoint with live sessions and a history file to flush, so
+/// "stop" has to run one shutdown choreography, not `exit(0)` from whichever
+/// task noticed first. The composer installs a hook; with no hook installed the
+/// default is the historical exit.
+type ExitHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 struct DaemonHub {
     instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
@@ -771,6 +1137,27 @@ struct DaemonHub {
     connection_count: Arc<AtomicUsize>,
     socket_path: Option<PathBuf>,
     pending_approvals: Arc<Mutex<std::collections::HashMap<String, PendingApproval>>>,
+    /// `session_id` → the instance id first assigned to it, so a re-register
+    /// keeps its identity (and its retained history) instead of arriving as a
+    /// stranger.
+    session_ids: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// `decision_id` → the instance that raised it, so an answer is routed
+    /// back to the session that asked the question.
+    pending_decisions: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Instances that have disconnected but whose operations are still inside
+    /// the replay window, stamped with when they went (SPEC R-DAEMON.7).
+    ///
+    /// History used to be dropped the instant an instance disconnected, which
+    /// made a whole class of work invisible: a hooked command is an instance
+    /// that lives for the length of one command, so by the time anyone looked
+    /// at the TUI it had always already gone.
+    ended_instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
+    /// What to run when a client sends [`ClientMsg::Shutdown`]. `None` means
+    /// the historical behaviour: unlink our socket and `exit(0)`.
+    exit_hook: parking_lot::Mutex<Option<ExitHook>>,
+    /// Appends operation history to disk so it outlives this process
+    /// (SPEC R-DAEMON.7). `None` keeps history in memory only.
+    history: parking_lot::Mutex<Option<Arc<crate::daemon_history::HistoryWriter>>>,
 }
 
 impl DaemonHub {
@@ -786,6 +1173,11 @@ impl DaemonHub {
                 connection_count: Arc::new(AtomicUsize::new(0)),
                 socket_path,
                 pending_approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                session_ids: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                pending_decisions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                ended_instances: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                exit_hook: parking_lot::Mutex::new(None),
+                history: parking_lot::Mutex::new(None),
             },
             rx,
         )
@@ -805,8 +1197,8 @@ impl DaemonHub {
     }
 
     /// Record an operation event so it can be replayed to subscribers that join
-    /// later. Only `OpStarted`/`OpFinished` carry replayable state; other events
-    /// (streaming output, log lines) are live-only and ignored here.
+    /// later: `OpStarted`, a bounded window of the output that followed it, and
+    /// the terminal `OpFinished`. Log lines are live-only.
     async fn record_op_event(&self, instance_id: &str, payload: &DaemonEvent) {
         match payload {
             DaemonEvent::OpStarted { id, .. } => {
@@ -815,13 +1207,61 @@ impl DaemonHub {
             DaemonEvent::OpFinished { id, .. } => {
                 self.record_op_finished(instance_id, id, payload).await
             }
-            _ => {}
+            DaemonEvent::OpOutput {
+                id,
+                line,
+                is_stderr,
+            } => {
+                self.record_op_output(instance_id, id, line, *is_stderr)
+                    .await
+            }
+            DaemonEvent::LogLine { .. } => {}
+        }
+    }
+
+    /// Append one output line to `op_id`'s retained window, evicting the oldest
+    /// once [`MAX_TAIL_LINES`] is reached. Output for an op the hub never saw
+    /// start is dropped: it has no row to belong to.
+    async fn record_op_output(&self, instance_id: &str, op_id: &str, line: &str, is_stderr: bool) {
+        let mut hist = self.op_history.lock().await;
+        if let Some(snap) = hist.get_mut(instance_id).and_then(|i| i.get_mut(op_id)) {
+            if snap.tail.len() >= MAX_TAIL_LINES {
+                snap.tail.pop_front();
+            }
+            snap.tail.push_back((line.to_string(), is_stderr));
         }
     }
 
     /// Retain `started` as the new head of `op_id`'s history, enforcing the
     /// per-instance retention cap.
     async fn record_op_started(&self, instance_id: &str, op_id: &str, started: &DaemonEvent) {
+        let history = self.history.lock().clone();
+        if let Some(writer) = history {
+            // The instance travels with the record so a replayed op still has a
+            // section to belong to after a restart, when nothing is attached.
+            let instance = self
+                .instances
+                .lock()
+                .await
+                .get(instance_id)
+                .cloned()
+                .unwrap_or_else(|| InstanceInfo {
+                    id: instance_id.to_string(),
+                    pid: 0,
+                    mode: String::new(),
+                    scope: String::new(),
+                    label: String::new(),
+                    client: None,
+                    session_id: None,
+                    client_pid: None,
+                    ended_epoch_ms: None,
+                });
+            writer.record(crate::daemon_history::HistoryRecord::Started {
+                ts: now_epoch_ms(),
+                instance,
+                event: started.clone(),
+            });
+        }
         let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
         let mut hist = self.op_history.lock().await;
         let inst = hist.entry(instance_id.to_string()).or_default();
@@ -831,6 +1271,8 @@ impl DaemonHub {
                 seq,
                 started: started.clone(),
                 finished: None,
+                tail: std::collections::VecDeque::new(),
+                finished_at_ms: None,
             },
         );
         if inst.len() > MAX_OPS_PER_INSTANCE {
@@ -838,20 +1280,190 @@ impl DaemonHub {
         }
     }
 
-    /// Attach the terminal event to `op_id`'s retained snapshot. An op whose
-    /// `OpStarted` was never seen (or was already evicted) has nothing to
-    /// attach to and is ignored.
+    /// Attach the terminal event to `op_id`'s retained snapshot.
+    ///
+    /// An op whose `OpStarted` the hub never saw — because it was evicted, or
+    /// because the daemon restarted while the op was running — is reconstructed
+    /// from the terminal event alone and flagged `partial`. Dropping it instead
+    /// (the old behaviour) lost the outcome of exactly the work a user is most
+    /// likely to ask about, and left the instance's tallies wrong.
     async fn record_op_finished(&self, instance_id: &str, op_id: &str, finished: &DaemonEvent) {
+        let DaemonEvent::OpFinished {
+            duration_ms,
+            ended_epoch_ms,
+            ..
+        } = finished
+        else {
+            return;
+        };
         let mut hist = self.op_history.lock().await;
-        if let Some(inst) = hist.get_mut(instance_id)
-            && let Some(snap) = inst.get_mut(op_id)
-        {
-            snap.finished = Some(finished.clone());
+        let inst = hist.entry(instance_id.to_string()).or_default();
+        // One disk write per operation, at the end, carrying the output window
+        // as it finally stood — persisting each line would turn a chatty build
+        // into megabytes for a window that is bounded anyway.
+        let history = self.history.lock().clone();
+        if let Some(writer) = history {
+            let tail = inst
+                .get(op_id)
+                .map(|s| s.tail.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            writer.record(crate::daemon_history::HistoryRecord::Finished {
+                ts: now_epoch_ms(),
+                instance_id: instance_id.to_string(),
+                event: finished.clone(),
+                tail,
+            });
+        }
+        match inst.get_mut(op_id) {
+            Some(snap) => {
+                snap.finished = Some(finished.clone());
+                snap.finished_at_ms = Some(ended_epoch_ms.unwrap_or_else(now_epoch_ms));
+            }
+            None => {
+                let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
+                inst.insert(
+                    op_id.to_string(),
+                    OpSnapshot {
+                        seq,
+                        started: synthetic_started(op_id, finished, *duration_ms, *ended_epoch_ms),
+                        finished: Some(finished.clone()),
+                        tail: std::collections::VecDeque::new(),
+                        finished_at_ms: Some(ended_epoch_ms.unwrap_or_else(now_epoch_ms)),
+                    },
+                );
+                if inst.len() > MAX_OPS_PER_INSTANCE {
+                    Self::evict_oldest_finished(inst);
+                }
+            }
         }
     }
 
-    /// Snapshot the retained op events for every instance, ordered for replay
-    /// (each op's `OpStarted` first, then its `OpFinished` if present).
+    /// Restore history written by a previous daemon (SPEC R-DAEMON.7).
+    ///
+    /// An operation that has a start record but no terminal one was still
+    /// running when that daemon went away. Its real outcome is unknowable — the
+    /// command may well have finished — so it is closed as `interrupted`
+    /// rather than left running forever (a spinner that never resolves) or
+    /// called failed (an invention).
+    async fn load_history(&self, records: Vec<crate::daemon_history::HistoryRecord>) {
+        use crate::daemon_history::HistoryRecord as R;
+        let mut hist = self.op_history.lock().await;
+        let mut ended = self.ended_instances.lock().await;
+        let mut ended_at: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+        for record in records {
+            match record {
+                R::Started {
+                    instance, event, ..
+                } => {
+                    let Some(op_id) = op_id_of(&event) else {
+                        continue;
+                    };
+                    let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
+                    hist.entry(instance.id.clone()).or_default().insert(
+                        op_id,
+                        OpSnapshot {
+                            seq,
+                            started: event,
+                            finished: None,
+                            tail: std::collections::VecDeque::new(),
+                            finished_at_ms: None,
+                        },
+                    );
+                    ended.entry(instance.id.clone()).or_insert(instance);
+                }
+                R::Finished {
+                    ts,
+                    instance_id,
+                    event,
+                    tail,
+                } => {
+                    let Some(op_id) = op_id_of(&event) else {
+                        continue;
+                    };
+                    if let Some(snap) = hist.get_mut(&instance_id).and_then(|i| i.get_mut(&op_id)) {
+                        snap.finished = Some(event);
+                        snap.finished_at_ms = Some(ts);
+                        snap.tail = tail.into_iter().collect();
+                    }
+                }
+                R::InstanceEnded { ts, instance_id } => {
+                    ended_at.insert(instance_id, ts);
+                }
+            }
+        }
+
+        for (id, info) in ended.iter_mut() {
+            // Nothing loaded from disk is attached: this daemon has only just
+            // started. Anything without a recorded end is stamped now, so it
+            // still ages out of the window.
+            info.ended_epoch_ms = Some(
+                ended_at
+                    .get(id)
+                    .copied()
+                    .or(info.ended_epoch_ms)
+                    .unwrap_or_else(now_epoch_ms),
+            );
+        }
+
+        let mut interrupted = 0usize;
+        for ops in hist.values_mut() {
+            for snap in ops.values_mut() {
+                if snap.finished.is_some() {
+                    continue;
+                }
+                let Some(op_id) = op_id_of(&snap.started) else {
+                    continue;
+                };
+                interrupted += 1;
+                snap.finished_at_ms = Some(now_epoch_ms());
+                snap.finished = Some(DaemonEvent::OpFinished {
+                    id: op_id,
+                    // "Failed" is what a reader that predates `interrupted`
+                    // sees; a current one renders the flag instead (R24.5).
+                    status: OpStatus::Failed,
+                    result_summary: Some(
+                        "interrupted: the daemon watching this operation exited".to_string(),
+                    ),
+                    duration_ms: 0,
+                    ended_epoch_ms: snap.finished_at_ms,
+                    exit_code: None,
+                    denial: None,
+                    interrupted: true,
+                });
+            }
+        }
+        if interrupted > 0 {
+            info!("ahma hub: {interrupted} operation(s) restored as interrupted");
+        }
+    }
+
+    /// Every instance a subscriber should know about: those attached now, plus
+    /// those retained inside the replay window so their operations have a
+    /// section to belong to. An ended instance carries `ended_epoch_ms`, which
+    /// is how a reader tells the two apart.
+    async fn instance_snapshot(&self) -> Vec<InstanceInfo> {
+        let mut out: Vec<InstanceInfo> = self.instances.lock().await.values().cloned().collect();
+        let live: std::collections::HashSet<String> = out.iter().map(|i| i.id.clone()).collect();
+        out.extend(
+            self.ended_instances
+                .lock()
+                .await
+                .values()
+                .filter(|i| !live.contains(&i.id))
+                .cloned(),
+        );
+        out
+    }
+
+    /// Snapshot the retained op events for every instance, ordered for replay:
+    /// each op's `OpStarted`, then the output window that followed it, then its
+    /// `OpFinished` if it has one.
+    ///
+    /// The output is replayed as ordinary `OpOutput` events rather than a new
+    /// message or a field on `OpStarted`: every subscriber already appends
+    /// those to the right pane, so replay is byte-for-byte the shape the live
+    /// stream has, and there is no second code path to keep in step (R24.5).
     async fn replay_events(&self) -> Vec<DaemonMsg> {
         let hist = self.op_history.lock().await;
         let mut snaps: Vec<(String, OpSnapshot)> = hist
@@ -861,10 +1473,21 @@ impl DaemonHub {
         snaps.sort_by_key(|(_, s)| s.seq);
         let mut out = Vec::with_capacity(snaps.len() * 2);
         for (instance_id, snap) in snaps {
+            let op_id = op_id_of(&snap.started).unwrap_or_default();
             out.push(DaemonMsg::Event {
                 instance_id: instance_id.clone(),
                 payload: snap.started,
             });
+            for (line, is_stderr) in snap.tail {
+                out.push(DaemonMsg::Event {
+                    instance_id: instance_id.clone(),
+                    payload: DaemonEvent::OpOutput {
+                        id: op_id.clone(),
+                        line,
+                        is_stderr,
+                    },
+                });
+            }
             if let Some(finished) = snap.finished {
                 out.push(DaemonMsg::Event {
                     instance_id,
@@ -873,6 +1496,51 @@ impl DaemonHub {
             }
         }
         out
+    }
+
+    /// Drop retained operations that have aged out of the replay window, and
+    /// any instance retained only for them; then enforce the global ceiling by
+    /// evicting oldest-finished-first across every instance.
+    async fn prune_history(&self, now_ms: u64) {
+        let cutoff = now_ms.saturating_sub(HISTORY_REPLAY_WINDOW.as_millis() as u64);
+        let mut hist = self.op_history.lock().await;
+        for ops in hist.values_mut() {
+            // A finished op ages out of the window; one still running never
+            // does, however long it takes.
+            ops.retain(|_, snap| snap.finished_at_ms.is_none_or(|ended| ended >= cutoff));
+        }
+        hist.retain(|_, ops| !ops.is_empty());
+
+        let mut total: usize = hist.values().map(|o| o.len()).sum();
+        while total > MAX_RETAINED_OPS {
+            let oldest = hist
+                .iter()
+                .flat_map(|(inst, ops)| {
+                    ops.iter()
+                        .filter(|(_, s)| s.finished.is_some())
+                        .map(move |(op, s)| (s.seq, inst.clone(), op.clone()))
+                })
+                .min();
+            let Some((_, inst, op)) = oldest else { break };
+            if let Some(ops) = hist.get_mut(&inst) {
+                ops.remove(&op);
+                if ops.is_empty() {
+                    hist.remove(&inst);
+                }
+            }
+            total -= 1;
+        }
+
+        // An instance retained only so its operations had somewhere to belong
+        // goes with the last of them.
+        let live: std::collections::HashSet<String> = hist.keys().cloned().collect();
+        let mut ended = self.ended_instances.lock().await;
+        ended.retain(|id, info| {
+            live.contains(id)
+                || info
+                    .ended_epoch_ms
+                    .is_some_and(|ended_at| ended_at >= cutoff)
+        });
     }
 }
 
@@ -893,129 +1561,164 @@ pub async fn run_daemon() -> Result<()> {
 /// Exposed for testing — callers can pass a temp-directory path to avoid
 /// colliding with a real daemon running on the default socket.
 pub async fn run_daemon_at(socket_path: PathBuf) -> Result<()> {
-    // ── Bind (the mutex): try, handle EADDRINUSE ──────────────────────────────
-    #[cfg(unix)]
-    let listener = bind_unix(&socket_path).await?;
-
-    #[cfg(not(unix))]
-    let listener = bind_tcp().await?;
-
-    info!("ahma daemon: listening on {}", socket_path.display());
-
-    let (hub, _) = DaemonHub::new(Some(socket_path.clone()));
-    let hub = Arc::new(hub);
-
-    // ── Idle-exit watcher ─────────────────────────────────────────────────────
-    let idle_count = hub.connection_count.clone();
-    #[cfg(unix)]
-    let idle_socket_path = socket_path.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            if idle_count.load(Ordering::Relaxed) == 0 {
-                // Wait 60 s with count still at 0.
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                if idle_count.load(Ordering::Relaxed) == 0 {
-                    info!("ahma daemon: idle timeout, exiting");
-                    // Unlink the socket file FIRST so late arrivals get ENOENT
-                    // (clean start) instead of ECONNREFUSED (ambiguous stale).
-                    // Unix-only: non-unix platforms bind via TCP (see `bind_tcp`
-                    // above), so there is no socket file to unlink.
-                    #[cfg(unix)]
-                    crate::fs_lock::remove_stale_socket(&idle_socket_path);
-                    std::process::exit(0);
-                }
-            }
+    let server = match HubServer::bind_at(socket_path).await {
+        Ok(server) => server,
+        Err(HubBindError::AlreadyRunning) => {
+            info!("ahma daemon: another instance is already running, exiting");
+            return Ok(());
         }
-    });
-
-    // ── Accept loop ───────────────────────────────────────────────────────────
-    accept_loop(listener, hub).await
+        Err(HubBindError::Failed(e)) => return Err(e),
+    };
+    server.spawn_standalone_idle_watcher();
+    server.serve().await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Embedded hub — TUI-owned server whose lifecycle matches the TUI process
+// Hub server — bind, serve and stop as three separate steps
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Handle for a hub server running inside the TUI process.
+/// Why [`HubServer::bind_at`] did not produce a server.
+#[derive(Debug)]
+pub enum HubBindError {
+    /// A live hub already owns the rendezvous. There is exactly one hub per
+    /// user by design (SPEC R-DAEMON.1), so this is an ordinary outcome for the
+    /// loser of a startup race, not a failure: connect to the winner instead.
+    AlreadyRunning,
+    /// The bind genuinely failed (permissions, a bad path, a port held by a
+    /// foreign process).
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for HubBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRunning => write!(f, "another ahma hub already owns the rendezvous"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for HubBindError {}
+
+#[cfg(unix)]
+type HubListener = tokio::net::UnixListener;
+#[cfg(not(unix))]
+type HubListener = tokio::net::TcpListener;
+
+/// A bound, not-yet-serving hub.
 ///
-/// The server binds the same Unix socket (macOS/Linux) or TCP loopback port
-/// (Windows) as the standalone `ahma daemon`.  When this handle is dropped the
-/// accept-loop task is aborted and the socket file is removed, so no IPC
-/// resources are left behind after the TUI exits — even on a panic.
-///
-/// Subscribers (ahma instances) see an EOF when the socket is removed and
-/// reconnect cleanly when a new TUI starts.
-pub struct EmbeddedHub {
-    broadcast: broadcast::Sender<DaemonMsg>,
-    abort: tokio::task::AbortHandle,
-    #[cfg(unix)]
+/// Binding, serving and stopping are separate so one process can host the hub
+/// *and* the MCP endpoint on one runtime with a single idle policy and a single
+/// exit path (SPEC R-DAEMON.3). Fused together — as they were, inside
+/// `run_daemon_at` — the hub's own idle timer and its `exit(0)` would race the
+/// MCP endpoint's live sessions.
+pub struct HubServer {
+    listener: HubListener,
+    hub: Arc<DaemonHub>,
     socket_path: PathBuf,
 }
 
-impl EmbeddedHub {
-    /// Subscribe to the event stream **directly** through an in-process
-    /// channel, with no socket round-trip.
-    pub fn subscribe(&self) -> broadcast::Receiver<DaemonMsg> {
-        self.broadcast.subscribe()
-    }
-}
-
-impl Drop for EmbeddedHub {
-    fn drop(&mut self) {
-        // Cancel the accept-loop task first so no new connections arrive
-        // while the socket file is being removed.
-        self.abort.abort();
-        // Best-effort removal — non-fatal if already gone.
+impl HubServer {
+    /// Bind the hub rendezvous at `socket_path` (bind-is-the-mutex).
+    ///
+    /// A stale socket file — one nothing answers on — is removed and the bind
+    /// retried; a **live** one is never stolen (SPEC R-ISO.2), it yields
+    /// [`HubBindError::AlreadyRunning`].
+    pub async fn bind_at(socket_path: PathBuf) -> std::result::Result<Self, HubBindError> {
         #[cfg(unix)]
-        let _ = std::fs::remove_file(&self.socket_path);
+        let listener = bind_unix(&socket_path).await?;
+        #[cfg(not(unix))]
+        let listener = bind_tcp().await?;
+
+        info!("ahma hub: listening on {}", socket_path.display());
+        let (hub, _) = DaemonHub::new(Some(socket_path.clone()));
+        Ok(Self {
+            listener,
+            hub: Arc::new(hub),
+            socket_path,
+        })
     }
-}
 
-/// Attempt to start a hub server embedded in the calling process.
-///
-/// Returns `Ok(Some(hub))` when the server is bound and running.
-/// Returns `Ok(None)` when another server (a running TUI or standalone
-/// `ahma daemon`) already owns the socket — the caller should fall back to
-/// `spawn_daemon_source` in `ahma_tui` (subscriber mode).
-/// Returns `Err` only for unexpected OS errors (e.g. permission denied).
-pub async fn try_start_hub_server() -> Result<Option<EmbeddedHub>> {
-    try_start_hub_server_at(default_socket_path()).await
-}
+    /// Bind at the platform default hub socket.
+    pub async fn bind() -> std::result::Result<Self, HubBindError> {
+        Self::bind_at(default_socket_path()).await
+    }
 
-/// Like [`try_start_hub_server`] but binds at `socket_path` instead of the
-/// platform default.  Exposed for testing.
-pub async fn try_start_hub_server_at(socket_path: PathBuf) -> Result<Option<EmbeddedHub>> {
-    #[cfg(unix)]
-    let listener = match try_bind_unix(&socket_path).await? {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+    /// Live connection count (instances, subscribers and one-shot queries).
+    /// Shared with the caller so a composed daemon can fold it into one idle
+    /// policy alongside its MCP session count.
+    pub fn connection_count(&self) -> Arc<AtomicUsize> {
+        self.hub.connection_count.clone()
+    }
 
-    #[cfg(not(unix))]
-    let listener = match try_bind_tcp().await? {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+    /// The path this server bound, for an identity-checked unlink at shutdown.
+    pub fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
 
-    info!(
-        "ahma hub: embedded server started on {}",
-        socket_path.display()
-    );
+    /// Install what runs when a client sends `Shutdown`. Without one the hub
+    /// unlinks its socket and exits the process, which is right only when the
+    /// hub is the whole process.
+    pub fn set_exit_hook(&self, hook: ExitHook) {
+        *self.hub.exit_hook.lock() = Some(hook);
+    }
 
-    let (hub, _) = DaemonHub::new(Some(socket_path.clone()));
-    let hub = Arc::new(hub);
-    let broadcast = hub.broadcast.clone();
+    /// Load the recent on-disk history and start persisting to it.
+    ///
+    /// Returns the writer so the caller can flush it on the way out; `None`
+    /// when no path is available, in which case history is in-memory only — a
+    /// degraded mode, not a failure.
+    pub async fn attach_history(
+        &self,
+        path: Option<PathBuf>,
+    ) -> Option<Arc<crate::daemon_history::HistoryWriter>> {
+        let path = path?;
+        let cutoff = crate::daemon_history::replay_cutoff_ms(now_epoch_ms());
+        let records = crate::daemon_history::load_recent(&path, cutoff).await;
+        if !records.is_empty() {
+            info!(
+                "ahma hub: restoring {} history record(s) from {}",
+                records.len(),
+                path.display()
+            );
+            self.hub.load_history(records).await;
+        }
+        let writer = Arc::new(crate::daemon_history::HistoryWriter::start(Some(path))?);
+        *self.hub.history.lock() = Some(writer.clone());
+        Some(writer)
+    }
 
-    let task = tokio::spawn(accept_loop(listener, hub));
-    let abort = task.abort_handle();
+    /// The standalone `ahma daemon`'s idle policy: exit once nothing has been
+    /// connected for 60 s. A composed daemon does **not** call this — it owns a
+    /// combined policy that also counts live MCP sessions (SPEC R-DAEMON.3).
+    fn spawn_standalone_idle_watcher(&self) {
+        let idle_count = self.hub.connection_count.clone();
+        let socket_path = self.socket_path.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if idle_count.load(Ordering::Relaxed) != 0 {
+                    continue;
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                if idle_count.load(Ordering::Relaxed) == 0 {
+                    info!("ahma daemon: idle timeout, exiting");
+                    // Unlink FIRST so a late arrival gets ENOENT (clean start)
+                    // rather than ECONNREFUSED (ambiguous stale).
+                    #[cfg(unix)]
+                    crate::fs_lock::remove_stale_socket(&socket_path);
+                    #[cfg(not(unix))]
+                    let _ = &socket_path;
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
-    Ok(Some(EmbeddedHub {
-        broadcast,
-        abort,
-        #[cfg(unix)]
-        socket_path,
-    }))
+    /// Accept and serve until the listener fails.
+    pub async fn serve(self) -> Result<()> {
+        accept_loop(self.listener, self.hub).await
+    }
 }
 
 // ── Unix bind/accept ──────────────────────────────────────────────────────────
@@ -1043,7 +1746,9 @@ pub fn restrict_unix_socket_permissions(path: &std::path::Path) {
 }
 
 #[cfg(unix)]
-async fn bind_unix(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
+async fn bind_unix(
+    path: &std::path::Path,
+) -> std::result::Result<tokio::net::UnixListener, HubBindError> {
     use tokio::net::UnixListener;
     loop {
         match UnixListener::bind(path) {
@@ -1052,57 +1757,25 @@ async fn bind_unix(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
                 return Ok(l);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                // Check if there is actually a live daemon.
+                // Probe before unlinking: a socket someone answers on is a live
+                // server and must never be stolen (SPEC R-ISO.2).
                 match tokio::net::UnixStream::connect(path).await {
-                    Ok(_) => {
-                        // Another daemon won the race. Exit gracefully.
-                        info!("ahma daemon: another instance is already running, exiting");
-                        std::process::exit(0);
-                    }
+                    Ok(_) => return Err(HubBindError::AlreadyRunning),
                     Err(_) => {
-                        // Stale socket file — unlink and retry.
-                        debug!("ahma daemon: removing stale socket at {}", path.display());
-                        crate::fs_lock::remove_stale_socket(path);
-                        // Small delay before retry to avoid tight loop on weird FS.
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            }
-            Err(e) => bail!("ahma daemon: failed to bind unix socket: {e}"),
-        }
-    }
-}
-
-/// Try to bind the Unix socket for the embedded hub.
-/// Returns `None` when another server is already running (caller should subscribe instead).
-#[cfg(unix)]
-async fn try_bind_unix(path: &std::path::Path) -> Result<Option<tokio::net::UnixListener>> {
-    use tokio::net::UnixListener;
-    loop {
-        match UnixListener::bind(path) {
-            Ok(l) => {
-                restrict_unix_socket_permissions(path);
-                return Ok(Some(l));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                match tokio::net::UnixStream::connect(path).await {
-                    Ok(_) => {
-                        // Another server owns the socket — caller should subscribe.
-                        debug!(
-                            "ahma hub: another server already running at {}",
-                            path.display()
-                        );
-                        return Ok(None);
-                    }
-                    Err(_) => {
-                        // Stale socket file — remove and retry.
+                        // Nothing answers — a stale file from a crash or reboot.
                         debug!("ahma hub: removing stale socket at {}", path.display());
                         crate::fs_lock::remove_stale_socket(path);
+                        // Small delay before retry to avoid a tight loop on odd filesystems.
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                return Err(HubBindError::Failed(anyhow::anyhow!(
+                    "ahma hub: failed to bind unix socket {}: {e}",
+                    path.display()
+                )));
+            }
         }
     }
 }
@@ -1126,51 +1799,25 @@ async fn accept_loop(listener: tokio::net::UnixListener, hub: Arc<DaemonHub>) ->
 // ── Windows bind/accept ───────────────────────────────────────────────────────
 
 #[cfg(not(unix))]
-async fn bind_tcp() -> Result<tokio::net::TcpListener> {
+async fn bind_tcp() -> std::result::Result<tokio::net::TcpListener, HubBindError> {
     use tokio::net::TcpListener;
     let port = daemon_port();
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     match TcpListener::bind(addr).await {
         Ok(l) => Ok(l),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // Try connecting to confirm a live daemon.
+            // Try connecting to confirm a live hub rather than a foreign
+            // process squatting the port.
             match tokio::net::TcpStream::connect(addr).await {
-                Ok(_) => {
-                    info!("ahma daemon: another instance is already running, exiting");
-                    std::process::exit(0);
-                }
-                Err(_) => {
-                    bail!("ahma daemon: port {} is in use by another process", port);
-                }
+                Ok(_) => Err(HubBindError::AlreadyRunning),
+                Err(_) => Err(HubBindError::Failed(anyhow::anyhow!(
+                    "ahma hub: port {port} is in use by another process"
+                ))),
             }
         }
-        Err(e) => bail!("ahma daemon: failed to bind TCP socket: {e}"),
-    }
-}
-
-/// Try to bind the TCP loopback port for the embedded hub on Windows.
-/// Returns `None` when another server is already running (caller should subscribe instead).
-#[cfg(not(unix))]
-async fn try_bind_tcp() -> Result<Option<tokio::net::TcpListener>> {
-    use tokio::net::TcpListener;
-    let port = daemon_port();
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    match TcpListener::bind(addr).await {
-        Ok(l) => Ok(Some(l)),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            match tokio::net::TcpStream::connect(addr).await {
-                Ok(_) => {
-                    // Another server owns the port — caller should subscribe.
-                    debug!("ahma hub: another server already running on port {}", port);
-                    Ok(None)
-                }
-                Err(_) => Err(anyhow::anyhow!(
-                    "port {} is in use by another process",
-                    port
-                )),
-            }
-        }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(HubBindError::Failed(anyhow::anyhow!(
+            "ahma hub: failed to bind TCP socket: {e}"
+        ))),
     }
 }
 
@@ -1220,16 +1867,22 @@ where
             scope,
             label,
             client,
+            session_id,
+            client_pid,
         } => {
             serve_instance(
                 &mut reader,
                 &mut writer,
                 &hub,
-                pid,
-                mode,
-                scope,
-                label,
-                client,
+                Registration {
+                    pid,
+                    mode,
+                    scope,
+                    label,
+                    client,
+                    session_id,
+                    client_pid,
+                },
             )
             .await
         }
@@ -1237,18 +1890,26 @@ where
         ClientMsg::Subscribe => serve_subscriber(&mut writer, &hub).await,
 
         ClientMsg::ListInstances => {
-            let instances: Vec<InstanceInfo> =
-                hub.instances.lock().await.values().cloned().collect();
+            let instances = hub.instance_snapshot().await;
             let _ = send_msg(&mut writer, &DaemonMsg::InstanceList { instances }).await;
             // One-shot query — connection closes after response.
         }
 
         ClientMsg::Shutdown => {
-            info!("daemon: shutdown requested, exiting");
-            if let Some(ref path) = hub.socket_path {
-                crate::fs_lock::remove_stale_socket(path);
+            info!("daemon: shutdown requested");
+            let hook = hub.exit_hook.lock().clone();
+            match hook {
+                // The composer owns the shutdown choreography (live MCP
+                // sessions to terminate, history to flush, two sockets to
+                // unlink) — it must not be short-circuited from here.
+                Some(hook) => hook("client requested shutdown"),
+                None => {
+                    if let Some(ref path) = hub.socket_path {
+                        crate::fs_lock::remove_stale_socket(path);
+                    }
+                    std::process::exit(0);
+                }
             }
-            std::process::exit(0);
         }
 
         ClientMsg::SubmitPrompt {
@@ -1280,9 +1941,15 @@ where
             decision,
             target_instance_id,
         } => {
+            // The instance that raised the question is the one that can apply
+            // the answer; an explicit target is honoured, but never a guess.
+            let target = match instance_for_decision(&hub, &decision_id).await {
+                Some(owner) => Some(owner),
+                None => target_instance_id,
+            };
             route_to_instance(
                 &hub,
-                target_instance_id,
+                target,
                 DaemonMsg::SubmitScopeGrant {
                     decision_id,
                     decision,
@@ -1296,9 +1963,13 @@ where
             decision,
             target_instance_id,
         } => {
+            let target = match instance_for_decision(&hub, &decision_id).await {
+                Some(owner) => Some(owner),
+                None => target_instance_id,
+            };
             route_to_instance(
                 &hub,
-                target_instance_id,
+                target,
                 DaemonMsg::SubmitWebApproval {
                     decision_id,
                     decision,
@@ -1377,7 +2048,17 @@ async fn route_submit_approval(
     approved: bool,
     target_instance_id: Option<String>,
 ) {
-    if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await {
+    // Prefer the instance that raised this exact call's question.
+    let owner = match id.as_deref() {
+        Some(call_id) => instance_for_decision(hub, call_id).await,
+        None => None,
+    };
+    let target = owner.or(target_instance_id);
+    if let Some(tid) = resolve_target(hub, target.as_deref()).await {
+        hub.pending_decisions
+            .lock()
+            .await
+            .retain(|_, owner| owner != &tid);
         hub.pending_approvals.lock().await.remove(&tid);
         if let Some(tx) = hub.instance_txs.lock().await.get(&tid) {
             let _ = tx.send(DaemonMsg::SubmitApproval { id, approved }).await;
@@ -1406,40 +2087,99 @@ async fn route_to_instance(
     }
 }
 
-/// Resolve which instance a TUI request targets: the explicit id when given,
-/// otherwise the first currently-registered instance (`None` if none exist).
+/// Resolve which instance a TUI request targets (SPEC R-DAEMON.6).
+///
+/// An explicit id must name a **live** instance; one that has gone resolves to
+/// nothing rather than falling through to somebody else's session. Without an
+/// explicit id there must be exactly one candidate: the old rule took
+/// `HashMap::keys().next()`, an arbitrary entry, which with one attached client
+/// was right by construction and with several sent a user's answer to a
+/// different window's question.
+///
+/// Hook and TUI instances are not candidates for an untargeted request: a hook
+/// has no agent loop to run a prompt, and the TUI is the thing asking.
 async fn resolve_target(hub: &DaemonHub, target: Option<&str>) -> Option<String> {
+    let instances = hub.instances.lock().await;
     match target {
-        Some(tid) => Some(tid.to_string()),
-        None => hub.instances.lock().await.keys().next().cloned(),
+        Some(tid) => instances.contains_key(tid).then(|| tid.to_string()),
+        None => {
+            let mut candidates: Vec<&InstanceInfo> = instances
+                .values()
+                .filter(|i| i.mode != "hook" && i.mode != "tui")
+                .collect();
+            match candidates.len() {
+                1 => Some(candidates.remove(0).id.clone()),
+                0 => None,
+                n => {
+                    warn!(
+                        "hub: refusing to guess among {n} attached instances for an \
+                         untargeted request; the sender must name one"
+                    );
+                    None
+                }
+            }
+        }
     }
+}
+
+/// Which instance raised `decision_id`, so its answer goes back to the session
+/// that asked rather than to whichever one happens to be first.
+async fn instance_for_decision(hub: &DaemonHub, decision_id: &str) -> Option<String> {
+    hub.pending_decisions.lock().await.get(decision_id).cloned()
 }
 
 /// Serve a registered ahma instance: register it, then exchange events and
 /// liveness pings until it disconnects, finally cleaning up its state.
 #[allow(clippy::too_many_arguments)]
-async fn serve_instance<R, W>(
-    reader: &mut BufReader<R>,
-    writer: &mut W,
-    hub: &Arc<DaemonHub>,
+/// The fields an instance announces when it registers.
+struct Registration {
     pid: u32,
     mode: String,
     scope: String,
     label: String,
     client: Option<String>,
+    session_id: Option<String>,
+    client_pid: Option<u32>,
+}
+
+async fn serve_instance<R, W>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    hub: &Arc<DaemonHub>,
+    reg: Registration,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let id = uuid_v4();
+    // One session keeps one instance id for its whole life. An instance
+    // re-registers whenever it learns something about itself (its client's
+    // name, its committed sandbox scope), and a fresh id each time made that
+    // look like a departure and an arrival: collapse state and selection keyed
+    // on the id were lost, and any view sorting by id reshuffled.
+    let id = match reg.session_id.as_deref() {
+        Some(session) => hub
+            .session_ids
+            .lock()
+            .await
+            .entry(session.to_string())
+            .or_insert_with(local_instance_id)
+            .clone(),
+        None => local_instance_id(),
+    };
+    // A session that comes back is live again, not history.
+    hub.ended_instances.lock().await.remove(&id);
     let info = InstanceInfo {
         id: id.clone(),
-        pid,
-        mode,
-        scope,
-        label,
-        client,
+        pid: reg.pid,
+        mode: reg.mode,
+        scope: reg.scope,
+        label: reg.label,
+        client: reg.client,
+        session_id: reg.session_id,
+        client_pid: reg.client_pid,
+        ended_epoch_ms: None,
     };
+    let pid = reg.pid;
     hub.instances.lock().await.insert(id.clone(), info.clone());
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DaemonMsg>(100);
@@ -1474,26 +2214,49 @@ async fn serve_instance<R, W>(
                         debug!("daemon: pong received from id={id}");
                     }
                     Ok(ClientMsg::ScopeGrantResolved { decision_id }) => {
+                        hub.pending_decisions.lock().await.remove(&decision_id);
                         let _ = hub.broadcast.send(DaemonMsg::ScopeGrantDismiss { decision_id });
                     }
                     Ok(ClientMsg::WebApprovalResolved { decision_id }) => {
+                        hub.pending_decisions.lock().await.remove(&decision_id);
                         let _ = hub.broadcast.send(DaemonMsg::WebApprovalDismiss { decision_id });
                     }
                     // Everything the hub forwards untouched. One arm, so a new
                     // HubRelay message reaches subscribers without this loop
                     // being edited — and cannot be half-added.
                     Ok(ClientMsg::Relay(relay)) => {
-                        // The one relay with a side effect: remember the question
-                        // so a TUI attaching mid-prompt is still shown it.
-                        if let HubRelay::ApprovalRequested { id: call_id, tool, args } = &relay {
-                            hub.pending_approvals.lock().await.insert(
-                                id.clone(),
-                                PendingApproval {
-                                    id: call_id.clone(),
-                                    tool: tool.clone(),
-                                    args: args.clone(),
-                                },
-                            );
+                        // Relays with a side effect: remember the question so a
+                        // TUI attaching mid-prompt is still shown it, and record
+                        // which instance asked so the answer goes back to that
+                        // session and no other (SPEC R-DAEMON.6).
+                        match &relay {
+                            HubRelay::ApprovalRequested { id: call_id, tool, args } => {
+                                hub.pending_approvals.lock().await.insert(
+                                    id.clone(),
+                                    PendingApproval {
+                                        id: call_id.clone(),
+                                        tool: tool.clone(),
+                                        args: args.clone(),
+                                    },
+                                );
+                                hub.pending_decisions
+                                    .lock()
+                                    .await
+                                    .insert(call_id.clone(), id.clone());
+                            }
+                            HubRelay::ScopeGrantRequested { request } => {
+                                hub.pending_decisions
+                                    .lock()
+                                    .await
+                                    .insert(request.decision_id.clone(), id.clone());
+                            }
+                            HubRelay::WebApprovalRequested { request } => {
+                                hub.pending_decisions
+                                    .lock()
+                                    .await
+                                    .insert(request.decision_id.clone(), id.clone());
+                            }
+                            _ => {}
                         }
                         let _ = hub.broadcast.send(DaemonMsg::Relay(relay));
                     }
@@ -1546,10 +2309,22 @@ async fn serve_instance<R, W>(
         }
     }
 
-    hub.instances.lock().await.remove(&id);
+    let departed = hub.instances.lock().await.remove(&id);
     hub.instance_txs.lock().await.remove(&id);
-    hub.op_history.lock().await.remove(&id);
     hub.pending_approvals.lock().await.remove(&id);
+    hub.pending_decisions
+        .lock()
+        .await
+        .retain(|_, owner| owner != &id);
+    // The operation history deliberately stays (SPEC R-DAEMON.7): it ages out
+    // of the replay window instead, so work done by a session that has since
+    // closed — or by a hook, which is an instance for the length of one
+    // command — is still there when someone opens a TUI a minute later.
+    if let Some(mut info) = departed {
+        info.ended_epoch_ms = Some(now_epoch_ms());
+        hub.ended_instances.lock().await.insert(id.clone(), info);
+    }
+    hub.prune_history(now_epoch_ms()).await;
     let _ = hub
         .broadcast
         .send(DaemonMsg::InstanceUnregistered { id: id.clone() });
@@ -1563,7 +2338,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     // Send current instance list, then stream events.
-    let instances: Vec<InstanceInfo> = hub.instances.lock().await.values().cloned().collect();
+    let instances = hub.instance_snapshot().await;
     if let Err(e) = send_msg(writer, &DaemonMsg::InstanceList { instances }).await {
         debug!("daemon: subscriber write failed: {e}");
         return;
@@ -1578,7 +2353,7 @@ where
         return;
     }
 
-    stream_subscriber_events(writer, rx).await;
+    stream_subscriber_events(writer, rx, hub).await;
 }
 
 async fn replay_subscriber_backlog<W>(writer: &mut W, hub: &Arc<DaemonHub>) -> Result<(), ()>
@@ -1609,8 +2384,11 @@ where
     Ok(())
 }
 
-async fn stream_subscriber_events<W>(writer: &mut W, mut rx: broadcast::Receiver<DaemonMsg>)
-where
+async fn stream_subscriber_events<W>(
+    writer: &mut W,
+    mut rx: broadcast::Receiver<DaemonMsg>,
+    hub: &Arc<DaemonHub>,
+) where
     W: AsyncWriteExt + Unpin,
 {
     loop {
@@ -1622,20 +2400,53 @@ where
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!("daemon: subscriber lagged by {n} messages");
-                // Continue — lagging is non-fatal.
+                // Continuing from the oldest available message is not enough:
+                // the dropped messages may have included an `OpFinished`, and a
+                // subscriber that misses one shows a spinner that never
+                // resolves. Re-send the authoritative state instead — the same
+                // snapshot a fresh subscriber gets — so the gap is repaired
+                // rather than merely survived.
+                warn!("daemon: subscriber lagged by {n} messages; resynchronising");
+                if resync_subscriber(writer, hub).await.is_err() {
+                    break;
+                }
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }
 
-// ─── Tiny UUID v4 without the uuid crate ──────────────────────────────────────
+/// Re-send the instance list and the retained history to one subscriber, after
+/// its stream fell behind far enough to drop messages.
+async fn resync_subscriber<W>(writer: &mut W, hub: &Arc<DaemonHub>) -> Result<(), ()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let instances = hub.instance_snapshot().await;
+    send_msg(writer, &DaemonMsg::InstanceList { instances })
+        .await
+        .map_err(|_| ())?;
+    replay_subscriber_backlog(writer, hub).await
+}
 
-fn uuid_v4() -> String {
+// ─── Instance ids ─────────────────────────────────────────────────────────────
+
+/// A label distinguishing one attached instance from another.
+///
+/// **Not a secret, and not a UUID.** It is `pid-nanos-counter`: unique among
+/// the instances of one machine, guessable by anyone who can guess a pid, and
+/// broadcast in cleartext to every subscriber inside `InstanceInfo` because
+/// naming an instance is its entire job.
+///
+/// It was called `uuid_v4`, which claimed randomness it has never had — the
+/// misreading a static analyser made before a human did, and a dangerous one
+/// to leave sitting one module away from
+/// [`crate::daemon_endpoint::DaemonEndpoint`], whose bearer token *is* a
+/// secret and *is* minted from a CSPRNG-backed `Uuid::new_v4`. When you need
+/// unguessability, that is the function to reach for; this one cannot give it
+/// to you.
+fn local_instance_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    // Use process ID + timestamp + a counter for sufficient uniqueness in a
-    // local IPC context.  We don't need cryptographic randomness here.
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1679,11 +2490,84 @@ mod tests {
             cwd: Some("/ws".into()),
             command: Some("cargo build".into()),
             origin: Some("cursor".into()),
+            partial: false,
+            unsandboxed: false,
         };
         let json = serde_json::to_string(&new).unwrap();
         let old: OldOpStarted = serde_json::from_str(&json).expect("old readers still parse");
         assert_eq!(old.id, "op_1");
         assert_eq!(old.tool_name, "run_terminal_command");
+    }
+
+    /// A daemon left running across an upgrade is the reader that decides
+    /// (R24.5), so a `Register` carrying the session fields must still parse
+    /// into one that has never heard of them.
+    #[test]
+    fn an_old_reader_ignores_the_new_registration_fields() {
+        #[derive(serde::Deserialize)]
+        struct OldRegister {
+            pid: u32,
+            mode: String,
+            scope: String,
+            label: String,
+        }
+
+        let msg = ClientMsg::Register {
+            pid: 4242,
+            mode: "stdio".into(),
+            scope: "/ws".into(),
+            label: "ahma".into(),
+            client: Some("claude-code".into()),
+            session_id: Some("sess-1".into()),
+            client_pid: Some(99),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains("\"session_id\":\"sess-1\"") && json.contains("\"client_pid\":99"),
+            "the new fields must actually be on the wire: {json}"
+        );
+        let old: OldRegister = serde_json::from_str(&json).expect("old daemons still parse");
+        assert_eq!(old.pid, 4242);
+        assert_eq!(old.mode, "stdio");
+        assert_eq!(old.scope, "/ws");
+        assert_eq!(old.label, "ahma");
+    }
+
+    /// ...and the reverse: an instance built before these fields existed still
+    /// registers against a new daemon.
+    #[test]
+    fn a_new_reader_accepts_a_registration_without_the_session_fields() {
+        let old_json = serde_json::json!({
+            "type": "Register",
+            "pid": 7,
+            "mode": "stdio",
+            "scope": "/ws",
+            "label": "ahma"
+        })
+        .to_string();
+        match serde_json::from_str::<ClientMsg>(&old_json).expect("old Register still parses") {
+            ClientMsg::Register {
+                session_id,
+                client_pid,
+                client,
+                ..
+            } => {
+                assert_eq!(session_id, None);
+                assert_eq!(client_pid, None);
+                assert_eq!(client, None);
+            }
+            other => panic!("expected Register, got {other:?}"),
+        }
+
+        let old_instance = serde_json::json!({
+            "id": "i1", "pid": 7, "mode": "stdio", "scope": "/ws", "label": "ahma"
+        })
+        .to_string();
+        let info: InstanceInfo =
+            serde_json::from_str(&old_instance).expect("old InstanceInfo still parses");
+        assert_eq!(info.session_id, None);
+        assert_eq!(info.client_pid, None);
+        assert_eq!(info.ended_epoch_ms, None);
     }
 
     /// An *old* event must deserialize into a *new* reader, with the new fields
@@ -1709,6 +2593,56 @@ mod tests {
         }
     }
 
+    /// Work that ran **outside** the sandbox says so on the wire.
+    ///
+    /// The TUI's `!` escape runs at the user's full privilege by design, and a
+    /// unified view that renders it identically to sandboxed work would be
+    /// lying by omission. An event from a producer that predates the field
+    /// reads as sandboxed, which is the only safe default: those producers had
+    /// no unsandboxed path to report.
+    #[test]
+    fn the_unsandboxed_flag_round_trips_and_defaults_to_confined() {
+        let ev = DaemonEvent::OpStarted {
+            id: "op_1".into(),
+            tool_name: "shell".into(),
+            description: "d".into(),
+            scope: "/ws".into(),
+            parent_id: None,
+            started_epoch_ms: None,
+            title: Some("rm -rf build".into()),
+            cwd: Some("/ws".into()),
+            command: Some("rm -rf build".into()),
+            origin: Some("tui".into()),
+            partial: false,
+            unsandboxed: true,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("\"unsandboxed\":true"),
+            "the flag must be on the wire: {json}"
+        );
+        match serde_json::from_str::<DaemonEvent>(&json).unwrap() {
+            DaemonEvent::OpStarted { unsandboxed, .. } => assert!(unsandboxed),
+            other => panic!("expected OpStarted, got {other:?}"),
+        }
+
+        let old = serde_json::json!({
+            "kind": "OpStarted",
+            "id": "op_1",
+            "tool_name": "run_terminal_command",
+            "description": "d",
+            "scope": "/ws"
+        })
+        .to_string();
+        match serde_json::from_str::<DaemonEvent>(&old).expect("old events still parse") {
+            DaemonEvent::OpStarted { unsandboxed, .. } => assert!(
+                !unsandboxed,
+                "a producer with no unsandboxed path must not be read as having used one"
+            ),
+            other => panic!("expected OpStarted, got {other:?}"),
+        }
+    }
+
     /// The exit code survives the round trip, because "failed" without one is not
     /// actionable.
     #[test]
@@ -1721,6 +2655,7 @@ mod tests {
             ended_epoch_ms: None,
             exit_code: Some(101),
             denial: None,
+            interrupted: false,
         };
         let back: DaemonEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         match back {
@@ -1768,13 +2703,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("regress.sock");
 
-        let hub = try_start_hub_server_at(socket_path.clone())
+        let server = HubServer::bind_at(socket_path.clone())
             .await
-            .unwrap()
-            .expect("embedded hub should bind a fresh socket");
+            .expect("hub should bind a fresh socket");
+        tokio::spawn(server.serve());
 
-        // Subscribe in-process before sending so the broadcast is observed.
-        let mut rx = hub.subscribe();
+        // Subscribe over the socket before sending, so the broadcast is observed.
+        let mut sub = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        send_msg(&mut sub, &ClientMsg::Subscribe).await.unwrap();
+        let mut sub_reader = BufReader::new(sub);
+        // Drain the initial InstanceList so the next read is the AgentError.
+        let _ = recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap();
 
         // Connect as a client and submit a prompt with no instances registered.
         let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
@@ -1791,10 +2730,13 @@ mod tests {
         .await
         .unwrap();
 
-        let msg = tokio::time::timeout(TestTimeouts::scale_secs(2), rx.recv())
-            .await
-            .expect("AgentError should be broadcast, not dropped")
-            .expect("broadcast channel open");
+        let msg = tokio::time::timeout(
+            TestTimeouts::scale_secs(2),
+            recv_msg::<_, DaemonMsg>(&mut sub_reader),
+        )
+        .await
+        .expect("AgentError should be broadcast, not dropped")
+        .expect("subscriber connection open");
 
         match msg {
             DaemonMsg::Relay(HubRelay::AgentError { error }) => {
@@ -1817,6 +2759,8 @@ mod tests {
             scope: "/test".to_string(),
             label: "TestLabel".to_string(),
             client: None,
+            session_id: None,
+            client_pid: None,
         };
         let mut buf = Vec::<u8>::new();
         send_msg(&mut buf, &msg).await.unwrap();
@@ -1836,6 +2780,7 @@ mod tests {
                 scope,
                 label,
                 client,
+                ..
             } => {
                 assert_eq!(pid, 42);
                 assert_eq!(mode, "stdio");
@@ -1902,6 +2847,8 @@ mod tests {
             cwd: None,
             command: None,
             origin: None,
+            partial: false,
+            unsandboxed: false,
         };
         let json = serde_json::to_string(&ev).unwrap();
         let back: DaemonEvent = serde_json::from_str(&json).unwrap();
@@ -1928,6 +2875,9 @@ mod tests {
                 scope: "/project".to_string(),
                 label: "Cursor".to_string(),
                 client: None,
+                session_id: None,
+                client_pid: None,
+                ended_epoch_ms: None,
             }],
         };
         let mut buf = Vec::<u8>::new();
@@ -1960,6 +2910,8 @@ mod tests {
                 cwd: None,
                 command: None,
                 origin: None,
+                partial: false,
+                unsandboxed: false,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -1992,6 +2944,7 @@ mod tests {
                 ended_epoch_ms: None,
                 exit_code: None,
                 denial: None,
+                interrupted: false,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -2046,19 +2999,31 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── uuid_v4 ───────────────────────────────────────────────────────────────
+    // ── Instance ids ──────────────────────────────────────────────────────────
 
+    /// Two instances attached at once must never share an id: the hub keys
+    /// every operation, every routed decision and every TUI section on it.
     #[test]
-    fn uuid_v4_produces_unique_values() {
-        let ids: Vec<String> = (0..20).map(|_| uuid_v4()).collect();
+    fn instance_ids_are_unique_within_a_process() {
+        let ids: Vec<String> = (0..20).map(|_| local_instance_id()).collect();
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
-        assert_eq!(unique.len(), ids.len(), "all UUIDs should be unique");
+        assert_eq!(unique.len(), ids.len(), "ids collided: {ids:?}");
     }
 
+    /// The three fields stay three fields.
+    ///
+    /// The value is deliberately **not** interpolated into the failure
+    /// message. It is not a secret — it is broadcast to every subscriber — but
+    /// it reads like one, and a scanner that cannot tell an instance label from
+    /// a credential was right to ask; the shape of the id is what this asserts,
+    /// and the shape is in the assertion.
     #[test]
-    fn uuid_v4_contains_dashes() {
-        let id = uuid_v4();
-        assert!(id.contains('-'), "UUID should contain dashes: {id}");
+    fn an_instance_id_has_three_dash_separated_fields() {
+        assert_eq!(
+            local_instance_id().split('-').count(),
+            3,
+            "the id is pid-nanos-counter"
+        );
     }
 
     #[test]
@@ -2217,6 +3182,8 @@ mod tests {
                 scope: "/test/scope".to_string(),
                 label: "TestInstance".to_string(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -2246,6 +3213,8 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
+                    unsandboxed: false,
                 },
             },
         )
@@ -2277,6 +3246,7 @@ mod tests {
                     ended_epoch_ms: None,
                     exit_code: None,
                     denial: None,
+                    interrupted: false,
                 },
             },
         )
@@ -2327,6 +3297,8 @@ mod tests {
                 scope: "/project".to_string(),
                 label: "HttpBridge".to_string(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -2402,6 +3374,8 @@ mod tests {
                 cwd: None,
                 command: None,
                 origin: None,
+                partial: false,
+                unsandboxed: false,
             },
         )
         .await;
@@ -2415,6 +3389,7 @@ mod tests {
                 ended_epoch_ms: None,
                 exit_code: None,
                 denial: None,
+                interrupted: false,
             },
         )
         .await;
@@ -2431,6 +3406,8 @@ mod tests {
                 cwd: None,
                 command: None,
                 origin: None,
+                partial: false,
+                unsandboxed: false,
             },
         )
         .await;
@@ -2498,6 +3475,8 @@ mod tests {
                 cwd: None,
                 command: None,
                 origin: None,
+                partial: false,
+                unsandboxed: false,
             },
         )
         .await;
@@ -2605,6 +3584,118 @@ mod tests {
         }
     }
 
+    /// R-ISO.1: the MCP endpoint must be per-run private under a harness, and
+    /// must key off the *same* discriminator as the hub socket — a test whose
+    /// frontend and daemon disagree about which run they belong to rendezvouses
+    /// on nothing (or, worse, on the developer's live endpoint).
+    #[test]
+    fn mcp_socket_path_is_private_under_test_harness_and_shares_the_hub_discriminator() {
+        let _g = ENV_MUTEX.lock();
+        let prev_nextest = std::env::var_os("NEXTEST");
+        unsafe { std::env::set_var("NEXTEST", "1") };
+
+        let mcp = PathBuf::from(mcp_socket_path(None));
+        let name = mcp.file_name().unwrap().to_string_lossy().into_owned();
+        let disc = crate::test_isolation::test_run_discriminator();
+        assert_eq!(
+            name,
+            format!("ahma-test-mcp-{disc}.sock"),
+            "harness fallback must be a private per-run MCP socket"
+        );
+        assert!(
+            mcp.starts_with(std::env::temp_dir()),
+            "private MCP socket must live in the temp dir, got {}",
+            mcp.display()
+        );
+        assert!(
+            name.contains(&disc),
+            "MCP socket must carry the same run discriminator the hub socket uses"
+        );
+
+        match prev_nextest {
+            Some(v) => unsafe { std::env::set_var("NEXTEST", v) },
+            None => unsafe { std::env::remove_var("NEXTEST") },
+        }
+    }
+
+    #[test]
+    fn mcp_socket_path_explicit_override_wins() {
+        let _g = ENV_MUTEX.lock();
+        assert_eq!(
+            mcp_socket_path(Some("/run/custom/ahma.sock")),
+            "/run/custom/ahma.sock",
+            "an explicit --unix-socket-path is used verbatim"
+        );
+        // An empty string is "unset" throughout AppConfig, not a path.
+        assert_ne!(mcp_socket_path(Some("")), "");
+    }
+
+    /// The two rendezvous files live side by side, so one `runtime_dir` check
+    /// covers both (SPEC R-DAEMON.2).
+    #[cfg(unix)]
+    #[test]
+    fn mcp_socket_path_lives_beside_the_hub_socket() {
+        let hub = platform_default_socket_path();
+        let mcp = platform_mcp_socket_path();
+        assert_eq!(
+            hub.parent(),
+            mcp.parent(),
+            "hub and MCP sockets must share the per-user runtime directory"
+        );
+        assert_eq!(mcp.file_name().unwrap(), "mcp.sock");
+        assert_ne!(
+            mcp.to_string_lossy(),
+            "/tmp/ahma.sock",
+            "the machine-global socket is retired"
+        );
+    }
+
+    /// A runtime directory another local user can read or write is refused:
+    /// a 0600 socket inside a 0777 directory is still squattable.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_rejects_group_or_other_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("run");
+        std::fs::create_dir(&dir).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        verify_runtime_dir_secure(&dir).expect("0700 owned by us is acceptable");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = verify_runtime_dir_secure(&dir)
+            .expect_err("group/other-readable runtime dir must be refused")
+            .to_string();
+        assert!(err.contains("chmod 700"), "error must name the fix: {err}");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = ENV_MUTEX.lock();
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        let dir = runtime_dir().expect("XDG_RUNTIME_DIR yields a runtime dir");
+        assert_eq!(dir, tmp.path().join("ahma"));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "runtime dir must be created 0700, got {mode:o}"
+        );
+        verify_runtime_dir_secure(&dir).expect("freshly created dir passes its own check");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+    }
+
     #[test]
     fn default_socket_path_returns_env_var_path() {
         let _g = ENV_MUTEX.lock();
@@ -2651,6 +3742,8 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
+                    unsandboxed: false,
                 },
             )
             .await;
@@ -2664,6 +3757,7 @@ mod tests {
                     ended_epoch_ms: None,
                     exit_code: None,
                     denial: None,
+                    interrupted: false,
                 },
             )
             .await;
@@ -2687,6 +3781,8 @@ mod tests {
                 cwd: None,
                 command: None,
                 origin: None,
+                partial: false,
+                unsandboxed: false,
             },
         )
         .await;
@@ -2725,6 +3821,8 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
+                    unsandboxed: false,
                 },
             )
             .await;
@@ -2737,153 +3835,776 @@ mod tests {
         );
     }
 
+    /// Superseded contract. A terminal event for an op the hub never saw used
+    /// to be dropped; it is now reconstructed (see
+    /// `finished_without_started_is_retained_as_partial`), because the outcome
+    /// is real even when the preamble is gone. What must still hold: the
+    /// reconstruction is a *separate* row and never corrupts a live one.
     #[tokio::test]
-    async fn record_op_finished_for_unknown_op_is_ignored() {
+    async fn a_finish_for_another_op_never_terminates_the_running_one() {
         let (hub, _rx) = DaemonHub::new(None);
+        hub.record_op_event("i1", &started_ev("real")).await;
+        hub.record_op_event("i1", &finished_ev("other", Some(now_epoch_ms())))
+            .await;
 
-        // OpFinished for a never-started op on an unknown instance is a no-op.
-        hub.record_op_event(
-            "i1",
-            &DaemonEvent::OpFinished {
-                id: "ghost".into(),
-                status: OpStatus::Failed,
-                result_summary: None,
-                duration_ms: 0,
-                ended_epoch_ms: None,
-                exit_code: None,
-                denial: None,
-            },
-        )
-        .await;
-        assert!(hub.replay_events().await.is_empty());
-
-        // OpFinished for a different id than the started one leaves it running.
-        hub.record_op_event(
-            "i1",
-            &DaemonEvent::OpStarted {
-                id: "real".into(),
-                tool_name: "t".into(),
-                description: "d".into(),
-                scope: "/w".into(),
-                parent_id: None,
-                started_epoch_ms: None,
-                title: None,
-                cwd: None,
-                command: None,
-                origin: None,
-            },
-        )
-        .await;
-        hub.record_op_event(
-            "i1",
-            &DaemonEvent::OpFinished {
-                id: "other".into(),
-                status: OpStatus::Failed,
-                result_summary: None,
-                duration_ms: 0,
-                ended_epoch_ms: None,
-                exit_code: None,
-                denial: None,
-            },
-        )
-        .await;
         let replay = hub.replay_events().await;
-        assert_eq!(
-            replay.len(),
-            1,
-            "only the started op replays; the mismatched finish is ignored"
+        let real_finished = replay.iter().any(|m| {
+            matches!(m, DaemonMsg::Event { payload: DaemonEvent::OpFinished { id, .. }, .. } if id == "real")
+        });
+        assert!(
+            !real_finished,
+            "the running op must stay running: {replay:?}"
         );
-        assert!(matches!(
-            &replay[0],
-            DaemonMsg::Event {
-                payload: DaemonEvent::OpStarted { id, .. },
-                ..
-            } if id == "real"
-        ));
+        let other_rows = replay
+            .iter()
+            .filter(|m| {
+                matches!(m, DaemonMsg::Event { payload, .. }
+                    if op_id_of(payload).as_deref() == Some("other"))
+            })
+            .count();
+        assert_eq!(
+            other_rows, 2,
+            "the orphan gets its own started+finished pair"
+        );
     }
 
     // ── resolve_target ────────────────────────────────────────────────────────
 
+    fn instance_with_mode(id: &str, mode: &str) -> InstanceInfo {
+        InstanceInfo {
+            id: id.into(),
+            pid: 1,
+            mode: mode.into(),
+            scope: "/w".into(),
+            label: "L".into(),
+            client: None,
+            session_id: None,
+            client_pid: None,
+            ended_epoch_ms: None,
+        }
+    }
+
+    /// An explicit target must name a live instance. Returning it verbatim let
+    /// a decision be routed at an instance that had already gone — or, worse,
+    /// at an id another session had since been given.
     #[tokio::test]
-    async fn resolve_target_prefers_explicit_then_falls_back_to_first() {
+    async fn resolve_target_explicit_must_name_a_live_instance() {
         let (hub, _rx) = DaemonHub::new(None);
-
-        // No explicit target and no instances → None.
-        assert_eq!(resolve_target(&hub, None).await, None);
-
-        // Explicit target is returned verbatim, even with no instances registered.
         assert_eq!(
-            resolve_target(&hub, Some("explicit")).await,
-            Some("explicit".to_string())
+            resolve_target(&hub, Some("ghost")).await,
+            None,
+            "an id nobody holds resolves to nothing"
         );
 
-        // No explicit target → first registered instance.
+        hub.instances
+            .lock()
+            .await
+            .insert("live".into(), instance_with_mode("live", "stdio"));
+        assert_eq!(
+            resolve_target(&hub, Some("live")).await,
+            Some("live".to_string())
+        );
+    }
+
+    /// With one attached client, picking "the first instance" was right by
+    /// construction. With three Claude Code windows it sent one window's answer
+    /// to another window's question; the hub now refuses to guess.
+    #[tokio::test]
+    async fn resolve_target_refuses_to_guess_among_several_instances() {
+        let (hub, _rx) = DaemonHub::new(None);
+        {
+            let mut instances = hub.instances.lock().await;
+            instances.insert("a".into(), instance_with_mode("a", "stdio"));
+            instances.insert("b".into(), instance_with_mode("b", "stdio"));
+        }
+        assert_eq!(
+            resolve_target(&hub, None).await,
+            None,
+            "an untargeted request among several sessions must not be guessed at"
+        );
+    }
+
+    /// Hooks and the TUI are not candidates for an untargeted request: a hook
+    /// has no agent loop to run a prompt, and the TUI is the thing asking. With
+    /// them excluded, one real session is still unambiguous.
+    #[tokio::test]
+    async fn resolve_target_ignores_hook_and_tui_instances() {
+        let (hub, _rx) = DaemonHub::new(None);
+        {
+            let mut instances = hub.instances.lock().await;
+            instances.insert("hook".into(), instance_with_mode("hook", "hook"));
+            instances.insert("tui".into(), instance_with_mode("tui", "tui"));
+            instances.insert("session".into(), instance_with_mode("session", "stdio"));
+        }
+        assert_eq!(
+            resolve_target(&hub, None).await,
+            Some("session".to_string())
+        );
+    }
+
+    /// An answer goes back to the session that asked, not to whichever instance
+    /// happens to be registered.
+    #[tokio::test]
+    async fn a_decision_routes_to_the_instance_that_raised_it() {
+        let (hub, _rx) = DaemonHub::new(None);
+        {
+            let mut instances = hub.instances.lock().await;
+            instances.insert("asker".into(), instance_with_mode("asker", "stdio"));
+            instances.insert("other".into(), instance_with_mode("other", "stdio"));
+        }
+        hub.pending_decisions
+            .lock()
+            .await
+            .insert("decision-1".into(), "asker".into());
+
+        assert_eq!(
+            instance_for_decision(&hub, "decision-1").await,
+            Some("asker".to_string())
+        );
+        assert_eq!(
+            instance_for_decision(&hub, "never-asked").await,
+            None,
+            "an unknown decision id must not fall back to an arbitrary instance"
+        );
+    }
+
+    // ── retention: output tails, ended instances, window and cap ──────────────
+
+    /// Helper: a minimal started event for retention tests.
+    fn started_ev(id: &str) -> DaemonEvent {
+        DaemonEvent::OpStarted {
+            id: id.into(),
+            tool_name: "run_terminal_command".into(),
+            description: "d".into(),
+            scope: "/w".into(),
+            parent_id: None,
+            started_epoch_ms: None,
+            title: Some(format!("cmd {id}")),
+            cwd: None,
+            command: None,
+            origin: None,
+            partial: false,
+            unsandboxed: false,
+        }
+    }
+
+    /// Helper: a terminal event that ended `ago_ms` milliseconds ago.
+    fn finished_ev(id: &str, ended_epoch_ms: Option<u64>) -> DaemonEvent {
+        DaemonEvent::OpFinished {
+            id: id.into(),
+            status: OpStatus::Completed,
+            result_summary: Some("ok".into()),
+            duration_ms: 5,
+            ended_epoch_ms,
+            exit_code: Some(0),
+            denial: None,
+            interrupted: false,
+        }
+    }
+
+    /// The retained output window is bounded: it is what a late subscriber
+    /// needs to see, not a log (SPEC R-DAEMON.7).
+    #[tokio::test]
+    async fn op_output_tail_is_bounded_to_max_tail_lines() {
+        let (hub, _rx) = DaemonHub::new(None);
+        hub.record_op_event("i1", &started_ev("op-1")).await;
+        for n in 0..(MAX_TAIL_LINES * 2) {
+            hub.record_op_event(
+                "i1",
+                &DaemonEvent::OpOutput {
+                    id: "op-1".into(),
+                    line: format!("line {n}"),
+                    is_stderr: false,
+                },
+            )
+            .await;
+        }
+
+        let lines: Vec<String> = hub
+            .replay_events()
+            .await
+            .into_iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Event {
+                    payload: DaemonEvent::OpOutput { line, .. },
+                    ..
+                } => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), MAX_TAIL_LINES, "the window is capped");
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("line {}", MAX_TAIL_LINES * 2 - 1),
+            "the newest line survives"
+        );
+        assert_eq!(
+            lines.first().unwrap(),
+            &format!("line {}", MAX_TAIL_LINES),
+            "the oldest lines are the ones dropped"
+        );
+    }
+
+    /// Replay is the same shape as the live stream — started, then output, then
+    /// finished — so a subscriber needs no second code path for history.
+    #[tokio::test]
+    async fn replay_emits_started_then_tail_then_finished_in_order() {
+        let (hub, _rx) = DaemonHub::new(None);
+        hub.record_op_event("i1", &started_ev("op-1")).await;
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpOutput {
+                id: "op-1".into(),
+                line: "compiling".into(),
+                is_stderr: false,
+            },
+        )
+        .await;
+        hub.record_op_event("i1", &finished_ev("op-1", Some(now_epoch_ms())))
+            .await;
+
+        let kinds: Vec<&'static str> = hub
+            .replay_events()
+            .await
+            .iter()
+            .map(|m| match m {
+                DaemonMsg::Event { payload, .. } => match payload {
+                    DaemonEvent::OpStarted { .. } => "started",
+                    DaemonEvent::OpOutput { .. } => "output",
+                    DaemonEvent::OpFinished { .. } => "finished",
+                    DaemonEvent::LogLine { .. } => "log",
+                },
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["started", "output", "finished"]);
+    }
+
+    /// A hook is an instance for the length of one command. Dropping its
+    /// history when it disconnected made hooked work permanently invisible:
+    /// by the time anyone looked, the instance had always already gone.
+    #[tokio::test]
+    async fn history_survives_unregister_and_the_instance_is_listed_as_ended() {
+        let (hub, _rx) = DaemonHub::new(None);
+        let info = InstanceInfo {
+            id: "i1".into(),
+            pid: 7,
+            mode: "hook".into(),
+            scope: "/w".into(),
+            label: "hook".into(),
+            client: Some("claude-code".into()),
+            session_id: None,
+            client_pid: None,
+            ended_epoch_ms: None,
+        };
+        hub.instances.lock().await.insert("i1".into(), info.clone());
+        hub.record_op_event("i1", &started_ev("op-1")).await;
+        hub.record_op_event("i1", &finished_ev("op-1", Some(now_epoch_ms())))
+            .await;
+
+        // Simulate the teardown serve_instance performs.
+        let mut departed = hub.instances.lock().await.remove("i1").unwrap();
+        departed.ended_epoch_ms = Some(now_epoch_ms());
+        hub.ended_instances
+            .lock()
+            .await
+            .insert("i1".into(), departed);
+        hub.prune_history(now_epoch_ms()).await;
+
+        let listed = hub.instance_snapshot().await;
+        assert_eq!(listed.len(), 1, "the ended instance is still listed");
+        assert!(
+            listed[0].ended_epoch_ms.is_some(),
+            "and is marked as ended, which is how a reader tells it apart"
+        );
+        assert_eq!(
+            hub.replay_events().await.len(),
+            2,
+            "its operations still replay"
+        );
+    }
+
+    /// Finished work ages out of the window; work still running never does,
+    /// however long it takes.
+    #[tokio::test]
+    async fn replay_window_evicts_finished_ops_older_than_the_window() {
+        let (hub, _rx) = DaemonHub::new(None);
+        let now = now_epoch_ms();
+        let long_ago = now - HISTORY_REPLAY_WINDOW.as_millis() as u64 - 60_000;
+
+        hub.record_op_event("i1", &started_ev("old")).await;
+        hub.record_op_event("i1", &finished_ev("old", Some(long_ago)))
+            .await;
+        hub.record_op_event("i1", &started_ev("recent")).await;
+        hub.record_op_event("i1", &finished_ev("recent", Some(now)))
+            .await;
+        hub.record_op_event("i1", &started_ev("still-running"))
+            .await;
+
+        hub.prune_history(now).await;
+
+        let ids: Vec<String> = hub
+            .replay_events()
+            .await
+            .iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Event {
+                    payload: DaemonEvent::OpStarted { id, .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!ids.contains(&"old".to_string()), "aged out: {ids:?}");
+        assert!(ids.contains(&"recent".to_string()), "kept: {ids:?}");
+        assert!(
+            ids.contains(&"still-running".to_string()),
+            "a running op is never pruned by age: {ids:?}"
+        );
+    }
+
+    /// The per-instance cap is unbounded in the number of instances, and a hook
+    /// registers one per hooked command; the global ceiling is what actually
+    /// bounds the daemon's memory.
+    #[tokio::test]
+    async fn global_retention_cap_evicts_oldest_finished_first() {
+        let (hub, _rx) = DaemonHub::new(None);
+        let now = now_epoch_ms();
+        for i in 0..(MAX_RETAINED_OPS + 50) {
+            let inst = format!("hook-{i}");
+            let op = format!("op-{i}");
+            hub.record_op_event(&inst, &started_ev(&op)).await;
+            hub.record_op_event(&inst, &finished_ev(&op, Some(now)))
+                .await;
+        }
+        hub.prune_history(now).await;
+
+        let retained: usize = hub.op_history.lock().await.values().map(|o| o.len()).sum();
+        assert!(
+            retained <= MAX_RETAINED_OPS,
+            "retention must be bounded across instances, kept {retained}"
+        );
+        let ids: Vec<String> = hub
+            .replay_events()
+            .await
+            .iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Event {
+                    payload: DaemonEvent::OpStarted { id, .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ids.contains(&format!("op-{}", MAX_RETAINED_OPS + 49)),
+            "the newest work is what survives"
+        );
+        assert!(!ids.contains(&"op-0".to_string()), "the oldest is evicted");
+    }
+
+    /// An operation whose start the hub never saw still has a real outcome. It
+    /// is reconstructed and flagged, rather than dropped — which used to lose
+    /// exactly the work a user is most likely to ask about.
+    #[tokio::test]
+    async fn finished_without_started_is_retained_as_partial() {
+        let (hub, _rx) = DaemonHub::new(None);
+        let now = now_epoch_ms();
+        hub.record_op_event("i1", &finished_ev("orphan", Some(now)))
+            .await;
+
+        let replay = hub.replay_events().await;
+        let started = replay
+            .iter()
+            .find_map(|m| match m {
+                DaemonMsg::Event {
+                    payload: payload @ DaemonEvent::OpStarted { .. },
+                    ..
+                } => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("a reconstructed start record");
+        match started {
+            DaemonEvent::OpStarted {
+                id,
+                partial,
+                title,
+                started_epoch_ms,
+                ..
+            } => {
+                assert_eq!(id, "orphan");
+                assert!(partial, "the row must admit it was reconstructed");
+                assert_eq!(title.as_deref(), Some("ok"), "outcome text is all we have");
+                assert_eq!(
+                    started_epoch_ms,
+                    Some(now - 5),
+                    "start derived from end minus duration"
+                );
+            }
+            other => panic!("expected OpStarted, got {other:?}"),
+        }
+        assert!(
+            replay.iter().any(|m| matches!(
+                m,
+                DaemonMsg::Event {
+                    payload: DaemonEvent::OpFinished { .. },
+                    ..
+                }
+            )),
+            "and its outcome still replays"
+        );
+    }
+
+    /// The daemon exits when idle, so without a file "what ran twenty minutes
+    /// ago" is answerable only while the process that saw it happen is still
+    /// alive. A fresh daemon must restore the window from disk — including the
+    /// output tail, and including operations that were still running when the
+    /// previous daemon went away (SPEC R-DAEMON.7).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fresh_hub_replays_the_last_hour_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let history = tmp.path().join("history.jsonl");
+
+        // ── Daemon 1: does some work, then goes away mid-operation ───────────
+        {
+            let server = HubServer::bind_at(tmp.path().join("first.sock"))
+                .await
+                .expect("bind");
+            let writer = server
+                .attach_history(Some(history.clone()))
+                .await
+                .expect("history writer");
+            let hub = server.hub.clone();
+            hub.instances.lock().await.insert(
+                "i1".into(),
+                InstanceInfo {
+                    id: "i1".into(),
+                    pid: 7,
+                    mode: "stdio".into(),
+                    scope: "/ws".into(),
+                    label: "ahma".into(),
+                    client: Some("claude-code".into()),
+                    session_id: Some("sess-1".into()),
+                    client_pid: Some(11),
+                    ended_epoch_ms: None,
+                },
+            );
+            hub.record_op_event("i1", &started_ev("done")).await;
+            hub.record_op_event(
+                "i1",
+                &DaemonEvent::OpOutput {
+                    id: "done".into(),
+                    line: "Compiling ahma_core".into(),
+                    is_stderr: false,
+                },
+            )
+            .await;
+            hub.record_op_event("i1", &finished_ev("done", Some(now_epoch_ms())))
+                .await;
+            // ...and one that never finishes: the daemon dies under it.
+            hub.record_op_event("i1", &started_ev("in-flight")).await;
+            writer.flush().await;
+        }
+
+        // ── Daemon 2: a fresh process, nothing attached ──────────────────────
+        let server = HubServer::bind_at(tmp.path().join("second.sock"))
+            .await
+            .expect("bind");
+        server
+            .attach_history(Some(history.clone()))
+            .await
+            .expect("history writer");
+
+        let listed = server.hub.instance_snapshot().await;
+        assert_eq!(listed.len(), 1, "the instance is restored: {listed:?}");
+        assert_eq!(listed[0].client.as_deref(), Some("claude-code"));
+        assert!(
+            listed[0].ended_epoch_ms.is_some(),
+            "restored instances are historic, not attached"
+        );
+
+        let replay = server.hub.replay_events().await;
+        let output: Vec<String> = replay
+            .iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Event {
+                    payload: DaemonEvent::OpOutput { line, .. },
+                    ..
+                } => Some(line.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            output,
+            vec!["Compiling ahma_core".to_string()],
+            "the output window survives the restart"
+        );
+
+        let interrupted: Vec<(String, bool)> = replay
+            .iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Event {
+                    payload:
+                        DaemonEvent::OpFinished {
+                            id, interrupted, ..
+                        },
+                    ..
+                } => Some((id.clone(), *interrupted)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            interrupted.contains(&("done".to_string(), false)),
+            "a completed op replays as completed: {interrupted:?}"
+        );
+        assert!(
+            interrupted.contains(&("in-flight".to_string(), true)),
+            "an op still running when the daemon died is closed as interrupted, \
+             neither left spinning forever nor called failed: {interrupted:?}"
+        );
+    }
+
+    /// A message a build does not understand is skipped, not fatal.
+    ///
+    /// This socket carries no version (R24.5), so a daemon left running across
+    /// an upgrade is the reader that decides — and it used to decide by
+    /// dropping the connection, which made every future message addition a hard
+    /// incompatibility. Skipping is the property that has to ship *before* any
+    /// new variant can.
+    #[tokio::test]
+    async fn an_unknown_message_type_is_skipped_and_the_next_one_still_arrives() {
+        let wire = concat!(
+            "{\"type\":\"SomethingFromTheFuture\",\"payload\":42}\n",
+            "{\"type\":\"Subscribe\"}\n"
+        );
+        let mut reader = BufReader::new(wire.as_bytes());
+        let msg: ClientMsg = recv_msg(&mut reader)
+            .await
+            .expect("the unknown line must not fail the connection");
+        assert!(
+            matches!(msg, ClientMsg::Subscribe),
+            "the next understood message is delivered, got {msg:?}"
+        );
+    }
+
+    /// Tolerance is for unknown *messages*, not for a broken stream: malformed
+    /// JSON is still an error, or a desynchronised connection would spin
+    /// forever pretending to make progress.
+    #[tokio::test]
+    async fn malformed_json_is_still_an_error() {
+        let mut reader = BufReader::new(&b"{not json at all\n"[..]);
+        assert!(
+            recv_msg::<_, ClientMsg>(&mut reader).await.is_err(),
+            "a broken line is a protocol error, not something to skip"
+        );
+    }
+
+    /// A subscriber that falls far enough behind drops messages — possibly an
+    /// `OpFinished`, which leaves a spinner that never resolves. The hub
+    /// repairs the gap by re-sending the authoritative state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lagging_subscriber_is_resynchronised_rather_than_left_with_a_hole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("lag.sock");
+        let server = HubServer::bind_at(sock.clone()).await.expect("bind");
+        let hub = server.hub.clone();
+        tokio::spawn(server.serve());
+
+        // An operation that ran and finished before anyone subscribed.
         hub.instances.lock().await.insert(
-            "only".into(),
+            "i1".into(),
             InstanceInfo {
-                id: "only".into(),
-                pid: 1,
+                id: "i1".into(),
+                pid: 7,
                 mode: "stdio".into(),
-                scope: "/w".into(),
-                label: "L".into(),
+                scope: "/ws".into(),
+                label: "ahma".into(),
                 client: None,
+                session_id: None,
+                client_pid: None,
+                ended_epoch_ms: None,
             },
         );
-        assert_eq!(resolve_target(&hub, None).await, Some("only".to_string()));
+        hub.record_op_event("i1", &started_ev("op-1")).await;
+        hub.record_op_event("i1", &finished_ev("op-1", Some(now_epoch_ms())))
+            .await;
+
+        // A resync sends exactly what a fresh subscriber would get.
+        let mut buf: Vec<u8> = Vec::new();
+        resync_subscriber(&mut buf, &hub)
+            .await
+            .expect("resync writes");
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("\"type\":\"InstanceList\""),
+            "resync re-sends the instance list: {text}"
+        );
+        assert!(
+            text.contains("\"kind\":\"OpFinished\""),
+            "and the terminal event the subscriber may have missed: {text}"
+        );
     }
 
-    // ── EmbeddedHub bind/None/stale/drop ──────────────────────────────────────
+    // ── HubServer bind / already-running / stale ──────────────────────────────
 
+    /// A live hub is never stolen: the loser of a startup race is told so and
+    /// connects to the winner instead of unlinking a socket in use
+    /// (SPEC R-DAEMON.1, R-ISO.2).
     #[cfg(unix)]
     #[tokio::test]
-    async fn embedded_hub_second_bind_returns_none() {
+    async fn bind_hub_reports_already_running_when_a_live_hub_owns_the_path() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("embed.sock");
-        let _hub = try_start_hub_server_at(sock.clone())
+        let first = HubServer::bind_at(sock.clone())
             .await
-            .unwrap()
             .expect("first bind should succeed on a fresh socket");
+        let count = first.connection_count();
+        tokio::spawn(first.serve());
 
-        // A second attempt finds a live server → caller should subscribe instead.
-        let again = try_start_hub_server_at(sock.clone()).await.unwrap();
+        match HubServer::bind_at(sock.clone()).await {
+            Err(HubBindError::AlreadyRunning) => {}
+            Err(HubBindError::Failed(e)) => panic!("expected AlreadyRunning, got failure: {e}"),
+            Ok(_) => panic!("second bind on a live socket must not succeed"),
+        }
         assert!(
-            again.is_none(),
-            "second bind on a live socket must return None"
+            sock.exists(),
+            "the live hub's socket must survive a losing bind attempt"
+        );
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "probe is not a connection"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn embedded_hub_removes_stale_socket_and_binds() {
+    async fn bind_hub_removes_a_stale_socket_and_binds() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("stale_embed.sock");
 
-        // Leave a stale socket file with nothing listening.
+        // Leave a socket file behind with nothing listening on it — what a
+        // crash or a reboot leaves on a filesystem that is not tmpfs.
         {
             let _l = tokio::net::UnixListener::bind(&sock).unwrap();
         }
         assert!(sock.exists());
 
-        let hub = try_start_hub_server_at(sock.clone()).await.unwrap();
-        assert!(
-            hub.is_some(),
-            "a stale socket should be cleaned up and bound successfully"
-        );
+        let server = HubServer::bind_at(sock.clone())
+            .await
+            .expect("a stale socket is cleaned up and bound");
+        assert_eq!(server.socket_path(), sock.as_path());
     }
 
+    /// `Shutdown` must not shortcut a composed daemon's shutdown: with a hook
+    /// installed the hub delegates instead of calling `process::exit`.
     #[cfg(unix)]
     #[tokio::test]
-    async fn embedded_hub_drop_removes_socket_file() {
+    async fn shutdown_message_invokes_exit_hook_instead_of_exiting() {
         let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("droptest.sock");
-        let hub = try_start_hub_server_at(sock.clone())
-            .await
-            .unwrap()
-            .expect("bind");
-        assert!(sock.exists(), "socket file exists while the hub is alive");
+        let sock = tmp.path().join("hook.sock");
+        let server = HubServer::bind_at(sock.clone()).await.expect("bind");
 
-        drop(hub);
-        assert!(!sock.exists(), "socket file is removed on hub drop");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        server.set_exit_hook(Arc::new(move |reason: &str| {
+            let _ = tx.send(reason.to_string());
+        }));
+        tokio::spawn(server.serve());
+
+        let mut client = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        send_msg(&mut client, &ClientMsg::Shutdown).await.unwrap();
+
+        let reason = tokio::time::timeout(crate::timeouts::TestTimeouts::scale_secs(5), rx.recv())
+            .await
+            .expect("exit hook must run instead of exiting the process")
+            .expect("hook sends its reason");
+        assert!(
+            reason.contains("shutdown"),
+            "hook is told why it was called: {reason}"
+        );
+        // The process is still alive, which is the whole point of the hook.
+        assert!(sock.exists());
+    }
+
+    /// An instance re-registers whenever it learns its client's name or commits
+    /// its sandbox scope. With a fresh id each time, a TUI saw one instance
+    /// leave and a stranger arrive — losing the section's expansion state and
+    /// reshuffling any view sorted by id. The session id keeps it the same
+    /// instance (SPEC R-DAEMON.6).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reregister_with_the_same_session_keeps_the_instance_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("stable.sock");
+        let server = HubServer::bind_at(sock.clone()).await.expect("bind");
+        tokio::spawn(server.serve());
+
+        async fn register_once(sock: &std::path::Path, client: Option<&str>) -> String {
+            let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+            let (r, mut w) = tokio::io::split(stream);
+            let reader = BufReader::new(r);
+            send_msg(
+                &mut w,
+                &ClientMsg::Register {
+                    pid: 11,
+                    mode: "stdio".into(),
+                    scope: "/ws".into(),
+                    label: "ahma".into(),
+                    client: client.map(str::to_string),
+                    session_id: Some("mcp-session-7".into()),
+                    client_pid: Some(4242),
+                },
+            )
+            .await
+            .unwrap();
+            // Observe the registration from a subscriber's point of view.
+            let sub = tokio::net::UnixStream::connect(sock).await.unwrap();
+            let (sr, mut sw) = tokio::io::split(sub);
+            let mut sub_reader = BufReader::new(sr);
+            send_msg(&mut sw, &ClientMsg::ListInstances).await.unwrap();
+            let id = match recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap() {
+                DaemonMsg::InstanceList { instances } => {
+                    let live: Vec<_> = instances
+                        .iter()
+                        .filter(|i| i.ended_epoch_ms.is_none())
+                        .collect();
+                    assert_eq!(live.len(), 1, "one session is one instance: {instances:?}");
+                    assert_eq!(live[0].session_id.as_deref(), Some("mcp-session-7"));
+                    assert_eq!(live[0].client_pid, Some(4242));
+                    live[0].id.clone()
+                }
+                other => panic!("expected InstanceList, got {other:?}"),
+            };
+            // Drop the instance connection so the next registration is a
+            // genuine reconnect-to-relabel.
+            drop(w);
+            drop(reader);
+            id
+        }
+
+        let first = register_once(&sock, None).await;
+        // Wait for the hub to finish tearing the first connection down.
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+            let (r, mut w) = tokio::io::split(stream);
+            let mut reader = BufReader::new(r);
+            send_msg(&mut w, &ClientMsg::ListInstances).await.unwrap();
+            if let DaemonMsg::InstanceList { instances } =
+                recv_msg::<_, DaemonMsg>(&mut reader).await.unwrap()
+                && instances.iter().all(|i| i.ended_epoch_ms.is_some())
+            {
+                break;
+            }
+        }
+        let second = register_once(&sock, Some("claude-code")).await;
+
+        assert_eq!(
+            first, second,
+            "the same session must keep its instance id across a re-register"
+        );
     }
 
     // ── serve_instance event forwarding ───────────────────────────────────────
@@ -2922,6 +4643,8 @@ mod tests {
                 scope: "/w".into(),
                 label: "L".into(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -3115,6 +4838,8 @@ mod tests {
                 scope: "/w".into(),
                 label: "L".into(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -3249,6 +4974,8 @@ mod tests {
                 scope: "/w".into(),
                 label: "L".into(),
                 client: None,
+                session_id: None,
+                client_pid: None,
             },
         )
         .await
@@ -3267,6 +4994,8 @@ mod tests {
                     cwd: None,
                     command: None,
                     origin: None,
+                    partial: false,
+                    unsandboxed: false,
                 },
             },
         )
@@ -3283,6 +5012,7 @@ mod tests {
                     ended_epoch_ms: None,
                     exit_code: None,
                     denial: None,
+                    interrupted: false,
                 },
             },
         )

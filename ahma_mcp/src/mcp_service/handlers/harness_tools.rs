@@ -424,7 +424,13 @@ impl AhmaMcpService {
     /// container stay allowed, and letting a read pick the project would let an
     /// incidental lookup spend the one narrowing the session gets.
     fn narrow_container_for(&self, path: &Path) -> Option<crate::sandbox::ContainerNarrowing> {
-        self.adapter.sandbox().narrow_container_to(path)
+        let narrowing = self.adapter.sandbox().narrow_container_to(path);
+        if narrowing.is_some() {
+            // The scope just shrank to one project; re-register so the hub
+            // stops advertising the container (SPEC R24.3).
+            crate::daemon_reporter::publish_committed_scope(self.adapter.sandbox());
+        }
+        narrowing
     }
 }
 

@@ -19,10 +19,11 @@ pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result
         println!("Stopping running background processes...");
         let _ = ahma_common::daemon_hub::stop_daemon().await;
 
+        let default_socket = ahma_common::daemon_hub::mcp_socket_path(None);
         let socket_path_opt = if cfg!(unix) && !cfg.unix_socket_path.is_empty() {
             Some(cfg.unix_socket_path.as_str())
         } else if cfg!(unix) {
-            Some(crate::shell::modes::server::GLOBAL_SOCKET_PATH)
+            Some(default_socket.as_str())
         } else {
             None
         };

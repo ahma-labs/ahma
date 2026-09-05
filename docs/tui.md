@@ -1,8 +1,13 @@
 # TUI Control Plane
 
-`ahma tui` opens a terminal dashboard for watching and controlling everything ahma is doing on your behalf — the operations your MCP client (Claude Code, Cursor, Antigravity, …) is running, and the commands you run yourself. It works over SSH, requires no graphical runtime, and is the primary interface for reviewing approval gates.
+`ahma tui` opens a terminal dashboard showing everything ahma is doing on your
+behalf — every editor session's work, every hooked shell command, and the
+commands you run yourself — in one view. It works over SSH, needs no graphical
+runtime, and is where approval gates are answered.
 
-It is **chat-first**: the default view is a chat/agent interface with operation cards. Everything else is a toggleable sub-window stacked above the chat: `/tasks` opens the live **task tree**, `/log` the log pane, and `/scope` the **sandbox scope panel**. Running the same command again (with focus on that pane, for the focusable ones) closes it.
+It is **work-first**: the view you open into is what is being done for you.
+Chat is a thing you then choose to do (`i`, or `/chat`), and the log pane
+(`/log`) and sandbox scope panel (`/scope`) are toggles.
 
 ## Quickstart
 
@@ -15,31 +20,56 @@ ahma tui
 ahma tui --connect http://localhost:8080
 ```
 
-## The live task tree — current at startup
+## One section per client session
 
-Open `ahma tui` in a project directory while your IDE agent is working and the ongoing tasks are **already there** (SPEC R24): every ahma instance reports its operations to a per-user hub daemon, which replays recent history (with true start/end timestamps) to the TUI the moment it subscribes. If live project work is found at startup, the TUI opens straight into the task view; press any key to take over.
+Open `ahma tui` in a project directory while your editors are working and their
+work is **already there** (SPEC R24.2): every ahma instance reports to the
+per-user daemon, which replays recent history — with true start and end times,
+and the output each command was printing — the moment the TUI subscribes. If
+there is live work for this project, its section opens by itself; any keystroke
+takes over.
 
 ```
-┌ Tasks · this project — [f] all ────────────────────────────┐
-│ ▾ claude-code · stdio · …/github/ahma      2⟳ 1◷ 14✓       │
-│    ⟳ cargo nextest run          [op_41]  1m12s   [P] [X]   │
-│    │ Compiling ahma_core v0.15.4                            │
-│    │ Compiling ahma_mcp v0.15.4                             │
-│    ▾ session build-loop                                     │
-│      ✓ cargo fmt --all          [op_39]  0.3s               │
-│      ⟳ cargo clippy             [op_40]  12s     [P] [X]   │
-│ ▸ cursor · stdio · …/github/ahma           3✓               │
-│ ▾ this terminal (you)                      1⟳               │
-│    ⟳ tail -f logs/ahma.log      [op_7]   4m02s   [P] [X]   │
-└─────────────────────────────────────────────────────────────┘
+ ahma · work · this project [f]    3 clients · 2⟳ 1◷ 14✓          Unix socket
+▶─ claude-code (1) · …/github/ahma ── ⢷⡪ ──────────────── 2⟳ 1◷ 14✓ ──
+   ⟳ cargo nextest run              [op_41]  1m12s        [P] [X]
+   │ Compiling ahma_core v0.15.4
+   │ Compiling ahma_mcp v0.15.4
+   ▾ session build-loop
+     ✓ cargo fmt --all              [op_39]  exit 0 · 0.3s
+── claude-code (2) · …/github/ahma ── ✓ cargo build ───────────── 8✓ ──
+── cursor · …/proj-b ── ⟳ npm test ──────────────────────── 1⟳ 3✓ ──
+── hooks · …/github/ahma ── ✓ pre-commit lint ───────────── 1⟳ 2✓ ──
+── this terminal (you) ── ! rm -rf build ───────────────────── 1✓ ──
+ ↑↓ move  Enter open  Space tail  f all projects  i chat  ? help  q quit
 ```
 
-- **One line per task.** Instance headers show *who* is driving (the MCP client identity from the `initialize` handshake), the transport, the sandbox scope, and at-a-glance tallies of how much is running / queued / done / failed in parallel.
-- **Children indent under what spawned them** — persistent-session commands under their session, subtasks under their parent operation, to any depth.
-- **Tasks resolve in place** when they finish: the spinner becomes ✓/✗ with the duration.
-- **Accordion drill-in:** `Space` (or click) on a task expands it inline into its live output tail — or its historic output/result if already finished — and collapses whichever task was expanded before; on an instance or session header it folds that subtree. `Enter` opens the full-screen operation detail overlay instead.
-- **Project-scoped by default:** only instances whose sandbox scope covers the directory you started in are shown; `f` shows all projects.
-- Finished tasks stay visible for an hour, so a TUI opened mid-session shows what *was* done, not just what is running.
+- **A section per client session.** Two windows of the same editor on the same
+  project are numbered, so you can tell them apart. Hooked commands fold into
+  one `hooks` section — a hook is one instance per command — and your own `!`
+  commands and chat tool calls are *this terminal (you)*.
+- **`!` commands are marked.** Anything you run with `!` runs outside the
+  sandbox, at your full privilege, and its row carries a `!` and its detail
+  pane says `UNSANDBOXED`. It is reported to the daemon like any other work, so
+  it is in the history, and a second TUI sees it too.
+- **A closed section still tells you something**: what it is running now, or
+  what it last ran. You should not have to open each one to find the one you
+  want.
+- **One section is open at a time.** Click a header (or press Enter on it) and
+  it opens while the previous one closes, over about a third of a second, so you
+  can see which line went where.
+- **Inside the open section**, children indent under whatever spawned them, and
+  one task at a time expands into its output: the live tail if it is running,
+  the retained tail or result if it has finished. Enter opens the full-screen
+  detail view instead.
+- **Project-scoped by default**; `f` shows every project. A session that has not
+  established its scope yet reads *no scope yet* rather than disappearing.
+- **Recent work survives.** Finished work stays for an hour — including work
+  from a session that has since closed, and from a daemon that has since exited,
+  because the daemon writes a bounded history beside its sockets, in the
+  per-user runtime directory. An
+  operation that was still running when its daemon went away is shown
+  `interrupted`, not failed: nobody established that it failed.
 
 ## Operation names and exit status
 
@@ -66,17 +96,20 @@ than showing a fabricated `exit 0`.
 | Key | Action |
 |-----|--------|
 | Ctrl-C (`q` in a pane) | Quit |
-| `↑`/`↓` (`j`/`k`) | Navigate rows |
-| `Space` / click | Expand task into live/historic output (accordion); fold headers |
-| `Enter` | Open the full-screen operation detail overlay |
-| `f` | Toggle this-project / all-projects |
-| `c` | Cancel selected operation |
-| `p` | Pin selected operation |
+| `↑`/`↓` (`j`/`k`) | Move the selection |
+| `Enter` / click a header | Open that section, closing the open one |
+| `Space` / click a task | Expand it into its output (one at a time) |
+| `Enter` on a task | Full-screen operation detail |
+| Wheel | Scroll the view |
+| `i` or `/chat` | Open or close the chat pane |
+| `f` | This project / all projects |
+| `c` | Cancel the selected operation |
+| `p` | Pin the selected operation |
 | `a` | Ask for access again (on a denied operation) |
 | `Tab` | Cycle panes |
-| `y` / `n` | Approve / reject pending gate |
-| `/` | Command navigator (from empty input) |
-| `?` | Help (from empty input, or any pane) |
+| `y` / `n` | Approve / reject a pending gate |
+| `/` | Command navigator (from an empty input) |
+| `?` | Help |
 
 ## Chat input prefixes
 
@@ -141,9 +174,13 @@ Press Ctrl-C to exit.
 
 ## Transport auto-detection
 
-`ahma tui` automatically picks the best available transport in order:
+`ahma tui` attaches to the per-user daemon; it never starts a server of its own,
+and in particular never one scoped to the directory you happened to open it in
+(SPEC R-DAEMON.9). It picks the best available transport in order:
 
-1. **Unix socket** (`/tmp/ahma.sock`, or `[http] unix_socket_path` in `~/.ahma/settings.toml`) — lowest latency, local only. `$AHMA_UNIX_SOCKET` is retired (R-CFG1.2) and ignored by the TUI as it is by `ahma serve`.
+1. **Unix socket** — the daemon's `mcp.sock` in your per-user runtime directory
+   (`$XDG_RUNTIME_DIR/ahma`, else `~/.ahma`), or `[http] unix_socket_path` in
+   `~/.ahma/settings.toml`. Lowest latency, local only. `$AHMA_UNIX_SOCKET` is retired (R-CFG1.2) and ignored by the TUI as it is by `ahma serve`.
 2. **HTTP/3 (QUIC)** — when the server advertises `Alt-Svc: h3=…` _and_ local TLS material exists at `~/.ahma/tls/`. See [TLS provisioning](#tls-provisioning-for-quic) below.
 3. **HTTP/1.1 / HTTP/2** — plain TCP, always available as a fallback.
 

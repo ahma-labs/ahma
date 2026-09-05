@@ -205,6 +205,19 @@ pub struct BridgeConfig {
     /// The sender is consumed on first use; subsequent bridge starts (after a
     /// hypothetical restart) will not fire it.
     pub bound_port_tx: Option<tokio::sync::oneshot::Sender<u16>>,
+
+    /// Translates a session's URL query into worker arguments. Set by the
+    /// daemon, which owns the allowlist (SPEC R-DAEMON.4); `None` on an
+    /// explicitly started bridge, which does not accept session options.
+    pub session_options: Option<crate::session::SessionOptionTranslator>,
+
+    /// Set when this bridge is hosted by the per-user daemon (SPEC R-DAEMON.3).
+    ///
+    /// With it, `/restart` and the idle timer ask the composer to stop instead
+    /// of calling `process::exit` — the daemon also owns the hub, live sessions
+    /// and a history file, and exiting from whichever task noticed first would
+    /// skip all of it.
+    pub exit: Option<Arc<DaemonExit>>,
 }
 
 impl Default for BridgeConfig {
@@ -231,6 +244,8 @@ impl Default for BridgeConfig {
             max_sessions: DEFAULT_MAX_SESSIONS,
             peer_factory: None,
             bound_port_tx: None,
+            session_options: None,
+            exit: None,
         }
     }
 }
@@ -264,6 +279,7 @@ impl std::fmt::Debug for BridgeConfig {
                 "bound_port_tx",
                 &self.bound_port_tx.as_ref().map(|_| "<Sender>"),
             )
+            .field("exit", &self.exit.as_ref().map(|_| "<DaemonExit>"))
             .finish_non_exhaustive()
     }
 }
@@ -288,6 +304,8 @@ impl Clone for BridgeConfig {
             rate_limit_burst: self.rate_limit_burst,
             active_sessions: self.active_sessions.clone(),
             idle_timeout_secs: self.idle_timeout_secs,
+            exit: self.exit.clone(),
+            session_options: self.session_options.clone(),
             max_sessions: self.max_sessions,
             peer_factory: self.peer_factory.clone(),
             // oneshot::Sender is not Clone; cloning a BridgeConfig discards the
@@ -359,6 +377,62 @@ impl BridgeConfig {
 ///
 /// The entire struct is wrapped in `Arc` before being registered as an Axum
 /// extension, so handler clones are cheap reference-count increments.
+/// How a composed daemon is asked to stop, so the bridge never exits the
+/// process out from under it (SPEC R-DAEMON.3).
+///
+/// A standalone `ahma serve http|unix` owns its process and exits directly. The
+/// per-user daemon does not: it also holds the observability hub, live MCP
+/// sessions and a history file to flush, so "stop" is one choreography owned by
+/// the composer. When an exit coordinator is installed the bridge asks; with
+/// none it behaves exactly as it always did.
+pub struct DaemonExit {
+    request: Box<dyn Fn(&str) + Send + Sync>,
+    draining: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::fmt::Debug for DaemonExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonExit")
+            .field("draining", &self.is_draining())
+            .finish()
+    }
+}
+
+impl DaemonExit {
+    /// Build a coordinator whose `request` runs the composer's shutdown.
+    pub fn new(request: Box<dyn Fn(&str) + Send + Sync>) -> Self {
+        Self {
+            request,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Stop now, for `reason`.
+    pub fn request(&self, reason: &str) {
+        (self.request)(reason);
+    }
+
+    /// Stop accepting new sessions and exit once the live ones end.
+    ///
+    /// This is what makes an upgrade safe: a newer client can replace the
+    /// daemon without tearing down another window's session mid-command, which
+    /// is what the old "restart the bridge" path did to everyone attached.
+    pub fn request_drain(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// True once draining has begun.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The flag itself, for the session manager's admission check.
+    pub fn draining_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.draining.clone()
+    }
+}
+
 pub struct BridgeState {
     /// Session manager (session isolation mode only)
     session_manager: Arc<SessionManager>,
@@ -370,6 +444,9 @@ pub struct BridgeState {
     require_token: ArcSwapOption<String>,
     /// The listener configuration, used for cleanup on restart.
     listener_kind: ListenerKind,
+    /// Set when this bridge is hosted by the per-user daemon, which owns the
+    /// process's exit path.
+    exit: Option<Arc<DaemonExit>>,
 }
 
 /// Build a CORS layer appropriate for the bind address.
@@ -562,6 +639,7 @@ async fn await_shutdown_signal() {
 
 fn spawn_idle_timeout_checker(timeout: u64, state: Arc<BridgeState>) {
     let session_manager = state.session_manager.clone();
+    let exit = state.exit.clone();
     #[cfg_attr(not(unix), allow(unused_variables))]
     let listener_kind = state.listener_kind.clone();
     let counter = session_manager
@@ -581,6 +659,13 @@ fn spawn_idle_timeout_checker(timeout: u64, state: Arc<BridgeState>) {
             idle_duration += check_interval;
             if idle_duration.as_secs() >= timeout {
                 tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
+                if let Some(exit) = exit.as_ref() {
+                    // The daemon's own idle policy also counts hub connections;
+                    // this checker is not installed there, but if it ever is,
+                    // it must ask rather than exit.
+                    exit.request("bridge idle timeout");
+                    return;
+                }
                 session_manager
                     .terminate_all(crate::session::SessionTerminationReason::Timeout)
                     .await;
@@ -641,6 +726,9 @@ pub async fn start_bridge(mut config: BridgeConfig) -> Result<()> {
 fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
     let session_config = create_session_config(config);
     let mut session_manager = SessionManager::new(session_config);
+    if let Some(ref exit) = config.exit {
+        session_manager.draining = Some(exit.draining_flag());
+    }
     if let Some(ref counter) = config.active_sessions {
         session_manager.active_sessions = Some(counter.clone());
     }
@@ -650,11 +738,13 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         session_manager,
         require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
         listener_kind: config.listener_kind.clone(),
+        exit: config.exit.clone(),
     })
 }
 
 fn create_session_config(config: &BridgeConfig) -> SessionManagerConfig {
     SessionManagerConfig {
+        session_options: config.session_options.clone(),
         server_command: config.server_command.clone(),
         server_args: config.server_args.clone(),
         default_scope: config.default_sandbox_scope.clone(),
@@ -1267,6 +1357,12 @@ pub struct HealthResponse {
     /// doesn't send this field still deserializes the response.
     #[serde(default)]
     pub default_sandbox_scope: Option<String>,
+    /// True once this daemon has been asked to drain: it is finishing the
+    /// sessions it has and accepting no new ones, so a client should start (or
+    /// wait for) its successor rather than opening a session here.
+    /// `#[serde(default)]` so a pre-upgrade client still parses the response.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 /// Health check endpoint
@@ -1285,6 +1381,7 @@ async fn health_check(State(state): State<Arc<BridgeState>>) -> impl IntoRespons
             status: "OK".to_string(),
             version,
             default_sandbox_scope,
+            draining: state.exit.as_ref().is_some_and(|e| e.is_draining()),
         }),
     )
 }
@@ -1319,6 +1416,39 @@ async fn handle_restart(
         )
             .into_response();
     }
+    // `?mode=drain` is what an upgrading client asks for: stop accepting new
+    // sessions and go when the live ones end. The old unconditional restart
+    // tore down every attached editor's session mid-command to install a new
+    // binary for one of them (SPEC R-DAEMON.5).
+    let drain_requested = request
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|kv| kv == "mode=drain"));
+    if let Some(exit) = state.exit.clone() {
+        if drain_requested {
+            info!("Drain requested: finishing live sessions, accepting no new ones.");
+            exit.request_drain();
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "draining",
+                    "version": format!("{}+{}", env!("CARGO_PKG_VERSION"), ahma_common::BUILD_ID)
+                })),
+            )
+                .into_response();
+        }
+        info!("Restart requested. Asking the daemon to stop...");
+        exit.request("restart requested");
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "restarting",
+                "version": format!("{}+{}", env!("CARGO_PKG_VERSION"), ahma_common::BUILD_ID)
+            })),
+        )
+            .into_response();
+    }
+
     info!("Restart requested. Shutting down bridge process...");
     #[cfg_attr(not(unix), allow(unused_variables))]
     let listener_kind = state.listener_kind.clone();
@@ -1718,9 +1848,12 @@ fn origin_is_loopback(origin: &str) -> bool {
 
 async fn handle_mcp_request(
     State(state): State<Arc<BridgeState>>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response {
+    // The query carries this client's own session options (SPEC R-DAEMON.4).
+    let session_query = uri.query().unwrap_or("").to_string();
     // JSON-RPC batch arrays are not supported (batching was removed from the
     // MCP spec in 2025-06-18). Refusing loudly beats the old behavior, which
     // forwarded the raw array to the subprocess with undefined results.
@@ -1735,6 +1868,7 @@ async fn handle_mcp_request(
             state.session_manager.clone(),
             headers,
             payload,
+            session_query,
         )
         .await;
     }
@@ -1743,6 +1877,7 @@ async fn handle_mcp_request(
         state.session_manager.clone(),
         headers,
         payload,
+        session_query,
     )
     .await
 }
@@ -1807,6 +1942,8 @@ mod tests {
             max_sessions: 50,
             peer_factory: None,
             bound_port_tx: None,
+            exit: None,
+            session_options: None,
         };
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(config.server_command, "custom_server");
@@ -1849,6 +1986,7 @@ mod tests {
             session_manager,
             require_token: ArcSwapOption::new(None),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
+            exit: None,
         })
     }
 
@@ -2585,6 +2723,7 @@ for line in sys.stdin:
             })),
             require_token: ArcSwapOption::new(token.map(|s| Arc::new(s.to_owned()))),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
+            exit: None,
         });
         let loopback_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         Router::new()
@@ -3034,6 +3173,7 @@ mod transport_guard_tests {
             session_manager,
             require_token: ArcSwapOption::new(None),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
+            exit: None,
         });
         let loopback: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         let app = build_mcp_router(state, build_cors_layer(&loopback), None, 0, 0)

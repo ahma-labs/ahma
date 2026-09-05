@@ -1,15 +1,23 @@
 # Connection Modes
 
 `ahma` supports:
-1. **STDIO Mode** (default): IDE spawns `ahma` as a subprocess and communicates via standard I/O. Recommended for development.
+1. **STDIO Mode** (default): your editor spawns `ahma` as a subprocess and communicates via standard I/O. Recommended for development.
 2. **HTTP Mode**: Start `ahma serve http` for HTTP/3 (QUIC) support.
+
+> **All of them go through one daemon.** Whatever an editor spawns, the process
+> that actually serves MCP is the single per-user daemon, and the tools run in a
+> kernel-sandboxed worker per session. See [docs/daemon.md](daemon.md).
 
 ## 1. STDIO Mode (Default)
 
-The IDE spawns `ahma` as a subprocess and communicates via standard I/O. This is the recommended mode for development because:
+Your editor spawns `ahma` as a subprocess and communicates via standard I/O.
+That subprocess is a **pipe**: it ensures the per-user daemon is running and
+forwards to it (SPEC R-DAEMON.1). This is the recommended mode for development
+because:
 
-- The sandbox scope comes from the workspace roots your IDE reports via `roots/list` (VS Code and Cursor do this automatically). The subprocess's working directory is **never** trusted as a scope on its own (SPEC R5.2.1) — it is client-config-controlled and spoofable.
-- Each workspace gets its own sandboxed server instance.
+- The sandbox scope comes from the workspace roots your editor reports via `roots/list` (VS Code and Cursor do this automatically). The subprocess's working directory is **never** trusted as a scope on its own (SPEC R5.2.1) — it is client-config-controlled and spoofable.
+- Each session gets its own kernel-sandboxed worker, locking its own scope. Three windows on three projects are three workers with three scopes.
+- Flags in *your* `mcp.json` — `--tools`, `--sandbox-scope`, a task vault — apply to *your* session and no one else's (SPEC R-DAEMON.4).
 - No network exposure.
 
 ```bash
@@ -240,8 +248,14 @@ Ahma treats an empty `roots/list` response as "client has no workspace roots yet
 
 Serves MCP Streamable HTTP over a Unix domain socket instead of TCP. Lower latency than HTTP mode, no port conflicts, and access-controlled by filesystem permissions.
 
+This is the transport the per-user daemon uses; running `ahma serve unix`
+yourself starts a **separate**, operator-owned server (SPEC R-DAEMON.1), which
+is what you want for a fixed scope or a custom path and not what you need for
+ordinary editor use.
+
 ```bash
-# Start on default socket path /tmp/ahma.sock
+# Start on the default socket: mcp.sock in your per-user runtime directory
+# ($XDG_RUNTIME_DIR/ahma, else ~/.ahma)
 ahma serve unix
 
 # Custom socket path
@@ -258,13 +272,13 @@ ahma serve unix --socket-path @ahma
     "servers": {
         "ahma-unix": {
             "type": "http",
-            "url": "unix:///tmp/ahma.sock#/mcp"
+            "url": "unix:///run/user/1000/ahma/mcp.sock#/mcp"
         }
     }
 }
 ```
 
-**Why `#/mcp` in the URL?** VS Code uses the URL fragment (`#/subpath`) as the documented way to specify the HTTP endpoint path when connecting over a Unix socket. This is VS Code-specific syntax — the socket path is `/tmp/ahma.sock` and `/mcp` is the HTTP path to request on the socket. See the [VS Code MCP configuration reference](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration) for details.
+**Why `#/mcp` in the URL?** VS Code uses the URL fragment (`#/subpath`) as the documented way to specify the HTTP endpoint path when connecting over a Unix socket. This is VS Code-specific syntax — the part before `#` is the socket path (`ahma setup` writes the resolved per-user path for you) and `/mcp` is the HTTP path to request on it. See the [VS Code MCP configuration reference](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration) for details.
 
 > Note: Unix socket mode is not available on Windows. Use `ahma serve http` instead.
 

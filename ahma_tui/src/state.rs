@@ -360,7 +360,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/tools", "list available ahma tools"),
     ("/skills", "list Agent Skills invocable with /<name>"),
-    ("/tasks", "open tasks view window"),
+    ("/tasks", "focus the work view"),
+    ("/chat", "open or close the chat pane"),
     ("/log", "open log view window"),
     ("/scope", "show the locked sandbox scope and its provenance"),
     (
@@ -588,18 +589,21 @@ impl PickerState {
 /// Which panel currently receives keyboard input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
-    /// Chat input box (default in Chat mode).
+    /// The unified work view — what the TUI opens into (SPEC R24.9). It is the
+    /// answer to "what is happening on my behalf", which is what someone opens
+    /// this window to find out; chat is a thing you then choose to do.
     #[default]
+    Work,
+    /// The chat pane, when it is open.
     Chat,
-    OpsDag,
     Log,
 }
 
 impl Focus {
-    fn active_order(tasks_open: bool, log_open: bool) -> Vec<Self> {
-        let mut order = vec![Self::Chat];
-        if tasks_open {
-            order.push(Self::OpsDag);
+    fn active_order(chat_open: bool, log_open: bool) -> Vec<Self> {
+        let mut order = vec![Self::Work];
+        if chat_open {
+            order.push(Self::Chat);
         }
         if log_open {
             order.push(Self::Log);
@@ -622,7 +626,9 @@ impl Focus {
 
     /// Panes that can be maximised to the full screen with `z`.
     pub fn is_zoomable(self) -> bool {
-        matches!(self, Self::OpsDag | Self::Log)
+        // The work view is the screen, so there is nothing to zoom it *from*;
+        // the log pane is the one thing worth filling the terminal with.
+        matches!(self, Self::Log)
     }
 }
 
@@ -713,13 +719,18 @@ pub enum OpStatus {
     /// says which path was refused, and the user can re-raise the grant
     /// question from it (R-PERM.7.1).
     Denied,
+    /// Still running when the daemon watching it went away, and reconstructed
+    /// from the history file at the next start. Distinct from `Failed`: the
+    /// command may well have succeeded, and claiming it failed would be an
+    /// invention (SPEC R-DAEMON.7).
+    Interrupted,
 }
 
 impl OpStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Denied
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Denied | Self::Interrupted
         )
     }
 
@@ -733,9 +744,10 @@ impl OpStatus {
             Self::Failed => "Failed",
             Self::Cancelled => "Cancelled",
             Self::Waiting => "Waiting",
-            // A denial travels the wire as a failure plus a `denial` field, so
-            // the wire word stays "Failed" for pre-upgrade readers (R24.5).
-            Self::Denied => "Failed",
+            // A denial and an interruption travel the wire as a failure plus a
+            // field, so the wire word stays "Failed" for pre-upgrade readers
+            // (R24.5).
+            Self::Denied | Self::Interrupted => "Failed",
         }
     }
 
@@ -749,6 +761,8 @@ impl OpStatus {
                 Self::Cancelled => "⊘",
                 Self::Waiting => "⏸",
                 Self::Denied => "✗",
+                // Not a cross: nobody established that this failed.
+                Self::Interrupted => "⁉",
             }
         } else {
             match self {
@@ -759,6 +773,7 @@ impl OpStatus {
                 Self::Cancelled => "-",
                 Self::Waiting => "|",
                 Self::Denied => "x",
+                Self::Interrupted => "?",
             }
         }
     }
@@ -804,9 +819,18 @@ pub struct Operation {
     /// [`OpStatus::Denied`]. Held so the row can name the path and the grant
     /// question can be re-raised for exactly that pair (SPEC R-PERM.7.1).
     pub denial: Option<(String, ahma_common::config::ScopeAccess)>,
+    /// This row was reconstructed from its terminal event alone: the hub never
+    /// saw the operation start (it aged out, or the daemon restarted mid-run).
+    /// Its outcome is real; its command and working directory are unknown.
+    pub partial: bool,
     /// When the most recent live output line arrived (set locally, not from
     /// the wire). Drives the fast-vs-slow cadence of the card's activity panel.
     pub last_output_at: Option<Instant>,
+    /// The command ran **outside** the kernel sandbox, at the user's full
+    /// privilege — today only a `!` command someone typed into this TUI
+    /// (SPEC R-DAEMON.9). Drawn as such: a unified view in which the one
+    /// unconfined row looks like all the others is the wrong view.
+    pub unsandboxed: bool,
 }
 
 /// Strategy 1: pull `command` out of an embedded JSON blob in the description.
@@ -883,6 +907,8 @@ impl Operation {
             origin: None,
             exit_code: None,
             last_output_at: None,
+            partial: false,
+            unsandboxed: false,
         }
     }
 
@@ -1181,6 +1207,9 @@ pub enum ClickTarget {
     /// A row of the monitor task tree: click selects it and toggles it
     /// (accordion expand for ops, collapse for instance/session headers).
     TreeRow(usize),
+    /// A section header in the work view: click opens that section and closes
+    /// whichever was open (SPEC R24.9).
+    SectionHeader(String),
     /// Open the full-screen detail view for the operation with this id.
     OpenOperationDetail(String),
     /// Open the full-screen detail view for one log line. The text is captured
@@ -1524,6 +1553,24 @@ pub struct AppState {
     /// Operation id whose output tail is expanded inline. Accordion: setting a
     /// new id implicitly collapses the previous one (SPEC R24).
     pub expanded_op: Option<String>,
+    /// The one open section (SPEC R24.9), keyed as `work_view::Section::key`.
+    pub open_section: Option<String>,
+    /// The section movement in flight, if any.
+    pub accordion: Option<crate::accordion::AccordionAnim>,
+    /// This frame's sections and their laid-out positions, so key handling and
+    /// hit-testing read exactly what was drawn (R24.8.2).
+    pub work_sections: std::cell::RefCell<Vec<crate::work_view::Section>>,
+    pub work_slots: std::cell::RefCell<Vec<crate::work_view::Slot>>,
+    /// Total rows the work view wants, for the scrollbar.
+    pub work_total_rows: std::cell::Cell<usize>,
+    /// Whether the next frame should pull the selection into view.
+    ///
+    /// A keyboard move should; a wheel scroll must not, or the very next frame
+    /// re-centres on a selection the user did not move and the wheel appears
+    /// not to work.
+    pub work_follow_selection: std::cell::Cell<bool>,
+    /// Whether the chat pane is open (it is a toggle now, not the home view).
+    pub chat_open: bool,
     /// Collapse keys (`inst:<id>`, `grp:<gid>:<key>`) the user has folded.
     pub collapsed_nodes: std::collections::HashSet<String>,
     /// Show instances from every project, not just the one the TUI started in.
@@ -1539,7 +1586,7 @@ pub struct AppState {
     pub auto_view_pending: bool,
     pub chat_area: std::cell::Cell<Rect>,
     pub log_area: std::cell::Cell<Rect>,
-    pub ops_area: std::cell::Cell<Rect>,
+    pub work_area: std::cell::Cell<Rect>,
     pub chat_input_area: std::cell::Cell<Rect>,
     pub last_mouse_pos: std::cell::Cell<Option<(u16, u16)>>,
 
@@ -1614,6 +1661,10 @@ pub struct AppState {
     pub bridge_tx: Option<tokio::sync::mpsc::Sender<crate::llm_bridge::BridgeEvent>>,
     pub mcp_source_tx: Option<tokio::sync::mpsc::Sender<crate::mcp_source::McpSourceCommand>>,
     pub approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    /// This TUI's own connection to the hub, so the `!` commands it runs are
+    /// visible everywhere the rest of the work is (SPEC R-DAEMON.9). `None`
+    /// only in tests, which build state without a runtime.
+    pub tui_reporter: Option<crate::tui_reporter::TuiReporter>,
 }
 
 /// Which provider a selection came from.
@@ -1770,6 +1821,17 @@ impl SandboxAuthority {
 }
 
 impl AppState {
+    /// Where a `!` command run in this TUI reports its progress, if this
+    /// process managed to open a reporter connection.
+    ///
+    /// Mints the operation id as well as handing back the channel, because the
+    /// two must agree and there is exactly one correct way to pair them.
+    pub fn bang_report(&self) -> Option<crate::llm_bridge::BangReport> {
+        let reporter = self.tui_reporter.clone()?;
+        let op_id = crate::tui_reporter::next_bang_op_id(reporter.session_id());
+        Some(crate::llm_bridge::BangReport { reporter, op_id })
+    }
+
     /// Raise an approval gate — the single guarded entry into the
     /// approval-pending state.
     ///
@@ -2043,6 +2105,13 @@ impl AppState {
             ops_selected: 0,
             ops_scroll: std::cell::Cell::new(0),
             expanded_op: None,
+            open_section: None,
+            accordion: None,
+            work_sections: std::cell::RefCell::new(Vec::new()),
+            work_slots: std::cell::RefCell::new(Vec::new()),
+            work_total_rows: std::cell::Cell::new(0),
+            work_follow_selection: std::cell::Cell::new(true),
+            chat_open: false,
             collapsed_nodes: std::collections::HashSet::new(),
             show_all_projects: false,
             project_root: None,
@@ -2050,7 +2119,7 @@ impl AppState {
             auto_view_pending: true,
             chat_area: std::cell::Cell::new(Rect::default()),
             log_area: std::cell::Cell::new(Rect::default()),
-            ops_area: std::cell::Cell::new(Rect::default()),
+            work_area: std::cell::Cell::new(Rect::default()),
             chat_input_area: std::cell::Cell::new(Rect::default()),
             last_mouse_pos: std::cell::Cell::new(None),
             chat_scroll_target: std::cell::Cell::new(0.0),
@@ -2095,6 +2164,7 @@ impl AppState {
             bridge_tx: None,
             mcp_source_tx: None,
             approval_tx: None,
+            tui_reporter: None,
         }
     }
 
@@ -2383,9 +2453,94 @@ impl AppState {
         }
     }
 
-    /// Number of navigable rows in the ops pane. When the task tree has been
-    /// drawn its rows are authoritative; before the first draw (or in tests
-    /// that never render) fall back to the flat operation list.
+    /// Rebuild this frame's sections and navigable rows.
+    ///
+    /// The one place the work view's model is built, called by the renderer
+    /// *and* by every handler that needs to know what is selected. It used to
+    /// be built inside the draw, so a key press before the first frame — or in
+    /// any test that never rendered — operated on a different model than the
+    /// one the user could see.
+    pub fn rebuild_work_view(&self, now_ms: u64) {
+        let area = self.work_area.get();
+        let opts = crate::work_view::SectionOptions {
+            instances: &self.active_instances,
+            project_root: self.project_root.as_deref(),
+            show_all: self.show_all_projects,
+            open_section: self.open_section.as_deref(),
+            closing_section: self
+                .accordion
+                .as_ref()
+                .filter(|a| a.is_active(now_ms))
+                .and_then(|a| a.closing.as_ref())
+                .map(|t| t.key.as_str()),
+            expanded_op: self.expanded_op.as_deref(),
+            collapsed: &self.collapsed_nodes,
+            tail_lines: crate::work_view::tail_lines_for(area.height),
+        };
+        let sections = crate::work_view::build_sections(&self.operations, &opts);
+        *self.task_rows.borrow_mut() = crate::work_view::flatten(&sections);
+        *self.work_sections.borrow_mut() = sections;
+    }
+
+    /// The content height each section is drawn at this frame: its full height
+    /// when open, nothing when closed, and the eased value while moving.
+    pub fn section_heights(&self, now_ms: u64) -> Vec<usize> {
+        let sections = self.work_sections.borrow();
+        sections
+            .iter()
+            .map(|s| {
+                let natural = s.rows.len();
+                match self.accordion.as_ref() {
+                    Some(anim) if anim.is_active(now_ms) => anim
+                        .height_for(&s.key, natural, now_ms)
+                        .unwrap_or(if s.open { natural } else { 0 }),
+                    _ => {
+                        if s.open {
+                            natural
+                        } else {
+                            0
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Open `key`, closing whichever section was open — the accordion (R24.9).
+    /// Toggling the open section shuts it.
+    pub fn toggle_section(&mut self, key: &str, now_ms: u64) {
+        let next = if self.open_section.as_deref() == Some(key) {
+            None
+        } else {
+            Some(key.to_string())
+        };
+        let natural_of = |k: &str| -> usize {
+            self.work_sections
+                .borrow()
+                .iter()
+                .find(|s| s.key == k)
+                .map(|s| s.rows.len())
+                .unwrap_or(0)
+        };
+        self.accordion = crate::accordion::AccordionAnim::retarget(
+            self.accordion.as_ref(),
+            self.open_section.as_deref(),
+            next.as_deref(),
+            natural_of,
+            now_ms,
+        );
+        self.open_section = next;
+        self.rebuild_work_view(now_ms);
+        // The rows under the cursor may have just gone; keep the selection on
+        // something that exists.
+        let rows = self.ops_row_count();
+        if rows > 0 && self.ops_selected >= rows {
+            self.ops_selected = rows - 1;
+        }
+        self.work_follow_selection.set(true);
+    }
+
+    /// Number of navigable rows in the work view.
     pub fn ops_row_count(&self) -> usize {
         let rows = self.task_rows.borrow();
         if rows.is_empty() {
@@ -2463,7 +2618,7 @@ impl AppState {
     /// Enter/click on the selected task-tree row: accordion-expand an
     /// operation (collapsing the previously expanded one), or fold/unfold an
     /// instance or session header.
-    pub fn toggle_selected_tree_node(&mut self) {
+    pub fn toggle_selected_tree_node(&mut self, now_ms: u64) {
         use crate::task_tree::RowKind;
         let action = {
             let rows = self.task_rows.borrow();
@@ -2476,7 +2631,15 @@ impl AppState {
             })
         };
         match action {
-            Some(TreeToggle::Fold(key)) => self.toggle_collapse_key(key),
+            Some(TreeToggle::Fold(key)) => match key.strip_prefix("inst:") {
+                // A section header opens the accordion; a group header inside a
+                // section still folds in place.
+                Some(section) => {
+                    let section = section.to_string();
+                    self.toggle_section(&section, now_ms);
+                }
+                None => self.toggle_collapse_key(key),
+            },
             Some(TreeToggle::Expand(op_index)) => self.toggle_expanded_op(op_index),
             None => {}
         }
@@ -2764,21 +2927,73 @@ mod tests {
         assert_eq!(s.selected_op().unwrap().id, "op-b");
 
         // Accordion: expanding a second op collapses the first implicitly.
-        s.toggle_selected_tree_node();
+        s.toggle_selected_tree_node(0);
         assert_eq!(s.expanded_op.as_deref(), Some("op-b"));
         s.ops_selected = 2;
-        s.toggle_selected_tree_node();
+        s.toggle_selected_tree_node(0);
         assert_eq!(s.expanded_op.as_deref(), Some("op-a"));
         // Toggling the same op collapses it.
-        s.toggle_selected_tree_node();
+        s.toggle_selected_tree_node(0);
         assert_eq!(s.expanded_op, None);
+    }
 
-        // Header toggle folds and unfolds the instance subtree.
+    /// A header row opens its section rather than folding a subtree in place:
+    /// the sections *are* the structure now (SPEC R24.9).
+    #[test]
+    fn a_header_row_opens_its_section_and_closes_the_other() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.active_instances = vec![
+            instance_info("i1", "claude-code", "/work/proj"),
+            instance_info("i2", "cursor", "/work/proj"),
+        ];
+        let mut a = Operation::new("op-a", "run_terminal_command", OpStatus::Running);
+        a.instance_id = Some("i1".into());
+        let mut b = Operation::new("op-b", "run_terminal_command", OpStatus::Running);
+        b.instance_id = Some("i2".into());
+        s.operations = vec![a, b];
+        s.rebuild_work_view(0);
+
+        // Select the first header and open it.
         s.ops_selected = 0;
-        s.toggle_selected_tree_node();
-        assert!(s.collapsed_nodes.contains("inst:i1"));
-        s.toggle_selected_tree_node();
-        assert!(!s.collapsed_nodes.contains("inst:i1"));
+        let first = s.work_sections.borrow()[0].key.clone();
+        s.toggle_selected_tree_node(0);
+        assert_eq!(s.open_section.as_deref(), Some(first.as_str()));
+        assert!(
+            s.collapsed_nodes.is_empty(),
+            "a section header is not a collapse key any more"
+        );
+
+        // Opening the other section closes the first — the accordion.
+        let second = s
+            .work_sections
+            .borrow()
+            .iter()
+            .find(|sec| sec.key != first)
+            .map(|sec| sec.key.clone())
+            .expect("a second section");
+        s.toggle_section(&second, 1_000);
+        assert_eq!(s.open_section.as_deref(), Some(second.as_str()));
+        let anim = s.accordion.as_ref().expect("the movement is animated");
+        assert_eq!(anim.closing.as_ref().unwrap().key, first);
+        assert_eq!(anim.opening.as_ref().unwrap().key, second);
+
+        // And toggling the open one shuts it.
+        s.toggle_section(&second, 2_000);
+        assert_eq!(s.open_section, None);
+    }
+
+    fn instance_info(id: &str, client: &str, scope: &str) -> ahma_common::daemon_hub::InstanceInfo {
+        ahma_common::daemon_hub::InstanceInfo {
+            id: id.into(),
+            pid: 7,
+            mode: "stdio".into(),
+            scope: scope.into(),
+            label: "ahma".into(),
+            client: Some(client.into()),
+            session_id: Some(format!("sess-{id}")),
+            client_pid: None,
+            ended_epoch_ms: None,
+        }
     }
 
     /// The activity feed records exactly one Started per live op and one
@@ -3078,13 +3293,18 @@ mod tests {
         assert!(s.ai_activity[0].tool.contains("tool_"));
     }
 
+    /// Tab cycles from the work view outwards: it is the home pane, so it is
+    /// where the cycle starts and returns to (SPEC R24.9).
     #[test]
-    fn focus_cycles_correctly() {
-        assert_eq!(Focus::Chat.cycle_next_active(true, true), Focus::OpsDag);
-        assert_eq!(Focus::OpsDag.cycle_next_active(true, true), Focus::Log);
-        assert_eq!(Focus::Log.cycle_next_active(true, true), Focus::Chat);
-        assert_eq!(Focus::Log.cycle_prev_active(true, true), Focus::OpsDag);
-        assert_eq!(Focus::Chat.cycle_prev_active(true, true), Focus::Log);
+    fn focus_cycles_from_the_work_view_outwards() {
+        assert_eq!(Focus::Work.cycle_next_active(true, true), Focus::Chat);
+        assert_eq!(Focus::Chat.cycle_next_active(true, true), Focus::Log);
+        assert_eq!(Focus::Log.cycle_next_active(true, true), Focus::Work);
+        assert_eq!(Focus::Log.cycle_prev_active(true, true), Focus::Chat);
+        assert_eq!(Focus::Work.cycle_prev_active(true, true), Focus::Log);
+
+        // With nothing else open there is nowhere else to go.
+        assert_eq!(Focus::Work.cycle_next_active(false, false), Focus::Work);
     }
 
     #[test]

@@ -239,7 +239,8 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Installation | [docs/installation.md](docs/installation.md) | — |
 | Session isolation | [docs/session-isolation.md](docs/session-isolation.md) | R10 |
 | Task vaults | [docs/task-vault.md](docs/task-vault.md) | §5.8 |
-| TUI | [docs/tui.md](docs/tui.md) | — |
+| TUI | [docs/tui.md](docs/tui.md) | R24, R24.9 |
+| Per-user daemon | [docs/daemon.md](docs/daemon.md) | R-DAEMON |
 | Egress sandbox | [docs/egress-sandbox.md](docs/egress-sandbox.md) | — |
 | Network egress (subprocess) | [docs/network-egress.md](docs/network-egress.md) | R-WEB.16, R-PERM.5.3 |
 | Execution audit log | [docs/execution-audit-log.md](docs/execution-audit-log.md) | R-HANDOFF.10 |

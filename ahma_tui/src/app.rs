@@ -37,14 +37,13 @@ pub async fn run(
     use ratatui::{Terminal, backend::CrosstermBackend};
     use tokio::sync::mpsc;
 
-    use crate::daemon_source::{spawn_daemon_source, spawn_embedded_hub_source};
+    use crate::daemon_source::spawn_daemon_source;
     use crate::keymap::map_key;
     use crate::llm_bridge::{BridgeEvent, spawn_discovery_task};
     use crate::mcp_source::{SourceEvent, spawn_mcp_source};
     use crate::state::AppState;
     use crate::theme::Theme;
     use crate::ui;
-    use ahma_common::daemon_hub::try_start_hub_server;
 
     let unicode = detect_unicode();
     let theme = Theme::with_color(unicode, !no_color());
@@ -116,27 +115,19 @@ pub async fn run(
         mcp_tx.clone(),
         workspace_path,
     ));
-    // Start the hub server inside this TUI process so its lifecycle matches the
-    // TUI — no dangling socket if the TUI crashes. ahma instances connect via
-    // Unix socket (macOS/Linux) or TCP loopback (Windows) using push messaging.
-    // If another TUI or standalone daemon already owns the socket, we fall back
-    // to subscriber mode so both TUI instances still receive events.
-    let _hub = match try_start_hub_server().await {
-        Ok(Some(hub)) => {
-            spawn_embedded_hub_source(hub.subscribe(), mcp_tx.clone());
-            Some(hub)
-        }
-        Ok(None) => {
-            // Another server owns the socket — subscribe instead.
-            debug!("hub: another server already running; connecting as subscriber");
-            spawn_daemon_source(mcp_tx.clone());
-            None
-        }
-        Err(e) => {
-            debug!("hub: could not start embedded server ({e}); no multi-instance aggregation");
-            None
-        }
-    };
+    // The TUI is always a subscriber, never the hub (SPEC R-DAEMON.9). It used
+    // to bind the hub socket itself when it started first, which made the
+    // observability of every other client depend on this window staying open:
+    // quitting the TUI unlinked the socket and every attached instance lost its
+    // event stream until it reconnected. The per-user daemon owns the hub; this
+    // process only watches it, and quitting sends nothing but EOF.
+    spawn_daemon_source(mcp_tx.clone());
+    // ...and a second, outgoing connection, because the TUI is also a place
+    // work happens: a `!` command runs here, unsandboxed, and used to be the
+    // one kind of work the unified view could not see (SPEC R-DAEMON.9).
+    state.tui_reporter = Some(crate::tui_reporter::spawn_tui_reporter(
+        state.workspace.clone(),
+    ));
 
     // Bridge channel carries both provider discovery results and LLM tokens.
     let (bridge_tx, mut bridge_rx) = mpsc::channel::<BridgeEvent>(512);
@@ -362,36 +353,40 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         Action::Tab => {
             state.focus = state
                 .focus
-                .cycle_next_active(state.tasks_window_open, state.log_window_open)
+                .cycle_next_active(state.chat_open, state.log_window_open)
         }
         Action::BackTab => {
             state.focus = state
                 .focus
-                .cycle_prev_active(state.tasks_window_open, state.log_window_open)
+                .cycle_prev_active(state.chat_open, state.log_window_open)
         }
         Action::ToggleHelp => state.toggle_help(),
+        Action::ToggleChat => toggle_chat_pane(state),
         Action::FocusChat => {
             // Esc backs out one level: restore a zoomed pane first, then
-            // return focus to the chat input.
+            // return to the work view — which is where the TUI lives, and is
+            // somewhere that always exists (the chat pane may be closed).
             if state.zoomed.is_some() {
                 state.zoomed = None;
-            } else {
+            } else if state.focus == crate::state::Focus::Work && state.chat_open {
                 state.focus = crate::state::Focus::Chat;
+            } else {
+                state.focus = crate::state::Focus::Work;
             }
         }
-        Action::Enter if state.focus == crate::state::Focus::OpsDag => {
+        Action::Enter if state.focus == crate::state::Focus::Work => {
             // Drill in: open the full-screen detail view for an operation
             // (or fold an instance/session header).
             state.open_selected_tree_detail();
         }
-        Action::ToggleNode if state.focus == crate::state::Focus::OpsDag => {
+        Action::ToggleNode if state.focus == crate::state::Focus::Work => {
             // Space: inline accordion-expand the selected task into its
             // live/historic output view (or fold a header) without leaving
             // the tree.
-            state.toggle_selected_tree_node();
+            state.toggle_selected_tree_node(crate::ui::wall_ms());
         }
         Action::DetailClose => state.close_modal(),
-        Action::ToggleProjectFilter if state.focus == crate::state::Focus::OpsDag => {
+        Action::ToggleProjectFilter if state.focus == crate::state::Focus::Work => {
             state.show_all_projects = !state.show_all_projects;
         }
         Action::Unknown | Action::Enter => {}
@@ -703,7 +698,12 @@ fn scroll_focus_up(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::OpsDag => state.ops_selected = state.ops_selected.saturating_sub(1),
+        Focus::Work => {
+            state.ops_selected = state.ops_selected.saturating_sub(1);
+            // A keyboard move should pull the view to the cursor; a wheel
+            // scroll should not (see `scroll_work`).
+            state.work_follow_selection.set(true);
+        }
         Focus::Log => {
             state.detach_log_follow();
             state.log_scroll = state.log_scroll.saturating_sub(1);
@@ -721,8 +721,9 @@ fn scroll_focus_down(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::OpsDag if state.ops_row_count() > 0 => {
+        Focus::Work if state.ops_row_count() > 0 => {
             state.ops_selected = (state.ops_selected + 1).min(state.ops_row_count() - 1);
+            state.work_follow_selection.set(true);
         }
         // While following we are already pinned to the bottom — nothing to do
         // (falls through to the no-op arm below).
@@ -747,7 +748,7 @@ fn move_focus_to_top(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::OpsDag => state.ops_selected = 0,
+        Focus::Work => state.ops_selected = 0,
         Focus::Log => {
             state.log_follow = false;
             state.log_scroll = 0;
@@ -764,7 +765,7 @@ fn move_focus_to_bottom(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::OpsDag => state.ops_selected = state.ops_row_count().saturating_sub(1),
+        Focus::Work => state.ops_selected = state.ops_row_count().saturating_sub(1),
         Focus::Log => {
             // Jump to the newest line and resume tracking new output.
             state.log_follow = true;
@@ -1120,6 +1121,18 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
         crate::ui::shorten_path(&working_dir, 20)
     );
 
+    // The command is about to run outside the sandbox; say so to the daemon
+    // before it starts, so the row exists in every view for as long as the
+    // command does (SPEC R-DAEMON.9).
+    let report = state.bang_report();
+    if let Some(r) = &report {
+        r.reporter.report(crate::tui_reporter::bang_started(
+            &r.op_id,
+            &cmd_str,
+            &working_dir,
+        ));
+    }
+
     let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
     let w = TuiWindow {
         id: win_id,
@@ -1136,7 +1149,7 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
         llm_model: None,
         visible: true,
         abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
-        op_id: None,
+        op_id: report.as_ref().map(|r| r.op_id.clone()),
     };
 
     state.windows.push(w);
@@ -1145,7 +1158,7 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
     }
 
     if let Some(tx) = &state.bridge_tx {
-        spawn_window_cli_task(win_id, cmd_str, working_dir, abort_rx, tx.clone());
+        spawn_window_cli_task(win_id, cmd_str, working_dir, abort_rx, tx.clone(), report);
     }
 }
 
@@ -1243,6 +1256,7 @@ fn format_recent_ops(operations: &[crate::state::Operation]) -> String {
                 OpStatus::Cancelled => "cancelled",
                 OpStatus::Waiting => "waiting",
                 OpStatus::Denied => "DENIED (sandbox)",
+                OpStatus::Interrupted => "interrupted (outcome unknown)",
             };
             let name = op.display_name();
             let elapsed = op.elapsed_display();
@@ -2378,17 +2392,10 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
             state.chat.compact(4);
             push_assistant_message(state, "Context window compacted (kept 4 latest turns).");
         }
-        "/tasks" => {
-            if !state.tasks_window_open {
-                state.tasks_window_open = true;
-                state.focus = crate::state::Focus::OpsDag;
-            } else if state.focus == crate::state::Focus::OpsDag {
-                state.tasks_window_open = false;
-                state.focus = crate::state::Focus::Chat;
-            } else {
-                state.focus = crate::state::Focus::OpsDag;
-            }
-        }
+        // The work view is always on screen now, so `/tasks` focuses it. Kept
+        // because it is in a lot of muscle memory.
+        "/tasks" => state.focus = crate::state::Focus::Work,
+        "/chat" => toggle_chat_pane(state),
         "/log" => {
             if !state.log_window_open {
                 state.log_window_open = true;
@@ -2425,11 +2432,11 @@ fn handle_settings_nav_command(cmd: &str, state: &mut crate::state::AppState) ->
 fn maybe_auto_open_task_view(state: &mut crate::state::AppState) {
     use crate::state::OpStatus;
 
-    if !state.auto_view_pending || state.tasks_window_open {
+    if !state.auto_view_pending {
         return;
     }
     let project = state.project_root.as_deref();
-    let has_live_project_work = state.operations.iter().any(|op| {
+    let live = state.operations.iter().find(|op| {
         op.instance_id.is_some()
             && matches!(
                 op.status,
@@ -2440,11 +2447,38 @@ fn maybe_auto_open_task_view(state: &mut crate::state::AppState) {
                 _ => true,
             }
     });
-    if has_live_project_work {
-        state.auto_view_pending = false;
-        state.tasks_window_open = true;
-        state.focus = crate::state::Focus::OpsDag;
+    let Some(live) = live else { return };
+
+    // Open the section that work belongs to, rather than merely switching to a
+    // view of everything: a user who opens the TUI mid-build wants that build's
+    // output, not a list they then have to click into (SPEC R24.2).
+    state.auto_view_pending = false;
+    state.focus = crate::state::Focus::Work;
+    let now = crate::ui::wall_ms();
+    state.rebuild_work_view(now);
+    let live_instance = live.instance_id.clone();
+    let key = state
+        .work_sections
+        .borrow()
+        .iter()
+        .find(|s| live_instance.as_deref() == Some(s.key.as_str()))
+        .map(|s| s.key.clone());
+    if let Some(key) = key
+        && state.open_section.as_deref() != Some(key.as_str())
+    {
+        state.toggle_section(&key, now);
     }
+}
+
+/// Open or close the chat pane (SPEC R24.9): it is a thing you choose to do,
+/// not the screen the window is for.
+fn toggle_chat_pane(state: &mut crate::state::AppState) {
+    state.chat_open = !state.chat_open;
+    state.focus = if state.chat_open {
+        crate::state::Focus::Chat
+    } else {
+        crate::state::Focus::Work
+    };
 }
 
 fn handle_mcp_list(state: &mut crate::state::AppState) {
@@ -3943,7 +3977,9 @@ fn window_status_for(op: &crate::state::Operation) -> crate::state::WindowStatus
         OpStatus::Pending | OpStatus::Waiting => WindowStatus::Pending,
         OpStatus::Succeeded => WindowStatus::Finished,
         OpStatus::Failed | OpStatus::Denied => WindowStatus::Error,
-        OpStatus::Cancelled => WindowStatus::Cancelled,
+        // Cancelled, not Error: an interrupted operation was not observed to
+        // fail, and colouring it red would assert something we do not know.
+        OpStatus::Cancelled | OpStatus::Interrupted => WindowStatus::Cancelled,
     }
 }
 
@@ -4463,7 +4499,20 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
     };
 
     if is_cli {
-        spawn_window_cli_task(win_id, command, working_dir, abort_rx, tx);
+        // A re-run is a second command, not the first one resuming, so it
+        // reports under an id of its own — window ids wrap and get reused.
+        let report = state.bang_report();
+        if let Some(r) = &report {
+            r.reporter.report(crate::tui_reporter::bang_started(
+                &r.op_id,
+                &command,
+                &working_dir,
+            ));
+            if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
+                w.op_id = Some(r.op_id.clone());
+            }
+        }
+        spawn_window_cli_task(win_id, command, working_dir, abort_rx, tx, report);
     } else {
         let mcp = if state.mcp_enabled {
             Some(mcp_chat_config(state))
@@ -4695,13 +4744,13 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
                     tx.clone(),
                 );
             }
-            state.focus = crate::state::Focus::OpsDag;
+            state.focus = crate::state::Focus::Work;
         }
         ClickTarget::PinOperation(op_id) => {
             if let Some(op) = state.operations.iter_mut().find(|o| o.id == op_id) {
                 op.pinned = !op.pinned;
             }
-            state.focus = crate::state::Focus::OpsDag;
+            state.focus = crate::state::Focus::Work;
         }
         ClickTarget::AnalyzeOperation(op_id) => {
             analyze_operation(state, &op_id);
@@ -4715,7 +4764,7 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
         }
         ClickTarget::SelectOperation(op_idx) => {
             state.ops_selected = op_idx;
-            state.focus = crate::state::Focus::OpsDag;
+            state.focus = crate::state::Focus::Work;
         }
         ClickTarget::CloseWindow(win_id) => {
             close_window_by_id(win_id, state);
@@ -4727,10 +4776,18 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
         }
         ClickTarget::TreeRow(row_idx) => {
             // Click = select + toggle: accordion-expand an operation into its
-            // live/historic output view, or fold an instance/session header.
+            // live/historic output view, or fold a session group.
             state.ops_selected = row_idx;
-            state.toggle_selected_tree_node();
-            state.focus = crate::state::Focus::OpsDag;
+            state.work_follow_selection.set(true);
+            state.toggle_selected_tree_node(crate::ui::wall_ms());
+            state.focus = crate::state::Focus::Work;
+        }
+        ClickTarget::SectionHeader(key) => {
+            // Clicking a header opens that section and closes whichever was
+            // open, over the 300ms tween (SPEC R24.9).
+            let now = crate::ui::wall_ms();
+            state.toggle_section(&key, now);
+            state.focus = crate::state::Focus::Work;
         }
         ClickTarget::OpenOperationDetail(op_id) => {
             state.open_operation_detail(op_id);
@@ -4856,8 +4913,8 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
         state.focus = crate::state::Focus::Log;
         return;
     }
-    if inside_rect(col, row, state.ops_area.get()) {
-        state.focus = crate::state::Focus::OpsDag;
+    if inside_rect(col, row, state.work_area.get()) {
+        state.focus = crate::state::Focus::Work;
     }
 }
 
@@ -4913,14 +4970,44 @@ fn scroll_log(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) 
 }
 
 fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
-    if scroll_overlay(up, state) || scroll_chat(col, row, up, state) {
+    if scroll_overlay(up, state)
+        || scroll_work(col, row, up, state)
+        || scroll_chat(col, row, up, state)
+    {
         return;
     }
     scroll_log(col, row, up, state);
 }
 
+/// Wheel over the work view scrolls it.
+///
+/// It also detaches selection-follow: without that the next frame pulls the
+/// view back to wherever the cursor is, and the wheel appears not to work.
+fn scroll_work(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) -> bool {
+    let area = state.work_area.get();
+    if area.width == 0 || area.height == 0 || !inside_rect(col, row, area) {
+        return false;
+    }
+    let visible = area.height as usize;
+    let total = state.work_total_rows.get();
+    let max_scroll = total.saturating_sub(visible);
+    let current = state.ops_scroll.get();
+    let next = if up {
+        current.saturating_sub(3)
+    } else {
+        (current + 3).min(max_scroll)
+    };
+    state.ops_scroll.set(next);
+    state.work_follow_selection.set(false);
+    true
+}
+
 fn determine_scrolled_panel(state: &crate::state::AppState) -> &'static str {
     if let Some((col, row)) = state.last_mouse_pos.get() {
+        let work_area = state.work_area.get();
+        if inside_rect(col, row, work_area) {
+            return "work";
+        }
         let chat_area = state.chat_area.get();
         let log_area = state.log_area.get();
 
@@ -4940,10 +5027,10 @@ fn determine_scrolled_panel(state: &crate::state::AppState) -> &'static str {
         }
     }
 
-    if state.focus == crate::state::Focus::Log {
-        "log"
-    } else {
-        "chat"
+    match state.focus {
+        crate::state::Focus::Log => "log",
+        crate::state::Focus::Work => "work",
+        crate::state::Focus::Chat => "chat",
     }
 }
 
@@ -5067,7 +5154,51 @@ fn chat_in_progress(state: &crate::state::AppState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::parse_run_command;
+    use super::run_unsandboxed_command;
+    use crate::state::AppState;
     use serde_json::json;
+
+    /// The `!` path must actually reach the reporter: a window that reports
+    /// nothing is exactly the invisible local command this was built to retire
+    /// (SPEC R-DAEMON.9).
+    ///
+    /// Asserted through the window rather than the socket because the window is
+    /// where the two halves have to agree — the card the user is looking at and
+    /// the operation the rest of the machine sees are the same command, and the
+    /// id is what says so.
+    #[tokio::test]
+    async fn a_bang_command_is_reported_and_its_window_carries_the_operation_id() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process (SPEC R-ISO.1).
+        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", dir.path().join("d.sock")) };
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.workspace = dir.path().display().to_string();
+
+        // Without a reporter the command still runs; it is simply unreported.
+        run_unsandboxed_command("echo one".to_string(), &mut state);
+        assert_eq!(state.windows.len(), 1);
+        assert!(
+            state.windows[0].op_id.is_none(),
+            "no reporter, no operation id to claim"
+        );
+
+        state.tui_reporter = Some(crate::tui_reporter::spawn_tui_reporter(
+            state.workspace.clone(),
+        ));
+        run_unsandboxed_command("echo two".to_string(), &mut state);
+        let w = state.windows.last().expect("the second window");
+        let op_id = w.op_id.clone().expect("a reported command has an id");
+        assert!(
+            op_id.starts_with("tui_"),
+            "the id must name where the work happened: {op_id}"
+        );
+        assert!(w.is_cli, "and it is still an ordinary CLI window");
+        assert_ne!(
+            state.windows[0].op_id, state.windows[1].op_id,
+            "two commands are two operations"
+        );
+    }
 
     /// Before the sandbox locks, `sandbox_status` holds the initial `"UNKNOWN"`.
     /// The guard meant to suppress that from the model's system prompt compared
@@ -5684,8 +5815,8 @@ mod tests {
         state.chat_area.set(Rect::new(10, 0, 20, 10));
         state.log_area.set(Rect::new(30, 0, 20, 15));
 
-        // Start with Focus::OpsDag
-        state.focus = Focus::OpsDag;
+        // Start with Focus::Work
+        state.focus = Focus::Work;
 
         // Click on Chat Input Area -> should change focus to Chat
         super::handle_mouse_click(15, 12, &mut state);
@@ -5832,38 +5963,109 @@ mod tests {
         );
     }
 
-    /// `z`/Enter zoom toggles the focused pane full-screen; Esc restores the
-    /// layout before it returns focus to chat.
+    /// Only the log pane zooms now: the work view *is* the screen, so there is
+    /// nothing to zoom it out of (SPEC R24.9).
     #[test]
-    fn zoom_toggles_focused_pane_and_esc_restores() {
+    fn only_the_log_pane_zooms() {
         use crate::keymap::Action;
         use crate::state::{AppState, Focus};
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
 
-        state.focus = Focus::OpsDag;
+        state.focus = Focus::Work;
         super::handle_action(Action::ToggleZoom, &mut state);
-        assert_eq!(state.zoomed, Some(Focus::OpsDag));
+        assert_eq!(state.zoomed, None, "the work view fills the screen already");
 
-        // Esc: first unzoom (focus stays), then focus chat.
+        state.focus = Focus::Log;
+        super::handle_action(Action::ToggleZoom, &mut state);
+        assert_eq!(state.zoomed, Some(Focus::Log));
+
+        // Esc unzooms first, leaving focus where it was.
         super::handle_action(Action::FocusChat, &mut state);
         assert_eq!(state.zoomed, None);
-        assert_eq!(state.focus, Focus::OpsDag);
-        super::handle_action(Action::FocusChat, &mut state);
-        assert_eq!(state.focus, Focus::Chat);
-
-        // Chat focus is not zoomable.
-        super::handle_action(Action::ToggleZoom, &mut state);
-        assert_eq!(state.zoomed, None);
+        assert_eq!(state.focus, Focus::Log);
     }
 
-    /// `/tasks` opens the tasks window and sets focus.
+    /// The wheel scrolls the work view, and stops the next frame from pulling
+    /// it back to the cursor — without which the wheel appears not to work.
     #[test]
-    fn tasks_command_opens_tasks_window() {
+    fn the_wheel_scrolls_the_work_view_and_detaches_selection_follow() {
+        use crate::state::AppState;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state
+            .work_area
+            .set(ratatui::layout::Rect::new(0, 0, 80, 10));
+        state.work_total_rows.set(60);
+        assert!(state.work_follow_selection.get());
+
+        super::handle_mouse_scroll(5, 5, false, &mut state);
+        assert_eq!(state.ops_scroll.get(), 3, "scrolls down by a wheel notch");
+        assert!(
+            !state.work_follow_selection.get(),
+            "and the next frame must not pull the view back to the cursor"
+        );
+
+        super::handle_mouse_scroll(5, 5, true, &mut state);
+        assert_eq!(state.ops_scroll.get(), 0, "and back up");
+
+        // A keyboard move re-engages following.
+        state.operations.push(crate::state::Operation::new(
+            "op-1",
+            "run_terminal_command",
+            crate::state::OpStatus::Running,
+        ));
+        state.rebuild_work_view(0);
+        super::scroll_focus_down(&mut state);
+        assert!(
+            state.work_follow_selection.get(),
+            "moving the cursor should bring the view with it"
+        );
+    }
+
+    /// `i` opens chat from the work view; in chat it is a typed character.
+    #[test]
+    fn i_opens_chat_from_the_work_view() {
+        use crate::keymap::{Action, map_key};
+        use crate::state::{AppState, Focus, ModalState};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let key = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(
+            map_key(key, Focus::Work, &ModalState::None, false),
+            Action::ToggleChat
+        );
+        assert_eq!(
+            map_key(key, Focus::Chat, &ModalState::None, false),
+            Action::InputChar('i'),
+            "in chat it is just a letter"
+        );
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::handle_action(Action::ToggleChat, &mut state);
+        assert!(state.chat_open);
+        assert_eq!(state.focus, Focus::Chat);
+    }
+
+    /// The work view is always on screen, so `/tasks` focuses it — and `/chat`
+    /// is the toggle now, because chat is the thing you choose to do
+    /// (SPEC R24.9).
+    #[test]
+    fn chat_is_the_toggle_and_tasks_focuses_the_work_view() {
         use crate::state::{AppState, Focus};
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        assert_eq!(state.focus, Focus::Work, "the TUI opens on the work view");
+        assert!(!state.chat_open, "and chat starts closed");
+
+        assert!(super::handle_basic_nav_command("/chat", &mut state));
+        assert!(state.chat_open);
+        assert_eq!(state.focus, Focus::Chat);
+
         assert!(super::handle_basic_nav_command("/tasks", &mut state));
-        assert!(state.tasks_window_open);
-        assert_eq!(state.focus, Focus::OpsDag);
+        assert_eq!(state.focus, Focus::Work, "/tasks focuses the work view");
+        assert!(state.chat_open, "without closing chat");
+
+        assert!(super::handle_basic_nav_command("/chat", &mut state));
+        assert!(!state.chat_open);
+        assert_eq!(state.focus, Focus::Work, "closing chat returns focus");
     }
 
     /// Startup notices reach the screen: everything into the log pane, and
@@ -5903,7 +6105,11 @@ mod tests {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         assert!(super::handle_basic_nav_command("/scope", &mut state));
         assert!(state.scope_window_open);
-        assert_eq!(state.focus, Focus::Chat, "no focus change");
+        assert_eq!(
+            state.focus,
+            Focus::Work,
+            "focus stays where it was — the work view is where the TUI opens"
+        );
         assert!(super::handle_basic_nav_command("/scope", &mut state));
         assert!(!state.scope_window_open);
     }

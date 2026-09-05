@@ -39,7 +39,7 @@ the config in place. There are several approaches, from zero-friction to global:
 
 - `ahma` — stdio mode (recommended, automatic per-client instances)
 - `ahma-http` — shared HTTP server on port 3000 (run `ahma serve http --tools git,fileutils --sandbox --log-monitor`)
-- `ahma-unix` — shared HTTP server over Unix socket (run `ahma serve unix --socket-path /tmp/ahma.sock --tools git,fileutils --sandbox --log-monitor`)
+- `ahma-unix` — an explicitly started server over a Unix socket, separate from the per-user daemon (run `ahma serve unix --socket-path <path> --tools git,fileutils --sandbox --log-monitor`)
 
 You can copy or customize this for your own projects. Create `.vscode/mcp.json` in your project root and commit it. Every VS Code user
 who opens the project gets Ahma configured automatically (prompted to trust once):
@@ -502,7 +502,7 @@ ahma serve stdio [--tools git,fileutils] [--sandbox] [--log-monitor]
 ahma serve http [--port 3000] [--host 0.0.0.0] [--disable-quic]
 
 # Start Unix socket server (IPC / Kubernetes sidecars)
-ahma serve unix [--socket-path /tmp/ahma.sock]
+ahma serve unix [--socket-path <path>]   # default: the per-user runtime dir
 
 # Run a single tool from the CLI
 ahma tool run run_terminal_command -- "echo hello"
@@ -657,7 +657,10 @@ When the user runs `/ahma tui`, the agent starts the TUI in the user's terminal:
 ahma tui
 ```
 
-This opens the terminal dashboard for monitoring active operations, viewing logs, and approving gates.
+This opens the work view: one section per client session — every attached
+editor, every hooked shell command, and the user's own commands — with recent
+history already replayed from the per-user daemon. One section is open at a
+time; `i` toggles the chat pane. Approval gates are answered here.
 
 Inside the TUI chat, `/skills` lists Agent Skills discovered from the standard locations
 (`.agents/skills/` and `.claude/skills/` in the workspace and home directory), and

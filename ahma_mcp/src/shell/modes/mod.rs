@@ -3,10 +3,13 @@
 //! Contains the different operational modes for the ahma_mcp server.
 
 pub mod cli;
+pub mod daemon;
+pub mod daemon_client;
 pub mod http_bridge;
 pub mod list_tools;
 pub mod proxy_client;
 pub mod server;
+pub mod session_options;
 #[cfg(unix)]
 pub mod unix_bridge;
 

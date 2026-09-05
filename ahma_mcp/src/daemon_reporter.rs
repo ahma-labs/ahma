@@ -65,8 +65,47 @@ pub struct WebApprovalReporting {
 /// (no `UpdateInstance` message), which keeps mixed-version daemons working;
 /// the hub replays this instance's operations to subscribers after the
 /// re-register, so the TUI view stays complete.
-static CLIENT_IDENTITY: std::sync::LazyLock<tokio::sync::watch::Sender<Option<String>>> =
-    std::sync::LazyLock::new(|| tokio::sync::watch::channel(None).0);
+/// What this instance knows about itself, as far as the hub is concerned.
+///
+/// Everything here is learned *after* the process starts and after the reporter
+/// first registers: the client's name arrives with the `initialize` handshake,
+/// the sandbox scope only exists once `roots/list` has been answered and the
+/// scope committed. A change to any field re-registers the instance
+/// (reconnect-to-relabel), which is what keeps the wire field-only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceIdentity {
+    /// `clientInfo.name` from the `initialize` handshake.
+    pub client: Option<String>,
+    /// The **committed** sandbox scope. Registration used to send
+    /// `sandbox_scopes.first()` or `"."` once at process start — before
+    /// `roots/list` — so in the default roots-driven configuration every
+    /// instance advertised `"."`, and a TUI filtering by project matched none
+    /// of them (SPEC R24.3).
+    pub scope: Option<String>,
+    /// The MCP session this instance serves, stable for its whole life.
+    pub session_id: Option<String>,
+    /// Pid of the client-facing frontend process.
+    pub client_pid: Option<u32>,
+}
+
+static INSTANCE_IDENTITY: std::sync::LazyLock<tokio::sync::watch::Sender<InstanceIdentity>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(InstanceIdentity::default()).0);
+
+/// Seed the parts of the identity known at startup (session id, frontend pid).
+pub fn set_initial_identity(session_id: Option<String>, client_pid: Option<u32>) {
+    INSTANCE_IDENTITY.send_if_modified(|cur| {
+        let mut next = cur.clone();
+        if session_id.is_some() {
+            next.session_id = session_id.clone();
+        }
+        if client_pid.is_some() {
+            next.client_pid = client_pid;
+        }
+        let changed = next != *cur;
+        *cur = next;
+        changed
+    });
+}
 
 /// Record the MCP client identity for this instance. Called from
 /// `on_initialized` once `clientInfo.name` is known. Idempotent: setting the
@@ -76,14 +115,50 @@ pub fn set_client_identity(name: impl Into<String>) {
     if name.is_empty() {
         return;
     }
-    CLIENT_IDENTITY.send_if_modified(|cur| {
-        if cur.as_deref() == Some(name.as_str()) {
+    INSTANCE_IDENTITY.send_if_modified(|cur| {
+        if cur.client.as_deref() == Some(name.as_str()) {
             false
         } else {
-            *cur = Some(name);
+            cur.client = Some(name);
             true
         }
     });
+}
+
+/// Record the sandbox scope this instance actually locked (SPEC R5.1's single
+/// commit point is the only caller). Re-registers so the hub — and every TUI
+/// watching it — sees the real scope rather than the placeholder the process
+/// started with.
+pub fn set_committed_scope(scopes: &[std::path::PathBuf]) {
+    let Some(primary) = scopes.first().map(|p| p.display().to_string()) else {
+        return;
+    };
+    INSTANCE_IDENTITY.send_if_modified(|cur| {
+        if cur.scope.as_deref() == Some(primary.as_str()) {
+            false
+        } else {
+            cur.scope = Some(primary);
+            true
+        }
+    });
+}
+
+/// Publish the scope a sandbox has just locked, so the hub — and every TUI
+/// watching it — sees what this instance is actually scoped to.
+///
+/// Called from each of the three places a scope becomes final: the `roots/list`
+/// commit, the explicit-scope commit, and a container narrowing. Registration
+/// happens long before any of them, so without this the instance advertises the
+/// placeholder it started with, and a TUI filtering by project matches nothing
+/// (SPEC R24.3).
+pub fn publish_committed_scope(sandbox: &crate::sandbox::Sandbox) {
+    set_committed_scope(&sandbox.scopes());
+}
+
+/// The identity as currently known, for callers that register outside the
+/// reporter loop.
+pub fn current_identity() -> InstanceIdentity {
+    INSTANCE_IDENTITY.borrow().clone()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,14 +184,75 @@ pub fn spawn_reporter(
     label: impl Into<String> + Send + 'static,
     grant: Option<GrantReporting>,
     web: Option<WebApprovalReporting>,
-) {
+) -> ReporterHandle {
     let mode = mode.into();
     let scope = scope.into();
     let label = label.into();
+    let (finished_tx, finished_rx) = tokio::sync::watch::channel(None);
 
     tokio::spawn(async move {
-        run_reporter_loop(monitor, mode, scope, label, grant, web).await;
+        run_reporter_loop(monitor, mode, scope, label, grant, web, finished_tx).await;
     });
+    ReporterHandle { finished_rx }
+}
+
+/// A handle for a caller that must not exit before its work has been reported.
+///
+/// A long-lived server never needs this: it outlives its operations. A hooked
+/// command does — it *is* one operation, and it exits the moment that command
+/// ends, so without waiting the terminal event races process teardown and the
+/// work never appears anywhere (SPEC R-DAEMON.8).
+pub struct ReporterHandle {
+    finished_rx: tokio::sync::watch::Receiver<Option<String>>,
+}
+
+impl ReporterHandle {
+    /// Wait until *any* terminal event has been written to the hub, or `budget`
+    /// elapses. For a process that runs exactly one operation — a hooked
+    /// command — the first one is its own.
+    pub async fn wait_for_any_finished(&mut self, budget: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if self.finished_rx.borrow().is_some() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, self.finished_rx.changed())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    /// Wait until `op_id`'s terminal event has actually been written to the
+    /// hub, or `budget` elapses.
+    ///
+    /// Bounded on purpose, and short: reporting is an observability nicety, and
+    /// a user's hooked command must never be held up by a daemon that is slow,
+    /// absent, or wedged. Returns whether the event made it.
+    pub async fn wait_for_finished(&mut self, op_id: &str, budget: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if self.finished_rx.borrow().as_deref() == Some(op_id) {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, self.finished_rx.changed())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
 }
 
 /// Await the next grant request, or pend forever when there is no receiver — the
@@ -200,6 +336,7 @@ fn next_backoff_secs(current: u64) -> u64 {
 }
 
 /// Main reporter loop.  Runs until the process exits.
+#[allow(clippy::too_many_arguments)]
 async fn run_reporter_loop(
     monitor: Arc<OperationMonitor>,
     mode: String,
@@ -207,6 +344,7 @@ async fn run_reporter_loop(
     label: String,
     grant: Option<GrantReporting>,
     web: Option<WebApprovalReporting>,
+    finished_tx: tokio::sync::watch::Sender<Option<String>>,
 ) {
     let pid = std::process::id();
     let mut backoff_secs: u64 = 1;
@@ -222,7 +360,7 @@ async fn run_reporter_loop(
     let mut web_req_rx = web.map(|w| w.req_rx);
     // Watch the client identity: learned after registration (the MCP
     // `initialize` handshake), a change makes us reconnect and re-register.
-    let mut client_rx = CLIENT_IDENTITY.subscribe();
+    let mut identity_rx = INSTANCE_IDENTITY.subscribe();
 
     loop {
         // ── Ensure daemon is running ─────────────────────────────────────────
@@ -254,13 +392,23 @@ async fn run_reporter_loop(
         // ── Register this instance ────────────────────────────────────────────
         // borrow_and_update marks the current identity as seen so the
         // `changed()` select branch only fires on a genuinely new value.
-        let client = client_rx.borrow_and_update().clone();
+        let identity = identity_rx.borrow_and_update().clone();
+        // The committed scope wins over the value this loop started with: the
+        // latter is a placeholder until `roots/list` has been answered.
+        let scope = identity.scope.clone().unwrap_or_else(|| scope.clone());
+        // An operation's origin is who asked for it, which is the MCP client
+        // when there is one — `claude-code`, `cursor` — not this process's
+        // instance label, which is `ahma` for every one of them and so tells a
+        // reader nothing about which window started the work (SPEC R24.7).
+        let origin = identity.client.clone().unwrap_or_else(|| label.clone());
         let reg = ClientMsg::Register {
             pid,
             mode: mode.clone(),
             scope: scope.clone(),
             label: label.clone(),
-            client,
+            client: identity.client.clone(),
+            session_id: identity.session_id.clone(),
+            client_pid: identity.client_pid,
         };
         if let Err(e) = send_msg(&mut writer, &reg).await {
             debug!("daemon_reporter: register failed ({e})");
@@ -279,11 +427,11 @@ async fn run_reporter_loop(
         // A send failure here means the connection dropped mid-replay; go
         // back to the top of the outer loop and reconnect.
         let completed_ops = monitor.get_completed_operations().await;
-        if !replay_completed_operations(&mut writer, &completed_ops, &scope, &label).await {
+        if !replay_completed_operations(&mut writer, &completed_ops, &scope, &origin).await {
             continue;
         }
         let active_ops = monitor.get_all_active_operations().await;
-        if !replay_active_operations(&mut writer, &active_ops, &scope, &label).await {
+        if !replay_active_operations(&mut writer, &active_ops, &scope, &origin).await {
             continue;
         }
 
@@ -297,14 +445,23 @@ async fn run_reporter_loop(
                 event_res = event_rx.recv() => {
                     match event_res {
                         Ok(event) => {
-                            let Some(payload) = daemon_event_for(&event, &scope, &label) else {
+                            let Some(payload) = daemon_event_for(&event, &scope, &origin) else {
                                 continue;
+                            };
+                            // Note the terminal event *after* it is on the wire,
+                            // so a caller waiting for its own operation waits for
+                            // the send, not for the intent to send.
+                            let finished_id = match &payload {
+                                DaemonEvent::OpFinished { id, .. } => Some(id.clone()),
+                                _ => None,
                             };
                             let client_msg = ClientMsg::Event { payload };
 
                             if let Err(e) = send_msg(&mut writer, &client_msg).await {
                                 debug!("daemon_reporter: send failed ({e}), reconnecting");
                                 closed = true;
+                            } else if let Some(id) = finished_id {
+                                let _ = finished_tx.send(Some(id));
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -355,12 +512,14 @@ async fn run_reporter_loop(
                     }
                 }
 
-                // 2d. Client identity learned/changed → reconnect so the hub
-                // re-registers this instance with the client name attached
-                // (reconnect-to-relabel; see CLIENT_IDENTITY).
-                changed = client_rx.changed() => {
+                // 2d. Something this instance knows about itself changed — the
+                // client's name, or the sandbox scope it committed → reconnect
+                // so the hub re-registers it with the new value
+                // (reconnect-to-relabel; see INSTANCE_IDENTITY). The instance id
+                // survives because the session id does.
+                changed = identity_rx.changed() => {
                     if changed.is_ok() {
-                        info!("daemon_reporter: MCP client identity learned; re-registering with hub");
+                        info!("daemon_reporter: instance identity changed; re-registering with hub");
                         closed = true;
                     }
                 }
@@ -421,6 +580,7 @@ async fn replay_completed_operations(
                 // Replay carries denials too, so a TUI opened after the fact
                 // still sees which path was refused (SPEC R-PERM.7).
                 denial,
+                interrupted: false,
             },
         };
         if send_msg(writer, &finished_ev).await.is_err() {
@@ -688,6 +848,11 @@ fn op_started_event(op: &Operation, scope: &str, origin: &str) -> DaemonEvent {
         cwd: op.cwd.clone(),
         command: op.command.clone(),
         origin: Some(origin.to_string()),
+        partial: false,
+        // Everything a worker runs goes through the kernel sandbox; the
+        // unsandboxed hook fallback is deliberately not reported at all
+        // (SPEC R-DAEMON.8).
+        unsandboxed: false,
     }
 }
 
@@ -730,6 +895,11 @@ fn daemon_event_for(
             cwd: cwd.clone(),
             command: command.clone(),
             origin: Some(origin.to_string()),
+            partial: false,
+            // Everything a worker runs goes through the kernel sandbox; the
+            // unsandboxed hook fallback is deliberately not reported at all
+            // (SPEC R-DAEMON.8).
+            unsandboxed: false,
         },
         Ev::OutputLine {
             operation_id,
@@ -760,6 +930,7 @@ fn daemon_event_for(
             // "Completed" without a code is not actionable; `exit 0` is.
             exit_code: exit_code_from_value(result),
             denial: None,
+            interrupted: false,
         },
         Ev::Failed {
             operation_id,
@@ -778,6 +949,7 @@ fn daemon_event_for(
             // A sandbox denial is a different thing from a failure and must say
             // so on every surface (SPEC R-PERM.7).
             denial: denial_from_text(error),
+            interrupted: false,
         },
         Ev::Cancelled {
             operation_id,
@@ -791,6 +963,7 @@ fn daemon_event_for(
             ended_epoch_ms: now_ms,
             exit_code: None,
             denial: None,
+            interrupted: false,
         },
         Ev::TimedOut {
             operation_id,
@@ -803,6 +976,7 @@ fn daemon_event_for(
             ended_epoch_ms: now_ms,
             exit_code: None,
             denial: None,
+            interrupted: false,
         },
         _ => return None,
     })
@@ -965,7 +1139,7 @@ mod tests {
         assert_eq!(
             origin.as_deref(),
             Some("test"),
-            "the instance label becomes the operation's origin"
+            "the caller's identity becomes the operation's origin"
         );
         assert_eq!(id, "op-1");
         assert_eq!(tool_name, "cargo_build");
@@ -1043,6 +1217,7 @@ mod tests {
             result_summary,
             ended_epoch_ms,
             exit_code: None,
+            interrupted: false,
         }) = daemon_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
@@ -1684,6 +1859,136 @@ mod tests {
         }
     }
 
+    /// A hooked command must not be held up by observability.
+    ///
+    /// The whole point of the flush budget is that it is bounded: with no
+    /// daemon listening, waiting costs the budget and no more, and the command's
+    /// own result is unaffected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_a_report_gives_up_within_its_budget() {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let mut handle = ReporterHandle { finished_rx: rx };
+
+        let budget = Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let flushed = handle.wait_for_any_finished(budget).await;
+        let waited = started.elapsed();
+
+        assert!(
+            !flushed,
+            "nothing was reported, and that is reported honestly"
+        );
+        assert!(
+            waited >= budget,
+            "it waits for its budget before giving up: {waited:?}"
+        );
+        assert!(
+            waited < budget * 8,
+            "and no longer: a user's command must not wait on a missing daemon ({waited:?})"
+        );
+    }
+
+    /// ...and when the event does land, the wait ends at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_a_report_returns_as_soon_as_it_lands() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let mut handle = ReporterHandle { finished_rx: rx };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(Some("op-1".to_string()));
+        });
+
+        assert!(
+            handle
+                .wait_for_finished("op-1", TestTimeouts::scale_secs(5))
+                .await,
+            "the wait ends on the event, not on the timeout"
+        );
+    }
+
+    /// The scope an instance advertises must be the one it actually locked.
+    ///
+    /// Registration happens at process start, before `roots/list` has been
+    /// answered — so an instance used to advertise a placeholder (`"."` in the
+    /// default roots-driven configuration) for its whole life, and a TUI
+    /// filtering by project matched none of them (SPEC R24.3, R-DAEMON.6).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn reporter_re_registers_with_the_committed_scope_and_session_id() {
+        use crate::operation_monitor::MonitorConfig;
+
+        let _lock = DAEMON_SOCK_MUTEX.lock();
+        let unique = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sock =
+            std::env::temp_dir().join(format!("ahma_scope_{}_{}.sock", std::process::id(), unique));
+        let _ = std::fs::remove_file(&sock);
+        let prev = std::env::var_os("AHMA_DAEMON_SOCK");
+        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &sock) };
+        let _env_guard = EnvGuard { prev };
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind temp daemon socket");
+
+        // The session identity is known at startup; the scope is not.
+        set_initial_identity(Some("mcp-session-42".to_string()), Some(4242));
+
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            TestTimeouts::scale_secs(60),
+        )));
+        let reporter = tokio::spawn(run_reporter_loop(
+            monitor.clone(),
+            "stdio".to_string(),
+            String::new(),
+            "ahma".to_string(),
+            None,
+            None,
+            tokio::sync::watch::channel(None).0,
+        ));
+
+        let (_r1, _w1, first) = accept_register(&listener).await;
+        match first {
+            ClientMsg::Register {
+                scope,
+                session_id,
+                client_pid,
+                ..
+            } => {
+                assert_eq!(
+                    scope, "",
+                    "before the commit there is no scope to advertise, and a \
+                     placeholder would be a claim we cannot back"
+                );
+                assert_eq!(session_id.as_deref(), Some("mcp-session-42"));
+                assert_eq!(client_pid, Some(4242));
+            }
+            other => panic!("expected Register first, got {other:?}"),
+        }
+
+        // The sandbox commits — the moment the real scope becomes knowable.
+        set_committed_scope(&[std::path::PathBuf::from("/work/project")]);
+
+        let (_r2, _w2, second) = accept_register(&listener).await;
+        match second {
+            ClientMsg::Register {
+                scope, session_id, ..
+            } => {
+                assert_eq!(
+                    scope, "/work/project",
+                    "the re-registration carries the scope the sandbox locked"
+                );
+                assert_eq!(
+                    session_id.as_deref(),
+                    Some("mcp-session-42"),
+                    "the session id is unchanged, so the hub keeps the instance id"
+                );
+            }
+            other => panic!("expected a re-Register, got {other:?}"),
+        }
+
+        reporter.abort();
+        let _ = std::fs::remove_file(&sock);
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     // The std Mutex deliberately serializes this whole async test (the daemon
@@ -1757,6 +2062,7 @@ mod tests {
             "VSCode".to_string(),
             Some(grant),
             None,
+            tokio::sync::watch::channel(None).0,
         ));
 
         // ── Register + replay ────────────────────────────────────────────────────

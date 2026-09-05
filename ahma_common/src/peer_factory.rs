@@ -68,7 +68,22 @@ pub struct PeerStreams {
 pub trait PeerFactory: Send + Sync + 'static {
     /// Create a new peer connection for a fresh session.
     ///
+    /// `options` carries what this session asked for and nobody else did: its
+    /// id, and the arguments derived from its own client's configuration
+    /// (SPEC R-DAEMON.4). They used to be process-wide, so the first client to
+    /// start the bridge configured every later one.
+    ///
     /// Returns an error (as `anyhow::Error`) if the backend cannot be
     /// initialised.
-    fn create(&self) -> BoxFuture<anyhow::Result<PeerStreams>>;
+    fn create(&self, options: PeerSpawnOptions) -> BoxFuture<anyhow::Result<PeerStreams>>;
+}
+
+/// What distinguishes one session's peer from another's.
+#[derive(Debug, Clone, Default)]
+pub struct PeerSpawnOptions {
+    /// The session this peer serves. Handed to the worker so its hub
+    /// registration is stable across re-registration.
+    pub session_id: String,
+    /// Extra worker arguments this client asked for.
+    pub extra_args: Vec<String>,
 }

@@ -117,10 +117,11 @@ fn unix_socket_path_ignores_retired_env_var() {
     );
 }
 
-/// With neither the settings key nor anything else set, the TUI falls back to the same
-/// machine-global socket path `ahma_mcp` defaults to, so the two agree out of the box.
+/// With neither the settings key nor anything else set, the TUI falls back to the
+/// same per-user daemon socket `ahma_mcp` defaults to, so the two agree out of the
+/// box (SPEC R-DAEMON.2).
 #[test]
-fn unix_socket_path_falls_back_to_the_global_default() {
+fn unix_socket_path_falls_back_to_the_per_user_daemon_socket() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     // A temp home with no settings.toml at all.
     // SAFETY: nextest isolates each test in its own OS process.
@@ -130,7 +131,7 @@ fn unix_socket_path_falls_back_to_the_global_default() {
     }
     assert_eq!(
         ahma_tui::connection::unix_socket_default_path(),
-        ahma_mcp::shell::modes::server::GLOBAL_SOCKET_PATH,
+        ahma_common::daemon_hub::mcp_socket_path(None),
     );
 }
 

@@ -408,6 +408,13 @@ impl BinaryReference {
 struct WrappedShellPayload {
     cwd: String,
     command: String,
+    /// The editor session this command belongs to, when the hook input named
+    /// one. Lets a TUI group hooked work with the session that caused it
+    /// (SPEC R-DAEMON.6). `#[serde(default)]` so a command wrapped by an older
+    /// ahma — the payload is base64 in someone's shell history, with no version
+    /// to negotiate — still decodes.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1220,6 +1227,24 @@ fn write_exec_output(output: &Value) -> Result<()> {
     Ok(())
 }
 
+/// How long a hooked command waits for its report to reach the daemon.
+const HOOK_REPORT_FLUSH: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Wait, briefly, for this command's terminal event to be written to the hub.
+///
+/// The operation id is not known to this function, so it waits for *any*
+/// terminal event: a hook process runs exactly one command, so the first one is
+/// this one.
+async fn flush_hook_report(mut reporter: crate::daemon_reporter::ReporterHandle) {
+    let flushed = reporter.wait_for_any_finished(HOOK_REPORT_FLUSH).await;
+    if !flushed {
+        tracing::debug!(
+            "hook: no ahma daemon took this command's report within {HOOK_REPORT_FLUSH:?}; \
+             the command itself is unaffected"
+        );
+    }
+}
+
 async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     let payload = decode_wrapped_shell_payload(&args.payload_base64)?;
     std::env::set_current_dir(&payload.cwd)
@@ -1277,6 +1302,26 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     let mutex_registry = std::sync::Arc::new(crate::adapter::CommandMutexRegistry::from_config(
         &cfg.mutex_groups,
     ));
+
+    // Report this command to the daemon, so hooked work is visible in the TUI
+    // alongside everything else (SPEC R-DAEMON.8). A hook is an instance for the
+    // length of one command, which is exactly why it was invisible before: it
+    // was always already gone by the time anyone looked.
+    //
+    // Detached and non-blocking: if no daemon is reachable, the command runs
+    // exactly as it would have. This never spawns a daemon — a hook is a
+    // latency-sensitive path, and starting one here would put a process launch
+    // in front of the user's command.
+    crate::daemon_reporter::set_initial_identity(payload.session_id.clone(), None);
+    let reporter = crate::daemon_reporter::spawn_reporter(
+        operation_monitor.clone(),
+        "hook",
+        payload.cwd.clone(),
+        "hook",
+        None,
+        None,
+    );
+
     let adapter = std::sync::Arc::new(crate::adapter::Adapter::new_with_registry(
         operation_monitor,
         shell_pool_manager,
@@ -1346,6 +1391,12 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             Some(&subcommand_config),
         )
         .await;
+
+    // The command is done; give its terminal event a brief moment to reach the
+    // daemon before this process exits. Bounded and short (SPEC R-DAEMON.8): a
+    // user's command must never wait on observability, so a daemon that is
+    // absent or slow costs this much and no more.
+    flush_hook_report(reporter).await;
 
     match result {
         Ok(output) => {
@@ -1660,7 +1711,14 @@ fn compute_exec_decision_internal(
         }
     };
 
-    match build_wrapped_shell_command(scope, env, &cwd, &args.command) {
+    // Editors that carry a session id in the hook input (Claude Code does) let
+    // the hooked command be grouped with the session that caused it.
+    let session_id = input
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    match build_wrapped_shell_command(scope, env, &cwd, &args.command, session_id) {
         Ok(wrapped) => {
             let updated = updated_tool_input(&args.tool_input, wrapped.clone(), &args.arg_key);
             HooksDecision::AllowRewrite {
@@ -1907,10 +1965,12 @@ fn build_wrapped_shell_command(
     env: &HookEnvironment,
     cwd: &str,
     command: &str,
+    session_id: Option<String>,
 ) -> Result<String> {
     let payload = WrappedShellPayload {
         cwd: cwd.to_string(),
         command: command.to_string(),
+        session_id,
     };
     let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
     let args = vec![
@@ -2963,10 +3023,26 @@ mod tests {
         let payload = WrappedShellPayload {
             cwd: "/tmp/work".to_string(),
             command: "echo hello && cargo test".to_string(),
+            session_id: Some("cc-session-1".to_string()),
         };
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
         let decoded = decode_wrapped_shell_payload(&encoded).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    /// A command wrapped by an older ahma is base64 in someone's shell history
+    /// or editor config, with no version to negotiate: it must still decode.
+    #[test]
+    fn a_payload_without_the_session_field_still_decodes() {
+        let legacy = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({"cwd": "/tmp/work", "command": "echo hi"})
+                .to_string()
+                .as_bytes(),
+        );
+        let decoded = decode_wrapped_shell_payload(&legacy).expect("older payloads still decode");
+        assert_eq!(decoded.cwd, "/tmp/work");
+        assert_eq!(decoded.command, "echo hi");
+        assert_eq!(decoded.session_id, None);
     }
 
     #[test]
@@ -3795,7 +3871,8 @@ mod tests {
     fn test_build_wrapped_shell_command_project_uses_path_lookup() {
         let env = test_env();
         let cmd =
-            build_wrapped_shell_command(HookScope::Project, &env, "/work", "cargo build").unwrap();
+            build_wrapped_shell_command(HookScope::Project, &env, "/work", "cargo build", None)
+                .unwrap();
         assert!(cmd.starts_with("ahma hooks run-shell"));
         assert!(cmd.contains("--payload-base64"));
         assert!(cmd.contains(WRAPPED_BY_MARKER));
@@ -3805,7 +3882,8 @@ mod tests {
     fn test_build_wrapped_shell_command_roundtrip_payload() {
         let env = test_env();
         let cmd =
-            build_wrapped_shell_command(HookScope::Project, &env, "/work/dir", "echo x").unwrap();
+            build_wrapped_shell_command(HookScope::Project, &env, "/work/dir", "echo x", None)
+                .unwrap();
         // Pull the base64 token (3rd whitespace-separated field after run-shell).
         let token = cmd
             .split_whitespace()
