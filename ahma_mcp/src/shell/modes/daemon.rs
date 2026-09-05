@@ -120,7 +120,7 @@ pub async fn run_daemon_mode(config: AppConfig) -> Result<()> {
 
     // ── The MCP endpoint ─────────────────────────────────────────────────────
     let active_sessions = Arc::new(AtomicUsize::new(0));
-    let bridge = build_bridge_config(&config, &mcp_socket, &active_sessions, &exit)?;
+    let bridge = build_bridge_config(&config, &mcp_socket, &hub_socket, &active_sessions, &exit)?;
 
     // An explicit --idle-timeout is a deliberate instruction and outranks the
     // settings value, as every other flag does (SPEC R-CFG1).
@@ -182,6 +182,7 @@ pub async fn run_daemon_mode(config: AppConfig) -> Result<()> {
 fn build_bridge_config(
     config: &AppConfig,
     mcp_socket: &str,
+    hub_socket: &std::path::Path,
     active_sessions: &Arc<AtomicUsize>,
     exit: &Arc<DaemonExit>,
 ) -> Result<BridgeConfig> {
@@ -190,10 +191,21 @@ fn build_bridge_config(
         .to_string_lossy()
         .to_string();
 
+    // Workers must report to *this* daemon's hub, not to whatever the default
+    // path resolves to. It is the same path in production, so this only shows
+    // up when a daemon is given an explicit socket — where a worker reporting
+    // somewhere else is exactly the confusion the one-daemon rule exists to
+    // remove.
+    let mut server_args = super::build_stdio_server_args(config, "--tools", false);
+    if config.daemon_socket_explicit {
+        server_args.push("--daemon-socket".to_string());
+        server_args.push(hub_socket.to_string_lossy().into_owned());
+    }
+
     Ok(BridgeConfig {
         bind_addr: "127.0.0.1:0".parse().expect("a literal loopback address"),
         server_command,
-        server_args: super::build_stdio_server_args(config, "--tools", false),
+        server_args,
         enable_colored_output: true,
         default_sandbox_scope: None,
         handshake_timeout_secs: config.handshake_timeout_secs,
@@ -308,6 +320,61 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// A worker must report to *its own* daemon's hub.
+    ///
+    /// The paths are identical in production, so this only bites when a daemon
+    /// is given an explicit socket — and then a worker reporting to whatever
+    /// the default resolves to is exactly the confusion one daemon exists to
+    /// remove. Found by running the thing rather than by a test, which is why
+    /// there is now a test.
+    #[test]
+    fn workers_are_told_which_hub_to_report_to() {
+        let hub = std::path::Path::new("/run/user/1000/ahma-test/daemon.sock");
+        let sessions = Arc::new(AtomicUsize::new(0));
+        let exit = Arc::new(DaemonExit::new(Box::new(|_| {})));
+
+        let explicit = AppConfig {
+            daemon_socket_explicit: true,
+            ..AppConfig::default()
+        };
+        let cfg = build_bridge_config(&explicit, "/tmp/mcp.sock", hub, &sessions, &exit)
+            .expect("config builds");
+        let idx = cfg
+            .server_args
+            .iter()
+            .position(|a| a == "--daemon-socket")
+            .expect("the worker is told which hub to use");
+        assert_eq!(cfg.server_args[idx + 1], hub.to_string_lossy());
+
+        // With no explicit socket both sides resolve the same default, and
+        // passing it would only be noise.
+        let default_cfg = AppConfig::default();
+        let cfg = build_bridge_config(&default_cfg, "/tmp/mcp.sock", hub, &sessions, &exit)
+            .expect("config builds");
+        assert!(!cfg.server_args.iter().any(|a| a == "--daemon-socket"));
+    }
+
+    /// The daemon's MCP endpoint carries no scope of its own: one there would
+    /// apply to every client (SPEC R5.1, R-DAEMON.9).
+    #[test]
+    fn the_daemon_endpoint_has_no_process_wide_sandbox_scope() {
+        let sessions = Arc::new(AtomicUsize::new(0));
+        let exit = Arc::new(DaemonExit::new(Box::new(|_| {})));
+        let cfg = build_bridge_config(
+            &AppConfig::default(),
+            "/tmp/mcp.sock",
+            std::path::Path::new("/tmp/daemon.sock"),
+            &sessions,
+            &exit,
+        )
+        .expect("config builds");
+        assert!(cfg.default_sandbox_scope.is_none());
+        assert!(
+            cfg.idle_timeout_secs.is_none(),
+            "the daemon owns the idle policy, not the bridge"
+        );
+    }
 
     /// Idleness spans both halves. Counting only MCP sessions would exit while
     /// a TUI sat watching an idle project; counting only hub connections would
