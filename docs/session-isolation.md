@@ -1,6 +1,10 @@
 # Session Isolation
 
-Session isolation is a key security feature of the Ahma HTTP Bridge (`ahma serve http`). It ensures that each client connection or session runs in a completely isolated environment with its own sandbox boundaries and lifecycle.
+Session isolation is how several clients share one ahma without sharing a
+sandbox. Each session runs in its own subprocess with its own kernel-enforced
+boundary and its own lifecycle — in the per-user daemon
+([docs/daemon.md](daemon.md)) as much as in an explicitly started
+`ahma serve http`.
 
 ## Why Session Isolation is Needed
 
@@ -56,7 +60,10 @@ ahma serve http --session-isolation
 
 ## Bridge Lifecycle
 
-An HTTP/Unix bridge auto-spawned by `ahma serve stdio` (proxy mode) or `ahma tui` self-terminates when no MCP client remains connected:
+The per-user daemon's lifetime is described in [docs/daemon.md](daemon.md): it
+exits when no MCP sessions **and** no hub subscribers have been attached for
+`[daemon] idle_timeout_secs`. What follows describes an explicitly started
+bridge given `--idle-timeout`:
 
 - The bridge runs with `--idle-timeout N` (default: 10 seconds).
 - Once `active_sessions` drops to zero and stays there for N seconds, the bridge calls `terminate_all` and exits cleanly.

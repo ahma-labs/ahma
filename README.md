@@ -266,20 +266,38 @@ Each vault gets its own kernel sandbox scope (`workdir/`), input copies, output 
 
 See [docs/task-vault.md](docs/task-vault.md).
 
-### TUI — terminal dashboard and approval gates
+### TUI — one view of everything being done for you
 
 ```bash
 ahma tui
 ahma tui --connect http://localhost:8080
 ```
 
-A terminal dashboard for monitoring active operations and handling approval gates (elevation requests, deletion confirmations, egress approvals).
+Open it in a project and you see what every attached editor is doing there —
+plus every hooked shell command, and your own — as one borderless list of
+sections, one per client session. A closed section says what it is running or
+last ran; clicking a header opens it (and closes the previous one) with a short
+animation, and a task inside expands into its live output.
 
-- **Redesigned Monitor Mode (`/mode monitor`)**: Features a unified operations list with clickable/touchable `[Pin]` and `[Cancel]` buttons, a detailed operation inspector with a clickable `[Analyze]` button for AI analysis of outputs/logs, and inline log viewing.
-- **Log Monitor Integration**: Type `/monitor file <path> [prompt]` in the chat input area to start a background log-monitoring operation using the built-in process-free tailing engine.
-- **AI Analysis**: Type `/analyze [op_id]` or click `[Analyze]` on any operation to ask the AI for analysis of the operation's stdout and alerts.
+- **Already current when you open it.** The daemon replays recent history with
+  true timestamps and the output each command was printing, including work from
+  sessions that have since closed.
+- **Approval gates** — tool approvals, sandbox grants, egress — are answered
+  here.
+- **Chat is a toggle** (`i`), not the screen: `/analyze [op_id]` asks the model
+  about an operation, `/monitor file <path>` starts log monitoring.
 
 See [docs/tui.md](docs/tui.md).
+
+### One daemon per user
+
+Whatever starts ahma — an editor, `ahma tui`, or a shell hook — there is one
+daemon per user hosting the MCP endpoint and the observability hub, so
+everything shows up in one place. It runs no commands itself: every tool call
+runs in a kernel-sandboxed worker, one per session, each locked to its own
+project.
+
+See [docs/daemon.md](docs/daemon.md).
 
 ### Egress Sandbox — per-task outbound network control
 

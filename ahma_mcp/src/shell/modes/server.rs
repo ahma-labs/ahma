@@ -698,7 +698,7 @@ fn open_capture_file_sync(path: &std::path::Path, banner: &str) -> Option<std::f
 ///
 /// It is a per-user singleton *by design*: several MCP clients share one daemon.
 /// That sharing is exactly why a test must never resolve it — see
-/// [`is_test_isolated`] and [`default_socket_path`]. It used to be the
+/// [`is_test_isolated`] and this module's socket resolution. It used to be the
 /// machine-global `/tmp/ahma.sock`, which every local user could see and, since
 /// nothing owned the path, pre-create; it now lives beside the hub socket in the
 /// 0700 per-user runtime directory.
