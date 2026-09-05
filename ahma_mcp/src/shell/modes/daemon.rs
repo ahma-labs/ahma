@@ -72,7 +72,19 @@ pub async fn run_daemon_mode(config: AppConfig) -> Result<()> {
     }
 
     // ── The rendezvous, and the mutex ────────────────────────────────────────
-    let hub_socket = ahma_common::daemon_hub::default_socket_path();
+    //
+    // The two sockets are a pair. When an explicit MCP socket is given without
+    // an explicit hub socket, the hub goes beside it: left on the shared path,
+    // this daemon would lose the bind to whichever one already held it and
+    // stand down, leaving nobody serving the endpoint it was asked for.
+    let mcp_socket = ahma_common::daemon_hub::mcp_socket_path(
+        Some(config.unix_socket_path.as_str()).filter(|p| !p.is_empty()),
+    );
+    let hub_socket = if config.daemon_socket_explicit {
+        ahma_common::daemon_hub::default_socket_path()
+    } else {
+        ahma_common::daemon_hub::hub_socket_beside(&mcp_socket)
+    };
     if let Some(dir) = hub_socket.parent()
         && let Err(e) = ahma_common::daemon_hub::verify_runtime_dir_secure(dir)
     {
@@ -108,9 +120,6 @@ pub async fn run_daemon_mode(config: AppConfig) -> Result<()> {
 
     // ── The MCP endpoint ─────────────────────────────────────────────────────
     let active_sessions = Arc::new(AtomicUsize::new(0));
-    let mcp_socket = ahma_common::daemon_hub::mcp_socket_path(
-        Some(config.unix_socket_path.as_str()).filter(|p| !p.is_empty()),
-    );
     let bridge = build_bridge_config(&config, &mcp_socket, &active_sessions, &exit)?;
 
     // An explicit --idle-timeout is a deliberate instruction and outranks the

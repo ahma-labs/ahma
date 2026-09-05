@@ -233,6 +233,13 @@ pub struct AppConfig {
     pub daemon_idle_timeout_secs: u64,
     /// Maximum concurrent HTTP server sessions.
     pub max_sessions: usize,
+    /// True when `--daemon-socket` named the hub rendezvous explicitly, so the
+    /// daemon must not derive one beside its MCP socket.
+    pub daemon_socket_explicit: bool,
+    /// The MCP session this worker serves (from `--session-id`).
+    pub session_id: Option<String>,
+    /// Pid of the client-facing frontend process (from `--client-pid`).
+    pub client_pid: Option<u32>,
     /// True when this process was launched as a child server subprocess (--server-child flag or AHMA_SERVER_CHILD env var).
     /// Prevents the child from itself trying to spawn a background bridge and become a proxy client.
     pub is_server_child: bool,
@@ -299,6 +306,9 @@ impl Default for AppConfig {
             idle_timeout_secs: None,
             max_sessions: 50,
             daemon_idle_timeout_secs: 60,
+            daemon_socket_explicit: false,
+            session_id: None,
+            client_pid: None,
             is_server_child: false,
             settings_origin: SettingsOriginCtx::default(),
         }
@@ -1299,6 +1309,18 @@ pub struct Cli {
     /// Indicate that this process is spawned as a child server subprocess.
     #[arg(long = "server-child", global = true)]
     pub server_child: bool,
+
+    /// The MCP session this worker serves, passed by the daemon that spawned
+    /// it. Stable for the session's life, so the hub keeps one instance
+    /// identity across re-registration and a reader can tell two windows on the
+    /// same project apart. Internal plumbing; not for users.
+    #[arg(long = "session-id", value_name = "ID", global = true, hide = true)]
+    pub session_id: Option<String>,
+
+    /// Pid of the client-facing frontend process, as opposed to this worker's.
+    /// Internal plumbing; not for users.
+    #[arg(long = "client-pid", value_name = "PID", global = true, hide = true)]
+    pub client_pid: Option<u32>,
 
     /// Maximum concurrent HTTP server sessions.
     #[arg(long = "max-sessions", value_name = "LIMIT", global = true)]
@@ -3049,6 +3071,9 @@ pub fn build_app_config_with_settings(
         idle_timeout_secs,
         max_sessions: cli.max_sessions.unwrap_or(10),
         daemon_idle_timeout_secs: s.daemon.idle_timeout_secs,
+        daemon_socket_explicit: cli.daemon_socket.is_some(),
+        session_id: cli.session_id.clone(),
+        client_pid: cli.client_pid,
         is_server_child: cli.server_child || std::env::var("AHMA_SERVER_CHILD").is_ok(),
         settings_origin: settings_origin_ctx(cli),
     }
@@ -3325,6 +3350,9 @@ mod tests {
             idle_timeout_secs: None,
             max_sessions: 10,
             daemon_idle_timeout_secs: 60,
+            daemon_socket_explicit: false,
+            session_id: None,
+            client_pid: None,
             is_server_child: false,
             settings_origin: SettingsOriginCtx::default(),
         }
@@ -4139,62 +4167,6 @@ mod tests {
         assert!(
             scopes.is_empty(),
             "CWD-in-temp with no container_root must return empty: {scopes:?}"
-        );
-    }
-
-    /// build_background_bridge_args does NOT include sandbox_scopes as --sandbox-scope
-    /// when they are empty, and DOES forward --scratch when use_scratch_dir is set.
-    #[test]
-    fn test_build_background_bridge_args_forwards_sandbox_flag_not_resolved_scopes() {
-        init_test();
-        let tmp = tempdir().unwrap();
-        let cfg = AppConfig {
-            no_sandbox: true,
-            sandbox_scopes: vec![], // no explicit scopes
-            use_scratch_dir: true,
-            scratch_directory: Some(tmp.path().to_path_buf()),
-            ..make_cfg()
-        };
-
-        let args = super::super::modes::server::build_background_bridge_args(&cfg);
-        let has_sandbox_scope = args.windows(2).any(|w| w[0] == "--sandbox-scope");
-        assert!(
-            !has_sandbox_scope,
-            "empty sandbox_scopes must not produce --sandbox-scope in bridge args: {args:?}"
-        );
-        assert!(
-            args.contains(&"--scratch".to_string()),
-            "--scratch flag must be forwarded to bridge: {args:?}"
-        );
-    }
-
-    /// build_background_bridge_args forwards explicit --sandbox-scope values but
-    /// not the --sandbox flag when use_scratch_dir is false.
-    #[test]
-    fn test_build_background_bridge_args_forwards_explicit_scope_only() {
-        init_test();
-        let tmp = tempdir().unwrap();
-        let scope = tmp.path().to_path_buf();
-        let cfg = AppConfig {
-            no_sandbox: true,
-            sandbox_scopes: vec![scope.clone()],
-            use_scratch_dir: false,
-            ..make_cfg()
-        };
-
-        let args = super::super::modes::server::build_background_bridge_args(&cfg);
-        let scope_idx = args
-            .iter()
-            .position(|a| a == "--sandbox-scope")
-            .expect("explicit scope must be forwarded");
-        let expected = scope.to_string_lossy().into_owned();
-        assert!(
-            args[scope_idx + 1].contains(expected.as_str()),
-            "scope value must be present after --sandbox-scope: {args:?}"
-        );
-        assert!(
-            !args.contains(&"--scratch".to_string()),
-            "--scratch must not appear when use_scratch_dir is false: {args:?}"
         );
     }
 

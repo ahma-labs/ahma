@@ -143,6 +143,18 @@ pub fn set_committed_scope(scopes: &[std::path::PathBuf]) {
     });
 }
 
+/// Publish the scope a sandbox has just locked, so the hub — and every TUI
+/// watching it — sees what this instance is actually scoped to.
+///
+/// Called from each of the three places a scope becomes final: the `roots/list`
+/// commit, the explicit-scope commit, and a container narrowing. Registration
+/// happens long before any of them, so without this the instance advertises the
+/// placeholder it started with, and a TUI filtering by project matches nothing
+/// (SPEC R24.3).
+pub fn publish_committed_scope(sandbox: &crate::sandbox::Sandbox) {
+    set_committed_scope(&sandbox.scopes());
+}
+
 /// The identity as currently known, for callers that register outside the
 /// reporter loop.
 pub fn current_identity() -> InstanceIdentity {
@@ -321,6 +333,11 @@ async fn run_reporter_loop(
         // The committed scope wins over the value this loop started with: the
         // latter is a placeholder until `roots/list` has been answered.
         let scope = identity.scope.clone().unwrap_or_else(|| scope.clone());
+        // An operation's origin is who asked for it, which is the MCP client
+        // when there is one — `claude-code`, `cursor` — not this process's
+        // instance label, which is `ahma` for every one of them and so tells a
+        // reader nothing about which window started the work (SPEC R24.7).
+        let origin = identity.client.clone().unwrap_or_else(|| label.clone());
         let reg = ClientMsg::Register {
             pid,
             mode: mode.clone(),
@@ -347,11 +364,11 @@ async fn run_reporter_loop(
         // A send failure here means the connection dropped mid-replay; go
         // back to the top of the outer loop and reconnect.
         let completed_ops = monitor.get_completed_operations().await;
-        if !replay_completed_operations(&mut writer, &completed_ops, &scope, &label).await {
+        if !replay_completed_operations(&mut writer, &completed_ops, &scope, &origin).await {
             continue;
         }
         let active_ops = monitor.get_all_active_operations().await;
-        if !replay_active_operations(&mut writer, &active_ops, &scope, &label).await {
+        if !replay_active_operations(&mut writer, &active_ops, &scope, &origin).await {
             continue;
         }
 
@@ -365,7 +382,7 @@ async fn run_reporter_loop(
                 event_res = event_rx.recv() => {
                     match event_res {
                         Ok(event) => {
-                            let Some(payload) = daemon_event_for(&event, &scope, &label) else {
+                            let Some(payload) = daemon_event_for(&event, &scope, &origin) else {
                                 continue;
                             };
                             let client_msg = ClientMsg::Event { payload };
@@ -1042,7 +1059,7 @@ mod tests {
         assert_eq!(
             origin.as_deref(),
             Some("test"),
-            "the instance label becomes the operation's origin"
+            "the caller's identity becomes the operation's origin"
         );
         assert_eq!(id, "op-1");
         assert_eq!(tool_name, "cargo_build");
@@ -1760,6 +1777,87 @@ mod tests {
                 _ => continue,
             }
         }
+    }
+
+    /// The scope an instance advertises must be the one it actually locked.
+    ///
+    /// Registration happens at process start, before `roots/list` has been
+    /// answered — so an instance used to advertise a placeholder (`"."` in the
+    /// default roots-driven configuration) for its whole life, and a TUI
+    /// filtering by project matched none of them (SPEC R24.3, R-DAEMON.6).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn reporter_re_registers_with_the_committed_scope_and_session_id() {
+        use crate::operation_monitor::MonitorConfig;
+
+        let _lock = DAEMON_SOCK_MUTEX.lock();
+        let unique = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sock =
+            std::env::temp_dir().join(format!("ahma_scope_{}_{}.sock", std::process::id(), unique));
+        let _ = std::fs::remove_file(&sock);
+        let prev = std::env::var_os("AHMA_DAEMON_SOCK");
+        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &sock) };
+        let _env_guard = EnvGuard { prev };
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind temp daemon socket");
+
+        // The session identity is known at startup; the scope is not.
+        set_initial_identity(Some("mcp-session-42".to_string()), Some(4242));
+
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            TestTimeouts::scale_secs(60),
+        )));
+        let reporter = tokio::spawn(run_reporter_loop(
+            monitor.clone(),
+            "stdio".to_string(),
+            String::new(),
+            "ahma".to_string(),
+            None,
+            None,
+        ));
+
+        let (_r1, _w1, first) = accept_register(&listener).await;
+        match first {
+            ClientMsg::Register {
+                scope,
+                session_id,
+                client_pid,
+                ..
+            } => {
+                assert_eq!(
+                    scope, "",
+                    "before the commit there is no scope to advertise, and a \
+                     placeholder would be a claim we cannot back"
+                );
+                assert_eq!(session_id.as_deref(), Some("mcp-session-42"));
+                assert_eq!(client_pid, Some(4242));
+            }
+            other => panic!("expected Register first, got {other:?}"),
+        }
+
+        // The sandbox commits — the moment the real scope becomes knowable.
+        set_committed_scope(&[std::path::PathBuf::from("/work/project")]);
+
+        let (_r2, _w2, second) = accept_register(&listener).await;
+        match second {
+            ClientMsg::Register {
+                scope, session_id, ..
+            } => {
+                assert_eq!(
+                    scope, "/work/project",
+                    "the re-registration carries the scope the sandbox locked"
+                );
+                assert_eq!(
+                    session_id.as_deref(),
+                    Some("mcp-session-42"),
+                    "the session id is unchanged, so the hub keeps the instance id"
+                );
+            }
+            other => panic!("expected a re-Register, got {other:?}"),
+        }
+
+        reporter.abort();
+        let _ = std::fs::remove_file(&sock);
     }
 
     #[cfg(unix)]

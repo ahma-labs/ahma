@@ -7,10 +7,8 @@ use crate::{
     config::ServerConfig as MpcServerConfig,
     sandbox,
     service_builder::{BuiltService, ServiceBuilder},
-    utils::logging::{BRIDGE_CAPTURE_HEADER, prepare_bridge_capture_files, read_log_tail},
     utils::stdio::emit_stdout_notification,
 };
-use ahma_common::timeouts::AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS;
 use ahma_http_mcp_client::client::HttpMcpTransport;
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
@@ -518,14 +516,29 @@ pub async fn get_bridge_version(
 
 #[cfg(unix)]
 pub async fn trigger_uds_restart(path: &str) -> bool {
+    trigger_uds_restart_with_mode(path, None).await
+}
+
+/// POST `/restart` over the Unix socket, optionally with a `mode` query.
+///
+/// `Some("drain")` asks a daemon to stop accepting new sessions and go once the
+/// live ones end, which is how a version handoff avoids ending sessions that
+/// belong to other windows (SPEC R-DAEMON.5).
+pub async fn trigger_uds_restart_with_mode(path: &str, mode: Option<&str>) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let connect = tokio::net::UnixStream::connect(path);
     let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_millis(200), connect).await else {
         return false;
     };
 
-    let request = b"POST /restart HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-    if stream.write_all(request).await.is_err() {
+    let target = match mode {
+        Some(mode) => format!("/restart?mode={mode}"),
+        None => "/restart".to_string(),
+    };
+    let request = format!(
+        "POST {target} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).await.is_err() {
         return false;
     }
 
@@ -537,7 +550,15 @@ pub async fn trigger_uds_restart(path: &str) -> bool {
 }
 
 pub async fn trigger_tcp_restart(url: &str) -> bool {
-    let restart_url = format!("{}/restart", url.trim_end_matches('/'));
+    trigger_tcp_restart_with_mode(url, None).await
+}
+
+/// TCP counterpart of [`trigger_uds_restart_with_mode`].
+pub async fn trigger_tcp_restart_with_mode(url: &str, mode: Option<&str>) -> bool {
+    let restart_url = match mode {
+        Some(mode) => format!("{}/restart?mode={mode}", url.trim_end_matches('/')),
+        None => format!("{}/restart", url.trim_end_matches('/')),
+    };
     if let Ok(resp) = PROBE_CLIENT.post(&restart_url).send().await {
         return resp.status().is_success();
     }
@@ -588,16 +609,30 @@ fn strip_global_endpoints_under_test<'a>(
 }
 
 pub async fn trigger_bridge_restart(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
+    trigger_bridge_restart_with_mode(socket_path, http_url, None).await
+}
+
+/// Ask the daemon to drain: finish the sessions it has, accept no new ones,
+/// then exit (SPEC R-DAEMON.5).
+pub async fn trigger_bridge_drain(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
+    trigger_bridge_restart_with_mode(socket_path, http_url, Some("drain")).await
+}
+
+async fn trigger_bridge_restart_with_mode(
+    socket_path: Option<&str>,
+    http_url: Option<&str>,
+    mode: Option<&str>,
+) -> bool {
     let (socket_path, http_url) = strip_global_endpoints_under_test(socket_path, http_url);
 
     #[cfg(unix)]
     if let Some(path) = socket_path
-        && trigger_uds_restart(path).await
+        && trigger_uds_restart_with_mode(path, mode).await
     {
         return true;
     }
     if let Some(url) = http_url
-        && trigger_tcp_restart(url).await
+        && trigger_tcp_restart_with_mode(url, mode).await
     {
         return true;
     }
@@ -606,73 +641,11 @@ pub async fn trigger_bridge_restart(socket_path: Option<&str>, http_url: Option<
     false
 }
 
-async fn check_bridge_running(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
+pub async fn check_bridge_running(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
     get_bridge_version(socket_path, http_url).await.is_some()
 }
 
-/// How long [`restart_bridge_server`] waits for the old bridge to stop answering
-/// health checks.
-const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
-/// How often [`restart_bridge_server`] re-checks while waiting for that stop.
-const BRIDGE_STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Poll `still_running` until it reports the bridge is gone, or until `timeout`
-/// elapses. Returns `true` only when a check actually *observed* the bridge stop;
-/// a timeout returns `false`.
-///
-/// The two outcomes are kept distinguishable on purpose. This wait previously
-/// reported "Old bridge stopped." on both, which logged the one case an operator
-/// needs to see — the old bridge outliving the wait, so a replacement is spawned
-/// while it may still hold the socket or port — as a success.
-async fn wait_for_bridge_to_stop(
-    timeout: Duration,
-    poll_interval: Duration,
-    still_running: impl AsyncFn() -> bool,
-) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if !still_running().await {
-            return true;
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
-    false
-}
-
-/// Ask the running bridge to shut down, then wait (up to [`BRIDGE_STOP_TIMEOUT`])
-/// for it to stop answering health checks so the caller can start a replacement.
-///
-/// Best-effort: neither a refused restart request nor a bridge that outlives the
-/// wait is fatal — the caller spawns a fresh bridge either way. Both are logged at
-/// `warn` so that a replacement which then fails to bind is explainable.
-async fn restart_bridge_server(socket_path_opt: Option<&str>, http_url_opt: Option<&str>) {
-    tracing::info!(
-        "Client version is newer than running bridge version. Requesting bridge restart..."
-    );
-    if !trigger_bridge_restart(socket_path_opt, http_url_opt).await {
-        tracing::warn!("Failed to request bridge restart. Attempting to start anyway.");
-        return;
-    }
-
-    let stopped =
-        wait_for_bridge_to_stop(BRIDGE_STOP_TIMEOUT, BRIDGE_STOP_POLL_INTERVAL, async || {
-            check_bridge_running(socket_path_opt, http_url_opt).await
-        })
-        .await;
-
-    if stopped {
-        tracing::info!("Old bridge stopped. Starting new bridge...");
-    } else {
-        tracing::warn!(
-            timeout_secs = BRIDGE_STOP_TIMEOUT.as_secs(),
-            "Old bridge is still answering health checks after the shutdown wait; starting a \
-             new bridge anyway. If the old process still holds the socket or port, the \
-             replacement may fail to bind."
-        );
-    }
-}
-
-fn re_exec_current_process() -> Result<()> {
+pub fn re_exec_current_process() -> Result<()> {
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut cmd = std::process::Command::new(exe);
@@ -696,188 +669,6 @@ fn re_exec_current_process() -> Result<()> {
     }
 }
 
-/// True when `client_semver` orders strictly after `bridge_semver`.
-///
-/// A version string either side cannot parse also counts as "client newer": an
-/// unreadable bridge version is not evidence that the running bridge is current,
-/// so the caller restarts it rather than proxying to it.
-fn semver_is_newer(client_semver: &str, bridge_semver: &str) -> bool {
-    match (parse_version(client_semver), parse_version(bridge_semver)) {
-        (Some(c), Some(b)) => c > b,
-        _ => true,
-    }
-}
-
-async fn handle_version_checks(
-    _config: &AppConfig,
-    is_test: bool,
-    socket_path_opt: Option<&str>,
-    http_url_opt: Option<&str>,
-) -> Result<Option<()>> {
-    let client_version = env!("CARGO_PKG_VERSION");
-    let client_build_id = ahma_common::BUILD_ID;
-    let bridge_version_opt = if is_test {
-        None
-    } else {
-        get_bridge_version(socket_path_opt, http_url_opt).await
-    };
-
-    let Some(bridge_version_raw) = bridge_version_opt else {
-        return Ok(None);
-    };
-
-    // Version strings from the health endpoint may carry a build-id suffix:
-    // "0.12.5+abc1234".  Split them out for independent semver and build-id checks.
-    let (bridge_semver, bridge_build_id) = split_version_and_build_id(&bridge_version_raw);
-    let client_semver = client_version;
-
-    tracing::info!(
-        client_version = client_version,
-        client_build_id = client_build_id,
-        bridge_version = %bridge_version_raw,
-        "Bridge version check: client={client_version}+{client_build_id} bridge={bridge_version_raw}"
-    );
-
-    let same_semver = bridge_semver == client_semver;
-    // When the bridge exposes a build-id, check it too.  Differing build-ids on the
-    // same semver mean a dev rebuild happened without bumping the version — treat the
-    // running bridge as stale.
-    let same_build = bridge_build_id.is_none_or(|bid| bid == client_build_id);
-
-    if same_semver && same_build {
-        return proxy_to_matching_bridge(socket_path_opt, http_url_opt, &bridge_version_raw).await;
-    }
-
-    // Same semver but different build-id: the bridge is a dev-rebuild peer on the same
-    // version; treat it as stale (client binary is "newer" in intent).
-    let client_is_newer =
-        semver_is_newer(client_semver, bridge_semver) || (same_semver && !same_build);
-
-    reconcile_version_mismatch(
-        socket_path_opt,
-        http_url_opt,
-        client_version,
-        &bridge_version_raw,
-        client_is_newer,
-    )
-    .await
-}
-
-/// Bridge reports the same semver and build-id as the client: forward stdio to it as a
-/// proxy client. If the proxy fails, or the bridge closed without forwarding any response,
-/// the daemon is stale — restart it once and fall back to a fresh spawn (`Ok(None)`), or
-/// error out if a restart was already attempted in this lineage.
-async fn proxy_to_matching_bridge(
-    socket_path_opt: Option<&str>,
-    http_url_opt: Option<&str>,
-    bridge_version_raw: &str,
-) -> Result<Option<()>> {
-    tracing::info!(
-        "Local bridge server is already running (v{bridge_version_raw}). Forwarding stdio as a proxy client."
-    );
-    // No respawn hook here: this path has no AppConfig to spawn with, and a
-    // stale same-version bridge already falls back to restart-and-respawn
-    // below (AHMA_RESTARTED lineage guard).
-    let proxy_result =
-        crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt, None)
-            .await;
-
-    // Bridge responded normally — this was a real MCP session that ended cleanly.
-    if matches!(proxy_result, Ok(true)) {
-        return Ok(Some(()));
-    }
-
-    // Proxy failed (Err) OR the bridge closed the connection before sending any
-    // response (Ok(false)).  Both indicate a stale / incompatible bridge daemon
-    // that happens to report the same version string.
-    warn_stale_same_version_bridge(&proxy_result, bridge_version_raw);
-
-    if std::env::var("AHMA_RESTARTED").is_ok() {
-        return Err(anyhow::anyhow!(
-            "Proxy to same-version bridge (v{bridge_version_raw}) failed after \
-             restart attempt. Please restart ahma manually: \
-             `pkill -f 'ahma serve'` then restart your IDE."
-        ));
-    }
-
-    tracing::info!("Triggering bridge restart and falling back to fresh bridge spawn...");
-    restart_bridge_server(socket_path_opt, http_url_opt).await;
-    // Return Ok(None) so run_server_mode proceeds to spawn a fresh bridge
-    // and connect to it.
-    Ok(None)
-}
-
-/// Log why a proxy attempt against a same-version bridge is being treated as a
-/// stale daemon: an outright failure and a bridge that hung up without forwarding
-/// anything are different symptoms of the same conclusion, and the operator needs
-/// to see which one happened.
-fn warn_stale_same_version_bridge(proxy_result: &Result<bool>, bridge_version_raw: &str) {
-    if let Err(e) = proxy_result {
-        tracing::warn!(
-            bridge_version = %bridge_version_raw,
-            error = %e,
-            "Proxy to same-version bridge failed; bridge may be stale"
-        );
-    } else {
-        tracing::warn!(
-            bridge_version = %bridge_version_raw,
-            "Proxy to same-version bridge exited without forwarding any bridge \
-             response; bridge may be stale (same semver, incompatible binary)"
-        );
-    }
-}
-
-/// Bridge semver/build differs from the client. When the client is newer, restart the
-/// bridge (unless a restart already ran this lineage, which would risk a respawn storm).
-/// When the client is older, re-exec into the matching binary, or error if we already did.
-/// Returns `Ok(None)` so the caller proceeds to spawn/connect to a fresh bridge.
-async fn reconcile_version_mismatch(
-    socket_path_opt: Option<&str>,
-    http_url_opt: Option<&str>,
-    client_version: &str,
-    bridge_version_raw: &str,
-    client_is_newer: bool,
-) -> Result<Option<()>> {
-    if client_is_newer {
-        if std::env::var("AHMA_RESTARTED").is_ok() {
-            // We already restarted once in this lineage. A *persistent*
-            // version/build mismatch must not trigger another restart — that is
-            // how a respawn storm starts when several ahma build-ids transiently
-            // coexist (e.g. a dev rebuild while old `ahma serve` processes still
-            // run). Proxy to whatever bridge is running instead; with a single
-            // installed build-id the mismatch converges after one restart, so a
-            // mismatch that *survives* a restart means restarting again is futile.
-            // (Symmetric with the same-semver stale-bridge branch above.)
-            tracing::warn!(
-                client_version = client_version,
-                bridge_version = %bridge_version_raw,
-                "Bridge version/build mismatch persists after a restart; proxying without restarting again to avoid a respawn storm"
-            );
-        } else {
-            tracing::info!(
-                client_version = client_version,
-                bridge_version = %bridge_version_raw,
-                "Client is newer than bridge (or same version with different build); requesting bridge restart"
-            );
-            restart_bridge_server(socket_path_opt, http_url_opt).await;
-        }
-    } else if std::env::var("AHMA_RESTARTED").is_ok() {
-        return Err(anyhow::anyhow!(
-            "Version mismatch: Client version (v{}) is older than running bridge version (v{}). Please update the client binary.",
-            client_version,
-            bridge_version_raw
-        ));
-    } else {
-        tracing::info!(
-            "Client version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
-            client_version,
-            bridge_version_raw
-        );
-        re_exec_current_process()?;
-    }
-    Ok(None)
-}
-
 /// Split a version string of the form `"semver+build_id"` into `(semver, Option<build_id>)`.
 /// If there is no `+` separator, the build_id portion is `None`.
 pub(crate) fn split_version_and_build_id(v: &str) -> (&str, Option<&str>) {
@@ -885,122 +676,6 @@ pub(crate) fn split_version_and_build_id(v: &str) -> (&str, Option<&str>) {
         (&v[..idx], Some(&v[idx + 1..]))
     } else {
         (v, None)
-    }
-}
-
-pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
-    let mut args = vec!["serve".to_string(), "--server-child".to_string()];
-    forward_path_and_scope_flags(&mut args, config);
-    forward_boolean_flags(&mut args, config);
-    forward_numeric_and_auth_flags(&mut args, config);
-    args
-}
-
-fn push_val(args: &mut Vec<String>, flag: &str, val: impl Into<String>) {
-    args.push(flag.to_string());
-    args.push(val.into());
-}
-
-fn forward_path_and_scope_flags(args: &mut Vec<String>, config: &AppConfig) {
-    for scope in &config.sandbox_scopes {
-        push_val(args, "--sandbox-scope", scope.to_string_lossy());
-    }
-    for wd in &config.working_dirs {
-        push_val(args, "--working-dir", wd.to_string_lossy());
-    }
-
-    if config.explicit_tools_dir
-        && let Some(ref tools_dir) = config.tools_dir
-    {
-        push_val(args, "--tools-dir", tools_dir.to_string_lossy());
-    }
-
-    if let Some(ref task_vault) = config.task_vault {
-        push_val(args, "--task-vault", task_vault.to_string_lossy());
-    }
-
-    for bundle in &config.tool_bundles {
-        push_val(args, "--tools", bundle.clone());
-    }
-
-    let idle_timeout = config
-        .idle_timeout_secs
-        .unwrap_or(AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS);
-    if idle_timeout > 0 {
-        push_val(args, "--idle-timeout", idle_timeout.to_string());
-    }
-
-    if !config.unix_socket_path.is_empty() {
-        let socket = config.unix_socket_path.clone();
-        push_val(args, "--unix-socket-path", socket);
-    }
-}
-
-fn forward_boolean_flags(args: &mut Vec<String>, config: &AppConfig) {
-    let flags: &[(&str, bool)] = &[
-        ("--no-sandbox", config.no_sandbox),
-        ("--skip-probes", config.skip_availability_probes),
-        ("--sync", config.force_sync),
-        ("--defer-sandbox", config.defer_sandbox),
-        ("--scratch", config.use_scratch_dir),
-        ("--tmp", config.tmp_access),
-        ("--disable-temp-files", config.no_temp_files),
-    ];
-    for &(flag, enabled) in flags {
-        if enabled {
-            args.push(flag.to_string());
-        }
-    }
-}
-
-fn forward_numeric_and_auth_flags(args: &mut Vec<String>, config: &AppConfig) {
-    if config.rate_limit_rps > 0 {
-        let rps = config.rate_limit_rps.to_string();
-        push_val(args, "--rate-limit-rps", rps);
-    }
-    if config.rate_limit_burst > 0 {
-        let burst = config.rate_limit_burst.to_string();
-        push_val(args, "--rate-limit-burst", burst);
-    }
-    if config.handshake_timeout_secs > 0 {
-        let handshake = config.handshake_timeout_secs.to_string();
-        push_val(args, "--handshake-timeout", handshake);
-    }
-
-    if let Some(ref token) = config.require_token {
-        push_val(args, "--require-token", token.clone());
-    }
-    if let Some(ref path) = config.require_token_path {
-        push_val(args, "--require-token-path", path.to_string_lossy());
-    }
-
-    if !config.instance_label.is_empty() {
-        push_val(args, "--instance-label", config.instance_label.clone());
-    }
-}
-
-/// Open a capture file for bridge output, writing `banner` as its first line.
-/// Returns `None` (and logs a warning) if the file can't be created or opened.
-///
-/// Async variant used on the server-startup path (`spawn_background_bridge`), which
-/// runs in a `tokio` task and must never block the executor with `std::fs` I/O
-/// (AGENTS.md: "Never `std::fs` or blocking I/O in an async fn").
-async fn open_capture_file(path: &std::path::Path, banner: &str) -> Option<std::fs::File> {
-    let result: std::io::Result<std::fs::File> = async {
-        tokio::fs::write(path, banner).await?;
-        let f = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .await?;
-        Ok(f.into_std().await)
-    }
-    .await;
-    match result {
-        Ok(f) => Some(f),
-        Err(e) => {
-            tracing::warn!("Failed to create bridge capture at {}: {e}", path.display());
-            None
-        }
     }
 }
 
@@ -1017,121 +692,6 @@ fn open_capture_file_sync(path: &std::path::Path, banner: &str) -> Option<std::f
             None
         }
     }
-}
-
-/// Poll the bridge's health endpoint until it responds or `timeout` elapses.
-/// Returns `true` as soon as a health check succeeds.
-async fn wait_for_bridge_healthy(
-    socket_path_opt: Option<&str>,
-    http_url_opt: Option<&str>,
-    timeout: Duration,
-) -> bool {
-    let start_time = std::time::Instant::now();
-    while start_time.elapsed() < timeout {
-        if check_bridge_running(socket_path_opt, http_url_opt).await {
-            return true;
-        }
-        tokio::time::sleep(ahma_common::timeouts::TestTimeouts::poll_interval()).await;
-    }
-    false
-}
-
-async fn spawn_background_bridge(
-    config: &AppConfig,
-    socket_path_opt: Option<&str>,
-    http_url_opt: Option<&str>,
-) -> Result<()> {
-    let server_command = std::env::current_exe()
-        .context("Failed to get current executable path")?
-        .to_string_lossy()
-        .to_string();
-
-    let server_args = build_background_bridge_args(config);
-
-    let mut cmd = tokio::process::Command::new(&server_command);
-    cmd.args(&server_args).env("AHMA_SERVER_CHILD", "1").env(
-        ahma_common::process_guard::SPAWN_DEPTH_ENV,
-        ahma_common::process_guard::child_spawn_depth(),
-    );
-
-    // Intentionally detached (SPEC R-PROC.3): the background bridge must outlive
-    // the process that spawned it, so it deliberately does NOT set kill_on_drop.
-    // `process_group(0)` keeps it alive when our own process group goes away —
-    // the opposite purpose it serves for an owned child (R-PROC.2).
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        cmd.creation_flags(crate::shell_pool::CREATE_NO_WINDOW);
-    }
-
-    let (stdout_path, stderr_path) = match prepare_bridge_capture_files() {
-        Ok(paths) => paths,
-        Err(e) => {
-            tracing::error!("Failed to prepare bridge capture files in logs/: {e:#}");
-            return Err(e);
-        }
-    };
-
-    let spawn_banner = format!(
-        "{BRIDGE_CAPTURE_HEADER}# bridge spawn parent_pid={}\n",
-        std::process::id()
-    );
-
-    match open_capture_file(&stdout_path, &spawn_banner).await {
-        Some(f) => cmd.stdout(f),
-        None => cmd.stdout(std::process::Stdio::null()),
-    };
-    match open_capture_file(&stderr_path, &spawn_banner).await {
-        Some(f) => cmd.stderr(f),
-        None => cmd.stderr(std::process::Stdio::null()),
-    };
-    cmd.stdin(std::process::Stdio::null());
-
-    match cmd.spawn() {
-        Ok(_) => tracing::info!("Spawned background bridge server successfully"),
-        Err(e) => tracing::error!("Failed to spawn background bridge server: {}", e),
-    }
-
-    // Wait for the background bridge to be healthy/available
-    let timeout =
-        ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick);
-    let healthy = wait_for_bridge_healthy(socket_path_opt, http_url_opt, timeout).await;
-    if !healthy {
-        return Err(bridge_unhealthy_error(&stderr_path, timeout));
-    }
-    tracing::info!(
-        bridge_stdout = %stdout_path.display(),
-        bridge_stderr = %stderr_path.display(),
-        "Background bridge server started successfully and is healthy"
-    );
-
-    Ok(())
-}
-
-/// Build the error returned when the freshly spawned background bridge does not
-/// become healthy in time, logging whatever stderr it managed to capture first.
-fn bridge_unhealthy_error(stderr_path: &std::path::Path, timeout: Duration) -> anyhow::Error {
-    let stderr_tail = read_log_tail(stderr_path, 8192);
-    if stderr_tail.is_empty() {
-        tracing::error!(
-            bridge_stderr = %stderr_path.display(),
-            "Background bridge failed health check within {timeout:?}; bridge stderr capture is empty"
-        );
-    } else {
-        tracing::error!(
-            bridge_stderr = %stderr_path.display(),
-            bridge_stderr_tail = %stderr_tail,
-            "Background bridge failed health check within {timeout:?}"
-        );
-    }
-    anyhow::anyhow!(
-        "Background bridge server failed to become healthy within {timeout:?}. \
-         Check {} and logs/ahma.log for details.",
-        stderr_path.display()
-    )
 }
 
 /// The per-user MCP endpoint the daemon binds (SPEC R-DAEMON.2).
@@ -1225,16 +785,16 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     };
     let http_url_opt = Some(http_url.as_str());
 
-    // A test-isolated process gets a private socket, but the HTTP endpoint still
-    // defaults to 127.0.0.1:3000 — a real bridge may be listening there. Skipping
-    // the version probe entirely keeps a test from ever judging (and restarting) a
-    // bridge it does not own.
-    let skip_version_check = is_test || is_test_isolated();
-
-    if let Some(()) =
-        handle_version_checks(&config, skip_version_check, socket_path_opt, http_url_opt).await?
-    {
-        return Ok(());
+    // ── The frontend path: a pipe, and nothing else ──────────────────────────
+    //
+    // An editor spawned us over a stdin/stdout pipe. Everything that actually
+    // serves MCP — the adapter, the shell pool, the sandbox — belongs to the
+    // per-user daemon and its per-session workers (SPEC R-DAEMON.1), so this
+    // process builds none of it and registers nothing with the hub. It used to
+    // build a complete service it never served, and register it, which is why a
+    // TUI showed a phantom instance that could not run anything.
+    if !is_test {
+        return run_as_frontend(&config, socket_path_opt, http_url_opt).await;
     }
 
     // Redirect stdout to stderr to prevent protocol stream corruption by standard prints
@@ -1306,14 +866,21 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     service_handler.set_web_approval_sender(web_req_tx);
     let web_coordinator = service_handler.web_approval.clone();
 
-    // Register this stdio instance with the hub daemon so TUI can see it.
+    // Register this worker with the hub so a TUI can see its work.
+    //
+    // The scope starts empty rather than `"."`: the real one is not known until
+    // `roots/list` has been answered and the sandbox committed, at which point
+    // `publish_committed_scope` re-registers with the truth. Advertising a
+    // placeholder made every roots-driven instance invisible to a TUI filtering
+    // by project (SPEC R24.3).
     {
         let scope_str = config
             .sandbox_scopes
             .first()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".".to_string());
+            .unwrap_or_default();
         let label = config.instance_label.clone();
+        crate::daemon_reporter::set_initial_identity(config.session_id.clone(), config.client_pid);
         crate::daemon_reporter::spawn_reporter(
             operation_monitor.clone(),
             "stdio",
@@ -1331,10 +898,6 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     }
 
     log_startup_summary(&config, &sandbox, loaded_configs.len());
-
-    if !is_test {
-        return run_as_frontend_and_proxy(&config, socket_path_opt, http_url_opt).await;
-    }
 
     serve_stdio_until_shutdown(
         service_handler,
@@ -1412,28 +975,37 @@ async fn serve_stdio_until_shutdown(
 /// `ahma serve stdio` processes from accumulating across IDE sessions. The
 /// detached bridge/daemon are deliberately NOT armed (they outlive their
 /// spawner by design and self-terminate via idle-timeout).
-async fn run_as_frontend_and_proxy(
+async fn run_as_frontend(
     config: &AppConfig,
     socket_path_opt: Option<&str>,
     http_url_opt: Option<&str>,
 ) -> Result<()> {
+    use crate::shell::modes::daemon_client;
+
     crate::utils::parent_watchdog::spawn_parent_death_watchdog();
 
-    spawn_background_bridge(config, socket_path_opt, http_url_opt).await?;
+    let outcome =
+        daemon_client::ensure_daemon(socket_path_opt, http_url_opt, config.idle_timeout_secs)
+            .await?;
+    if let Some(notice) = daemon_client::disclosure(&outcome) {
+        // R7: never let ahma's own state be something the user has to infer.
+        tracing::warn!("{notice}");
+    }
 
-    // Respawn hook: if the bridge later dies or its socket vanishes (e.g. it
-    // was killed out-of-band), the proxy's reconnect loop can bring a fresh
-    // bridge up instead of re-dialing a gone endpoint until it gives up.
+    // Respawn hook: if the daemon later dies or its socket vanishes (killed
+    // out-of-band, or it exited on idle between our calls), the proxy's
+    // reconnect loop brings one back instead of re-dialing a gone endpoint.
     let respawn_bridge: crate::shell::modes::proxy_client::BridgeRespawnFn = {
-        let config = config.clone();
         let socket_path = socket_path_opt.map(str::to_string);
         let http_url = http_url_opt.map(str::to_string);
+        let idle = config.idle_timeout_secs;
         Box::new(move || {
-            let config = config.clone();
             let socket_path = socket_path.clone();
             let http_url = http_url.clone();
             Box::pin(async move {
-                spawn_background_bridge(&config, socket_path.as_deref(), http_url.as_deref()).await
+                daemon_client::ensure_daemon(socket_path.as_deref(), http_url.as_deref(), idle)
+                    .await
+                    .map(|_| ())
             })
         })
     };
@@ -1520,79 +1092,10 @@ mod tests {
             mutex_groups: ahma_common::config::default_mutex_groups(),
             settings_origin: crate::shell::cli::SettingsOriginCtx::default(),
             daemon_idle_timeout_secs: 60,
+            daemon_socket_explicit: false,
+            session_id: None,
+            client_pid: None,
         }
-    }
-
-    /// --sandbox is forwarded; empty sandbox_scopes do not produce --sandbox-scope.
-    #[test]
-    fn test_bridge_args_sandbox_flag_no_scope_forwarded() {
-        let tmp = tempdir().unwrap();
-        let cfg = AppConfig {
-            use_scratch_dir: true,
-            scratch_directory: Some(tmp.path().to_path_buf()),
-            ..base_cfg()
-        };
-
-        let args = build_background_bridge_args(&cfg);
-        let has_sandbox_scope = args.windows(2).any(|w| w[0] == "--sandbox-scope");
-        assert!(
-            !has_sandbox_scope,
-            "empty sandbox_scopes must not produce --sandbox-scope: {args:?}"
-        );
-        assert!(
-            args.contains(&"--scratch".to_string()),
-            "--scratch flag must be forwarded: {args:?}"
-        );
-    }
-
-    /// Explicit --sandbox-scope is forwarded; --scratch not forwarded when not set.
-    #[test]
-    fn test_bridge_args_explicit_scope_forwarded_no_sandbox_flag() {
-        let tmp = tempdir().unwrap();
-        let scope = tmp.path().to_path_buf();
-        let cfg = AppConfig {
-            sandbox_scopes: vec![scope.clone()],
-            use_scratch_dir: false,
-            ..base_cfg()
-        };
-
-        let args = build_background_bridge_args(&cfg);
-        let scope_idx = args
-            .iter()
-            .position(|a| a == "--sandbox-scope")
-            .expect("explicit scope must appear as --sandbox-scope");
-        let expected = scope.to_string_lossy().into_owned();
-        assert!(
-            args[scope_idx + 1].contains(expected.as_str()),
-            "scope value must follow --sandbox-scope: {args:?}"
-        );
-        assert!(
-            !args.contains(&"--scratch".to_string()),
-            "--scratch must not appear when use_scratch_dir is false: {args:?}"
-        );
-    }
-
-    /// Both --scratch and explicit --sandbox-scope coexist when both are set.
-    #[test]
-    fn test_bridge_args_both_sandbox_and_scope() {
-        let tmp = tempdir().unwrap();
-        let scope = tmp.path().to_path_buf();
-        let cfg = AppConfig {
-            sandbox_scopes: vec![scope.clone()],
-            use_scratch_dir: true,
-            scratch_directory: Some(tmp.path().to_path_buf()),
-            ..base_cfg()
-        };
-
-        let args = build_background_bridge_args(&cfg);
-        assert!(
-            args.contains(&"--scratch".to_string()),
-            "--scratch must be present: {args:?}"
-        );
-        assert!(
-            args.iter().any(|a| a == "--sandbox-scope"),
-            "--sandbox-scope must be present: {args:?}"
-        );
     }
 
     // ------------------------------------------------------------------
@@ -2004,313 +1507,6 @@ mod tests {
     // build_background_bridge_args — additional branch coverage
     // ------------------------------------------------------------------
 
-    /// Returns the value following `flag`, if present.
-    fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-        args.iter()
-            .position(|a| a == flag)
-            .and_then(|i| args.get(i + 1))
-            .map(|s| s.as_str())
-    }
-
-    #[test]
-    fn test_bridge_args_always_includes_serve_and_server_child() {
-        let args = build_background_bridge_args(&base_cfg());
-        assert_eq!(args[0], "serve");
-        assert!(args.contains(&"--server-child".to_string()));
-    }
-
-    #[test]
-    fn test_bridge_args_numeric_flags_omitted_when_zero() {
-        let cfg = AppConfig {
-            rate_limit_rps: 0,
-            rate_limit_burst: 0,
-            handshake_timeout_secs: 0,
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        assert!(!args.iter().any(|a| a == "--rate-limit-rps"), "{args:?}");
-        assert!(!args.iter().any(|a| a == "--rate-limit-burst"), "{args:?}");
-        assert!(!args.iter().any(|a| a == "--handshake-timeout"), "{args:?}");
-    }
-
-    #[test]
-    fn test_bridge_args_numeric_flags_present_when_positive() {
-        let cfg = AppConfig {
-            rate_limit_rps: 5,
-            rate_limit_burst: 7,
-            handshake_timeout_secs: 30,
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        assert_eq!(arg_value(&args, "--rate-limit-rps"), Some("5"));
-        assert_eq!(arg_value(&args, "--rate-limit-burst"), Some("7"));
-        assert_eq!(arg_value(&args, "--handshake-timeout"), Some("30"));
-    }
-
-    #[test]
-    fn test_bridge_args_boolean_flags_omitted_by_default() {
-        // base_cfg has no_sandbox=true, so check the others which default false.
-        let cfg = AppConfig {
-            no_sandbox: false,
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        for flag in [
-            "--no-sandbox",
-            "--skip-probes",
-            "--sync",
-            "--defer-sandbox",
-            "--scratch",
-            "--tmp",
-            "--disable-temp-files",
-        ] {
-            assert!(
-                !args.iter().any(|a| a == flag),
-                "{flag} must be absent by default: {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_bridge_args_all_boolean_flags_present_when_set() {
-        let cfg = AppConfig {
-            no_sandbox: true,
-            skip_availability_probes: true,
-            force_sync: true,
-            defer_sandbox: true,
-            use_scratch_dir: true,
-            tmp_access: true,
-            no_temp_files: true,
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        for flag in [
-            "--no-sandbox",
-            "--skip-probes",
-            "--sync",
-            "--defer-sandbox",
-            "--scratch",
-            "--tmp",
-            "--disable-temp-files",
-        ] {
-            assert!(
-                args.iter().any(|a| a == flag),
-                "{flag} must be present when set: {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_bridge_args_idle_timeout_default_when_none() {
-        let cfg = AppConfig {
-            idle_timeout_secs: None,
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        let expected_idle = AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS.to_string();
-        assert_eq!(
-            arg_value(&args, "--idle-timeout"),
-            Some(expected_idle.as_str())
-        );
-    }
-
-    #[test]
-    fn test_bridge_args_idle_timeout_explicit_value() {
-        let cfg = AppConfig {
-            idle_timeout_secs: Some(123),
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        assert_eq!(arg_value(&args, "--idle-timeout"), Some("123"));
-    }
-
-    #[test]
-    fn test_bridge_args_idle_timeout_zero_omitted() {
-        let cfg = AppConfig {
-            idle_timeout_secs: Some(0),
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        assert!(
-            !args.iter().any(|a| a == "--idle-timeout"),
-            "zero idle-timeout must be omitted: {args:?}"
-        );
-    }
-
-    #[test]
-    fn test_bridge_args_unix_socket_path_forwarded() {
-        let cfg = AppConfig {
-            unix_socket_path: "/run/ahma/x.sock".to_string(),
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        assert_eq!(
-            arg_value(&args, "--unix-socket-path"),
-            Some("/run/ahma/x.sock")
-        );
-    }
-
-    #[test]
-    fn test_bridge_args_unix_socket_path_omitted_when_empty() {
-        let cfg = AppConfig {
-            unix_socket_path: String::new(),
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        assert!(
-            !args.iter().any(|a| a == "--unix-socket-path"),
-            "empty socket path must be omitted: {args:?}"
-        );
-    }
-
-    #[test]
-    fn test_bridge_args_require_token_and_path() {
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token.txt");
-        let cfg = AppConfig {
-            require_token: Some("s3cret".to_string()),
-            require_token_path: Some(token_path.clone()),
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        assert_eq!(arg_value(&args, "--require-token"), Some("s3cret"));
-        let expected_token_path = token_path.to_string_lossy().to_string();
-        assert_eq!(
-            arg_value(&args, "--require-token-path"),
-            Some(expected_token_path.as_str())
-        );
-    }
-
-    #[test]
-    fn test_bridge_args_require_token_omitted_when_none() {
-        let cfg = AppConfig {
-            require_token: None,
-            require_token_path: None,
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        assert!(!args.iter().any(|a| a == "--require-token"), "{args:?}");
-        assert!(
-            !args.iter().any(|a| a == "--require-token-path"),
-            "{args:?}"
-        );
-    }
-
-    #[test]
-    fn test_bridge_args_instance_label_forwarded() {
-        let cfg = AppConfig {
-            instance_label: "my-label".to_string(),
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        assert_eq!(arg_value(&args, "--instance-label"), Some("my-label"));
-    }
-
-    #[test]
-    fn test_bridge_args_instance_label_omitted_when_empty() {
-        let cfg = AppConfig {
-            instance_label: String::new(),
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        assert!(
-            !args.iter().any(|a| a == "--instance-label"),
-            "empty instance_label must be omitted: {args:?}"
-        );
-    }
-
-    #[test]
-    fn test_bridge_args_task_vault_forwarded() {
-        let tmp = tempdir().unwrap();
-        let vault = tmp.path().join("vault");
-        let cfg = AppConfig {
-            task_vault: Some(vault.clone()),
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        let expected_vault = vault.to_string_lossy().to_string();
-        assert_eq!(
-            arg_value(&args, "--task-vault"),
-            Some(expected_vault.as_str())
-        );
-    }
-
-    #[test]
-    fn test_bridge_args_task_vault_omitted_when_none() {
-        let args = build_background_bridge_args(&base_cfg());
-        assert!(!args.iter().any(|a| a == "--task-vault"), "{args:?}");
-    }
-
-    #[test]
-    fn test_bridge_args_tools_dir_only_when_explicit() {
-        let tmp = tempdir().unwrap();
-        let tools_dir = tmp.path().join("tools");
-
-        // Set but NOT explicit → omitted.
-        let cfg_implicit = AppConfig {
-            explicit_tools_dir: false,
-            tools_dir: Some(tools_dir.clone()),
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg_implicit);
-        assert!(
-            !args.iter().any(|a| a == "--tools-dir"),
-            "implicit tools_dir must not be forwarded: {args:?}"
-        );
-
-        // Explicit → forwarded.
-        let cfg_explicit = AppConfig {
-            explicit_tools_dir: true,
-            tools_dir: Some(tools_dir.clone()),
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg_explicit);
-        let expected_tools_dir = tools_dir.to_string_lossy().to_string();
-        assert_eq!(
-            arg_value(&args, "--tools-dir"),
-            Some(expected_tools_dir.as_str())
-        );
-    }
-
-    #[test]
-    fn test_bridge_args_tool_bundles_forwarded_per_bundle() {
-        let cfg = AppConfig {
-            tool_bundles: vec!["cargo".to_string(), "git".to_string()],
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        let tools: Vec<&str> = args
-            .windows(2)
-            .filter(|w| w[0] == "--tools")
-            .map(|w| w[1].as_str())
-            .collect();
-        assert_eq!(tools, vec!["cargo", "git"]);
-    }
-
-    #[test]
-    fn test_bridge_args_working_dirs_forwarded_per_dir() {
-        let tmp = tempdir().unwrap();
-        let d1 = tmp.path().join("a");
-        let d2 = tmp.path().join("b");
-        let cfg = AppConfig {
-            working_dirs: vec![d1.clone(), d2.clone()],
-            ..base_cfg()
-        };
-        let args = build_background_bridge_args(&cfg);
-        let dirs: Vec<String> = args
-            .windows(2)
-            .filter(|w| w[0] == "--working-dir")
-            .map(|w| w[1].clone())
-            .collect();
-        assert_eq!(
-            dirs,
-            vec![
-                d1.to_string_lossy().to_string(),
-                d2.to_string_lossy().to_string()
-            ]
-        );
-    }
-
     // ------------------------------------------------------------------
     // network_enforcement_note
     // ------------------------------------------------------------------
@@ -2583,145 +1779,6 @@ mod tests {
             ..base_cfg()
         };
         let result = try_setup_mcp_client(&cfg).await;
-        assert!(
-            result.is_ok(),
-            "a valid ahma mcp.json with no servers must be a no-op: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_try_setup_mcp_client_non_http_server_is_ok() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("mcp.json");
-        std::fs::write(
-            &path,
-            r#"{"servers": {"local": {"type": "child_process", "command": "echo", "args": []}}}"#,
-        )
-        .unwrap();
-        let cfg = AppConfig {
-            mcp_config: path,
-            ..base_cfg()
-        };
-        let result = try_setup_mcp_client(&cfg).await;
-        assert!(
-            result.is_ok(),
-            "a child_process server entry must be skipped (only Http is wired), not error: {result:?}"
-        );
-    }
-
-    /// Regression test: a bridge that outlives the shutdown wait must be reported as
-    /// *not stopped*. `restart_bridge_server` used to log "Old bridge stopped." on
-    /// this path too, so the timeout was indistinguishable from a clean stop.
-    #[tokio::test]
-    async fn wait_for_bridge_to_stop_reports_timeout_when_bridge_never_stops() {
-        let polls = std::sync::atomic::AtomicUsize::new(0);
-
-        let stopped = wait_for_bridge_to_stop(
-            Duration::from_millis(60),
-            Duration::from_millis(10),
-            async || {
-                polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                true // still answering health checks, forever
-            },
-        )
-        .await;
-
-        assert!(
-            !stopped,
-            "a bridge still answering after the timeout must report not-stopped"
-        );
-        assert!(
-            polls.load(std::sync::atomic::Ordering::Relaxed) > 1,
-            "the wait must actually poll more than once before giving up"
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_for_bridge_to_stop_reports_success_when_bridge_goes_away() {
-        let polls = std::sync::atomic::AtomicUsize::new(0);
-
-        let stopped = wait_for_bridge_to_stop(
-            Duration::from_secs(30),
-            Duration::from_millis(1),
-            async || {
-                // Answers twice, then the bridge is gone.
-                polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2
-            },
-        )
-        .await;
-
-        assert!(stopped, "an observed stop must report stopped");
-        assert_eq!(
-            polls.load(std::sync::atomic::Ordering::Relaxed),
-            3,
-            "the wait must return on the first check that observes the stop"
-        );
-    }
-
-    /// Regression (shutdown unification): every exit path runs the same
-    /// choreography, and that choreography leaves no active operation behind —
-    /// whatever is still running when the grace period lapses is cancelled
-    /// with the shutdown reason. Zero grace makes the wait deterministic:
-    /// the drain loop never sleeps, so the test exercises exactly the
-    /// "grace elapsed, cancel the stragglers" branch.
-    #[tokio::test]
-    async fn graceful_shutdown_cancels_remaining_operations_on_every_path() {
-        use crate::operation_monitor::{
-            MonitorConfig, Operation, OperationMonitor, OperationStatus,
-        };
-
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            Duration::from_secs(3600),
-        )));
-        let shell_pool = Arc::new(crate::shell_pool::ShellPoolManager::new(
-            crate::shell_pool::ShellPoolConfig::default(),
-        ));
-        let td = tempdir().unwrap();
-        let sandbox = Arc::new(
-            crate::sandbox::Sandbox::new(
-                vec![td.path().to_path_buf()],
-                crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
-            )
-            .unwrap(),
-        );
-        let adapter =
-            Arc::new(crate::adapter::Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap());
-
-        let mut op = Operation::new(
-            "shutdown-straggler".to_string(),
-            "test_tool".to_string(),
-            "op still running at shutdown".to_string(),
-            None,
-        );
-        op.state = OperationStatus::InProgress;
-        monitor.add_operation(op).await;
-
-        graceful_shutdown(
-            &adapter,
-            &monitor,
-            Some(Duration::ZERO),
-            "test: shutdown unification",
-        )
-        .await;
-
-        assert_eq!(
-            monitor.get_shutdown_summary().await.total_active,
-            0,
-            "graceful_shutdown must leave no active operations"
-        );
-        let op = monitor
-            .get_completed_operations()
-            .await
-            .into_iter()
-            .find(|op| op.id == "shutdown-straggler")
-            .expect("cancelled operation must be found in completion history");
-        assert_eq!(
-            op.state,
-            OperationStatus::Cancelled,
-            "the straggler must have been cancelled by the shared shutdown routine"
-        );
+        assert!(result.is_ok(), "an empty servers map is fine: {result:?}");
     }
 }

@@ -766,6 +766,26 @@ pub fn platform_mcp_socket_path() -> PathBuf {
     }
 }
 
+/// The hub socket that belongs with `mcp_socket`.
+///
+/// The rendezvous is a **pair**, and the hub half is the mutex: a daemon told
+/// to serve a private MCP socket but left on the shared hub socket would lose
+/// the bind to whichever daemon already held it, stand down, and leave nobody
+/// serving the path its caller asked for. So an explicitly chosen MCP socket
+/// brings its own hub, beside it.
+pub fn hub_socket_beside(mcp_socket: &str) -> PathBuf {
+    let mcp = PathBuf::from(mcp_socket);
+    if mcp == platform_mcp_socket_path() {
+        return platform_default_socket_path();
+    }
+    let dir = mcp.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = mcp
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ahma".to_string());
+    dir.join(format!("{stem}.hub.sock"))
+}
+
 /// Resolve the MCP endpoint socket path (SPEC R-DAEMON.2).
 ///
 /// Resolution order, mirroring [`default_socket_path`] so the two rendezvous
