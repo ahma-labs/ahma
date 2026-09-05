@@ -12,6 +12,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod tui_daemon_subscriber_test;
 mod tui_http3_quic_connection_test;
 mod tui_http_connection_test;
 mod tui_unix_connection_test;

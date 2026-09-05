@@ -877,6 +877,18 @@ async fn try_connect() -> bool {
 /// daemon in its own group so it is *not* killed when the spawning terminal/IDE
 /// exits, rather than so it can be reaped with us.
 fn spawn_detached_daemon() -> Result<()> {
+    // Never from a test binary (SPEC R-ISO.1). `current_exe()` inside one is
+    // the *test harness*, not `ahma`, so this would re-run the test binary with
+    // `daemon` as its filter argument. If any test name matches that filter,
+    // each spawned copy re-runs the tests that spawn — a fork bomb that takes
+    // the whole machine's process table with it, which is exactly what happened
+    // the first time a test exercised this path with no daemon running.
+    if crate::test_isolation::spawned_under_test_harness() {
+        bail!(
+            "refusing to spawn a daemon from a test binary: start one explicitly \
+             (`run_daemon_at`/`HubServer::bind_at`) and point the client at its socket"
+        );
+    }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ahma"));
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("daemon")

@@ -243,12 +243,18 @@ pub fn spawn_tool_call_task(
             .await;
 
         if is_local_default_server(&mcp.base_url) {
-            let res = crate::connection::ensure_server_running(Some(&mcp.workspace_root)).await;
+            // The chat's tool calls run in an ordinary MCP session on the
+            // per-user daemon, scoped by this TUI's own `roots/list` answer —
+            // not by a server started for this directory (SPEC R-DAEMON.9).
+            let socket = ahma_common::daemon_hub::mcp_socket_path(None);
+            let res =
+                ahma_mcp::shell::modes::daemon_client::ensure_daemon(Some(&socket), None, None)
+                    .await;
             if let Err(e) = res {
                 let _ = tx
                     .send(BridgeEvent::ToolCallFinished {
                         id: id.clone(),
-                        result: format!("Error ensuring bridge server is running: {e}"),
+                        result: format!("Error reaching the ahma daemon: {e}"),
                         failed: true,
                     })
                     .await;

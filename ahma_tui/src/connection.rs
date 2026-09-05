@@ -18,7 +18,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ahma_common::timeouts::AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS;
 use anyhow::{Result, bail};
 use tracing::debug;
 
@@ -445,9 +444,9 @@ fn parse_status_2xx(response: &[u8]) -> bool {
     false
 }
 
-use ahma_mcp::shell::modes::server::{
-    BridgeHealth, parse_version, query_tcp_health, trigger_tcp_restart,
-};
+#[cfg(test)]
+use ahma_mcp::shell::modes::server::parse_version;
+use ahma_mcp::shell::modes::server::{BridgeHealth, query_tcp_health, trigger_tcp_restart};
 #[cfg(unix)]
 use ahma_mcp::shell::modes::server::{query_uds_health, trigger_uds_restart};
 
@@ -473,187 +472,15 @@ pub async fn trigger_candidate_restart(candidate: &ResolvedConnection) -> bool {
     }
 }
 
-/// True when `bridge_scope` (as self-reported by a running bridge's
-/// `/health`) and `wanted_scope` (the project the caller actually wants)
-/// refer to the same directory. Canonicalizes both sides first so a trailing
-/// slash or a symlinked path doesn't read as a mismatch; falls back to a
-/// literal comparison if canonicalization fails (e.g. the directory doesn't
-/// exist yet). `dunce::canonicalize` (not `std::fs::canonicalize`) so this is
-/// correct on Windows, where `\\?\`-prefixed paths would otherwise never
-/// equal their un-prefixed form.
-fn scope_matches(bridge_scope: &str, wanted_scope: &std::path::Path) -> bool {
-    let bridge_path = std::path::Path::new(bridge_scope);
-    match (
-        dunce::canonicalize(bridge_path),
-        dunce::canonicalize(wanted_scope),
-    ) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => bridge_path == wanted_scope,
-    }
-}
-
-async fn handle_existing_candidate(
-    candidate: &ResolvedConnection,
-    client_version: &str,
-    bridge_version: String,
-    bridge_default_scope: Option<&str>,
-    wanted_scope: Option<&std::path::Path>,
-) -> Result<Option<()>> {
-    // A healthy bridge is only safe to reuse if it's actually scoped to the
-    // project we want. Without this check, a stale daemon left running for a
-    // *different* project (or one pinned to the `~/sandbox` fallback because
-    // it was started with `--sandbox` and no explicit `--sandbox-scope`) gets
-    // silently reused: every new session then auto-locks to that wrong
-    // directory instead of the one the user actually opened the TUI in
-    // (SPEC R7 — never disclose sandbox state silently).
-    if let (Some(bridge_scope), Some(wanted)) = (bridge_default_scope, wanted_scope)
-        && !scope_matches(bridge_scope, wanted)
-    {
-        // R7: never disclose sandbox state silently — and a tracing::warn to a
-        // log file the user has not been told about is silent.
-        crate::startup_notices::push(
-            crate::startup_notices::Level::Info,
-            format!(
-                "A running ahma server is sandboxed to a different project ({bridge_scope}); \
-                 started a fresh one scoped to {} instead of reusing it.",
-                wanted.display()
-            ),
-        );
-        return Ok(None);
-    }
-
-    if bridge_version == client_version {
-        return Ok(Some(()));
-    }
-
-    let c_ver = parse_version(client_version);
-    let b_ver = parse_version(&bridge_version);
-    let client_is_newer = match (c_ver, b_ver) {
-        (Some(c), Some(b)) => c > b,
-        _ => true,
-    };
-
-    if client_is_newer {
-        restart_stale_bridge(candidate, client_version, &bridge_version).await
-    } else {
-        self_restart_for_newer_bridge(client_version, &bridge_version)
-    }
-}
-
-/// The running bridge is older than this client: restart it, then wait
-/// briefly for it to go down so the caller doesn't race the old process for
-/// the socket/port.
-async fn restart_stale_bridge(
-    candidate: &ResolvedConnection,
-    client_version: &str,
-    bridge_version: &str,
-) -> Result<Option<()>> {
-    // Restarting a server this TUI did not start is a side effect on
-    // someone else's session (an IDE may be attached to it) — say so.
-    crate::startup_notices::push(
-        crate::startup_notices::Level::Warn,
-        format!(
-            "Restarted the running ahma server: it was v{bridge_version} and this TUI is \
-             v{client_version}. Any editor session attached to it reconnects to the new server."
-        ),
-    );
-
-    let _ = trigger_candidate_restart(candidate).await;
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(2) {
-        if get_candidate_version(candidate).await.is_none() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    Ok(None)
-}
-
-/// This client is older than the running bridge: self-restart (re-exec) so
-/// the TUI upgrades to match, or bail if that was already tried once
-/// (AHMA_RESTARTED) and the mismatch persists.
-fn self_restart_for_newer_bridge(client_version: &str, bridge_version: &str) -> Result<Option<()>> {
-    if std::env::var("AHMA_RESTARTED").is_ok() {
-        bail!(
-            "Version mismatch: TUI version (v{}) is older than running bridge version (v{}). Please update TUI binary.",
-            client_version,
-            bridge_version
-        );
-    }
-
-    // exec() replaces this process image, so a notice pushed here would
-    // be discarded with it. The restarted process reports instead, via
-    // the AHMA_RESTARTED marker it is launched with (see below).
-    tracing::info!(
-        "TUI version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
-        client_version,
-        bridge_version
-    );
-
-    let exe = std::env::current_exe()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(&args);
-    cmd.env("AHMA_RESTARTED", "1");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = cmd.exec();
-        Err(anyhow::anyhow!("Failed to re-exec TUI process: {}", err))
-    }
-    #[cfg(not(unix))]
-    {
-        let mut child = cmd
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()?;
-        let status = child.wait()?;
-        std::process::exit(status.code().unwrap_or(0));
-    }
-}
-
-fn spawn_server_process(exe: &std::path::Path, args: &[&str]) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.args(args);
-        cmd.process_group(0);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        cmd.spawn()?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let mut cmd = std::process::Command::new(exe);
-        cmd.args(args);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(ahma_mcp::shell_pool::CREATE_NO_WINDOW);
-        }
-        cmd.spawn()?;
-    }
-    Ok(())
-}
-
-/// Pre-flight the scope candidate with the same hard rejections the server
-/// will apply (must exist — never created here — and no $HOME / ancestors /
+/// Pre-flight the directory this TUI will answer `roots/list` with, applying
+/// the same hard rejections the server will (must exist — never created here — and no $HOME / ancestors /
 /// filesystem root, SPEC R5.2.4). Without this, `ahma tui /typo/path`
 /// silently materialised the typo as a sandbox root, and `ahma tui` from
 /// `$HOME` started a bridge whose every per-session subprocess then died on
 /// the rejection — far from the cause. Failing here names the problem at
 /// launch. The path is a deliberate human choice (the launch directory or an
 /// explicit argument), which is why it may become an explicit scope at all.
-fn resolve_scope_path(scope_path: Option<&std::path::Path>) -> Result<Option<PathBuf>> {
+pub fn preflight_scope(scope_path: Option<&std::path::Path>) -> Result<Option<PathBuf>> {
     match scope_path {
         Some(p) => Ok(Some(ahma_mcp::sandbox::preflight_scope_candidate(p)?)),
         None => match std::env::current_dir() {
@@ -661,100 +488,6 @@ fn resolve_scope_path(scope_path: Option<&std::path::Path>) -> Result<Option<Pat
             Err(_) => Ok(None),
         },
     }
-}
-
-/// Probe `candidates` in order and, for the first one that responds, decide
-/// (via [`handle_existing_candidate`]) whether it's safe to reuse. Only the
-/// first responsive candidate is consulted — matching the original
-/// probe-then-decide-once behaviour rather than trying every candidate.
-async fn try_reuse_existing_server(
-    candidates: &[ResolvedConnection],
-    client_version: &str,
-    path_to_use: Option<&std::path::Path>,
-) -> Result<bool> {
-    for candidate in candidates {
-        if let Some(health) = get_candidate_health(candidate).await {
-            let reused = handle_existing_candidate(
-                candidate,
-                client_version,
-                health.version,
-                health.default_sandbox_scope.as_deref(),
-                path_to_use,
-            )
-            .await?;
-            return Ok(reused.is_some());
-        }
-    }
-    Ok(false)
-}
-
-/// Build the `ahma serve ...` argv for a background server scoped to `path_to_use`.
-fn build_spawn_args(path_to_use: Option<&std::path::Path>) -> Vec<String> {
-    let mut args = Vec::new();
-    args.push("serve".to_string());
-    #[cfg(unix)]
-    args.push("unix".to_string());
-    #[cfg(not(unix))]
-    args.push("http".to_string());
-
-    if let Some(path) = path_to_use {
-        args.push("--sandbox-scope".to_string());
-        args.push(path.to_string_lossy().into_owned());
-    }
-
-    // Apply the same default idle-timeout as the stdio-proxy spawn path so this
-    // bridge also self-terminates when the TUI disconnects.
-    args.push("--idle-timeout".to_string());
-    args.push(AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS.to_string());
-    args
-}
-
-/// Poll `candidates` until one responds healthy or `timeout` elapses.
-async fn wait_for_any_healthy(candidates: &[ResolvedConnection], timeout: Duration) -> bool {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        for candidate in candidates {
-            if probe_candidate(candidate).await {
-                tracing::info!(
-                    "Background server started and healthy at {}",
-                    candidate.display_url
-                );
-                return true;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    false
-}
-
-/// Ensure a local server is running by probing available local transports.
-/// If none is reachable, spawns a background `ahma serve unix` (on macOS/Linux)
-/// or `ahma serve http` (on Windows) and polls until healthy.
-pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Result<()> {
-    let client_version = env!("CARGO_PKG_VERSION");
-    let path_to_use = resolve_scope_path(scope_path)?;
-    let candidates = default_candidates();
-
-    if try_reuse_existing_server(&candidates, client_version, path_to_use.as_deref()).await? {
-        return Ok(());
-    }
-
-    let exe = std::env::current_exe()?;
-    let args = build_spawn_args(path_to_use.as_deref());
-    let args_slices: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-    tracing::info!(
-        "Spawning background server: {} {:?}",
-        exe.display(),
-        args_slices
-    );
-    spawn_server_process(&exe, &args_slices)?;
-
-    if wait_for_any_healthy(&candidates, Duration::from_secs(2)).await {
-        return Ok(());
-    }
-
-    bail!("Failed to start background server within 2 seconds")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1100,20 +833,6 @@ mod tests {
         handle.abort();
     }
 
-    #[test]
-    fn scope_matches_compares_literally_when_uncanonicalizable() {
-        // Neither side exists on disk, so canonicalization fails and the
-        // comparison falls back to a literal path comparison.
-        assert!(scope_matches(
-            "/does/not/exist/a",
-            std::path::Path::new("/does/not/exist/a")
-        ));
-        assert!(!scope_matches(
-            "/does/not/exist/a",
-            std::path::Path::new("/does/not/exist/b")
-        ));
-    }
-
     #[tokio::test]
     async fn get_candidate_version_http_and_http3() {
         let (url, h) = start_test_http_server(200, Some("7.8.9"), 200, None).await;
@@ -1257,105 +976,6 @@ mod tests {
             "no upgrade when /health is non-2xx"
         );
         h3.abort();
-    }
-
-    #[tokio::test]
-    async fn handle_existing_candidate_same_version_returns_some() {
-        let c = ResolvedConnection {
-            display_url: "http://x".to_string(),
-            transport: ResolvedTransport::Http("http://x".to_string()),
-        };
-        let r = handle_existing_candidate(&c, "1.2.3", "1.2.3".to_string(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            r,
-            Some(()),
-            "matching versions must short-circuit to Some(())"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_existing_candidate_scope_mismatch_returns_none_even_if_versions_match() {
-        let c = ResolvedConnection {
-            display_url: "http://x".to_string(),
-            transport: ResolvedTransport::Http("http://x".to_string()),
-        };
-        let wanted = std::path::PathBuf::from("/some/project/a");
-        let r = handle_existing_candidate(
-            &c,
-            "1.2.3",
-            "1.2.3".to_string(),
-            Some("/some/other/project/b"),
-            Some(&wanted),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            r, None,
-            "a bridge scoped to a different project must never be silently reused"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_existing_candidate_scope_match_reuses_candidate() {
-        let c = ResolvedConnection {
-            display_url: "http://x".to_string(),
-            transport: ResolvedTransport::Http("http://x".to_string()),
-        };
-        let wanted = std::path::PathBuf::from("/some/project/a");
-        let r = handle_existing_candidate(
-            &c,
-            "1.2.3",
-            "1.2.3".to_string(),
-            Some("/some/project/a"),
-            Some(&wanted),
-        )
-        .await
-        .unwrap();
-        assert_eq!(r, Some(()), "matching scope must still reuse the bridge");
-    }
-
-    #[tokio::test]
-    async fn handle_existing_candidate_client_newer_unreachable_returns_none() {
-        let dead = unreachable_url().await;
-        let c = ResolvedConnection {
-            display_url: dead.clone(),
-            transport: ResolvedTransport::Http(dead.clone()),
-        };
-        let r = handle_existing_candidate(&c, "999.0.0", "0.0.1".to_string(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(r, None, "client-newer path returns Ok(None)");
-    }
-
-    #[tokio::test]
-    async fn handle_existing_candidate_client_older_with_restart_flag_errors() {
-        unsafe {
-            std::env::set_var("AHMA_RESTARTED", "1");
-        }
-        let c = ResolvedConnection {
-            display_url: "http://x".to_string(),
-            transport: ResolvedTransport::Http("http://x".to_string()),
-        };
-        let r = handle_existing_candidate(&c, "0.0.1", "999.0.0".to_string(), None, None).await;
-        unsafe {
-            std::env::remove_var("AHMA_RESTARTED");
-        }
-        assert!(
-            r.is_err(),
-            "older client with AHMA_RESTARTED set must error"
-        );
-        let msg = r.unwrap_err().to_string();
-        assert!(msg.contains("Version mismatch"), "unexpected error: {msg}");
-    }
-
-    #[test]
-    fn spawn_server_process_nonexistent_exe_errors() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let fake = dir.path().join("does_not_exist_ahma_bin");
-        let r = spawn_server_process(&fake, &["serve"]);
-        assert!(r.is_err(), "spawning a nonexistent binary must return Err");
     }
 
     #[cfg(unix)]
