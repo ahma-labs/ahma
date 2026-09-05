@@ -2162,9 +2162,9 @@ async fn serve_instance<R, W>(
             .lock()
             .await
             .entry(session.to_string())
-            .or_insert_with(uuid_v4)
+            .or_insert_with(local_instance_id)
             .clone(),
-        None => uuid_v4(),
+        None => local_instance_id(),
     };
     // A session that comes back is live again, not history.
     hub.ended_instances.lock().await.remove(&id);
@@ -2429,12 +2429,24 @@ where
     replay_subscriber_backlog(writer, hub).await
 }
 
-// ─── Tiny UUID v4 without the uuid crate ──────────────────────────────────────
+// ─── Instance ids ─────────────────────────────────────────────────────────────
 
-fn uuid_v4() -> String {
+/// A label distinguishing one attached instance from another.
+///
+/// **Not a secret, and not a UUID.** It is `pid-nanos-counter`: unique among
+/// the instances of one machine, guessable by anyone who can guess a pid, and
+/// broadcast in cleartext to every subscriber inside `InstanceInfo` because
+/// naming an instance is its entire job.
+///
+/// It was called `uuid_v4`, which claimed randomness it has never had — the
+/// misreading a static analyser made before a human did, and a dangerous one
+/// to leave sitting one module away from
+/// [`crate::daemon_endpoint::DaemonEndpoint`], whose bearer token *is* a
+/// secret and *is* minted from a CSPRNG-backed `Uuid::new_v4`. When you need
+/// unguessability, that is the function to reach for; this one cannot give it
+/// to you.
+fn local_instance_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    // Use process ID + timestamp + a counter for sufficient uniqueness in a
-    // local IPC context.  We don't need cryptographic randomness here.
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2987,19 +2999,31 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── uuid_v4 ───────────────────────────────────────────────────────────────
+    // ── Instance ids ──────────────────────────────────────────────────────────
 
+    /// Two instances attached at once must never share an id: the hub keys
+    /// every operation, every routed decision and every TUI section on it.
     #[test]
-    fn uuid_v4_produces_unique_values() {
-        let ids: Vec<String> = (0..20).map(|_| uuid_v4()).collect();
+    fn instance_ids_are_unique_within_a_process() {
+        let ids: Vec<String> = (0..20).map(|_| local_instance_id()).collect();
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
-        assert_eq!(unique.len(), ids.len(), "all UUIDs should be unique");
+        assert_eq!(unique.len(), ids.len(), "ids collided: {ids:?}");
     }
 
+    /// The three fields stay three fields.
+    ///
+    /// The value is deliberately **not** interpolated into the failure
+    /// message. It is not a secret — it is broadcast to every subscriber — but
+    /// it reads like one, and a scanner that cannot tell an instance label from
+    /// a credential was right to ask; the shape of the id is what this asserts,
+    /// and the shape is in the assertion.
     #[test]
-    fn uuid_v4_contains_dashes() {
-        let id = uuid_v4();
-        assert!(id.contains('-'), "UUID should contain dashes: {id}");
+    fn an_instance_id_has_three_dash_separated_fields() {
+        assert_eq!(
+            local_instance_id().split('-').count(),
+            3,
+            "the id is pid-nanos-counter"
+        );
     }
 
     #[test]
