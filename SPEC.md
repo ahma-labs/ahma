@@ -1503,6 +1503,19 @@ These three mechanisms together bound how long any abandoned `ahma serve stdio` 
   afterwards. It subscribes, registers itself as `mode: "tui"` for its own `!`
   commands, and opens its chat session like any other client (scope from its own
   `roots/list`, R5.2.1.1). Quitting sends nothing but EOF.
+  - **A `!` command is reported like any other work, and marked as
+    unconfined.** The TUI opens a second, outgoing connection under a session
+    id stable for its lifetime, and reports `OpStarted` / `OpOutput` /
+    `OpFinished` for every command typed behind `!` — which is what puts them
+    in the history file, in a second TUI, and in the view after a restart.
+    `OpStarted.unsandboxed` is set on exactly these, and every surface that
+    renders an operation **must** say so: the row carries a mark and the detail
+    pane names it. A unified view in which the one command that ran at the
+    user's full privilege looks like all the others is withholding the only
+    thing about it a reader needs.
+  - The reporter **must not** start a daemon (the subscriber already ensures
+    one) and **must not** block the UI: a command runs, and shows its output
+    locally, whether or not the report lands.
 
 - **R-DAEMON.10 — Test isolation.** Every path in R-DAEMON.2, and the history
   file, resolves under one per-run private location when
@@ -1788,9 +1801,9 @@ correct **at startup**, not only for events that happen afterwards.
   Instance and session headers fold/unfold their subtree.
 
 - **R24.5 — Field-only wire evolution.** The protocol additions
-  (`parent_id`, `started_epoch_ms`, `ended_epoch_ms`, `partial`, `interrupted`
-  on `DaemonEvent`; `client`, `session_id`, `client_pid`, `ended_epoch_ms` on
-  `Register`/`InstanceInfo`) are `#[serde(default)]` **field**
+  (`parent_id`, `started_epoch_ms`, `ended_epoch_ms`, `partial`, `interrupted`,
+  `unsandboxed` on `DaemonEvent`; `client`, `session_id`, `client_pid`,
+  `ended_epoch_ms` on `Register`/`InstanceInfo`) are `#[serde(default)]` **field**
   additions — never new message variants — so mixed-version daemon / instance
   / TUI combinations keep interoperating. The MCP client identity
   (`clientInfo.name`, learned at `initialize` — after hub registration) is

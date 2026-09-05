@@ -45,6 +45,9 @@ pub struct OpWireIdentity {
     /// is true, the tool/command/working directory are unknown. Rendered as
     /// such rather than as blanks (SPEC R24.8).
     pub partial: bool,
+    /// The command ran outside the kernel sandbox — today only the TUI's
+    /// human-typed `!` escape. Carried so the row can say so.
+    pub unsandboxed: bool,
 }
 
 pub use crate::mcp_source::SourceEvent;
@@ -188,6 +191,7 @@ impl DaemonState {
         op.command = identity.command;
         op.origin = identity.origin;
         op.partial = identity.partial;
+        op.unsandboxed = identity.unsandboxed;
         if op.cwd.is_none() {
             op.cwd = identity.cwd;
         }
@@ -477,6 +481,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 command,
                 origin,
                 partial,
+                unsandboxed,
             } => {
                 state.on_op_started(
                     &instance_id,
@@ -492,6 +497,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                         command,
                         origin,
                         partial,
+                        unsandboxed,
                     },
                 );
                 Applied::ListChanged
@@ -1026,6 +1032,7 @@ mod tests {
                     command: None,
                     origin: None,
                     partial: false,
+                    unsandboxed: false,
                 },
             },
         );
@@ -1095,6 +1102,7 @@ mod tests {
                     command: None,
                     origin: None,
                     partial: false,
+                    unsandboxed: false,
                 },
             },
         );
@@ -1531,6 +1539,7 @@ mod tests {
                     command: None,
                     origin: None,
                     partial: false,
+                    unsandboxed: false,
                 },
             },
         )
@@ -1939,6 +1948,7 @@ mod tests {
                     command: None,
                     origin: None,
                     partial: false,
+                    unsandboxed: false,
                 },
             },
         )

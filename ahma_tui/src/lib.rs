@@ -25,6 +25,7 @@ pub mod state;
 pub mod task_tree;
 mod terminal_guard;
 pub mod theme;
+pub mod tui_reporter;
 pub mod ui;
 pub mod work_view;
 

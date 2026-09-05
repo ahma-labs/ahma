@@ -267,6 +267,7 @@ mod tests {
             command: Some("cargo build".into()),
             origin: Some("claude-code".into()),
             partial: false,
+            unsandboxed: false,
         }
     }
 

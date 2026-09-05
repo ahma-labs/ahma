@@ -242,6 +242,15 @@ pub enum DaemonEvent {
         /// blanks as fact.
         #[serde(default)]
         partial: bool,
+        /// The operation ran **outside** the kernel sandbox, at the user's full
+        /// privilege. Today that is only the TUI's human-typed `!` escape
+        /// (SPEC R-DAEMON.9), and a unified view that drew it like any other
+        /// row would be hiding the one thing about it worth knowing.
+        ///
+        /// Absent means confined: a producer that predates this field had no
+        /// unsandboxed path to report.
+        #[serde(default)]
+        unsandboxed: bool,
     },
     OpFinished {
         id: String,
@@ -1088,6 +1097,9 @@ fn synthetic_started(
         // The whole point of this record: it was reconstructed, and a reader
         // must not present its blanks as fact.
         partial: true,
+        // Unknown, and "unknown" is not a claim we get to make in the
+        // alarming direction.
+        unsandboxed: false,
     }
 }
 
@@ -2467,6 +2479,7 @@ mod tests {
             command: Some("cargo build".into()),
             origin: Some("cursor".into()),
             partial: false,
+            unsandboxed: false,
         };
         let json = serde_json::to_string(&new).unwrap();
         let old: OldOpStarted = serde_json::from_str(&json).expect("old readers still parse");
@@ -2564,6 +2577,56 @@ mod tests {
                 assert!(title.is_none(), "no title from a pre-R24.7 server");
                 assert!(origin.is_none());
             }
+            other => panic!("expected OpStarted, got {other:?}"),
+        }
+    }
+
+    /// Work that ran **outside** the sandbox says so on the wire.
+    ///
+    /// The TUI's `!` escape runs at the user's full privilege by design, and a
+    /// unified view that renders it identically to sandboxed work would be
+    /// lying by omission. An event from a producer that predates the field
+    /// reads as sandboxed, which is the only safe default: those producers had
+    /// no unsandboxed path to report.
+    #[test]
+    fn the_unsandboxed_flag_round_trips_and_defaults_to_confined() {
+        let ev = DaemonEvent::OpStarted {
+            id: "op_1".into(),
+            tool_name: "shell".into(),
+            description: "d".into(),
+            scope: "/ws".into(),
+            parent_id: None,
+            started_epoch_ms: None,
+            title: Some("rm -rf build".into()),
+            cwd: Some("/ws".into()),
+            command: Some("rm -rf build".into()),
+            origin: Some("tui".into()),
+            partial: false,
+            unsandboxed: true,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("\"unsandboxed\":true"),
+            "the flag must be on the wire: {json}"
+        );
+        match serde_json::from_str::<DaemonEvent>(&json).unwrap() {
+            DaemonEvent::OpStarted { unsandboxed, .. } => assert!(unsandboxed),
+            other => panic!("expected OpStarted, got {other:?}"),
+        }
+
+        let old = serde_json::json!({
+            "kind": "OpStarted",
+            "id": "op_1",
+            "tool_name": "run_terminal_command",
+            "description": "d",
+            "scope": "/ws"
+        })
+        .to_string();
+        match serde_json::from_str::<DaemonEvent>(&old).expect("old events still parse") {
+            DaemonEvent::OpStarted { unsandboxed, .. } => assert!(
+                !unsandboxed,
+                "a producer with no unsandboxed path must not be read as having used one"
+            ),
             other => panic!("expected OpStarted, got {other:?}"),
         }
     }
@@ -2773,6 +2836,7 @@ mod tests {
             command: None,
             origin: None,
             partial: false,
+            unsandboxed: false,
         };
         let json = serde_json::to_string(&ev).unwrap();
         let back: DaemonEvent = serde_json::from_str(&json).unwrap();
@@ -2835,6 +2899,7 @@ mod tests {
                 command: None,
                 origin: None,
                 partial: false,
+                unsandboxed: false,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -3125,6 +3190,7 @@ mod tests {
                     command: None,
                     origin: None,
                     partial: false,
+                    unsandboxed: false,
                 },
             },
         )
@@ -3285,6 +3351,7 @@ mod tests {
                 command: None,
                 origin: None,
                 partial: false,
+                unsandboxed: false,
             },
         )
         .await;
@@ -3316,6 +3383,7 @@ mod tests {
                 command: None,
                 origin: None,
                 partial: false,
+                unsandboxed: false,
             },
         )
         .await;
@@ -3384,6 +3452,7 @@ mod tests {
                 command: None,
                 origin: None,
                 partial: false,
+                unsandboxed: false,
             },
         )
         .await;
@@ -3650,6 +3719,7 @@ mod tests {
                     command: None,
                     origin: None,
                     partial: false,
+                    unsandboxed: false,
                 },
             )
             .await;
@@ -3688,6 +3758,7 @@ mod tests {
                 command: None,
                 origin: None,
                 partial: false,
+                unsandboxed: false,
             },
         )
         .await;
@@ -3727,6 +3798,7 @@ mod tests {
                     command: None,
                     origin: None,
                     partial: false,
+                    unsandboxed: false,
                 },
             )
             .await;
@@ -3888,6 +3960,7 @@ mod tests {
             command: None,
             origin: None,
             partial: false,
+            unsandboxed: false,
         }
     }
 
@@ -4898,6 +4971,7 @@ mod tests {
                     command: None,
                     origin: None,
                     partial: false,
+                    unsandboxed: false,
                 },
             },
         )

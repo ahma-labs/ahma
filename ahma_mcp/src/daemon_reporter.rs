@@ -849,6 +849,10 @@ fn op_started_event(op: &Operation, scope: &str, origin: &str) -> DaemonEvent {
         command: op.command.clone(),
         origin: Some(origin.to_string()),
         partial: false,
+        // Everything a worker runs goes through the kernel sandbox; the
+        // unsandboxed hook fallback is deliberately not reported at all
+        // (SPEC R-DAEMON.8).
+        unsandboxed: false,
     }
 }
 
@@ -892,6 +896,10 @@ fn daemon_event_for(
             command: command.clone(),
             origin: Some(origin.to_string()),
             partial: false,
+            // Everything a worker runs goes through the kernel sandbox; the
+            // unsandboxed hook fallback is deliberately not reported at all
+            // (SPEC R-DAEMON.8).
+            unsandboxed: false,
         },
         Ev::OutputLine {
             operation_id,

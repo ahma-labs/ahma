@@ -122,6 +122,12 @@ pub async fn run(
     // event stream until it reconnected. The per-user daemon owns the hub; this
     // process only watches it, and quitting sends nothing but EOF.
     spawn_daemon_source(mcp_tx.clone());
+    // ...and a second, outgoing connection, because the TUI is also a place
+    // work happens: a `!` command runs here, unsandboxed, and used to be the
+    // one kind of work the unified view could not see (SPEC R-DAEMON.9).
+    state.tui_reporter = Some(crate::tui_reporter::spawn_tui_reporter(
+        state.workspace.clone(),
+    ));
 
     // Bridge channel carries both provider discovery results and LLM tokens.
     let (bridge_tx, mut bridge_rx) = mpsc::channel::<BridgeEvent>(512);
@@ -1115,6 +1121,18 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
         crate::ui::shorten_path(&working_dir, 20)
     );
 
+    // The command is about to run outside the sandbox; say so to the daemon
+    // before it starts, so the row exists in every view for as long as the
+    // command does (SPEC R-DAEMON.9).
+    let report = state.bang_report();
+    if let Some(r) = &report {
+        r.reporter.report(crate::tui_reporter::bang_started(
+            &r.op_id,
+            &cmd_str,
+            &working_dir,
+        ));
+    }
+
     let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
     let w = TuiWindow {
         id: win_id,
@@ -1131,7 +1149,7 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
         llm_model: None,
         visible: true,
         abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
-        op_id: None,
+        op_id: report.as_ref().map(|r| r.op_id.clone()),
     };
 
     state.windows.push(w);
@@ -1140,7 +1158,7 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
     }
 
     if let Some(tx) = &state.bridge_tx {
-        spawn_window_cli_task(win_id, cmd_str, working_dir, abort_rx, tx.clone());
+        spawn_window_cli_task(win_id, cmd_str, working_dir, abort_rx, tx.clone(), report);
     }
 }
 
@@ -4481,7 +4499,20 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
     };
 
     if is_cli {
-        spawn_window_cli_task(win_id, command, working_dir, abort_rx, tx);
+        // A re-run is a second command, not the first one resuming, so it
+        // reports under an id of its own — window ids wrap and get reused.
+        let report = state.bang_report();
+        if let Some(r) = &report {
+            r.reporter.report(crate::tui_reporter::bang_started(
+                &r.op_id,
+                &command,
+                &working_dir,
+            ));
+            if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
+                w.op_id = Some(r.op_id.clone());
+            }
+        }
+        spawn_window_cli_task(win_id, command, working_dir, abort_rx, tx, report);
     } else {
         let mcp = if state.mcp_enabled {
             Some(mcp_chat_config(state))

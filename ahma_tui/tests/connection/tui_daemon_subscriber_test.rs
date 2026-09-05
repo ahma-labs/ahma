@@ -85,6 +85,7 @@ async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
                     command: Some("pre-commit lint".to_string()),
                     origin: Some("hook".to_string()),
                     partial: false,
+                    unsandboxed: false,
                 },
             },
         )

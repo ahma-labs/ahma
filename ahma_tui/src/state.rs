@@ -826,6 +826,11 @@ pub struct Operation {
     /// When the most recent live output line arrived (set locally, not from
     /// the wire). Drives the fast-vs-slow cadence of the card's activity panel.
     pub last_output_at: Option<Instant>,
+    /// The command ran **outside** the kernel sandbox, at the user's full
+    /// privilege — today only a `!` command someone typed into this TUI
+    /// (SPEC R-DAEMON.9). Drawn as such: a unified view in which the one
+    /// unconfined row looks like all the others is the wrong view.
+    pub unsandboxed: bool,
 }
 
 /// Strategy 1: pull `command` out of an embedded JSON blob in the description.
@@ -903,6 +908,7 @@ impl Operation {
             exit_code: None,
             last_output_at: None,
             partial: false,
+            unsandboxed: false,
         }
     }
 
@@ -1655,6 +1661,10 @@ pub struct AppState {
     pub bridge_tx: Option<tokio::sync::mpsc::Sender<crate::llm_bridge::BridgeEvent>>,
     pub mcp_source_tx: Option<tokio::sync::mpsc::Sender<crate::mcp_source::McpSourceCommand>>,
     pub approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    /// This TUI's own connection to the hub, so the `!` commands it runs are
+    /// visible everywhere the rest of the work is (SPEC R-DAEMON.9). `None`
+    /// only in tests, which build state without a runtime.
+    pub tui_reporter: Option<crate::tui_reporter::TuiReporter>,
 }
 
 /// Which provider a selection came from.
@@ -1811,6 +1821,17 @@ impl SandboxAuthority {
 }
 
 impl AppState {
+    /// Where a `!` command run in this TUI reports its progress, if this
+    /// process managed to open a reporter connection.
+    ///
+    /// Mints the operation id as well as handing back the channel, because the
+    /// two must agree and there is exactly one correct way to pair them.
+    pub fn bang_report(&self) -> Option<crate::llm_bridge::BangReport> {
+        let reporter = self.tui_reporter.clone()?;
+        let op_id = crate::tui_reporter::next_bang_op_id(reporter.session_id());
+        Some(crate::llm_bridge::BangReport { reporter, op_id })
+    }
+
     /// Raise an approval gate — the single guarded entry into the
     /// approval-pending state.
     ///
@@ -2143,6 +2164,7 @@ impl AppState {
             bridge_tx: None,
             mcp_source_tx: None,
             approval_tx: None,
+            tui_reporter: None,
         }
     }
 

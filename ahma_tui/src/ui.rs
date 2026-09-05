@@ -657,6 +657,9 @@ fn operation_identity_footnote(op: &crate::state::Operation) -> Option<String> {
     if op.partial {
         parts.push("start record not seen".to_string());
     }
+    if op.unsandboxed {
+        parts.push("UNSANDBOXED".to_string());
+    }
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
@@ -683,6 +686,16 @@ fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Li
         None => format!("{:?}", op.status),
     };
     lines.push(kv("status", status, theme.op_status_style(&op.status)));
+    // Loud, and second only to the outcome: this command was not confined by
+    // the kernel, and no other line on this pane would tell the reader so
+    // (SPEC R-DAEMON.9).
+    if op.unsandboxed {
+        lines.push(kv(
+            "sandbox",
+            "UNSANDBOXED — ran at your full privilege".to_string(),
+            theme.failed(),
+        ));
+    }
     // The detail pane is the screen a user opens to find out *why* something
     // failed, and a denial's whole point is the path it names (SPEC R-PERM.7.1).
     // Taken from the shared identity mechanism so this pane and the operation
@@ -2873,6 +2886,10 @@ fn build_tree_op_item(
         (true, false) => "v ",
         (false, _) => "",
     };
+    // The `!` the user typed, kept on the row it produced. A scan down the work
+    // view is where unconfined work has to be distinguishable from the rest;
+    // the detail pane is a screen too late.
+    let unsandboxed_mark = if op.unsandboxed { "! " } else { "" };
 
     let clean_id_str = op.clean_id();
     let id_part = format!(" [{}]", clean_id_str);
@@ -2896,7 +2913,8 @@ fn build_tree_op_item(
         _ => format!("  {}", op.elapsed_display()),
     };
 
-    let fixed_prefix_len = sel_symbol.len() + indent.len() + expand_mark.len() + 2;
+    let fixed_prefix_len =
+        sel_symbol.len() + indent.len() + expand_mark.len() + unsandboxed_mark.len() + 2;
     let rem_width = width.saturating_sub(fixed_prefix_len);
 
     let display_name = op.display_name();
@@ -2915,6 +2933,7 @@ fn build_tree_op_item(
             format!("{} ", op.status.glyph(state.unicode)),
             theme.op_status_style(&op.status),
         ),
+        Span::styled(unsandboxed_mark, theme.failed()),
         Span::styled(expand_mark, theme.dim()),
     ];
 
@@ -4581,6 +4600,62 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("start record not seen"), "{text}");
+    }
+
+    /// A command that ran outside the sandbox must say so on the row *and* in
+    /// the detail pane.
+    ///
+    /// The unified view's promise is that one screen tells you what has been
+    /// happening on this machine. A `!` command ran at the user's full
+    /// privilege; drawing it identically to sandboxed work would keep the one
+    /// fact about it that changes what a reader should think.
+    #[test]
+    fn an_unsandboxed_command_says_so_on_the_row_and_in_the_detail() {
+        let theme = Theme::new(true);
+        let mut op =
+            crate::state::Operation::new("op-1", "shell", crate::state::OpStatus::Succeeded);
+        op.title = Some("rm -rf build".into());
+        op.origin = Some("tui".into());
+        op.unsandboxed = true;
+
+        let flatten = |lines: Vec<Line<'static>>| -> String {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let detail = flatten(operation_detail_lines(&op, &theme, 70));
+        assert!(
+            detail.contains("UNSANDBOXED"),
+            "the detail pane must name it: {detail}"
+        );
+
+        let state = AppState::new("http://localhost:3000", "HTTP", true);
+        let row = flatten(vec![build_tree_op_item(
+            &op, 1, false, false, &state, &theme, 70,
+        )]);
+        assert!(
+            row.contains('!'),
+            "the row a reader scans must carry the mark too: {row}"
+        );
+
+        // ...and a sandboxed command must not be marked, or the mark means
+        // nothing.
+        let mut confined = op.clone();
+        confined.unsandboxed = false;
+        let row = flatten(vec![build_tree_op_item(
+            &confined, 1, false, false, &state, &theme, 70,
+        )]);
+        assert!(!row.contains('!'), "no mark on confined work: {row}");
+        let detail = flatten(operation_detail_lines(&confined, &theme, 70));
+        assert!(!detail.contains("UNSANDBOXED"), "{detail}");
     }
 
     #[test]

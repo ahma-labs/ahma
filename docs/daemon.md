@@ -96,6 +96,16 @@ for. Until the handover happens, the mismatch is disclosed rather than hidden.
 `ahma daemon` in a terminal runs one in the foreground, which is the way to see
 what it is doing.
 
+## The TUI's own commands
+
+`ahma tui` is a subscriber, but it is also a place work happens: a `!` command
+typed into its input runs right there, outside the sandbox, at your full
+privilege. So the TUI registers a connection of its own (`mode: "tui"`) and
+reports those commands like any other client — which is what puts them in the
+history file and in front of a second TUI. They are flagged `unsandboxed` on
+the wire and every surface says so. If the daemon is down the command still
+runs and still shows its output; only the report is lost.
+
 ## Hooked commands
 
 A command wrapped by ahma's shell hook registers as an instance of its own for

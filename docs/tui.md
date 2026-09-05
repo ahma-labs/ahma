@@ -40,7 +40,7 @@ takes over.
 ── claude-code (2) · …/github/ahma ── ✓ cargo build ───────────── 8✓ ──
 ── cursor · …/proj-b ── ⟳ npm test ──────────────────────── 1⟳ 3✓ ──
 ── hooks · …/github/ahma ── ✓ pre-commit lint ───────────── 1⟳ 2✓ ──
-── this terminal (you) ─────────────────────────────────────── idle ──
+── this terminal (you) ── ! rm -rf build ───────────────────── 1✓ ──
  ↑↓ move  Enter open  Space tail  f all projects  i chat  ? help  q quit
 ```
 
@@ -48,6 +48,10 @@ takes over.
   project are numbered, so you can tell them apart. Hooked commands fold into
   one `hooks` section — a hook is one instance per command — and your own `!`
   commands and chat tool calls are *this terminal (you)*.
+- **`!` commands are marked.** Anything you run with `!` runs outside the
+  sandbox, at your full privilege, and its row carries a `!` and its detail
+  pane says `UNSANDBOXED`. It is reported to the daemon like any other work, so
+  it is in the history, and a second TUI sees it too.
 - **A closed section still tells you something**: what it is running now, or
   what it last ran. You should not have to open each one to find the one you
   want.
