@@ -524,6 +524,15 @@ pub async fn trigger_uds_restart(path: &str) -> bool {
 /// `Some("drain")` asks a daemon to stop accepting new sessions and go once the
 /// live ones end, which is how a version handoff avoids ending sessions that
 /// belong to other windows (SPEC R-DAEMON.5).
+///
+/// `#[cfg(unix)]` like every other filesystem-socket helper here
+/// ([`query_uds_health`], [`trigger_uds_restart`]): Windows has no
+/// `UnixStream`, and this function's only caller is already inside a
+/// `cfg(unix)` block. Omitting the gate broke the Windows build outright — a
+/// break no developer on macOS or Linux can see, because this workspace cannot
+/// compile for `x86_64-pc-windows-msvc` (`aws-lc-sys` needs an MSVC
+/// toolchain). CI's Windows leg is the only thing that catches it.
+#[cfg(unix)]
 pub async fn trigger_uds_restart_with_mode(path: &str, mode: Option<&str>) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let connect = tokio::net::UnixStream::connect(path);
