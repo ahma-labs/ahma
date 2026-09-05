@@ -87,6 +87,34 @@ pub fn daemon_port() -> u16 {
     WINDOWS_DAEMON_PORT
 }
 
+/// The bridge's HTTP port, made private under a test harness (SPEC R-ISO.1).
+///
+/// The Unix socket and the hub port were isolated per run; this port was not,
+/// and it is the *fallback* every discovery probe tries when the socket has
+/// nothing on it. So a test whose daemon failed to start found the developer's
+/// live bridge on the machine-global 3000, read its `/health`, and reported
+/// success. A whole release's worth of E2E tests passed that way on one
+/// machine and failed on CI, where there is no live server to borrow.
+///
+/// Isolation applies only to the default: an operator or a test that names a
+/// port means that port.
+pub fn bridge_http_port(configured: u16) -> u16 {
+    if configured != DEFAULT_BRIDGE_HTTP_PORT
+        || !crate::test_isolation::spawned_under_test_harness()
+    {
+        return configured;
+    }
+    // Same derivation as `daemon_port`, offset so the two never collide.
+    let disc = crate::test_isolation::test_run_discriminator();
+    let hash: u32 = disc.bytes().fold(0u32, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u32::from(b))
+    });
+    32768 + (hash % 16000) as u16
+}
+
+/// The port `ahma serve http` listens on when nothing says otherwise.
+pub const DEFAULT_BRIDGE_HTTP_PORT: u16 = 3000;
+
 /// Interval at which the hub sends liveness pings to connected instances.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -3497,6 +3525,29 @@ mod tests {
         std::sync::LazyLock::new(|| parking_lot::Mutex::new(()));
 
     // ── daemon_port / default_socket_path (env-driven) ────────────────────────
+
+    /// The HTTP fallback must be per-run under a harness, or a test finds the
+    /// developer's live server and calls it a pass.
+    #[test]
+    fn the_default_bridge_port_is_private_under_a_test_harness() {
+        // The suite always runs under one, so this is the live expectation.
+        let isolated = bridge_http_port(DEFAULT_BRIDGE_HTTP_PORT);
+        assert_ne!(
+            isolated, DEFAULT_BRIDGE_HTTP_PORT,
+            "a test must never probe the machine-global bridge port"
+        );
+        assert!(isolated >= 32768, "ephemeral range: {isolated}");
+        assert_eq!(
+            isolated,
+            bridge_http_port(DEFAULT_BRIDGE_HTTP_PORT),
+            "every process in one run must agree on it"
+        );
+        assert_eq!(
+            bridge_http_port(8123),
+            8123,
+            "a port someone named is the port they meant"
+        );
+    }
 
     #[test]
     fn daemon_port_default_and_override() {

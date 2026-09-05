@@ -566,7 +566,10 @@ pub async fn trigger_tcp_restart_with_mode(url: &str, mode: Option<&str>) -> boo
 }
 
 /// Default TCP port of the shared bridge — the other machine-global endpoint.
-pub const GLOBAL_HTTP_PORT: u16 = 3000;
+///
+/// One definition, in `ahma_common`, because this number is what test isolation
+/// keys off (`bridge_http_port`) and two copies would drift.
+pub const GLOBAL_HTTP_PORT: u16 = ahma_common::daemon_hub::DEFAULT_BRIDGE_HTTP_PORT;
 
 /// True when `url` addresses the shared bridge's default port on loopback.
 fn is_global_bridge_url(url: &str) -> bool {
@@ -761,7 +764,16 @@ fn resolve_bridge_endpoints(config: &AppConfig) -> (String, String) {
     } else {
         config.unix_socket_path.clone()
     };
-    let http_url = format!("http://{}:{}", config.http_host, config.http_port);
+    // Under a test harness the default port is redirected to a per-run one
+    // (SPEC R-ISO.1). Without that, a probe that should have found nothing
+    // found the developer's live bridge on 3000 and reported it healthy —
+    // which is how a daemon that never started produced a green local run and
+    // a red CI one.
+    let http_url = format!(
+        "http://{}:{}",
+        config.http_host,
+        ahma_common::daemon_hub::bridge_http_port(config.http_port)
+    );
     (socket_path, http_url)
 }
 
@@ -1338,7 +1350,24 @@ mod tests {
             )),
             "expected the per-run private socket, got {socket}"
         );
-        assert_eq!(url, "http://127.0.0.1:3000");
+        // ...and so is the HTTP fallback, which is the half this test used to
+        // pin the wrong way round. The socket was private and the URL was not,
+        // so a probe that found nothing on the private socket fell through to
+        // the machine-global port and found the developer's live bridge. Every
+        // E2E test that spawns the real binary passed on that borrowed server
+        // and failed on CI, where there is none.
+        assert_ne!(
+            url, "http://127.0.0.1:3000",
+            "a test must not probe the machine-global bridge port either"
+        );
+        assert_eq!(
+            url,
+            format!(
+                "http://127.0.0.1:{}",
+                ahma_common::daemon_hub::bridge_http_port(GLOBAL_HTTP_PORT)
+            ),
+            "and every process in one run must agree on which port that is"
+        );
     }
 
     /// Defence in depth: even if a test somehow resolves the shared endpoints, it

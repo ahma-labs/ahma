@@ -64,6 +64,51 @@ pub(crate) fn idle_exit_due(
     timeout_secs > 0 && idle_for.as_secs() >= timeout_secs
 }
 
+/// Is this rendezvous in the directory **ahma chose**, rather than one it was
+/// told to use?
+///
+/// The R-DAEMON.2 ownership-and-mode guarantee is one ahma makes about the
+/// runtime directory it creates `0700` itself. An operator who passes
+/// `--unix-socket-path` (or `[http] unix_socket_path`) has made a deliberate
+/// placement decision, and vetoing it is not ahma's call — `/tmp` is owned by
+/// root on every Unix, so the veto refused to start at all.
+fn rendezvous_is_ahma_owned(hub_socket: &std::path::Path) -> bool {
+    ahma_common::daemon_hub::runtime_dir()
+        .is_some_and(|chosen| hub_socket.parent() == Some(chosen.as_path()))
+}
+
+/// What to say about an operator-chosen directory others can write.
+///
+/// `None` when there is nothing to say. The sticky bit is the distinction that
+/// matters: without it another local user can unlink our socket and bind their
+/// own in its place, and every client would connect to theirs. With it — `/tmp`
+/// and `/var/tmp` on every Unix — they cannot, which is why the shared temp
+/// directories are a reasonable place to put a socket and a bare `0777`
+/// directory is not.
+#[cfg(unix)]
+fn squattable_directory_notice(dir: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(dir).ok()?.permissions().mode();
+    let others_can_write = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    (others_can_write && !sticky).then(|| {
+        format!(
+            "the ahma daemon's rendezvous directory {} is writable by other users and has no \
+             sticky bit, so another local user can replace its sockets with their own. This \
+             path was chosen explicitly; ahma's own runtime directory is created 0700. Move \
+             the socket, or chmod +t the directory.",
+            dir.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn squattable_directory_notice(_dir: &std::path::Path) -> Option<String> {
+    // Access control on Windows comes from the per-user profile ACL, which no
+    // mode-bit inspection would describe.
+    None
+}
+
 /// Run the per-user daemon: hub plus MCP endpoint, one runtime, one exit.
 pub async fn run_daemon_mode(config: AppConfig) -> Result<()> {
     if let Err(msg) = ahma_common::process_guard::check_spawn_depth() {
@@ -85,12 +130,16 @@ pub async fn run_daemon_mode(config: AppConfig) -> Result<()> {
     } else {
         ahma_common::daemon_hub::hub_socket_beside(&mcp_socket)
     };
-    if let Some(dir) = hub_socket.parent()
-        && let Err(e) = ahma_common::daemon_hub::verify_runtime_dir_secure(dir)
-    {
-        // Refusing is the point: a directory another user can write is a
-        // directory in which our sockets can be replaced with theirs.
-        return Err(e.context("refusing to start the ahma daemon"));
+    if let Some(dir) = hub_socket.parent() {
+        if rendezvous_is_ahma_owned(&hub_socket) {
+            if let Err(e) = ahma_common::daemon_hub::verify_runtime_dir_secure(dir) {
+                // Refusing is the point: a directory another user can write is
+                // a directory in which our sockets can be replaced with theirs.
+                return Err(e.context("refusing to start the ahma daemon"));
+            }
+        } else if let Some(notice) = squattable_directory_notice(dir) {
+            tracing::warn!("{notice}");
+        }
     }
 
     let hub = match HubServer::bind_at(hub_socket.clone()).await {
@@ -362,6 +411,71 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// ahma vets the directory it chose, and only that one.
+    ///
+    /// The check exists because a `0600` socket inside a directory another user
+    /// can write is still squattable (SPEC R-DAEMON.2) — a guarantee ahma makes
+    /// about the runtime directory *it* creates. Applying it to a path an
+    /// operator named turned that guarantee into a veto: `--unix-socket-path
+    /// /tmp/x.sock` refused to start at all, because `/tmp` is owned by root.
+    ///
+    /// Every E2E test that drives the real binary passes such a path, and on
+    /// Linux CI every one of them died on it. They passed on the developer's
+    /// machine only because a live ahma bridge was listening on the HTTP
+    /// fallback port and answered the readiness probe — the daemon under test
+    /// had never started at all. That is R-ISO.1's failure mode from the other
+    /// side: not a test corrupting live state, but live state rescuing a test.
+    #[test]
+    fn ahma_vets_its_own_rendezvous_directory_and_not_one_it_was_given() {
+        let chosen = ahma_common::daemon_hub::runtime_dir().expect("a runtime dir is available");
+        assert!(
+            rendezvous_is_ahma_owned(&chosen.join("daemon.sock")),
+            "the directory ahma resolved is ahma's to guarantee"
+        );
+
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !rendezvous_is_ahma_owned(&elsewhere.path().join("daemon.sock")),
+            "a path the operator named is theirs, and refusing it is not our call"
+        );
+    }
+
+    /// Not vetting is not the same as saying nothing.
+    ///
+    /// An operator may put the rendezvous where they like, but a directory
+    /// others can write, without the sticky bit that stops them unlinking our
+    /// socket, is genuinely squattable — so it is disclosed (SPEC R7: ahma's
+    /// own posture is never something a user has to infer).
+    #[cfg(unix)]
+    #[test]
+    fn a_squattable_rendezvous_directory_is_disclosed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set = |mode: u32| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+
+        set(0o700);
+        assert!(squattable_directory_notice(dir.path()).is_none(), "private");
+
+        set(0o1777);
+        assert!(
+            squattable_directory_notice(dir.path()).is_none(),
+            "sticky: another user cannot unlink our socket"
+        );
+
+        set(0o777);
+        let notice = squattable_directory_notice(dir.path())
+            .expect("world-writable without the sticky bit is worth saying out loud");
+        assert!(
+            notice.contains(&dir.path().display().to_string()),
+            "the notice must name the directory: {notice}"
+        );
+
+        set(0o700);
+    }
 
     /// A worker must report to *its own* daemon's hub.
     ///
