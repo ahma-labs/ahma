@@ -355,13 +355,17 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
                 .cycle_prev_active(state.chat_open, state.log_window_open)
         }
         Action::ToggleHelp => state.toggle_help(),
+        Action::ToggleChat => toggle_chat_pane(state),
         Action::FocusChat => {
             // Esc backs out one level: restore a zoomed pane first, then
-            // return focus to the chat input.
+            // return to the work view — which is where the TUI lives, and is
+            // somewhere that always exists (the chat pane may be closed).
             if state.zoomed.is_some() {
                 state.zoomed = None;
-            } else {
+            } else if state.focus == crate::state::Focus::Work && state.chat_open {
                 state.focus = crate::state::Focus::Chat;
+            } else {
+                state.focus = crate::state::Focus::Work;
             }
         }
         Action::Enter if state.focus == crate::state::Focus::Work => {
@@ -688,7 +692,12 @@ fn scroll_focus_up(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::Work => state.ops_selected = state.ops_selected.saturating_sub(1),
+        Focus::Work => {
+            state.ops_selected = state.ops_selected.saturating_sub(1);
+            // A keyboard move should pull the view to the cursor; a wheel
+            // scroll should not (see `scroll_work`).
+            state.work_follow_selection.set(true);
+        }
         Focus::Log => {
             state.detach_log_follow();
             state.log_scroll = state.log_scroll.saturating_sub(1);
@@ -708,6 +717,7 @@ fn scroll_focus_down(state: &mut crate::state::AppState) {
     match state.focus {
         Focus::Work if state.ops_row_count() > 0 => {
             state.ops_selected = (state.ops_selected + 1).min(state.ops_row_count() - 1);
+            state.work_follow_selection.set(true);
         }
         // While following we are already pinned to the bottom — nothing to do
         // (falls through to the no-op arm below).
@@ -4929,14 +4939,44 @@ fn scroll_log(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) 
 }
 
 fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
-    if scroll_overlay(up, state) || scroll_chat(col, row, up, state) {
+    if scroll_overlay(up, state)
+        || scroll_work(col, row, up, state)
+        || scroll_chat(col, row, up, state)
+    {
         return;
     }
     scroll_log(col, row, up, state);
 }
 
+/// Wheel over the work view scrolls it.
+///
+/// It also detaches selection-follow: without that the next frame pulls the
+/// view back to wherever the cursor is, and the wheel appears not to work.
+fn scroll_work(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) -> bool {
+    let area = state.work_area.get();
+    if area.width == 0 || area.height == 0 || !inside_rect(col, row, area) {
+        return false;
+    }
+    let visible = area.height as usize;
+    let total = state.work_total_rows.get();
+    let max_scroll = total.saturating_sub(visible);
+    let current = state.ops_scroll.get();
+    let next = if up {
+        current.saturating_sub(3)
+    } else {
+        (current + 3).min(max_scroll)
+    };
+    state.ops_scroll.set(next);
+    state.work_follow_selection.set(false);
+    true
+}
+
 fn determine_scrolled_panel(state: &crate::state::AppState) -> &'static str {
     if let Some((col, row)) = state.last_mouse_pos.get() {
+        let work_area = state.work_area.get();
+        if inside_rect(col, row, work_area) {
+            return "work";
+        }
         let chat_area = state.chat_area.get();
         let log_area = state.log_area.get();
 
@@ -4956,10 +4996,10 @@ fn determine_scrolled_panel(state: &crate::state::AppState) -> &'static str {
         }
     }
 
-    if state.focus == crate::state::Focus::Log {
-        "log"
-    } else {
-        "chat"
+    match state.focus {
+        crate::state::Focus::Log => "log",
+        crate::state::Focus::Work => "work",
+        crate::state::Focus::Chat => "chat",
     }
 }
 
@@ -5868,6 +5908,66 @@ mod tests {
         super::handle_action(Action::FocusChat, &mut state);
         assert_eq!(state.zoomed, None);
         assert_eq!(state.focus, Focus::Log);
+    }
+
+    /// The wheel scrolls the work view, and stops the next frame from pulling
+    /// it back to the cursor — without which the wheel appears not to work.
+    #[test]
+    fn the_wheel_scrolls_the_work_view_and_detaches_selection_follow() {
+        use crate::state::AppState;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state
+            .work_area
+            .set(ratatui::layout::Rect::new(0, 0, 80, 10));
+        state.work_total_rows.set(60);
+        assert!(state.work_follow_selection.get());
+
+        super::handle_mouse_scroll(5, 5, false, &mut state);
+        assert_eq!(state.ops_scroll.get(), 3, "scrolls down by a wheel notch");
+        assert!(
+            !state.work_follow_selection.get(),
+            "and the next frame must not pull the view back to the cursor"
+        );
+
+        super::handle_mouse_scroll(5, 5, true, &mut state);
+        assert_eq!(state.ops_scroll.get(), 0, "and back up");
+
+        // A keyboard move re-engages following.
+        state.operations.push(crate::state::Operation::new(
+            "op-1",
+            "run_terminal_command",
+            crate::state::OpStatus::Running,
+        ));
+        state.rebuild_work_view(0);
+        super::scroll_focus_down(&mut state);
+        assert!(
+            state.work_follow_selection.get(),
+            "moving the cursor should bring the view with it"
+        );
+    }
+
+    /// `i` opens chat from the work view; in chat it is a typed character.
+    #[test]
+    fn i_opens_chat_from_the_work_view() {
+        use crate::keymap::{Action, map_key};
+        use crate::state::{AppState, Focus, ModalState};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let key = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(
+            map_key(key, Focus::Work, &ModalState::None, false),
+            Action::ToggleChat
+        );
+        assert_eq!(
+            map_key(key, Focus::Chat, &ModalState::None, false),
+            Action::InputChar('i'),
+            "in chat it is just a letter"
+        );
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::handle_action(Action::ToggleChat, &mut state);
+        assert!(state.chat_open);
+        assert_eq!(state.focus, Focus::Chat);
     }
 
     /// The work view is always on screen, so `/tasks` focuses it — and `/chat`

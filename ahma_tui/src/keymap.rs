@@ -32,6 +32,9 @@ pub enum Action {
     DetailClose,
     /// Toggle the task tree between this project's instances and all projects.
     ToggleProjectFilter,
+    /// Open (or close) the chat pane. Chat is a thing you choose to do, so it
+    /// has a key rather than being the screen (SPEC R24.9).
+    ToggleChat,
     // Toggles
     ToggleHelp,
     // Log filter
@@ -233,6 +236,7 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
         (Char('p'), KM::NONE) if focus == Focus::Work => Action::PinOp,
         (Char('a'), KM::NONE) if focus == Focus::Work => Action::ReRaiseGrant,
         (Char('f'), KM::NONE) if focus == Focus::Work => Action::ToggleProjectFilter,
+        (Char('i'), KM::NONE) if focus == Focus::Work => Action::ToggleChat,
         (Char(' '), KM::NONE) if focus == Focus::Work => Action::ToggleNode,
 
         // Zoom the focused pane to full screen and back.

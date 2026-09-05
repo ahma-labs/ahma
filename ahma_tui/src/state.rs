@@ -360,7 +360,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/tools", "list available ahma tools"),
     ("/skills", "list Agent Skills invocable with /<name>"),
-    ("/tasks", "open tasks view window"),
+    ("/tasks", "focus the work view"),
+    ("/chat", "open or close the chat pane"),
     ("/log", "open log view window"),
     ("/scope", "show the locked sandbox scope and its provenance"),
     (
