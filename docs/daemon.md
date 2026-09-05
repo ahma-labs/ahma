@@ -60,6 +60,12 @@ or others. It holds:
 | `mcp.sock` | The MCP endpoint editors proxy to. `0600`. |
 | `history.jsonl` | The last hour of operations, so recent work survives a restart. `0600`. |
 
+You can put the sockets somewhere else with `--unix-socket-path` (or `[http]
+unix_socket_path`), and ahma will honour it. It checks ownership and mode only
+on the directory it picked itself — the `0700` one above. A directory you named
+is your decision; if it is writable by other users and has no sticky bit to stop
+them unlinking your socket, ahma says so at startup and carries on.
+
 The old machine-global `/tmp/ahma.sock` is retired: every local user could see
 it, and since nothing owned the path, pre-create it. A `0600` socket inside a
 world-writable directory is still squattable, which is why the directory is
