@@ -8,6 +8,7 @@
 //!
 //! This crate is licensed under **AGPL-3.0-or-later**.
 
+pub mod accordion;
 pub mod agent_config;
 pub mod app;
 pub mod connection;
@@ -25,6 +26,7 @@ pub mod task_tree;
 mod terminal_guard;
 pub mod theme;
 pub mod ui;
+pub mod work_view;
 
 pub use connection::{ResolvedConnection, ResolvedTransport};
 

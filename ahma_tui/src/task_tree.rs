@@ -74,7 +74,7 @@ pub struct GroupCounts {
 }
 
 impl GroupCounts {
-    fn add(&mut self, status: &OpStatus) {
+    pub(crate) fn add(&mut self, status: &OpStatus) {
         match status {
             OpStatus::Running => self.running += 1,
             OpStatus::Pending | OpStatus::Waiting => self.queued += 1,
@@ -181,7 +181,7 @@ pub fn build_rows(ops: &[Operation], opts: &TreeOptions<'_>) -> Vec<TreeRow> {
 /// (instance_id = Some) and through the direct MCP status poll
 /// (instance_id = None). Prefer the hub copy, which carries instance
 /// grouping metadata; returns the indices into `ops` that should be shown.
-fn dedup_visible_ops(ops: &[Operation]) -> Vec<usize> {
+pub(crate) fn dedup_visible_ops(ops: &[Operation]) -> Vec<usize> {
     let hub_ids: HashSet<&str> = ops
         .iter()
         .filter(|o| o.instance_id.is_some())
@@ -269,7 +269,7 @@ fn order_groups<'a>(
 }
 
 /// Label/detail text for an instance header row.
-fn instance_label_detail(gid: &str, info: Option<&InstanceInfo>) -> (String, String) {
+pub(crate) fn instance_label_detail(gid: &str, info: Option<&InstanceInfo>) -> (String, String) {
     match info {
         Some(info) => (
             display_label(info),
@@ -282,7 +282,7 @@ fn instance_label_detail(gid: &str, info: Option<&InstanceInfo>) -> (String, Str
 
 /// Emit the operations of one instance group: session groups, parent/child
 /// nesting, and the expanded op's inline output.
-fn emit_group_ops(
+pub(crate) fn emit_group_ops(
     ops: &[Operation],
     gid: &str,
     member_idx: &[usize],
@@ -321,7 +321,7 @@ fn emit_group_ops(
 /// Bucket one group's operation indices into parent→children edges, session
 /// groups (insertion-ordered), and root ops (no known parent in this group).
 #[allow(clippy::type_complexity)]
-fn bucket_group_ops(
+pub(crate) fn bucket_group_ops(
     ops: &[Operation],
     member_idx: &[usize],
 ) -> (
@@ -357,7 +357,7 @@ fn bucket_group_ops(
 
 /// Emit one operation row, its expanded output tail (if any), and its
 /// children, recursively.
-fn emit_op(
+pub(crate) fn emit_op(
     ops: &[Operation],
     i: usize,
     depth: u8,
@@ -386,7 +386,12 @@ fn emit_op(
 /// Push the inline output-tail rows for an expanded operation: the last
 /// [`EXPANDED_TAIL_LINES`] stdout lines, or the terminal result summary when
 /// there is no tail (the op finished before ever streaming output).
-fn push_expanded_output(op: &Operation, op_index: usize, depth: u8, rows: &mut Vec<TreeRow>) {
+pub(crate) fn push_expanded_output(
+    op: &Operation,
+    op_index: usize,
+    depth: u8,
+    rows: &mut Vec<TreeRow>,
+) {
     let tail: Vec<&String> = op
         .stdout_tail
         .iter()
@@ -420,14 +425,14 @@ fn push_expanded_output(op: &Operation, op_index: usize, depth: u8, rows: &mut V
 }
 
 /// Prefer the MCP client identity over the generic instance label.
-fn display_label(info: &InstanceInfo) -> String {
+pub(crate) fn display_label(info: &InstanceInfo) -> String {
     let base = info.client.as_deref().unwrap_or(&info.label);
     format!("{}:{}", base, info.pid)
 }
 
 /// Shorten a scope path for the header line: home-relative when possible,
 /// then last two components.
-fn short_path(p: &str) -> String {
+pub(crate) fn short_path(p: &str) -> String {
     let normalized = p.replace('\\', "/");
     let parts: Vec<&str> = normalized.trim_end_matches('/').split('/').collect();
     if parts.len() <= 2 {
