@@ -643,6 +643,10 @@ pub struct SessionManager {
     config: SessionManagerConfig,
     /// Shared atomic counter tracking active connections.
     pub active_sessions: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Set once the hosting daemon has been asked to drain: existing sessions
+    /// run to completion, new ones are refused so they are not started inside a
+    /// process that is about to go (SPEC R-DAEMON.5).
+    pub draining: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Extract the request ID from a JSON-RPC request value.
@@ -1124,6 +1128,7 @@ impl SessionManager {
             sessions: DashMap::new(),
             config,
             active_sessions: None,
+            draining: None,
         }
     }
 
@@ -1259,6 +1264,15 @@ impl SessionManager {
     /// already dead, then evict the oldest unobserved session, and fail only
     /// when neither frees a slot.
     async fn ensure_session_capacity(&self) -> Result<()> {
+        if self
+            .draining
+            .as_ref()
+            .is_some_and(|d| d.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            // Accepting here would start a session inside a process that is
+            // leaving, so the client would lose it moments later.
+            return Err(BridgeError::Draining);
+        }
         if self.sessions.len() < self.config.max_sessions {
             return Ok(());
         }

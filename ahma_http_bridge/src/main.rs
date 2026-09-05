@@ -156,6 +156,8 @@ async fn main() -> anyhow::Result<()> {
         max_sessions: args.max_sessions,
         peer_factory: None,
         bound_port_tx: None,
+        // Standalone bridge: it owns its process and exits directly.
+        exit: None,
     };
 
     // Warn when listening on a non-loopback address without a token.

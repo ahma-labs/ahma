@@ -78,7 +78,7 @@ pub mod quic;
 /// Session lifecycle management for HTTP clients.
 pub mod session;
 
-pub use bridge::{BridgeConfig, ListenerKind, start_bridge};
+pub use bridge::{BridgeConfig, DaemonExit, ListenerKind, start_bridge};
 pub use error::{BridgeError, Result};
 pub use peer::{PeerFactory, PeerShutdownFn, PeerStreams, SubprocessPeerFactory};
 pub use session::{

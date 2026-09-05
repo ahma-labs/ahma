@@ -824,6 +824,23 @@ pub async fn connect_to_daemon() -> Result<DaemonStream> {
     }
 }
 
+/// One-shot query of a daemon at an explicit socket: connect, ask for the
+/// instance list, read the answer, hang up.
+///
+/// Takes the path rather than resolving it so a test can address the daemon it
+/// started, and so a diagnostic can address one that is not the default.
+#[cfg(unix)]
+pub async fn list_instances_at(socket_path: &std::path::Path) -> Result<Vec<InstanceInfo>> {
+    let stream = tokio::net::UnixStream::connect(socket_path).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    send_msg(&mut write_half, &ClientMsg::ListInstances).await?;
+    match recv_msg::<_, DaemonMsg>(&mut reader).await? {
+        DaemonMsg::InstanceList { instances } => Ok(instances),
+        other => bail!("expected an instance list, got {other:?}"),
+    }
+}
+
 /// Returns `true` if a daemon is currently accepting connections.
 async fn try_connect() -> bool {
     connect_to_daemon().await.is_ok()

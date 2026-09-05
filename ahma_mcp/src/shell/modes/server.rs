@@ -1519,6 +1519,7 @@ mod tests {
             small_model_harness: false,
             mutex_groups: ahma_common::config::default_mutex_groups(),
             settings_origin: crate::shell::cli::SettingsOriginCtx::default(),
+            daemon_idle_timeout_secs: 60,
         }
     }
 

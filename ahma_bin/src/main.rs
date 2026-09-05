@@ -131,8 +131,10 @@ async fn main() -> Result<()> {
             dispatch_llm(llm_args).await
         }
         Subcommands::Daemon(_) => {
-            tracing::info!("Starting TUI hub daemon");
-            ahma_common::daemon_hub::run_daemon().await
+            tracing::info!("Starting the per-user ahma daemon");
+            // Hosts both the observability hub and the MCP endpoint in one
+            // process, with one idle policy and one exit path (SPEC R-DAEMON.1).
+            ahma_mcp::shell::modes::daemon::run_daemon_mode(cfg).await
         }
         Subcommands::Simplify(simplify_args) => {
             tracing::info!("Running in simplify mode");

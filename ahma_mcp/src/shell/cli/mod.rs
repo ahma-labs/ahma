@@ -228,6 +228,9 @@ pub struct AppConfig {
     pub instance_label: String,
     /// Idle timeout in seconds before the background bridge shuts down (default 10).
     pub idle_timeout_secs: Option<u64>,
+    /// Seconds the per-user daemon stays alive with nothing attached — no MCP
+    /// sessions and no hub subscribers (`[daemon] idle_timeout_secs`).
+    pub daemon_idle_timeout_secs: u64,
     /// Maximum concurrent HTTP server sessions.
     pub max_sessions: usize,
     /// True when this process was launched as a child server subprocess (--server-child flag or AHMA_SERVER_CHILD env var).
@@ -295,6 +298,7 @@ impl Default for AppConfig {
             instance_label: "ahma".to_string(),
             idle_timeout_secs: None,
             max_sessions: 50,
+            daemon_idle_timeout_secs: 60,
             is_server_child: false,
             settings_origin: SettingsOriginCtx::default(),
         }
@@ -3044,6 +3048,7 @@ pub fn build_app_config_with_settings(
         instance_label: auth.instance_label,
         idle_timeout_secs,
         max_sessions: cli.max_sessions.unwrap_or(10),
+        daemon_idle_timeout_secs: s.daemon.idle_timeout_secs,
         is_server_child: cli.server_child || std::env::var("AHMA_SERVER_CHILD").is_ok(),
         settings_origin: settings_origin_ctx(cli),
     }
@@ -3319,6 +3324,7 @@ mod tests {
             instance_label: "ahma".to_string(),
             idle_timeout_secs: None,
             max_sessions: 10,
+            daemon_idle_timeout_secs: 60,
             is_server_child: false,
             settings_origin: SettingsOriginCtx::default(),
         }

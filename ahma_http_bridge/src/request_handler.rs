@@ -600,7 +600,8 @@ fn encode_initialize_response(
 
 /// Create a new session or return an error response.
 ///
-/// Distinguishes session-limit errors (HTTP 429) from other failures (HTTP 500).
+/// Distinguishes a draining daemon (HTTP 503, retryable in a moment) from the
+/// session limit (HTTP 429) and from other failures (HTTP 500).
 async fn create_session_or_error(
     session_manager: &Arc<SessionManager>,
     request_id: Value,
@@ -609,7 +610,21 @@ async fn create_session_or_error(
         Ok(id) => Ok(id),
         Err(e) => {
             error!("Failed to create session: {}", e);
-            let response = if matches!(e, BridgeError::SessionLimitExceeded { .. }) {
+            let response = if matches!(e, BridgeError::Draining) {
+                // The successor daemon is on its way up; this is a "try again
+                // in a second", not a failure of the request.
+                let mut resp = error_response_with_status(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    request_id,
+                    JSONRPC_REQUEST_TIMEOUT,
+                    &format!("Failed to create session: {}", e),
+                );
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    HeaderValue::from_static("1"),
+                );
+                resp
+            } else if matches!(e, BridgeError::SessionLimitExceeded { .. }) {
                 error_response_with_status(
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
                     request_id,

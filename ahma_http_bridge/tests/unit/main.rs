@@ -15,6 +15,7 @@
 mod common;
 
 mod client_response_routing_test;
+mod daemon_drain_test;
 mod sandbox_security_test;
 mod session_coverage_test;
 mod session_sandbox_test;

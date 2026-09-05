@@ -91,6 +91,8 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         max_sessions: config.max_sessions,
         peer_factory: None,
         bound_port_tx: None,
+        // Explicitly started bridge: it owns its process (SPEC R-DAEMON.1).
+        exit: None,
     };
 
     start_bridge(bridge_config).await?;

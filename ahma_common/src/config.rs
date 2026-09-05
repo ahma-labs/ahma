@@ -1242,6 +1242,33 @@ impl Default for InstanceSettings {
     }
 }
 
+/// Per-user daemon settings (SPEC R-DAEMON.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonSettings {
+    /// Seconds the daemon stays alive with nothing attached — no MCP sessions
+    /// and no hub subscribers — before exiting. `0` keeps it running forever.
+    ///
+    /// The daemon is cheap to restart and holds no state a client depends on
+    /// (history is on disk), so the default trades a fraction of a second on
+    /// the next connect for not leaving a process running all night. Under a
+    /// test harness the default drops to ten seconds, so a test-spawned daemon
+    /// cannot outlive the run that started it by a minute.
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for DaemonSettings {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: if crate::test_isolation::spawned_under_test_harness() {
+                10
+            } else {
+                60
+            },
+        }
+    }
+}
+
 /// Default policy for outbound HTTP made by ahma's own tools (`fetch_webpage`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1475,6 +1502,8 @@ pub struct AhmaSettings {
     pub auth: AuthSettings,
     /// Instance identity settings.
     pub instance: InstanceSettings,
+    /// Per-user daemon lifetime settings.
+    pub daemon: DaemonSettings,
     /// LLM provider/model most recently selected in `ahma tui`, persisted so the
     /// MCP sub-agent and the next session can reuse it.
     pub agent: AgentSettings,
@@ -2108,6 +2137,15 @@ impl AhmaSettings {
             toml_str(&d.instance.label),
         );
 
+        // ── Daemon ───────────────────────────────────────────────────────────
+        w.section("Per-user daemon (ahma daemon)", "daemon");
+        w.setting(
+            "Seconds with nothing attached — no MCP sessions and no TUI — before the daemon exits. 0 keeps it running forever.",
+            "idle_timeout_secs",
+            self.daemon.idle_timeout_secs.to_string(),
+            d.daemon.idle_timeout_secs.to_string(),
+        );
+
         w.section("Agent (last-selected LLM, written by ahma tui)", "agent");
         w.setting(
             "Provider name/label of the most recently selected LLM.",
@@ -2686,6 +2724,9 @@ mod tests {
             },
             instance: InstanceSettings {
                 label: "custom-label".into(),
+            },
+            daemon: DaemonSettings {
+                idle_timeout_secs: 321,
             },
             agent: AgentSettings {
                 provider: Some("Ollama".into()),
@@ -3728,6 +3769,7 @@ mod tier_tests {
             ("tools", "tools_dir"),
             ("logging", "target"),
             ("instance", "label"),
+            ("daemon", "idle_timeout_secs"),
             ("http", "handshake_timeout_secs"),
         ] {
             assert_eq!(
