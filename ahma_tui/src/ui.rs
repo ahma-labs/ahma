@@ -19,6 +19,8 @@ use ratatui::{
 use crate::state::{AppState, ChatEntry, ClickTarget, Focus, NavCommand, SandboxAuthority};
 use crate::theme::Theme;
 
+pub mod work;
+
 // ─── Top-level draw ───────────────────────────────────────────────────────────
 
 /// Called every redraw tick — the only public entry point in this module.
@@ -305,7 +307,7 @@ fn draw_collapsed_window(
 }
 
 /// Milliseconds since the epoch — the clock that drives stateless panels.
-fn wall_ms() -> u64 {
+pub fn wall_ms() -> u64 {
     ahma_common::keepalive::current_timestamp_ms()
 }
 
@@ -766,8 +768,8 @@ fn draw_zoomed_chat_pane(
     zoom: Focus,
 ) {
     match zoom {
-        Focus::OpsDag => {
-            state.ops_area.set(chat_a);
+        Focus::Work => {
+            state.work_area.set(chat_a);
             draw_ops_dag(frame, state, theme, chat_a);
         }
         Focus::Log => {
@@ -776,69 +778,6 @@ fn draw_zoomed_chat_pane(
         }
         _ => {}
     }
-}
-
-fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme, chat_a: Rect) {
-    let chat_content_area = draw_stacked_panels(frame, state, theme, chat_a);
-    state.chat_area.set(chat_content_area);
-    draw_chat_body(frame, state, theme, chat_content_area);
-}
-
-/// Draw whichever of the scope/tasks/log panes are open, stacked above the
-/// chat, and return the area left over for the chat itself.
-///
-/// The constraints pushed here and the areas consumed below must stay in the
-/// same order — each pane contributes at most one of each, in this sequence.
-fn draw_stacked_panels(frame: &mut Frame, state: &AppState, theme: &Theme, chat_a: Rect) -> Rect {
-    let mut constraints = Vec::new();
-    let show_scope = state.scope_window_open;
-    let show_tasks = state.tasks_window_open;
-    let show_log = state.log_window_open;
-
-    // Sized to content (honest panes, R24.8: budget the rows the renderer
-    // draws); scope_window_lines caps itself rather than relying on clipping.
-    // Built once here and handed to the renderer — the height calculation and
-    // the draw used to each build their own copy (with their own `Theme`),
-    // every frame the window was open.
-    let scope_lines = show_scope.then(|| scope_window_lines(state, theme));
-    if let Some(lines) = &scope_lines {
-        constraints.push(Constraint::Length(scope_window_height(lines.len(), chat_a)));
-    }
-    if show_tasks {
-        let tasks_h = (chat_a.height / 3).clamp(6, 16);
-        constraints.push(Constraint::Length(tasks_h));
-    }
-    if show_log {
-        let log_h = (chat_a.height / 3).clamp(6, 16);
-        constraints.push(Constraint::Length(log_h));
-    }
-    constraints.push(Constraint::Min(4));
-
-    let areas = Layout::vertical(constraints).split(chat_a);
-    let mut idx = 0;
-    if let Some(lines) = scope_lines {
-        let area = areas[idx];
-        idx += 1;
-        draw_scope_window(frame, theme, area, lines);
-    }
-    if show_tasks {
-        let area = areas[idx];
-        idx += 1;
-        state.ops_area.set(area);
-        draw_ops_dag(frame, state, theme, area);
-    } else {
-        state.ops_area.set(Rect::default());
-    }
-    if show_log {
-        let area = areas[idx];
-        idx += 1;
-        state.log_area.set(area);
-        draw_log(frame, state, theme, area);
-    } else {
-        state.log_area.set(Rect::default());
-    }
-
-    areas[idx]
 }
 
 /// Split the chat area between the scrolling history and the stack of visible
@@ -861,6 +800,13 @@ fn draw_chat_body(frame: &mut Frame, state: &AppState, theme: &Theme, chat_conte
     draw_windows_layout(frame, state, theme, windows_area, &layouts);
 }
 
+/// The main screen: a header bar, the work view, whatever panes are open below
+/// it, and a footer (SPEC R24.9).
+///
+/// The work view is home. Chat is a pane you open, and its input box exists
+/// only while it is open — the old layout drew an input box on every frame,
+/// which made "type a message" the thing the window was for, when what the
+/// window is for is seeing what is being done on your behalf.
 fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
     let approval_h: u16 = if let Some(gate) = &state.approval {
@@ -871,9 +817,13 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         0
     };
 
-    let input_h = compute_chat_input_height(state, full.width);
+    let input_h = if state.chat_open {
+        compute_chat_input_height(state, full.width)
+    } else {
+        0
+    };
 
-    let [header_a, chat_a, approval_a, input_a, footer_a] = Layout::vertical([
+    let [header_a, body_a, approval_a, input_a, footer_a] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
         Constraint::Length(approval_h),
@@ -882,22 +832,67 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     ])
     .areas(full);
 
-    draw_chat_header(frame, state, theme, header_a);
-
     // Clear window_rects at start of drawing
     state.window_rects.borrow_mut().clear();
 
     if let Some(zoom) = state.zoomed {
-        draw_zoomed_chat_pane(frame, state, theme, chat_a, zoom);
+        draw_chat_header(frame, state, theme, header_a);
+        draw_zoomed_chat_pane(frame, state, theme, body_a, zoom);
     } else {
-        draw_unzoomed_chat_layout(frame, state, theme, chat_a);
+        work::draw_work_header(frame, state, theme, header_a);
+        draw_main_body(frame, state, theme, body_a);
     }
 
     if state.approval.is_some() {
         draw_approval(frame, state, theme, approval_a);
     }
-    draw_input_box(frame, state, theme, input_a);
+    if state.chat_open {
+        draw_input_box(frame, state, theme, input_a);
+    } else {
+        // Nothing may claim clicks for a pane that is not on screen.
+        state.chat_input_area.set(Rect::default());
+    }
     draw_chat_footer(frame, state, theme, footer_a);
+}
+
+/// Work view on top, then whichever panes are open beneath it.
+fn draw_main_body(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let mut constraints = vec![Constraint::Min(3)];
+
+    let scope_lines = state
+        .scope_window_open
+        .then(|| scope_window_lines(state, theme));
+    if let Some(lines) = &scope_lines {
+        constraints.push(Constraint::Length(scope_window_height(lines.len(), area)));
+    }
+    if state.log_window_open {
+        constraints.push(Constraint::Length((area.height / 3).clamp(6, 16)));
+    }
+    if state.chat_open {
+        constraints.push(Constraint::Min(4));
+    }
+
+    let areas = Layout::vertical(constraints).split(area);
+    let mut idx = 0;
+
+    work::draw_work_view(frame, state, theme, areas[idx], wall_ms());
+    idx += 1;
+
+    if let Some(lines) = scope_lines {
+        draw_scope_window(frame, theme, areas[idx], lines);
+        idx += 1;
+    }
+    if state.log_window_open {
+        draw_log(frame, state, theme, areas[idx]);
+        idx += 1;
+    }
+    if state.chat_open {
+        let chat_a = areas[idx];
+        state.chat_area.set(chat_a);
+        draw_chat_body(frame, state, theme, chat_a);
+    } else {
+        state.chat_area.set(Rect::default());
+    }
 }
 
 fn get_mcp_label(mcp_enabled: bool, unicode: bool) -> &'static str {
@@ -1759,7 +1754,7 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     let mode_label = "AHMA";
 
     let keys: &[(&str, &str)] = match state.focus {
-        Focus::OpsDag => &[
+        Focus::Work => &[
             ("↑↓", "nav ops"),
             ("Space", "fold/unfold"),
             ("Tab", "cycle panels"),
@@ -2397,7 +2392,7 @@ fn draw_task_tree_row(
 }
 
 fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let focused = state.focus == Focus::OpsDag;
+    let focused = state.focus == Focus::Work;
     let border_style = if focused {
         theme.border_focused()
     } else {
@@ -2417,7 +2412,7 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    state.ops_area.set(area);
+    state.work_area.set(area);
 
     rebuild_task_rows(state);
     let rows = state.task_rows.borrow();

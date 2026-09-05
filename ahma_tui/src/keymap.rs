@@ -229,11 +229,11 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
         (Char('n'), KM::NONE) => Action::Reject,
 
         // Op actions (only meaningful when OpsDag is focused)
-        (Char('c'), KM::NONE) if focus == Focus::OpsDag => Action::CancelOp,
-        (Char('p'), KM::NONE) if focus == Focus::OpsDag => Action::PinOp,
-        (Char('a'), KM::NONE) if focus == Focus::OpsDag => Action::ReRaiseGrant,
-        (Char('f'), KM::NONE) if focus == Focus::OpsDag => Action::ToggleProjectFilter,
-        (Char(' '), KM::NONE) if focus == Focus::OpsDag => Action::ToggleNode,
+        (Char('c'), KM::NONE) if focus == Focus::Work => Action::CancelOp,
+        (Char('p'), KM::NONE) if focus == Focus::Work => Action::PinOp,
+        (Char('a'), KM::NONE) if focus == Focus::Work => Action::ReRaiseGrant,
+        (Char('f'), KM::NONE) if focus == Focus::Work => Action::ToggleProjectFilter,
+        (Char(' '), KM::NONE) if focus == Focus::Work => Action::ToggleNode,
 
         // Zoom the focused pane to full screen and back.
         (Char('z'), KM::NONE) if focus.is_zoomable() => Action::ToggleZoom,
@@ -389,15 +389,19 @@ mod tests {
         );
     }
 
+    /// Only the log pane zooms: the work view already fills the screen
+    /// (SPEC R24.9).
     #[test]
-    fn z_zooms_zoomable_panes_only() {
-        for focus in [Focus::OpsDag, Focus::Log] {
-            assert_eq!(
-                map_key(kn(KeyCode::Char('z')), focus, &none_modal(), false),
-                Action::ToggleZoom,
-                "focus {focus:?}"
-            );
-        }
+    fn z_zooms_the_log_pane_only() {
+        assert_eq!(
+            map_key(kn(KeyCode::Char('z')), Focus::Log, &none_modal(), false),
+            Action::ToggleZoom
+        );
+        assert_ne!(
+            map_key(kn(KeyCode::Char('z')), Focus::Work, &none_modal(), false),
+            Action::ToggleZoom,
+            "there is nothing to zoom the work view out of"
+        );
         // In chat focus 'z' is just a typed character.
         assert_eq!(
             map_key(kn(KeyCode::Char('z')), Focus::Chat, &none_modal(), false),
@@ -408,7 +412,7 @@ mod tests {
     #[test]
     fn space_folds_tree_node_in_ops_focus() {
         assert_eq!(
-            map_key(kn(KeyCode::Char(' ')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char(' ')), Focus::Work, &none_modal(), false),
             Action::ToggleNode
         );
     }
@@ -751,7 +755,7 @@ mod tests {
     #[test]
     fn global_quit_q() {
         assert_eq!(
-            map_key(kn(KeyCode::Char('q')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('q')), Focus::Work, &none_modal(), false),
             Action::Quit
         );
     }
@@ -761,7 +765,7 @@ mod tests {
         assert_eq!(
             map_key(
                 k(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                Focus::OpsDag,
+                Focus::Work,
                 &none_modal(),
                 false
             ),
@@ -772,11 +776,11 @@ mod tests {
     #[test]
     fn global_up_arrow_and_k() {
         assert_eq!(
-            map_key(kn(KeyCode::Up), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Up), Focus::Work, &none_modal(), false),
             Action::Up
         );
         assert_eq!(
-            map_key(kn(KeyCode::Char('k')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('k')), Focus::Work, &none_modal(), false),
             Action::Up
         );
     }
@@ -784,11 +788,11 @@ mod tests {
     #[test]
     fn global_down_arrow_and_j() {
         assert_eq!(
-            map_key(kn(KeyCode::Down), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Down), Focus::Work, &none_modal(), false),
             Action::Down
         );
         assert_eq!(
-            map_key(kn(KeyCode::Char('j')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('j')), Focus::Work, &none_modal(), false),
             Action::Down
         );
     }
@@ -796,7 +800,7 @@ mod tests {
     #[test]
     fn global_top_g() {
         assert_eq!(
-            map_key(kn(KeyCode::Char('g')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('g')), Focus::Work, &none_modal(), false),
             Action::Top
         );
     }
@@ -806,14 +810,14 @@ mod tests {
         assert_eq!(
             map_key(
                 k(KeyCode::Char('G'), KeyModifiers::SHIFT),
-                Focus::OpsDag,
+                Focus::Work,
                 &none_modal(),
                 false
             ),
             Action::Bottom
         );
         assert_eq!(
-            map_key(kn(KeyCode::Char('G')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('G')), Focus::Work, &none_modal(), false),
             Action::Bottom
         );
     }
@@ -821,11 +825,11 @@ mod tests {
     #[test]
     fn global_tab_and_backtab() {
         assert_eq!(
-            map_key(kn(KeyCode::Tab), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Tab), Focus::Work, &none_modal(), false),
             Action::Tab
         );
         assert_eq!(
-            map_key(kn(KeyCode::BackTab), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::BackTab), Focus::Work, &none_modal(), false),
             Action::BackTab
         );
     }
@@ -841,7 +845,7 @@ mod tests {
     #[test]
     fn global_enter_elsewhere_is_enter() {
         assert_eq!(
-            map_key(kn(KeyCode::Enter), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Enter), Focus::Work, &none_modal(), false),
             Action::Enter
         );
     }
@@ -873,7 +877,7 @@ mod tests {
     #[test]
     fn global_approve_y() {
         assert_eq!(
-            map_key(kn(KeyCode::Char('y')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('y')), Focus::Work, &none_modal(), false),
             Action::Approve
         );
     }
@@ -881,7 +885,7 @@ mod tests {
     #[test]
     fn global_reject_n() {
         assert_eq!(
-            map_key(kn(KeyCode::Char('n')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('n')), Focus::Work, &none_modal(), false),
             Action::Reject
         );
     }
@@ -889,7 +893,7 @@ mod tests {
     #[test]
     fn global_opsdag_cancel_c() {
         assert_eq!(
-            map_key(kn(KeyCode::Char('c')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('c')), Focus::Work, &none_modal(), false),
             Action::CancelOp
         );
     }
@@ -900,7 +904,7 @@ mod tests {
     #[test]
     fn removed_noop_binding_falls_through() {
         assert_eq!(
-            map_key(kn(KeyCode::Char('d')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('d')), Focus::Work, &none_modal(), false),
             Action::Unknown
         );
     }
@@ -909,7 +913,7 @@ mod tests {
     #[test]
     fn opsdag_a_reraises_the_grant_question() {
         assert_eq!(
-            map_key(kn(KeyCode::Char('a')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('a')), Focus::Work, &none_modal(), false),
             Action::ReRaiseGrant
         );
     }
@@ -917,7 +921,7 @@ mod tests {
     #[test]
     fn global_opsdag_pin_p() {
         assert_eq!(
-            map_key(kn(KeyCode::Char('p')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('p')), Focus::Work, &none_modal(), false),
             Action::PinOp
         );
     }
@@ -925,7 +929,7 @@ mod tests {
     #[test]
     fn global_toggle_help() {
         assert_eq!(
-            map_key(kn(KeyCode::Char('?')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('?')), Focus::Work, &none_modal(), false),
             Action::ToggleHelp
         );
     }
@@ -935,7 +939,7 @@ mod tests {
     /// mode that swallowed keys and only ever logged "Command: <text>".
     fn global_colon_no_longer_opens_palette() {
         assert_eq!(
-            map_key(kn(KeyCode::Char(':')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char(':')), Focus::Work, &none_modal(), false),
             Action::Unknown
         );
     }
@@ -943,7 +947,7 @@ mod tests {
     #[test]
     fn global_slash_opens_navigator_when_not_log() {
         assert_eq!(
-            map_key(kn(KeyCode::Char('/')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('/')), Focus::Work, &none_modal(), false),
             Action::OpenNavigator
         );
     }
@@ -959,7 +963,7 @@ mod tests {
     #[test]
     fn global_esc_focuses_chat() {
         assert_eq!(
-            map_key(kn(KeyCode::Esc), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Esc), Focus::Work, &none_modal(), false),
             Action::FocusChat
         );
     }
@@ -968,7 +972,7 @@ mod tests {
     fn global_unknown_fallthrough() {
         // 'x' with no modifier matches no global arm ('z' is now zoom).
         assert_eq!(
-            map_key(kn(KeyCode::Char('x')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('x')), Focus::Work, &none_modal(), false),
             Action::Unknown
         );
     }
@@ -977,7 +981,7 @@ mod tests {
     fn global_w_off_log_is_unknown() {
         // 'w' only special on Log focus; elsewhere falls through.
         assert_eq!(
-            map_key(kn(KeyCode::Char('w')), Focus::OpsDag, &none_modal(), false),
+            map_key(kn(KeyCode::Char('w')), Focus::Work, &none_modal(), false),
             Action::Unknown
         );
     }

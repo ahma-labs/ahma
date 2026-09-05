@@ -347,12 +347,12 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         Action::Tab => {
             state.focus = state
                 .focus
-                .cycle_next_active(state.tasks_window_open, state.log_window_open)
+                .cycle_next_active(state.chat_open, state.log_window_open)
         }
         Action::BackTab => {
             state.focus = state
                 .focus
-                .cycle_prev_active(state.tasks_window_open, state.log_window_open)
+                .cycle_prev_active(state.chat_open, state.log_window_open)
         }
         Action::ToggleHelp => state.toggle_help(),
         Action::FocusChat => {
@@ -364,19 +364,19 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
                 state.focus = crate::state::Focus::Chat;
             }
         }
-        Action::Enter if state.focus == crate::state::Focus::OpsDag => {
+        Action::Enter if state.focus == crate::state::Focus::Work => {
             // Drill in: open the full-screen detail view for an operation
             // (or fold an instance/session header).
             state.open_selected_tree_detail();
         }
-        Action::ToggleNode if state.focus == crate::state::Focus::OpsDag => {
+        Action::ToggleNode if state.focus == crate::state::Focus::Work => {
             // Space: inline accordion-expand the selected task into its
             // live/historic output view (or fold a header) without leaving
             // the tree.
-            state.toggle_selected_tree_node();
+            state.toggle_selected_tree_node(crate::ui::wall_ms());
         }
         Action::DetailClose => state.close_modal(),
-        Action::ToggleProjectFilter if state.focus == crate::state::Focus::OpsDag => {
+        Action::ToggleProjectFilter if state.focus == crate::state::Focus::Work => {
             state.show_all_projects = !state.show_all_projects;
         }
         Action::Unknown | Action::Enter => {}
@@ -688,7 +688,7 @@ fn scroll_focus_up(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::OpsDag => state.ops_selected = state.ops_selected.saturating_sub(1),
+        Focus::Work => state.ops_selected = state.ops_selected.saturating_sub(1),
         Focus::Log => {
             state.detach_log_follow();
             state.log_scroll = state.log_scroll.saturating_sub(1);
@@ -706,7 +706,7 @@ fn scroll_focus_down(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::OpsDag if state.ops_row_count() > 0 => {
+        Focus::Work if state.ops_row_count() > 0 => {
             state.ops_selected = (state.ops_selected + 1).min(state.ops_row_count() - 1);
         }
         // While following we are already pinned to the bottom — nothing to do
@@ -732,7 +732,7 @@ fn move_focus_to_top(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::OpsDag => state.ops_selected = 0,
+        Focus::Work => state.ops_selected = 0,
         Focus::Log => {
             state.log_follow = false;
             state.log_scroll = 0;
@@ -749,7 +749,7 @@ fn move_focus_to_bottom(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::OpsDag => state.ops_selected = state.ops_row_count().saturating_sub(1),
+        Focus::Work => state.ops_selected = state.ops_row_count().saturating_sub(1),
         Focus::Log => {
             // Jump to the newest line and resume tracking new output.
             state.log_follow = true;
@@ -2364,17 +2364,10 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
             state.chat.compact(4);
             push_assistant_message(state, "Context window compacted (kept 4 latest turns).");
         }
-        "/tasks" => {
-            if !state.tasks_window_open {
-                state.tasks_window_open = true;
-                state.focus = crate::state::Focus::OpsDag;
-            } else if state.focus == crate::state::Focus::OpsDag {
-                state.tasks_window_open = false;
-                state.focus = crate::state::Focus::Chat;
-            } else {
-                state.focus = crate::state::Focus::OpsDag;
-            }
-        }
+        // The work view is always on screen now, so `/tasks` focuses it. Kept
+        // because it is in a lot of muscle memory.
+        "/tasks" => state.focus = crate::state::Focus::Work,
+        "/chat" => toggle_chat_pane(state),
         "/log" => {
             if !state.log_window_open {
                 state.log_window_open = true;
@@ -2411,11 +2404,11 @@ fn handle_settings_nav_command(cmd: &str, state: &mut crate::state::AppState) ->
 fn maybe_auto_open_task_view(state: &mut crate::state::AppState) {
     use crate::state::OpStatus;
 
-    if !state.auto_view_pending || state.tasks_window_open {
+    if !state.auto_view_pending {
         return;
     }
     let project = state.project_root.as_deref();
-    let has_live_project_work = state.operations.iter().any(|op| {
+    let live = state.operations.iter().find(|op| {
         op.instance_id.is_some()
             && matches!(
                 op.status,
@@ -2426,11 +2419,38 @@ fn maybe_auto_open_task_view(state: &mut crate::state::AppState) {
                 _ => true,
             }
     });
-    if has_live_project_work {
-        state.auto_view_pending = false;
-        state.tasks_window_open = true;
-        state.focus = crate::state::Focus::OpsDag;
+    let Some(live) = live else { return };
+
+    // Open the section that work belongs to, rather than merely switching to a
+    // view of everything: a user who opens the TUI mid-build wants that build's
+    // output, not a list they then have to click into (SPEC R24.2).
+    state.auto_view_pending = false;
+    state.focus = crate::state::Focus::Work;
+    let now = crate::ui::wall_ms();
+    state.rebuild_work_view(now);
+    let live_instance = live.instance_id.clone();
+    let key = state
+        .work_sections
+        .borrow()
+        .iter()
+        .find(|s| live_instance.as_deref() == Some(s.key.as_str()))
+        .map(|s| s.key.clone());
+    if let Some(key) = key
+        && state.open_section.as_deref() != Some(key.as_str())
+    {
+        state.toggle_section(&key, now);
     }
+}
+
+/// Open or close the chat pane (SPEC R24.9): it is a thing you choose to do,
+/// not the screen the window is for.
+fn toggle_chat_pane(state: &mut crate::state::AppState) {
+    state.chat_open = !state.chat_open;
+    state.focus = if state.chat_open {
+        crate::state::Focus::Chat
+    } else {
+        crate::state::Focus::Work
+    };
 }
 
 fn handle_mcp_list(state: &mut crate::state::AppState) {
@@ -4683,13 +4703,13 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
                     tx.clone(),
                 );
             }
-            state.focus = crate::state::Focus::OpsDag;
+            state.focus = crate::state::Focus::Work;
         }
         ClickTarget::PinOperation(op_id) => {
             if let Some(op) = state.operations.iter_mut().find(|o| o.id == op_id) {
                 op.pinned = !op.pinned;
             }
-            state.focus = crate::state::Focus::OpsDag;
+            state.focus = crate::state::Focus::Work;
         }
         ClickTarget::AnalyzeOperation(op_id) => {
             analyze_operation(state, &op_id);
@@ -4703,7 +4723,7 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
         }
         ClickTarget::SelectOperation(op_idx) => {
             state.ops_selected = op_idx;
-            state.focus = crate::state::Focus::OpsDag;
+            state.focus = crate::state::Focus::Work;
         }
         ClickTarget::CloseWindow(win_id) => {
             close_window_by_id(win_id, state);
@@ -4715,10 +4735,18 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
         }
         ClickTarget::TreeRow(row_idx) => {
             // Click = select + toggle: accordion-expand an operation into its
-            // live/historic output view, or fold an instance/session header.
+            // live/historic output view, or fold a session group.
             state.ops_selected = row_idx;
-            state.toggle_selected_tree_node();
-            state.focus = crate::state::Focus::OpsDag;
+            state.work_follow_selection.set(true);
+            state.toggle_selected_tree_node(crate::ui::wall_ms());
+            state.focus = crate::state::Focus::Work;
+        }
+        ClickTarget::SectionHeader(key) => {
+            // Clicking a header opens that section and closes whichever was
+            // open, over the 300ms tween (SPEC R24.9).
+            let now = crate::ui::wall_ms();
+            state.toggle_section(&key, now);
+            state.focus = crate::state::Focus::Work;
         }
         ClickTarget::OpenOperationDetail(op_id) => {
             state.open_operation_detail(op_id);
@@ -4844,8 +4872,8 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
         state.focus = crate::state::Focus::Log;
         return;
     }
-    if inside_rect(col, row, state.ops_area.get()) {
-        state.focus = crate::state::Focus::OpsDag;
+    if inside_rect(col, row, state.work_area.get()) {
+        state.focus = crate::state::Focus::Work;
     }
 }
 
@@ -5672,8 +5700,8 @@ mod tests {
         state.chat_area.set(Rect::new(10, 0, 20, 10));
         state.log_area.set(Rect::new(30, 0, 20, 15));
 
-        // Start with Focus::OpsDag
-        state.focus = Focus::OpsDag;
+        // Start with Focus::Work
+        state.focus = Focus::Work;
 
         // Click on Chat Input Area -> should change focus to Chat
         super::handle_mouse_click(15, 12, &mut state);
@@ -5820,38 +5848,49 @@ mod tests {
         );
     }
 
-    /// `z`/Enter zoom toggles the focused pane full-screen; Esc restores the
-    /// layout before it returns focus to chat.
+    /// Only the log pane zooms now: the work view *is* the screen, so there is
+    /// nothing to zoom it out of (SPEC R24.9).
     #[test]
-    fn zoom_toggles_focused_pane_and_esc_restores() {
+    fn only_the_log_pane_zooms() {
         use crate::keymap::Action;
         use crate::state::{AppState, Focus};
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
 
-        state.focus = Focus::OpsDag;
+        state.focus = Focus::Work;
         super::handle_action(Action::ToggleZoom, &mut state);
-        assert_eq!(state.zoomed, Some(Focus::OpsDag));
+        assert_eq!(state.zoomed, None, "the work view fills the screen already");
 
-        // Esc: first unzoom (focus stays), then focus chat.
+        state.focus = Focus::Log;
+        super::handle_action(Action::ToggleZoom, &mut state);
+        assert_eq!(state.zoomed, Some(Focus::Log));
+
+        // Esc unzooms first, leaving focus where it was.
         super::handle_action(Action::FocusChat, &mut state);
         assert_eq!(state.zoomed, None);
-        assert_eq!(state.focus, Focus::OpsDag);
-        super::handle_action(Action::FocusChat, &mut state);
-        assert_eq!(state.focus, Focus::Chat);
-
-        // Chat focus is not zoomable.
-        super::handle_action(Action::ToggleZoom, &mut state);
-        assert_eq!(state.zoomed, None);
+        assert_eq!(state.focus, Focus::Log);
     }
 
-    /// `/tasks` opens the tasks window and sets focus.
+    /// The work view is always on screen, so `/tasks` focuses it — and `/chat`
+    /// is the toggle now, because chat is the thing you choose to do
+    /// (SPEC R24.9).
     #[test]
-    fn tasks_command_opens_tasks_window() {
+    fn chat_is_the_toggle_and_tasks_focuses_the_work_view() {
         use crate::state::{AppState, Focus};
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        assert_eq!(state.focus, Focus::Work, "the TUI opens on the work view");
+        assert!(!state.chat_open, "and chat starts closed");
+
+        assert!(super::handle_basic_nav_command("/chat", &mut state));
+        assert!(state.chat_open);
+        assert_eq!(state.focus, Focus::Chat);
+
         assert!(super::handle_basic_nav_command("/tasks", &mut state));
-        assert!(state.tasks_window_open);
-        assert_eq!(state.focus, Focus::OpsDag);
+        assert_eq!(state.focus, Focus::Work, "/tasks focuses the work view");
+        assert!(state.chat_open, "without closing chat");
+
+        assert!(super::handle_basic_nav_command("/chat", &mut state));
+        assert!(!state.chat_open);
+        assert_eq!(state.focus, Focus::Work, "closing chat returns focus");
     }
 
     /// Startup notices reach the screen: everything into the log pane, and
@@ -5891,7 +5930,11 @@ mod tests {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         assert!(super::handle_basic_nav_command("/scope", &mut state));
         assert!(state.scope_window_open);
-        assert_eq!(state.focus, Focus::Chat, "no focus change");
+        assert_eq!(
+            state.focus,
+            Focus::Work,
+            "focus stays where it was — the work view is where the TUI opens"
+        );
         assert!(super::handle_basic_nav_command("/scope", &mut state));
         assert!(!state.scope_window_open);
     }
