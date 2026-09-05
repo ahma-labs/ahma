@@ -66,9 +66,16 @@ world-writable directory is still squattable, which is why the directory is
 checked and not only the socket.
 
 On **Windows** there are no filesystem sockets, so `daemon.lock` (a kernel
-advisory lock, released automatically when its holder dies) is the mutex, both
-listeners bind ephemeral ports, and `daemon.json` publishes them with a random
-bearer token that stands in for the mode bits.
+advisory lock, released automatically when its holder dies) is the mutex, and
+`daemon.json` publishes the daemon's ports with a random bearer token that
+stands in for the mode bits.
+
+Windows still binds the historical fixed loopback ports rather than ephemeral
+ones, and discovery still reads those rather than the descriptor — so on a
+shared machine the token, not the port, is what keeps another local user out.
+This is not finished work: it could not be compiled, let alone tested, on the
+machine it was written on, and shipping an unverified rendezvous change is how
+a daemon becomes unreachable on a platform you cannot debug.
 
 ## Lifetime
 

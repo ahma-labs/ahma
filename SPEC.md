@@ -52,7 +52,7 @@
 | Execution Audit Log (R-HANDOFF.10) | tests-pass | Append-only `<log dir>/audit.jsonl` on every execution path (sync, async, PTY, session), in the vault's wire format; `tool_call` before spawn, one `tool_complete` on every terminal path, sandbox denials included; write failures warn and never fail the operation |
 | Profile Network Hosts (R-PERM.5.3) | tests-pass | Sandbox profiles declare the hosts their toolchain needs, each with a reason; union with `[network] allow`, refusable independently of path grants (`[network] profile_hosts` / `deny_profile_hosts`); label-anchored ASCII-only matching. Restriction itself stays opt-in |
 | `ahma setup` / `ahma uninstall` | tests-pass | Interactive wizard installs / removes MCP entries, hooks, skills, binary; symmetric teardown leaves other user config intact |
-| Single Per-User Daemon (R-DAEMON) | tests-pass | One daemon per user hosts the MCP endpoint and the observability hub, in a 0700 per-user runtime dir (Windows: lock + endpoint file + token). First comer starts it, never from a confined process or a test binary; idle exit needs both halves empty; upgrade drains rather than tearing down other windows' sessions. Workers stay one per session (R5.1). Hooks and the TUI register as instances; bounded output tails and a one-hour `history.jsonl` survive restarts. Explicitly-started `ahma serve http/unix` remain persistent and operator-owned |
+| Single Per-User Daemon (R-DAEMON) | tests-pass | One daemon per user hosts the MCP endpoint and the observability hub, in a 0700 per-user runtime dir (Windows: lock + endpoint file + token, but still on fixed loopback ports — ephemeral-port discovery is unwired and untestable here, R-DAEMON.2). First comer starts it, never from a confined process or a test binary; idle exit needs both halves empty; upgrade drains rather than tearing down other windows' sessions. Workers stay one per session (R5.1). Hooks and the TUI register as instances; bounded output tails and a one-hour `history.jsonl` survive restarts. Explicitly-started `ahma serve http/unix` remain persistent and operator-owned |
 | Binary Code Signing (R-SIGN) | in-progress | macOS ad-hoc binary gets `SIGKILL (Code Signature Invalid)` under heavy-build memory pressure / in-place rebuild → opaque `Connection closed`. Done: atomic out-of-place install + local re-sign in `ahma update` (R-SIGN.2, R-SIGN.1-local); signal-death classification surfaced in the client's JSON-RPC error + panic log-flush (R-SIGN.5). Pending: Developer-ID release signing (R-SIGN.1, blocked on Apple Developer credentials), Windows WDAC/SAC verify (R-SIGN.3) |
 
 ---
@@ -1413,10 +1413,21 @@ These three mechanisms together bound how long any abandoned `ahma serve stdio` 
     lose the bind to whichever daemon already held it, stand down, and leave
     nobody serving the endpoint it was asked for.
   - **Windows** has no filesystem sockets: `daemon.lock` (a kernel advisory
-    lock, released when its holder dies) is the mutex, both listeners bind
-    ephemeral ports, and an atomically written `daemon.json` publishes them with
-    a random bearer token that stands in for the mode bits. Liveness is the
-    lock, never a pid probe — a pid can be reused, a lock cannot.
+    lock, released when its holder dies) is the mutex, and an atomically
+    written `daemon.json` publishes the daemon's ports with a random bearer
+    token that stands in for the mode bits. Liveness is the lock, never a pid
+    probe — a pid can be reused, a lock cannot.
+  - **Not yet done on Windows: ephemeral ports.** The lock, the descriptor and
+    the token are written and tested on every platform, but both listeners
+    still bind the historical fixed loopback ports and discovery still reads
+    those rather than the descriptor — so any local user can still reach them,
+    and the token is the only thing between them and the endpoint. Wiring port
+    `0` blind was refused deliberately: this workspace cannot compile for
+    `x86_64-pc-windows-msvc` (`aws-lc-sys` needs an MSVC toolchain), so the
+    code could not be shown to build, let alone to work, and an untested
+    rendezvous change is how a daemon becomes unreachable on a platform nobody
+    here can debug. Until CI's Windows leg proves it, Windows keeps the fixed
+    ports and this gap is stated rather than papered over.
 
 - **R-DAEMON.3 — Lifetime.** The first comer starts it, detached (R-PROC.3),
   and **never from a process that is itself confined** (R7.6) — a daemon that
