@@ -218,9 +218,24 @@ async fn list_instances_answers_on_the_hub_socket() {
     let hub = HubServer::bind_at(socket.clone()).await.expect("bind");
     let task = tokio::spawn(hub.serve());
 
-    let listed = ahma_common::daemon_hub::list_instances_at(&socket)
+    // `list_instances_at` takes a socket *path* and is Unix-only by
+    // construction (it dials a `UnixStream` directly); the portable
+    // equivalent — connecting through `connect_to_daemon()`, which honours
+    // both env vars `isolated_socket()` set — is what this test actually
+    // needs, since it only ever talks to the hub it just bound.
+    let one_shot = ahma_common::daemon_hub::connect_to_daemon()
         .await
-        .expect("the hub answers a one-shot query");
+        .expect("connect to the hub this test just bound");
+    let (r, mut w) = tokio::io::split(one_shot);
+    let mut one_shot_reader = BufReader::new(r);
+    send_msg(&mut w, &ClientMsg::ListInstances).await.unwrap();
+    let listed = match recv_msg::<_, DaemonMsg>(&mut one_shot_reader)
+        .await
+        .expect("the hub answers a one-shot query")
+    {
+        DaemonMsg::InstanceList { instances } => instances,
+        other => panic!("expected an instance list, got {other:?}"),
+    };
     assert!(listed.is_empty(), "nothing has registered yet");
 
     // And an unknown message does not kill the connection (R24.5).
