@@ -570,7 +570,7 @@ async fn red_team_livelog_symlink_read_allowed() {
 
     // Use a non-tmp scope so --disable-temp-files does not reject the working dir.
     let scope_dir = create_non_tmp_scope_dir(); // sandbox scope
-    let log_dir = scope_dir.path().join("logs");
+    let log_dir = scope_dir.path().join(".ahma").join("logs");
     std::fs::create_dir_all(&log_dir).unwrap();
 
     let outside_dir = create_non_tmp_tempdir();

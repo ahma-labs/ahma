@@ -1,7 +1,7 @@
 //! # Logging Initialization
 //!
 //! Centralized logging for ahma processes. Every line is prefixed with `pid=` and
-//! `role=` so interleaved multi-process logs in `./logs/ahma.log` remain attributable.
+//! `role=` so interleaved multi-process logs in `.ahma/logs/ahma.log` remain attributable.
 
 use ahma_common::observability::{ObservabilityConfig, TelemetryGuard};
 use anyhow::{Context, Result};
@@ -151,13 +151,18 @@ pub fn set_log_dir_from_scope(dir: PathBuf) {
 /// 1. `--log-dir` CLI flag
 /// 2. `AHMA_LOG_DIR` env var (deprecated)
 /// 3. `[logging] dir` in `~/.ahma/settings.toml`
-/// 4. Primary sandbox scope `<scope>/logs` (set after `roots/list`)
-/// 5. `<workspace-root>/logs` if writable — see `log_anchor_dir`
+/// 4. Primary sandbox scope `<scope>/.ahma/logs` (set after `roots/list`)
+/// 5. `<workspace-root>/.ahma/logs` if writable — see `log_anchor_dir`
 /// 6. `~/.ahma/logs/<project-namespace>` — a per-project subdirectory, not one
 ///    shared flat file: the sandbox already enforces per-project isolation on
 ///    disk, and a single shared log would quietly undo that at the
 ///    observability layer (one project's commands/paths/errors readable
 ///    alongside every other project ahma has ever touched).
+///
+/// Cases 4 and 5 nest logs under `.ahma/`, ahma's own per-project directory,
+/// rather than directly at the workspace root: `.ahma/.gitignore` (see
+/// [`ensure_gitignore_entry`]) then keeps plaintext logs out of the tracked
+/// tree without ever touching the project's own top-level `.gitignore`.
 pub fn project_log_dir() -> PathBuf {
     if let Some(dir) = LOG_DIR_OVERRIDE.get() {
         return dir.clone();
@@ -184,7 +189,7 @@ pub fn project_log_dir() -> PathBuf {
         && cwd.parent().is_some()
     {
         let anchor = log_anchor_dir(&cwd);
-        let log_dir = anchor.join("logs");
+        let log_dir = anchor.join(".ahma").join("logs");
         let exists_and_writeable = log_dir.exists() && is_writeable(&log_dir);
         let can_create = !log_dir.exists() && is_writeable(&anchor);
         if exists_and_writeable || can_create {
@@ -199,7 +204,7 @@ pub fn project_log_dir() -> PathBuf {
             .join(project_log_namespace());
     }
 
-    PathBuf::from(".").join("logs")
+    PathBuf::from(".").join(".ahma").join("logs")
 }
 
 /// A stable, filesystem-safe, human-legible directory name for this project,
@@ -312,13 +317,27 @@ fn gitignore_covers_dir_name(gitignore: &Path, dir_name: &str) -> bool {
 
 static LOG_LOCATION_DISCLOSED: Once = Once::new();
 
+/// Is `dir` ahma's own managed per-project directory (`.ahma/`, or something
+/// nested under it)? Used to decide whether [`disclose_log_location_once`]
+/// may self-manage a `.gitignore` entry silently: `.ahma/` is ahma's own
+/// directory, so writing to `.ahma/.gitignore` is not the same trust decision
+/// as editing a project's top-level `.gitignore`, which is left to the user
+/// (or the explicit `ahma logs gitignore` command).
+fn is_ahma_managed_dir(dir: &Path) -> bool {
+    dir.components().any(|c| c.as_os_str() == ".ahma")
+}
+
 /// Emit a one-time, loud disclosure of the active log directory — so it is
 /// never ambiguous which of the possible locations ([`project_log_dir`]'s
-/// priority order) ended up active — and, if that directory lives inside a
-/// git repository without an existing ignore rule, a warning that plaintext
-/// operational logs (including full tool-call transcripts) are about to be
-/// written into the tracked working tree, with the remedy. Safe to call from
-/// multiple places; only the first call does anything.
+/// priority order) ended up active. When the directory is ahma's own
+/// managed `.ahma/logs` (the default), any missing ignore rule is added to
+/// `.ahma/.gitignore` silently and automatically — the whole point of
+/// nesting logs under `.ahma/` is that users never have to touch their own
+/// `.gitignore` for this. For a custom location outside `.ahma/` (e.g. a
+/// bespoke `--log-dir` inside the tree), ahma instead warns that plaintext
+/// operational logs — including full tool-call transcripts — are not yet
+/// covered by an ignore rule, naming the remedy. Safe to call from multiple
+/// places; only the first call does anything.
 pub fn disclose_log_location_once() {
     LOG_LOCATION_DISCLOSED.call_once(|| {
         let log_dir = project_log_dir();
@@ -326,6 +345,14 @@ pub fn disclose_log_location_once() {
             log_dir = %log_dir.display(),
             "ahma: writing operational logs to this directory"
         );
+
+        if is_ahma_managed_dir(&log_dir) {
+            // Best-effort and silent: this is ahma's own directory to manage,
+            // and failure (e.g. not inside a git repo) simply means there is
+            // nothing to gitignore.
+            let _ = ensure_gitignore_entry();
+            return;
+        }
 
         if let Some(repo_root) = find_git_root(&log_dir)
             && !is_log_dir_gitignored(&repo_root, &log_dir)
@@ -344,9 +371,15 @@ pub fn disclose_log_location_once() {
 }
 
 /// Add an ignore rule for the active log directory to the nearest
-/// `.gitignore` (creating one at the repo root if none exists yet). Returns
-/// `Ok(true)` if an entry was added, `Ok(false)` if one already covered it.
-/// Errors if the active log directory is not inside a git repository at all.
+/// `.gitignore` — the one in the log directory's own parent, creating both
+/// the directory and the file if neither exists yet. For the default
+/// `<scope-or-repo-root>/.ahma/logs`, this lands the rule in
+/// `.ahma/.gitignore`, never the project's own top-level `.gitignore`.
+/// Returns `Ok(true)` if an entry was added, `Ok(false)` if one already
+/// covered it (checked from the log directory's parent up through the
+/// enclosing repository root, so a rule already present anywhere in that
+/// chain — including a project's own root `.gitignore` — counts). Errors if
+/// the active log directory is not inside a git repository at all.
 pub fn ensure_gitignore_entry() -> Result<bool> {
     let log_dir = project_log_dir();
     let repo_root = find_git_root(&log_dir).ok_or_else(|| {
@@ -362,8 +395,11 @@ pub fn ensure_gitignore_entry() -> Result<bool> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow::anyhow!("could not determine the log directory's name"))?;
+    let gitignore_dir = log_dir.parent().unwrap_or(&repo_root);
 
-    let gitignore_path = repo_root.join(".gitignore");
+    std::fs::create_dir_all(gitignore_dir)
+        .with_context(|| format!("Failed to create {}", gitignore_dir.display()))?;
+    let gitignore_path = gitignore_dir.join(".gitignore");
     let mut contents = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
     if !contents.is_empty() && !contents.ends_with('\n') {
         contents.push('\n');
@@ -742,7 +778,7 @@ mod tests {
         std::env::set_current_dir(&temp_path_canonical).unwrap();
 
         let dir = project_log_dir();
-        assert_eq!(dir, temp_path_canonical.join("logs"));
+        assert_eq!(dir, temp_path_canonical.join(".ahma").join("logs"));
 
         let _ = std::env::set_current_dir(prev);
     }
@@ -764,9 +800,9 @@ mod tests {
         let dir = project_log_dir();
         let _ = std::env::set_current_dir(prev);
 
-        assert_eq!(dir, repo_root.join("logs"));
+        assert_eq!(dir, repo_root.join(".ahma").join("logs"));
         assert!(
-            !command_cwd.join("logs").exists(),
+            !command_cwd.join(".ahma").exists(),
             "resolving the log dir must not litter the command's own directory"
         );
     }
@@ -833,7 +869,7 @@ mod tests {
                     "expected an 'unknown-<hash>' namespace, got {leaf:?}"
                 );
             } else {
-                assert_eq!(dir, PathBuf::from(".").join("logs"));
+                assert_eq!(dir, PathBuf::from(".").join(".ahma").join("logs"));
             }
             let _ = std::env::set_current_dir(prev);
         }
@@ -960,7 +996,7 @@ mod tests {
 
         let _ = std::env::set_current_dir(prev);
 
-        let expected_dir = temp_canon.join("logs");
+        let expected_dir = temp_canon.join(".ahma").join("logs");
         assert_eq!(out, expected_dir.join(BRIDGE_STDOUT_NAME));
         assert_eq!(err, expected_dir.join(BRIDGE_STDERR_NAME));
     }
@@ -987,16 +1023,16 @@ mod tests {
         let temp_canon = dunce::canonicalize(temp.path()).unwrap();
         std::env::set_current_dir(&temp_canon).unwrap();
 
-        // project_log_dir() -> <cwd>/logs which is writeable -> Some(appender).
+        // project_log_dir() -> <cwd>/.ahma/logs which is writeable -> Some(appender).
         // Exercises cleanup_old_logs + daily appender construction (+ unix symlink).
         let appender = try_create_file_appender();
-        let log_dir = temp_canon.join("logs");
+        let log_dir = temp_canon.join(".ahma").join("logs");
 
         let _ = std::env::set_current_dir(prev);
 
         assert!(
             appender.is_some(),
-            "writeable cwd/logs should yield an appender"
+            "writeable cwd/.ahma/logs should yield an appender"
         );
         assert!(log_dir.exists(), "log dir should be created");
 
@@ -1108,6 +1144,9 @@ mod tests {
         assert!(!is_log_dir_gitignored(&repo_root, &log_dir));
     }
 
+    /// The whole point of nesting logs under `.ahma/logs`: the ignore rule
+    /// lands in `.ahma/.gitignore`, and a project's own top-level
+    /// `.gitignore` is never created or touched.
     #[test]
     fn test_ensure_gitignore_entry_creates_file_when_missing() {
         let temp = tempdir().unwrap();
@@ -1121,8 +1160,12 @@ mod tests {
         let _ = std::env::set_current_dir(prev);
 
         assert!(matches!(added, Ok(true)));
-        let contents = fs::read_to_string(repo_root.join(".gitignore")).unwrap();
+        let contents = fs::read_to_string(repo_root.join(".ahma").join(".gitignore")).unwrap();
         assert!(contents.contains("logs/"), "got: {contents:?}");
+        assert!(
+            !repo_root.join(".gitignore").exists(),
+            "the project's own top-level .gitignore must not be created"
+        );
     }
 
     #[test]
@@ -1130,7 +1173,8 @@ mod tests {
         let temp = tempdir().unwrap();
         let repo_root = dunce::canonicalize(temp.path()).unwrap();
         fs::create_dir_all(repo_root.join(".git")).unwrap();
-        fs::write(repo_root.join(".gitignore"), "target/").unwrap(); // no trailing newline
+        fs::create_dir_all(repo_root.join(".ahma")).unwrap();
+        fs::write(repo_root.join(".ahma").join(".gitignore"), "settings.toml").unwrap(); // no trailing newline
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo_root).unwrap();
 
@@ -1139,8 +1183,8 @@ mod tests {
         let _ = std::env::set_current_dir(prev);
 
         assert!(matches!(added, Ok(true)));
-        let contents = fs::read_to_string(repo_root.join(".gitignore")).unwrap();
-        assert_eq!(contents, "target/\nlogs/\n");
+        let contents = fs::read_to_string(repo_root.join(".ahma").join(".gitignore")).unwrap();
+        assert_eq!(contents, "settings.toml\nlogs/\n");
     }
 
     #[test]
@@ -1159,6 +1203,40 @@ mod tests {
 
         assert!(matches!(added, Ok(false)));
         assert_eq!(contents_before, "logs/\n", "must not duplicate the entry");
+    }
+
+    #[test]
+    fn test_is_ahma_managed_dir() {
+        assert!(is_ahma_managed_dir(Path::new("/repo/.ahma/logs")));
+        assert!(is_ahma_managed_dir(Path::new("/repo/.ahma")));
+        assert!(!is_ahma_managed_dir(Path::new("/repo/logs")));
+        assert!(!is_ahma_managed_dir(Path::new(
+            "/home/me/.ahma_backup/logs"
+        )));
+    }
+
+    /// The default `.ahma/logs` location is ahma's own directory, so the
+    /// ignore rule is self-managed silently — no warning, and the project's
+    /// own top-level `.gitignore` is left untouched (SPEC R8.1/R8.3).
+    #[test]
+    fn test_disclose_log_location_once_auto_gitignores_ahma_managed_dir() {
+        let _g = ENV_MUTEX.lock();
+        let temp = tempdir().unwrap();
+        let repo_root = dunce::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo_root).unwrap();
+
+        disclose_log_location_once();
+
+        let _ = std::env::set_current_dir(prev);
+
+        let contents = fs::read_to_string(repo_root.join(".ahma").join(".gitignore")).unwrap();
+        assert!(contents.contains("logs/"), "got: {contents:?}");
+        assert!(
+            !repo_root.join(".gitignore").exists(),
+            "the project's own top-level .gitignore must not be touched"
+        );
     }
 
     #[test]

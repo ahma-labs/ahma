@@ -5,7 +5,7 @@
 //!
 //! ## Security model
 //!
-//! All requested paths are resolved relative to the project log directory (`./logs/`
+//! All requested paths are resolved relative to the project log directory (`.ahma/logs/`
 //! within the sandbox scope). Absolute paths are rejected.  Traversals (`../`) are
 //! normalised away by `canonicalize` and rejected if they escape the log directory.
 //!

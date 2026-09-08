@@ -1283,9 +1283,10 @@ pub struct Cli {
     pub log_to_stderr: bool,
 
     /// Directory for rolling log files. Defaults to the sandbox scope's
-    /// `logs/`, else `logs/` at the enclosing repository root, falling back to
-    /// `~/.ahma/logs`. Set `[logging] dir` in settings.toml to make a choice
-    /// persistent. Replaces the deprecated AHMA_LOG_DIR environment variable.
+    /// `.ahma/logs/`, else `.ahma/logs/` at the enclosing repository root,
+    /// falling back to `~/.ahma/logs`. Set `[logging] dir` in settings.toml to
+    /// make a choice persistent. Replaces the deprecated AHMA_LOG_DIR
+    /// environment variable.
     #[arg(long = "log-dir", value_name = "PATH", global = true)]
     pub log_dir: Option<PathBuf>,
 
@@ -1834,8 +1835,11 @@ pub struct LogsArgs {
 /// Subcommands for `ahma logs` — manage where ahma writes its operational
 /// logs. The active directory follows a priority order (`--log-dir` flag,
 /// `AHMA_LOG_DIR`, `[logging] dir` in settings.toml, sandbox scope,
-/// `logs/` at the enclosing repository root, then a per-project directory
-/// under `~/.ahma/logs`); ahma discloses which one is active at startup.
+/// `.ahma/logs/` at the enclosing repository root, then a per-project
+/// directory under `~/.ahma/logs`); ahma discloses which one is active at
+/// startup. The default `.ahma/logs` location is gitignored automatically
+/// (via `.ahma/.gitignore`) — this subcommand exists for the uncommon case
+/// of a custom `--log-dir` pointed elsewhere inside a git working tree.
 #[derive(Subcommand, Debug, Clone)]
 pub enum LogsCommand {
     /// Add an ignore rule for the active log directory to the nearest

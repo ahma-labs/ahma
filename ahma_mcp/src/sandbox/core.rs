@@ -106,7 +106,7 @@ fn resolve_livelog_scopes(canonicalized: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn log_dir_for_scope(scope: &Path) -> PathBuf {
-    scope.join("logs")
+    scope.join(".ahma").join("logs")
 }
 
 fn resolve_log_dir_symlinks(

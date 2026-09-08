@@ -2715,8 +2715,12 @@ mod tests {
         let _ = std::env::set_current_dir(prev);
 
         result.expect("gitignore command should succeed inside a git repo");
-        let contents = std::fs::read_to_string(repo_root.join(".gitignore")).unwrap();
+        let contents = std::fs::read_to_string(repo_root.join(".ahma").join(".gitignore")).unwrap();
         assert!(contents.contains("logs/"), "got: {contents:?}");
+        assert!(
+            !repo_root.join(".gitignore").exists(),
+            "the project's own top-level .gitignore must not be created"
+        );
     }
 
     #[test]
