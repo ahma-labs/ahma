@@ -237,7 +237,7 @@ async fn spawn_daemon(
     }
     anyhow::bail!(
         "The ahma daemon did not become reachable within {timeout:?}. \
-         Check logs/ahma.log, or run `ahma daemon` in a terminal to see why."
+         Check .ahma/logs/ahma.log, or run `ahma daemon` in a terminal to see why."
     )
 }
 

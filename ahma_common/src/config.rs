@@ -1128,7 +1128,7 @@ pub fn ensure_sandbox_directory(path: &Path) -> Result<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggingSettings {
-    /// Log destination: `"file"` (rolling log under `./logs/`) or `"stderr"`.
+    /// Log destination: `"file"` (rolling log under `.ahma/logs/`) or `"stderr"`.
     /// `"stderr"` is useful for Docker, CI, or any environment where
     /// stdout/stderr is captured.
     /// Default: `"file"`
@@ -1145,8 +1145,8 @@ pub struct LoggingSettings {
     /// Directory for ahma's operational logs.  The persistent equivalent of the
     /// `--log-dir` flag, for keeping logs out of the working tree entirely
     /// (e.g. `~/.ahma/logs`).  Empty means "resolve automatically": the sandbox
-    /// scope's `logs/` when one is locked, otherwise `logs/` at the enclosing
-    /// repository root.  `~` is expanded.
+    /// scope's `.ahma/logs/` when one is locked, otherwise `.ahma/logs/` at the
+    /// enclosing repository root.  `~` is expanded.
     /// Default: `""`
     pub dir: String,
 }
@@ -2068,7 +2068,7 @@ impl AhmaSettings {
             d.logging.monitor_rate_limit_secs.to_string(),
         );
         w.setting(
-            "Directory for ahma's operational logs (persistent form of --log-dir). Empty resolves automatically: the sandbox scope's logs/, else logs/ at the repository root.",
+            "Directory for ahma's operational logs (persistent form of --log-dir). Empty resolves automatically: the sandbox scope's .ahma/logs/, else .ahma/logs/ at the repository root.",
             "dir",
             toml_str(&self.logging.dir),
             toml_str(&d.logging.dir),

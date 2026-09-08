@@ -39,7 +39,9 @@ coverage_summary.md
 analysis_results/
 CODE_SIMPLICITY.*
 
-# Local Ahma Logs and temporary files during development
+# Temporary files during development. Ahma's own operational logs default to
+# .ahma/logs/, which is gitignored automatically via .ahma/.gitignore; this
+# broader pattern remains as a general fallback for other logs/ directories.
 **/logs/
 **/temp/
 

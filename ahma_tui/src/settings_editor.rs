@@ -595,7 +595,7 @@ impl SettingsEditor {
             SettingItem {
                 key: "logging.dir",
                 label: "Log directory",
-                description: "Empty = repo root's logs/; set to keep logs out of the tree",
+                description: "Empty = repo root's .ahma/logs/; set to keep logs out of the tree",
                 value: SettingValue::String(l.dir.clone()),
                 default_value: SettingValue::String(d.dir.clone()),
                 security_tier: false,

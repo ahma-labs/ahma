@@ -320,7 +320,7 @@ By default, the system temp directory is accessible only via platform-implicit r
 
 ## Live Log Monitoring (`--livelog`)
 
-The `--livelog` flag grants additional read-only access to specific log files via symlinks in the `log/` directory at server startup — see [live-log-monitoring.md](live-log-monitoring.md) and [SPEC.md R9](../SPEC.md).
+The `--livelog` flag grants additional read-only access to specific log files via symlinks in the `.ahma/logs/` directory at server startup — see [live-log-monitoring.md](live-log-monitoring.md) and [SPEC.md R9](../SPEC.md).
 
 ---
 

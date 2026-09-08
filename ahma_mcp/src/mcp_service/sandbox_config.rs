@@ -669,7 +669,7 @@ impl AhmaMcpService {
             .first()
             .map(|p| p.to_path_buf());
         if let Some(ref scope) = primary_scope {
-            crate::utils::logging::set_log_dir_from_scope(scope.join("logs"));
+            crate::utils::logging::set_log_dir_from_scope(scope.join(".ahma").join("logs"));
         }
 
         // Per-client tool discovery: load tools from `<root>/.ahma/` if present.

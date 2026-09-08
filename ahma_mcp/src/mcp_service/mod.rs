@@ -417,7 +417,7 @@ impl AhmaMcpService {
                 self.generate_input_schema_for_run_terminal_command(),
             ),
             BuiltinTool::LogsList => (
-                "List all log files in the project log directory (`./logs/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.",
+                "List all log files in the project log directory (`.ahma/logs/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.",
                 handlers::log_tools::logs_list_schema(),
             ),
             BuiltinTool::LogsApprove => (
