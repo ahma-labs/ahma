@@ -519,22 +519,18 @@ impl LlmClient {
 
     // ─── Chat ─────────────────────────────────────────────────────────────────
 
-    /// Send a chat conversation and stream back token chunks.
-    ///
-    /// Returns a `Stream` of `Result<String>` where each `Ok` item is a text
-    /// delta from the server-sent-events stream.  The stream ends when the
-    /// server sends `data: [DONE]`.
-    pub fn chat_stream(
+    /// Build the (url, body) pair for [`chat_stream`](Self::chat_stream),
+    /// isolating the per-flavor request-shaping match (OpenAI's flat message
+    /// list vs. Anthropic's system/messages split) from the stream plumbing
+    /// that follows it.
+    fn build_chat_stream_request(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: &[ChatMessage],
         system_prompt: Option<&str>,
-    ) -> impl Stream<Item = Result<String, LlmMonitorError>> + '_ {
-        use futures::StreamExt as _;
-        use futures::stream;
-
-        let (url, body) = match self.flavor {
+    ) -> (String, Value) {
+        match self.flavor {
             ApiFlavor::OpenAi => {
-                let mut body = build_chat_stream_body(&self.model, &messages, system_prompt);
+                let mut body = build_chat_stream_body(&self.model, messages, system_prompt);
                 self.apply_num_ctx(&mut body);
                 (format!("{}/chat/completions", self.base_url), body)
             }
@@ -543,7 +539,7 @@ impl LlmClient {
                 if let Some(sys) = system_prompt {
                     openai_msgs.push(json!({"role": "system", "content": sys}));
                 }
-                for message in &messages {
+                for message in messages {
                     openai_msgs.push(message.as_openai_message());
                 }
                 let (system, amsgs) = anthropic::openai_to_anthropic(&openai_msgs);
@@ -560,7 +556,23 @@ impl LlmClient {
                     ),
                 )
             }
-        };
+        }
+    }
+
+    /// Send a chat conversation and stream back token chunks.
+    ///
+    /// Returns a `Stream` of `Result<String>` where each `Ok` item is a text
+    /// delta from the server-sent-events stream.  The stream ends when the
+    /// server sends `data: [DONE]`.
+    pub fn chat_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        system_prompt: Option<&str>,
+    ) -> impl Stream<Item = Result<String, LlmMonitorError>> + '_ {
+        use futures::StreamExt as _;
+        use futures::stream;
+
+        let (url, body) = self.build_chat_stream_request(&messages, system_prompt);
         let http = self.http.clone();
         let api_key = self.api_key.clone();
         let flavor = self.flavor;
@@ -896,6 +908,27 @@ impl StreamingToolAccumulator {
         (content, thinking)
     }
 
+    /// Return the `(id, name, arguments)` accumulator slot for `index`,
+    /// growing `self.tools` with empty slots as new indices appear.
+    fn tool_slot(&mut self, index: usize) -> &mut (String, String, String) {
+        while self.tools.len() <= index {
+            self.tools
+                .push((String::new(), String::new(), String::new()));
+        }
+        &mut self.tools[index]
+    }
+
+    /// Replace `*target` with `value` when `value` is present and non-empty.
+    /// Used for the `id`/`name` fields, which arrive once (not accumulated)
+    /// on whichever chunk first carries them.
+    fn set_if_present(target: &mut String, value: Option<&str>) {
+        if let Some(v) = value
+            && !v.is_empty()
+        {
+            *target = v.to_string();
+        }
+    }
+
     /// Fold `delta.tool_calls` fragments (keyed by `index`) into `self.tools`,
     /// growing the accumulator as new indices appear.
     fn accumulate_tool_call_deltas(&mut self, delta: &Value) {
@@ -904,21 +937,12 @@ impl StreamingToolAccumulator {
         };
         for call in calls {
             let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            while self.tools.len() <= index {
-                self.tools
-                    .push((String::new(), String::new(), String::new()));
-            }
-            let slot = &mut self.tools[index];
-            if let Some(id) = call.get("id").and_then(Value::as_str)
-                && !id.is_empty()
-            {
-                slot.0 = id.to_string();
-            }
-            if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
-                && !name.is_empty()
-            {
-                slot.1 = name.to_string();
-            }
+            let slot = self.tool_slot(index);
+            Self::set_if_present(&mut slot.0, call.get("id").and_then(Value::as_str));
+            Self::set_if_present(
+                &mut slot.1,
+                call.pointer("/function/name").and_then(Value::as_str),
+            );
             if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
                 slot.2.push_str(args);
             }
@@ -1111,6 +1135,31 @@ fn process_stream_line(
     StreamLineOutcome::Chunk { content, thinking }
 }
 
+/// Forward one line's content/thinking fragments to `deltas`, logging the
+/// first streamed token exactly once. Isolated from
+/// [`drain_streaming_deltas`]'s line-buffering loop so that loop reads as a
+/// flat sequence of "parse a line, forward its deltas" steps rather than
+/// nesting two more `if let`s inside it.
+async fn forward_stream_deltas(
+    content: Option<String>,
+    thinking: Option<String>,
+    deltas: &tokio::sync::mpsc::Sender<StreamDelta>,
+    model: &str,
+    started: std::time::Instant,
+    first_token_logged: &mut bool,
+) {
+    if let Some(c) = content {
+        if !*first_token_logged {
+            *first_token_logged = true;
+            info!(model = %model, elapsed_ms = started.elapsed().as_millis(), "llm: first streamed token");
+        }
+        let _ = deltas.send(StreamDelta::Content(c)).await;
+    }
+    if let Some(t) = thinking {
+        let _ = deltas.send(StreamDelta::Thinking(t)).await;
+    }
+}
+
 /// Drain an OpenAI-compatible SSE byte stream to completion, forwarding
 /// content/thinking deltas live via `deltas`, and return the accumulated
 /// `{choices:[{message}]}` JSON (with `usage`, if seen) once the stream
@@ -1142,16 +1191,15 @@ async fn drain_streaming_deltas(
                 StreamLineOutcome::Done => break 'outer,
                 StreamLineOutcome::Chunk { content, thinking } => (content, thinking),
             };
-            if let Some(c) = content_delta {
-                if !first_token_logged {
-                    first_token_logged = true;
-                    info!(model = %model, elapsed_ms = started.elapsed().as_millis(), "llm: first streamed token");
-                }
-                let _ = deltas.send(StreamDelta::Content(c)).await;
-            }
-            if let Some(t) = thinking_delta {
-                let _ = deltas.send(StreamDelta::Thinking(t)).await;
-            }
+            forward_stream_deltas(
+                content_delta,
+                thinking_delta,
+                deltas,
+                model,
+                started,
+                &mut first_token_logged,
+            )
+            .await;
         }
         match byte_stream.next().await {
             None => break,
@@ -1166,6 +1214,29 @@ async fn drain_streaming_deltas(
     Ok(acc.into_response_json(usage, finish_reason))
 }
 
+/// Result of parsing one SSE line during [`chat_stream_poll`]: nothing to
+/// yield yet, the stream's done, or a token to yield.
+enum PollLineOutcome {
+    Skip,
+    Done,
+    Token(String),
+}
+
+/// Parse one already-dechunked SSE line per `flavor` into a
+/// [`PollLineOutcome`], isolating the flavor dispatch and `"__DONE__"`
+/// sentinel check from [`chat_stream_poll`]'s read loop.
+fn resolve_poll_line(flavor: ApiFlavor, line: &str) -> PollLineOutcome {
+    let parsed = match flavor {
+        ApiFlavor::OpenAi => parse_sse_line(line),
+        ApiFlavor::Anthropic => anthropic::parse_sse_line(line),
+    };
+    match parsed {
+        None => PollLineOutcome::Skip,
+        Some(token) if token == "__DONE__" => PollLineOutcome::Done,
+        Some(token) => PollLineOutcome::Token(token),
+    }
+}
+
 async fn chat_stream_poll(
     mut stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, LlmMonitorError>> + Send>>,
     mut buffer: String,
@@ -1174,24 +1245,20 @@ async fn chat_stream_poll(
     use futures::StreamExt as _;
     loop {
         if let Some(line) = take_sse_line(&mut buffer) {
-            let parsed = match flavor {
-                ApiFlavor::OpenAi => parse_sse_line(&line),
-                ApiFlavor::Anthropic => anthropic::parse_sse_line(&line),
-            };
-            if let Some(token) = parsed {
-                if token == "__DONE__" {
-                    return Some((Ok(String::new()), ChatStreamState::Done));
+            match resolve_poll_line(flavor, &line) {
+                PollLineOutcome::Skip => continue,
+                PollLineOutcome::Done => return Some((Ok(String::new()), ChatStreamState::Done)),
+                PollLineOutcome::Token(token) => {
+                    return Some((
+                        Ok(token),
+                        ChatStreamState::Streaming {
+                            stream,
+                            buffer,
+                            flavor,
+                        },
+                    ));
                 }
-                return Some((
-                    Ok(token),
-                    ChatStreamState::Streaming {
-                        stream,
-                        buffer,
-                        flavor,
-                    },
-                ));
             }
-            continue;
         }
 
         match stream.next().await {

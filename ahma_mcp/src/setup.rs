@@ -503,27 +503,32 @@ pub fn detect_mcp_config_drifts() -> Vec<McpConfigDrift> {
         .copied()
         .filter(|p| p.supports_mcp())
         .filter_map(|platform| {
-            let (path, format) = platform.mcp_config(&home)?;
-            if !path.exists() {
-                return None;
-            }
-            match format {
-                McpConfigFormat::Toml => {
-                    detect_toml_drift(platform, path, build_codex_toml_value("stdio"))
-                }
-                McpConfigFormat::Json(servers_key) => {
-                    let recommended = select_mcp_json_entry(
-                        platform,
-                        "stdio",
-                        &servers_entry,
-                        &scoped_servers_entry,
-                        &home,
-                    );
-                    detect_json_drift(platform, path, servers_key, recommended)
-                }
-            }
+            detect_platform_mcp_drift(platform, &home, &servers_entry, &scoped_servers_entry)
         })
         .collect()
+}
+
+/// Drift for one platform's MCP config, or `None` when the platform has no
+/// config file on disk yet (nothing to correct) — see [`detect_toml_drift`]
+/// and [`detect_json_drift`] for the "file exists but matches" case.
+fn detect_platform_mcp_drift(
+    platform: Platform,
+    home: &Path,
+    servers_entry: &serde_json::Value,
+    scoped_servers_entry: &serde_json::Value,
+) -> Option<McpConfigDrift> {
+    let (path, format) = platform.mcp_config(home)?;
+    if !path.exists() {
+        return None;
+    }
+    match format {
+        McpConfigFormat::Toml => detect_toml_drift(platform, path, build_codex_toml_value("stdio")),
+        McpConfigFormat::Json(servers_key) => {
+            let recommended =
+                select_mcp_json_entry(platform, "stdio", servers_entry, scoped_servers_entry, home);
+            detect_json_drift(platform, path, servers_key, recommended)
+        }
+    }
 }
 
 /// Drift for one Codex-style TOML config, or `None` when there is nothing to
@@ -803,6 +808,24 @@ pub(crate) fn skill_install_dirs(home: &Path) -> [PathBuf; 2] {
     ]
 }
 
+/// Writes the bundled skill content to `skill_dir/SKILL.md`, creating
+/// `skill_dir` first. Self-contained per-directory step of
+/// [`setup_agent_skills`], pulled out so the loop over install directories
+/// stays flat.
+async fn install_agent_skill_to(skill_dir: &Path, interactive: bool) -> Result<()> {
+    let skill_path = skill_dir.join("SKILL.md");
+    tokio::fs::create_dir_all(skill_dir)
+        .await
+        .with_context(|| format!("Failed to create directory {}", skill_dir.display()))?;
+    tokio::fs::write(&skill_path, SKILL_CONTENT)
+        .await
+        .with_context(|| format!("Failed to write skill to {}", skill_path.display()))?;
+    if interactive {
+        println!("✓ Installed ahma skill to {}", skill_path.display());
+    }
+    Ok(())
+}
+
 async fn setup_agent_skills(interactive: bool) -> Result<()> {
     // `ahma_home_dir`, not `dirs::home_dir`: `uninstall_agent_skills` resolves the
     // same directories through it, and the two must agree or an install/uninstall
@@ -812,16 +835,7 @@ async fn setup_agent_skills(interactive: bool) -> Result<()> {
         .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
     for skill_dir in skill_install_dirs(&home) {
-        let skill_path = skill_dir.join("SKILL.md");
-        tokio::fs::create_dir_all(&skill_dir)
-            .await
-            .with_context(|| format!("Failed to create directory {}", skill_dir.display()))?;
-        tokio::fs::write(&skill_path, SKILL_CONTENT)
-            .await
-            .with_context(|| format!("Failed to write skill to {}", skill_path.display()))?;
-        if interactive {
-            println!("✓ Installed ahma skill to {}", skill_path.display());
-        }
+        install_agent_skill_to(&skill_dir, interactive).await?;
     }
 
     // Migrate away from the legacy Claude Code *plugin* install (version-stamped
@@ -894,17 +908,17 @@ async fn setup_llm_prompts(interactive: bool) -> Result<()> {
 
     let new_template = AhmaPrompts::generate_template();
 
-    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(&path, &new_template).await?;
-        if interactive {
-            println!("✓ Created global LLM prompts file at {}", path.display());
-            println!();
-        }
-    } else {
-        prompt_and_backup_prompts_file(&path, &new_template, interactive).await?;
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return prompt_and_backup_prompts_file(&path, &new_template, interactive).await;
+    }
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&path, &new_template).await?;
+    if interactive {
+        println!("✓ Created global LLM prompts file at {}", path.display());
+        println!();
     }
     Ok(())
 }

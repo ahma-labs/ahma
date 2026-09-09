@@ -34,16 +34,11 @@ fn sorted_languages<T>(language_map: &HashMap<Language, T>) -> Vec<&Language> {
 }
 
 fn language_group_label(lang: &Language, is_workspace: bool) -> &'static str {
-    match lang {
-        Language::Rust => {
-            if is_workspace {
-                "Crate"
-            } else {
-                "Module"
-            }
-        }
-        Language::Python | Language::JavaScript | Language::TypeScript => "Module",
-        Language::Kotlin | Language::Java => "Package",
+    match (lang, is_workspace) {
+        (Language::Rust, true) => "Crate",
+        (Language::Rust, false) => "Module",
+        (Language::Python | Language::JavaScript | Language::TypeScript, _) => "Module",
+        (Language::Kotlin | Language::Java, _) => "Package",
         _ => "Directory",
     }
 }
@@ -60,6 +55,33 @@ fn path_components(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Aggregates one language's files into its `LanguageSummary`: the language-wide
+/// average score plus each package's average score, sorted by score desc then name.
+fn build_language_summary(lang_files: &[&FileSimplicity], base_dir: &Path) -> LanguageSummary {
+    let lang_avg = average(lang_files.iter().map(|f| f.score));
+
+    let mut package_map: HashMap<String, Vec<f64>> = HashMap::new();
+    for f in lang_files {
+        let package = get_package_name(Path::new(&f.path), base_dir);
+        package_map.entry(package).or_default().push(f.score);
+    }
+
+    let mut package_scores: Vec<(String, f64)> = package_map
+        .into_iter()
+        .map(|(p, scores)| (p, average(scores)))
+        .collect();
+    package_scores.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    LanguageSummary {
+        score: lang_avg,
+        package_scores,
+    }
+}
+
 impl RepoSummary {
     pub fn from_files(files: &[FileSimplicity], base_dir: &Path) -> Self {
         let avg_score = average(files.iter().map(|f| f.score));
@@ -69,35 +91,10 @@ impl RepoSummary {
             lang_map.entry(f.language).or_default().push(f);
         }
 
-        let mut language_summaries = HashMap::new();
-
-        for (lang, lang_files) in lang_map {
-            let lang_avg = average(lang_files.iter().map(|f| f.score));
-
-            let mut package_map: HashMap<String, Vec<f64>> = HashMap::new();
-            for f in &lang_files {
-                let package = get_package_name(Path::new(&f.path), base_dir);
-                package_map.entry(package).or_default().push(f.score);
-            }
-
-            let mut package_scores: Vec<(String, f64)> = package_map
-                .into_iter()
-                .map(|(p, scores)| (p, average(scores)))
-                .collect();
-            package_scores.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-
-            language_summaries.insert(
-                lang,
-                LanguageSummary {
-                    score: lang_avg,
-                    package_scores,
-                },
-            );
-        }
+        let language_summaries = lang_map
+            .into_iter()
+            .map(|(lang, lang_files)| (lang, build_language_summary(&lang_files, base_dir)))
+            .collect();
 
         Self {
             avg_score,
@@ -196,25 +193,39 @@ fn write_package_simplicity(report: &mut String, summary: &RepoSummary, is_works
     let languages = sorted_languages(&summary.language_summaries);
 
     for lang in languages {
-        if let Some(lang_summary) = summary.language_summaries.get(lang) {
-            report.push_str(&format!(
-                "## {} Simplicity (Avg: {:.0}%)\n\n",
-                lang.display_name(),
-                lang_summary.score
-            ));
+        let Some(lang_summary) = summary.language_summaries.get(lang) else {
+            continue;
+        };
 
-            let group_label = language_group_label(lang, is_workspace);
+        report.push_str(&format!(
+            "## {} Simplicity (Avg: {:.0}%)\n\n",
+            lang.display_name(),
+            lang_summary.score
+        ));
 
-            if lang_summary.package_scores.len() > 1 {
-                report.push_str(&format!("### By {}\n\n", group_label));
-
-                for (i, (p, score)) in lang_summary.package_scores.iter().enumerate() {
-                    report.push_str(&format!("{}. **{}**: {:.0}%\n", i + 1, p, score));
-                }
-                report.push('\n');
-            }
-        }
+        write_package_scores_list(report, lang, lang_summary, is_workspace);
     }
+}
+
+/// Writes the "By Crate/Module/Package" breakdown for a language, when there is
+/// more than one package to distinguish.
+fn write_package_scores_list(
+    report: &mut String,
+    lang: &Language,
+    lang_summary: &LanguageSummary,
+    is_workspace: bool,
+) {
+    if lang_summary.package_scores.len() <= 1 {
+        return;
+    }
+
+    let group_label = language_group_label(lang, is_workspace);
+    report.push_str(&format!("### By {}\n\n", group_label));
+
+    for (i, (p, score)) in lang_summary.package_scores.iter().enumerate() {
+        report.push_str(&format!("{}. **{}**: {:.0}%\n", i + 1, p, score));
+    }
+    report.push('\n');
 }
 
 /// Returns the shortest path suffix (joined by `/`) from `components` that is

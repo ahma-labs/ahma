@@ -649,36 +649,41 @@ async fn create_session_or_error(
         Ok(id) => Ok(id),
         Err(e) => {
             error!("Failed to create session: {}", e);
-            let response = if matches!(e, BridgeError::Draining) {
-                // The successor daemon is on its way up; this is a "try again
-                // in a second", not a failure of the request.
-                let mut resp = error_response_with_status(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    request_id,
-                    JSONRPC_REQUEST_TIMEOUT,
-                    &format!("Failed to create session: {}", e),
-                );
-                resp.headers_mut().insert(
-                    axum::http::header::RETRY_AFTER,
-                    HeaderValue::from_static("1"),
-                );
-                resp
-            } else if matches!(e, BridgeError::SessionLimitExceeded { .. }) {
-                error_response_with_status(
-                    axum::http::StatusCode::TOO_MANY_REQUESTS,
-                    request_id,
-                    JSONRPC_REQUEST_TIMEOUT,
-                    &format!("Failed to create session: {}", e),
-                )
-            } else {
-                error_response(
-                    request_id,
-                    -32603,
-                    &format!("Failed to create session: {}", e),
-                )
-            };
-            Err(response)
+            Err(session_creation_error_response(e, request_id))
         }
+    }
+}
+
+/// Map a session-creation failure to the HTTP/JSON-RPC error it should
+/// surface as, per the distinctions documented on [`create_session_or_error`].
+fn session_creation_error_response(e: BridgeError, request_id: Value) -> Response {
+    match e {
+        BridgeError::Draining => {
+            // The successor daemon is on its way up; this is a "try again
+            // in a second", not a failure of the request.
+            let mut resp = error_response_with_status(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                request_id,
+                JSONRPC_REQUEST_TIMEOUT,
+                &format!("Failed to create session: {}", e),
+            );
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("1"),
+            );
+            resp
+        }
+        BridgeError::SessionLimitExceeded { .. } => error_response_with_status(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            request_id,
+            JSONRPC_REQUEST_TIMEOUT,
+            &format!("Failed to create session: {}", e),
+        ),
+        _ => error_response(
+            request_id,
+            -32603,
+            &format!("Failed to create session: {}", e),
+        ),
     }
 }
 

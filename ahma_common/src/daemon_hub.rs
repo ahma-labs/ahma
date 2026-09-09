@@ -1421,46 +1421,9 @@ impl DaemonHub {
             }
         }
 
-        for (id, info) in ended.iter_mut() {
-            // Nothing loaded from disk is attached: this daemon has only just
-            // started. Anything without a recorded end is stamped now, so it
-            // still ages out of the window.
-            info.ended_epoch_ms = Some(
-                ended_at
-                    .get(id)
-                    .copied()
-                    .or(info.ended_epoch_ms)
-                    .unwrap_or_else(now_epoch_ms),
-            );
-        }
+        stamp_instance_end_times(&mut ended, &ended_at);
 
-        let mut interrupted = 0usize;
-        for ops in hist.values_mut() {
-            for snap in ops.values_mut() {
-                if snap.finished.is_some() {
-                    continue;
-                }
-                let Some(op_id) = op_id_of(&snap.started) else {
-                    continue;
-                };
-                interrupted += 1;
-                snap.finished_at_ms = Some(now_epoch_ms());
-                snap.finished = Some(DaemonEvent::OpFinished {
-                    id: op_id,
-                    // "Failed" is what a reader that predates `interrupted`
-                    // sees; a current one renders the flag instead (R24.5).
-                    status: OpStatus::Failed,
-                    result_summary: Some(
-                        "interrupted: the daemon watching this operation exited".to_string(),
-                    ),
-                    duration_ms: 0,
-                    ended_epoch_ms: snap.finished_at_ms,
-                    exit_code: None,
-                    denial: None,
-                    interrupted: true,
-                });
-            }
-        }
+        let interrupted = mark_unfinished_ops_interrupted(&mut hist);
         if interrupted > 0 {
             info!("ahma hub: {interrupted} operation(s) restored as interrupted");
         }
@@ -1539,25 +1502,7 @@ impl DaemonHub {
         }
         hist.retain(|_, ops| !ops.is_empty());
 
-        let mut total: usize = hist.values().map(|o| o.len()).sum();
-        while total > MAX_RETAINED_OPS {
-            let oldest = hist
-                .iter()
-                .flat_map(|(inst, ops)| {
-                    ops.iter()
-                        .filter(|(_, s)| s.finished.is_some())
-                        .map(move |(op, s)| (s.seq, inst.clone(), op.clone()))
-                })
-                .min();
-            let Some((_, inst, op)) = oldest else { break };
-            if let Some(ops) = hist.get_mut(&inst) {
-                ops.remove(&op);
-                if ops.is_empty() {
-                    hist.remove(&inst);
-                }
-            }
-            total -= 1;
-        }
+        evict_oldest_finished_until_ceiling(&mut hist, MAX_RETAINED_OPS);
 
         // An instance retained only so its operations had somewhere to belong
         // goes with the last of them.
@@ -1570,6 +1515,102 @@ impl DaemonHub {
                     .is_some_and(|ended_at| ended_at >= cutoff)
         });
     }
+}
+
+/// Evict finished operations oldest-first, across every instance, until the
+/// global retained-op count is at or under `max` (part of
+/// [`DaemonHub::prune_history`]'s ceiling enforcement).
+///
+/// A running op is never a candidate — only `s.finished.is_some()` entries are
+/// considered — so this can leave `hist` above `max` when everything left is
+/// still in flight; that is by design, matching the age-out pass above it,
+/// which never drops a running op either.
+fn evict_oldest_finished_until_ceiling(
+    hist: &mut std::collections::HashMap<String, InstanceOpHistory>,
+    max: usize,
+) {
+    let mut total: usize = hist.values().map(|o| o.len()).sum();
+    while total > max {
+        let oldest = hist
+            .iter()
+            .flat_map(|(inst, ops)| {
+                ops.iter()
+                    .filter(|(_, s)| s.finished.is_some())
+                    .map(move |(op, s)| (s.seq, inst.clone(), op.clone()))
+            })
+            .min();
+        let Some((_, inst, op)) = oldest else { break };
+        if let Some(ops) = hist.get_mut(&inst) {
+            ops.remove(&op);
+            if ops.is_empty() {
+                hist.remove(&inst);
+            }
+        }
+        total -= 1;
+    }
+}
+
+/// Give every retained-but-ended instance an `ended_epoch_ms` (part of
+/// [`DaemonHub::load_history`]'s restore).
+///
+/// Nothing loaded from disk is attached: this daemon has only just started.
+/// Anything without a recorded end is stamped now, so it still ages out of
+/// the replay window.
+fn stamp_instance_end_times(
+    ended: &mut std::collections::HashMap<String, InstanceInfo>,
+    ended_at: &std::collections::HashMap<String, u64>,
+) {
+    for (id, info) in ended.iter_mut() {
+        info.ended_epoch_ms = Some(
+            ended_at
+                .get(id)
+                .copied()
+                .or(info.ended_epoch_ms)
+                .unwrap_or_else(now_epoch_ms),
+        );
+    }
+}
+
+/// Close every operation left without a terminal event as `interrupted`
+/// (part of [`DaemonHub::load_history`]'s restore; SPEC R-DAEMON.7).
+///
+/// An operation that has a start record but no terminal one was still
+/// running when the previous daemon went away. Its real outcome is
+/// unknowable — the command may well have finished — so it is closed as
+/// `interrupted` rather than left running forever (a spinner that never
+/// resolves) or called failed (an invention). Returns how many operations
+/// were restored this way, for the caller to log.
+fn mark_unfinished_ops_interrupted(
+    hist: &mut std::collections::HashMap<String, InstanceOpHistory>,
+) -> usize {
+    let mut interrupted = 0usize;
+    for ops in hist.values_mut() {
+        for snap in ops.values_mut() {
+            if snap.finished.is_some() {
+                continue;
+            }
+            let Some(op_id) = op_id_of(&snap.started) else {
+                continue;
+            };
+            interrupted += 1;
+            snap.finished_at_ms = Some(now_epoch_ms());
+            snap.finished = Some(DaemonEvent::OpFinished {
+                id: op_id,
+                // "Failed" is what a reader that predates `interrupted` sees;
+                // a current one renders the flag instead (R24.5).
+                status: OpStatus::Failed,
+                result_summary: Some(
+                    "interrupted: the daemon watching this operation exited".to_string(),
+                ),
+                duration_ms: 0,
+                ended_epoch_ms: snap.finished_at_ms,
+                exit_code: None,
+                denial: None,
+                interrupted: true,
+            });
+        }
+    }
+    interrupted
 }
 
 /// Start the hub daemon.
@@ -1969,17 +2010,12 @@ where
             decision,
             target_instance_id,
         } => {
-            // The instance that raised the question is the one that can apply
-            // the answer; an explicit target is honoured, but never a guess.
-            let target = match instance_for_decision(&hub, &decision_id).await {
-                Some(owner) => Some(owner),
-                None => target_instance_id,
-            };
-            route_to_instance(
+            route_decision_to_instance(
                 &hub,
-                target,
+                target_instance_id,
+                &decision_id,
                 DaemonMsg::SubmitScopeGrant {
-                    decision_id,
+                    decision_id: decision_id.clone(),
                     decision,
                 },
             )
@@ -1991,15 +2027,12 @@ where
             decision,
             target_instance_id,
         } => {
-            let target = match instance_for_decision(&hub, &decision_id).await {
-                Some(owner) => Some(owner),
-                None => target_instance_id,
-            };
-            route_to_instance(
+            route_decision_to_instance(
                 &hub,
-                target,
+                target_instance_id,
+                &decision_id,
                 DaemonMsg::SubmitWebApproval {
-                    decision_id,
+                    decision_id: decision_id.clone(),
                     decision,
                 },
             )
@@ -2154,6 +2187,24 @@ async fn resolve_target(hub: &DaemonHub, target: Option<&str>) -> Option<String>
 /// that asked rather than to whichever one happens to be first.
 async fn instance_for_decision(hub: &DaemonHub, decision_id: &str) -> Option<String> {
     hub.pending_decisions.lock().await.get(decision_id).cloned()
+}
+
+/// Route a decision answer (scope grant, web approval) back to the instance
+/// that raised it. The instance that raised the question is the one that can
+/// apply the answer; an explicit `target_instance_id` is honoured only as a
+/// fallback when no instance is on record for `decision_id`, never as a guess
+/// that overrides it.
+async fn route_decision_to_instance(
+    hub: &Arc<DaemonHub>,
+    target_instance_id: Option<String>,
+    decision_id: &str,
+    msg: DaemonMsg,
+) {
+    let target = match instance_for_decision(hub, decision_id).await {
+        Some(owner) => Some(owner),
+        None => target_instance_id,
+    };
+    route_to_instance(hub, target, msg).await
 }
 
 /// Serve a registered ahma instance: register it, then exchange events and

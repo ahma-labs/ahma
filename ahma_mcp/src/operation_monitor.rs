@@ -657,38 +657,13 @@ impl OperationMonitor {
             ops.values()
                 .filter(|op| !op.state.is_terminal())
                 .filter_map(|op| {
-                    let timeout = op.timeout_duration.unwrap_or(self.config.default_timeout);
-                    let elapsed = now.duration_since(op.start_time).ok()?;
-                    if elapsed > timeout {
-                        let reason = format!(
-                            "Operation timed out after {:.1}s (limit: {:.1}s)",
-                            elapsed.as_secs_f64(),
-                            timeout.as_secs_f64()
-                        );
-                        return Some((op.id.clone(), reason));
-                    }
-                    // Idle watchdog. `last_activity` advances on output *and* on
-                    // proof of life from the process tree's CPU (see
-                    // `note_liveness`), so reaching here means the operation has
-                    // been both silent and idle — not merely quiet.
-                    //
-                    // The reason states what was observed and does not assert a
-                    // cause: the previous wording ("likely wedged on a lock or a
-                    // denied write") was a confident guess that sent debugging in
-                    // the wrong direction when the real culprit was a buffered pipe.
-                    if let Some(idle_limit) = self.config.idle_timeout {
-                        let idle = now.duration_since(op.last_activity.get()).ok()?;
-                        if idle > idle_limit {
-                            let reason = format!(
-                                "Operation stalled: no output and no CPU activity for {:.1}s \
-                                 (idle limit: {:.1}s)",
-                                idle.as_secs_f64(),
-                                idle_limit.as_secs_f64()
-                            );
-                            return Some((op.id.clone(), reason));
-                        }
-                    }
-                    None
+                    let reason = timeout_reason(
+                        op,
+                        now,
+                        self.config.default_timeout,
+                        self.config.idle_timeout,
+                    )?;
+                    Some((op.id.clone(), reason))
                 })
                 .collect::<Vec<_>>()
         };
@@ -1006,31 +981,81 @@ impl OperationMonitor {
         };
 
         // Wait until the completion flag turns true (or timeout).
-        // `wait_for` is safe against missed signals: the watch channel stores its
-        // current value, so even if `send(true)` fired between
-        // `get_completion_receiver_or_terminal_pub` and this await, the receiver
-        // will see `true` on the very first poll.
-        //
-        // Note: `watch::Ref` wraps an `RwLockReadGuard` which is not `Send`, so we
-        // extract a plain `bool` and drop the guard before the next `await`.
-        let timed_out = match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, rx.wait_for(|done| *done))
-                .await
-                .is_err(),
-            None => {
-                let _ = rx.wait_for(|done| *done).await;
-                false
-            }
-        };
-        if timed_out {
+        if wait_for_completion_flag(&mut rx, timeout).await {
             tracing::warn!("Wait for operation {} timed out.", id);
-            None
-        } else {
-            // The completion signal was sent *after* history insertion, so the
-            // operation must already be in history at this point.
-            self.check_completion_history_pub(id).await
+            return None;
+        }
+        // The completion signal was sent *after* history insertion, so the
+        // operation must already be in history at this point.
+        self.check_completion_history_pub(id).await
+    }
+}
+
+/// Block on `rx` until the completion flag turns `true`, bounded by `timeout`.
+///
+/// Returns `true` if `timeout` elapsed first, `false` if the flag was observed.
+/// `wait_for` is safe against missed signals: the watch channel stores its
+/// current value, so even if the sender fired between subscribing and this
+/// await, the receiver sees `true` on the very first poll.
+///
+/// Note: `watch::Ref` wraps an `RwLockReadGuard` which is not `Send`, so
+/// `wait_for`'s predicate extracts a plain `bool` and the guard is dropped
+/// before the next await.
+async fn wait_for_completion_flag(rx: &mut WatchReceiver<bool>, timeout: Option<Duration>) -> bool {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, rx.wait_for(|done| *done))
+            .await
+            .is_err(),
+        None => {
+            let _ = rx.wait_for(|done| *done).await;
+            false
         }
     }
+}
+
+/// Decide whether `op` has breached either timeout budget as of `now`.
+///
+/// Checks the total-runtime budget (`op.timeout_duration` or `default_timeout`)
+/// first, then — when `idle_timeout` is configured — the idle-output watchdog
+/// measured from `op.last_activity`. Returns a message naming whichever budget
+/// tripped, or `None` if the operation is still within both. Pure and
+/// lock-free so [`OperationMonitor::check_timeouts`] can stay a thin
+/// collect-then-act loop.
+fn timeout_reason(
+    op: &Operation,
+    now: SystemTime,
+    default_timeout: Duration,
+    idle_timeout: Option<Duration>,
+) -> Option<String> {
+    let timeout = op.timeout_duration.unwrap_or(default_timeout);
+    let elapsed = now.duration_since(op.start_time).ok()?;
+    if elapsed > timeout {
+        return Some(format!(
+            "Operation timed out after {:.1}s (limit: {:.1}s)",
+            elapsed.as_secs_f64(),
+            timeout.as_secs_f64()
+        ));
+    }
+
+    // Idle watchdog. `last_activity` advances on output *and* on proof of life
+    // from the process tree's CPU (see `note_liveness`), so reaching here means
+    // the operation has been both silent and idle — not merely quiet.
+    //
+    // The reason states what was observed and does not assert a cause: the
+    // previous wording ("likely wedged on a lock or a denied write") was a
+    // confident guess that sent debugging in the wrong direction when the real
+    // culprit was a buffered pipe.
+    let idle_limit = idle_timeout?;
+    let idle = now.duration_since(op.last_activity.get()).ok()?;
+    if idle > idle_limit {
+        return Some(format!(
+            "Operation stalled: no output and no CPU activity for {:.1}s \
+             (idle limit: {:.1}s)",
+            idle.as_secs_f64(),
+            idle_limit.as_secs_f64()
+        ));
+    }
+    None
 }
 
 /// Map a terminal [`Operation`] to its unified terminal event.

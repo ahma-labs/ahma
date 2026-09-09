@@ -2376,15 +2376,9 @@ fn toml_tool_approvals(v: &[crate::permissions::ToolApproval]) -> String {
                 format!("workspace = {}", toml_path(&a.workspace)),
                 format!("tools = {}", toml_str_list(&a.tools)),
             ];
-            if let Some(at) = &a.granted_at {
-                parts.push(format!("granted_at = {}", toml_str(at)));
-            }
-            if let Some(by) = &a.granted_by {
-                parts.push(format!("granted_by = {}", toml_str(by)));
-            }
-            if let Some(s) = &a.surface {
-                parts.push(format!("surface = {}", toml_str(s)));
-            }
+            push_opt_str_field(&mut parts, "granted_at", &a.granted_at);
+            push_opt_str_field(&mut parts, "granted_by", &a.granted_by);
+            push_opt_str_field(&mut parts, "surface", &a.surface);
             format!("{{ {} }}", parts.join(", "))
         })
         .collect();

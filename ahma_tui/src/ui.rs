@@ -850,13 +850,7 @@ fn draw_chat_body(frame: &mut Frame, state: &AppState, theme: &Theme, chat_conte
 /// window is for is seeing what is being done on your behalf.
 fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
-    let approval_h: u16 = if let Some(gate) = &state.approval {
-        // +2 for the rounded border (top/bottom). 2 content lines normally,
-        // or 2 + blank + up to 9 diff lines when a diff is attached.
-        if gate.diff.is_some() { 14 } else { 4 }
-    } else {
-        0
-    };
+    let approval_h = compute_approval_height(state);
 
     let input_h = if state.chat_open {
         compute_chat_input_height(state, full.width)
@@ -894,6 +888,17 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         state.chat_input_area.set(Rect::default());
     }
     draw_chat_footer(frame, state, theme, footer_a);
+}
+
+/// Height of the approval pane: 0 when nothing is pending, 4 for a plain
+/// yes/no gate, or 14 when a diff is attached (+2 for the rounded border,
+/// 2 content lines normally, or 2 + blank + up to 9 diff lines).
+fn compute_approval_height(state: &AppState) -> u16 {
+    match &state.approval {
+        Some(gate) if gate.diff.is_some() => 14,
+        Some(_) => 4,
+        None => 0,
+    }
 }
 
 /// Work view on top, then whichever panes are open beneath it.
@@ -1041,42 +1046,9 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     let external_part = format_external_tools_part(state);
     let max_path_len = max_header_workspace_len(area.width);
     let sandbox_style = sandbox_status_style(&state.sandbox_status, theme);
-    // Honest scope display (SPEC R5.4): once the server reports its locked
-    // scope, show *that* — not the TUI's launch directory, which can differ
-    // (container-root fallback, auto-narrowing). Before the report arrives the
-    // launch path is only a guess, so mark it as such instead of presenting it
-    // as the boundary.
-    let sandbox_part = match state.locked_scope_root() {
-        Some(root) => {
-            let extra = state
-                .sandbox_scope
-                .as_ref()
-                .map(|s| s.write.len().saturating_sub(1))
-                .unwrap_or(0);
-            let short = shorten_path(root, max_path_len);
-            if extra > 0 {
-                format!(" · sandbox: {short} +{extra}")
-            } else {
-                format!(" · sandbox: {short}")
-            }
-        }
-        None if !state.workspace.is_empty() => {
-            let short = shorten_path(&state.workspace, max_path_len);
-            format!(" · sandbox: {short}?")
-        }
-        None => String::new(),
-    };
-    let sandbox_status_part = if state.sandbox_status.is_known() {
-        format!(" [{}]", state.sandbox_status.label())
-    } else {
-        String::new()
-    };
-
-    let active_skills_part = if !state.active_skills.is_empty() {
-        format!(" · skills:{}", state.active_skills.len())
-    } else {
-        String::new()
-    };
+    let sandbox_part = format_sandbox_part(state, max_path_len);
+    let sandbox_status_part = format_sandbox_status_part(state);
+    let active_skills_part = format_active_skills_part(state);
 
     // Token spend and context fill — the numbers that decide whether to keep
     // chatting or /compact. Computed all along but only ever rendered by a
@@ -1107,6 +1079,50 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     ]);
 
     frame.render_widget(Paragraph::new(line).style(theme.header_bar()), area);
+}
+
+/// Honest scope display (SPEC R5.4): once the server reports its locked
+/// scope, show *that* — not the TUI's launch directory, which can differ
+/// (container-root fallback, auto-narrowing). Before the report arrives the
+/// launch path is only a guess, so mark it as such instead of presenting it
+/// as the boundary.
+fn format_sandbox_part(state: &AppState, max_path_len: usize) -> String {
+    match state.locked_scope_root() {
+        Some(root) => {
+            let extra = state
+                .sandbox_scope
+                .as_ref()
+                .map(|s| s.write.len().saturating_sub(1))
+                .unwrap_or(0);
+            let short = shorten_path(root, max_path_len);
+            if extra > 0 {
+                format!(" · sandbox: {short} +{extra}")
+            } else {
+                format!(" · sandbox: {short}")
+            }
+        }
+        None if !state.workspace.is_empty() => {
+            let short = shorten_path(&state.workspace, max_path_len);
+            format!(" · sandbox: {short}?")
+        }
+        None => String::new(),
+    }
+}
+
+fn format_sandbox_status_part(state: &AppState) -> String {
+    if state.sandbox_status.is_known() {
+        format!(" [{}]", state.sandbox_status.label())
+    } else {
+        String::new()
+    }
+}
+
+fn format_active_skills_part(state: &AppState) -> String {
+    if !state.active_skills.is_empty() {
+        format!(" · skills:{}", state.active_skills.len())
+    } else {
+        String::new()
+    }
 }
 
 /// Word-wrap a single logical [`Line`] into one or more physical rows that each
@@ -2433,23 +2449,37 @@ fn draw_task_tree_row(
     }
 }
 
-fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let focused = state.focus == Focus::Work;
-    let border_style = if focused {
+fn ops_dag_border_style(state: &AppState, theme: &Theme) -> Style {
+    if state.focus == Focus::Work {
         theme.border_focused()
     } else {
         theme.border_unfocused()
-    };
+    }
+}
 
-    let title = if state.show_all_projects {
+fn ops_dag_title(state: &AppState) -> &'static str {
+    if state.show_all_projects {
         " Tasks · all projects — [f] this project "
     } else {
         " Tasks · this project — [f] all "
+    }
+}
+
+/// The empty-tree hint, shown in place of rows when there is nothing to draw.
+fn draw_empty_ops_hint(frame: &mut Frame, state: &AppState, theme: &Theme, inner: Rect) {
+    let hint = if state.show_all_projects {
+        "  No tasks yet — connected clients appear here as they work"
+    } else {
+        "  No tasks in this project yet — [f] shows all projects"
     };
+    frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
+}
+
+fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let block = Block::default()
-        .title(Span::styled(title, theme.title()))
+        .title(Span::styled(ops_dag_title(state), theme.title()))
         .borders(Borders::ALL)
-        .border_style(border_style);
+        .border_style(ops_dag_border_style(state, theme));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2460,12 +2490,7 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
     let rows = state.task_rows.borrow();
 
     if rows.is_empty() {
-        let hint = if state.show_all_projects {
-            "  No tasks yet — connected clients appear here as they work"
-        } else {
-            "  No tasks in this project yet — [f] shows all projects"
-        };
-        frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
+        draw_empty_ops_hint(frame, state, theme, inner);
         return;
     }
 
@@ -2863,6 +2888,36 @@ fn push_dag_metadata_spans(
     line_spans.push(Span::styled(truncate(display_name, rem_width), row_style));
 }
 
+fn tree_row_sel_symbol(is_selected: bool, unicode: bool) -> &'static str {
+    match (is_selected, unicode) {
+        (true, true) => "▶ ",
+        (true, false) => "> ",
+        (false, _) => "  ",
+    }
+}
+
+/// A finished row shows *how* it finished, not just how long it took. "Failed"
+/// without a code is not actionable; `exit 101` is (SPEC R24.7). Operations that
+/// are not processes have no code, and say nothing rather than inventing one.
+/// A denial is not a failure and must not read as one: name the path the
+/// kernel refused, and the key that asks for it (SPEC R-PERM.7/.7.1). This
+/// is the row a user acts on, so the affordance belongs on the row.
+fn format_op_elapsed_part(op: &crate::state::Operation) -> String {
+    match (&op.denial, op.exit_code) {
+        (Some((path, access)), _) if op.status == crate::state::OpStatus::Denied => {
+            format!(
+                "  denied: {} ({}) · [a] ask",
+                shorten_path(path, 28),
+                access.short()
+            )
+        }
+        (_, Some(code)) if op.status.is_terminal() => {
+            format!("  exit {code} · {}", op.elapsed_display())
+        }
+        _ => format!("  {}", op.elapsed_display()),
+    }
+}
+
 /// One operation row of the task tree: indent by depth, status glyph, name,
 /// id, elapsed. The owning instance is the header above, so no instance tag.
 #[allow(clippy::too_many_arguments)]
@@ -2875,11 +2930,7 @@ fn build_tree_op_item(
     theme: &Theme,
     width: usize,
 ) -> Line<'static> {
-    let sel_symbol = if is_selected {
-        if state.unicode { "▶ " } else { "> " }
-    } else {
-        "  "
-    };
+    let sel_symbol = tree_row_sel_symbol(is_selected, state.unicode);
     let indent = "  ".repeat(depth.max(1) as usize - 1);
     let expand_mark = match (expanded, state.unicode) {
         (true, true) => "▾ ",
@@ -2893,25 +2944,7 @@ fn build_tree_op_item(
 
     let clean_id_str = op.clean_id();
     let id_part = format!(" [{}]", clean_id_str);
-    // A finished row shows *how* it finished, not just how long it took. "Failed"
-    // without a code is not actionable; `exit 101` is (SPEC R24.7). Operations that
-    // are not processes have no code, and say nothing rather than inventing one.
-    // A denial is not a failure and must not read as one: name the path the
-    // kernel refused, and the key that asks for it (SPEC R-PERM.7/.7.1). This
-    // is the row a user acts on, so the affordance belongs on the row.
-    let elapsed_part = match (&op.denial, op.exit_code) {
-        (Some((path, access)), _) if op.status == crate::state::OpStatus::Denied => {
-            format!(
-                "  denied: {} ({}) · [a] ask",
-                shorten_path(path, 28),
-                access.short()
-            )
-        }
-        (_, Some(code)) if op.status.is_terminal() => {
-            format!("  exit {code} · {}", op.elapsed_display())
-        }
-        _ => format!("  {}", op.elapsed_display()),
-    };
+    let elapsed_part = format_op_elapsed_part(op);
 
     let fixed_prefix_len =
         sel_symbol.len() + indent.len() + expand_mark.len() + unsandboxed_mark.len() + 2;

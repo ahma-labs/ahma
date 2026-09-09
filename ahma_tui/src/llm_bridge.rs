@@ -225,6 +225,41 @@ fn is_local_default_server(url: &str) -> bool {
     trimmed == "http://localhost:3000" || trimmed == "http://127.0.0.1:3000"
 }
 
+/// Recovers from a `403` on the (possibly cached/reused) MCP session: drops
+/// it from the process-wide cache, negotiates a fresh one, tells `tx` about
+/// it so subsequent calls reuse it instead of retrying a dead session, and
+/// retries the tool call exactly once.
+async fn retry_tool_call_after_403(
+    client: &reqwest::Client,
+    url: &str,
+    mcp: &McpChatConfig,
+    tool: &str,
+    arguments: serde_json::Value,
+    tx: &Sender<BridgeEvent>,
+) -> (String, bool) {
+    ahma_core::agent::invalidate_cached_session(url, &mcp.workspace_root);
+    let fresh_mcp = McpChatConfig {
+        session_id: None,
+        ..mcp.clone()
+    };
+    let new_sid = match ahma_core::agent::get_or_create_session(client, url, &fresh_mcp).await {
+        Ok(sid) => sid,
+        Err(e) => return (format!("Error: {e}"), true),
+    };
+    // The old session_id was rejected (403); replace it in app state so
+    // subsequent calls don't keep retrying a dead session before falling
+    // back here every time.
+    let _ = tx
+        .send(BridgeEvent::SessionEstablished {
+            session_id: new_sid.clone(),
+        })
+        .await;
+    match ahma_core::agent::call_mcp_tool_http(client, url, &new_sid, tool, arguments).await {
+        Ok((result, failed)) => (result, failed),
+        Err(e) => (format!("Error: {e}"), true),
+    }
+}
+
 pub fn spawn_tool_call_task(
     tool: String,
     arguments: serde_json::Value,
@@ -313,35 +348,7 @@ pub fn spawn_tool_call_task(
         let (result, failed) = match tool_result {
             Ok((result, failed)) => (result, failed),
             Err(ref err) if err.contains("HTTP 403") => {
-                // The cached/reused session was rejected — drop it from the
-                // process-wide cache too, or get_or_create_session would just
-                // hand back the same dead id for `fresh_mcp` below.
-                ahma_core::agent::invalidate_cached_session(&url, &mcp.workspace_root);
-                let fresh_mcp = McpChatConfig {
-                    session_id: None,
-                    ..mcp.clone()
-                };
-                match ahma_core::agent::get_or_create_session(&client, &url, &fresh_mcp).await {
-                    Ok(new_sid) => {
-                        // The old session_id was rejected (403); replace it in
-                        // app state so subsequent calls don't keep retrying a
-                        // dead session before falling back here every time.
-                        let _ = tx
-                            .send(BridgeEvent::SessionEstablished {
-                                session_id: new_sid.clone(),
-                            })
-                            .await;
-                        match ahma_core::agent::call_mcp_tool_http(
-                            &client, &url, &new_sid, &tool, arguments,
-                        )
-                        .await
-                        {
-                            Ok((result, failed)) => (result, failed),
-                            Err(e) => (format!("Error: {e}"), true),
-                        }
-                    }
-                    Err(e) => (format!("Error: {e}"), true),
-                }
+                retry_tool_call_after_403(&client, &url, &mcp, &tool, arguments, &tx).await
             }
             Err(err) => (format!("Error: {err}"), true),
         };
@@ -528,6 +535,45 @@ impl BangReport {
     }
 }
 
+/// The outcome fields shared by every exit path of `spawn_window_cli_task`,
+/// bundled together so `finish_window` takes one value instead of six.
+struct WindowOutcome {
+    window_id: usize,
+    op_status: ahma_common::daemon_hub::OpStatus,
+    success: bool,
+    summary: String,
+    exit_code: Option<i64>,
+    started: std::time::Instant,
+}
+
+/// Emits both the daemon-hub completion record (if this window is a
+/// reported `!` command) and the TUI's own `WindowFinished` event, so every
+/// exit path of `spawn_window_cli_task` updates both places the same way.
+async fn finish_window(
+    tx: &Sender<BridgeEvent>,
+    report: &Option<BangReport>,
+    outcome: WindowOutcome,
+) {
+    let WindowOutcome {
+        window_id,
+        op_status,
+        success,
+        summary,
+        exit_code,
+        started,
+    } = outcome;
+    if let Some(r) = report {
+        r.finished(op_status, &summary, exit_code, started);
+    }
+    let _ = tx
+        .send(BridgeEvent::WindowFinished {
+            window_id,
+            success,
+            summary,
+        })
+        .await;
+}
+
 pub fn spawn_window_cli_task(
     window_id: usize,
     command_str: String,
@@ -563,21 +609,19 @@ pub fn spawn_window_cli_task(
             Ok(c) => c,
             Err(e) => {
                 let summary = format!("Failed to spawn: {e}");
-                if let Some(r) = &report {
-                    r.finished(
-                        ahma_common::daemon_hub::OpStatus::Failed,
-                        &summary,
-                        None,
-                        started,
-                    );
-                }
-                let _ = tx
-                    .send(BridgeEvent::WindowFinished {
+                finish_window(
+                    &tx,
+                    &report,
+                    WindowOutcome {
                         window_id,
+                        op_status: ahma_common::daemon_hub::OpStatus::Failed,
                         success: false,
                         summary,
-                    })
-                    .await;
+                        exit_code: None,
+                        started,
+                    },
+                )
+                .await;
                 return;
             }
         };
@@ -623,19 +667,19 @@ pub fn spawn_window_cli_task(
                 let _ = ahma_mcp::shell_pool::kill_process_tree(&mut child).await;
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
-                if let Some(r) = &report {
-                    r.finished(
-                        ahma_common::daemon_hub::OpStatus::Cancelled,
-                        "Cancelled",
-                        None,
+                finish_window(
+                    &tx,
+                    &report,
+                    WindowOutcome {
+                        window_id,
+                        op_status: ahma_common::daemon_hub::OpStatus::Cancelled,
+                        success: false,
+                        summary: "Cancelled".to_string(),
+                        exit_code: None,
                         started,
-                    );
-                }
-                let _ = tx.send(BridgeEvent::WindowFinished {
-                    window_id,
-                    success: false,
-                    summary: "Cancelled".to_string(),
-                }).await;
+                    },
+                )
+                .await;
             }
             res = wait_loop => {
                 let _ = stdout_handle.await;
@@ -648,39 +692,40 @@ pub fn spawn_window_cli_task(
                         } else {
                             format!("Failed with exit code {:?}", status.code())
                         };
-                        if let Some(r) = &report {
-                            r.finished(
-                                if success {
-                                    ahma_common::daemon_hub::OpStatus::Completed
-                                } else {
-                                    ahma_common::daemon_hub::OpStatus::Failed
-                                },
-                                &summary,
-                                status.code().map(i64::from),
+                        let op_status = if success {
+                            ahma_common::daemon_hub::OpStatus::Completed
+                        } else {
+                            ahma_common::daemon_hub::OpStatus::Failed
+                        };
+                        finish_window(
+                            &tx,
+                            &report,
+                            WindowOutcome {
+                                window_id,
+                                op_status,
+                                success,
+                                summary,
+                                exit_code: status.code().map(i64::from),
                                 started,
-                            );
-                        }
-                        let _ = tx.send(BridgeEvent::WindowFinished {
-                            window_id,
-                            success,
-                            summary,
-                        }).await;
+                            },
+                        )
+                        .await;
                     }
                     Err(e) => {
                         let summary = format!("Execution error: {e}");
-                        if let Some(r) = &report {
-                            r.finished(
-                                ahma_common::daemon_hub::OpStatus::Failed,
-                                &summary,
-                                None,
+                        finish_window(
+                            &tx,
+                            &report,
+                            WindowOutcome {
+                                window_id,
+                                op_status: ahma_common::daemon_hub::OpStatus::Failed,
+                                success: false,
+                                summary,
+                                exit_code: None,
                                 started,
-                            );
-                        }
-                        let _ = tx.send(BridgeEvent::WindowFinished {
-                            window_id,
-                            success: false,
-                            summary,
-                        }).await;
+                            },
+                        )
+                        .await;
                     }
                 }
             }

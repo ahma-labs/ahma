@@ -379,6 +379,36 @@ fn classify_structured_response(text: &str) -> StructuredVerdict {
     StructuredVerdict::Alert(alert)
 }
 
+/// Resolve the alert text for a non-empty LLM response, or `None` when the
+/// response is a clean structured verdict that should be dropped silently.
+///
+/// Isolates the structured-vs-plain-text branching so `maybe_analyze` reads as
+/// a single "is this an alert" guard clause instead of a nested match.
+fn resolve_alert_summary(op_id: &str, structured_output: bool, raw: &str) -> Option<String> {
+    if !structured_output {
+        return Some(raw.to_string());
+    }
+    // In structured mode, parse JSON and short-circuit on `issue:false`. A
+    // response that is *not* valid JSON (model answered in prose) must NOT be
+    // treated as clean — it falls through to the plain-text path so a
+    // prose-reported crash is still surfaced, never dropped.
+    match classify_structured_response(raw) {
+        StructuredVerdict::Alert(s) => Some(s),
+        StructuredVerdict::Clean => {
+            debug!("livelog[{}]: structured response: clean", op_id);
+            None
+        }
+        StructuredVerdict::Unparseable => {
+            debug!(
+                "livelog[{}]: structured response was not JSON; \
+                 treating as plain-text alert",
+                op_id
+            );
+            Some(raw.to_string())
+        }
+    }
+}
+
 /// Send `chunk` to the LLM for analysis; record an `Alert` if issues are found.
 ///
 /// Respects the cooldown window — if an alert was sent recently the chunk is
@@ -420,28 +450,8 @@ async fn maybe_analyze(
         .await
     {
         Ok(Some(raw)) => {
-            // In structured mode, parse JSON and short-circuit on `issue:false`.
-            // A response that is *not* valid JSON (model answered in prose) must
-            // NOT be treated as clean — it falls through to the plain-text path
-            // so a prose-reported crash is still surfaced, never dropped.
-            let summary = if ctx.structured_output {
-                match classify_structured_response(&raw) {
-                    StructuredVerdict::Alert(s) => s,
-                    StructuredVerdict::Clean => {
-                        debug!("livelog[{}]: structured response: clean", op_id);
-                        return;
-                    }
-                    StructuredVerdict::Unparseable => {
-                        debug!(
-                            "livelog[{}]: structured response was not JSON; \
-                             treating as plain-text alert",
-                            op_id
-                        );
-                        raw.clone()
-                    }
-                }
-            } else {
-                raw.clone()
+            let Some(summary) = resolve_alert_summary(op_id, ctx.structured_output, &raw) else {
+                return;
             };
 
             info!("livelog[{}]: LLM detected issue: {}", op_id, summary);
@@ -553,6 +563,66 @@ async fn extend_chunk(
     }
 }
 
+/// Read the file's current length, sleeping briefly and returning `None` on
+/// error so the caller can `continue` its poll loop rather than tightly
+/// spinning on a transient metadata failure.
+async fn poll_file_len(op_id: &str, file: &tokio::fs::File) -> Option<u64> {
+    match file.metadata().await {
+        Ok(m) => Some(m.len()),
+        Err(e) => {
+            warn!("file_monitor[{}]: failed to read metadata: {}", op_id, e);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            None
+        }
+    }
+}
+
+/// Read newly-appended bytes at `[pos, new_len)`, fold them into `chunk` via
+/// [`process_new_bytes`] and [`extend_chunk`], and return the offset to
+/// resume reading from next time.
+///
+/// Pulling this out of the poll loop is what keeps the file-growth arm from
+/// nesting a byte-count match inside the truncated/grew/idle branch inside
+/// the loop body.
+#[allow(clippy::too_many_arguments)]
+async fn handle_file_growth(
+    op_id: &str,
+    ctx: &AnalysisCtx<'_>,
+    file: &mut tokio::fs::File,
+    pos: u64,
+    new_len: u64,
+    buffer: &mut [u8],
+    remainder: &mut String,
+    monitor: &OperationMonitor,
+    chunk: &mut Vec<String>,
+    chunk_start: &mut Instant,
+    last_alert: &mut Option<Instant>,
+    max_lines: usize,
+) -> u64 {
+    let to_read = (new_len - pos).min(buffer.len() as u64) as usize;
+    match file.read(&mut buffer[..to_read]).await {
+        Ok(0) => pos,
+        Ok(n) => {
+            let new_lines = process_new_bytes(buffer, n, remainder, op_id, monitor).await;
+            extend_chunk(
+                op_id,
+                ctx,
+                new_lines,
+                chunk,
+                chunk_start,
+                last_alert,
+                max_lines,
+            )
+            .await;
+            pos + n as u64
+        }
+        Err(e) => {
+            warn!("file_monitor[{}]: read error: {}", op_id, e);
+            pos
+        }
+    }
+}
+
 /// Run the file-log tailing pipeline, reading from the file as it grows.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_file_monitor_pipeline(
@@ -619,16 +689,10 @@ pub async fn run_file_monitor_pipeline(
         }
 
         // Check file metadata / size
-        let metadata = match file.metadata().await {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("file_monitor[{}]: failed to read metadata: {}", op_id, e);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
+        let Some(new_len) = poll_file_len(op_id, &file).await else {
+            continue;
         };
 
-        let new_len = metadata.len();
         if new_len < pos {
             // File truncated / rotated
             info!("file_monitor[{}]: file truncated/rotated", op_id);
@@ -638,30 +702,21 @@ pub async fn run_file_monitor_pipeline(
             }
             remainder.clear();
         } else if new_len > pos {
-            // Read new bytes
-            let to_read = (new_len - pos).min(buffer.len() as u64) as usize;
-            match file.read(&mut buffer[..to_read]).await {
-                Ok(0) => {}
-                Ok(n) => {
-                    pos += n as u64;
-                    let new_lines =
-                        process_new_bytes(&buffer, n, &mut remainder, op_id, monitor.as_ref())
-                            .await;
-                    extend_chunk(
-                        op_id,
-                        &ctx,
-                        new_lines,
-                        &mut chunk,
-                        &mut chunk_start,
-                        &mut last_alert,
-                        chunk_max_lines,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    warn!("file_monitor[{}]: read error: {}", op_id, e);
-                }
-            }
+            pos = handle_file_growth(
+                op_id,
+                &ctx,
+                &mut file,
+                pos,
+                new_len,
+                &mut buffer,
+                &mut remainder,
+                monitor.as_ref(),
+                &mut chunk,
+                &mut chunk_start,
+                &mut last_alert,
+                chunk_max_lines,
+            )
+            .await;
         } else {
             // Sleep briefly before polling again
             tokio::time::sleep(Duration::from_millis(500)).await;

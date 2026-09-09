@@ -1773,27 +1773,7 @@ impl SessionManager {
         stderr: Option<Box<dyn AsyncRead + Send + Unpin + 'static>>,
         colored_output: bool,
     ) {
-        // Spawn a dedicated stdout reader to make stdout reading cancel-safe.
-        // `Lines::next_line()` is NOT cancel-safe inside `tokio::select!` — when
-        // another branch wins (e.g. stderr), the stdout future is cancelled and
-        // partially-read data can be lost (causing `roots/list` to be silently
-        // dropped). An mpsc channel receive IS cancel-safe, so we forward lines
-        // through one here.
-        let (stdout_line_tx, mut stdout_line_rx) =
-            mpsc::channel::<std::io::Result<Option<String>>>(64);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
-            loop {
-                let line = reader.next_line().await;
-                let done = matches!(&line, Ok(None) | Err(_));
-                if stdout_line_tx.send(line).await.is_err() {
-                    break;
-                }
-                if done {
-                    break;
-                }
-            }
-        });
+        let mut stdout_line_rx = spawn_stdout_line_forwarder(stdout);
 
         let mut stderr_reader = stderr.map(|s| BufReader::new(s).lines());
 
@@ -1867,32 +1847,68 @@ impl SessionManager {
             }
         }
 
-        // Mark session as terminated if not already
-        session.set_terminated(true);
-
-        // Send explicit error responses to all pending requests before clearing.
-        // This prevents "Response channel closed" errors that manifest as cryptic
-        // "Canceled: canceled" messages in clients.
-        if !session.pending_requests.is_empty() {
-            // R-SIGN.5: if the peer died abnormally, its exit monitor has
-            // classified the cause (e.g. the macOS code-signing SIGKILL).
-            // Surface that to the client instead of a bare "terminated
-            // unexpectedly". Wait briefly — the exit status can land a moment
-            // after the pipe EOF that broke the I/O loop.
-            let cause = match session.exit_cause.lock().await.take() {
-                Some(rx) => tokio::time::timeout(Duration::from_millis(500), rx)
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok()),
-                None => None,
-            };
-            let message = match cause {
-                Some(cause) => format!("Session terminated: server subprocess died: {cause}"),
-                None => "Session terminated unexpectedly - subprocess may have crashed or handshake failed".to_string(),
-            };
-            fail_pending_requests(&session.pending_requests, &session.id, &message);
-        }
+        finish_session_io(&session).await;
     }
+}
+
+/// Spawn a dedicated stdout reader task and return the cancel-safe channel it
+/// forwards lines through.
+///
+/// `Lines::next_line()` is NOT cancel-safe inside `tokio::select!` — when
+/// another branch wins (e.g. stderr), the stdout future is cancelled and
+/// partially-read data can be lost (causing `roots/list` to be silently
+/// dropped). An mpsc channel receive IS cancel-safe, so lines are forwarded
+/// through one here.
+fn spawn_stdout_line_forwarder(
+    stdout: Box<dyn AsyncRead + Send + Unpin + 'static>,
+) -> mpsc::Receiver<std::io::Result<Option<String>>> {
+    let (stdout_line_tx, stdout_line_rx) = mpsc::channel::<std::io::Result<Option<String>>>(64);
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout).lines();
+        loop {
+            let line = reader.next_line().await;
+            let done = matches!(&line, Ok(None) | Err(_));
+            if stdout_line_tx.send(line).await.is_err() {
+                break;
+            }
+            if done {
+                break;
+            }
+        }
+    });
+    stdout_line_rx
+}
+
+/// After `handle_session_io`'s select loop exits, mark the session terminated
+/// and answer any still-pending requests with an explicit error.
+///
+/// This prevents "Response channel closed" errors that manifest as cryptic
+/// "Canceled: canceled" messages in clients.
+async fn finish_session_io(session: &Arc<Session>) {
+    session.set_terminated(true);
+
+    if session.pending_requests.is_empty() {
+        return;
+    }
+
+    // R-SIGN.5: if the peer died abnormally, its exit monitor has
+    // classified the cause (e.g. the macOS code-signing SIGKILL).
+    // Surface that to the client instead of a bare "terminated
+    // unexpectedly". Wait briefly — the exit status can land a moment
+    // after the pipe EOF that broke the I/O loop.
+    let cause = match session.exit_cause.lock().await.take() {
+        Some(rx) => tokio::time::timeout(Duration::from_millis(500), rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok()),
+        None => None,
+    };
+    let message = match cause {
+        Some(cause) => format!("Session terminated: server subprocess died: {cause}"),
+        None => "Session terminated unexpectedly - subprocess may have crashed or handshake failed"
+            .to_string(),
+    };
+    fail_pending_requests(&session.pending_requests, &session.id, &message);
 }
 
 #[cfg(test)]

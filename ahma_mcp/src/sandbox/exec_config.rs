@@ -462,10 +462,9 @@ pub async fn resolve_git_dirs_async(workspace_root: &Path) -> Vec<PathBuf> {
         // A skipped entry still costs budget: the budget bounds how much of the
         // directory we look at, not how much of it we descend into.
         budget -= 1;
-        if !is_scannable_child(&entry.file_name().to_string_lossy()) {
-            continue;
-        }
-        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+        if is_scannable_child(&entry.file_name().to_string_lossy())
+            && entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
+        {
             collect_git_dir_async(&entry.path(), &mut out).await;
         }
     }
@@ -477,19 +476,20 @@ pub async fn resolve_git_dirs_async(workspace_root: &Path) -> Vec<PathBuf> {
 /// `config` can, so everything else skips [`resolve_git_dirs_async`] entirely and
 /// the common write pays no filesystem cost at all.
 pub fn needs_git_dir_resolution(path: &Path) -> bool {
-    let mut saw_hooks = false;
-    for c in path.components() {
-        if let Component::Normal(s) = c {
-            let s = s.to_string_lossy();
-            if s.eq_ignore_ascii_case("hooks") {
-                saw_hooks = true;
-            }
-        }
-    }
-    saw_hooks
-        || path
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("config"))
+    has_hooks_component(path) || is_named_config(path)
+}
+
+/// Does any path component literally spell `hooks` (case-insensitively)?
+fn has_hooks_component(path: &Path) -> bool {
+    path.components().any(
+        |c| matches!(c, Component::Normal(s) if s.to_string_lossy().eq_ignore_ascii_case("hooks")),
+    )
+}
+
+/// Is the path's final component literally named `config` (case-insensitively)?
+fn is_named_config(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("config"))
 }
 
 async fn collect_git_dir_async(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -649,29 +649,51 @@ pub fn grantable_git_dirs(roots: &[PathBuf], scopes: &[PathBuf]) -> GitDirGrants
 
     // Two passes: a `commondir` grant is only as good as the worktree git dir it
     // was reached through, and that dir may be resolved after it.
+    classify_direct_dirs(&resolved, scopes, &mut seen, &mut out);
+    classify_commondir_dirs(&resolved, scopes, &mut seen, &mut out);
+
+    out
+}
+
+/// First pass of [`grantable_git_dirs`]: every resolved dir that is *not* a
+/// `commondir` hop — a plain `.git` directory or a `gitdir:` pointer.
+fn classify_direct_dirs(
+    resolved: &[ResolvedGitDir],
+    scopes: &[PathBuf],
+    seen: &mut Vec<PathBuf>,
+    out: &mut GitDirGrants,
+) {
     for dir in resolved
         .iter()
         .filter(|d| !matches!(d.origin, GitDirOrigin::CommonDir { .. }))
     {
-        if !first_visit(&mut seen, &dir.path) {
+        if !first_visit(seen, &dir.path) {
             continue;
         }
         let verdict = classify_grant(dir, scopes);
-        record_verdict(&mut out, &dir.path, pointer_of(dir), verdict);
+        record_verdict(out, &dir.path, pointer_of(dir), verdict);
     }
+}
 
-    for dir in &resolved {
+/// Second pass of [`grantable_git_dirs`]: `commondir` hops, which can only be
+/// trusted once the worktree git dir that named them has already been
+/// classified by the first pass.
+fn classify_commondir_dirs(
+    resolved: &[ResolvedGitDir],
+    scopes: &[PathBuf],
+    seen: &mut Vec<PathBuf>,
+    out: &mut GitDirGrants,
+) {
+    for dir in resolved {
         let GitDirOrigin::CommonDir { via } = &dir.origin else {
             continue;
         };
-        if !first_visit(&mut seen, &dir.path) {
+        if !first_visit(seen, &dir.path) {
             continue;
         }
         let verdict = classify_common_dir(&dir.path, via, scopes, &out.granted);
-        record_verdict(&mut out, &dir.path, Some(via.clone()), verdict);
+        record_verdict(out, &dir.path, Some(via.clone()), verdict);
     }
-
-    out
 }
 
 /// Every git dir governing any of `roots`, deduplicated by resolved path and
@@ -737,22 +759,39 @@ fn classify_grant(dir: &ResolvedGitDir, scopes: &[PathBuf]) -> Result<GrantBasis
         // a root that is itself outside the scopes. Nothing vouches for it.
         return Err(refusals::NO_BACKREF);
     };
-    if let Ok(backref) = std::fs::read_to_string(dir.path.join("gitdir")) {
-        let claimed = canonical_or(Path::new(backref.trim()));
-        return if claimed == canonical_or(dot_git_file) {
-            Ok(GrantBasis::WorktreeBackref)
-        } else {
-            Err(refusals::BACKREF_MISMATCH)
-        };
+    if let Some(verdict) = worktree_backref_verdict(&dir.path, dot_git_file) {
+        return verdict;
     }
-    // `--separate-git-dir`: the relocated dir's config names the working tree.
-    let worktree_parent = dot_git_file.parent().map(canonical_or);
-    if let (Some(parent), Some(declared)) = (worktree_parent, core_worktree_of(&dir.path))
-        && declared == parent
-    {
+    if has_separate_git_dir_backref(&dir.path, dot_git_file) {
         return Ok(GrantBasis::SeparateGitDirBackref);
     }
     Err(refusals::NO_BACKREF)
+}
+
+/// Linked-worktree check: `<dir>/gitdir` names the `.git` pointer file back.
+/// `None` when there is no such file to check (falls through to the
+/// `--separate-git-dir` check); `Some` carries the final verdict once a
+/// back-reference file exists, whether it matches or not.
+fn worktree_backref_verdict(
+    dir: &Path,
+    dot_git_file: &Path,
+) -> Option<Result<GrantBasis, &'static str>> {
+    let backref = std::fs::read_to_string(dir.join("gitdir")).ok()?;
+    let claimed = canonical_or(Path::new(backref.trim()));
+    Some(if claimed == canonical_or(dot_git_file) {
+        Ok(GrantBasis::WorktreeBackref)
+    } else {
+        Err(refusals::BACKREF_MISMATCH)
+    })
+}
+
+/// `--separate-git-dir` check: the relocated dir's config names the working
+/// tree that `dot_git_file` sits in.
+fn has_separate_git_dir_backref(dir: &Path, dot_git_file: &Path) -> bool {
+    let Some(parent) = dot_git_file.parent().map(canonical_or) else {
+        return false;
+    };
+    core_worktree_of(dir).is_some_and(|declared| declared == parent)
 }
 
 fn classify_common_dir(

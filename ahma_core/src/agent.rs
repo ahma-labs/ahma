@@ -625,6 +625,25 @@ fn prepare_tool_definitions(
         .collect()
 }
 
+/// Decide whether a tool call may proceed: tools that don't require approval
+/// (or that were already granted "always allow" for this workspace) pass
+/// straight through; everything else is routed to the approval gate.
+async fn resolve_tool_approval(
+    call_id: &str,
+    call_name: &str,
+    cfg: &McpChatConfig,
+    args_str: &str,
+    gate: &dyn AgentApprovalGate,
+) -> bool {
+    if !needs_approval(call_name, cfg.tool_approval) {
+        return true;
+    }
+    if crate::approvals::is_tool_approved(&cfg.workspace_root, call_name).await {
+        return true;
+    }
+    gate.request_approval(call_id, call_name, args_str).await
+}
+
 async fn execute_single_tool_call(
     call: ahma_llm_monitor::client::ChatToolCall,
     cfg: McpChatConfig,
@@ -634,17 +653,8 @@ async fn execute_single_tool_call(
     let args_value = call.arguments;
     let args_str = serde_json::to_string(&args_value).unwrap_or_default();
 
-    let approved = if needs_approval(&call.name, cfg.tool_approval) {
-        // A previously granted "always allow" for this tool in this workspace
-        // skips the prompt entirely.
-        if crate::approvals::is_tool_approved(&cfg.workspace_root, &call.name).await {
-            true
-        } else {
-            gate.request_approval(&call.id, &call.name, &args_str).await
-        }
-    } else {
-        true
-    };
+    let approved =
+        resolve_tool_approval(&call.id, &call.name, &cfg, &args_str, gate.as_ref()).await;
 
     if !approved {
         let err_text = "Error: Tool execution rejected by user".to_string();
