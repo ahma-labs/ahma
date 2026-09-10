@@ -200,17 +200,16 @@ concurrency:
   # squash-merge that may publish a release, so it must always finish.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/production' }}
 
-# TIERED CI (see .github/workflows/fast-tier.yml):
-#   - Pull requests run the FAST tier only (Linux fmt + clippy + nextest `smoke`), ~5 min.
-#   - This full cross-platform matrix runs at the MERGE GATE via the merge queue
-#     (`merge_group`) — once per landed feature, not on every iteration push — and on
-#     every push to main/production. The release binaries are built + published only when
-#     the push bumps Cargo.toml to an as-yet-unreleased version (see job-release-gate): an
-#     ordinary land runs the test matrix + coverage but skips the 6-platform release build.
-# This is why `pull_request` is intentionally NOT a trigger here: the full matrix is the
-# gate to LAND, the fast tier is the gate to ITERATE.
+# CI PIPELINE:
+#   - Pull requests run Fast Tier (~5 min quick feedback) and this full cross-platform
+#     matrix (Linux, macOS, Windows, Android), gated by `CI green` (`ci-green`).
+#   - The release binaries are built + published only when a push to main bumps Cargo.toml to an
+#     as-yet-unreleased version (see job-release-gate): PR runs and ordinary lands run the test
+#     matrix but skip the 6-platform release build.
 on:
   push:
+    branches: [main, production]
+  pull_request:
     branches: [main, production]
   merge_group:
   workflow_dispatch:
