@@ -97,7 +97,7 @@ The whole loop is two commands:
    you fix something
         │
         ▼
-  /ahmadev land  ──►  branch from origin/main ─► PR ─► CI runs (Fast Tier + Full Matrix)
+  /ahmadev land  ──►  branch from origin/main ─► PR ─► full CI matrix
         │                                                     │
         │                                                     ▼
         │                                              gh pr checks --watch (all checks must pass)
@@ -114,9 +114,9 @@ The whole loop is two commands:
 **Q: I fixed something — how do I drive it to `main` if it passes PR CI?**
 → `/ahmadev land`. It branches from `origin/main`, makes small conventional commits, opens a
 PR, actively watches all CI checks pass (`gh pr checks --watch`), and squash-merges to `main`
-(`gh pr merge --squash --delete-branch`). Both Fast Tier (~5m) and the full cross-platform matrix
-(`build.yml`: Linux, macOS, Windows, Android gated by `CI green`) run on the PR and must pass
-before the merge can occur.
+(`gh pr merge --squash --delete-branch`). The full cross-platform matrix (`build.yml`: Linux,
+macOS, Windows, Android, gated by `CI green`) runs on the PR and must pass before the merge
+can occur.
 
 **Q: What do I type to publish a new release?**
 → `/ahmadev release`. The **version number is the release trigger**: a push to `main` builds
@@ -130,25 +130,25 @@ then watches CI publish the GitHub Release. (You almost never type `/ahmadev bum
 
 **Q: Why watch checks before merging?**
 → `gh pr checks --watch` monitors all CI checks to completion and exits non-zero if any check
-fails, halting the land before `gh pr merge` is ever called. In addition, `main` enforces required
-status checks (`CI green` and `Fast Tier (fmt + clippy + smoke)`) so broken code can never merge.
+fails, halting the land before `gh pr merge` is ever called. In addition, `main` enforces the required
+status check (`CI green`) so broken code can never merge.
 It's a good idea here precisely because:
 - changes are **small and squashed** → one revertable commit each, a clean linear `main`;
 - undo is a **one-liner** → `git revert <sha>` (single parent);
 - all platforms (Linux, macOS, Windows, Android) are verified *before* code reaches `main`.
 
-  It is **not** a fire-and-forget rubber stamp. Fast Tier (and CI generally) can't catch design
-  mistakes, security/invariant regressions, or breaking API changes. So `/ahmadev land` **pauses
-  for human confirmation** when a change touches sandbox/security invariants (SPEC R5/R6) or release
-  signing, alters CI or branch-protection itself, breaks a public API, or is otherwise
-  platform-sensitive. For routine small fixes: watch checks pass and land. See **Gate Model** at the
-  bottom for the full rationale.
+  It is **not** a fire-and-forget rubber stamp. CI can't catch high-level design mistakes,
+  security/invariant regressions, or breaking API changes. So `/ahmadev land` **pauses for human
+  confirmation** when a change touches sandbox/security invariants (SPEC R5/R6) or release signing,
+  alters CI or branch-protection itself, breaks a public API, or is otherwise platform-sensitive.
+  For routine small fixes: watch checks pass and land. See **Gate Model** at the bottom for the
+  full rationale.
 
 ### Subcommand list
 
 ```
 /ahmadev help      — Show this overview + subcommand list
-/ahmadev land      — Branch → PR → auto squash-merge on main when Fast Tier passes  ← drive a fix to main
+/ahmadev land      — Branch → PR → squash-merge on main when all CI checks pass  ← drive a fix to main
 /ahmadev release   — Land pending work + bump version on main; CI publishes the GitHub Release  ← ship to users
                      (alias: /ahmadev publish — "publish" and "release" mean the same thing here)
 /ahmadev simplify  — Review the diff for cleanup opportunities, apply fixes, report before/after metrics table
@@ -163,10 +163,9 @@ It's a good idea here precisely because:
 Reference `/ahma help` for general ahma tooling (sandbox, livelog, run_terminal_command,
 simplify, ahma update, etc.).
 
-> **The gate is live:** `main` requires **`CI green`** (the full cross-platform test matrix)
-> and **`Fast Tier (fmt + clippy + smoke)`**, and `/ahmadev land` actively watches all PR checks
-> pass before merging (`gh pr checks --watch`). See **Gate Model** at the bottom for the
-> rationale and the exact settings.
+> **The gate is live:** `main` requires **`CI green`** (the full cross-platform test matrix),
+> and `/ahmadev land` actively watches all PR checks pass before merging (`gh pr checks --watch`).
+> See **Gate Model** at the bottom for the rationale and the exact settings.
 
 ---
 
@@ -175,7 +174,7 @@ simplify, ahma update, etc.).
 ### What it does
 
 Takes one focused change and lands it as a **single squashed commit** on `main`, gated on all
-PR CI checks passing (both **Fast Tier** and the full cross-platform matrix **CI green**). This
+PR CI checks passing (**`CI green`** covering Linux, macOS, Windows, and Android). This
 is the workhorse of the many-small-features workflow. It watches checks with `gh pr checks --watch`
 and squash-merges once the PR is completely green.
 
@@ -240,7 +239,7 @@ If it prints any `⚠` line, surface it to the human and suggest `/ahmadev gitco
    gh pr create --fill --base main
    gh pr view --web
    ```
-   The PR push triggers CI: **Fast Tier** (~5 min) and the full cross-platform test matrix (**Ahma** / `CI green`).
+   The PR push triggers CI: the full cross-platform test matrix (**Ahma** / `CI green`).
 
 5. **Wait for all CI checks to pass:**
    ```bash
@@ -260,7 +259,7 @@ If it prints any `⚠` line, surface it to the human and suggest `/ahmadev gitco
 
 ### Why `gh pr merge`, never local `git merge --squash` + push
 
-A local squash-and-push **bypasses the Fast Tier gate** and can put unbuildable code on `main`.
+A local squash-and-push **bypasses the PR CI gate** and can put unbuildable code on `main`.
 Always route landings through the PR so nothing merges unchecked. (Branch protection — required
 status check + `enforce_admins` + blocked force-push — refuses direct pushes to `main` anyway.)
 
@@ -269,8 +268,7 @@ status check + `enforce_admins` + blocked force-push — refuses direct pushes t
 Drive routine features straight to merged, but **stop and confirm with the human** when the
 change: touches the sandbox/security invariants (SPEC R5/R6) or the release-signing path;
 alters CI or branch-protection itself; changes a public API in a breaking way; or is
-platform-sensitive (Windows/macOS/Android paths) — Fast Tier won't catch an other-OS break
-before it lands, so these warrant extra care. Otherwise, the philosophy is
+platform-sensitive (Windows/macOS/Android paths). Otherwise, the philosophy is
 push-forward-and-clean-up: land it, watch the post-merge matrix, and `git revert` (or
 forward-fix) if it turns out wrong.
 
@@ -302,10 +300,8 @@ attestation altogether. So a release = landing a version bump on `main`.
 > and `ci-green` only passes when the entire cross-platform matrix is green on the exact bump
 > commit: `job-cargo-nextest` (Linux/macOS/Windows full + ARM64 smoke), `job-android-nextest`
 > (Android/Kotlin), and `job-security` (`cargo deny`). If any leg is red the release is **not**
-> published — the tag is never created (`ahma update` keeps serving the previous release). Note
-> the bump *lands* on `main` gated only on Fast Tier (like any land), but it only *publishes*
-> after the heavy matrix passes post-merge. So a released `v<X.Y.Z>` has always cleared the full
-> suite on every supported platform.
+> published — the tag is never created (`ahma update` keeps serving the previous release).
+> So a released `v<X.Y.Z>` has always cleared the full suite on every supported platform.
 
 > **`cargo xtask bump-version` now also refreshes `Cargo.lock`** (every workspace member
 > carries its version there, and all CI builds `--locked`). A bump commit therefore builds
@@ -1224,7 +1220,6 @@ Landing is gated on PR CI, requiring all checks to pass before merging:
 
 1. **Local** (before push): `cargo clippy --allow-dirty --fix`, then `cargo clippy --tests --allow-dirty --fix`, then `cargo fmt --all`, then `cargo nextest run`, then `cargo test --doc`, then `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items`.
 2. **PR CI Gates** (on `pull_request`):
-   - **Fast Tier** (`fast-tier.yml`): Linux fmt + clippy + smoke + cargo deny (~5 min).
    - **Full Matrix & CI Green** (`build.yml`): cross-platform test matrix (Linux, macOS, Windows, Android) and aggregate gate `CI green` (`ci-green`).
    - **CodeQL** (`codeql.yml`).
    `/ahmadev land` runs `gh pr checks --watch` to monitor and verify all checks pass *before* merging.
@@ -1235,7 +1230,7 @@ Landing is gated on PR CI, requiring all checks to pass before merging:
 
 | Setting | Value | Why |
 |---------|-------|-----|
-| Required status checks (classic protection on `main`) | `CI green`, `Fast Tier (fmt + clippy + smoke)` | The gates that protect `main` |
+| Required status checks (classic protection on `main`) | `CI green` | The gate that protects `main` |
 | "Require branches up to date" (`strict`) | **off** | Forcing a rebase between every land kills throughput |
 | `enforce_admins` ("Do not allow bypassing") | off (admin override) / on | Protect against accidental un-gated pushes |
 | `allow_force_pushes` / `allow_deletions` (on `main`) | off / off | Protect history |
