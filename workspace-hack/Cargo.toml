@@ -20,7 +20,7 @@ publish = false
 [dependencies]
 aho-corasick = { version = "1" }
 aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
-aws-lc-sys = { version = "0.41", default-features = false, features = ["prebuilt-nasm"] }
+aws-lc-sys = { version = "0.45", default-features = false, features = ["prebuilt-nasm"] }
 axum = { version = "0.8", features = ["http2"] }
 base64 = { version = "0.22" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
@@ -43,7 +43,6 @@ getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-f
 hashbrown = { version = "0.17" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
-itertools = { version = "0.14" }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
@@ -82,14 +81,13 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 [build-dependencies]
 fastrand = { version = "2" }
 hashbrown = { version = "0.17" }
-itertools = { version = "0.14" }
 memchr = { version = "2" }
 proc-macro2 = { version = "1" }
 quote = { version = "1" }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "float_roundtrip", "preserve_order", "raw_value"] }
 siphasher = { version = "1" }
-syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["full"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 
 [target.aarch64-apple-darwin.dependencies]
@@ -163,7 +161,8 @@ rustls = { version = "0.23" }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "evntrace", "handleapi", "impl-default", "in6addr", "inaddr", "minwinbase", "ntsecapi", "processenv", "profileapi", "synchapi", "winbase", "windef", "winerror", "winioctl", "winuser"] }
 windows = { version = "0.62", features = ["Wdk_System_SystemInformation", "Wdk_System_SystemServices", "Wdk_System_Threading", "Win32_Security_Authorization", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Shell"] }
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_SystemInformation"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
