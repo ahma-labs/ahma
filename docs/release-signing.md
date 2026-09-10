@@ -163,7 +163,7 @@ cargo install --git https://github.com/ahma-labs/ahma ahma_bin --bin ahma --root
 
 ## AGPL + Sigstore: two-layer supply chain defence
 
-The `ahma` binary and security-relevant crates are **AGPL-3.0-or-later**. AGPL requires
+The `ahma` binary and security-relevant crates are **AGPL-3.0**. AGPL requires
 source disclosure for any distributed or network-accessible modification, closing the route
 of shipping a backdoored binary without publishing the changes. The Sigstore attestation
 verifies that what you install was built from the published, auditable source by the

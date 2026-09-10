@@ -28,7 +28,7 @@
 //!
 //! | Crate | License | Primitives |
 //! |-------|---------|-----------|
-//! | `ahma_tui` | AGPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
+//! | `ahma_tui` | AGPL-3.0 | `TuiApp`, `TuiEvent`, `run_tui` |
 //!
 //! Linking any of these AGPL crates into a binary means any modified version
 //! offered to remote users over a network must provide source access per

@@ -195,10 +195,10 @@ mod wizard_prompt;
 // ── New modules (roadmap milestones) ─────────────────────────────────────────
 //
 // The following milestone modules have been extracted into dedicated
-// AGPL-3.0-or-later crates to allow this library to
+// AGPL-3.0 crates to allow this library to
 // remain MIT OR Apache-2.0:
 //
-//   ahma_tui       — ratatui TUI control plane               (AGPL-3.0-or-later)
+//   ahma_tui       — ratatui TUI control plane               (AGPL-3.0)
 //
 // These crates live in the same workspace and depend on this library;
 // they must NOT be depended on from this crate.

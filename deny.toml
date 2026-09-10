@@ -53,7 +53,7 @@ allow = [
     "Unicode-3.0",                    # icu_* / unicode crates
     "CDLA-Permissive-2.0",            # webpki-root-certs, webpki-roots
     # First-party crates (ahma_bin, ahma_tui, etc.)
-    "AGPL-3.0-or-later",
+    "AGPL-3.0",
 ]
 
 # ---------------------------------------------------------------------------

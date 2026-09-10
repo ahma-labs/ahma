@@ -6,7 +6,7 @@
 //!
 //! ## License
 //!
-//! This crate is licensed under **AGPL-3.0-or-later**.
+//! This crate is licensed under **AGPL-3.0**.
 
 pub mod accordion;
 pub mod agent_config;

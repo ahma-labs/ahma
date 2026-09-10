@@ -1,7 +1,7 @@
 [package]
 authors.workspace = true
 edition.workspace = true
-license = "AGPL-3.0-or-later"
+license = "AGPL-3.0"
 name = "ahma_bin"
 readme.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,8 @@ description = "The ahma binary: wires the MIT ahma_mcp library with the AGPL-lic
 repository = "https://github.com/ahma-labs/ahma"
 homepage = "https://github.com/ahma-labs/ahma"
 
-# All first-party copyleft crates (ahma_tui) are AGPL-3.0-or-later. The compiled ahma binary is therefore
-# AGPL-3.0-or-later. See README for details.
+# All first-party copyleft crates (ahma_tui) are AGPL-3.0. The compiled ahma binary is therefore
+# AGPL-3.0. See README for details.
 
 # ── cargo-binstall: fetch the prebuilt, attested release binary ──────────────
 # Lets `cargo binstall --git https://github.com/ahma-labs/ahma ahma_bin` pull the

@@ -26,7 +26,7 @@
 ## 3. Non-Functional Requirements
 
 - **Binary Portability**: Compiles cleanly into a single static binary.
-- **License Compliance**: Subject to the AGPL-3.0-or-later license, enforcing source disclosure for distributed changes.
+- **License Compliance**: Subject to the AGPL-3.0 license, enforcing source disclosure for distributed changes.
 
 ## 4. Out of Scope
 
