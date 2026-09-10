@@ -1,6 +1,6 @@
 //! # ahma binary entry point
 //!
-//! This crate is licensed under **AGPL-3.0-or-later**.
+//! This crate is licensed under **AGPL-3.0**.
 
 use anyhow::{Context, Result};
 use clap::Parser as _;

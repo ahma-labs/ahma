@@ -2120,7 +2120,7 @@ Ahma does not only *ship* skills — it can *run* any skill that follows the
 
 ### 12.1 Removed: orphaned incubating crates (`ahma_decompose`, `ahma_worker`, `ahma_renewal`)
 
-These three AGPL-3.0-or-later crates were removed from the workspace because nothing in the
+These three AGPL-3.0 crates were removed from the workspace because nothing in the
 shipped product invoked them:
 
 - **`ahma_renewal`** — renewal contract for long-running tasks. Had zero dependents and no SPEC.

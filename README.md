@@ -389,8 +389,8 @@ Ahma uses a dual-tier licensing model to keep the core library reusable while en
 | `ahma_update` | MIT OR Apache-2.0 | Self-update: release download, Sigstore verification (`ahma verify`), git installs |
 | `ahma_vault` | MIT OR Apache-2.0 | Task vault: isolated per-task directories, two-phase trash, audit log |
 | `generate_tool_schema` | MIT OR Apache-2.0 | Schema generation utility |
-| `ahma_tui` | AGPL-3.0-or-later | Terminal dashboard and approval flow |
-| `ahma_bin` | AGPL-3.0-or-later | Shipped `ahma` binary |
+| `ahma_tui` | AGPL-3.0 | Terminal dashboard and approval flow |
+| `ahma_bin` | AGPL-3.0 | Shipped `ahma` binary |
 
 `MIT OR Apache-2.0` is used for the embeddable libraries, transports, and
 tooling crates so other Rust applications can adopt Ahma's protocol and secure
@@ -400,7 +400,7 @@ license so developers can embed Ahma's MCP server and sandbox execution primitiv
 explicit patent grant, and the MIT side preserves the standard Rust dual-license
 option used by many libraries.
 
-`AGPL-3.0-or-later` is used for the end-user and network-exposed product crates
+`AGPL-3.0` is used for the end-user and network-exposed product crates
 that define the shipped product surface and security-relevant runtime behavior.
 That includes the shipped `ahma` binary and the user-facing TUI.
 
@@ -451,7 +451,7 @@ architecture, manual verification commands, and trust model details.
 | If you want to... | Typical answer |
 |---|---|
 | Embed `ahma_mcp`, `ahma_core`, or `ahma_http_mcp_client` in your own application | Allowed under **MIT OR Apache-2.0** for those crates |
-| Distribute a modified `ahma` binary | Allowed under **AGPL-3.0-or-later** — source must be published |
+| Distribute a modified `ahma` binary | Allowed under **AGPL-3.0** — source must be published |
 | Offer a modified `ahma` service to remote users | Allowed under AGPL — source-availability obligations apply |
 | Use Ahma internally for local or private workflows | Allowed subject to the applicable crate terms |
 

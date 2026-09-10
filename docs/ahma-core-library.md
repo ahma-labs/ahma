@@ -31,7 +31,7 @@ those crates.
 
 | Crate | License | Key types |
 |-------|---------|----------|
-| `ahma_tui` | AGPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
+| `ahma_tui` | AGPL-3.0 | `TuiApp`, `TuiEvent`, `run_tui` |
 
 Embedding any of these AGPL crates means any modified version offered to remote users
 over a network must publish its modified source code (AGPL-3.0 §13).

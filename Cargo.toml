@@ -4,7 +4,7 @@
 resolver = "3"
 # default-members equals members (minus dev-only xtask): a plain `cargo build`
 # builds the whole product. The permissive crates (MIT OR Apache-2.0) form the
-# embeddable engine; the AGPL-3.0-or-later crates are the end-user product
+# embeddable engine; the AGPL-3.0 crates are the end-user product
 # surface. ahma_bin gates simplify behind a cargo feature (on by default).
 default-members = [
     # Permissive crates (MIT OR Apache-2.0)
@@ -24,7 +24,7 @@ default-members = [
     "ahma_simplify",
     "ahma_test_support",
     "ahma_harness_tools",
-    # AGPL-3.0-or-later crates (end-user product surface)
+    # AGPL-3.0 crates (end-user product surface)
     "ahma_tui",
     "ahma_bin",
 ]
@@ -47,7 +47,7 @@ members = [
     "ahma_simplify",
     "ahma_test_support",
     "ahma_harness_tools",
-    # AGPL-3.0-or-later crates (end-user product surface)
+    # AGPL-3.0 crates (end-user product surface)
     "ahma_tui",
     "ahma_bin",
     # cargo-hakari workspace-hack: pins one third-party feature set for every
@@ -64,7 +64,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 rust-version = "1.95.0"
-version = "0.21.0"
+version = "0.21.1"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -161,4 +161,3 @@ debug = 0
 lto = "thin"
 codegen-units = 1
 opt-level = 3
-
