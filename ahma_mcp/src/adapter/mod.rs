@@ -629,45 +629,69 @@ impl Adapter {
         let exit_code = output.status.code();
         let result = interpret_sync_command_output(output);
         if result.is_err() {
-            sandbox::grant_channel::notify_stderr_denial(
-                &self.sandbox,
-                self.scope_grant_notifier.as_ref(),
-                &stderr,
-                &stdout,
-                command,
-            )
-            .await;
-            // When the failure was a kernel denial on an out-of-scope path, return
-            // it as a typed error so the MCP boundary attaches a structured
-            // `sandbox_denial` payload (path + grant->restart->retry remediation)
-            // instead of leaving the agent with a raw `os error 1`.
-            if let Some(hit) = sandbox::scan_denial_streams(&stderr, &stdout)
-                && !self.sandbox.is_path_in_scope(&hit.path)
-            {
-                // Same payload, durable copy: the structured error reaches the
-                // agent now, the audit line survives the session (SPEC R5.4.7).
-                audit::record_sandbox_denial(Some(op_id), &hit.path, hit.access.label(), command)
-                    .await;
-                let details = result.err().map(|e| e.to_string()).unwrap_or_default();
-                return SyncRun {
-                    outcome: audit::Outcome::Failed,
-                    exit_code,
-                    result: Err(sandbox::SandboxError::RuntimeDenial {
-                        path: hit.path,
-                        access: hit.access,
-                        scopes: self.sandbox.scopes().to_vec(),
-                        details,
-                    }
-                    .into()),
-                };
-            }
+            return self
+                .finalize_sync_denial(command, op_id, exit_code, &stdout, &stderr, result)
+                .await;
         }
         SyncRun {
-            outcome: if result.is_ok() {
-                audit::Outcome::Completed
-            } else {
-                audit::Outcome::Failed
-            },
+            outcome: audit::Outcome::Completed,
+            exit_code,
+            result,
+        }
+    }
+
+    /// Turn a failed sync command's output into the final [`SyncRun`], scanning
+    /// stderr/stdout for a sandbox denial the kernel did not name.
+    ///
+    /// Split out of [`Self::run_sync_prepared`] so the happy path there stays a
+    /// straight line; this is the async-path twin of `record_failure_diagnostics`.
+    async fn finalize_sync_denial(
+        &self,
+        command: &str,
+        op_id: &str,
+        exit_code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+        result: Result<String, anyhow::Error>,
+    ) -> SyncRun {
+        sandbox::grant_channel::notify_stderr_denial(
+            &self.sandbox,
+            self.scope_grant_notifier.as_ref(),
+            stderr,
+            stdout,
+            command,
+        )
+        .await;
+        // When the failure was a kernel denial on an out-of-scope path, return
+        // it as a typed error so the MCP boundary attaches a structured
+        // `sandbox_denial` payload (path + grant->restart->retry remediation)
+        // instead of leaving the agent with a raw `os error 1`.
+        let Some(hit) = sandbox::scan_denial_streams(stderr, stdout) else {
+            return SyncRun {
+                outcome: audit::Outcome::Failed,
+                exit_code,
+                result,
+            };
+        };
+        if !self.sandbox.is_path_in_scope(&hit.path) {
+            // Same payload, durable copy: the structured error reaches the
+            // agent now, the audit line survives the session (SPEC R5.4.7).
+            audit::record_sandbox_denial(Some(op_id), &hit.path, hit.access.label(), command).await;
+            let details = result.err().map(|e| e.to_string()).unwrap_or_default();
+            return SyncRun {
+                outcome: audit::Outcome::Failed,
+                exit_code,
+                result: Err(sandbox::SandboxError::RuntimeDenial {
+                    path: hit.path,
+                    access: hit.access,
+                    scopes: self.sandbox.scopes().to_vec(),
+                    details,
+                }
+                .into()),
+            };
+        }
+        SyncRun {
+            outcome: audit::Outcome::Failed,
             exit_code,
             result,
         }
@@ -1215,41 +1239,16 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // Serialise commands in the same mutex group within the same working
     // directory.  The permit is held for the entire execution and released
     // automatically when it drops at the end of this function.
-    let _exclusive_permit = if let Some(group) = mutex_registry.find_group(&command) {
-        let group_name = group.name.clone();
-        monitor.note_progress(
-            &op_id,
-            format!(
-                "Queued: waiting for '{group_name}' mutex \
-                 (another {group_name} command is running in this directory)"
-            ),
-        );
-        let wd_path = std::path::Path::new(&working_dir);
-        match mutex_registry.acquire(group, wd_path).await {
-            Ok(permit) => {
-                tracing::debug!(op_id = %op_id, group = %group_name, "Acquired mutex group gate");
-                Some(permit)
-            }
-            Err(mutex_groups::MutexGroupError::Timeout { secs, .. }) => {
-                let err = format!(
-                    "Timed out waiting for '{group_name}' exclusive lock after {secs}s. \
-                     Another {group_name} command is still running in this directory. \
-                     Try again after it completes."
-                );
+    let _exclusive_permit =
+        match acquire_mutex_gate(&mutex_registry, &monitor, &op_id, &command, &working_dir).await {
+            Ok(permit) => permit,
+            Err(err) => {
                 fail_operation_with_error(&monitor, &op_id, err).await;
                 audit_complete(audit::Outcome::TimedOut, None).await;
                 task_handles.lock().await.remove(&op_id);
                 return;
             }
-            Err(mutex_groups::MutexGroupError::Closed { .. }) => {
-                // Semaphore was closed — should never happen; proceed without gate.
-                tracing::warn!("mutex group '{group_name}' semaphore unexpectedly closed");
-                None
-            }
-        }
-    } else {
-        None
-    };
+        };
 
     let start_time = Instant::now();
     let wd_path = std::path::PathBuf::from(&working_dir);
@@ -1296,6 +1295,53 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     audit_complete(outcome, exit_code).await;
 
     task_handles.lock().await.remove(&op_id);
+}
+
+/// Acquire the command's mutex-group gate, if the command belongs to one.
+///
+/// Split out of [`run_async_operation`] so its early-return control flow
+/// doesn't nest a match inside an `if let` inside that function's straight
+/// line of guard clauses.
+///
+/// Returns `Ok(None)` when the command isn't gated by any group, `Ok(Some(permit))`
+/// once both the in-memory and filesystem locks are held (or the semaphore was
+/// unexpectedly closed — logged and treated as ungated), and `Err(message)` when
+/// the wait timed out and the caller should fail the operation with `message`.
+async fn acquire_mutex_gate(
+    mutex_registry: &CommandMutexRegistry,
+    monitor: &Arc<OperationMonitor>,
+    op_id: &str,
+    command: &str,
+    working_dir: &str,
+) -> Result<Option<mutex_groups::MutexGroupGuard>, String> {
+    let Some(group) = mutex_registry.find_group(command) else {
+        return Ok(None);
+    };
+    let group_name = group.name.clone();
+    monitor.note_progress(
+        op_id,
+        format!(
+            "Queued: waiting for '{group_name}' mutex \
+             (another {group_name} command is running in this directory)"
+        ),
+    );
+    let wd_path = std::path::Path::new(working_dir);
+    match mutex_registry.acquire(group, wd_path).await {
+        Ok(permit) => {
+            tracing::debug!(op_id = %op_id, group = %group_name, "Acquired mutex group gate");
+            Ok(Some(permit))
+        }
+        Err(mutex_groups::MutexGroupError::Timeout { secs, .. }) => Err(format!(
+            "Timed out waiting for '{group_name}' exclusive lock after {secs}s. \
+             Another {group_name} command is still running in this directory. \
+             Try again after it completes."
+        )),
+        Err(mutex_groups::MutexGroupError::Closed { .. }) => {
+            // Semaphore was closed — should never happen; proceed without gate.
+            tracing::warn!("mutex group '{group_name}' semaphore unexpectedly closed");
+            Ok(None)
+        }
+    }
 }
 
 async fn fail_operation_with_error(

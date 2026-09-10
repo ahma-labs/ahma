@@ -637,10 +637,40 @@ async fn await_shutdown_signal() {
     }
 }
 
+/// Tear the bridge down after `spawn_idle_timeout_checker` observes zero
+/// active sessions for the configured timeout.
+///
+/// When hosted by the per-user daemon, `exit` owns the process's exit path,
+/// so this only *asks* it to stop (the daemon's own idle policy also counts
+/// hub connections, so it must decide rather than have this checker exit
+/// unilaterally). Standalone, it tears down sessions itself, cleans up a
+/// Unix socket if any, and exits directly.
+async fn shutdown_idle_bridge(
+    timeout: u64,
+    session_manager: Arc<SessionManager>,
+    exit: Option<Arc<DaemonExit>>,
+    #[cfg_attr(not(unix), allow(unused_variables))] listener_kind: ListenerKind,
+) {
+    tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
+    if let Some(exit) = exit.as_ref() {
+        exit.request("bridge idle timeout");
+        return;
+    }
+    session_manager
+        .terminate_all(crate::session::SessionTerminationReason::Timeout)
+        .await;
+    #[cfg(unix)]
+    if let ListenerKind::Unix(ref path) = listener_kind
+        && !path.starts_with('\0')
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    std::process::exit(0);
+}
+
 fn spawn_idle_timeout_checker(timeout: u64, state: Arc<BridgeState>) {
     let session_manager = state.session_manager.clone();
     let exit = state.exit.clone();
-    #[cfg_attr(not(unix), allow(unused_variables))]
     let listener_kind = state.listener_kind.clone();
     let counter = session_manager
         .active_sessions
@@ -658,24 +688,8 @@ fn spawn_idle_timeout_checker(timeout: u64, state: Arc<BridgeState>) {
 
             idle_duration += check_interval;
             if idle_duration.as_secs() >= timeout {
-                tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
-                if let Some(exit) = exit.as_ref() {
-                    // The daemon's own idle policy also counts hub connections;
-                    // this checker is not installed there, but if it ever is,
-                    // it must ask rather than exit.
-                    exit.request("bridge idle timeout");
-                    return;
-                }
-                session_manager
-                    .terminate_all(crate::session::SessionTerminationReason::Timeout)
-                    .await;
-                #[cfg(unix)]
-                if let ListenerKind::Unix(ref path) = listener_kind
-                    && !path.starts_with('\0')
-                {
-                    let _ = std::fs::remove_file(path);
-                }
-                std::process::exit(0);
+                shutdown_idle_bridge(timeout, session_manager, exit, listener_kind).await;
+                return;
             }
         }
     });
@@ -1390,6 +1404,69 @@ async fn health_check(State(state): State<Arc<BridgeState>>) -> impl IntoRespons
 /// process exits regardless. See [`handle_restart`].
 const RESTART_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// `?mode=drain` is what an upgrading client asks for: stop accepting new
+/// sessions and go when the live ones end. The old unconditional restart
+/// tore down every attached editor's session mid-command to install a new
+/// binary for one of them (SPEC R-DAEMON.5).
+fn drain_requested(request: &axum::extract::Request) -> bool {
+    request
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|kv| kv == "mode=drain"))
+}
+
+/// Build the `{"status": <status>, "version": ...}` response shared by every
+/// `/restart` outcome (`"draining"` / `"restarting"`).
+fn restart_status_response(status: &str) -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": status,
+            "version": format!("{}+{}", env!("CARGO_PKG_VERSION"), ahma_common::BUILD_ID)
+        })),
+    )
+        .into_response()
+}
+
+/// Tear the bridge process down after `/restart` has already told the caller
+/// it is restarting.
+///
+/// Once we have said "shutting down", we MUST exit. A bridge that announces
+/// shutdown and then lives on is the worst of both worlds: it has torn down
+/// its sessions so it can no longer serve anyone, but it holds its clients'
+/// connections open, so they hear neither a response nor a disconnect. One
+/// did exactly that for five and a half hours, and the client it stranded
+/// simply hung.
+///
+/// Session teardown is already individually bounded (PEER_SHUTDOWN_GRACE);
+/// this outer bound is the backstop that makes exit unconditional.
+async fn shut_down_after_restart(
+    session_manager: Arc<SessionManager>,
+    #[cfg_attr(not(unix), allow(unused_variables))] listener_kind: ListenerKind,
+) {
+    if tokio::time::timeout(
+        RESTART_SHUTDOWN_GRACE,
+        session_manager.terminate_all(crate::session::SessionTerminationReason::ClientRequested),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            grace_secs = RESTART_SHUTDOWN_GRACE.as_secs(),
+            "Session teardown exceeded the shutdown grace period; exiting anyway \
+             rather than stranding clients on a half-dead bridge"
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    #[cfg(unix)]
+    if let ListenerKind::Unix(ref path) = listener_kind
+        && !path.starts_with('\0')
+    {
+        ahma_common::fs_lock::remove_stale_socket(path);
+    }
+    std::process::exit(0);
+}
+
 /// Handler for POST /restart
 ///
 /// Anyone who can call this kills the bridge, so it is gated three ways: it
@@ -1416,84 +1493,22 @@ async fn handle_restart(
         )
             .into_response();
     }
-    // `?mode=drain` is what an upgrading client asks for: stop accepting new
-    // sessions and go when the live ones end. The old unconditional restart
-    // tore down every attached editor's session mid-command to install a new
-    // binary for one of them (SPEC R-DAEMON.5).
-    let drain_requested = request
-        .uri()
-        .query()
-        .is_some_and(|q| q.split('&').any(|kv| kv == "mode=drain"));
     if let Some(exit) = state.exit.clone() {
-        if drain_requested {
+        if drain_requested(&request) {
             info!("Drain requested: finishing live sessions, accepting no new ones.");
             exit.request_drain();
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "draining",
-                    "version": format!("{}+{}", env!("CARGO_PKG_VERSION"), ahma_common::BUILD_ID)
-                })),
-            )
-                .into_response();
+            return restart_status_response("draining");
         }
         info!("Restart requested. Asking the daemon to stop...");
         exit.request("restart requested");
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "restarting",
-                "version": format!("{}+{}", env!("CARGO_PKG_VERSION"), ahma_common::BUILD_ID)
-            })),
-        )
-            .into_response();
+        return restart_status_response("restarting");
     }
 
     info!("Restart requested. Shutting down bridge process...");
-    #[cfg_attr(not(unix), allow(unused_variables))]
     let listener_kind = state.listener_kind.clone();
     let session_manager = state.session_manager.clone();
-    tokio::spawn(async move {
-        // Once we have said "shutting down", we MUST exit. A bridge that announces
-        // shutdown and then lives on is the worst of both worlds: it has torn down
-        // its sessions so it can no longer serve anyone, but it holds its clients'
-        // connections open, so they hear neither a response nor a disconnect. One
-        // did exactly that for five and a half hours, and the client it stranded
-        // simply hung.
-        //
-        // Session teardown is already individually bounded (PEER_SHUTDOWN_GRACE);
-        // this outer bound is the backstop that makes exit unconditional.
-        if tokio::time::timeout(
-            RESTART_SHUTDOWN_GRACE,
-            session_manager
-                .terminate_all(crate::session::SessionTerminationReason::ClientRequested),
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!(
-                grace_secs = RESTART_SHUTDOWN_GRACE.as_secs(),
-                "Session teardown exceeded the shutdown grace period; exiting anyway \
-                 rather than stranding clients on a half-dead bridge"
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        #[cfg(unix)]
-        if let ListenerKind::Unix(ref path) = listener_kind
-            && !path.starts_with('\0')
-        {
-            ahma_common::fs_lock::remove_stale_socket(path);
-        }
-        std::process::exit(0);
-    });
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "restarting",
-            "version": format!("{}+{}", env!("CARGO_PKG_VERSION"), ahma_common::BUILD_ID)
-        })),
-    )
-        .into_response()
+    tokio::spawn(shut_down_after_restart(session_manager, listener_kind));
+    restart_status_response("restarting")
 }
 
 /// Fallback handler for unknown routes.

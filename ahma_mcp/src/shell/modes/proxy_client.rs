@@ -190,22 +190,37 @@ async fn emit_session_event_downstream<S>(
         event_notification(kind, *seq, now, detail.clone()),
         message_mirror_notification(kind, *seq, now, detail),
     ] {
-        match serde_json::from_value::<TxJsonRpcMessage<RoleServer>>(val) {
-            Ok(msg) => {
-                if let Err(e) = stdio.send(msg).await {
-                    tracing::debug!(
-                        kind = kind.as_str(),
-                        error = ?e,
-                        "session event emission to stdio failed (non-fatal)"
-                    );
-                }
+        send_session_event_notification(stdio, kind, val).await;
+    }
+}
+
+/// Deserialize one session-event notification and send it downstream,
+/// logging (never propagating) either failure: a malformed notification or a
+/// failed send must not affect the session that was just saved.
+#[cfg(unix)]
+async fn send_session_event_notification<S>(
+    stdio: &mut S,
+    kind: ahma_common::session_event::SessionEventKind,
+    val: serde_json::Value,
+) where
+    S: Transport<RoleServer>,
+    S::Error: std::fmt::Debug,
+{
+    match serde_json::from_value::<TxJsonRpcMessage<RoleServer>>(val) {
+        Ok(msg) => {
+            if let Err(e) = stdio.send(msg).await {
+                tracing::debug!(
+                    kind = kind.as_str(),
+                    error = ?e,
+                    "session event emission to stdio failed (non-fatal)"
+                );
             }
-            Err(e) => tracing::debug!(
-                kind = kind.as_str(),
-                error = %e,
-                "session event did not serialize as a notification (non-fatal)"
-            ),
         }
+        Err(e) => tracing::debug!(
+            kind = kind.as_str(),
+            error = %e,
+            "session event did not serialize as a notification (non-fatal)"
+        ),
     }
 }
 
@@ -523,23 +538,8 @@ where
                     error = %e,
                     "Reconnect attempt failed"
                 );
-                if attempt < MAX_RECONNECT_ATTEMPTS
-                    && let Some(respawn) = respawn.as_deref_mut()
-                    && reconnect_failure_wants_respawn(&e)
-                {
-                    tracing::warn!(
-                        transport,
-                        "Bridge endpoint is gone; respawning background bridge before \
-                         the next reconnect attempt"
-                    );
-                    if let Err(spawn_err) = respawn().await {
-                        tracing::warn!(
-                            transport,
-                            error = %spawn_err,
-                            "Background bridge respawn failed"
-                        );
-                    }
-                }
+                respawn_after_reconnect_failure(attempt, &e, respawn.as_deref_mut(), transport)
+                    .await;
                 last_err = Some(e);
             }
         }
@@ -548,6 +548,41 @@ where
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("reconnect failed for an unknown reason")))
+}
+
+/// After a failed reconnect `attempt`, respawn the background bridge when
+/// there is another attempt left to retry *and* the failure proves the
+/// endpoint itself is gone (not merely glitching) *and* a respawn hook is
+/// available. Best-effort: a failed respawn only logs, so the caller still
+/// moves on to the next reconnect attempt.
+#[cfg(unix)]
+async fn respawn_after_reconnect_failure(
+    attempt: u32,
+    err: &anyhow::Error,
+    respawn: Option<&mut BridgeRespawnFn>,
+    transport: &str,
+) {
+    if attempt >= MAX_RECONNECT_ATTEMPTS {
+        return;
+    }
+    let Some(respawn) = respawn else {
+        return;
+    };
+    if !reconnect_failure_wants_respawn(err) {
+        return;
+    }
+    tracing::warn!(
+        transport,
+        "Bridge endpoint is gone; respawning background bridge before \
+         the next reconnect attempt"
+    );
+    if let Err(spawn_err) = respawn().await {
+        tracing::warn!(
+            transport,
+            error = %spawn_err,
+            "Background bridge respawn failed"
+        );
+    }
 }
 
 /// Resolve the frontend handshake deadline: the internal
@@ -598,11 +633,7 @@ pub async fn run_proxy_client_with_options(
     session_query: &str,
 ) -> Result<bool> {
     let handshake_deadline = frontend_handshake_deadline();
-    let mcp_uri = if session_query.is_empty() {
-        "http://localhost/mcp".to_string()
-    } else {
-        format!("http://localhost/mcp?{session_query}")
-    };
+    let mcp_uri = append_session_query("http://localhost/mcp", session_query);
 
     #[cfg(unix)]
     if let Some(path) = uds_path {
@@ -612,11 +643,7 @@ pub async fn run_proxy_client_with_options(
 
     if let Some(url) = http_url {
         tracing::info!(url = url, "Proxying stdio to HTTP server");
-        let url = if session_query.is_empty() {
-            url.to_string()
-        } else {
-            format!("{}?{session_query}", url.trim_end_matches('/'))
-        };
+        let url = append_session_query(url, session_query);
         return run_proxy_client_http(&url, handshake_deadline).await;
     }
 
@@ -624,6 +651,17 @@ pub async fn run_proxy_client_with_options(
     let _ = (uds_path, respawn_bridge);
 
     Err(anyhow!("No socket or HTTP URL provided for proxy client"))
+}
+
+/// Append `?session_query` to `base` (trimming any trailing `/` first so the
+/// query never lands after a doubled slash), or return `base` unchanged when
+/// there is no query to carry.
+fn append_session_query(base: &str, session_query: &str) -> String {
+    if session_query.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}?{session_query}", base.trim_end_matches('/'))
+    }
 }
 
 #[cfg(unix)]
@@ -1202,14 +1240,7 @@ async fn forward_buffered_sse_lines(
 ) -> ForwardOutcome {
     while let Some(pos) = buffer.find('\n') {
         let line = buffer.drain(..=pos).collect::<String>();
-        let Some(data) = line.trim().strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() {
-            continue;
-        }
-        let Ok(msg) = serde_json::from_str::<TxJsonRpcMessage<RoleServer>>(data) else {
+        let Some(msg) = parse_sse_data_line(&line) else {
             continue;
         };
         if sse_tx.send(msg).await.is_err() {
@@ -1218,6 +1249,17 @@ async fn forward_buffered_sse_lines(
         }
     }
     ForwardOutcome::Continue
+}
+
+/// Parse one buffered SSE line into a JSON-RPC message, or `None` when the
+/// line is not a `data:` line, carries an empty payload, or does not parse —
+/// each of those is silently skipped by the caller.
+fn parse_sse_data_line(line: &str) -> Option<TxJsonRpcMessage<RoleServer>> {
+    let data = line.trim().strip_prefix("data:")?.trim();
+    if data.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<TxJsonRpcMessage<RoleServer>>(data).ok()
 }
 
 /// Pump messages between stdio and the bridge until stdio hits EOF or the SSE

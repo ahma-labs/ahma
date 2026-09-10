@@ -65,17 +65,12 @@ impl UninstallAction {
 /// Runs the uninstall wizard.
 pub async fn run(args: UninstallArgs) -> Result<()> {
     let interactive = is_interactive_session(&args);
-
-    if interactive {
-        print_banner("Ahma Uninstall Wizard");
-    }
+    print_banner_if_interactive(interactive, "Ahma Uninstall Wizard");
 
     // Question 1: which actions to perform.
     let actions = select_actions(&args, interactive);
     if actions.is_empty() {
-        if interactive {
-            println!("Nothing selected — exiting without changes.\n");
-        }
+        println_if_interactive(interactive, "Nothing selected — exiting without changes.\n");
         return Ok(());
     }
 
@@ -87,11 +82,23 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
 
     execute_actions(&actions, &platforms, args.dry_run, purge, interactive).await?;
 
-    if interactive {
-        print_banner("Uninstall completed!");
-    }
+    print_banner_if_interactive(interactive, "Uninstall completed!");
 
     Ok(())
+}
+
+/// Prints the boxed banner, but only in interactive mode.
+fn print_banner_if_interactive(interactive: bool, title: &str) {
+    if interactive {
+        print_banner(title);
+    }
+}
+
+/// Prints a status line, but only in interactive mode.
+fn println_if_interactive(interactive: bool, msg: &str) {
+    if interactive {
+        println!("{}", msg);
+    }
 }
 
 /// Whether the wizard may prompt: `--auto` is an explicit "don't ask", and a redirected
@@ -144,19 +151,7 @@ fn should_purge_ahma_dir(
 // ── Selection helpers ─────────────────────────────────────────────────────────
 
 fn select_actions(args: &UninstallArgs, interactive: bool) -> Vec<UninstallAction> {
-    let mut flagged = Vec::new();
-    if args.skills {
-        flagged.push(UninstallAction::Skills);
-    }
-    if args.mcp {
-        flagged.push(UninstallAction::Mcp);
-    }
-    if args.hooks {
-        flagged.push(UninstallAction::Hooks);
-    }
-    if args.binary {
-        flagged.push(UninstallAction::Binary);
-    }
+    let flagged = actions_from_flags(args);
     if !flagged.is_empty() {
         return flagged;
     }
@@ -173,6 +168,25 @@ fn select_actions(args: &UninstallArgs, interactive: bool) -> Vec<UninstallActio
         .collect()
 }
 
+/// Collects the actions explicitly requested via CLI flags (`--skills`, `--mcp`,
+/// `--hooks`, `--binary`). Empty when the caller wants the interactive prompt instead.
+fn actions_from_flags(args: &UninstallArgs) -> Vec<UninstallAction> {
+    let mut flagged = Vec::new();
+    if args.skills {
+        flagged.push(UninstallAction::Skills);
+    }
+    if args.mcp {
+        flagged.push(UninstallAction::Mcp);
+    }
+    if args.hooks {
+        flagged.push(UninstallAction::Hooks);
+    }
+    if args.binary {
+        flagged.push(UninstallAction::Binary);
+    }
+    flagged
+}
+
 fn select_platforms(
     actions: &[UninstallAction],
     platform_filter: &[String],
@@ -184,7 +198,7 @@ fn select_platforms(
     let relevant: Vec<Platform> = PLATFORMS
         .iter()
         .copied()
-        .filter(|p| (want_mcp && p.supports_mcp()) || (want_hooks && p.supports_hooks()))
+        .filter(|p| is_relevant_platform(*p, want_mcp, want_hooks))
         .collect();
 
     // If caller specified platforms via --platform flag, filter to those.
@@ -216,6 +230,12 @@ fn filter_platforms_by_cli_args(
                 .any(|f| f.eq_ignore_ascii_case(p.cli_name()) || f.eq_ignore_ascii_case(p.label()))
         })
         .collect()
+}
+
+/// A platform is relevant to this uninstall run when it supports at least one of the
+/// per-platform actions the caller selected (MCP servers, terminal hooks).
+fn is_relevant_platform(p: Platform, want_mcp: bool, want_hooks: bool) -> bool {
+    (want_mcp && p.supports_mcp()) || (want_hooks && p.supports_hooks())
 }
 
 // ── Action dispatcher ─────────────────────────────────────────────────────────
@@ -714,26 +734,37 @@ fn purge_ahma_dir(dry_run: bool) -> Result<()> {
     let legacy_sandbox_dir = home.join("sandbox");
 
     if dry_run {
-        if ahma_dir.exists() {
-            println!("[dry-run] Would remove {}", ahma_dir.display());
-        }
-        if legacy_sandbox_dir.exists() {
-            println!(
-                "[dry-run] Would remove {} (legacy sandbox directory)",
-                legacy_sandbox_dir.display()
-            );
-        }
+        announce_dry_run_purge(&ahma_dir, &legacy_sandbox_dir);
         return Ok(());
     }
 
-    if ahma_dir.exists() {
-        std::fs::remove_dir_all(&ahma_dir)
-            .with_context(|| format!("Failed to remove {}", ahma_dir.display()))?;
-        println!("✓ Removed {}", ahma_dir.display());
-    }
-
+    remove_ahma_data_dir(&ahma_dir)?;
     remove_legacy_sandbox_dir_if_empty(&legacy_sandbox_dir);
 
+    Ok(())
+}
+
+/// Prints what `purge_ahma_dir` would remove, without touching the filesystem.
+fn announce_dry_run_purge(ahma_dir: &Path, legacy_sandbox_dir: &Path) {
+    if ahma_dir.exists() {
+        println!("[dry-run] Would remove {}", ahma_dir.display());
+    }
+    if legacy_sandbox_dir.exists() {
+        println!(
+            "[dry-run] Would remove {} (legacy sandbox directory)",
+            legacy_sandbox_dir.display()
+        );
+    }
+}
+
+/// Deletes `~/.ahma` (and everything under it) if it exists. No-op otherwise.
+fn remove_ahma_data_dir(ahma_dir: &Path) -> Result<()> {
+    if !ahma_dir.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(ahma_dir)
+        .with_context(|| format!("Failed to remove {}", ahma_dir.display()))?;
+    println!("✓ Removed {}", ahma_dir.display());
     Ok(())
 }
 

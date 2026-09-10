@@ -140,12 +140,13 @@ impl AsyncProgressState {
 
     async fn track_completion(&self, token: &str, message: &str) {
         let removed = self.pending_tokens.lock().await.remove(token);
-        if removed {
-            if is_progress_failure(message) {
-                self.completed_error.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.completed_success.fetch_add(1, Ordering::Relaxed);
-            }
+        if !removed {
+            return;
+        }
+        if is_progress_failure(message) {
+            self.completed_error.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.completed_success.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -842,11 +843,7 @@ fn spawn_stderr_monitor(
 
         while let Ok(Some(line)) = reader.next_line().await {
             println!("[SERVER] {}", line);
-
-            recent_lines.push(line.clone());
-            if recent_lines.len() > CONTEXT_LINES {
-                recent_lines.remove(0);
-            }
+            push_bounded(&mut recent_lines, line.clone(), CONTEXT_LINES);
 
             if !is_fatal_server_error(&line) {
                 continue;
@@ -858,6 +855,14 @@ fn spawn_stderr_monitor(
             break;
         }
     });
+}
+
+/// Pushes `line` onto `lines`, dropping the oldest entry if that would exceed `max`.
+fn push_bounded(lines: &mut Vec<String>, line: String, max: usize) {
+    lines.push(line);
+    if lines.len() > max {
+        lines.remove(0);
+    }
 }
 
 fn is_fatal_server_error(line: &str) -> bool {
@@ -894,24 +899,26 @@ async fn store_error_context(
     ctx.push(format!("╔{}╗", separator));
     ctx.push("║  ERROR CONTEXT (recent server output before error)       ║".to_string());
     ctx.push(format!("╠{}╣", separator));
-
-    for (i, line) in recent_lines.iter().enumerate() {
-        if i == recent_lines.len() - 1 {
-            ctx.push(format!(">>> {}", line));
-        } else {
-            ctx.push(format!("    {}", line));
-        }
-    }
+    push_marked_last(&mut ctx, recent_lines);
 
     ctx.push(format!("╠{}╣", separator));
     ctx.push("║  FOLLOWING OUTPUT                                         ║".to_string());
     ctx.push(format!("╠{}╣", separator));
-
     for line in trailing_lines {
         ctx.push(format!("    {}", line));
     }
 
     ctx.push(format!("╚{}╝", separator));
+}
+
+/// Appends `lines` to `ctx`, marking the final entry with a `>>>` pointer so the
+/// line that immediately preceded the error stands out from its context.
+fn push_marked_last(ctx: &mut Vec<String>, lines: &[String]) {
+    let last_index = lines.len().saturating_sub(1);
+    for (i, line) in lines.iter().enumerate() {
+        let prefix = if i == last_index { ">>> " } else { "    " };
+        ctx.push(format!("{}{}", prefix, line));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,16 +1044,20 @@ async fn run_monitoring_loop(
         }
 
         if start.elapsed().as_secs().is_multiple_of(5) {
-            let elapsed = start.elapsed().as_secs();
-            let rate = success.checked_div(elapsed).unwrap_or(0);
-            println!(
-                "[{:3}s] Success: {} | Errors: {} | Rate: {}/s",
-                elapsed, success, errors, rate
-            );
+            print_progress(start.elapsed().as_secs(), success, errors);
         }
 
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Prints the periodic "[Ns] Success: … | Errors: … | Rate: …/s" status line.
+fn print_progress(elapsed_secs: u64, success: u64, errors: u64) {
+    let rate = success.checked_div(elapsed_secs).unwrap_or(0);
+    println!(
+        "[{:3}s] Success: {} | Errors: {} | Rate: {}/s",
+        elapsed_secs, success, errors, rate
+    );
 }
 
 fn print_final_report(counters: &SharedCounters, elapsed: f64) {
@@ -1081,6 +1092,69 @@ fn print_final_report(counters: &SharedCounters, elapsed: f64) {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Waits for the server to report healthy, or prints an error, kills the
+/// server, and exits the process if it never does. Returns the server back
+/// to the caller once it is confirmed healthy.
+async fn ensure_server_healthy_or_exit(base_url: &str, server: ServerManager) -> ServerManager {
+    if let Err(e) = wait_for_health(base_url, 120).await {
+        eprintln!("\nFAIL Failed to start server: {}", e);
+        eprintln!("Cleaning up server process...");
+        let _ = server.kill().await;
+        std::process::exit(1);
+    }
+    server
+}
+
+/// Spawns the one synchronous client plus `async_clients` asynchronous ones.
+fn spawn_all_clients(
+    join_set: &mut JoinSet<Result<()>>,
+    base_url: &str,
+    async_clients: usize,
+    commands: &[Vec<String>],
+    counters: &SharedCounters,
+    stop_flag: &Arc<AtomicBool>,
+) {
+    spawn_client(
+        join_set,
+        base_url,
+        SpawnConfig {
+            is_sync: true,
+            seed: 12345,
+            label: "Sync client".to_string(),
+        },
+        commands.to_vec(),
+        counters,
+        stop_flag.clone(),
+    );
+
+    for i in 0..async_clients {
+        spawn_client(
+            join_set,
+            base_url,
+            SpawnConfig {
+                is_sync: false,
+                seed: 67890 + i as u64,
+                label: format!("Async client {}", i + 1),
+            },
+            commands.to_vec(),
+            counters,
+            stop_flag.clone(),
+        );
+    }
+}
+
+/// Waits for every spawned client task to finish, logging any error each
+/// returned without aborting the drain.
+async fn drain_clients(join_set: &mut JoinSet<Result<()>>) {
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("Client error: {}", e),
+            Err(e) => eprintln!("Task error: {}", e),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1101,12 +1175,7 @@ async fn main() -> Result<()> {
     let server = ServerManager::spawn(args.port, args.binary).await?;
 
     let base_url = format!("http://127.0.0.1:{}", args.port);
-    if let Err(e) = wait_for_health(&base_url, 120).await {
-        eprintln!("\nFAIL Failed to start server: {}", e);
-        eprintln!("Cleaning up server process...");
-        let _ = server.kill().await;
-        std::process::exit(1);
-    }
+    let server = ensure_server_healthy_or_exit(&base_url, server).await;
 
     println!();
     println!("Starting {} client(s)...", args.async_clients + 1);
@@ -1116,33 +1185,14 @@ async fn main() -> Result<()> {
     let commands = get_command_pool();
     let mut join_set = JoinSet::new();
 
-    spawn_client(
+    spawn_all_clients(
         &mut join_set,
         &base_url,
-        SpawnConfig {
-            is_sync: true,
-            seed: 12345,
-            label: "Sync client".to_string(),
-        },
-        commands.clone(),
+        args.async_clients,
+        &commands,
         &counters,
-        stop_flag.clone(),
+        &stop_flag,
     );
-
-    for i in 0..args.async_clients {
-        spawn_client(
-            &mut join_set,
-            &base_url,
-            SpawnConfig {
-                is_sync: false,
-                seed: 67890 + i as u64,
-                label: format!("Async client {}", i + 1),
-            },
-            commands.clone(),
-            &counters,
-            stop_flag.clone(),
-        );
-    }
 
     println!();
     println!("Running stress test...");
@@ -1170,13 +1220,7 @@ async fn main() -> Result<()> {
     println!();
     println!("Stopping clients...");
 
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => eprintln!("Client error: {}", e),
-            Err(e) => eprintln!("Task error: {}", e),
-        }
-    }
+    drain_clients(&mut join_set).await;
 
     let had_server_error = server.has_error();
     println!("Stopping server...");

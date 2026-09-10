@@ -926,16 +926,11 @@ impl Operation {
             return Self::format_ms_duration(u128::from(ms));
         }
         if let (Some(start), Some(end)) = (self.started_at, self.completed_at) {
-            let d = if end >= start {
-                end.duration_since(start)
-            } else {
-                std::time::Duration::ZERO
-            };
-            Self::format_ms_duration(d.as_millis())
-        } else {
-            let secs = self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-            format!("{secs}s")
+            let d = end.saturating_duration_since(start);
+            return Self::format_ms_duration(d.as_millis());
         }
+        let secs = self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        format!("{secs}s")
     }
 
     /// The name a human reads for this operation.
@@ -2285,17 +2280,17 @@ fn parse_word_len<I: Iterator<Item = char>>(
 fn handle_word_fit(current_line_len: &mut usize, lines: &mut usize, word_len: usize, width: usize) {
     if *current_line_len + word_len <= width {
         *current_line_len += word_len;
-    } else {
-        if *current_line_len > 0 {
-            *lines += 1;
-        }
-        let mut rem = word_len;
-        while rem > width {
-            *lines += 1;
-            rem -= width;
-        }
-        *current_line_len = rem;
+        return;
     }
+    if *current_line_len > 0 {
+        *lines += 1;
+    }
+    let mut rem = word_len;
+    while rem > width {
+        *lines += 1;
+        rem -= width;
+    }
+    *current_line_len = rem;
 }
 
 /// Account for a single space: it either fits on the current line or closes it
@@ -2488,22 +2483,21 @@ impl AppState {
         let sections = self.work_sections.borrow();
         sections
             .iter()
-            .map(|s| {
-                let natural = s.rows.len();
-                match self.accordion.as_ref() {
-                    Some(anim) if anim.is_active(now_ms) => anim
-                        .height_for(&s.key, natural, now_ms)
-                        .unwrap_or(if s.open { natural } else { 0 }),
-                    _ => {
-                        if s.open {
-                            natural
-                        } else {
-                            0
-                        }
-                    }
-                }
-            })
+            .map(|s| self.section_height(s, now_ms))
             .collect()
+    }
+
+    /// The content height a single section is drawn at this frame — see
+    /// [`Self::section_heights`].
+    fn section_height(&self, s: &crate::work_view::Section, now_ms: u64) -> usize {
+        let natural = s.rows.len();
+        let open_height = if s.open { natural } else { 0 };
+        match self.accordion.as_ref() {
+            Some(anim) if anim.is_active(now_ms) => anim
+                .height_for(&s.key, natural, now_ms)
+                .unwrap_or(open_height),
+            _ => open_height,
+        }
     }
 
     /// Open `key`, closing whichever section was open — the accordion (R24.9).

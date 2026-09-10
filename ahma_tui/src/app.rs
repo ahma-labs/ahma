@@ -2141,51 +2141,62 @@ fn handle_skills_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
             true
         }
         "skill" => {
-            // Explicit form: a missing skill is reported, not treated as an
-            // unknown command.
-            let (name, args) = split_first_token(rest);
-            if name.is_empty() {
-                list_skills(state);
-            } else if let Some(skill) = find_user_skill(state, name) {
-                invoke_skill(state, &skill, args, cmd);
-            } else {
-                push_assistant_message(
-                    state,
-                    format!(
-                        "No Agent Skill named `{name}`. Use /skills to list what is available."
-                    ),
-                );
-            }
+            handle_explicit_skill_command(rest, cmd, state);
             true
         }
-        name => {
-            // Implicit form `/<name> [args]`: only names that are valid per the
-            // Agent Skills spec and actually resolve to a skill are consumed;
-            // everything else falls through to the unknown-command message.
-            if ahma_common::skills::validate_name(name).is_err() {
-                return false;
-            }
-            let workspace = std::path::Path::new(&state.workspace);
-            let set = ahma_common::skills::discover_skills(workspace);
-            if let Some(err) = set.invalid.iter().find(|e| {
-                e.path
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .is_some_and(|n| n == name)
-            }) {
-                push_assistant_message(
-                    state,
-                    format!("Skill `{name}` could not be loaded: {}", err.reason),
-                );
-                return true;
-            }
-            let Some(skill) = find_user_skill(state, name) else {
-                return false;
-            };
-            invoke_skill(state, &skill, rest, cmd);
-            true
-        }
+        name => handle_implicit_skill_command(name, rest, cmd, state),
     }
+}
+
+/// `/skill [name] [args]`: a missing skill is reported, not treated as an
+/// unknown command. Split out of `handle_skills_nav_command` so that arm
+/// reads as one call.
+fn handle_explicit_skill_command(rest: &str, cmd: &str, state: &mut crate::state::AppState) {
+    let (name, args) = split_first_token(rest);
+    if name.is_empty() {
+        list_skills(state);
+    } else if let Some(skill) = find_user_skill(state, name) {
+        invoke_skill(state, &skill, args, cmd);
+    } else {
+        push_assistant_message(
+            state,
+            format!("No Agent Skill named `{name}`. Use /skills to list what is available."),
+        );
+    }
+}
+
+/// Implicit form `/<name> [args]`: only names that are valid per the Agent
+/// Skills spec and actually resolve to a skill are consumed; everything else
+/// falls through to the unknown-command message (`false`). Split out of
+/// `handle_skills_nav_command` so that arm reads as one call.
+fn handle_implicit_skill_command(
+    name: &str,
+    rest: &str,
+    cmd: &str,
+    state: &mut crate::state::AppState,
+) -> bool {
+    if ahma_common::skills::validate_name(name).is_err() {
+        return false;
+    }
+    let workspace = std::path::Path::new(&state.workspace);
+    let set = ahma_common::skills::discover_skills(workspace);
+    if let Some(err) = set.invalid.iter().find(|e| {
+        e.path
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == name)
+    }) {
+        push_assistant_message(
+            state,
+            format!("Skill `{name}` could not be loaded: {}", err.reason),
+        );
+        return true;
+    }
+    let Some(skill) = find_user_skill(state, name) else {
+        return false;
+    };
+    invoke_skill(state, &skill, rest, cmd);
+    true
 }
 
 /// Split `s` into its first whitespace-delimited token and the trimmed rest.
@@ -3058,8 +3069,33 @@ fn open_provider_picker(state: &mut crate::state::AppState) {
     state.modal = crate::state::ModalState::ProviderPicker(picker);
 }
 
+/// Kick off an async model-list refresh and let the user know it's in
+/// flight. Split out of `open_model_picker` so the empty-items branch reads
+/// as one call instead of a nested `if let`.
+fn request_model_refresh(state: &mut crate::state::AppState) {
+    let (base_url, _) = parse_llm_selection(state);
+    if !base_url.is_empty()
+        && let Some(tx) = &state.bridge_tx
+    {
+        crate::llm_bridge::spawn_model_refresh(base_url, tx.clone());
+    }
+    push_assistant_message(state, "Fetching model list…");
+}
+
+/// The `provider / model` prefix used to pre-select the current choice in
+/// the model picker.
+fn selected_provider_label(state: &crate::state::AppState) -> String {
+    state
+        .llm_selection
+        .as_ref()
+        .map(|s| match &s.provider {
+            crate::state::ProviderRef::Named(n) => n.clone(),
+            crate::state::ProviderRef::Profile(a) => format!("profile:{a}"),
+        })
+        .unwrap_or_default()
+}
+
 fn open_model_picker(state: &mut crate::state::AppState) {
-    use crate::llm_bridge::spawn_model_refresh;
     use crate::state::PickerState;
 
     let mut items = Vec::new();
@@ -3073,26 +3109,13 @@ fn open_model_picker(state: &mut crate::state::AppState) {
     }
 
     if items.is_empty() {
-        let (base_url, _) = parse_llm_selection(state);
-        if !base_url.is_empty()
-            && let Some(tx) = &state.bridge_tx
-        {
-            spawn_model_refresh(base_url, tx.clone());
-        }
-        push_assistant_message(state, "Fetching model list…");
+        request_model_refresh(state);
         return;
     }
 
     let mut picker = PickerState::new("Select model", items);
     let selected_model = state.selected_model();
-    let selected_provider = state
-        .llm_selection
-        .as_ref()
-        .map(|s| match &s.provider {
-            crate::state::ProviderRef::Named(n) => n.clone(),
-            crate::state::ProviderRef::Profile(a) => format!("profile:{a}"),
-        })
-        .unwrap_or_default();
+    let selected_provider = selected_provider_label(state);
     if !selected_model.is_empty() && !selected_provider.is_empty() {
         let exact = format!("{selected_provider} / {selected_model}");
         picker.select_exact(&exact);
@@ -3863,24 +3886,30 @@ fn extract_args_summary(tool_name: &str, description: &str) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(|cmd| format!("command: {cmd}"))
     } else {
-        let parts: Vec<String> = obj
-            .iter()
-            .filter(|(k, _)| {
-                *k != "working_directory" && *k != "working_dir" && *k != "synchronous"
-            })
-            .map(|(k, v)| {
-                let val_str = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => v.to_string(),
-                };
-                format!("{k}={val_str}")
-            })
-            .collect();
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(", "))
-        }
+        format_generic_args_summary(obj)
+    }
+}
+
+/// Render every argument except the plumbing-only ones (`working_directory`,
+/// `working_dir`, `synchronous`) as `key=value`, joined by `, `. Split out of
+/// `extract_args_summary` so its non-`run_terminal_command` branch reads as
+/// one call.
+fn format_generic_args_summary(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let parts: Vec<String> = obj
+        .iter()
+        .filter(|(k, _)| *k != "working_directory" && *k != "working_dir" && *k != "synchronous")
+        .map(|(k, v)| {
+            let val_str = match v {
+                serde_json::Value::String(s) => s.clone(),
+                _ => v.to_string(),
+            };
+            format!("{k}={val_str}")
+        })
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
     }
 }
 
@@ -4158,24 +4187,33 @@ fn handle_event_log_lines_updated(
     append: bool,
     state: &mut crate::state::AppState,
 ) {
-    if Some(&file) == state.active_log_file.as_ref() {
-        // The cumulative counter drives the log title's rain panel: each
-        // arriving line advances the animation one frame, so pour rate shows
-        // arrival rate.
-        state.log_lines_total = state
-            .log_lines_total
-            .wrapping_add(content.lines().count() as u64);
-        if append {
-            for line in content.lines() {
-                state.active_log_lines.push(line.to_string());
-            }
-            if state.active_log_lines.len() > 2000 {
-                let drain_len = state.active_log_lines.len() - 2000;
-                state.active_log_lines.drain(0..drain_len);
-            }
-        } else {
-            state.active_log_lines = content.lines().map(String::from).collect();
-        }
+    if Some(&file) != state.active_log_file.as_ref() {
+        return;
+    }
+
+    // The cumulative counter drives the log title's rain panel: each
+    // arriving line advances the animation one frame, so pour rate shows
+    // arrival rate.
+    state.log_lines_total = state
+        .log_lines_total
+        .wrapping_add(content.lines().count() as u64);
+    if append {
+        append_active_log_lines(&mut state.active_log_lines, &content);
+    } else {
+        state.active_log_lines = content.lines().map(String::from).collect();
+    }
+}
+
+/// Append `content`'s lines to the active log tail, then drop the oldest
+/// lines past the 2000-line cap. Split out of `handle_event_log_lines_updated`
+/// so its `append` branch reads as one call instead of a nested loop-plus-if.
+fn append_active_log_lines(active_log_lines: &mut Vec<String>, content: &str) {
+    for line in content.lines() {
+        active_log_lines.push(line.to_string());
+    }
+    if active_log_lines.len() > 2000 {
+        let drain_len = active_log_lines.len() - 2000;
+        active_log_lines.drain(0..drain_len);
     }
 }
 
@@ -4473,7 +4511,7 @@ fn run_next_pending_window(state: &mut crate::state::AppState) {
 }
 
 fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
-    use crate::llm_bridge::{spawn_window_cli_task, spawn_window_llm_task};
+    use crate::llm_bridge::spawn_window_llm_task;
 
     let (base_url, model) = parse_llm_selection(state);
 
@@ -4499,20 +4537,7 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
     };
 
     if is_cli {
-        // A re-run is a second command, not the first one resuming, so it
-        // reports under an id of its own — window ids wrap and get reused.
-        let report = state.bang_report();
-        if let Some(r) = &report {
-            r.reporter.report(crate::tui_reporter::bang_started(
-                &r.op_id,
-                &command,
-                &working_dir,
-            ));
-            if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
-                w.op_id = Some(r.op_id.clone());
-            }
-        }
-        spawn_window_cli_task(win_id, command, working_dir, abort_rx, tx, report);
+        start_cli_window(win_id, command, working_dir, abort_rx, tx, state);
     } else {
         let mcp = if state.mcp_enabled {
             Some(mcp_chat_config(state))
@@ -4521,6 +4546,35 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
         };
         spawn_window_llm_task(win_id, base_url, model, command, mcp, abort_rx, tx);
     }
+}
+
+/// Report the re-run to the active bang reporter (if any) and hand the
+/// command off to the CLI task. Split out of `start_window_execution` so the
+/// `is_cli` branch there reads as one call.
+fn start_cli_window(
+    win_id: usize,
+    command: String,
+    working_dir: String,
+    abort_rx: tokio::sync::oneshot::Receiver<()>,
+    tx: tokio::sync::mpsc::Sender<crate::llm_bridge::BridgeEvent>,
+    state: &mut crate::state::AppState,
+) {
+    use crate::llm_bridge::spawn_window_cli_task;
+
+    // A re-run is a second command, not the first one resuming, so it
+    // reports under an id of its own — window ids wrap and get reused.
+    let report = state.bang_report();
+    if let Some(r) = &report {
+        r.reporter.report(crate::tui_reporter::bang_started(
+            &r.op_id,
+            &command,
+            &working_dir,
+        ));
+        if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
+            w.op_id = Some(r.op_id.clone());
+        }
+    }
+    spawn_window_cli_task(win_id, command, working_dir, abort_rx, tx, report);
 }
 
 fn close_window_by_id(win_id: usize, state: &mut crate::state::AppState) {

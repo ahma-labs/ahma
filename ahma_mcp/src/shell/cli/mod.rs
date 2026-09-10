@@ -390,23 +390,33 @@ fn check_sandbox_availability(no_sandbox: bool) -> Result<SandboxAvailability> {
     }
 
     #[cfg(target_os = "macos")]
-    {
-        if let Err(e) = sandbox::test_sandbox_exec_available() {
-            match e {
-                // We are demonstrably inside an outer sandbox that forbids nesting.
-                // Defer to it (loudly) instead of crashing at startup.
-                sandbox::SandboxError::NestedSandboxDetected => {
-                    let host = sandbox::detect_host_sandbox()
-                        .unwrap_or(sandbox::HostSandbox::Unidentified);
-                    return Ok(SandboxAvailability::DeferToHost(host));
-                }
-                // e.g. sandbox-exec missing entirely — still a hard, fail-closed stop.
-                other => sandbox::exit_with_sandbox_error(&other),
-            }
-        }
+    if let Some(deferred) = check_macos_sandbox_exec_nesting() {
+        return Ok(deferred);
     }
 
     Ok(SandboxAvailability::Available)
+}
+
+/// macOS-only half of [`check_sandbox_availability`]: probes whether
+/// `sandbox-exec` can nest inside an outer sandbox. Returns `Some(..)` only
+/// when startup should defer to that outer sandbox instead of proceeding;
+/// any other failure is fail-closed (`exit_with_sandbox_error`, which never
+/// returns).
+#[cfg(target_os = "macos")]
+fn check_macos_sandbox_exec_nesting() -> Option<SandboxAvailability> {
+    let Err(e) = sandbox::test_sandbox_exec_available() else {
+        return None;
+    };
+    match e {
+        // We are demonstrably inside an outer sandbox that forbids nesting.
+        // Defer to it (loudly) instead of crashing at startup.
+        sandbox::SandboxError::NestedSandboxDetected => {
+            let host = sandbox::detect_host_sandbox().unwrap_or(sandbox::HostSandbox::Unidentified);
+            Some(SandboxAvailability::DeferToHost(host))
+        }
+        // e.g. sandbox-exec missing entirely — still a hard, fail-closed stop.
+        other => sandbox::exit_with_sandbox_error(&other),
+    }
 }
 
 fn canonicalize_paths(paths: &[PathBuf], context: &str) -> Result<Vec<PathBuf>> {
@@ -2841,23 +2851,8 @@ fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::
     let allow_keychain = resolve_allow_keychain(cli, s);
     sandbox::set_keychain_access_allowed(allow_keychain);
 
-    // Install the macOS credential-read deny set (built-in defaults ±
-    // `[sandbox] deny_credential_reads`/`allow_credential_reads`, plus the login
-    // keychain when `allow_keychain` is off). On macOS the Seatbelt profile grants
-    // global file-read, so these dirs are denied to sandboxed tools to prevent
-    // credential exfiltration. No-op on Linux/Windows where reads are scoped.
-    if let Some(home) = dirs::home_dir() {
-        let denies = compute_credential_read_denies(&home, s, allow_keychain);
-        if cfg!(target_os = "macos") && !denies.is_empty() {
-            tracing::info!(
-                "macOS credential-read protection: denying tool reads of {} dir(s): {:?} \
-                 (adjust via [sandbox] deny_credential_reads / allow_credential_reads)",
-                denies.len(),
-                denies
-            );
-        }
-        sandbox::set_credential_read_denies(denies);
-    }
+    install_credential_read_denies(s, allow_keychain);
+
     if cfg!(target_os = "macos") && !allow_keychain {
         tracing::info!(
             "macOS keychain access disabled ([sandbox] allow_keychain=false / \
@@ -2865,6 +2860,28 @@ fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::
              under the sandbox"
         );
     }
+}
+
+/// Install the macOS credential-read deny set (built-in defaults ±
+/// `[sandbox] deny_credential_reads`/`allow_credential_reads`, plus the login
+/// keychain when `allow_keychain` is off). On macOS the Seatbelt profile grants
+/// global file-read, so these dirs are denied to sandboxed tools to prevent
+/// credential exfiltration. No-op on Linux/Windows where reads are scoped, and
+/// a no-op entirely when the home directory cannot be resolved.
+fn install_credential_read_denies(s: &ahma_common::config::AhmaSettings, allow_keychain: bool) {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let denies = compute_credential_read_denies(&home, s, allow_keychain);
+    if cfg!(target_os = "macos") && !denies.is_empty() {
+        tracing::info!(
+            "macOS credential-read protection: denying tool reads of {} dir(s): {:?} \
+             (adjust via [sandbox] deny_credential_reads / allow_credential_reads)",
+            denies.len(),
+            denies
+        );
+    }
+    sandbox::set_credential_read_denies(denies);
 }
 
 /// Install the trust-handoff escape hatches (SPEC R-HANDOFF.3) and disclose any

@@ -885,6 +885,16 @@ struct Candidate {
     is_dir: bool,
 }
 
+/// Parse the argument at `args[i]` as a numeric flag value, or print an error naming `flag`
+/// and exit. Shared by every `clean-stale` flag that takes a number, so the parse-or-exit
+/// pattern lives in one place instead of being repeated per flag.
+fn require_numeric_flag_arg<T: std::str::FromStr>(args: &[String], i: usize, flag: &str) -> T {
+    args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+        eprintln!("ERROR: {flag} requires a numeric argument");
+        process::exit(1);
+    })
+}
+
 fn parse_clean_opts(args: &[String]) -> CleanOpts {
     let mut opts = CleanOpts {
         dry_run: false,
@@ -899,17 +909,11 @@ fn parse_clean_opts(args: &[String]) -> CleanOpts {
             "--aggressive" => opts.aggressive = true,
             "--max-age-days" => {
                 i += 1;
-                opts.max_age_days = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
-                    eprintln!("ERROR: --max-age-days requires a numeric argument");
-                    process::exit(1);
-                });
+                opts.max_age_days = require_numeric_flag_arg(args, i, "--max-age-days");
             }
             "--max-size-gb" => {
                 i += 1;
-                let v: f64 = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
-                    eprintln!("ERROR: --max-size-gb requires a numeric argument");
-                    process::exit(1);
-                });
+                let v: f64 = require_numeric_flag_arg(args, i, "--max-size-gb");
                 if !v.is_finite() || v <= 0.0 {
                     eprintln!("ERROR: --max-size-gb must be a positive, finite number");
                     process::exit(1);
@@ -973,6 +977,18 @@ fn print_clean_stale_summary(
         report.removed_count
     );
 
+    print_target_size_after_clean(size_before, report, opts, target_dir);
+    print_budget_shortfall_note(size_before, report, opts.max_size_gb);
+}
+
+/// Print `target/`'s size after cleaning — the real post-clean size when files were actually
+/// deleted, or the size a dry run would have left behind.
+fn print_target_size_after_clean(
+    size_before: u64,
+    report: &CleanReport,
+    opts: &CleanOpts,
+    target_dir: &Path,
+) {
     if opts.dry_run {
         println!(
             "target/ would be {:.2} GB.",
@@ -984,15 +1000,19 @@ fn print_clean_stale_summary(
             dir_size(target_dir) as f64 / BYTES_PER_GB
         );
     }
+}
 
-    if let Some(budget_gb) = opts.max_size_gb {
-        let after = size_before.saturating_sub(report.bytes_reclaimed) as f64 / BYTES_PER_GB;
-        if after > budget_gb {
-            println!(
-                "NOTE: could not reach the {budget_gb:.2} GB budget — {after:.2} GB remains in \
-                 artifacts this command will not touch. Use `cargo clean` to reclaim the rest."
-            );
-        }
+/// If a `--max-size-gb` budget was given and the clean still leaves `target/` over it, say so.
+fn print_budget_shortfall_note(size_before: u64, report: &CleanReport, max_size_gb: Option<f64>) {
+    let Some(budget_gb) = max_size_gb else {
+        return;
+    };
+    let after = size_before.saturating_sub(report.bytes_reclaimed) as f64 / BYTES_PER_GB;
+    if after > budget_gb {
+        println!(
+            "NOTE: could not reach the {budget_gb:.2} GB budget — {after:.2} GB remains in \
+             artifacts this command will not touch. Use `cargo clean` to reclaim the rest."
+        );
     }
 }
 
@@ -1030,19 +1050,8 @@ fn clean_target(target_dir: &Path, opts: &CleanOpts) -> CleanReport {
     let mut report = CleanReport::default();
     let profiles = discover_profile_dirs(target_dir);
 
-    // 1. Pure garbage, removed at any age. `.profraw` files are per-process raw coverage
-    //    counters that are dead the moment they are merged into a report, and they accumulate
-    //    one-per-test-process; `target/tmp` is scratch space.
-    remove_coverage_counters(target_dir, opts, &mut report);
-    for profile in &profiles {
-        remove_coverage_counters(profile, opts, &mut report);
-    }
-    let tmp_dir = target_dir.join("tmp");
-    if tmp_dir.is_dir() {
-        for entry in read_dir_sorted(&tmp_dir) {
-            remove_candidate(&entry, opts, &mut report);
-        }
-    }
+    // 1. Pure garbage, removed at any age.
+    remove_pure_garbage(target_dir, &profiles, opts, &mut report);
 
     // 2. Age pass over every profile directory.
     for profile in &profiles {
@@ -1058,6 +1067,27 @@ fn clean_target(target_dir: &Path, opts: &CleanOpts) -> CleanReport {
     }
 
     report
+}
+
+/// Step 1 of [`clean_target`]: garbage removed regardless of age. `.profraw` files are
+/// per-process raw coverage counters that are dead the moment they are merged into a report,
+/// and they accumulate one-per-test-process; `target/tmp` is scratch space.
+fn remove_pure_garbage(
+    target_dir: &Path,
+    profiles: &[PathBuf],
+    opts: &CleanOpts,
+    report: &mut CleanReport,
+) {
+    remove_coverage_counters(target_dir, opts, report);
+    for profile in profiles {
+        remove_coverage_counters(profile, opts, report);
+    }
+    let tmp_dir = target_dir.join("tmp");
+    if tmp_dir.is_dir() {
+        for entry in read_dir_sorted(&tmp_dir) {
+            remove_candidate(&entry, opts, report);
+        }
+    }
 }
 
 /// Directories under `target/` that hold build output. Discovered rather than hardcoded to
@@ -1098,17 +1128,17 @@ fn child_dirs(entries: fs::ReadDir) -> impl Iterator<Item = PathBuf> {
         .filter(|path| path.is_dir())
 }
 
+/// Whether `path` is a coverage counter file (`.profraw`/`.profdata`) — dead the moment it is
+/// merged into a report, so it is removable regardless of age.
+fn is_coverage_counter(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e == "profraw" || e == "profdata")
+}
+
 fn remove_coverage_counters(dir: &Path, opts: &CleanOpts, report: &mut CleanReport) {
     for candidate in read_dir_sorted(dir) {
-        if candidate.is_dir {
-            continue;
-        }
-        let is_counter = candidate
-            .path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e == "profraw" || e == "profdata");
-        if is_counter {
+        if !candidate.is_dir && is_coverage_counter(&candidate.path) {
             remove_candidate(&candidate, opts, report);
         }
     }
@@ -1160,20 +1190,23 @@ fn prune_dir_older_than(
 }
 
 /// Remove oldest-first until `target/` fits in `budget_bytes`.
+/// Nothing was actually deleted in a dry run, so the age pass's claimed reclaim must be
+/// subtracted to model the real post-clean size.
+fn dry_run_discount(opts: &CleanOpts, report: &CleanReport) -> u64 {
+    if opts.dry_run {
+        report.bytes_reclaimed
+    } else {
+        0
+    }
+}
+
 fn enforce_size_budget(
     target_dir: &Path,
     budget_bytes: u64,
     opts: &CleanOpts,
     report: &mut CleanReport,
 ) {
-    // Nothing was actually deleted in a dry run, so discount what the age pass claimed in
-    // order to model the real post-clean size.
-    let discount = if opts.dry_run {
-        report.bytes_reclaimed
-    } else {
-        0
-    };
-    let mut current = dir_size(target_dir).saturating_sub(discount);
+    let mut current = dir_size(target_dir).saturating_sub(dry_run_discount(opts, report));
     if current <= budget_bytes {
         return;
     }

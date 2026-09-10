@@ -30,36 +30,50 @@ async fn try_setup_mcp_client(config: &AppConfig) -> Result<()> {
     if !fs::try_exists(&config.mcp_config).await.unwrap_or(false) {
         return Ok(());
     }
-    match crate::config::load_mcp_config(&config.mcp_config).await {
-        Ok(mcp_config) => {
-            if let Some(server_config) = mcp_config.servers.values().next()
-                && let MpcServerConfig::Http(http_config) = server_config
-            {
-                tracing::info!("Initializing HTTP MCP Client for: {}", http_config.url);
-                let url =
-                    url::Url::parse(&http_config.url).context("Failed to parse MCP server URL")?;
-                let transport = HttpMcpTransport::new(
-                    url,
-                    http_config.atlassian_client_id.clone(),
-                    http_config.atlassian_client_secret.clone(),
-                )?;
-                transport.ensure_authenticated().await?;
-                tracing::info!("Successfully connected to HTTP MCP server");
-                tracing::warn!(
-                    "Remote tools are not yet proxied to the client - this is a partial integration"
-                );
-                // Keep the transport alive for the duration of the process
-                let _ = MCP_TRANSPORT.set(transport);
-            }
-        }
+
+    let mcp_config = match crate::config::load_mcp_config(&config.mcp_config).await {
+        Ok(mcp_config) => mcp_config,
         Err(e) => {
             tracing::debug!(
                 "Could not parse mcp.json as ahma_mcp config (this is OK if it's a Cursor/VSCode MCP config): {}",
                 e
             );
+            return Ok(());
         }
-    }
+    };
+
+    // Only an HTTP-transport server entry needs a client wired up here; a
+    // missing entry or a child-process entry is a no-op for this path.
+    let Some(MpcServerConfig::Http(http_config)) = mcp_config.servers.values().next() else {
+        return Ok(());
+    };
+
+    let transport = connect_http_mcp_client(http_config).await?;
+    // Keep the transport alive for the duration of the process
+    let _ = MCP_TRANSPORT.set(transport);
     Ok(())
+}
+
+/// Connect and authenticate an [`HttpMcpTransport`] for `http_config`,
+/// disclosing the outcome. Self-contained tail of [`try_setup_mcp_client`]:
+/// isolated here so that function's control flow stays a flat sequence of
+/// guard clauses.
+async fn connect_http_mcp_client(
+    http_config: &crate::config::HttpServerConfig,
+) -> Result<HttpMcpTransport> {
+    tracing::info!("Initializing HTTP MCP Client for: {}", http_config.url);
+    let url = url::Url::parse(&http_config.url).context("Failed to parse MCP server URL")?;
+    let transport = HttpMcpTransport::new(
+        url,
+        http_config.atlassian_client_id.clone(),
+        http_config.atlassian_client_secret.clone(),
+    )?;
+    transport.ensure_authenticated().await?;
+    tracing::info!("Successfully connected to HTTP MCP server");
+    tracing::warn!(
+        "Remote tools are not yet proxied to the client - this is a partial integration"
+    );
+    Ok(transport)
 }
 
 /// Start the guarded egress proxy and route every sandboxed subprocess through it
