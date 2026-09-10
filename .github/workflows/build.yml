@@ -15,8 +15,8 @@ permissions:
 # the live set instead of a snapshot plus its accumulated dead weight.
 #
 # Set up with the `.github/actions/sccache-ghac` composite action and verified with
-# `.github/actions/sccache-verify`. Both are shared by every job here and in codeql.yml /
-# fast-tier.yml, deliberately: ghac is switched on in exactly one place, and every job that
+# `.github/actions/sccache-verify`. Both are shared by every job here and in codeql.yml,
+# deliberately: ghac is switched on in exactly one place, and every job that
 # switches it on also asserts that it took effect.
 #
 # That sharing is not just tidiness -- it is what makes the jobs share a cache at all. sccache
@@ -24,15 +24,13 @@ permissions:
 # read and write different namespaces and silently never share an object. Under the tarball model
 # only job-coverage was version-pinned, because a tarball key does not carry the version; under
 # ghac every job must be pinned to the SAME version, which is why the pin lives in the shared
-# action rather than in any job. This is the same class of bug as the one-sided
-# CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG that once cost fast-tier.yml its entire Rust hit rate:
-# it does not fail, it just quietly stops sharing.
+# action rather than in any job.
 #
 # Three rules keep the footprint inside the quota. Change any and re-check the arithmetic.
 #
 # 1. PR runs consume cache, never produce it. Caches saved on a `pull_request` ref are visible
 #    only to that one PR, yet they bill against the shared 10 GiB and evict main's entries, which
-#    every PR restores from. fast-tier.yml therefore passes `mode: read-only`, which sets
+#    every PR restores from. PR runs therefore pass `mode: read-only`, which sets
 #    SCCACHE_GHA_RW_MODE=READ_ONLY. Note what changed here: this used to be the *convention* of
 #    omitting a save step, and is now enforced by sccache itself. The cost is unchanged -- a
 #    second push to the same PR recompiles the workspace crates it changed; deps still come from
@@ -381,9 +379,7 @@ jobs:
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # Fail fast on formatting before any expensive compile. The PR fast tier already runs
-      # this, but a direct push to main (e.g. the release version-bump commit) bypasses the
-      # fast tier — this is main's fmt backstop. <1s; Linux only (rustfmt is platform-agnostic).
+      # Fail fast on formatting before any expensive compile. <1s; Linux only (rustfmt is platform-agnostic).
       - name: Cargo fmt --check
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: cargo fmt --all --check
@@ -472,9 +468,7 @@ jobs:
           cargo test --locked -p ahma_bin -p ahma_http_bridge --no-run
 
       # --all-targets rather than the previous `--locked` / `--tests` pair: that
-      # pair covered lib + tests but not examples or benches, so a broken example
-      # only showed up in the PR fast tier (which does run --all-targets) and a
-      # direct push to main missed it. Both feature configurations are linted:
+      # pair covered lib + tests but not examples or benches. Both feature configurations are linted:
       # default is the canonical (tested, shipped) flavour, and the
       # --no-default-features pass is the ONLY place the lean build is proven to
       # compile -- check mode, so it costs no codegen and no links.

@@ -97,7 +97,7 @@ materially so the rules above stay grounded in numbers rather than lore.
 | Finding | Action |
 |---|---|
 | Repo `.cargo/config.toml` set `[build] jobs = 4` for a Raspberry Pi 5; capped every developer machine | Removed; machine limits go in `~/.cargo/config.toml` (documented in that file) |
-| `ring` and `directories` were direct deps with zero uses | Removed. `ring` then still arrived transitively as a **second** rustls crypto provider next to the mandatory `aws-lc-rs` — through `rcgen`'s and `quinn`'s default features and an explicit `rustls::crypto::ring` in the bridge's QUIC config. All three now select `aws-lc-rs`; `scripts/check-dependency-graph.sh` (pre-push and Fast Tier) fails if any dependency's defaults bring `ring` back into the product graph on any CI platform |
+| `ring` and `directories` were direct deps with zero uses | Removed. `ring` then still arrived transitively as a **second** rustls crypto provider next to the mandatory `aws-lc-rs` — through `rcgen`'s and `quinn`'s default features and an explicit `rustls::crypto::ring` in the bridge's QUIC config. All three now select `aws-lc-rs`; `scripts/check-dependency-graph.sh` (pre-push and PR CI) fails if any dependency's defaults bring `ring` back into the product graph on any CI platform |
 | `ahma_core` used `tokio = "full"`, `ahma_mcp` bare `tokio = "1.53.1"` | Both on the workspace-curated feature list |
 | macOS Spotlight (`mds_stores`, `mdworker`) consumed 3–4 cores indexing rebuilt objects | Documented: add `target/` to Spotlight's Search Privacy list |
 | `scripts/stress-test.sh` used `-p ahma-http-bridge` (hyphenated, never valid) and `-p ahma_mcp --bin ahma` (bin lives in `ahma_bin`) | Fixed with the new binary names |

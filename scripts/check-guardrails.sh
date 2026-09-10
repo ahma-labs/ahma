@@ -239,7 +239,7 @@ echo "=== Guardrail: workspace cargo check ==="
 cargo check --workspace --locked
 
 echo "=== Guardrail: dependency graph invariants (hakari in sync, one crypto provider) ==="
-# Shared with Fast Tier CI so a PR cannot land a stale workspace-hack/ or a second
+# Shared with PR CI so a PR cannot land a stale workspace-hack/ or a second
 # rustls crypto provider; see the script for the rationale of each invariant.
 bash ./scripts/check-dependency-graph.sh
 

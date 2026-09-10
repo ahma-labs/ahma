@@ -1,7 +1,7 @@
 #!/bin/bash
 # Dependency-graph invariants. No compile: `cargo hakari verify` and `cargo tree` read
 # Cargo.lock only, so this runs in seconds and belongs in every gate (pre-push via
-# check-guardrails.sh, and Fast Tier on every PR).
+# check-guardrails.sh, and CI on every PR).
 #
 # 1. workspace-hack/ is in sync with the real dependency graph. It pins one third-party
 #    feature set for every cargo invocation so `-p <crate>` builds reuse the workspace

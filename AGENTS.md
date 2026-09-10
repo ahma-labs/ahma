@@ -81,7 +81,7 @@ Before you claim "all green" and stop work, run:
    `cargo hakari generate && cargo hakari manage-deps` — regenerates `workspace-hack/`, the
    crate that pins one third-party feature set for every invocation. `cargo hakari verify`
    runs in `scripts/check-dependency-graph.sh` (called by the pre-push guardrails and by
-   Fast Tier CI), so a stale hack fails before it lands. Install once with
+   PR CI), so a stale hack fails before it lands. Install once with
    `cargo install cargo-hakari --locked`.
 9. **If you added a dependency that touches TLS** (anything with a `rustls`, `rcgen`,
    `quinn` or `*-tls` feature): the same script also checks that `aws-lc-rs` is the *only*
@@ -596,7 +596,7 @@ Capture full logs (`<cmd> 2>&1 | tee …`) and reduce concurrency to a single te
 - **R-GUARD.1**: Pre-commit and pre-push guardrail script: `./scripts/check-guardrails.sh`.
 - **R-GUARD.2**: Guardrail scripts **must** reject newly added literal `Duration::from_secs(...)` / `Duration::from_millis(...)` patterns in timeout-sensitive handshake/bridge integration tests (`scripts/lint_test_paths.sh`).
 - **R-GUARD.3**: Guardrail scripts **should** verify that custom HTTP bridge integration tests use shared startup helpers from `tests/common/server.rs`.
-- **R-GUARD.4**: Guardrail scripts **must** run `scripts/check-dependency-graph.sh` (`cargo hakari verify` plus the single-crypto-provider check), so a dependency edit that was not followed by `cargo hakari generate && cargo hakari manage-deps`, or that drags `ring` back in through a default feature, fails before push. Fast Tier CI runs the same script on every PR.
+- **R-GUARD.4**: Guardrail scripts **must** run `scripts/check-dependency-graph.sh` (`cargo hakari verify` plus the single-crypto-provider check), so a dependency edit that was not followed by `cargo hakari generate && cargo hakari manage-deps`, or that drags `ring` back in through a default feature, fails before push. PR CI runs the same script on every PR.
 - **R-GUARD.5**: Guardrail scripts **must** reject a new top-level `tests/*.rs` file that is not on the per-crate root-binary allowlist (see [Test Binary Layout](#test-binary-layout--one-binary-per-harness-class)).
 
 ---
