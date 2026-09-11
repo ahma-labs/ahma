@@ -98,22 +98,38 @@ async fn maybe_run_setup_wizard(args: &UpdateArgs, binary_path: &Path) -> Result
         return Ok(());
     }
 
-    if !drifts.is_empty() && can_prompt_for_setup() {
-        println!();
-        println!("Detected outdated MCP server configuration(s):");
-        for drift in &drifts {
-            println!(
-                "  - {} ({})",
-                drift.platform_name,
-                drift.config_path.display()
-            );
-        }
-        if prompt_yes_no(
-            "Update outdated MCP configuration(s) and create backups (.bak)? [Y/n]: ",
-            true,
-        )
-        .await?
-        {
+    if !drifts.is_empty() {
+        if can_prompt_for_setup() {
+            println!();
+            println!("Detected outdated MCP server configuration(s):");
+            for drift in &drifts {
+                println!(
+                    "  - {} ({})",
+                    drift.platform_name,
+                    drift.config_path.display()
+                );
+            }
+            if prompt_yes_no(
+                "Update outdated MCP configuration(s) and create backups (.bak)? [Y/n]: ",
+                true,
+            )
+            .await?
+            {
+                for drift in &drifts {
+                    if let Err(e) = drift.apply_update() {
+                        eprintln!(
+                            "Warning: failed to update MCP config for {}: {e}",
+                            drift.platform_name
+                        );
+                    } else {
+                        println!(
+                            "✓ Updated and backed up MCP config for {}",
+                            drift.platform_name
+                        );
+                    }
+                }
+            }
+        } else {
             for drift in &drifts {
                 if let Err(e) = drift.apply_update() {
                     eprintln!(
