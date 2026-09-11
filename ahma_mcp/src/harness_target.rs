@@ -152,6 +152,34 @@ impl Platform {
         };
         Some((path, format))
     }
+
+    /// Base configuration directory or marker for this harness, if any.
+    ///
+    /// Used by drift detection to know if a harness is installed even if its
+    /// MCP config file does not exist yet.
+    pub fn app_directory(self, home: &Path) -> Option<PathBuf> {
+        let dir = match self {
+            Platform::Antigravity => home.join(".gemini"),
+            Platform::ClaudeCode => {
+                let claude_dir = home.join(".claude");
+                if claude_dir.exists() {
+                    claude_dir
+                } else {
+                    home.join(".claude.json")
+                }
+            }
+            Platform::ClaudeDesktop => {
+                let (path, _) = self.mcp_config(home)?;
+                path.parent()?.to_path_buf()
+            }
+            Platform::Codex => home.join(".codex"),
+            Platform::Cursor => home.join(".cursor"),
+            Platform::Copilot => return None,
+            Platform::LmStudio => home.join(".lmstudio"),
+            Platform::VsCode => home.join(".vscode"),
+        };
+        Some(dir)
+    }
 }
 
 /// Claude Desktop's config location relative to the home directory.

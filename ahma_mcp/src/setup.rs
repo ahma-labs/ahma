@@ -363,13 +363,40 @@ fn mcp_shared_transport_url(transport: &str) -> Option<String> {
     }
 }
 
+/// Resolve the command string used in MCP configurations.
+///
+/// Under test isolation this returns "ahma" so unit tests match without depending
+/// on the local environment. When executed live (e.g. `ahma setup` or `ahma update`),
+/// it resolves to the absolute path of the ahma executable so that GUI applications
+/// (such as Google Antigravity or Claude Desktop on macOS) can spawn ahma without
+/// relying on `~/.local/bin` being in the application subprocess `PATH`.
+fn resolve_ahma_command() -> String {
+    if !ahma_common::test_isolation::spawned_under_test_harness() {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(stem) = exe.file_stem()
+            && stem.eq_ignore_ascii_case("ahma")
+        {
+            let canon = dunce::canonicalize(&exe).unwrap_or(exe);
+            return canon.to_string_lossy().to_string();
+        }
+        if let Ok(install_dir) = ahma_update::default_install_dir() {
+            let candidate = install_dir.join(ahma_update::AHMA_BINARY_NAME);
+            if candidate.exists() {
+                let canon = dunce::canonicalize(&candidate).unwrap_or(candidate);
+                return canon.to_string_lossy().to_string();
+            }
+        }
+    }
+    "ahma".to_string()
+}
+
 fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
     if let Some(url) = mcp_shared_transport_url(transport) {
         return json!({ "type": "http", "url": url });
     }
     json!({
         "type": "stdio",
-        "command": "ahma",
+        "command": resolve_ahma_command(),
         "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
     })
 }
@@ -394,7 +421,7 @@ fn build_scoped_servers_entry(transport: &str, _home: &Path) -> serde_json::Valu
         return json!({ "url": url });
     }
     json!({
-        "command": "ahma",
+        "command": resolve_ahma_command(),
         "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
     })
 }
@@ -411,7 +438,7 @@ fn build_claude_desktop_mcp_entry(transport: &str, _home: &Path) -> serde_json::
         return json!({ "type": "http", "url": url });
     }
     json!({
-        "command": "ahma",
+        "command": resolve_ahma_command(),
         "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
     })
 }
@@ -508,9 +535,8 @@ pub fn detect_mcp_config_drifts() -> Vec<McpConfigDrift> {
         .collect()
 }
 
-/// Drift for one platform's MCP config, or `None` when the platform has no
-/// config file on disk yet (nothing to correct) — see [`detect_toml_drift`]
-/// and [`detect_json_drift`] for the "file exists but matches" case.
+/// Drift for one platform's MCP config, or `None` when the platform is not
+/// installed and has no config file on disk yet (nothing to correct).
 fn detect_platform_mcp_drift(
     platform: Platform,
     home: &Path,
@@ -518,11 +544,15 @@ fn detect_platform_mcp_drift(
     scoped_servers_entry: &serde_json::Value,
 ) -> Option<McpConfigDrift> {
     let (path, format) = platform.mcp_config(home)?;
-    if !path.exists() {
+    let app_dir_exists = platform.app_directory(home).is_some_and(|d| d.exists());
+    if !path.exists() && !app_dir_exists {
         return None;
     }
     match format {
-        McpConfigFormat::Toml => detect_toml_drift(platform, path, build_codex_toml_value("stdio")),
+        McpConfigFormat::Toml => {
+            let recommended = build_codex_toml_value("stdio");
+            detect_toml_drift(platform, path, recommended)
+        }
         McpConfigFormat::Json(servers_key) => {
             let recommended =
                 select_mcp_json_entry(platform, "stdio", servers_entry, scoped_servers_entry, home);
@@ -531,19 +561,97 @@ fn detect_platform_mcp_drift(
     }
 }
 
+fn mcp_commands_match(existing: &str, recommended: &str) -> bool {
+    if existing == recommended {
+        return true;
+    }
+    let e_stem = Path::new(existing).file_stem().and_then(|s| s.to_str());
+    let r_stem = Path::new(recommended).file_stem().and_then(|s| s.to_str());
+    match (e_stem, r_stem) {
+        (Some(es), Some(rs)) => es.eq_ignore_ascii_case("ahma") && rs.eq_ignore_ascii_case("ahma"),
+        _ => false,
+    }
+}
+
+fn json_mcp_entries_match(existing: &serde_json::Value, recommended: &serde_json::Value) -> bool {
+    if existing == recommended {
+        return true;
+    }
+    if existing.get("args") != recommended.get("args") {
+        return false;
+    }
+    if existing.get("type") != recommended.get("type") {
+        return false;
+    }
+    if existing.get("url") != recommended.get("url") {
+        return false;
+    }
+    match (
+        existing.get("command").and_then(|c| c.as_str()),
+        recommended.get("command").and_then(|c| c.as_str()),
+    ) {
+        (Some(e), Some(r)) => mcp_commands_match(e, r),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn toml_mcp_entries_match(existing: &toml::Value, recommended: &toml::Value) -> bool {
+    if existing == recommended {
+        return true;
+    }
+    if existing.get("args") != recommended.get("args") {
+        return false;
+    }
+    if existing.get("url") != recommended.get("url") {
+        return false;
+    }
+    match (
+        existing.get("command").and_then(|c| c.as_str()),
+        recommended.get("command").and_then(|c| c.as_str()),
+    ) {
+        (Some(e), Some(r)) => mcp_commands_match(e, r),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Drift for one Codex-style TOML config, or `None` when there is nothing to
-/// update: the file is unreadable or unparseable, carries no Ahma entry at all
-/// (setup never wrote one, so drift correction has nothing to correct), or the
-/// entry already matches `recommended`.
+/// update: the file is unreadable or unparseable, or the entry already matches
+/// `recommended`.
 fn detect_toml_drift(
     platform: Platform,
     path: PathBuf,
     recommended: toml::Value,
 ) -> Option<McpConfigDrift> {
-    let content = std::fs::read_to_string(&path).ok()?;
-    let parsed = toml::from_str::<toml::Value>(&content).ok()?;
-    let existing = parsed.get("mcp_servers")?.get("Ahma")?;
-    if existing == &recommended {
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => {
+            return Some(McpConfigDrift {
+                platform_name: platform.label(),
+                config_path: path,
+                is_toml: true,
+                servers_key: "mcp_servers",
+                recommended_json: None,
+                recommended_toml: Some(recommended),
+            });
+        }
+    };
+    let parsed = match toml::from_str::<toml::Value>(&content) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let Some(existing) = parsed.get("mcp_servers").and_then(|s| s.get("Ahma")) else {
+        return Some(McpConfigDrift {
+            platform_name: platform.label(),
+            config_path: path,
+            is_toml: true,
+            servers_key: "mcp_servers",
+            recommended_json: None,
+            recommended_toml: Some(recommended),
+        });
+    };
+    if toml_mcp_entries_match(existing, &recommended) {
         return None;
     }
     Some(McpConfigDrift {
@@ -556,18 +664,41 @@ fn detect_toml_drift(
     })
 }
 
-/// Drift for one JSON MCP config. Same "nothing to update" cases as
-/// [`detect_toml_drift`].
+/// Drift for one JSON MCP config. Same rules as [`detect_toml_drift`].
 fn detect_json_drift(
     platform: Platform,
     path: PathBuf,
     servers_key: &'static str,
     recommended: serde_json::Value,
 ) -> Option<McpConfigDrift> {
-    let content = std::fs::read_to_string(&path).ok()?;
-    let parsed = serde_json::from_str::<serde_json::Value>(&content).ok()?;
-    let existing = parsed.get(servers_key)?.get("Ahma")?;
-    if existing == &recommended {
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => {
+            return Some(McpConfigDrift {
+                platform_name: platform.label(),
+                config_path: path,
+                is_toml: false,
+                servers_key,
+                recommended_json: Some(recommended),
+                recommended_toml: None,
+            });
+        }
+    };
+    let parsed = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let Some(existing) = parsed.get(servers_key).and_then(|s| s.get("Ahma")) else {
+        return Some(McpConfigDrift {
+            platform_name: platform.label(),
+            config_path: path,
+            is_toml: false,
+            servers_key,
+            recommended_json: Some(recommended),
+            recommended_toml: None,
+        });
+    };
+    if json_mcp_entries_match(existing, &recommended) {
         return None;
     }
     Some(McpConfigDrift {
@@ -689,7 +820,7 @@ fn build_codex_toml_value(transport: &str) -> toml::Value {
         _ => {
             table.insert(
                 "command".to_string(),
-                toml::Value::String("ahma".to_string()),
+                toml::Value::String(resolve_ahma_command()),
             );
             let args = vec![
                 toml::Value::String("serve".to_string()),
@@ -1992,5 +2123,121 @@ mod tests {
             serde_json::json!(["serve", "stdio", "--sandbox"])
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_detect_json_drift_absolute_path_matches_bare_ahma() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("mcp_config.json");
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "Ahma": {
+                    "command": "/Users/testuser/.local/bin/ahma",
+                    "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        let recommended = serde_json::json!({
+            "command": "ahma",
+            "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
+        });
+
+        let drift = detect_json_drift(Platform::Antigravity, path, "mcpServers", recommended);
+        assert!(
+            drift.is_none(),
+            "Absolute path to ahma matching recommended args must not be considered drift"
+        );
+    }
+
+    #[test]
+    fn test_detect_json_drift_different_args_detects_drift() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("mcp_config.json");
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "Ahma": {
+                    "command": "/Users/testuser/.local/bin/ahma",
+                    "args": ["serve", "stdio", "--sandbox"]
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        let recommended = serde_json::json!({
+            "command": "ahma",
+            "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
+        });
+
+        let drift = detect_json_drift(Platform::Antigravity, path, "mcpServers", recommended);
+        assert!(drift.is_some(), "Outdated args must be detected as drift");
+    }
+
+    #[test]
+    fn test_detect_json_drift_missing_ahma_entry_detects_drift() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("mcp_config.json");
+        let existing = serde_json::json!({
+            "mcpServers": {}
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        let recommended = serde_json::json!({
+            "command": "ahma",
+            "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
+        });
+
+        let drift = detect_json_drift(Platform::Antigravity, path, "mcpServers", recommended);
+        assert!(
+            drift.is_some(),
+            "Missing Ahma server in existing config must be detected as drift"
+        );
+    }
+
+    #[test]
+    fn test_detect_platform_mcp_drift_installed_antigravity_missing_config_detects_drift() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        // Simulate Antigravity being installed by creating ~/.gemini
+        std::fs::create_dir_all(home.join(".gemini").join("config")).unwrap();
+
+        let servers = build_mcp_servers_entry("stdio");
+        let scoped = build_scoped_servers_entry("stdio", home);
+
+        let drift = detect_platform_mcp_drift(Platform::Antigravity, home, &servers, &scoped);
+        assert!(
+            drift.is_some(),
+            "Installed Antigravity without mcp_config.json must be detected as drift"
+        );
+        let drift = drift.unwrap();
+        assert_eq!(
+            drift.config_path,
+            home.join(".gemini").join("config").join("mcp_config.json")
+        );
+
+        // Applying update should create the file with the recommended config
+        drift.apply_update().unwrap();
+        assert!(
+            home.join(".gemini")
+                .join("config")
+                .join("mcp_config.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn test_detect_platform_mcp_drift_uninstalled_platform_returns_none() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        // Neither ~/.gemini nor mcp_config.json exists
+        let servers = build_mcp_servers_entry("stdio");
+        let scoped = build_scoped_servers_entry("stdio", home);
+
+        let drift = detect_platform_mcp_drift(Platform::Antigravity, home, &servers, &scoped);
+        assert!(
+            drift.is_none(),
+            "Uninstalled platform with no config file must return None"
+        );
     }
 }
