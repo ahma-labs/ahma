@@ -14,6 +14,12 @@ use serde_json::Value;
 /// Canonical (lowercase) name of the protocol-version header.
 pub const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
+/// Modern stateless MCP protocol revision (SEP-2575).
+pub const MCP_PROTOCOL_VERSION_2026_07_28: &str = "2026-07-28";
+
+/// Stateful MCP protocol revision with tools/call notifications.
+pub const MCP_PROTOCOL_VERSION_2025_11_25: &str = "2025-11-25";
+
 /// The protocol revision ahma's own clients request at `initialize`.
 pub const REQUESTED_PROTOCOL_VERSION: &str = "2025-06-18";
 

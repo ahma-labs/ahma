@@ -6,9 +6,15 @@
 
 use crate::transport_patch::PatchedStdioTransport;
 #[cfg(unix)]
-use ahma_common::mcp_methods::{INITIALIZED_METHOD, ROOTS_LIST_METHOD};
+use ahma_common::mcp_methods::ROOTS_LIST_METHOD;
+use ahma_common::mcp_methods::{
+    INITIALIZE_METHOD, INITIALIZED_METHOD, SERVER_DISCOVER_METHOD, SERVER_INSTRUCTIONS,
+    SUBSCRIPTIONS_LISTEN_METHOD,
+};
+use ahma_common::mcp_protocol::{MCP_PROTOCOL_VERSION_2025_11_25, MCP_PROTOCOL_VERSION_2026_07_28};
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
+use rmcp::model::{CustomResult, RequestId, ServerResult};
 #[cfg(unix)]
 use rmcp::service::RoleClient;
 use rmcp::service::{RoleServer, TxJsonRpcMessage};
@@ -745,6 +751,7 @@ where
 
     loop {
         tokio::select! {
+            biased;
             _ = &mut handshake_timer, if !forwarded_any => {
                 tracing::warn!(
                     transport,
@@ -765,6 +772,148 @@ where
                 };
                 let val = serde_json::to_value(&msg).unwrap();
                 let request_id = val.get("id").filter(|id| !id.is_null()).cloned();
+                if val.get("method").and_then(|m| m.as_str()) == Some(SERVER_DISCOVER_METHOD) {
+                    tracing::info!(
+                        transport,
+                        "Received server/discover probe from modern MCP client (2026-07-28); establishing first-class modern stateless session"
+                    );
+                    let discover_id = request_id.clone().unwrap_or_else(|| serde_json::json!(1));
+
+                    let client_info = val
+                        .get("params")
+                        .and_then(|p| {
+                            p.get("_meta")
+                                .and_then(|m| m.get("clientInfo"))
+                                .or_else(|| p.get("clientInfo"))
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            serde_json::json!({
+                                "name": "modern-client",
+                                "version": "1.0.0"
+                            })
+                        });
+
+                    let client_capabilities = val
+                        .get("params")
+                        .and_then(|p| {
+                            p.get("_meta")
+                                .and_then(|m| m.get("clientCapabilities"))
+                                .or_else(|| p.get("capabilities"))
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            serde_json::json!({
+                                "roots": { "listChanged": true }
+                            })
+                        });
+
+                    let synth_init = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "method": INITIALIZE_METHOD,
+                        "params": {
+                            "protocolVersion": MCP_PROTOCOL_VERSION_2025_11_25,
+                            "capabilities": client_capabilities,
+                            "clientInfo": client_info
+                        }
+                    });
+
+                    handshake.observe_client_to_bridge(&synth_init);
+
+                    let init_msg: TxJsonRpcMessage<RoleClient> = match serde_json::from_value(synth_init) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!(transport, error = %e, "Failed to serialize synthesized initialize");
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = client.send(init_msg).await {
+                        tracing::error!(transport, error = %e, "Failed to send synthesized initialize to bridge");
+                        continue;
+                    }
+
+                    let init_resp = match client.receive().await {
+                        Some(resp) => resp,
+                        None => {
+                            tracing::error!(transport, "Bridge closed connection while waiting for initialize response");
+                            break;
+                        }
+                    };
+
+                    let init_resp_val = serde_json::to_value(&init_resp).unwrap_or_default();
+                    let init_result = init_resp_val.get("result").cloned().unwrap_or_default();
+
+                    let bridge_capabilities = init_result.get("capabilities").cloned().unwrap_or_else(|| {
+                        serde_json::json!({
+                            "tools": { "listChanged": true }
+                        })
+                    });
+                    let bridge_server_info = init_result.get("serverInfo").cloned().unwrap_or_else(|| {
+                        serde_json::json!({
+                            "name": env!("CARGO_PKG_NAME"),
+                            "version": env!("CARGO_PKG_VERSION")
+                        })
+                    });
+                    let bridge_instructions = init_result
+                        .get("instructions")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| SERVER_INSTRUCTIONS.to_string());
+
+                    let discover_result = serde_json::json!({
+                        "supportedVersions": [
+                            MCP_PROTOCOL_VERSION_2026_07_28,
+                            MCP_PROTOCOL_VERSION_2025_11_25
+                        ],
+                        "capabilities": bridge_capabilities,
+                        "instructions": bridge_instructions,
+                        "serverInfo": bridge_server_info.clone(),
+                        "_meta": {
+                            "io.modelcontextprotocol/serverInfo": bridge_server_info
+                        }
+                    });
+
+                    let req_id: RequestId =
+                        serde_json::from_value(discover_id).unwrap_or(RequestId::Number(1));
+                    let tx_msg = TxJsonRpcMessage::<RoleServer>::response(
+                        ServerResult::CustomResult(CustomResult(discover_result)),
+                        req_id,
+                    );
+
+                    if let Err(e) = stdio.send(tx_msg).await {
+                        tracing::error!(transport, error = ?e, "Failed to send server/discover response to stdio");
+                        break;
+                    }
+
+                    let notif_init = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": INITIALIZED_METHOD,
+                        "params": {}
+                    });
+                    handshake.observe_client_to_bridge(&notif_init);
+                    if let Ok(notif_msg) = serde_json::from_value::<TxJsonRpcMessage<RoleClient>>(notif_init) {
+                        let _ = client.send(notif_msg).await;
+                    }
+
+                    consecutive_forward_failures = 0;
+                    forwarded_any = true;
+                    bridge_responded = true;
+                    continue;
+                }
+
+                if val.get("method").and_then(|m| m.as_str()) == Some(SUBSCRIPTIONS_LISTEN_METHOD) {
+                    tracing::debug!(transport, "Handling modern subscriptions/listen request");
+                    if let Some(id) = request_id {
+                        let req_id: RequestId =
+                            serde_json::from_value(id).unwrap_or(RequestId::Number(1));
+                        let ok_msg =
+                            TxJsonRpcMessage::<RoleServer>::response(ServerResult::empty(()), req_id);
+                        let _ = stdio.send(ok_msg).await;
+                    }
+                    continue;
+                }
                 handshake.observe_client_to_bridge(&val);
                 // `val` is kept alive past the send: the gone-endpoint recovery
                 // path below resends this exact message on a fresh transport.
@@ -1033,29 +1182,182 @@ async fn perform_http_initialize(
     handshake_deadline: Option<Duration>,
 ) -> Result<(String, String)> {
     // Bounded by the handshake deadline so a connection that is spawned and
-    // abandoned (no `initialize` ever sent) exits rather than parking on
+    // abandoned (no handshake message ever sent) exits rather than parking on
     // stdin forever and piling up.
     let first_recv = stdio.receive();
-    let init_msg = match handshake_deadline {
-        Some(deadline) => match tokio::time::timeout(deadline, first_recv).await {
-            Ok(msg) => msg,
-            Err(_) => {
-                tracing::warn!(
-                    ?deadline,
-                    "Proxy exiting: no MCP handshake within deadline (connection spawned but abandoned)"
-                );
-                // Exit directly: the stdin reader thread is still blocked on the
-                // held-open pipe, so returning would hang on runtime shutdown.
-                std::process::exit(0);
+    let msg = match handshake_deadline {
+            Some(deadline) => match tokio::time::timeout(deadline, first_recv).await {
+                Ok(msg) => msg,
+                Err(_) => {
+                    tracing::warn!(
+                        ?deadline,
+                        "Proxy exiting: no MCP handshake within deadline (connection spawned but abandoned)"
+                    );
+                    // Exit directly: the stdin reader thread is still blocked on the
+                    // held-open pipe, so returning would hang on runtime shutdown.
+                    std::process::exit(0);
+                }
+            },
+            None => first_recv.await,
+        }
+        .ok_or_else(|| {
+            tracing::error!("Proxy HTTP handshake failed: no initialize message on stdin");
+            anyhow!("No initialize message on stdin")
+        })?;
+
+    let val = serde_json::to_value(&msg)?;
+    if val.get("method").and_then(|m| m.as_str()) == Some(SERVER_DISCOVER_METHOD) {
+        tracing::info!(
+            "Received server/discover probe from modern MCP client (2026-07-28); establishing first-class modern stateless session via HTTP"
+        );
+        let discover_id = val
+            .get("id")
+            .filter(|id| !id.is_null())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(1));
+
+        let client_info = val
+            .get("params")
+            .and_then(|p| {
+                p.get("_meta")
+                    .and_then(|m| m.get("clientInfo"))
+                    .or_else(|| p.get("clientInfo"))
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "name": "modern-client",
+                    "version": "1.0.0"
+                })
+            });
+
+        let client_capabilities = val
+            .get("params")
+            .and_then(|p| {
+                p.get("_meta")
+                    .and_then(|m| m.get("clientCapabilities"))
+                    .or_else(|| p.get("capabilities"))
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "roots": { "listChanged": true }
+                })
+            });
+
+        let synth_init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": INITIALIZE_METHOD,
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION_2025_11_25,
+                "capabilities": client_capabilities,
+                "clientInfo": client_info
             }
-        },
-        None => first_recv.await,
+        });
+
+        let response = client
+            .post(mcp_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&synth_init)
+            .send()
+            .await
+            .with_context(|| format!("Proxy HTTP initialize POST failed for {mcp_url}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            tracing::error!(
+                url = %mcp_url,
+                status = %status,
+                "Proxy HTTP initialize returned non-success status"
+            );
+            return Err(anyhow!("Initialize failed with HTTP {status}"));
+        }
+
+        let session_id = crate::mcp_client::session_id_header(&response).ok_or_else(|| {
+            tracing::error!(
+                url = %mcp_url,
+                "Proxy HTTP initialize missing mcp-session-id header"
+            );
+            anyhow!("Missing mcp-session-id header in initialize response")
+        })?;
+
+        let resp_bytes = response
+            .bytes()
+            .await
+            .context("Failed to read initialize response body")?;
+
+        let protocol_version = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+            .map(|v| ahma_common::mcp_protocol::negotiated_protocol_version(&v))
+            .unwrap_or_else(|_| {
+                ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION.to_string()
+            });
+
+        let init_resp_val =
+            serde_json::from_slice::<serde_json::Value>(&resp_bytes).unwrap_or_default();
+        let init_result = init_resp_val.get("result").cloned().unwrap_or_default();
+
+        let bridge_capabilities = init_result.get("capabilities").cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "tools": { "listChanged": true }
+            })
+        });
+        let bridge_server_info = init_result.get("serverInfo").cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "name": env!("CARGO_PKG_NAME"),
+                "version": env!("CARGO_PKG_VERSION")
+            })
+        });
+        let bridge_instructions = init_result
+            .get("instructions")
+            .and_then(|i| i.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| SERVER_INSTRUCTIONS.to_string());
+
+        let discover_result = serde_json::json!({
+            "supportedVersions": [
+                MCP_PROTOCOL_VERSION_2026_07_28,
+                MCP_PROTOCOL_VERSION_2025_11_25
+            ],
+            "capabilities": bridge_capabilities,
+            "instructions": bridge_instructions,
+            "serverInfo": bridge_server_info.clone(),
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": bridge_server_info
+            }
+        });
+
+        let req_id: RequestId = serde_json::from_value(discover_id).unwrap_or(RequestId::Number(1));
+        let resp_msg = TxJsonRpcMessage::<RoleServer>::response(
+            ServerResult::CustomResult(CustomResult(discover_result)),
+            req_id,
+        );
+        stdio
+            .send(resp_msg)
+            .await
+            .context("Failed to forward discover response to stdio")?;
+
+        let notif_init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": INITIALIZED_METHOD,
+            "params": {}
+        });
+        let _ = client
+            .post(mcp_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("mcp-session-id", &session_id)
+            .header(
+                ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER,
+                &protocol_version,
+            )
+            .json(&notif_init)
+            .send()
+            .await;
+
+        return Ok((session_id, protocol_version));
     }
-    .ok_or_else(|| {
-        tracing::error!("Proxy HTTP handshake failed: no initialize message on stdin");
-        anyhow!("No initialize message on stdin")
-    })?;
-    let init_val = serde_json::to_value(&init_msg)?;
+    let init_val = val;
 
     let response = client
         .post(mcp_url)
@@ -1290,6 +1592,18 @@ async fn run_http_proxy_loop(
                 let has_id = val.get("id").is_some();
                 let is_request = val.get("method").is_some();
 
+                if val.get("method").and_then(|m| m.as_str()) == Some(SUBSCRIPTIONS_LISTEN_METHOD) {
+                    tracing::debug!("Handling modern subscriptions/listen request via HTTP");
+                    if let Some(id) = val.get("id").filter(|id| !id.is_null()) {
+                        let req_id: RequestId =
+                            serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(1));
+                        let ok_msg =
+                            TxJsonRpcMessage::<RoleServer>::response(ServerResult::empty(()), req_id);
+                        let _ = stdio.send(ok_msg).await;
+                    }
+                    continue;
+                }
+
                 let mut req = client.post(mcp_url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .header("mcp-session-id", session_id)
@@ -1463,6 +1777,25 @@ mod tests {
         .expect("valid bridge response")
     }
 
+    fn bridge_initialize_response(id: i64) -> RxJsonRpcMessage<RoleClient> {
+        serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {
+                    "tools": { "listChanged": true }
+                },
+                "serverInfo": {
+                    "name": "ahma",
+                    "version": "0.1.0"
+                },
+                "instructions": "Ahma tools"
+            }
+        }))
+        .expect("valid bridge initialize response")
+    }
+
     /// The client's `initialize` request — the first message of any real
     /// session, and the one the reconnect path replays from cache.
     fn client_initialize(id: i64) -> RxJsonRpcMessage<RoleServer> {
@@ -1473,6 +1806,20 @@ mod tests {
             "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}
         }))
         .expect("valid initialize request")
+    }
+
+    fn client_discover_request(id: i64) -> RxJsonRpcMessage<RoleServer> {
+        serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                }
+            }
+        }))
+        .expect("valid discover request")
     }
 
     /// The client's `notifications/initialized` — sent once, no response expected.
@@ -2764,6 +3111,62 @@ mod tests {
             state.closed.load(Ordering::SeqCst),
             1,
             "forwarded_any == true -> close() must still be attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_discover_probe_returns_discover_result_and_establishes_session() {
+        let state = TestState::new();
+        // Send server/discover first, then subscriptions/listen, then client_request(3)
+        let stdio = state.stdio(VecDeque::from(vec![
+            client_discover_request(1),
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "subscriptions/listen",
+                "params": {"notifications": {"toolsListChanged": true}}
+            }))
+            .unwrap(),
+            client_request(3),
+        ]));
+        let mut client = state.client(0);
+        client.inbound = VecDeque::from(vec![bridge_initialize_response(0), bridge_response(3)]);
+        let mut reconnect = no_reconnect;
+
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
+        assert!(result.is_ok());
+
+        // Inspect what was sent to stdio
+        let sent = state.sent.lock();
+        assert!(
+            sent.len() >= 2,
+            "expected discover response and subscriptions/listen response"
+        );
+        let first_sent = serde_json::to_value(&sent[0]).expect("json");
+        assert_eq!(first_sent["id"], 1);
+        assert_eq!(
+            first_sent["result"]["supportedVersions"],
+            serde_json::json!(["2026-07-28", "2025-11-25"]),
+            "first_sent was: {first_sent:#?}"
+        );
+        assert_eq!(
+            first_sent["result"]["capabilities"]["tools"]["listChanged"],
+            true
+        );
+        assert_eq!(first_sent["result"]["serverInfo"]["name"], "ahma");
+
+        let second_sent = serde_json::to_value(&sent[1]).expect("json");
+        assert_eq!(second_sent["id"], 2);
+        assert_eq!(second_sent["result"], serde_json::json!({}));
+
+        // The bridge should have received:
+        // 1. Synthesized initialize (id 0)
+        // 2. Synthesized notifications/initialized
+        // 3. client_request(3)
+        assert_eq!(
+            state.attempts.load(Ordering::SeqCst),
+            3,
+            "bridge received synthesized initialize, initialized notification, and client_request"
         );
     }
 

@@ -4,8 +4,10 @@ use crate::session::{McpRoot, SessionManager};
 use ahma_common::mcp_methods::{
     INITIALIZE_METHOD, INITIALIZED_METHOD, JSONRPC_REQUEST_TIMEOUT, JSONRPC_SANDBOX_FAILED,
     JSONRPC_SANDBOX_NOT_READY, ROOTS_LIST_CHANGED_METHOD, ROOTS_LIST_METHOD,
-    SAMPLING_CREATE_MESSAGE_METHOD, TOOLS_CALL_METHOD,
+    SAMPLING_CREATE_MESSAGE_METHOD, SERVER_DISCOVER_METHOD, SERVER_INSTRUCTIONS,
+    SUBSCRIPTIONS_LISTEN_METHOD, TOOLS_CALL_METHOD,
 };
+use ahma_common::mcp_protocol::{MCP_PROTOCOL_VERSION_2025_11_25, MCP_PROTOCOL_VERSION_2026_07_28};
 use ahma_common::timeouts::BRIDGE_TOOL_CALL_CEILING_SECS;
 use axum::{
     body::Body,
@@ -421,6 +423,44 @@ async fn handle_post_request(
     if method == Some(INITIALIZE_METHOD) {
         terminate_session_being_reinitialized(&session_manager, session_id.as_deref()).await;
         return handle_initialize(&session_manager, &payload, mode, &session_query).await;
+    }
+
+    if method == Some(SERVER_DISCOVER_METHOD) {
+        debug!("server/discover probe received; returning first-class DiscoverResult");
+        let server_info = serde_json::json!({
+            "name": "ahma",
+            "version": env!("CARGO_PKG_VERSION"),
+        });
+        let result = serde_json::json!({
+            "supportedVersions": [
+                MCP_PROTOCOL_VERSION_2026_07_28,
+                MCP_PROTOCOL_VERSION_2025_11_25,
+            ],
+            "capabilities": {
+                "tools": {
+                    "listChanged": true,
+                }
+            },
+            "instructions": SERVER_INSTRUCTIONS,
+            "serverInfo": server_info.clone(),
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": server_info,
+            }
+        });
+        return json_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": payload_id(&payload),
+            "result": result,
+        }));
+    }
+
+    if method == Some(SUBSCRIPTIONS_LISTEN_METHOD) {
+        debug!("subscriptions/listen request received; returning success");
+        return json_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": payload_id(&payload),
+            "result": {},
+        }));
     }
 
     let Some(session_id) = session_id else {
@@ -1832,6 +1872,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_discover_probe_without_session_returns_200_discover_result() {
+        let sm = keepalive_manager();
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                }
+            }
+        });
+        let resp =
+            handle_session_isolated_request(sm, HeaderMap::new(), payload, String::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], json!(1));
+        assert_eq!(
+            body["result"]["supportedVersions"],
+            json!(["2026-07-28", "2025-11-25"])
+        );
+        assert_eq!(body["result"]["capabilities"]["tools"]["listChanged"], true);
+        assert_eq!(body["result"]["serverInfo"]["name"], "ahma");
+    }
+
+    #[tokio::test]
     async fn session_not_found_response_is_404() {
         let resp = session_not_found_response(json!(9));
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -2787,6 +2853,46 @@ mod tests {
             handle_session_isolated_request(mgr, HeaderMap::new(), payload, String::new()).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn isolated_request_server_discover_returns_discover_result() {
+        let mgr = keepalive_manager();
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {}
+        });
+        let resp =
+            handle_session_isolated_request(mgr, HeaderMap::new(), payload, String::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 1);
+        assert_eq!(
+            body["result"]["supportedVersions"],
+            json!(["2026-07-28", "2025-11-25"])
+        );
+        assert_eq!(body["result"]["capabilities"]["tools"]["listChanged"], true);
+        assert_eq!(body["result"]["serverInfo"]["name"], "ahma");
+        assert_eq!(body["result"]["instructions"], SERVER_INSTRUCTIONS);
+    }
+
+    #[tokio::test]
+    async fn isolated_request_subscriptions_listen_returns_empty_result() {
+        let mgr = keepalive_manager();
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "subscriptions/listen",
+            "params": {"notifications": {"toolsListChanged": true}}
+        });
+        let resp =
+            handle_session_isolated_request(mgr, HeaderMap::new(), payload, String::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 2);
+        assert_eq!(body["result"], json!({}));
     }
 
     #[tokio::test]

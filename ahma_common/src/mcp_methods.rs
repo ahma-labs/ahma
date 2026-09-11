@@ -38,6 +38,40 @@ pub const ACTIVE_SANDBOX_DISABLED: &str = "disabled";
 /// Client → server request opening the MCP handshake.
 pub const INITIALIZE_METHOD: &str = "initialize";
 
+/// Modern MCP (2026-07-28 / SEP-2575) stateless discovery probe.
+pub const SERVER_DISCOVER_METHOD: &str = "server/discover";
+
+/// Modern MCP (2026-07-28 / SEP-2575) subscriptions listen method.
+pub const SUBSCRIPTIONS_LISTEN_METHOD: &str = "subscriptions/listen";
+
+/// Canonical server instructions for MCP initialization and discovery.
+pub const SERVER_INSTRUCTIONS: &str = "\
+Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
+kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
+Job Objects on Windows). Prefer `run_terminal_command` over the native terminal when: \
+(1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; \
+(2) the command is long-running — `run_terminal_command` returns an operation_id immediately \
+and you can `status`, `await`, or `cancel` it without blocking; \
+(3) the command's output should be watched for errors — set `monitor_level` and ahma \
+streams alerts when matching lines appear; \
+(4) multiple commands should run concurrently — each call gets its own operation_id. \
+Workflow: start operations, do other useful work, then `await` the ids you need — \
+completion is also pushed via notifications, so avoid polling `status` in a loop. \
+Push notifications only arrive over a live, actively-listening connection — if you \
+might stop generating before an operation finishes (ending your turn, handing off, \
+or exiting), call `await` and let it block rather than counting on a notification to \
+resume you; a push sent while you are not listening is not queued or replayed. \
+A soft `await` timeout is not completion — before declaring a task done, `status` \
+or `await` every operation_id you started and confirm each reached a terminal state, \
+not \"still running\". \
+Results include a bounded stdout/stderr window plus an `output_file` path holding the \
+COMPLETE output of the operation; when the inline output is marked truncated, read or \
+grep that file instead of re-running the command. \
+For reading, searching, and editing files (read, grep, glob, edit) keep using the \
+IDE's native file tools — that is what they are for; ahma withholds its own \
+read_file/write_file/replace_in_file/list_dir/file_search/grep_search from clients \
+that already have native equivalents.";
+
 /// Client → server request invoking a tool.
 pub const TOOLS_CALL_METHOD: &str = "tools/call";
 
@@ -89,6 +123,9 @@ pub const JSONRPC_REQUEST_TIMEOUT: i32 = -32002;
 /// Sandbox configuration failed, or the session is terminated — the session
 /// will never become usable. Paired with HTTP 403.
 pub const JSONRPC_SANDBOX_FAILED: i32 = -32000;
+
+/// Standard JSON-RPC 2.0 Method Not Found error code.
+pub const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
 
 /// Deserialize a field to its `Default` when the value is missing **or**
 /// malformed, instead of failing the whole payload (lenient parsing — see the
@@ -545,5 +582,7 @@ mod tests {
             "notifications/ahma/pushChannelChanged"
         );
         assert_eq!(HEARTBEAT_METHOD, "notifications/ahma/heartbeat");
+        assert_eq!(SERVER_DISCOVER_METHOD, "server/discover");
+        assert_eq!(SUBSCRIPTIONS_LISTEN_METHOD, "subscriptions/listen");
     }
 }
