@@ -110,11 +110,8 @@ async fn resolve_connection_upgrades_to_http3() {
     std::fs::write(tls_dir.path().join("key.der"), b"dummy_key_for_tui_test")
         .expect("write key.der");
 
-    // Override AHMA_TLS_DIR so that `try_upgrade_to_http3` finds the cert.
-    // SAFETY: nextest isolates each test in its own OS process.
-    unsafe {
-        std::env::set_var("AHMA_TLS_DIR", tls_dir.path());
-    }
+    // Override TLS directory so that `try_upgrade_to_http3` finds the cert.
+    ahma_common::local_tls::LocalTlsConfig::set_dir_override(tls_dir.path().to_path_buf());
 
     let result = ahma_tui::connection::resolve_connection(Some(&bridge.base_url))
         .await
