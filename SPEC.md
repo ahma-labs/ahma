@@ -1073,6 +1073,7 @@ The subprocess egress sandbox is a complementary mechanism that covers HTTP traf
   - Non-ASCII hostnames **must** be **rejected**, not folded to punycode. `сrates.io` with a Cyrillic `с` is visually identical to the real entry, so silently normalizing it would make the allowlist say one thing and mean another; the same matcher serves the vault allowlist so the two cannot diverge.
   - A malformed entry **must** be dropped with a warning, never coerced into something that matches. Guessing at a broken pattern is how an allowlist grows a hole its author cannot see.
   - Consequently, "with `restrict = true` and an empty `allow`, all egress is denied" holds only when there are **also** no profile-contributed hosts (R-PERM.5.3). Any statement of the deny-all condition **must** name both halves.
+- **R-WEB.16.10** (session precedence): A per-session decision from R-WEB.16.8 (session grant or session deny) **must** be consulted before the static `egress.allowlist`, not after. A session deny **must** block a domain even if it is also covered by the allowlist (the allowlist can be hot-reloaded mid-session, and a config entry must not silently override an explicit interactive answer already given). Checking the allowlist first is also a reliability hazard, not just an ordering nit: a domain the allowlist happens to cover falls through to the real DNS lookup in the CONNECT path instead of being rejected from the coordinator's in-memory state, which is unbounded and has hung past CI's hang-bound timeouts under network contention.
 
 ---
 

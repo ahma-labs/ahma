@@ -293,14 +293,24 @@ async fn resolve_egress_approval(
     allowlist: &EgressAllowlist,
     net_approval: &NetApprovalContext,
 ) -> bool {
-    if allowlist.allows(host) {
-        return true;
-    }
+    // Session decisions (R-WEB.16.10) are checked *before* the static
+    // allowlist: an explicit interactive answer for this session must not be
+    // second-guessed by a config-file entry that predates or postdates it
+    // (the allowlist can be hot-reloaded mid-session). Checking the allowlist
+    // first was also a latent CI flake — a session-denied domain fell through
+    // to the real `vetted_addrs` DNS lookup below whenever the allowlist
+    // happened to also cover it (e.g. a blanket `*`), and that lookup has no
+    // timeout of its own; on a contended runner it occasionally exceeded even
+    // `read_chunk`'s generous hang bound instead of failing fast on the
+    // session-deny check that should have short-circuited it.
     if net_approval.coordinator.is_session_granted(host) {
         return true;
     }
     if net_approval.coordinator.is_session_denied(host) {
         return false;
+    }
+    if allowlist.allows(host) {
+        return true;
     }
 
     // Dedup: a decision for this domain already in flight (a concurrent
@@ -981,6 +991,13 @@ mod tests {
 
     #[tokio::test]
     async fn connect_session_denied_domain_returns_407_without_reprompting() {
+        // Uses a nonexistent `.example` host and a blanket `*` allowlist so
+        // this only passes if the session-deny check actually short-circuits
+        // `resolve_egress_approval` before the allowlist/DNS path — see
+        // R-WEB.16.10. If the deny check were skipped or ordered after the
+        // allowlist, this domain would fall through to a real (and
+        // unbounded) DNS lookup in `vetted_addrs` instead of being rejected
+        // deterministically here.
         let net_approval = NetApprovalContext::default();
         let req = net_approval
             .coordinator
