@@ -76,47 +76,31 @@ impl AhmaPrompts {
         let mut prompts = Self::default();
 
         // 1. Load global defaults (~/.ahma/prompts.toml)
-        if let Some(path) = global_prompts_path().filter(|p| p.exists()) {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => match toml::from_str::<Self>(&content) {
-                    Ok(parsed) => {
-                        prompts.merge(parsed);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse global prompts at {}: {e}", path.display());
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!("Failed to read global prompts at {}: {e}", path.display());
-                }
-            }
+        if let Some(path) = global_prompts_path() {
+            prompts.load_and_merge(&path);
         }
 
         // 2. Load project-local override (<project_dir>/.ahma/prompts.toml)
-        let local_path = project_dir.join(".ahma").join("prompts.toml");
-        if local_path.exists() {
-            match std::fs::read_to_string(&local_path) {
-                Ok(content) => match toml::from_str::<Self>(&content) {
-                    Ok(parsed) => {
-                        prompts.merge(parsed);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to parse project prompts at {}: {e}",
-                            local_path.display()
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read project prompts at {}: {e}",
-                        local_path.display()
-                    );
-                }
-            }
-        }
+        prompts.load_and_merge(&project_dir.join(".ahma").join("prompts.toml"));
 
         prompts
+    }
+
+    /// Read and parse `path` if it exists, merging it into `self`. Missing
+    /// files are silent (both tiers are optional); read/parse failures are
+    /// logged and otherwise ignored, since a broken prompts override must
+    /// never prevent the process from starting.
+    fn load_and_merge(&mut self, path: &Path) {
+        if !path.exists() {
+            return;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(content) => match toml::from_str::<Self>(&content) {
+                Ok(parsed) => self.merge(parsed),
+                Err(e) => tracing::warn!("Failed to parse prompts at {}: {e}", path.display()),
+            },
+            Err(e) => tracing::warn!("Failed to read prompts at {}: {e}", path.display()),
+        }
     }
 
     /// Merge another prompts structure into this one (overwriting Some values).

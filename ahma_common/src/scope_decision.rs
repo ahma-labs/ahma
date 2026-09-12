@@ -43,13 +43,16 @@ pub fn grants_new_access(established: &[PathBuf], proposed: &[PathBuf]) -> bool 
 }
 
 /// Classify how `proposed` changes access relative to `established`.
+///
+/// Expressed in terms of [`compare_restrictiveness`] rather than re-deriving
+/// the same two `grants_new_access` checks: `established` is more restrictive
+/// (`Greater`, i.e. `proposed` narrower) narrows; anything else where
+/// `proposed` grants new access (`Less`, or the incomparable `None`) widens.
 pub fn classify_scope_change(established: &[PathBuf], proposed: &[PathBuf]) -> ScopeDelta {
-    let proposed_widens = grants_new_access(established, proposed);
-    let established_widens = grants_new_access(proposed, established);
-    match (proposed_widens, established_widens) {
-        (true, _) => ScopeDelta::Widens,
-        (false, true) => ScopeDelta::Narrows,
-        (false, false) => ScopeDelta::Same,
+    match compare_restrictiveness(established, proposed) {
+        Some(Ordering::Equal) => ScopeDelta::Same,
+        Some(Ordering::Greater) => ScopeDelta::Narrows,
+        Some(Ordering::Less) | None => ScopeDelta::Widens,
     }
 }
 

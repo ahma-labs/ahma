@@ -39,6 +39,7 @@
 //! 3. Allows environment-based overrides for debugging
 //! 4. Accounts for coverage mode which adds additional overhead
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Timeout categories with platform-aware defaults.
@@ -74,11 +75,16 @@ impl TestTimeouts {
     /// - Coverage mode: Additional 2x on top of platform multiplier
     /// - Default: 1x
     pub fn multiplier() -> u64 {
-        let base = if cfg!(windows) { 4 } else { 1 };
-
-        let coverage_multiplier = if is_coverage_mode() { 2 } else { 1 };
-
-        base * coverage_multiplier
+        // Both inputs (target platform, coverage env vars) are fixed for the
+        // life of the process, and this is called pervasively across the test
+        // suite — compute it once rather than re-reading the environment on
+        // every timeout lookup.
+        static MULTIPLIER: OnceLock<u64> = OnceLock::new();
+        *MULTIPLIER.get_or_init(|| {
+            let base = if cfg!(windows) { 4 } else { 1 };
+            let coverage_multiplier = if is_coverage_mode() { 2 } else { 1 };
+            base * coverage_multiplier
+        })
     }
 
     /// Unscaled base timeout (seconds) for a category, before the platform

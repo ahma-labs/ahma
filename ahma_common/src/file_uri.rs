@@ -65,8 +65,11 @@ pub fn encode_file_uri(path: &Path) -> String {
     if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
         path_str = stripped.to_string();
     }
-    // Normalise path separators to forward slashes.
-    path_str = path_str.replace('\\', "/");
+    // Normalise path separators to forward slashes (no-op, no allocation, on
+    // the common case of a Unix path with no backslashes).
+    if path_str.contains('\\') {
+        path_str = path_str.replace('\\', "/");
+    }
 
     let mut out = String::with_capacity(path_str.len() + 10);
     out.push_str("file://");

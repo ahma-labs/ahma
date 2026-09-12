@@ -115,23 +115,36 @@ impl SandboxStateMachine {
         self.inner.subscribe()
     }
 
-    /// Transition from AwaitingRoots to Configuring
-    pub fn transition_to_configuring(&self, scopes: Vec<PathBuf>) -> Result<(), InvalidTransition> {
+    /// Shared shape for a transition that fires when `guard` accepts the
+    /// current state and otherwise reports [`InvalidTransition`] for `action`.
+    /// Used by the transitions below whose guard only inspects the old
+    /// state's *shape* — `transition_to_active`/`_with_scopes` read the old
+    /// state's *fields* (e.g. carrying `Configuring`'s scopes forward) and so
+    /// stay hand-written.
+    fn simple_transition(
+        &self,
+        guard: impl Fn(&SandboxState) -> bool,
+        action: &'static str,
+        build: impl FnOnce() -> SandboxState,
+    ) -> Result<(), InvalidTransition> {
         self.inner.modify(|state| {
             let from = state.name();
-            if matches!(state, SandboxState::AwaitingRoots) {
-                *state = SandboxState::Configuring { scopes };
+            if guard(state) {
+                *state = build();
                 (true, Ok(()))
             } else {
-                (
-                    false,
-                    Err(InvalidTransition {
-                        from,
-                        action: "to_configuring",
-                    }),
-                )
+                (false, Err(InvalidTransition { from, action }))
             }
         })
+    }
+
+    /// Transition from AwaitingRoots to Configuring
+    pub fn transition_to_configuring(&self, scopes: Vec<PathBuf>) -> Result<(), InvalidTransition> {
+        self.simple_transition(
+            |state| matches!(state, SandboxState::AwaitingRoots),
+            "to_configuring",
+            || SandboxState::Configuring { scopes },
+        )
     }
 
     /// Transition from Configuring to Active
@@ -249,40 +262,20 @@ impl SandboxStateMachine {
 
     /// Transition to Failed from any non-terminal state
     pub fn transition_to_failed(&self, error: String) -> Result<(), InvalidTransition> {
-        self.inner.modify(|state| {
-            let from = state.name();
-            if !state.is_terminal() {
-                *state = SandboxState::Failed { error };
-                (true, Ok(()))
-            } else {
-                (
-                    false,
-                    Err(InvalidTransition {
-                        from,
-                        action: "to_failed",
-                    }),
-                )
-            }
-        })
+        self.simple_transition(
+            |state| !state.is_terminal(),
+            "to_failed",
+            || SandboxState::Failed { error },
+        )
     }
 
     /// Transition to Terminated from any non-terminal state
     pub fn transition_to_terminated(&self) -> Result<(), InvalidTransition> {
-        self.inner.modify(|state| {
-            let from = state.name();
-            if !state.is_terminal() {
-                *state = SandboxState::Terminated;
-                (true, Ok(()))
-            } else {
-                (
-                    false,
-                    Err(InvalidTransition {
-                        from,
-                        action: "to_terminated",
-                    }),
-                )
-            }
-        })
+        self.simple_transition(
+            |state| !state.is_terminal(),
+            "to_terminated",
+            || SandboxState::Terminated,
+        )
     }
 
     /// Wait until sandbox is Active - NO POLLING, uses watch channel

@@ -60,10 +60,12 @@ pub fn title_for_value(tool_name: &str, args: Option<&Value>) -> String {
     title_for(tool_name, args.and_then(Value::as_object))
 }
 
-/// The literal command a tool was asked to run, if it has one.
-fn command_arg(args: &Map<String, Value>) -> Option<String> {
-    for key in ["command", "cmd", "command_line"] {
-        if let Some(s) = args.get(key).and_then(Value::as_str)
+/// The first non-empty (trimmed) string value among `keys`, in order.
+/// Shared by [`command_arg`] and [`salient_arg`], which differ only in which
+/// keys they look for.
+fn first_nonempty_str(args: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = args.get(*key).and_then(Value::as_str)
             && !s.trim().is_empty()
         {
             return Some(s.trim().to_string());
@@ -72,27 +74,28 @@ fn command_arg(args: &Map<String, Value>) -> Option<String> {
     None
 }
 
+/// The literal command a tool was asked to run, if it has one.
+fn command_arg(args: &Map<String, Value>) -> Option<String> {
+    first_nonempty_str(args, &["command", "cmd", "command_line"])
+}
+
 /// The argument most worth showing beside a tool's name — a path, a pattern, a
 /// query. Deliberately a small, ordered list rather than "the first string we
 /// find": a stable choice is what makes rows comparable at a glance.
 fn salient_arg(args: &Map<String, Value>) -> Option<String> {
-    for key in [
-        "path",
-        "file",
-        "file_path",
-        "query",
-        "pattern",
-        "url",
-        "target",
-        "name",
-    ] {
-        if let Some(s) = args.get(key).and_then(Value::as_str)
-            && !s.trim().is_empty()
-        {
-            return Some(s.trim().to_string());
-        }
-    }
-    None
+    first_nonempty_str(
+        args,
+        &[
+            "path",
+            "file",
+            "file_path",
+            "query",
+            "pattern",
+            "url",
+            "target",
+            "name",
+        ],
+    )
 }
 
 /// A command may be a whole shell script. The first non-empty line is what the

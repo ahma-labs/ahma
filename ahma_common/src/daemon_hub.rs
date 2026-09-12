@@ -78,13 +78,21 @@ pub fn daemon_port() -> u16 {
     // `init_test_daemon_isolation` must still not reach the live daemon port.
     // Derive a stable per-run port so every process in the test run agrees.
     if crate::test_isolation::spawned_under_test_harness() {
-        let disc = crate::test_isolation::test_run_discriminator();
-        let hash: u32 = disc.bytes().fold(0u32, |acc, b| {
-            acc.wrapping_mul(31).wrapping_add(u32::from(b))
-        });
-        return 49152 + (hash % 16000) as u16;
+        return 49152 + test_run_port_offset(16000);
     }
     WINDOWS_DAEMON_PORT
+}
+
+/// Fold the current test run's discriminator into a stable pseudo-random
+/// offset in `0..modulus`, shared by [`daemon_port`] and [`bridge_http_port`]
+/// so every process in a test run agrees on both derived ports without
+/// colliding (callers add different base offsets).
+fn test_run_port_offset(modulus: u32) -> u16 {
+    let disc = crate::test_isolation::test_run_discriminator();
+    let hash: u32 = disc.bytes().fold(0u32, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u32::from(b))
+    });
+    (hash % modulus) as u16
 }
 
 /// The bridge's HTTP port, made private under a test harness (SPEC R-ISO.1).
@@ -105,11 +113,7 @@ pub fn bridge_http_port(configured: u16) -> u16 {
         return configured;
     }
     // Same derivation as `daemon_port`, offset so the two never collide.
-    let disc = crate::test_isolation::test_run_discriminator();
-    let hash: u32 = disc.bytes().fold(0u32, |acc, b| {
-        acc.wrapping_mul(31).wrapping_add(u32::from(b))
-    });
-    32768 + (hash % 16000) as u16
+    32768 + test_run_port_offset(16000)
 }
 
 /// The port `ahma serve http` listens on when nothing says otherwise.
@@ -186,7 +190,7 @@ pub enum OpStatus {
 }
 
 /// Metadata about a registered ahma instance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceInfo {
     /// Random UUID assigned by the daemon at registration time.
     pub id: String,
@@ -1078,12 +1082,7 @@ struct OpSnapshot {
 type InstanceOpHistory = std::collections::HashMap<String, OpSnapshot>;
 
 /// Wall-clock milliseconds since the Unix epoch.
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use crate::keepalive::current_timestamp_ms as now_epoch_ms;
 
 /// The operation id an event refers to, if it is about an operation at all.
 fn op_id_of(event: &DaemonEvent) -> Option<String> {
@@ -1275,14 +1274,7 @@ impl DaemonHub {
                 .cloned()
                 .unwrap_or_else(|| InstanceInfo {
                     id: instance_id.to_string(),
-                    pid: 0,
-                    mode: String::new(),
-                    scope: String::new(),
-                    label: String::new(),
-                    client: None,
-                    session_id: None,
-                    client_pid: None,
-                    ended_epoch_ms: None,
+                    ..Default::default()
                 });
             writer.record(crate::daemon_history::HistoryRecord::Started {
                 ts: now_epoch_ms(),
@@ -1849,22 +1841,6 @@ async fn bind_unix(
     }
 }
 
-#[cfg(unix)]
-async fn accept_loop(listener: tokio::net::UnixListener, hub: Arc<DaemonHub>) -> Result<()> {
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                hub.connection_count.fetch_add(1, Ordering::Relaxed);
-                let hub2 = hub.clone();
-                tokio::spawn(async move {
-                    handle_connection(stream, hub2).await;
-                });
-            }
-            Err(e) => warn!("ahma daemon: accept error: {e}"),
-        }
-    }
-}
-
 // ── Windows bind/accept ───────────────────────────────────────────────────────
 
 #[cfg(not(unix))]
@@ -1890,8 +1866,11 @@ async fn bind_tcp() -> std::result::Result<tokio::net::TcpListener, HubBindError
     }
 }
 
-#[cfg(not(unix))]
-async fn accept_loop(listener: tokio::net::TcpListener, hub: Arc<DaemonHub>) -> Result<()> {
+/// Accept loop shared by both platforms: [`HubListener`] is a `UnixListener`
+/// on Unix and a `TcpListener` elsewhere, and both accept a stream type
+/// [`handle_connection`] is already generic over — only the bind/rendezvous
+/// mechanics above this differ per platform.
+async fn accept_loop(listener: HubListener, hub: Arc<DaemonHub>) -> Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -2207,9 +2186,6 @@ async fn route_decision_to_instance(
     route_to_instance(hub, target, msg).await
 }
 
-/// Serve a registered ahma instance: register it, then exchange events and
-/// liveness pings until it disconnects, finally cleaning up its state.
-#[allow(clippy::too_many_arguments)]
 /// The fields an instance announces when it registers.
 struct Registration {
     pid: u32,
@@ -2221,6 +2197,8 @@ struct Registration {
     client_pid: Option<u32>,
 }
 
+/// Serve a registered ahma instance: register it, then exchange events and
+/// liveness pings until it disconnects, finally cleaning up its state.
 async fn serve_instance<R, W>(
     reader: &mut BufReader<R>,
     writer: &mut W,

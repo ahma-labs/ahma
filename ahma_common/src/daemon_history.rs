@@ -208,8 +208,18 @@ async fn append_record(path: &Path, record: &HistoryRecord) -> std::io::Result<(
 /// line of it is malformed would trade a small loss for a total one.
 pub async fn load_recent(path: &Path, cutoff_ms: u64) -> Vec<HistoryRecord> {
     let mut out = Vec::new();
-    for candidate in [previous_path(path), path.to_path_buf()] {
-        let Ok(text) = tokio::fs::read_to_string(&candidate).await else {
+    // The rotated predecessor and the current file are independent reads;
+    // fetch both concurrently, then process in fixed (previous, then
+    // current) order so replay ordering across a rotation is unaffected.
+    let (prev_text, cur_text) = tokio::join!(
+        tokio::fs::read_to_string(previous_path(path)),
+        tokio::fs::read_to_string(path)
+    );
+    for (candidate, text) in [
+        (previous_path(path), prev_text),
+        (path.to_path_buf(), cur_text),
+    ] {
+        let Ok(text) = text else {
             continue;
         };
         let mut skipped = 0usize;
