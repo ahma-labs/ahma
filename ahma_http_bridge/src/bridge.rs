@@ -470,33 +470,31 @@ fn build_cors_layer(bind_addr: &SocketAddr) -> CorsLayer {
         .parse::<axum::http::HeaderName>()
         .unwrap()]);
 
-    if bind_addr.ip().is_loopback() {
+    let origin = if bind_addr.ip().is_loopback() {
         // Restrictive: only accept requests originating from loopback web pages.
-        CorsLayer::new()
-            .allow_origin(tower_http::cors::AllowOrigin::predicate(
-                |origin: &HeaderValue, _req: &axum::http::request::Parts| {
-                    let Ok(origin_str) = origin.to_str() else {
-                        return false;
-                    };
-                    // Allow http://127.0.0.1[:port], http://localhost[:port], http://[::1][:port]
-                    let lower = origin_str.to_ascii_lowercase();
-                    lower.starts_with("http://127.0.0.1")
-                        || lower.starts_with("http://localhost")
-                        || lower.starts_with("http://[::1]")
-                },
-            ))
-            .allow_methods(methods)
-            .allow_headers(headers)
-            .expose_headers(expose)
+        tower_http::cors::AllowOrigin::predicate(
+            |origin: &HeaderValue, _req: &axum::http::request::Parts| {
+                let Ok(origin_str) = origin.to_str() else {
+                    return false;
+                };
+                // Allow http://127.0.0.1[:port], http://localhost[:port], http://[::1][:port]
+                let lower = origin_str.to_ascii_lowercase();
+                lower.starts_with("http://127.0.0.1")
+                    || lower.starts_with("http://localhost")
+                    || lower.starts_with("http://[::1]")
+            },
+        )
     } else {
         // Non-loopback: user explicitly opted into network exposure.
         // Allow any origin but restrict methods/headers.
-        CorsLayer::new()
-            .allow_origin(tower_http::cors::AllowOrigin::any())
-            .allow_methods(methods)
-            .allow_headers(headers)
-            .expose_headers(expose)
-    }
+        tower_http::cors::AllowOrigin::any()
+    };
+
+    CorsLayer::new()
+        .allow_origin(origin)
+        .allow_methods(methods)
+        .allow_headers(headers)
+        .expose_headers(expose)
 }
 
 /// MCP Session-Id header name (per MCP spec 2025-03-26)
@@ -771,6 +769,18 @@ fn create_session_config(config: &BridgeConfig) -> SessionManagerConfig {
     }
 }
 
+/// Read a bearer token file, trimming whitespace and rejecting an empty result.
+///
+/// Shared by the startup load (`main::load_token_file`) and the SIGHUP
+/// hot-reload below so the two paths can never accept different token files.
+pub fn read_token_from_file(path: &std::path::Path) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("Failed to read token file {}: {e}", path.display()))?;
+    let token = raw.trim().to_owned();
+    anyhow::ensure!(!token.is_empty(), "Token file {} is empty", path.display());
+    Ok(token)
+}
+
 /// On Unix, spawn a background task that watches for SIGHUP and reloads the
 /// bearer token from the given path.  The new token is swapped in atomically
 /// so no in-flight request is interrupted.
@@ -778,20 +788,15 @@ fn create_session_config(config: &BridgeConfig) -> SessionManagerConfig {
 /// No-op on non-Unix platforms (Windows has no SIGHUP).
 #[cfg(unix)]
 fn reload_token_from_path(state: &BridgeState, p: &std::path::Path) {
-    match std::fs::read_to_string(p) {
-        Ok(raw) => {
-            let token = raw.trim().to_owned();
-            if token.is_empty() {
-                warn!(
-                    "Token file {} is empty after SIGHUP — keeping current token",
-                    p.display()
-                );
-            } else {
-                state.require_token.store(Some(Arc::new(token)));
-                info!("Bearer token reloaded from {} after SIGHUP", p.display());
-            }
+    match read_token_from_file(p) {
+        Ok(token) => {
+            state.require_token.store(Some(Arc::new(token)));
+            info!("Bearer token reloaded from {} after SIGHUP", p.display());
         }
-        Err(e) => warn!("Failed to reload token on SIGHUP from {}: {e}", p.display()),
+        Err(e) => warn!(
+            "Failed to reload token on SIGHUP from {}: keeping current token",
+            e
+        ),
     }
 }
 
@@ -1615,7 +1620,10 @@ async fn handle_session_delete(
 /// that when the last subscriber drops the stream (client disconnect), the
 /// session is terminated after a grace period if no one reconnects.
 struct CleanupStream<S> {
-    inner: S,
+    // Boxed and pre-pinned rather than pin-projected: `S` here is a `Chain` over
+    // an `impl Stream` and is not `Unpin`, but `Pin<Box<S>>` always is, so
+    // `CleanupStream` derives `Unpin` for free and `poll_next` needs no `unsafe`.
+    inner: std::pin::Pin<Box<S>>,
     session_id: String,
     session_manager: Arc<SessionManager>,
 }
@@ -1624,13 +1632,10 @@ impl<S: futures::Stream> futures::Stream for CleanupStream<S> {
     type Item = S::Item;
 
     fn poll_next(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        unsafe {
-            let this = self.get_unchecked_mut();
-            std::pin::Pin::new_unchecked(&mut this.inner).poll_next(cx)
-        }
+        self.inner.as_mut().poll_next(cx)
     }
 }
 
@@ -1765,7 +1770,7 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
     let combined = replay_stream.chain(live_stream);
 
     let combined = CleanupStream {
-        inner: combined,
+        inner: Box::pin(combined),
         session_id: session_id.clone(),
         session_manager: state.session_manager.clone(),
     };

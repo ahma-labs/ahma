@@ -172,7 +172,19 @@ impl GrantCoordinator {
         reason: GrantReason,
         tool: Option<String>,
     ) -> Option<ScopeGrantRequest> {
-        let canonical = canonicalize_best_effort(path);
+        self.begin_canonical(canonicalize_best_effort(path), access, reason, tool)
+    }
+
+    /// [`Self::begin`], given an already-canonicalized path — lets
+    /// [`Self::reopen`] canonicalize once and reuse the result instead of
+    /// canonicalizing again inside `begin`.
+    fn begin_canonical(
+        &self,
+        canonical: PathBuf,
+        access: ScopeAccess,
+        reason: GrantReason,
+        tool: Option<String>,
+    ) -> Option<ScopeGrantRequest> {
         let key = (canonical.clone(), access);
         let mut inner = self.inner.lock();
         if inner.dismissed.contains(&key) || inner.active_keys.contains(&key) {
@@ -208,12 +220,12 @@ impl GrantCoordinator {
         reason: GrantReason,
         tool: Option<String>,
     ) -> Option<ScopeGrantRequest> {
+        let canonical = canonicalize_best_effort(path);
         {
             let mut inner = self.inner.lock();
-            let key = (canonicalize_best_effort(path), access);
-            inner.dismissed.remove(&key);
+            inner.dismissed.remove(&(canonical.clone(), access));
         }
-        self.begin(path, access, reason, tool)
+        self.begin_canonical(canonical, access, reason, tool)
     }
 
     /// Resolve a decision with the human's answer. First-answer-wins and idempotent:

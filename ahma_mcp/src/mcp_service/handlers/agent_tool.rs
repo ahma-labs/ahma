@@ -68,31 +68,27 @@ pub fn agent_schema() -> Arc<Map<String, Value>> {
     let mut props = Map::new();
     props.insert(
         "prompt".to_string(),
-        json!({
-            "type": "string",
-            "description": "The self-contained task or question to delegate to the ahma sub-agent."
-        }),
+        schema::string_property(
+            "The self-contained task or question to delegate to the ahma sub-agent.",
+        ),
     );
     props.insert(
         "system_prompt".to_string(),
-        json!({
-            "type": "string",
-            "description": "Optional system-prompt override. Defaults to ahma's editable agent prompt."
-        }),
+        schema::string_property(
+            "Optional system-prompt override. Defaults to ahma's editable agent prompt.",
+        ),
     );
     props.insert(
         "model".to_string(),
-        json!({
-            "type": "string",
-            "description": "Optional model id. Defaults to the model last selected in ahma tui."
-        }),
+        schema::string_property(
+            "Optional model id. Defaults to the model last selected in ahma tui.",
+        ),
     );
     props.insert(
         "provider".to_string(),
-        json!({
-            "type": "string",
-            "description": "Optional provider name or base URL. Defaults to the last-selected provider."
-        }),
+        schema::string_property(
+            "Optional provider name or base URL. Defaults to the last-selected provider.",
+        ),
     );
     props.insert(
         "max_turns".to_string(),

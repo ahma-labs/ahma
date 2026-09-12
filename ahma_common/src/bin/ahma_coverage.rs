@@ -44,6 +44,29 @@ struct SummaryStats {
     percent: f64,
 }
 
+/// One file's row in the coverage table plus its uncovered-line detail —
+/// named fields instead of a positional tuple sorted and destructured by
+/// index.
+struct FileCoverage {
+    filename: String,
+    line_pct: f64,
+    uncovered_count: usize,
+    uncovered_display: String,
+    uncovered_ranges: Vec<String>,
+}
+
+/// Close a run of consecutive uncovered lines `[start, end]` into its display
+/// form (`"N"` for a single line, `"N-M"` for a range), appending it to
+/// `ranges`. Shared by the mid-loop close (a gap follows) and the final flush
+/// (the run ends at the last line) in [`main`].
+fn push_range(ranges: &mut Vec<String>, start: u64, end: u64) {
+    if start == end {
+        ranges.push(format!("{start}"));
+    } else {
+        ranges.push(format!("{start}-{end}"));
+    }
+}
+
 fn main() -> Result<()> {
     let input_path = "coverage.json";
     let output_path = "coverage_summary.md";
@@ -118,54 +141,50 @@ fn main() -> Result<()> {
 
                 for &curr_line in lines.iter().skip(1) {
                     if curr_line > prev_line + 1 {
-                        if current_start == prev_line {
-                            uncovered_ranges.push(format!("{}", current_start));
-                        } else {
-                            uncovered_ranges.push(format!("{}-{}", current_start, prev_line));
-                        }
+                        push_range(&mut uncovered_ranges, current_start, prev_line);
                         current_start = curr_line;
                     }
                     prev_line = curr_line;
                 }
 
-                if current_start == prev_line {
-                    uncovered_ranges.push(format!("{}", current_start));
-                } else {
-                    uncovered_ranges.push(format!("{}-{}", current_start, prev_line));
-                }
+                push_range(&mut uncovered_ranges, current_start, prev_line);
             }
         }
 
         if uncovered_count > 0 {
             let uncovered_str = uncovered_ranges.join(", ");
-            let table_uncovered = if uncovered_str.len() < 50 {
+            let uncovered_display = if uncovered_str.len() < 50 {
                 uncovered_str.clone()
             } else {
                 format!("{}...", &uncovered_str[..47])
             };
 
-            parsed_files.push((
-                file_entry.filename.clone(),
-                line_cov,
+            parsed_files.push(FileCoverage {
+                filename: file_entry.filename.clone(),
+                line_pct: line_cov,
                 uncovered_count,
-                table_uncovered,
+                uncovered_display,
                 uncovered_ranges,
-            ));
+            });
         }
     }
 
-    parsed_files.sort_by_key(|entry| Reverse(entry.2));
+    parsed_files.sort_by_key(|entry| Reverse(entry.uncovered_count));
     let top_files = parsed_files.into_iter().take(20).collect::<Vec<_>>();
 
     let mut uncovered_details = Vec::new();
 
-    for (filename, line_cov, _, table_uncovered, uncovered_ranges) in &top_files {
+    for entry in &top_files {
         writeln!(
             output,
             "| {} | {:.2}% | {} |",
-            filename, line_cov, table_uncovered
+            entry.filename, entry.line_pct, entry.uncovered_display
         )?;
-        uncovered_details.push((filename.clone(), *line_cov, uncovered_ranges.clone()));
+        uncovered_details.push((
+            entry.filename.clone(),
+            entry.line_pct,
+            entry.uncovered_ranges.clone(),
+        ));
     }
 
     if !uncovered_details.is_empty() {

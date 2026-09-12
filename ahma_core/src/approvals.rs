@@ -164,20 +164,11 @@ pub fn argument_preview(tool: &str, args: &str) -> Option<String> {
 /// design (R5.4.8); that reads as "not approved" and prompts, rather than
 /// wedging.
 pub async fn is_tool_approved(workspace: &Path, tool: &str) -> bool {
-    let Some(path) = settings_path() else {
-        return false;
-    };
-    let contents = match tokio::fs::read_to_string(&path).await {
-        Ok(c) => c,
-        Err(_) => return false, // not yet created / unreadable → prompt
-    };
-    let settings = match AhmaSettings::parse(&contents) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("approvals: settings file does not parse ({e}); treating as not approved");
-            return false;
-        }
-    };
+    // `load_async` already degrades a missing/unreadable/unparsable ledger to
+    // `Self::default()` (empty permissions, so this reads as "not approved")
+    // with the sandbox-aware logging described above — no need to re-read and
+    // re-parse the file by hand here.
+    let settings = AhmaSettings::load_async().await;
     let key = workspace_key_async(workspace).await;
     settings.permissions.is_tool_approved(&key, tool)
 }

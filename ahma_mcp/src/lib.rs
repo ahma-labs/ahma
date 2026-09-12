@@ -124,7 +124,6 @@
 pub mod adapter;
 /// Client helpers for talking to Ahma.
 pub mod builtin_tool;
-mod check_service_ext;
 pub mod client;
 /// Client type helpers and compatibility flags.
 pub mod client_type;

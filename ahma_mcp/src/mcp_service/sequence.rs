@@ -110,7 +110,7 @@ async fn register_progress_target(
         return;
     };
     let client_type = McpClientType::from_peer(&context.peer);
-    let progress_enabled = force_progress_notifications || client_type.supports_progress();
+    let progress_enabled = super::progress_enabled(force_progress_notifications, client_type);
     progress_push
         .register(
             id,

@@ -410,22 +410,12 @@ fn extract_sampling_completion_text(content_arr: &[serde_json::Value]) -> String
 /// Build the reqwest client and the `/mcp` URL to reach it, handling the
 /// `unix://` base-url convention (a local Unix domain socket) separately
 /// from a normal HTTP(S) base URL.
+///
+/// Delegates to [`cached_http_client`], which already implements this exact
+/// `unix://`-prefix decision (and additionally reuses one client per base URL
+/// instead of paying TLS/connection-pool setup on every sampling call).
 fn build_sampling_client(mcp: &McpChatConfig) -> Result<(reqwest::Client, String), String> {
-    let builder = reqwest::Client::builder();
-    let (request_base_url, builder) = if let Some(path) = mcp.base_url.strip_prefix("unix://") {
-        #[cfg(unix)]
-        {
-            ("http://localhost".to_string(), builder.unix_socket(path))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            (mcp.base_url.clone(), builder)
-        }
-    } else {
-        (mcp.base_url.clone(), builder)
-    };
-    let client = builder.build().map_err(|e| e.to_string())?;
+    let (request_base_url, client) = cached_http_client(&mcp.base_url)?;
     let url = format!("{}/mcp", request_base_url);
     Ok((client, url))
 }
@@ -646,15 +636,14 @@ async fn resolve_tool_approval(
 
 async fn execute_single_tool_call(
     call: ahma_llm_monitor::client::ChatToolCall,
-    cfg: McpChatConfig,
+    cfg: &McpChatConfig,
     tx: Sender<AgentEvent>,
     gate: Arc<dyn AgentApprovalGate>,
 ) -> (String, String, serde_json::Value, bool) {
     let args_value = call.arguments;
     let args_str = serde_json::to_string(&args_value).unwrap_or_default();
 
-    let approved =
-        resolve_tool_approval(&call.id, &call.name, &cfg, &args_str, gate.as_ref()).await;
+    let approved = resolve_tool_approval(&call.id, &call.name, cfg, &args_str, gate.as_ref()).await;
 
     if !approved {
         let err_text = "Error: Tool execution rejected by user".to_string();
@@ -681,7 +670,7 @@ async fn execute_single_tool_call(
         })
         .await;
 
-    let result = dispatch_tool_execution(&call.name, args_value, &cfg).await;
+    let result = dispatch_tool_execution(&call.name, args_value, cfg).await;
     match result {
         Ok((text, failed)) => {
             let _ = tx
@@ -722,13 +711,13 @@ async fn dispatch_tool_execution(
     args_value: serde_json::Value,
     cfg: &McpChatConfig,
 ) -> Result<(String, bool), String> {
-    let Some((server, tool)) = name.split_once("::") else {
-        return spawn_local_tool_call(cfg.clone(), name, args_value).await;
+    let Some((server, tool)) = cfg.mcp_connections.resolve_tool_name(name) else {
+        return spawn_local_tool_call(cfg, name, args_value).await;
     };
 
-    let conn = cfg.mcp_connections.clone();
-    if conn.servers.iter().any(|s| s.name == server) {
-        return conn
+    if cfg.mcp_connections.servers.iter().any(|s| s.name == server) {
+        return cfg
+            .mcp_connections
             .call_tool(name, args_value)
             .await
             .map_err(|e| format!("MCP tool error ({name}): {e}"));
@@ -866,7 +855,8 @@ async fn fetch_completion(
 
 /// The read-only tools whose results carry the "read before you edit" hint.
 fn is_read_hint_tool(tool_name: &str) -> bool {
-    tool_name == "read_file" || tool_name == "list_dir"
+    use ahma_mcp::builtin_tool::BuiltinTool;
+    tool_name == BuiltinTool::ReadFile.name() || tool_name == BuiltinTool::ListDir.name()
 }
 
 /// Decide which harness hints this batch of tool results is eligible for, as
@@ -895,23 +885,6 @@ fn append_hint_to_field(
     if let Some(serde_json::Value::String(s)) = obj.get_mut(key) {
         s.push_str(hint);
     }
-}
-
-/// True when a failed-tool-call hint should be appended: the call failed, the
-/// caller opted into hinting this turn, and no failure hint has been sent yet.
-fn should_inject_error_hint(failed: bool, inject_error_hint: bool, error_hinted: bool) -> bool {
-    failed && inject_error_hint && !error_hinted
-}
-
-/// True when a read-file-tool hint should be appended: the tool is a read
-/// tool, the caller opted into hinting this turn, and no read hint has been
-/// sent yet.
-fn should_inject_read_hint(
-    tool_name: &str,
-    inject_read_hint: bool,
-    read_file_hinted: bool,
-) -> bool {
-    is_read_hint_tool(tool_name) && inject_read_hint && !read_file_hinted
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -955,7 +928,10 @@ fn inject_harness_hints_into_payload(
     error_hinted: &mut bool,
     read_file_hinted: &mut bool,
 ) {
-    if should_inject_error_hint(failed, inject_error_hint, *error_hinted) {
+    // Each hint fires at most once per run: `failed`/`is_read_hint_tool` gate
+    // *this* call's eligibility, `inject_*_hint` is the caller's per-batch
+    // opt-in (from `plan_harness_hints`), and `!*_hinted` is the run-wide latch.
+    if failed && inject_error_hint && !*error_hinted {
         *error_hinted = true;
         let key = if obj.contains_key("error") {
             "error"
@@ -968,7 +944,7 @@ fn inject_harness_hints_into_payload(
             "\n\u{1f4a1} [Harness Hint: The previous tool call failed. Carefully read the error output above. Ensure parameter values are correct, check for typo errors, and try a different approach.]",
         );
     }
-    if should_inject_read_hint(tool_name, inject_read_hint, *read_file_hinted) {
+    if is_read_hint_tool(tool_name) && inject_read_hint && !*read_file_hinted {
         *read_file_hinted = true;
         append_hint_to_field(
             obj,
@@ -1092,7 +1068,7 @@ pub async fn execute_agent_turn(
         return handle_final_agent_response(completion, content_streamed, tx).await;
     }
 
-    let Some(mcp_cfg) = mcp.clone() else {
+    let Some(mcp_cfg) = mcp.as_ref() else {
         let _ = tx
             .send(AgentEvent::Error(
                 "Model requested tools but MCP is not configured".to_string(),
@@ -1143,7 +1119,7 @@ async fn handle_final_agent_response(
 
 async fn dispatch_turn_tool_calls(
     completion: ahma_llm_monitor::client::ChatCompletionResponse,
-    mcp_cfg: McpChatConfig,
+    mcp_cfg: &McpChatConfig,
     tx: Sender<AgentEvent>,
     gate: Arc<dyn AgentApprovalGate>,
     msg_json: &mut Vec<serde_json::Value>,
@@ -1164,7 +1140,7 @@ async fn dispatch_turn_tool_calls(
     let call_futures = completion
         .tool_calls
         .into_iter()
-        .map(|call| execute_single_tool_call(call, mcp_cfg.clone(), tx.clone(), gate.clone()));
+        .map(|call| execute_single_tool_call(call, mcp_cfg, tx.clone(), gate.clone()));
     let tool_results = join_all(call_futures).await;
 
     let (inject_error_hint, inject_read_hint) = if mcp_cfg.small_model_harness {
@@ -1329,14 +1305,11 @@ async fn finish_with_limit_summary(
 
     match fetch_completion(client, msg_json, &[], mcp, tx, messages, system_prompt).await {
         Some((completion, content_streamed)) => {
-            if let Some(usage) = &completion.usage {
-                let _ = tx.send(AgentEvent::Usage(usage.clone())).await;
-            }
-            // Streamed paths already emitted the content token-by-token.
-            if !content_streamed && !completion.content.is_empty() {
-                let _ = tx.send(AgentEvent::Token(completion.content)).await;
-            }
-            let _ = tx.send(AgentEvent::Done).await;
+            // Same "emit usage, then the final answer" sequence as a normal
+            // turn's no-tool-calls path — reuse both steps rather than a
+            // second hand-maintained copy.
+            record_turn_usage(&completion.usage, tx, &mut 0).await;
+            handle_final_agent_response(completion, content_streamed, tx).await;
         }
         None => {
             // fetch_completion already surfaced the concrete error to the UI.
@@ -1392,13 +1365,13 @@ pub fn cached_http_client(base_url: &str) -> Result<(String, reqwest::Client), S
 }
 
 async fn spawn_local_tool_call(
-    mcp: McpChatConfig,
+    mcp: &McpChatConfig,
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<(String, bool), String> {
     let (request_base_url, client) = cached_http_client(&mcp.base_url)?;
     let url = format!("{}/mcp", request_base_url);
-    let session_id = get_or_create_session(&client, &url, &mcp).await?;
+    let session_id = get_or_create_session(&client, &url, mcp).await?;
     call_mcp_tool_http(&client, &url, &session_id, tool, arguments).await
 }
 
@@ -1618,10 +1591,13 @@ pub fn needs_approval(tool_name: &str, tool_approval_enabled: bool) -> bool {
     if tool_approval_enabled {
         return true;
     }
-    tool_name == "write_file"
-        || tool_name == "replace_in_file"
-        || tool_name.ends_with("::write_file")
-        || tool_name.ends_with("::replace_in_file")
+    use ahma_mcp::builtin_tool::BuiltinTool;
+    let write_file = BuiltinTool::WriteFile.name();
+    let replace_in_file = BuiltinTool::ReplaceInFile.name();
+    tool_name == write_file
+        || tool_name == replace_in_file
+        || tool_name.ends_with(&format!("::{write_file}"))
+        || tool_name.ends_with(&format!("::{replace_in_file}"))
 }
 
 pub fn get_mcp_base_url(app_config: Option<&ahma_mcp::shell::cli::AppConfig>) -> String {
@@ -1763,10 +1739,10 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         hub_tx: tokio::sync::mpsc::Sender<ClientMsg>,
         session: Arc<tokio::sync::Mutex<ActiveAgentSession>>,
     ) -> Result<(), String> {
-        // Build the client/tools/config (tool_approval on → prompts the TUI),
-        // and convert the inbound messages.
+        // Build the client/tools/config (interactive → tool_approval on,
+        // prompts the TUI), and convert the inbound messages.
         let (client, mcp_config, available_tools) =
-            build_agent_run_context(provider, model, None).await?;
+            build_agent_run_context(provider, model, None, true).await?;
         let chat_messages = daemon_messages_to_chat(messages);
 
         // Spawn the agent task with the hub approval gate and an event channel.
@@ -1850,11 +1826,10 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         });
         let model = model.or_else(|| settings.agent.model.clone());
 
-        let (client, mut mcp_config, available_tools) =
-            build_agent_run_context(provider, model, max_turns).await?;
         // A delegated sub-agent has no interactive surface, so do not gate tool
-        // calls on human approval — auto-approve them.
-        mcp_config.tool_approval = false;
+        // calls on human approval — auto-approve them (`interactive: false`).
+        let (client, mcp_config, available_tools) =
+            build_agent_run_context(provider, model, max_turns, false).await?;
 
         let chat_messages = daemon_messages_to_chat(messages);
 
@@ -1891,6 +1866,7 @@ async fn build_agent_run_context(
     provider: Option<String>,
     model: Option<String>,
     max_turns_override: Option<u32>,
+    interactive: bool,
 ) -> Result<
     (
         LlmClient,
@@ -1936,6 +1912,7 @@ async fn build_agent_run_context(
         &settings,
         max_turns_override,
         num_ctx,
+        interactive,
     );
 
     Ok((client, mcp_config, available_tools))
@@ -1948,6 +1925,13 @@ async fn build_agent_run_context(
 /// proactive compaction and the context budgets have a denominator on the
 /// daemon-hub `SubmitPrompt` path (issue #484 — a `None` here made both
 /// features silently inert for every hub-routed chat).
+///
+/// `interactive` becomes [`McpChatConfig::tool_approval`]: an interactive run
+/// (a human at the TUI) gates tool calls on approval, while a delegated
+/// sub-agent has no interactive surface to ask and auto-approves instead. This
+/// is decided here, at construction, rather than by a caller reaching back in
+/// to flip the field afterwards.
+#[allow(clippy::too_many_arguments)]
 fn assemble_hub_chat_config(
     local_mcp_base_url: String,
     workspace_root: PathBuf,
@@ -1955,6 +1939,7 @@ fn assemble_hub_chat_config(
     settings: &ahma_common::config::AhmaSettings,
     max_turns_override: Option<u32>,
     num_ctx: Option<u32>,
+    interactive: bool,
 ) -> McpChatConfig {
     McpChatConfig {
         base_url: local_mcp_base_url,
@@ -1962,7 +1947,7 @@ fn assemble_hub_chat_config(
         session_id: None,
         external_http_servers: BTreeMap::new(),
         max_turns: max_turns_override.unwrap_or(settings.tools.max_turns),
-        tool_approval: true,
+        tool_approval: interactive,
         mcp_connections,
         minimize_tokens: settings.tools.minimize_tokens,
         small_model_harness: settings.tools.small_model_harness,
@@ -2090,6 +2075,7 @@ mod tests {
             &settings,
             None,
             Some(16_384),
+            true,
         );
         assert_eq!(cfg.context_length, Some(16_384));
         // And the compaction trigger actually engages with that denominator.
@@ -2106,6 +2092,7 @@ mod tests {
             &settings,
             None,
             None,
+            true,
         );
         assert_eq!(cfg.context_length, None);
     }
@@ -3783,7 +3770,7 @@ mod tests {
         };
         let (tx, mut rx) = mpsc::channel(8);
         let (id, name, payload, failed) =
-            execute_single_tool_call(call, cfg, tx, Arc::new(RejectGate)).await;
+            execute_single_tool_call(call, &cfg, tx, Arc::new(RejectGate)).await;
         assert!(failed);
         assert_eq!(id, "call_x");
         assert_eq!(name, "write_file");
@@ -3809,7 +3796,7 @@ mod tests {
         };
         let (tx, mut rx) = mpsc::channel(8);
         let (id, name, payload, failed) =
-            execute_single_tool_call(call, cfg, tx, Arc::new(AutoApproveGate)).await;
+            execute_single_tool_call(call, &cfg, tx, Arc::new(AutoApproveGate)).await;
         assert!(failed);
         assert_eq!(id, "cerr");
         assert_eq!(name, "status");

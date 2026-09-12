@@ -37,14 +37,6 @@ pub enum McpHttpError {
     #[error("Missing access token")]
     MissingAccessToken,
 
-    /// The RPC endpoint was not found or announced.
-    #[error("RPC endpoint not announced yet")]
-    MissingRpcEndpoint,
-
-    /// Failed to refresh the OAuth2 token.
-    #[error("Token refresh failed")]
-    TokenRefreshFailed,
-
     /// Custom error message.
     #[error("Custom error: {0}")]
     Custom(String),
@@ -76,18 +68,6 @@ mod tests {
     fn missing_access_token_display() {
         let err = McpHttpError::MissingAccessToken;
         assert_eq!(err.to_string(), "Missing access token");
-    }
-
-    #[test]
-    fn missing_rpc_endpoint_display() {
-        let err = McpHttpError::MissingRpcEndpoint;
-        assert_eq!(err.to_string(), "RPC endpoint not announced yet");
-    }
-
-    #[test]
-    fn token_refresh_failed_display() {
-        let err = McpHttpError::TokenRefreshFailed;
-        assert_eq!(err.to_string(), "Token refresh failed");
     }
 
     #[test]

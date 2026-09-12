@@ -182,8 +182,11 @@ impl StreamableHttpMcpClient {
             let connector = connector.clone();
             let session_id = session_id.clone();
             let protocol_version = protocol_version.clone();
-            let roots = opts.roots.clone();
-            let notifications = opts.notifications.clone();
+            // Partial-moved out of `opts` rather than cloned: neither field is
+            // read again after the handshake below (only the `Copy` timeout
+            // fields are), so there is nothing left to preserve them for.
+            let roots = opts.roots;
+            let notifications = opts.notifications;
             tokio::spawn(async move {
                 if let Err(e) = run_sse_listener(
                     connector,
@@ -218,17 +221,7 @@ impl StreamableHttpMcpClient {
         }
 
         // notifications/initialized — only now that the return stream is live.
-        // Failures are deliberately ignored (fire-and-forget), matching every
-        // pre-unification consumer.
-        let _ = connector
-            .post_client
-            .post(&connector.mcp_url)
-            .header("Content-Type", "application/json")
-            .header(SESSION_ID_HEADER, &session_id)
-            .header(MCP_PROTOCOL_VERSION_HEADER, &protocol_version)
-            .json(&json!({ "jsonrpc": "2.0", "method": INITIALIZED_METHOD }))
-            .send()
-            .await;
+        post_initialized(&connector, &session_id, &protocol_version, false).await;
 
         // Optionally wait for the sandbox-lock confirmation. Non-fatal on
         // timeout: the listener keeps running and tools/call retries on 409.
@@ -244,13 +237,12 @@ impl StreamableHttpMcpClient {
             }
         }
 
-        Ok(Self {
-            post_client: connector.post_client,
-            mcp_url: connector.mcp_url,
+        Ok(Self::attach(
+            connector.post_client,
+            connector.mcp_url,
             session_id,
             protocol_version,
-            next_id: AtomicU64::new(FIRST_REQUEST_ID),
-        })
+        ))
     }
 
     /// Minimal handshake: `initialize` + `notifications/initialized`, with
@@ -269,25 +261,14 @@ impl StreamableHttpMcpClient {
         )
         .await?;
 
-        // Fire-and-forget, matching pre-unification consumers.
-        let _ = connector
-            .post_client
-            .post(&connector.mcp_url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .header(SESSION_ID_HEADER, &session_id)
-            .header(MCP_PROTOCOL_VERSION_HEADER, &protocol_version)
-            .json(&json!({ "jsonrpc": "2.0", "method": INITIALIZED_METHOD }))
-            .send()
-            .await;
+        post_initialized(&connector, &session_id, &protocol_version, true).await;
 
-        Ok(Self {
-            post_client: connector.post_client,
-            mcp_url: connector.mcp_url,
+        Ok(Self::attach(
+            connector.post_client,
+            connector.mcp_url,
             session_id,
             protocol_version,
-            next_id: AtomicU64::new(FIRST_REQUEST_ID),
-        })
+        ))
     }
 
     /// Attach to an already-negotiated session (a cached session id, or one
@@ -358,10 +339,19 @@ impl StreamableHttpMcpClient {
         arguments: Value,
         retry: ConflictRetryPolicy,
     ) -> Result<ToolCallOutcome> {
-        let params = json!({ "name": tool, "arguments": arguments });
+        let mut params = Some(json!({ "name": tool, "arguments": arguments }));
         let mut attempt: u32 = 0;
         let resp = loop {
-            let resp = self.post_json_rpc("tools/call", params.clone()).await?;
+            // Only clone the request body when another attempt is still
+            // possible after this one; the final allowed attempt (including
+            // the only attempt under `ConflictRetryPolicy::NONE`, the common
+            // poll-style case) sends it by move, with no JSON clone.
+            let body = if attempt < retry.max_retries {
+                params.clone().expect("params set until the final attempt")
+            } else {
+                params.take().expect("params taken exactly once, here")
+            };
+            let resp = self.post_json_rpc("tools/call", body).await?;
             if resp.status() == reqwest::StatusCode::CONFLICT && attempt < retry.max_retries {
                 attempt += 1;
                 tokio::time::sleep(retry.delay).await;
@@ -511,6 +501,33 @@ async fn initialize_session(
     let protocol_version = negotiated_protocol_version(&init_response);
 
     Ok((sid, protocol_version))
+}
+
+/// Send `notifications/initialized`, the second step common to both
+/// [`StreamableHttpMcpClient::connect`] and
+/// [`StreamableHttpMcpClient::connect_minimal`]. Fire-and-forget (failures
+/// deliberately ignored, matching every pre-unification consumer);
+/// `accept_json` is the one thing that differs between the two callers
+/// (`connect_minimal` targets servers that require an explicit `Accept`).
+async fn post_initialized(
+    connector: &Connector,
+    session_id: &str,
+    protocol_version: &str,
+    accept_json: bool,
+) {
+    let mut req = connector
+        .post_client
+        .post(&connector.mcp_url)
+        .header("Content-Type", "application/json");
+    if accept_json {
+        req = req.header("Accept", "application/json");
+    }
+    let _ = req
+        .header(SESSION_ID_HEADER, session_id)
+        .header(MCP_PROTOCOL_VERSION_HEADER, protocol_version)
+        .json(&json!({ "jsonrpc": "2.0", "method": INITIALIZED_METHOD }))
+        .send()
+        .await;
 }
 
 /// Long-lived SSE listener for a session: opens the GET stream, signals

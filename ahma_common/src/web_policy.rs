@@ -177,6 +177,13 @@ impl WebPattern {
     /// Does this pattern match the given request coordinates? `scheme` is
     /// case-sensitive; `host` is matched case-insensitively.
     pub fn matches(&self, scheme: &str, host: &str, port: u16) -> bool {
+        self.matches_lc(scheme, &host.to_ascii_lowercase(), port)
+    }
+
+    /// [`Self::matches`], given a `host` the caller has already lowercased —
+    /// lets [`WebPolicy::decide`] lowercase the request host once and reuse it
+    /// against every configured pattern instead of reallocating per pattern.
+    fn matches_lc(&self, scheme: &str, host_lc: &str, port: u16) -> bool {
         if let Some(s) = &self.scheme
             && s != scheme
         {
@@ -187,12 +194,11 @@ impl WebPattern {
         {
             return false;
         }
-        let host = host.to_ascii_lowercase();
         match &self.host {
-            HostMatch::Exact(h) => *h == host,
+            HostMatch::Exact(h) => h == host_lc,
             HostMatch::Wildcard { parent } => {
                 // Exactly one label in front of `.parent`.
-                match host.strip_suffix(parent) {
+                match host_lc.strip_suffix(parent) {
                     Some(prefix) => {
                         // prefix must be "<label>." with no interior dots.
                         prefix.ends_with('.') && {
@@ -275,11 +281,15 @@ impl WebPolicy {
                 reason: "unsupported or malformed URL (only http/https with a host)".into(),
             };
         };
+        // Lowercased once and reused for every pattern plus the session
+        // checks below, instead of each `matches()` call and the session
+        // checks each lowercasing `host` again.
+        let host_lc = host.to_ascii_lowercase();
 
         if let Some(p) = self
             .never_allow
             .iter()
-            .find(|p| p.matches(&scheme, &host, port))
+            .find(|p| p.matches_lc(&scheme, &host_lc, port))
         {
             return WebDecision::Deny {
                 reason: format!("'{host}' matches never_allow pattern '{}'", p.as_str()),
@@ -288,13 +298,12 @@ impl WebPolicy {
         if let Some(p) = self
             .always_allow
             .iter()
-            .find(|p| p.matches(&scheme, &host, port))
+            .find(|p| p.matches_lc(&scheme, &host_lc, port))
         {
             return WebDecision::Allow {
                 matched: p.as_str().to_string(),
             };
         }
-        let host_lc = host.to_ascii_lowercase();
         if session_grants
             .iter()
             .any(|g| g.eq_ignore_ascii_case(&host_lc))

@@ -113,12 +113,11 @@ pub fn todo_write_schema() -> Arc<Map<String, Value>> {
             "items": {
                 "type": "object",
                 "properties": {
-                    "content": {"type": "string", "description": "Short imperative description of the step."},
-                    "status": {
-                        "type": "string",
-                        "enum": ["pending", "in_progress", "completed"],
-                        "description": "Step status. Defaults to pending."
-                    }
+                    "content": schema::string_property("Short imperative description of the step."),
+                    "status": schema::enum_string_property(
+                        "Step status. Defaults to pending.",
+                        &["pending", "in_progress", "completed"],
+                    )
                 },
                 "required": ["content"],
                 "additionalProperties": false

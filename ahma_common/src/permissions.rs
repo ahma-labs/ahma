@@ -184,31 +184,23 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
         });
     }
 
-    for pattern in &settings.web.always_allow {
-        out.push(GrantRecord {
-            kind: GrantKind::WebDomain,
-            subject: pattern.clone(),
-            access: Some("allow".to_string()),
-            tier: GrantTier::Always,
-            granted_by: None,
-            granted_at: None,
-            surface: None,
-            note: None,
-            scope_note: None,
-        });
-    }
-    for pattern in &settings.web.never_allow {
-        out.push(GrantRecord {
-            kind: GrantKind::WebDomain,
-            subject: pattern.clone(),
-            access: Some("deny".to_string()),
-            tier: GrantTier::Always,
-            granted_by: None,
-            granted_at: None,
-            surface: None,
-            note: None,
-            scope_note: None,
-        });
+    for (patterns, access) in [
+        (&settings.web.always_allow, "allow"),
+        (&settings.web.never_allow, "deny"),
+    ] {
+        for pattern in patterns {
+            out.push(GrantRecord {
+                kind: GrantKind::WebDomain,
+                subject: pattern.clone(),
+                access: Some(access.to_string()),
+                tier: GrantTier::Always,
+                granted_by: None,
+                granted_at: None,
+                surface: None,
+                note: None,
+                scope_note: None,
+            });
+        }
     }
 
     for approval in &settings.permissions.tool_approvals {

@@ -195,8 +195,7 @@ pub fn endpoint_supports_num_ctx(base_url: &str, kind: ProviderKind) -> bool {
     if kind != ProviderKind::OpenAi {
         return false;
     }
-    let lower = base_url.to_ascii_lowercase();
-    lower.contains(":11434") || lower.contains("ollama")
+    base_url.contains(":11434") || base_url.to_ascii_lowercase().contains("ollama")
 }
 
 impl ProviderEntry {
@@ -2348,13 +2347,7 @@ fn toml_persistent_scopes(v: &[PersistentScope]) -> String {
         .map(|ps| {
             let mut parts = vec![
                 format!("path = {}", toml_path(&ps.path)),
-                format!(
-                    "access = {}",
-                    toml_str(match ps.access {
-                        ScopeAccess::Ro => "ro",
-                        ScopeAccess::Rw => "rw",
-                    })
-                ),
+                format!("access = {}", toml_str(ps.access.short())),
             ];
             push_opt_str_field(&mut parts, "granted_by", &ps.granted_by);
             push_opt_str_field(&mut parts, "granted_at", &ps.granted_at);

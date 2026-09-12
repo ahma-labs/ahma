@@ -157,6 +157,34 @@ impl BuiltinTool {
             | BuiltinTool::LogMonitor => false,
         }
     }
+
+    /// Whether this tool is a synchronous/meta tool for the purposes of
+    /// protocol-level cancellation bookkeeping (answers "is this a small,
+    /// synchronous control-plane call rather than a long-running command?").
+    pub fn is_sync_meta_tool_for_protocol_cancel(self) -> bool {
+        match self {
+            BuiltinTool::Await
+            | BuiltinTool::Status
+            | BuiltinTool::Cancel
+            | BuiltinTool::LogsList
+            | BuiltinTool::LogsApprove
+            | BuiltinTool::LogsRead
+            | BuiltinTool::LogsSearch
+            | BuiltinTool::Restart => true,
+            BuiltinTool::RunTerminalCommand
+            | BuiltinTool::SandboxGrant
+            | BuiltinTool::ReadFile
+            | BuiltinTool::ListDir
+            | BuiltinTool::FileSearch
+            | BuiltinTool::GrepSearch
+            | BuiltinTool::FetchWebpage
+            | BuiltinTool::WriteFile
+            | BuiltinTool::ReplaceInFile
+            | BuiltinTool::Agent
+            | BuiltinTool::TodoWrite
+            | BuiltinTool::LogMonitor => false,
+        }
+    }
 }
 
 #[cfg(test)]

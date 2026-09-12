@@ -183,15 +183,25 @@ pub struct SandboxLifecycleParams {
     pub scope: Option<SandboxScopeSummary>,
 }
 
+/// Leniently parse a notification's `params`: missing or malformed input
+/// yields `T::default()` rather than an error, mirroring the historical
+/// `.get()` chains these typed params replaced — a lifecycle notification is
+/// never rejected over its payload. Shared by every `*Params::from_params`.
+fn lenient_from_params<T: serde::de::DeserializeOwned + Default>(
+    params: Option<&serde_json::Value>,
+) -> T {
+    params
+        .map(|p| serde_json::from_value(p.clone()).unwrap_or_default())
+        .unwrap_or_default()
+}
+
 impl SandboxLifecycleParams {
     /// Leniently parse the params of a sandbox lifecycle notification: missing
     /// or malformed params yield the default (both fields `None`), mirroring
     /// the historical `.get()` chains — a lifecycle notification is never
     /// rejected over its payload.
     pub fn from_params(params: Option<&serde_json::Value>) -> Self {
-        params
-            .map(|p| serde_json::from_value(p.clone()).unwrap_or_default())
-            .unwrap_or_default()
+        lenient_from_params(params)
     }
 
     /// As [`Self::from_params`], but starting from a full JSON-RPC
@@ -317,9 +327,7 @@ impl PushChannelChangedParams {
     /// Leniently parse the params: missing or malformed input yields the safe
     /// default (`connected: false`), mirroring the historical `.get()` chain.
     pub fn from_params(params: Option<&serde_json::Value>) -> Self {
-        params
-            .map(|p| serde_json::from_value(p.clone()).unwrap_or_default())
-            .unwrap_or_default()
+        lenient_from_params(params)
     }
 }
 
