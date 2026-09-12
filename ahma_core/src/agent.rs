@@ -64,6 +64,12 @@ pub struct McpChatConfig {
     /// small local models are not flooded past their window.  `None` uses
     /// generous defaults (tighter ones when `small_model_harness` is on).
     pub context_length: Option<u32>,
+    /// Tool names classified as non-mutating (read-only or reporting), from
+    /// [`ahma_mcp::AhmaMcpService::non_mutating_tool_names`] — computed once
+    /// per run rather than looked up per call, so [`needs_approval`] stays a
+    /// pure, synchronous function. See that method's doc for the fail-closed
+    /// default this implies for any name not in the set.
+    pub non_mutating_tool_names: Arc<std::collections::HashSet<String>>,
 }
 
 // ─── Context budgets (small-model support) ───────────────────────────────────
@@ -334,7 +340,7 @@ async fn maybe_compact_conversation(
     })];
 
     match client
-        .chat_completion_with_tools(compaction_messages, &[])
+        .chat_completion_with_tools(&compaction_messages, &[])
         .await
     {
         Ok(resp) if !resp.content.trim().is_empty() => {
@@ -376,9 +382,9 @@ async fn maybe_compact_conversation(
 
 /// Convert internal `{role, content}` chat messages into the MCP sampling
 /// wire format, where content is a typed `{type: "text", text}` object.
-fn to_mcp_content_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+fn to_mcp_content_messages(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
     messages
-        .into_iter()
+        .iter()
         .map(|msg| {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -423,7 +429,7 @@ fn build_sampling_client(mcp: &McpChatConfig) -> Result<(reqwest::Client, String
 async fn call_mcp_sampling_routed(
     mcp: &McpChatConfig,
     target_label: &str,
-    messages: Vec<serde_json::Value>,
+    messages: &[serde_json::Value],
     system_prompt: Option<&str>,
 ) -> Result<ahma_llm_monitor::client::ChatCompletionResponse, String> {
     let (client, url) = build_sampling_client(mcp)?;
@@ -514,7 +520,7 @@ async fn run_mcp_sampling_chat(
         .into_iter()
         .map(|msg| serde_json::json!({"role": msg.role, "content": msg.content}))
         .collect();
-    match call_mcp_sampling_routed(&mcp_cfg, &target_label, msg_vals, system_prompt.as_deref())
+    match call_mcp_sampling_routed(&mcp_cfg, &target_label, &msg_vals, system_prompt.as_deref())
         .await
     {
         Ok(resp) => {
@@ -625,7 +631,7 @@ async fn resolve_tool_approval(
     args_str: &str,
     gate: &dyn AgentApprovalGate,
 ) -> bool {
-    if !needs_approval(call_name, cfg.tool_approval) {
+    if !needs_approval(call_name, cfg.tool_approval, &cfg.non_mutating_tool_names) {
         return true;
     }
     if crate::approvals::is_tool_approved(&cfg.workspace_root, call_name).await {
@@ -748,13 +754,7 @@ async fn fetch_completion_via_mcp_sampling(
             .await;
         return None;
     };
-    match call_mcp_sampling_routed(
-        mcp_cfg,
-        target_label,
-        msg_json.to_vec(),
-        system_prompt.as_deref(),
-    )
-    .await
+    match call_mcp_sampling_routed(mcp_cfg, target_label, msg_json, system_prompt.as_deref()).await
     {
         Ok(c) => Some((c, false)),
         Err(e) => {
@@ -787,7 +787,7 @@ async fn stream_completion_via_http(
         }
     });
     let result = client
-        .chat_completion_with_tools_streaming(msg_json.to_vec(), tool_defs, dtx)
+        .chat_completion_with_tools_streaming(msg_json, tool_defs, dtx)
         .await;
     let _ = forwarder.await;
     result
@@ -1587,17 +1587,51 @@ pub async fn call_mcp_tool_http(
     }
 }
 
-pub fn needs_approval(tool_name: &str, tool_approval_enabled: bool) -> bool {
+/// Whether `tool_name` needs approval before this call runs.
+///
+/// `tool_approval_enabled` is the interactive profile setting: when on,
+/// every tool prompts and `non_mutating_tool_names` is never consulted. When
+/// off, only tools classified as mutating prompt — `non_mutating_tool_names`
+/// is the precomputed set from
+/// [`ahma_mcp::AhmaMcpService::non_mutating_tool_names`] (builtins via
+/// [`ahma_mcp::builtin_tool::BuiltinTool::is_mutating`], configured tools via
+/// their MTDF `mutates` field). A name absent from that set — including any
+/// custom tool this process has never heard of — is treated as mutating:
+/// fail-closed, not fail-open.
+pub fn needs_approval(
+    tool_name: &str,
+    tool_approval_enabled: bool,
+    non_mutating_tool_names: &std::collections::HashSet<String>,
+) -> bool {
     if tool_approval_enabled {
         return true;
     }
-    use ahma_mcp::builtin_tool::BuiltinTool;
-    let write_file = BuiltinTool::WriteFile.name();
-    let replace_in_file = BuiltinTool::ReplaceInFile.name();
-    tool_name == write_file
-        || tool_name == replace_in_file
-        || tool_name.ends_with(&format!("::{write_file}"))
-        || tool_name.ends_with(&format!("::{replace_in_file}"))
+    // External MCP tools are dispatched by their full `server::tool` name
+    // (see `dispatch_tool_execution`), but classification is per-tool, not
+    // per-server — strip the namespace the same way the old hardcoded check
+    // did with `ends_with("::{name}")`.
+    let bare = tool_name.rsplit("::").next().unwrap_or(tool_name);
+    !non_mutating_tool_names.contains(bare)
+}
+
+/// The builtin-only half of [`needs_approval`]'s non-mutating classification
+/// — just [`ahma_mcp::builtin_tool::BuiltinTool::is_mutating`], with no
+/// configured-tool coverage.
+///
+/// For callers with a live [`ahma_mcp::AhmaMcpService`] in this process,
+/// prefer [`ahma_mcp::AhmaMcpService::non_mutating_tool_names`] instead — it
+/// also covers MTDF-configured tools via their `mutates` field. This
+/// function is for callers with no such service to ask, such as `ahma tui`'s
+/// direct HTTP connection to a *remote* bridge: it has no way to know a
+/// remote custom tool's `mutates` field, so those tools fall back to the
+/// fail-closed default (mutating) exactly as intended — this only supplies
+/// the part of the classification that never depends on config.
+pub fn builtin_non_mutating_tool_names() -> std::collections::HashSet<String> {
+    ahma_mcp::builtin_tool::BuiltinTool::ALL
+        .iter()
+        .filter(|t| !t.is_mutating())
+        .map(|t| t.name().to_string())
+        .collect()
 }
 
 pub fn get_mcp_base_url(app_config: Option<&ahma_mcp::shell::cli::AppConfig>) -> String {
@@ -1685,9 +1719,19 @@ impl LlmConnection {
     }
 }
 
+/// Resolve which LLM provider/model/kind a run should use, from an
+/// already-loaded [`ahma_common::config::AhmaConfig`].
+///
+/// Takes `config` by reference rather than loading it internally so callers
+/// with one already in hand (`build_agent_run_context`, which loads it
+/// asynchronously alongside settings and tool discovery) never pay for a
+/// second, blocking `~/.ahma/config.toml` read — `AhmaConfig::load()` is
+/// synchronous `std::fs` I/O, which AGENTS.md forbids on an async path, and
+/// this function used to call it up to once per branch.
 fn resolve_llm_connection(
     provider: Option<String>,
     model: Option<String>,
+    config: &ahma_common::config::AhmaConfig,
 ) -> Result<LlmConnection, String> {
     if let Some(p_name) = provider {
         if provider_is_url(&p_name) {
@@ -1695,7 +1739,6 @@ fn resolve_llm_connection(
             // matching config entry declares must still be recovered here
             // (issue #484 — a lost `num_ctx` silently disables compaction, and
             // a lost `kind` sends the wrong wire format to a proxied provider).
-            let config = ahma_common::config::AhmaConfig::load();
             let entry = config.provider_for_base_url(&p_name);
             return Ok(LlmConnection {
                 base_url: p_name,
@@ -1705,14 +1748,12 @@ fn resolve_llm_connection(
                 kind: entry.map(|e| e.kind),
             });
         }
-        let config = ahma_common::config::AhmaConfig::load();
         let resolved = config
             .resolve_provider(&p_name)
             .map_err(|e| format!("Failed to resolve provider '{}': {e}", p_name))?;
         return Ok(LlmConnection::from_resolved(resolved, model));
     }
 
-    let config = ahma_common::config::AhmaConfig::load();
     let Some(first_provider) = config.providers.first() else {
         return Err("No LLM providers configured in ~/.ahma/config.toml".to_string());
     };
@@ -1788,12 +1829,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
                     completion_tokens: usage.completion_tokens,
                     total_tokens: usage.total_tokens,
                 },
-                // No dedicated hub wire type for this yet — surfaced as a plain
-                // visible chat token so it is never silent, same as the direct
-                // (non-hub) llm_bridge path's dedicated note.
-                AgentEvent::Truncated { reason } => HubRelay::ChatToken {
-                    token: format!("[{reason}]"),
-                },
+                AgentEvent::Truncated { reason } => HubRelay::Truncated { reason },
             };
             let client_msg = ClientMsg::from(relay);
 
@@ -1878,10 +1914,6 @@ async fn build_agent_run_context(
     let service = ahma_mcp::get_active_service()
         .ok_or_else(|| "No active AhmaMcpService found in this process".to_string())?;
 
-    let conn = resolve_llm_connection(provider, model)?;
-    let num_ctx = conn.num_ctx;
-    let client = conn.into_client();
-
     // These three are independent — a tool-list assembly, a settings file read and
     // a lock acquisition — and ran back to back, so every turn paid their latency
     // in series on the critical path before the model could be called.
@@ -1890,6 +1922,18 @@ async fn build_agent_run_context(
         ahma_common::config::AhmaSettings::load_async(),
         async { service.mcp_connections.read().await.clone() },
     );
+
+    // Reuses the just-loaded `settings` for the synthetic `lmstudio` provider
+    // entry instead of `AhmaConfig::load()`, which previously did its own
+    // *second*, blocking `~/.ahma/settings.toml` read on top of a blocking
+    // `~/.ahma/config.toml` read — both off the async runtime, in violation
+    // of AGENTS.md's "never std::fs in an async fn" rule, and both on this
+    // function's critical path since `resolve_llm_connection` used to run
+    // before the join above rather than after it.
+    let ahma_config = ahma_common::config::AhmaConfig::load_async_with(&settings).await;
+    let conn = resolve_llm_connection(provider, model, &ahma_config)?;
+    let num_ctx = conn.num_ctx;
+    let client = conn.into_client();
 
     let workspace_root = service
         .adapter
@@ -1905,6 +1949,11 @@ async fn build_agent_run_context(
         get_mcp_base_url(app_config_ref)
     };
 
+    // A quick read-lock scan of the currently loaded tool configs; see
+    // `non_mutating_tool_names`'s own doc for why this is computed once here
+    // rather than looked up per tool call.
+    let non_mutating_tool_names = Arc::new(service.non_mutating_tool_names());
+
     let mcp_config = assemble_hub_chat_config(
         local_mcp_base_url,
         workspace_root,
@@ -1913,6 +1962,7 @@ async fn build_agent_run_context(
         max_turns_override,
         num_ctx,
         interactive,
+        non_mutating_tool_names,
     );
 
     Ok((client, mcp_config, available_tools))
@@ -1940,6 +1990,7 @@ fn assemble_hub_chat_config(
     max_turns_override: Option<u32>,
     num_ctx: Option<u32>,
     interactive: bool,
+    non_mutating_tool_names: Arc<std::collections::HashSet<String>>,
 ) -> McpChatConfig {
     McpChatConfig {
         base_url: local_mcp_base_url,
@@ -1952,6 +2003,7 @@ fn assemble_hub_chat_config(
         minimize_tokens: settings.tools.minimize_tokens,
         small_model_harness: settings.tools.small_model_harness,
         context_length: num_ctx,
+        non_mutating_tool_names,
     }
 }
 
@@ -2058,6 +2110,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness,
             context_length,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         }
     }
 
@@ -2076,6 +2129,7 @@ mod tests {
             None,
             Some(16_384),
             true,
+            Arc::new(std::collections::HashSet::new()),
         );
         assert_eq!(cfg.context_length, Some(16_384));
         // And the compaction trigger actually engages with that denominator.
@@ -2093,6 +2147,7 @@ mod tests {
             None,
             None,
             true,
+            Arc::new(std::collections::HashSet::new()),
         );
         assert_eq!(cfg.context_length, None);
     }
@@ -2356,6 +2411,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             context_length: None,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         };
 
         let (tx, mut rx) = mpsc::channel(100);
@@ -2523,6 +2579,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             context_length: None,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         };
 
         let (tx, mut rx) = mpsc::channel(100);
@@ -2669,6 +2726,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             context_length: None,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         };
 
         let client = reqwest::Client::new();
@@ -2727,6 +2785,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             context_length: None,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         }
     }
 
@@ -2913,6 +2972,7 @@ mod tests {
             minimize_tokens: true,
             small_model_harness: true,
             context_length: None,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         }
     }
 
@@ -3243,27 +3303,49 @@ mod tests {
 
     #[test]
     fn needs_approval_when_globally_enabled_is_always_true() {
-        assert!(needs_approval("read_file", true));
-        assert!(needs_approval("anything_at_all", true));
+        let empty = std::collections::HashSet::new();
+        assert!(needs_approval("read_file", true, &empty));
+        assert!(needs_approval("anything_at_all", true, &empty));
     }
 
     #[test]
     fn needs_approval_disabled_only_for_mutating_tools() {
-        assert!(needs_approval("write_file", false));
-        assert!(needs_approval("replace_in_file", false));
-        assert!(needs_approval("server::write_file", false));
-        assert!(needs_approval("server::replace_in_file", false));
+        let non_mutating: std::collections::HashSet<String> = ["read_file", "status"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(needs_approval("write_file", false, &non_mutating));
+        assert!(needs_approval("replace_in_file", false, &non_mutating));
+        assert!(needs_approval("server::write_file", false, &non_mutating));
+        assert!(needs_approval(
+            "server::replace_in_file",
+            false,
+            &non_mutating
+        ));
         // Read-only / unrelated tools do not require approval.
-        assert!(!needs_approval("read_file", false));
-        assert!(!needs_approval("status", false));
-        assert!(!needs_approval("server::read_file", false));
+        assert!(!needs_approval("read_file", false, &non_mutating));
+        assert!(!needs_approval("status", false, &non_mutating));
+        assert!(!needs_approval("server::read_file", false, &non_mutating));
+    }
+
+    /// A tool name absent from the non-mutating set is treated as mutating —
+    /// the fail-closed default for a custom tool this classification set has
+    /// never heard of (e.g. `mutates` omitted in its MTDF definition).
+    #[test]
+    fn needs_approval_defaults_closed_for_unknown_tools() {
+        let non_mutating: std::collections::HashSet<String> =
+            ["status".to_string()].into_iter().collect();
+        assert!(needs_approval("git_commit", false, &non_mutating));
+        assert!(needs_approval("server::git_commit", false, &non_mutating));
     }
 
     // ── resolve_llm_connection (URL fast-path) ──
     // Note: a URL provider never *requires* config, but `num_ctx` is enriched
-    // from a matching configured provider when one exists (#484), so these
-    // tests do not assert on `num_ctx` — its value depends on the local
-    // ~/.ahma/config.toml. The URL-matching lookup itself is unit-tested as
+    // from a matching configured provider when one exists (#484). These tests
+    // pass an empty `AhmaConfig` explicitly (now that the caller supplies one
+    // rather than this function loading `~/.ahma/config.toml` itself), so
+    // there is no matching entry and `num_ctx`/`kind` stay `None` — the
+    // URL-matching lookup itself is unit-tested as
     // `AhmaConfig::num_ctx_for_base_url` in ahma_common.
 
     #[test]
@@ -3271,6 +3353,7 @@ mod tests {
         let conn = resolve_llm_connection(
             Some("http://localhost:1234/v1".to_string()),
             Some("my-model".to_string()),
+            &ahma_common::config::AhmaConfig::default(),
         )
         .expect("URL provider resolves without config");
         assert_eq!(conn.base_url, "http://localhost:1234/v1");
@@ -3280,8 +3363,12 @@ mod tests {
 
     #[test]
     fn resolve_llm_connection_url_provider_uses_empty_default_model() {
-        let conn = resolve_llm_connection(Some("unix:///run/ahma.sock".to_string()), None)
-            .expect("unix URL provider resolves");
+        let conn = resolve_llm_connection(
+            Some("unix:///run/ahma.sock".to_string()),
+            None,
+            &ahma_common::config::AhmaConfig::default(),
+        )
+        .expect("unix URL provider resolves");
         assert_eq!(conn.base_url, "unix:///run/ahma.sock");
         assert_eq!(conn.model, "", "missing model defaults to empty string");
         assert!(conn.api_key.is_none());
@@ -3450,7 +3537,7 @@ mod tests {
         let resp = call_mcp_sampling_routed(
             &cfg,
             "label",
-            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            &[serde_json::json!({"role": "user", "content": "hi"})],
             None,
         )
         .await
@@ -3466,7 +3553,7 @@ mod tests {
     async fn call_mcp_sampling_routed_http_error() {
         let base = mock_post_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
         let cfg = cfg_session(&base);
-        let err = call_mcp_sampling_routed(&cfg, "label", vec![], None)
+        let err = call_mcp_sampling_routed(&cfg, "label", &[], None)
             .await
             .expect_err("non-2xx must error");
         assert!(err.contains("HTTP 500"), "{err}");
@@ -3477,7 +3564,7 @@ mod tests {
     async fn call_mcp_sampling_routed_json_error_field() {
         let base = mock_post_json(serde_json::json!({"error": {"message": "nope"}})).await;
         let cfg = cfg_session(&base);
-        let err = call_mcp_sampling_routed(&cfg, "label", vec![], Some("sys"))
+        let err = call_mcp_sampling_routed(&cfg, "label", &[], Some("sys"))
             .await
             .expect_err("JSON-RPC error must propagate");
         assert_eq!(err, "nope");
@@ -3487,7 +3574,7 @@ mod tests {
     async fn call_mcp_sampling_routed_missing_result() {
         let base = mock_post_json(serde_json::json!({})).await;
         let cfg = cfg_session(&base);
-        let err = call_mcp_sampling_routed(&cfg, "label", vec![], None)
+        let err = call_mcp_sampling_routed(&cfg, "label", &[], None)
             .await
             .expect_err("missing result must error");
         assert_eq!(err, "Missing result in response");
@@ -3497,7 +3584,7 @@ mod tests {
     async fn call_mcp_sampling_routed_missing_content() {
         let base = mock_post_json(serde_json::json!({"result": {}})).await;
         let cfg = cfg_session(&base);
-        let err = call_mcp_sampling_routed(&cfg, "label", vec![], None)
+        let err = call_mcp_sampling_routed(&cfg, "label", &[], None)
             .await
             .expect_err("missing content array must error");
         assert_eq!(err, "Missing or invalid content in result");

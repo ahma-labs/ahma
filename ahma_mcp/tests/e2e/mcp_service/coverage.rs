@@ -68,6 +68,7 @@ fn test_tool_config_creation() {
         command: "cargo".to_string(),
         subcommand: Some(vec![SubcommandConfig {
             extra: Default::default(),
+            mutates: None,
             name: "build".to_string(),
             description: "Build project".to_string(),
             enabled: true,
@@ -121,6 +122,7 @@ fn test_subcommand_config_creation() {
     init_test_logging();
     let subcommand = SubcommandConfig {
         extra: Default::default(),
+        mutates: None,
         name: "build".to_string(),
         description: "Build project".to_string(),
         enabled: true,
@@ -223,6 +225,7 @@ async fn test_service_with_configs() {
         timeout_seconds: Some(60),
         subcommand: Some(vec![SubcommandConfig {
             extra: Default::default(),
+            mutates: None,
             name: "test_sub".to_string(),
             description: "Test subcommand".to_string(),
             enabled: true,
@@ -321,6 +324,7 @@ fn test_tool_config_with_nested_subcommands() {
         description: "Cargo tool".to_string(),
         subcommand: Some(vec![SubcommandConfig {
             extra: Default::default(),
+            mutates: None,
             name: "build".to_string(),
             description: "Build command".to_string(),
             enabled: true,
@@ -332,6 +336,7 @@ fn test_tool_config_with_nested_subcommands() {
             guidance_key: None,
             subcommand: Some(vec![SubcommandConfig {
                 extra: Default::default(),
+                mutates: None,
                 name: "release".to_string(),
                 description: "Release build".to_string(),
                 enabled: true,
@@ -390,6 +395,7 @@ async fn test_service_with_tool_configs() {
         description: "Cargo tool".to_string(),
         subcommand: Some(vec![SubcommandConfig {
             extra: Default::default(),
+            mutates: None,
             name: "build".to_string(),
             description: "Build project".to_string(),
             enabled: true,

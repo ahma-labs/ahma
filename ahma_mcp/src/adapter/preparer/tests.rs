@@ -241,6 +241,7 @@ async fn boolean_option_uses_alias_when_true() {
     let temp_manager = test_temp_manager();
     let subcommand_config = SubcommandConfig {
         extra: Default::default(),
+        mutates: None,
         name: "demo".to_string(),
         description: "demo".to_string(),
         enabled: true,
@@ -299,6 +300,7 @@ async fn file_arg_uses_configured_flag_and_writes_content() {
     let temp_manager = test_temp_manager();
     let subcommand_config = SubcommandConfig {
         extra: Default::default(),
+        mutates: None,
         name: "demo".to_string(),
         description: "demo".to_string(),
         enabled: true,
@@ -337,6 +339,7 @@ async fn file_arg_uses_configured_flag_and_writes_content() {
 fn make_grep_subcommand() -> SubcommandConfig {
     SubcommandConfig {
         extra: Default::default(),
+        mutates: None,
         name: "grep".to_string(),
         description: "Search text patterns in files".to_string(),
         enabled: true,
@@ -373,6 +376,7 @@ fn make_grep_subcommand() -> SubcommandConfig {
 fn make_cat_subcommand() -> SubcommandConfig {
     SubcommandConfig {
         extra: Default::default(),
+        mutates: None,
         name: "cat".to_string(),
         description: "Display file contents".to_string(),
         enabled: true,

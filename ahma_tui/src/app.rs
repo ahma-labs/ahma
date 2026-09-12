@@ -442,6 +442,12 @@ fn approve_symlink(state: &mut crate::state::AppState) {
             minimize_tokens,
             small_model_harness,
             context_length,
+            // This auto-triggered logs_approve call bypasses needs_approval
+            // entirely (spawn_tool_call_task below, not the agent loop's
+            // resolve_tool_approval), so this field is never consulted here.
+            non_mutating_tool_names: std::sync::Arc::new(
+                ahma_core::agent::builtin_non_mutating_tool_names(),
+            ),
         };
         tokio::spawn(async move {
             crate::llm_bridge::spawn_tool_call_task(
@@ -1569,6 +1575,14 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
         minimize_tokens,
         small_model_harness,
         context_length,
+        // The TUI connects to the bridge over HTTP with no in-process
+        // AhmaMcpService, so it cannot resolve a remote custom tool's MTDF
+        // `mutates` field — only the static builtin classification is known
+        // here. An unrecognized configured tool therefore falls back to the
+        // fail-closed default (mutating) exactly as intended, not a bug.
+        non_mutating_tool_names: std::sync::Arc::new(
+            ahma_core::agent::builtin_non_mutating_tool_names(),
+        ),
     }
 }
 
@@ -4283,7 +4297,8 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         | SourceEvent::AgentError { .. }
         | SourceEvent::Usage { .. }
         | SourceEvent::ToolCallStarted { .. }
-        | SourceEvent::ToolCallFinished { .. } => {
+        | SourceEvent::ToolCallFinished { .. }
+        | SourceEvent::Truncated { .. } => {
             handle_source_chat_event(event, state);
         }
     }
@@ -4403,6 +4418,16 @@ fn handle_source_chat_event(
         SourceEvent::ToolCallFinished { id, result, failed } => {
             state.mark_stream_activity(crate::state::LivenessState::Thinking);
             state.chat.finish_tool_call(&id, result, failed);
+            state.chat_scroll = 0;
+        }
+        SourceEvent::Truncated { reason } => {
+            // Same rendering as the in-process BridgeEvent::Truncated: a
+            // visible note in the transcript, not silently folded into the
+            // model's own output.
+            state.chat.push(crate::state::ChatEntry::Assistant {
+                content: format!("[{reason}]"),
+                streaming: false,
+            });
             state.chat_scroll = 0;
         }
         _ => {}
@@ -5533,19 +5558,21 @@ mod tests {
 
     #[test]
     fn test_needs_approval_filtering() {
-        use ahma_core::agent::needs_approval;
+        use ahma_core::agent::{builtin_non_mutating_tool_names, needs_approval};
+        let non_mutating = builtin_non_mutating_tool_names();
+
         // Gating write_file and replace_in_file by default
-        assert!(needs_approval("write_file", false));
-        assert!(needs_approval("replace_in_file", false));
-        assert!(needs_approval("srv::write_file", false));
-        assert!(needs_approval("srv::replace_in_file", false));
+        assert!(needs_approval("write_file", false, &non_mutating));
+        assert!(needs_approval("replace_in_file", false, &non_mutating));
+        assert!(needs_approval("srv::write_file", false, &non_mutating));
+        assert!(needs_approval("srv::replace_in_file", false, &non_mutating));
         // Not gating read_file by default
-        assert!(!needs_approval("read_file", false));
-        assert!(!needs_approval("srv::read_file", false));
+        assert!(!needs_approval("read_file", false, &non_mutating));
+        assert!(!needs_approval("srv::read_file", false, &non_mutating));
 
         // When tool_approval is enabled, all tools need approval
-        assert!(needs_approval("read_file", true));
-        assert!(needs_approval("srv::list_dir", true));
+        assert!(needs_approval("read_file", true, &non_mutating));
+        assert!(needs_approval("srv::list_dir", true, &non_mutating));
     }
 
     #[test]

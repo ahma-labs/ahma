@@ -946,6 +946,52 @@ impl AhmaMcpService {
         self.extension_handlers.write().insert(name, handler);
     }
 
+    /// Tool names — bare builtin names, or the flattened `tool_subcommand`
+    /// names [`Self::get_all_available_tools`] advertises — whose effective
+    /// `mutates` resolves to `false`.
+    ///
+    /// Read once per agent run and handed to the caller (`ahma_core`'s
+    /// `needs_approval`) rather than looked up per tool call, so that
+    /// function stays a pure, synchronous, easily tested check. Everything
+    /// **not** in this set is treated as mutating, including a name this
+    /// service has never heard of — the default is fail-closed, matching
+    /// [`crate::config::ToolConfig::mutates`]'s own documented default: an
+    /// author who never set the flag is assumed capable of doing harm until
+    /// they say otherwise, not the reverse.
+    pub fn non_mutating_tool_names(&self) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+
+        for tool in BuiltinTool::ALL {
+            if !tool.is_mutating() {
+                names.insert(tool.name().to_string());
+            }
+        }
+
+        // Same flattening `create_tools_from_config` uses, so the names
+        // computed here are exactly the names `tools/call` will receive.
+        let configs = self.configs.read();
+        for tool_config in configs.values() {
+            let leaves = Self::leaf_subcommands(tool_config);
+            if Self::creates_single_tool(&leaves) {
+                if !tool_config.mutates.unwrap_or(true) {
+                    names.insert(tool_config.name.clone());
+                }
+                continue;
+            }
+            for (sub_path, subcommand_config) in leaves {
+                let effective = subcommand_config
+                    .mutates
+                    .or(tool_config.mutates)
+                    .unwrap_or(true);
+                if !effective {
+                    names.insert(format!("{}_{}", tool_config.name, sub_path));
+                }
+            }
+        }
+
+        names
+    }
+
     fn leaf_subcommands(
         tool_config: &ToolConfig,
     ) -> Vec<(String, &crate::config::SubcommandConfig)> {
@@ -2991,6 +3037,7 @@ mod tests {
             command: "echo".to_string(),
             subcommand: Some(vec![SubcommandConfig {
                 extra: Default::default(),
+                mutates: None,
                 name: "default".to_string(),
                 description: "d".to_string(),
                 enabled: true,
@@ -3331,6 +3378,63 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"mytool_hello".to_string()));
         assert!(names.contains(&"mytool_world".to_string()));
+    }
+
+    #[tokio::test]
+    async fn non_mutating_tool_names_covers_builtins_and_configured_tools() {
+        let service = make_service().await;
+
+        // A single-tool config with no subcommands: mutates: false exempts it,
+        // mutates omitted (default true) does not.
+        let read_only = cfg_from(json!({
+            "name": "status_check", "description": "d", "command": "echo",
+            "mutates": false
+        }));
+        service
+            .configs
+            .write()
+            .insert(read_only.name.clone(), read_only);
+        let undeclared = cfg_from(json!({
+            "name": "npm_publish", "description": "d", "command": "npm"
+        }));
+        service
+            .configs
+            .write()
+            .insert(undeclared.name.clone(), undeclared);
+
+        // A flattened tool: the subcommand's own mutates overrides the
+        // tool-level default, in both directions.
+        let git = cfg_from(json!({
+            "name": "git", "description": "d", "command": "git",
+            "mutates": true,
+            "subcommand": [
+                {"name": "status", "description": "s", "mutates": false},
+                {"name": "commit", "description": "c"}
+            ]
+        }));
+        service.configs.write().insert(git.name.clone(), git);
+
+        let names = service.non_mutating_tool_names();
+
+        // Builtins: BuiltinTool::is_mutating() drives this directly.
+        assert!(names.contains(BuiltinTool::ReadFile.name()));
+        assert!(!names.contains(BuiltinTool::WriteFile.name()));
+        assert!(!names.contains(BuiltinTool::RunTerminalCommand.name()));
+
+        // Configured tools.
+        assert!(names.contains("status_check"), "mutates: false must exempt");
+        assert!(
+            !names.contains("npm_publish"),
+            "an undeclared custom tool must default to mutating (fail closed)"
+        );
+        assert!(
+            names.contains("git_status"),
+            "subcommand mutates: false must exempt the flattened name"
+        );
+        assert!(
+            !names.contains("git_commit"),
+            "a subcommand with no override inherits the tool-level mutates: true"
+        );
     }
 
     #[tokio::test]

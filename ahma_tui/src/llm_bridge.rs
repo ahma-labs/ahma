@@ -462,7 +462,7 @@ pub fn spawn_decompose_task(client: LlmClient, goal: String, tx: Sender<BridgeEv
         });
 
         let completion_res = client
-            .chat_completion_with_tools(vec![system_msg, user_msg], &[])
+            .chat_completion_with_tools(&[system_msg, user_msg], &[])
             .await;
         match completion_res {
             Ok(completion) => {

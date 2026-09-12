@@ -40,7 +40,7 @@ macro_rules! builtin_tools {
             pub const ALL: &'static [BuiltinTool] = &[$(BuiltinTool::$variant),+];
 
             /// The name this tool is called by on the wire.
-            pub fn name(self) -> &'static str {
+            pub const fn name(self) -> &'static str {
                 match self {
                     $(BuiltinTool::$variant => $name),+
                 }
@@ -94,7 +94,7 @@ impl BuiltinTool {
     /// on an undecided scope. These six do not: they inspect or steer ahma
     /// itself, and `sandbox_grant` is how a stuck scope gets unstuck — gating
     /// it on a settled scope would deadlock the very case it exists for.
-    pub fn is_sandbox_exempt(self) -> bool {
+    pub const fn is_sandbox_exempt(self) -> bool {
         match self {
             BuiltinTool::Status
             | BuiltinTool::Await
@@ -123,7 +123,7 @@ impl BuiltinTool {
     ///
     /// `agent` is withheld from the agent loop so a run cannot recurse into
     /// itself; every other built-in is fair game.
-    pub fn is_denied_in_agent_loop(self) -> bool {
+    pub const fn is_denied_in_agent_loop(self) -> bool {
         matches!(self, BuiltinTool::Agent)
     }
 
@@ -133,7 +133,7 @@ impl BuiltinTool {
     /// Advertising these unconditionally cost a real incident: a Claude Code
     /// plan-mode subagent that lacked native `Write` used ahma's instead. They
     /// are withheld from clients with native equivalents.
-    pub fn is_harness_file_tool(self) -> bool {
+    pub const fn is_harness_file_tool(self) -> bool {
         match self {
             BuiltinTool::ReadFile
             | BuiltinTool::WriteFile
@@ -161,7 +161,7 @@ impl BuiltinTool {
     /// Whether this tool is a synchronous/meta tool for the purposes of
     /// protocol-level cancellation bookkeeping (answers "is this a small,
     /// synchronous control-plane call rather than a long-running command?").
-    pub fn is_sync_meta_tool_for_protocol_cancel(self) -> bool {
+    pub const fn is_sync_meta_tool_for_protocol_cancel(self) -> bool {
         match self {
             BuiltinTool::Await
             | BuiltinTool::Status
@@ -180,6 +180,47 @@ impl BuiltinTool {
             | BuiltinTool::FetchWebpage
             | BuiltinTool::WriteFile
             | BuiltinTool::ReplaceInFile
+            | BuiltinTool::Agent
+            | BuiltinTool::TodoWrite
+            | BuiltinTool::LogMonitor => false,
+        }
+    }
+
+    /// Whether this built-in changes the filesystem, a persisted setting, or
+    /// external state — the same question [`crate::config::ToolConfig::mutates`]
+    /// answers for MTDF-defined tools, asked here for the tools ahma answers
+    /// itself so `needs_approval` has one classification covering both.
+    ///
+    /// `write_file` and `replace_in_file` write the workspace; `logs_approve`
+    /// persists a log-symlink exception outside it
+    /// (`sandbox::add_log_exception`); `run_terminal_command` runs an
+    /// arbitrary command, the least contained of all of them. `sandbox_grant`
+    /// is exempt despite writing the permission ledger: its own handler
+    /// already refuses to self-persist for the autonomous agent-loop client,
+    /// routing `confirm: true` to the human approval surface instead
+    /// (`handle_sandbox_grant`) — gating it again here would be redundant,
+    /// not safer. Everything else only reads or only steers ahma's own
+    /// control plane. Each is exempted explicitly, never by omission — the
+    /// same fail-closed shape as the MTDF default.
+    pub const fn is_mutating(self) -> bool {
+        match self {
+            BuiltinTool::WriteFile
+            | BuiltinTool::ReplaceInFile
+            | BuiltinTool::RunTerminalCommand
+            | BuiltinTool::LogsApprove => true,
+            BuiltinTool::Await
+            | BuiltinTool::Status
+            | BuiltinTool::LogsList
+            | BuiltinTool::LogsRead
+            | BuiltinTool::LogsSearch
+            | BuiltinTool::Restart
+            | BuiltinTool::Cancel
+            | BuiltinTool::SandboxGrant
+            | BuiltinTool::ReadFile
+            | BuiltinTool::ListDir
+            | BuiltinTool::FileSearch
+            | BuiltinTool::GrepSearch
+            | BuiltinTool::FetchWebpage
             | BuiltinTool::Agent
             | BuiltinTool::TodoWrite
             | BuiltinTool::LogMonitor => false,
@@ -222,5 +263,38 @@ mod tests {
         // Near-misses must not resolve: dispatch depends on exact names.
         assert_eq!(BuiltinTool::from_name("Await"), None);
         assert_eq!(BuiltinTool::from_name("await "), None);
+    }
+
+    /// The two file-mutating builtins and `run_terminal_command` (arbitrary
+    /// execution) must require approval; `logs_approve` persists a log
+    /// exception and must too. This is a regression guard: it's the
+    /// classification `needs_approval` reads to decide whether a builtin
+    /// prompts when the interactive tool-approval setting is off.
+    #[test]
+    fn is_mutating_covers_the_known_writers() {
+        for tool in [
+            BuiltinTool::WriteFile,
+            BuiltinTool::ReplaceInFile,
+            BuiltinTool::RunTerminalCommand,
+            BuiltinTool::LogsApprove,
+        ] {
+            assert!(tool.is_mutating(), "{} must be mutating", tool.name());
+        }
+    }
+
+    /// `sandbox_grant` writes the permission ledger but is exempt here: its
+    /// own handler refuses to self-persist for the agent-loop client and
+    /// routes to the human approval surface instead, so gating it a second
+    /// time through `needs_approval` would be redundant.
+    #[test]
+    fn is_mutating_exempts_sandbox_grant_and_read_only_tools() {
+        for tool in [
+            BuiltinTool::SandboxGrant,
+            BuiltinTool::ReadFile,
+            BuiltinTool::Status,
+            BuiltinTool::Await,
+        ] {
+            assert!(!tool.is_mutating(), "{} must not be mutating", tool.name());
+        }
     }
 }

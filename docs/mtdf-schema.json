@@ -129,6 +129,13 @@
           "type": "null"
         }
       ]
+    },
+    "mutates": {
+      "description": "Whether this tool changes the filesystem, a persisted setting, or\nexternal state, as opposed to only reading or reporting.\n\nRead by the agent-loop's tool-approval gate\n(`ahma_core::agent::needs_approval`) to decide whether a call needs\nhuman approval when interactive tool-approval is off. **Omitted or\nunset defaults to `true` (mutating)** — a custom tool the approval\ngate has never been told about is treated as capable of doing harm\nuntil its author says otherwise, not the reverse. Set `false`\nexplicitly for a tool that only reads or reports (e.g. a status\ncheck, a linter run with no `--fix`). Subcommand-level settings\noverride this tool-level default.",
+      "type": [
+        "boolean",
+        "null"
+      ]
     }
   },
   "additionalProperties": true,
@@ -245,6 +252,13 @@
           "description": "Installation guidance displayed when the subcommand is unavailable.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "mutates": {
+          "description": "Override the tool-level `mutates` for this specific subcommand — e.g.\n`git status` (`mutates: false`) under a `git` tool whose other\nsubcommands (`commit`, `push`) mutate. Omitted or unset inherits the\ntool-level `mutates` (or its own default of `true`). See\n[`ToolConfig::mutates`].",
+          "type": [
+            "boolean",
             "null"
           ]
         }
