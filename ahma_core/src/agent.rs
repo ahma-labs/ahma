@@ -64,6 +64,12 @@ pub struct McpChatConfig {
     /// small local models are not flooded past their window.  `None` uses
     /// generous defaults (tighter ones when `small_model_harness` is on).
     pub context_length: Option<u32>,
+    /// Tool names classified as non-mutating (read-only or reporting), from
+    /// [`ahma_mcp::AhmaMcpService::non_mutating_tool_names`] — computed once
+    /// per run rather than looked up per call, so [`needs_approval`] stays a
+    /// pure, synchronous function. See that method's doc for the fail-closed
+    /// default this implies for any name not in the set.
+    pub non_mutating_tool_names: Arc<std::collections::HashSet<String>>,
 }
 
 // ─── Context budgets (small-model support) ───────────────────────────────────
@@ -625,7 +631,7 @@ async fn resolve_tool_approval(
     args_str: &str,
     gate: &dyn AgentApprovalGate,
 ) -> bool {
-    if !needs_approval(call_name, cfg.tool_approval) {
+    if !needs_approval(call_name, cfg.tool_approval, &cfg.non_mutating_tool_names) {
         return true;
     }
     if crate::approvals::is_tool_approved(&cfg.workspace_root, call_name).await {
@@ -1581,17 +1587,51 @@ pub async fn call_mcp_tool_http(
     }
 }
 
-pub fn needs_approval(tool_name: &str, tool_approval_enabled: bool) -> bool {
+/// Whether `tool_name` needs approval before this call runs.
+///
+/// `tool_approval_enabled` is the interactive profile setting: when on,
+/// every tool prompts and `non_mutating_tool_names` is never consulted. When
+/// off, only tools classified as mutating prompt — `non_mutating_tool_names`
+/// is the precomputed set from
+/// [`ahma_mcp::AhmaMcpService::non_mutating_tool_names`] (builtins via
+/// [`ahma_mcp::builtin_tool::BuiltinTool::is_mutating`], configured tools via
+/// their MTDF `mutates` field). A name absent from that set — including any
+/// custom tool this process has never heard of — is treated as mutating:
+/// fail-closed, not fail-open.
+pub fn needs_approval(
+    tool_name: &str,
+    tool_approval_enabled: bool,
+    non_mutating_tool_names: &std::collections::HashSet<String>,
+) -> bool {
     if tool_approval_enabled {
         return true;
     }
-    use ahma_mcp::builtin_tool::BuiltinTool;
-    let write_file = BuiltinTool::WriteFile.name();
-    let replace_in_file = BuiltinTool::ReplaceInFile.name();
-    tool_name == write_file
-        || tool_name == replace_in_file
-        || tool_name.ends_with(&format!("::{write_file}"))
-        || tool_name.ends_with(&format!("::{replace_in_file}"))
+    // External MCP tools are dispatched by their full `server::tool` name
+    // (see `dispatch_tool_execution`), but classification is per-tool, not
+    // per-server — strip the namespace the same way the old hardcoded check
+    // did with `ends_with("::{name}")`.
+    let bare = tool_name.rsplit("::").next().unwrap_or(tool_name);
+    !non_mutating_tool_names.contains(bare)
+}
+
+/// The builtin-only half of [`needs_approval`]'s non-mutating classification
+/// — just [`ahma_mcp::builtin_tool::BuiltinTool::is_mutating`], with no
+/// configured-tool coverage.
+///
+/// For callers with a live [`ahma_mcp::AhmaMcpService`] in this process,
+/// prefer [`ahma_mcp::AhmaMcpService::non_mutating_tool_names`] instead — it
+/// also covers MTDF-configured tools via their `mutates` field. This
+/// function is for callers with no such service to ask, such as `ahma tui`'s
+/// direct HTTP connection to a *remote* bridge: it has no way to know a
+/// remote custom tool's `mutates` field, so those tools fall back to the
+/// fail-closed default (mutating) exactly as intended — this only supplies
+/// the part of the classification that never depends on config.
+pub fn builtin_non_mutating_tool_names() -> std::collections::HashSet<String> {
+    ahma_mcp::builtin_tool::BuiltinTool::ALL
+        .iter()
+        .filter(|t| !t.is_mutating())
+        .map(|t| t.name().to_string())
+        .collect()
 }
 
 pub fn get_mcp_base_url(app_config: Option<&ahma_mcp::shell::cli::AppConfig>) -> String {
@@ -1909,6 +1949,11 @@ async fn build_agent_run_context(
         get_mcp_base_url(app_config_ref)
     };
 
+    // A quick read-lock scan of the currently loaded tool configs; see
+    // `non_mutating_tool_names`'s own doc for why this is computed once here
+    // rather than looked up per tool call.
+    let non_mutating_tool_names = Arc::new(service.non_mutating_tool_names());
+
     let mcp_config = assemble_hub_chat_config(
         local_mcp_base_url,
         workspace_root,
@@ -1917,6 +1962,7 @@ async fn build_agent_run_context(
         max_turns_override,
         num_ctx,
         interactive,
+        non_mutating_tool_names,
     );
 
     Ok((client, mcp_config, available_tools))
@@ -1944,6 +1990,7 @@ fn assemble_hub_chat_config(
     max_turns_override: Option<u32>,
     num_ctx: Option<u32>,
     interactive: bool,
+    non_mutating_tool_names: Arc<std::collections::HashSet<String>>,
 ) -> McpChatConfig {
     McpChatConfig {
         base_url: local_mcp_base_url,
@@ -1956,6 +2003,7 @@ fn assemble_hub_chat_config(
         minimize_tokens: settings.tools.minimize_tokens,
         small_model_harness: settings.tools.small_model_harness,
         context_length: num_ctx,
+        non_mutating_tool_names,
     }
 }
 
@@ -2062,6 +2110,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness,
             context_length,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         }
     }
 
@@ -2080,6 +2129,7 @@ mod tests {
             None,
             Some(16_384),
             true,
+            Arc::new(std::collections::HashSet::new()),
         );
         assert_eq!(cfg.context_length, Some(16_384));
         // And the compaction trigger actually engages with that denominator.
@@ -2097,6 +2147,7 @@ mod tests {
             None,
             None,
             true,
+            Arc::new(std::collections::HashSet::new()),
         );
         assert_eq!(cfg.context_length, None);
     }
@@ -2360,6 +2411,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             context_length: None,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         };
 
         let (tx, mut rx) = mpsc::channel(100);
@@ -2527,6 +2579,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             context_length: None,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         };
 
         let (tx, mut rx) = mpsc::channel(100);
@@ -2673,6 +2726,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             context_length: None,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         };
 
         let client = reqwest::Client::new();
@@ -2731,6 +2785,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             context_length: None,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         }
     }
 
@@ -2917,6 +2972,7 @@ mod tests {
             minimize_tokens: true,
             small_model_harness: true,
             context_length: None,
+            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
         }
     }
 
@@ -3247,20 +3303,40 @@ mod tests {
 
     #[test]
     fn needs_approval_when_globally_enabled_is_always_true() {
-        assert!(needs_approval("read_file", true));
-        assert!(needs_approval("anything_at_all", true));
+        let empty = std::collections::HashSet::new();
+        assert!(needs_approval("read_file", true, &empty));
+        assert!(needs_approval("anything_at_all", true, &empty));
     }
 
     #[test]
     fn needs_approval_disabled_only_for_mutating_tools() {
-        assert!(needs_approval("write_file", false));
-        assert!(needs_approval("replace_in_file", false));
-        assert!(needs_approval("server::write_file", false));
-        assert!(needs_approval("server::replace_in_file", false));
+        let non_mutating: std::collections::HashSet<String> = ["read_file", "status"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(needs_approval("write_file", false, &non_mutating));
+        assert!(needs_approval("replace_in_file", false, &non_mutating));
+        assert!(needs_approval("server::write_file", false, &non_mutating));
+        assert!(needs_approval(
+            "server::replace_in_file",
+            false,
+            &non_mutating
+        ));
         // Read-only / unrelated tools do not require approval.
-        assert!(!needs_approval("read_file", false));
-        assert!(!needs_approval("status", false));
-        assert!(!needs_approval("server::read_file", false));
+        assert!(!needs_approval("read_file", false, &non_mutating));
+        assert!(!needs_approval("status", false, &non_mutating));
+        assert!(!needs_approval("server::read_file", false, &non_mutating));
+    }
+
+    /// A tool name absent from the non-mutating set is treated as mutating —
+    /// the fail-closed default for a custom tool this classification set has
+    /// never heard of (e.g. `mutates` omitted in its MTDF definition).
+    #[test]
+    fn needs_approval_defaults_closed_for_unknown_tools() {
+        let non_mutating: std::collections::HashSet<String> =
+            ["status".to_string()].into_iter().collect();
+        assert!(needs_approval("git_commit", false, &non_mutating));
+        assert!(needs_approval("server::git_commit", false, &non_mutating));
     }
 
     // ── resolve_llm_connection (URL fast-path) ──

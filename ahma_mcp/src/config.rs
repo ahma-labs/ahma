@@ -116,6 +116,20 @@ pub struct ToolConfig {
     /// Live log monitoring configuration. Required when `tool_type` is `Livelog`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub livelog: Option<LivelogConfig>,
+    /// Whether this tool changes the filesystem, a persisted setting, or
+    /// external state, as opposed to only reading or reporting.
+    ///
+    /// Read by the agent-loop's tool-approval gate
+    /// (`ahma_core::agent::needs_approval`) to decide whether a call needs
+    /// human approval when interactive tool-approval is off. **Omitted or
+    /// unset defaults to `true` (mutating)** — a custom tool the approval
+    /// gate has never been told about is treated as capable of doing harm
+    /// until its author says otherwise, not the reverse. Set `false`
+    /// explicitly for a tool that only reads or reports (e.g. a status
+    /// check, a linter run with no `--fix`). Subcommand-level settings
+    /// override this tool-level default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutates: Option<bool>,
 }
 
 /// Classifier that determines how the MCP service routes a tool invocation.
@@ -453,6 +467,13 @@ pub struct SubcommandConfig {
     /// Installation guidance displayed when the subcommand is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_instructions: Option<String>,
+    /// Override the tool-level `mutates` for this specific subcommand — e.g.
+    /// `git status` (`mutates: false`) under a `git` tool whose other
+    /// subcommands (`commit`, `push`) mutate. Omitted or unset inherits the
+    /// tool-level `mutates` (or its own default of `true`). See
+    /// [`ToolConfig::mutates`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutates: Option<bool>,
 }
 
 /// Configuration for a single command-line option.

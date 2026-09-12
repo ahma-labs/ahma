@@ -303,8 +303,9 @@ impl AhmaConfig {
     /// has already read the file (e.g. via async I/O — see [`Self::load_async`])
     /// does not need a `toml` dependency of its own. Mirrors
     /// [`AhmaSettings::parse`]. Does **not** apply the synthetic `lmstudio`
-    /// provider entry — that requires an [`AhmaSettings`], applied separately
-    /// by [`Self::with_lmstudio_provider`].
+    /// provider entry — that requires an [`AhmaSettings`], applied
+    /// separately by [`Self::load_from`] and [`Self::load_async`] once one
+    /// is available.
     pub fn parse(contents: &str) -> Result<Self, String> {
         toml::from_str(contents).map_err(|e| e.to_string())
     }

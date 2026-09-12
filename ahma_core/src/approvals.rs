@@ -123,11 +123,11 @@ fn reask_note_for(status: GrantStatus) -> Option<String> {
 /// Built-in tools that mutate nothing and take no path, so an argument preview
 /// on their approval prompt would be noise.
 ///
-/// Built from [`BuiltinTool::name`] rather than repeating the literals: those
-/// three strings used to be typed out here independently of the enum they
-/// name, which is exactly the two-lists drift `builtin_tool`'s own module doc
-/// warns about. Everything *not* on this list previews — see
-/// [`shows_argument_preview`].
+/// Built from [`ahma_mcp::builtin_tool::BuiltinTool::name`] rather than
+/// repeating the literals: those three strings used to be typed out here
+/// independently of the enum they name, which is exactly the two-lists drift
+/// `builtin_tool`'s own module doc warns about. Everything *not* on this
+/// list previews — see [`shows_argument_preview`].
 const PREVIEW_EXEMPT_TOOLS: &[&str] = &[
     ahma_mcp::builtin_tool::BuiltinTool::Status.name(),
     ahma_mcp::builtin_tool::BuiltinTool::Await.name(),

@@ -366,6 +366,10 @@ impl AhmaMcpService {
             step_delay_ms: None,
             availability_check: None,
             install_instructions: None,
+            // run_terminal_command executes an arbitrary shell command — the
+            // least contained builtin there is, matching
+            // BuiltinTool::RunTerminalCommand.is_mutating() == true.
+            mutates: Some(true),
         }
     }
 

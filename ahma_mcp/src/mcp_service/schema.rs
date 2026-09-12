@@ -591,6 +591,7 @@ mod tests {
     fn make_subcommand(name: &str, description: &str, enabled: bool) -> SubcommandConfig {
         SubcommandConfig {
             extra: Default::default(),
+            mutates: None,
             name: name.to_string(),
             description: description.to_string(),
             enabled,
@@ -606,6 +607,7 @@ mod tests {
     ) -> SubcommandConfig {
         SubcommandConfig {
             extra: Default::default(),
+            mutates: None,
             name: name.to_string(),
             description: description.to_string(),
             subcommand: Some(nested),
