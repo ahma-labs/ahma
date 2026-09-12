@@ -243,6 +243,15 @@ where
     Tool::new(name, description, input_schema).with_title(title)
 }
 
+/// Whether progress notifications should be sent to a client with the given
+/// `force` override and client-type heuristic. Shared by
+/// [`AhmaMcpService::effective_supports_progress`] and
+/// `sequence::register_progress_target`, which can't reach `self` and so
+/// takes `force` as an already-resolved parameter.
+fn progress_enabled(force: bool, client_type: crate::client_type::McpClientType) -> bool {
+    force || client_type.supports_progress()
+}
+
 impl AhmaMcpService {
     /// Whether the bridge in front of this subprocess (if any) currently has
     /// a live push channel open to the real client. See the
@@ -275,7 +284,7 @@ impl AhmaMcpService {
         &self,
         client_type: crate::client_type::McpClientType,
     ) -> bool {
-        self.force_progress_notifications_override() || client_type.supports_progress()
+        progress_enabled(self.force_progress_notifications_override(), client_type)
     }
 
     /// The pure dispatch logic behind [`ServerHandler::on_custom_notification`],
@@ -585,17 +594,8 @@ impl AhmaMcpService {
     }
 
     fn is_sync_meta_tool_for_protocol_cancel(tool_name: &str) -> bool {
-        matches!(
-            tool_name,
-            "await"
-                | "status"
-                | "cancel"
-                | "logs_list"
-                | "logs_approve"
-                | "logs_read"
-                | "logs_search"
-                | "restart"
-        )
+        BuiltinTool::from_name(tool_name)
+            .is_some_and(BuiltinTool::is_sync_meta_tool_for_protocol_cancel)
     }
 
     fn task_vault_trash_dir(&self) -> Option<PathBuf> {
@@ -1093,10 +1093,7 @@ impl AhmaMcpService {
         if !BuiltinTool::from_name(name).is_some_and(BuiltinTool::is_harness_file_tool) {
             return true;
         }
-        !matches!(
-            client_type,
-            McpClientType::ClaudeDesktop | McpClientType::Cursor | McpClientType::VSCode
-        )
+        !client_type.has_native_file_tools()
     }
 
     /// Resolves a `tools/call` tool name to its config, returning the

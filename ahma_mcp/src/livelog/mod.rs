@@ -484,16 +484,20 @@ async fn process_new_bytes(
     monitor: &OperationMonitor,
 ) -> Vec<String> {
     let text = format!("{}{}", remainder, String::from_utf8_lossy(&buffer[..n]));
-    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
-    if let Some(last) = lines.pop() {
-        *remainder = last;
+    // Split into borrowed `&str` segments first and trim the trailing `\r`
+    // before allocating — the old code allocated an owned `String` per
+    // segment, then a second owned+trimmed copy, then cloned that a third
+    // time for the monitor call.
+    let mut parts: Vec<&str> = text.split('\n').collect();
+    if let Some(last) = parts.pop() {
+        *remainder = last.to_string();
     } else {
         remainder.clear();
     }
 
-    let mut cleaned = Vec::new();
-    for line in lines {
-        let line_clean = line.trim_end_matches('\r').to_string();
+    let mut cleaned = Vec::with_capacity(parts.len());
+    for part in parts {
+        let line_clean = part.trim_end_matches('\r').to_string();
         monitor.append_stdout_line(op_id, line_clean.clone()).await;
         cleaned.push(line_clean);
     }

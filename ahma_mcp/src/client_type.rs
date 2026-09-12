@@ -113,6 +113,21 @@ impl McpClientType {
         !matches!(self, McpClientType::Cursor)
     }
 
+    /// Whether this client already ships native file read/write/search tools
+    /// (`read_file`, `write_file`, `list_dir`, …), so ahma's harness-file
+    /// built-ins duplicate a capability the harness itself provides.
+    ///
+    /// Advertising these unconditionally cost a real incident: a Claude Code
+    /// plan-mode subagent that lacked native `Write` used ahma's instead —
+    /// see [`crate::builtin_tool::BuiltinTool::is_harness_file_tool`]. The
+    /// gate is only ever applied to that subset of tools.
+    pub fn has_native_file_tools(&self) -> bool {
+        matches!(
+            self,
+            McpClientType::ClaudeDesktop | McpClientType::Cursor | McpClientType::VSCode
+        )
+    }
+
     /// Human-readable name for logging.
     pub fn display_name(&self) -> &'static str {
         match self {

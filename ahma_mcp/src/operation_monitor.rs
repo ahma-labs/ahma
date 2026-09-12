@@ -756,7 +756,10 @@ impl OperationMonitor {
             if status.is_terminal() {
                 operation_to_move = ops.remove(id);
             } else {
-                updated_op = Some(op.clone());
+                // Only `id`/`state` are needed for the progress event below —
+                // avoid cloning the whole `Operation` (which can carry a large
+                // result payload) just to read two fields.
+                updated_op = Some((op.id.clone(), op.state));
             }
         }
 
@@ -765,10 +768,10 @@ impl OperationMonitor {
         if let Some(op) = operation_to_move {
             tracing::debug!("Moving operation {} to completion history.", id);
             self.move_to_history_and_notify(id, Some(op)).await;
-        } else if let Some(op) = updated_op {
+        } else if let Some((op_id, op_state)) = updated_op {
             self.events.emit(OperationEvent::Progress {
-                operation_id: op.id.clone(),
-                message: format!("status: {:?}", op.state),
+                operation_id: op_id,
+                message: format!("status: {:?}", op_state),
                 percent: None,
             });
         }

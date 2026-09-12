@@ -184,9 +184,14 @@ fn is_blocked_temp_path(path_str: &str) -> bool {
 }
 
 fn is_in_temp_dir(path: &Path) -> bool {
-    dunce::canonicalize(std::env::temp_dir())
-        .map(|temp_dir| path.starts_with(&temp_dir))
-        .unwrap_or(false)
+    // `std::env::temp_dir()` is fixed for the process lifetime, and
+    // canonicalizing it is a syscall — cache it once rather than paying that
+    // cost on every path check.
+    static CANONICAL_TEMP_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    CANONICAL_TEMP_DIR
+        .get_or_init(|| dunce::canonicalize(std::env::temp_dir()).ok())
+        .as_deref()
+        .is_some_and(|temp_dir| path.starts_with(temp_dir))
 }
 
 /// The name of the immediate child of `container` that `requested` lives in, or
@@ -1047,12 +1052,12 @@ pub(super) fn path_within_scopes(canonical: &Path, scopes: &[PathBuf]) -> bool {
         .any(|scope| canonical_stripped.starts_with(strip_extended_prefix(scope)))
 }
 
-fn strip_extended_prefix(path: &Path) -> PathBuf {
+fn strip_extended_prefix(path: &Path) -> std::borrow::Cow<'_, Path> {
     #[cfg(target_os = "windows")]
     if let Some(stripped) = path.as_os_str().to_string_lossy().strip_prefix(r"\\?\") {
-        return PathBuf::from(stripped);
+        return std::borrow::Cow::Owned(PathBuf::from(stripped));
     }
-    path.to_path_buf()
+    std::borrow::Cow::Borrowed(path)
 }
 
 #[cfg(test)]

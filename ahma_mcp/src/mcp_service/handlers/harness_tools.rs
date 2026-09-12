@@ -5,6 +5,16 @@ use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
 impl AhmaMcpService {
+    /// Resolves the `base_dir` argument shared by `file_search`/`grep_search`:
+    /// the explicit value if given, else the first sandbox scope, else `.`.
+    fn resolve_base_dir(&self, args: &Map<String, Value>) -> PathBuf {
+        args.get("base_dir")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| self.adapter.sandbox().scopes().first().cloned())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     pub async fn handle_read_file(
         &self,
         args: Map<String, Value>,
@@ -58,12 +68,7 @@ impl AhmaMcpService {
             .and_then(Value::as_str)
             .ok_or_else(|| mcp_invalid_params("'pattern' is required"))?;
 
-        let base_dir = args
-            .get("base_dir")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .or_else(|| self.adapter.sandbox().scopes().first().cloned())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let base_dir = self.resolve_base_dir(&args);
 
         let scopes = self.adapter.sandbox().scopes().to_vec();
         let matches = self
@@ -95,12 +100,7 @@ impl AhmaMcpService {
             .and_then(Value::as_u64)
             .map(|v| v as usize);
 
-        let base_dir = args
-            .get("base_dir")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .or_else(|| self.adapter.sandbox().scopes().first().cloned())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let base_dir = self.resolve_base_dir(&args);
 
         let scopes = self.adapter.sandbox().scopes().to_vec();
         let matches = self
@@ -467,15 +467,15 @@ pub fn read_file_schema() -> Arc<Map<String, Value>> {
     let mut props = Map::new();
     props.insert(
         "path".to_string(),
-        json!({"type": "string", "description": "Absolute or scoped-relative file path."}),
+        schema::string_property("Absolute or scoped-relative file path."),
     );
     props.insert(
         "start_line".to_string(),
-        json!({"type": "integer", "description": "1-based inclusive start line."}),
+        schema::integer_property("1-based inclusive start line."),
     );
     props.insert(
         "end_line".to_string(),
-        json!({"type": "integer", "description": "1-based inclusive end line."}),
+        schema::integer_property("1-based inclusive end line."),
     );
     schema::object_input_schema(props, &["path"])
 }
@@ -484,7 +484,7 @@ pub fn list_dir_schema() -> Arc<Map<String, Value>> {
     let mut props = Map::new();
     props.insert(
         "path".to_string(),
-        json!({"type": "string", "description": "Directory path. Defaults to current scope root."}),
+        schema::string_property("Directory path. Defaults to current scope root."),
     );
     schema::object_input_schema(props, &[])
 }
@@ -493,11 +493,11 @@ pub fn file_search_schema() -> Arc<Map<String, Value>> {
     let mut props = Map::new();
     props.insert(
         "pattern".to_string(),
-        json!({"type": "string", "description": "Glob pattern, e.g. '**/*.rs'."}),
+        schema::string_property("Glob pattern, e.g. '**/*.rs'."),
     );
     props.insert(
         "base_dir".to_string(),
-        json!({"type": "string", "description": "Base directory for glob search."}),
+        schema::string_property("Base directory for glob search."),
     );
     schema::object_input_schema(props, &["pattern"])
 }
@@ -506,7 +506,7 @@ pub fn grep_search_schema() -> Arc<Map<String, Value>> {
     let mut props = Map::new();
     props.insert(
         "query".to_string(),
-        json!({"type": "string", "description": "Search query (regex or plain text)."}),
+        schema::string_property("Search query (regex or plain text)."),
     );
     props.insert(
         "is_regex".to_string(),
@@ -514,15 +514,15 @@ pub fn grep_search_schema() -> Arc<Map<String, Value>> {
     );
     props.insert(
         "base_dir".to_string(),
-        json!({"type": "string", "description": "Directory root to search from."}),
+        schema::string_property("Directory root to search from."),
     );
     props.insert(
         "include_pattern".to_string(),
-        json!({"type": "string", "description": "Optional glob filter for files."}),
+        schema::string_property("Optional glob filter for files."),
     );
     props.insert(
         "max_results".to_string(),
-        json!({"type": "integer", "description": "Maximum number of matches to return."}),
+        schema::integer_property("Maximum number of matches to return."),
     );
     schema::object_input_schema(props, &["query"])
 }
@@ -531,11 +531,11 @@ pub fn fetch_webpage_schema() -> Arc<Map<String, Value>> {
     let mut props = Map::new();
     props.insert(
         "url".to_string(),
-        json!({"type": "string", "description": "HTTP/HTTPS URL to fetch."}),
+        schema::string_property("HTTP/HTTPS URL to fetch."),
     );
     props.insert(
         "query".to_string(),
-        json!({"type": "string", "description": "Optional query to filter extracted text."}),
+        schema::string_property("Optional query to filter extracted text."),
     );
     schema::object_input_schema(props, &["url"])
 }
@@ -544,11 +544,11 @@ pub fn write_file_schema() -> Arc<Map<String, Value>> {
     let mut props = Map::new();
     props.insert(
         "path".to_string(),
-        json!({"type": "string", "description": "Absolute or scoped-relative file path."}),
+        schema::string_property("Absolute or scoped-relative file path."),
     );
     props.insert(
         "content".to_string(),
-        json!({"type": "string", "description": "UTF-8 content to write."}),
+        schema::string_property("UTF-8 content to write."),
     );
     schema::object_input_schema(props, &["path", "content"])
 }
@@ -557,15 +557,15 @@ pub fn replace_in_file_schema() -> Arc<Map<String, Value>> {
     let mut props = Map::new();
     props.insert(
         "path".to_string(),
-        json!({"type": "string", "description": "Absolute or scoped-relative file path."}),
+        schema::string_property("Absolute or scoped-relative file path."),
     );
     props.insert(
         "old_str".to_string(),
-        json!({"type": "string", "description": "Exact string to replace."}),
+        schema::string_property("Exact string to replace."),
     );
     props.insert(
         "new_str".to_string(),
-        json!({"type": "string", "description": "Replacement string."}),
+        schema::string_property("Replacement string."),
     );
     schema::object_input_schema(props, &["path", "old_str", "new_str"])
 }

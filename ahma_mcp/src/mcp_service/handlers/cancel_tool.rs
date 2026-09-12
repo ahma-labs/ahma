@@ -1,3 +1,4 @@
+use super::common;
 use crate::AhmaMcpService;
 use crate::mcp_service::schema;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData as McpError};
@@ -16,10 +17,9 @@ pub fn cancel_schema() -> Arc<Map<String, Value>> {
     );
     props.insert(
         "all".to_string(),
-        serde_json::json!({
-            "type": "boolean",
-            "description": "Cancel EVERY in-flight operation and reap each one's process tree (cargo/rustc/sccache). The clean alternative to killing and restarting the server when work wedges. Omit `id` when set.",
-        }),
+        schema::boolean_property(
+            "Cancel EVERY in-flight operation and reap each one's process tree (cargo/rustc/sccache). The clean alternative to killing and restarting the server when work wedges. Omit `id` when set.",
+        ),
     );
     props.insert(
         "reason".to_string(),
@@ -37,10 +37,7 @@ impl AhmaMcpService {
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
         // Optional cancellation reason to aid debugging (shared by both modes).
-        let reason: Option<String> = args
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let reason: Option<String> = common::opt_str(&args, "reason");
 
         // Bulk mode: `all: true` cancels every in-flight operation.
         if args.get("all").and_then(Value::as_bool) == Some(true) {

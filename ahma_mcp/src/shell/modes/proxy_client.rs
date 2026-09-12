@@ -1667,9 +1667,6 @@ async fn run_proxy_client_http(
     let (session_id, protocol_version) =
         perform_http_initialize(&client, &mcp_url, &mut stdio, handshake_deadline).await?;
 
-    // The bridge successfully responded to initialize — it is alive and communicating.
-    let bridge_responded = true;
-
     tracing::info!(
         url = %mcp_url,
         session_id = %session_id,
@@ -1706,7 +1703,9 @@ async fn run_proxy_client_http(
         .send()
         .await;
 
-    Ok(bridge_responded)
+    // The bridge successfully responded to initialize, so it was reachable
+    // and communicating — nothing past that point can make this `false`.
+    Ok(true)
 }
 
 // `run_transport_proxy` and the `RoleClient` import are Unix-only, so these
