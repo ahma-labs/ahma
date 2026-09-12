@@ -199,35 +199,29 @@ impl HttpMcpTransport {
                     continue;
                 }
                 Action::PerformAuth(notify) => {
-                    if let Some(oauth_client) = &self.oauth_client {
-                        info!("No token found, starting authentication flow.");
-                        match self.perform_oauth_flow(oauth_client).await {
-                            Ok(new_token) => {
-                                self.auth_state.transition(|state| {
-                                    *state = AuthState::Authenticated(new_token);
-                                });
-                                info!("Authentication successful.");
-                                notify.notify_waiters();
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                self.auth_state.transition(|state| {
-                                    *state = AuthState::Unauthenticated;
-                                });
-                                notify.notify_waiters();
-                                return Err(e);
-                            }
+                    let result = match &self.oauth_client {
+                        Some(oauth_client) => {
+                            info!("No token found, starting authentication flow.");
+                            self.perform_oauth_flow(oauth_client).await
                         }
-                    } else {
-                        self.auth_state.transition(|state| {
-                            *state = AuthState::Unauthenticated;
-                        });
-                        notify.notify_waiters();
-                        return Err(McpHttpError::Auth(
+                        None => Err(McpHttpError::Auth(
                             "OAuth client not configured, but authentication is required."
                                 .to_string(),
-                        ));
-                    }
+                        )),
+                    };
+
+                    // One transition+notify+return for both outcomes, rather
+                    // than duplicating that sequence per error source.
+                    let (new_state, outcome) = match result {
+                        Ok(new_token) => {
+                            info!("Authentication successful.");
+                            (AuthState::Authenticated(new_token), Ok(()))
+                        }
+                        Err(e) => (AuthState::Unauthenticated, Err(e)),
+                    };
+                    self.auth_state.transition(|state| *state = new_state);
+                    notify.notify_waiters();
+                    return outcome;
                 }
             }
         }

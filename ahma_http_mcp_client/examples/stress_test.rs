@@ -59,6 +59,29 @@ const TOOL_CALL_RETRY_WINDOW_SECS: u64 = 10;
 const TOOL_CALL_RETRY_BACKOFF_MS: u64 = 100;
 const SANDBOX_INITIALIZING_MESSAGE: &str = "Sandbox initializing from client roots";
 
+/// Box-drawing border used by every banner printed by this tool, so the
+/// width (61 `═` characters) can't drift out of sync between the five call
+/// sites that used to retype it.
+const BOX_BORDER: &str = "═══════════════════════════════════════════════════════════";
+
+/// Print a boxed banner: a top border, one or more centered/left-aligned
+/// content lines (each already padded by the caller to line up inside the
+/// box), and a bottom border — via `println!` or `eprintln!` per `to_stderr`.
+fn print_boxed(lines: &[&str], to_stderr: bool) {
+    let emit = |s: String| {
+        if to_stderr {
+            eprintln!("{s}");
+        } else {
+            println!("{s}");
+        }
+    };
+    emit(format!("╔{BOX_BORDER}╗"));
+    for line in lines {
+        emit((*line).to_string());
+    }
+    emit(format!("╚{BOX_BORDER}╝"));
+}
+
 // ---------------------------------------------------------------------------
 // CLI arguments
 // ---------------------------------------------------------------------------
@@ -624,8 +647,12 @@ async fn run_sse_loop(
         }
 
         while let Some(event_end) = buffer.find("\n\n") {
-            let event_block = buffer[..event_end].to_string();
-            buffer = buffer[event_end + 2..].to_string();
+            // `drain` shifts only the remaining tail down in place, rather
+            // than reallocating and copying it into a fresh `String` (as
+            // `buffer[event_end + 2..].to_string()` did) on every event.
+            // The trailing blank line `parse_sse_event`'s `.lines()` sees is
+            // harmless: it yields no `data:`-prefixed line to join in.
+            let event_block: String = buffer.drain(..event_end + 2).collect();
 
             if let Some(msg) = parse_sse_event(&event_block) {
                 ctx.handle_message(&msg).await?;
@@ -893,22 +920,21 @@ async fn store_error_context(
     recent_lines: &[String],
     trailing_lines: &[String],
 ) {
-    let separator = "═══════════════════════════════════════════════════════════";
     let mut ctx = error_context.lock().await;
 
-    ctx.push(format!("╔{}╗", separator));
+    ctx.push(format!("╔{BOX_BORDER}╗"));
     ctx.push("║  ERROR CONTEXT (recent server output before error)       ║".to_string());
-    ctx.push(format!("╠{}╣", separator));
+    ctx.push(format!("╠{BOX_BORDER}╣"));
     push_marked_last(&mut ctx, recent_lines);
 
-    ctx.push(format!("╠{}╣", separator));
+    ctx.push(format!("╠{BOX_BORDER}╣"));
     ctx.push("║  FOLLOWING OUTPUT                                         ║".to_string());
-    ctx.push(format!("╠{}╣", separator));
+    ctx.push(format!("╠{BOX_BORDER}╣"));
     for line in trailing_lines {
         ctx.push(format!("    {}", line));
     }
 
-    ctx.push(format!("╚{}╝", separator));
+    ctx.push(format!("╚{BOX_BORDER}╝"));
 }
 
 /// Appends `lines` to `ctx`, marking the final entry with a `>>>` pointer so the
@@ -1073,9 +1099,10 @@ fn print_final_report(counters: &SharedCounters, elapsed: f64) {
     };
 
     println!();
-    println!("╔═══════════════════════════════════════════════════════════╗");
-    println!("║                     Test Results                          ║");
-    println!("╚═══════════════════════════════════════════════════════════╝");
+    print_boxed(
+        &["║                     Test Results                          ║"],
+        false,
+    );
     println!("  Total requests: {}", total);
     println!("  Successful: {} ({:.1}%)", success, success_rate);
     println!("  Errors: {}", errors);
@@ -1159,9 +1186,10 @@ async fn drain_clients(join_set: &mut JoinSet<Result<()>>) {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    println!("╔═══════════════════════════════════════════════════════════╗");
-    println!("║       AHMA HTTP Bridge Stress Test                        ║");
-    println!("╚═══════════════════════════════════════════════════════════╝");
+    print_boxed(
+        &["║       AHMA HTTP Bridge Stress Test                        ║"],
+        false,
+    );
     println!();
     println!("Configuration:");
     println!("  Port: {}", args.port);
@@ -1239,9 +1267,10 @@ async fn main() -> Result<()> {
 
 async fn print_server_error(server: &ServerManager) {
     eprintln!();
-    eprintln!("╔═══════════════════════════════════════════════════════════╗");
-    eprintln!("║             FAIL SERVER ERROR DETECTED                       ║");
-    eprintln!("╚═══════════════════════════════════════════════════════════╝");
+    print_boxed(
+        &["║             FAIL SERVER ERROR DETECTED                       ║"],
+        true,
+    );
     eprintln!();
     for line in server.get_error_context().await {
         eprintln!("{}", line);
@@ -1254,9 +1283,10 @@ async fn print_server_error(server: &ServerManager) {
 fn print_excessive_errors(counters: &SharedCounters) {
     let errors = counters.error.load(Ordering::Relaxed);
     eprintln!();
-    eprintln!("╔═══════════════════════════════════════════════════════════╗");
-    eprintln!("║       FAIL TOO MANY CLIENT ERRORS - ABORTING                 ║");
-    eprintln!("╚═══════════════════════════════════════════════════════════╝");
+    print_boxed(
+        &["║       FAIL TOO MANY CLIENT ERRORS - ABORTING                 ║"],
+        true,
+    );
     eprintln!();
     eprintln!("  Errors: {} with 0 successes", errors);
     eprintln!("  This indicates a fundamental problem with the server or protocol.");
