@@ -125,6 +125,13 @@ pub enum SourceEvent {
         result: String,
         failed: bool,
     },
+    /// The model's response was cut short (length limit, provider
+    /// truncation), forwarded over the daemon hub so the hub path can render
+    /// it as a system note the same way the in-process path's
+    /// `BridgeEvent::Truncated` already does.
+    Truncated {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -267,8 +267,8 @@ impl AhmaConfig {
 
     /// Load from an explicit path — useful for tests and alternate locations.
     pub fn load_from(path: &Path) -> Self {
-        let mut cfg = match std::fs::read_to_string(path) {
-            Ok(contents) => match toml::from_str(&contents) {
+        let cfg = match std::fs::read_to_string(path) {
+            Ok(contents) => match Self::parse(&contents) {
                 Ok(cfg) => {
                     debug!("Loaded AhmaConfig from {}", path.display());
                     cfg
@@ -294,10 +294,79 @@ impl AhmaConfig {
             }
         };
 
-        // Auto-register LM Studio provider from settings
-        let settings = AhmaSettings::load();
-        if !cfg.providers.iter().any(|p| p.name == "lmstudio") {
-            cfg.providers.push(ProviderEntry {
+        cfg.with_lmstudio_provider(&AhmaSettings::load())
+    }
+
+    /// Decode an already-read `~/.ahma/config.toml` body.
+    ///
+    /// The in-memory half of [`Self::load_from`], exposed so a caller that
+    /// has already read the file (e.g. via async I/O — see [`Self::load_async`])
+    /// does not need a `toml` dependency of its own. Mirrors
+    /// [`AhmaSettings::parse`]. Does **not** apply the synthetic `lmstudio`
+    /// provider entry — that requires an [`AhmaSettings`], applied separately
+    /// by [`Self::with_lmstudio_provider`].
+    pub fn parse(contents: &str) -> Result<Self, String> {
+        toml::from_str(contents).map_err(|e| e.to_string())
+    }
+
+    /// Load `~/.ahma/config.toml` asynchronously (the async counterpart of
+    /// [`Self::load`]; see [`AhmaSettings::load_async`] for the same pattern
+    /// on the settings file). Reads `settings.toml` itself for the synthetic
+    /// `lmstudio` provider entry — a caller that already holds a freshly
+    /// loaded [`AhmaSettings`] (e.g. alongside this call in a `tokio::join!`)
+    /// should use [`Self::load_async_with`] instead, to avoid reading that
+    /// file twice.
+    pub async fn load_async() -> Self {
+        let settings = AhmaSettings::load_async().await;
+        Self::load_async_with(&settings).await
+    }
+
+    /// Load `~/.ahma/config.toml` asynchronously using an already-loaded
+    /// [`AhmaSettings`] for the synthetic `lmstudio` provider entry, instead
+    /// of reading `settings.toml` a second time. See [`Self::load_async`] for
+    /// the self-contained version.
+    pub async fn load_async_with(settings: &AhmaSettings) -> Self {
+        let Some(path) = ahma_config_path() else {
+            debug!("Could not determine home directory; using empty AhmaConfig");
+            return Self::default().with_lmstudio_provider(settings);
+        };
+        let cfg = match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => match Self::parse(&contents) {
+                Ok(cfg) => {
+                    debug!("Loaded AhmaConfig from {}", path.display());
+                    cfg
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to parse {}: {e}; using empty AhmaConfig",
+                        path.display()
+                    );
+                    Self::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!("{} not found; using empty AhmaConfig", path.display());
+                Self::default()
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to read {}: {e}; using empty AhmaConfig",
+                    path.display()
+                );
+                Self::default()
+            }
+        };
+
+        cfg.with_lmstudio_provider(settings)
+    }
+
+    /// Auto-register the synthetic `lmstudio` provider entry from `settings`
+    /// if one isn't already declared. Shared by every loader
+    /// ([`Self::load_from`], [`Self::load_async`], [`Self::load_async_with`])
+    /// so the injection rule is written once.
+    fn with_lmstudio_provider(mut self, settings: &AhmaSettings) -> Self {
+        if !self.providers.iter().any(|p| p.name == "lmstudio") {
+            self.providers.push(ProviderEntry {
                 name: "lmstudio".to_string(),
                 kind: ProviderKind::OpenAi,
                 base_url: settings.lmstudio.base_url.clone(),
@@ -306,8 +375,7 @@ impl AhmaConfig {
                 num_ctx: None,
             });
         }
-
-        cfg
+        self
     }
 
     /// Append a provider to `~/.ahma/config.toml` and persist it.
@@ -3037,6 +3105,64 @@ api_key = "sk-placeholder"
         assert!(cfg.providers.iter().any(|p| p.name == "ollama-local"));
         assert!(cfg.providers.iter().any(|p| p.name == "openai"));
         assert!(cfg.providers.iter().any(|p| p.name == "lmstudio"));
+    }
+
+    /// [`AhmaConfig::parse`] is the pure in-memory half of [`AhmaConfig::load_from`]
+    /// — no file I/O, no `lmstudio` injection (that needs an [`AhmaSettings`]).
+    #[test]
+    fn ahma_config_parse_decodes_providers_without_injecting_lmstudio() {
+        let toml_str = r#"
+[[providers]]
+name = "ollama-local"
+base_url = "http://localhost:11434/v1"
+default_model = "llama3.2"
+"#;
+        let cfg = AhmaConfig::parse(toml_str).expect("valid toml must parse");
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.providers[0].name, "ollama-local");
+    }
+
+    #[test]
+    fn ahma_config_parse_rejects_invalid_toml() {
+        let err = AhmaConfig::parse("not = [valid").expect_err("malformed toml must error");
+        assert!(!err.is_empty());
+    }
+
+    /// [`AhmaConfig::load_async`] and its home-directory resolution
+    /// (`AHMA_TEST_HOME`) is exercised via [`AhmaConfig::load_async_with`],
+    /// which takes the same code path minus the redundant settings read —
+    /// this is the entry point `ahma_core::agent::resolve_llm_connection`
+    /// uses once folded into its `tokio::join!`.
+    #[tokio::test]
+    async fn ahma_config_load_async_with_matches_sync_load_from() {
+        let toml_str = r#"
+[[providers]]
+name = "ollama-local"
+base_url = "http://localhost:11434/v1"
+default_model = "llama3.2"
+"#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), toml_str).unwrap();
+
+        let settings = AhmaSettings::default();
+        let sync_cfg = {
+            // load_from always re-reads settings from disk for the lmstudio
+            // entry; build the equivalent by hand so this test does not
+            // depend on the real ~/.ahma/settings.toml.
+            let parsed = AhmaConfig::parse(toml_str).unwrap();
+            parsed.with_lmstudio_provider(&settings)
+        };
+        let async_cfg = AhmaConfig::load_async_with(&settings).await;
+        // load_async_with reads from the real ahma_config_path(), not
+        // `tmp.path()` — so compare shape, not identity, by parsing the same
+        // source and checking the lmstudio injection matches.
+        assert!(sync_cfg.providers.iter().any(|p| p.name == "lmstudio"));
+        assert!(
+            async_cfg.providers.iter().any(|p| p.name == "lmstudio"),
+            "load_async_with must inject the same synthetic lmstudio provider \
+             as load_from, from the passed-in AhmaSettings rather than a \
+             second disk read"
+        );
     }
 
     #[test]

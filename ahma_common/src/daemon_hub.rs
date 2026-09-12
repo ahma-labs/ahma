@@ -5225,6 +5225,15 @@ mod relay_wire_compat {
             }),
             json!({"type": "AgentError", "error": "boom"}),
         );
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::Truncated {
+                reason: "length".into(),
+            }),
+            DaemonMsg::Relay(HubRelay::Truncated {
+                reason: "length".into(),
+            }),
+            json!({"type": "Truncated", "reason": "length"}),
+        );
     }
 
     #[test]

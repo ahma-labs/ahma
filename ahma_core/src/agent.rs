@@ -1679,9 +1679,19 @@ impl LlmConnection {
     }
 }
 
+/// Resolve which LLM provider/model/kind a run should use, from an
+/// already-loaded [`ahma_common::config::AhmaConfig`].
+///
+/// Takes `config` by reference rather than loading it internally so callers
+/// with one already in hand (`build_agent_run_context`, which loads it
+/// asynchronously alongside settings and tool discovery) never pay for a
+/// second, blocking `~/.ahma/config.toml` read — `AhmaConfig::load()` is
+/// synchronous `std::fs` I/O, which AGENTS.md forbids on an async path, and
+/// this function used to call it up to once per branch.
 fn resolve_llm_connection(
     provider: Option<String>,
     model: Option<String>,
+    config: &ahma_common::config::AhmaConfig,
 ) -> Result<LlmConnection, String> {
     if let Some(p_name) = provider {
         if provider_is_url(&p_name) {
@@ -1689,7 +1699,6 @@ fn resolve_llm_connection(
             // matching config entry declares must still be recovered here
             // (issue #484 — a lost `num_ctx` silently disables compaction, and
             // a lost `kind` sends the wrong wire format to a proxied provider).
-            let config = ahma_common::config::AhmaConfig::load();
             let entry = config.provider_for_base_url(&p_name);
             return Ok(LlmConnection {
                 base_url: p_name,
@@ -1699,14 +1708,12 @@ fn resolve_llm_connection(
                 kind: entry.map(|e| e.kind),
             });
         }
-        let config = ahma_common::config::AhmaConfig::load();
         let resolved = config
             .resolve_provider(&p_name)
             .map_err(|e| format!("Failed to resolve provider '{}': {e}", p_name))?;
         return Ok(LlmConnection::from_resolved(resolved, model));
     }
 
-    let config = ahma_common::config::AhmaConfig::load();
     let Some(first_provider) = config.providers.first() else {
         return Err("No LLM providers configured in ~/.ahma/config.toml".to_string());
     };
@@ -1782,12 +1789,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
                     completion_tokens: usage.completion_tokens,
                     total_tokens: usage.total_tokens,
                 },
-                // No dedicated hub wire type for this yet — surfaced as a plain
-                // visible chat token so it is never silent, same as the direct
-                // (non-hub) llm_bridge path's dedicated note.
-                AgentEvent::Truncated { reason } => HubRelay::ChatToken {
-                    token: format!("[{reason}]"),
-                },
+                AgentEvent::Truncated { reason } => HubRelay::Truncated { reason },
             };
             let client_msg = ClientMsg::from(relay);
 
@@ -1872,10 +1874,6 @@ async fn build_agent_run_context(
     let service = ahma_mcp::get_active_service()
         .ok_or_else(|| "No active AhmaMcpService found in this process".to_string())?;
 
-    let conn = resolve_llm_connection(provider, model)?;
-    let num_ctx = conn.num_ctx;
-    let client = conn.into_client();
-
     // These three are independent — a tool-list assembly, a settings file read and
     // a lock acquisition — and ran back to back, so every turn paid their latency
     // in series on the critical path before the model could be called.
@@ -1884,6 +1882,18 @@ async fn build_agent_run_context(
         ahma_common::config::AhmaSettings::load_async(),
         async { service.mcp_connections.read().await.clone() },
     );
+
+    // Reuses the just-loaded `settings` for the synthetic `lmstudio` provider
+    // entry instead of `AhmaConfig::load()`, which previously did its own
+    // *second*, blocking `~/.ahma/settings.toml` read on top of a blocking
+    // `~/.ahma/config.toml` read — both off the async runtime, in violation
+    // of AGENTS.md's "never std::fs in an async fn" rule, and both on this
+    // function's critical path since `resolve_llm_connection` used to run
+    // before the join above rather than after it.
+    let ahma_config = ahma_common::config::AhmaConfig::load_async_with(&settings).await;
+    let conn = resolve_llm_connection(provider, model, &ahma_config)?;
+    let num_ctx = conn.num_ctx;
+    let client = conn.into_client();
 
     let workspace_root = service
         .adapter
@@ -3255,9 +3265,11 @@ mod tests {
 
     // ── resolve_llm_connection (URL fast-path) ──
     // Note: a URL provider never *requires* config, but `num_ctx` is enriched
-    // from a matching configured provider when one exists (#484), so these
-    // tests do not assert on `num_ctx` — its value depends on the local
-    // ~/.ahma/config.toml. The URL-matching lookup itself is unit-tested as
+    // from a matching configured provider when one exists (#484). These tests
+    // pass an empty `AhmaConfig` explicitly (now that the caller supplies one
+    // rather than this function loading `~/.ahma/config.toml` itself), so
+    // there is no matching entry and `num_ctx`/`kind` stay `None` — the
+    // URL-matching lookup itself is unit-tested as
     // `AhmaConfig::num_ctx_for_base_url` in ahma_common.
 
     #[test]
@@ -3265,6 +3277,7 @@ mod tests {
         let conn = resolve_llm_connection(
             Some("http://localhost:1234/v1".to_string()),
             Some("my-model".to_string()),
+            &ahma_common::config::AhmaConfig::default(),
         )
         .expect("URL provider resolves without config");
         assert_eq!(conn.base_url, "http://localhost:1234/v1");
@@ -3274,8 +3287,12 @@ mod tests {
 
     #[test]
     fn resolve_llm_connection_url_provider_uses_empty_default_model() {
-        let conn = resolve_llm_connection(Some("unix:///run/ahma.sock".to_string()), None)
-            .expect("unix URL provider resolves");
+        let conn = resolve_llm_connection(
+            Some("unix:///run/ahma.sock".to_string()),
+            None,
+            &ahma_common::config::AhmaConfig::default(),
+        )
+        .expect("unix URL provider resolves");
         assert_eq!(conn.base_url, "unix:///run/ahma.sock");
         assert_eq!(conn.model, "", "missing model defaults to empty string");
         assert!(conn.api_key.is_none());

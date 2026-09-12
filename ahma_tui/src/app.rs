@@ -4283,7 +4283,8 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         | SourceEvent::AgentError { .. }
         | SourceEvent::Usage { .. }
         | SourceEvent::ToolCallStarted { .. }
-        | SourceEvent::ToolCallFinished { .. } => {
+        | SourceEvent::ToolCallFinished { .. }
+        | SourceEvent::Truncated { .. } => {
             handle_source_chat_event(event, state);
         }
     }
@@ -4403,6 +4404,16 @@ fn handle_source_chat_event(
         SourceEvent::ToolCallFinished { id, result, failed } => {
             state.mark_stream_activity(crate::state::LivenessState::Thinking);
             state.chat.finish_tool_call(&id, result, failed);
+            state.chat_scroll = 0;
+        }
+        SourceEvent::Truncated { reason } => {
+            // Same rendering as the in-process BridgeEvent::Truncated: a
+            // visible note in the transcript, not silently folded into the
+            // model's own output.
+            state.chat.push(crate::state::ChatEntry::Assistant {
+                content: format!("[{reason}]"),
+                streaming: false,
+            });
             state.chat_scroll = 0;
         }
         _ => {}
