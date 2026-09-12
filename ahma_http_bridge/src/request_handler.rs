@@ -105,10 +105,7 @@ fn request_timeout_response(
     match mode {
         ResponseMode::Json => json_response_with_status(StatusCode::OK, body),
         ResponseMode::Sse => {
-            let (event_id, json_str) = session_manager
-                .get_session(session_id)
-                .map(|session| session_sse_event(&session, &body))
-                .unwrap_or_else(|| (1, serialize_sse_data(&body)));
+            let (event_id, json_str) = sse_event_for_session(session_manager, session_id, &body);
             sse_single_event_response_with_id(event_id, json_str)
         }
     }
@@ -311,7 +308,7 @@ async fn handle_routed_sampling_request(
         Ok(Ok(response)) => {
             let mut final_response = response;
             final_response["id"] = original_id;
-            encode_routed_response(session_manager, session_id, is_sse, &final_response)
+            encode_routed_response(session_manager, session_id, is_sse, final_response)
         }
         Ok(Err(_)) => error_response(original_id, -32603, "Routed request sender dropped"),
         Err(_) => {
@@ -331,21 +328,13 @@ fn encode_routed_response(
     session_manager: &SessionManager,
     session_id: &str,
     is_sse: bool,
-    response: &Value,
+    response: Value,
 ) -> Response {
     if !is_sse {
-        return with_session_header(json_response(response.clone()), session_id);
+        return with_session_header(json_response(response), session_id);
     }
-    match session_manager.get_session(session_id) {
-        Some(session) => {
-            let (id, json_str) = session_sse_event(&session, response);
-            with_session_header(sse_single_event_response_with_id(id, json_str), session_id)
-        }
-        None => with_session_header(
-            sse_single_event_response_with_id(1, serialize_sse_data(response)),
-            session_id,
-        ),
-    }
+    let (id, json_str) = sse_event_for_session(session_manager, session_id, &response);
+    with_session_header(sse_single_event_response_with_id(id, json_str), session_id)
 }
 
 /// How the response to a `POST /mcp` request is encoded on the wire.
@@ -1236,7 +1225,7 @@ async fn mark_session_initialized(
     }
     if let Some(session) = session_manager.get_session(session_id) {
         match session.mark_mcp_initialized().await {
-            Ok(true) | Ok(false) => {
+            Ok(_) => {
                 // Auto-lock from default_scope if configured so that clients
                 // that don't send roots/list (or don't open an SSE stream) still work.
                 session_manager.auto_lock_if_default_scope(session_id).await;
@@ -1461,6 +1450,23 @@ fn session_sse_event(session: &crate::session::Session, value: &Value) -> (u64, 
     (id, json_str)
 }
 
+/// Look up `session_id` and assign `value` an SSE event ID from its replay
+/// buffer, or fall back to event ID 1 with no replay history when the session
+/// has already vanished (e.g. terminated mid-request).
+///
+/// Shared by every call site that needs "the SSE encoding of a response for
+/// this session, best-effort" so the fallback behavior can't drift between them.
+fn sse_event_for_session(
+    session_manager: &SessionManager,
+    session_id: &str,
+    value: &Value,
+) -> (u64, String) {
+    session_manager
+        .get_session(session_id)
+        .map(|session| session_sse_event(&session, value))
+        .unwrap_or_else(|| (1, serialize_sse_data(value)))
+}
+
 /// Record a lagged-broadcast gap on the session and render the SSE comment
 /// that discloses it.
 ///
@@ -1629,10 +1635,7 @@ fn build_initialize_sse_response(
     session_id: &str,
     response: &Value,
 ) -> Response {
-    let (event_id, json_str) = session_manager
-        .get_session(session_id)
-        .map(|session| session_sse_event(&session, response))
-        .unwrap_or_else(|| (1, serialize_sse_data(response)));
+    let (event_id, json_str) = sse_event_for_session(session_manager, session_id, response);
     sse_single_event_response_with_id(event_id, json_str)
 }
 

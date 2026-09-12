@@ -194,11 +194,7 @@ fn detect_local_debug_binary(base_dir: &Path) -> Option<String> {
 /// Returns `Ok(None)` when `path` is `None`.
 fn load_token_file(path: Option<&Path>) -> anyhow::Result<Option<String>> {
     let Some(p) = path else { return Ok(None) };
-    let raw = std::fs::read_to_string(p)
-        .map_err(|e| anyhow::anyhow!("Failed to read token file {}: {e}", p.display()))?;
-    let token = raw.trim().to_owned();
-    anyhow::ensure!(!token.is_empty(), "Token file {} is empty", p.display());
-    Ok(Some(token))
+    ahma_http_bridge::read_token_from_file(p).map(Some)
 }
 
 #[cfg(test)]
