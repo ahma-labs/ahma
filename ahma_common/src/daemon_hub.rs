@@ -407,6 +407,15 @@ pub enum HubRelay {
     AgentDone,
     /// The agent turn encountered an error.
     AgentError { error: String },
+    /// The model's response was cut short (length limit, provider truncation).
+    /// Kept distinct from [`Self::ChatToken`] so the TUI can render it as a
+    /// system note rather than model output — previously folded onto
+    /// `ChatToken` (`[{reason}]`) because this variant did not exist yet; a
+    /// daemon running a version of this crate from before this variant was
+    /// added will fail to deserialize a `Truncated` relay from a newer
+    /// instance until it is restarted (see the module doc's wire-compat note
+    /// — this is the accepted, one-time cost of a real addition).
+    Truncated { reason: String },
 }
 
 impl From<HubRelay> for ClientMsg {

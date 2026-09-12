@@ -125,7 +125,7 @@ async fn test_chat_completion_error_is_typed_and_classified() {
 
     let client = LlmClient::new(server.uri(), "test-model", None);
     let err = client
-        .chat_completion_with_tools(vec![json!({"role": "user", "content": "hi"})], &[])
+        .chat_completion_with_tools(&[json!({"role": "user", "content": "hi"})], &[])
         .await
         .expect_err("401 must fail the request");
 
@@ -224,7 +224,7 @@ async fn test_chat_completion_with_tools_success() {
 
     let client = LlmClient::new(server.uri(), "test-model", None);
     let response = client
-        .chat_completion_with_tools(vec![json!({"role": "user", "content": "hi"})], &[])
+        .chat_completion_with_tools(&[json!({"role": "user", "content": "hi"})], &[])
         .await
         .unwrap();
 
@@ -296,7 +296,7 @@ async fn chat_completion_retries_transient_5xx_then_succeeds() {
 
     let client = LlmClient::new(server.uri(), "test-model", None);
     let resp = client
-        .chat_completion_with_tools(vec![], &[])
+        .chat_completion_with_tools(&[], &[])
         .await
         .expect("retry should recover from transient 503s");
     assert_eq!(resp.content, "recovered");
@@ -317,7 +317,7 @@ async fn chat_completion_does_not_retry_4xx() {
 
     let client = LlmClient::new(server.uri(), "test-model", None);
     let err = client
-        .chat_completion_with_tools(vec![], &[])
+        .chat_completion_with_tools(&[], &[])
         .await
         .expect_err("4xx must surface as an error, not be retried");
     assert!(err.to_string().contains("400"), "got: {err}");

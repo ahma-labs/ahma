@@ -334,7 +334,7 @@ async fn maybe_compact_conversation(
     })];
 
     match client
-        .chat_completion_with_tools(compaction_messages, &[])
+        .chat_completion_with_tools(&compaction_messages, &[])
         .await
     {
         Ok(resp) if !resp.content.trim().is_empty() => {
@@ -376,9 +376,9 @@ async fn maybe_compact_conversation(
 
 /// Convert internal `{role, content}` chat messages into the MCP sampling
 /// wire format, where content is a typed `{type: "text", text}` object.
-fn to_mcp_content_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+fn to_mcp_content_messages(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
     messages
-        .into_iter()
+        .iter()
         .map(|msg| {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -423,7 +423,7 @@ fn build_sampling_client(mcp: &McpChatConfig) -> Result<(reqwest::Client, String
 async fn call_mcp_sampling_routed(
     mcp: &McpChatConfig,
     target_label: &str,
-    messages: Vec<serde_json::Value>,
+    messages: &[serde_json::Value],
     system_prompt: Option<&str>,
 ) -> Result<ahma_llm_monitor::client::ChatCompletionResponse, String> {
     let (client, url) = build_sampling_client(mcp)?;
@@ -514,7 +514,7 @@ async fn run_mcp_sampling_chat(
         .into_iter()
         .map(|msg| serde_json::json!({"role": msg.role, "content": msg.content}))
         .collect();
-    match call_mcp_sampling_routed(&mcp_cfg, &target_label, msg_vals, system_prompt.as_deref())
+    match call_mcp_sampling_routed(&mcp_cfg, &target_label, &msg_vals, system_prompt.as_deref())
         .await
     {
         Ok(resp) => {
@@ -748,13 +748,7 @@ async fn fetch_completion_via_mcp_sampling(
             .await;
         return None;
     };
-    match call_mcp_sampling_routed(
-        mcp_cfg,
-        target_label,
-        msg_json.to_vec(),
-        system_prompt.as_deref(),
-    )
-    .await
+    match call_mcp_sampling_routed(mcp_cfg, target_label, msg_json, system_prompt.as_deref()).await
     {
         Ok(c) => Some((c, false)),
         Err(e) => {
@@ -787,7 +781,7 @@ async fn stream_completion_via_http(
         }
     });
     let result = client
-        .chat_completion_with_tools_streaming(msg_json.to_vec(), tool_defs, dtx)
+        .chat_completion_with_tools_streaming(msg_json, tool_defs, dtx)
         .await;
     let _ = forwarder.await;
     result
@@ -3450,7 +3444,7 @@ mod tests {
         let resp = call_mcp_sampling_routed(
             &cfg,
             "label",
-            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            &[serde_json::json!({"role": "user", "content": "hi"})],
             None,
         )
         .await
@@ -3466,7 +3460,7 @@ mod tests {
     async fn call_mcp_sampling_routed_http_error() {
         let base = mock_post_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
         let cfg = cfg_session(&base);
-        let err = call_mcp_sampling_routed(&cfg, "label", vec![], None)
+        let err = call_mcp_sampling_routed(&cfg, "label", &[], None)
             .await
             .expect_err("non-2xx must error");
         assert!(err.contains("HTTP 500"), "{err}");
@@ -3477,7 +3471,7 @@ mod tests {
     async fn call_mcp_sampling_routed_json_error_field() {
         let base = mock_post_json(serde_json::json!({"error": {"message": "nope"}})).await;
         let cfg = cfg_session(&base);
-        let err = call_mcp_sampling_routed(&cfg, "label", vec![], Some("sys"))
+        let err = call_mcp_sampling_routed(&cfg, "label", &[], Some("sys"))
             .await
             .expect_err("JSON-RPC error must propagate");
         assert_eq!(err, "nope");
@@ -3487,7 +3481,7 @@ mod tests {
     async fn call_mcp_sampling_routed_missing_result() {
         let base = mock_post_json(serde_json::json!({})).await;
         let cfg = cfg_session(&base);
-        let err = call_mcp_sampling_routed(&cfg, "label", vec![], None)
+        let err = call_mcp_sampling_routed(&cfg, "label", &[], None)
             .await
             .expect_err("missing result must error");
         assert_eq!(err, "Missing result in response");
@@ -3497,7 +3491,7 @@ mod tests {
     async fn call_mcp_sampling_routed_missing_content() {
         let base = mock_post_json(serde_json::json!({"result": {}})).await;
         let cfg = cfg_session(&base);
-        let err = call_mcp_sampling_routed(&cfg, "label", vec![], None)
+        let err = call_mcp_sampling_routed(&cfg, "label", &[], None)
             .await
             .expect_err("missing content array must error");
         assert_eq!(err, "Missing or invalid content in result");

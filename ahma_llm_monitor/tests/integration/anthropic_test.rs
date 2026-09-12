@@ -96,7 +96,7 @@ async fn chat_completion_parses_tool_use_blocks() {
     })];
 
     let resp = client
-        .chat_completion_with_tools(vec![json!({"role": "user", "content": "status?"})], &tools)
+        .chat_completion_with_tools(&[json!({"role": "user", "content": "status?"})], &tools)
         .await
         .expect("request should succeed");
 
@@ -131,7 +131,7 @@ async fn chat_completion_adaptive_thinking_in_request_body() {
     // Default Anthropic flavor enables adaptive thinking.
     let client = anthropic_client(server.uri());
     let resp = client
-        .chat_completion_with_tools(vec![json!({"role": "user", "content": "hi"})], &[])
+        .chat_completion_with_tools(&[json!({"role": "user", "content": "hi"})], &[])
         .await
         .expect("request should succeed");
     assert_eq!(resp.content, "done");
@@ -189,7 +189,7 @@ async fn http_error_surfaces_as_parse_error() {
 
     let client = anthropic_client(server.uri());
     let err = client
-        .chat_completion_with_tools(vec![json!({"role": "user", "content": "hi"})], &[])
+        .chat_completion_with_tools(&[json!({"role": "user", "content": "hi"})], &[])
         .await
         .expect_err("401 should be an error");
     assert!(err.to_string().contains("401"), "got: {err}");

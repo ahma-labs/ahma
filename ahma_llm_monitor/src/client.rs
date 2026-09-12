@@ -622,10 +622,10 @@ impl LlmClient {
     /// Send a non-streaming chat completion with OpenAI-compatible tools.
     pub async fn chat_completion_with_tools(
         &self,
-        messages: Vec<Value>,
+        messages: &[Value],
         tools: &[Value],
     ) -> Result<ChatCompletionResponse, LlmMonitorError> {
-        let (url, body) = self.build_chat_completion_request_payload(&messages, tools);
+        let (url, body) = self.build_chat_completion_request_payload(messages, tools);
 
         let started = std::time::Instant::now();
         info!(
@@ -747,7 +747,7 @@ impl LlmClient {
     /// visible content as a single delta so callers still see output.
     pub async fn chat_completion_with_tools_streaming(
         &self,
-        messages: Vec<Value>,
+        messages: &[Value],
         tools: &[Value],
         deltas: tokio::sync::mpsc::Sender<StreamDelta>,
     ) -> Result<ChatCompletionResponse, LlmMonitorError> {
