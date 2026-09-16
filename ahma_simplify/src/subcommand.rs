@@ -22,7 +22,7 @@ use analysis::{
     AnalyzerRegistry, ExternalMetrics, ScanOptions, get_project_name, is_cargo_workspace,
     perform_analysis, run_analysis,
 };
-use analysis::{dead_code, source_tree};
+use analysis::{altitude, dead_code, source_tree};
 use models::{FileSimplicity, MetricsResults, MultiLensReport, resolve_extensions};
 use report::{create_report_md, generate_ai_fix_prompt, generate_report};
 
@@ -89,13 +89,24 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
         Vec::new()
     };
 
-    let dead_symbols = if lenses.contains(&Lens::DeadCode) {
-        let trees: Vec<_> = scan
-            .sources
+    // Both structural lenses read the same parsed trees, so parse once.
+    let trees: Vec<_> = if lenses.contains(&Lens::DeadCode) || lenses.contains(&Lens::Altitude) {
+        scan.sources
             .iter()
             .filter_map(|(path, _)| source_tree::parse_source_tree(path))
-            .collect();
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let dead_symbols = if lenses.contains(&Lens::DeadCode) {
         dead_code::find_dead_symbols(&scan.sources, &trees)
+    } else {
+        Vec::new()
+    };
+
+    let altitude_chains = if lenses.contains(&Lens::Altitude) {
+        altitude::find_altitude_chains(&trees)
     } else {
         Vec::new()
     };
@@ -104,6 +115,7 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
         complexity_files: files_simplicity,
         duplicates,
         dead_symbols,
+        altitude_chains,
         ..Default::default()
     };
     if lens_report.is_empty() {
@@ -573,7 +585,12 @@ mod tests {
         assert!(!args.diff);
         assert_eq!(
             parse_lenses(&args.lens).unwrap(),
-            vec![Lens::Complexity, Lens::Reuse, Lens::DeadCode]
+            vec![
+                Lens::Complexity,
+                Lens::Reuse,
+                Lens::DeadCode,
+                Lens::Altitude
+            ]
         );
     }
 

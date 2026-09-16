@@ -1,5 +1,7 @@
 use super::analysis::{get_package_name, get_relative_path};
-use super::models::{DeadSymbol, DuplicateGroup, FileSimplicity, Language, MultiLensReport};
+use super::models::{
+    AltitudeChain, DeadSymbol, DuplicateGroup, FileSimplicity, Language, MultiLensReport,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -162,9 +164,58 @@ pub fn create_report_md(
     write_emergencies(&mut report, files, limit, base_dir);
     write_duplicates(&mut report, &lenses.duplicates, limit, base_dir);
     write_dead_symbols(&mut report, &lenses.dead_symbols, limit, base_dir);
+    write_altitude_chains(&mut report, &lenses.altitude_chains, limit, base_dir);
     write_glossary(&mut report);
 
     report
+}
+
+/// Renders the altitude lens. A forwarding layer is frequently deliberate — a
+/// public facade over an internal module, a trait impl delegating to a free
+/// function, a platform shim — so a chain is a question about where the logic
+/// belongs, not evidence of a mistake.
+fn write_altitude_chains(
+    report: &mut String,
+    chains: &[AltitudeChain],
+    limit: usize,
+    base_dir: &Path,
+) {
+    if chains.is_empty() {
+        return;
+    }
+
+    report.push_str("## Delegation Chains (Altitude Lens)\n\n");
+    report.push_str(&format!(
+        "{} chain(s) of functions that only forward to the next one. Each layer adds \
+         a call frame and a name to learn without adding behaviour — but forwarding \
+         is often deliberate, so treat these as questions about where the logic \
+         belongs rather than defects.\n\n",
+        chains.len()
+    ));
+
+    for chain in chains.iter().take(limit) {
+        report.push_str(&format!(
+            "- **{} hops** — {}\n",
+            chain.depth, chain.description
+        ));
+        for call in &chain.calls {
+            report.push_str(&format!(
+                "  - `{}` → `{}` at `{}`:{}\n",
+                call.caller,
+                call.callee,
+                get_relative_path(&call.file, base_dir).display(),
+                call.line
+            ));
+        }
+    }
+    report.push('\n');
+
+    if chains.len() > limit {
+        report.push_str(&format!(
+            "*{} further chain(s) not shown; raise --limit to see them.*\n\n",
+            chains.len() - limit
+        ));
+    }
 }
 
 /// Renders the dead-code lens. Reference counting is textual, so it cannot see a

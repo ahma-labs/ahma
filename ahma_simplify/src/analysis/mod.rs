@@ -1,3 +1,4 @@
+pub mod altitude;
 pub mod changed_files;
 pub mod checkstyle;
 mod conversion;

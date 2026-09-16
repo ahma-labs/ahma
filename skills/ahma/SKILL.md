@@ -817,6 +817,7 @@ prompting required**.
 /ahma simplify kotlin 2        # Manual mode: Kotlin issue #2 only
 /ahma simplify --lens reuse    # Reuse lens only — duplicate-code candidates (see below)
 /ahma simplify --lens dead-code # Dead-code lens only — unreferenced exports (see below)
+/ahma simplify --lens altitude # Altitude lens only — delegation chains (see below)
 /ahma simplify --diff          # Only files changed in git, instead of the whole tree
 ```
 
@@ -840,11 +841,14 @@ Language names are case-insensitive and expand to their extensions automatically
 - `dead-code` (also accepted: `dead_code`, `deadcode`, case-insensitive) — unreferenced
   exported functions/methods, Rust/TypeScript/JavaScript/Python/Java only. See below —
   its findings need the same "verify, don't blindly act" treatment as reuse.
+- `altitude` — thin-wrapper delegation-chain detection (A → B → C forwarding, 2+ hops),
+  Rust/TypeScript/JavaScript/Python/Java only. See below — a forwarding layer is often
+  intentional, so treat findings as candidates too.
 - `all` — every lens above (default).
 
-Selecting only `reuse` and/or `dead-code` skips the rust-code-analysis metrics parse
-entirely, so e.g. `--lens reuse` is much faster than a full run. Unknown lens names are a
-hard CLI error listing the valid options.
+Selecting only `reuse`, `dead-code`, and/or `altitude` skips the rust-code-analysis
+metrics parse entirely, so e.g. `--lens reuse` is much faster than a full run. Unknown
+lens names are a hard CLI error listing the valid options.
 
 ### Scoping to changed files — `--diff` (CLI) / `diff` (MCP)
 
@@ -887,6 +891,15 @@ justification for a deletion. Four blind spots the lens structurally cannot see:
 Full details, including the mitigations already applied (private/`main`/`test_`-prefixed
 functions, suppression markers, Rust trait-required names) and why Kotlin is excluded:
 [docs/simplify.md](https://github.com/ahma-labs/ahma/blob/main/docs/simplify.md).
+
+### Altitude Lens — Understand Before You Collapse
+
+The `altitude` lens flags thin-wrapper delegation chains (A → B → C, 2+ forwarding hops) as
+**candidates, not defects.** A forwarding layer is frequently deliberate: a public API facade,
+a trait impl delegating to a free function, or a platform-abstraction shim. Before collapsing a
+chain, establish *why* each layer exists — a chain being found is not license to inline it.
+
+Full details: [docs/simplify.md](https://github.com/ahma-labs/ahma/blob/main/docs/simplify.md).
 
 ### Supported Languages
 
@@ -1169,7 +1182,7 @@ Score = 0.4 × MI + 0.3 × Cognitive Density + 0.2 × Peak Cognitive + 0.1 × Le
 | `exclude` | array | — | Additional glob patterns to exclude |
 | `output_path` | path | — | Write report to directory instead of stdout |
 | `html` | boolean | false | Also generate HTML report |
-| `lens` | array | all | Which lenses to run: `complexity`, `reuse`, `dead-code`, or `all` (e.g. `["reuse"]`, `["dead-code"]`) |
+| `lens` | array | all | Which lenses to run: `complexity`, `reuse`, `dead-code`, `altitude`, or `all` (e.g. `["reuse"]`, `["dead-code"]`, `["altitude"]`) |
 | `diff` | boolean | false | Restrict to files git reports as changed instead of the whole tree |
 
 ### CLI Quick Reference
@@ -1204,6 +1217,9 @@ ahma simplify . --lens reuse
 
 # Dead-code lens only — unreferenced exports (Rust/TS/JS/Python/Java only)
 ahma simplify . --lens dead-code
+
+# Altitude lens only — thin-wrapper delegation chains (Rust/TS/JS/Python/Java only)
+ahma simplify . --lens altitude
 
 # Only the files changed in git
 ahma simplify . --diff

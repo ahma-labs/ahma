@@ -60,7 +60,7 @@ Two commands carry the day-to-day loop; the rest are occasional specialists.
 | Command | Purpose |
 |---------|---------|
 | `/ahmadev help` | Show the process overview + subcommand list |
-| `/ahmadev simplify` | Review the changed diff for reuse/simplification/efficiency/altitude issues, apply fixes, report **before/after metrics table** |
+| `/ahmadev simplify` | Run the `reuse`/`dead-code`/`altitude` lenses on the diff, dispatch agents to judge the findings and catch what lenses can't, apply fixes, report **before/after metrics table** |
 | `/ahmadev bisect` | Find the commit that introduced a regression via `git bisect run` (local, zero-CI) |
 | `/ahmadev coverage` | Fan out parallel subagents across 3–10 low-coverage files, close all holes in each (≥80% target per file), land as one PR |
 | `/ahmadev update` | Upgrade workspace deps that are ≥14 days old and advisory-clean |
@@ -151,7 +151,7 @@ It's a good idea here precisely because:
 /ahmadev land      — Branch → PR → squash-merge on main when all CI checks pass  ← drive a fix to main
 /ahmadev release   — Land pending work + bump version on main; CI publishes the GitHub Release  ← ship to users
                      (alias: /ahmadev publish — "publish" and "release" mean the same thing here)
-/ahmadev simplify  — Review the diff for cleanup opportunities, apply fixes, report before/after metrics table
+/ahmadev simplify  — Run reuse/dead-code/altitude lenses on the diff, agents judge + fill gaps, apply fixes, report before/after metrics table
 /ahmadev bisect    — git bisect run a repro to find the commit that introduced a regression (local, free)
 /ahmadev coverage  — Fan out parallel subagents (3–10 files), close all holes per file (≥80% each), land one batch PR
 /ahmadev update    — Upgrade workspace dependencies (safe: ≥14d old, no known advisories)
@@ -687,49 +687,73 @@ yourself. The agent fan-out IS the work.
 
 ### What it does
 
-Reviews the diff for reuse, simplification, efficiency, and altitude issues, applies the fixes,
-and bookends the work with a **mandatory before/after metrics table** that makes the value of each
-run concrete and comparable across sessions. The metrics table is not optional — running simplify
-and reporting no numbers is not acceptable.
+Runs `ahma simplify`'s static-analysis lenses over the diff, then dispatches review agents to
+**judge** what the lenses found and catch what they structurally cannot see. Fixes get applied,
+bookended by a **mandatory before/after metrics table** — not optional; running simplify and
+reporting no numbers is not acceptable.
 
 Quality only: this command does not hunt for correctness bugs (use `/code-review` for that) and
 does not bump, release, or push (unless the human explicitly asks to land the result).
 
-### Mandatory metrics — collect BEFORE doing anything
+### Step 1 — run the lenses first (exhaustive, deterministic findings)
 
-Before writing a single line of code, measure every file that appears in the diff and display
-this table:
+```bash
+ahma simplify . --lens reuse,dead-code,altitude --diff
+# large diff (many files, or a refactor touching hot paths)? add complexity too:
+ahma simplify . --lens reuse,dead-code,altitude,complexity --diff
+```
+
+(Or the `simplify` MCP tool: `lens: [...]`, `diff: true` — same analysis.) `--diff` scopes to
+files git reports as changed (staged, unstaged, untracked) — exactly what a diff review wants.
+
+| Lens | Finds | Language coverage |
+|------|-------|--------------------|
+| `reuse` | Duplicate code blocks (4+ lines), text-based | Every language, incl. ones with no AST support |
+| `dead-code` | Exported functions/methods with no reference anywhere in the scanned files | Rust, TypeScript, JavaScript, Python, Java only |
+| `altitude` | Thin-wrapper delegation chains — a function whose whole body forwards to another, 2+ hops | Same five languages as `dead-code` |
+| `complexity` | AST metrics/hotspots (pre-existing); worth adding on a large diff | See `docs/simplify.md` |
+
+Lens internals aren't re-explained here — see [docs/simplify.md](https://github.com/ahma-labs/ahma/blob/main/docs/simplify.md) and `skills/ahma/SKILL.md`'s Lenses section.
+
+**Candidates, not verdicts.** Every lens reports candidates, not defects to auto-fix. `dead-code`
+cannot see a downstream crate consuming a public API, a macro-generated call site, trait-object
+dispatch, or reflection by name — verify before deleting; "the tool said so" is not
+justification. `altitude` likewise: a forwarding layer is often a deliberate, correct facade.
+Neither lens's report is a to-do list.
+
+### Step 2 — mandatory before metrics, sourced from the tool's output
+
+Before touching any code, display this table, built from Step 1's run — not eyeballed:
 
 | File | Lines | Duplication instances |
 |------|---------|-----------------------|
-| `path/to/file.rs` | N | e.g. "5× identical `Sandbox::new(…)` blocks; 4× `get_envs()→HashMap`" |
+| `path/to/file.rs` | N | e.g. "5× identical `Sandbox::new(…)` blocks (reuse lens); 2× 3-hop forwarding chains (altitude lens)" |
 
-**How to collect:**
-- **Lines**: `wc -l <file>` for each file in the diff.
-- **Duplication instances**: read the diff, count visually identical blocks (copy-paste groups).
-  Name them concisely: "N× `<short description of the block>`".
-- **Complexity** (optional): if `mcp__Ahma__simplify` is available, run it on the changed files
-  and add a "Complexity" column with the score. This is a bonus, not a gate.
+**How to collect:** Lines = `wc -l <file>`. Duplication instances = the `reuse` lens's match-group
+count, plus `dead-code`/`altitude` candidate counts — no longer a visual estimate. Complexity
+(optional): if that lens ran, add a "Complexity" column with the score — bonus, not a gate.
 
-Display the before-table and wait for the review agents before touching any code.
+### Step 3 — review agents: judge the findings, cover what no lens can
 
-### Four parallel review agents (same as `/simplify`)
+Launch concurrently, one angle each. Reuse and Altitude start from the lens's candidate list —
+verification and judgment, not rediscovery. Simplification and Efficiency have no lens
+underneath; they stay full manual review.
 
-Launch all four concurrently. Pass each agent the diff and one angle:
+| Agent | Angle | Starts from |
+|-------|-------|--------------|
+| **Reuse** | Verify each `reuse`-lens candidate is real duplication, not coincidental shape; judge whether extraction clarifies. Catch *semantic* duplication too — a new abstraction re-implementing an existing helper differently, so no text match exists. | `reuse` candidates + own read of the diff |
+| **Simplification** | Redundant state, copy-paste the `reuse` lens missed, deep nesting, and each `dead-code` candidate — confirm no downstream/macro/trait-object/reflection reference before flagging removal. | `dead-code` candidates + own read of the diff |
+| **Efficiency** | Wasted computation, sequential independent ops, blocking work on hot paths — no lens measures runtime cost. | Own read of the diff, unassisted |
+| **Altitude** | Verify each `altitude`-lens chain: dead-weight forwarding vs. deliberate facade. Also catch bandaids on shared infrastructure that aren't literal forwarding chains — fix at the right depth, not a special case. | `altitude` candidates + own read of the diff |
 
-| Agent | Angle |
-|-------|-------|
-| **Reuse** | New code that re-implements something the codebase already has — name the existing helper |
-| **Simplification** | Redundant state, copy-paste variation, deep nesting, dead code — name the simpler form |
-| **Efficiency** | Wasted computation, sequential independent ops, blocking work on hot paths |
-| **Altitude** | Bandaid layered on shared infrastructure — fix at the right depth, not with a special case |
-
-Each agent returns: `file`, `line`, one-line `summary`, concrete cost.
+Each agent returns: `file`, `line`, one-line `summary`, concrete cost, and — for lens-sourced
+findings — a verdict (`act` / `skip`, with reason).
 
 ### Apply fixes and collect AFTER metrics
 
 Dedup overlapping findings. Apply each fix. For findings skipped (behavior change, out-of-scope,
-false positive), note the skip and the reason.
+false positive, or a lens candidate an agent judged to be a deliberate facade/false positive),
+note the skip and the reason.
 
 After all fixes are applied, measure every file that was modified and display:
 
