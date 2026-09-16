@@ -327,6 +327,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "tree-sitter",
  "walkdir",
  "workspace-hack",
 ]

@@ -1,14 +1,11 @@
 //! Analysis lens selection for `ahma simplify --lens`.
 //!
-//! A lens is one independent analysis pass over the codebase. Today there are
-//! two: [`Lens::Complexity`] (the existing metrics analysis) and
-//! [`Lens::Reuse`] (duplicate-code detection). More will follow (dead-code,
-//! wrapper-chain detection); this module is the single place that maps CLI
-//! strings to the set of lenses to run.
+//! A lens is one independent analysis pass over the codebase. This module is
+//! the single place that maps CLI strings to the set of lenses to run.
 
 use std::str::FromStr;
 
-const VALID_LENS_NAMES: &str = "complexity, reuse, all";
+const VALID_LENS_NAMES: &str = "complexity, reuse, dead-code, all";
 
 /// One independent analysis pass over the codebase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,10 +15,12 @@ pub enum Lens {
     Complexity,
     /// Duplicate-code detection.
     Reuse,
+    /// Exported symbols with no apparent references.
+    DeadCode,
 }
 
 impl Lens {
-    const ALL: [Lens; 2] = [Lens::Complexity, Lens::Reuse];
+    const ALL: [Lens; 3] = [Lens::Complexity, Lens::Reuse, Lens::DeadCode];
 }
 
 impl FromStr for Lens {
@@ -31,6 +30,7 @@ impl FromStr for Lens {
         match s.trim().to_ascii_lowercase().as_str() {
             "complexity" => Ok(Lens::Complexity),
             "reuse" => Ok(Lens::Reuse),
+            "dead-code" | "dead_code" | "deadcode" => Ok(Lens::DeadCode),
             other => Err(anyhow::anyhow!(
                 "unknown lens '{other}'; valid values are: {VALID_LENS_NAMES}"
             )),
@@ -76,6 +76,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_dead_code_in_each_spelling() {
+        for spelling in ["dead-code", "dead_code", "deadcode", "DEAD-CODE"] {
+            assert_eq!(
+                spelling.parse::<Lens>().unwrap(),
+                Lens::DeadCode,
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
     fn parsing_is_case_insensitive() {
         assert_eq!("Complexity".parse::<Lens>().unwrap(), Lens::Complexity);
         assert_eq!("REUSE".parse::<Lens>().unwrap(), Lens::Reuse);
@@ -84,9 +95,9 @@ mod tests {
 
     #[test]
     fn unknown_value_names_valid_options_in_error() {
-        let err = "dead-code".parse::<Lens>().unwrap_err();
+        let err = "wrapper-chains".parse::<Lens>().unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("dead-code"));
+        assert!(message.contains("wrapper-chains"));
         assert!(message.contains("complexity"));
         assert!(message.contains("reuse"));
     }
@@ -94,19 +105,19 @@ mod tests {
     #[test]
     fn all_expands_to_every_variant_in_declaration_order() {
         let lenses = parse_lenses(&["all".to_string()]).unwrap();
-        assert_eq!(lenses, vec![Lens::Complexity, Lens::Reuse]);
+        assert_eq!(lenses, vec![Lens::Complexity, Lens::Reuse, Lens::DeadCode]);
     }
 
     #[test]
     fn all_is_case_insensitive() {
         let lenses = parse_lenses(&["ALL".to_string()]).unwrap();
-        assert_eq!(lenses, vec![Lens::Complexity, Lens::Reuse]);
+        assert_eq!(lenses, vec![Lens::Complexity, Lens::Reuse, Lens::DeadCode]);
     }
 
     #[test]
     fn empty_input_means_all() {
         let lenses = parse_lenses(&[]).unwrap();
-        assert_eq!(lenses, vec![Lens::Complexity, Lens::Reuse]);
+        assert_eq!(lenses, vec![Lens::Complexity, Lens::Reuse, Lens::DeadCode]);
     }
 
     #[test]
