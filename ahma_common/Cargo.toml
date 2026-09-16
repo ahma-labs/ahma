@@ -39,7 +39,7 @@ url.workspace = true
 # rustls crypto provider next to the mandatory `aws-lc-rs` (rustls' default, and the only one
 # sigstore/tough support). One provider per workspace; guarded by the
 # `test_single_rustls_crypto_provider_invariant` test.
-rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
