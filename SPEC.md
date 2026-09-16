@@ -2028,7 +2028,10 @@ entry existed here; those citations now resolve.)
 | HTML report | PASS | `CODE_SIMPLICITY.html` generated alongside the Markdown report with `--html` or `--heml` |
 | AI fix prompt | PASS | `--ai-fix N` / MCP `ai_fix` appends a structured prompt naming the Nth-worst file's hotspot functions and instructing targeted-only changes |
 | `--verify` before/after comparison | PASS | Re-analyzes a file against the rust-code-analysis TOML baseline from the previous run and reports a verdict; not supported for Kotlin/Swift/ObjC (no persisted external baseline) |
-| MCP `simplify` tool | PASS | Exposes `directory`, `ai_fix`, `limit`, `verify`, `extensions`, `exclude`, `output_path`, `html` (requires `--tools simplify` at startup) |
+| MCP `simplify` tool | PASS | Exposes `directory`, `ai_fix`, `limit`, `verify`, `extensions`, `exclude`, `output_path`, `html`, `lens`, `diff` (requires `--tools simplify` at startup) |
+| `--lens` analysis selection | PASS | Comma-separated `complexity`/`reuse`/`all` (default `all`); unknown values are a hard error listing the valid options. Selecting only non-complexity lenses skips the rust-code-analysis parse entirely |
+| Reuse lens — duplicate code detection | PASS | Language-agnostic, text-based duplicate-block detector: strips comments per language, collapses whitespace, finds repeated blocks of 4+ lines. Deterministic output. Reports candidates for extraction, not defects. Known limitation: a comment delimiter inside a string literal is misread as a comment start. Adds a `## Duplicate Code (Reuse Lens)` report section capped by `--limit` |
+| `--diff` change-scoped analysis | PASS | Restricts analysis to files git reports as changed (staged, unstaged, untracked-but-not-ignored) instead of the whole tree; fails loudly if the directory isn't a git repository or git isn't installed |
 
 ---
 

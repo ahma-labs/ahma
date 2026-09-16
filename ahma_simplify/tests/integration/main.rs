@@ -6,3 +6,4 @@
 //! override applies. Add suites as `tests/integration/<name>.rs` + `mod` below.
 
 mod report_test;
+mod reuse_lens_test;

@@ -39,7 +39,20 @@
                 {
                     "name": "html",
                     "type": "boolean",
-                    "description": "Generate HTML report and open it automatically (shorthand for --html and --open combined)"
+                    "description": "Additionally render CODE_SIMPLICITY.html next to the Markdown report. Also causes the report to be written to disk rather than returned on stdout, so pair it with output_path when you want to know where it landed."
+                },
+                {
+                    "name": "lens",
+                    "type": "array",
+                    "description": "Which analysis lenses to run. 'complexity' ranks files by cognitive/cyclomatic complexity and maintainability; 'reuse' detects duplicated code blocks across the project. Defaults to all lenses. Selecting only 'reuse' skips the complexity parse entirely and is much faster. Reuse findings are candidates for extraction, not defects — evaluate each one before acting.",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                {
+                    "name": "diff",
+                    "type": "boolean",
+                    "description": "Analyze only files git reports as changed (staged, unstaged, and untracked) instead of the whole project. Use this to check work you just did rather than re-scanning everything. Fails if the directory is not a git repository."
                 },
                 {
                     "name": "extensions",

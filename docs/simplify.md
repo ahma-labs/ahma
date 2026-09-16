@@ -6,12 +6,16 @@ SPEC.md's Quick Status table lists it `tests-pass`. Building with `--no-default-
 drops the feature; the `simplify` subcommand still parses but fails at run time with a message
 naming the missing feature.
 
-Ahma includes a built-in code complexity analyzer (`ahma simplify`) that scores every source
-file in your project, identifies the worst hotspot functions, and returns a structured AI prompt
-to fix them with minimal, targeted changes.
+Ahma includes a built-in code analyzer (`ahma simplify`) that runs one or more independent
+analysis **lenses** over your project and returns a structured AI prompt to fix what it finds,
+with minimal, targeted changes. Two lenses exist today: **complexity** (the original analysis —
+scores every source file, identifies the worst hotspot functions, and ranks files worst-first)
+and **reuse** (duplicate-code-block detection, see below). `--lens` selects which lenses run;
+the default, `all`, runs every lens.
 
 Supports: **Rust, Python, JavaScript, TypeScript, Kotlin, Swift, Objective-C, C, C++, Java, C#,
-Go, CSS, HTML**.
+Go, CSS, HTML**. The reuse lens covers all of these, including the languages with no AST
+support, because it works on text rather than a parsed structure.
 
 ---
 
@@ -40,6 +44,12 @@ ahma simplify . --ai-fix 1
 
 # Rust files only
 ahma simplify . --extensions rust --ai-fix 1
+
+# Duplicate-code detection only — skips the AST parse, so it's fast
+ahma simplify . --lens reuse
+
+# Only the files you just changed
+ahma simplify . --diff
 
 # Verify improvement after editing
 ahma simplify . --verify src/my_module.rs
@@ -162,6 +172,17 @@ Objective-C files, because their baselines come from the external analyzers (Det
 SwiftLint, Lizard) and are not persisted for later comparison; run a full `ahma simplify`
 before and after your change for those languages instead.
 
+### Diff mode
+
+```bash
+# Analyze only files git reports as changed, instead of the whole tree
+ahma simplify . --diff
+```
+
+`--diff` restricts analysis to files that are staged, unstaged, or untracked-but-not-ignored
+according to git. It fails with a clear error if the directory is not a git repository or git
+is not installed, rather than silently falling back to a full scan.
+
 ### Report output
 
 ```bash
@@ -198,6 +219,8 @@ Authoritative source: `ahma_common/src/simplify_args.rs` (`SimplifyArgs`).
 | `--output-path` | path | none (prints to stdout) | Directory to write `CODE_SIMPLICITY.md` / `CODE_SIMPLICITY.html` into, instead of printing to stdout |
 | `--ai-fix` | integer | none | Generate a structured AI fix prompt for the Nth most complex file (1-indexed) |
 | `--verify` | path | none | Re-analyze a specific file and compare against the baseline from the previous run |
+| `--lens` | comma-separated list | `all` | Which analysis lenses to run: `complexity`, `reuse`, or `all`. Unknown values are a hard error listing the valid options. Selecting only non-complexity lenses skips the rust-code-analysis parse entirely (the dominant cost), so e.g. `--lens reuse` is substantially faster than a full run |
+| `--diff` | flag | off | Restrict analysis to files git reports as changed (staged, unstaged, and untracked-but-not-ignored) instead of walking the whole tree; fails if the directory isn't a git repository or git isn't installed, rather than silently falling back to a full scan |
 
 ## MCP Tool Reference
 
@@ -213,6 +236,8 @@ Tool name: `simplify` (requires `--tools simplify` at ahma startup).
 | `exclude` | array | — | Additional glob patterns to exclude |
 | `output_path` | path | — | Write report to directory instead of stdout |
 | `html` | boolean | false | Also generate HTML report |
+| `lens` | array | all | Which analysis lenses to run (e.g. `["reuse"]`); see `--lens` above |
+| `diff` | boolean | false | Restrict analysis to files git reports as changed instead of the whole tree; see `--diff` above |
 
 ### MCP tool invocation examples
 
@@ -226,6 +251,8 @@ Tool name: `simplify` (requires `--tools simplify` at ahma startup).
 simplify(directory=".", ai_fix=1)
 simplify(directory=".", extensions=["rs"], ai_fix=1)
 simplify(directory=".", verify="src/my_module.rs")
+simplify(directory=".", lens=["reuse"])
+simplify(directory=".", diff=true)
 ```
 
 ---
@@ -288,10 +315,50 @@ for Kotlin/Swift/Objective-C files and coarser metrics for the Lizard-supported 
 
 ---
 
+## Reuse Lens: Duplicate Code Detection
+
+The `reuse` lens finds duplicated blocks of code so you can judge whether extracting a shared
+helper is worthwhile. Run it on its own with `--lens reuse`, or leave `--lens` at its default
+(`all`) to run it alongside the complexity lens.
+
+```bash
+# Duplicate-code detection only — skips the rust-code-analysis parse, so it's fast
+ahma simplify . --lens reuse
+```
+
+Key properties:
+
+- **Language-agnostic.** Detection is purely textual: it strips comments using each language's
+  comment syntax, collapses whitespace, then finds repeated blocks. This means it works on
+  every language `simplify` supports, including Swift, Go, and C#, which have no AST-based
+  complexity metrics.
+- **Minimum block size is 4 lines.** Shorter matches are not reported.
+- **Candidates for extraction, not defects.** Identical-looking code can be coincidental —
+  the reader decides whether a shared helper is actually clearer. The report lists duplicate
+  blocks to be evaluated, not a list of confirmed problems.
+- **Deterministic.** The same input always produces byte-identical output.
+- **Known limitation — string literals.** Comment stripping is textual, not a real
+  per-language lexer, so a comment delimiter that happens to appear inside a string literal
+  (e.g. `let url = "https://example.com";`) is misread as the start of a comment, which can
+  cause a missed or spurious match. A real per-language lexer would fix this but is out of
+  proportion for what this lens is for.
+
+For example, running the reuse lens on this repository surfaces 19 identical lines shared
+between `ahma_simplify/src/analysis/detekt.rs` and `ahma_simplify/src/analysis/checkstyle.rs`
+— both parse Checkstyle XML issues.
+
+Findings appear in the report under `## Duplicate Code (Reuse Lens)`, one entry per duplicate
+group, each listing the block's line count, occurrence count, every file/line location, and a
+sample of the duplicated code. The section is capped by `--limit`, same as the complexity
+findings.
+
+---
+
 ## Report Generation and the AI Fix Prompt
 
 `ahma simplify` produces a Markdown report (`CODE_SIMPLICITY.md`) ranking files worst-to-best
-by score, with per-file function hotspots. With `--html` it additionally renders
+by score, with per-file function hotspots (complexity lens), and, when the reuse lens ran, a
+`## Duplicate Code (Reuse Lens)` section (see above). With `--html` it additionally renders
 `CODE_SIMPLICITY.html`. There is no other output format.
 
 `--ai-fix N` (CLI) / `ai_fix` (MCP) appends a structured fix prompt for the Nth-worst file

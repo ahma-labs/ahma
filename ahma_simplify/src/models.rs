@@ -227,7 +227,7 @@ impl Language {
     pub fn from_path(path: &std::path::Path) -> Self {
         path.extension()
             .and_then(|ext| ext.to_str())
-            .map(Self::from_extension)
+            .map(|ext| Self::from_extension(&ext.to_lowercase()))
             .unwrap_or(Language::Unknown)
     }
 
@@ -235,7 +235,7 @@ impl Language {
         match ext {
             "rs" => Language::Rust,
             "py" => Language::Python,
-            "js" | "jsx" => Language::JavaScript,
+            "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
             "ts" | "tsx" => Language::TypeScript,
             "kt" | "kts" => Language::Kotlin,
             "swift" => Language::Swift,

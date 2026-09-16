@@ -1,5 +1,5 @@
 use super::analysis::{get_package_name, get_relative_path};
-use super::models::{FileSimplicity, Language};
+use super::models::{DuplicateGroup, FileSimplicity, Language, MultiLensReport};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -104,7 +104,7 @@ impl RepoSummary {
 }
 
 pub fn generate_report(
-    files: &[FileSimplicity],
+    lenses: &MultiLensReport,
     is_workspace: bool,
     limit: usize,
     output_dir: &Path,
@@ -112,7 +112,7 @@ pub fn generate_report(
     project_name: &str,
     report_output_dir: &Path,
 ) -> Result<(), std::io::Error> {
-    let md_content = create_report_md(files, is_workspace, limit, output_dir, project_name);
+    let md_content = create_report_md(lenses, is_workspace, limit, output_dir, project_name);
 
     fs::write(report_output_dir.join("CODE_SIMPLICITY.md"), &md_content)?;
 
@@ -146,12 +146,13 @@ pub fn generate_report(
 }
 
 pub fn create_report_md(
-    files: &[FileSimplicity],
+    lenses: &MultiLensReport,
     is_workspace: bool,
     limit: usize,
     base_dir: &Path,
     project_name: &str,
 ) -> String {
+    let files = &lenses.complexity_files;
     let summary = RepoSummary::from_files(files, base_dir);
     let mut report = String::new();
 
@@ -159,9 +160,61 @@ pub fn create_report_md(
     write_executive_summary(&mut report, summary.avg_score);
     write_package_simplicity(&mut report, &summary, is_workspace);
     write_emergencies(&mut report, files, limit, base_dir);
+    write_duplicates(&mut report, &lenses.duplicates, limit, base_dir);
     write_glossary(&mut report);
 
     report
+}
+
+/// Renders the reuse lens. Duplicate blocks are *candidates* for extraction, not
+/// defects: identical-looking code can be coincidental, and the reader has to
+/// judge whether a shared helper would actually be clearer. The wording says so,
+/// because a report that reads as a verdict gets acted on as one.
+fn write_duplicates(report: &mut String, groups: &[DuplicateGroup], limit: usize, base_dir: &Path) {
+    if groups.is_empty() {
+        return;
+    }
+
+    let duplicated_lines: usize = groups
+        .iter()
+        .map(|group| group.line_count * group.locations.len().saturating_sub(1))
+        .sum();
+
+    report.push_str("## Duplicate Code (Reuse Lens)\n\n");
+    report.push_str(&format!(
+        "Found {} duplicated block(s) spanning roughly {} redundant line(s). \
+         These are candidates for extraction, not confirmed problems — review each \
+         before changing anything.\n\n",
+        groups.len(),
+        duplicated_lines
+    ));
+
+    for (index, group) in groups.iter().take(limit).enumerate() {
+        report.push_str(&format!(
+            "### Duplicate #{} — {} lines × {} occurrences\n\n",
+            index + 1,
+            group.line_count,
+            group.locations.len()
+        ));
+        for location in &group.locations {
+            report.push_str(&format!(
+                "- `{}` lines {}–{}\n",
+                get_relative_path(&location.file, base_dir).display(),
+                location.start_line,
+                location.end_line
+            ));
+        }
+        report.push_str("\n```\n");
+        report.push_str(group.sample_text.trim_end());
+        report.push_str("\n```\n\n");
+    }
+
+    if groups.len() > limit {
+        report.push_str(&format!(
+            "*{} further duplicate group(s) not shown; raise --limit to see them.*\n\n",
+            groups.len() - limit
+        ));
+    }
 }
 
 fn write_header(report: &mut String, project_name: &str, avg_score: f64) {
@@ -566,6 +619,13 @@ mod tests {
     use super::super::models::{AnalysisConfidence, FunctionHotspot};
     use super::*;
 
+    fn lens_report(complexity_files: Vec<FileSimplicity>) -> MultiLensReport {
+        MultiLensReport {
+            complexity_files,
+            ..Default::default()
+        }
+    }
+
     /// Helper to construct a FileSimplicity for tests without hotspots.
     fn test_file(
         path: &str,
@@ -643,7 +703,13 @@ mod tests {
             ),
         ];
 
-        let report = create_report_md(&files, false, 10, Path::new("."), "test_project");
+        let report = create_report_md(
+            &lens_report(files),
+            false,
+            10,
+            Path::new("."),
+            "test_project",
+        );
         assert!(report.contains("# Code Simplicity Metrics: test_project"));
         assert!(report.contains("## Overall Repository Simplicity: **60%**"));
         assert!(report.contains("## Rust Simplicity"));
@@ -656,7 +722,7 @@ mod tests {
             test_file("file2.py", Language::Python, 40.0, 25.0, 20.0, 150.0, 40.0),
         ];
 
-        let report = create_report_md(&files, false, 10, Path::new("."), "test_multi");
+        let report = create_report_md(&lens_report(files), false, 10, Path::new("."), "test_multi");
 
         assert!(report.contains("## Top 1 Rust Code Complexity Issues"));
         assert!(report.contains("## Top 1 Python Code Complexity Issues"));
@@ -871,7 +937,13 @@ mod tests {
             ),
         ];
 
-        let report = create_report_md(&files, false, 10, Path::new("."), "test_disambig");
+        let report = create_report_md(
+            &lens_report(files),
+            false,
+            10,
+            Path::new("."),
+            "test_disambig",
+        );
 
         assert!(report.contains("**analysis/translation.rs**"));
         assert!(report.contains("**views/translation.rs**"));
@@ -908,7 +980,13 @@ mod tests {
             ],
         )];
 
-        let report = create_report_md(&files, false, 10, Path::new("."), "test_hotspots");
+        let report = create_report_md(
+            &lens_report(files),
+            false,
+            10,
+            Path::new("."),
+            "test_hotspots",
+        );
 
         assert!(report.contains("**Hotspots**:"));
         assert!(report.contains("`handle_request()` lines 145-210: Cog=28, Cyc=15"));
@@ -927,7 +1005,13 @@ mod tests {
             90.0,
         )];
 
-        let report = create_report_md(&files, false, 10, Path::new("."), "test_no_hotspots");
+        let report = create_report_md(
+            &lens_report(files),
+            false,
+            10,
+            Path::new("."),
+            "test_no_hotspots",
+        );
 
         assert!(!report.contains("**Hotspots**"));
     }

@@ -14,22 +14,38 @@ use crate::models::Language;
 // Public analysis API (drop-in replacement for the old CLI-based version)
 // ---------------------------------------------------------------------------
 
+/// Which files a scan covers and how much work it does per file: the extension
+/// filter, the exclusion globs, an optional allowlist of paths git reported as
+/// changed (`--diff`), and whether to compute complexity metrics at all —
+/// parsing every file is the dominant cost, so a run that selected only
+/// whole-project lenses skips it.
+pub struct ScanOptions<'a> {
+    pub extensions: &'a [String],
+    pub excludes: &'a [String],
+    pub changed: Option<&'a HashSet<PathBuf>>,
+    pub compute_metrics: bool,
+}
+
 /// Analyses all source files under `dir`, writes per-file TOML metric results
 /// into `output_dir`, and optionally runs external analyzers via `registry`.
 ///
 /// Returns a map of absolute file path → external metrics for any files that
 /// were covered by an external analyzer.  The map is empty when `registry` is
 /// `None` or no analyzers are available.
+///
+/// `sources` accumulates the text of every file visited, for the whole-project
+/// lenses (duplicate detection) that cannot work from the per-file TOML mirror.
 pub fn run_analysis(
     dir: &Path,
     output_dir: &Path,
-    extensions: &[String],
-    custom_excludes: &[String],
+    options: &ScanOptions<'_>,
     registry: Option<&AnalyzerRegistry>,
+    sources: &mut Vec<(PathBuf, String)>,
 ) -> Result<HashMap<PathBuf, ExternalMetrics>> {
     eprintln!("Analyzing {}...", dir.display());
 
-    let allowed_exts: HashSet<&str> = extensions
+    let allowed_exts: HashSet<&str> = options
+        .extensions
         .iter()
         .map(|e| e.trim_start_matches('.'))
         .collect();
@@ -37,14 +53,17 @@ pub fn run_analysis(
     // Run rca analysis and collect the set of languages seen.
     let mut languages_present: HashSet<Language> = HashSet::new();
     let mut analyzed_count = 0usize;
-    let count = source_files(dir, &allowed_exts, custom_excludes).try_fold(
+    let count = source_files(dir, &allowed_exts, options).try_fold(
         0usize,
         |count, path| -> Result<usize> {
-            if let Some(lang) = file_language(&path) {
+            let lang = Language::from_path(&path);
+            if lang != Language::Unknown {
                 languages_present.insert(lang);
             }
-            let had_metrics = write_metrics_toml(&path, dir, output_dir)?;
-            if had_metrics {
+            if let Ok(text) = fs::read_to_string(&path) {
+                sources.push((path.clone(), text));
+            }
+            if options.compute_metrics && write_metrics_toml(&path, dir, output_dir)? {
                 analyzed_count += 1;
             }
             Ok(count + 1)
@@ -62,13 +81,19 @@ pub fn run_analysis(
     Ok(external)
 }
 
-/// Check if a file matches the extension filter and is not excluded.
+/// Check if a file matches the extension filter, is not excluded, and — when
+/// `--diff` narrowed the scan — is one of the files git reported as changed.
 fn is_matching_source_file(
     path: &Path,
     allowed_exts: &HashSet<&str>,
-    custom_excludes: &[String],
+    options: &ScanOptions<'_>,
 ) -> bool {
-    if should_exclude(path, custom_excludes) {
+    if should_exclude(path, options.excludes) {
+        return false;
+    }
+    if let Some(changed) = options.changed
+        && !changed.contains(path)
+    {
         return false;
     }
     path.extension()
@@ -78,38 +103,18 @@ fn is_matching_source_file(
         })
 }
 
-/// Detect the language of a file from its extension.
-fn file_language(path: &Path) -> Option<Language> {
-    let ext = path.extension()?.to_str()?;
-    match ext.to_lowercase().as_str() {
-        "kt" | "kts" => Some(Language::Kotlin),
-        "rs" => Some(Language::Rust),
-        "java" => Some(Language::Java),
-        "py" => Some(Language::Python),
-        "js" | "mjs" | "cjs" => Some(Language::JavaScript),
-        "ts" | "tsx" => Some(Language::TypeScript),
-        "swift" => Some(Language::Swift),
-        "m" | "mm" => Some(Language::ObjectiveC),
-        "go" => Some(Language::Go),
-        "cpp" | "cc" | "cxx" => Some(Language::Cpp),
-        "c" | "h" => Some(Language::C),
-        "cs" => Some(Language::CSharp),
-        _ => None,
-    }
-}
-
 /// Iterate source files in `dir` matching extension and exclusion filters.
 fn source_files<'a>(
     dir: &'a Path,
     allowed_exts: &'a std::collections::HashSet<&'a str>,
-    custom_excludes: &'a [String],
+    options: &'a ScanOptions<'a>,
 ) -> impl Iterator<Item = PathBuf> + 'a {
     WalkDir::new(dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(walkdir::DirEntry::into_path)
-        .filter(move |path| is_matching_source_file(path, allowed_exts, custom_excludes))
+        .filter(move |path| is_matching_source_file(path, allowed_exts, options))
 }
 
 /// Ensure the parent directory of `path` exists.
@@ -137,19 +142,25 @@ fn write_metrics_toml(path: &Path, dir: &Path, output_dir: &Path) -> Result<bool
     Ok(true)
 }
 
+/// Result of a whole-project scan: external metrics per file, plus the source
+/// text of every file visited for the whole-project lenses.
+pub struct ScanResult {
+    pub external: HashMap<PathBuf, ExternalMetrics>,
+    pub sources: Vec<(PathBuf, String)>,
+}
+
 pub fn perform_analysis(
     directory: &Path,
     output: &Path,
     is_workspace: bool,
-    extensions: &[String],
-    custom_excludes: &[String],
+    options: &ScanOptions<'_>,
     registry: Option<&AnalyzerRegistry>,
-) -> Result<HashMap<PathBuf, ExternalMetrics>> {
+) -> Result<ScanResult> {
     let dirs = workspace_analysis_dirs(directory, is_workspace)?;
-    let mut all_external: HashMap<PathBuf, ExternalMetrics> = HashMap::new();
+    let mut external: HashMap<PathBuf, ExternalMetrics> = HashMap::new();
+    let mut sources: Vec<(PathBuf, String)> = Vec::new();
     for dir in &dirs {
-        let external = run_analysis(dir, output, extensions, custom_excludes, registry)?;
-        all_external.extend(external);
+        external.extend(run_analysis(dir, output, options, registry, &mut sources)?);
     }
-    Ok(all_external)
+    Ok(ScanResult { external, sources })
 }

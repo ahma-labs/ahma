@@ -1,5 +1,7 @@
-use ahma_simplify::analysis::perform_analysis;
-use ahma_simplify::models::{AnalysisConfidence, FileSimplicity, Language, MetricsResults};
+use ahma_simplify::analysis::{ScanOptions, perform_analysis};
+use ahma_simplify::models::{
+    AnalysisConfidence, FileSimplicity, Language, MetricsResults, MultiLensReport,
+};
 use ahma_simplify::report::create_report_md;
 use std::collections::HashSet;
 use std::fs;
@@ -21,6 +23,13 @@ const LANG_EXTS: &[(&str, Language)] = &[
     ("html", Language::Html),
     ("css", Language::Css),
 ];
+
+fn lens_report(complexity_files: Vec<FileSimplicity>) -> MultiLensReport {
+    MultiLensReport {
+        complexity_files,
+        ..Default::default()
+    }
+}
 
 fn file(path: &str, language: Language, score: f64) -> FileSimplicity {
     FileSimplicity {
@@ -460,7 +469,13 @@ fn test_single_module_suppresses_by_section() {
         file("ui/index.html", Language::Html, 71.0),
     ];
 
-    let report = create_report_md(&files, false, 10, Path::new("."), "single-module");
+    let report = create_report_md(
+        &lens_report(files),
+        false,
+        10,
+        Path::new("."),
+        "single-module",
+    );
 
     assert!(report.contains("## Rust Simplicity"));
     assert!(report.contains("## Python Simplicity"));
@@ -478,7 +493,13 @@ fn test_multi_module_shows_by_section() {
         file("mod_c/main.py", Language::Python, 60.0),
     ];
 
-    let report = create_report_md(&files, false, 10, Path::new("."), "python-modules");
+    let report = create_report_md(
+        &lens_report(files),
+        false,
+        10,
+        Path::new("."),
+        "python-modules",
+    );
 
     assert!(report.contains("## Python Simplicity"));
     assert!(report.contains("### By Module"));
@@ -494,7 +515,13 @@ fn test_rust_workspace_uses_by_crate_label() {
         file("crate_b/src/lib.rs", Language::Rust, 60.0),
     ];
 
-    let report = create_report_md(&files, true, 10, Path::new("."), "rust-workspace");
+    let report = create_report_md(
+        &lens_report(files),
+        true,
+        10,
+        Path::new("."),
+        "rust-workspace",
+    );
 
     assert!(report.contains("## Rust Simplicity"));
     assert!(report.contains("### By Crate"));
@@ -524,7 +551,13 @@ fn test_all_languages_correct_labels() {
         }
     }
 
-    let report = create_report_md(&files, false, 10, Path::new("."), "all-languages");
+    let report = create_report_md(
+        &lens_report(files),
+        false,
+        10,
+        Path::new("."),
+        "all-languages",
+    );
 
     assert!(report.contains("### By Module"));
     assert!(report.contains("### By Directory"));
@@ -540,7 +573,7 @@ fn test_multi_language_multi_module_maximalist() {
         files.push(file(&format!("mod_c/sample.{ext}"), *lang, 35.0));
     }
 
-    let report = create_report_md(&files, false, 5, Path::new("."), "maximalist");
+    let report = create_report_md(&lens_report(files), false, 5, Path::new("."), "maximalist");
 
     for (_, lang) in LANG_EXTS {
         assert!(report.contains(&format!("## {} Simplicity", lang.display_name())));
@@ -565,10 +598,28 @@ fn test_full_pipeline_on_generated_fixtures_single_and_multi_module() {
 
     let single_output = temp.path().join("single_output");
     fs::create_dir_all(&single_output).unwrap();
-    perform_analysis(&single_case, &single_output, false, &extensions, &[], None).unwrap();
+    perform_analysis(
+        &single_case,
+        &single_output,
+        false,
+        &ScanOptions {
+            extensions: &extensions,
+            excludes: &[],
+            changed: None,
+            compute_metrics: true,
+        },
+        None,
+    )
+    .unwrap();
     let mut single_simplicity = load_metrics(&single_output, true);
     single_simplicity.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
-    let single_report = create_report_md(&single_simplicity, false, 3, &single_case, "single-case");
+    let single_report = create_report_md(
+        &lens_report(single_simplicity),
+        false,
+        3,
+        &single_case,
+        "single-case",
+    );
 
     assert!(single_report.contains("## Rust Simplicity"));
     assert!(single_report.contains("## Python Simplicity"));
@@ -581,13 +632,29 @@ fn test_full_pipeline_on_generated_fixtures_single_and_multi_module() {
 
     let multi_output = temp.path().join("multi_output");
     fs::create_dir_all(&multi_output).unwrap();
-    perform_analysis(&multi_case, &multi_output, false, &extensions, &[], None).unwrap();
+    perform_analysis(
+        &multi_case,
+        &multi_output,
+        false,
+        &ScanOptions {
+            extensions: &extensions,
+            excludes: &[],
+            changed: None,
+            compute_metrics: true,
+        },
+        None,
+    )
+    .unwrap();
     let mut multi_simplicity = load_metrics(&multi_output, true);
     multi_simplicity.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
-    let multi_report = create_report_md(&multi_simplicity, false, 3, &multi_case, "multi-case");
+    let multi_lenses = lens_report(multi_simplicity);
+    let multi_report = create_report_md(&multi_lenses, false, 3, &multi_case, "multi-case");
 
-    let detected_languages: HashSet<Language> =
-        multi_simplicity.iter().map(|f| f.language).collect();
+    let detected_languages: HashSet<Language> = multi_lenses
+        .complexity_files
+        .iter()
+        .map(|f| f.language)
+        .collect();
     assert!(
         detected_languages.len() >= 6,
         "expected broad multi-language coverage, got {} languages",
