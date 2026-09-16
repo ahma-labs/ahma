@@ -2018,6 +2018,18 @@ entry existed here; those citations now resolve.)
 | MTDF Validation | PASS | Validate tool configs against JSON schema via `ahma --validate` |
 | Error reporting | PASS | Concise, actionable error messages |
 
+### 9.5 ahma simplify
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| AST complexity scoring | PASS | Full AST metrics via `rust-code-analysis` for Rust, JavaScript, TypeScript, Java, Python and C/C++/Objective-C; composite score = 0.4 × MI + 0.3 × Cognitive Density + 0.2 × Peak Cognitive + 0.1 × Length. A Kotlin grammar is present but its metric traits are no-ops, so Kotlin is routed to the external registry instead |
+| External analyzer registry | PASS | Kotlin via Detekt CLI → Gradle Detekt → Lizard; Swift via SwiftLint → Lizard; Java/Go/C#/ObjC/JS/TS via Lizard; `--no-external` disables the registry |
+| Markdown report | PASS | `CODE_SIMPLICITY.md`, worst-to-best file ranking with per-file function hotspots; printed to stdout unless `--output-path`/`--html`/`--open` is set |
+| HTML report | PASS | `CODE_SIMPLICITY.html` generated alongside the Markdown report with `--html` or `--heml` |
+| AI fix prompt | PASS | `--ai-fix N` / MCP `ai_fix` appends a structured prompt naming the Nth-worst file's hotspot functions and instructing targeted-only changes |
+| `--verify` before/after comparison | PASS | Re-analyzes a file against the rust-code-analysis TOML baseline from the previous run and reports a verdict; not supported for Kotlin/Swift/ObjC (no persisted external baseline) |
+| MCP `simplify` tool | PASS | Exposes `directory`, `ai_fix`, `limit`, `verify`, `extensions`, `exclude`, `output_path`, `html` (requires `--tools simplify` at startup) |
+
 ---
 
 ## 10. Agent Skills (R-SK)

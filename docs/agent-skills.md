@@ -35,4 +35,4 @@ Once installed, agents load the skill automatically when you ask about ahma, san
 
 Install or upgrade the binary with `ahma update` (see [installation.md](installation.md)).
 
-For code complexity analysis details, see [SIMPLIFY.md](../SIMPLIFY.md).
+For code complexity analysis details, see [simplify.md](simplify.md).

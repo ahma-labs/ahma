@@ -238,7 +238,7 @@ See [docs/live-log-monitoring.md](docs/live-log-monitoring.md) for setup, the An
 
 - **Custom tools**: If you want to expose your own command-line tools through ahma, start with [docs/custom-tools.md](docs/custom-tools.md).
 - **Agent skills**: Optional agent-specific setup is documented in [docs/agent-skills.md](docs/agent-skills.md).
-- **Code complexity analysis**: `ahma simplify` analyzes source files and returns structured AI fix instructions. See [SIMPLIFY.md](SIMPLIFY.md).
+- **Code complexity analysis**: `ahma simplify` analyzes source files and returns structured AI fix instructions. See [docs/simplify.md](docs/simplify.md).
 
 ---
 

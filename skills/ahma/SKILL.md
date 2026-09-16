@@ -1149,4 +1149,4 @@ ahma simplify . --exclude '**/generated/**,**/vendor/**' --ai-fix 1
 [connection-modes.md](https://github.com/ahma-labs/ahma/blob/main/docs/connection-modes.md) ·
 [environment-variables.md](https://github.com/ahma-labs/ahma/blob/main/docs/environment-variables.md) ·
 [mtdf-schema.json](https://github.com/ahma-labs/ahma/blob/main/docs/mtdf-schema.json) ·
-[SIMPLIFY.md](https://github.com/ahma-labs/ahma/blob/main/SIMPLIFY.md)
+[simplify.md](https://github.com/ahma-labs/ahma/blob/main/docs/simplify.md)
