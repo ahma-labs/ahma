@@ -640,6 +640,15 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # Override the action's default `packages: tools platform-tools`. The legacy
+          # `tools` package (the old `android` command-line tool, superseded by
+          # cmdline-tools years ago) was removed from Google's SDK repository upstream,
+          # so `sdkmanager tools` now fails with "Failed to find package 'tools'" and
+          # exit code 1 -- this job never reaches its cargo nextest step. Nothing here
+          # (the kotlin/android MTDF config tests) invokes the legacy `tools` package;
+          # they only need `platform-tools` (adb) on PATH.
+          packages: platform-tools
 
       # There are deliberately NO Gradle caches in this job. Two used to exist (`gradle-deeper-*`
       # for ~/.gradle deps and `gradle-android-build-*` for the sample app's build outputs) and
