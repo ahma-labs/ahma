@@ -23,7 +23,9 @@ dunce.workspace = true
 opener = "0.8"
 pulldown-cmark = "0.13"
 quick-xml = "0.41"
+regex = { workspace = true }
 rust-code-analysis = { package = "rust-code-analysis-code-split", version = "0.0.26-cs.0" }
+rustc-hash = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tempfile.workspace = true
