@@ -21,7 +21,7 @@ chrono.workspace = true
 clap = { workspace = true, features = ["derive"] }
 dashmap = "6.2"
 futures.workspace = true
-owo-colors = "4.3"
+owo-colors = "4.4.0"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 hmac.workspace = true
@@ -53,7 +53,7 @@ http-body-util = "0.1"
 # into every binary. One provider per workspace; guarded by the
 # `test_single_rustls_crypto_provider_invariant` test.
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
-rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 rustls = "0.23"
 rustls-pki-types = "1"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

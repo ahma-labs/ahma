@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// Describes how complete the metric data is for a file.
@@ -202,7 +204,7 @@ impl FunctionHotspot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Language {
     Rust,
     Python,
@@ -246,6 +248,66 @@ impl Language {
             "html" | "htm" => Language::Html,
             "css" => Language::Css,
             _ => Language::Unknown,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Language::Rust => "rust",
+            Language::Python => "python",
+            Language::JavaScript => "javascript",
+            Language::TypeScript => "typescript",
+            Language::Kotlin => "kotlin",
+            Language::Swift => "swift",
+            Language::ObjectiveC => "objective-c",
+            Language::Cpp => "c++",
+            Language::C => "c",
+            Language::Java => "java",
+            Language::CSharp => "c#",
+            Language::Go => "go",
+            Language::Html => "html",
+            Language::Css => "css",
+            Language::Unknown => "unknown",
+        }
+    }
+
+    /// Single-line comment prefix for this language, if standard.
+    pub fn single_line_comment(&self) -> Option<&'static str> {
+        match self {
+            Language::Rust
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Kotlin
+            | Language::Swift
+            | Language::ObjectiveC
+            | Language::Cpp
+            | Language::C
+            | Language::Java
+            | Language::CSharp
+            | Language::Go => Some("//"),
+            Language::Python => Some("#"),
+            Language::Html | Language::Css | Language::Unknown => None,
+        }
+    }
+
+    /// Multi-line comment delimiters (start, end) for this language, if standard.
+    pub fn multi_line_comment(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Language::Rust
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Kotlin
+            | Language::Swift
+            | Language::ObjectiveC
+            | Language::Cpp
+            | Language::C
+            | Language::Java
+            | Language::CSharp
+            | Language::Go
+            | Language::Css => Some(("/*", "*/")),
+            Language::Html => Some(("<!--", "-->")),
+            Language::Python => Some(("\"\"\"", "\"\"\"")),
+            Language::Unknown => None,
         }
     }
 
@@ -647,6 +709,124 @@ impl FileSimplicity {
         } else {
             None
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Lens Analysis Models
+// ---------------------------------------------------------------------------
+
+/// Location of a duplicated code snippet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateLocation {
+    pub file: PathBuf,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+/// A group of duplicate code blocks detected across the codebase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateGroup {
+    pub hash: u64,
+    pub line_count: usize,
+    pub locations: Vec<DuplicateLocation>,
+    pub sample_text: String,
+}
+
+/// Kind of symbol detected by dead code or structural analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SymbolKind {
+    Function,
+    Method,
+    Struct,
+    Enum,
+    Trait,
+    Class,
+    Interface,
+    TypeAlias,
+    Constant,
+}
+
+impl SymbolKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            SymbolKind::Function => "fn",
+            SymbolKind::Method => "method",
+            SymbolKind::Struct => "struct",
+            SymbolKind::Enum => "enum",
+            SymbolKind::Trait => "trait",
+            SymbolKind::Class => "class",
+            SymbolKind::Interface => "interface",
+            SymbolKind::TypeAlias => "type",
+            SymbolKind::Constant => "const",
+        }
+    }
+}
+
+/// A symbol that has public/exported visibility but no external references found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeadSymbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub file: PathBuf,
+    pub line: usize,
+    pub visibility: String,
+    pub references_found: usize,
+}
+
+/// An efficiency/performance finding detected via pattern matching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EfficiencyFinding {
+    pub rule_id: String,
+    pub file: PathBuf,
+    pub line: usize,
+    pub snippet: String,
+    pub suggestion: String,
+    pub language: Language,
+}
+
+/// A single step in an altitude/delegation call chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AltitudeCall {
+    pub caller: String,
+    pub callee: String,
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+/// A thin-wrapper delegation chain detected across functions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AltitudeChain {
+    pub calls: Vec<AltitudeCall>,
+    pub depth: usize,
+    pub description: String,
+}
+
+/// Aggregated multi-lens simplicity report.
+#[derive(Debug, Default)]
+pub struct MultiLensReport {
+    pub complexity_files: Vec<FileSimplicity>,
+    pub duplicates: Vec<DuplicateGroup>,
+    pub dead_symbols: Vec<DeadSymbol>,
+    pub efficiency_findings: Vec<EfficiencyFinding>,
+    pub altitude_chains: Vec<AltitudeChain>,
+}
+
+impl MultiLensReport {
+    pub fn is_empty(&self) -> bool {
+        self.complexity_files.is_empty()
+            && self.duplicates.is_empty()
+            && self.dead_symbols.is_empty()
+            && self.efficiency_findings.is_empty()
+            && self.altitude_chains.is_empty()
+    }
+
+    pub fn total_issues(&self) -> usize {
+        self.complexity_files.len()
+            + self.duplicates.len()
+            + self.dead_symbols.len()
+            + self.efficiency_findings.len()
+            + self.altitude_chains.len()
     }
 }
 
@@ -1070,5 +1250,44 @@ mod tests {
         let cpp_exts = resolve_extensions(&["cpp".to_string()]);
         assert!(cpp_exts.contains(&"cpp".to_string()));
         assert!(cpp_exts.contains(&"hpp".to_string()));
+    }
+
+    #[test]
+    fn test_language_comments_and_names() {
+        assert_eq!(Language::Rust.single_line_comment(), Some("//"));
+        assert_eq!(Language::Rust.multi_line_comment(), Some(("/*", "*/")));
+        assert_eq!(Language::Python.single_line_comment(), Some("#"));
+        assert_eq!(
+            Language::Python.multi_line_comment(),
+            Some(("\"\"\"", "\"\"\""))
+        );
+        assert_eq!(Language::Html.single_line_comment(), None);
+        assert_eq!(Language::Html.multi_line_comment(), Some(("<!--", "-->")));
+        assert_eq!(Language::Kotlin.single_line_comment(), Some("//"));
+        assert_eq!(Language::Swift.single_line_comment(), Some("//"));
+        assert_eq!(Language::Rust.name(), "rust");
+    }
+
+    #[test]
+    fn test_multi_lens_report_empty_and_total() {
+        let mut report = MultiLensReport::default();
+        assert!(report.is_empty());
+        assert_eq!(report.total_issues(), 0);
+
+        report.duplicates.push(DuplicateGroup {
+            hash: 12345,
+            line_count: 5,
+            locations: vec![DuplicateLocation {
+                file: PathBuf::from("src/foo.rs"),
+                start_line: 1,
+                end_line: 5,
+            }],
+            sample_text: "fn dup() {}".to_string(),
+        });
+        assert!(!report.is_empty());
+        assert_eq!(report.total_issues(), 1);
+
+        assert_eq!(SymbolKind::Function.label(), "fn");
+        assert_eq!(SymbolKind::Struct.label(), "struct");
     }
 }
