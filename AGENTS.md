@@ -247,6 +247,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Artifacts | [docs/artifacts.md](docs/artifacts.md) | — |
 | Bundle audit | [docs/bundle-audit.md](docs/bundle-audit.md) | — |
 | ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | — |
+| Code complexity analysis (`simplify`) | [docs/simplify.md](docs/simplify.md) | §9.5 |
 
 ### Maintenance Checklist
 
