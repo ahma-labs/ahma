@@ -8,14 +8,16 @@ naming the missing feature.
 
 Ahma includes a built-in code analyzer (`ahma simplify`) that runs one or more independent
 analysis **lenses** over your project and returns a structured AI prompt to fix what it finds,
-with minimal, targeted changes. Two lenses exist today: **complexity** (the original analysis —
-scores every source file, identifies the worst hotspot functions, and ranks files worst-first)
-and **reuse** (duplicate-code-block detection, see below). `--lens` selects which lenses run;
-the default, `all`, runs every lens.
+with minimal, targeted changes. Three lenses exist today: **complexity** (the original analysis —
+scores every source file, identifies the worst hotspot functions, and ranks files worst-first),
+**reuse** (duplicate-code-block detection, see below), and **dead-code** (unreferenced exported
+symbols, see below). `--lens` selects which lenses run; the default, `all`, runs every lens.
 
 Supports: **Rust, Python, JavaScript, TypeScript, Kotlin, Swift, Objective-C, C, C++, Java, C#,
 Go, CSS, HTML**. The reuse lens covers all of these, including the languages with no AST
-support, because it works on text rather than a parsed structure.
+support, because it works on text rather than a parsed structure. The dead-code lens covers a
+narrower set — Rust, TypeScript, JavaScript, Python, and Java — because it needs a parsed AST;
+see [Dead Code Lens](#dead-code-lens-unreferenced-exports) below.
 
 ---
 
@@ -219,7 +221,7 @@ Authoritative source: `ahma_common/src/simplify_args.rs` (`SimplifyArgs`).
 | `--output-path` | path | none (prints to stdout) | Directory to write `CODE_SIMPLICITY.md` / `CODE_SIMPLICITY.html` into, instead of printing to stdout |
 | `--ai-fix` | integer | none | Generate a structured AI fix prompt for the Nth most complex file (1-indexed) |
 | `--verify` | path | none | Re-analyze a specific file and compare against the baseline from the previous run |
-| `--lens` | comma-separated list | `all` | Which analysis lenses to run: `complexity`, `reuse`, or `all`. Unknown values are a hard error listing the valid options. Selecting only non-complexity lenses skips the rust-code-analysis parse entirely (the dominant cost), so e.g. `--lens reuse` is substantially faster than a full run |
+| `--lens` | comma-separated list | `all` | Which analysis lenses to run: `complexity`, `reuse`, `dead-code` (also accepted: `dead_code`, `deadcode`, case-insensitive), or `all`. Unknown values are a hard error listing the valid options. Selecting only non-complexity lenses skips the rust-code-analysis parse entirely (the dominant cost), so e.g. `--lens reuse` is substantially faster than a full run |
 | `--diff` | flag | off | Restrict analysis to files git reports as changed (staged, unstaged, and untracked-but-not-ignored) instead of walking the whole tree; fails if the directory isn't a git repository or git isn't installed, rather than silently falling back to a full scan |
 
 ## MCP Tool Reference
@@ -236,7 +238,7 @@ Tool name: `simplify` (requires `--tools simplify` at ahma startup).
 | `exclude` | array | — | Additional glob patterns to exclude |
 | `output_path` | path | — | Write report to directory instead of stdout |
 | `html` | boolean | false | Also generate HTML report |
-| `lens` | array | all | Which analysis lenses to run (e.g. `["reuse"]`); see `--lens` above |
+| `lens` | array | all | Which analysis lenses to run (e.g. `["reuse"]`, `["dead-code"]`); see `--lens` above |
 | `diff` | boolean | false | Restrict analysis to files git reports as changed instead of the whole tree; see `--diff` above |
 
 ### MCP tool invocation examples
@@ -354,12 +356,71 @@ findings.
 
 ---
 
+## Dead Code Lens: Unreferenced Exports
+
+The `dead-code` lens finds exported functions and methods that have no reference anywhere in
+the scanned files. Run it on its own with `--lens dead-code` (also accepted: `dead_code`,
+`deadcode`, case-insensitive), or leave `--lens` at its default (`all`) to run it alongside the
+other two lenses.
+
+```bash
+# Dead-code detection only
+ahma simplify . --lens dead-code
+```
+
+**How it works.** The lens parses real tree-sitter ASTs to locate exported functions, then
+counts identifier occurrences across every scanned file. A symbol with exactly one occurrence —
+its own definition — is a candidate.
+
+**Language support.** Rust, TypeScript, JavaScript, Python, and Java only. Other languages are
+skipped because no AST grammar is available for them in this lens. This is narrower than the
+reuse lens, which covers every language `simplify` supports because it works on text rather
+than a parsed structure. Kotlin is deliberately excluded even though the complexity and reuse
+lenses both handle it: Kotlin's tree-sitter grammar declares no field names on call
+expressions, so the callee cannot be extracted the way it can for the other five languages.
+Kotlin coverage still comes from the complexity lens (via Detekt) and the reuse lens.
+
+**It reports candidates, never verdicts.** Acting on a finding without checking it first is how
+live code gets deleted. Four classes of false positive are structurally invisible to this lens:
+
+- A public API consumed only by a downstream crate — a library's entire public surface
+  legitimately looks unreferenced from inside the library itself.
+- Call sites generated by a macro.
+- Dispatch through a trait object.
+- Reflection or dynamic dispatch by string name.
+
+**Mitigations already applied**, so a finding has already survived some filtering before it
+reaches the report:
+
+- Private functions are skipped entirely — rustc/clippy already catch those.
+- `main` is skipped.
+- `test_`-prefixed functions, anything under a `tests/` directory, and anything in a
+  `*_test.rs`/`*_tests.rs` file are skipped.
+- A function is skipped if any of the 3 lines above it contains `#[allow(dead_code)]`,
+  `#[cfg(test)]`, `@SuppressWarnings`, `# noqa`, `eslint-disable`, or `pub use`.
+- For Rust, commonly trait-required names (`new`, `default`, `from`, `try_from`, `fmt`, `drop`,
+  `clone`, `eq`, `hash`, `next`, `poll`) are skipped, since a trait method reached only through
+  a trait object has no textual call site and these are overwhelmingly required implementations
+  rather than genuinely unused code.
+
+Output is deterministic, sorted by file then line.
+
+For example, running the dead-code lens against the whole ahma workspace surfaced 30
+candidates; run against just the `ahma_simplify` crate alone, it surfaced exactly one —
+`AnalysisConfidence::is_reliable` — which really is referenced nowhere.
+
+Findings appear in the report under `## Possibly Unreferenced Exports (Dead Code Lens)`, a
+table of Symbol / Kind / Visibility / Location, capped by `--limit`, same as the other lenses.
+
+---
+
 ## Report Generation and the AI Fix Prompt
 
 `ahma simplify` produces a Markdown report (`CODE_SIMPLICITY.md`) ranking files worst-to-best
-by score, with per-file function hotspots (complexity lens), and, when the reuse lens ran, a
-`## Duplicate Code (Reuse Lens)` section (see above). With `--html` it additionally renders
-`CODE_SIMPLICITY.html`. There is no other output format.
+by score, with per-file function hotspots (complexity lens), and, depending on which lenses
+ran, a `## Duplicate Code (Reuse Lens)` section and/or a
+`## Possibly Unreferenced Exports (Dead Code Lens)` section (see above). With `--html` it
+additionally renders `CODE_SIMPLICITY.html`. There is no other output format.
 
 `--ai-fix N` (CLI) / `ai_fix` (MCP) appends a structured fix prompt for the Nth-worst file
 (1-indexed) after the report: it names the file, its score, and its specific hotspot

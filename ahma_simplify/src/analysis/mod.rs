@@ -1,6 +1,7 @@
 pub mod changed_files;
 pub mod checkstyle;
 mod conversion;
+pub mod dead_code;
 pub mod detekt;
 pub mod detekt_cli;
 mod exclusion;
@@ -10,6 +11,7 @@ pub mod lizard;
 pub mod paths;
 mod pipeline;
 pub mod reuse;
+pub mod source_tree;
 pub mod swiftlint;
 pub mod workspace;
 

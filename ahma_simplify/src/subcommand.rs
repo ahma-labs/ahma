@@ -22,6 +22,7 @@ use analysis::{
     AnalyzerRegistry, ExternalMetrics, ScanOptions, get_project_name, is_cargo_workspace,
     perform_analysis, run_analysis,
 };
+use analysis::{dead_code, source_tree};
 use models::{FileSimplicity, MetricsResults, MultiLensReport, resolve_extensions};
 use report::{create_report_md, generate_ai_fix_prompt, generate_report};
 
@@ -88,9 +89,21 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
         Vec::new()
     };
 
+    let dead_symbols = if lenses.contains(&Lens::DeadCode) {
+        let trees: Vec<_> = scan
+            .sources
+            .iter()
+            .filter_map(|(path, _)| source_tree::parse_source_tree(path))
+            .collect();
+        dead_code::find_dead_symbols(&scan.sources, &trees)
+    } else {
+        Vec::new()
+    };
+
     let lens_report = MultiLensReport {
         complexity_files: files_simplicity,
         duplicates,
+        dead_symbols,
         ..Default::default()
     };
     if lens_report.is_empty() {
@@ -560,7 +573,7 @@ mod tests {
         assert!(!args.diff);
         assert_eq!(
             parse_lenses(&args.lens).unwrap(),
-            vec![Lens::Complexity, Lens::Reuse]
+            vec![Lens::Complexity, Lens::Reuse, Lens::DeadCode]
         );
     }
 

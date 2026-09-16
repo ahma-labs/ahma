@@ -29,6 +29,10 @@ rustc-hash = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tempfile.workspace = true
+# Pinned to the exact version rust-code-analysis-code-split pins, because we walk
+# the `tree_sitter::Node` its parser hands back; a mismatch is two incompatible
+# copies of the type, not a version bump.
+tree-sitter = "=0.26.9"
 toml.workspace = true
 walkdir = "2.5"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
