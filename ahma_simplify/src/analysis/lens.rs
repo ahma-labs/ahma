@@ -5,7 +5,7 @@
 
 use std::str::FromStr;
 
-const VALID_LENS_NAMES: &str = "complexity, reuse, dead-code, all";
+const VALID_LENS_NAMES: &str = "complexity, reuse, dead-code, altitude, all";
 
 /// One independent analysis pass over the codebase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,10 +17,17 @@ pub enum Lens {
     Reuse,
     /// Exported symbols with no apparent references.
     DeadCode,
+    /// Chains of functions that only forward to the next one.
+    Altitude,
 }
 
 impl Lens {
-    const ALL: [Lens; 3] = [Lens::Complexity, Lens::Reuse, Lens::DeadCode];
+    const ALL: [Lens; 4] = [
+        Lens::Complexity,
+        Lens::Reuse,
+        Lens::DeadCode,
+        Lens::Altitude,
+    ];
 }
 
 impl FromStr for Lens {
@@ -31,6 +38,7 @@ impl FromStr for Lens {
             "complexity" => Ok(Lens::Complexity),
             "reuse" => Ok(Lens::Reuse),
             "dead-code" | "dead_code" | "deadcode" => Ok(Lens::DeadCode),
+            "altitude" => Ok(Lens::Altitude),
             other => Err(anyhow::anyhow!(
                 "unknown lens '{other}'; valid values are: {VALID_LENS_NAMES}"
             )),
@@ -76,6 +84,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_altitude() {
+        assert_eq!("altitude".parse::<Lens>().unwrap(), Lens::Altitude);
+        assert_eq!("ALTITUDE".parse::<Lens>().unwrap(), Lens::Altitude);
+    }
+
+    #[test]
     fn parses_dead_code_in_each_spelling() {
         for spelling in ["dead-code", "dead_code", "deadcode", "DEAD-CODE"] {
             assert_eq!(
@@ -105,19 +119,43 @@ mod tests {
     #[test]
     fn all_expands_to_every_variant_in_declaration_order() {
         let lenses = parse_lenses(&["all".to_string()]).unwrap();
-        assert_eq!(lenses, vec![Lens::Complexity, Lens::Reuse, Lens::DeadCode]);
+        assert_eq!(
+            lenses,
+            vec![
+                Lens::Complexity,
+                Lens::Reuse,
+                Lens::DeadCode,
+                Lens::Altitude
+            ]
+        );
     }
 
     #[test]
     fn all_is_case_insensitive() {
         let lenses = parse_lenses(&["ALL".to_string()]).unwrap();
-        assert_eq!(lenses, vec![Lens::Complexity, Lens::Reuse, Lens::DeadCode]);
+        assert_eq!(
+            lenses,
+            vec![
+                Lens::Complexity,
+                Lens::Reuse,
+                Lens::DeadCode,
+                Lens::Altitude
+            ]
+        );
     }
 
     #[test]
     fn empty_input_means_all() {
         let lenses = parse_lenses(&[]).unwrap();
-        assert_eq!(lenses, vec![Lens::Complexity, Lens::Reuse, Lens::DeadCode]);
+        assert_eq!(
+            lenses,
+            vec![
+                Lens::Complexity,
+                Lens::Reuse,
+                Lens::DeadCode,
+                Lens::Altitude
+            ]
+        );
     }
 
     #[test]

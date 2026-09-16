@@ -5,6 +5,7 @@
 //! process. Pure-unit (no subprocess, no network), so no `.config/nextest.toml`
 //! override applies. Add suites as `tests/integration/<name>.rs` + `mod` below.
 
+mod altitude_lens_test;
 mod dead_code_lens_test;
 mod report_test;
 mod reuse_lens_test;

@@ -8,16 +8,18 @@ naming the missing feature.
 
 Ahma includes a built-in code analyzer (`ahma simplify`) that runs one or more independent
 analysis **lenses** over your project and returns a structured AI prompt to fix what it finds,
-with minimal, targeted changes. Three lenses exist today: **complexity** (the original analysis —
+with minimal, targeted changes. Four lenses exist today: **complexity** (the original analysis —
 scores every source file, identifies the worst hotspot functions, and ranks files worst-first),
-**reuse** (duplicate-code-block detection, see below), and **dead-code** (unreferenced exported
-symbols, see below). `--lens` selects which lenses run; the default, `all`, runs every lens.
+**reuse** (duplicate-code-block detection, see below), **dead-code** (unreferenced exported
+symbols, see below), and **altitude** (thin-wrapper delegation-chain detection, see below).
+`--lens` selects which lenses run; the default, `all`, runs every lens.
 
 Supports: **Rust, Python, JavaScript, TypeScript, Kotlin, Swift, Objective-C, C, C++, Java, C#,
 Go, CSS, HTML**. The reuse lens covers all of these, including the languages with no AST
-support, because it works on text rather than a parsed structure. The dead-code lens covers a
-narrower set — Rust, TypeScript, JavaScript, Python, and Java — because it needs a parsed AST;
-see [Dead Code Lens](#dead-code-lens-unreferenced-exports) below.
+support, because it works on text rather than a parsed structure. The dead-code and altitude
+lenses cover a narrower set — Rust, TypeScript, JavaScript, Python, and Java — because each
+needs a parsed AST; see [Dead Code Lens](#dead-code-lens-unreferenced-exports) and
+[Altitude Lens](#altitude-lens) below.
 
 ---
 
@@ -221,7 +223,7 @@ Authoritative source: `ahma_common/src/simplify_args.rs` (`SimplifyArgs`).
 | `--output-path` | path | none (prints to stdout) | Directory to write `CODE_SIMPLICITY.md` / `CODE_SIMPLICITY.html` into, instead of printing to stdout |
 | `--ai-fix` | integer | none | Generate a structured AI fix prompt for the Nth most complex file (1-indexed) |
 | `--verify` | path | none | Re-analyze a specific file and compare against the baseline from the previous run |
-| `--lens` | comma-separated list | `all` | Which analysis lenses to run: `complexity`, `reuse`, `dead-code` (also accepted: `dead_code`, `deadcode`, case-insensitive), or `all`. Unknown values are a hard error listing the valid options. Selecting only non-complexity lenses skips the rust-code-analysis parse entirely (the dominant cost), so e.g. `--lens reuse` is substantially faster than a full run |
+| `--lens` | comma-separated list | `all` | Which analysis lenses to run: `complexity`, `reuse`, `dead-code` (also accepted: `dead_code`, `deadcode`, case-insensitive), `altitude`, or `all`. Unknown values are a hard error listing the valid options. Selecting only non-complexity lenses skips the rust-code-analysis parse entirely (the dominant cost), so e.g. `--lens reuse` is substantially faster than a full run |
 | `--diff` | flag | off | Restrict analysis to files git reports as changed (staged, unstaged, and untracked-but-not-ignored) instead of walking the whole tree; fails if the directory isn't a git repository or git isn't installed, rather than silently falling back to a full scan |
 
 ## MCP Tool Reference
@@ -238,7 +240,7 @@ Tool name: `simplify` (requires `--tools simplify` at ahma startup).
 | `exclude` | array | — | Additional glob patterns to exclude |
 | `output_path` | path | — | Write report to directory instead of stdout |
 | `html` | boolean | false | Also generate HTML report |
-| `lens` | array | all | Which analysis lenses to run (e.g. `["reuse"]`, `["dead-code"]`); see `--lens` above |
+| `lens` | array | all | Which analysis lenses to run (e.g. `["reuse"]`, `["dead-code"]`, `["altitude"]`); see `--lens` above |
 | `diff` | boolean | false | Restrict analysis to files git reports as changed instead of the whole tree; see `--diff` above |
 
 ### MCP tool invocation examples
@@ -361,7 +363,7 @@ findings.
 The `dead-code` lens finds exported functions and methods that have no reference anywhere in
 the scanned files. Run it on its own with `--lens dead-code` (also accepted: `dead_code`,
 `deadcode`, case-insensitive), or leave `--lens` at its default (`all`) to run it alongside the
-other two lenses.
+other lenses.
 
 ```bash
 # Dead-code detection only
@@ -414,13 +416,66 @@ table of Symbol / Kind / Visibility / Location, capped by `--limit`, same as the
 
 ---
 
+## Altitude Lens
+
+The `altitude` lens finds thin-wrapper delegation chains: a function whose entire body is a
+single statement forwarding to another function, which itself only forwards to a third, and so
+on. Run it on its own with `--lens altitude`, or leave `--lens` at its default (`all`) to run it
+alongside the other lenses.
+
+```bash
+# Delegation-chain detection only
+ahma simplify . --lens altitude
+```
+
+The name comes from fixing a problem at the wrong *altitude*: a bandaid layered on shared
+infrastructure rather than a fix at the depth where it actually belongs. A long forwarding
+chain is the symptom — each layer adds a call frame and a name to learn, but no behaviour.
+
+**Candidates, not defects.** This is the most important thing to understand about this lens's
+output. A forwarding layer is frequently deliberate and correct:
+
+- a public API facade over an internal module,
+- a trait impl delegating to a free function,
+- a platform-abstraction shim.
+
+The report frames a chain as a question about where the logic belongs, not as a mistake — read
+every hop before deciding whether anything should be collapsed.
+
+Key properties:
+
+- **A thin wrapper** is a function whose body is exactly one statement making exactly one call.
+- **Only chains of 2 or more forwarding hops are reported** (A → B → C). A single forwarding
+  call is ordinary delegation and would drown the signal.
+- **AST-based**, so it covers the same five languages as the dead-code lens: Rust, TypeScript,
+  JavaScript, Python, and Java. Not Kotlin (its tree-sitter grammar declares no field names on
+  call expressions, so the callee cannot be extracted), and not Swift, Go, or C# (no grammar at
+  all in this analyzer). The reuse lens remains the only one covering every language.
+- **Name resolution is deliberately conservative.** The AST exposes only a call's trailing
+  identifier, with no type information, so two same-named functions in different modules are
+  indistinguishable. When a callee name matches more than one definition in the scanned corpus,
+  the chain stops there rather than guessing — a fabricated chain wastes more of a reader's time
+  than a missed one.
+- Recursive and mutually-recursive wrappers are detected and the walk terminates instead of
+  looping forever.
+- **Only maximal chains are reported** — the sub-chain B → C of a reported A → B → C is not
+  listed separately.
+- Deterministic output.
+
+Findings appear in the report under `## Delegation Chains (Altitude Lens)`, one entry per
+chain, listing its hop count, a description, and every caller → callee edge with file and line.
+The section is capped by `--limit`, same as the other lenses.
+
+---
+
 ## Report Generation and the AI Fix Prompt
 
 `ahma simplify` produces a Markdown report (`CODE_SIMPLICITY.md`) ranking files worst-to-best
 by score, with per-file function hotspots (complexity lens), and, depending on which lenses
-ran, a `## Duplicate Code (Reuse Lens)` section and/or a
-`## Possibly Unreferenced Exports (Dead Code Lens)` section (see above). With `--html` it
-additionally renders `CODE_SIMPLICITY.html`. There is no other output format.
+ran, a `## Duplicate Code (Reuse Lens)` section, a
+`## Possibly Unreferenced Exports (Dead Code Lens)` section, and/or a
+`## Delegation Chains (Altitude Lens)` section (see above). With `--html` it additionally
+renders `CODE_SIMPLICITY.html`. There is no other output format.
 
 `--ai-fix N` (CLI) / `ai_fix` (MCP) appends a structured fix prompt for the Nth-worst file
 (1-indexed) after the report: it names the file, its score, and its specific hotspot
