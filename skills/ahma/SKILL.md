@@ -815,13 +815,57 @@ prompting required**.
 /ahma simplify rust top 3      # Auto-fix top 3 Rust issues concurrently
 /ahma simplify 3               # Manual mode: get fix prompt for issue #3 only
 /ahma simplify kotlin 2        # Manual mode: Kotlin issue #2 only
+/ahma simplify --lens reuse    # Reuse lens only — duplicate-code candidates (see below)
+/ahma simplify --diff          # Only files changed in git, instead of the whole tree
 ```
 
 **Mode selection rule:** If the command contains `top N` or has NO trailing integer,
 use **auto mode** (concurrent subagents). If a bare trailing integer is given without
-`top`, use **manual mode** (single-file sequential workflow).
+`top`, use **manual mode** (single-file sequential workflow). `--lens` and `--diff` are
+orthogonal to mode selection — they narrow *what* gets analyzed, not whether subagents
+are spawned; combine them with the forms above (e.g. `/ahma simplify rust --lens reuse`).
 
 Language names are case-insensitive and expand to their extensions automatically.
+
+### Lenses — `--lens` (CLI) / `lens` (MCP)
+
+`ahma simplify` runs one or more independent analysis lenses, comma-separated in `--lens`
+(default `all`):
+
+- `complexity` — the metrics/hotspot analysis this whole section is built around.
+- `reuse` — duplicate-code-block detection across the project (any supported language,
+  including ones with no AST support). See below — its findings need a different
+  response than a complexity issue.
+- `all` — both (default).
+
+Selecting only `reuse` skips the AST parse entirely, so `--lens reuse` is much faster than
+a full run. Unknown lens names are a hard CLI error listing the valid options.
+
+### Scoping to changed files — `--diff` (CLI) / `diff` (MCP)
+
+`--diff` restricts analysis to files git reports as changed (staged, unstaged, and
+untracked-but-not-ignored) instead of walking the whole tree. Use it to check just what
+you touched, e.g. after Phase 3 verification below. It fails with a clear error if the
+directory isn't a git repository or git isn't installed — it does not silently fall back
+to a full scan.
+
+### Reuse Lens — Evaluate, Don't Blindly Act
+
+The `reuse` lens reports **candidates for extraction, not defects.** Two identical-looking
+blocks can be coincidental, and a shared helper is not automatically clearer. Before acting
+on a reuse-lens finding:
+
+- Read every listed location, not just the sample — confirm the blocks are actually the
+  same logic, not just the same shape.
+- Judge whether extracting a helper would make the code clearer, not just shorter. If it
+  wouldn't, leave it and say so — this is a normal, expected outcome.
+- Treat a match spanning a string literal (e.g. a URL) with extra suspicion: comment
+  stripping is textual, so a comment delimiter inside a string can produce a spurious or
+  missed match.
+
+Do not spawn a fix subagent per reuse-lens finding the way Phase 2 does for complexity
+issues below — read the findings yourself first and decide which, if any, are worth acting
+on.
 
 ### Supported Languages
 
@@ -1104,6 +1148,8 @@ Score = 0.4 × MI + 0.3 × Cognitive Density + 0.2 × Peak Cognitive + 0.1 × Le
 | `exclude` | array | — | Additional glob patterns to exclude |
 | `output_path` | path | — | Write report to directory instead of stdout |
 | `html` | boolean | false | Also generate HTML report |
+| `lens` | array | all | Which lenses to run: `complexity`, `reuse`, or `all` (e.g. `["reuse"]`) |
+| `diff` | boolean | false | Restrict to files git reports as changed instead of the whole tree |
 
 ### CLI Quick Reference
 
@@ -1131,6 +1177,12 @@ ahma simplify . --html
 
 # Exclude generated code
 ahma simplify . --exclude '**/generated/**,**/vendor/**' --ai-fix 1
+
+# Reuse lens only — duplicate-code candidates, skips the AST parse (fast)
+ahma simplify . --lens reuse
+
+# Only the files changed in git
+ahma simplify . --diff
 ```
 
 ### Anti-Patterns to Avoid

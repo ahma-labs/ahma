@@ -16,11 +16,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use analysis::lens::{Lens, parse_lenses};
+use analysis::reuse::{self, ReuseConfig};
 use analysis::{
-    AnalyzerRegistry, ExternalMetrics, get_project_name, is_cargo_workspace, perform_analysis,
-    run_analysis,
+    AnalyzerRegistry, ExternalMetrics, ScanOptions, get_project_name, is_cargo_workspace,
+    perform_analysis, run_analysis,
 };
-use models::{FileSimplicity, MetricsResults, resolve_extensions};
+use models::{FileSimplicity, MetricsResults, MultiLensReport, resolve_extensions};
 use report::{create_report_md, generate_ai_fix_prompt, generate_report};
 
 /// Run the simplify analysis with the given arguments.
@@ -44,6 +46,7 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
 
     let is_workspace = is_cargo_workspace(&args.directory);
     let extensions = resolve_extensions(&args.extensions);
+    let lenses = parse_lenses(&args.lens)?;
 
     // Build the external analyzer registry unless the user requested rca-only.
     let registry = build_registry(args.no_external);
@@ -53,22 +56,48 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
         Some(&registry)
     };
 
-    let external_metrics = perform_analysis(
+    let changed = if args.diff {
+        Some(analysis::changed_files::changed_files(&directory)?)
+    } else {
+        None
+    };
+
+    let scan = perform_analysis(
         &directory,
         &args.output,
         is_workspace,
-        &extensions,
-        &args.exclude,
+        &ScanOptions {
+            extensions: &extensions,
+            excludes: &args.exclude,
+            changed: changed.as_ref(),
+            compute_metrics: lenses.contains(&Lens::Complexity),
+        },
         registry_ref,
     )?;
 
-    let mut files_simplicity = load_metrics(&args.output, true, &external_metrics)?;
-    if files_simplicity.is_empty() {
-        eprintln!("No analysis files found in {}.", args.output.display());
+    let mut files_simplicity = if lenses.contains(&Lens::Complexity) {
+        load_metrics(&args.output, true, &scan.external)?
+    } else {
+        Vec::new()
+    };
+    sort_files_by_simplicity(&mut files_simplicity);
+
+    let duplicates = if lenses.contains(&Lens::Reuse) {
+        reuse::find_duplicates(&scan.sources, &ReuseConfig::default())
+    } else {
+        Vec::new()
+    };
+
+    let lens_report = MultiLensReport {
+        complexity_files: files_simplicity,
+        duplicates,
+        ..Default::default()
+    };
+    if lens_report.is_empty() {
+        eprintln!("No findings: nothing matched the selected lenses.");
         return Ok(());
     }
 
-    sort_files_by_simplicity(&mut files_simplicity);
     let project_name = get_project_name(&directory);
 
     // Determine output mode: write to file if --output-path, --html, or --open is set
@@ -80,7 +109,7 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
             .context("Failed to create report output directory")?;
 
         generate_report(
-            &files_simplicity,
+            &lens_report,
             is_workspace,
             args.limit,
             &directory,
@@ -95,7 +124,7 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
             handle_ai_fix_from_file(
                 issue_number,
                 &report_output_dir,
-                &files_simplicity,
+                &lens_report.complexity_files,
                 &directory,
             )?;
         }
@@ -108,7 +137,7 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
     } else {
         // Default: output markdown to stdout
         let md_content = create_report_md(
-            &files_simplicity,
+            &lens_report,
             is_workspace,
             args.limit,
             &directory,
@@ -116,7 +145,12 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
         );
 
         if let Some(issue_number) = args.ai_fix {
-            handle_ai_fix_to_stdout(&md_content, issue_number, &files_simplicity, &directory);
+            handle_ai_fix_to_stdout(
+                &md_content,
+                issue_number,
+                &lens_report.complexity_files,
+                &directory,
+            );
         } else {
             println!("{}", md_content);
         }
@@ -352,7 +386,18 @@ fn run_verify(
     let parent_dir = canonical_verify
         .parent()
         .context("Cannot determine parent directory")?;
-    run_analysis(parent_dir, temp_output.path(), extensions, &[], None)?;
+    run_analysis(
+        parent_dir,
+        temp_output.path(),
+        &ScanOptions {
+            extensions,
+            excludes: &[],
+            changed: None,
+            compute_metrics: true,
+        },
+        None,
+        &mut Vec::new(),
+    )?;
 
     let current = find_baseline_metrics(temp_output.path(), &canonical_verify)?;
     let current_simplicity = FileSimplicity::calculate(&current, true);
@@ -506,6 +551,46 @@ mod tests {
     fn test_cli_parsing_with_ai_fix() {
         let args = parse(&["test", ".", "--ai-fix", "1"]);
         assert_eq!(args.ai_fix, Some(1));
+    }
+
+    #[test]
+    fn lens_defaults_to_all_and_diff_defaults_off() {
+        let args = parse(&["test", "."]);
+        assert_eq!(args.lens, vec!["all".to_string()]);
+        assert!(!args.diff);
+        assert_eq!(
+            parse_lenses(&args.lens).unwrap(),
+            vec![Lens::Complexity, Lens::Reuse]
+        );
+    }
+
+    #[test]
+    fn lens_accepts_a_comma_separated_list() {
+        let args = parse(&["test", ".", "--lens", "reuse,complexity"]);
+        assert_eq!(
+            args.lens,
+            vec!["reuse".to_string(), "complexity".to_string()]
+        );
+    }
+
+    #[test]
+    fn lens_rejects_an_unknown_value() {
+        let args = parse(&["test", ".", "--lens", "nonsense"]);
+        let err = parse_lenses(&args.lens).unwrap_err().to_string();
+        assert!(
+            err.contains("nonsense"),
+            "error should name the bad value: {err}"
+        );
+        assert!(
+            err.contains("reuse"),
+            "error should list valid values: {err}"
+        );
+    }
+
+    #[test]
+    fn diff_flag_is_parsed() {
+        let args = parse(&["test", ".", "--diff"]);
+        assert!(args.diff);
     }
 
     #[test]

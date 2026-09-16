@@ -66,7 +66,9 @@ pub struct SimplifyArgs {
     #[arg(long)]
     pub open: bool,
 
-    /// Shorthand for --format html
+    /// Additionally renders CODE_SIMPLICITY.html next to the Markdown report,
+    /// and (like --open/--output-path) causes the report to be written to
+    /// disk rather than printed to stdout.
     #[arg(long)]
     pub html: bool,
 
@@ -115,4 +117,19 @@ pub struct SimplifyArgs {
     /// metrics with relative improvement percentages.
     #[arg(long)]
     pub verify: Option<PathBuf>,
+
+    /// Which analysis lenses to run, comma-separated. Valid values: complexity
+    /// (the default metrics analysis), reuse (duplicate-code detection), or
+    /// all. Reach for a narrower set when you only care about one signal, for
+    /// example --lens reuse to check for duplication without a full metrics
+    /// pass. Default: all.
+    #[arg(long, value_delimiter = ',', default_value = "all")]
+    pub lens: Vec<String>,
+
+    /// Restrict analysis to files changed in git (staged, unstaged, and
+    /// untracked) instead of the whole tree. Reach for this after making a
+    /// change, to check what you just touched rather than re-scanning the
+    /// entire project.
+    #[arg(long)]
+    pub diff: bool,
 }
