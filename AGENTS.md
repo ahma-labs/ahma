@@ -599,6 +599,9 @@ Capture full logs (`<cmd> 2>&1 | tee …`) and reduce concurrency to a single te
 - **R-GUARD.3**: Guardrail scripts **should** verify that custom HTTP bridge integration tests use shared startup helpers from `tests/common/server.rs`.
 - **R-GUARD.4**: Guardrail scripts **must** run `scripts/check-dependency-graph.sh` (`cargo hakari verify` plus the single-crypto-provider check), so a dependency edit that was not followed by `cargo hakari generate && cargo hakari manage-deps`, or that drags `ring` back in through a default feature, fails before push. PR CI runs the same script on every PR.
 - **R-GUARD.5**: Guardrail scripts **must** reject a new top-level `tests/*.rs` file that is not on the per-crate root-binary allowlist (see [Test Binary Layout](#test-binary-layout--one-binary-per-harness-class)).
+- **R-GUARD.6**: Guardrail scripts **must** reject any `skills/*/SKILL.md` over the SPEC.md
+  R-SK3 500-line cap, so a skill can grow with every feature PR without anyone noticing it
+  drifted out of compliance.
 
 ---
 

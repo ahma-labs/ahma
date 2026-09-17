@@ -73,6 +73,26 @@ if [[ -n "$SKILL_LINK_VIOLATIONS" ]]; then
 fi
 echo "OK No relative docs/ links in SKILL.md files"
 
+echo "=== Guardrail: SKILL.md size limit (R-SK3, 500 lines) ==="
+# SPEC.md R-SK3: skills must stay dense and link to docs/ for deep dives, so a skill
+# growing unboundedly with every feature (as skills/ahma/SKILL.md did, 1152 -> 1244 lines
+# across two PRs) goes unnoticed until an agent has to load a huge file for a small task.
+SKILL_SIZE_VIOLATIONS=""
+while IFS= read -r -d '' skill_file; do
+  LINE_COUNT=$(wc -l < "$skill_file")
+  if [[ "$LINE_COUNT" -gt 500 ]]; then
+    SKILL_SIZE_VIOLATIONS+="  $skill_file: $LINE_COUNT lines (limit 500)"$'\n'
+  fi
+done < <(find skills -mindepth 2 -name 'SKILL.md' -print0)
+if [[ -n "$SKILL_SIZE_VIOLATIONS" ]]; then
+  echo ""
+  echo "FAIL SKILL.md files exceed the R-SK3 500-line cap:"
+  echo "$SKILL_SIZE_VIOLATIONS"
+  echo "Move worked examples and deep-dive prose into docs/<feature>.md and link to it instead."
+  exit 1
+fi
+echo "OK All SKILL.md files are within the 500-line cap"
+
 echo "=== Guardrail: skill version consistency with Cargo.toml ==="
 CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 AHMA_SKILL_VER=$(grep '^version:' skills/ahma/SKILL.md | head -1 | awk '{print $2}')

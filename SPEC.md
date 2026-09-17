@@ -2058,7 +2058,8 @@ Every `SKILL.md` MUST have a YAML frontmatter block with:
 ### R-SK3 — Size limit
 
 Skills MUST NOT exceed **500 lines**. Keep content dense: use tables, bullet lists, and code
-snippets rather than prose paragraphs. Link to `docs/` for deep dives.
+snippets rather than prose paragraphs. Link to `docs/` for deep dives. Enforced by
+`scripts/check-guardrails.sh` (AGENTS.md §4 R-GUARD.6).
 
 ### R-SK4 — Required sections (ahma skill)
 
