@@ -14,6 +14,7 @@ pub mod cli;
 pub mod client;
 pub mod concurrency;
 pub mod config;
+pub mod config_builders;
 pub mod fs;
 pub mod http;
 pub mod in_process;

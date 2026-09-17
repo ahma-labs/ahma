@@ -75,6 +75,7 @@ fn find_subcommand_in_level<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::config_builders::{make_subcommand, make_subcommand_with_nested};
 
     fn make_tool_config(name: &str, subcommands: Option<Vec<SubcommandConfig>>) -> ToolConfig {
         ToolConfig {
@@ -82,47 +83,7 @@ mod tests {
             description: format!("{} tool", name),
             command: name.to_string(),
             subcommand: subcommands,
-            input_schema: None,
-            timeout_seconds: None,
-            synchronous: None,
-            hints: Default::default(),
             enabled: true,
-            guidance_key: None,
-            sequence: None,
-            step_delay_ms: None,
-            availability_check: None,
-            install_instructions: None,
-            monitor_level: None,
-            monitor_stream: None,
-            tool_type: None,
-            livelog: None,
-            ..Default::default()
-        }
-    }
-
-    fn make_subcommand(name: &str, enabled: bool) -> SubcommandConfig {
-        SubcommandConfig {
-            extra: Default::default(),
-            mutates: None,
-            name: name.to_string(),
-            description: format!("{} subcommand", name),
-            enabled,
-            ..Default::default()
-        }
-    }
-
-    fn make_subcommand_with_nested(
-        name: &str,
-        enabled: bool,
-        nested: Vec<SubcommandConfig>,
-    ) -> SubcommandConfig {
-        SubcommandConfig {
-            extra: Default::default(),
-            mutates: None,
-            name: name.to_string(),
-            description: format!("{} subcommand", name),
-            subcommand: Some(nested),
-            enabled,
             ..Default::default()
         }
     }

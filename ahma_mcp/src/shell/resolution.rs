@@ -277,7 +277,7 @@ pub async fn run_cli_sequence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ToolHints;
+    use crate::test_utils::config_builders::{make_subcommand, make_subcommand_with_nested};
 
     // =========================================================================
     // Helper: Create a minimal ToolConfig for testing
@@ -288,20 +288,6 @@ mod tests {
             description: format!("{} tool", name),
             command: command.to_string(),
             enabled,
-            timeout_seconds: None,
-            synchronous: None,
-            guidance_key: None,
-            input_schema: None,
-            hints: ToolHints::default(),
-            subcommand: None,
-            sequence: None,
-            step_delay_ms: None,
-            availability_check: None,
-            install_instructions: None,
-            monitor_level: None,
-            monitor_stream: None,
-            tool_type: None,
-            livelog: None,
             ..Default::default()
         }
     }
@@ -317,47 +303,7 @@ mod tests {
             description: format!("{} tool", name),
             command: command.to_string(),
             enabled,
-            timeout_seconds: None,
-            synchronous: None,
-            guidance_key: None,
-            input_schema: None,
-            hints: ToolHints::default(),
             subcommand: Some(subcommands),
-            sequence: None,
-            step_delay_ms: None,
-            availability_check: None,
-            install_instructions: None,
-            monitor_level: None,
-            monitor_stream: None,
-            tool_type: None,
-            livelog: None,
-            ..Default::default()
-        }
-    }
-
-    fn make_subcommand(name: &str, enabled: bool) -> SubcommandConfig {
-        SubcommandConfig {
-            extra: Default::default(),
-            mutates: None,
-            name: name.to_string(),
-            description: format!("{} subcommand", name),
-            enabled,
-            ..Default::default()
-        }
-    }
-
-    fn make_subcommand_with_nested(
-        name: &str,
-        enabled: bool,
-        nested: Vec<SubcommandConfig>,
-    ) -> SubcommandConfig {
-        SubcommandConfig {
-            extra: Default::default(),
-            mutates: None,
-            name: name.to_string(),
-            description: format!("{} subcommand", name),
-            subcommand: Some(nested),
-            enabled,
             ..Default::default()
         }
     }
