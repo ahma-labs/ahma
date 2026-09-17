@@ -30,19 +30,12 @@ kernel-level filesystem sandboxing, async execution, and live log monitoring.
 
 ## Quick Start: mcp.json Setup
 
-MCP stdio servers auto-start when the IDE needs tools — the only step is getting
-the config in place. There are several approaches, from zero-friction to global:
+MCP stdio servers auto-start when the IDE needs tools — the only step is getting config in
+place. Full walkthrough of every mode (stdio/HTTP/Unix socket) and client:
+[docs/connection-modes.md](https://github.com/ahma-labs/ahma/blob/main/docs/connection-modes.md);
+first-time install: [docs/installation.md](https://github.com/ahma-labs/ahma/blob/main/docs/installation.md).
 
-### 1. Commit to the repo (recommended — zero setup for teammates)
-
-**The Ahma project already provides `.vscode/mcp.json` with three configurations to try:**
-
-- `ahma` — stdio mode (recommended, automatic per-client instances)
-- `ahma-http` — shared HTTP server on port 3000 (run `ahma serve http --tools git,fileutils --sandbox --log-monitor`)
-- `ahma-unix` — an explicitly started server over a Unix socket, separate from the per-user daemon (run `ahma serve unix --socket-path <path> --tools git,fileutils --sandbox --log-monitor`)
-
-You can copy or customize this for your own projects. Create `.vscode/mcp.json` in your project root and commit it. Every VS Code user
-who opens the project gets Ahma configured automatically (prompted to trust once):
+**Recommended — commit `.vscode/mcp.json` to the repo** so every teammate gets it automatically:
 
 ```json
 {
@@ -56,82 +49,21 @@ who opens the project gets Ahma configured automatically (prompted to trust once
 }
 ```
 
-### 2. User-level config (available in all workspaces)
+| Approach | Where |
+|---|---|
+| User-level (all workspaces) | VS Code `~/.config/Code/User/mcp.json`, Cursor `~/.cursor/mcp.json`, Claude Code `~/.claude.json` → `mcpServers`, Claude Desktop `claude_desktop_config.json` |
+| VS Code auto-start | `{ "chat.mcp.autoStart": true }` in settings |
+| VS Code sandbox integration | add `"sandboxEnabled": true` + `"sandbox": {...}` to the server entry — auto-approves tool calls |
+| Multi-IDE install script | `curl -fsSL https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh \| bash` |
+| Dev containers | run the install script from `postCreateCommand`, combine with a committed `.vscode/mcp.json` |
+| One-step setup (all of the above) | `ahma setup` (interactive) or `ahma setup -y` (non-interactive) |
 
-| IDE | Config file |
-|-----|-------------|
-| **VS Code** | `~/.config/Code/User/mcp.json` (or run `MCP: Open User Configuration`) |
-| **Cursor** | `~/.cursor/mcp.json` |
-| **Claude Code** | `~/.claude.json` → `"mcpServers"` key |
-| **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-
-Same JSON structure as above. The server starts automatically when chat is opened.
-
-### 3. VS Code auto-start setting
-
-Enable globally in VS Code settings:
-```json
-{ "chat.mcp.autoStart": true }
-```
-This auto-(re)starts MCP servers when configuration changes are detected, so
-Ahma spins up as soon as VS Code sees the config — no need to open chat first.
-
-### 4. VS Code sandbox integration (auto-approve tool calls)
-
-VS Code provides its own sandbox for MCP stdio servers. When enabled, tool calls
-are auto-approved (no confirmation dialogs). Pairs well with Ahma's kernel sandbox:
-
-```json
-{
-  "servers": {
-    "ahma": {
-      "type": "stdio",
-      "command": "ahma",
-      "args": ["serve", "stdio", "--tools", "git,fileutils"],
-      "sandboxEnabled": true,
-      "sandbox": {
-        "filesystem": { "allowWrite": ["${workspaceFolder}"] }
-      }
-    }
-  }
-}
-```
-
-### 5. Install script (multi-IDE setup)
-
-Run the install script to configure Ahma across all supported IDEs at once:
-```bash
-curl -fsSL https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash
-```
-
-### 6. Dev containers
-
-Add to `.devcontainer/devcontainer.json` for Codespaces / container users:
-```json
-{
-  "features": {},
-  "postCreateCommand": "curl -fsSL https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash",
-  "customizations": {
-    "vscode": {
-      "settings": { "chat.mcp.autoStart": true }
-    }
-  }
-}
-```
-Combine with `.vscode/mcp.json` committed to the repo.
-
-### AI Agent: Helping Users Set Up
-
-If a user asks you to use Ahma but it isn't configured, help them by:
-1. Check if `.vscode/mcp.json` exists — if not, offer to create it
-2. Ask which bundles they need (git, python, etc.)
-3. Create the config and tell them to reload the window (`Developer: Reload Window`)
+**Helping a user set up Ahma:** check for `.vscode/mcp.json`, offer to create it, ask which
+bundles they need, then tell them to reload the window.
 
 ## Tool Bundles
 
-Ahma groups command-line tools into logical bundles that can be loaded at startup using the `--tools` parameter.
-
-### Available Bundles
+Ahma groups command-line tools into logical bundles loaded at startup via `--tools`.
 
 | Bundle | Activate with | Key tools | When to use |
 |--------|--------------|-----------|-------------|
@@ -141,7 +73,6 @@ Ahma groups command-line tools into logical bundles that can be loaded at startu
 | `python` | `--tools python` | python script execution | Python projects |
 | `simplify` | `--tools simplify` | Code complexity analysis | Code quality work |
 
-To enable bundles at startup:
 ```json
 "args": ["serve", "stdio", "--tools", "git,fileutils"]
 ```
@@ -153,17 +84,12 @@ To enable bundles at startup:
 ### `run_terminal_command` — Run any shell command
 
 ```
-run_terminal_command(
-  command="cargo build --release",
-  working_directory="/path/to/project",
-  timeout_seconds=300
-)
+run_terminal_command(command="cargo build --release", working_directory="/path/to/project", timeout_seconds=300)
 ```
 
-- Runs inside the kernel sandbox (cannot write outside project scope)
-- Supports pipes, redirects, variables, multi-command strings
-- `monitor_level` ("error"/"warn"/"info") and `monitor_stream` ("stderr"/"stdout"/"both")
-  trigger LLM log alerts when issues are detected
+Runs inside the kernel sandbox. Supports pipes, redirects, multi-command strings.
+`monitor_level` (`error`/`warn`/`info`) + `monitor_stream` (`stderr`/`stdout`/`both`) trigger
+LLM log alerts.
 
 ### `status` — Check async operation progress
 
@@ -171,8 +97,7 @@ run_terminal_command(
 status(id="op_abc123")
 ```
 
-Returns current state: `running`, `complete`, `failed`, `cancelled`, or `timeout`.
-Non-blocking — safe to call repeatedly.
+Returns `running`/`complete`/`failed`/`cancelled`/`timeout`. Non-blocking, safe to poll.
 
 ### `await` — Wait for an async operation to finish
 
@@ -180,16 +105,10 @@ Non-blocking — safe to call repeatedly.
 await(id="op_abc123", timeout_seconds=60)
 ```
 
-Blocks until the operation completes or times out. Use sparingly — prefer `status` polling
-when you want to continue other work in parallel.
-
-`timeout_seconds` is optional (default `540`, or `tools.await_timeout_secs` / `--await-timeout`).
-The timeout is **soft**: it ends your wait, it does not cancel the operation. On timeout the
-reply says so — call `await` again with the same `id` to keep waiting, or `cancel` to stop the work.
-A wait can also end **early**, before `timeout_seconds`, if ahma's liveness probe of your
-connection goes unanswered; the reply then says "Stopped waiting … after Ns (requested Ms)" with
-the seconds that actually passed and why. Treat it exactly like a timeout: the operation is still
-running — `await` it again.
+Blocks until completion or timeout (default 540s / `tools.await_timeout_secs`). The timeout is
+**soft** — it ends your wait, not the operation; call `await` again with the same `id`, or
+`cancel` to stop it. A wait can also end early if the liveness probe of your connection goes
+unanswered — treat that the same as a timeout and `await` again.
 
 ### `cancel` — Cancel a running operation
 
@@ -197,212 +116,95 @@ running — `await` it again.
 cancel(id="op_abc123")
 ```
 
-Sends cancellation signal. The process is terminated and resources are freed.
+Terminates the process and frees resources.
 
 ---
 
 ## Async-First Workflow
 
-Most tools run **asynchronously** by default — they return an `operation_id` immediately.
+Most tools run **asynchronously** by default, returning an `operation_id` immediately:
 
 ```
-# 1. Start a long operation
-result = cargo_build(subcommand="build")
-# → { "operation_id": "op_abc123", "status": "started" }
-
-# 2. Check progress (non-blocking)
-status(id="op_abc123")
-# → { "status": "running", "output_so_far": "..." }
-
-# 3. Wait for completion when needed
-await(id="op_abc123", timeout_seconds=120)
-# → { "status": "complete", "exit_code": 0, "output": "..." }
-
-# Or: cancel if taking too long
-cancel(id="op_abc123")
+result = cargo_build(subcommand="build")        # → { "operation_id": "op_abc123", "status": "started" }
+status(id="op_abc123")                          # → { "status": "running", ... }  (non-blocking)
+await(id="op_abc123", timeout_seconds=120)      # → { "status": "complete", "exit_code": 0, ... }
 ```
 
-**Force synchronous** for state-modifying commands (e.g., `cargo add`):
-- Set `"synchronous": true` in the tool's MTDF JSON, or
-- Start server with `--sync` flag
+**Force synchronous** for state-modifying commands (e.g. `cargo add`): set `"synchronous":
+true` in the tool's MTDF JSON, or start the server with `--sync`.
 
-> **Caveat: the push notification needs you to still be listening.** The completion push in
-> step 3 above rides the same live connection that started the operation — it is not a mailbox,
-> so nothing is queued or replayed for a caller who isn't connected when it arrives. If there is
-> any chance you'll stop generating, hand off, or end your turn before the operation finishes,
-> call `await` and let it block instead of ending your turn to "wait for the notification." This
-> matters most for subagents: unlike a top-level session, a subagent that ends its turn is not
-> automatically woken back up by an MCP push — only an explicit message from whatever
-> orchestrated it can resume the subagent, so a missed notification means the work silently
-> stalls until someone notices.
+> **The completion push needs you to still be listening.** It rides the same live connection
+> that started the operation — nothing is queued or replayed for a caller who has disconnected.
+> If there's any chance you'll end your turn before an operation finishes, `await` it (blocking)
+> rather than relying on the notification — this matters most for subagents, which aren't woken
+> back up by an MCP push the way a top-level session is.
 
-> **Before declaring a task done, confirm every operation you started actually finished.**
-> A soft `await` timeout is not completion — it explicitly says the work is "still running,"
-> and no timeout mechanism (however accurate) protects you from summarizing success while an
-> operation is genuinely mid-flight, because efficiency and correctness are different problems.
-> Before your final summary, `status` (or `await`) every `operation_id` you spawned this turn
+> **Before declaring a task done, confirm every operation you started actually finished.** A
+> soft `await` timeout is not completion. `status`/`await` every `operation_id` from this turn
 > and confirm each reached a terminal state (`Completed`/`Failed`/`Cancelled`), not `InProgress`.
-> This has bitten real sessions: a compiler error that only surfaced after a truncated `await`
-> got missed because the agent read "still running" as good enough and moved on.
 
 ---
 
 ## Sandbox — Filesystem Security
 
-Ahma enforces **kernel-level** filesystem boundaries set once at startup.
+Ahma enforces **kernel-level** filesystem boundaries set once at startup. Full detail (scope
+narrowing, trust-handoff writes, network egress, platform internals):
+[docs/security-sandbox.md](https://github.com/ahma-labs/ahma/blob/main/docs/security-sandbox.md).
 
-### Scope Rules
-- **STDIO mode**: Scope = `cwd` from mcp.json (usually `${workspaceFolder}`)
-- **HTTP mode**: Scope = workspace roots from MCP `roots/list` response
-- **Override**: `--sandbox-scope /path/a` CLI flag (repeat for multiple paths)
-
-### Temp Directory
-```json
-"args": ["serve", "stdio", "--tmp"]
-```
-Adds `/tmp` (or `%TEMP%` on Windows) to the scope. Required for compilers, build tools.
-
-### Nested Sandbox Detection
-Ahma detects an outer sandbox (Cursor, VS Code, Docker, or another ahma) and always
-says which sandbox is actually protecting you. Terminal hooks defer to the host; the
-MCP server keeps enforcing on top of it — except on macOS, where Seatbelt cannot nest:
-an ahma that is itself inside a Seatbelt profile (typically ahma running ahma — this
-test suite or a nested `ahma serve` through `run_terminal_command`) defers to that
-outer sandbox and reports `deferred_to_host`, naming "an outer ahma" when the outer
-ahma stamped it (`AHMA_OUTER_SANDBOX_PID`, a marker ahma sets, not a setting). Commands
-still run, confined by the outer boundary. Nothing to configure; to get ahma's own
-enforcement, start it from a plain terminal instead. `--no-sandbox` is the explicit
-"defer to the outer sandbox" switch on every platform.
-
-### Platform Enforcement
-- **Linux**: Landlock LSM (requires kernel 5.13+)
-- **macOS**: `sandbox-exec` (Seatbelt, built-in)
-- **Windows**: Job Objects + AppContainer (in progress)
+| Rule | Detail |
+|---|---|
+| Scope (STDIO) | `cwd` from mcp.json (usually `${workspaceFolder}`) |
+| Scope (HTTP) | Workspace roots from MCP `roots/list` |
+| Override | `--sandbox-scope /path/a` (repeat for multiple paths) |
+| Temp dir | `--tmp` adds `/tmp` (`%TEMP%` on Windows); needed for compilers/build tools |
+| Nested sandbox | Ahma detects an outer sandbox (Cursor/VS Code/Docker/another ahma) and discloses which one is actually protecting you; on macOS, Seatbelt can't nest so ahma running inside another Seatbelt defers (`deferred_to_host`). `--no-sandbox` is the explicit opt-out. |
+| Platform | Linux: Landlock (kernel 5.13+) · macOS: Seatbelt · Windows: Job Objects (+ AppContainer, in progress) |
 
 ---
 
 ## Terminal Hooks — Shell Interception & Security
 
-For AI agents that run commands natively in your local terminal (like Claude Code, Cursor, Codex, or GitHub Copilot CLI), they execute commands directly in your shell rather than via an MCP server.
-
-To extend Ahma's **kernel sandbox** to these native shell tools, you can install **managed terminal hooks**.
-
-### How it works
-1. **Intercept**: The hook intercepts bash/shell execution requests from the AI agent.
-2. **Rewrite**: It wraps the command with `ahma hooks run-shell` and passes it to `ahma`'s sandboxed terminal runner.
-3. **Execute**: The command runs inside the kernel sandbox, preventing escapes outside the allowed scope.
-
-### Configuration Scopes
-- **User scope** (machine-level): Configures the hook globally for all projects.
-- **Project scope** (repo-level): Configures the hook only for the current project repository.
-
-### Setup & Management
-
-Use the `hooks` subcommand to configure and verify hooks:
+For agents that run shell commands natively (Claude Code, Cursor, Codex, Copilot CLI) rather
+than via MCP, **terminal hooks** extend the kernel sandbox to those commands by wrapping them
+with `ahma hooks run-shell`. Full setup, fail-safe semantics, and per-client config paths:
+[docs/installation.md#terminal-hooks](https://github.com/ahma-labs/ahma/blob/main/docs/installation.md#terminal-hooks).
 
 ```bash
-# Check current hook installation status across all platforms
-ahma hooks status
-
-# Install user-scoped hooks for all supported tools (including Cursor)
-ahma hooks install --scope user
-
-# Install project-scoped hooks for GitHub Copilot specifically
+ahma hooks status                                    # effective ACTIVE/INACTIVE + why
+ahma hooks install --scope user                      # all supported clients
 ahma hooks install --platform copilot --scope project
-
-# Uninstall hooks
 ahma hooks uninstall --platform copilot --scope user
 ```
 
-Supported Hook Platforms:
-- **Cursor**: Configures `${HOME}/.cursor/hooks.json` (user) or `<repo>/.cursor/hooks.json` (project)
-- **Claude Code**: Configures `${HOME}/.claude/settings.json` (user or `<repo>/.claude/settings.json` for project)
-- **Codex**: Configures `${HOME}/.codex/hooks.json`
-- **GitHub Copilot / Copilot CLI**: Configures `${HOME}/.copilot/hooks/ahma.json` (user) and `.github/hooks/ahma.json` (project)
-- **Antigravity**: Configures `${HOME}/.gemini/config/hooks.json` (user) and `<repo>/.agents/hooks.json` (project)
-
-> [!IMPORTANT]
-> **Installed ≠ active.** `ahma hooks install` only writes the hook file. In the default `auto` mode the hook is *active* only when an ahma MCP server is detected for that client; otherwise commands pass through UNSANDBOXED. `ahma hooks status` prints the effective ACTIVE/INACTIVE verdict and why — always check it. Force with `AHMA_HOOKS=on|off`.
-
-> [!NOTE]
-> **Fail-safe, not silent.** If ahma is *active* but cannot sandbox a command (missing binary, no kernel support, unknown working directory), the command is **blocked**, not run unsandboxed — with an actionable message. `ahma hooks doctor` diagnoses it; `ahma hooks approve-unsandboxed` grants a loud, session-only override (cleared on reboot), and `ahma hooks revoke` clears it. The only silent pass-through is when ahma is *inactive* (off, or `auto` with no MCP server detected). Cursor hooks use `failClosed: false` so a crashed/absent hook binary never wedges your terminal.
-
-> [!IMPORTANT]
-> **Turning off ahma without breaking your terminal**: When you intentionally disable ahma (remove it from `mcp.json`, set `AHMA_HOOKS=off`, or run `ahma hooks uninstall`), the hook automatically passes commands to the default terminal. It never bricks your workflow. The three safe off-switches:
-> 1. Remove/comment out the `ahma` entry in `~/.cursor/mcp.json`
-> 2. Set `AHMA_HOOKS=off` in your shell environment (also accepts `AHMA_DISABLE_HOOKS=1`)
-> 3. Run `ahma hooks uninstall --platform cursor`
->
-> The hook reads `AHMA_HOOKS` and the MCP config at invocation time — no Cursor restart needed for options 1 and 2.
-
-> [!NOTE]
-> **Cursor and VS Code Hook Support**: Cursor supports shell execution hooks as of June 2026 via `~/.cursor/hooks.json` or `<project>/.cursor/hooks.json`. The installer configures them automatically. VS Code does not have hook support and is not configured.
-
-> [!NOTE]
-> **Hooks + MCP are complementary, not redundant.** Running both the terminal hooks and the ahma MCP server for the same client is **supported and safe** — they sandbox different command streams. The MCP server sandboxes the named tools the agent calls explicitly (`run_terminal_command`, file-tools, git, …); the hooks sandbox the shell commands the agent runs through its *native* terminal/Bash tool, which never pass through MCP. A command is only ever wrapped once (already-wrapped and MCP tool calls pass through untouched). The only tradeoff is a small per-command sandbox cold-start from hooks — if your agent only ever uses ahma's MCP tools and never its native terminal, you can drop hooks with `ahma hooks uninstall --scope user`.
-
-> [!NOTE]
-> **Git worktrees.** When a command runs inside a linked worktree, its git storage lives outside the
-> workspace (`<main>/.git` and `<main>/.git/worktrees/<name>`), so the sandbox would otherwise fail
-> every commit with `EPERM`. Ahma grants those two directories read/write — but only after the git
-> dir *proves it already knows about this workspace*, via the `gitdir` back-reference `git worktree
-> add` writes (or `core.worktree` for `git init --separate-git-dir`). A `.git` pointer file that
-> names a directory which does not name it back is refused and logged; the pointer file lives inside
-> the workspace, so its contents are not evidence on their own.
->
-> Writes to `<git_dir>/hooks` stay denied. **How that denial is enforced depends on the platform**
-> (SPEC R-HANDOFF.4): kernel-enforced on macOS, where Seatbelt's last-match-wins denies subtract
-> from an allowed subtree; **application-layer only on Linux**, because Landlock cannot carve a
-> denied hole inside an allowed directory (R6.1.7) — so on Linux a shell command run through
-> `run_terminal_command` can still write a hook; and not enforced at all on Windows. `ahma status`
-> reports the active platform's limits.
+Key points: **installed ≠ active** (only active when an ahma MCP server is detected for that
+client, unless forced with `AHMA_HOOKS=on|off`); **fail-safe, not silent** (a command ahma can't
+sandbox is blocked, not run unsandboxed — `ahma hooks doctor` diagnoses it); hooks and the MCP
+server are complementary, not redundant (they sandbox different command streams, so running
+both is safe).
 
 ---
 
 ## Live Log Monitoring
 
-Two flavors of log monitoring:
+Full reference: [docs/live-log-monitoring.md](https://github.com/ahma-labs/ahma/blob/main/docs/live-log-monitoring.md).
 
-### 1. `--log-monitor` flag — Monitor Ahma's own server logs
-
-```json
-"args": ["serve", "stdio", "--log-monitor"]
-```
-
-Tails Ahma's rolling log files (`.ahma/logs/ahma.log.*`), analyzes chunks with an LLM, and
-pushes `LogAlert` MCP progress notifications when errors or anomalies are detected.
-
-Configure minimum seconds between alerts: `--monitor-rate-limit 60` (default 60).
-
-### 2. `livelog` tool type — Monitor any streaming command
-
-For tools defined in `.ahma/` with `"tool_type": "livelog"`:
-```json
-{
-  "name": "logcat",
-  "tool_type": "livelog",
-  "livelog": {
-    "source_command": "adb",
-    "source_args": ["-d", "logcat", "-v", "threadtime"],
-    "detection_prompt": "Look for crashes, ANR errors, or exceptions.",
-    "llm_provider": { "base_url": "http://localhost:11434/v1", "model": "llama3.2" },
-    "chunk_max_lines": 50,
-    "chunk_max_seconds": 30,
-    "cooldown_seconds": 60
-  }
-}
-```
-
-Built-in examples (activate with `--tools`): `android-logcat`.
+| Flavor | Enable | What it does |
+|---|---|---|
+| Server logs | `--log-monitor` (rate limit: `--monitor-rate-limit 60`) | Tails `.ahma/logs/ahma.log.*`, pushes `LogAlert` notifications on LLM-detected anomalies |
+| `livelog` tool type | Define in `.ahma/*.json` with `"tool_type": "livelog"` | Monitors any streaming command (e.g. `adb logcat`) via a `source_command` + `detection_prompt`; built-in example: `android-logcat` |
 
 ---
 
 ## Custom Tools — `.ahma/` Directory
 
-Place `*.json` files in `.ahma/` at the project root to define project-local tools.
-Ahma auto-detects and loads them at startup. Override path via `--tools-dir /path/to/dir`.
+Place `*.json` files in `.ahma/` at the project root to define project-local tools (override
+path: `--tools-dir`). Ahma loads them once at startup — no watch mode; call the `restart` tool
+after editing one. Canonical guide with the full config format, subcommand/sequence-tool
+examples, reserved names, and validation:
+[.ahma/README.md](https://github.com/ahma-labs/ahma/blob/main/.ahma/README.md) ·
+[docs/custom-tools.md](https://github.com/ahma-labs/ahma/blob/main/docs/custom-tools.md).
 
-### Minimal MTDF tool definition
+Minimal example:
 
 ```json
 {
@@ -414,62 +216,16 @@ Ahma auto-detects and loads them at startup. Override path via `--tools-dir /pat
 }
 ```
 
-### With subcommands and options
-
-```json
-{
-  "name": "myapp",
-  "description": "Build and run the application",
-  "command": "python",
-  "subcommand": [
-    {
-      "name": "build",
-      "description": "Build the app",
-      "options": [
-        { "name": "release", "type": "boolean", "description": "Optimized build" }
-      ]
-    },
-    {
-      "name": "run",
-      "description": "Run the app",
-      "options": [
-        { "name": "port", "type": "integer", "description": "Port number", "default": 8080 }
-      ]
-    }
-  ]
-}
-```
-
-### Sequence tools (multi-step workflows)
-
-```json
-{
-  "name": "check",
-  "description": "Format, lint, and test in one command",
-  "command": "sequence",
-  "sequences": [
-    { "tool": "cargo", "subcommand": "fmt", "args": { "all": true } },
-    { "tool": "cargo", "subcommand": "clippy", "args": {} },
-    { "tool": "cargo", "subcommand": "nextest_run", "args": {} }
-  ]
-}
-```
-
-Validate tool configs: `ahma tool validate .ahma/`
-
-Tool definitions load once at startup — there is no watch mode. After editing a definition, call the `restart` tool to reload it.
+Validate configs: `ahma tool validate .ahma/`
 
 ---
 
 ## Key CLI Flags and Settings
 
-> [!IMPORTANT]
-> `AHMA_*` **configuration** environment variables are **retired** (R-CFG1.2) and ignored by the
-> `ahma` binary. Use CLI flags (in `mcp.json` `args`) or `~/.ahma/settings.toml` instead.
-> This does not cover terminal-hook variables (`AHMA_HOOKS`, `AHMA_DISABLE_HOOKS`,
-> `AHMA_PREFER_OWN_SANDBOX`), which remain live, or the `scripts/install.sh`/`install.ps1`
-> bootstrap installers, which run before any `ahma` binary exists. See
-> [docs/environment-variables.md](../../docs/environment-variables.md) for the full picture.
+> `AHMA_*` **configuration** env vars are retired and ignored — use CLI flags or
+> `~/.ahma/settings.toml`. Terminal-hook vars (`AHMA_HOOKS`, `AHMA_DISABLE_HOOKS`,
+> `AHMA_PREFER_OWN_SANDBOX`) remain live. Full reference:
+> [docs/environment-variables.md](https://github.com/ahma-labs/ahma/blob/main/docs/environment-variables.md).
 
 | CLI flag / Settings key | Default | Purpose |
 |----------|---------|---------|
@@ -478,17 +234,15 @@ Tool definitions load once at startup — there is no watch mode. After editing 
 | `--sync` / `tools.force_sync` | off | Force all tools synchronous |
 | `--no-sandbox` / `sandbox.disable` | off | Disable kernel sandbox (UNSAFE) |
 | `--sandbox-scope` / `sandbox.scopes` | cwd | Sandbox scope paths |
-| `sandbox.container_root` | unset | Directory holding your projects (e.g. `~/github`); scope fallback when the client reports no roots, narrowed to the project in use |
-| `--scratch` / `sandbox.use_scratch_directory` | off | Add `sandbox.scratch_directory` as a persistent secondary scope (no-op unless that path is set) |
+| `sandbox.container_root` | unset | Directory holding your projects; scope fallback when the client reports no roots |
+| `--scratch` / `sandbox.use_scratch_directory` | off | Add a persistent secondary scope |
 | `--tmp` / `sandbox.tmp_access` | off | Add temp dir to sandbox scope (opt-in) |
 | `--disable-temp-files` / `sandbox.disable_temp` | off | Block all temp dir access |
 | `--no-package-cache-write` | off | Disable cargo cache writes (strictest isolation) |
 | `--log-to-stderr` / `logging.target` | file | Log to stderr |
 | `--log-monitor` / `logging.log_monitor` | off | Enable live log monitoring |
 | `--monitor-rate-limit` / `logging.monitor_rate_limit_secs` | `60` | Min seconds between log alerts |
-| `RUST_LOG` (env, PLATFORM) | `info` | Log verbosity (e.g., `ahma_mcp=debug`) |
-
-Full reference: [environment-variables.md](https://github.com/ahma-labs/ahma/blob/main/docs/environment-variables.md)
+| `RUST_LOG` (env) | `info` | Log verbosity (e.g. `ahma_mcp=debug`) |
 
 ---
 
@@ -510,10 +264,7 @@ ahma tool run run_terminal_command -- "echo hello"
 # Validate .ahma/ tool configs
 ahma tool validate [.ahma/]
 
-# List all configured tools
-ahma tool list [--http http://localhost:3000] [--format json]
-
-# Show locally configured tools with descriptions
+# Show locally configured tools with descriptions (use this, not `ahma tool list`, for local configs)
 ahma tool info [--tools git,fileutils]
 
 # Local TLS certificate management (required for QUIC/HTTP3 transport)
@@ -524,67 +275,38 @@ ahma tls status    # Show cert path, age, and rotation recommendation
 
 ---
 
-## Common Recipes
-
-### Git project — full version control pipeline
-
-```
-git_status(subcommand="status")
-git_commit(subcommand="commit", message="Update docs")
-git_push(subcommand="push")
-```
-
-### Run arbitrary shell commands
-
-```
-run_terminal_command(command="npm ci && npm run build", working_directory="/project")
-run_terminal_command(command="docker compose up -d", timeout_seconds=60)
-```
-
-### Monitor Android app logs
-
-```
-android_logcat(...)   # if defined in .ahma/android-logcat.json
-```
-
----
-
 ## Troubleshooting
 
-**Tool not found**: Make sure the bundle is specified in the `--tools` parameter at startup (e.g., `--tools git,fileutils`).
+**Tool not found**: check the tool's bundle is in `--tools` at startup (e.g. `--tools git,fileutils`).
 
-**Timeout**: Increase via `--timeout 600` in mcp.json args, or set `tools.timeout_secs = 600` in `~/.ahma/settings.toml`.
+**Timeout**: `--timeout 600` in mcp.json args, or `tools.timeout_secs = 600` in `~/.ahma/settings.toml`.
 
-**Permission denied / sandbox error**: The file is outside the sandbox scope.
-Check the `--sandbox-scope` CLI flag, or set `[sandbox] container_root` in `~/.ahma/settings.toml` to the directory that holds your projects, or `--tmp` if temp file access is needed.
+**Permission denied / sandbox error**: the path is outside the sandbox scope — check
+`--sandbox-scope`, set `[sandbox] container_root`, or add `--tmp` for temp-file access.
 
-**"was called without `working_directory`" / "sandbox scope is your container root"**: the session's scope is your container root, which spans every project — ahma refuses to guess which one this task is about. Pass `working_directory` naming the project subdirectory; that also tells ahma which subtree to narrow the writable scope to.
+**"sandbox scope is your container root"**: the session scope spans every project; pass
+`working_directory` naming the project subdirectory so ahma knows which subtree to narrow to.
 
-> **Cargo dependency errors**: If `cargo add` or `cargo update` fail with permission errors, do **not** add `--sandbox-scope ~/.cargo` to your `mcp.json` — that grants write to the entire cargo home including binaries and credentials.  Instead, the built-in `package_cache_write` feature (on by default) handles this correctly, granting write only to `registry/`, `git/`, and the cargo lock files.  If you previously had `--sandbox-scope ~/.cargo` in your config, remove it — it is no longer needed.
+**Cargo/tool-install permission errors** (`cargo add`, `cargo install`, `npm i -g`, …): do
+**not** add `--sandbox-scope ~/.cargo` — that grants write to the whole cargo home including
+credentials. The built-in `package_cache_write` feature (on by default) already handles
+`cargo add`/`update`. For installs into `~/.cargo/bin`, use the `sandbox_grant` tool (preview,
+then `confirm: true`) + `restart`, or install into the workspace instead
+(`cargo install --root <workspace>/.tools`). Full rationale:
+[docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs](https://github.com/ahma-labs/ahma/blob/main/docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs).
 
-> **Tool installs (`cargo install` / `cargo binstall`, `npm i -g`, …)**: These write into `~/.cargo/bin` and update an install manifest (`~/.cargo/.crates.toml`), which are read-only by default, so they fail with `Operation not permitted (os error 1)`.  This is expected — there is no special flag.  ahma detects the denied path and returns a `sandbox_denial` error: call the `sandbox_grant` tool with the named path (preview, then `confirm: true`), run the `restart` tool to apply, then re-run the command.  In a hooked native terminal the recovery is the CLI equivalent: `ahma sandbox grant <path>`, then re-run.  To avoid grants entirely, install into the workspace: `cargo install --root <workspace>/.tools`.
+**"ahma is DEFERRING to … sandbox"**: ahma is inside an outer sandbox it can't nest inside
+(macOS Seatbelt refuses nesting). Commands still run, confined by the outer sandbox — expected
+when running ahma's own test suite or a nested `ahma serve`. For ahma's own enforcement, start
+it from a plain terminal.
 
-**"ahma is DEFERRING to … sandbox"**: Ahma is inside an outer sandbox it cannot nest its
-own inside (macOS Seatbelt refuses nesting; "an outer ahma" means ahma is running ahma).
-Commands still run, confined by the outer sandbox. Expected when running ahma's test
-suite or a nested `ahma serve` through `run_terminal_command`; for ahma's own
-enforcement, start it from a plain terminal.
+**Tool still running**: `status(operation_id)` to check, or `cancel(operation_id)`.
 
-**`sandbox-exec: sandbox_apply: Operation not permitted`** from a command: an older ahma
-built in-process inside an outer Seatbelt sandbox, before it learned to defer; update ahma.
-
-**Tool still running**: Use `status(operation_id)` to check, or `cancel(operation_id)`.
-
-**Linux old kernel**: Landlock requires kernel 5.13+. Use `--no-sandbox` on
-older systems (Raspberry Pi OS bullseye, etc.).
-
----
+**Linux old kernel**: Landlock needs kernel 5.13+; use `--no-sandbox` on older systems.
 
 ---
 
 ## User-Invocable Subcommands
-
-The `/ahma` skill supports these user-invocable subcommands in chat:
 
 | Command | Alias | Purpose |
 |---------|-------|---------|
@@ -597,642 +319,169 @@ The `/ahma` skill supports these user-invocable subcommands in chat:
 | `/ahma update` | — | Update ahma to the latest version |
 | `/ahma uninstall` | — | Remove integrations installed by `ahma setup` (MCP entries, hooks, skills, binary) |
 
----
-
-## `/ahma help` — List Subcommands
-
-When the user types `/ahma help` or `/ahma ?`, respond with a concise list of all available
-user-invocable subcommands and a one-line description of each:
-
-```
-/ahma help              — Show this help list
-/ahma ?                 — Alias for /ahma help
-/ahma tool list         — Show all available tools in the current project
-/ahma simplify          — Auto-fix top 10 complexity issues concurrently via subagents
-/ahma simplify top 5    — Auto-fix top 5 issues concurrently
-/ahma simplify 3        — Manual mode: get fix instructions for issue #3 only
-/ahma simplify rust     — Auto-fix top 10 Rust issues concurrently
-/ahma tui               — Start the terminal user interface (TUI) control plane
-/ahma update            — Update ahma to the latest version
-/ahma uninstall         — Remove integrations installed by ahma setup
-```
-
-Also mention the key flags for configure, e.g., `--tools`, `--sandbox`, `--log-monitor`.
+`/ahma help` / `/ahma ?` just reprints this table plus the key config flags (`--tools`,
+`--sandbox`, `--log-monitor`).
 
 ---
 
 ## `/ahma tool list` — List Configured Tools
 
-### Syntax
-
-```
-/ahma tool list
-/ahma tools
-```
-
-### Workflow
-
-When the user runs `/ahma tool list` or `/ahma tools`, the agent lists all configured tools (both built-in bundles and local `.ahma/` configurations).
-
-To list them, the agent:
-1. Loads the tool configurations using `ahma tool info`. (Note: Do NOT run `ahma tool list` directly on the CLI as it expects a connection to a running server and will fail. Always use `ahma tool info` to list local configurations).
-2. Presents them in a clean markdown table, showing the tool name, description, and available subcommands.
-
+`/ahma tool list` / `/ahma tools`: list all configured tools (built-in bundles + local
+`.ahma/` configs). Load them with `ahma tool info` (**not** `ahma tool list`, which expects a
+running server connection and fails on the bare CLI) and present as a markdown table of name,
+description, subcommands.
 
 ---
 
 ## `/ahma tui` — Start the TUI Dashboard
 
-### Syntax
-
-```
-/ahma tui
-```
-
-### Workflow
-
-When the user runs `/ahma tui`, the agent starts the TUI in the user's terminal:
-
-```bash
-ahma tui
-```
-
-This opens the work view: one section per client session — every attached
-editor, every hooked shell command, and the user's own commands — with recent
-history already replayed from the per-user daemon. One section is open at a
-time; `i` toggles the chat pane. Approval gates are answered here.
-
-Inside the TUI chat, `/skills` lists Agent Skills discovered from the standard locations
-(`.agents/skills/` and `.claude/skills/` in the workspace and home directory), and
-`/<name> [args]` runs one — the skill's `SKILL.md` instructions are injected into the
-LLM conversation per the [Agent Skills standard](https://agentskills.io/specification).
+`/ahma tui` runs `ahma tui` in the user's terminal: a work view with one section per client
+session (attached editors, hooked shell commands, the user's own commands), history replayed
+from the per-user daemon, and `i` to toggle the chat pane where approval gates are answered.
+Inside that chat, `/skills` lists Agent Skills from the standard locations and `/<name>
+[args]` runs one. Full detail: [docs/tui.md](https://github.com/ahma-labs/ahma/blob/main/docs/tui.md).
 
 ---
 
 ## `/ahma update [ref]` — Update the Installed Binary
 
-### Syntax
-
 ```
-/ahma update                  # Install the latest published GitHub release
-/ahma update 0.15.2           # Install a specific release tag (semver, with or without 'v')
-/ahma update main             # Build and install from the main branch
-/ahma update <branch-name>    # Build and install from a named feature branch
+/ahma update                  # latest published GitHub release
+/ahma update 0.15.2           # a specific release tag (semver, with or without 'v')
+/ahma update main             # build and install from the main branch
+/ahma update <branch-name>    # build and install from a named feature branch
 ```
 
-### What the ref means
+**Workflow — always prefer the built-in subcommand**, which handles platform detection,
+version comparison, `RUSTFLAGS`, and PATH hints automatically:
 
-| ref | Behaviour |
-|-----|-----------|
-| *(omitted)* | Downloads the latest pre-built release asset for the current platform |
-| semver (e.g. `0.15.2`) | Downloads that specific release asset |
-| branch name (e.g. `main`) | Runs `cargo install --git ... ahma_bin --branch <ref>` from GitHub source |
+1. `run_terminal_command("ahma update")` (or `ahma update <branch-name>` — branch installs
+   compile from source and take several minutes; watch for `Installed /path/to/ahma`)
+2. `run_terminal_command("ahma --version")` — confirm it reports the expected version
+3. Ask the user to reload the IDE (MCP clients cache the binary path)
 
-### Primary workflow — use the built-in `ahma update` subcommand
-
-The `ahma update` subcommand handles platform detection, version comparison, `RUSTFLAGS`,
-PATH hints, and the restart reminder automatically.  Always prefer it.
-
-**Step 1 — run the update:**
-
-```
-run_terminal_command("ahma update")
-```
-
-Or to build from a specific branch (replace `<branch-name>` with the real branch, e.g. `main`):
-
-```
-run_terminal_command("ahma update <branch-name>")
-```
-
-Branch installs compile from source and take several minutes.  Watch for the
-`Installed /path/to/ahma` line to confirm success.
-
-**Step 2 — verify the version:**
-
-```
-run_terminal_command("ahma --version")
-```
-
-The output must show the expected version (e.g. `ahma 0.15.2`).
-
-**Step 3 — reload the IDE**
-
-MCP clients cache the binary path. After a successful update, ask the user to:
-- VS Code: run **Developer: Reload Window** (Cmd/Ctrl+Shift+P)
-- Cursor: reload the window or restart the app
-
-### Fallback — manual `cargo install` (only when `ahma update` is absent or broken)
-
-Use this only if `ahma` is not yet installed or `ahma update` itself is broken:
-
-**Linux / macOS:**
-
-```bash
-RUSTFLAGS='--cfg reqwest_unstable' \
-  cargo install --git https://github.com/ahma-labs/ahma \
-    --branch feature/update ahma_bin --bin ahma --root ~/.local --locked --force
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-**Windows (PowerShell 5.1+):**
-
-```powershell
-$env:RUSTFLAGS='--cfg reqwest_unstable'
-cargo install --git https://github.com/ahma-labs/ahma `
-  --branch feature/update ahma_bin --bin ahma --root $HOME\.local --locked --force
-```
-
-**Local checkout (iterating on ahma itself):**
-
-```bash
-RUSTFLAGS='--cfg reqwest_unstable' \
-  cargo install --path ahma_bin --bin ahma --root ~/.local --locked --force
-```
-
-### Anti-patterns
-
-- **Do NOT target the `ahma_mcp` package.** The `ahma` binary moved to `ahma_bin` in 0.7.0.
-  `--path ahma_mcp` / `ahma_mcp` as the positional package will fail with
-  `no bin target named ahma`.
-- **Do NOT omit `RUSTFLAGS='--cfg reqwest_unstable'` for source builds.** The workspace uses
-  `reqwest` with the `http3` feature, which refuses to compile without this flag.
-  The `ahma update` subcommand sets it automatically; the manual snippets above show
-  the exact form needed.
-- **Do NOT skip the version check.** Run `ahma --version` and confirm it reports the
-  expected value before declaring success.
-- **Do NOT forget to reload the IDE.** An updated binary is not picked up by a running
-  MCP session until the client restarts.
+Manual `cargo install` fallback (only if `ahma update` is absent or broken), the
+`RUSTFLAGS='--cfg reqwest_unstable'` requirement, and anti-patterns (never target the retired
+`ahma_mcp` package): [docs/installation.md](https://github.com/ahma-labs/ahma/blob/main/docs/installation.md).
 
 ---
 
 ## `/ahma uninstall` — Remove Installed Integrations
 
 Symmetrically reverses `ahma setup`: removes MCP server entries, terminal hooks, agent skills
-and/or the ahma binary.  Only Ahma-managed keys and files are touched; other user config is
-preserved.
-
-### Syntax
+and/or the ahma binary. Only ahma-managed keys/files are touched.
 
 ```
-/ahma uninstall                  # Interactive wizard (prompts for what and which platforms)
-/ahma uninstall --auto           # Non-interactive: remove everything from all platforms
-/ahma uninstall --mcp --platform cursor,claude  # Remove only Cursor + Claude Code MCP entries
-/ahma uninstall --auto --dry-run  # Preview removals without writing files
-/ahma uninstall --auto --purge    # Also delete ~/.ahma data directory (TLS, prompts, logs)
+/ahma uninstall                                 # Interactive wizard
+/ahma uninstall --auto                          # Non-interactive: remove everything
+/ahma uninstall --mcp --platform cursor,claude  # Remove only specific MCP entries
+/ahma uninstall --auto --dry-run                # Preview without writing
+/ahma uninstall --auto --purge                  # Also delete ~/.ahma data directory
 ```
-
-### Flags
 
 | Flag | Description |
 |------|-------------|
 | `-y` / `--auto` | Skip prompts, remove everything |
-| `--mcp` | Remove only MCP server entries |
-| `--hooks` | Remove only terminal hooks |
-| `--skills` | Remove only agent skills and Claude Code plugin |
-| `--binary` | Remove the ahma binary from the install dir |
+| `--mcp` / `--hooks` / `--skills` / `--binary` | Remove only that category |
 | `--platform <list>` | Comma-separated platforms to target |
 | `--purge` | Also remove `~/.ahma` data dir (TLS, settings, logs) |
 | `--dry-run` | Print planned changes without modifying files |
 
-After uninstall, the wizard prints a list of tools to restart.  Background ahma servers
-will self-terminate once no IDE or TUI client is connected.
+Background ahma servers self-terminate once no IDE/TUI client is connected.
 
 ---
 
 ## `/ahma simplify` — Automatic Code Simplification
 
-When the user types `/ahma simplify`, automatically analyze the codebase, identify the
-top complexity issues, and spawn concurrent subagents to fix them — **no additional
-prompting required**.
+When the user types `/ahma simplify`, automatically analyze the codebase, identify the top
+complexity issues, and spawn concurrent subagents to fix them — **no additional prompting
+required**. Full reference (all lenses' caveats, supported languages, CLI flags, MCP args,
+score formula, fail-closed rule):
+[docs/simplify.md](https://github.com/ahma-labs/ahma/blob/main/docs/simplify.md).
 
 ### Syntax
 
 ```
-/ahma simplify                 # Auto-fix top 10 issues concurrently (DEFAULT)
-/ahma simplify top 5           # Auto-fix top 5 issues concurrently
-/ahma simplify rust            # Auto-fix top 10 Rust issues concurrently
-/ahma simplify rust top 3      # Auto-fix top 3 Rust issues concurrently
-/ahma simplify 3               # Manual mode: get fix prompt for issue #3 only
-/ahma simplify kotlin 2        # Manual mode: Kotlin issue #2 only
-/ahma simplify --lens reuse    # Reuse lens only — duplicate-code candidates (see below)
-/ahma simplify --lens dead-code # Dead-code lens only — unreferenced exports (see below)
-/ahma simplify --lens altitude # Altitude lens only — delegation chains (see below)
-/ahma simplify --diff          # Only files changed in git, instead of the whole tree
+/ahma simplify                  # Auto-fix top 10 issues concurrently (DEFAULT)
+/ahma simplify top 5            # Auto-fix top 5 issues concurrently
+/ahma simplify rust             # Auto-fix top 10 Rust issues concurrently
+/ahma simplify rust top 3       # Auto-fix top 3 Rust issues concurrently
+/ahma simplify 3                # Manual mode: get fix prompt for issue #3 only
+/ahma simplify kotlin 2         # Manual mode: Kotlin issue #2 only
+/ahma simplify --lens reuse     # Reuse lens only — duplicate-code candidates
+/ahma simplify --lens dead-code # Dead-code lens only — unreferenced exports
+/ahma simplify --lens altitude  # Altitude lens only — delegation chains
+/ahma simplify --diff           # Only files changed in git, instead of the whole tree
 ```
 
-**Mode selection rule:** If the command contains `top N` or has NO trailing integer,
-use **auto mode** (concurrent subagents). If a bare trailing integer is given without
-`top`, use **manual mode** (single-file sequential workflow). `--lens` and `--diff` are
-orthogonal to mode selection — they narrow *what* gets analyzed, not whether subagents
-are spawned; combine them with the forms above (e.g. `/ahma simplify rust --lens reuse`).
+**Mode selection:** `top N`, or no trailing integer → **auto mode** (concurrent subagents). A
+bare trailing integer without `top` → **manual mode** (single-file, sequential). `--lens` and
+`--diff` narrow *what* gets analyzed and combine with either mode.
 
-Language names are case-insensitive and expand to their extensions automatically.
-
-### Lenses — `--lens` (CLI) / `lens` (MCP)
-
-`ahma simplify` runs one or more independent analysis lenses, comma-separated in `--lens`
-(default `all`):
-
-- `complexity` — the metrics/hotspot analysis this whole section is built around.
-- `reuse` — duplicate-code-block detection across the project (any supported language,
-  including ones with no AST support). See below — its findings need a different
-  response than a complexity issue.
-- `dead-code` (also accepted: `dead_code`, `deadcode`, case-insensitive) — unreferenced
-  exported functions/methods, Rust/TypeScript/JavaScript/Python/Java only. See below —
-  its findings need the same "verify, don't blindly act" treatment as reuse.
-- `altitude` — thin-wrapper delegation-chain detection (A → B → C forwarding, 2+ hops),
-  Rust/TypeScript/JavaScript/Python/Java only. See below — a forwarding layer is often
-  intentional, so treat findings as candidates too.
-- `all` — every lens above (default).
-
-Selecting only `reuse`, `dead-code`, and/or `altitude` skips the rust-code-analysis
-metrics parse entirely, so e.g. `--lens reuse` is much faster than a full run. Unknown
-lens names are a hard CLI error listing the valid options.
-
-### Scoping to changed files — `--diff` (CLI) / `diff` (MCP)
-
-`--diff` restricts analysis to files git reports as changed (staged, unstaged, and
-untracked-but-not-ignored) instead of walking the whole tree. Use it to check just what
-you touched, e.g. after Phase 3 verification below. It fails with a clear error if the
-directory isn't a git repository or git isn't installed — it does not silently fall back
-to a full scan.
-
-### Reuse Lens — Evaluate, Don't Blindly Act
-
-The `reuse` lens reports **candidates for extraction, not defects.** Two identical-looking
-blocks can be coincidental, and a shared helper is not automatically clearer. Before acting
-on a reuse-lens finding:
-
-- Read every listed location, not just the sample — confirm the blocks are actually the
-  same logic, not just the same shape.
-- Judge whether extracting a helper would make the code clearer, not just shorter. If it
-  wouldn't, leave it and say so — this is a normal, expected outcome.
-- Treat a match spanning a string literal (e.g. a URL) with extra suspicion: comment
-  stripping is textual, so a comment delimiter inside a string can produce a spurious or
-  missed match.
-
-Do not spawn a fix subagent per reuse-lens finding the way Phase 2 does for complexity
-issues below — read the findings yourself first and decide which, if any, are worth acting
-on.
-
-### Dead Code Lens — Verify Before You Delete
-
-The `dead-code` lens flags exported functions/methods with exactly one identifier occurrence
-in the scanned corpus (their own definition) — a candidate, never a verdict. You **must**
-verify a candidate before deleting anything. "The tool said so" is not sufficient
-justification for a deletion. Four blind spots the lens structurally cannot see:
-
-- A public API consumed only by a downstream crate.
-- A call site generated by a macro.
-- Dispatch through a trait object.
-- Reflection or dynamic dispatch by string name.
-
-Full details, including the mitigations already applied (private/`main`/`test_`-prefixed
-functions, suppression markers, Rust trait-required names) and why Kotlin is excluded:
-[docs/simplify.md](https://github.com/ahma-labs/ahma/blob/main/docs/simplify.md).
-
-### Altitude Lens — Understand Before You Collapse
-
-The `altitude` lens flags thin-wrapper delegation chains (A → B → C, 2+ forwarding hops) as
-**candidates, not defects.** A forwarding layer is frequently deliberate: a public API facade,
-a trait impl delegating to a free function, or a platform-abstraction shim. Before collapsing a
-chain, establish *why* each layer exists — a chain being found is not license to inline it.
-
-Full details: [docs/simplify.md](https://github.com/ahma-labs/ahma/blob/main/docs/simplify.md).
-
-### Supported Languages
-
-| Name | Extensions |
-|------|------------|
-| `rust` | `.rs` |
-| `kotlin` | `.kt`, `.kts` |
-| `swift` | `.swift` |
-| `objc` / `objective-c` | `.m`, `.mm` |
-| `python` | `.py` |
-| `javascript` | `.js`, `.jsx` |
-| `typescript` | `.ts`, `.tsx` |
-| `java` | `.java` |
-| `c++` / `cpp` | `.cpp`, `.cc`, `.hpp`, `.hh` |
-| `c#` / `csharp` | `.cs` |
-| `go` | `.go` |
-| `html` | `.html`, `.htm` |
-| `css` | `.css` |
-
-**Kotlin analyzer cascade:** detekt-cli (standalone, preferred) → Gradle detekt (plugin required) → Lizard (universal fallback). Install `brew install detekt` or `pip install lizard` for zero-config Kotlin analysis.
-
-**Swift analyzer cascade:** SwiftLint (cyclomatic + cognitive) → Lizard (cyclomatic only). Install `brew install swiftlint` for full Swift complexity analysis. `pip install lizard` as a lighter-weight alternative.
-
-### Prerequisites
-
-**Via MCP tool (preferred):** The `simplify` tool must be active — start Ahma with `--tools simplify`
-or `--tools git,simplify`.
-
-**Via CLI:** `ahma simplify` is the subcommand. Run `ahma simplify --help` to verify.
-
-**Build requirement:** the analyzer is the `ahma_simplify` crate, compiled into the `ahma`
-binary through the `simplify` cargo feature of `ahma_bin`. It is **on by default** (release
-binaries and `cargo build -p ahma_bin` have it); a binary built with `--no-default-features`
-still lists the subcommand but `ahma simplify …` then exits with an error naming the missing
-feature. If you see that error, rebuild with the default features — do not fall back to
-heuristics.
-
-### CRITICAL: Fail-Closed Rule
-
-**If the `simplify` MCP tool is not available:**
-1. Ensure `simplify` is listed in `--tools` at startup (e.g. `--tools git,simplify`), OR
-2. Run `ahma simplify <directory> --ai-fix 1` directly via the sandboxed shell.
-
-**NEVER substitute shell heuristics** such as `find ... | wc -l` (line counts) or `wc -c` (file sizes) as a proxy for complexity. File length is not a complexity metric. Using it will produce incorrect rankings and mislead refactoring effort. If neither the tool nor the CLI is available, tell the user and stop — do not improvise.
-
----
+**Lenses** (`--lens`/`lens`, default `all`): `complexity` (metrics/hotspots); `reuse`
+(duplicate-code candidates — evaluate each before extracting, don't auto-spawn a fix per
+finding); `dead-code` (unreferenced exports, Rust/TS/JS/Python/Java only — a candidate, never a
+verdict, verify before deleting); `altitude` (thin-wrapper delegation chains, same 5 languages —
+a forwarding layer is often intentional). Full per-lens blind spots and mitigations are in the
+docs page linked above.
 
 ### Auto Mode — Concurrent Simplification (DEFAULT)
 
-This is the default when the user types `/ahma simplify` with no trailing integer.
-The agent orchestrates the entire workflow automatically without additional prompting.
+**Phase 1 — Analyze (parent agent):** run `simplify(directory="<root>", ai_fix=1)` (or `ahma
+simplify <root> --ai-fix 1`); parse the ranked file list and set `N =
+min(requested_count, total_issues)` (default `requested_count` 10). Tell the user how many
+issues were found and that N subagents are being spawned.
 
-#### Phase 1 — Analyze (parent agent)
-
-Run the complexity analysis once to get the full report:
-
-**Via MCP tool:**
-```
-simplify(directory="<project-root>", ai_fix=1)
-```
-
-**Via CLI:**
-```bash
-ahma simplify <project-root> --ai-fix 1
-```
-
-If language filters were specified (e.g., `/ahma simplify rust`), add `--extensions rust`.
-
-The output contains:
-1. Overall project simplicity score (0–100%)
-2. Ranked file list (worst first)
-3. Function-level hotspots for the top issue
-4. A structured fix prompt for issue #1
-
-Parse the ranked file list to determine how many issues exist. Set `N` to
-`min(requested_count, total_issues)` — default `requested_count` is 10.
-
-
-Tell the user: "Analyzing codebase... Found N complexity issues. Spawning N
-concurrent subagents to fix them."
-
-#### Phase 2 — Spawn subagents (concurrent)
-
-Spawn **one subagent per issue**, all concurrently. Each subagent is independent
-and edits a different file, so there are no file conflicts.
-
-**How to spawn depends on your environment.** Use the first strategy that works:
-
-| If you have... | Then do... |
-|----------------|------------|
-| A subagent/agent spawning tool (e.g., `invoke_subagent`, `Agent` tool, `Task` tool) | Spawn N subagent tool calls **in the same response** so they run concurrently |
-| Background task capability but no subagent tool | Launch N background tasks, one per issue |
-| Neither | Run the N issues sequentially, one at a time |
+**Phase 2 — Spawn subagents (concurrent):** spawn **one subagent per issue, in the same
+response**, so they run concurrently — each edits a different file, so there are no conflicts.
+No subagent tool? Launch N background tasks, or run sequentially as a last resort.
 
 > [!IMPORTANT]
-> **Antigravity Environment**: In Antigravity, there is no general-purpose code subagent spawning tool (the only subagent tool is `browser_subagent` which is for browser tasks only).
-> Therefore, you **MUST** run the N issues **sequentially, one at a time** yourself.
-> 
-> To ensure reliability and prevent token exhaustion:
-> 1. **Default to N = 1** (the single worst file). Only proceed to N > 1 if the user explicitly requested it (e.g., `/ahma simplify top 3`).
-> 2. **Implement one file at a time**. Edit the target file, verify the improvement using `ahma simplify <project-root> --verify <file>`, and check/test compilation.
-> 3. **Obtain user approval before proceeding to the next file**. Do NOT attempt to refactor multiple files in a single turn without stopping. Always pause, report progress, run tests, and ask the user before editing subsequent files.
+> **Antigravity**: no general-purpose subagent tool exists (only `browser_subagent`, for
+> browser tasks). Run issues **sequentially**, default to **N = 1** unless the user asked for
+> more, verify each file with `--verify` before the next, and get user approval between files.
 
-**Each subagent receives this prompt** (fill in the template for each issue number):
+Each subagent's prompt:
 
 ```
-You are simplifying a codebase. Your task is to fix complexity issue #<N>.
+Fix complexity issue #<N> in project root <PROJECT_ROOT>.
 
-Project root: <PROJECT_ROOT>
-
-## Step 1 — Get your fix instructions
-
-Run this command to get the structured fix prompt for your assigned issue:
-
-    ahma simplify <PROJECT_ROOT> --ai-fix <N>
-
-Or via MCP tool:
-
-    simplify(directory="<PROJECT_ROOT>", ai_fix=<N>)
-
-Read the output. It contains:
-- The exact file path to edit
-- Hotspot functions (name, line range, metrics)
-- A structured evaluation and fix prompt
-
-## Step 2 — Read and evaluate the target file
-
-Read the target file identified in the fix prompt. Evaluate critically:
-- Are the hotspot functions genuinely hard to understand?
-- Or is the complexity score driven by volume/enumeration (many match arms, config fields)?
-- Would splitting them force readers to jump between more locations?
-
-If the code is already clear and metrics are driven by volume rather than genuine
-algorithmic complexity, report "No changes needed — complexity is structural, not
-cognitive" and STOP.
-
-## Step 3 — Apply focused changes (if warranted)
-
-Constraints:
-- Edit ONLY the hotspot functions listed in the fix prompt
-- Do NOT refactor surrounding code
-- Do NOT change function signatures, public APIs, or behavior
-- Do NOT run cargo fmt, cargo clippy, or cargo test (the parent agent will do this)
-- Prefer: early returns/guard clauses, helper extraction for self-contained logic,
-  named predicates for complex boolean chains
-
-For test files: skip unless a single test function is individually complex.
-
-## Step 4 — Report
-
-Report what you changed (file path, functions modified, patterns applied) or why
-no changes were needed.
+1. Run `ahma simplify <PROJECT_ROOT> --ai-fix <N>` (or simplify(directory=<PROJECT_ROOT>,
+   ai_fix=<N>)) and read the fix prompt: file path, hotspot functions, evaluation, constraints.
+2. Evaluate critically — if complexity is volume-driven (many match arms, config fields)
+   rather than genuinely hard to follow, report "No changes needed" and STOP.
+3. Otherwise edit ONLY the listed hotspot functions: no signature/API/behavior changes, no
+   surrounding refactors, no cargo fmt/clippy/test (the parent runs those once at the end).
+   Prefer guard clauses, helper extraction, named predicates. Skip test files unless one test
+   function is individually complex.
+4. Report what changed (or why nothing did).
 ```
 
-#### Phase 3 — Verify (parent agent, after ALL subagents complete)
-
-After all subagents have finished, the parent agent runs a single verification pass:
-
-1. **Format and lint:**
-   ```bash
-   cargo fmt --all && cargo clippy --all-targets
-   ```
-
-2. **Run tests:**
-   ```bash
-   cargo nextest run
-   ```
-   If tests fail, identify which subagent's changes caused the failure and revert
-   or fix those specific changes.
-
-3. **Re-analyze to show improvement:**
-   ```bash
-   ahma simplify <project-root> --ai-fix 1
-   ```
-   Report the before/after project simplicity score to the user.
-
-4. **Summarize results** in a table:
-   ```
-   | Issue # | File | Action | Result |
-   |---------|------|--------|--------|
-   | 1 | src/foo.rs | Extracted 3 helpers | Improved |
-   | 2 | src/bar.rs | No changes needed | Skipped |
-   | ... | ... | ... | ... |
-   ```
-
----
+**Phase 3 — Verify (parent agent, after ALL subagents complete):**
+1. `cargo fmt --all && cargo clippy --all-targets`
+2. `cargo nextest run` — on failure, identify and revert/fix the responsible subagent's change
+3. Re-run `ahma simplify <project-root> --ai-fix 1`; report the before/after project score
+4. Summarize per-issue results in a table (file, action, result)
 
 ### Manual Mode — Single-Issue Workflow
 
-Triggered when the user provides a bare trailing integer (e.g., `/ahma simplify 3`
-or `/ahma simplify rust 2`). This follows the original sequential workflow for
-targeted single-file work.
+Triggered by a bare trailing integer (e.g. `/ahma simplify 3`):
 
-#### Step 1 — Run complexity analysis
-
-**Via MCP tool:**
-```
-simplify(directory="<project-root>", ai_fix=<N>)
-```
-
-**Via CLI:**
-```bash
-ahma simplify <project-root> --ai-fix <N>
-```
-
-#### Step 2 — Read and follow the structured fix prompt
-
-The `--ai-fix N` output ends with a structured prompt. It specifies:
-- The exact file path to edit
-- Hotspot functions (name, line range, metrics)
-- Constraints on what to change
-
-**Follow the prompt's constraints exactly:**
-- Edit **only** the listed hotspot functions
-- Do not refactor the whole file
-- Do not change function signatures, public APIs, or behavior
-
-#### Step 3 — Apply targeted changes
-
-Common complexity-reduction patterns:
-- Extract deeply nested logic into well-named helper functions
-- Replace complex boolean chains with named predicates
-- Replace long match/switch arms with lookup tables
-- Flatten early-return cascades (guard clauses)
-
-**For test files:** High test count is expected. Skip unless a single test function is individually complex.
-
-#### Step 4 — Verify improvement
-
-**Via MCP tool:**
-```
-simplify(directory="<project-root>", verify="<path-to-edited-file>")
-```
-
-**Via CLI:**
-```bash
-ahma simplify <project-root> --verify <path-to-edited-file>
-```
-
-| Verdict | Meaning |
-|---------|---------|
-| Significant improvement (≥10%) | Success — move to next issue |
-| Modest improvement (1–9%) | Acceptable |
-| No change | Hotspot functions may not have been modified |
-| Regression | Revert and try a different approach |
-
-#### Step 5 — Iterate
-
-```
-simplify(directory="<project-root>", ai_fix=<N+1>)
-```
-
-Continue until the project score is satisfactory.
-
----
-
-### Score Interpretation
-
-```
-Score = 0.4 × MI + 0.3 × Cognitive Density + 0.2 × Peak Cognitive + 0.1 × Length Score
-```
-
-| Score | Status | Action |
-|-------|--------|--------|
-| 85–100% | Excellent | No action needed |
-| 70–84% | Good | Fix only worst outliers |
-| 55–69% | Fair | Plan a simplification sprint |
-| 40–54% | Poor | Prioritize before new features |
-| 0–39% | Critical | Address now |
-
-### MCP Tool Reference (`simplify`)
-
-| Argument | Type | Default | Purpose |
-|----------|------|---------|---------|
-| `directory` | path (required) | — | Project root to analyze |
-| `ai_fix` | integer | — | Issue number for fix prompt (1 = worst file) |
-| `limit` | integer | 50 | Issues to include in report |
-| `verify` | path | — | Re-analyze a file vs. baseline |
-| `extensions` | array | all | Restrict to file types (e.g. `["rs","py"]`) |
-| `exclude` | array | — | Additional glob patterns to exclude |
-| `output_path` | path | — | Write report to directory instead of stdout |
-| `html` | boolean | false | Also generate HTML report |
-| `lens` | array | all | Which lenses to run: `complexity`, `reuse`, `dead-code`, `altitude`, or `all` (e.g. `["reuse"]`, `["dead-code"]`, `["altitude"]`) |
-| `diff` | boolean | false | Restrict to files git reports as changed instead of the whole tree |
-
-### CLI Quick Reference
-
-```bash
-# Analyze and get fix prompt for worst file
-ahma simplify . --ai-fix 1
-
-# Rust files only
-ahma simplify . --extensions rust --ai-fix 1
-
-# Multiple languages
-ahma simplify . --extensions rust,python --ai-fix 1
-
-# 2nd worst file
-ahma simplify . --ai-fix 2
-
-# Verify improvement after editing
-ahma simplify . --verify src/my_module.rs
-
-# Full report to file
-ahma simplify . --output-path ./reports
-
-# HTML report
-ahma simplify . --html
-
-# Exclude generated code
-ahma simplify . --exclude '**/generated/**,**/vendor/**' --ai-fix 1
-
-# Reuse lens only — duplicate-code candidates, skips the AST parse (fast)
-ahma simplify . --lens reuse
-
-# Dead-code lens only — unreferenced exports (Rust/TS/JS/Python/Java only)
-ahma simplify . --lens dead-code
-
-# Altitude lens only — thin-wrapper delegation chains (Rust/TS/JS/Python/Java only)
-ahma simplify . --lens altitude
-
-# Only the files changed in git
-ahma simplify . --diff
-```
+1. `simplify(directory=".", ai_fix=<N>)` — read the structured fix prompt
+2. Edit only the listed hotspot functions (no signature/API/behavior changes, no whole-file refactor)
+3. `simplify(directory=".", verify="<edited-file>")` — see the verdict table in
+   [docs/simplify.md#verification](https://github.com/ahma-labs/ahma/blob/main/docs/simplify.md#verification)
+4. Iterate with `ai_fix=<N+1>` until the project score is satisfactory
 
 ### Anti-Patterns to Avoid
 
-1. **Do not refactor the whole file** — follow the hotspot list exactly.
-2. **Do not add comments to improve scores** — structural change is needed.
-3. **Do not inline complex logic** — fewer functions with more complexity each makes scores worse.
-4. **Do not run `--ai-fix` without reading the structured prompt.**
-5. **Do not skip verification** — complexity improvements must be confirmed by metrics.
-6. **Do not have subagents run cargo fmt/clippy/test** — the parent agent runs these once after all subagents complete to avoid build lock contention.
+1. Don't refactor the whole file — follow the hotspot list exactly.
+2. Don't add comments to improve scores — structural change is needed.
+3. Don't inline complex logic — fewer, denser functions score worse.
+4. Don't run `--ai-fix` without reading the structured prompt.
+5. Don't skip verification.
+6. Don't have subagents run cargo fmt/clippy/test — the parent runs them once, after all
+   subagents finish, to avoid build lock contention.
 
 ---
 
