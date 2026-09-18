@@ -770,6 +770,13 @@ mod tests {
     }
 
     #[test]
+    fn grant_tier_is_persistent() {
+        assert!(!GrantTier::Once.is_persistent());
+        assert!(!GrantTier::Session.is_persistent());
+        assert!(GrantTier::Always.is_persistent());
+    }
+
+    #[test]
     fn approve_tool_is_idempotent_and_sorted() {
         let mut p = PermissionSettings::default();
         assert!(p.approve_tool(&key("/ws"), "list_dir", None, None));

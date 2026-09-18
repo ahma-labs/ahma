@@ -1217,4 +1217,18 @@ mod scope_view_tests {
         );
         assert!(text.contains("Sandbox:"), "missing header:\n{text}");
     }
+
+    #[test]
+    fn sandbox_tmp_access_getter() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(sb.is_tmp_access());
+    }
 }

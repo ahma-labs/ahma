@@ -2882,6 +2882,34 @@ enum TreeToggle {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_log_level_parse_level() {
+        assert_eq!(LogLevel::parse_level("WARN"), LogLevel::Warn);
+        assert_eq!(LogLevel::parse_level("ERROR"), LogLevel::Error);
+        assert_eq!(LogLevel::parse_level("DEBUG"), LogLevel::Debug);
+        assert_eq!(LogLevel::parse_level("INFO"), LogLevel::Info);
+        assert_eq!(LogLevel::parse_level("UNKNOWN"), LogLevel::Info);
+    }
+
+    #[test]
+    fn test_pending_approval_gate_with_deadline() {
+        let now = Instant::now();
+        let gate = ApprovalGate::new("dec-1", "tool", "summary")
+            .with_deadline(Some(now + Duration::from_secs(10)));
+        assert!(gate.remaining_secs().unwrap() <= 10);
+    }
+
+    #[test]
+    fn test_chat_input_is_blank() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        assert!(s.chat_input_is_blank());
+        s.chat_input = tui_textarea::TextArea::from(["   "]);
+        assert!(s.chat_input_is_blank());
+        assert!(!s.chat_input_is_empty());
+        s.chat_input = tui_textarea::TextArea::from(["hello"]);
+        assert!(!s.chat_input_is_blank());
+    }
+
     /// Selection resolves through the drawn task-tree rows (not raw operation
     /// indices), and Enter behaves as a single-expand accordion for ops and a
     /// fold toggle for headers (SPEC R24.4).

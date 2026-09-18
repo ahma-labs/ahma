@@ -97,3 +97,41 @@ pub fn assert_formatted_json_contains(raw: &str, expected: &[&str]) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_assert_completes_within() {
+        let val =
+            assert_completes_within(Duration::from_millis(100), "fast async block", async { 42 })
+                .await;
+        assert_eq!(val, 42);
+    }
+
+    #[tokio::test]
+    async fn test_assert_times_out() {
+        assert_times_out(
+            Duration::from_millis(10),
+            "blocking sleep",
+            tokio::time::sleep(Duration::from_millis(100)),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_assert_eventually() {
+        let mut count = 0;
+        assert_eventually(
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+            "eventual increment",
+            || {
+                count += 1;
+                async move { count >= 3 }
+            },
+        )
+        .await;
+    }
+}

@@ -44,3 +44,26 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_wait_for_notification() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send("hello").await.unwrap();
+        let res = wait_for_notification(&mut rx, Duration::from_millis(50)).await;
+        assert_eq!(res, Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_notification_matching() {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+        let res =
+            wait_for_notification_matching(&mut rx, Duration::from_millis(50), |&x| x == 2).await;
+        assert_eq!(res, Some(2));
+    }
+}

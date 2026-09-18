@@ -834,6 +834,13 @@ impl MultiLensReport {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_analysis_confidence_is_reliable() {
+        assert!(AnalysisConfidence::Full.is_reliable());
+        assert!(!AnalysisConfidence::PartialExternal.is_reliable());
+        assert!(!AnalysisConfidence::CyclomaticOnly.is_reliable());
+    }
+
     fn make_space_entry(
         name: &str,
         start_line: u32,

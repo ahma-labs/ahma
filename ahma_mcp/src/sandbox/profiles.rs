@@ -585,6 +585,17 @@ mod tests {
     }
 
     #[test]
+    fn test_is_profile_path() {
+        let cargo = super::resolve_path("${CARGO_HOME:-~/.cargo}").unwrap();
+        assert!(is_profile_path(&cargo, &names(), true));
+        assert!(!is_profile_path(
+            Path::new("/some/nonexistent/random/path"),
+            &names(),
+            true
+        ));
+    }
+
+    #[test]
     fn the_rust_profile_reproduces_the_carve_outs_it_replaced() {
         // This is the golden assertion for the refactor: the paths that used to be
         // hard-coded in landlock.rs / seatbelt.rs / pkg_cache.rs must come out of
