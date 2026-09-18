@@ -1166,6 +1166,15 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_sensitive_text() {
+        let text = "line1 token=secret1\nline2 token=secret2";
+        let redacted = redact_sensitive_text(text);
+        assert!(!redacted.contains("secret1"));
+        assert!(!redacted.contains("secret2"));
+        assert_eq!(redacted.lines().count(), 2);
+    }
+
+    #[test]
     fn test_redact_env_var_style_secret_keys() {
         // Regression: env-var-style names end in a sensitive word but are
         // preceded by a word character (`_`), so the old `\b(api_key)` rule
