@@ -2583,9 +2583,11 @@ impl AppState {
     }
 
     /// Enter on the selected task-tree row: drill into an operation's
-    /// full-screen detail view; fold/unfold an instance or session header.
-    /// (The inline accordion toggle stays on [`Self::toggle_selected_tree_node`].)
-    pub fn open_selected_tree_detail(&mut self) {
+    /// full-screen detail view, or open the accordion section for a
+    /// session/instance header — the same `open_section` toggle a click or
+    /// `Space` on that header performs (docs/tui.md: "Enter / click a
+    /// header ... open"). A nested group header still folds in place.
+    pub fn open_selected_tree_detail(&mut self, now_ms: u64) {
         use crate::task_tree::RowKind;
         let action = {
             let rows = self.task_rows.borrow();
@@ -2598,7 +2600,13 @@ impl AppState {
             })
         };
         match action {
-            Some(TreeToggle::Fold(key)) => self.toggle_collapse_key(key),
+            Some(TreeToggle::Fold(key)) => match key.strip_prefix("inst:") {
+                Some(section) => {
+                    let section = section.to_string();
+                    self.toggle_section(&section, now_ms);
+                }
+                None => self.toggle_collapse_key(key),
+            },
             Some(TreeToggle::Expand(op_index)) => {
                 if let Some(op) = self.operations.get(op_index) {
                     let id = op.id.clone();
@@ -3048,10 +3056,12 @@ mod tests {
         assert!(s.events.len() <= 200);
     }
 
-    /// Enter drills into the full-screen detail overlay for op rows and keeps
-    /// the fold behavior for instance headers.
+    /// Enter drills into the full-screen detail overlay for op rows, and opens
+    /// the accordion section for a session/instance header — the same
+    /// `open_section` toggle a click or `Space` on that header performs
+    /// (matching `docs/tui.md`'s "Enter / click a header → open").
     #[test]
-    fn enter_opens_detail_overlay_for_ops_and_folds_headers() {
+    fn enter_opens_detail_overlay_for_ops_and_opens_section_for_headers() {
         use crate::task_tree::{RowKind, TreeRow};
         let mut s = AppState::new("http://localhost:3000", "HTTP", true);
         s.operations
@@ -3078,7 +3088,7 @@ mod tests {
 
         // Op row → detail overlay opens on that op, scroll reset.
         s.ops_selected = 1;
-        s.open_selected_tree_detail();
+        s.open_selected_tree_detail(0);
         match &s.modal {
             ModalState::OperationDetail(d) => {
                 assert_eq!(d.op_id, "op-a");
@@ -3087,12 +3097,17 @@ mod tests {
             other => panic!("expected OperationDetail modal, got {other:?}"),
         }
 
-        // Header row → folds, no overlay.
+        // Header row → opens the accordion section, no overlay. (The
+        // open-then-close toggle itself is `toggle_section`'s own contract,
+        // covered by `a_header_row_opens_its_section_and_closes_the_other`;
+        // this test only needs to prove `Enter` reaches `toggle_section` at
+        // all, which is what regressed.)
         s.modal = ModalState::None;
         s.ops_selected = 0;
-        s.open_selected_tree_detail();
+        assert_eq!(s.open_section, None);
+        s.open_selected_tree_detail(0);
         assert!(matches!(s.modal, ModalState::None));
-        assert!(s.collapsed_nodes.contains("inst:i1"));
+        assert_eq!(s.open_section.as_deref(), Some("i1"));
     }
 
     /// Before any frame is drawn the row list is empty and selection falls

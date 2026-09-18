@@ -271,6 +271,7 @@ pub async fn run(
                 _ = tokio::time::sleep(if (state.chat_scroll_current.get() - state.chat_scroll_target.get()).abs() > 0.01
                     || (state.log_scroll_current.get() - state.log_scroll_target.get()).abs() > 0.01
                     || (state.chat_input_height_current.get() - state.chat_input_height_target.get()).abs() > 0.01
+                    || state.accordion.as_ref().is_some_and(|a| a.is_active(crate::ui::wall_ms()))
                 {
                     Duration::from_millis(15)
                 } else if chat_in_progress(&state) {
@@ -376,8 +377,8 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         }
         Action::Enter if state.focus == crate::state::Focus::Work => {
             // Drill in: open the full-screen detail view for an operation
-            // (or fold an instance/session header).
-            state.open_selected_tree_detail();
+            // (or open the accordion section for an instance/session header).
+            state.open_selected_tree_detail(crate::ui::wall_ms());
         }
         Action::ToggleNode if state.focus == crate::state::Focus::Work => {
             // Space: inline accordion-expand the selected task into its
@@ -6259,6 +6260,34 @@ mod tests {
             other => panic!("expected the log-line overlay, got {other:?}"),
         }
         assert_eq!(state.focus, Focus::Log);
+    }
+
+    /// Clicking a registered `SectionHeader` target dispatches all the way
+    /// through to `toggle_section`, the same accordion open/close a keyboard
+    /// `Enter`/`Space` on the header performs. This is the end-to-end
+    /// coverage `clicking_a_header_is_a_registered_target` (ui/work.rs) was
+    /// missing: that test only checks the target is *registered*, not that a
+    /// simulated click actually opens the section.
+    #[tokio::test]
+    async fn clicking_a_section_header_opens_it() {
+        use crate::state::{AppState, ClickTarget, Focus};
+        use ratatui::layout::Rect;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Log;
+
+        state.click_targets.borrow_mut().push((
+            ClickTarget::SectionHeader("i1".into()),
+            Rect::new(0, 2, 60, 1),
+        ));
+
+        assert_eq!(state.open_section, None);
+        super::handle_mouse_click(10, 2, &mut state);
+        assert_eq!(state.open_section.as_deref(), Some("i1"));
+        assert_eq!(state.focus, Focus::Work);
+
+        // Clicking the same (now open) header again closes it.
+        super::handle_mouse_click(10, 2, &mut state);
+        assert_eq!(state.open_section, None);
     }
 
     /// The overlay scroll keys drive whichever overlay is open — the log-line

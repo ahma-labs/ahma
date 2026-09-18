@@ -159,19 +159,6 @@ When a command is blocked by the sandbox, the operation row says so — `denied:
 
 Persistent grants and revocations are appended to `~/.ahma/permissions-audit.jsonl`; see [docs/permissions.md](permissions.md).
 
-## Text-mode fallback
-
-When the full ratatui interface is not compiled in, `ahma tui` runs a simple polling loop that prints one status line per server check:
-
-```
-Ahma TUI (text mode)
-Connecting to: http://localhost:3000
-[12:01:00] Server http://localhost:3000 — HEALTHY
-[12:01:02] Server http://localhost:3000 — HEALTHY
-```
-
-Press Ctrl-C to exit.
-
 ## Transport auto-detection
 
 `ahma tui` attaches to the per-user daemon; it never starts a server of its own,
