@@ -277,6 +277,15 @@ mod tests {
         assert!(Theme::new(true).color, "colour is on unless refused");
     }
 
+    #[test]
+    fn work_row_selected_style() {
+        let theme = Theme::new(true);
+        assert_eq!(
+            theme.work_row_selected(),
+            theme.c(Style::default().bg(Color::Rgb(38, 42, 52)))
+        );
+    }
+
     /// Under `NO_COLOR` every style keeps its modifiers and loses its hues.
     /// The convention is about colour; dropping bold/dim too would flatten the
     /// emphasis a monochrome terminal relies on to show structure.
