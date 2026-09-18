@@ -165,6 +165,12 @@ mod tests {
         assert_eq!(loaded.bundles[0].name, "rust");
     }
 
+    #[tokio::test]
+    async fn load_from_url_async_fails_gracefully_on_invalid_url() {
+        let res = BundleIndex::load_from_url_async("http://127.0.0.1:0/nonexistent").await;
+        assert!(res.is_err());
+    }
+
     #[test]
     fn builtin_index_is_well_formed() {
         let idx = BundleIndex::builtin();
