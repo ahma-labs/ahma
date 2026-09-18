@@ -1358,6 +1358,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn for_provider_constructs_client() {
+        let provider = ahma_common::config::ResolvedProvider {
+            name: "test".into(),
+            kind: ahma_common::config::ProviderKind::Anthropic,
+            base_url: "https://api.anthropic.com".into(),
+            default_model: "claude-3-5-sonnet".into(),
+            api_key: Some("secret".into()),
+            num_ctx: Some(8192),
+        };
+        let client = LlmClient::for_provider(&provider);
+        assert_eq!(client.flavor(), ApiFlavor::Anthropic);
+        assert_eq!(client.base_url(), "https://api.anthropic.com");
+    }
+
+    #[test]
     fn retryable_status_classification() {
         use reqwest::StatusCode;
         for s in [429u16, 500, 502, 503, 504] {
