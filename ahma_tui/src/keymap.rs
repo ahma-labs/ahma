@@ -140,6 +140,7 @@ fn map_navigator_key(key: KeyEvent) -> Action {
     use KeyModifiers as KM;
 
     match (key.code, key.modifiers) {
+        (Char('c'), KM::CONTROL) => Action::Quit,
         (Esc, _) => Action::NavEsc,
         (Enter, _) => Action::NavSubmit,
         (Tab, _) => Action::NavComplete,
@@ -158,6 +159,7 @@ fn map_log_modal_key(key: KeyEvent) -> Action {
     use KeyModifiers as KM;
 
     match (key.code, key.modifiers) {
+        (Char('c'), KM::CONTROL) => Action::Quit,
         (Esc, _) => Action::CloseLogSwitcher,
         (Enter, _) => Action::SubmitLogSwitcher,
         (Up, _) | (Char('k'), KM::NONE) => Action::Up,
@@ -236,7 +238,10 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
         (Char('p'), KM::NONE) if focus == Focus::Work => Action::PinOp,
         (Char('a'), KM::NONE) if focus == Focus::Work => Action::ReRaiseGrant,
         (Char('f'), KM::NONE) if focus == Focus::Work => Action::ToggleProjectFilter,
-        (Char('i'), KM::NONE) if focus == Focus::Work => Action::ToggleChat,
+        // `i` is the documented global chat toggle ("Open or close the chat
+        // pane") — it must not fire while `Focus::Chat` is reading literal
+        // characters, but should work from any other pane, not just Work.
+        (Char('i'), KM::NONE) if focus != Focus::Chat => Action::ToggleChat,
         (Char(' '), KM::NONE) if focus == Focus::Work => Action::ToggleNode,
 
         // Zoom the focused pane to full screen and back.
@@ -262,6 +267,7 @@ fn map_filter_key(key: KeyEvent) -> Action {
     use KeyModifiers as KM;
 
     match (key.code, key.modifiers) {
+        (Char('c'), KM::CONTROL) => Action::Quit,
         (Esc, _) => Action::FilterEsc,
         (Enter, _) => Action::FilterEsc, // commit filter
         (Backspace, _) => Action::FilterBackspace,
@@ -530,6 +536,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn navigator_ctrl_c_quits() {
+        // Ctrl-C is documented as a universal quit; the navigator modal must
+        // not swallow it (matches the fix already applied to chat input,
+        // global keys, and the op-detail overlay).
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::Quit
+        );
+    }
+
     // ─── Log switcher modal dispatch (map_log_modal_key) ────────────────────────
 
     #[test]
@@ -595,6 +617,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn log_modal_ctrl_c_quits() {
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Focus::Chat,
+                &logfiles_modal(),
+                false
+            ),
+            Action::Quit
+        );
+    }
+
     // ─── Log filter dispatch (map_filter_key) ───────────────────────────────────
 
     #[test]
@@ -643,6 +678,19 @@ mod tests {
         assert_eq!(
             map_key(kn(KeyCode::Tab), Focus::Log, &none_modal(), true),
             Action::Unknown
+        );
+    }
+
+    #[test]
+    fn filter_ctrl_c_quits() {
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Focus::Log,
+                &none_modal(),
+                true
+            ),
+            Action::Quit
         );
     }
 
@@ -969,6 +1017,26 @@ mod tests {
         assert_eq!(
             map_key(kn(KeyCode::Esc), Focus::Work, &none_modal(), false),
             Action::FocusChat
+        );
+    }
+
+    #[test]
+    fn global_i_toggles_chat_from_work_and_log_but_not_from_chat() {
+        // `i` is the documented global chat toggle — it must work from Work
+        // and Log focus. From Chat focus it never reaches `map_global_key`
+        // at all (map_key routes Focus::Chat to map_chat_input_key first),
+        // where a literal 'i' must be typed instead.
+        assert_eq!(
+            map_key(kn(KeyCode::Char('i')), Focus::Work, &none_modal(), false),
+            Action::ToggleChat
+        );
+        assert_eq!(
+            map_key(kn(KeyCode::Char('i')), Focus::Log, &none_modal(), false),
+            Action::ToggleChat
+        );
+        assert_eq!(
+            map_key(kn(KeyCode::Char('i')), Focus::Chat, &none_modal(), false),
+            Action::InputChar('i')
         );
     }
 

@@ -1813,9 +1813,10 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     let keys: &[(&str, &str)] = match state.focus {
         Focus::Work => &[
             ("↑↓", "nav ops"),
+            ("Enter", "open"),
             ("Space", "fold/unfold"),
             ("Tab", "cycle panels"),
-            ("Esc", "focus chat"),
+            ("i", "chat"),
             ("/quit", "quit"),
         ],
         Focus::Log => &[
@@ -1823,7 +1824,7 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
             ("w", "wrap"),
             ("l", "files"),
             ("Tab", "cycle panels"),
-            ("Esc", "focus chat"),
+            ("i", "chat"),
             ("/quit", "quit"),
         ],
         _ => &[
@@ -3755,6 +3756,7 @@ const HELP_RIGHT_ROWS: &[(&str, &str)] = &[
         "Space / Click a task",
         "Expand it into live/historic output (one at a time)",
     ),
+    ("Enter on a task", "Full-screen operation detail"),
     ("Wheel", "Scroll the view"),
     ("i, /chat", "Open or close the chat pane"),
     ("f", "Toggle this-project / all-projects filter"),
@@ -3811,6 +3813,7 @@ const HELP_SINGLE_ROWS: &[(&str, &str)] = &[
         "Space / Click a task",
         "Expand it into live/historic output (one at a time)",
     ),
+    ("Enter on a task", "Full-screen operation detail"),
     ("Wheel", "Scroll the view"),
     ("i, /chat", "Open or close the chat pane"),
     ("f", "Toggle this-project / all-projects filter"),
