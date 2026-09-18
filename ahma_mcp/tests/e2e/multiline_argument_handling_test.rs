@@ -193,13 +193,9 @@ async fn test_multiline_argument_with_echo() {
     );
 }
 
-#[tokio::test]
-async fn test_multiline_git_commit_with_real_tool() {
-    skip_if_nested_sandbox!();
-    init_test_logging();
-    skip_if_nested_sandbox!();
-    init_test_logging();
-    let temp_dir = tempdir().expect("Failed to create temp dir");
+fn setup_git_test_repo_and_adapter(
+    temp_dir: &tempfile::TempDir,
+) -> (Arc<OperationMonitor>, Adapter) {
     let repo_path = temp_dir.path();
 
     // Initialize a git repository for testing
@@ -208,7 +204,6 @@ async fn test_multiline_git_commit_with_real_tool() {
         .current_dir(repo_path)
         .output()
         .expect("Failed to run git init");
-
     assert!(init_result.status.success(), "Git init failed");
 
     // Configure git user for testing
@@ -233,7 +228,6 @@ async fn test_multiline_git_commit_with_real_tool() {
         .current_dir(repo_path)
         .output()
         .expect("Failed to run git add");
-
     assert!(add_result.status.success(), "Git add failed");
 
     // Setup the adapter
@@ -257,6 +251,16 @@ async fn test_multiline_git_commit_with_real_tool() {
 
     let adapter =
         Adapter::new(monitor.clone(), shell_pool, sandbox).expect("Failed to create adapter");
+    (monitor, adapter)
+}
+
+#[tokio::test]
+async fn test_multiline_git_commit_with_real_tool() {
+    skip_if_nested_sandbox!();
+    init_test_logging();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let repo_path = temp_dir.path();
+    let (monitor, adapter) = setup_git_test_repo_and_adapter(&temp_dir);
 
     // Load the real git tool configuration
     let git_tool_path = get_workspace_path(".ahma/git.json");
@@ -369,66 +373,9 @@ async fn test_multiline_git_commit_with_real_tool() {
 async fn test_multiline_git_commit_message() {
     skip_if_nested_sandbox!();
     init_test_logging();
-    skip_if_nested_sandbox!();
-    init_test_logging();
     let temp_dir = tempdir().expect("Failed to create temp dir");
     let repo_path = temp_dir.path();
-
-    // Initialize a git repository for testing
-    let init_result = std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(repo_path)
-        .output()
-        .expect("Failed to run git init");
-
-    assert!(init_result.status.success(), "Git init failed");
-
-    // Configure git user for testing
-    std::process::Command::new("git")
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(repo_path)
-        .output()
-        .expect("Failed to configure git user email");
-
-    std::process::Command::new("git")
-        .args(["config", "user.name", "Test User"])
-        .current_dir(repo_path)
-        .output()
-        .expect("Failed to configure git user name");
-
-    // Create a test file to commit
-    std::fs::write(repo_path.join("test.txt"), "test content").expect("Failed to create test file");
-
-    // Add the file to git
-    let add_result = std::process::Command::new("git")
-        .args(["add", "test.txt"])
-        .current_dir(repo_path)
-        .output()
-        .expect("Failed to run git add");
-
-    assert!(add_result.status.success(), "Git add failed");
-
-    // Setup the adapter
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(30),
-    )));
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
-
-    // Create sandbox with temp_dir as a scope
-    let scopes = vec![temp_dir.path().to_path_buf(), std::env::temp_dir()];
-    let sandbox = Arc::new(
-        Sandbox::new(
-            scopes,
-            ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
-
-    let adapter =
-        Adapter::new(monitor.clone(), shell_pool, sandbox).expect("Failed to create adapter");
+    let (monitor, adapter) = setup_git_test_repo_and_adapter(&temp_dir);
 
     // Create a config for git commit with file_arg support
     let commit_config = SubcommandConfig {

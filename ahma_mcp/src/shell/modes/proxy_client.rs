@@ -670,6 +670,49 @@ fn append_session_query(base: &str, session_query: &str) -> String {
     }
 }
 
+/// Synthesizes a standard `initialize` JSON-RPC message from a `server/discover` probe.
+fn synthesize_initialize_request(val: &serde_json::Value) -> serde_json::Value {
+    let client_info = val
+        .get("params")
+        .and_then(|p| {
+            p.get("_meta")
+                .and_then(|m| m.get("clientInfo"))
+                .or_else(|| p.get("clientInfo"))
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "name": "modern-client",
+                "version": "1.0.0"
+            })
+        });
+
+    let client_capabilities = val
+        .get("params")
+        .and_then(|p| {
+            p.get("_meta")
+                .and_then(|m| m.get("clientCapabilities"))
+                .or_else(|| p.get("capabilities"))
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "roots": { "listChanged": true }
+            })
+        });
+
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": INITIALIZE_METHOD,
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION_2025_11_25,
+            "capabilities": client_capabilities,
+            "clientInfo": client_info
+        }
+    })
+}
+
 #[cfg(unix)]
 async fn run_proxy_client_unix(
     socket_path: &str,
@@ -779,45 +822,7 @@ where
                     );
                     let discover_id = request_id.clone().unwrap_or_else(|| serde_json::json!(1));
 
-                    let client_info = val
-                        .get("params")
-                        .and_then(|p| {
-                            p.get("_meta")
-                                .and_then(|m| m.get("clientInfo"))
-                                .or_else(|| p.get("clientInfo"))
-                        })
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            serde_json::json!({
-                                "name": "modern-client",
-                                "version": "1.0.0"
-                            })
-                        });
-
-                    let client_capabilities = val
-                        .get("params")
-                        .and_then(|p| {
-                            p.get("_meta")
-                                .and_then(|m| m.get("clientCapabilities"))
-                                .or_else(|| p.get("capabilities"))
-                        })
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            serde_json::json!({
-                                "roots": { "listChanged": true }
-                            })
-                        });
-
-                    let synth_init = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": 0,
-                        "method": INITIALIZE_METHOD,
-                        "params": {
-                            "protocolVersion": MCP_PROTOCOL_VERSION_2025_11_25,
-                            "capabilities": client_capabilities,
-                            "clientInfo": client_info
-                        }
-                    });
+                    let synth_init = synthesize_initialize_request(&val);
 
                     handshake.observe_client_to_bridge(&synth_init);
 
@@ -1216,45 +1221,7 @@ async fn perform_http_initialize(
             .cloned()
             .unwrap_or_else(|| serde_json::json!(1));
 
-        let client_info = val
-            .get("params")
-            .and_then(|p| {
-                p.get("_meta")
-                    .and_then(|m| m.get("clientInfo"))
-                    .or_else(|| p.get("clientInfo"))
-            })
-            .cloned()
-            .unwrap_or_else(|| {
-                serde_json::json!({
-                    "name": "modern-client",
-                    "version": "1.0.0"
-                })
-            });
-
-        let client_capabilities = val
-            .get("params")
-            .and_then(|p| {
-                p.get("_meta")
-                    .and_then(|m| m.get("clientCapabilities"))
-                    .or_else(|| p.get("capabilities"))
-            })
-            .cloned()
-            .unwrap_or_else(|| {
-                serde_json::json!({
-                    "roots": { "listChanged": true }
-                })
-            });
-
-        let synth_init = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": INITIALIZE_METHOD,
-            "params": {
-                "protocolVersion": MCP_PROTOCOL_VERSION_2025_11_25,
-                "capabilities": client_capabilities,
-                "clientInfo": client_info
-            }
-        });
+        let synth_init = synthesize_initialize_request(&val);
 
         let response = client
             .post(mcp_url)
