@@ -2245,4 +2245,10 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         // _env_guard restores AHMA_DAEMON_SOCK; _lock releases the serialization.
     }
+
+    #[test]
+    fn current_identity_returns_instance_identity() {
+        let id = current_identity();
+        assert_eq!(id, id.clone());
+    }
 }

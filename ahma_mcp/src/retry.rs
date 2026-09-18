@@ -293,6 +293,12 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_config_builder() {
+        let cfg = RetryConfig::default().with_policy(RetryPolicy::ExponentialBackoff);
+        assert_eq!(cfg.policy, RetryPolicy::ExponentialBackoff);
+    }
+
+    #[test]
     fn test_retryable_patterns() {
         assert!(is_retryable_error("ETIMEDOUT"));
         assert!(is_retryable_error("Connection reset by peer"));

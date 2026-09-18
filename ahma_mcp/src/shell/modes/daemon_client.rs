@@ -274,6 +274,13 @@ mod tests {
     const OUR_BUILD: &str = "abc1234";
 
     #[test]
+    fn test_socket_is_stale_nonexistent() {
+        assert!(!socket_is_stale(Path::new(
+            "/nonexistent/socket/path/12345"
+        )));
+    }
+
+    #[test]
     fn the_same_build_is_simply_used() {
         assert_eq!(
             skew_action(OURS, OUR_BUILD, "0.20.2+abc1234", false),

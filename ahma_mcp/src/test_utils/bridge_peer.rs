@@ -307,4 +307,11 @@ mod tests {
         assert!(builder.configs.is_none());
         assert!(builder.scopes.is_empty());
     }
+
+    #[test]
+    fn in_process_factory_builder_with_configs() {
+        let builder =
+            InProcessMcpPeerFactory::builder().with_configs(std::collections::HashMap::new());
+        assert!(builder.configs.is_some());
+    }
 }

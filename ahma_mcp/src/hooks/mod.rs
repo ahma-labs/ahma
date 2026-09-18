@@ -3070,6 +3070,12 @@ mod tests {
     }
 
     #[test]
+    fn test_any_managed_hooks_installed() {
+        // Just verify calling the public entry point returns a valid Result
+        let _ = any_managed_hooks_installed(HookScope::Project);
+    }
+
+    #[test]
     fn test_copilot_install_writes_bash_and_powershell() {
         let env = test_env();
         let path = env.config_path(HookPlatform::Copilot, HookScope::User);

@@ -285,6 +285,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn client_service_accessors() {
+        let mut client = Client::new();
+        assert!(client.service().is_none());
+        assert!(client.service_mut().is_none());
+    }
+
+    #[test]
     fn extract_id_parses_identifier() {
         let text = "AHMA ID: job_123 Follow-up";
         let job_id = extract_id(text).unwrap();

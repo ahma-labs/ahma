@@ -247,3 +247,59 @@ where
     }
     results
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_timeouts() {
+        assert!(ci_heavy_timeout() > ci_default_timeout());
+    }
+
+    #[tokio::test]
+    async fn test_with_ci_timeout() {
+        let res = with_ci_timeout("quick", Duration::from_millis(100), async { 10 }).await;
+        assert_eq!(res.unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_tasks_with_barrier() {
+        let res = spawn_tasks_with_barrier(3, |n| async move { n * 2 }).await;
+        assert_eq!(res, vec![0, 2, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_collect_results_with_deadline() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+        let res = collect_results_with_deadline(&mut rx, 2, Duration::from_millis(100)).await;
+        assert_eq!(res, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_assert_unique() {
+        assert_all_unique(&[1, 2, 3]);
+        assert_unique_by(&[("a", 1), ("b", 2)], |x| x.0);
+    }
+
+    #[tokio::test]
+    async fn test_wait_with_backoff() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = count.clone();
+        let res = wait_with_backoff("counter", Duration::from_millis(100), move || {
+            let val = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { val >= 1 }
+        })
+        .await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_bounded_concurrent() {
+        let items = vec![1, 2, 3];
+        let res = spawn_bounded_concurrent(items, 2, |x| async move { x + 1 }).await;
+        assert_eq!(res, vec![2, 3, 4]);
+    }
+}
