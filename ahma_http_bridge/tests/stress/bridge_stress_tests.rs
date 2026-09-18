@@ -55,20 +55,14 @@ async fn bounded_call_tool(
     }
 }
 
-/// Initialise a client against a freshly spawned server and run the
-/// 14-request concurrent batch.
-///
-/// A spawn failure skips locally and **fails on CI**. It used to return early
-/// unconditionally, "so as not to break CI when the binary is unavailable" — but
-/// CI is where the binary is built as a prerequisite step, so its absence there
-/// is the regression, and a trivially-passing stress test is worse than a
-/// failing one: it reports that the concurrency invariants held.
-async fn run_concurrent_tool_calls(transport: TransportMode) {
+async fn setup_stress_client(
+    transport: TransportMode,
+) -> Option<(common::TestServerInstance, Arc<McpTestClient>)> {
     let server = match spawn_test_server().await {
         Ok(s) => s,
         Err(e) => {
             common::skip_or_fail(&format!("failed to spawn server: {e}"));
-            return;
+            return None;
         }
     };
 
@@ -87,17 +81,32 @@ async fn run_concurrent_tool_calls(transport: TransportMode) {
                 "WARNING  Skipping test - failed to initialize MCP client: {}",
                 e
             );
-            return;
+            return None;
         }
         Err(_) => {
             eprintln!(
                 "WARNING  Skipping test - MCP handshake timed out after {:?}",
                 handshake_timeout
             );
-            return;
+            return None;
         }
     }
-    let mcp = Arc::new(mcp);
+    Some((server, Arc::new(mcp)))
+}
+
+/// Initialise a client against a freshly spawned server and run the
+/// 14-request concurrent batch.
+///
+/// A spawn failure skips locally and **fails on CI**. It used to return early
+/// unconditionally, "so as not to break CI when the binary is unavailable" — but
+/// CI is where the binary is built as a prerequisite step, so its absence there
+/// is the regression, and a trivially-passing stress test is worse than a
+/// failing one: it reports that the concurrency invariants held.
+async fn run_concurrent_tool_calls(transport: TransportMode) {
+    let (_server, mcp) = match setup_stress_client(transport).await {
+        Some(res) => res,
+        None => return,
+    };
     let start = Instant::now();
 
     // Use platform-appropriate commands: Unix tools (ls -la, uname, cat|head)
@@ -200,40 +209,10 @@ async fn run_concurrent_tool_calls(transport: TransportMode) {
 /// High-volume echo stress run.  `num_requests` is caller-controlled so that
 /// the Windows variant can use a smaller count.
 async fn run_high_volume_concurrent_requests(num_requests: usize, transport: TransportMode) {
-    let server = match spawn_test_server().await {
-        Ok(s) => s,
-        Err(e) => {
-            common::skip_or_fail(&format!("failed to spawn server: {e}"));
-            return;
-        }
+    let (_server, mcp) = match setup_stress_client(transport).await {
+        Some(res) => res,
+        None => return,
     };
-
-    let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(transport);
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let handshake_timeout = TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Handshake);
-    match tokio::time::timeout(
-        handshake_timeout,
-        mcp.initialize_with_roots("stress-client", &[root]),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            eprintln!(
-                "WARNING  Skipping test - failed to initialize MCP client: {}",
-                e
-            );
-            return;
-        }
-        Err(_) => {
-            eprintln!(
-                "WARNING  Skipping test - MCP handshake timed out after {:?}",
-                handshake_timeout
-            );
-            return;
-        }
-    }
-    let mcp = Arc::new(mcp);
     let start = Instant::now();
 
     let futures: Vec<_> = (0..num_requests)

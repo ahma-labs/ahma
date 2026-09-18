@@ -116,6 +116,26 @@ fn scope_dir() -> (TempDir, PathBuf) {
     (dir, canonical)
 }
 
+async fn dispatch_echo_with_args(adapter: &Adapter, scope: &Path, args_list: Vec<Value>) -> String {
+    let mut args = Map::new();
+    args.insert("args".to_string(), Value::Array(args_list));
+    adapter
+        .execute_async_in_dir_with_options(
+            "echo_tool",
+            "echo",
+            scope.to_str().unwrap(),
+            AsyncExecOptions {
+                id: None,
+                args: Some(args),
+                timeout: Some(TestTimeouts::get(TimeoutCategory::ToolCall).as_secs()),
+                subcommand_config: None,
+                log_monitor_config: None,
+            },
+        )
+        .await
+        .expect("dispatch")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // tool_call is written before execution
 // ─────────────────────────────────────────────────────────────────────────────
@@ -196,24 +216,7 @@ async fn tool_call_and_tool_complete_pair_for_a_successful_command() {
     let (_dir, scope) = scope_dir();
     let adapter = test_adapter(&scope);
 
-    let mut args = Map::new();
-    args.insert("args".to_string(), json!(["audit-pairing"]));
-
-    let op_id = adapter
-        .execute_async_in_dir_with_options(
-            "echo_tool",
-            "echo",
-            scope.to_str().unwrap(),
-            AsyncExecOptions {
-                id: None,
-                args: Some(args),
-                timeout: Some(TestTimeouts::get(TimeoutCategory::ToolCall).as_secs()),
-                subcommand_config: None,
-                log_monitor_config: None,
-            },
-        )
-        .await
-        .expect("dispatch");
+    let op_id = dispatch_echo_with_args(&adapter, &scope, vec![json!("audit-pairing")]).await;
 
     assert!(
         wait_until(|events| {
@@ -293,27 +296,15 @@ async fn secrets_are_redacted_out_of_the_arguments_and_the_command() {
     const GITHUB_TOKEN: &str = "ghp_auditshouldnevercapturethis01234";
     const PROVIDER_KEY: &str = "sk-ant-api03-auditshouldnevercapturethis";
 
-    let mut args = Map::new();
-    args.insert(
-        "args".to_string(),
-        json!([format!("GITHUB_TOKEN={GITHUB_TOKEN}"), PROVIDER_KEY]),
-    );
-
-    let op_id = adapter
-        .execute_async_in_dir_with_options(
-            "echo_tool",
-            "echo",
-            scope.to_str().unwrap(),
-            AsyncExecOptions {
-                id: None,
-                args: Some(args),
-                timeout: Some(TestTimeouts::get(TimeoutCategory::ToolCall).as_secs()),
-                subcommand_config: None,
-                log_monitor_config: None,
-            },
-        )
-        .await
-        .expect("dispatch");
+    let op_id = dispatch_echo_with_args(
+        &adapter,
+        &scope,
+        vec![
+            json!(format!("GITHUB_TOKEN={GITHUB_TOKEN}")),
+            json!(PROVIDER_KEY),
+        ],
+    )
+    .await;
 
     let events = events_for(&op_id).await;
     let call = &events[0];
@@ -440,23 +431,8 @@ async fn concurrent_operations_do_not_corrupt_the_log() {
 
     let mut op_ids = Vec::new();
     for i in 0..8u32 {
-        let mut args = Map::new();
-        args.insert("args".to_string(), json!([format!("concurrent-{i}")]));
-        let op_id = adapter
-            .execute_async_in_dir_with_options(
-                "echo_tool",
-                "echo",
-                scope.to_str().unwrap(),
-                AsyncExecOptions {
-                    id: None,
-                    args: Some(args),
-                    timeout: Some(TestTimeouts::get(TimeoutCategory::ToolCall).as_secs()),
-                    subcommand_config: None,
-                    log_monitor_config: None,
-                },
-            )
-            .await
-            .expect("dispatch");
+        let op_id =
+            dispatch_echo_with_args(&adapter, &scope, vec![json!(format!("concurrent-{i}"))]).await;
         op_ids.push(op_id);
     }
 

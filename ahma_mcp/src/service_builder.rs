@@ -685,9 +685,7 @@ mod tests {
 
     // ─── tools_dir loading ───────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_build_with_tools_dir_loads_custom_tool() {
-        let temp = tempdir().unwrap();
+    fn setup_temp_tools_dir_with_echo(temp: &tempfile::TempDir) -> std::path::PathBuf {
         let tools_dir = temp.path().join(".ahma");
         std::fs::create_dir_all(&tools_dir).unwrap();
         // NOTE: CommandOption uses #[serde(rename = "type")] so the JSON key must be "type".
@@ -716,6 +714,13 @@ mod tests {
             }"#,
         )
         .unwrap();
+        tools_dir
+    }
+
+    #[tokio::test]
+    async fn test_build_with_tools_dir_loads_custom_tool() {
+        let temp = tempdir().unwrap();
+        let tools_dir = setup_temp_tools_dir_with_echo(&temp);
 
         let sandbox = make_test_sandbox(temp.path().to_path_buf());
         let config = AppConfig {
@@ -758,34 +763,7 @@ mod tests {
     async fn test_build_with_tools_dir_and_probes_enabled() {
         // echo has no availability_check, so no actual shell probes are run.
         let temp = tempdir().unwrap();
-        let tools_dir = temp.path().join(".ahma");
-        std::fs::create_dir_all(&tools_dir).unwrap();
-        // NOTE: CommandOption uses #[serde(rename = "type")] so JSON key must be "type".
-        std::fs::write(
-            tools_dir.join("echo.json"),
-            r#"{
-                "name": "echo",
-                "description": "Echo a message",
-                "command": "echo",
-                "timeout_seconds": 10,
-                "enabled": true,
-                "subcommand": [
-                    {
-                        "name": "default",
-                        "description": "echo the message",
-                        "positional_args": [
-                            {
-                                "name": "message",
-                                "type": "string",
-                                "description": "message to echo",
-                                "required": true
-                            }
-                        ]
-                    }
-                ]
-            }"#,
-        )
-        .unwrap();
+        let tools_dir = setup_temp_tools_dir_with_echo(&temp);
 
         let sandbox = make_test_sandbox(temp.path().to_path_buf());
         let config = AppConfig {
