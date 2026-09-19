@@ -376,9 +376,13 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
             }
         }
         Action::Enter if state.focus == crate::state::Focus::Work => {
-            // Drill in: open the full-screen detail view for an operation
-            // (or open the accordion section for an instance/session header).
-            state.open_selected_tree_detail(crate::ui::wall_ms());
+            if let Some(key) = selected_instance_header_key(state) {
+                activate_window_chat(&key, state);
+            } else {
+                // Drill in: open the full-screen detail view for an operation
+                // (or open the accordion section for an instance/session header).
+                state.open_selected_tree_detail(crate::ui::wall_ms());
+            }
         }
         Action::ToggleNode if state.focus == crate::state::Focus::Work => {
             // Space: inline accordion-expand the selected task into its
@@ -581,6 +585,21 @@ fn submit_active_picker(state: &mut crate::state::AppState) {
 
     if let Some(picker) = state.take_model_picker() {
         submit_model_picker(picker, state);
+        return;
+    }
+
+    if let Some(picker) = state.take_llm_setup_provider() {
+        submit_llm_setup_provider(picker, state);
+        return;
+    }
+
+    if let Some((picker, base_url)) = state.take_llm_setup_ollama_flavor() {
+        submit_llm_setup_ollama_flavor(picker, base_url, state);
+        return;
+    }
+
+    if let Some((picker, provider_name, base_url, _is_enhanced)) = state.take_llm_setup_model() {
+        submit_llm_setup_model(picker, provider_name, base_url, state);
     }
 }
 
@@ -643,10 +662,241 @@ fn submit_model_picker(picker: crate::state::PickerState, state: &mut crate::sta
 fn close_active_pickers(state: &mut crate::state::AppState) {
     if matches!(
         state.modal,
-        crate::state::ModalState::ProviderPicker(_) | crate::state::ModalState::ModelPicker(_)
+        crate::state::ModalState::ProviderPicker(_)
+            | crate::state::ModalState::ModelPicker(_)
+            | crate::state::ModalState::LlmSetupProvider(_)
+            | crate::state::ModalState::LlmSetupOllamaFlavor { .. }
+            | crate::state::ModalState::LlmSetupModel { .. }
     ) {
         state.close_modal();
     }
+}
+
+fn selected_instance_header_key(state: &crate::state::AppState) -> Option<String> {
+    use crate::task_tree::RowKind;
+    let rows = state.task_rows.borrow();
+    rows.get(state.ops_selected).and_then(|r| match &r.kind {
+        RowKind::Instance { group_id, .. } => Some(group_id.clone()),
+        _ => None,
+    })
+}
+
+fn activate_window_chat(key: &str, state: &mut crate::state::AppState) {
+    let now = crate::ui::wall_ms();
+    if state.open_section.as_deref() == Some(key)
+        && (state.focus == crate::state::Focus::Chat || state.llm_selection.is_none())
+    {
+        state.toggle_section(key, now);
+        state.chat_open = false;
+        state.focus = crate::state::Focus::Work;
+        state.active_target_instance = None;
+        return;
+    }
+
+    state.open_section(key, now);
+    state.active_target_instance = Some(key.to_string());
+
+    // Restore or assign default LLM for this window
+    if let Some(win_cfg) = state.get_window_llm(key).cloned() {
+        state.current_provider_url = win_cfg.provider_url;
+        state.llm_selection = Some(crate::state::LlmSelection::named(
+            win_cfg.provider,
+            win_cfg.model,
+        ));
+    } else if let Some(sel) = &state.llm_selection {
+        state.set_window_llm(
+            key,
+            crate::session_config::WindowLlmConfig {
+                provider: sel.persistable_provider().to_string(),
+                model: sel.model.clone(),
+                provider_url: state.current_provider_url.clone(),
+            },
+        );
+        save_session(state);
+    }
+
+    state.focus = crate::state::Focus::Work;
+    // If still no LLM configured anywhere, start the setup wizard!
+    if state.llm_selection.is_none() {
+        start_llm_setup_wizard(state);
+    } else {
+        state.chat_open = true;
+        state.focus = crate::state::Focus::Chat;
+    }
+}
+
+fn start_llm_setup_wizard(state: &mut crate::state::AppState) {
+    use crate::state::PickerState;
+    let mut items = vec![
+        "Ollama (Local AI - Free, Private, Fast)".to_string(),
+        "OpenAI-Compatible (LM Studio, vLLM, OpenAI, Groq)".to_string(),
+        "Anthropic Claude (Claude 3.5 Sonnet, Claude 3 Opus)".to_string(),
+    ];
+
+    if state
+        .available_providers
+        .iter()
+        .any(|p| p.name.to_lowercase().contains("ollama"))
+    {
+        items[0].push_str(" · [detected running]");
+    }
+
+    for inst in &state.active_instances {
+        if let Some(virtual_p) = virtual_provider_for_instance(&inst.label) {
+            items.push(format!("IDE Sampling: {} ({})", virtual_p.name, inst.label));
+        }
+    }
+
+    let picker = PickerState::new("Connect AI: Step 1/3 - Select Provider", items);
+    state.modal = crate::state::ModalState::LlmSetupProvider(picker);
+}
+
+fn submit_llm_setup_provider(
+    picker: crate::state::PickerState,
+    state: &mut crate::state::AppState,
+) {
+    let Some(item) = picker.selected_item() else {
+        return;
+    };
+    if item.starts_with("Ollama") {
+        let picker = crate::state::PickerState::new(
+            "Connect AI: Step 2/3 - Ollama API Flavor",
+            vec![
+                "Enhanced Ollama API (Recommended - Context control, thinking tags, streaming)"
+                    .to_string(),
+                "Standard OpenAI-Compatible API (/v1)".to_string(),
+            ],
+        );
+        state.modal = crate::state::ModalState::LlmSetupOllamaFlavor {
+            picker,
+            base_url: "http://localhost:11434".to_string(),
+        };
+    } else if item.starts_with("OpenAI-Compatible") {
+        let picker = crate::state::PickerState::new(
+            "Connect AI: Step 2/2 - Select Model",
+            vec![
+                "gpt-4o".to_string(),
+                "gpt-4o-mini".to_string(),
+                "o3-mini".to_string(),
+                "local-model".to_string(),
+            ],
+        );
+        state.modal = crate::state::ModalState::LlmSetupModel {
+            picker,
+            provider_name: "OpenAI-Compatible".to_string(),
+            base_url: "http://localhost:1234/v1".to_string(),
+            is_enhanced_ollama: false,
+        };
+    } else if item.starts_with("Anthropic") {
+        let picker = crate::state::PickerState::new(
+            "Connect AI: Step 2/2 - Select Model",
+            vec![
+                "claude-3-5-sonnet-latest".to_string(),
+                "claude-3-5-haiku-latest".to_string(),
+                "claude-3-opus-latest".to_string(),
+            ],
+        );
+        state.modal = crate::state::ModalState::LlmSetupModel {
+            picker,
+            provider_name: "Anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            is_enhanced_ollama: false,
+        };
+    } else if item.starts_with("IDE Sampling:") {
+        for inst in &state.active_instances {
+            if let Some(virtual_p) = virtual_provider_for_instance(&inst.label)
+                && (item.contains(&inst.label) || item.contains(&virtual_p.name))
+            {
+                let model = virtual_p.models.first().cloned().unwrap_or_default();
+                finish_llm_setup(virtual_p.name, model, Some(virtual_p.base_url), state);
+                return;
+            }
+        }
+    }
+}
+
+fn submit_llm_setup_ollama_flavor(
+    picker: crate::state::PickerState,
+    base_url: String,
+    state: &mut crate::state::AppState,
+) {
+    let Some(item) = picker.selected_item() else {
+        return;
+    };
+    let is_enhanced = item.starts_with("Enhanced");
+
+    let mut models: Vec<String> = state
+        .available_providers
+        .iter()
+        .find(|p| p.name.to_lowercase().contains("ollama"))
+        .map(|p| p.models.clone())
+        .unwrap_or_default();
+
+    if models.is_empty() {
+        models = vec![
+            "qwen2.5-coder:7b".to_string(),
+            "qwen2.5-coder:14b".to_string(),
+            "qwen2.5-coder:32b".to_string(),
+            "llama3.2:3b".to_string(),
+            "llama3.3:70b".to_string(),
+            "deepseek-r1:8b".to_string(),
+            "deepseek-r1:14b".to_string(),
+            "mistral:7b".to_string(),
+        ];
+    }
+
+    let provider_label = if is_enhanced {
+        "Ollama (Enhanced)".to_string()
+    } else {
+        "Ollama".to_string()
+    };
+
+    let model_picker =
+        crate::state::PickerState::new("Connect AI: Step 3/3 - Select Ollama Model", models);
+    state.modal = crate::state::ModalState::LlmSetupModel {
+        picker: model_picker,
+        provider_name: provider_label,
+        base_url,
+        is_enhanced_ollama: is_enhanced,
+    };
+}
+
+fn submit_llm_setup_model(
+    picker: crate::state::PickerState,
+    provider_name: String,
+    base_url: String,
+    state: &mut crate::state::AppState,
+) {
+    let Some(model) = picker.selected_item().map(|s| s.to_string()) else {
+        return;
+    };
+    finish_llm_setup(provider_name, model, Some(base_url), state);
+}
+
+fn finish_llm_setup(
+    provider_name: String,
+    model: String,
+    base_url: Option<String>,
+    state: &mut crate::state::AppState,
+) {
+    state.current_provider_url = base_url.clone();
+    let selection = crate::state::LlmSelection::named(provider_name.clone(), model.clone());
+    state.llm_selection = Some(selection);
+
+    if let Some(target) = state.active_target_instance.clone() {
+        state.set_window_llm(
+            &target,
+            crate::session_config::WindowLlmConfig {
+                provider: provider_name,
+                model,
+                provider_url: base_url,
+            },
+        );
+    }
+    save_session(state);
+    state.close_modal();
+    state.chat_open = true;
+    state.focus = crate::state::Focus::Chat;
 }
 
 fn handle_navigation_action(
@@ -1238,12 +1488,18 @@ fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: S
 
     let system_prompt = Some(build_system_prompt(state));
 
+    let target_instance_id = state
+        .active_target_instance
+        .as_ref()
+        .filter(|key| state.active_instances.iter().any(|i| &i.id == *key))
+        .cloned();
+
     send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitPrompt {
         messages,
         system_prompt,
         provider: Some(base_url),
         model: Some(model),
-        target_instance_id: None,
+        target_instance_id,
     });
 }
 
@@ -1776,9 +2032,11 @@ fn handle_picker_key(key: crossterm::event::KeyEvent, state: &mut crate::state::
 
 fn active_picker_mut(state: &mut crate::state::AppState) -> Option<&mut crate::state::PickerState> {
     match &mut state.modal {
-        crate::state::ModalState::ProviderPicker(p) | crate::state::ModalState::ModelPicker(p) => {
-            Some(p)
-        }
+        crate::state::ModalState::ProviderPicker(p)
+        | crate::state::ModalState::ModelPicker(p)
+        | crate::state::ModalState::LlmSetupProvider(p)
+        | crate::state::ModalState::LlmSetupOllamaFlavor { picker: p, .. }
+        | crate::state::ModalState::LlmSetupModel { picker: p, .. } => Some(p),
         _ => None,
     }
 }
@@ -2038,7 +2296,11 @@ fn handle_chat_input_key(
             true
         }
         (KeyCode::Esc, _) => {
-            state.clear_chat_input();
+            if state.chat_input_is_empty() {
+                state.focus = crate::state::Focus::Work;
+            } else {
+                state.clear_chat_input();
+            }
             true
         }
         // `?` on an empty input opens help, the same way `/` opens the
@@ -3344,6 +3606,10 @@ fn default_provider_base_url(provider_name: &str) -> String {
 
 /// Persist the current session config to `.ahma/session.toml`.
 fn save_session(state: &crate::state::AppState) {
+    if cfg!(test) {
+        return;
+    }
+
     use crate::session_config::TuiSessionConfig;
 
     // Straight off the typed selection. Splitting the *display* label here is
@@ -3360,6 +3626,7 @@ fn save_session(state: &crate::state::AppState) {
         provider_url: state.current_provider_url.clone(),
         mcp_enabled: state.mcp_enabled,
         active_profile: state.active_profile.clone(),
+        window_llms: state.window_llms.clone(),
     };
 
     if let Ok(cwd) = std::env::current_dir()
@@ -4863,11 +5130,7 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
             state.focus = crate::state::Focus::Work;
         }
         ClickTarget::SectionHeader(key) => {
-            // Clicking a header opens that section and closes whichever was
-            // open, over the 300ms tween (SPEC R24.9).
-            let now = crate::ui::wall_ms();
-            state.toggle_section(&key, now);
-            state.focus = crate::state::Focus::Work;
+            activate_window_chat(&key, state);
         }
         ClickTarget::OpenOperationDetail(op_id) => {
             state.open_operation_detail(op_id);
@@ -6270,10 +6533,11 @@ mod tests {
     /// simulated click actually opens the section.
     #[tokio::test]
     async fn clicking_a_section_header_opens_it() {
-        use crate::state::{AppState, ClickTarget, Focus};
+        use crate::state::{AppState, ClickTarget, Focus, LlmSelection};
         use ratatui::layout::Rect;
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         state.focus = Focus::Log;
+        state.llm_selection = Some(LlmSelection::named("Ollama", "qwen2.5-coder:32b"));
 
         state.click_targets.borrow_mut().push((
             ClickTarget::SectionHeader("i1".into()),
@@ -6283,11 +6547,12 @@ mod tests {
         assert_eq!(state.open_section, None);
         super::handle_mouse_click(10, 2, &mut state);
         assert_eq!(state.open_section.as_deref(), Some("i1"));
-        assert_eq!(state.focus, Focus::Work);
+        assert_eq!(state.focus, Focus::Chat);
 
         // Clicking the same (now open) header again closes it.
         super::handle_mouse_click(10, 2, &mut state);
         assert_eq!(state.open_section, None);
+        assert_eq!(state.focus, Focus::Work);
     }
 
     /// The overlay scroll keys drive whichever overlay is open — the log-line
@@ -6425,6 +6690,113 @@ mod tests {
                 op.started_time.format("%H:%M:%S")
             )
         );
+    }
+
+    #[test]
+    fn test_activate_window_chat_with_saved_llm() {
+        use crate::session_config::WindowLlmConfig;
+        use crate::state::{AppState, Focus};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.set_window_llm(
+            "claude-code",
+            WindowLlmConfig {
+                provider: "Ollama".to_string(),
+                model: "qwen2.5-coder:32b".to_string(),
+                provider_url: Some("http://localhost:11434".to_string()),
+            },
+        );
+
+        super::activate_window_chat("claude-code", &mut state);
+
+        assert_eq!(state.active_target_instance.as_deref(), Some("claude-code"));
+        assert!(state.chat_open);
+        assert_eq!(state.focus, Focus::Chat);
+        let sel = state.llm_selection.as_ref().unwrap();
+        assert_eq!(sel.persistable_provider(), "Ollama");
+        assert_eq!(sel.model, "qwen2.5-coder:32b");
+    }
+
+    #[test]
+    fn test_activate_window_chat_triggers_wizard_when_no_llm() {
+        use crate::state::{AppState, ModalState};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.llm_selection = None;
+        state.window_llms.clear();
+
+        super::activate_window_chat("claude-code", &mut state);
+
+        assert_eq!(state.active_target_instance.as_deref(), Some("claude-code"));
+        assert!(matches!(state.modal, ModalState::LlmSetupProvider(_)));
+    }
+
+    #[test]
+    fn test_llm_setup_wizard_flow() {
+        use crate::state::{AppState, Focus, ModalState, PickerState};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.active_target_instance = Some("claude-code".to_string());
+        state.llm_selection = None;
+
+        // Step 1: Select Ollama
+        let picker = PickerState::new(
+            "Step 1",
+            vec!["Ollama (Local AI - Free, Private, Fast)".to_string()],
+        );
+        super::submit_llm_setup_provider(picker, &mut state);
+
+        let (ollama_picker, base_url) = match std::mem::take(&mut state.modal) {
+            ModalState::LlmSetupOllamaFlavor { picker, base_url } => (picker, base_url),
+            other => panic!("expected LlmSetupOllamaFlavor, got {other:?}"),
+        };
+        assert_eq!(base_url, "http://localhost:11434");
+
+        // Step 2: Select Enhanced Ollama API
+        super::submit_llm_setup_ollama_flavor(ollama_picker, base_url, &mut state);
+
+        let (mut model_picker, provider_name, base_url, is_enhanced) =
+            match std::mem::take(&mut state.modal) {
+                ModalState::LlmSetupModel {
+                    picker,
+                    provider_name,
+                    base_url,
+                    is_enhanced_ollama,
+                } => (picker, provider_name, base_url, is_enhanced_ollama),
+                other => panic!("expected LlmSetupModel, got {other:?}"),
+            };
+        assert_eq!(provider_name, "Ollama (Enhanced)");
+        assert!(is_enhanced);
+        assert!(!model_picker.items.is_empty());
+
+        // Step 3: Select model
+        model_picker.select_exact("qwen2.5-coder:32b");
+        super::submit_llm_setup_model(model_picker, provider_name, base_url, &mut state);
+
+        // Completion checks
+        assert!(matches!(state.modal, ModalState::None));
+        assert!(state.chat_open);
+        assert_eq!(state.focus, Focus::Chat);
+        let sel = state.llm_selection.as_ref().unwrap();
+        assert_eq!(sel.persistable_provider(), "Ollama (Enhanced)");
+        assert_eq!(sel.model, "qwen2.5-coder:32b");
+
+        let win_cfg = state.get_window_llm("claude-code").unwrap();
+        assert_eq!(win_cfg.provider, "Ollama (Enhanced)");
+        assert_eq!(win_cfg.model, "qwen2.5-coder:32b");
+    }
+
+    #[test]
+    fn test_esc_in_empty_chat_input_unfocuses_to_work() {
+        use crate::state::{AppState, Focus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.chat_open = true;
+        state.focus = Focus::Chat;
+        state.clear_chat_input();
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let handled = super::handle_chat_input_key(key, &mut state);
+        assert!(handled);
+        assert_eq!(state.focus, Focus::Work);
     }
 
     /// SPEC R-SK8: `/name [args]` invokes a discovered Agent Skill — the pane

@@ -44,7 +44,12 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
         crate::state::ModalState::Help => draw_help(frame, state, theme, full),
         crate::state::ModalState::Navigator(_) => draw_navigator(frame, state, theme, full),
         crate::state::ModalState::ProviderPicker(picker)
-        | crate::state::ModalState::ModelPicker(picker) => draw_picker(frame, picker, theme, full),
+        | crate::state::ModalState::ModelPicker(picker)
+        | crate::state::ModalState::LlmSetupProvider(picker)
+        | crate::state::ModalState::LlmSetupOllamaFlavor { picker, .. }
+        | crate::state::ModalState::LlmSetupModel { picker, .. } => {
+            draw_picker(frame, picker, theme, full)
+        }
         crate::state::ModalState::LogFiles { .. } => {
             draw_log_files_modal(frame, state, theme, full)
         }
@@ -1725,15 +1730,27 @@ fn insert_input_cursor(lines: &mut Vec<String>, row: usize, col: usize, unicode:
 }
 
 fn get_input_title_left(state: &AppState, theme: &Theme) -> Line<'static> {
+    let target_part = if let Some(target) = &state.active_target_instance {
+        let client_name = state
+            .active_instances
+            .iter()
+            .find(|i| &i.id == target)
+            .and_then(|i| i.client.as_deref().or(Some(&i.label)))
+            .unwrap_or(target.as_str());
+        format!(" [{client_name}]")
+    } else {
+        String::new()
+    };
+
     if state.llm_selection.is_none() {
         Line::from(Span::styled(
-            " ahma: no LLM — /provider to configure ",
+            format!(" ahma{target_part}: no LLM — Enter to connect "),
             theme.title(),
         ))
         .left_aligned()
     } else {
         Line::from(Span::styled(
-            format!(" ahma: {} ", state.llm_label()),
+            format!(" ahma{target_part}: {} ", state.llm_label()),
             theme.title(),
         ))
         .left_aligned()
@@ -1776,7 +1793,7 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     let is_empty = rendered_lines.len() == 1 && rendered_lines[0].is_empty();
 
     let para = if is_empty {
-        input_placeholder_paragraph(theme, focused, state.unicode)
+        input_placeholder_paragraph(state, theme, focused, state.unicode)
     } else {
         if focused {
             insert_input_cursor(&mut rendered_lines, cursor_row, cursor_col, state.unicode);
@@ -1788,13 +1805,30 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
 
 /// Paragraph shown when the chat input is empty: the placeholder hint, with a
 /// leading cursor glyph when focused.
-fn input_placeholder_paragraph(theme: &Theme, focused: bool, unicode: bool) -> Paragraph<'static> {
-    let placeholder = "Type a message... (! UNSANDBOXED cmd · # decompose · / commands)";
+fn input_placeholder_paragraph(
+    state: &AppState,
+    theme: &Theme,
+    focused: bool,
+    unicode: bool,
+) -> Paragraph<'static> {
+    let target = state
+        .active_target_instance
+        .as_deref()
+        .map(|t| {
+            state
+                .active_instances
+                .iter()
+                .find(|i| i.id == t)
+                .and_then(|i| i.client.as_deref().or(Some(&i.label)))
+                .unwrap_or(t)
+        })
+        .unwrap_or("window");
+    let placeholder = format!("Type to chat with {target}... (Esc unfocus · ! cmd · # decompose)");
     let text = if focused {
         let cursor = if unicode { "│" } else { "|" };
         format!("{}{}", cursor, placeholder)
     } else {
-        placeholder.to_string()
+        placeholder
     };
     let style = theme.input_placeholder().patch(theme.input_bg());
     Paragraph::new(Span::styled(text, style)).wrap(Wrap { trim: false })
@@ -1812,11 +1846,11 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
 
     let keys: &[(&str, &str)] = match state.focus {
         Focus::Work => &[
-            ("↑↓", "nav ops"),
-            ("Enter", "open"),
+            ("↑↓", "nav windows"),
+            ("Enter", "chat with window"),
             ("Space", "fold/unfold"),
             ("Tab", "cycle panels"),
-            ("i", "chat"),
+            ("i", "toggle chat"),
             ("/quit", "quit"),
         ],
         Focus::Log => &[
@@ -1830,12 +1864,10 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         _ => &[
             ("Enter", "send"),
             ("Shift+Enter", "newline"),
+            ("Esc", "unfocus window"),
+            ("/provider", "change LLM"),
             ("/", "commands"),
             ("?", "help"),
-            ("/tasks", "focus the work view"),
-            ("/chat", "chat pane"),
-            ("/log", "log view"),
-            ("/scope", "sandbox"),
             ("/quit", "quit"),
         ],
     };
