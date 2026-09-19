@@ -6,6 +6,14 @@ fn default_mcp_enabled() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WindowLlmConfig {
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub provider_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuiSessionConfig {
     pub provider: String,
@@ -15,6 +23,8 @@ pub struct TuiSessionConfig {
     pub mcp_enabled: bool,
     #[serde(default)]
     pub active_profile: Option<String>,
+    #[serde(default)]
+    pub window_llms: std::collections::HashMap<String, WindowLlmConfig>,
 }
 
 impl TuiSessionConfig {
@@ -87,6 +97,7 @@ mod tests {
             provider_url: Some("http://localhost:11434".to_string()),
             mcp_enabled: false,
             active_profile: Some("dev".to_string()),
+            window_llms: std::collections::HashMap::new(),
         };
 
         config.save(temp.path()).unwrap();
@@ -113,6 +124,7 @@ mod tests {
             provider_url: None,
             mcp_enabled: true,
             active_profile: None,
+            window_llms: std::collections::HashMap::new(),
         };
 
         config.save(temp.path()).unwrap();
@@ -140,6 +152,7 @@ mod tests {
             provider_url: None,
             mcp_enabled: true,
             active_profile: None,
+            window_llms: std::collections::HashMap::new(),
         };
         config.save(temp.path()).unwrap();
 
@@ -158,6 +171,7 @@ mod tests {
             provider_url: None,
             mcp_enabled: true,
             active_profile: None,
+            window_llms: std::collections::HashMap::new(),
         };
         first.save(temp.path()).unwrap();
 
@@ -167,6 +181,7 @@ mod tests {
             provider_url: Some("http://example".to_string()),
             mcp_enabled: false,
             active_profile: Some("prod".to_string()),
+            window_llms: std::collections::HashMap::new(),
         };
         second.save(temp.path()).unwrap();
 
@@ -196,5 +211,36 @@ mod tests {
             result.is_err(),
             "expected Err when session.toml is malformed"
         );
+    }
+
+    #[test]
+    fn test_window_llms_round_trip() {
+        let temp = TempDir::new().unwrap();
+        let mut window_llms = std::collections::HashMap::new();
+        window_llms.insert(
+            "claude-code".to_string(),
+            WindowLlmConfig {
+                provider: "Ollama".to_string(),
+                model: "qwen2.5-coder:32b".to_string(),
+                provider_url: Some("http://localhost:11434".to_string()),
+            },
+        );
+
+        let config = TuiSessionConfig {
+            provider: "Ollama".to_string(),
+            model: "llama3.2".to_string(),
+            provider_url: None,
+            mcp_enabled: true,
+            active_profile: None,
+            window_llms,
+        };
+        config.save(temp.path()).unwrap();
+
+        let loaded = TuiSessionConfig::load(temp.path()).unwrap().unwrap();
+        assert_eq!(loaded.window_llms.len(), 1);
+        let win = loaded.window_llms.get("claude-code").unwrap();
+        assert_eq!(win.provider, "Ollama");
+        assert_eq!(win.model, "qwen2.5-coder:32b");
+        assert_eq!(win.provider_url, Some("http://localhost:11434".to_string()));
     }
 }

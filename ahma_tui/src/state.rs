@@ -1248,6 +1248,20 @@ pub enum ModalState {
     /// not wrap by default, so a long line is truncated at the pane edge with
     /// no way to read the rest; this shows it wrapped and scrollable.
     LogLineDetail(LogLineDetailState),
+    /// Step 1 of LLM setup wizard: select provider.
+    LlmSetupProvider(PickerState),
+    /// Step 2 of LLM setup wizard: select Ollama API flavor (Enhanced vs Standard).
+    LlmSetupOllamaFlavor {
+        picker: PickerState,
+        base_url: String,
+    },
+    /// Step 3 of LLM setup wizard: select model.
+    LlmSetupModel {
+        picker: PickerState,
+        provider_name: String,
+        base_url: String,
+        is_enhanced_ollama: bool,
+    },
 }
 
 /// State of the full-screen log-line detail overlay.
@@ -1454,6 +1468,10 @@ pub struct AppState {
     pub session_id: Option<String>,
     pub sandbox_status: SandboxAuthority,
     pub workspace: String,
+    /// The currently targeted instance or window for chat (SPEC R24, R24.9).
+    pub active_target_instance: Option<String>,
+    /// Last-used LLM configurations per window/session.
+    pub window_llms: HashMap<String, crate::session_config::WindowLlmConfig>,
     /// Token/context preferences resolved from CLI flags (`--minimize-tokens`,
     /// `--small-model-harness`, `--context-length`).  Flag values override
     /// settings.toml and the deprecated env vars.
@@ -1929,7 +1947,12 @@ impl AppState {
     pub fn text_entry_modal_open(&self) -> bool {
         matches!(
             self.modal,
-            ModalState::Navigator(_) | ModalState::ProviderPicker(_) | ModalState::ModelPicker(_)
+            ModalState::Navigator(_)
+                | ModalState::ProviderPicker(_)
+                | ModalState::ModelPicker(_)
+                | ModalState::LlmSetupProvider(_)
+                | ModalState::LlmSetupOllamaFlavor { .. }
+                | ModalState::LlmSetupModel { .. }
         )
     }
 
@@ -1998,6 +2021,44 @@ impl AppState {
         }
     }
 
+    /// Close the LLM setup provider picker and return its state.
+    pub fn take_llm_setup_provider(&mut self) -> Option<PickerState> {
+        match std::mem::take(&mut self.modal) {
+            ModalState::LlmSetupProvider(p) => Some(p),
+            other => {
+                self.modal = other;
+                None
+            }
+        }
+    }
+
+    /// Close the LLM setup Ollama flavor picker and return its state and base URL.
+    pub fn take_llm_setup_ollama_flavor(&mut self) -> Option<(PickerState, String)> {
+        match std::mem::take(&mut self.modal) {
+            ModalState::LlmSetupOllamaFlavor { picker, base_url } => Some((picker, base_url)),
+            other => {
+                self.modal = other;
+                None
+            }
+        }
+    }
+
+    /// Close the LLM setup model picker and return its state and provider details.
+    pub fn take_llm_setup_model(&mut self) -> Option<(PickerState, String, String, bool)> {
+        match std::mem::take(&mut self.modal) {
+            ModalState::LlmSetupModel {
+                picker,
+                provider_name,
+                base_url,
+                is_enhanced_ollama,
+            } => Some((picker, provider_name, base_url, is_enhanced_ollama)),
+            other => {
+                self.modal = other;
+                None
+            }
+        }
+    }
+
     /// The highlighted row of the log-file switcher, if it is open.
     pub fn log_files_selected(&self) -> Option<usize> {
         match self.modal {
@@ -2051,6 +2112,10 @@ impl AppState {
             .and_then(|cwd| McpConnectionManager::load(&cwd).ok())
             .unwrap_or_default();
         let active_profile = session.as_ref().and_then(|s| s.active_profile.clone());
+        let window_llms = session
+            .as_ref()
+            .map(|s| s.window_llms.clone())
+            .unwrap_or_default();
 
         Self {
             server_url: server_url.into(),
@@ -2061,6 +2126,8 @@ impl AppState {
             session_id: None,
             sandbox_status: SandboxAuthority::Unknown,
             workspace,
+            active_target_instance: None,
+            window_llms,
             token_prefs: crate::TokenPrefs::default(),
             minimize_tokens: false,
             last_prompt_tokens: 0,
@@ -2532,6 +2599,53 @@ impl AppState {
             self.ops_selected = rows - 1;
         }
         self.work_follow_selection.set(true);
+    }
+
+    /// Ensure that section `key` is open (opening it if currently closed).
+    pub fn open_section(&mut self, key: &str, now_ms: u64) {
+        if self.open_section.as_deref() == Some(key) {
+            return;
+        }
+        let next = Some(key.to_string());
+        let natural_of = |k: &str| -> usize {
+            self.work_sections
+                .borrow()
+                .iter()
+                .find(|s| s.key == k)
+                .map(|s| s.rows.len())
+                .unwrap_or(0)
+        };
+        self.accordion = crate::accordion::AccordionAnim::retarget(
+            self.accordion.as_ref(),
+            self.open_section.as_deref(),
+            next.as_deref(),
+            natural_of,
+            now_ms,
+        );
+        self.open_section = next;
+        self.rebuild_work_view(now_ms);
+        let rows = self.ops_row_count();
+        if rows > 0 && self.ops_selected >= rows {
+            self.ops_selected = rows - 1;
+        }
+        self.work_follow_selection.set(true);
+    }
+
+    /// Get the last-used LLM configuration for a window.
+    pub fn get_window_llm(
+        &self,
+        window_key: &str,
+    ) -> Option<&crate::session_config::WindowLlmConfig> {
+        self.window_llms.get(window_key)
+    }
+
+    /// Record the last-used LLM configuration for a window.
+    pub fn set_window_llm(
+        &mut self,
+        window_key: &str,
+        config: crate::session_config::WindowLlmConfig,
+    ) {
+        self.window_llms.insert(window_key.to_string(), config);
     }
 
     /// Number of navigable rows in the work view.
