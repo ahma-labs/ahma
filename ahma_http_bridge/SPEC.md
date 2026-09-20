@@ -49,6 +49,17 @@
   followed by the response event, then closes. No wall-clock windows: an event that arrives
   later is delivered on the live `GET /mcp` stream and retained for `Last-Event-Id` replay,
   never raced against a timer.
+- **RB.4 — Active client liveness probe**: the bridge periodically pings every session that has
+  a live SSE subscriber, over the same routed-request channel used for sampling
+  (`Session::routed_requests`), and terminates a session — cascading to its sandboxed worker
+  subprocess — once its client misses a fixed number of consecutive pings. This closes a gap the
+  subprocess's own liveness ping cannot see: that ping (SPEC R2.6.5.3) is answered by the bridge
+  on the client's behalf the moment an SSE subscriber is merely *attached*, so it proves only
+  that the socket looks open, never that anything is actually reading it — a crashed client, a
+  hung process, or a dead network path can leave a session (and its subprocess) alive
+  indefinitely otherwise. A session with **no** SSE subscriber at all remains the pre-existing
+  idle-eviction sweep's responsibility (`SessionManager::evict_oldest_inactive_session`), not
+  this probe's — pinging it would have nothing to reach.
 
 ## 5. Out of Scope
 

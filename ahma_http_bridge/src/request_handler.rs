@@ -766,6 +766,14 @@ async fn handle_existing_session_request(
         debug!(session_id = %session_id, "Received notifications/initialized");
     }
 
+    // Any request the real client sends on this session is proof of life for
+    // the active liveness prober (SPEC RB.4) — it must never treat a session
+    // that is plainly busy as unresponsive just because it hasn't also
+    // answered an unsolicited `ping`.
+    if let Some(session) = session_manager.get_session(session_id) {
+        session.touch_client_activity();
+    }
+
     if let Some(response) = gate_session_request(
         session_manager,
         session_id,
