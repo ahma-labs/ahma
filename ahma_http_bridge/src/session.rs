@@ -1255,15 +1255,29 @@ impl SessionManager {
     /// How often the bridge actively pings each connected session's real
     /// downstream client to confirm it is still there and answering — not
     /// just that its SSE socket is still attached.
-    const LIVENESS_PING_INTERVAL: Duration = Duration::from_secs(30);
+    ///
+    /// Deliberately long: a real IDE session goes idle for minutes at a time
+    /// as a matter of course (the human reading output, thinking, switching
+    /// tasks), and the idle-gate in `ping_connected_sessions` only starts
+    /// this clock once real traffic has *already* stopped. This is a probe
+    /// for a session abandoned for a long time (the orphaned-worker problem
+    /// this mechanism exists to catch), not a fast health check — a tight
+    /// interval here risks killing an active user's session over an entirely
+    /// normal pause. Windows CI proved this at `Duration::from_secs(30)`: a
+    /// legitimate ~132s gap between requests in one e2e test was long enough
+    /// to rack up two missed pings and get the session torn down mid-test.
+    const LIVENESS_PING_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
     /// How long a client has to answer one liveness ping before it counts as
-    /// missed.
-    const LIVENESS_PING_TIMEOUT: Duration = Duration::from_secs(10);
+    /// missed. Generous on purpose — the client may itself be busy or slow.
+    const LIVENESS_PING_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Consecutive missed liveness pings before a session's client is treated
     /// as gone and the session (and its worker subprocess) is torn down.
-    const MAX_MISSED_LIVENESS_PINGS: u64 = 2;
+    /// Combined with `LIVENESS_PING_INTERVAL`/`LIVENESS_PING_TIMEOUT`, this
+    /// requires roughly 15+ minutes of total silence from the real client
+    /// before a session is killed.
+    const MAX_MISSED_LIVENESS_PINGS: u64 = 3;
 
     /// Spawns a background task that periodically pings every session with a
     /// live SSE subscriber, terminating any whose client stops answering
