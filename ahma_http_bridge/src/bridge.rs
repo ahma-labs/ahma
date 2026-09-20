@@ -746,6 +746,7 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
     }
     let session_manager = Arc::new(session_manager);
     session_manager.start_sweeper();
+    session_manager.start_liveness_prober();
     Arc::new(BridgeState {
         session_manager,
         require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),

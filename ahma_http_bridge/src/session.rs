@@ -153,6 +153,9 @@ pub enum SessionTerminationReason {
     ProcessCrashed,
     /// Session timed out
     Timeout,
+    /// The real client missed enough consecutive bridge-initiated liveness
+    /// pings in a row to be treated as gone (SPEC RB.4).
+    Unresponsive,
 }
 
 /// Represents an active client session.
@@ -218,6 +221,28 @@ pub struct Session {
     /// requests can be in-flight simultaneously, preventing head-of-line blocking when
     /// an IDE session hosts multiple agents.
     pub sampling_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Consecutive bridge-initiated liveness pings (see [`ping_session_client`])
+    /// the real client has missed in a row. Reset to 0 by any answered ping;
+    /// a session is terminated once this reaches
+    /// [`SessionManager::MAX_MISSED_LIVENESS_PINGS`].
+    ///
+    /// Distinct from the subprocess↔bridge keepalive in `ahma_common::keepalive`:
+    /// that one is answered by the bridge on the client's behalf
+    /// (`answer_subprocess_ping`) whenever an SSE subscriber is merely
+    /// *attached*, so it cannot tell a live client from a socket the OS still
+    /// thinks is open but nobody is reading (a hung/crashed client, a dead
+    /// network path). This counter tracks an actual round trip to that client.
+    missed_liveness_pings: AtomicU64,
+    /// Wall-clock time of the most recent request the real client sent the
+    /// bridge on this session (any `POST /mcp` — a tool call, a client
+    /// response, anything; see `touch_client_activity`). The liveness prober
+    /// only pings sessions that have gone quiet for at least one interval, so
+    /// a session that is plainly busy is never penalized merely for not also
+    /// answering an unsolicited `ping` — many legitimate MCP clients (thin
+    /// integrations, test harnesses) never implement the server→client `ping`
+    /// side of the protocol at all, and treating silence to it as death would
+    /// kill a session that is actively working.
+    last_client_activity: parking_lot::Mutex<Instant>,
 }
 
 impl Session {
@@ -335,6 +360,34 @@ impl Session {
     /// Get the number of active SSE subscribers.
     pub fn sse_receivers(&self) -> usize {
         self.broadcast_tx.receiver_count()
+    }
+
+    /// Record that a liveness ping to the real client was answered: reset the
+    /// consecutive-miss counter.
+    fn record_liveness_pong(&self) {
+        self.missed_liveness_pings.store(0, Ordering::Relaxed);
+    }
+
+    /// Record that a liveness ping to the real client went unanswered.
+    /// Returns the new consecutive-miss count.
+    fn record_liveness_miss(&self) -> u64 {
+        self.missed_liveness_pings.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Record that the real client sent the bridge a request on this session
+    /// (SPEC RB.4). Any genuine traffic is at least as strong a liveness
+    /// signal as an answered ping, so this also clears the missed-ping
+    /// counter — a session that just made a tool call must not be one
+    /// stray unanswered ping away from termination.
+    pub fn touch_client_activity(&self) {
+        *self.last_client_activity.lock() = Instant::now();
+        self.missed_liveness_pings.store(0, Ordering::Relaxed);
+    }
+
+    /// How long it has been since the real client last sent the bridge a
+    /// request on this session.
+    fn idle_since_last_activity(&self) -> Duration {
+        self.last_client_activity.lock().elapsed()
     }
 
     /// Record `n` events lost due to broadcast receiver lag.
@@ -1035,6 +1088,44 @@ fn deliver_ping_answer(session: &Arc<Session>, json_str: String) {
     });
 }
 
+/// Actively probe one session's real downstream client for liveness over its
+/// existing SSE channel, distinguishing "the SSE socket is still attached"
+/// from "the client is actually there and answering" (SPEC RB.4) — the gap
+/// `answer_subprocess_ping` cannot see, since it answers the subprocess's own
+/// ping locally the moment an SSE subscriber is attached, without ever
+/// reaching the client (SPEC R2.6.5.3).
+///
+/// Reuses the same routed-request mechanism as `handle_routed_sampling_request`:
+/// register a oneshot under a fresh id in `routed_requests`, push a `ping`
+/// request over the session's SSE broadcast, and wait for the client to POST
+/// its answer back — `match_client_response_id` already resolves that POST
+/// against `routed_requests` before any subprocess-forwarding logic runs, so
+/// the answer cannot be misrouted to the subprocess.
+///
+/// Returns `true` iff the client answered within `timeout`.
+async fn ping_session_client(session: &Arc<Session>, timeout: Duration) -> bool {
+    let ping_id = format!("liveness_{}", Uuid::new_v4());
+    let (tx, rx) = oneshot::channel();
+    session.routed_requests.insert(ping_id.clone(), tx);
+
+    let payload = serde_json::json!({"jsonrpc": "2.0", "id": ping_id, "method": PING_METHOD});
+    let sent = serde_json::to_string(&payload)
+        .ok()
+        .is_some_and(|json_str| session.broadcast(json_str).is_ok());
+    if !sent {
+        session.routed_requests.remove(&ping_id);
+        return false;
+    }
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(_)) => true,
+        _ => {
+            session.routed_requests.remove(&ping_id);
+            false
+        }
+    }
+}
+
 /// How one JSON-RPC frame read from the subprocess must be routed.
 ///
 /// A frame carrying a `method` is a request or notification the subprocess is
@@ -1159,6 +1250,105 @@ impl SessionManager {
                 manager.prune_stale_sessions().await;
             }
         });
+    }
+
+    /// How often the bridge actively pings each connected session's real
+    /// downstream client to confirm it is still there and answering — not
+    /// just that its SSE socket is still attached.
+    const LIVENESS_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+    /// How long a client has to answer one liveness ping before it counts as
+    /// missed.
+    const LIVENESS_PING_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Consecutive missed liveness pings before a session's client is treated
+    /// as gone and the session (and its worker subprocess) is torn down.
+    const MAX_MISSED_LIVENESS_PINGS: u64 = 2;
+
+    /// Spawns a background task that periodically pings every session with a
+    /// live SSE subscriber, terminating any whose client stops answering
+    /// (SPEC RB.4).
+    ///
+    /// This closes a gap the handshake/eviction sweeper (`start_sweeper`)
+    /// cannot: a fully-initialized session is only ever reaped when its SSE
+    /// receiver count drops to zero (`is_evictable`), but a crashed client,
+    /// a hung process, or a dead network path can leave the TCP socket
+    /// looking open to the OS indefinitely with nobody actually reading it.
+    /// Without an active probe that session — and its sandboxed worker
+    /// subprocess — never gets cleaned up.
+    pub fn start_liveness_prober(self: &Arc<Self>) {
+        let manager = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Self::LIVENESS_PING_INTERVAL).await;
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                manager
+                    .ping_connected_sessions(
+                        Self::LIVENESS_PING_TIMEOUT,
+                        Self::LIVENESS_PING_INTERVAL,
+                    )
+                    .await;
+            }
+        });
+    }
+
+    /// Ping every session with a live SSE subscriber that has gone quiet, in
+    /// parallel, and terminate any whose client has missed
+    /// `MAX_MISSED_LIVENESS_PINGS` in a row. A session with real traffic more
+    /// recent than `min_idle` is skipped entirely — it is already known to be
+    /// alive, and many legitimate clients never implement the server→client
+    /// `ping` side of the protocol, so probing a busy session risks killing
+    /// it over a ping it was never going to answer regardless of whether it
+    /// is alive. `timeout` and `min_idle` are parameters (rather than always
+    /// the `LIVENESS_PING_*`/`LIVENESS_PING_INTERVAL` constants) so tests can
+    /// drive this deterministically with short bounds.
+    async fn ping_connected_sessions(&self, timeout: Duration, min_idle: Duration) {
+        let candidates: Vec<Arc<Session>> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                let session = entry.value();
+                session.sse_receivers() > 0 && session.idle_since_last_activity() >= min_idle
+            })
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let answers = futures::future::join_all(
+            candidates
+                .iter()
+                .map(|session| ping_session_client(session, timeout)),
+        )
+        .await;
+
+        for (session, answered) in candidates.iter().zip(answers) {
+            if answered {
+                session.record_liveness_pong();
+                continue;
+            }
+            let missed = session.record_liveness_miss();
+            warn!(
+                session_id = %session.id,
+                missed,
+                max = Self::MAX_MISSED_LIVENESS_PINGS,
+                "Liveness ping to real client went unanswered"
+            );
+            if missed >= Self::MAX_MISSED_LIVENESS_PINGS {
+                warn!(
+                    session_id = %session.id,
+                    "Client unresponsive to {} consecutive liveness pings; terminating session",
+                    missed
+                );
+                let _ = self
+                    .terminate_session(&session.id, SessionTerminationReason::Unresponsive)
+                    .await;
+            }
+        }
     }
 
     /// Returns true when this server requires client roots to complete sandbox lock.
@@ -1415,6 +1605,8 @@ impl SessionManager {
             routed_requests: Arc::new(DashMap::new()),
             pending_client_requests: Arc::new(DashMap::new()),
             sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
+            missed_liveness_pings: AtomicU64::new(0),
+            last_client_activity: parking_lot::Mutex::new(Instant::now()),
         });
 
         // Spawn the I/O handler task
@@ -1997,7 +2189,7 @@ mod sandbox_configured_parse_tests {
 #[cfg(test)]
 mod session_logic_tests {
     use super::*;
-    use ahma_common::timeouts::TestTimeouts;
+    use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -2033,6 +2225,8 @@ mod session_logic_tests {
             routed_requests: Arc::new(DashMap::new()),
             pending_client_requests: Arc::new(DashMap::new()),
             sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
+            missed_liveness_pings: AtomicU64::new(0),
+            last_client_activity: parking_lot::Mutex::new(Instant::now()),
         });
         (session, rx)
     }
@@ -2094,6 +2288,60 @@ mod session_logic_tests {
             .expect("pushChannelChanged(false) must be sent");
         let v: Value = serde_json::from_str(&sent).unwrap();
         assert_eq!(v["params"]["connected"], false);
+    }
+
+    // ── Liveness ping (bridge → real client) ──────────────────────────────
+
+    #[tokio::test]
+    async fn ping_session_client_true_when_client_answers() {
+        let (session, _rx) = make_test_session();
+        let mut sub = session.subscribe();
+
+        let ping_session = Arc::clone(&session);
+        let ping_timeout = TestTimeouts::get(TimeoutCategory::Quick);
+        let handle =
+            tokio::spawn(async move { ping_session_client(&ping_session, ping_timeout).await });
+
+        let (_event_id, json_str) = sub.recv().await.unwrap();
+        let ping: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(ping["method"], PING_METHOD);
+        assert_eq!(ping["jsonrpc"], "2.0");
+        let ping_id = ping["id"]
+            .as_str()
+            .expect("ping id is a string")
+            .to_string();
+
+        let (_, sender) = session.routed_requests.remove(&ping_id).expect(
+            "ping id must be registered in routed_requests, exactly like a routed sampling request",
+        );
+        sender
+            .send(serde_json::json!({"jsonrpc": "2.0", "id": ping_id, "result": {}}))
+            .unwrap();
+
+        assert!(handle.await.unwrap(), "an answered ping must return true");
+    }
+
+    #[tokio::test]
+    async fn ping_session_client_false_when_client_never_answers() {
+        let (session, _rx) = make_test_session();
+        let _sub = session.subscribe(); // socket "open", nobody reads it
+
+        let answered = ping_session_client(&session, Duration::from_millis(20)).await;
+
+        assert!(!answered);
+        assert!(
+            session.routed_requests.is_empty(),
+            "a timed-out ping must remove its own routed_requests entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_session_client_false_when_no_sse_subscriber() {
+        let (session, _rx) = make_test_session();
+        // No `subscribe()` call: broadcast has 0 receivers, so the send itself
+        // fails and this must return false immediately, not wait out the timeout.
+        let answered = ping_session_client(&session, Duration::from_millis(20)).await;
+        assert!(!answered);
     }
 
     #[tokio::test]
@@ -2946,6 +3194,116 @@ mod session_logic_tests {
         mgr.create_session().await.unwrap();
         let err = mgr.create_session().await.unwrap_err();
         assert!(err.to_string().contains("Session limit exceeded"));
+    }
+
+    // ── Liveness ping (bridge → real client) ──────────────────────────────
+
+    #[tokio::test]
+    async fn ping_connected_sessions_skips_a_session_with_no_sse_subscriber() {
+        // No `subscribe()` call: sse_receivers() == 0, so the session is the
+        // handshake/eviction sweeper's problem, not the liveness prober's —
+        // pinging it would just always miss and wrongly count against it.
+        let mgr = SessionManager::new(test_config(None, 8));
+        let id = mgr.create_session().await.unwrap();
+
+        mgr.ping_connected_sessions(Duration::from_millis(20), Duration::ZERO)
+            .await;
+
+        assert!(mgr.session_exists(&id));
+        let session = mgr.get_session(&id).unwrap();
+        assert_eq!(session.missed_liveness_pings.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn ping_connected_sessions_skips_a_session_with_recent_activity() {
+        // A session that just had real client traffic must not be pinged at
+        // all, regardless of whether it would ever answer a ping — many
+        // legitimate clients never implement the server→client `ping` side of
+        // the protocol, and this session is already known to be alive.
+        let mgr = SessionManager::new(test_config(None, 8));
+        let id = mgr.create_session().await.unwrap();
+        let session = mgr.get_session(&id).unwrap();
+        let _sub = session.subscribe(); // never answers anything
+        session.touch_client_activity();
+
+        mgr.ping_connected_sessions(
+            Duration::from_millis(20),
+            TestTimeouts::get(TimeoutCategory::Quick),
+        )
+        .await;
+
+        assert!(mgr.session_exists(&id));
+        assert_eq!(session.missed_liveness_pings.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn ping_connected_sessions_terminates_after_max_missed_pings() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let id = mgr.create_session().await.unwrap();
+        let session = mgr.get_session(&id).unwrap();
+        // A subscriber that never answers: the SSE socket looks open, but
+        // nothing is actually reading it — exactly the gap this probe closes.
+        let _sub = session.subscribe();
+
+        let short_timeout = Duration::from_millis(20);
+        for round in 1..=SessionManager::MAX_MISSED_LIVENESS_PINGS {
+            mgr.ping_connected_sessions(short_timeout, Duration::ZERO)
+                .await;
+            if round < SessionManager::MAX_MISSED_LIVENESS_PINGS {
+                assert!(
+                    mgr.session_exists(&id),
+                    "session must survive before the max is reached"
+                );
+            }
+        }
+
+        assert!(
+            !mgr.session_exists(&id),
+            "session must be terminated once its client misses \
+             MAX_MISSED_LIVENESS_PINGS in a row"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_connected_sessions_resets_miss_count_when_client_answers() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let id = mgr.create_session().await.unwrap();
+        let session = mgr.get_session(&id).unwrap();
+        let mut sub = session.subscribe();
+
+        let short_timeout = TestTimeouts::get(TimeoutCategory::Quick);
+        // Run the ping round and the client's answer concurrently *without*
+        // moving `sub` into a spawned task — a spawned task would drop the
+        // receiver as soon as it finished, which would drop `sse_receivers()`
+        // to 0 and make the second round below silently skip the session
+        // instead of exercising the "missed" path it is meant to test.
+        let respond_once = async {
+            let (_event_id, json_str) = sub.recv().await.unwrap();
+            let ping: Value = serde_json::from_str(&json_str).unwrap();
+            assert_eq!(ping["method"], PING_METHOD);
+            let ping_id = ping["id"].as_str().unwrap().to_string();
+            let (_, sender) = session
+                .routed_requests
+                .remove(&ping_id)
+                .expect("ping id must be registered in routed_requests");
+            sender
+                .send(serde_json::json!({"jsonrpc": "2.0", "id": ping_id, "result": {}}))
+                .unwrap();
+        };
+        tokio::join!(
+            mgr.ping_connected_sessions(short_timeout, Duration::ZERO),
+            respond_once
+        );
+        assert_eq!(session.missed_liveness_pings.load(Ordering::Relaxed), 0);
+
+        // One missed round after an answered one must not carry over any
+        // prior misses — it takes MAX_MISSED_LIVENESS_PINGS in a row, not
+        // cumulative misses, to terminate the session. `sub` is still held
+        // here (still subscribed) but nobody drains/answers it this time.
+        mgr.ping_connected_sessions(Duration::from_millis(20), Duration::ZERO)
+            .await;
+        assert!(mgr.session_exists(&id));
+        assert_eq!(session.missed_liveness_pings.load(Ordering::Relaxed), 1);
     }
 
     /// A peer that stays alive until the test drops its retained end, and whose
