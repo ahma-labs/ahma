@@ -5,6 +5,7 @@
 //! (and emitted as `Alert` events on the unified stream), and the final
 //! result is stored on the completed operation.
 
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::adapter::{Adapter, AsyncExecOptions};
 use ahma_mcp::log_monitor::{LogLevel, LogMonitorConfig, MonitorStream};
 use ahma_mcp::operation_monitor::{MonitorConfig, Operation, OperationMonitor};
@@ -12,11 +13,10 @@ use ahma_mcp::sandbox::Sandbox;
 use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
 use serde_json::Map;
 use std::sync::Arc;
-use std::time::Duration;
 use tempfile::tempdir;
 
 async fn create_test_adapter() -> (Adapter, Arc<OperationMonitor>) {
-    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(30));
+    let monitor_config = MonitorConfig::with_timeout(TestTimeouts::get(TimeoutCategory::ToolCall));
     let monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_pool_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_pool_config));
@@ -47,10 +47,14 @@ fn monitor_config(level: LogLevel, stream: MonitorStream) -> Option<LogMonitorCo
 /// Wait for the operation to reach a terminal state and return it (with its
 /// alerts and final result).
 async fn wait_for_completion(monitor: &OperationMonitor, op_id: &str) -> Operation {
-    tokio::time::timeout(Duration::from_secs(15), monitor.wait_for_operation(op_id))
-        .await
-        .expect("Timed out waiting for operation to complete")
-        .expect("Operation should have completed")
+    // Platform-scaled (R-TIMEOUT): a fixed 15 s timed out on Windows runners.
+    tokio::time::timeout(
+        TestTimeouts::get(TimeoutCategory::ToolCall),
+        monitor.wait_for_operation(op_id),
+    )
+    .await
+    .expect("Timed out waiting for operation to complete")
+    .expect("Operation should have completed")
 }
 
 fn result_stdout_stderr(op: &Operation) -> String {
