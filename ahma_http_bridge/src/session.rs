@@ -589,7 +589,7 @@ pub const NO_SANDBOX_SCOPE_REMEDIATION: &str = "Start the bridge with `--sandbox
 /// Configuration for the `SessionManager`.
 #[derive(Clone)]
 pub struct SessionManagerConfig {
-    /// The executable command to start the MCP server (e.g., "ahma_mcp").
+    /// The executable command to start the MCP server (e.g., "ahma").
     ///
     /// Ignored when [`peer_factory`] is `Some`.
     ///

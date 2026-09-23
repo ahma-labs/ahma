@@ -1620,50 +1620,9 @@ These three mechanisms together bound how long any abandoned `ahma serve stdio` 
 
 ## 7. HTTP Bridge & Session Isolation
 
-### R8: HTTP Bridge & Streamable HTTP
-
-- **R8.1**: HTTP bridge mode via `ahma serve http`.
-- **R8.2**: SSE at `/mcp` (GET) for server-to-client notifications.
-- **R8.3**: JSON-RPC via POST at `/mcp`. Protocol conformance details that bind both POST transports:
-  - **R8.3.1**: Notifications (id-less messages) are answered **HTTP 202** with no JSON-RPC body.
-  - **R8.3.2**: An unknown or terminated `Mcp-Session-Id` is answered **HTTP 404**, which is the signal a spec-conforming client (rmcp included) uses to drop the stale session and re-`initialize`. It must not be 403 — clients treat that as terminal.
-  - **R8.3.3**: JSON-RPC batch arrays are rejected with **HTTP 400** (batching was removed from the MCP spec in 2025-06-18; forwarding a raw array to the subprocess is undefined behavior).
-  - **R8.3.4**: Requests carrying a non-loopback `Origin` header are rejected (server-side DNS-rebinding validation per the MCP transport security requirements; CORS headers alone only gate what a browser lets a page *read*, not what the server *executes*). Non-browser clients send no `Origin` and are unaffected.
-  - **R8.3.5**: **`MCP-Protocol-Version` header** (2025-06-18 Streamable HTTP): the bridge validates the header when present — an unsupported value gets HTTP 400 naming the supported set — and assumes `2025-03-26` when absent (the spec's backwards-compatibility rule, which is also what keeps every pre-2025-06-18 client working). ahma's own first-party HTTP clients (the stdio proxy, the TUI, the external-tool client) negotiate the current revision at `initialize` and echo the **server-answered** version in the header on every subsequent request, via the one shared implementation in `ahma_common::mcp_protocol` — protocol currency must not be re-implemented per client.
-  - **R8.3.6**: HTTP `DELETE /mcp` with a valid `Mcp-Session-Id` terminates that session (its subprocess is stopped) and is answered **HTTP 204**; a missing header gets 400, an unknown id gets the R8.3.2 404.
-- **R8.4**: **Subprocess death fails the session loudly; there is no auto-restart.** A crashed subprocess answers its session's in-flight requests with a classified error (R-SIGN.5) and the session terminates; the client re-initializes into a fresh session via R8.3.2's 404. (An earlier restart-with-handshake-replay mechanism was intentionally removed; `tests/handshake_replay_test.rs` records the decision.)
-- **R8.4.1**: **Stateful by design — stateless mode is out of scope.** Every session is bound to a live subprocess holding a kernel sandbox lock (R5.1); a scope commit cannot be stateless, so the Streamable HTTP spec's optional stateless-server mode is deliberately not implemented. Conformance effort goes into the *stateful* session lifecycle instead: session header, DELETE termination, 202/404 semantics above.
-- **R8.5**: Content negotiation via `Accept` header (`text/event-stream` → SSE, `application/json` → JSON).
-- **R8.6**: **HTTP Streaming (MCP Streamable HTTP)**: POST requests support SSE response streaming for full multiplexing and reconnection resilience.
-  - **R8.6.1**: POST with `Accept: text/event-stream` returns SSE-formatted response and interleaved server notifications within a single stream.
-  - **R8.6.2**: Per-session SSE event IDs (`id:` field) enable ordering and deduplication. Each JSON-RPC response and notification receives a monotonically-increasing session-unique ID.
-  - **R8.6.3**: Event history buffer maintains recent events (bounded to 1000 events per session) for `Last-Event-Id` replay support.
-  - **R8.6.4**: GET requests with `Last-Event-Id: N` replay all events with ID > N from the per-session history buffer, enabling seamless reconnection after temporary network loss.
-  - **R8.6.5**: Event IDs are independent per session and start at 1. Event history is cleared when the session ends.
-- **R8.7**: **HTTP/3 (QUIC) Client Preference**: All HTTP clients built with `reqwest` use the `http3` feature to prefer HTTP/3 (QUIC) transport when the server advertises support via Alt-Svc headers.
-  - **R8.7.1**: HTTP/3 uses QUIC (UDP-based) for reduced connection latency and improved multiplexing compared to HTTP/2 over TCP.
-  - **R8.7.2**: Transparent fallback to HTTP/2 or HTTP/1.1 when the server does not support HTTP/3.
-  - **R8.7.3**: **Known limitation**: the GET SSE stream is **not served over HTTP/3** — the QUIC endpoint answers it with 406 Not Acceptable and an explanatory body, and clients fall back to HTTP/2 or HTTP/1.1 for the push channel. POST request/response works over HTTP/3. (An earlier revision claimed both endpoints worked over HTTP/3; the code never did.)
-- **R8.8**: **Session-Health Disclosure** (issue #485; design: `docs/session-health-notifications.md`): structured server→client disclosure of session-health changes the client cannot otherwise observe. Events are **information only** — they never demand a response, never gate server progress, and emission failure must never fail or block the operation that triggered the event.
-  - **R8.8.1**: Canonical event notification `notifications/ahma/session_event` with envelope `{kind, timestamp, seq, detail}`; `seq` is per-emitter monotonic so a client can detect gaps. Kinds: `reconnected`, `reconnect_failed`, `grant_pending`, `grant_decided`, `health`.
-  - **R8.8.2**: Every event is mirrored as a standard `notifications/message` logging notification (`data` = the event params; level `error` for `reconnect_failed`, `warning` for reconnect/grant kinds, `info` for `health`) so foreign clients surface the disclosure with zero ahma-specific code. The mirror is emitted with the standard wire shape directly (rmcp 2.0 deprecates the typed logging API per SEP-2577).
-  - **R8.8.3**: The stdio proxy — the only party that knows a transparent reconnect (#479) happened — synthesizes `reconnected` after a successful rebuild and a terminal `reconnect_failed` before exiting on exhaustion, **downstream only**: session events must never reach the (fresh) bridge session, mirroring how the replayed handshake never reaches stdio.
-  - **R8.8.4**: The `notifications/ahma/heartbeat` payload carries `pending_grants` (grants awaiting a human decision, filled by the server from the `GrantCoordinator`) and `reconnects` (overlaid by the proxy — the server behind it cannot know). Both fields are `#[serde(default)]` and wire-compatible in both directions with pre-R8.8 peers.
-  - **R8.8.5**: The permission broker emits `grant_pending` (with `grant_id` = the coordinator's `decision_id`) once per deduped `(path, access)` before the question ladder asks, and `grant_decided` (`granted`/`declined`) on resolution — **beside**, never instead of, the human asking surfaces. The R5.3/R5.4 grant security gates and session scope-immutability are unaffected: disclosure carries no approval authority.
-
-### R10: Session Isolation
-
-- **R10.1**: Every HTTP-served MCP session gets its own `ahma serve stdio` subprocess with its own sandbox scope. This is unconditional — there is no flag and no shared-process mode.
-- **R10.2**: Session ID (UUID) generated on `initialize`, returned via `Mcp-Session-Id` header.
-- **R10.3**: Sandbox scope is resolved per the R5.2 source precedence (explicit → `roots/list` → elicitation → auto-narrowed container root) and committed through the single atomic compare-and-swap of R5.1.1. Each session's dedicated subprocess owns and commits its own scope (R5.1): an explicit bridge-level `--sandbox-scope` locks every session to the same operator-chosen value; otherwise each session derives its scope from its own client's `roots/list` answer, in full isolation from every other session.
-- **R10.4**: Once committed, the instance sandbox scope **cannot** be changed (security invariant; R5.1).
-- **R10.5**: `roots/list_changed` after sandbox lock is a **tolerated no-op**: the committed instance scope is immutable and can never be widened (R5.1 / R5.1.1 / R5.2.2), so the notification is acknowledged with success, **not** forwarded to the subprocess, and the session is **kept alive**. The server **must not** widen, narrow, or re-derive scope from it, and **must not** terminate the session. (Real clients re-emit `roots/list_changed` routinely; terminating on it caused 403 → stdio-proxy respawn churn. Sandbox escape is prevented by the immutability of the commit, not by tearing down the session.) Any actual scope-widening is rejected at the single commit point (R5.1.1) — there is no second path to widen scope after lock.
-- **R10.6**: **Client Response Mapping**: The HTTP bridge MUST keep track of server-to-client JSON-RPC requests (such as `roots/list` and `sampling/createMessage`) by recording their request IDs. When a client sends a JSON-RPC response with a `result` field, the bridge MUST only process it as a `roots/list` response (and lock the sandbox) if its request ID matches an outstanding `roots/list` request. Client responses to other methods (e.g. keepalive pings or sampling) MUST NOT trigger roots-parsing or sandbox-locking logic, and MUST NOT generate invalid roots warnings or errors.
-- **R10.7**: **Daemon Chat MCP Base URL Resolution**: When the background daemon (`ahma serve` hub) runs an agent task, the `McpChatConfig` base URL (`base_url`) MUST be resolved to the local MCP bridge server's endpoint (HTTP host/port or Unix socket path as configured in the active service's `AppConfig`) rather than being set to the LLM provider's base URL. This ensures local tool calls (e.g. `read_file`) are routed back to the local MCP bridge.
-- **R10.8**: **TUI Window Chat MCP Resolution**: TUI window/subtask LLM tasks MUST be provided with the resolved `McpChatConfig` when running chat tasks to allow proper tool routing and sampling capabilities when requested.
-
-
----
+The Streamable HTTP transport (R8.1–R8.8), session isolation (R10.1–R10.6) and the bridge's
+pipeline invariants (RB) are specified in [ahma_http_bridge/SPEC.md](ahma_http_bridge/SPEC.md).
+Chat-agent MCP routing (R10.7, R10.8) is in [ahma_core/SPEC.md](ahma_core/SPEC.md).
 
 ## 8. Implementation Constraints
 

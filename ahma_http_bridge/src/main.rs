@@ -21,7 +21,7 @@ struct Args {
     default_sandbox_scope: Option<PathBuf>,
 
     /// Command to run the MCP server subprocess.
-    /// If not specified, auto-detects local debug binary or uses 'ahma_mcp'.
+    /// If not specified, auto-detects the local debug binary or uses `ahma`.
     #[arg(long)]
     server_command: Option<String>,
 
@@ -66,9 +66,9 @@ struct Args {
     #[arg(long, global = true)]
     opentelemetry: Option<String>,
 
-    /// Path to a file containing the bearer token required on every request. The file
-    /// should contain a single line with the secret token. Using a file instead of
-    /// `--token` avoids exposing the secret in `ps` output. Required when `--bind-addr` is non-loopback.
+    /// Path to a file containing the bearer token required on every request (a single
+    /// line). Reading it from a file keeps the secret out of `ps` output. Strongly
+    /// recommended with a non-loopback `--bind-addr`, which warns without it.
     #[arg(long, value_name = "PATH")]
     require_token: Option<PathBuf>,
 
