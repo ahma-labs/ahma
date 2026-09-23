@@ -349,7 +349,7 @@ pub async fn run(
     // ── Always restore terminal ───────────────────────────────────────────────
     // One restore path, shared with the guard's `Drop` and its panic hook, so a
     // crash cannot leave the user in raw mode on the alternate screen with the
-    // panic message written somewhere they cannot see (ahma_tui/SPEC.md §3).
+    // panic message written somewhere they cannot see (ahma_tui/SPEC.md, Non-Functional Requirements).
     // Explicit here rather than left to the drop at end of scope so the terminal
     // is back to normal before anything else this function might print.
     terminal_guard.restore();

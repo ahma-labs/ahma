@@ -1,197 +1,179 @@
 # Ahma Requirements
 
-> **Specification:** This document defines **what** the Ahma product and services do and **why**. For developer workflows, testing philosophy, and repository conventions, see [AGENTS.md](AGENTS.md).
+> This document states **what** Ahma does and **why**, and how its parts fit together.
+> Each crate's own `SPEC.md` holds the requirements that crate alone implements; the
+> [requirement index](#9-requirement-index) says where each id family lives. How to build,
+> test and contribute is in [AGENTS.md](AGENTS.md). User guides are in [docs/](docs/).
+>
+> Requirement ids are stable: code cites them, and `scripts/check-spec-ids.sh` fails CI when
+> a cited id is defined in no spec. Move a requirement, keep its id.
 
-## Quick Status
+## 1. What Ahma is
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Core Tool Execution | tests-pass | `ahma` adapter executes CLI tools via MTDF JSON |
-| Tracked Operations, Sync by Default (R2.1) | tests-pass | Every call is a monitored, cancellable operation; `tools.execution_mode` = `sync` (default: wait for the result within the client's budget) or `async` (return an `id`, collect with `await`) |
-| Shell Pool | removed | Dead prewarmed pool removed — commands spawn directly (~6ms median measured by `latency_guard_test`); `shell_pool` module retains platform shell selection + command timeout config |
-| Unified Operation Event Stream | tests-pass | Single `OperationEvent` stream (`ahma_common::event_dispatcher`); `OperationMonitor` is the sole lifecycle emitter; subscribers: MCP progress push, daemon hub, vault audit, TUI |
-| Output Spill Files | tests-pass | Complete per-operation output at `<log dir>/operations/<id>.log`; advertised as `output_file` in results; retention-cleaned |
-| Small-Model Context Harness | tests-pass | `ahma tui` budgets tool results + trims conversation for limited-context local models; `--context-length`, `--small-model-harness`/`--no-small-model-harness` |
-| Feature-Gated Incubating Crates | tests-pass | `simplify` (code-complexity analysis) is its own crate, `ahma_simplify`, linked into the `ahma` binary by `ahma_bin`'s `simplify` cargo feature (on by default; `--no-default-features` drops it and the subcommand then fails with a clear error). `ahma_mcp` carries exactly one cargo feature, `otel` (see the row below), and no others; `ahma_tui` carries none — its `tui` feature was deleted in v0.20.1 because it gated a configuration nothing ever compiled (`--no-default-features` on that crate produced 184 errors, and `ahma_bin`'s dependency edge re-enabled the feature anyway, so no build ever exercised it). `full` is an alias for `simplify` plus `otel`. vault, decompose, worker, and renewal were fully removed as crates, not feature-gated (see "Removed" below) |
-| OpenTelemetry Export (`otel` feature) | tests-pass | `ahma_common`'s `otel` cargo feature gates the OTLP SDK subtree (`opentelemetry*`/`tracing-opentelemetry`, ~200 crates); off by default, forwarded through `ahma_mcp/otel` and `ahma_http_bridge/otel`, `ahma_bin --features otel` (part of `full`). `ahma_common::observability` keeps the same public API either way — without it, `create_otel_layer`/`current_traceparent`/`record_*` are hard no-ops regardless of `--opentelemetry <url>` or `OTEL_*` env vars. CI builds, clippies, and tests the `otel` flavour separately (Linux leg only) and release binaries ship it |
-| Latency Regression Guards | tests-pass | Ignored benchmarks guard end-to-end dispatch latency and per-line streaming cost (`latency_guard_test`) |
-| Linux Sandbox (Landlock) | tests-pass | Kernel-level FS sandboxing on Linux 5.13+ |
-| macOS Sandbox (Seatbelt) | tests-pass | Kernel-level FS sandboxing via `sandbox-exec` — **write** confinement only. Reads are unconfined (APFS firmlink limitation, R6.2.2) and controlled by a credential denylist instead (R6.2.3); disclosed at runtime per R-PERM.5.1 |
-| Nested Sandbox Detection | tests-pass | Detects Cursor/VS Code/Docker/outer-ahma sandboxes; hooks defer to host, MCP stays authoritative, active sandbox always disclosed (R7). macOS Seatbelt cannot nest: a confined `Sandbox` defers to the outer boundary at construction, on every execution path, and says so (R7.6) |
-| Windows Runtime (PowerShell) | in-progress | Built-in PowerShell (5.1+) runtime; cross-platform path security + file URI; parity tests green |
-| Windows Sandbox backend | in-progress | Job Object enforcement done. AppContainer spawn isolation + scoped DACL grants are written but **a `windows-latest` CI run proved the grant DACL does not take effect** — in-scope writes are denied along with out-of-scope ones. Not wired into the default spawn path until fixed; `create_platform_sandboxed_command` falls back to Job-Object-only on Windows. R6.3.3 stays open |
-| Windows Pre-built Releases | in-progress | `x86_64-pc-windows-msvc`; `.zip` CI artifacts; `install.ps1` |
-| STDIO Mode | tests-pass | Direct MCP server over stdio for IDE integration |
-| HTTP Bridge Mode | tests-pass | HTTP/SSE proxy for web clients |
-| HTTP Streaming (Streamable HTTP) | tests-pass | POST SSE with event IDs, event history, Last-Event-Id replay, full multiplexing |
-| HTTP/3 (QUIC) Client Preference | tests-pass | All HTTP clients prefer HTTP/3 (QUIC) when server supports it; transparent fallback to HTTP/2 and HTTP/1.1 |
-| Session Isolation (HTTP) | tests-pass | One kernel-sandboxed worker per MCP session, each locking its own scope from its own client's `roots/list` (R5.1, R10.3); per-client options travel with the session (R-DAEMON.4) |
-| Built-in `status` Tool | tests-pass | Non-blocking progress check for async operations |
-| Built-in `await` Tool | tests-pass | Blocking wait for operation completion; soft timeout (R2.5.1); liveness-probed waits are answered by the bridge iff the push channel is live, and a probe-ended wait reports the time that actually passed (R2.6.5.3, R2.6.5.4) |
-| Built-in `cancel` Tool | tests-pass | Cancel running operations |
-| Built-in `run_terminal_command` | tests-pass | Execute arbitrary shell commands within sandbox |
-| Built-in file tools (R26) | tests-pass | Read-before-edit, unique-match edits, `multi_edit`, `apply_patch`, atomic writes, `.gitignore`-aware bounded search; other harnesses' tool/argument names mapped |
-| Batteries-Included Tools | tests-pass | Built-in MTDF setups activated via CLI flags (e.g. `--python`, `--git`) |
-| MTDF Schema Validation | tests-pass | JSON schema validation at startup |
-| Sequence Tools | tests-pass | Chain multiple commands into workflows |
-| Tool Reload | tests-pass | Watcher-based hot-reload withdrawn (R1.4/R-HANDOFF.7): the tool-config directory is agent-writable, so watching it would execute a write with no user action. Reload only via the explicit `restart` tool; `notifications/tools/list_changed` is sent where a live session's tool set actually changes (`update_tools`), not from `restart`, which replaces the process |
-| MCP Progress Push | tests-pass | Event-stream subscriber pushes `notifications/progress` per registered operation (replaces legacy callback chain) |
-| Session-Health Disclosure (R8.8) | tests-pass | `notifications/ahma/session_event` + `notifications/message` mirror; proxy reconnect disclosure (#479/#485); `grant_pending`/`grant_decided` beside the asking surfaces; heartbeat `pending_grants`/`reconnects`. Design: `docs/session-health-notifications.md` |
-| HTTP MCP Client | tests-pass | Connect to external HTTP MCP servers |
-| OAuth 2.0 + PKCE | tests-pass | Authentication for HTTP MCP servers |
-| `ahma --validate` | tests-pass | Validate tool configs against MTDF schema |
-| `generate-tool-schema` CLI | tests-pass | Generate MTDF JSON schema |
-| Graceful Shutdown | tests-pass | 10-second grace period for operation completion |
-| Unified Shell Output | tests-pass | stderr redirected to stdout (`2>&1`) |
-| Logging (File + Stderr) | tests-pass | Daily rolling logs, `--log-to-stderr` for debug |
-| Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
-| TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
-| Trusted folders, one question per tool (R-PERM.1.2, R-PERM.1.3) | tests-pass | One "Trust this folder?" per folder covers everything inside its sandbox; boundary-crossing tools still ask; parallel calls share one question |
-| Doctor (R-DOCTOR) | tests-pass | `ahma doctor [--fix]` and TUI `/doctor`: shared read-only checks (settings, missing grants, daemon build, trust, log warnings); fixes applied only after a per-fix `y`; `/doctor <question>` lets the chat model explain with the report as context |
-| Unified Work View (R24, R24.9, R24.10) | tests-pass | The TUI's home view: one borderless section per client session (hooks and this terminal folded), one open at a time with a 300 ms eased tween, chat on a toggle. Current at startup via daemon replay with true timestamps and the retained output window; ordering independent of activity; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
-| Configuration Standard (R-CFG) | in-progress | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5). Done: Security-tier `AHMA_*` retirement (warn-and-ignore, R-CFG1.2/R-CFG7.1), settings-file/`--no-settings` resolution, settings provenance (`ahma settings show --origin`, R-CFG5.1), trust tiers (`settings_tier`, with a drift test over every key), and the project-tier settings file (R-CFG3: Preference-only, Security keys refused and named). Pending: R-CFG5.2 per-setting startup log lines, R-CFG6.2 unknown-key abort for `[sandbox]`/`[auth]` in the *user* file, R-CFG6.3 permissions warning |
-| Unified Permissions (R-PERM) | tests-pass | One ledger under `~/.ahma` (fs scopes, web domains, tool approvals; legacy `approvals.json` migrated); question ladder (harness elicitation → TUI modal → fail-closed with paste-able remediation); sandbox profiles replace the hard-coded toolchain carve-outs; hooks enabled per client. User guide: `docs/permissions.md` |
-| Trust-Handoff Hardening (R-HANDOFF) | in-progress | Two-tier posture for writes a *trusted, unsandboxed* component executes later (git hook dirs, editor/harness auto-run config, daemon sockets): deny-write where nothing legitimate writes, allow-plus-loud-disclosure where it does. Kernel-enforced on macOS (last-match-wins SBPL denies); **application-layer only on Linux** (Landlock V1 is additive-allow, R6.1.7) and therefore bypassable from `run_terminal_command`; none on Windows yet. Child env strips code-injection and client-redirect vars, keeps `SSH_AUTH_SOCK`. Cross-project package-cache channel disclosed at runtime as the `rust` profile's stated `cost` in `ahma permissions list` (R-HANDOFF.8/R-PERM.5.2), not only in docs. Platform enforcement gaps (macOS reads, Windows both directions, Linux's application-layer-only deny tier) are surfaced on the R5.4 scope surfaces by `sandbox::profiles::platform_enforcement` |
-| Execution Audit Log (R-HANDOFF.10) | tests-pass | Append-only `<log dir>/audit.jsonl` on every execution path (sync, async, PTY, session), in the vault's wire format; `tool_call` before spawn, one `tool_complete` on every terminal path, sandbox denials included; write failures warn and never fail the operation |
-| Profile Network Hosts (R-PERM.5.3) | tests-pass | Sandbox profiles declare the hosts their toolchain needs, each with a reason; union with `[network] allow`, refusable independently of path grants (`[network] profile_hosts` / `deny_profile_hosts`); label-anchored ASCII-only matching. Restriction itself stays opt-in |
-| `ahma setup` / `ahma uninstall` | tests-pass | Interactive wizard installs / removes MCP entries, hooks, skills, binary; symmetric teardown leaves other user config intact |
-| Single Per-User Daemon (R-DAEMON) | tests-pass | One daemon per user hosts the MCP endpoint and the observability hub, in a 0700 per-user runtime dir (Windows: lock + endpoint file + token, but still on fixed loopback ports — ephemeral-port discovery is unwired and untestable here, R-DAEMON.2). First comer starts it, never from a confined process or a test binary; idle exit needs both halves empty; upgrade drains rather than tearing down other windows' sessions. Workers stay one per session (R5.1). Hooks and the TUI register as instances; bounded output tails and a one-hour `history.jsonl` survive restarts. Explicitly-started `ahma serve http/unix` remain persistent and operator-owned |
-| Binary Code Signing (R-SIGN) | in-progress | macOS ad-hoc binary gets `SIGKILL (Code Signature Invalid)` under heavy-build memory pressure / in-place rebuild → opaque `Connection closed`. Done: atomic out-of-place install + local re-sign in `ahma update` (R-SIGN.2, R-SIGN.1-local); signal-death classification surfaced in the client's JSON-RPC error + panic log-flush (R-SIGN.5). Pending: Developer-ID release signing (R-SIGN.1, blocked on Apple Developer credentials), Windows WDAC/SAC verify (R-SIGN.3) |
+Ahma (Finnish for "wolverine") is an MCP server that lets AI agents run a project's real
+command-line tools — builds, tests, formatters, git, log tails — inside a kernel-enforced
+sandbox scoped to the project, with every command tracked as an operation the agent and the
+human can watch, cancel and audit. It exists because the alternative an agent otherwise
+reaches for, unrestricted terminal access, is both too powerful and too opaque.
 
----
+### 1.1 Design invariants
 
-## 1. Project Overview
+Every requirement below serves one of these. When two requirements seem to conflict, the
+invariant decides.
 
-**Ahma** (Finnish for "wolverine") is a universal, high-performance **Model Context Protocol (MCP) server** designed to dynamically adapt any command-line tool for use by AI agents. Its purpose is to provide a consistent, powerful, and non-blocking bridge between AI and the vast ecosystem of command-line utilities.
-
-_"Create agents from your command line tools with one JSON file, then watch them complete your work faster with **true multi-threaded tool-use agentic AI workflows**."_
-
-### Technology Stack
-
-| Tech | Version | Purpose |
-|------|---------|---------|
-| Rust | 2024 Edition (1.93+) | Core language |
-| rmcp | 1.5 | MCP protocol implementation |
-| Tokio | 1.x | Async runtime |
-| Landlock | 0.4.4 | Linux kernel sandboxing |
-| reqwest | 0.13.2 (http3) | HTTP client with HTTP/3 (QUIC) preference |
-| schemars | 1.2.0 | JSON Schema generation |
-
----
+1. **The kernel is the boundary.** Commands run under Landlock (Linux), Seatbelt (macOS) or
+   Job Objects (Windows) with a write scope fixed for the session. The scope is committed
+   once and never widened afterwards (R5.1). Application-layer checks are defence in depth,
+   never the boundary.
+2. **Nothing is silent.** ahma never silently disables enforcement, drops an argument,
+   skips a check or degrades a guarantee. Whichever sandbox is authoritative, and any
+   platform gap, is disclosed where the user will see it (R5.4, R7).
+3. **Every call is an operation.** Each tool call is tracked in one `OperationMonitor`:
+   visible, cancellable, its full output spilled to a file, recorded in the audit log.
+   The execution mode changes only how long the call waits for it (R2).
+4. **Agent-writable is not trusted.** Anything inside the scope can be written by the
+   agent, so nothing inside it may change what ahma or another trusted program executes
+   without a human in the loop: tool definitions are never hot-reloaded, and writes that a
+   trusted program later executes are denied or loudly disclosed (R-HANDOFF).
+5. **Configuration is explicit and resolved once.** CLI flags and settings files only;
+   `AHMA_*` environment variables are not a configuration source. The two most dangerous
+   switches are CLI-flag-only. Configuration is immutable after startup (R-CFG).
+6. **One ledger, one question.** Every permission — filesystem grants, web domains, tool
+   approvals, trusted folders — lives in one ledger outside every sandbox scope, and each
+   decision is asked at most once, on the best surface available, failing closed (R-PERM).
+7. **One implementation per rule.** A rule that binds two surfaces is implemented once and
+   shared (built-in tool names, the MCP handshake client, the event stream, retired-env
+   handling), so surfaces cannot drift apart.
 
 ## 2. Architecture
 
-### 2.1 Core Modules
-
-| Module | Purpose |
-|--------|---------|
-| `adapter` | Primary engine for executing external CLI tools (sync/async) |
-| `mcp_service` | Implements `rmcp::ServerHandler` - handles `tools/list`, `tools/call`, etc. |
-| `operation_monitor` | Tracks background operations (progress, timeout, cancellation) |
-| `shell_pool` | Platform shell selection (bash/PowerShell 5.1+) and default command timeout config |
-| `sandbox` | Kernel-level sandboxing (Landlock on Linux, Seatbelt on macOS) |
-| `config` | MTDF (Multi-Tool Definition Format) configuration models |
-| `ahma_common::event_dispatcher` | Unified `OperationEvent` broadcast stream (Started/OutputLine/Progress/Alert/terminal) |
-| `mcp_service::progress_push` | Event-stream subscriber that pushes `notifications/progress` to the registered MCP client |
-| `adapter::spill` | Complete per-operation output spill files (queryable with file tools) |
-| `path_security` | Path validation for sandbox enforcement |
-
-### 2.2 Built-in Internal Tools
-
-These tools are always available regardless of JSON configuration:
-
-| Tool | Description |
-|------|-------------|
-| `status` | Non-blocking progress check for async operations |
-| `await` | Blocking wait for operation completion (use sparingly) |
-| `cancel` | Cancel running operations |
-| `run_terminal_command` | Execute arbitrary shell commands within sandbox scope (promoted from file-based to internal) |
-
-**Note**: These internal tools are hardcoded into the `AhmaMcpService` and are guaranteed to be available even when no `.ahma` directory exists or when all external tool configurations fail to load.
-
-### 2.3 Operation Architecture
+### 2.1 Crates and licenses
 
 ```text
-┌─────────────────┐         ┌──────────────────┐
-│  AI Agent (IDE) │ ──MCP─▶ │  AhmaMcpService  │
-└─────────────────┘         └────────┬─────────┘
-                                     │
-                    ┌────────────────┼────────────────┐
-                    ▼                ▼                ▼
-            ┌───────────┐    ┌───────────────┐  ┌─────────┐
-            │  Adapter  │    │ OperationMon. │  │ Sandbox │
-            └─────┬─────┘    └───────────────┘  └─────────┘
-                  │
-                  ▼
-            ┌───────────────┐
-            │ Direct spawn /│ ──▶ Sandboxed bash/PowerShell processes
-            │ PTY sessions  │     (persistent sessions via `session_id`)
-            └───────────────┘
+            ahma_common  (foundation: config, permissions, event stream, daemon wire types)
+                 ▲
+   ┌─────────────┼───────────────────────────────────────────────┐
+ ahma_vault  ahma_bundle  ahma_update  ahma_llm_monitor  ahma_http_mcp_client  ahma_http_bridge
+ ahma_log_monitor  ahma_harness_guard  ahma_harness_tools  ahma_output_optimizer   (no deps)
+                 ▲
+             ahma_mcp  (the engine and the whole `ahma` CLI)
+                 ▲
+             ahma_core (embedding facade + chat agent)        ahma_simplify (optional)
+                 ▲                                                 ▲
+             ahma_tui  ──────────────▶  ahma_bin  ◀────────────────┘
+             (AGPL-3.0)                 (AGPL-3.0: the `ahma` binary)
 ```
 
-**Workflow:**
+Everything except `ahma_tui` and `ahma_bin` is MIT OR Apache-2.0, so the engine can be
+embedded without copyleft; the end-user product surface is AGPL-3.0. A permissive crate
+never depends on an AGPL one (`scripts/check-license-boundaries.sh`). Dev-only crates:
+`ahma_test_support`, `generate_tool_schema`, `xtask`, `workspace-hack`.
 
-1. AI invokes tool → Server immediately returns `id`
-2. Command executes in background (direct sandboxed spawn; output streamed line-by-line)
-3. Every state transition is emitted on the unified operation event stream; the
-   MCP progress-push subscriber forwards events for registered operations as
-   `notifications/progress`
-4. AI processes the notification when it arrives, or retrieves the stored
-   result via `await`/`status` (the store of record)
-
-### 2.3.1 Unified Operation Event Stream
-
-All operation lifecycle data flows through ONE broadcast stream of
-`ahma_common::event_dispatcher::OperationEvent` values
-(`Started` / `OutputLine` / `Progress` / `Alert` /
-`Completed` / `Failed` / `Cancelled` / `TimedOut`):
-
-- **Single emission point**: the `OperationMonitor` emits events at each state
-  transition (`add_operation` → `Started`, `append_output_line` →
-  `OutputLine`, `append_alert` → `Alert`, terminal `update_status` → exactly
-  one terminal event). No other component emits lifecycle events.
-- **Ordering invariant**: on terminal transitions the monitor writes
-  completion history, signals the completion watch, then emits the terminal
-  event — readers woken by the watch always observe complete history.
-- **Lagged subscribers**: the broadcast is a live feed, not the store of
-  record. A subscriber that lags reconciles from monitor state
-  (`status`/`await`); awaiting a result never depends on the broadcast.
-- **Subscribers**: MCP progress push (`mcp_service::progress_push`), the
-  daemon hub reporter (feeds `ahma tui` and remote dashboards), the vault
-  audit subscriber, and tests.
-- **Full output**: the bounded `stdout_tail` (100 lines) and result window are
-  for token economy; the complete redacted output of every async operation is
-  spilled to `<project log dir>/operations/<operation_id>.log` and advertised
-  as `output_file` in results, so agents query big outputs with file tools
-  instead of re-running commands.
-
-### 2.4 Execution Mode Resolution
-
-Every call runs as a tracked operation (R2.1); the mode decides only how long
-the call waits for it before answering.
+### 2.2 Processes
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
-│                    EXECUTION MODE RESOLUTION                     │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. CLI flag (highest priority; last one given wins)             │
-│     └── --sync / --async                                         │
-│                                                                  │
-│  2. Settings: tools.execution_mode = "sync" | "async"            │
-│     └── project .ahma/settings.toml over ~/.ahma/settings.toml   │
-│                                                                  │
-│  3. Default (lowest priority)                                    │
-│     └── SYNC — wait for the result, within the client's budget   │
-│                                                                  │
-│  Per call, in sync mode only: an MTDF tool with                  │
-│  "synchronous": false, or a call with "blocking": false, returns │
-│  after the adaptive window instead (run_terminal_command has no  │
-│  such argument — R2.6.3). "blocking": true / "synchronous": true │
-│  still select the legacy direct path in either mode.             │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+ IDE / agent ──stdio──▶ ahma serve stdio (frontend proxy)
+                               │ HTTP or Unix socket
+ ahma tui ────────────────────▶│
+ terminal hooks ──────────────▶▼
+                        per-user daemon  (bridge + observability hub, R-DAEMON)
+                               │ one per MCP session (R10)
+                               ▼
+                        ahma serve stdio worker ── sandboxed commands
+                        (commits its own scope, R5.1)
 ```
+
+- An editor launches `ahma serve stdio`. By default that process is a thin proxy to the
+  **per-user daemon**, started on first use, which hosts the Streamable HTTP endpoint and
+  the hub that every surface (TUI, hooks, other windows) reports to and reads from.
+- The daemon runs **one worker subprocess per MCP session**. The worker owns the session's
+  sandbox scope, executes every command, and reports operations to the hub. The daemon
+  itself runs no commands.
+- `ahma serve http|unix` starts an operator-owned bridge with the same session model.
+- `ahma tui` is a client of the daemon: it shows every session's work and answers the
+  permission questions the workers raise.
+
+### 2.3 One tool call
+
+1. The client calls a tool. MTDF tools come from `.ahma/*.json` (§5); built-ins from
+   `ahma_mcp::builtin_tool`. Calls wait until the session's scope is committed (R5.1.2).
+2. The adapter builds the command and spawns it inside the platform sandbox with the
+   locked scope (R5, R6). An execution-audit record is written before the spawn
+   (R-HANDOFF.10).
+3. `OperationMonitor` tracks it and is the only emitter onto the `OperationEvent` stream
+   (§2.4). Output is redacted, spilled in full to `<log dir>/operations/<id>.log`, and kept
+   as a bounded tail.
+4. In `sync` mode the call returns the result when the command ends, within the client's
+   request budget; in `async` mode it returns the operation id after a short window and the
+   client collects the result with `await` (R2).
+5. Subscribers turn the stream into MCP progress notifications, hub events for the TUI,
+   and audit records.
+
+### 2.4 Unified operation event stream
+
+All operation lifecycle data flows through one broadcast stream of
+`ahma_common::event_dispatcher::OperationEvent` (`Started` / `OutputLine` / `Progress` /
+`Alert` / `Completed` / `Failed` / `Cancelled` / `TimedOut`):
+
+- **Single emission point**: `OperationMonitor` emits every lifecycle event, and exactly one
+  terminal event per operation. No other component emits them.
+- **Ordering**: on a terminal transition the monitor writes history, signals the completion
+  watch, then emits the event, so a reader woken by the watch sees complete history.
+- **The stream is a feed, not the store of record**: a lagging subscriber reconciles from
+  monitor state; `await` never depends on the broadcast.
+
+### 2.5 Execution mode resolution
+
+`tools.execution_mode` is `--sync` / `--async` (last one wins), then the project and user
+settings files, then the default **`sync`** (R2.1, R2.4). Per call, an MTDF tool may pass
+`blocking: false` to return after the adaptive window in sync mode; `run_terminal_command`
+has no such argument (R2.6.3).
+
+### 2.6 Trust boundaries
+
+| Zone | Who can write it | Rule |
+|---|---|---|
+| The session scope (workspace) | the agent | Everything here is untrusted input to ahma (invariant 4) |
+| `~/.ahma` (settings, ledger, logs outside the tree) | the user, ahma outside the sandbox | Never inside any sandbox scope (R5.4.8), so the agent cannot read or extend its own grants |
+| Paths a trusted program executes (git hooks, editor/harness auto-run config, daemon sockets) | — | Deny-write, or allow with loud disclosure (R-HANDOFF) |
+| The network | — | Unrestricted unless `--restrict-network` (R-WEB.16); `fetch_webpage` is governed by `[web]` (R-WEB) |
+
+## Quick Status
+
+`tests-pass` means implemented and covered by tests; `in-progress` means partly done, with
+what is missing named; `dormant` means present but not active.
+
+| Component | Status | Notes |
+|---|---|---|
+| MTDF tool execution, schema validation, sequences | tests-pass | R1, R4, §5 |
+| Tracked operations, sync by default (R2) | tests-pass | `tools.execution_mode = sync` (default) or `async` |
+| Unified operation event stream | tests-pass | §2.4; subscribers: progress push, daemon hub, audit, TUI |
+| Output spill files | tests-pass | `<log dir>/operations/<id>.log`, advertised as `output_file` |
+| Built-in tools | tests-pass | `ahma_mcp::builtin_tool::BuiltinTool::ALL`; file tools withheld from clients with native ones (R26) |
+| Tool reload | tests-pass | Explicit `restart` only; no directory watcher (R1.4) |
+| Linux sandbox (Landlock) | tests-pass | Reads and writes confined; deny tier application-layer only (R6.1.7) |
+| macOS sandbox (Seatbelt) | tests-pass | Writes confined; reads unconfined with a credential denylist (R6.2.2, R6.2.3) |
+| Windows sandbox | in-progress | Job Objects only; AppContainer written but disproved in CI, so off — no OS path boundary (R6.3.3) |
+| Nested sandbox detection and deferral (R7) | tests-pass | Hooks defer to the host; the MCP server stays authoritative |
+| Trust-handoff hardening (R-HANDOFF) | in-progress | Kernel-enforced on macOS; application-layer on Linux; none on Windows |
+| Execution audit log (R-HANDOFF.10) | tests-pass | `<log dir>/audit.jsonl` on every execution path |
+| Unified permissions and doctor (R-PERM, R-DOCTOR) | tests-pass | One ledger under `~/.ahma`; question ladder; `ahma doctor [--fix]` |
+| Configuration standard (R-CFG) | in-progress | Done: retirement of `AHMA_*`, tiers, provenance, project file. Pending: R-CFG5.2, R-CFG6.2, R-CFG6.3 |
+| STDIO, HTTP bridge, Streamable HTTP, session isolation | tests-pass | `ahma_http_bridge/SPEC.md` (R8, R10) |
+| Per-user daemon (R-DAEMON) | tests-pass | Windows still uses fixed loopback ports (R-DAEMON.2) |
+| HTTP MCP client, OAuth 2.0 + PKCE | tests-pass | OAuth endpoints are Atlassian's; no token refresh |
+| Web egress policy for `fetch_webpage` (R-WEB) | tests-pass | Three-tier approval, private-range block, redirect guard |
+| Subprocess egress restriction (R-WEB.16) | tests-pass | Opt-in `--restrict-network`; kernel-enforced on macOS and Linux 6.7+ |
+| Live log monitoring (`livelog`, `--log-monitor`) | tests-pass | §5.5, R9 |
+| TUI (R24, R25) | tests-pass | `ahma_tui/SPEC.md` |
+| Task vaults | tests-pass (experimental) | `--task-vault`; `ahma_vault/SPEC.md` |
+| Bundle audit | tests-pass (experimental) | `ahma_bundle/SPEC.md`; checksum is not a signature |
+| `ahma setup` / `ahma uninstall` | tests-pass | R-SETUP, R-UNINSTALL |
+| Self-update and provenance | tests-pass | `ahma_update/SPEC.md` |
+| Binary code signing (R-SIGN) | in-progress | Done: atomic install, local re-sign, signal-death classification. Pending: Developer-ID signing (R-SIGN.1), Windows (R-SIGN.3) |
+| OpenTelemetry export | tests-pass | `otel` cargo feature, off by default |
+| Server-side output minimization | dormant | `ahma_output_optimizer/SPEC.md` |
+| Code complexity analysis (`ahma simplify`) | tests-pass | `ahma_simplify/SPEC.md` |
 
 ---
 
@@ -201,20 +183,12 @@ the call waits for it before answering.
 
 - **R1.1**: The system **must** adapt any CLI tool for use as MCP tools based on declarative JSON configuration files.
 - **R1.2**: All tool definitions **must** be stored in `.json` files within a `tools/` directory (default: `.ahma/`).
-- **R1.2.1**: **Auto-Detection**: When `--tools-dir` is not explicitly provided, the system **must** check for a `.ahma` directory in the current working directory. If found, it **must** be used as the tools directory. If not found, the system **must** log a warning and operate with only the built-in internal tools (`await`, `status`, `run_terminal_command`).
+- **R1.2.1**: **Auto-Detection**: When `--tools-dir` is not explicitly provided, the system **must** check for a `.ahma` directory in the current working directory. If found, it **must** be used as the tools directory. If not found, the system **must** log a warning and operate with only the built-in tools (`ahma_mcp::builtin_tool::BuiltinTool::ALL`).
 - **R1.2.2**: When `--tools-dir` is explicitly provided via CLI argument, that path **must** take precedence over auto-detection.
 - **R1.3**: The system **must not** be recompiled to add, remove, or modify a tool.
-- **R1.4**: **Reload is explicit, never watched**: the system **must not** watch the tools directory for changes. A tool definition is a command ahma will run, the directory lives *inside* the workspace the agent can write, and a watcher turns writing that file into executing it with no user action in between — the trust-handoff shape of R-HANDOFF.1 with the human removed from the loop (R-HANDOFF.7). Reload happens only through the explicit `restart` tool. Earlier revisions of this requirement mandated the watcher; that mandate is withdrawn.
-  - **`restart` does not send `notifications/tools/list_changed`, and must not be expected to.** An earlier revision required it. `restart` is a *process replacement* on every transport — the bridge path is `POST /restart` → `terminate_all` → `exit(0)` — so by the time a new tool set exists there is no surviving MCP session to notify, and emitting the notification just before tearing the peer down would be a no-op dressed up as compliance. The client learns the new tool set by re-initializing, which it must do anyway.
-  - The notification **must** be sent on the one path where the tool set genuinely changes inside a live session: `mcp_service::sandbox_config::update_tools`, which overlays a connecting client's `<root>/.ahma/` mid-handshake. That is where it is sent today. A requirement the code deliberately violates for a good reason is a requirement that should be rewritten; leaving it teaches readers the spec is approximate.
-- **R1.5**: [REMOVED] Progressive disclosure and the `activate_tools` meta-tool have been removed from the server.
-- **R1.5.1**: [REMOVED]
-- **R1.5.2**: [REMOVED]
-- **R1.5.3**: [REMOVED]
-- **R1.5.4**: The `instructions` field in the MCP `initialize` response contains sandbox routing directives instructing the model to use `run_terminal_command` for all command execution.
-- **R1.5.5**: [REMOVED]
-- **R1.5.6**: [REMOVED]
-
+- **R1.4**: **Reload is explicit, never watched**: the system **must not** watch the tools directory for changes. A tool definition is a command ahma will run, the directory lives *inside* the workspace the agent can write, and a watcher turns writing that file into executing it with no user action in between — the trust-handoff shape of R-HANDOFF.1 with the human removed from the loop (R-HANDOFF.7). Reload happens only through the explicit `restart` tool.
+  - **`restart` does not send `notifications/tools/list_changed`, and must not be expected to.** `restart` is a *process replacement* on every transport — the bridge path is `POST /restart` → `terminate_all` → `exit(0)` — so by the time a new tool set exists there is no surviving MCP session to notify, and emitting the notification just before tearing the peer down would be a no-op dressed up as compliance. The client learns the new tool set by re-initializing, which it must do anyway.
+  - The notification **must** be sent on the one path where the tool set genuinely changes inside a live session: `mcp_service::sandbox_config::update_tools`, which overlays a connecting client's `<root>/.ahma/` mid-handshake.
 ### R1.5: Built-in Tool Names Are Reserved
 
 * **R1.5.1**: The tools ahma implements itself are declared once
@@ -226,13 +200,14 @@ the call waits for it before answering.
 * **R1.5.2**: A configured tool **must** be refused at load if its name is one
   of them, with an error naming the conflict and the file to rename. Silently
   loading it and then filtering it out of `tools/list` is not acceptable: the
-  user gets neither the tool nor a reason. (This was the behaviour for five of
-  the twenty names until v0.20.1, because the validator's list had drifted from
-  the dispatch table.)
+  user gets neither the tool nor a reason.
 * **R1.5.3**: Adding a built-in **must** force an explicit answer to whether it
   is exempt from the sandbox-ready gate (R5.1.2), whether ahma's own agent loop
   may call it, and whether it is a harness file tool withheld from clients with
   native equivalents. These are exhaustive matches, not membership lists.
+* **R1.5.4**: The `instructions` field of the MCP `initialize` response directs the model to
+  use `run_terminal_command` for command execution and describes the session's actual
+  execution mode (R2.1).
 
 ### R2: Tracked Operations, Sync by Default
 
@@ -241,16 +216,16 @@ the call waits for it before answering.
   - **`async`** — the call waits the adaptive inline window (R2.6.1), then returns the operation id; the caller collects the result with `await`. This lets a model start several long commands in parallel.
   - The server `instructions` **must** describe the mode the session is actually in.
   - The legacy direct execution path (not a tracked operation) is used only by CLI one-shot mode and by the deprecated `blocking: true` / `"synchronous": true` (R2.3).
-  - Sync became the default in v0.22: async-first made the common case — run a command, read its output — cost an extra `await` round trip, while the reason given for it (clients abandoning long requests) is handled by bounding the sync wait instead.
+  - **Why sync is the default**: the common case — run a command, read its output — should not cost an extra `await` round trip. The risk of a client abandoning a long request is handled by bounding the sync wait, not by making every call async.
 - **R2.2**: On completion, the system **must** store results reliably in `OperationMonitor` (pull channel) and **should** push a best-effort MCP progress notification. Clients rely on the `await` tool for guaranteed result delivery; the push notification is an optimistic shortcut to avoid a round-trip.
 - **R2.2.1**: **A per-client progress suppression must be overridable, and must say so when it isn't measured.** `McpClientType::supports_progress()` may suppress R2.2's push for a specific client (currently: Cursor, believed to log a client-side error for valid progress tokens). Because MCP notifications are one-way — no response, no ack — ahma has no way to observe whether the behavior it is working around still exists, or ever did; unlike the request-budget and elicitation-budget tables (R2.6.5, R5.3.1), which are set from a captured, timestamped measurement, a progress suppression **must** say in its own doc comment when it is asserted rather than measured, so it is not read as equally trustworthy. `tools.force_progress_notifications` / `--force-progress-notifications` **must** let an operator override the suppression uniformly once it is known to be stale.
-- **R2.3**: **Static Synchronous Flag (DEPRECATED)**: The static `"synchronous": true/false` configuration in tool and subcommand JSON definitions is deprecated. Code calling tools should not rely on static config.
+- **R2.3**: **Static `synchronous` flag (deprecated)**: `"synchronous": true/false` in MTDF definitions is deprecated. `true` selects the legacy direct (untracked) path; new definitions should omit it and rely on `tools.execution_mode`.
 - **R2.4**: **Resolution**: the server's mode is `tools.execution_mode`, resolved per §2.4 — `--sync`/`--async` over the project and user settings over the default, `sync` — and is a server-operator decision. On an MTDF tool a call may still pass `blocking: false` to return after the adaptive window in sync mode; `run_terminal_command` has no such argument (R2.6.3). The retired `tools.force_sync` key is parsed and ignored: the only value it could hold, `true`, is the new default. `--sync` and `--async` override each other (last one wins), because a worker receives its daemon's flags first and its session's after them.
 - **R2.5**: **`await` soft timeout.** The `await` tool waits at most `tools.await_timeout_secs` seconds (default `540`, i.e. 9 minutes — under the 10-minute idle disconnect used by common MCP clients). Resolution order: the call's optional `timeout_seconds` argument, then the `--await-timeout` CLI flag, then `tools.await_timeout_secs` in `settings.toml`, then the compiled-in default. When awaiting by tool filter and no explicit `timeout_seconds` is given, the effective wait is `max(default, longest pending operation timeout)` so a legitimately long operation is never cut short by a shorter await default.
-- **R2.5.1**: The timeout is **soft**: expiry **must not** cancel the awaited operation(s), and the returned text **must** state that the work is still running in the background and that the client should call `await` again (by `id` where one was given) to keep waiting. This distinguishes "your wait ended" from "your operation died" — the two were previously indistinguishable to an agent.
+- **R2.5.1**: The timeout is **soft**: expiry **must not** cancel the awaited operation(s), and the returned text **must** state that the work is still running in the background and that the client should call `await` again (by `id` where one was given) to keep waiting. This distinguishes "your wait ended" from "your operation died".
 - **R2.5.2**: The resolved timeout from R2.5 **must** be the only deadline on the wait — no inner bound may pre-empt it. `OperationMonitor::wait_for_operation`'s own default cap is shorter than the await default, so `await` **must** opt out of it (`wait_for_operation_bounded(id, None)`). Otherwise expiry past that inner cap is misreported as "completed but no result available" (by `id`) or silently drops a still-running operation from an apparently successful result (by tool filter), defeating R2.5.1.
 - **R2.5.3**: **Progress follows the waiting request.** While an `await` is in flight, progress notifications for the operations it is waiting on **must** carry *that request's* `progressToken`, not the token of the `tools/call` that started the operation. A progress token belongs to an in-flight request; the starting call's token is retired by the time anyone awaits, so notifications sent under it are invalid and a validating client discards them — leaving a multi-minute `await` with no liveness signal at all. The displaced target **must** be restored when the await returns, so the best-effort completion push (R2.2) still lands.
-- **R2.5.4**: **Push notifications assume a listening caller.** The R2.2 best-effort push is delivered over the *same live transport connection* that started the operation (`Peer<RoleServer>::notify_progress` in `progress_push.rs`) — it is not a queue and is never replayed. A caller that might stop listening before the operation completes (ends its turn, hands off, disconnects, or exits) **must** block on `await` before doing so; there is no mechanism that wakes such a caller back up when the push arrives. This bit in practice: a subagent started a long operation via `run_terminal_command`, relied on the server's async-workflow guidance to end its turn expecting a later notification, and was never resumed — the orchestrating agent had to notice the work stalled and explicitly resend a message to get it moving again. The server `instructions` (`mcp_service/mod.rs`) and the `/ahma` skill doc carry the caller-facing version of this warning.
+- **R2.5.4**: **Push notifications assume a listening caller.** The R2.2 best-effort push is delivered over the *same live transport connection* that started the operation (`Peer<RoleServer>::notify_progress` in `progress_push.rs`) — it is not a queue and is never replayed. A caller that might stop listening before the operation completes (ends its turn, hands off, disconnects, or exits) **must** block on `await` before doing so; there is no mechanism that wakes such a caller back up when the push arrives. A caller that ends its turn expecting a later notification is never resumed. The server `instructions` (`mcp_service/mod.rs`) and the `/ahma` skill doc carry the caller-facing version of this warning.
 - **R2.5.5**: **A timeout's accuracy is not a substitute for checking.** No amount of timeout precision (R2.5, R2.6.5.3) protects a caller who reads a soft-timeout's "still running" as good enough and declares the task done anyway — efficiency (how promptly `await` returns) and correctness (whether the work is actually finished before summarizing) are different problems, and only the caller can solve the second one. The server `instructions` (`mcp_service/mod.rs`) and the `/ahma` skill doc **must** tell the caller, independent of any timeout-accuracy guarantee, to confirm every `operation_id` it started has reached a terminal state before declaring a task complete. This is a structural backstop, not a claim that it is enforced server-side — MCP gives the server no way to block a client from summarizing prematurely; the disclosure is the only lever available.
 
 #### R2.6: The inline/async decision belongs to ahma
@@ -271,12 +246,12 @@ bounded window and decides from the outcome.
 - **R2.6.5**: **Fallback single-request budget.** ahma **must** apply a conservative bound on how long it holds one MCP request open when there is no better signal available (R2.6.5.3 supplies the better signal when it can). This is **not** a per-`clientInfo.name` table: guessing which *product* deserves more trust was a proxy for the thing that actually matters — is the connection right now still alive — and the proxy was exactly as reliable as the guess behind it, silently wrong for any client whose name didn't match. Both the R2.6.1 window ceiling and the R2.5 `await` default are bounded by it, uniformly, regardless of client identity.
 - **R2.6.5.1**: **A shortened wait says so.** When the fallback budget cuts an `await` below the timeout that was resolved for it, the result **must** state the wait that was applied, the wait that was asked for, and that the operation is still running. A caller who requested 540s and received a timeout at 20s cannot otherwise tell a deliberate cap from a hung operation, and "call `await` again" is the wrong conclusion to have to infer. An explicit `timeout_seconds` argument is honoured verbatim (R2.5.1) and **must not** be reported as capped.
 - **R2.6.5.2**: **The fallback is overridable.** A deployment whose actual fallback-window tolerance differs from the conservative default is not otherwise correctable except by a code change. `tools.request_budget_override_secs` (settings.toml) / `--request-budget-secs` (CLI) **must** let an operator replace the effective fallback budget for every client uniformly. Falling back to the conservative default for an unrecognised `clientInfo.name` **must** be logged at `warn` (once per distinct name per process) so the degradation is never silent.
-- **R2.6.5.3**: **A confirmed live channel is verified directly, not guessed.** When `AhmaMcpService::push_channel_open()` confirms the bridge has a live push channel to the real client, `await` **must not** apply the R2.6.5 fallback clamp at all — it uses the full resolved R2.5 timeout and verifies liveness itself: a bare MCP `ping` sent periodically (every `LIVENESS_PROBE_INTERVAL`), each bounded by `LIVENESS_PROBE_TIMEOUT`, ending the wait — as the same soft timeout (R2.5.1), since the caller-facing outcome is identical either way — the moment a probe fails, rather than at a fixed a-priori deadline regardless of whether the connection is actually still healthy. `push_channel_open()` itself is fed by the bridge (`ahma_http_bridge`), which sends a `notifications/ahma/pushChannelChanged` notification (params: `{"connected": <bool>}`, typed as `ahma_common::mcp_methods::PushChannelChangedParams`) to the subprocess whenever its session's SSE stream opens; it defaults to `false` — a session with no confirmed channel (direct stdio before the internal proxy hop's SSE opens, or a deployment with a configured default sandbox scope where a client can skip SSE entirely, by design) **must** fall back to R2.6.5 rather than attempt a probe with nowhere to be delivered. **The bridge answers the probe on the client's behalf, iff it holds the live channel.** The ping cannot be relayed to the real client through ahma's own stdio proxy while the `await` that sent it is in flight: rmcp's streamable-HTTP client awaits each POST inline, so nothing the bridge pushes over SSE reaches the proxy until the `tools/call` response lands — forwarding the ping timed out the probe against a perfectly healthy client ~25s into every long `await`, which the subprocess then reported as a timeout (the dogfooding bug of 2026-09). The live SSE stream *is* the liveness the probe was meant to verify, so `ahma_http_bridge` **must** answer a subprocess-initiated `ping` directly when the session has at least one SSE subscriber, and **must** leave it unanswered when it has none, so the probe times out and the wait ends on the "client gone" verdict. When the client dies its proxy exits, the stream closes, and the next probe correctly goes unanswered. Separately, a subprocess message that carries a `method` is a request, never a response: the bridge **must not** match it against a pending client call by id, because the subprocess's and the client's request-id counters are independent and collide.
+- **R2.6.5.3**: **A confirmed live channel is verified directly, not guessed.** When `AhmaMcpService::push_channel_open()` confirms the bridge has a live push channel to the real client, `await` **must not** apply the R2.6.5 fallback clamp at all — it uses the full resolved R2.5 timeout and verifies liveness itself: a bare MCP `ping` sent periodically (every `LIVENESS_PROBE_INTERVAL`), each bounded by `LIVENESS_PROBE_TIMEOUT`, ending the wait — as the same soft timeout (R2.5.1), since the caller-facing outcome is identical either way — the moment a probe fails, rather than at a fixed a-priori deadline regardless of whether the connection is actually still healthy. `push_channel_open()` itself is fed by the bridge (`ahma_http_bridge`), which sends a `notifications/ahma/pushChannelChanged` notification (params: `{"connected": <bool>}`, typed as `ahma_common::mcp_methods::PushChannelChangedParams`) to the subprocess whenever its session's SSE stream opens; it defaults to `false` — a session with no confirmed channel (direct stdio before the internal proxy hop's SSE opens, or a deployment with a configured default sandbox scope where a client can skip SSE entirely, by design) **must** fall back to R2.6.5 rather than attempt a probe with nowhere to be delivered. **The bridge answers the probe on the client's behalf, iff it holds the live channel.** The ping cannot be relayed to the real client through ahma's own stdio proxy while the `await` that sent it is in flight: rmcp's streamable-HTTP client awaits each POST inline, so nothing the bridge pushes over SSE reaches the proxy until the `tools/call` response lands — forwarding the ping would time out the probe against a healthy client during every long `await`. The live SSE stream *is* the liveness the probe was meant to verify, so `ahma_http_bridge` **must** answer a subprocess-initiated `ping` directly when the session has at least one SSE subscriber, and **must** leave it unanswered when it has none, so the probe times out and the wait ends on the "client gone" verdict. When the client dies its proxy exits, the stream closes, and the next probe correctly goes unanswered. Separately, a subprocess message that carries a `method` is a request, never a response: the bridge **must not** match it against a pending client call by id, because the subprocess's and the client's request-id counters are independent and collide.
 - **R2.6.5.4**: **A wait that ends early reports the time that passed, never the time that was asked for.** When a liveness probe ends an `await` (R2.6.5.3), the result **must** state how long the wait actually lasted (whole seconds, never exceeding the wall clock), state the requested timeout separately, say that the wait ended because the client stopped answering probes rather than because the timeout expired, and carry the R2.5.1 still-running notice. "Timeout waiting for operation X after 1500s" written after 79 seconds is a claim no reader can reconcile with their clock, and it sent an agent looking for a 25-minute stall that never happened.
 
 ### R3: Performance
 
-- **R3.1**: Command dispatch **must** stay low-latency via direct sandboxed spawns (~6ms median, guarded by the `latency_guard_test` benchmarks). The former prewarmed shell pool was removed as dead code.
+- **R3.1**: Command dispatch **must** stay low-latency via direct sandboxed spawns (~6ms median, guarded by the `latency_guard_test` benchmarks).
 - **R3.2**: Persistent shell sessions (opt-in via `session_id`) are tracked per session and automatically cleaned up on shutdown.
 
 ### R4: JSON Schema Validation
@@ -337,15 +312,15 @@ Server configuration (everything except MTDF tool definitions) **must** be deter
 - **R-CFG6.2**: Unknown keys in the `[sandbox]` and `[auth]` tables **must** abort startup (a typo in a security key must not be silently ignored). Unknown keys elsewhere **must** produce a `warn` listing each key (forward compatibility).
 - **R-CFG6.3**: On Unix, a settings file that is group- or world-writable **should** produce a startup `warn`.
 
-### R-CFG7: Migration Schedule
+### R-CFG7: Retirement of `AHMA_*` configuration variables (complete)
 
-- **R-CFG7.1**: Next minor release: project settings file, trust tiers, `--origin`, strict parsing, flag pairs; Security-tier `AHMA_*` variables (`AHMA_DISABLE_SANDBOX`, `AHMA_SANDBOX_SCOPE`, `AHMA_SANDBOX_DEFER`, `AHMA_WORKING_DIRS`, `AHMA_TMP_ACCESS`, `AHMA_DISABLE_TEMP`, `AHMA_NO_PACKAGE_CACHE_WRITE`, `AHMA_TASK_VAULT`, `AHMA_REQUIRE_TOKEN`, `AHMA_REQUIRE_TOKEN_PATH`, `AHMA_TLS_DIR`, `AHMA_INSECURE_SKIP_VERIFY`) ignored with `warn`. Preference-tier variables demoted below settings files and warned.
-- **R-CFG7.2**: The following minor release: all remaining `AHMA_*` configuration variables ignored. Only R-CFG1.3 allowlisted reads survive.
-- **R-CFG7.3**: `docs/environment-variables.md`, `docs/connection-modes.md` (the Antigravity example currently sets `AHMA_SANDBOX_SCOPE`; it must use `--sandbox-scope` in `args`), `skills/ahma/SKILL.md`, and README **must** be updated in the same PR as each migration step (see [AGENTS.md](AGENTS.md) §1 Feature Documentation Contract (R-DOC) and §3 R-SK6).
+- **R-CFG7.1**: Security-tier `AHMA_*` variables (`AHMA_DISABLE_SANDBOX`, `AHMA_SANDBOX_SCOPE`, `AHMA_SANDBOX_DEFER`, `AHMA_WORKING_DIRS`, `AHMA_TMP_ACCESS`, `AHMA_DISABLE_TEMP`, `AHMA_NO_PACKAGE_CACHE_WRITE`, `AHMA_TASK_VAULT`, `AHMA_REQUIRE_TOKEN`, `AHMA_REQUIRE_TOKEN_PATH`, `AHMA_TLS_DIR`, `AHMA_INSECURE_SKIP_VERIFY`) are ignored with a `warn`.
+- **R-CFG7.2**: All other `AHMA_*` configuration variables are ignored with a `warn`. Only the R-CFG1.3 allowlist and the INTERNAL/TEST variables of `docs/environment-variables.md` are read.
+- **R-CFG7.3**: Retiring or adding a variable updates `docs/environment-variables.md`, `skills/ahma/SKILL.md` and the README in the same PR (AGENTS.md R-DOC).
 
 ### R-CFG8: Required Tests
 
-- **R-CFG8.1**: Red team: with `AHMA_DISABLE_SANDBOX=1` in the environment, the sandbox **must** still be enforced (write outside scope blocked).
+- **R-CFG8.1**: Red team: with `--no-sandbox` in the environment, the sandbox **must** still be enforced (write outside scope blocked).
 - **R-CFG8.2**: Red team: a project `<workspace>/.ahma/settings.toml` containing `sandbox.disable = true`, widened `sandbox.scopes`, or `auth` keys **must not** affect behavior, and the ignored keys **must** appear in startup warnings.
 - **R-CFG8.3**: Precedence matrix per R-CFG5.3; parse-failure abort per R-CFG6.1; `--no-x` overriding a settings-file `x = true` per R-CFG1.4.
 
@@ -435,16 +410,14 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 - **R5.3.3**: **Dual-modal coordination**: When multiple sessions are attached to one workspace instance, a single downgrade decision is fanned to all capable sessions under one `decision_id`. The server (not any client) owns the decision. When any session answers, the server **must** dismiss the prompt on the others via `notifications/cancelled` for that `decision_id`. When a session that holds an open prompt terminates (e.g. the IDE is closed), the server **must** resolve that prompt as cancelled-not-decided and dismiss any twin.
 - **R5.3.4**: **Conflict resolution — most-restrictive-wins, then re-confirm**: If two sessions answer the same `decision_id` within a short debounce window, the **narrowest** answer wins regardless of arrival order; a widening answer can never win over a narrowing one by timing. When answers conflicted, the committed (narrowest) scope **must** be shown for re-confirmation before lock; because the narrowest option is always the safe choice, this re-confirmation may auto-accept after a brief visible window.
 - **R5.3.5**: **Decision freshness**: A `decision_id` **must** bind to the session generation that created it. An answer that arrives after the handshake deadline (R10) or after the session was recycled **must** be rejected, never applied to a new session.
-- **R5.3.6**: **TUI-only establishment is pending**: An answer given in the TUI when no IDE session is live **must** establish the scope as **pending** (shown as such), applied when the next IDE session attaches to the workspace instance; it **must not** silently lock a scope that no live session is using as if it were active. _Status_: **not reachable in production.** `WorkspaceScope` (`commit_pending` / `promote_pending` / `CommitOutcome`) and `ElicitationDecision` (most-restrictive fold, generation freshness) are complete and unit-tested in `ahma_common`, and are referenced **nowhere outside their own `#[cfg(test)]` modules**. The live commit door is a different object — `Sandbox::commit_scopes` over the two-atomic `ScopeLock` — which has no pending state, no generation, and no sharing across sessions. Saying "implemented and unit-tested" without saying that reads as "works"; it does not, because nothing calls it.
-  - Two prerequisites, one of them now done. **Done**: `ScopeSource::Pending` used to carry two opposite meanings — `Sandbox::scope_source` derives it as the residual "no provenance yet", while its doc comment described this requirement's TUI-parked answer. `handlers::working_directory` refuses to substitute the residual case, correctly, so wiring R5.3.6 onto the shared variant would have silently inherited that refusal for a scope a human explicitly chose. Split into `Unestablished` and `PendingTui`, which render as the same `pending` wire token (R5.4's vocabulary is unchanged) but are distinct values.
-  - **Outstanding**: `ElicitationDecision` cannot ride the grant coordinator — `scope_grant.rs` explains why they are siblings, a grant widening *at next start* against a downgrade decision binding *this* session — so it needs its own fan-out, and the hub protocol carries no message for a scope establishment/downgrade answer (`ScopeGrantRequested` / `SubmitScopeGrant` / `ScopeGrantDismiss` are all it has). That is an add-only protocol extension per R24.5 plus a per-workspace `Arc<WorkspaceScope>` replacing the per-session `ScopeLock` — i.e. a change to the one mechanism R5.1.1 requires to have exactly one door. It is deliberately not being done piecemeal: a partial wiring is a second door.
+- **R5.3.6**: **TUI-only establishment is pending**: An answer given in the TUI when no IDE session is live **must** establish the scope as **pending** (shown as such), applied when the next IDE session attaches to the workspace instance; it **must not** silently lock a scope that no live session is using as if it were active. _Status_: **not implemented.** The building blocks (`WorkspaceScope` with `commit_pending` / `promote_pending`, and `ElicitationDecision` with the most-restrictive fold and generation freshness) exist and are unit-tested in `ahma_common`, but nothing in production calls them: the live commit point is `Sandbox::commit_scopes` over the per-session `ScopeLock`, which has no pending state and no cross-session sharing. Wiring it needs a hub message for the answer (add-only, R24.5) and a per-workspace `Arc<WorkspaceScope>` replacing the per-session lock — a change to the single commit point of R5.1.1, so it must be done whole, never piecemeal.
 
 #### Subprocess propagation and defaults
 
 - **R5.4.1**: **Scope propagation to subprocesses**: When the stdio MCP server spawns a background bridge or per-session subprocesses, it **must** forward only genuinely explicit `--sandbox-scope` values (never the provisional CWD or temp). The `--sandbox` and `--tmp` boolean flags are forwarded separately so each subprocess derives the default secondary and auxiliary scopes itself.
 - **R5.4.2**: **Default install carries no scope and no downgrade**: The MCP server configuration installed by `ahma setup` for Cursor, VSCode, Claude, Antigravity, Codex, and LM Studio **must not** include `--tmp` (a downgrade, R5.2.5) and **must not** inject a sandbox scope the user did not choose — no `--sandbox-scope`, and no directory pre-created as a side effect of setup. These files are **client-owned**: anyone who configures the client can edit them, which is precisely why R5.2.3 keeps the container root out of them. A client that reports no usable roots reaches its scope through elicitation (R5.3.1) or the user's container root (R5.2.3).
-  - Earlier revisions required `--sandbox` in the generated args. That flag never toggled the kernel sandbox — it is a deprecated alias for `--scratch`, which merely appends an auxiliary scratch directory — so requiring it in every config advertised a protection it did not provide, and the `~/sandbox` default behind it is what silently locked roots-less sessions to a directory nobody chose. Generated configs **must not** carry it.
-  - **Correction of record**: earlier revisions of this document and `docs/connection-modes.md` stated that Antigravity and LM Studio do not support `roots/list`. For Antigravity that is **false**, verified on the wire: it declares `roots: {listChanged: true}` and `elicitation: {form: {}, url: {}}` at `initialize` (protocol `2025-11-25`, `clientInfo.name = "antigravity-client"`), and it *answers* `roots/list` — with `{"roots": []}`. It is roots-**empty**, not roots-**less**, which is R5.2.7, not a missing capability. Client capability claims in this document **must** cite wire evidence; an inferred client limitation that turns out to be false produces exactly the wrong remediation.
+  - Generated configs **must not** carry `--sandbox`. It never toggled the kernel sandbox — it is a deprecated alias for `--scratch`, which appends an auxiliary scratch directory — so it advertises a protection it does not provide.
+  - **Antigravity supports `roots/list`**, verified on the wire: it declares `roots: {listChanged: true}` and `elicitation: {form: {}, url: {}}` at `initialize` (protocol `2025-11-25`, `clientInfo.name = "antigravity-client"`), and it *answers* `roots/list` — with `{"roots": []}`. It is roots-**empty**, not roots-**less**, which is R5.2.7, not a missing capability. Client capability claims in this document **must** cite wire evidence; an inferred client limitation that turns out to be false produces exactly the wrong remediation.
   - **Antigravity's `PreToolUse` allow-cache keys on the exact literal command, so a rewriting hook must self-register its own pattern.** Verified against agy's own embedded `PreToolUse` contract docs (extracted from the shipped `agy` binary) and against a real `~/.gemini/antigravity-cli/settings.json`, whose `permissions.allow` entries are `command(<regex>)` strings compiled with Go's `regexp` package (confirmed via the `regexp.Compile`/`regexp.QuoteMeta`/`(*Regexp).MatchString` symbols present in the binary, and by a live regex-escaped entry — `command(\./generate-swift-bindings\.sh)` — that predates this change). Every ahma-wrapped shell command carries a unique `--payload-base64` blob (the JSON-encoded `{cwd, command}`), so each distinct underlying command the agent runs looks like a brand-new command to that cache and the user is re-prompted forever, never once. The fix is not a client setting: agy's own contract gives a rewriting hook exactly this escape hatch — a `PreToolUse` response that both rewrites (`overwrite`) and self-registers (`permissionOverrides: ["command(<regex>)"]`) a pattern covering its own rewrites, wildcarding only the varying payload argument and regex-escaping the literal binary path and flags either side of it. `build_antigravity_permission_override` (`ahma_mcp/src/hooks/mod.rs`) implements this; it degrades to a fully-escaped literal (today's narrower per-call behavior) if the expected `--payload-base64`/`--wrapped-by` markers are ever absent, rather than panicking inside a synchronous hook response.
 - **R5.4.3**: **Write Protection**: The system **must** block any attempt to write outside the locked scope, including via command arguments (e.g. `touch /outside/file`).
 
@@ -483,7 +456,7 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 
 - **R6.1.1**: Uses Landlock (kernel 5.13+) for kernel-level FS sandboxing.
 - **R6.1.2**: If Landlock is unavailable and sandbox is not explicitly disabled, server **must** refuse to start with upgrade instructions.
-- **R6.1.3**: If user explicitly opts into compatibility mode (`--disable-sandbox` or `AHMA_DISABLE_SANDBOX=1`), server **must** start in unsandboxed mode and emit a clear warning that Ahma sandboxing is disabled until the kernel is upgraded.
+- **R6.1.3**: If user explicitly opts into compatibility mode (`--no-sandbox` or `AHMA_DISABLE_SANDBOX=1`), server **must** start in unsandboxed mode and emit a clear warning that Ahma sandboxing is disabled until the kernel is upgraded.
 - **R6.1.4**: **Spawn-time enforcement (per command)**: `landlock_restrict_self(2)` restricts only the calling thread and threads/processes created after it, so process-level enforcement performed inside an already-running async runtime does **not** cover commands spawned from pre-existing worker threads. Every child process created through `Sandbox::create_command` (including PTY execution) **must** have the Landlock ruleset — built from the sandbox's current scopes — applied in `pre_exec`, between `fork` and `exec`, where the child is single-threaded. Process-level enforcement at startup remains as defense-in-depth for the server itself.
 - **R6.1.5**: **Availability probing**: Landlock availability **must** be determined by calling `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` — never by kernel version or the `/sys/kernel/security/lsm` list, both of which report false positives in containers (seccomp-blocked syscall, unmounted securityfs, LSM compiled out).
 - **R6.1.6**: **Reads are genuinely confined on Linux**: Landlock rules are file-descriptor-based allow-lists, so the read-only set is expressed as explicitly as the writable one. The platform-invariant system directories are added read+execute by the backend (`sandbox/landlock.rs`, `add_landlock_system_rules`), toolchain directories arrive through shipped profiles (R-PERM.5), and anything not named is unreadable. This is the position the rest of this document means by "outside the scope is denied" — it holds on Linux and **must not** be generalized to the other backends (R6.2.2, R6.3.9).
@@ -494,7 +467,6 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 - **R6.2.1**: Uses `sandbox-exec` with Seatbelt profiles (SBPL).
 - **R6.2.2**: **On macOS the sandbox is a write boundary, not a read boundary**: the profile opens with `(deny default)` and confines **writes** strictly — to the locked scope, the necessary temp paths, and the paths shipped profiles grant (R-PERM.5). **Reads are not confined at all.** The backend emits a bare, unqualified `(allow file-read*)` with no path qualifier (`sandbox/seatbelt.rs`, `get_macos_system_rules`), because on Apple Silicon and macOS 26+ the APFS firmlink / cryptex volume layout means `bash` and `dyld` resolve paths to vnodes that match no traditional `/usr`, `/System`, … subpath prefix. Read rules written as subpaths simply do not fire, so a profile that tried to scope reads would deny the commands it exists to protect rather than confine them.
   - This is a platform **limitation**, not a grant, which is why it cannot be expressed as a profile and **must** instead be disclosed on every scope surface R5.4 governs — startup banner, `ahma status`, TUI scope panel — in the honest register R7.5 requires (R-PERM.5.1, `sandbox/profiles.rs::macos_read_disclosure`).
-  - **Correction of record**: earlier revisions of this requirement stated that reads and writes were both "strictly limited to the sandbox scope" on macOS. That was false for as long as it was written, and the code never matched it. A requirement that overstates a guarantee is worse than no requirement, because every downstream document, README, and disclosure string inherits the overstatement.
 - **R6.2.3**: **On macOS a denylist, not the scope, is what keeps secrets unreadable**: since R6.2.2 leaves reads open, the only read control is an explicit deny set. Each entry is emitted as `(deny file-read* (subpath …))` placed **after** the global allow and **before** the workspace-scope allows, exploiting SBPL's last-match-wins ordering so an explicit scope grant still wins while the denied paths stay denied by default. The set is owned by `sandbox/credential_reads.rs` and **must not** be enumerated here — it is tuned so no common build / test / VCS tool breaks, is extensible via `[sandbox] deny_credential_reads`, and covers ahma's own control plane (R5.4.8), plaintext cloud and VCS credential stores, private key material, and container daemon sockets (R-HANDOFF.6). The login keychain is governed by its own `[sandbox] allow_keychain` toggle (default on): it is encrypted at rest and secret extraction is gated by `securityd` regardless of file access, so denying it mostly breaks `gh` and `git-credential-osxkeychain` for no real gain.
   - A denylist is a **weaker** guarantee than a scope and **must** be described as one wherever it is surfaced. A scope denies everything not named; a denylist denies only what *is* named, so any secret nobody thought to enumerate is readable. It is the best available answer on this platform, not an equivalent of R6.1.6.
   - Denying key *files* while keeping `SSH_AUTH_SOCK` in the child environment is deliberate, not an oversight — see R-HANDOFF.5.
@@ -505,32 +477,16 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 
 > **Security gate**: Windows GA release requires this section to reach `tests-pass` status.
 > Until it does, strict mode **must** fail closed (`SandboxError::PrerequisiteFailed`) so the
-> server never runs unsandboxed without explicit `--disable-sandbox` opt-out.
+> server never runs unsandboxed without the explicit `--no-sandbox` opt-out.
 >
-> **Current status**: Job Object enforcement is implemented in `sandbox/windows.rs`.
-> Per-command **AppContainer spawn isolation and scoped DACL grants are written**
-> (per-session container SID, scope grants, `STARTUPINFOEX` +
-> `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` spawn via the `ahma.exe` launcher
-> re-entry), and a `windows-latest` CI run has now executed them — and **found the
-> grant DACL does not take effect**: `writes_outside_the_scope_are_blocked_and_
-> inside_still_work` and `cleanup_revokes_and_a_fresh_session_regrants` both fail on
-> the in-scope half (`Access to the path '...' is denied` for a write inside the
-> locked scope). The out-of-scope half incidentally "passes" only because the
-> container denies everything — exactly the "blocks everything, proves nothing"
-> failure mode the gate test's own docstring warns against. Consequently
-> `create_platform_sandboxed_command` does **not** route Windows spawns through
-> `plan_windows_sandboxed_spawn`; it falls back to the plain (Job-Object-contained)
-> `base_command`, matching the platform's pre-R6.3.3 behavior. With AppContainer
-> disabled, `reads_outside_the_scope_are_blocked` now fails honestly too (it used
-> to pass only because the broken grant denied in-scope reads as well) — all three
-> `windows_sandbox_integration_test::appcontainer` behavioral tests are
-> `#[ignore]`d, citing the CI failure that earned each one. "Written" is not
-> "works": until a `windows-latest` CI run demonstrates the in-scope write and
-> read succeeding *and* the out-of-scope write and read blocked, R6.3.3 stays
-> open, R6.3.9's disclosure stays as written, and
-> `red_team_command_write_escape_blocked` stays `#[cfg_attr(windows, ignore)]`.
-> Claiming the boundary before the platform proves it is precisely the failure
-> R6.2.2 and R7.5 exist to prevent.
+> **Current status**: Job Object containment is implemented (`sandbox/windows.rs`).
+> AppContainer spawn isolation with scoped DACL grants is written, but a `windows-latest`
+> CI run showed the grant does not take effect — writes *inside* the locked scope are denied
+> along with those outside. It is therefore switched off
+> (`sandbox::windows::appcontainer_spawn_enabled()` is the single place that verdict lives),
+> Windows has no OS filesystem boundary in either direction, and the three AppContainer
+> behavioural tests stay `#[ignore]`d. R6.3.3 closes only when a `windows-latest` run shows
+> in-scope writes and reads succeeding **and** out-of-scope ones blocked.
 
 ##### Architecture decision
 
@@ -571,20 +527,11 @@ The planned implementation uses two mechanisms in order of preference:
     produce an unmistakable startup error naming both remedies, and egress restriction
     **must not** take effect that session — the one thing ahma may not do is let the
     operator believe egress is gated when it is not (R7).
-    - **The exclusion is conditional on the container, not on the platform, and both
-      sites read one predicate.** "Windows" and "AppContainer is in the spawn
-      path" were the same condition when this clause was written and stopped being the
-      same condition when R6.3.3's spawn path was disabled. For that whole interval a
-      Windows operator asking for `--restrict-network` was refused, and told the reason
-      was a container that was no longer being created — leaving them with neither a
-      filesystem boundary nor an egress one, which is the exact state R7 forbids. The
-      refusal **must** therefore be gated on
-      `sandbox::windows::appcontainer_spawn_enabled()`, which the spawn path
-      (`sandbox/command.rs`) and the proxy (`shell/modes/server.rs`) both read, so the
-      two can never again disagree about whether a container exists. While it is off,
-      `--restrict-network` **must** work on Windows exactly as it does elsewhere. A
-      requirement written as a platform name rather than as the condition it means is a
-      requirement that goes stale silently.
+    - **The exclusion is conditional on the container, not on the platform.** Both the
+      spawn path (`sandbox/command.rs`) and the proxy (`shell/modes/server.rs`) read
+      `sandbox::windows::appcontainer_spawn_enabled()`, so they cannot disagree about
+      whether a container exists. While it is off, `--restrict-network` **must** work on
+      Windows exactly as it does elsewhere.
 
     **(b)** The user's `%TEMP%` lies outside every
     scope, so `TEMP`/`TMP` are redirected to the per-container folder
@@ -606,7 +553,7 @@ The planned implementation uses two mechanisms in order of preference:
 ##### Windows path model
 
 - Sandbox scope paths use native Windows absolute paths (e.g., `C:\Users\name\project`).
-- File URIs from MCP clients are parsed by `SessionManager::parse_file_uri_to_path` which
+- File URIs from MCP clients are parsed by `ahma_common::file_uri`, which
   handles `file:///C:/...` (drive letter) and `file://server/share/path` (UNC) forms.
 - `normalize_path_lexically` never pops a `Prefix` or `RootDir` component (enforced by
   `scopes.rs`).
@@ -779,20 +726,20 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
 
 ## 4.5 File System Contracts and Features
 
-### R8: Project Logging (`.ahma/logs` directory)
+### R-LOG: Project Logging (`.ahma/logs` directory)
 
-- **R8.1**: All ahma and execution logs **must** be placed in the `.ahma/logs/` directory at the root of the (primary) configured sandbox scope, rather than global user cache directories (`~/.cache`). Nesting under `.ahma/` — ahma's own per-project directory — rather than directly at the scope root means the ignore rule that keeps plaintext logs out of git (R8.3) lives in `.ahma/.gitignore`, never the project's own top-level `.gitignore`.
-- **R8.1.1**: **One project resolves to one log directory, on every execution path.** Where no scope has been locked yet, the log directory is anchored on the enclosing **repository root**, never on the process's current working directory. This binds the paths that have no `roots/list` of their own — above all the terminal-hook path (R5.5), where each hooked command runs as its own short-lived process whose cwd is the *command's* own directory. Anchoring those on cwd scatters a `.ahma/logs/` into every subdirectory an agent happens to run a command in, which is both litter and a disclosure hazard: build tooling that scans a tree by convention (an Android `res/`, an asset pipeline) will pick up plaintext logs regardless of `.gitignore`.
-- **R8.1.2**: The resolution order is: `--log-dir` flag → `[logging] dir` in `settings.toml` → primary sandbox scope → repository root (R8.1.1) → a per-project namespaced directory under `~/.ahma/logs`. A directory the user *wrote down* (flag or setting) outranks one ahma *discovered*. The active directory is disclosed at startup (R8.3). A directory written down by flag or setting is not required to live under `.ahma/`; the automatic gitignore-management of R8.3 applies only to the default `.ahma/logs` location.
-- **R8.2**: When the project is built or the server initialized, the `.ahma/logs/` directory is created if it does not exist, and old `.log` files are deleted to wipe previous logs.
-- **R8.3**: ahma **must** disclose the active log directory once at startup. For the default `.ahma/logs` location, ahma **must** silently ensure `.ahma/.gitignore` covers it — no user action required. For a custom log directory outside `.ahma/` (e.g. a bespoke `--log-dir` inside the tree), ahma **must** instead warn when it writes plaintext operational logs — which include full tool-call transcripts — into a git working tree not already covered by an ignore rule, naming the remedy (`ahma logs gitignore`, or `--log-dir` / `[logging] dir` to move them out of the tree entirely).
+- **R-LOG.1**: All ahma and execution logs **must** be placed in the `.ahma/logs/` directory at the root of the (primary) configured sandbox scope, rather than global user cache directories (`~/.cache`). Nesting under `.ahma/` — ahma's own per-project directory — rather than directly at the scope root means the ignore rule that keeps plaintext logs out of git (R-LOG.3) lives in `.ahma/.gitignore`, never the project's own top-level `.gitignore`.
+- **R-LOG.1.1**: **One project resolves to one log directory, on every execution path.** Where no scope has been locked yet, the log directory is anchored on the enclosing **repository root**, never on the process's current working directory. This binds the paths that have no `roots/list` of their own — above all the terminal-hook path (R5.5), where each hooked command runs as its own short-lived process whose cwd is the *command's* own directory. Anchoring those on cwd scatters a `.ahma/logs/` into every subdirectory an agent happens to run a command in, which is both litter and a disclosure hazard: build tooling that scans a tree by convention (an Android `res/`, an asset pipeline) will pick up plaintext logs regardless of `.gitignore`.
+- **R-LOG.1.2**: The resolution order is: `--log-dir` flag → `[logging] dir` in `settings.toml` → primary sandbox scope → repository root (R-LOG.1.1) → a per-project namespaced directory under `~/.ahma/logs`. A directory the user *wrote down* (flag or setting) outranks one ahma *discovered*. The active directory is disclosed at startup (R-LOG.3). A directory written down by flag or setting is not required to live under `.ahma/`; the automatic gitignore-management of R-LOG.3 applies only to the default `.ahma/logs` location.
+- **R-LOG.2**: When the project is built or the server initialized, the `.ahma/logs/` directory is created if it does not exist, and old `.log` files are deleted to wipe previous logs.
+- **R-LOG.3**: ahma **must** disclose the active log directory once at startup. For the default `.ahma/logs` location, ahma **must** silently ensure `.ahma/.gitignore` covers it — no user action required. For a custom log directory outside `.ahma/` (e.g. a bespoke `--log-dir` inside the tree), ahma **must** instead warn when it writes plaintext operational logs — which include full tool-call transcripts — into a git working tree not already covered by an ignore rule, naming the remedy (`ahma logs gitignore`, or `--log-dir` / `[logging] dir` to move them out of the tree entirely).
 
-### R9: Safe Live Log Monitoring (`--livelog`)
+### R9: Safe Live Log Monitoring (`--log-monitor`)
 
-- **R9.1**: The `--livelog` feature flag enables safe read-only access to specific log files located outside the sandbox scope without compromising the sandbox contract.
+- **R9.1**: With `--log-monitor` (or `[logging] log_monitor = true`), ahma enables safe read-only access to specific log files located outside the sandbox scope without compromising the sandbox contract.
 - **R9.2**: **Mechanisms**: During initialization (and ONLY at initialization), the system scans the `.ahma/logs/` directories of all configured sandbox roots for symbolic links. The targets of these symlinks are evaluated.
 - **R9.3**: **Enforcement**: The resolved physical paths of those symlinks are dynamically added to the sandbox profile (across Linux, macOS, and Windows) as **read-only scopes**.
-- **R9.4**: **Abuse Prevention**: Since symlinks are only resolved and granted access at startup, hostile entities or rogue AI cannot abuse this later by creating new symlinks to sensitive files (e.g. `/etc/passwd`). Existing files placed in read-only scopes are tightly controlled by the system operator running `ahma --livelog`.
+- **R9.4**: **Abuse Prevention**: Since symlinks are only resolved and granted access at startup, hostile entities or rogue AI cannot abuse this later by creating new symlinks to sensitive files (e.g. `/etc/passwd`). Existing files placed in read-only scopes are tightly controlled by the system operator running `ahma --log-monitor`.
 - **R9.5**: **LLM-Based Detection** (`tool_type: livelog`): Tools with `tool_type: livelog` spawn their `source_command` inside the kernel-enforced sandbox scope. The LLM endpoint is an outbound connection from the ahma process and is not subject to the inbound sandbox policy. See Section 5.5 for the full pipeline specification.
 
 ---
@@ -819,16 +766,6 @@ This matters for design:
 2. The "deny is safe" invariant is even more important for web than filesystem: a denied web request leaks nothing; a denied file read blocks the agent, but data stays local.
 3. Domain-level approval is necessarily coarse. Approving `github.com` approves every GitHub API endpoint — the repos API, the Gist upload API, the OAuth token exchange endpoint. There is no path-level approval; see R-WEB.13.
 
-**Established patterns this design draws from:**
-
-| System | Pattern used | What ahma adapts |
-|--------|-------------|-----------------|
-| Browser Content Security Policy | `api.example.com`, `*.example.com` (single-level) | Pattern syntax |
-| macOS AppSandbox entitlements | `com.apple.security.network.client` enable/disable | Process-level `default_policy` |
-| Little Snitch / LuLu | Per-connection prompts; once / always; domain patterns | Three-tier approval + TUI modal |
-| Burp Suite intercept | Every request, show full URL, user decides | "Allow once" option |
-| DNS-based blocklists (Pi-hole) | Domain block/allow with wildcard | Pattern matching rules |
-
 **What this design explicitly does NOT do, and why:**
 
 - **No path-based approval** (`github.com/api/*` vs `github.com/login/*`): URL paths and query strings are not meaningful security boundaries — the same data can be sent via POST body to any path, and redirects can change the path after approval. Path patterns create false confidence. See R-WEB.13.
@@ -840,7 +777,7 @@ This matters for design:
 
 ### R-WEB.1: Scope
 
-This section governs **tool-level outbound HTTP requests made by the ahma process itself** — currently `fetch_webpage`, and any future tool that uses `EgressClient` (R-WEB.14). It does **not** govern:
+This section governs **tool-level outbound HTTP requests made by the ahma process itself** — currently `fetch_webpage`, and any future tool that fetches through the same guarded path (R-WEB.14). It does **not** govern:
 - Subprocess HTTP traffic (the `--restrict-network` proxy, R-WEB.16; user guide `docs/network-egress.md`).
 - The ahma process's own MCP client connections (LLM provider `base_url`) — those are operator-configured endpoints, not agent-driven requests.
 - Inbound connections to the ahma MCP server.
@@ -875,8 +812,8 @@ This section governs **tool-level outbound HTTP requests made by the ahma proces
   | Symbolic names: `localhost` | Resolved before check |
 
 - **R-WEB.3.2**: The private-range check **must** run at **DNS resolution time** — on the resolved IP address(es), not on the domain name string. A domain pattern entry resolving to a private IP is blocked at connection time, catching DNS rebinding attacks where a whitelisted domain's IP changes after approval. A pattern entry whose literal text is a private IP address **must** be rejected at parse time.
-- **R-WEB.3.3**: `block_private_ranges = false` (in `[web]`) disables the private-range check. This opt-out is permitted for development environments where the agent legitimately needs to reach a local dev server. Setting it to `false` **must** produce a loud startup warning and a persistent TUI banner, identical in prominence to the `--disable-sandbox` unsandboxed-mode banner.
-- **R-WEB.3.4**: The resolved-IP check is the responsibility of a custom `reqwest` connector configured in `EgressClient` (R-WEB.14). Raw `reqwest::Client::new()` callers bypass this check — this is why all tools are required to use `EgressClient`.
+- **R-WEB.3.3**: `block_private_ranges = false` (in `[web]`) disables the private-range check. This opt-out is permitted for development environments where the agent legitimately needs to reach a local dev server. Setting it to `false` **must** produce a loud startup warning and a persistent TUI banner, identical in prominence to the `--no-sandbox` unsandboxed-mode banner.
+- **R-WEB.3.4**: The resolved-IP check is the responsibility of a custom `reqwest` connector configured by `ahma_harness_tools::egress_guard` (R-WEB.14). Raw `reqwest::Client::new()` callers bypass this check — this is why all tools are required to use `EgressClient`.
 
 ---
 
@@ -1002,7 +939,7 @@ Parallel to `ahma sandbox grant|list|revoke`:
 
 - **R-WEB.10.1**: `ahma web allow` and `ahma web deny` **must** reject invalid patterns (bare `*`, TLD-level wildcards, private IP addresses) and warn on `http://`-scheme patterns.
 - **R-WEB.10.2**: Every mutation command **must** print the settings file path and the exact line changed or added.
-- **R-WEB.10.3**: `ahma web list` includes a `last_used` timestamp column (tracked in-session, cleared on restart) to encourage pruning stale entries.
+- **R-WEB.10.3**: `ahma web list` **should** show a `last_used` timestamp per entry to encourage pruning. _Not implemented._
 
 ---
 
@@ -1037,7 +974,7 @@ never_allow = []
 ```
 
 - **R-WEB.11.1**: The `[web]` section uses `#[serde(deny_unknown_fields)]` so a typo is a hard error rather than a silent no-op.
-- **R-WEB.11.2**: `ahma config validate` **must** parse and validate every pattern in `always_allow` and `never_allow`, rejecting the config with a clear error if any pattern is invalid.
+- **R-WEB.11.2**: `ahma settings show` **must** parse and validate every pattern in `always_allow` and `never_allow`, rejecting the config with a clear error if any pattern is invalid.
 - **R-WEB.11.3**: The settings file lives in `~/.ahma/settings.toml` — outside every workspace scope — so no sandboxed tool can read or modify it (same guarantee as `persistent_scopes`, R5.4.5).
 
 ---
@@ -1072,16 +1009,12 @@ Users who need path-level or header-level egress control should route traffic th
 
 ---
 
-### R-WEB.14: Internal implementation architecture
+### R-WEB.14: Implementation map
 
-- **`WebPolicy`** (`ahma_common::config`): the `[web]` config struct. `#[serde(deny_unknown_fields, default)]`. Parsed at startup, stored in `AhmaSettings`.
-- **`WebDomainPattern`** (`ahma_common::web_egress`): validated parsed pattern. `parse(s) -> Result<Self, PatternError>`. `matches(url: &Url) -> bool` (case-insensitive hostname, optional scheme/port filter).
-- **`WebApprovalRequest`** (`ahma_common::web_egress`): `{ request_id: Uuid, url: Url, domain: String, method: HttpMethod, tool: String }`.
-- **`WebDecision`** enum: `Deny | AllowOnce | AllowSession(WebDomainPattern) | AllowPersist(WebDomainPattern)`.
-- **`WebApprovalCoordinator`** (`ahma_common::web_egress`): holds a `Mutex<HashMap<String, PendingSlot>>` keyed by domain (R-WEB.7), a `HashSet<WebDomainPattern>` for session grants, a `HashSet<String>` for the session deny-list.
-- **`EgressClient`** (`ahma_common::web_egress`): wraps `reqwest::Client`. Pre-request async check sequence: (1) `never_allow` → immediate error; (2) private-range block on URL host → immediate error; (3) `always_allow` → pass; (4) session grant set → pass; (5) `default_policy = "allow"` and no match → pass; (6) otherwise → call `WebApprovalCoordinator::request_decision()` and await. On redirect, re-run the full sequence for the new URL (R-WEB.8). On connect, re-check resolved IP (R-WEB.3.4).
-- **All tools making outbound HTTP calls must use `EgressClient`**, not `reqwest::Client::new()`. A Clippy deny lint **should** be added to prevent bare `Client::new()` in tool-handler code.
-- The TUI `draw_web_approval_modal` function follows the same pattern as `draw_scope_grant_modal`: drawn last, `[n]` highlighted as default, Enter/Esc deny.
+- **`WebPolicy`**, **`WebPattern`**, **`WebDecision`** (`ahma_common::web_policy`): the `[web]` settings, the validated domain pattern (R-WEB.4), and the policy's verdict for a URL.
+- **`WebApprovalCoordinator`**, **`WebApprovalRequest`**, **`WebApprovalDecision`** (`ahma_common::web_approval`): the per-domain dedup of pending prompts (R-WEB.7), session grants and session denies; `persist_web_allow` writes an "always" answer.
+- **Fetching**: `fetch_webpage` goes through `ahma_harness_tools::fetch_webpage_with_redirect_guard`, whose resolver blocks private addresses at connect time on every hop (R-WEB.3) and whose redirect policy re-checks each new host against the live policy (R-WEB.8). Every ahma-originated outbound HTTP request made on an agent's behalf **must** use this path, never a bare `reqwest::Client`.
+- The TUI's `draw_web_approval_modal` follows `draw_scope_grant_modal`: drawn last, `[n]` the default, Enter/Esc deny.
 
 ---
 
@@ -1125,7 +1058,7 @@ The subprocess egress sandbox covers HTTP traffic from **sandboxed subprocesses*
 | Session grants are never serialized to disk | R-WEB.5.1 |
 | Redirect targets are independently checked (no inherited approval) | R-WEB.8.1 |
 | No path-based filtering (explicitly excluded to avoid false safety) | R-WEB.13 |
-| All outbound HTTP tools must use `EgressClient`, not bare `reqwest` | R-WEB.14 |
+| All agent-driven outbound HTTP uses the guarded fetch path, not a bare `reqwest` client | R-WEB.14 |
 | Every request is audit-logged regardless of policy | R-WEB.9.1 |
 | `never_allow` cannot be overridden by session grants or `always_allow` | R-WEB.2.3 |
 | `block_private_ranges` cannot be overridden by any domain pattern | R-WEB.3.1 |
@@ -1167,7 +1100,7 @@ The subprocess egress sandbox covers HTTP traffic from **sandboxed subprocesses*
 |-------|-------------|
 | `command` | Base executable (e.g., `git`, `cargo`) |
 | `subcommand` | Array of subcommands; final tool name is `{command}_{name}` |
-| `synchronous` | `true` for blocking, `false`/omit for async (default) |
+| `synchronous` | Deprecated (R2.3); omit it — `tools.execution_mode` decides |
 | `options` | Command-line flags (e.g., `--release`) |
 | `positional_args` | Positional arguments |
 | `format: "path"` | **CRITICAL**: Any path argument **must** include this for security validation |
@@ -1240,7 +1173,7 @@ Set `"tool_type": "livelog"` to turn any long-running log-streaming command into
 3. Lines from stdout and stderr are accumulated into a chunk.
 4. When the chunk reaches `chunk_max_lines` lines **or** `chunk_max_seconds` seconds elapse, the chunk is sent to the LLM with the `detection_prompt`.
 5. The LLM responds with `"CLEAN"` (case-insensitive) if no issue is found, or a brief human-readable summary if an issue is detected.
-6. On an issue: a `ProgressUpdate::LogAlert` notification is pushed to the MCP client **if** the cooldown window has elapsed since the last alert.
+6. On an issue: a an `Alert` event on the operation (pushed as `notifications/progress`) notification is pushed to the MCP client **if** the cooldown window has elapsed since the last alert.
 7. The pipeline continues until the source process exits or the client calls `cancel <operation_id>`.
 
 #### Example (Android logcat via Ollama)
@@ -1275,37 +1208,17 @@ The `source_command` executes inside the same sandbox scope as all other tools (
 
 ---
 
-### 5.6 Removed tool types (`decompose`, `worker`)
+### 5.6 Extension tool types
 
-The `decompose` and `worker` MTDF tool types were removed. Their
-implementing crates (`ahma_decompose`, `ahma_worker`) were deleted because
-nothing in the shipped product dispatched them — no handler was registered and
-no example config shipped. The generic `Extension` tool-type mechanism (a
-runtime-registered handler resolved from a tool's `tool_type` string; see
-`register_extension_handler` / `get_extension_key`) remains available for
-out-of-tree handlers. Recover the removed crates from git history if these
-roadmap features are revived.
-
----
+Beyond the built-in `tool_type`s, a runtime-registered handler can serve a tool whose
+`tool_type` names it (`register_extension_handler` / `get_extension_key`). No handler ships
+in the product.
 
 ### 5.8 Task Vault
 
-Each `ahma vault create <slug>` call produces a directory tree at
-`~/.ahma/tasks/<utc-date>-<slug>-<hex>/`:
-
-```
-inputs/       — copies of user-provided files (read intent)
-workdir/      — kernel sandbox scope root
-outputs/      — tool artifacts (HTML reports, CSV exports)
-trash/        — staged deletions (two-phase delete)
-audit.jsonl   — append-only event log
-egress.allowlist — per-task outbound domain allowlist
-```
-
-Use `--task-vault <path>` on `ahma serve http` or `ahma serve stdio` to set
-the sandbox scope to `<vault>/workdir/` and wire the audit log and trash.
-
-See [docs/security-sandbox.md](docs/security-sandbox.md) for full documentation.
+`--task-vault <dir>` makes the vault's `workdir/` the whole sandbox scope and stages `rm`
+targets into its `trash/`. Requirements: [ahma_vault/SPEC.md](ahma_vault/SPEC.md); user guide:
+[docs/task-vault.md](docs/task-vault.md).
 
 ---
 
@@ -1321,10 +1234,10 @@ ahma serve stdio
 
 Alternatively, standard tool configurations are bundled directly inside the binary. Enable them using the `--tools` flag to activate built-in fallback definitions:
 ```bash
-ahma serve stdio --tools python,git,github,fileutils,simplify,kotlin
+ahma serve stdio --tools python,git,github,fileutils,simplify
 ```
 
-Note: Core tools (`run_terminal_command`, `await`, `status`, `cancel`) are always available without any flags.
+Built-in tools (`BuiltinTool::ALL`) are always available without any flags.
 
 **Tool loading priority**: When an `.ahma/` directory exists (auto-detected or via explicit `--tools-dir`), **all** tool definitions in it are always loaded regardless of bundle flags. Bundle flags (`--tools python`, `--tools simplify`, etc.) additionally activate built-in tool definitions compiled into the binary, serving as **fallbacks** for tools not defined locally. Local `.ahma/` definitions override bundled defaults with the same name. If *no* `.ahma/` directory exists and no `--tools-dir` is given, only bundle-flag tools plus core built-ins are available.
 
@@ -1358,14 +1271,15 @@ ahma serve http --port 8080
 Execute a single tool command:
 
 ```bash
-ahma --tool_name cargo --tool_args '{"subcommand": "build"}'
+ahma tool run cargo_build -- --release
 ```
 
 ### 6.4 List Tools Mode
 
 ```bash
-ahma --list-tools -- /path/to/ahma --tools-dir ./tools
-ahma --list-tools --http http://localhost:3000
+ahma tool list -- /path/to/ahma serve stdio --tools-dir ./tools
+ahma tool list --http http://localhost:3000
+ahma tool validate .ahma/
 ```
 
 ---
@@ -1392,21 +1306,9 @@ ahma --list-tools --http http://localhost:3000
 
 ### R-LIFECYCLE: Auto-Spawned Bridge Self-Termination
 
-> **Superseded for auto-spawned bridges by [R-DAEMON.3](#r-daemon-the-single-per-user-daemon).**
-> Nothing is auto-spawned per client any more: `ahma serve stdio` and `ahma tui`
-> rendezvous on the one per-user daemon, whose lifetime is R-DAEMON.3 (idle
-> across *both* halves, one exit path). What remains true below is the frontend
-> orphan prevention in R-LIFECYCLE.2, and that explicitly started servers have
-> no idle timeout.
-
-Bridges **auto-spawned** by `ahma serve stdio` (proxy mode) or `ahma tui` automatically self-terminate once no MCP client remains connected:
-
-1. Each auto-spawned bridge is started with `--idle-timeout <N>` (default: `AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS = 10`).
-2. The idle-timeout checker polls `active_sessions` every second; when the counter is zero for `N` seconds, the bridge calls `terminate_all` and `process::exit(0)`.
-3. The bridge also installs a SIGINT/SIGTERM handler that runs `terminate_all`, removes the Unix socket, and exits cleanly.
-4. The TUI sends `DELETE /mcp` for its session on quit; the Unix stdio proxy calls `transport.close()` on EOF — both signal the bridge promptly rather than waiting for SSE-drop detection.
-
-**Explicitly-started bridges** (`ahma serve http`, `ahma serve unix`) have no idle timeout by default and remain running until stopped by the user.
+> Auto-spawned bridges are gone: `ahma serve stdio` and `ahma tui` rendezvous on the
+> per-user daemon, whose lifetime is R-DAEMON.3. Explicitly started `ahma serve http|unix`
+> servers have no idle exit unless given `--idle-timeout`.
 
 #### R-LIFECYCLE.2: Frontend (proxy) Orphan Prevention
 
@@ -1414,19 +1316,15 @@ The IDE-facing `ahma serve stdio` **frontend** process (which proxies stdin/stdo
 
 1. **Stdin EOF** (existing): when the client closes the pipe, the proxy loop exits.
 2. **Parent-death watchdog**: the frontend polls `getppid()`; when it is reparented (parent IDE died) it `process::exit(0)`s within a few seconds. This covers the case where the client is hard-killed without closing stdin. (Unix; the detached bridge/daemon are deliberately **not** watched, since they outlive their spawner by design.)
-3. **Handshake deadline**: if the client never sends its first message (the `initialize` handshake) within `FRONTEND_HANDSHAKE_DEADLINE_SECS` (default `30`; overridable for tests via `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS`), the connection was spawned-and-abandoned and the frontend `process::exit(0)`s. The deadline is disarmed once the first message is forwarded, so a live but idle session is never killed.
+3. **Handshake deadline**: if the client never sends its first message (the `initialize` handshake) within `FRONTEND_HANDSHAKE_DEADLINE_SECS` (default `30`; debug builds let tests override it with `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS`), the connection was spawned-and-abandoned and the frontend `process::exit(0)`s. The deadline is disarmed once the first message is forwarded, so a live but idle session is never killed.
 
 These three mechanisms together bound how long any abandoned `ahma serve stdio` can live; none of them affect a healthy, actively-used session.
 
 ### R-DAEMON: The Single Per-User Daemon
 
-> **Why.** ahma's background presence used to be two independent singletons: an
-> MCP bridge on the machine-global `/tmp/ahma.sock`, and an observability hub on
-> a per-user socket. Two rendezvous points, two lifetimes, no shared identity —
-> so `ahma tui` could end up *being* the hub while a detached bridge served MCP,
-> and quitting that terminal window took the event stream away from three
-> editors that knew nothing about it. Hooked commands reported to neither and
-> were invisible everywhere.
+> **Why one daemon.** With a separate bridge and hub, each with its own rendezvous and
+> lifetime, quitting one terminal could take the event stream away from every editor, and
+> hooked commands reported to neither. One daemon gives every surface one place to meet.
 
 - **R-DAEMON.1 — One daemon per user.** Exactly one ahma daemon per user hosts
   **both** the MCP endpoint and the observability hub. Every entry point that
@@ -1628,20 +1526,13 @@ Chat-agent MCP routing (R10.7, R10.8) is in [ahma_core/SPEC.md](ahma_core/SPEC.m
 
 ### 8.1 Meta-Parameters
 
-These control execution environment but **must not** be passed as CLI arguments:
+These are per-call arguments of the MCP request, never forwarded to the command itself:
 
 - `working_directory`: Where command executes
 - `execution_mode`: Sync vs async
 - `timeout_seconds`: Operation timeout
 
 ### 8.2 Process Lifetime Hygiene
-
-> **Note on numbering**: R-PROC was previously `R10.1`–`R10.3`, which collided with the
-> unrelated `R10` "Session Isolation" family in §7 (`R10.1`–`R10.8`). One id could not name
-> two requirements, so it was renamed to the self-describing `R-PROC` namespace. Nothing
-> outside this section referenced the old id. (The async-I/O-in-async-fn coding convention
-> that used to sit alongside it here has no code citations and lives solely in
-> [AGENTS.md](AGENTS.md) §4 now, to avoid saying it twice.)
 
 #### R-PROC: Child Process Lifetime
 
@@ -1709,13 +1600,6 @@ started_rx.await.ok();  // Don't return until spawn is live
   - Watch channels (`tokio::sync::watch`)
   - Event listeners with guaranteed delivery
   - NOT: multiple copies of state with synchronization attempts
-
-> Environment-variable security (production must not be controllable via
-> attacker-settable env vars, test-only behavior must be gated behind
-> `#[cfg(test)]`/CLI params/constructor injection) is specified once, in
-> §3.5's R-CFG9 "Test-Only Configuration" — this section previously
-> restated it as R21 with an overlapping numbering scheme; R-CFG9 is now
-> the sole authority.
 
 #### R22: Visual Minimalism
 
@@ -1814,69 +1698,29 @@ The file tools ahma serves itself (`read_file`, `write_file`, `replace_in_file`,
 
 ---
 
-## 9. Feature Requirements by Module
+## 9. Requirement index
 
-### 9.1 ahma
+Where each requirement family is defined. Ids never move between numbers; they move between
+files with the code that implements them.
 
-| Feature | Status | Description |
-|---------|--------|-------------|
-| Adapter execution | PASS | Sync/async CLI tool execution |
-| MCP ServerHandler | PASS | Complete MCP protocol implementation |
-| Shell sessions | PASS | Persistent PTY sessions (`session_id`); prewarmed pool removed as dead code |
-| Linux sandbox | PASS | Landlock enforcement |
-| macOS sandbox | PASS | Seatbelt/sandbox-exec enforcement |
-| Nested sandbox detection | PASS | Detect outer sandboxes |
-| Operation monitor | PASS | Track async operations |
-| Callback system | PASS | Push completion notifications |
-| Config loading | PASS | MTDF JSON parsing |
-| Schema validation | PASS | Validate at startup |
-| Sequence tools | PASS | Multi-command workflows |
-| Tool reload | in-progress | Explicit `restart` only; directory watcher withdrawn (R1.4) |
+| Ids | Topic | Defined in |
+|---|---|---|
+| R1–R4 | Tools, operations, execution mode, schema | this file §3 |
+| R-CFG | Configuration sources, tiers, retirement of `AHMA_*` | this file §3.5 |
+| R5–R7 | Sandbox scope, platform enforcement, nested sandboxes | this file §4 |
+| R-HANDOFF, R-PERM, R-DOCTOR | Trust handoff, permissions, doctor | this file §4 |
+| R-LOG, R9 | Project logging, safe live-log access | this file §4.5 |
+| R-WEB | Web and subprocess egress | this file §4.6 |
+| R-SETUP, R-UNINSTALL, R-LIFECYCLE, R-DAEMON, R-ISO, R-SIGN | Install, lifetime, daemon, test isolation, signing | this file §6.5 |
+| R-PROC, R18–R20, R22, R23, R26 | Process lifetime, concurrency, output, state machines, file tools | this file §8 |
+| R-SK | Agent skills | this file §10 |
+| R8, R10, RB | Streamable HTTP, session isolation, bridge invariants | [ahma_http_bridge/SPEC.md](ahma_http_bridge/SPEC.md) (R10.7–R10.8: [ahma_core/SPEC.md](ahma_core/SPEC.md)) |
+| R24, R25 | TUI work view and chat | [ahma_tui/SPEC.md](ahma_tui/SPEC.md) |
+| R13–R16, R-TIMEOUT, R-GUARD, R-DOC, R-HELPER, R-HARNESS, R-TEST-PATH | Testing and contribution rules | [AGENTS.md](AGENTS.md) |
 
-### 9.2 ahma-http-bridge
-
-| Feature | Status | Description |
-|---------|--------|-------------|
-| HTTP-to-stdio bridge | PASS | Proxy JSON-RPC to subprocess |
-| SSE streaming | PASS | Server-sent events for notifications |
-| Session isolation | PASS | Per-session sandbox scope |
-| Subprocess crash handling | PASS | No auto-restart by design — session fails loudly and the client re-initializes fresh (R8.4) |
-| Health endpoint | PASS | `/health` monitoring |
-| Session termination | PASS | DELETE with `Mcp-Session-Id` |
-
-### 9.3 ahma-http-mcp-client
-
-| Feature | Status | Description |
-|---------|--------|-------------|
-| HTTP transport | PASS | POST requests with Bearer auth |
-| SSE receiving | PASS | Background task for server messages |
-| OAuth 2.0 + PKCE | PASS | Browser-based auth flow |
-| Token storage | PASS | Persist to temp directory |
-| Token refresh | PLANNED | Auto-refresh expired tokens |
-
-### 9.4 ahma --validate
-
-| Feature | Status | Description |
-|---------|--------|-------------|
-| MTDF Validation | PASS | Validate tool configs against JSON schema via `ahma --validate` |
-| Error reporting | PASS | Concise, actionable error messages |
-
-### 9.5 ahma simplify
-
-| Feature | Status | Description |
-|---------|--------|-------------|
-| AST complexity scoring | PASS | Full AST metrics via `rust-code-analysis` for Rust, JavaScript, TypeScript, Java, Python and C/C++/Objective-C; composite score = 0.4 × MI + 0.3 × Cognitive Density + 0.2 × Peak Cognitive + 0.1 × Length. A Kotlin grammar is present but its metric traits are no-ops, so Kotlin is routed to the external registry instead |
-| External analyzer registry | PASS | Kotlin via Detekt CLI → Gradle Detekt → Lizard; Swift via SwiftLint → Lizard; Java/Go/C#/ObjC/JS/TS via Lizard; `--no-external` disables the registry |
-| Markdown report | PASS | `CODE_SIMPLICITY.md`, worst-to-best file ranking with per-file function hotspots; printed to stdout unless `--output-path`/`--html`/`--open` is set |
-| HTML report | PASS | `CODE_SIMPLICITY.html` generated alongside the Markdown report with `--html` or `--heml` |
-| AI fix prompt | PASS | `--ai-fix N` / MCP `ai_fix` appends a structured prompt naming the Nth-worst file's hotspot functions and instructing targeted-only changes |
-| `--verify` before/after comparison | PASS | Re-analyzes a file against the rust-code-analysis TOML baseline from the previous run and reports a verdict; not supported for Kotlin/Swift/ObjC (no persisted external baseline) |
-| MCP `simplify` tool | PASS | Exposes `directory`, `ai_fix`, `limit`, `verify`, `extensions`, `exclude`, `output_path`, `html`, `lens`, `diff` (requires `--tools simplify` at startup) |
-| `--lens` analysis selection | PASS | Comma-separated `complexity`/`reuse`/`dead-code`/`altitude`/`all` (default `all`; `dead-code` also accepts `dead_code`/`deadcode`, case-insensitive); unknown values are a hard error listing the valid options. Selecting only non-complexity lenses skips the rust-code-analysis parse entirely |
-| Reuse lens — duplicate code detection | PASS | Language-agnostic, text-based duplicate-block detector: strips comments per language, collapses whitespace, finds repeated blocks of 4+ lines. Deterministic output. Reports candidates for extraction, not defects. Known limitation: a comment delimiter inside a string literal is misread as a comment start. Adds a `## Duplicate Code (Reuse Lens)` report section capped by `--limit` |
-| Dead-code lens — unreferenced exports | PASS | AST-based reachability lens (Rust, TypeScript, JavaScript, Python, Java only — no grammar for other languages, and Kotlin's call-expression nodes lack field names so it is excluded even though complexity/reuse cover it) that flags exported functions/methods with exactly one identifier occurrence in the scanned corpus (their own definition). Reports candidates, not verdicts: cannot see a downstream crate's use of a public API, macro-generated call sites, trait-object dispatch, or reflection by string name. Skips private functions, `main`, `test_`-prefixed functions, `tests/`-directory and `*_test(s).rs` files, functions preceded by a suppression marker (`#[allow(dead_code)]`, `#[cfg(test)]`, `@SuppressWarnings`, `# noqa`, `eslint-disable`, `pub use`), and, for Rust, common trait-required names (`new`, `default`, `from`, `try_from`, `fmt`, `drop`, `clone`, `eq`, `hash`, `next`, `poll`). Deterministic output, sorted by file then line. Adds a `## Possibly Unreferenced Exports (Dead Code Lens)` report section capped by `--limit` |
-| Altitude lens — thin-wrapper delegation chains | PASS | AST-based lens (same five languages as dead-code: Rust, TypeScript, JavaScript, Python, Java) that flags a function as a thin wrapper when its body is exactly one statement making exactly one call, then walks forwarding chains and reports only those with 2+ hops (A→B→C); a single forwarding call is ordinary delegation and is not reported. Name resolution is conservative: the AST gives only a call's trailing identifier, so a callee name matching more than one definition in the corpus stops the walk there rather than guessing. Recursive/mutually-recursive wrappers terminate the walk instead of looping forever; only maximal chains are reported (the sub-chain of an already-reported chain is not listed separately). Reports candidates, not defects — a forwarding layer is frequently a deliberate facade, trait-impl delegation, or platform shim. Deterministic output. Adds a `## Delegation Chains (Altitude Lens)` report section listing each chain's hop count, description, and every caller→callee edge with file/line, capped by `--limit` |
-| `--diff` change-scoped analysis | PASS | Restricts analysis to files git reports as changed (staged, unstaged, untracked-but-not-ignored) instead of the whole tree; fails loudly if the directory isn't a git repository or git isn't installed |
+Each crate's `SPEC.md` states what that crate must guarantee; start with
+[ahma_mcp/SPEC.md](ahma_mcp/SPEC.md) (the engine) and
+[ahma_common/SPEC.md](ahma_common/SPEC.md) (the shared contracts).
 
 ---
 
@@ -1912,17 +1756,15 @@ snippets rather than prose paragraphs. Link to `docs/` for deep dives. Enforced 
 |---------|---------|
 | Quick Start | mcp.json setup for VS Code, Cursor, Claude Code |
 | Tool Bundles | Table of all bundles, how to activate, when to use |
-| Built-in Tools | `run_terminal_command`, `status`, `await`, `cancel` with examples |
-| Async Workflow | Operation ID pattern, status/await/cancel usage |
-| Sandbox | Scope rules, `--tmp`, env vars, nested sandbox note |
-| Key Env Vars | Quick-reference table with link to full reference |
+| Built-in Tools | The always-available tools, with examples |
+| Sync and Async Modes | What each mode returns; the operation-id pattern with `await`/`status`/`cancel` |
+| Sandbox | Scope rules, `--tmp`, nested sandbox note |
+| Key CLI Flags and Settings | Quick-reference table; the few live env vars; link to the full reference |
 | CLI Reference | `serve`/`tool` subcommand synopsis |
 | Troubleshooting | Common errors and fixes |
 
-> Keeping `skills/ahma/SKILL.md` current with the product surface it documents (currency
-> requirement, CI validation of the symlink, and its division of labor with `AGENTS.md`) is
-> a maintenance-process concern, not skill product behavior — that content now lives in
-> [AGENTS.md](AGENTS.md) §1 and §3 (formerly R-SK5/R-SK6/R-SK7 here).
+> Keeping the skill current, validating its symlink, and its division of labour with
+> `AGENTS.md` are contributor process: AGENTS.md §1 and §3 (R-SK6, R-SK7).
 
 ### R-SK8 — Running standard skills
 
@@ -1958,56 +1800,17 @@ Ahma does not only *ship* skills — it can *run* any skill that follows the
 
 ---
 
-## 11. Future Work
+## 11. Known gaps
 
-### v0.8 — Discovery, Observability, Economics
+Stated here so that no other document implies otherwise.
 
-| Area | Item | Notes |
-|------|------|-------|
-| UX | **`ratatui` TUI** — real-time task dashboard | ✓ Completed (full ratatui TUI implemented) |
-| Economics | **Cost metering** — track token counts + estimated cost per tool call | Aggregate by provider; expose via `ahma tool info --cost-summary` |
-| Security | **Signed bundle index** (`bundle-index.json` with HMAC-SHA256 over manifest) | Prevent silent tampering with downloaded bundles |
-| Security | **`--require-token` key rotation** — reload token from file on SIGHUP | Zero-downtime key rotation for long-running HTTP bridge instances |
-
-### v0.9 — Scheduling Refinement, Keyring
-
-| Area | Item | Notes |
-|------|------|-------|
-| Security | **OS keyring integration** (`keyring` crate) — store API keys in system credential store instead of env vars | macOS Keychain, GNOME Secrets, Windows Credential Manager |
-| Config | **Encrypted secrets at rest** in `~/.ahma/config.toml` (age encryption) | Fallback when OS keyring is unavailable |
-
----
-
-## 12. Removed Features & Deferred Decisions
-
-### 12.1 Removed: orphaned incubating crates (`ahma_decompose`, `ahma_worker`, `ahma_renewal`)
-
-These three AGPL-3.0 crates were removed from the workspace because nothing in the
-shipped product invoked them:
-
-- **`ahma_renewal`** — renewal contract for long-running tasks. Had zero dependents and no SPEC.
-- **`ahma_worker`** — ephemeral worker code synthesis. Had zero dependents.
-- **`ahma_decompose`** — local-LLM decompose orchestration. Had zero dependents; self-flagged for deprecation in its own `lib.rs`.
-
-The related `tool_type: decompose`/`worker` handler stubs inside `ahma_mcp` and the
-`.ahma/decompose.json` example are tracked separately. The sources remain in git history if
-these roadmap features are revived; recover them from the commit that deleted the crate
-directories.
-
-### 12.2 TODO: Python bindings (former `ahma_py` crate)
-
-The `ahma_py` crate has been removed from the workspace and the source files deleted. Before removal it served as the project's Python bindings (PyO3) to expose `ahma_core` to Python consumers and provided build notes for producing a wheel. Key points captured from the crate's source before deletion:
-
-- Purpose: Python bindings for `ahma_core` via PyO3; intended to publish an `ahma-py` wheel for Jupyter/FastAPI/Streamlit use-cases.
-- AGPL separation: planned separate `ahma_py_agpl` distribution for bindings that expose AGPL-licensed crates (e.g., `ahma_decompose`, `ahma_worker`).
-- Build hints (from removed crate): use `maturin` to build/develop the wheel; example commands were included in the crate docs.
-- Implementation notes: some APIs were stubs that returned errors when AGPL dependencies were not present (explicitly instructing the integrator to add the AGPL crate if they accept those terms).
-
-Deferred action items (documented TODO):
-
-1. Re-evaluate packaging and licensing approach for Python bindings (single wheel vs. split permissive/AGPL wheels).
-2. If re-introducing bindings: add `pyo3` and `maturin` build guidance to workspace docs, update `workspace.dependencies` or document build-time requirements, and gate AGPL features behind a separate crate/package.
-3. Preserve a record of the removed crate in the git history and reference the commit that deleted `ahma_py` for future restoration.
-
-The deleted crate files were under `ahma_py/` prior to removal. Check the git history if you need the original sources.
-
+- **Windows filesystem boundary** (R6.3.3): none until AppContainer grants are proven both ways in CI.
+- **Linux deny tier** (R6.1.7): application-layer only; a shell command can write the paths it protects.
+- **Windows daemon ports** (R-DAEMON.2): fixed loopback ports guarded by a bearer token, not ephemeral ports.
+- **Release signing** (R-SIGN.1, R-SIGN.3): no Developer-ID signing or notarization; no Windows verification.
+- **Configuration** (R-CFG5.2, R-CFG6.2, R-CFG6.3): per-setting startup log lines, unknown-key abort for security tables in the user file, and the permissions warning are pending.
+- **Bundle trust**: no signature and no load-time gate; the checksum detects corruption only.
+- **Server-side output minimization**: dormant (`ahma_output_optimizer/SPEC.md`).
+- **OAuth**: endpoints fixed to Atlassian; no token refresh.
+- **Multi-session scope decisions** (R5.3.3, R5.3.4, R5.3.6): specified but not wired; the building blocks are unit-tested only.
+- **Log-exception grants** (`logs_approve`): stored in `<platform config dir>/ahma/log_exceptions.json` (relocatable with `AHMA_CONFIG_DIR`), not in the unified ledger that R-PERM.1 requires.

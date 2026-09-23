@@ -48,7 +48,7 @@ product rules this crate implements; the list below is what this crate must guar
 - `OperationMonitor` is the single lifecycle emitter onto the one `OperationEvent` stream
   (`ahma_common::event_dispatcher`) and emits exactly one terminal event per operation.
   Subscribers — MCP progress push (`mcp_service::progress_push`), daemon hub, audit, TUI —
-  only consume it (§2.3.1).
+  only consume it (root SPEC §2.4).
 - The complete redacted output of every operation is written to
   `<project log dir>/operations/<id>.log` and advertised as `output_file`; the inline result
   window is bounded.

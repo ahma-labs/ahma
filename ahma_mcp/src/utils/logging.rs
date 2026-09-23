@@ -296,7 +296,7 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 /// setting, a locked sandbox scope) has named one: the enclosing repository
 /// root if `cwd` is inside one, otherwise `cwd` itself.
 ///
-/// Anchoring on the repo root rather than the raw cwd is what makes SPEC R8.1
+/// Anchoring on the repo root rather than the raw cwd is what makes SPEC R-LOG.1
 /// ("the `logs/` directory at the root of the primary sandbox scope") hold for
 /// every execution path, not just the MCP server. A hooked terminal command
 /// runs as its own short-lived `ahma hooks run-shell` process whose cwd is the
@@ -831,7 +831,7 @@ mod tests {
         let _ = std::env::set_current_dir(prev);
     }
 
-    /// The hooks regression (SPEC R8.1): each hooked terminal command runs as
+    /// The hooks regression (SPEC R-LOG.1): each hooked terminal command runs as
     /// its own process whose cwd is the *command's* directory, so anchoring on
     /// the raw cwd created a `logs/` in every subdirectory an agent ran a
     /// command in. One repository must resolve to one log directory.
@@ -1288,7 +1288,7 @@ mod tests {
 
     /// The default `.ahma/logs` location is ahma's own directory, so the
     /// ignore rule is self-managed silently — no warning, and the project's
-    /// own top-level `.gitignore` is left untouched (SPEC R8.1/R8.3).
+    /// own top-level `.gitignore` is left untouched (SPEC R-LOG.1/R-LOG.3).
     #[test]
     fn test_disclose_log_location_once_auto_gitignores_ahma_managed_dir() {
         let _g = ENV_MUTEX.lock();
