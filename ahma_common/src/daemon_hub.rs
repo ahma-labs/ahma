@@ -477,6 +477,17 @@ pub enum ClientMsg {
         model: Option<String>,
         target_instance_id: Option<String>,
     },
+    /// Stop the agent turn running on an instance (Esc / Ctrl-C in the TUI).
+    /// The instance answers with one `AgentError` naming the cancellation, so
+    /// every subscriber ends the turn the same way it ends a failed one.
+    CancelPrompt { target_instance_id: Option<String> },
+    /// Cancel an operation on the instance that owns it. Operation ids are
+    /// unique only per instance, and a TUI's own MCP session cannot see
+    /// another client's operations, so the cancel must travel to the owner.
+    CancelOperation {
+        op_id: String,
+        target_instance_id: Option<String>,
+    },
     /// TUI client response containing user's approval decision.
     SubmitApproval {
         #[serde(default)]
@@ -547,6 +558,10 @@ pub enum DaemonMsg {
         provider: Option<String>,
         model: Option<String>,
     },
+    /// Forward a TUI's turn cancellation to the instance running the turn.
+    CancelPrompt,
+    /// Forward a TUI's operation cancel to the instance that owns it.
+    CancelOperation { op_id: String },
     /// Forward user approval to registered instance.
     SubmitApproval {
         #[serde(default)]
@@ -1987,6 +2002,22 @@ where
             .await
         }
 
+        ClientMsg::CancelPrompt { target_instance_id } => {
+            route_to_instance(&hub, target_instance_id, DaemonMsg::CancelPrompt).await
+        }
+
+        ClientMsg::CancelOperation {
+            op_id,
+            target_instance_id,
+        } => {
+            route_to_instance(
+                &hub,
+                target_instance_id,
+                DaemonMsg::CancelOperation { op_id },
+            )
+            .await
+        }
+
         ClientMsg::SubmitApproval {
             id,
             approved,
@@ -2340,7 +2371,9 @@ async fn serve_instance<R, W>(
                         | ClientMsg::Subscribe
                         | ClientMsg::ListInstances
                         | ClientMsg::Shutdown
-                        | ClientMsg::SubmitPrompt { .. }) => {
+                        | ClientMsg::SubmitPrompt { .. }
+                        | ClientMsg::CancelPrompt { .. }
+                        | ClientMsg::CancelOperation { .. }) => {
                         debug!("daemon: ignoring subscriber-only message from instance id={id}");
                     }
                     // Decisions the hub routes *to* an instance. They arrive on
@@ -4966,6 +4999,37 @@ mod tests {
                 assert_eq!(model.as_deref(), Some("m"));
             }
             other => panic!("expected RunPrompt, got {other:?}"),
+        }
+
+        // CancelPrompt routed to the instance running the turn.
+        let mut tui_cancel = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        send_msg(
+            &mut tui_cancel,
+            &ClientMsg::CancelPrompt {
+                target_instance_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
+            DaemonMsg::CancelPrompt => {}
+            other => panic!("expected CancelPrompt, got {other:?}"),
+        }
+
+        // CancelOperation routed to the instance that owns the operation.
+        let mut tui_cancel_op = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        send_msg(
+            &mut tui_cancel_op,
+            &ClientMsg::CancelOperation {
+                op_id: "op-7".into(),
+                target_instance_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
+            DaemonMsg::CancelOperation { op_id } => assert_eq!(op_id, "op-7"),
+            other => panic!("expected CancelOperation, got {other:?}"),
         }
 
         // SubmitApproval routed.

@@ -309,6 +309,7 @@ mod tests {
     fn op_detail_modal() -> ModalState {
         ModalState::OperationDetail(crate::state::OperationDetailState {
             op_id: "op_1".into(),
+            instance_id: None,
             scroll: 0,
         })
     }

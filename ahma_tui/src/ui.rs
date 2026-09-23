@@ -428,7 +428,10 @@ fn draw_operation_detail(
 
     frame.render_widget(Clear, area);
 
-    let op = state.operations.iter().find(|o| o.id == detail.op_id);
+    let op = state.find_op(&crate::state::OpKey {
+        id: detail.op_id.clone(),
+        instance_id: detail.instance_id.clone(),
+    });
     let title = match op {
         Some(op) => format!(" Operation — {} ", truncate(&op.display_name(), 60)),
         None => " Operation (no longer tracked) ".to_string(),
@@ -515,12 +518,16 @@ fn draw_operation_detail(
     let spans = vec![
         register(
             cancel_btn,
-            (!cancel_btn.is_empty()).then(|| ClickTarget::CancelOperation(op.id.clone())),
+            (!cancel_btn.is_empty())
+                .then(|| ClickTarget::CancelOperation(crate::state::OpKey::of(op))),
         ),
-        register(pin_btn, Some(ClickTarget::PinOperation(op.id.clone()))),
+        register(
+            pin_btn,
+            Some(ClickTarget::PinOperation(crate::state::OpKey::of(op))),
+        ),
         register(
             analyze_btn,
-            Some(ClickTarget::AnalyzeOperation(op.id.clone())),
+            Some(ClickTarget::AnalyzeOperation(crate::state::OpKey::of(op))),
         ),
         Span::styled(
             "  Esc close · j/k scroll · g/G top/bottom · c cancel",
@@ -1841,8 +1848,28 @@ fn input_text_paragraph(theme: &Theme, rendered_lines: &[String]) -> Paragraph<'
     Paragraph::new(Span::styled(text, style)).wrap(Wrap { trim: false })
 }
 
+/// How long a transient footer hint stays up.
+const FOOTER_HINT_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+
 fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let mode_label = "AHMA";
+
+    // A fresh hint is the one thing the user must read ("press again to
+    // quit"): it replaces the key list until it fades.
+    if let Some((hint, at)) = &state.footer_hint
+        && at.elapsed() < FOOTER_HINT_TTL
+    {
+        let spans = vec![
+            Span::styled(format!(" {mode_label} "), theme.footer_key()),
+            Span::styled(" │  ", theme.dim()),
+            Span::styled(hint.clone(), theme.pending()),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(theme.footer()),
+            area,
+        );
+        return;
+    }
 
     let keys: &[(&str, &str)] = match state.focus {
         Focus::Work => &[
@@ -1876,6 +1903,28 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         Span::styled(format!(" {mode_label} "), theme.footer_key()),
         Span::styled(" │", theme.dim()),
     ];
+    // A running turn leads with the key that stops it; the key works from
+    // any panel (Ctrl-C) and from the chat input (Esc).
+    if let Some(turn) = &state.turn {
+        let key = if state.focus == Focus::Chat {
+            "  Esc "
+        } else {
+            "  Ctrl-C "
+        };
+        spans.push(Span::styled(key, theme.footer_key()));
+        spans.push(Span::styled("cancel turn", theme.footer()));
+        if turn.is_stalled(std::time::Instant::now()) {
+            let warn = if state.unicode { "⚠" } else { "!" };
+            spans.push(Span::styled(
+                format!(
+                    "  {warn} no response for {}s",
+                    turn.last_event.elapsed().as_secs()
+                ),
+                theme.pending(),
+            ));
+        }
+        spans.push(Span::styled(" │", theme.dim()));
+    }
     for (key, desc) in keys {
         spans.push(Span::styled(format!("  {key} "), theme.footer_key()));
         spans.push(Span::styled(desc.to_string(), theme.footer()));
@@ -2713,20 +2762,20 @@ fn draw_op_tree_row(
         theme.dim()
     };
     frame.render_widget(Paragraph::new(Span::styled(" [P] ", pin_style)), pin_a);
-    state
-        .click_targets
-        .borrow_mut()
-        .push((ClickTarget::PinOperation(op.id.clone()), pin_a));
+    state.click_targets.borrow_mut().push((
+        ClickTarget::PinOperation(crate::state::OpKey::of(op)),
+        pin_a,
+    ));
 
     if !op.status.is_terminal() {
         frame.render_widget(
             Paragraph::new(Span::styled(" [X] ", theme.failed())),
             cancel_a,
         );
-        state
-            .click_targets
-            .borrow_mut()
-            .push((ClickTarget::CancelOperation(op.id.clone()), cancel_a));
+        state.click_targets.borrow_mut().push((
+            ClickTarget::CancelOperation(crate::state::OpKey::of(op)),
+            cancel_a,
+        ));
     }
 }
 
@@ -3450,7 +3499,7 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
     };
     let tool = gate.tool.as_deref().unwrap_or("A sandboxed command");
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(tool.to_string(), theme.normal().bold()),
             Span::styled(
@@ -3484,9 +3533,22 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
         ]),
         Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
     ];
+    lines.extend(gate_typing_note(state, theme));
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
+}
+
+/// While the chat input holds text the gate keys type into it instead of
+/// answering (see [`AppState::typing_in_chat`]); say so where the keys are
+/// shown, or the prompt looks broken.
+fn gate_typing_note(state: &AppState, theme: &Theme) -> Option<Line<'static>> {
+    state.typing_in_chat().then(|| {
+        Line::from(Span::styled(
+            "  You are typing — press Esc to clear the input, then answer.",
+            theme.pending(),
+        ))
+    })
 }
 
 fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
@@ -3551,6 +3613,7 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
         ]),
         Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
     ]);
+    lines.extend(gate_typing_note(state, theme));
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
@@ -3666,6 +3729,7 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
             Span::styled(" reject", theme.normal()),
         ]),
     ];
+    lines.extend(gate_typing_note(state, theme));
 
     if let Some(diff) = &gate.diff {
         lines.push(Line::from(""));
@@ -3732,7 +3796,8 @@ fn format_help_rows<'a>(
 /// `state::SLASH_COMMANDS` — see `help_rows_reference_only_known_commands`.
 const HELP_LEFT_ROWS: &[(&str, &str)] = &[
     ("GLOBAL", ""),
-    ("q / Ctrl-C", "Quit"),
+    ("Ctrl-C", "Cancel the running turn; press again to quit"),
+    ("q", "Quit (press again if work is still running)"),
     ("Tab / Shift-Tab", "Cycle focus"),
     ("?", "Toggle this help"),
     ("Esc / ?", "Close help overlay"),
@@ -3740,7 +3805,7 @@ const HELP_LEFT_ROWS: &[(&str, &str)] = &[
     ("CHAT", ""),
     ("Enter", "Send message"),
     ("Shift+Enter", "Insert newline"),
-    ("Esc", "Clear current input"),
+    ("Esc", "Clear input; if empty, cancel the running turn"),
     ("Arrows / Home / End", "Move within editor"),
     ("", ""),
     ("CHAT INPUT PREFIXES", ""),
@@ -3811,7 +3876,8 @@ const HELP_RIGHT_ROWS: &[(&str, &str)] = &[
 
 const HELP_SINGLE_ROWS: &[(&str, &str)] = &[
     ("GLOBAL", ""),
-    ("q / Ctrl-C", "Quit"),
+    ("Ctrl-C", "Cancel the running turn; press again to quit"),
+    ("q", "Quit (press again if work is still running)"),
     ("Tab / Shift-Tab", "Cycle focus"),
     ("?", "Toggle this help"),
     ("Esc / ? (when help open)", "Close help overlay"),
@@ -3819,7 +3885,7 @@ const HELP_SINGLE_ROWS: &[(&str, &str)] = &[
     ("CHAT", ""),
     ("Enter", "Send message"),
     ("Shift+Enter", "Insert newline"),
-    ("Esc", "Clear current input"),
+    ("Esc", "Clear input; if empty, cancel the running turn"),
     ("Arrow keys / Home / End", "Move within the editor"),
     ("", ""),
     ("CHAT INPUT PREFIXES", ""),
@@ -4331,6 +4397,55 @@ mod tests {
         let w = layout_window(WindowStatus::Finished, 2);
         assert!(!window_has_command_header(&w));
         assert_eq!(expanded_window_line_count(&w), 2);
+    }
+
+    fn render_footer(state: &AppState, width: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| draw_chat_footer(frame, state, &theme, Rect::new(0, 0, width, 1)))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    /// While a turn runs the footer names the key that stops it, and says so
+    /// when the turn has gone quiet for too long.
+    #[test]
+    fn footer_offers_cancel_while_a_turn_runs_and_flags_a_stall() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+        assert!(!render_footer(&state, 160).contains("cancel"));
+
+        state.turn = Some(crate::state::ChatTurn::new(None));
+        let footer = render_footer(&state, 160);
+        assert!(
+            footer.contains("Esc") && footer.contains("cancel turn"),
+            "{footer}"
+        );
+        assert!(!footer.contains("no response"), "{footer}");
+
+        state.turn.as_mut().unwrap().last_event =
+            std::time::Instant::now() - crate::state::TURN_STALL_AFTER;
+        assert!(render_footer(&state, 160).contains("no response"));
+    }
+
+    /// A fresh hint replaces the key list; it is the thing the user must read.
+    #[test]
+    fn footer_shows_a_fresh_hint() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.footer_hint = Some(("press again to quit".into(), std::time::Instant::now()));
+        assert!(render_footer(&state, 120).contains("press again to quit"));
+
+        state.footer_hint = Some((
+            "press again to quit".into(),
+            std::time::Instant::now() - FOOTER_HINT_TTL,
+        ));
+        assert!(!render_footer(&state, 120).contains("press again"));
     }
 
     /// Render a real window and read back the text of each row, so the test

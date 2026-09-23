@@ -19,6 +19,41 @@ pub const CHAT_HISTORY_CAP: usize = 200;
 
 // ─── Liveness State Machine ───────────────────────────────────────────────────
 
+/// How long a turn may go without any server event before the TUI says it
+/// looks stalled. Long enough for a slow model's first token, short enough that
+/// a turn silently lost to a dead daemon is not left looking busy.
+pub const TURN_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Window in which a second Ctrl-C quits. The first one cancels a running turn.
+pub const CTRL_C_QUIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A chat turn submitted to the daemon and not yet ended by `AgentDone` or
+/// `AgentError`. Unlike `liveness_state`, which stays `Idle` until the first
+/// server event, this exists from the moment the prompt is sent.
+#[derive(Debug, Clone)]
+pub struct ChatTurn {
+    pub started: std::time::Instant,
+    /// Last event of any kind for this turn; drives the stall hint.
+    pub last_event: std::time::Instant,
+    /// The instance the prompt was routed to, so a cancel goes to the same one.
+    pub target_instance: Option<String>,
+}
+
+impl ChatTurn {
+    pub fn new(target_instance: Option<String>) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            last_event: now,
+            target_instance,
+        }
+    }
+
+    pub fn is_stalled(&self, now: std::time::Instant) -> bool {
+        now.duration_since(self.last_event) >= TURN_STALL_AFTER
+    }
+}
+
 /// State of the turn's streaming liveness indicator. Each state maps to a
 /// directional panel pattern (see [`crate::liveness`]): thinking shimmers
 /// (nondeterministic exploration), streaming rains (the answer pouring down),
@@ -173,18 +208,27 @@ impl ChatHistory {
         }
     }
 
-    /// Mark the last assistant entry (and any still-streaming thinking block) as
-    /// no longer streaming, so their live cursors/glyphs collapse.
+    /// End the turn: every assistant reply and thinking block stops streaming,
+    /// so live cursors collapse and `collect_chat_history` sends the text back
+    /// to the model next turn. The empty placeholder pushed at submit is
+    /// dropped if no text ever landed in it.
     pub fn finish_stream(&mut self) {
-        if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.back_mut() {
-            *streaming = false;
-        }
+        self.seal_streaming();
+        self.entries.retain(|entry| {
+            !matches!(entry, ChatEntry::Assistant { content, streaming: false } if content.is_empty())
+        });
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Mark every streaming assistant/thinking entry as finished.
+    fn seal_streaming(&mut self) {
         for entry in self.entries.iter_mut() {
-            if let ChatEntry::Thinking { streaming, .. } = entry {
+            if let ChatEntry::Assistant { streaming, .. } | ChatEntry::Thinking { streaming, .. } =
+                entry
+            {
                 *streaming = false;
             }
         }
-        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Locate the latest `User` entry and set its `duration_ms` based on `started_at` elapsed time.
@@ -219,30 +263,32 @@ impl ChatHistory {
         self.entries.is_empty()
     }
 
-    /// Compaction: removes ToolCall entries from old history to save tokens.
-    /// `keep_latest` specifies how many of the most recent entries are preserved intact.
-    pub fn compact(&mut self, keep_latest: usize) {
-        let len = self.entries.len();
-        if len <= keep_latest {
-            return;
-        }
-        let cutoff = len - keep_latest;
-
-        // Everything from `cutoff` on is preserved intact; before it, tool calls
-        // are dropped to save context window space.
-        let keep = |(i, entry): &(usize, ChatEntry)| {
-            *i >= cutoff || !matches!(entry, ChatEntry::ToolCall { .. })
-        };
-        self.entries = std::mem::take(&mut self.entries)
-            .into_iter()
+    /// Keep only the last `keep_turns` turns (a turn is a user message and
+    /// everything after it) and drop the rest, so the model really sees less
+    /// on the next turn. Returns how many turns were dropped.
+    ///
+    /// This used to drop only tool-call rows, which `collect_chat_history`
+    /// never sends anyway, while reporting that the context was compacted.
+    pub fn compact(&mut self, keep_turns: usize) -> usize {
+        let user_positions: Vec<usize> = self
+            .entries
+            .iter()
             .enumerate()
-            .filter(keep)
-            .map(|(_, entry)| entry)
+            .filter(|(_, e)| matches!(e, ChatEntry::User { .. }))
+            .map(|(i, _)| i)
             .collect();
+        let dropped = user_positions.len().saturating_sub(keep_turns);
+        let cut = match keep_turns {
+            0 => self.entries.len(),
+            _ => user_positions.get(dropped).copied().unwrap_or(0),
+        };
+        self.entries.drain(..cut);
         self.generation = self.generation.wrapping_add(1);
+        dropped
     }
 
     pub fn start_tool_call(&mut self, id: String, name: String, args: String) {
+        self.seal_streaming();
         self.push(ChatEntry::ToolCall {
             id,
             name,
@@ -253,10 +299,11 @@ impl ChatHistory {
     }
 
     pub fn finish_tool_call(&mut self, id: &str, result: String, failed: bool) {
+        let mut closed = false;
         for entry in self.entries.iter_mut().rev() {
             if let ChatEntry::ToolCall {
                 id: entry_id,
-                result: entry_result,
+                result: entry_result @ None,
                 failed: entry_failed,
                 ..
             } = entry
@@ -265,8 +312,21 @@ impl ChatHistory {
                 *entry_result = Some(result);
                 *entry_failed = failed;
                 self.generation = self.generation.wrapping_add(1);
+                closed = true;
                 break;
             }
+        }
+        // Once the last pending call is back the model is working again: give
+        // the liveness pulse a live reply to ride on until its next token.
+        let pending = self
+            .entries
+            .iter()
+            .any(|e| matches!(e, ChatEntry::ToolCall { result: None, .. }));
+        if closed && !pending {
+            self.push(ChatEntry::Assistant {
+                content: String::new(),
+                streaming: true,
+            });
         }
     }
 }
@@ -381,7 +441,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/export markdown", "export chat transcript to markdown"),
     ("/settings", "open settings panel (edit & persist)"),
     ("/analyze [op_id]", "ask the LLM to analyze an operation"),
-    ("/compact", "compact the chat transcript"),
+    (
+        "/compact",
+        "keep only the last 4 turns (the model sees less)",
+    ),
     ("/provider add", "add a provider to the registry"),
     (
         "/provider numctx",
@@ -1191,11 +1254,50 @@ impl WebApprovalGate {
 
 // ─── Click target ─────────────────────────────────────────────────────────────
 
+/// Which operation an action is about. Operation ids are unique only within
+/// the instance that ran them, so an id alone can name another client's
+/// operation: cancel, pin and detail must carry the instance too.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OpKey {
+    pub id: String,
+    /// `None` when the source did not say (the TUI's own `!` windows, the
+    /// poll path); such a key falls back to the first operation with the id.
+    pub instance_id: Option<String>,
+}
+
+impl OpKey {
+    pub fn of(op: &Operation) -> Self {
+        Self {
+            id: op.id.clone(),
+            instance_id: op.instance_id.clone(),
+        }
+    }
+
+    /// A key for an id whose instance is not known.
+    pub fn bare(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            instance_id: None,
+        }
+    }
+
+    /// Index of the operation this key names in `ops`.
+    pub fn position_in(&self, ops: &[Operation]) -> Option<usize> {
+        let exact = ops
+            .iter()
+            .position(|o| o.id == self.id && o.instance_id == self.instance_id);
+        match &self.instance_id {
+            Some(_) => exact,
+            None => exact.or_else(|| ops.iter().position(|o| o.id == self.id)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClickTarget {
-    CancelOperation(String),
-    PinOperation(String),
-    AnalyzeOperation(String),
+    CancelOperation(OpKey),
+    PinOperation(OpKey),
+    AnalyzeOperation(OpKey),
     SelectOperation(usize),
     CloseWindow(usize),
     ToggleWindow(usize),
@@ -1205,8 +1307,8 @@ pub enum ClickTarget {
     /// A section header in the work view: click opens that section and closes
     /// whichever was open (SPEC R24.9).
     SectionHeader(String),
-    /// Open the full-screen detail view for the operation with this id.
-    OpenOperationDetail(String),
+    /// Open the full-screen detail view for this operation.
+    OpenOperationDetail(OpKey),
     /// Open the full-screen detail view for one log line. The text is captured
     /// at draw time because the log is re-derived (and re-filtered) every frame,
     /// so a row index would not survive until the click is handled.
@@ -1279,6 +1381,9 @@ pub struct LogLineDetailState {
 pub struct OperationDetailState {
     /// Id of the operation being inspected.
     pub op_id: String,
+    /// Its instance, so the overlay and its keys act on that operation and
+    /// not on another instance's operation with the same id.
+    pub instance_id: Option<String>,
     /// Scroll offset into the rendered lines; clamped at draw time via
     /// [`AppState::detail_max_scroll`].
     pub scroll: usize,
@@ -1670,6 +1775,17 @@ pub struct AppState {
     // ── Config ──
     pub unicode: bool,
     pub should_quit: bool,
+    /// The chat turn in flight, if any (see [`ChatTurn`]).
+    pub turn: Option<ChatTurn>,
+    /// A model-list refresh the user asked for is in flight; its result may
+    /// open the model picker. Unrequested refreshes never do.
+    pub model_picker_requested: bool,
+    /// When a quit was requested while work was running. A second request
+    /// inside [`CTRL_C_QUIT_WINDOW`] quits; otherwise the first one only warns.
+    pub quit_armed_at: Option<std::time::Instant>,
+    /// A one-line transient hint shown in the footer (e.g. "press q again to
+    /// quit"), with the moment it was raised so it can fade.
+    pub footer_hint: Option<(String, std::time::Instant)>,
     /// Sender half of the bridge channel; set by app.rs after spawning.
     pub bridge_tx: Option<tokio::sync::mpsc::Sender<crate::llm_bridge::BridgeEvent>>,
     pub mcp_source_tx: Option<tokio::sync::mpsc::Sender<crate::mcp_source::McpSourceCommand>>,
@@ -1939,6 +2055,14 @@ impl AppState {
         self.liveness_state = LivenessState::Idle;
         self.last_stream_activity = None;
         self.last_wait_tick = None;
+    }
+
+    /// True while the user is typing into the chat input. Gate keys (`y`/`a`/
+    /// `n`, Enter) are text then, not answers: a word starting with `a` must
+    /// not persist "always allow", and Enter must send the message, not deny a
+    /// grant. Esc clears the input, after which the gate keys answer again.
+    pub fn typing_in_chat(&self) -> bool {
+        self.focus == Focus::Chat && !self.chat_input_is_empty()
     }
 
     /// True when a text-entry overlay (navigator or an inline picker) is open.
@@ -2217,6 +2341,10 @@ impl AppState {
 
             liveness_glyph: "  ".to_string(),
             liveness_state: LivenessState::Idle,
+            turn: None,
+            model_picker_requested: false,
+            quit_armed_at: None,
+            footer_hint: None,
             liveness_seed: liveness_initial_seed(),
             liveness_frame: 0,
             last_stream_activity: None,
@@ -2634,18 +2762,34 @@ impl AppState {
     /// Get the last-used LLM configuration for a window.
     pub fn get_window_llm(
         &self,
-        window_key: &str,
+        section_key: &str,
     ) -> Option<&crate::session_config::WindowLlmConfig> {
-        self.window_llms.get(window_key)
+        self.window_llms.get(&self.window_llm_key(section_key))
     }
 
     /// Record the last-used LLM configuration for a window.
     pub fn set_window_llm(
         &mut self,
-        window_key: &str,
+        section_key: &str,
         config: crate::session_config::WindowLlmConfig,
     ) {
-        self.window_llms.insert(window_key.to_string(), config);
+        let key = self.window_llm_key(section_key);
+        self.window_llms.insert(key, config);
+    }
+
+    /// The key a window's LLM choice is saved under. A section is keyed by
+    /// the daemon's instance id, which is stable only while that daemon and
+    /// that IDE session live; a choice saved under it was lost on every
+    /// restart and left a dead entry behind. What the user means by "this
+    /// window" across restarts is the client in this workspace.
+    pub fn window_llm_key(&self, section_key: &str) -> String {
+        match self.active_instances.iter().find(|i| i.id == section_key) {
+            Some(inst) => {
+                let who = inst.client.as_deref().unwrap_or(&inst.label);
+                format!("{who}@{}", inst.scope)
+            }
+            None => section_key.to_string(),
+        }
     }
 
     /// Number of navigable rows in the work view.
@@ -2684,9 +2828,34 @@ impl AppState {
     }
 
     /// Open the full-screen detail overlay for one operation.
-    pub fn open_operation_detail(&mut self, op_id: String) {
+    pub fn open_operation_detail(&mut self, key: OpKey) {
         self.detail_max_scroll.set(0);
-        self.modal = ModalState::OperationDetail(OperationDetailState { op_id, scroll: 0 });
+        self.modal = ModalState::OperationDetail(OperationDetailState {
+            op_id: key.id,
+            instance_id: key.instance_id,
+            scroll: 0,
+        });
+    }
+
+    pub fn find_op(&self, key: &OpKey) -> Option<&Operation> {
+        key.position_in(&self.operations)
+            .map(|i| &self.operations[i])
+    }
+
+    pub fn find_op_mut(&mut self, key: &OpKey) -> Option<&mut Operation> {
+        key.position_in(&self.operations)
+            .map(|i| &mut self.operations[i])
+    }
+
+    /// The operation shown in the detail overlay, if it is open.
+    pub fn detail_op_key(&self) -> Option<OpKey> {
+        match &self.modal {
+            ModalState::OperationDetail(d) => Some(OpKey {
+                id: d.op_id.clone(),
+                instance_id: d.instance_id.clone(),
+            }),
+            _ => None,
+        }
     }
 
     /// Open the full-screen detail overlay for one log line, wrapped so the
@@ -2723,8 +2892,8 @@ impl AppState {
             },
             Some(TreeToggle::Expand(op_index)) => {
                 if let Some(op) = self.operations.get(op_index) {
-                    let id = op.id.clone();
-                    self.open_operation_detail(id);
+                    let key = OpKey::of(op);
+                    self.open_operation_detail(key);
                 }
             }
             None => {}
@@ -3595,14 +3764,15 @@ mod tests {
             duration_ms: None,
         });
 
-        assert_eq!(hist.entries.len(), 4);
-        hist.compact(1); // Keep the last 1 item ("Thanks.") intact
+        // Keep the last turn: the whole first turn (user, tool call, reply)
+        // goes, so the next prompt carries less context — the point.
+        assert_eq!(hist.compact(1), 1);
+        assert_eq!(hist.entries.len(), 1);
+        assert!(matches!(&hist.entries[0], ChatEntry::User { text, .. } if text == "Thanks."));
 
-        // The tool call (at index 1) should be dropped, but user and assistant messages kept.
-        assert_eq!(hist.entries.len(), 3);
-        assert!(matches!(hist.entries[0], ChatEntry::User { .. }));
-        assert!(matches!(hist.entries[1], ChatEntry::Assistant { .. }));
-        assert!(matches!(hist.entries[2], ChatEntry::User { .. }));
+        // Nothing older left to drop.
+        assert_eq!(hist.compact(1), 0);
+        assert_eq!(hist.entries.len(), 1);
     }
 
     #[test]
@@ -3768,6 +3938,95 @@ mod tests {
             WindowLine::output("-- applying migration"),
         ];
         assert_eq!(w.last_output_line(), Some("-- applying migration"));
+    }
+
+    /// Text the model wrote before a tool call is a finished reply the moment
+    /// the tool call starts. Left flagged `streaming`, it kept its live cursor
+    /// forever and was never sent back to the model in later turns.
+    #[test]
+    fn tool_call_seals_the_reply_written_before_it() {
+        let mut hist = ChatHistory::default();
+        hist.push(ChatEntry::Assistant {
+            content: String::new(),
+            streaming: true,
+        });
+        hist.append_token("let me look");
+        hist.start_tool_call("c1".into(), "read_file".into(), "{}".into());
+
+        assert!(matches!(
+            &hist.entries()[0],
+            ChatEntry::Assistant { content, streaming: false } if content == "let me look"
+        ));
+
+        hist.finish_tool_call("c1", "ok".into(), false);
+        hist.append_token("done");
+        hist.finish_stream();
+
+        let streaming = hist.entries().iter().filter(|e| {
+            matches!(
+                e,
+                ChatEntry::Assistant {
+                    streaming: true,
+                    ..
+                }
+            )
+        });
+        assert_eq!(streaming.count(), 0);
+    }
+
+    /// The empty placeholder pushed at submit must not survive the turn when
+    /// thinking or a tool call came first and no text ever landed in it.
+    #[test]
+    fn finish_stream_drops_an_empty_placeholder() {
+        let mut hist = ChatHistory::default();
+        hist.push(ChatEntry::Assistant {
+            content: String::new(),
+            streaming: true,
+        });
+        hist.append_thinking("hmm");
+        hist.append_token("answer");
+        hist.finish_stream();
+
+        let assistants: Vec<_> = hist
+            .entries()
+            .iter()
+            .filter_map(|e| match e {
+                ChatEntry::Assistant { content, streaming } => Some((content.as_str(), *streaming)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants, vec![("answer", false)]);
+    }
+
+    /// A window's LLM choice survives the client reconnecting under a new
+    /// instance id: it is the same client in the same workspace.
+    #[test]
+    fn window_llm_survives_a_new_instance_id() {
+        use crate::session_config::WindowLlmConfig;
+        let inst = |id: &str| ahma_common::daemon_hub::InstanceInfo {
+            id: id.into(),
+            scope: "/w".into(),
+            label: "ahma".into(),
+            client: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.active_instances = vec![inst("uuid-1")];
+        s.set_window_llm(
+            "uuid-1",
+            WindowLlmConfig {
+                provider: "Ollama".into(),
+                model: "qwen".into(),
+                provider_url: None,
+            },
+        );
+
+        s.active_instances = vec![inst("uuid-2")];
+        assert_eq!(
+            s.get_window_llm("uuid-2").map(|c| c.model.as_str()),
+            Some("qwen")
+        );
+        assert_eq!(s.window_llms.len(), 1);
     }
 
     #[test]

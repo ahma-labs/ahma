@@ -546,7 +546,9 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
         // instance that owns the path. A subscriber seeing it has nothing to do
         // — the re-raised question arrives as a normal ScopeGrantRequested.
         DaemonMsg::ReRaiseScopeGrant { .. } => Applied::None,
-        DaemonMsg::RunPrompt { .. } => Applied::None,
+        DaemonMsg::RunPrompt { .. }
+        | DaemonMsg::CancelPrompt
+        | DaemonMsg::CancelOperation { .. } => Applied::None,
         DaemonMsg::SubmitApproval { .. } => Applied::None,
         DaemonMsg::ScopeGrantDismiss { decision_id } => {
             Applied::Event(SourceEvent::ScopeGrantDismiss { decision_id })

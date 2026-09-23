@@ -1,7 +1,6 @@
 use ahma_llm_monitor::ChatMessage;
 use ahma_llm_monitor::LocalProvider;
 use ahma_llm_monitor::client::LlmClient;
-use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 /// Build an [`LlmClient`] for `base_url`, honoring everything the matching
@@ -31,11 +30,10 @@ pub fn build_configured_client(base_url: impl Into<String>, model: impl Into<Str
 }
 
 pub enum BridgeEvent {
-    Token(String),
-    /// Reasoning / "thinking" fragment, rendered in lower contrast.
-    Thinking(String),
-    Done,
     Error(String),
+    /// A chat turn's message could not be delivered to the daemon; the turn
+    /// is ended with this reason rather than left spinning.
+    TurnSendFailed(String),
     ToolCallStarted {
         id: String,
         name: String,
@@ -66,18 +64,6 @@ pub enum BridgeEvent {
     ExternalToolsRefreshed {
         manager: crate::mcp_connections::McpConnectionManager,
     },
-    RequestApproval {
-        id: String,
-        tool: String,
-        args: String,
-        tx: tokio::sync::oneshot::Sender<bool>,
-    },
-    Usage(ahma_llm_monitor::client::TokenUsage),
-    /// The model's response was cut off by a length/context limit; the agent
-    /// is requesting a continuation. See [`ahma_core::agent::AgentEvent::Truncated`].
-    Truncated {
-        reason: String,
-    },
     /// A tool call just negotiated (or reused) an MCP session. The app stores
     /// this in `state.session_id` so the *next* tool call's `McpChatConfig`
     /// carries it and `get_or_create_session` takes its reuse fast-path
@@ -89,103 +75,6 @@ pub enum BridgeEvent {
 }
 
 pub type McpChatConfig = ahma_core::agent::McpChatConfig;
-
-struct TuiApprovalGate {
-    tx: Sender<BridgeEvent>,
-}
-
-#[async_trait::async_trait]
-impl ahma_core::agent::AgentApprovalGate for TuiApprovalGate {
-    async fn request_approval(&self, id: &str, tool: &str, args: &str) -> bool {
-        let (approval_tx, approval_rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .tx
-            .send(BridgeEvent::RequestApproval {
-                id: id.to_string(),
-                tool: tool.to_string(),
-                args: args.to_string(),
-                tx: approval_tx,
-            })
-            .await;
-        approval_rx.await.unwrap_or(false)
-    }
-}
-
-pub fn spawn_agent_task(
-    client: LlmClient,
-    messages: Vec<ChatMessage>,
-    system_prompt: Option<String>,
-    mcp: Option<McpChatConfig>,
-    available_tools: Vec<crate::mcp_connections::ToolInfo>,
-    tx: Sender<BridgeEvent>,
-) {
-    let (core_tx, mut core_rx) = tokio::sync::mpsc::channel(100);
-    let gate = Arc::new(TuiApprovalGate { tx: tx.clone() });
-
-    ahma_core::agent::spawn_agent_task(
-        client,
-        messages,
-        system_prompt,
-        mcp,
-        available_tools,
-        core_tx,
-        gate,
-    );
-
-    tokio::spawn(async move {
-        while let Some(evt) = core_rx.recv().await {
-            let bridge_evt = match evt {
-                ahma_core::agent::AgentEvent::Token(t) => BridgeEvent::Token(t),
-                ahma_core::agent::AgentEvent::Thinking(t) => BridgeEvent::Thinking(t),
-                ahma_core::agent::AgentEvent::Done => BridgeEvent::Done,
-                ahma_core::agent::AgentEvent::Error(e) => BridgeEvent::Error(e),
-                ahma_core::agent::AgentEvent::ToolCallStarted { id, name, args } => {
-                    BridgeEvent::ToolCallStarted { id, name, args }
-                }
-                ahma_core::agent::AgentEvent::ToolCallFinished { id, result, failed } => {
-                    BridgeEvent::ToolCallFinished { id, result, failed }
-                }
-                ahma_core::agent::AgentEvent::Usage(u) => BridgeEvent::Usage(u),
-                ahma_core::agent::AgentEvent::Truncated { reason } => {
-                    BridgeEvent::Truncated { reason }
-                }
-            };
-            let _ = tx.send(bridge_evt).await;
-        }
-    });
-}
-
-pub fn spawn_chat_task(
-    client: LlmClient,
-    messages: Vec<ChatMessage>,
-    system_prompt: Option<String>,
-    mcp: Option<McpChatConfig>,
-    tx: Sender<BridgeEvent>,
-) {
-    let (core_tx, mut core_rx) = tokio::sync::mpsc::channel(100);
-    ahma_core::agent::spawn_chat_task(client, messages, system_prompt, mcp, core_tx);
-    tokio::spawn(async move {
-        while let Some(evt) = core_rx.recv().await {
-            let bridge_evt = match evt {
-                ahma_core::agent::AgentEvent::Token(t) => BridgeEvent::Token(t),
-                ahma_core::agent::AgentEvent::Thinking(t) => BridgeEvent::Thinking(t),
-                ahma_core::agent::AgentEvent::Done => BridgeEvent::Done,
-                ahma_core::agent::AgentEvent::Error(e) => BridgeEvent::Error(e),
-                ahma_core::agent::AgentEvent::ToolCallStarted { id, name, args } => {
-                    BridgeEvent::ToolCallStarted { id, name, args }
-                }
-                ahma_core::agent::AgentEvent::ToolCallFinished { id, result, failed } => {
-                    BridgeEvent::ToolCallFinished { id, result, failed }
-                }
-                ahma_core::agent::AgentEvent::Usage(u) => BridgeEvent::Usage(u),
-                ahma_core::agent::AgentEvent::Truncated { reason } => {
-                    BridgeEvent::Truncated { reason }
-                }
-            };
-            let _ = tx.send(bridge_evt).await;
-        }
-    });
-}
 
 pub fn spawn_external_tools_refresh(
     mut manager: crate::mcp_connections::McpConnectionManager,

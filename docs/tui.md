@@ -95,9 +95,11 @@ than showing a fabricated `exit 0`.
 
 | Key | Action |
 |-----|--------|
-| Ctrl-C (`q` in a pane) | Quit |
+| Ctrl-C | Cancel the running chat turn; press again (within 2 s) to quit |
+| `q` (in a pane) | Quit — asks you to press it again while operations or a turn are still running |
+| `Esc` (chat input) | Clear the input; on an empty input, cancel the running turn |
 | `↑`/`↓` (`j`/`k`) | Move the selection |
-| `Enter` / click a header | Open that section, closing the open one |
+| `Enter` / click a header | Open that section and chat with that window |
 | `Space` / click a task | Expand it into its output (one at a time) |
 | `Enter` on a task | Full-screen operation detail |
 | Wheel | Scroll the view |
@@ -107,7 +109,7 @@ than showing a fabricated `exit 0`.
 | `p` | Pin the selected operation |
 | `a` | Ask for access again (on a denied operation) |
 | `Tab` | Cycle panes |
-| `y` / `n` | Approve / reject a pending gate |
+| `y` / `a` / `n` | Approve / always allow / reject a pending gate. While you are typing in the chat input these keys type; press `Esc` to clear the input first |
 | `/` | Command navigator (from an empty input) |
 | `?` | Help |
 

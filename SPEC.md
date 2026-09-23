@@ -45,7 +45,7 @@
 | Logging (File + Stderr) | tests-pass | Daily rolling logs, `--log-to-stderr` for debug |
 | Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
 | TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
-| Unified Work View (R24, R24.9) | tests-pass | The TUI's home view: one borderless section per client session (hooks and this terminal folded), one open at a time with a 300 ms eased tween, chat on a toggle. Current at startup via daemon replay with true timestamps and the retained output window; ordering independent of activity; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
+| Unified Work View (R24, R24.9, R24.10) | tests-pass | The TUI's home view: one borderless section per client session (hooks and this terminal folded), one open at a time with a 300 ms eased tween, chat on a toggle. Current at startup via daemon replay with true timestamps and the retained output window; ordering independent of activity; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
 | Configuration Standard (R-CFG) | in-progress | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5). Done: Security-tier `AHMA_*` retirement (warn-and-ignore, R-CFG1.2/R-CFG7.1), settings-file/`--no-settings` resolution, settings provenance (`ahma settings show --origin`, R-CFG5.1), trust tiers (`settings_tier`, with a drift test over every key), and the project-tier settings file (R-CFG3: Preference-only, Security keys refused and named). Pending: R-CFG5.2 per-setting startup log lines, R-CFG6.2 unknown-key abort for `[sandbox]`/`[auth]` in the *user* file, R-CFG6.3 permissions warning |
 | Unified Permissions (R-PERM) | tests-pass | One ledger under `~/.ahma` (fs scopes, web domains, tool approvals; legacy `approvals.json` migrated); question ladder (harness elicitation → TUI modal → fail-closed with paste-able remediation); sandbox profiles replace the hard-coded toolchain carve-outs; hooks enabled per client. User guide: `docs/permissions.md` |
 | Trust-Handoff Hardening (R-HANDOFF) | in-progress | Two-tier posture for writes a *trusted, unsandboxed* component executes later (git hook dirs, editor/harness auto-run config, daemon sockets): deny-write where nothing legitimate writes, allow-plus-loud-disclosure where it does. Kernel-enforced on macOS (last-match-wins SBPL denies); **application-layer only on Linux** (Landlock V1 is additive-allow, R6.1.7) and therefore bypassable from `run_terminal_command`; none on Windows yet. Child env strips code-injection and client-redirect vars, keeps `SSH_AUTH_SOCK`. Cross-project package-cache channel disclosed at runtime as the `rust` profile's stated `cost` in `ahma permissions list` (R-HANDOFF.8/R-PERM.5.2), not only in docs. Platform enforcement gaps (macOS reads, Windows both directions, Linux's application-layer-only deny tier) are surfaced on the R5.4 scope surfaces by `sandbox::profiles::platform_enforcement` |
@@ -1958,6 +1958,37 @@ correct **at startup**, not only for events that happen afterwards.
     (R24.8.2). A pane that is closed claims no clicks.
   - Identity — transport, pids, session id — is the footnote in the detail
     overlay, never the header (R24.8.6).
+- **R24.10 — A chat turn is always stoppable and never silently lost.**
+  - **R24.10.1 — Cancel reaches the loop.** Esc on an empty chat input, or
+    Ctrl-C anywhere, stops the running turn: the TUI sends `CancelPrompt`, the
+    hub routes it to the instance running the turn, and that instance aborts
+    the agent loop, wakes any approval waiter, and ends the turn with one
+    `AgentError`. The TUI ends the turn locally at once, so cancel works even
+    when the daemon is gone. A second Ctrl-C within 2 s quits. `CancelPrompt`
+    and `CancelOperation` are new message types; a reader that predates them
+    skips them (R24.5), so against an older instance the turn still ends in the
+    TUI while that instance finishes it unobserved.
+  - **R24.10.2 — A turn ends visibly.** A prompt that cannot be delivered ends
+    its turn with the reason; a turn with no server event for 60 s is marked
+    stalled in the footer beside the key that cancels it. `AgentError` stops the
+    turn's timer exactly as `AgentDone` does.
+  - **R24.10.3 — Stream events belong to a turn.** Chat events arriving while
+    this TUI has no turn in flight (another TUI's turn, or output from one just
+    cancelled) are ignored rather than opening a reply nothing will close.
+    Text written before a tool call is a finished reply and is sent back to the
+    model on later turns.
+  - **R24.10.4 — Typing is not answering.** While the chat input holds text,
+    gate keys (`y`/`a`/`n`, Enter) are text, and every gate says so; they answer
+    once the input is empty. A word starting with `a` must never persist
+    "always allow".
+  - **R24.10.5 — Quitting never surprises.** `q` and `/quit` quit at once when
+    nothing is running; while operations or a turn are running they warn and
+    quit on a second press.
+  - **R24.10.6 — An operation is named by its instance and id.** Operation ids
+    are unique only per instance, so cancel, pin, detail and live output resolve
+    `(instance, id)`; cancel is routed through the hub (`CancelOperation`) to
+    the owning instance, since the TUI's own MCP session cannot see another
+    client's operations.
 
 #### R25: Tool-call session reuse (TUI chat)
 
