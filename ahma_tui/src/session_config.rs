@@ -25,6 +25,45 @@ pub struct TuiSessionConfig {
     pub active_profile: Option<String>,
     #[serde(default)]
     pub window_llms: std::collections::HashMap<String, WindowLlmConfig>,
+    /// Recently chosen models that ahma runs itself (not an MCP client's own
+    /// model), most recent first — where chat falls back to when the client
+    /// whose model it was using goes away.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent: Vec<WindowLlmConfig>,
+}
+
+/// How many recent models [`TuiSessionConfig::recent`] keeps.
+const RECENT_LLMS_CAP: usize = 5;
+
+/// Whether `url` is an MCP client's own model (sampling), which exists only
+/// while that client is connected.
+pub fn is_client_model_url(url: &str) -> bool {
+    url.starts_with("mcp://")
+}
+
+/// Record `entry` as the most recent model, keeping the list short and free of
+/// duplicates. A client's own model is never recorded: it cannot be fallen back
+/// *to*, only away from.
+pub fn push_recent(recent: &mut Vec<WindowLlmConfig>, entry: WindowLlmConfig) {
+    let url = entry.provider_url.as_deref().unwrap_or_default();
+    if entry.model.is_empty() || is_client_model_url(url) {
+        return;
+    }
+    recent.retain(|r| !(r.provider_url == entry.provider_url && r.model == entry.model));
+    recent.insert(0, entry);
+    recent.truncate(RECENT_LLMS_CAP);
+}
+
+/// The most recent model whose provider is available right now.
+pub fn pick_fallback<'a>(
+    recent: &'a [WindowLlmConfig],
+    available: &[ahma_llm_monitor::LocalProvider],
+) -> Option<&'a WindowLlmConfig> {
+    recent.iter().find(|r| {
+        available
+            .iter()
+            .any(|p| Some(&p.base_url) == r.provider_url.as_ref())
+    })
 }
 
 impl TuiSessionConfig {
@@ -53,6 +92,40 @@ impl TuiSessionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn llm(url: &str, model: &str) -> WindowLlmConfig {
+        WindowLlmConfig {
+            provider: "p".into(),
+            model: model.into(),
+            provider_url: Some(url.into()),
+        }
+    }
+
+    #[test]
+    fn recent_models_are_mru_deduped_and_never_client_models() {
+        let mut recent = Vec::new();
+        push_recent(&mut recent, llm("http://localhost:11434/v1", "qwen"));
+        push_recent(&mut recent, llm("mcp://claude-code", "client's choice"));
+        push_recent(&mut recent, llm("http://localhost:1234/v1", "gemma"));
+        push_recent(&mut recent, llm("http://localhost:11434/v1", "qwen"));
+        let models: Vec<_> = recent.iter().map(|r| r.model.as_str()).collect();
+        assert_eq!(models, ["qwen", "gemma"]);
+    }
+
+    #[test]
+    fn fallback_is_the_most_recent_model_still_available() {
+        let recent = vec![
+            llm("http://localhost:1234/v1", "gemma"),
+            llm("http://localhost:11434/v1", "qwen"),
+        ];
+        let available = vec![ahma_llm_monitor::LocalProvider {
+            name: "Ollama".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            models: vec!["qwen".into()],
+        }];
+        assert_eq!(pick_fallback(&recent, &available).unwrap().model, "qwen");
+        assert!(pick_fallback(&recent, &[]).is_none());
+    }
 
     #[test]
     fn test_mcp_enabled_default_true() {
@@ -98,6 +171,7 @@ mod tests {
             mcp_enabled: false,
             active_profile: Some("dev".to_string()),
             window_llms: std::collections::HashMap::new(),
+            recent: Vec::new(),
         };
 
         config.save(temp.path()).unwrap();
@@ -125,6 +199,7 @@ mod tests {
             mcp_enabled: true,
             active_profile: None,
             window_llms: std::collections::HashMap::new(),
+            recent: Vec::new(),
         };
 
         config.save(temp.path()).unwrap();
@@ -153,6 +228,7 @@ mod tests {
             mcp_enabled: true,
             active_profile: None,
             window_llms: std::collections::HashMap::new(),
+            recent: Vec::new(),
         };
         config.save(temp.path()).unwrap();
 
@@ -172,6 +248,7 @@ mod tests {
             mcp_enabled: true,
             active_profile: None,
             window_llms: std::collections::HashMap::new(),
+            recent: Vec::new(),
         };
         first.save(temp.path()).unwrap();
 
@@ -182,6 +259,7 @@ mod tests {
             mcp_enabled: false,
             active_profile: Some("prod".to_string()),
             window_llms: std::collections::HashMap::new(),
+            recent: Vec::new(),
         };
         second.save(temp.path()).unwrap();
 
@@ -233,6 +311,7 @@ mod tests {
             mcp_enabled: true,
             active_profile: None,
             window_llms,
+            recent: Vec::new(),
         };
         config.save(temp.path()).unwrap();
 

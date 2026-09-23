@@ -634,10 +634,39 @@ async fn resolve_tool_approval(
     if !needs_approval(call_name, cfg.tool_approval, &cfg.non_mutating_tool_names) {
         return true;
     }
-    if crate::approvals::is_tool_approved(&cfg.workspace_root, call_name).await {
+    if crate::approvals::is_tool_allowed(&cfg.workspace_root, call_name).await {
+        return true;
+    }
+    // The model often asks for the same tool several times in one turn, and
+    // those calls run concurrently. Hold one lock per (workspace, tool) across
+    // "check, then ask", and check again once it is ours: a sibling call may
+    // have just been answered "always allow" (or the folder trusted) while we
+    // waited, and asking again would be exactly the repeated prompt the user
+    // already answered.
+    let lock = approval_lock_for(&cfg.workspace_root, call_name);
+    let _guard = lock.lock().await;
+    if crate::approvals::is_tool_allowed(&cfg.workspace_root, call_name).await {
         return true;
     }
     gate.request_approval(call_id, call_name, args_str).await
+}
+
+/// The lock serialising approval questions for one tool in one workspace.
+///
+/// Process-global rather than per run so two sessions asking about the same
+/// tool in the same folder also share one question. The map only ever holds
+/// one entry per (workspace, tool) pair actually prompted for, so it stays tiny.
+fn approval_lock_for(workspace: &std::path::Path, tool: &str) -> Arc<tokio::sync::Mutex<()>> {
+    type Locks = std::collections::HashMap<(PathBuf, String), Arc<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<Locks>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut locks = LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks
+        .entry((workspace.to_path_buf(), tool.to_string()))
+        .or_default()
+        .clone()
 }
 
 async fn execute_single_tool_call(
@@ -1480,7 +1509,7 @@ pub async fn get_or_create_session(
     let opts = ConnectOptions {
         // clientInfo.name is load-bearing: the bridge keys `supports_progress`
         // and `request_budget` off it.
-        client_name: "ahma-core-tool".to_string(),
+        client_name: AGENT_TOOL_CLIENT.to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         roots: vec![mcp.workspace_root.clone()],
         notifications: None,
@@ -1804,6 +1833,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let gate = Arc::new(HubApprovalGate {
             hub_tx: hub_tx.clone(),
+            workspace: Some(mcp_config.workspace_root.display().to_string()),
             session,
             approval_mutex: tokio::sync::Mutex::new(()),
         });
@@ -1947,6 +1977,7 @@ async fn build_agent_run_context(
     let ahma_config = ahma_common::config::AhmaConfig::load_async_with(&settings).await;
     let conn = resolve_llm_connection(provider, model, &ahma_config)?;
     let num_ctx = conn.num_ctx;
+    let local_model = ahma_llm_monitor::client::is_loopback_url(&conn.base_url);
     let client = conn.into_client();
 
     let workspace_root = service
@@ -1978,6 +2009,13 @@ async fn build_agent_run_context(
         interactive,
         non_mutating_tool_names,
     );
+    // A model on this machine gets the small-model budgets whether or not the
+    // user found the setting: every token of context is prompt it has to read
+    // before answering, and on a laptop that is minutes, not milliseconds.
+    let mcp_config = McpChatConfig {
+        small_model_harness: mcp_config.small_model_harness || local_model,
+        ..mcp_config
+    };
 
     Ok((client, mcp_config, available_tools))
 }
@@ -2041,6 +2079,13 @@ fn daemon_messages_to_chat(messages: Vec<DaemonChatMessage>) -> Vec<ChatMessage>
         .collect()
 }
 
+/// The `clientInfo.name` the agent loop's own tool-execution session announces.
+///
+/// That session is plumbing, not a separate client: its work is the chat's
+/// work, and the TUI files it with the chat's own section rather than showing
+/// a stranger named after an internal crate.
+pub const AGENT_TOOL_CLIENT: &str = "ahma-core-tool";
+
 /// Approval gate that approves every tool call — used by the headless MCP
 /// `agent` sub-agent, which has no interactive surface to ask a human.
 struct AutoApproveAgentGate;
@@ -2054,6 +2099,9 @@ impl AgentApprovalGate for AutoApproveAgentGate {
 
 struct HubApprovalGate {
     hub_tx: tokio::sync::mpsc::Sender<ClientMsg>,
+    /// The workspace this run checks grants against, sent with every question
+    /// so an "always allow" answer is persisted under the key that will match.
+    workspace: Option<String>,
     session: Arc<tokio::sync::Mutex<ActiveAgentSession>>,
     approval_mutex: tokio::sync::Mutex<()>,
 }
@@ -2076,6 +2124,7 @@ impl AgentApprovalGate for HubApprovalGate {
             id: id.to_string(),
             tool: tool.to_string(),
             args: args.to_string(),
+            workspace: self.workspace.clone(),
         });
         if self.hub_tx.send(msg).await.is_err() {
             let mut session_guard = self.session.lock().await;
@@ -3836,6 +3885,7 @@ mod tests {
         ));
         let gate = HubApprovalGate {
             hub_tx,
+            workspace: None,
             session,
             approval_mutex: tokio::sync::Mutex::new(()),
         };
@@ -3850,6 +3900,7 @@ mod tests {
         ));
         let gate = HubApprovalGate {
             hub_tx,
+            workspace: None,
             session: session.clone(),
             approval_mutex: tokio::sync::Mutex::new(()),
         };
@@ -3860,7 +3911,7 @@ mod tests {
 
         // The gate emits an approval request before awaiting the decision.
         match hub_rx.recv().await.unwrap() {
-            ClientMsg::Relay(HubRelay::ApprovalRequested { id, tool, args }) => {
+            ClientMsg::Relay(HubRelay::ApprovalRequested { id, tool, args, .. }) => {
                 assert_eq!(id, "id7");
                 assert_eq!(tool, "write_file");
                 assert_eq!(args, "{\"p\":1}");
@@ -3878,6 +3929,54 @@ mod tests {
         tx.send(true).unwrap();
 
         assert!(handle.await.unwrap(), "decision propagates back to caller");
+    }
+
+    /// A gate that answers "always allow" (persisting the grant the way the TUI
+    /// does) and counts how many times the human was asked.
+    struct AlwaysAllowCountingGate {
+        workspace: PathBuf,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentApprovalGate for AlwaysAllowCountingGate {
+        async fn request_approval(&self, _id: &str, tool: &str, _args: &str) -> bool {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Let the sibling calls pile up behind this question first.
+            tokio::task::yield_now().await;
+            crate::approvals::remember_tool_approval(&self.workspace, tool).unwrap();
+            true
+        }
+    }
+
+    /// Regression: the model asked for `read_file` twice in one turn and the
+    /// user was asked twice, even after answering "always allow" (2026-09-23).
+    #[tokio::test]
+    async fn parallel_calls_to_one_tool_ask_once_after_always_allow() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs this test in its own process; set before any read.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let ws = tempfile::tempdir().unwrap();
+        let mut cfg = empty_mcp_config("http://127.0.0.1:9");
+        cfg.workspace_root = ws.path().to_path_buf();
+        cfg.tool_approval = true;
+        let gate = AlwaysAllowCountingGate {
+            workspace: ws.path().to_path_buf(),
+            asked: Default::default(),
+        };
+
+        let ids = ["c0", "c1", "c2"];
+        let calls = ids
+            .iter()
+            .map(|id| resolve_tool_approval(id, "read_file", &cfg, "{}", &gate));
+        let results = futures::future::join_all(calls).await;
+
+        assert!(results.iter().all(|approved| *approved));
+        assert_eq!(
+            gate.asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one answer covers every queued call to the same tool"
+        );
     }
 
     // ── execute_single_tool_call (rejection & dispatch-error branches) ─────────

@@ -1783,13 +1783,15 @@ mod tests {
 
     #[cfg(unix)]
     fn with_home<R>(home: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        // `AHMA_TEST_HOME` is the documented seam (`config::ahma_home_dir`);
+        // `$HOME` alone no longer reaches it under a test harness.
         let _guard = HOME_ENV_MUTEX.lock();
-        let prev = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", home) };
+        let prev = std::env::var_os("AHMA_TEST_HOME");
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home) };
         let out = f();
         match prev {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
+            Some(v) => unsafe { std::env::set_var("AHMA_TEST_HOME", v) },
+            None => unsafe { std::env::remove_var("AHMA_TEST_HOME") },
         }
         out
     }

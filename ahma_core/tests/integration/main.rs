@@ -7,3 +7,4 @@
 
 mod approvals_migration;
 mod approvals_persistence;
+mod trusted_workspace;

@@ -46,6 +46,8 @@
 | Logging (File + Stderr) | tests-pass | Daily rolling logs, `--log-to-stderr` for debug |
 | Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
 | TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
+| Trusted folders, one question per tool (R-PERM.1.2, R-PERM.1.3) | tests-pass | One "Trust this folder?" per folder covers everything inside its sandbox; boundary-crossing tools still ask; parallel calls share one question |
+| Doctor (R-DOCTOR) | tests-pass | `ahma doctor [--fix]` and TUI `/doctor`: shared read-only checks (settings, missing grants, daemon build, trust, log warnings); fixes applied only after a per-fix `y`; `/doctor <question>` lets the chat model explain with the report as context |
 | Unified Work View (R24, R24.9, R24.10) | tests-pass | The TUI's home view: one borderless section per client session (hooks and this terminal folded), one open at a time with a 300 ms eased tween, chat on a toggle. Current at startup via daemon replay with true timestamps and the retained output window; ordering independent of activity; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
 | Configuration Standard (R-CFG) | in-progress | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5). Done: Security-tier `AHMA_*` retirement (warn-and-ignore, R-CFG1.2/R-CFG7.1), settings-file/`--no-settings` resolution, settings provenance (`ahma settings show --origin`, R-CFG5.1), trust tiers (`settings_tier`, with a drift test over every key), and the project-tier settings file (R-CFG3: Preference-only, Security keys refused and named). Pending: R-CFG5.2 per-setting startup log lines, R-CFG6.2 unknown-key abort for `[sandbox]`/`[auth]` in the *user* file, R-CFG6.3 permissions warning |
 | Unified Permissions (R-PERM) | tests-pass | One ledger under `~/.ahma` (fs scopes, web domains, tool approvals; legacy `approvals.json` migrated); question ladder (harness elicitation → TUI modal → fail-closed with paste-able remediation); sandbox profiles replace the hard-coded toolchain carve-outs; hooks enabled per client. User guide: `docs/permissions.md` |
@@ -690,12 +692,37 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
 
 - **R-PERM.1**: **All persistent permissions live in `~/.ahma/`, and nowhere else**: filesystem scope grants (R5.4.4), web-domain grants (R-WEB.5), per-workspace tool approvals, and hook unsandboxed consent (R5.5.3) **must** share a single control-plane directory. `~/.config/ahma/` is retired as a permission store; an existing `approvals.json` there **must** be migrated once, non-destructively, and the legacy file left in place with a `.migrated` suffix. The ledger directory inherits R5.4.8 unchanged: it is never part of any workspace scope, is kernel-unreadable and kernel-unwritable from inside the sandbox, and therefore **cannot** be authored by a sandboxed command.
 - **R-PERM.1.1**: **Tool trust is keyed by workspace, and never leaks between them**: a `tool`-kind grant records the **canonicalized workspace root** it applies to. Approving `cargo_build` in one project **must not** silently approve it in another — the same tool name in a different workspace is a different question, because the code it would run is different. The key is canonicalized (see `workspace_key`) so a symlinked or non-normalized spelling of the same directory still matches the grant the user actually gave, and so a path that merely *looks* different cannot be used to dodge a revocation.
+- **R-PERM.1.2**: **One answer is one question**: a tool call that needs approval is asked about at most once per `(workspace, tool)` at a time. Parallel calls to the same tool in one turn — which models emit routinely — **must** share the question, and each **must** re-check the persisted grants once it holds the question, so an "always allow" (or a trust, R-PERM.1.3) given for the first call covers the ones queued behind it. The grant is persisted under the workspace the *asking agent* checks (its locked sandbox root, carried as `ApprovalRequested.workspace`, field-only per R24.5), never under the answering surface's own working directory.
+- **R-PERM.1.3**: **Trusted folders**: the first time `ahma tui` opens a folder it asks once, "Trust this folder?". Yes records trust for the canonical folder (as the `*` entry of its `tool_approvals`, so an older reader simply keeps asking). In a trusted folder every tool that runs **inside the folder's kernel sandbox** runs without asking. Trust **never** covers what reaches past that boundary: tools on external MCP servers (`server::tool`), `sandbox_grant`, `logs_approve`, `fetch_webpage` (which keeps its own egress gate, R-WEB.6), `!` commands (R-DAEMON.9), or any change to `~/.ahma` or a project's `.ahma/` (R5.4.8, R-HANDOFF.7). Trust is never offered for — and `trust_workspace` refuses — a filesystem root, the home directory, or an ancestor of it. Enter, Esc and `n` answer "ask per tool" (R5.3.1). Revoke with `ahma permissions revoke tool '*' --workspace <dir>`.
 - **R-PERM.2**: **One record shape, one preview, one confirmation**: every grant, of every kind, is representable as `{kind: fs-scope | web-domain | tool | hook-unsandboxed, subject, access, tier, granted_by, granted_at, surface, note}`. `tier` is one of `once` | `session` | `always`. A `once` grant is **never** stored. A `session` grant lives **only** in memory and dies with the instance. Only `always` is written to disk, and only after the preview-and-approve exchange R5.4.5 already mandates for `sandbox_grant`, generalized to every kind: the user is shown the **absolute file path** and the **exact line(s)** that would be written, and nothing is written without explicit approval. The R5.4.5 hard denylist gates **every** write path into the ledger — the MCP tool, the CLI, and any elicitation/TUI answer — not just the `sandbox_grant` tool.
 - **R-PERM.2.1**: **One CLI, one audit trail**: `ahma permissions list | grant | revoke` **must** manage every kind through the same preview-and-confirm path, showing provenance (`granted_by`, `surface`) for each record. Kind-scoped aliases (`ahma sandbox grant|list|revoke`, `ahma web allow|list|revoke`) **must** continue to work, because they are the strings ahma itself emits as remediation. Every persist and revoke **must** append one record to an append-only audit log in `~/.ahma/`.
 - **R-PERM.2.2**: **Recording a decision must never destroy it** — the ledger's availability outranks its bookkeeping. This generalizes R-WEB.9.3 (which stated it for the web audit log alone) to **every** kind in the unified ledger:
   - An **audit-log write failure is non-fatal** and **must not** fail the grant it is recording. The grant was already confirmed by a human and is safely in the settings file; losing the *record* of it is a lesser harm than losing the *grant*. Failures are logged, not propagated.
   - A **legacy-migration failure (R-PERM.1) must never block startup**. The worst case is that the user re-approves a tool once; refusing to start because an old `approvals.json` could not be read would turn a bookkeeping problem into an outage.
   - Neither relaxation may ever run the *other* way: a failure to **persist a grant** is fatal to that grant and **must** be reported, because silently continuing would leave the user believing they had granted something they had not.
+
+#### R-DOCTOR: ahma explains itself, and repairs only with consent
+
+- **R-DOCTOR.1 — One set of checks.** `ahma doctor` and the TUI's `/doctor` run
+  the same checks (`ahma_common::doctor`): settings parse, granted folders that
+  no longer exist, approvals for folders that no longer exist, the daemon's
+  build against this binary's, this folder's trust, and the most repeated
+  warnings in the latest log. Each finding says what it costs and what would
+  fix it. The checks are read-only.
+- **R-DOCTOR.2 — A fix is shown, then confirmed, one at a time.** A fix
+  changes nothing until the user answered `y` to that exact fix (TUI modal, or
+  `--fix` on a terminal; without a terminal nothing changes). Every fix writes
+  through `AhmaSettings::update` and is recorded in the permission audit log.
+- **R-DOCTOR.3 — The model advises; it never applies.** `/doctor <question>`
+  sends the report and the question to the chat model with rules it must keep:
+  it cannot change settings (they are outside every sandbox, R5.4.8), it names
+  the `/settings` row, `/doctor fix <n>` or `ahma` command the user can use
+  instead, and it never suggests widening access without saying what that
+  would allow. Nothing in its answer reaches a fix.
+- **R-DOCTOR.4 — Tests never touch the real home.** In debug builds under a
+  test harness, a test that did not choose a home (`AHMA_TEST_HOME`) gets a
+  private per-run one: a test once wrote a `/opt/two` grant into the
+  developer's real settings on every run.
 
 #### The question ladder (where a permission question is asked)
 
@@ -1981,9 +2008,30 @@ correct **at startup**, not only for events that happen afterwards.
     skips them (R24.5), so against an older instance the turn still ends in the
     TUI while that instance finishes it unobserved.
   - **R24.10.2 — A turn ends visibly.** A prompt that cannot be delivered ends
-    its turn with the reason; a turn with no server event for 60 s is marked
-    stalled in the footer beside the key that cancels it. `AgentError` stops the
-    turn's timer exactly as `AgentDone` does.
+    its turn with the reason; a model that has gone quiet for 60 s *while
+    thinking or writing* — or for 10 minutes while still reading its prompt,
+    which is silent by nature — is marked stalled in the footer beside the key
+    that cancels it. Waiting on the user or on a running tool is never a stall.
+    `AgentError` stops the turn's timer exactly as `AgentDone` does.
+  - **R24.10.7 — A running turn always says what it is doing.** A status line
+    pinned under the transcript (outside the scrolled rows) shows the liveness
+    panel and the turn's phase in plain words, from real events only: the model
+    reading its prompt (with the prompt's size and, once this session has
+    measured the model's reading speed, the time left), thinking, writing (with
+    tokens/second), running a named tool, or waiting for the user's answer (a
+    still, dimmed panel — never animated as if the model were busy). When a
+    large prompt on a slow model is the reason for the wait, a dim hint says
+    what the user can do (`/compact`, `/model`). A turn over 10 s leaves a dim
+    one-line summary (time, tokens read, reading and writing speed).
+  - **R24.10.8 — A dropped connection is retried once, visibly.** When a turn
+    fails for a connection reason (timeout, reset, 5xx) before any answer text
+    arrived, the TUI sends the message again once and says so in the
+    transcript; a second failure is reported with what to do next. A request
+    error (4xx, refused tool, cancel) is never retried. These notices are the
+    TUI talking to the user and are never sent to the model. A model on this
+    machine (loopback endpoint) gets a 30-minute read window and no timeout
+    retries: it is silent while it reads the prompt, and re-sending restarts
+    that reading from zero.
   - **R24.10.3 — Stream events belong to a turn.** Chat events arriving while
     this TUI has no turn in flight (another TUI's turn, or output from one just
     cancelled) are ignored rather than opening a reply nothing will close.
@@ -2018,6 +2066,16 @@ correct **at startup**, not only for events that happen afterwards.
     cost only when a price is known — neither is guessed; an estimate is labelled
     as one.
 
+  - **R24.11.3 — Chrome earns its place.** A pane that is part of the layout
+    (chat, input, command windows, log, `/scope`) is framed by one title rule
+    carrying its name and live facts — never a left, right or bottom border;
+    the terminal's edges already bound it. Only floating overlays (pickers,
+    modals, gates) keep a full border. A scrollable pane keeps its right column
+    for the scrollbar. The work view gets the rows its content needs (at most
+    half the body) and chat fills the rest; a conversation shorter than its pane
+    sits at the bottom against the input. The chat agent's own tool session is
+    part of "this terminal (you)", and a header never counts "0 clients".
+
 - **R24.12 — It does what the user expects.**
   - **R24.12.1 — Help cannot drift from the keys.** The help overlay and footer
     **must** render from the one key table (`keymap::KEY_REFERENCE`) that tests
@@ -2030,6 +2088,26 @@ correct **at startup**, not only for events that happen afterwards.
     A URL-addressed provider carries its configured key to the agent loop. Only
     a client that declared MCP `sampling` at `initialize` (carried as
     `InstanceInfo.sampling`, field-only per R24.5) is offered as a provider.
+  - **R24.12.6 — Two levels of explanation.** `/intro` (alias
+    `/getting-started`) shows ahma in one screen — one line per topic — and
+    Enter opens a topic's second level. It opens by itself once, on the first
+    run (marker `~/.ahma/intro-shown`). It names only commands that exist
+    (tested against the command list).
+  - **R24.12.7 — Every setting has a place in `/settings`.** Besides the
+    editable tables, the panel shows what this folder is trusted with and has
+    been allowed (trust, always-allowed tools, folders granted outside it, web
+    allow/deny lists) and which model chat uses. Trust and the folder's tool
+    grants change there only on a confirming second keypress, through the same
+    audited ledger path as the gates (R-PERM.2.1); everything else in that
+    category names the command that changes it. `/settings <words>` jumps to
+    the first matching row.
+  - **R24.12.5 — Chat stays on a model that exists.** A client's own model
+    (`mcp://`) exists only while that client is connected. When it goes, chat
+    moves to the most recent model ahma runs itself (`.ahma/session.toml`
+    `recent`) — or to none, with a pointer to `/setup` — and says so; when the
+    client returns and the user has not chosen another model meanwhile, chat
+    moves back, also said. Local model servers are looked for again every 30 s
+    while idle.
   - **R24.12.3 — A window's conversation is its own.** Switching windows switches
     transcript, and is refused while a reply is streaming. Transcripts are saved
     after each turn under `~/.ahma/transcripts/` — never in the project — and

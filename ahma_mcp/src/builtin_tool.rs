@@ -238,9 +238,44 @@ impl BuiltinTool {
     }
 }
 
+impl BuiltinTool {
+    /// Whether this built-in's effect reaches **outside** the workspace sandbox,
+    /// so a trusted folder (SPEC R-PERM.1.3) must not auto-approve it.
+    ///
+    /// `logs_approve` persists a log-symlink exception outside the workspace.
+    /// `sandbox_grant` widens the scope itself and already routes to a human.
+    /// `fetch_webpage` reaches the network, which has its own egress gate
+    /// (R-WEB.6) and is never the folder's to trust. Everything else runs inside
+    /// the kernel sandbox, or only steers ahma's own control plane.
+    pub const fn crosses_sandbox_boundary(self) -> bool {
+        matches!(
+            self,
+            BuiltinTool::LogsApprove | BuiltinTool::SandboxGrant | BuiltinTool::FetchWebpage
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_boundary_tools_are_the_ones_that_leave_the_workspace() {
+        for tool in [
+            BuiltinTool::LogsApprove,
+            BuiltinTool::SandboxGrant,
+            BuiltinTool::FetchWebpage,
+        ] {
+            assert!(tool.crosses_sandbox_boundary(), "{}", tool.name());
+        }
+        for tool in [
+            BuiltinTool::RunTerminalCommand,
+            BuiltinTool::WriteFile,
+            BuiltinTool::ReadFile,
+        ] {
+            assert!(!tool.crosses_sandbox_boundary(), "{}", tool.name());
+        }
+    }
 
     #[test]
     fn every_variant_round_trips_through_its_name() {

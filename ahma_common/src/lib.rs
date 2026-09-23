@@ -47,6 +47,7 @@ pub mod daemon_history;
 pub mod daemon_hub;
 /// SHA-256 hex digests, one encoder for every `SHA256SUMS`-style surface.
 pub mod digest;
+pub mod doctor;
 pub mod elicitation;
 pub mod event_dispatcher;
 pub mod file_uri;

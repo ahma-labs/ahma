@@ -1005,6 +1005,7 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in permission-ledger management mode");
             commands::run_permissions_command(args)
         }
+        Subcommands::Doctor(args) => commands::run_doctor_command(args),
     }
 }
 
@@ -1430,6 +1431,19 @@ pub enum Subcommands {
     /// it has been trusted with nor grant itself more. `ahma sandbox` and
     /// `ahma web` remain as kind-scoped shortcuts into the same ledger.
     Permissions(PermissionsArgs),
+    /// Check ahma's own health and say what would fix what it finds: settings that do not parse, granted folders that no longer exist, a daemon running a different build, the warnings repeating in the logs, and whether this folder is trusted. Read-only unless you pass --fix, and even then every fix is shown and asked about first. The same checks run as /doctor in `ahma tui`.
+    Doctor(DoctorArgs),
+}
+
+/// Arguments for `ahma doctor`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct DoctorArgs {
+    /// Offer each fix the report lists, one at a time, and apply only the ones you answer `y` to. Needs a terminal; without one nothing is changed.
+    #[arg(long)]
+    pub fix: bool,
+    /// The folder to check (trust, logs). Defaults to the current directory.
+    #[arg(long)]
+    pub path: Option<std::path::PathBuf>,
 }
 
 /// Arguments for `ahma permissions`.

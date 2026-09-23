@@ -24,6 +24,11 @@ pub const CHAT_HISTORY_CAP: usize = 200;
 /// a turn silently lost to a dead daemon is not left looking busy.
 pub const TURN_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The same, for a model still reading its prompt: that is silent by nature
+/// and can legitimately take minutes on a local model (the status line says
+/// so meanwhile), but a turn lost to a dead daemon must still be flagged.
+pub const READING_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Token spend for one window's conversations, as reported by its provider.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WindowUsage {
@@ -50,6 +55,32 @@ pub struct ChatTurn {
     pub first_token_at: Option<std::time::Instant>,
     /// Characters of answer streamed so far this turn.
     pub streamed_chars: usize,
+    /// What the turn is doing right now, in words the user can act on.
+    pub phase: TurnPhase,
+    /// When [`Self::phase`] began — the clock the status line shows.
+    pub phase_since: std::time::Instant,
+    /// How long the model took to start answering its last request (from the
+    /// request to its first token or thought). Paired with the prompt size the
+    /// next `Usage` reports, it becomes the model's measured reading speed.
+    pub last_prefill: Option<std::time::Duration>,
+}
+
+/// What a running turn is doing, derived only from real events — never a guess
+/// dressed up as progress. Shown on the chat status line so a slow local model
+/// reads as "busy reading 37k tokens", not as dead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnPhase {
+    /// The request is with the model and it has not produced anything yet:
+    /// it is loading, or reading (prefilling) the whole prompt.
+    Reading,
+    /// The model is reasoning (thinking tokens are arriving).
+    Thinking,
+    /// The answer is streaming.
+    Writing,
+    /// A tool the model asked for is running.
+    Tool { name: String },
+    /// Blocked on the user answering an approval — not the model's time.
+    AwaitingYou,
 }
 
 impl ChatTurn {
@@ -61,11 +92,33 @@ impl ChatTurn {
             target_instance,
             first_token_at: None,
             streamed_chars: 0,
+            phase: TurnPhase::Reading,
+            phase_since: now,
+            last_prefill: None,
         }
+    }
+
+    /// Move to `phase`, restarting its clock only when it actually changes.
+    /// Leaving [`TurnPhase::Reading`] for model output records how long the
+    /// model took to read its prompt.
+    pub fn enter(&mut self, phase: TurnPhase) {
+        if self.phase == phase {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.phase == TurnPhase::Reading
+            && matches!(phase, TurnPhase::Thinking | TurnPhase::Writing)
+        {
+            self.last_prefill = Some(now.duration_since(self.phase_since));
+        }
+        self.phase = phase;
+        self.phase_since = now;
+        self.last_event = now;
     }
 
     /// Record a streamed answer token.
     pub fn note_token(&mut self, token: &str) {
+        self.enter(TurnPhase::Writing);
         self.first_token_at
             .get_or_insert_with(std::time::Instant::now);
         self.streamed_chars += token.len();
@@ -79,8 +132,91 @@ impl ChatTurn {
             .then(|| ((self.streamed_chars as f64 / 4.0) / secs).round() as u32)
     }
 
+    /// Quiet for too long *on the model's side*. Waiting on the user is never
+    /// a stall, and neither is a tool that is running (it has its own
+    /// progress); reading a prompt gets the longer [`READING_STALL_AFTER`].
     pub fn is_stalled(&self, now: std::time::Instant) -> bool {
-        now.duration_since(self.last_event) >= TURN_STALL_AFTER
+        let quiet = now.duration_since(self.last_event);
+        match self.phase {
+            TurnPhase::Thinking | TurnPhase::Writing => quiet >= TURN_STALL_AFTER,
+            TurnPhase::Reading => quiet >= READING_STALL_AFTER,
+            TurnPhase::Tool { .. } | TurnPhase::AwaitingYou => false,
+        }
+    }
+}
+
+/// The one-line, always-current account of a running turn shown under the
+/// transcript: what is happening, for how long, and — when the numbers justify
+/// it — what the user could do about it.
+///
+/// `prompt_tokens` is the best available size of what the model is reading and
+/// `read_rate` the model's measured reading speed (tokens/second), when known.
+pub fn turn_status_text(
+    turn: &ChatTurn,
+    now: std::time::Instant,
+    model: &str,
+    prompt_tokens: u32,
+    read_rate: Option<f64>,
+) -> (String, Option<String>) {
+    let in_phase = now.duration_since(turn.phase_since);
+    let clock = fmt_duration_short(in_phase);
+    match &turn.phase {
+        TurnPhase::Reading => {
+            let mut text = if prompt_tokens > 0 {
+                format!(
+                    "{model} is reading {} tokens of context · {clock}",
+                    fmt_tokens_short(prompt_tokens)
+                )
+            } else {
+                format!("waiting for {model} · {clock}")
+            };
+            let expected = read_rate
+                .filter(|r| *r > 0.0 && prompt_tokens > 0)
+                .map(|r| std::time::Duration::from_secs_f64(f64::from(prompt_tokens) / r));
+            if let Some(expected) = expected {
+                match expected.checked_sub(in_phase) {
+                    Some(left) if left.as_secs() >= 1 => {
+                        text.push_str(&format!(" · ~{} left", fmt_duration_short(left)));
+                    }
+                    _ => text.push_str(" · taking longer than last time"),
+                }
+            }
+            let slow = read_rate.is_some_and(|r| r < 200.0) || in_phase.as_secs() >= 60;
+            let hint = (slow && prompt_tokens >= 20_000).then(|| {
+                "large context for this model — /compact to shrink it, or /model for a faster one"
+                    .to_string()
+            });
+            (text, hint)
+        }
+        TurnPhase::Thinking => (format!("{model} is thinking · {clock}"), None),
+        TurnPhase::Writing => {
+            let rate = turn
+                .tokens_per_sec(now)
+                .map(|r| format!(" · {r} tok/s"))
+                .unwrap_or_default();
+            (format!("{model} is writing{rate}"), None)
+        }
+        TurnPhase::Tool { name } => (format!("running {name} · {clock}"), None),
+        TurnPhase::AwaitingYou => (format!("waiting for your answer above · {clock}"), None),
+    }
+}
+
+/// `37k`, `850` — the size style of the status line.
+fn fmt_tokens_short(tokens: u32) -> String {
+    if tokens >= 1_000 {
+        format!("{}k", (tokens + 500) / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// `42s`, `3m05s`, `1h02m` — short, and stable in width within a unit.
+fn fmt_duration_short(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
     }
 }
 
@@ -148,6 +284,9 @@ pub enum ChatEntry {
         result: Option<String>,
         failed: bool,
     },
+    /// ahma talking to the user about the conversation — a retry, a turn's
+    /// cost — shown dim in the transcript and **never** sent to the model.
+    Notice { text: String },
 }
 
 /// Ring buffer of chat history entries (capped at `CHAT_HISTORY_CAP`).
@@ -479,7 +618,20 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/agent load <name>", "load an agent profile"),
     ("/agent delete <name>", "delete an agent profile"),
     ("/export markdown", "export chat transcript to markdown"),
-    ("/settings", "open settings panel (edit & persist)"),
+    ("/intro", "ahma in one screen — Enter on a line for more"),
+    (
+        "/doctor [question]",
+        "check ahma's health; ask it anything about ahma; fixes only with your OK",
+    ),
+    (
+        "/doctor fix <n>",
+        "apply fix n from the last /doctor report (asks first)",
+    ),
+    ("/getting-started", "same as /intro"),
+    (
+        "/settings [search]",
+        "every setting: model, trust & access, tools, sandbox — [search] jumps to a row",
+    ),
     (
         "/sync",
         "tool calls wait for their result (default; saved to settings)",
@@ -1182,6 +1334,9 @@ pub struct ApprovalGate {
     pub op_id: String,
     /// Raw tool name (e.g. `list_dir`), used when persisting an "always allow".
     pub tool: String,
+    /// The workspace an "always allow" is persisted under — the one the asking
+    /// agent checks, which is not necessarily this TUI's working directory.
+    pub workspace: String,
     pub description: String,
     /// Short scope hint (e.g. "new workspace …") shown dim when the prompt
     /// appears in an unfamiliar workspace; `None` when no context is warranted.
@@ -1204,6 +1359,7 @@ impl ApprovalGate {
         Self {
             op_id: op_id.into(),
             tool: tool.into(),
+            workspace: String::new(),
             description: description.into(),
             note: None,
             deadline: None,
@@ -1227,6 +1383,11 @@ impl ApprovalGate {
 
     /// Attach a diff preview to display alongside the prompt.
     #[must_use]
+    pub fn with_workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.workspace = workspace.into();
+        self
+    }
+
     pub fn with_diff(mut self, diff: Option<String>) -> Self {
         self.diff = diff;
         self
@@ -1384,6 +1545,9 @@ pub enum ModalState {
     None,
     /// The help screen.
     Help,
+    /// The two-level `/intro` tour: the highlighted topic, and whether its
+    /// second level is open.
+    Intro { selected: usize, expanded: bool },
     /// The `/` command navigator.
     Navigator(CommandNavigator),
     /// The inline provider picker.
@@ -1671,6 +1835,27 @@ pub struct AppState {
     pub scope_grant: Option<ScopeGrantGate>,
     /// Pending web-egress approval prompt, if any (parallel to `scope_grant`).
     pub web_approval: Option<WebApprovalGate>,
+    /// Measured prompt-reading speed (tokens/second) per model label, from
+    /// this session's own turns. Feeds the "~2m left" estimate.
+    pub read_rates: std::collections::HashMap<String, f64>,
+    /// Automatic retries spent on the current message (see
+    /// `app::end_turn_with_error`); reset when the user sends a new one.
+    pub turn_retries: u32,
+    /// Recently chosen models ahma runs itself, most recent first (persisted in
+    /// `.ahma/session.toml`): the fallback when a client's own model goes away.
+    pub recent_llms: Vec<crate::session_config::WindowLlmConfig>,
+    /// The client model chat was moved off because its client disconnected:
+    /// (that selection, its `mcp://` URL, the stand-in chosen for it). Lets chat
+    /// move back when the client returns, unless the user chose since.
+    pub displaced_client_model: Option<(LlmSelection, String, LlmSelection)>,
+    /// The one-time "trust this folder?" question (SPEC R-PERM.1.3), holding
+    /// the canonical folder it is about. `None` once answered, or when the
+    /// folder is already trusted or may never be (home, a root).
+    pub trust_prompt: Option<String>,
+    /// Fixes the last `/doctor` report offered, numbered from 1 in order.
+    pub doctor_fixes: Vec<ahma_common::doctor::Fix>,
+    /// A doctor fix waiting for the user's `y` (SPEC R-DOCTOR.2).
+    pub doctor_confirm: Option<ahma_common::doctor::Fix>,
     pub tools_list: Vec<crate::mcp_connections::ToolInfo>,
     pub mcp_connections: McpConnectionManager,
 
@@ -2347,8 +2532,12 @@ impl AppState {
         transport_label: impl Into<String>,
         unicode: bool,
     ) -> Self {
+        // Canonical, like the `--path` branch in `app::run`: this string keys
+        // approval grants, and a symlinked spelling would never match the
+        // canonical sandbox root the agent checks them against.
         let workspace = std::env::current_dir()
             .ok()
+            .map(|p| dunce::canonicalize(&p).unwrap_or(p))
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_default();
 
@@ -2402,6 +2591,16 @@ impl AppState {
             approval: None,
             scope_grant: None,
             web_approval: None,
+            read_rates: std::collections::HashMap::new(),
+            turn_retries: 0,
+            recent_llms: session
+                .as_ref()
+                .map(|s| s.recent.clone())
+                .unwrap_or_default(),
+            displaced_client_model: None,
+            trust_prompt: None,
+            doctor_fixes: Vec::new(),
+            doctor_confirm: None,
             tools_list: vec![],
             mcp_connections,
 
@@ -3409,6 +3608,88 @@ enum TreeToggle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn_in(phase: TurnPhase, for_secs: u64) -> (ChatTurn, std::time::Instant) {
+        let mut turn = ChatTurn::new(None);
+        turn.enter(phase);
+        let now = turn.phase_since + std::time::Duration::from_secs(for_secs);
+        (turn, now)
+    }
+
+    /// The 2026-09-23 session: qwen spent minutes reading a 37k-token prompt
+    /// and the screen said nothing. Every phase must say what is happening.
+    #[test]
+    fn status_line_names_each_phase_in_plain_words() {
+        let (reading, now) = turn_in(TurnPhase::Reading, 72);
+        let (text, hint) = turn_status_text(&reading, now, "qwen3.8", 37_400, Some(145.0));
+        assert_eq!(
+            text,
+            "qwen3.8 is reading 37k tokens of context · 1m12s · ~3m05s left"
+        );
+        assert!(
+            hint.unwrap().contains("/compact"),
+            "slow + large → actionable hint"
+        );
+
+        let (thinking, now) = turn_in(TurnPhase::Thinking, 5);
+        assert_eq!(
+            turn_status_text(&thinking, now, "qwen3.8", 0, None).0,
+            "qwen3.8 is thinking · 5s"
+        );
+
+        let (tool, now) = turn_in(
+            TurnPhase::Tool {
+                name: "cargo build".into(),
+            },
+            42,
+        );
+        assert_eq!(
+            turn_status_text(&tool, now, "qwen3.8", 0, None).0,
+            "running cargo build · 42s"
+        );
+
+        let (you, now) = turn_in(TurnPhase::AwaitingYou, 3);
+        assert!(
+            turn_status_text(&you, now, "m", 0, None)
+                .0
+                .contains("waiting for your answer")
+        );
+    }
+
+    #[test]
+    fn reading_past_the_estimate_says_so_instead_of_counting_negative() {
+        let (turn, now) = turn_in(TurnPhase::Reading, 400);
+        let (text, _) = turn_status_text(&turn, now, "m", 10_000, Some(100.0));
+        assert!(text.ends_with("taking longer than last time"), "{text}");
+    }
+
+    #[test]
+    fn leaving_reading_records_how_long_the_model_took_to_start() {
+        let mut turn = ChatTurn::new(None);
+        assert_eq!(turn.phase, TurnPhase::Reading);
+        turn.note_token("hi");
+        assert_eq!(turn.phase, TurnPhase::Writing);
+        assert!(turn.last_prefill.is_some());
+    }
+
+    /// Waiting on the user, or on a running tool, is never the model stalling.
+    #[test]
+    fn only_a_silent_model_counts_as_stalled() {
+        let late = TURN_STALL_AFTER + std::time::Duration::from_secs(1);
+        for (phase, stalled) in [
+            (TurnPhase::AwaitingYou, false),
+            (TurnPhase::Tool { name: "t".into() }, false),
+            (TurnPhase::Thinking, true),
+        ] {
+            let mut turn = ChatTurn::new(None);
+            turn.enter(phase.clone());
+            assert_eq!(
+                turn.is_stalled(turn.last_event + late),
+                stalled,
+                "{phase:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_log_level_parse_level() {

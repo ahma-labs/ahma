@@ -249,6 +249,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | — |
 | Code complexity analysis (`simplify`) | [docs/simplify.md](docs/simplify.md) | §9.5 |
 | Built-in file tools | [docs/file-tools.md](docs/file-tools.md) | R26 |
+| Doctor (`ahma doctor`, `/doctor`) | [docs/doctor.md](docs/doctor.md) | R-DOCTOR |
 | Sync/async execution mode | [docs/settings.md](docs/settings.md#sync-or-async-toolsexecution_mode) | R2.1, R2.4 |
 
 ### Maintenance Checklist

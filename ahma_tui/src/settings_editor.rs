@@ -13,6 +13,11 @@ use ahma_common::config::{AhmaSettings, FeatureSettings};
 pub enum SettingsCategory {
     Features,
     Tools,
+    /// What this folder is trusted with, and what ahma has been allowed to
+    /// reach outside it (SPEC R-PERM). Changes here ask for confirmation.
+    Access,
+    /// Which model chat uses (`[agent]`) — changed with `/model`.
+    Model,
     Sandbox,
     Logging,
     Http,
@@ -24,6 +29,8 @@ impl SettingsCategory {
     pub const ALL: &[Self] = &[
         Self::Tools,
         Self::Sandbox,
+        Self::Access,
+        Self::Model,
         Self::Logging,
         Self::Http,
         Self::Auth,
@@ -34,6 +41,8 @@ impl SettingsCategory {
         match self {
             Self::Features => "Features",
             Self::Tools => "Tools",
+            Self::Access => "Access & trust",
+            Self::Model => "Model",
             Self::Sandbox => "Sandbox",
             Self::Logging => "Logging",
             Self::Http => "HTTP",
@@ -49,6 +58,8 @@ impl SettingsCategory {
         match self {
             Self::Features => "-",
             Self::Tools => "T",
+            Self::Access => "P",
+            Self::Model => "M",
             Self::Sandbox => "S",
             Self::Logging => "L",
             Self::Http => "H",
@@ -266,6 +277,11 @@ pub struct SettingsEditor {
     pub confirming_discard: bool,
     /// Inline edit mode for string/numeric fields.
     pub editing: Option<String>,
+    /// The folder "this folder" rows are about (the TUI's workspace).
+    pub workspace: std::path::PathBuf,
+    /// An Access change waiting for its confirming second keypress: the row
+    /// index. Permissions are never changed on a single keystroke.
+    pub pending_confirm: Option<usize>,
 }
 
 impl Default for SettingsEditor {
@@ -279,13 +295,52 @@ impl Default for SettingsEditor {
             status_message: None,
             confirming_discard: false,
             editing: None,
+            workspace: std::env::current_dir().unwrap_or_default(),
+            pending_confirm: None,
         }
     }
 }
 
 impl SettingsEditor {
+    /// Open the panel on `workspace` and jump to the first row matching
+    /// `query` (key, label or description; case-insensitive), if any.
+    pub fn open_at(&mut self, workspace: &std::path::Path, query: &str) {
+        self.workspace = workspace.to_path_buf();
+        self.open();
+        let query = query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return;
+        }
+        let found = SettingsCategory::ALL
+            .iter()
+            .enumerate()
+            .find_map(|(c, cat)| {
+                self.items_for_category(*cat)
+                    .iter()
+                    .position(|item| {
+                        [item.key, item.label, item.description]
+                            .iter()
+                            .any(|t| t.to_ascii_lowercase().contains(&query))
+                    })
+                    .map(|i| (c, i))
+            });
+        match found {
+            Some((c, i)) => {
+                self.selected_category = c;
+                self.selected_item = i;
+            }
+            None => {
+                self.status_message = Some((
+                    format!("No setting matches \"{query}\""),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
+    }
+
     /// Open the settings panel, refreshing from disk.
     pub fn open(&mut self) {
+        self.pending_confirm = None;
         self.settings = AhmaSettings::load();
         self.open = true;
         self.dirty = false;
@@ -362,6 +417,10 @@ impl SettingsEditor {
     /// rather than read-only.
     pub fn toggle_current(&mut self) {
         let category = self.current_category();
+        if category == SettingsCategory::Access {
+            self.access_action(self.selected_item);
+            return;
+        }
         let mut items = self.items_for_category(category);
         let Some(item) = items.get_mut(self.selected_item) else {
             return;
@@ -371,7 +430,9 @@ impl SettingsEditor {
             self.dirty = true;
             return;
         }
-        let why = if item.security_tier {
+        let why = if category == SettingsCategory::Model {
+            item.description.to_string()
+        } else if item.security_tier {
             // R-CFG2.3: the dangerous switches are CLI-flag-only by design, so
             // they are always visible at the invocation site.
             format!(
@@ -399,10 +460,28 @@ impl SettingsEditor {
         }
     }
 
-    /// Save settings to disk.
+    /// Save the panel's edits to disk.
+    ///
+    /// Writes onto the file *as it is now*, not the snapshot taken when the
+    /// panel opened: everything the panel does not edit — tool approvals,
+    /// trusted folders, scope grants, web domains, the chosen model — comes
+    /// from disk, so a grant recorded while the panel was open is kept.
     pub fn save(&mut self) {
-        match self.settings.save() {
-            Ok(()) => {
+        let edited = self.settings.clone();
+        let saved = AhmaSettings::update(|on_disk| {
+            let persistent_scopes = std::mem::take(&mut on_disk.sandbox.persistent_scopes);
+            on_disk.features = edited.features.clone();
+            on_disk.tools = edited.tools.clone();
+            on_disk.sandbox = edited.sandbox.clone();
+            on_disk.sandbox.persistent_scopes = persistent_scopes;
+            on_disk.logging = edited.logging.clone();
+            on_disk.http = edited.http.clone();
+            on_disk.auth = edited.auth.clone();
+            on_disk.instance = edited.instance.clone();
+        });
+        match saved {
+            Ok(fresh) => {
+                self.settings = fresh;
                 self.dirty = false;
                 self.status_message = Some(("✓ Saved".into(), std::time::Instant::now()));
             }
@@ -430,6 +509,8 @@ impl SettingsEditor {
         match category {
             SettingsCategory::Features => self.feature_items(&defaults),
             SettingsCategory::Tools => self.tool_items(&defaults),
+            SettingsCategory::Access => self.access_items(),
+            SettingsCategory::Model => self.model_items(),
             SettingsCategory::Sandbox => self.sandbox_items(&defaults),
             SettingsCategory::Logging => self.logging_items(&defaults),
             SettingsCategory::Http => self.http_items(&defaults),
@@ -611,6 +692,150 @@ impl SettingsEditor {
         ]
     }
 
+    fn access_items(&self) -> Vec<SettingItem> {
+        let key = ahma_common::permissions::workspace_key(&self.workspace);
+        let perms = &self.settings.permissions;
+        let tools_here: Vec<String> = perms
+            .tool_approvals
+            .iter()
+            .filter(|a| a.workspace == key)
+            .flat_map(|a| a.tools.iter())
+            .filter(|t| *t != ahma_common::permissions::TRUSTED_WORKSPACE_TOOL)
+            .cloned()
+            .collect();
+        let scopes: Vec<String> = self
+            .settings
+            .sandbox
+            .persistent_scopes
+            .iter()
+            .map(|s| {
+                let access = match s.access {
+                    ahma_common::config::ScopeAccess::Ro => "read",
+                    ahma_common::config::ScopeAccess::Rw => "read+write",
+                };
+                format!("{} ({access})", s.path.display())
+            })
+            .collect();
+        let web = &self.settings.web;
+        let row = |key, label, description, value| SettingItem {
+            key,
+            label,
+            description,
+            default_value: SettingValue::StringList(Vec::new()),
+            value,
+            security_tier: true,
+        };
+        vec![
+            SettingItem {
+                key: "permissions.trusted",
+                label: "Trust this folder",
+                description: "Tools run here without asking; outside, network and settings still ask. Space changes (confirm)",
+                value: SettingValue::Bool(perms.is_workspace_trusted(&key)),
+                default_value: SettingValue::Bool(false),
+                security_tier: true,
+            },
+            row(
+                "permissions.tool_approvals",
+                "Always-allowed tools here",
+                "Answered \"always\" for this folder. Space forgets them all (confirm)",
+                SettingValue::StringList(tools_here),
+            ),
+            row(
+                "sandbox.persistent_scopes",
+                "Folders outside granted",
+                "Remove one: ahma sandbox revoke <path>",
+                SettingValue::StringList(scopes),
+            ),
+            row(
+                "web.always_allow",
+                "Web: always allowed",
+                "Remove one: ahma web revoke <domain>",
+                SettingValue::StringList(web.always_allow.clone()),
+            ),
+            row(
+                "web.never_allow",
+                "Web: never allowed",
+                "Remove one: ahma web revoke <domain>",
+                SettingValue::StringList(web.never_allow.clone()),
+            ),
+        ]
+    }
+
+    /// Carry out the Access row's change on its second keypress (the first
+    /// only says what would happen). Writes go straight to the permission
+    /// ledger through the audited helpers, never through `save`.
+    fn access_action(&mut self, index: usize) {
+        let folder = self.workspace.display().to_string();
+        let trusted = ahma_core::approvals::is_workspace_trusted(&self.workspace);
+        let preview = match index {
+            0 if trusted => {
+                format!("Stop trusting {folder}? Tools will ask again. Space to confirm")
+            }
+            0 => format!("Trust {folder}? Tools will run here without asking. Space to confirm"),
+            1 => format!("Forget every \"always allow\" for {folder}? Space to confirm"),
+            _ => {
+                let key = self
+                    .items_for_category(SettingsCategory::Access)
+                    .get(index)
+                    .map_or("", |i| i.description);
+                self.status_message = Some((key.to_string(), std::time::Instant::now()));
+                return;
+            }
+        };
+        if self.pending_confirm != Some(index) {
+            self.pending_confirm = Some(index);
+            self.status_message = Some((preview, std::time::Instant::now()));
+            return;
+        }
+        self.pending_confirm = None;
+        let result = match index {
+            0 if trusted => ahma_core::approvals::untrust_workspace(&self.workspace)
+                .map(|_| format!("✓ No longer trusting {folder}")),
+            0 => ahma_core::approvals::trust_workspace(&self.workspace)
+                .map(|()| format!("✓ Trusting {folder}")),
+            _ => ahma_core::approvals::forget_tool_approvals(&self.workspace)
+                .map(|n| format!("✓ Forgot {n} always-allowed tool(s)")),
+        };
+        let message = match result {
+            Ok(done) => {
+                // Show the ledger as it now is; the panel's unsaved edits to
+                // other tables are untouched.
+                self.settings.permissions = AhmaSettings::load().permissions;
+                done
+            }
+            Err(e) => format!("⚠ {e}"),
+        };
+        self.status_message = Some((message, std::time::Instant::now()));
+    }
+
+    fn model_items(&self) -> Vec<SettingItem> {
+        let a = &self.settings.agent;
+        let text = |v: &Option<String>| SettingValue::String(v.clone().unwrap_or_default());
+        let row = |key, label, description, value| SettingItem {
+            key,
+            label,
+            description,
+            default_value: SettingValue::String(String::new()),
+            value,
+            security_tier: false,
+        };
+        vec![
+            row(
+                "agent.provider",
+                "Provider",
+                "Change with /provider or /setup",
+                text(&a.provider),
+            ),
+            row("agent.model", "Model", "Change with /model", text(&a.model)),
+            row(
+                "agent.provider_url",
+                "Endpoint",
+                "Where the model is served (set by /provider)",
+                text(&a.provider_url),
+            ),
+        ]
+    }
+
     fn logging_items(&self, defaults: &AhmaSettings) -> Vec<SettingItem> {
         let l = &self.settings.logging;
         let d = &defaults.logging;
@@ -728,6 +953,9 @@ impl SettingsEditor {
         match category {
             SettingsCategory::Features => self.apply_feature(index, value),
             SettingsCategory::Tools => self.apply_tool(index, value),
+            // Access changes are applied (confirmed) immediately, never via
+            // save; Model is changed with /model. Neither is edited here.
+            SettingsCategory::Access | SettingsCategory::Model => {}
             SettingsCategory::Sandbox => self.apply_sandbox(index, value),
             SettingsCategory::Logging => self.apply_logging(index, value),
             SettingsCategory::Http => self.apply_http(index, value),
@@ -956,8 +1184,9 @@ mod tests {
 
         // Logging item 0 is a String — editable, but only in the file.
         editor.status_message = None;
-        editor.category_down();
-        assert_eq!(editor.current_category(), SettingsCategory::Logging);
+        while editor.current_category() != SettingsCategory::Logging {
+            editor.category_down();
+        }
         editor.toggle_current();
         let (msg, _) = editor.status_message.clone().expect("must explain");
         assert!(msg.contains("settings.toml"), "got: {msg}");
@@ -1014,6 +1243,8 @@ mod tests {
         let expected = [
             (SettingsCategory::Tools, "Tools", "T"),
             (SettingsCategory::Sandbox, "Sandbox", "S"),
+            (SettingsCategory::Access, "Access & trust", "P"),
+            (SettingsCategory::Model, "Model", "M"),
             (SettingsCategory::Logging, "Logging", "L"),
             (SettingsCategory::Http, "HTTP", "H"),
             (SettingsCategory::Auth, "Auth", "A"),
@@ -1346,9 +1577,10 @@ mod tests {
     #[test]
     fn reset_current_restores_modified_string_field() {
         let mut editor = SettingsEditor::default();
-        // Go to Logging (index 2); item 0 = target (String, default "file").
-        editor.category_down();
-        editor.category_down();
+        // Go to Logging; item 0 = target (String, default "file").
+        while editor.current_category() != SettingsCategory::Logging {
+            editor.category_down();
+        }
         assert_eq!(editor.current_category(), SettingsCategory::Logging);
         editor.apply_logging(0, &SettingValue::String("stderr".into()));
         assert_eq!(editor.settings().logging.target, "stderr");
@@ -1545,6 +1777,103 @@ mod tests {
     }
 
     // ── save() via the AHMA_TEST_HOME debug seam (success path) ────────────
+
+    /// `/settings <words>` lands on the matching row, in whatever category.
+    #[test]
+    fn open_at_jumps_to_the_first_matching_row() {
+        let mut editor = SettingsEditor::default();
+        editor.open_at(std::path::Path::new("/ws"), "trust");
+        assert_eq!(editor.current_category(), SettingsCategory::Access);
+        assert_eq!(editor.selected_item, 0);
+
+        editor.open_at(std::path::Path::new("/ws"), "handshake");
+        assert_eq!(editor.current_category(), SettingsCategory::Http);
+
+        editor.open_at(std::path::Path::new("/ws"), "no such thing");
+        let (msg, _) = editor.status_message.clone().unwrap();
+        assert!(msg.contains("No setting matches"), "{msg}");
+    }
+
+    /// Permissions never change on one keystroke: the first Space says what
+    /// would happen, the second does it — through the audited ledger helpers.
+    #[test]
+    fn trusting_from_the_panel_takes_a_confirming_second_press() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::HOME_SEAM_GUARD.lock();
+        // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        unsafe {
+            std::env::set_var("AHMA_TEST_HOME", home.path());
+        }
+        let project = home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut editor = SettingsEditor::default();
+        editor.open_at(&project, "trust this folder");
+
+        editor.toggle_current();
+        assert!(!ahma_core::approvals::is_workspace_trusted(&project));
+        let (msg, _) = editor.status_message.clone().unwrap();
+        assert!(msg.contains("Space to confirm"), "{msg}");
+
+        editor.toggle_current();
+        assert!(ahma_core::approvals::is_workspace_trusted(&project));
+        assert!(!editor.dirty, "applied directly, not left for [s]");
+
+        // And back, again only on the second press.
+        editor.toggle_current();
+        assert!(ahma_core::approvals::is_workspace_trusted(&project));
+        editor.toggle_current();
+        assert!(!ahma_core::approvals::is_workspace_trusted(&project));
+        unsafe {
+            std::env::remove_var("AHMA_TEST_HOME");
+        }
+    }
+
+    #[test]
+    fn model_rows_say_how_to_change_the_model() {
+        let mut editor = SettingsEditor::default();
+        editor.open_at(std::path::Path::new("/ws"), "agent.model");
+        editor.toggle_current();
+        let (msg, _) = editor.status_message.clone().unwrap();
+        assert!(msg.contains("/model"), "{msg}");
+    }
+
+    /// Regression: the panel saved the snapshot it took when opened, erasing
+    /// any grant recorded while it was open — which then got asked again.
+    #[test]
+    fn save_keeps_a_grant_recorded_while_the_panel_was_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::HOME_SEAM_GUARD.lock();
+        // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        unsafe {
+            std::env::set_var("AHMA_TEST_HOME", dir.path());
+        }
+        let mut editor = SettingsEditor::default();
+        editor.open();
+
+        // Meanwhile, another surface records an "always allow".
+        AhmaSettings::update(|s| {
+            s.permissions
+                .approve_tool(std::path::Path::new("/ws"), "list_dir", None, None);
+        })
+        .unwrap();
+
+        editor.item_down();
+        editor.toggle_current();
+        editor.dirty = true;
+        editor.save();
+
+        let reloaded = AhmaSettings::load();
+        assert_eq!(reloaded.tools.execution_mode, ExecutionPolicy::Async);
+        assert!(
+            reloaded
+                .permissions
+                .is_tool_approved(std::path::Path::new("/ws"), "list_dir"),
+            "the grant made while the panel was open survives its save"
+        );
+        unsafe {
+            std::env::remove_var("AHMA_TEST_HOME");
+        }
+    }
 
     #[test]
     fn save_writes_to_home_seam_and_reloads() {

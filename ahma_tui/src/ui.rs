@@ -42,6 +42,9 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     match &state.modal {
         crate::state::ModalState::None => {}
         crate::state::ModalState::Help => draw_help(frame, state, theme, full),
+        crate::state::ModalState::Intro { selected, expanded } => {
+            draw_intro(frame, theme, full, *selected, *expanded)
+        }
         crate::state::ModalState::Navigator(_) => draw_navigator(frame, state, theme, full),
         crate::state::ModalState::ProviderPicker(picker)
         | crate::state::ModalState::ModelPicker(picker)
@@ -71,6 +74,98 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     if state.web_approval.is_some() {
         draw_web_approval_modal(frame, state, theme, full);
     }
+    if state.trust_prompt.is_some() {
+        draw_trust_modal(frame, state, theme, full);
+    }
+    if state.doctor_confirm.is_some() {
+        draw_doctor_confirm(frame, state, theme, full);
+    }
+}
+
+/// "Apply this fix?" for `/doctor fix <n>`: the exact change, then `y`.
+fn draw_doctor_confirm(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let Some(fix) = &state.doctor_confirm else {
+        return;
+    };
+    let popup = centered_rect(76, 9, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(
+            " Doctor · apply this fix? ",
+            theme.title().bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let mut lines = vec![
+        Line::from(Span::styled(fix.describe(), theme.normal())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Recorded in ~/.ahma/permissions-audit.jsonl.",
+            theme.dim(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [y] ", theme.success().bold()),
+            Span::styled("Apply    ", theme.normal().bold()),
+            Span::styled("[n] ", theme.failed().bold()),
+            Span::styled("Leave it (default)", theme.normal()),
+        ]),
+    ];
+    lines.extend(gate_typing_note(state, theme));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// The one-time "trust this folder?" question (SPEC R-PERM.1.3). Says plainly
+/// what yes covers and what it never covers, so one keystroke replaces the
+/// per-tool questions without anyone having to guess what they agreed to.
+fn draw_trust_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let Some(folder) = &state.trust_prompt else {
+        return;
+    };
+    let popup = centered_rect(76, 13, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(" Trust this folder? ", theme.title().bold()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = vec![
+        Line::from(Span::styled(folder.clone(), theme.success().bold())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Yes: tools read, write, build and test inside this folder without asking.",
+            theme.normal(),
+        )),
+        Line::from(Span::styled(
+            "The kernel sandbox still keeps every command inside it.",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            "Always asks: paths outside it, network access, `!` commands, settings.",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            "No: ahma asks before each tool that changes something.",
+            theme.dim(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [y] ", theme.success().bold()),
+            Span::styled("Trust this folder    ", theme.normal().bold()),
+            Span::styled("[n] ", theme.failed().bold()),
+            Span::styled("Ask per tool (default)", theme.normal()),
+        ]),
+        Line::from(Span::styled("  Enter / Esc = ask per tool", theme.dim())),
+    ];
+    lines.extend(gate_typing_note(state, theme));
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
 }
 
 // ─── Chat layout ──────────────────────────────────────────────────────────────
@@ -113,8 +208,8 @@ fn compute_window_layouts(
             let preferred_h = if w.collapsed {
                 1
             } else {
-                // +2 for the top/bottom border.
-                (expanded_window_line_count(w) + 2).clamp(3, 8) as u16
+                // + the title rule.
+                (expanded_window_line_count(w) + PANE_BORDER_ROWS).clamp(2, 7) as u16
             };
             RenderedWindowLayout {
                 orig_idx: i,
@@ -352,6 +447,15 @@ fn build_window_title(w: &crate::state::TuiWindow, width: u16, unicode: bool) ->
     }
 }
 
+/// The frame of a pane that is part of the layout (chat, input, windows,
+/// log): a single top rule carrying the title. The terminal's own edges already
+/// bound the left, right and bottom; drawing them again only costs columns and
+/// rows. Floating overlays (pickers, modals) keep a full border, because they
+/// sit on top of content and need an edge to read as separate from it.
+const PANE_BORDERS: Borders = Borders::TOP;
+/// Rows [`PANE_BORDERS`] takes from a pane's height.
+const PANE_BORDER_ROWS: usize = 1;
+
 fn draw_expanded_window(
     frame: &mut Frame,
     w: &crate::state::TuiWindow,
@@ -363,7 +467,7 @@ fn draw_expanded_window(
 
     let block = Block::default()
         .title(Span::styled(title_combined, theme.normal()))
-        .borders(Borders::ALL)
+        .borders(PANE_BORDERS)
         .border_style(status_style);
 
     let inner = block.inner(area);
@@ -796,7 +900,8 @@ fn draw_windows_layout(
 }
 
 fn compute_chat_input_height(state: &AppState, full_width: u16) -> u16 {
-    let inner_width = full_width.saturating_sub(2);
+    // No side borders (see [`PANE_BORDERS`]): the text gets the full width.
+    let inner_width = full_width;
     let wrapped_line_count = state
         .chat_input_line_count(inner_width as usize)
         .clamp(1, 6);
@@ -809,7 +914,7 @@ fn compute_chat_input_height(state: &AppState, full_width: u16) -> u16 {
         .get()
         .round()
         .clamp(1.0, 6.0) as u16;
-    input_lines + 2 // borders
+    input_lines + PANE_BORDER_ROWS as u16
 }
 
 fn draw_zoomed_chat_pane(
@@ -916,7 +1021,15 @@ fn compute_approval_height(state: &AppState) -> u16 {
 
 /// Work view on top, then whichever panes are open beneath it.
 fn draw_main_body(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let mut constraints = vec![Constraint::Min(3)];
+    // With chat open the work view takes the rows it has content for (up to
+    // half the body) and chat fills the rest; alone, it fills the body.
+    let work = if state.chat_open {
+        let wanted = work::content_rows(state, wall_ms()).max(1);
+        Constraint::Length(wanted.min((area.height / 2).max(3)))
+    } else {
+        Constraint::Fill(1)
+    };
+    let mut constraints = vec![work];
 
     let scope_lines = state
         .scope_window_open
@@ -928,7 +1041,7 @@ fn draw_main_body(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
         constraints.push(Constraint::Length((area.height / 3).clamp(6, 16)));
     }
     if state.chat_open {
-        constraints.push(Constraint::Min(4));
+        constraints.push(Constraint::Fill(1));
     }
 
     let areas = Layout::vertical(constraints).split(area);
@@ -1028,7 +1141,7 @@ fn connection_span(
 }
 
 /// `12s`, `3m`, `2h` — coarse on purpose, it only has to say "a while".
-fn format_elapsed_short(d: std::time::Duration) -> String {
+pub(crate) fn format_elapsed_short(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     match secs {
         0..=59 => format!("{secs}s"),
@@ -1361,10 +1474,23 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     };
 
     let block = Block::default()
-        .borders(Borders::ALL)
+        .title(Span::styled(chat_title(state), theme.title()))
+        .title(Line::from(Span::styled(chat_scroll_hint(state), theme.dim())).right_aligned())
+        .borders(PANE_BORDERS)
         .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // A running turn pins its status line(s) to the bottom of the transcript,
+    // outside the scrolled region: however far back the user has scrolled,
+    // what the model is doing right now stays in view.
+    let status = turn_status_lines(state, theme);
+    let status_h = (status.len() as u16).min(inner.height.saturating_sub(1));
+    let [inner, status_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(status_h)]).areas(inner);
+    if status_h > 0 {
+        frame.render_widget(Paragraph::new(Text::from(status)), status_area);
+    }
 
     state.chat_area.set(inner);
 
@@ -1419,10 +1545,22 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     // Rows are already wrapped to `text_width`; render without ratatui's wrap so
     // the rendered height matches the row count exactly. Confine the paragraph to
     // the reserved text column width to leave room for the scrollbar.
+    //
+    // A conversation shorter than the pane sits at its bottom, against the
+    // input, the way a terminal fills — not at the top with a gap below it.
+    let pad = visible_h.saturating_sub(visible_rows.len()) as u16;
     let text_area = Rect {
+        y: inner.y + pad,
+        height: inner.height - pad,
         width: inner.width.saturating_sub(1).max(1),
         ..inner
     };
+    // Clicks map through `chat_area`, so it must be where the rows are drawn.
+    state.chat_area.set(Rect {
+        y: inner.y + pad,
+        height: inner.height - pad,
+        ..inner
+    });
     frame.render_widget(Paragraph::new(Text::from(visible_rows)), text_area);
 
     // Physical-row units so position, viewport, and content length all match
@@ -1440,6 +1578,98 @@ fn chat_history_hint(state: &AppState) -> &'static str {
     } else {
         "  Type a message and press Enter to start chatting"
     }
+}
+
+/// ` chat ` or ` chat · claude-code `: whose conversation this is.
+fn chat_title(state: &AppState) -> String {
+    let window = state.active_target_instance.as_deref().and_then(|id| {
+        state
+            .active_instances
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.client.clone().unwrap_or_else(|| i.label.clone()))
+    });
+    match window {
+        Some(name) => format!(" chat · {name} "),
+        None => " chat ".to_string(),
+    }
+}
+
+/// ` ↓ newer below ` while the transcript is scrolled back, so it is never a
+/// mystery why new replies are not appearing.
+fn chat_scroll_hint(state: &AppState) -> String {
+    if state.chat_scroll > 0 {
+        let arrow = if state.unicode { "↓" } else { "v" };
+        format!(" {arrow} newer below ")
+    } else {
+        String::new()
+    }
+}
+
+/// The live status line under the transcript while a turn runs: the liveness
+/// panel, then what is happening in plain words (see
+/// [`crate::state::turn_status_text`]), and a dim hint line when the numbers
+/// suggest the user could do something about a slow turn. Empty with no turn.
+fn turn_status_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let Some(turn) = &state.turn else {
+        return Vec::new();
+    };
+    let now = std::time::Instant::now();
+    let label = state.llm_label();
+    let model = shorten_llm_label(&label);
+    let known = state
+        .window_usage
+        .get(&AppState::usage_key(turn.target_instance.as_deref()))
+        .map_or(0, |u| u.last_prompt_tokens);
+    let prompt_tokens = known.max(estimate_tokens(conversation_chars(state)));
+    let rate = state.read_rates.get(&label).copied();
+    let (text, hint) = crate::state::turn_status_text(turn, now, &model, prompt_tokens, rate);
+
+    let waiting_on_you = turn.phase == crate::state::TurnPhase::AwaitingYou;
+    // Waiting on the user is not the model working: hold the panel still and
+    // dim, so it cannot be mistaken for progress.
+    let (glyph, style) = if waiting_on_you {
+        (
+            if state.unicode { "⣿⣿" } else { "||" }.to_string(),
+            theme.pending(),
+        )
+    } else if state.liveness_glyph.trim().is_empty() {
+        (
+            crate::liveness::panel_glyphs(0, 0, turn_pattern(turn), state.unicode),
+            theme.running(),
+        )
+    } else {
+        (state.liveness_glyph.clone(), theme.running())
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(glyph, style),
+        Span::raw(" "),
+        Span::styled(
+            text,
+            if waiting_on_you {
+                theme.pending()
+            } else {
+                theme.dim()
+            },
+        ),
+    ])];
+    if let Some(hint) = hint {
+        lines.push(Line::from(Span::styled(
+            format!("   {hint}"),
+            theme.dim().italic(),
+        )));
+    }
+    lines
+}
+
+/// The panel pattern for a turn that has not produced output yet.
+fn turn_pattern(turn: &crate::state::ChatTurn) -> crate::liveness::PanelPattern {
+    match turn.phase {
+        crate::state::TurnPhase::Tool { .. } => crate::state::LivenessState::ToolWait,
+        crate::state::TurnPhase::Writing => crate::state::LivenessState::Streaming,
+        _ => crate::state::LivenessState::Thinking,
+    }
+    .pattern()
 }
 
 /// Whether the transcript's rendering depends on inputs no cache key can
@@ -1546,6 +1776,13 @@ fn push_chat_entry_lines(
             theme,
             width,
         ),
+        ChatEntry::Notice { text } => {
+            let mark = if state.unicode { "·" } else { "-" };
+            lines.push(Line::from(Span::styled(
+                format!("   {mark} {text}"),
+                theme.dim().italic(),
+            )));
+        }
     }
 }
 
@@ -1876,7 +2113,7 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     let block = Block::default()
         .title(title_left)
         .title(title_right)
-        .borders(Borders::ALL)
+        .borders(PANE_BORDERS)
         .border_style(border_style)
         .style(theme.input_bg());
     let inner = block.inner(area);
@@ -2219,11 +2456,11 @@ fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
-/// Height for the `/scope` window: sized to its content (+2 border rows),
+/// Height for the `/scope` window: sized to its content (+ its title rule),
 /// never more than half the available area — honest panes (R24.8) budget the
 /// rows the renderer actually draws.
 fn scope_window_height(content_lines: usize, area: Rect) -> u16 {
-    (content_lines as u16 + 2).clamp(4, (area.height / 2).max(4))
+    (content_lines as u16 + PANE_BORDER_ROWS as u16).clamp(3, (area.height / 2).max(3))
 }
 
 /// The persistent sandbox-scope sub-window, toggled with `/scope`. Informational
@@ -2233,7 +2470,7 @@ fn draw_scope_window(frame: &mut Frame, theme: &Theme, area: Rect, lines: Vec<Li
     let block = Block::default()
         .title(Span::styled(" Sandbox · scope ", theme.title()))
         .title(Line::from(Span::styled(" /scope closes ", theme.dim())).right_aligned())
-        .borders(Borders::ALL)
+        .borders(PANE_BORDERS)
         .border_style(theme.border_unfocused());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2459,6 +2696,7 @@ fn conversation_chars(state: &AppState) -> usize {
             ChatEntry::ToolCall { args, result, .. } => {
                 args.len() + result.as_ref().map_or(0, |r| r.len())
             }
+            ChatEntry::Notice { .. } => 0,
         })
         .sum()
 }
@@ -2562,7 +2800,7 @@ fn draw_empty_ops_hint(frame: &mut Frame, state: &AppState, theme: &Theme, inner
 fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let block = Block::default()
         .title(Span::styled(ops_dag_title(state), theme.title()))
-        .borders(Borders::ALL)
+        .borders(PANE_BORDERS)
         .border_style(ops_dag_border_style(state, theme));
 
     let inner = block.inner(area);
@@ -3256,7 +3494,7 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
     let block = Block::default()
         .title(Span::styled(build_log_title(state), theme.title()))
-        .borders(Borders::ALL)
+        .borders(PANE_BORDERS)
         .border_style(border_style);
 
     let inner = block.inner(area);
@@ -3886,6 +4124,64 @@ fn help_single_rows() -> Vec<HelpRow> {
     rows
 }
 
+/// The `/intro` tour (SPEC R24.12.6): one line per topic, the highlighted
+/// one's second level opened beneath it on Enter.
+fn draw_intro(frame: &mut Frame, theme: &Theme, area: Rect, selected: usize, expanded: bool) {
+    let topics = crate::intro::TOPICS;
+    let detail_rows = if expanded {
+        topics.get(selected).map_or(0, |t| t.detail.len() + 1)
+    } else {
+        0
+    };
+    let w = 96u16.min(area.width);
+    let h = (topics.len() as u16 * 2 + detail_rows as u16 + 4).min(area.height);
+    let popup = centered_rect(w, h, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(" ahma in one screen ", theme.title().bold()))
+        .title(
+            Line::from(Span::styled(
+                " ↑↓ choose · Enter more · Esc done ",
+                theme.dim(),
+            ))
+            .right_aligned(),
+        )
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = Vec::new();
+    for (i, topic) in topics.iter().enumerate() {
+        let here = i == selected;
+        let marker = match (here, expanded) {
+            (true, true) => "▾ ",
+            (true, false) => "▸ ",
+            _ => "  ",
+        };
+        let title_style = if here {
+            theme.title().bold()
+        } else {
+            theme.normal().bold()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, theme.title()),
+            Span::styled(topic.title, title_style),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", topic.summary),
+            if here { theme.normal() } else { theme.dim() },
+        )));
+        if here && expanded {
+            for d in topic.detail {
+                lines.push(Line::from(Span::styled(format!("    {d}"), theme.dim())));
+            }
+            lines.push(Line::default());
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let use_two_columns = area.width >= 100;
 
@@ -3904,7 +4200,10 @@ fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
-        .title(Span::styled(" Help — ahma TUI ", theme.title()))
+        .title(Span::styled(
+            " Help — ahma TUI · new here? /intro ",
+            theme.title(),
+        ))
         .title(Line::from(Span::styled(" ↑↓ scroll · Esc closes ", theme.dim())).right_aligned())
         .borders(Borders::ALL)
         .border_style(theme.border_focused());
@@ -4318,7 +4617,7 @@ mod tests {
         );
 
         let layouts = compute_window_layouts(std::slice::from_ref(&w), 40);
-        let inner_h = layouts[0].height as usize - 2; // borders
+        let inner_h = layouts[0].height as usize - PANE_BORDER_ROWS;
         assert!(
             inner_h >= expanded_window_line_count(&w),
             "window sized {inner_h} rows for {} rendered lines — the answer is cut off",
@@ -4365,8 +4664,19 @@ mod tests {
         );
         assert!(!footer.contains("no response"), "{footer}");
 
+        // A model reading its prompt is silent by nature: not yet a stall…
         state.turn.as_mut().unwrap().last_event =
             std::time::Instant::now() - crate::state::TURN_STALL_AFTER;
+        assert!(!render_footer(&state, 160).contains("no response"));
+        // …until it has been silent far longer than any prompt takes.
+        state.turn.as_mut().unwrap().last_event =
+            std::time::Instant::now() - crate::state::READING_STALL_AFTER;
+        assert!(render_footer(&state, 160).contains("no response"));
+
+        // A model that started answering and went quiet is flagged at 60 s.
+        let turn = state.turn.as_mut().unwrap();
+        turn.enter(crate::state::TurnPhase::Writing);
+        turn.last_event = std::time::Instant::now() - crate::state::TURN_STALL_AFTER;
         assert!(render_footer(&state, 160).contains("no response"));
     }
 
@@ -4476,6 +4786,77 @@ mod tests {
         );
     }
 
+    /// The whole screen, as the user sees it, at `w`×`h`.
+    fn render_full_screen(state: &AppState, w: u16, h: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| draw(frame, state, &theme)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Minimal chrome (2026-09-23 review): no frame down the screen's left or
+    /// right edge, no bottom rule under a pane, and a short conversation sits
+    /// against the input instead of leaving a band of empty rows above it.
+    #[test]
+    fn panes_have_a_title_rule_only_and_chat_fills_the_screen() {
+        for (w, h) in [(80u16, 24u16), (200, 60)] {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.chat_open = true;
+            state.chat.push(ChatEntry::User {
+                text: "hello there".into(),
+                payload: None,
+                started_at: None,
+                duration_ms: Some(1),
+            });
+            let screen = render_full_screen(&state, w, h);
+
+            for (y, row) in screen.iter().enumerate() {
+                let first = row.chars().next().unwrap_or(' ');
+                let last = row.chars().last().unwrap_or(' ');
+                assert!(
+                    !matches!(first, '│' | '┌' | '└' | '╭' | '╰'),
+                    "{w}x{h} row {y} has a left edge: {row:?}"
+                );
+                assert!(
+                    !matches!(last, '│' | '┐' | '┘' | '╮' | '╯'),
+                    "{w}x{h} row {y} has a right edge: {row:?}"
+                );
+            }
+            let message_row = screen
+                .iter()
+                .position(|r| r.contains("hello there"))
+                .expect("the message is drawn");
+            assert!(
+                message_row >= (h as usize) * 2 / 3,
+                "{w}x{h}: a short conversation sits low, near the input (row {message_row})"
+            );
+        }
+    }
+
+    #[test]
+    fn intro_shows_every_topic_and_the_open_ones_detail() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.modal = crate::state::ModalState::Intro {
+            selected: 1,
+            expanded: true,
+        };
+        let screen = render_full_screen(&state, 120, 40).join("\n");
+        for topic in crate::intro::TOPICS {
+            assert!(screen.contains(topic.title), "missing {}", topic.title);
+        }
+        assert!(screen.contains(crate::intro::TOPICS[1].detail[0].trim()));
+        assert!(!screen.contains(crate::intro::TOPICS[0].detail[0].trim()));
+    }
+
     /// Render the chat history pane into a TestBackend and read back the screen.
     fn render_chat_screen(state: &AppState, theme: &Theme, w: u16, h: u16) -> String {
         use ratatui::Terminal;
@@ -4493,6 +4874,38 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A turn that has produced nothing yet still says what is going on, on
+    /// the last row, even with the transcript scrolled back (2026-09-23: qwen
+    /// read a 37k prompt for minutes with no sign of life on screen).
+    #[test]
+    fn a_silent_turn_shows_what_the_model_is_doing_on_the_last_row() {
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.chat.push(ChatEntry::User {
+            text: "read the repo".into(),
+            payload: None,
+            started_at: Some(std::time::Instant::now()),
+            duration_ms: None,
+        });
+        state.turn = Some(crate::state::ChatTurn::new(None));
+        state.chat_scroll = 5;
+
+        let screen = render_chat_screen(&state, &theme, 80, 10);
+        let last = screen.lines().last().unwrap_or_default();
+        assert!(
+            last.contains("reading") || last.contains("waiting for"),
+            "{screen}"
+        );
+
+        state
+            .turn
+            .as_mut()
+            .unwrap()
+            .enter(crate::state::TurnPhase::AwaitingYou);
+        let screen = render_chat_screen(&state, &theme, 80, 10);
+        assert!(screen.contains("waiting for your answer"), "{screen}");
     }
 
     /// A tool-call line is clipped to one row; the row still knows which
@@ -4662,7 +5075,7 @@ mod tests {
                 .join("\n")
         };
 
-        // Following: pinned to the newest entries (6 inner rows).
+        // Following: pinned to the newest entries (7 rows under the title rule).
         state.log_follow = true;
         let screen = render(&state);
         assert!(
@@ -4671,7 +5084,7 @@ mod tests {
         );
         assert_eq!(
             state.log_max_scroll.get(),
-            50 - 6,
+            50 - 7,
             "scroll bounds must cover the whole buffer, not just the slice"
         );
 
@@ -4693,7 +5106,7 @@ mod tests {
         );
         assert_eq!(
             state.log_max_scroll.get(),
-            11usize.saturating_sub(6),
+            11usize.saturating_sub(7),
             "bounds must be over the filtered rows (line-4, line-40..49)"
         );
     }
@@ -4867,9 +5280,10 @@ mod tests {
                 .draw(|frame| draw_ops_dag(frame, &state, &theme, Rect::new(0, 0, w, h)))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
-            // Column w-2 is inside the block border, where the bar renders.
-            (1..h - 1)
-                .map(|y| buf.cell((w - 2, y)).unwrap().bg.into())
+            // The bar is the pane's last column (there is no right border), on
+            // every row under the title rule.
+            (1..h)
+                .map(|y| buf.cell((w - 1, y)).unwrap().bg.into())
                 .collect()
         };
 

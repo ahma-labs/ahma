@@ -1695,6 +1695,54 @@ pub(crate) fn check_stdio_not_interactive() -> Result<()> {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `ahma doctor [--fix]` (SPEC R-DOCTOR): print the shared health report and,
+/// with `--fix` on a terminal, offer each fix individually.
+pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    let workspace = match args.path {
+        Some(p) => p,
+        None => std::env::current_dir().context("cannot read the current directory")?,
+    };
+    let findings =
+        ahma_common::doctor::run(&ahma_common::doctor::DoctorInput::for_workspace(&workspace));
+    print!("{}", ahma_common::doctor::render(&findings));
+    let fixes = ahma_common::doctor::fixes(&findings);
+    if fixes.is_empty() {
+        println!("\nNothing to fix.");
+        return Ok(());
+    }
+    if !args.fix {
+        println!(
+            "\n{} fix(es) available. `ahma doctor --fix` offers each one (nothing changes \
+             without a y), or use /doctor in ahma tui.",
+            fixes.len()
+        );
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        println!("\n--fix needs a terminal to ask you; nothing was changed.");
+        return Ok(());
+    }
+    let stdin = std::io::stdin();
+    for (i, fix) in fixes.iter().enumerate() {
+        print!("\nfix {}: {}\nApply? [y/N] ", i + 1, fix.describe());
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        stdin.lock().read_line(&mut answer)?;
+        if answer.trim().eq_ignore_ascii_case("y") {
+            let now = chrono::Local::now().to_rfc3339();
+            match fix.apply(&now) {
+                Ok(done) => println!("{done}."),
+                Err(e) => println!("Could not apply: {e:#}"),
+            }
+        } else {
+            println!("Skipped.");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
