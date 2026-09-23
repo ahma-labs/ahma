@@ -1,17 +1,13 @@
 //! The tools ahma answers itself, named once.
 //!
-//! These twenty names used to be written out in four places — the `Tool::new`
-//! arguments, `HARDCODED_TOOLS`, `RESERVED_TOOL_NAMES`, and the `match` in
-//! `dispatch_tool_call` — plus three subset lists carved out of them. PR #617
-//! collapsed the first three into one constant and added a test to keep it
-//! honest. This finishes the job: a name is now a *variant*, so the remaining
-//! agreements are checked by the compiler rather than by a test.
+//! Each built-in is a *variant*, declared in one list below, so every place that
+//! must agree on the set — the advertised `Tool`s, the reserved names MTDF configs
+//! may not reuse (SPEC R1.5), and dispatch — is checked by the compiler.
 //!
-//! The distinction matters most in dispatch. That `match` ends in
-//! `_ => dispatch_configured_tool(...)`, so a built-in added to the list and
-//! forgotten there did not fail loudly — it fell through to the configured-tool
-//! lookup and returned "tool not found". Matching on this enum makes that a
-//! compile error.
+//! Dispatch is where this matters most: its `match` ends in
+//! `_ => dispatch_configured_tool(...)`, so a built-in missing from it would fall
+//! through to the configured-tool lookup and answer "tool not found". Matching on
+//! this enum makes that a compile error.
 //!
 //! The subset predicates below are the other half. Each is an exhaustive match,
 //! so adding a tool forces an explicit answer to "is it exempt from the sandbox
@@ -77,8 +73,7 @@ builtin_tools! {
 impl BuiltinTool {
     /// The built-in called `name`, if there is one.
     ///
-    /// A linear scan over twenty `&'static str` comparisons, run once per tool
-    /// call. Deriving it from [`Self::name`] rather than writing a second
+    /// A linear scan over [`Self::ALL`], run once per tool call. Deriving it from [`Self::name`] rather than writing a second
     /// `match` is the point: one declaration, no way to disagree with itself.
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|tool| tool.name() == name)

@@ -238,9 +238,7 @@ fn run_settings_init(force: bool, path: Option<PathBuf>) -> Result<()> {
 /// both as named functions is what stops the two reports from drifting apart.
 fn print_settings_plain(rows: &[SettingRow], file_path: Option<&std::path::Path>) {
     println!("# Effective Ahma settings");
-    println!(
-        "# Sources: [file] = ~/.ahma/settings.toml  [env] = AHMA_* (deprecated)  [default] = compiled-in"
-    );
+    println!("# Sources: [file] = ~/.ahma/settings.toml  [default] = compiled-in");
     println!("# Run `ahma settings show --origin` for exact per-key provenance.");
     println!();
 

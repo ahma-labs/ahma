@@ -1048,7 +1048,7 @@ pub struct Cli {
     pub markdown_help: bool,
 
     /// Ignore `~/.ahma/settings.toml` for this invocation. All settings fall
-    /// back to compiled-in defaults and any deprecated `AHMA_*` env vars.
+    /// back to compiled-in defaults (`AHMA_*` env vars are never a source).
     #[arg(long, global = true)]
     pub no_settings: bool,
 
@@ -1117,12 +1117,12 @@ pub struct Cli {
     #[arg(long = "restrict-network", global = true)]
     pub restrict_network: bool,
 
-    /// Enable output compression and token minimization.
+    /// In `ahma tui` chat, append a conciseness rule to the model's system prompt
+    /// to cut response tokens. Equivalent to `tools.minimize_tokens = true`.
     #[arg(long = "minimize-tokens", global = true)]
     pub minimize_tokens: bool,
 
-    /// Disable output compression and token minimization
-    /// (overrides settings.toml and the deprecated AHMA_MINIMIZE_TOKENS env var).
+    /// Turn off `--minimize-tokens` for this invocation (overrides settings.toml).
     #[arg(
         long = "no-minimize-tokens",
         global = true,
@@ -1135,8 +1135,7 @@ pub struct Cli {
     #[arg(long = "small-model-harness", global = true)]
     pub small_model_harness: bool,
 
-    /// Disable small-model harness adaptations
-    /// (overrides settings.toml and the deprecated AHMA_SMALL_MODEL_HARNESS env var).
+    /// Turn off `--small-model-harness` for this invocation (overrides settings.toml).
     #[arg(
         long = "no-small-model-harness",
         global = true,
@@ -1308,7 +1307,7 @@ pub struct Cli {
     /// Directory for rolling log files. Defaults to the sandbox scope's
     /// `.ahma/logs/`, else `.ahma/logs/` at the enclosing repository root,
     /// falling back to `~/.ahma/logs`. Set `[logging] dir` in settings.toml to
-    /// make a choice persistent. Replaces the deprecated AHMA_LOG_DIR
+    /// make a choice persistent. Replaces the retired AHMA_LOG_DIR
     /// environment variable.
     #[arg(long = "log-dir", value_name = "PATH", global = true)]
     pub log_dir: Option<PathBuf>,
@@ -1321,12 +1320,12 @@ pub struct Cli {
     pub hooks_mode: Option<String>,
 
     /// Directory for local TLS certificates (default: `~/.ahma/tls`).
-    /// Replaces the deprecated AHMA_TLS_DIR environment variable.
+    /// Replaces the retired AHMA_TLS_DIR environment variable.
     #[arg(long = "tls-dir", value_name = "PATH", global = true)]
     pub tls_dir: Option<PathBuf>,
 
     /// Hub daemon socket path (Unix socket path; `host:port` on Windows).
-    /// Replaces the deprecated AHMA_DAEMON_SOCK environment variable.
+    /// Replaces the retired AHMA_DAEMON_SOCK environment variable.
     #[arg(long = "daemon-socket", value_name = "PATH", global = true)]
     pub daemon_socket: Option<PathBuf>,
 
@@ -1872,7 +1871,7 @@ pub struct LogsArgs {
 
 /// Subcommands for `ahma logs` — manage where ahma writes its operational
 /// logs. The active directory follows a priority order (`--log-dir` flag,
-/// `AHMA_LOG_DIR`, `[logging] dir` in settings.toml, sandbox scope,
+/// `[logging] dir` in settings.toml, sandbox scope,
 /// `.ahma/logs/` at the enclosing repository root, then a per-project
 /// directory under `~/.ahma/logs`); ahma discloses which one is active at
 /// startup. The default `.ahma/logs` location is gitignored automatically
@@ -2701,7 +2700,16 @@ struct SandboxSettings {
 fn parse_sandbox_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> SandboxSettings {
     // Security-tier: AHMA_DISABLE_SANDBOX retired — warn and ignore.
     warn_retired_security_env!("AHMA_DISABLE_SANDBOX");
-    let no_sandbox = cli.no_sandbox || s.sandbox.disable;
+    // R-CFG2.3: disabling the sandbox is CLI-flag-only, so it is always visible
+    // at the invocation site. The settings key still parses (an existing file must
+    // not abort startup, R-CFG6.1) but never takes effect.
+    if s.sandbox.disable {
+        tracing::warn!(
+            "`[sandbox] disable` in settings.toml is IGNORED: only the --no-sandbox flag \
+             can disable the sandbox (SPEC R-CFG2.3)."
+        );
+    }
+    let no_sandbox = cli.no_sandbox;
 
     // Security-tier: AHMA_SANDBOX_DEFER retired — warn and ignore.
     warn_retired_security_env!("AHMA_SANDBOX_DEFER");
@@ -2718,6 +2726,7 @@ fn parse_sandbox_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> S
     let no_temp_files = cli.no_temp_files || s.sandbox.disable_temp;
 
     // R-CFG1.2: preference-tier env vars are RETIRED — warn and ignore.
+    warn_retired_env!("AHMA_LOG_DIR");
     warn_retired_env!("AHMA_LOG_MONITOR");
     warn_retired_env!("AHMA_MONITOR_RATE_LIMIT");
     let log_monitor = cli.log_monitor || s.logging.log_monitor;
@@ -4655,7 +4664,10 @@ mod tests {
 
         let resolved = parse_sandbox_settings(&cli, &s);
 
-        assert!(resolved.no_sandbox, "sandbox.disable → no_sandbox");
+        assert!(
+            !resolved.no_sandbox,
+            "sandbox.disable in a settings file must not disable the sandbox (R-CFG2.3)"
+        );
         assert!(!resolved.defer_sandbox, "sandbox.defer → defer_sandbox");
         assert!(resolved.tmp_access, "sandbox.tmp_access → tmp_access");
         assert!(
@@ -4671,6 +4683,32 @@ mod tests {
         assert!(
             resolved.package_cache_write,
             "package_cache_write follows settings when no CLI flag"
+        );
+    }
+
+    /// SPEC R-CFG2.3: disabling the sandbox is CLI-flag-only. A settings file —
+    /// which persists invisibly and can be written by other tools — must never do
+    /// it; only `--no-sandbox`, visible at the invocation site, may.
+    #[test]
+    fn settings_file_cannot_disable_sandbox_only_the_flag_can() {
+        let _guard = ENV_MUTEX.lock();
+        init_test();
+        let mut s = ahma_common::config::AhmaSettings::default();
+        s.sandbox.disable = true;
+
+        let without_flag = parse_sandbox_settings(&Cli::parse_from(["ahma", "serve", "stdio"]), &s);
+        assert!(
+            !without_flag.no_sandbox,
+            "settings key alone must be ignored"
+        );
+
+        let with_flag = parse_sandbox_settings(
+            &Cli::parse_from(["ahma", "--no-sandbox", "serve", "stdio"]),
+            &s,
+        );
+        assert!(
+            with_flag.no_sandbox,
+            "--no-sandbox still disables the sandbox"
         );
     }
 

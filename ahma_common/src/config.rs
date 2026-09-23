@@ -945,10 +945,10 @@ fn scope_paths_equiv(a: &Path, b: &Path) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SandboxSettings {
-    /// Disable the kernel sandbox entirely.
-    /// **UNSAFE** — the AI can read and write anywhere on the filesystem.
-    /// Use only in environments that provide their own containment (Docker, CI containers).
-    /// Default: `false`
+    /// **Ignored.** Disabling the sandbox is CLI-flag-only (`--no-sandbox`, SPEC
+    /// R-CFG2.3), so it is always visible at the invocation site. The key still
+    /// parses so an existing file does not abort startup, and a `true` value is
+    /// warned about. Default: `false`
     pub disable: bool,
     /// Add the system temp directory to the sandbox scope.
     /// Useful for workflows that need scratch space (compilers, build systems).
@@ -1580,9 +1580,11 @@ impl Default for NetworkSettings {
 /// ## Priority order (highest to lowest)
 ///
 /// 1. CLI flags (`--timeout 600`, `--no-sandbox`, …)
-/// 2. This settings file
-/// 3. `AHMA_*` environment variables (deprecated; emit a warning if set)
-/// 4. Compiled-in defaults
+/// 2. This settings file (the project file's preference keys over the user file's)
+/// 3. Compiled-in defaults
+///
+/// `AHMA_*` environment variables are not a source: they are retired and
+/// ignored with a warning (SPEC R-CFG1.2).
 ///
 /// ## Generating the file
 ///
@@ -1940,7 +1942,7 @@ impl AhmaSettings {
         w.line("# preserved across upgrades (hand-written comments are not).");
         w.line("#");
         w.line(
-            "# Priority: CLI flags > this file > deprecated AHMA_* env vars > built-in defaults.",
+            "# Priority: CLI flags > this file > built-in defaults (AHMA_* env vars are ignored).",
         );
         w.line("# `ahma settings show` prints effective values; `ahma settings init` resets this file.");
         w.blank();
@@ -2044,7 +2046,7 @@ impl AhmaSettings {
         // ── Sandbox & filesystem security ────────────────────────────────────
         w.section("Sandbox & filesystem security", "sandbox");
         w.setting(
-            "UNSAFE: disable the kernel sandbox entirely.",
+            "IGNORED: only the --no-sandbox flag can disable the sandbox (R-CFG2.3).",
             "disable",
             self.sandbox.disable.to_string(),
             d.sandbox.disable.to_string(),
