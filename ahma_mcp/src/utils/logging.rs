@@ -189,6 +189,17 @@ pub fn project_log_dir() -> PathBuf {
         && cwd.parent().is_some()
     {
         let anchor = log_anchor_dir(&cwd);
+        #[cfg(debug_assertions)]
+        if redirect_from_source_checkout(
+            &anchor,
+            ahma_common::test_isolation::spawned_under_test_harness(),
+        ) && let Some(home) = ahma_common::config::ahma_home_dir()
+        {
+            return home
+                .join(".ahma")
+                .join("logs")
+                .join(project_log_namespace());
+        }
         let log_dir = anchor.join(".ahma").join("logs");
         let exists_and_writeable = log_dir.exists() && is_writeable(&log_dir);
         let can_create = !log_dir.exists() && is_writeable(&anchor);
@@ -197,7 +208,7 @@ pub fn project_log_dir() -> PathBuf {
         }
     }
 
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = ahma_common::config::ahma_home_dir() {
         return home
             .join(".ahma")
             .join("logs")
@@ -205,6 +216,29 @@ pub fn project_log_dir() -> PathBuf {
     }
 
     PathBuf::from(".").join(".ahma").join("logs")
+}
+
+/// The checkout this binary was built from, when it is a debug build of this
+/// workspace (`ahma_mcp`'s manifest dir is one level below the root).
+#[cfg(debug_assertions)]
+fn source_checkout_root() -> Option<PathBuf> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest.parent()?;
+    Some(dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
+}
+
+/// Whether a log directory anchored at `anchor` must go to the (test) home
+/// instead: under a test harness, never into ahma's own source checkout.
+///
+/// Tests spawn `ahma` with its cwd inside the repository, so the ordinary
+/// repo-root anchor put every test run's logs into the developer's real
+/// `.ahma/logs` — mixed in with their own sessions, and read back by `ahma
+/// doctor` as if they were theirs (2026-09-23). Only the checkout is
+/// redirected: tests that assert the anchoring rules use temp directories and
+/// keep exercising them.
+#[cfg(debug_assertions)]
+fn redirect_from_source_checkout(anchor: &Path, under_harness: bool) -> bool {
+    under_harness && source_checkout_root().is_some_and(|root| root == anchor)
 }
 
 /// A stable, filesystem-safe, human-legible directory name for this project,
@@ -818,6 +852,29 @@ mod tests {
         assert_eq!(project_log_dir(), PathBuf::from("/settings/logs"));
     }
 
+    /// Test runs must not write into the developer's own checkout's logs.
+    #[test]
+    fn test_logs_from_a_test_run_stay_out_of_the_source_checkout() {
+        let root = source_checkout_root().expect("a debug build knows its checkout");
+        assert!(redirect_from_source_checkout(&root, true));
+        assert!(
+            !redirect_from_source_checkout(&root, false),
+            "a developer's own session in the checkout keeps its logs there"
+        );
+        let elsewhere = dunce::canonicalize(tempdir().unwrap().path()).unwrap();
+        assert!(!redirect_from_source_checkout(&elsewhere, true));
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let dir = project_log_dir();
+        let _ = std::env::set_current_dir(prev);
+        assert!(
+            !dir.starts_with(&root),
+            "under nextest, logs for the checkout go to the test home: {}",
+            dir.display()
+        );
+    }
+
     #[test]
     fn test_log_anchor_dir_finds_repo_root_from_nested_dir() {
         let temp = tempdir().unwrap();
@@ -856,7 +913,7 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         if std::env::set_current_dir(Path::new("/")).is_ok() {
             let dir = project_log_dir();
-            if let Some(home) = dirs::home_dir() {
+            if let Some(home) = ahma_common::config::ahma_home_dir() {
                 // Namespaced per-project (see project_log_namespace): the root
                 // has no file_name, so the namespace falls back to "unknown-<hash>".
                 assert_eq!(

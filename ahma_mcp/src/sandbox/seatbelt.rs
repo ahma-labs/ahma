@@ -109,18 +109,7 @@ impl Sandbox {
         let grants = super::exec_config::grantable_git_dirs(roots, &scopes);
 
         // R7: a boundary decision is never silent, in either direction.
-        for refusal in &grants.refused {
-            tracing::warn!(
-                "sandbox: refusing to grant git dir {} — {}{}",
-                refusal.path.display(),
-                refusal.reason,
-                refusal
-                    .pointer
-                    .as_ref()
-                    .map(|p| format!(" (named by {})", p.display()))
-                    .unwrap_or_default()
-            );
-        }
+        super::exec_config::report_refusals(&grants.refused);
 
         let mut rules = String::new();
         for grant in grants.granted.iter().filter(|g| g.needs_rule()) {

@@ -580,6 +580,57 @@ pub struct GitDirRefusal {
     pub reason: &'static str,
 }
 
+impl GitDirRefusal {
+    /// Whether this refusal is worth a warning. A refused `gitdir:` pointer or
+    /// `commondir` hop is: something inside the workspace named a directory
+    /// outside it, which is exactly the escape attempt the check exists for. A
+    /// plain `.git` *directory* outside every scope is not — it is what a tool
+    /// probe run from a repository before the scope is known finds, and nothing
+    /// was asked for.
+    pub fn is_notable(&self) -> bool {
+        self.pointer.is_some()
+    }
+}
+
+/// Report each refusal: notable ones as a warning, once per `(path, reason)`
+/// per process, routine ones at debug. Every Seatbelt spawn re-derives the same
+/// refusals, so without the once-only memo one misconfigured pointer filled the
+/// log once per command. Both kernels report through here (R7: a boundary
+/// decision is never silent, in either direction).
+pub fn report_refusals(refused: &[GitDirRefusal]) {
+    for refusal in refused {
+        let named_by = refusal
+            .pointer
+            .as_ref()
+            .map(|p| format!(" (named by {})", p.display()))
+            .unwrap_or_default();
+        if refusal.is_notable() && first_report(&refusal.path, refusal.reason) {
+            tracing::warn!(
+                "sandbox: refusing to grant git dir {} — {}{named_by}",
+                refusal.path.display(),
+                refusal.reason,
+            );
+        } else {
+            tracing::debug!(
+                "sandbox: not granting git dir {} — {}{named_by}",
+                refusal.path.display(),
+                refusal.reason,
+            );
+        }
+    }
+}
+
+/// `true` the first time this process reports `(path, reason)`.
+fn first_report(path: &Path, reason: &'static str) -> bool {
+    static REPORTED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashSet<(PathBuf, &'static str)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    REPORTED
+        .lock()
+        .map(|mut seen| seen.insert((path.to_path_buf(), reason)))
+        .unwrap_or(true)
+}
+
 /// Outcome of [`grantable_git_dirs`].
 #[derive(Debug, Clone, Default)]
 pub struct GitDirGrants {
@@ -599,6 +650,8 @@ impl GitDirGrants {
 }
 
 mod refusals {
+    pub const OUTSIDE_SCOPE: &str =
+        "a plain `.git` directory outside every sandbox scope; nothing vouches for it";
     pub const NO_BACKREF: &str = "the directory does not name this workspace back (no `gitdir` \
          back-reference and no `core.worktree`), so the `gitdir:` pointer is unverifiable";
     pub const BACKREF_MISMATCH: &str =
@@ -757,7 +810,7 @@ fn classify_grant(dir: &ResolvedGitDir, scopes: &[PathBuf]) -> Result<GrantBasis
     let GitDirOrigin::Pointer { dot_git_file } = &dir.origin else {
         // A plain `.git` *directory* outside every scope was reached by scanning
         // a root that is itself outside the scopes. Nothing vouches for it.
-        return Err(refusals::NO_BACKREF);
+        return Err(refusals::OUTSIDE_SCOPE);
     };
     if let Some(verdict) = worktree_backref_verdict(&dir.path, dot_git_file) {
         return verdict;
@@ -1790,6 +1843,58 @@ mod tests {
             grants.rule_paths().is_empty(),
             "an in-scope git dir is already covered by the scope rules — emitting a \
              rule for it would be noise: {grants:?}"
+        );
+    }
+
+    /// The startup case: tool probes run before the client names a scope, from a
+    /// working directory that is an ordinary repository. Its `.git` is refused
+    /// (nothing vouches for it), but it is not a forged pointer and must not be
+    /// reported as one — that report repeated once per probe, 17 times a start.
+    #[test]
+    fn plain_git_dir_outside_every_scope_is_refused_without_pointer_blame() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
+        let roots = vec![dunce::canonicalize(&repo).unwrap()];
+
+        let grants = grantable_git_dirs(&roots, &[]);
+
+        assert!(grants.granted.is_empty(), "nothing is granted: {grants:?}");
+        assert_eq!(grants.refused.len(), 1, "{grants:?}");
+        let refusal = &grants.refused[0];
+        assert_eq!(refusal.reason, refusals::OUTSIDE_SCOPE);
+        assert!(
+            !refusal.is_notable(),
+            "a plain .git outside the scope is routine, not a forgery attempt"
+        );
+    }
+
+    #[test]
+    fn a_refused_pointer_stays_notable() {
+        let tmp = tempdir().unwrap();
+        let (wt, wt_meta, _) = worktree_fixture(tmp.path());
+        std::fs::remove_file(wt_meta.join("gitdir")).unwrap();
+        let scopes = vec![dunce::canonicalize(&wt).unwrap()];
+
+        let grants = grantable_git_dirs(&scopes, &scopes);
+
+        let pointer = grants
+            .refused
+            .iter()
+            .find(|r| r.path == dunce::canonicalize(&wt_meta).unwrap())
+            .expect("the unverifiable pointer target is refused");
+        assert_eq!(pointer.reason, refusals::NO_BACKREF);
+        assert!(pointer.is_notable(), "an unverifiable pointer is reported");
+    }
+
+    #[test]
+    fn a_refusal_is_reported_once_per_process() {
+        let path = PathBuf::from("/nonexistent/report-once-test/.git");
+        assert!(first_report(&path, refusals::NO_BACKREF));
+        assert!(!first_report(&path, refusals::NO_BACKREF));
+        assert!(
+            first_report(&path, refusals::BACKREF_MISMATCH),
+            "a different reason for the same path is news"
         );
     }
 

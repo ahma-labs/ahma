@@ -570,10 +570,37 @@ pub fn ahma_home_dir() -> Option<PathBuf> {
 /// are reasoning about.
 #[cfg(debug_assertions)]
 fn test_run_home() -> PathBuf {
-    dirs::cache_dir()
+    let parent = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("ahma-test-homes")
-        .join(crate::test_isolation::test_run_discriminator())
+        .join("ahma-test-homes");
+    static PRUNED: std::sync::Once = std::sync::Once::new();
+    PRUNED.call_once(|| {
+        prune_stale_test_homes(&parent, std::time::Duration::from_secs(24 * 60 * 60));
+    });
+    parent.join(crate::test_isolation::test_run_discriminator())
+}
+
+/// Remove run homes under `parent` last modified more than `max_age` ago.
+///
+/// Each test run gets its own home, so without this they accumulate for ever
+/// in the developer's cache directory. Best effort: a run still going (or one
+/// we cannot inspect) is left alone.
+#[cfg(debug_assertions)]
+fn prune_stale_test_homes(parent: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if stale && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Returns the canonical path to `~/.ahma/config.toml`, or `None` if the home
@@ -1547,49 +1574,6 @@ impl Default for NetworkSettings {
     }
 }
 
-/// Runtime feature toggles.
-///
-/// default to the most useful "batteries-included" configuration: everything
-/// that works without additional setup is enabled.
-///
-/// Toggle in `~/.ahma/settings.toml` or via `ahma tui` → `/settings`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FeatureSettings {
-    /// Code complexity analysis (`ahma simplify`).
-    /// Analyzes source code and generates simplicity reports.
-    /// Default: `true`
-    pub simplify: bool,
-    /// Task vault isolation (`ahma vault create/list`).
-    /// Per-question isolated working directories with audit log and trash.
-    /// Default: `false` (enable to auto-create vaults per TUI session)
-    pub vault: bool,
-    /// Network egress proxy for sandboxed tasks.
-    /// Per-task HTTP proxy with domain allowlist for controlled outbound access.
-    /// Default: `true`
-    pub egress: bool,
-    /// HTML artifact output channel.
-    /// Tools can emit interactive HTML artifacts with embedded LLM chat.
-    /// Default: `true`
-    pub artifact: bool,
-    /// LLM-powered task decomposition.
-    /// Split complex questions into sub-tasks, dispatch concurrently, aggregate.
-    /// Default: `true`
-    pub decompose: bool,
-}
-
-impl Default for FeatureSettings {
-    fn default() -> Self {
-        Self {
-            simplify: true,
-            vault: false,
-            egress: true,
-            artifact: true,
-            decompose: true,
-        }
-    }
-}
-
 /// Top-level user settings loaded from `~/.ahma/settings.toml`.
 ///
 /// All fields have sensible defaults — an empty file (or no file at all) is
@@ -1612,8 +1596,6 @@ impl Default for FeatureSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AhmaSettings {
-    /// Runtime feature toggles (simplify, vault, etc.).
-    pub features: FeatureSettings,
     /// LM Studio local-server provider configuration.
     pub lmstudio: LmStudioSettings,
     /// Tool execution settings.
@@ -1964,39 +1946,6 @@ impl AhmaSettings {
         );
         w.line("# `ahma settings show` prints effective values; `ahma settings init` resets this file.");
         w.blank();
-
-        // ── Features ─────────────────────────────────────────────────────────
-        w.section("Features", "features");
-        w.setting(
-            "Code complexity analysis (ahma simplify).",
-            "simplify",
-            self.features.simplify.to_string(),
-            d.features.simplify.to_string(),
-        );
-        w.setting(
-            "Task vault isolation (per-session working directories).",
-            "vault",
-            self.features.vault.to_string(),
-            d.features.vault.to_string(),
-        );
-        w.setting(
-            "Network egress proxy for sandboxed tasks.",
-            "egress",
-            self.features.egress.to_string(),
-            d.features.egress.to_string(),
-        );
-        w.setting(
-            "HTML artifact output channel.",
-            "artifact",
-            self.features.artifact.to_string(),
-            d.features.artifact.to_string(),
-        );
-        w.setting(
-            "LLM-powered task decomposition.",
-            "decompose",
-            self.features.decompose.to_string(),
-            d.features.decompose.to_string(),
-        );
 
         // ── LM Studio ────────────────────────────────────────────────────────
         w.section("LM Studio (local OpenAI-compatible server)", "lmstudio");
@@ -2640,6 +2589,25 @@ mod tests {
     /// `update` works on the file as it is now, so a grant written by someone
     /// else after we last looked survives our write.
     #[test]
+    fn stale_test_homes_are_pruned_and_fresh_ones_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("abcd1234");
+        std::fs::create_dir_all(run.join(".ahma")).unwrap();
+        std::fs::write(tmp.path().join("not-a-home.txt"), "x").unwrap();
+
+        prune_stale_test_homes(tmp.path(), std::time::Duration::from_secs(3600));
+        assert!(run.exists(), "a fresh run home is kept");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        prune_stale_test_homes(tmp.path(), std::time::Duration::from_millis(1));
+        assert!(!run.exists(), "an old run home is removed");
+        assert!(
+            tmp.path().join("not-a-home.txt").exists(),
+            "only directories are removed"
+        );
+    }
+
+    #[test]
     fn update_keeps_changes_made_on_disk_since_we_last_looked() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
@@ -2852,13 +2820,6 @@ mod tests {
     /// lost value when this round-trips through TOML.
     fn all_non_default_settings() -> AhmaSettings {
         AhmaSettings {
-            features: FeatureSettings {
-                simplify: false,
-                vault: true,
-                egress: false,
-                artifact: false,
-                decompose: false,
-            },
             lmstudio: LmStudioSettings {
                 base_url: "http://example.test:9999/v1".into(),
                 model: "my/custom-model".into(),
@@ -2988,6 +2949,28 @@ mod tests {
         assert_eq!(once, twice, "render must be a fixed point");
     }
 
+    /// `[features]` was removed because nothing read it. A file that still has
+    /// the table must keep loading, and the next regeneration drops it.
+    #[test]
+    fn a_leftover_features_table_loads_and_is_dropped_on_regeneration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "[features]\nsimplify = false\n\n[tools]\ntimeout_secs = 77\n",
+        )
+        .unwrap();
+
+        let loaded: AhmaSettings =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.tools.timeout_secs, 77);
+
+        AhmaSettings::ensure_current(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("[features]"), "{text}");
+        assert!(text.contains("timeout_secs = 77"), "user values survive");
+    }
+
     #[test]
     fn render_documented_default_has_no_active_assignments() {
         // A default configuration is fully minimized: every value line is either
@@ -3002,7 +2985,6 @@ mod tests {
         }
         // It still documents every section.
         for table in [
-            "[features]",
             "[lmstudio]",
             "[tools]",
             "[sandbox]",

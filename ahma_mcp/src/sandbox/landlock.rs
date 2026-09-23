@@ -60,13 +60,7 @@ fn build_landlock_ruleset(
     // this ruleset can carve out. Refusing unverified dirs is what bounds it.
     let mut all_scopes = scopes.to_vec();
     let grants = super::exec_config::grantable_git_dirs(scopes, scopes);
-    for refusal in &grants.refused {
-        tracing::warn!(
-            "sandbox: refusing to grant git dir {} — {}",
-            refusal.path.display(),
-            refusal.reason
-        );
-    }
+    super::exec_config::report_refusals(&grants.refused);
     for git_dir in grants.rule_paths() {
         if !all_scopes.contains(&git_dir) {
             tracing::warn!(

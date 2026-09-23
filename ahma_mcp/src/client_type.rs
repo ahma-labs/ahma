@@ -15,7 +15,8 @@
 //!
 //! - **VSCode/Copilot**: Handles progress notifications correctly.
 //!
-//! - **Claude Desktop**: Handles progress notifications correctly.
+//! - **Claude Desktop** (`claude-ai`) and **Claude Code** (`claude-code`): handle
+//!   progress notifications correctly.
 
 use rmcp::service::{Peer, RoleServer};
 
@@ -29,8 +30,12 @@ pub enum McpClientType {
     Cursor,
     /// VS Code / GitHub Copilot - handles progress notifications correctly.
     VSCode,
-    /// Claude Desktop - handles progress notifications correctly.
+    /// Claude Desktop (`clientInfo.name` `claude-ai`) - handles progress
+    /// notifications correctly.
     ClaudeDesktop,
+    /// Claude Code (`clientInfo.name` `claude-code`) - handles progress
+    /// notifications correctly and ships its own file tools.
+    ClaudeCode,
     /// Zed editor
     Zed,
     /// LM Studio - handles progress notifications correctly.
@@ -63,6 +68,8 @@ impl McpClientType {
             McpClientType::Ahma
         } else if name_lower.contains("cursor") {
             McpClientType::Cursor
+        } else if name_lower.contains("claude-code") || name_lower.contains("claude code") {
+            McpClientType::ClaudeCode
         } else if name_lower.contains("claude") {
             McpClientType::ClaudeDesktop
         } else if name_lower.contains("vscode") || name_lower.contains("copilot") {
@@ -124,7 +131,10 @@ impl McpClientType {
     pub fn has_native_file_tools(&self) -> bool {
         matches!(
             self,
-            McpClientType::ClaudeDesktop | McpClientType::Cursor | McpClientType::VSCode
+            McpClientType::ClaudeDesktop
+                | McpClientType::ClaudeCode
+                | McpClientType::Cursor
+                | McpClientType::VSCode
         )
     }
 
@@ -135,6 +145,7 @@ impl McpClientType {
             McpClientType::Cursor => "Cursor",
             McpClientType::VSCode => "VSCode/Copilot",
             McpClientType::ClaudeDesktop => "Claude Desktop",
+            McpClientType::ClaudeCode => "Claude Code",
             McpClientType::Zed => "Zed",
             McpClientType::LmStudio => "LM Studio",
             McpClientType::Ollama => "Ollama",
@@ -200,6 +211,7 @@ impl McpClientType {
             // No observed client-side cancellation; a human gets two minutes.
             McpClientType::Ahma
             | McpClientType::ClaudeDesktop
+            | McpClientType::ClaudeCode
             | McpClientType::Cursor
             | McpClientType::VSCode
             | McpClientType::Zed => Duration::from_secs(120),
@@ -356,6 +368,26 @@ mod tests {
         assert_eq!(
             McpClientType::from_client_name("Claude"),
             McpClientType::ClaudeDesktop
+        );
+        // What Claude Desktop actually sends.
+        assert_eq!(
+            McpClientType::from_client_name("claude-ai"),
+            McpClientType::ClaudeDesktop
+        );
+    }
+
+    /// Claude Code sends `claude-code`; it used to be labelled Claude Desktop
+    /// because any name containing "claude" matched that first.
+    #[test]
+    fn claude_code_is_not_claude_desktop() {
+        let t = McpClientType::from_client_name("claude-code");
+        assert_eq!(t, McpClientType::ClaudeCode);
+        assert_eq!(t.display_name(), "Claude Code");
+        assert!(t.has_native_file_tools());
+        assert!(t.supports_progress());
+        assert_eq!(
+            t.elicitation_budget(),
+            McpClientType::ClaudeDesktop.elicitation_budget()
         );
     }
 
