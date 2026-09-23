@@ -52,7 +52,7 @@ fn setting_rows(
     row!("lmstudio.base_url", lmstudio.base_url);
     row!("lmstudio.model", lmstudio.model);
     row!("tools.timeout_secs", tools.timeout_secs);
-    row!("tools.force_sync", tools.force_sync);
+    row!("tools.execution_mode", tools.execution_mode);
     row!("tools.skip_probes", tools.skip_probes);
     row!("sandbox.disable", sandbox.disable);
     row!("sandbox.tmp_access", sandbox.tmp_access);
@@ -1930,7 +1930,7 @@ mod tests {
         // A key the file does not set stays attributed to the default.
         let other = out
             .lines()
-            .find(|l| l.starts_with("tools.force_sync"))
+            .find(|l| l.starts_with("tools.execution_mode"))
             .unwrap();
         assert!(
             other.contains("# default"),

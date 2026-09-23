@@ -25,6 +25,8 @@ chrono = { workspace = true }
 crossterm.workspace = true
 dunce.workspace = true
 futures.workspace = true
+# Same spec as ahma_simplify, so it is one artifact, not a second flavour.
+pulldown-cmark = "0.13"
 ratatui.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 serde = { workspace = true, features = ["derive"] }

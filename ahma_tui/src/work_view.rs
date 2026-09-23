@@ -542,6 +542,7 @@ mod tests {
             client: client.map(String::from),
             session_id: Some(format!("sess-{id}")),
             client_pid: Some(99),
+            sampling: false,
             ended_epoch_ms: None,
         }
     }

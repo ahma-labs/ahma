@@ -7,7 +7,7 @@
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Core Tool Execution | tests-pass | `ahma` adapter executes CLI tools via MTDF JSON |
-| Async-First Operations | tests-pass | Operations return `id`, push results via MCP notifications |
+| Tracked Operations, Sync by Default (R2.1) | tests-pass | Every call is a monitored, cancellable operation; `tools.execution_mode` = `sync` (default: wait for the result within the client's budget) or `async` (return an `id`, collect with `await`) |
 | Shell Pool | removed | Dead prewarmed pool removed — commands spawn directly (~6ms median measured by `latency_guard_test`); `shell_pool` module retains platform shell selection + command timeout config |
 | Unified Operation Event Stream | tests-pass | Single `OperationEvent` stream (`ahma_common::event_dispatcher`); `OperationMonitor` is the sole lifecycle emitter; subscribers: MCP progress push, daemon hub, vault audit, TUI |
 | Output Spill Files | tests-pass | Complete per-operation output at `<log dir>/operations/<id>.log`; advertised as `output_file` in results; retention-cleaned |
@@ -30,6 +30,7 @@
 | Built-in `await` Tool | tests-pass | Blocking wait for operation completion; soft timeout (R2.5.1); liveness-probed waits are answered by the bridge iff the push channel is live, and a probe-ended wait reports the time that actually passed (R2.6.5.3, R2.6.5.4) |
 | Built-in `cancel` Tool | tests-pass | Cancel running operations |
 | Built-in `run_terminal_command` | tests-pass | Execute arbitrary shell commands within sandbox |
+| Built-in file tools (R26) | tests-pass | Read-before-edit, unique-match edits, `multi_edit`, `apply_patch`, atomic writes, `.gitignore`-aware bounded search; other harnesses' tool/argument names mapped |
 | Batteries-Included Tools | tests-pass | Built-in MTDF setups activated via CLI flags (e.g. `--python`, `--git`) |
 | MTDF Schema Validation | tests-pass | JSON schema validation at startup |
 | Sequence Tools | tests-pass | Chain multiple commands into workflows |
@@ -45,7 +46,7 @@
 | Logging (File + Stderr) | tests-pass | Daily rolling logs, `--log-to-stderr` for debug |
 | Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
 | TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
-| Unified Work View (R24, R24.9) | tests-pass | The TUI's home view: one borderless section per client session (hooks and this terminal folded), one open at a time with a 300 ms eased tween, chat on a toggle. Current at startup via daemon replay with true timestamps and the retained output window; ordering independent of activity; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
+| Unified Work View (R24, R24.9, R24.10) | tests-pass | The TUI's home view: one borderless section per client session (hooks and this terminal folded), one open at a time with a 300 ms eased tween, chat on a toggle. Current at startup via daemon replay with true timestamps and the retained output window; ordering independent of activity; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
 | Configuration Standard (R-CFG) | in-progress | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5). Done: Security-tier `AHMA_*` retirement (warn-and-ignore, R-CFG1.2/R-CFG7.1), settings-file/`--no-settings` resolution, settings provenance (`ahma settings show --origin`, R-CFG5.1), trust tiers (`settings_tier`, with a drift test over every key), and the project-tier settings file (R-CFG3: Preference-only, Security keys refused and named). Pending: R-CFG5.2 per-setting startup log lines, R-CFG6.2 unknown-key abort for `[sandbox]`/`[auth]` in the *user* file, R-CFG6.3 permissions warning |
 | Unified Permissions (R-PERM) | tests-pass | One ledger under `~/.ahma` (fs scopes, web domains, tool approvals; legacy `approvals.json` migrated); question ladder (harness elicitation → TUI modal → fail-closed with paste-able remediation); sandbox profiles replace the hard-coded toolchain carve-outs; hooks enabled per client. User guide: `docs/permissions.md` |
 | Trust-Handoff Hardening (R-HANDOFF) | in-progress | Two-tier posture for writes a *trusted, unsandboxed* component executes later (git hook dirs, editor/harness auto-run config, daemon sockets): deny-write where nothing legitimate writes, allow-plus-loud-disclosure where it does. Kernel-enforced on macOS (last-match-wins SBPL denies); **application-layer only on Linux** (Landlock V1 is additive-allow, R6.1.7) and therefore bypassable from `run_terminal_command`; none on Windows yet. Child env strips code-injection and client-redirect vars, keeps `SSH_AUTH_SOCK`. Cross-project package-cache channel disclosed at runtime as the `rust` profile's stated `cost` in `ahma permissions list` (R-HANDOFF.8/R-PERM.5.2), not only in docs. Platform enforcement gaps (macOS reads, Windows both directions, Linux's application-layer-only deny tier) are surfaced on the R5.4 scope surfaces by `sandbox::profiles::platform_enforcement` |
@@ -106,7 +107,7 @@ These tools are always available regardless of JSON configuration:
 
 **Note**: These internal tools are hardcoded into the `AhmaMcpService` and are guaranteed to be available even when no `.ahma` directory exists or when all external tool configurations fail to load.
 
-### 2.3 Async-First Architecture
+### 2.3 Operation Architecture
 
 ```text
 ┌─────────────────┐         ┌──────────────────┐
@@ -162,24 +163,30 @@ All operation lifecycle data flows through ONE broadcast stream of
   as `output_file` in results, so agents query big outputs with file tools
   instead of re-running commands.
 
-### 2.4 Synchronous Setting Inheritance
+### 2.4 Execution Mode Resolution
+
+Every call runs as a tracked operation (R2.1); the mode decides only how long
+the call waits for it before answering.
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                    EXECUTION MODE RESOLUTION                     │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│  1. CLI Flag (highest priority)                                  │
-│     └── --sync flag forces ALL tools to run synchronously        │
+│  1. CLI flag (highest priority; last one given wins)             │
+│     └── --sync / --async                                         │
 │                                                                  │
-│  2. Subcommand Config                                            │
-│     └── "synchronous": true/false in subcommand definition       │
+│  2. Settings: tools.execution_mode = "sync" | "async"            │
+│     └── project .ahma/settings.toml over ~/.ahma/settings.toml   │
 │                                                                  │
-│  3. Tool Config                                                  │
-│     └── "synchronous": true/false at tool level                  │
+│  3. Default (lowest priority)                                    │
+│     └── SYNC — wait for the result, within the client's budget   │
 │                                                                  │
-│  4. Default (lowest priority)                                    │
-│     └── ASYNC - operations run in background by default          │
+│  Per call, in sync mode only: an MTDF tool with                  │
+│  "synchronous": false, or a call with "blocking": false, returns │
+│  after the adaptive window instead (run_terminal_command has no  │
+│  such argument — R2.6.3). "blocking": true / "synchronous": true │
+│  still select the legacy direct path in either mode.             │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -225,13 +232,18 @@ All operation lifecycle data flows through ONE broadcast stream of
   may call it, and whether it is a harness file tool withheld from clients with
   native equivalents. These are exhaustive matches, not membership lists.
 
-### R2: Async-First Architecture
+### R2: Tracked Operations, Sync by Default
 
-- **R2.1**: Operations **must** execute asynchronously by default, returning an `id` immediately.
+- **R2.1**: **Every call is a tracked operation; the mode decides how long it waits.** A tool call **must** start its command as an operation in `OperationMonitor` in both modes, so it is visible to `status`, the TUI and the audit log, cancellable, and spills its full output to `output_file`. `tools.execution_mode` (`--sync` / `--async`, resolved per §2.4) then decides the answer:
+  - **`sync` (the default)** — the call waits for the operation to finish and returns its result in the inline format (R2.6.2). The wait is bounded exactly as a default `await` on it would be (R2.5, R2.6.5, R2.6.5.3), because a result written into a connection the client has abandoned is lost; an operation still running at that bound returns its id with a statement that it is still running and how to collect it (`await`). Progress keeps flowing to the call's token during the wait. A sequence waits for its steps within one such window.
+  - **`async`** — the call waits the adaptive inline window (R2.6.1), then returns the operation id; the caller collects the result with `await`. This lets a model start several long commands in parallel.
+  - The server `instructions` **must** describe the mode the session is actually in.
+  - The legacy direct execution path (not a tracked operation) is used only by CLI one-shot mode and by the deprecated `blocking: true` / `"synchronous": true` (R2.3).
+  - Sync became the default in v0.22: async-first made the common case — run a command, read its output — cost an extra `await` round trip, while the reason given for it (clients abandoning long requests) is handled by bounding the sync wait instead.
 - **R2.2**: On completion, the system **must** store results reliably in `OperationMonitor` (pull channel) and **should** push a best-effort MCP progress notification. Clients rely on the `await` tool for guaranteed result delivery; the push notification is an optimistic shortcut to avoid a round-trip.
 - **R2.2.1**: **A per-client progress suppression must be overridable, and must say so when it isn't measured.** `McpClientType::supports_progress()` may suppress R2.2's push for a specific client (currently: Cursor, believed to log a client-side error for valid progress tokens). Because MCP notifications are one-way — no response, no ack — ahma has no way to observe whether the behavior it is working around still exists, or ever did; unlike the request-budget and elicitation-budget tables (R2.6.5, R5.3.1), which are set from a captured, timestamped measurement, a progress suppression **must** say in its own doc comment when it is asserted rather than measured, so it is not read as equally trustworthy. `tools.force_progress_notifications` / `--force-progress-notifications` **must** let an operator override the suppression uniformly once it is known to be stale.
 - **R2.3**: **Static Synchronous Flag (DEPRECATED)**: The static `"synchronous": true/false` configuration in tool and subcommand JSON definitions is deprecated. Code calling tools should not rely on static config.
-- **R2.4**: **Dynamic Resolution**: Execution mode (blocking/synchronous vs non-blocking/asynchronous) is resolved dynamically per-invocation using the `blocking` boolean parameter in the MCP `tools/call` arguments. If not specified, tool execution defaults to asynchronous.
+- **R2.4**: **Resolution**: the server's mode is `tools.execution_mode`, resolved per §2.4 — `--sync`/`--async` over the project and user settings over the default, `sync` — and is a server-operator decision. On an MTDF tool a call may still pass `blocking: false` to return after the adaptive window in sync mode; `run_terminal_command` has no such argument (R2.6.3). The retired `tools.force_sync` key is parsed and ignored: the only value it could hold, `true`, is the new default. `--sync` and `--async` override each other (last one wins), because a worker receives its daemon's flags first and its session's after them.
 - **R2.5**: **`await` soft timeout.** The `await` tool waits at most `tools.await_timeout_secs` seconds (default `540`, i.e. 9 minutes — under the 10-minute idle disconnect used by common MCP clients). Resolution order: the call's optional `timeout_seconds` argument, then the `--await-timeout` CLI flag, then `tools.await_timeout_secs` in `settings.toml`, then the compiled-in default. When awaiting by tool filter and no explicit `timeout_seconds` is given, the effective wait is `max(default, longest pending operation timeout)` so a legitimately long operation is never cut short by a shorter await default.
 - **R2.5.1**: The timeout is **soft**: expiry **must not** cancel the awaited operation(s), and the returned text **must** state that the work is still running in the background and that the client should call `await` again (by `id` where one was given) to keep waiting. This distinguishes "your wait ended" from "your operation died" — the two were previously indistinguishable to an agent.
 - **R2.5.2**: The resolved timeout from R2.5 **must** be the only deadline on the wait — no inner bound may pre-empt it. `OperationMonitor::wait_for_operation`'s own default cap is shorter than the await default, so `await` **must** opt out of it (`wait_for_operation_bounded(id, None)`). Otherwise expiry past that inner cap is misreported as "completed but no result available" (by `id`) or silently drops a still-running operation from an apparently successful result (by tool filter), defeating R2.5.1.
@@ -246,13 +258,13 @@ round-trip, and one that takes minutes must not hold an MCP request open. Which
 of the two is happening is not known when the call arrives, so ahma waits a
 bounded window and decides from the outcome.
 
-- **R2.6.1**: **Adaptive inline window.** A `tools/call` that spawns an async operation **must** wait a bounded window for it to finish and return the result inline if it does; otherwise it returns the operation id. The window is **not** a fixed constant — it is chosen from whether the session has other operations in flight:
+- **R2.6.1**: **Adaptive inline window (async mode).** A `tools/call` that spawns an async operation **must** wait a bounded window for it to finish and return the result inline if it does; otherwise it returns the operation id. The window is **not** a fixed constant — it is chosen from whether the session has other operations in flight:
   - **nothing else running** → the long window (`INLINE_WINDOW_IDLE_SECS`). The model has nothing to overlap with and its next move would be `await` anyway, so the wait is free wall-clock and may save a whole LLM turn.
   - **operations already in flight** → the short window (`INLINE_WINDOW_BUSY_SECS`). The model is fanning out; holding this response delays the next command.
 
   The window **must** additionally be clamped to at most half the caller's single-request budget (R2.6.5), so the call that was meant to save a round-trip can never instead exceed what the client will wait for.
 - **R2.6.2**: **A completed operation always states its outcome.** An inline result **must** begin with the operation identity line (R24.7) — what ran, exit code, duration — followed by the command's output, or `(no output)` when it produced none. Returning bare stdout is not sufficient: a successful silent command (`cargo fmt --check` on clean code) then yields an empty result, which a model cannot distinguish from a broken tool. The exit code and duration exist regardless; a progress notification is best-effort (R2.2) and **must not** be the only place they appear.
-- **R2.6.3**: **No caller-selectable synchronous mode on `run_terminal_command`.** Its input schema **must not** advertise `sync`, `blocking`, `execution_mode`, or any equivalent. Models do not use such a flag selectively — they default to it — and a synchronous `cargo` build blocks one MCP request for longer than several clients tolerate, so the flag breaks precisely the case it is reached for. `execution_mode` remains accepted but unadvertised as the CLI/test escape hatch; `--sync` (R2.4, `force_synchronous`) remains a server-operator decision.
+- **R2.6.3**: **No caller-selectable synchronous mode on `run_terminal_command`.** Its input schema **must not** advertise `sync`, `blocking`, `execution_mode`, or any equivalent. Models do not use such a flag selectively — they default to it — and a synchronous `cargo` build blocks one MCP request for longer than several clients tolerate, so the flag breaks precisely the case it is reached for. `execution_mode` remains accepted but unadvertised as the CLI/test escape hatch; the server's `tools.execution_mode` (R2.1, R2.4) remains a server-operator decision. In sync mode (the default) a command still returns its result without the model asking — the wait is bounded by the client's budget, which is what makes it safe here.
 - **R2.6.4**: **Ignored arguments are disclosed.** When `run_terminal_command` receives arguments it does not act on, it **must** execute normally and name them in the result. Silently dropping an argument leaves a model believing it took effect — an observed session had a model send `"sync": true`, receive no error, and conclude from the (then empty, see R2.6.2) result that ahma was broken rather than that its parameter was imaginary.
 - **R2.6.5**: **Fallback single-request budget.** ahma **must** apply a conservative bound on how long it holds one MCP request open when there is no better signal available (R2.6.5.3 supplies the better signal when it can). This is **not** a per-`clientInfo.name` table: guessing which *product* deserves more trust was a proxy for the thing that actually matters — is the connection right now still alive — and the proxy was exactly as reliable as the guess behind it, silently wrong for any client whose name didn't match. Both the R2.6.1 window ceiling and the R2.5 `await` default are bounded by it, uniformly, regardless of client identity.
 - **R2.6.5.1**: **A shortened wait says so.** When the fallback budget cuts an `await` below the timeout that was resolved for it, the result **must** state the wait that was applied, the wait that was asked for, and that the operation is still running. A caller who requested 540s and received a timeout at 20s cannot otherwise tell a deliberate cap from a hung operation, and "call `await` again" is the wrong conclusion to have to infer. An explicit `timeout_seconds` argument is honoured verbatim (R2.5.1) and **must not** be reported as capped.
@@ -1958,6 +1970,74 @@ correct **at startup**, not only for events that happen afterwards.
     (R24.8.2). A pane that is closed claims no clicks.
   - Identity — transport, pids, session id — is the footnote in the detail
     overlay, never the header (R24.8.6).
+- **R24.10 — A chat turn is always stoppable and never silently lost.**
+  - **R24.10.1 — Cancel reaches the loop.** Esc on an empty chat input, or
+    Ctrl-C anywhere, stops the running turn: the TUI sends `CancelPrompt`, the
+    hub routes it to the instance running the turn, and that instance aborts
+    the agent loop, wakes any approval waiter, and ends the turn with one
+    `AgentError`. The TUI ends the turn locally at once, so cancel works even
+    when the daemon is gone. A second Ctrl-C within 2 s quits. `CancelPrompt`
+    and `CancelOperation` are new message types; a reader that predates them
+    skips them (R24.5), so against an older instance the turn still ends in the
+    TUI while that instance finishes it unobserved.
+  - **R24.10.2 — A turn ends visibly.** A prompt that cannot be delivered ends
+    its turn with the reason; a turn with no server event for 60 s is marked
+    stalled in the footer beside the key that cancels it. `AgentError` stops the
+    turn's timer exactly as `AgentDone` does.
+  - **R24.10.3 — Stream events belong to a turn.** Chat events arriving while
+    this TUI has no turn in flight (another TUI's turn, or output from one just
+    cancelled) are ignored rather than opening a reply nothing will close.
+    Text written before a tool call is a finished reply and is sent back to the
+    model on later turns.
+  - **R24.10.4 — Typing is not answering.** While the chat input holds text,
+    gate keys (`y`/`a`/`n`, Enter) are text, and every gate says so; they answer
+    once the input is empty. A word starting with `a` must never persist
+    "always allow".
+  - **R24.10.5 — Quitting never surprises.** `q` and `/quit` quit at once when
+    nothing is running; while operations or a turn are running they warn and
+    quit on a second press.
+  - **R24.10.6 — An operation is named by its instance and id.** Operation ids
+    are unique only per instance, so cancel, pin, detail and live output resolve
+    `(instance, id)`; cancel is routed through the hub (`CancelOperation`) to
+    the owning instance, since the TUI's own MCP session cannot see another
+    client's operations.
+
+- **R24.11 — What a glance is for is always on screen.**
+  - **R24.11.1 — One status header in every layout.** It **must** show the
+    execution mode (R2.1), whether the ahma server and the daemon are reachable
+    — a lost connection spelled out with how long it has been down, never a
+    glyph flip alone — the transport, and the sandbox as locked (R5.4). Showing
+    these only in a zoomed pane hid a dead daemon from anyone in the default
+    layout.
+  - **R24.11.2 — Each window shows its own LLM and spend.** A section's rule
+    names the model its chat uses and, once used, its context fill and tokens
+    in/out; the chat input's title shows the same for the window being typed to,
+    plus tokens/second and elapsed time while a turn streams. Usage is charged to
+    the in-flight turn's window. Context fill is shown only when the model's
+    window size is known (`--context-length` or the provider's `num_ctx`), and
+    cost only when a price is known — neither is guessed; an estimate is labelled
+    as one.
+
+- **R24.12 — It does what the user expects.**
+  - **R24.12.1 — Help cannot drift from the keys.** The help overlay and footer
+    **must** render from the one key table (`keymap::KEY_REFERENCE`) that tests
+    check both ways: every documented key does something, and every bound key
+    is documented.
+  - **R24.12.2 — Setup is checked, and keys are not handled.** `/setup` fetches
+    the provider's model list before saving (the connection test) and offers
+    only models the provider has. A cloud key is read from the environment and
+    registered as a `${VAR}` reference; the TUI never asks for or stores the key.
+    A URL-addressed provider carries its configured key to the agent loop. Only
+    a client that declared MCP `sampling` at `initialize` (carried as
+    `InstanceInfo.sampling`, field-only per R24.5) is offered as a provider.
+  - **R24.12.3 — A window's conversation is its own.** Switching windows switches
+    transcript, and is refused while a reply is streaming. Transcripts are saved
+    after each turn under `~/.ahma/transcripts/` — never in the project — and
+    restored with `/resume`.
+  - **R24.12.4 — Input behaves like a terminal.** ↑/↓ recall earlier input; a
+    paste goes where the user is typing and is visible; replies render Markdown;
+    a clipped tool call opens in full on click (R24.8.4); `x3` is a message and
+    `/x3` the command.
 
 #### R25: Tool-call session reuse (TUI chat)
 
@@ -1968,6 +2048,35 @@ back into `state.session_id` so every later tool call in the turn — and across
 it instead of racing the bridge's session limit. (This id was referenced from four call sites
 — `ahma_tui/SPEC.md`, `ahma_tui/src/llm_bridge.rs`, `ahma_core/src/agent.rs` — before this
 entry existed here; those citations now resolve.)
+
+#### R26: Built-in file tools
+
+The file tools ahma serves itself (`read_file`, `write_file`, `replace_in_file`,
+`multi_edit`, `apply_patch`, `list_dir`, `file_search`, `grep_search`,
+`fetch_webpage`) follow one contract. User guide: [docs/file-tools.md](docs/file-tools.md).
+
+- **R26.1 — Read before change.** Overwriting or editing an existing file
+  **must** be refused unless this session read it and its modification time and
+  length are unchanged since; a successful write re-records it. New files need
+  no read.
+- **R26.2 — An edit names one place.** `old_str` **must** match exactly once
+  unless `replace_all`; a miss reports the nearest match (whitespace-insensitive,
+  or the first line's position).
+- **R26.3 — All or nothing, atomically.** `multi_edit` and `apply_patch` **must**
+  compute every change before writing any; each file is replaced via a temp file
+  and rename, keeping permissions. A file's CRLF line endings are preserved.
+- **R26.4 — Bounded, and says so.** `read_file` (2000 numbered lines, 2000 chars
+  a line, binary refused), `grep_search` (200), `file_search` (1000),
+  `fetch_webpage` (50,000 chars) **must** state when they cut and how to narrow.
+  Search **must** respect `.gitignore`.
+- **R26.5 — Same guard, same audit.** Every path any of them writes, including an
+  `apply_patch` move target, passes the exec-config write guard and is audited
+  (R-HANDOFF), and is scope-checked including not-yet-existing paths (`..`
+  refused).
+- **R26.6 — Other harnesses' vocabulary.** Tool and argument names models are
+  trained on (`Edit`, `str_replace`, `apply_patch`, `file_path`, `old_string`…)
+  are mapped to these tools by the name/argument healer; a name that is itself a
+  known tool is never remapped.
 
 ---
 

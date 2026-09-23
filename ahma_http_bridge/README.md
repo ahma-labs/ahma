@@ -52,7 +52,6 @@ cargo build --relese
       "cwd": "/path/to/working/directory",
       "command": "/path/to/ahma/target/release/ahma",
       "args": [
-        "--sync",
         "--tools-dir",
         "/path/to/ahma/.ahma",
         "--log-to-stderr"
@@ -74,8 +73,7 @@ cargo build --relese
             "cwd": "/path/to/working/directory",
             "command": "/path/to/ahma/target/release/ahma",
             "args": [
-                "--sync",
-                "--tools-dir",
+                        "--tools-dir",
                 "/path/to/ahma/.ahma",
                 "--log-to-stderr"
             ],

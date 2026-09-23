@@ -30,8 +30,8 @@ there is live work for this project, its section opens by itself; any keystroke
 takes over.
 
 ```
- ahma · work · this project [f]    3 clients · 2⟳ 1◷ 14✓          Unix socket
-▶─ claude-code (1) · …/github/ahma ── ⢷⡪ ──────────────── 2⟳ 1◷ 14✓ ──
+ ahma · work · this project [f] 3 clients 2⟳ 1◷ 14✓   sync ● ahma ● daemon · Unix socket · sandbox: …/github/ahma [ENFORCED]
+▶─ claude-code (1) · …/github/ahma · qwen2.5-coder · ctx 38% (49k/128k) · ↑52k ↓6.1k ── ⢷⡪ ─── 2⟳ 1◷ 14✓ ──
    ⟳ cargo nextest run              [op_41]  1m12s        [P] [X]
    │ Compiling ahma_core v0.15.4
    │ Compiling ahma_mcp v0.15.4
@@ -44,6 +44,19 @@ takes over.
  ↑↓ move  Enter open  Space tail  f all projects  i chat  ? help  q quit
 ```
 
+- **One status header, in every layout.** Left: the project filter, clients and
+  task tallies. Right: the execution mode (`sync`/`async`, see
+  [settings](settings.md#sync-or-async-toolsexecution_mode)), whether the ahma
+  server and the per-user daemon are reachable — spelled out with how long, e.g.
+  `○ daemon OFFLINE 12s`, when one is not — the transport, and the sandbox the
+  server actually locked.
+- **Each window shows its own LLM and spend.** A section's rule names the model
+  Enter will chat with there and, once it has been used, its context fill and
+  tokens in/out. The chat input's title carries the same meter for the window
+  you are typing to, plus the live tokens/second and elapsed time while a turn
+  streams. Context fill needs the model's window size (`--context-length`, or
+  `num_ctx` for the provider in `~/.ahma/config.toml`); without one it is left
+  out rather than guessed. Providers that report no usage get a `~N tok est`.
 - **A section per client session.** Two windows of the same editor on the same
   project are numbered, so you can tell them apart. Hooked commands fold into
   one `hooks` section — a hook is one instance per command — and your own `!`
@@ -93,11 +106,17 @@ than showing a fabricated `exit 0`.
 
 ## Key bindings
 
+The in-app help (`?`) and the footer are generated from the same table the key
+bindings are tested against, so what they say is what the keys do. The most
+useful ones:
+
 | Key | Action |
 |-----|--------|
-| Ctrl-C (`q` in a pane) | Quit |
+| Ctrl-C | Cancel the running chat turn; press again (within 2 s) to quit |
+| `q` (in a pane) | Quit — asks you to press it again while operations or a turn are still running |
+| `Esc` (chat input) | Clear the input; on an empty input, cancel the running turn |
 | `↑`/`↓` (`j`/`k`) | Move the selection |
-| `Enter` / click a header | Open that section, closing the open one |
+| `Enter` / click a header | Open that section and chat with that window |
 | `Space` / click a task | Expand it into its output (one at a time) |
 | `Enter` on a task | Full-screen operation detail |
 | Wheel | Scroll the view |
@@ -107,9 +126,36 @@ than showing a fabricated `exit 0`.
 | `p` | Pin the selected operation |
 | `a` | Ask for access again (on a denied operation) |
 | `Tab` | Cycle panes |
-| `y` / `n` | Approve / reject a pending gate |
+| `y` / `a` / `n` | Approve / always allow / reject a pending gate. While you are typing in the chat input these keys type; press `Esc` to clear the input first |
 | `/` | Command navigator (from an empty input) |
 | `?` | Help |
+| `↑`/`↓` (chat input) | Earlier / later message, from the first / last line |
+| Click a tool call in chat | Open its full arguments and result |
+
+## Chatting
+
+- **Connect an LLM with `/setup`** (also offered when you first chat with a
+  window). It checks the provider before saving anything: the model list is
+  fetched from the provider — that is the connection test — and the models you
+  pick from are the ones it actually has. Cloud providers read their key from
+  the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`); the key is never typed
+  into the TUI or stored — the provider is registered in `~/.ahma/config.toml`
+  with a `${VAR}` reference. A window whose client supports MCP sampling can also
+  answer with the client's own model. Any other OpenAI-compatible server:
+  `/provider add`.
+- **Each window has its own conversation.** Switching windows switches
+  transcript, so a question for one client's model is never sent to another.
+  After each turn the conversation is saved under `~/.ahma/transcripts/` (not in
+  the project, so it cannot be committed by accident); `/resume` brings it back
+  in a later session.
+- **Replies are rendered Markdown**: headings, lists, emphasis, and code blocks
+  that read as code.
+- **A paste lands where you can see it**: in the log filter when that is open,
+  otherwise in the chat input, which opens and takes focus.
+- **Window commands need their slash**: `/x3` closes window 3; a message that
+  happens to start `x3` is sent as a message.
+- `/compact` keeps the last four turns so the model sees less; `/sync` and
+  `/async` switch how tool calls return (see the status header).
 
 ## Chat input prefixes
 
@@ -171,7 +217,7 @@ and in particular never one scoped to the directory you happened to open it in
 2. **HTTP/3 (QUIC)** — when the server advertises `Alt-Svc: h3=…` _and_ local TLS material exists at `~/.ahma/tls/`. See [TLS provisioning](#tls-provisioning-for-quic) below.
 3. **HTTP/1.1 / HTTP/2** — plain TCP, always available as a fallback.
 
-The transport in use is shown in the TUI header (e.g. `transport: HTTP/3 (QUIC)` or `transport: Unix socket`).
+The transport in use is shown in the TUI's status header (e.g. `HTTP/3 (QUIC)` or `Unix socket`).
 
 Use `--connect` to bypass detection and force a specific endpoint:
 

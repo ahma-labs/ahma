@@ -78,6 +78,7 @@ async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
                 client: Some("claude-code".to_string()),
                 session_id: Some("hook-1".to_string()),
                 client_pid: None,
+                sampling: false,
             },
         )
         .await

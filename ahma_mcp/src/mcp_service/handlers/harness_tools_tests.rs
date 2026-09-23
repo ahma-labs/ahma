@@ -76,8 +76,12 @@ impl FileOpsProvider for MockFileOpsProvider {
         _path: &Path,
         _old_str: &str,
         _new_str: &str,
-    ) -> Result<usize> {
-        Ok(self.replace_count)
+        _replace_all: bool,
+    ) -> Result<ahma_harness_tools::edit::EditOutcome> {
+        Ok(ahma_harness_tools::edit::EditOutcome {
+            replacements: self.replace_count,
+            snippet: String::new(),
+        })
     }
 
     async fn file_search(
@@ -93,12 +97,11 @@ impl FileOpsProvider for MockFileOpsProvider {
         &self,
         _scopes: &[PathBuf],
         _base_dir: &Path,
-        _query: &str,
-        _is_regex: bool,
-        _include_pattern: Option<&str>,
-        _max_results: Option<usize>,
-    ) -> Result<Vec<GrepMatch>> {
-        Ok(self.grep_matches.clone())
+        _opts: &ahma_harness_tools::GrepOptions,
+    ) -> Result<ahma_harness_tools::GrepOutput> {
+        Ok(ahma_harness_tools::GrepOutput::Matches(
+            self.grep_matches.clone(),
+        ))
     }
 }
 
@@ -131,7 +134,8 @@ impl FileOpsProvider for FailingFileOpsProvider {
         _path: &Path,
         _old_str: &str,
         _new_str: &str,
-    ) -> Result<usize> {
+        _replace_all: bool,
+    ) -> Result<ahma_harness_tools::edit::EditOutcome> {
         Err(anyhow::anyhow!("replace_in_file failed"))
     }
 
@@ -148,11 +152,8 @@ impl FileOpsProvider for FailingFileOpsProvider {
         &self,
         _scopes: &[PathBuf],
         _base_dir: &Path,
-        _query: &str,
-        _is_regex: bool,
-        _include_pattern: Option<&str>,
-        _max_results: Option<usize>,
-    ) -> Result<Vec<GrepMatch>> {
+        _opts: &ahma_harness_tools::GrepOptions,
+    ) -> Result<ahma_harness_tools::GrepOutput> {
         Err(anyhow::anyhow!("grep_search failed"))
     }
 }
@@ -576,12 +577,11 @@ async fn write_file_success() {
     assert_eq!(text, "File written");
 }
 
-/// `write_file`'s own description says "(create or overwrite)" — this asserts
-/// the handler actually honours that against a real, already-existing file on
-/// disk (the harness guard used to hard-block this with a `FILE_EXISTS`
-/// error, contradicting the tool's advertised contract).
+/// `write_file` creates or overwrites. Overwriting needs to have seen what is
+/// there: an existing file it never read is refused (it used to be replaced
+/// blind), and one read in this session is overwritten.
 #[tokio::test]
-async fn write_file_overwrites_an_existing_file() {
+async fn write_file_overwrites_an_existing_file_it_has_read() {
     let svc = make_service_with(
         Arc::new(MockFileOpsProvider::default()),
         Arc::new(MockWebPageFetcher::default()),
@@ -590,14 +590,50 @@ async fn write_file_overwrites_an_existing_file() {
     let dir = tempfile::tempdir().unwrap();
     let existing = dir.path().join("already-here.txt");
     std::fs::write(&existing, "old content").unwrap();
+    let path = json!(existing.to_str().unwrap());
 
-    let args = make_args(&[
-        ("path", json!(existing.to_str().unwrap())),
-        ("content", json!("new content")),
-    ]);
-    let result = svc.handle_write_file(args).await.unwrap();
+    let write = || make_args(&[("path", path.clone()), ("content", json!("new content"))]);
+    let err = svc.handle_write_file(write()).await.unwrap_err();
+    assert!(err.message.contains("read_file first"), "{}", err.message);
+
+    svc.handle_read_file(make_args(&[("path", path.clone())]))
+        .await
+        .unwrap();
+    let result = svc.handle_write_file(write()).await.unwrap();
     let text = result.content[0].as_text().unwrap().text.as_str();
     assert_eq!(text, "File written");
+}
+
+/// A file that changed after it was read is not edited blind either.
+#[tokio::test]
+async fn an_edit_after_an_outside_change_is_refused() {
+    let svc = make_service_with(
+        Arc::new(MockFileOpsProvider::default()),
+        Arc::new(MockWebPageFetcher::default()),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f.txt");
+    std::fs::write(&file, "one").unwrap();
+    let path = json!(file.to_str().unwrap());
+    svc.handle_read_file(make_args(&[("path", path.clone())]))
+        .await
+        .unwrap();
+    std::fs::write(&file, "one, then someone else's edit").unwrap();
+
+    let err = svc
+        .handle_replace_in_file(make_args(&[
+            ("path", path),
+            ("old_str", json!("one")),
+            ("new_str", json!("1")),
+        ]))
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.contains("changed since you last read"),
+        "{}",
+        err.message
+    );
 }
 
 #[tokio::test]

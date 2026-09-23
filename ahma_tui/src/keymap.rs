@@ -73,6 +73,269 @@ pub enum Action {
     Unknown,
 }
 
+// ─── Key reference (help overlay and footer) ──────────────────────────────────
+
+/// Where a documented key applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyScope {
+    /// Any panel except while typing in the chat input.
+    Global,
+    /// The work view (sections and tasks).
+    Work,
+    /// The log pane.
+    Log,
+    /// The chat input.
+    Chat,
+    /// A pending approval / scope-grant / web-access prompt.
+    Gate,
+}
+
+/// One documented key binding.
+pub struct KeyDoc {
+    pub scope: KeyScope,
+    /// The keys, as `map_key` receives them; checked by the tests below, so a
+    /// documented key that does nothing fails the build's tests.
+    pub keys: &'static [(KeyCode, KeyModifiers)],
+    /// How the keys are written in help and the footer.
+    pub label: &'static str,
+    pub action: &'static str,
+    /// The footer's short form (a word or two); `None` = only in `?` help.
+    /// The footer is one line, so the help text is too long for it.
+    pub footer: Option<&'static str>,
+}
+
+const NONE: KeyModifiers = KeyModifiers::NONE;
+const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
+
+/// The single source for every key the help overlay and footer mention. The
+/// help used to be hand-written next to the bindings and drifted: it said Enter
+/// opened a section after Enter started opening chat, and omitted half the
+/// work-view keys. `every_bound_key_is_documented` and
+/// `every_documented_key_does_something` keep this table and `map_key` in step.
+pub const KEY_REFERENCE: &[KeyDoc] = &[
+    KeyDoc {
+        scope: KeyScope::Global,
+        keys: &[(KeyCode::Char('c'), CTRL)],
+        label: "Ctrl-C",
+        action: "cancel the running turn; again to quit",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Global,
+        keys: &[(KeyCode::Char('q'), NONE)],
+        label: "q",
+        action: "quit (asks again while work runs)",
+        footer: Some("quit"),
+    },
+    KeyDoc {
+        scope: KeyScope::Global,
+        keys: &[(KeyCode::Tab, NONE), (KeyCode::BackTab, SHIFT)],
+        label: "Tab",
+        action: "next panel (Shift-Tab: previous)",
+        footer: Some("panels"),
+    },
+    KeyDoc {
+        scope: KeyScope::Global,
+        keys: &[(KeyCode::Char('?'), NONE)],
+        label: "?",
+        action: "help",
+        footer: Some("help"),
+    },
+    KeyDoc {
+        scope: KeyScope::Global,
+        keys: &[(KeyCode::Char('i'), NONE)],
+        label: "i",
+        action: "open or close chat",
+        footer: Some("chat"),
+    },
+    KeyDoc {
+        scope: KeyScope::Global,
+        keys: &[(KeyCode::Char('/'), NONE)],
+        label: "/",
+        action: "commands (in the log pane: filter)",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Global,
+        keys: &[(KeyCode::Esc, NONE)],
+        label: "Esc",
+        action: "back to the chat input",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Global,
+        keys: &[
+            (KeyCode::Up, NONE),
+            (KeyCode::Down, NONE),
+            (KeyCode::Char('k'), NONE),
+            (KeyCode::Char('j'), NONE),
+        ],
+        label: "↑↓ j k",
+        action: "move / scroll",
+        footer: Some("move"),
+    },
+    KeyDoc {
+        scope: KeyScope::Global,
+        keys: &[(KeyCode::Char('g'), NONE), (KeyCode::Char('G'), SHIFT)],
+        label: "g G",
+        action: "top / bottom",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Global,
+        keys: &[],
+        label: "PgUp PgDn",
+        action: "scroll the panel under focus or the mouse",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Work,
+        keys: &[(KeyCode::Enter, NONE)],
+        label: "Enter",
+        action: "on a header: chat with that window · on a task: full detail",
+        footer: Some("chat / detail"),
+    },
+    KeyDoc {
+        scope: KeyScope::Work,
+        keys: &[(KeyCode::Char(' '), NONE)],
+        label: "Space",
+        action: "fold/unfold; expand a task's output",
+        footer: Some("expand"),
+    },
+    KeyDoc {
+        scope: KeyScope::Work,
+        keys: &[(KeyCode::Char('f'), NONE)],
+        label: "f",
+        action: "this project / all projects",
+        footer: Some("all projects"),
+    },
+    KeyDoc {
+        scope: KeyScope::Work,
+        keys: &[(KeyCode::Char('c'), NONE)],
+        label: "c",
+        action: "cancel the selected operation",
+        footer: Some("cancel op"),
+    },
+    KeyDoc {
+        scope: KeyScope::Work,
+        keys: &[(KeyCode::Char('p'), NONE)],
+        label: "p",
+        action: "pin the selected operation",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Work,
+        keys: &[(KeyCode::Char('a'), NONE)],
+        label: "a",
+        action: "ask for access again (on a denied operation)",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Log,
+        keys: &[(KeyCode::Enter, NONE), (KeyCode::Char('z'), NONE)],
+        label: "Enter z",
+        action: "zoom / restore the pane",
+        footer: Some("zoom"),
+    },
+    KeyDoc {
+        scope: KeyScope::Log,
+        keys: &[(KeyCode::Char('w'), NONE)],
+        label: "w",
+        action: "toggle line wrap",
+        footer: Some("wrap"),
+    },
+    KeyDoc {
+        scope: KeyScope::Log,
+        keys: &[(KeyCode::Char('l'), NONE)],
+        label: "l",
+        action: "switch log file",
+        footer: Some("files"),
+    },
+    KeyDoc {
+        scope: KeyScope::Log,
+        keys: &[(KeyCode::Char('a'), NONE)],
+        label: "a",
+        action: "approve a pending symlink",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Chat,
+        keys: &[(KeyCode::Enter, NONE)],
+        label: "Enter",
+        action: "send",
+        footer: Some("send"),
+    },
+    KeyDoc {
+        scope: KeyScope::Chat,
+        keys: &[(KeyCode::Enter, SHIFT)],
+        label: "Shift-Enter",
+        action: "newline",
+        footer: Some("newline"),
+    },
+    KeyDoc {
+        scope: KeyScope::Chat,
+        keys: &[(KeyCode::Esc, NONE)],
+        label: "Esc",
+        action: "clear input; if empty, cancel the turn or leave chat",
+        footer: Some("clear / cancel"),
+    },
+    KeyDoc {
+        scope: KeyScope::Chat,
+        keys: &[(KeyCode::Up, NONE), (KeyCode::Down, NONE)],
+        label: "↑↓",
+        action: "earlier / later message (on the first / last line)",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Chat,
+        keys: &[(KeyCode::Char('t'), CTRL)],
+        label: "Ctrl-T",
+        action: "start `/run <tool>`",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Chat,
+        keys: &[(KeyCode::Char('/'), NONE)],
+        label: "/",
+        action: "commands (from an empty input)",
+        footer: Some("commands"),
+    },
+    KeyDoc {
+        scope: KeyScope::Chat,
+        keys: &[(KeyCode::Char('?'), NONE)],
+        label: "?",
+        action: "help (from an empty input)",
+        footer: Some("help"),
+    },
+    KeyDoc {
+        scope: KeyScope::Gate,
+        keys: &[(KeyCode::Char('y'), NONE)],
+        label: "y",
+        action: "approve (a scope grant: read+write)",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Gate,
+        keys: &[(KeyCode::Char('a'), NONE)],
+        label: "a",
+        action: "always allow this tool here (web: always this domain)",
+        footer: None,
+    },
+    KeyDoc {
+        scope: KeyScope::Gate,
+        keys: &[(KeyCode::Char('n'), NONE)],
+        label: "n",
+        action: "reject — Enter and Esc also deny a grant",
+        footer: None,
+    },
+];
+
+/// The documented keys for a scope, in table order.
+pub fn key_docs(scope: KeyScope) -> impl Iterator<Item = &'static KeyDoc> {
+    KEY_REFERENCE.iter().filter(move |d| d.scope == scope)
+}
+
 /// Convert a raw crossterm `KeyEvent` into an `Action`.
 ///
 /// Checked in priority order:
@@ -289,6 +552,79 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
+    fn documented(scopes: &[KeyScope], code: KeyCode) -> bool {
+        KEY_REFERENCE
+            .iter()
+            .filter(|d| scopes.contains(&d.scope))
+            .any(|d| d.keys.iter().any(|(c, _)| *c == code))
+    }
+
+    /// Every key the work view and log pane act on is in the help. The help
+    /// was hand-written and drifted from the bindings; this is what stops it.
+    #[test]
+    fn every_bound_key_is_documented() {
+        let mut universe: Vec<KeyEvent> = Vec::new();
+        for c in ('a'..='z').chain('0'..='9').chain([' ', '/', '?']) {
+            universe.push(k(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        for c in 'A'..='Z' {
+            universe.push(k(KeyCode::Char(c), KeyModifiers::SHIFT));
+        }
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Backspace,
+        ] {
+            universe.push(kn(code));
+        }
+        universe.push(k(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        for (focus, scope) in [(Focus::Work, KeyScope::Work), (Focus::Log, KeyScope::Log)] {
+            for key in &universe {
+                let action = map_key(*key, focus, &ModalState::None, false);
+                if action == Action::Unknown {
+                    continue;
+                }
+                assert!(
+                    documented(&[KeyScope::Global, scope, KeyScope::Gate], key.code),
+                    "{:?} does {action:?} in {focus:?} but is not in KEY_REFERENCE",
+                    key.code
+                );
+            }
+        }
+    }
+
+    /// Every documented work-view, log and global key does something there.
+    #[test]
+    fn every_documented_key_does_something() {
+        for doc in KEY_REFERENCE {
+            let focuses: &[Focus] = match doc.scope {
+                KeyScope::Global => &[Focus::Work, Focus::Log],
+                KeyScope::Work => &[Focus::Work],
+                KeyScope::Log => &[Focus::Log],
+                // Handled before map_key; checked in app.rs.
+                KeyScope::Chat | KeyScope::Gate => continue,
+            };
+            for &(code, mods) in doc.keys {
+                for &focus in focuses {
+                    assert_ne!(
+                        map_key(k(code, mods), focus, &ModalState::None, false),
+                        Action::Unknown,
+                        "`{}` is documented as '{}' but does nothing in {focus:?}",
+                        doc.label,
+                        doc.action
+                    );
+                }
+            }
+        }
+    }
+
     /// Build a KeyEvent with no modifiers.
     fn kn(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -309,6 +645,7 @@ mod tests {
     fn op_detail_modal() -> ModalState {
         ModalState::OperationDetail(crate::state::OperationDetailState {
             op_id: "op_1".into(),
+            instance_id: None,
             scroll: 0,
         })
     }

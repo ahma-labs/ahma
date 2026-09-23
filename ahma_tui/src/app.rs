@@ -199,7 +199,13 @@ pub async fn run(
                             // Any keystroke disarms the startup auto-switch to
                             // the task view — the user has taken the wheel.
                             state.auto_view_pending = false;
-                            if (key.code == crossterm::event::KeyCode::PageUp || key.code == crossterm::event::KeyCode::PageDown)
+                            if key.code == crossterm::event::KeyCode::Char('c')
+                                && key.modifiers == crossterm::event::KeyModifiers::CONTROL
+                            {
+                                // One meaning everywhere, ahead of every
+                                // overlay: cancel the turn, else quit.
+                                interrupt(&mut state);
+                            } else if (key.code == crossterm::event::KeyCode::PageUp || key.code == crossterm::event::KeyCode::PageDown)
                                 && !state.is_help_open()
                                 && state.log_files_selected().is_none()
                             {
@@ -250,7 +256,7 @@ pub async fn run(
                             // it does not trigger a send; the user must press Enter themselves.
                             // Interior newlines are kept, so a multi-line paste appears as
                             // multiple lines in one input rather than many separate requests.
-                            state.paste_into_chat_input(&text);
+                            state.handle_paste(&text);
                         }
                         Some(Err(e)) => {
                             debug!("terminal event error: {e}");
@@ -350,7 +356,7 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
     }
 
     match action {
-        Action::Quit => state.should_quit = true,
+        Action::Quit => request_quit(state),
         Action::Tab => {
             state.focus = state
                 .focus
@@ -558,7 +564,7 @@ fn handle_picker_action(
         Action::Down | Action::NavDown => select_active_picker_next(state),
         Action::Enter | Action::NavSubmit | Action::InputSubmit => submit_active_picker(state),
         Action::NavEsc | Action::InputClear => close_active_pickers(state),
-        Action::Quit => state.should_quit = true,
+        Action::Quit => request_quit(state),
         _ => {}
     }
 
@@ -593,12 +599,7 @@ fn submit_active_picker(state: &mut crate::state::AppState) {
         return;
     }
 
-    if let Some((picker, base_url)) = state.take_llm_setup_ollama_flavor() {
-        submit_llm_setup_ollama_flavor(picker, base_url, state);
-        return;
-    }
-
-    if let Some((picker, provider_name, base_url, _is_enhanced)) = state.take_llm_setup_model() {
+    if let Some((picker, provider_name, base_url)) = state.take_llm_setup_model() {
         submit_llm_setup_model(picker, provider_name, base_url, state);
     }
 }
@@ -626,6 +627,7 @@ fn submit_provider_picker(picker: crate::state::PickerState, state: &mut crate::
 
     if let Some(tx) = &state.bridge_tx {
         spawn_model_refresh(base_url, tx.clone());
+        state.model_picker_requested = true;
     }
 
     save_session(state);
@@ -665,7 +667,6 @@ fn close_active_pickers(state: &mut crate::state::AppState) {
         crate::state::ModalState::ProviderPicker(_)
             | crate::state::ModalState::ModelPicker(_)
             | crate::state::ModalState::LlmSetupProvider(_)
-            | crate::state::ModalState::LlmSetupOllamaFlavor { .. }
             | crate::state::ModalState::LlmSetupModel { .. }
     ) {
         state.close_modal();
@@ -683,6 +684,15 @@ fn selected_instance_header_key(state: &crate::state::AppState) -> Option<String
 
 fn activate_window_chat(key: &str, state: &mut crate::state::AppState) {
     let now = crate::ui::wall_ms();
+    // A running turn streams into the transcript on screen; changing window
+    // under it would pour one window's answer into another's conversation.
+    if state.turn.is_some() && state.active_target_instance.as_deref() != Some(key) {
+        set_footer_hint(
+            state,
+            "A reply is still coming — Esc cancels it, then switch windows",
+        );
+        return;
+    }
     if state.open_section.as_deref() == Some(key)
         && (state.focus == crate::state::Focus::Chat || state.llm_selection.is_none())
     {
@@ -690,11 +700,13 @@ fn activate_window_chat(key: &str, state: &mut crate::state::AppState) {
         state.chat_open = false;
         state.focus = crate::state::Focus::Work;
         state.active_target_instance = None;
+        state.switch_transcript("");
         return;
     }
 
     state.open_section(key, now);
     state.active_target_instance = Some(key.to_string());
+    state.switch_transcript(key);
 
     // Restore or assign default LLM for this window
     if let Some(win_cfg) = state.get_window_llm(key).cloned() {
@@ -725,29 +737,43 @@ fn activate_window_chat(key: &str, state: &mut crate::state::AppState) {
     }
 }
 
+const SETUP_OLLAMA: &str = "Ollama — local, free, private";
+const SETUP_LM_STUDIO: &str = "LM Studio — local";
+const SETUP_ANTHROPIC: &str = "Anthropic Claude — key from $ANTHROPIC_API_KEY";
+const SETUP_OPENAI: &str = "OpenAI — key from $OPENAI_API_KEY";
+const SETUP_OTHER: &str = "Another OpenAI-compatible server — see /provider add";
+const SETUP_SAMPLING: &str = "Use the client's own model: ";
+
+/// Step 1 of `/setup`: choose where the model runs.
+///
+/// Every choice is checked before it is saved: the provider's model list is
+/// fetched (that *is* the connection test) and the picker in step 2 offers
+/// what it actually has, rather than a hard-coded list of names that may not
+/// exist there.
 fn start_llm_setup_wizard(state: &mut crate::state::AppState) {
     use crate::state::PickerState;
-    let mut items = vec![
-        "Ollama (Local AI - Free, Private, Fast)".to_string(),
-        "OpenAI-Compatible (LM Studio, vLLM, OpenAI, Groq)".to_string(),
-        "Anthropic Claude (Claude 3.5 Sonnet, Claude 3 Opus)".to_string(),
-    ];
-
+    let mut ollama = SETUP_OLLAMA.to_string();
     if state
         .available_providers
         .iter()
         .any(|p| p.name.to_lowercase().contains("ollama"))
     {
-        items[0].push_str(" · [detected running]");
+        ollama.push_str(" · running");
     }
-
+    let mut items = vec![
+        ollama,
+        SETUP_LM_STUDIO.to_string(),
+        SETUP_ANTHROPIC.to_string(),
+        SETUP_OPENAI.to_string(),
+    ];
     for inst in &state.active_instances {
-        if let Some(virtual_p) = virtual_provider_for_instance(&inst.label) {
-            items.push(format!("IDE Sampling: {} ({})", virtual_p.name, inst.label));
+        if let Some(p) = virtual_provider_for_instance(inst) {
+            items.push(format!("{SETUP_SAMPLING}{}", p.name));
         }
     }
+    items.push(SETUP_OTHER.to_string());
 
-    let picker = PickerState::new("Connect AI: Step 1/3 - Select Provider", items);
+    let picker = PickerState::new("Connect an LLM · step 1/2 — where does it run?", items);
     state.modal = crate::state::ModalState::LlmSetupProvider(picker);
 }
 
@@ -755,110 +781,153 @@ fn submit_llm_setup_provider(
     picker: crate::state::PickerState,
     state: &mut crate::state::AppState,
 ) {
-    let Some(item) = picker.selected_item() else {
+    use crate::state::{CloudSetup, SetupPending};
+    use ahma_common::config::ProviderKind;
+    let Some(item) = picker.selected_item().map(str::to_string) else {
         return;
     };
-    if item.starts_with("Ollama") {
-        let picker = crate::state::PickerState::new(
-            "Connect AI: Step 2/3 - Ollama API Flavor",
-            vec![
-                "Enhanced Ollama API (Recommended - Context control, thinking tags, streaming)"
-                    .to_string(),
-                "Standard OpenAI-Compatible API (/v1)".to_string(),
-            ],
-        );
-        state.modal = crate::state::ModalState::LlmSetupOllamaFlavor {
-            picker,
-            base_url: "http://localhost:11434".to_string(),
+    let local = |name: &str, url: &str| SetupPending {
+        provider_name: name.to_string(),
+        base_url: url.to_string(),
+        cloud: None,
+        connected: false,
+    };
+    if item.starts_with(SETUP_OLLAMA) {
+        // `/v1`: the client posts to `{base}/chat/completions`, which Ollama
+        // serves under `/v1` only. The bare port 404'd every request.
+        begin_setup_connect(state, local("Ollama", "http://localhost:11434/v1"), None);
+    } else if item.starts_with(SETUP_LM_STUDIO) {
+        begin_setup_connect(state, local("LM Studio", "http://localhost:1234/v1"), None);
+    } else if item.starts_with(SETUP_ANTHROPIC) {
+        let cloud = CloudSetup {
+            config_name: "anthropic",
+            kind: ProviderKind::Anthropic,
+            key_env: "ANTHROPIC_API_KEY",
         };
-    } else if item.starts_with("OpenAI-Compatible") {
-        let picker = crate::state::PickerState::new(
-            "Connect AI: Step 2/2 - Select Model",
-            vec![
-                "gpt-4o".to_string(),
-                "gpt-4o-mini".to_string(),
-                "o3-mini".to_string(),
-                "local-model".to_string(),
-            ],
-        );
-        state.modal = crate::state::ModalState::LlmSetupModel {
-            picker,
-            provider_name: "OpenAI-Compatible".to_string(),
-            base_url: "http://localhost:1234/v1".to_string(),
-            is_enhanced_ollama: false,
+        begin_cloud_setup(state, "Anthropic", "https://api.anthropic.com/v1", cloud);
+    } else if item.starts_with(SETUP_OPENAI) {
+        let cloud = CloudSetup {
+            config_name: "openai",
+            kind: ProviderKind::OpenAi,
+            key_env: "OPENAI_API_KEY",
         };
-    } else if item.starts_with("Anthropic") {
-        let picker = crate::state::PickerState::new(
-            "Connect AI: Step 2/2 - Select Model",
-            vec![
-                "claude-3-5-sonnet-latest".to_string(),
-                "claude-3-5-haiku-latest".to_string(),
-                "claude-3-opus-latest".to_string(),
-            ],
+        begin_cloud_setup(state, "OpenAI", "https://api.openai.com/v1", cloud);
+    } else if item.starts_with(SETUP_OTHER) {
+        push_assistant_message(
+            state,
+            "Register any OpenAI-compatible server with\n\
+             `/provider add <name> <base_url> <model> - ${YOUR_KEY_VAR}`\n\
+             (e.g. `/provider add groq https://api.groq.com/openai/v1 llama-3.3-70b - ${GROQ_API_KEY}`), \
+             then choose it with /provider.",
         );
-        state.modal = crate::state::ModalState::LlmSetupModel {
-            picker,
-            provider_name: "Anthropic".to_string(),
-            base_url: "https://api.anthropic.com".to_string(),
-            is_enhanced_ollama: false,
-        };
-    } else if item.starts_with("IDE Sampling:") {
-        for inst in &state.active_instances {
-            if let Some(virtual_p) = virtual_provider_for_instance(&inst.label)
-                && (item.contains(&inst.label) || item.contains(&virtual_p.name))
-            {
-                let model = virtual_p.models.first().cloned().unwrap_or_default();
-                finish_llm_setup(virtual_p.name, model, Some(virtual_p.base_url), state);
-                return;
-            }
+    } else if let Some(name) = item.strip_prefix(SETUP_SAMPLING) {
+        let chosen = state
+            .active_instances
+            .iter()
+            .find_map(|inst| virtual_provider_for_instance(inst).filter(|p| p.name == name));
+        if let Some(p) = chosen {
+            let model = p.models.first().cloned().unwrap_or_default();
+            finish_llm_setup(p.name, model, Some(p.base_url), state);
         }
     }
 }
 
-fn submit_llm_setup_ollama_flavor(
-    picker: crate::state::PickerState,
-    base_url: String,
+/// A cloud provider needs its key in the environment first. The key is never
+/// typed into the TUI or written anywhere: the provider is registered with a
+/// `${VAR}` reference that ahma resolves when it calls the API.
+fn begin_cloud_setup(
     state: &mut crate::state::AppState,
+    name: &str,
+    base_url: &str,
+    cloud: crate::state::CloudSetup,
 ) {
-    let Some(item) = picker.selected_item() else {
+    let key = std::env::var(cloud.key_env)
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    let Some(key) = key else {
+        push_assistant_message(
+            state,
+            format!(
+                "{name} needs an API key in the environment: set `{var}` (e.g. \
+                 `export {var}=…` in your shell profile), restart `ahma tui` from that \
+                 shell, and run /setup again. The key is never typed here or stored — \
+                 ahma reads it from `${var}` when it calls {name}.",
+                var = cloud.key_env
+            ),
+        );
         return;
     };
-    let is_enhanced = item.starts_with("Enhanced");
+    let pending = crate::state::SetupPending {
+        provider_name: name.to_string(),
+        base_url: base_url.to_string(),
+        cloud: Some(cloud),
+        connected: false,
+    };
+    begin_setup_connect(state, pending, Some(key));
+}
 
-    let mut models: Vec<String> = state
-        .available_providers
-        .iter()
-        .find(|p| p.name.to_lowercase().contains("ollama"))
-        .map(|p| p.models.clone())
-        .unwrap_or_default();
-
-    if models.is_empty() {
-        models = vec![
-            "qwen2.5-coder:7b".to_string(),
-            "qwen2.5-coder:14b".to_string(),
-            "qwen2.5-coder:32b".to_string(),
-            "llama3.2:3b".to_string(),
-            "llama3.3:70b".to_string(),
-            "deepseek-r1:8b".to_string(),
-            "deepseek-r1:14b".to_string(),
-            "mistral:7b".to_string(),
-        ];
+/// Fetch the provider's model list; its arrival (or its absence) is the
+/// connection test. See [`handle_setup_models`].
+fn begin_setup_connect(
+    state: &mut crate::state::AppState,
+    pending: crate::state::SetupPending,
+    api_key: Option<String>,
+) {
+    push_assistant_message(
+        state,
+        format!(
+            "Connecting to {} at {}…",
+            pending.provider_name, pending.base_url
+        ),
+    );
+    if let Some(tx) = &state.bridge_tx {
+        crate::llm_bridge::spawn_model_refresh_with_key(
+            pending.base_url.clone(),
+            api_key,
+            tx.clone(),
+        );
     }
+    state.setup_pending = Some(pending);
+}
 
-    let provider_label = if is_enhanced {
-        "Ollama (Enhanced)".to_string()
-    } else {
-        "Ollama".to_string()
+/// The wizard's connection result: a model list opens step 2; nothing means
+/// the provider is not reachable (or the key is wrong), and says what to fix.
+fn handle_setup_models(models: Vec<String>, state: &mut crate::state::AppState) {
+    let Some(mut pending) = state.setup_pending.take() else {
+        return;
     };
-
-    let model_picker =
-        crate::state::PickerState::new("Connect AI: Step 3/3 - Select Ollama Model", models);
+    if models.is_empty() {
+        let advice = match (&pending.cloud, pending.provider_name.as_str()) {
+            (Some(cloud), name) => format!(
+                "{name} did not return a model list. Check that `${}` holds a valid key, \
+                 then /setup.",
+                cloud.key_env
+            ),
+            (None, "Ollama") => "No models from Ollama. Is it running (`ollama serve`) with a \
+                 model pulled (e.g. `ollama pull qwen2.5-coder`)? Then /setup."
+                .to_string(),
+            (None, name) => format!(
+                "No models from {name} at {}. Start its server with a model loaded, then /setup.",
+                pending.base_url
+            ),
+        };
+        push_assistant_message(state, advice);
+        return;
+    }
+    let picker = crate::state::PickerState::new(
+        format!(
+            "Connect an LLM · step 2/2 — {} model",
+            pending.provider_name
+        ),
+        models,
+    );
     state.modal = crate::state::ModalState::LlmSetupModel {
-        picker: model_picker,
-        provider_name: provider_label,
-        base_url,
-        is_enhanced_ollama: is_enhanced,
+        picker,
+        provider_name: pending.provider_name.clone(),
+        base_url: pending.base_url.clone(),
     };
+    pending.connected = true;
+    state.setup_pending = Some(pending);
 }
 
 fn submit_llm_setup_model(
@@ -870,6 +939,27 @@ fn submit_llm_setup_model(
     let Some(model) = picker.selected_item().map(|s| s.to_string()) else {
         return;
     };
+    let pending = state.setup_pending.take();
+    if let Some(cloud) = pending.and_then(|p| p.cloud).filter(|_| {
+        ahma_common::config::AhmaConfig::load()
+            .provider_for_base_url(&base_url)
+            .is_none()
+    }) {
+        let entry = ahma_common::config::ProviderEntry {
+            name: cloud.config_name.to_string(),
+            kind: cloud.kind,
+            base_url: base_url.clone(),
+            default_model: model.clone(),
+            api_key: Some(format!("${{{}}}", cloud.key_env)),
+            num_ctx: None,
+        };
+        if let Err(e) = ahma_common::config::AhmaConfig::add_provider(entry) {
+            push_assistant_message(
+                state,
+                format!("Could not register {provider_name} in ~/.ahma/config.toml: {e}"),
+            );
+        }
+    }
     finish_llm_setup(provider_name, model, Some(base_url), state);
 }
 
@@ -1091,12 +1181,9 @@ fn reraise_grant_for_selected_op(state: &mut crate::state::AppState) {
 
     // Inside the detail overlay, act on the operation being viewed rather than
     // whatever the tree selection happens to be behind it — same rule as `c`.
-    let op = match &state.modal {
-        crate::state::ModalState::OperationDetail(d) => {
-            let id = d.op_id.clone();
-            state.operations.iter().find(|o| o.id == id).cloned()
-        }
-        _ => state.selected_op().cloned(),
+    let op = match state.detail_op_key() {
+        Some(key) => state.find_op(&key).cloned(),
+        None => state.selected_op().cloned(),
     };
     let Some(op) = op else { return };
 
@@ -1183,31 +1270,45 @@ fn handle_operation_action(
 }
 
 fn request_cancel_selected_op(state: &mut crate::state::AppState) {
-    use crate::state::{LogEntry, LogLevel};
-
     // Inside the detail overlay `c` cancels the operation being viewed, not
     // whatever the tree selection happens to be behind it.
-    let id = if let crate::state::ModalState::OperationDetail(d) = &state.modal {
-        d.op_id.clone()
-    } else if let Some(op) = state.selected_op() {
-        op.id.clone()
-    } else {
-        return;
+    let key = match state.detail_op_key() {
+        Some(key) => key,
+        None => match state.selected_op() {
+            Some(op) => crate::state::OpKey::of(op),
+            None => return,
+        },
     };
+    cancel_op(state, key);
+}
+
+/// Cancel one operation where it lives. An operation from another client is
+/// cancelled on that client's instance through the daemon; the TUI's own MCP
+/// session cannot see it, so the `cancel` tool there would miss. Without a
+/// known instance the TUI's own session is the only place to ask.
+fn cancel_op(state: &mut crate::state::AppState, key: crate::state::OpKey) {
+    use crate::state::{LogEntry, LogLevel};
     state.push_log(LogEntry {
         timestamp: chrono::Local::now(),
         level: LogLevel::Info,
-        message: format!("Cancel requested: {id}"),
+        message: format!("Cancel requested: {}", key.id),
     });
-
-    if let Some(tx) = &state.bridge_tx {
-        let mcp_config = mcp_chat_config(state);
-        crate::llm_bridge::spawn_tool_call_task(
-            "cancel".to_string(),
-            serde_json::json!({ "id": id }),
-            mcp_config,
-            tx.clone(),
-        );
+    match key.instance_id {
+        Some(instance) => send_daemon_msg(ahma_common::daemon_hub::ClientMsg::CancelOperation {
+            op_id: key.id,
+            target_instance_id: Some(instance),
+        }),
+        None => {
+            if let Some(tx) = &state.bridge_tx {
+                let mcp_config = mcp_chat_config(state);
+                crate::llm_bridge::spawn_tool_call_task(
+                    "cancel".to_string(),
+                    serde_json::json!({ "id": key.id }),
+                    mcp_config,
+                    tx.clone(),
+                );
+            }
+        }
     }
 }
 
@@ -1288,20 +1389,6 @@ fn backspace_chat_input(state: &mut crate::state::AppState) {
     });
 }
 
-fn maybe_close_window_shortcut(text: &str, state: &mut crate::state::AppState) -> bool {
-    let lower = text.to_lowercase();
-    if lower.starts_with('x')
-        && !lower[1..].is_empty()
-        && lower[1..].chars().all(|c| c.is_ascii_digit())
-        && let Ok(win_id) = lower[1..].parse::<usize>()
-    {
-        close_window_by_id(win_id, state);
-        true
-    } else {
-        false
-    }
-}
-
 fn maybe_decompose_goal(
     text: &str,
     base_url: &str,
@@ -1317,7 +1404,10 @@ fn maybe_decompose_goal(
             return true;
         }
         if base_url.is_empty() {
-            push_assistant_message(state, "No LLM configured. Use /provider to select one.");
+            push_assistant_message(
+                state,
+                "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+            );
             return true;
         }
         state.push_log(LogEntry {
@@ -1427,10 +1517,7 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
         return;
     }
     state.clear_chat_input();
-
-    if maybe_close_window_shortcut(&text, state) {
-        return;
-    }
+    state.remember_input(&text);
 
     if text.starts_with('/') {
         dispatch_nav_command(&text, state);
@@ -1448,7 +1535,10 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     }
 
     if base_url.is_empty() {
-        push_assistant_message(state, "No LLM configured. Use /provider to select one.");
+        push_assistant_message(
+            state,
+            "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+        );
         return;
     }
 
@@ -1494,13 +1584,122 @@ fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: S
         .filter(|key| state.active_instances.iter().any(|i| &i.id == *key))
         .cloned();
 
-    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitPrompt {
-        messages,
-        system_prompt,
-        provider: Some(base_url),
-        model: Some(model),
-        target_instance_id,
+    state.turn = Some(crate::state::ChatTurn::new(target_instance_id.clone()));
+    send_turn_msg(
+        state,
+        ahma_common::daemon_hub::ClientMsg::SubmitPrompt {
+            messages,
+            system_prompt,
+            provider: Some(base_url),
+            model: Some(model),
+            target_instance_id,
+        },
+    );
+}
+
+/// Send a message a chat turn depends on. Unlike [`send_daemon_msg`], a
+/// failure is not swallowed: the turn is ended with the reason, because a
+/// prompt that never reached the daemon otherwise spins forever.
+fn send_turn_msg(state: &crate::state::AppState, msg: ahma_common::daemon_hub::ClientMsg) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("send_turn_msg: no active tokio runtime, skipping message: {msg:?}");
+        return;
+    };
+    let failed_tx = state.bridge_tx.clone();
+    handle.spawn(async move {
+        let sent = match ahma_common::daemon_hub::connect_to_daemon().await {
+            Ok(mut stream) => ahma_common::daemon_hub::send_msg(&mut stream, &msg).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = sent
+            && let Some(tx) = failed_tx
+        {
+            let _ = tx
+                .send(crate::llm_bridge::BridgeEvent::TurnSendFailed(format!(
+                    "Could not reach the ahma daemon: {e}"
+                )))
+                .await;
+        }
     });
+}
+
+/// The turn finished normally: stop every live indicator.
+fn end_turn(state: &mut crate::state::AppState) {
+    state.turn = None;
+    state.reset_liveness();
+    state.chat.finish_stream();
+    state.chat.finish_user_timing();
+}
+
+fn end_turn_with_error(state: &mut crate::state::AppState, error: &str) {
+    end_turn(state);
+    push_assistant_message(state, format!("Error: {error}"));
+    state.chat_scroll = 0;
+}
+
+/// Stop the running turn, if any. The turn ends here at once rather than on
+/// the instance's reply, so Esc works even when the daemon is gone; the
+/// instance's own "cancelled" error then finds no turn and is ignored.
+fn cancel_turn(state: &mut crate::state::AppState) -> bool {
+    let Some(turn) = state.turn.take() else {
+        return false;
+    };
+    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::CancelPrompt {
+        target_instance_id: turn.target_instance,
+    });
+    end_turn(state);
+    push_assistant_message(state, "Cancelled.");
+    state.chat_scroll = 0;
+    true
+}
+
+/// Operations and `!` windows still running in this TUI's view.
+fn running_work_count(state: &crate::state::AppState) -> usize {
+    use crate::state::{OpStatus, WindowStatus};
+    let ops = state
+        .operations
+        .iter()
+        .filter(|op| matches!(op.status, OpStatus::Running | OpStatus::Pending))
+        .count();
+    let windows = state
+        .windows
+        .iter()
+        .filter(|w| matches!(w.status, WindowStatus::Running | WindowStatus::Pending))
+        .count();
+    ops + windows
+}
+
+fn set_footer_hint(state: &mut crate::state::AppState, hint: impl Into<String>) {
+    state.footer_hint = Some((hint.into(), std::time::Instant::now()));
+}
+
+fn quit_is_armed(state: &crate::state::AppState) -> bool {
+    state
+        .quit_armed_at
+        .is_some_and(|t| t.elapsed() < crate::state::CTRL_C_QUIT_WINDOW)
+}
+
+/// `q` / `/quit`: quit at once when nothing is running, otherwise warn and
+/// quit on a second request inside [`crate::state::CTRL_C_QUIT_WINDOW`].
+fn request_quit(state: &mut crate::state::AppState) {
+    let busy = running_work_count(state) + usize::from(state.turn.is_some());
+    if busy == 0 || quit_is_armed(state) {
+        state.should_quit = true;
+        return;
+    }
+    state.quit_armed_at = Some(std::time::Instant::now());
+    set_footer_hint(state, format!("{busy} still running — press again to quit"));
+}
+
+/// Ctrl-C: the first press cancels a running turn; otherwise, or pressed
+/// again, it quits (asking first while work is running, like `q`).
+fn interrupt(state: &mut crate::state::AppState) {
+    if cancel_turn(state) {
+        state.quit_armed_at = Some(std::time::Instant::now());
+        set_footer_hint(state, "Turn cancelled — Ctrl-C again to quit");
+        return;
+    }
+    request_quit(state);
 }
 
 fn format_recent_ops(operations: &[crate::state::Operation]) -> String {
@@ -1927,7 +2126,7 @@ fn handle_settings_key(
             .modifiers
             .contains(crossterm::event::KeyModifiers::CONTROL)
     {
-        state.should_quit = true;
+        interrupt(state);
         return true;
     }
 
@@ -1960,7 +2159,7 @@ fn handle_help_key(key: crossterm::event::KeyEvent, state: &mut crate::state::Ap
         // which made the documented "Ctrl-C always quits" untrue exactly where
         // a stuck user is most likely to try it.
         (KeyCode::Char('c'), m) if m.contains(crossterm::event::KeyModifiers::CONTROL) => {
-            state.should_quit = true;
+            interrupt(state);
             true
         }
         // `q` closes help, matching every other overlay in the app.
@@ -2035,7 +2234,6 @@ fn active_picker_mut(state: &mut crate::state::AppState) -> Option<&mut crate::s
         crate::state::ModalState::ProviderPicker(p)
         | crate::state::ModalState::ModelPicker(p)
         | crate::state::ModalState::LlmSetupProvider(p)
-        | crate::state::ModalState::LlmSetupOllamaFlavor { picker: p, .. }
         | crate::state::ModalState::LlmSetupModel { picker: p, .. } => Some(p),
         _ => None,
     }
@@ -2054,7 +2252,11 @@ fn handle_approval_key(
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if state.approval.is_none() || state.text_entry_modal_open() || state.log_filter_active {
+    if state.approval.is_none()
+        || state.text_entry_modal_open()
+        || state.log_filter_active
+        || state.typing_in_chat()
+    {
         return false;
     }
 
@@ -2085,7 +2287,11 @@ fn handle_scope_grant_key(
     use ahma_common::scope_grant::GrantDecision;
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if state.scope_grant.is_none() || state.text_entry_modal_open() || state.log_filter_active {
+    if state.scope_grant.is_none()
+        || state.text_entry_modal_open()
+        || state.log_filter_active
+        || state.typing_in_chat()
+    {
         return false;
     }
 
@@ -2161,7 +2367,11 @@ fn handle_web_approval_key(
     use ahma_common::web_approval::WebApprovalDecision;
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if state.web_approval.is_none() || state.text_entry_modal_open() || state.log_filter_active {
+    if state.web_approval.is_none()
+        || state.text_entry_modal_open()
+        || state.log_filter_active
+        || state.typing_in_chat()
+    {
         return false;
     }
 
@@ -2261,10 +2471,6 @@ fn handle_chat_input_key(
     }
 
     match (key.code, key.modifiers) {
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            state.should_quit = true;
-            true
-        }
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
             if state.chat_input_is_empty() {
                 state.chat_input.insert_str("/run ");
@@ -2275,6 +2481,19 @@ fn handle_chat_input_key(
                 nav.refresh_completions(&tools);
                 state.modal = crate::state::ModalState::Navigator(nav);
             }
+            true
+        }
+        // Recall earlier input from the first line, later from the last;
+        // anywhere else the arrows move the cursor.
+        (KeyCode::Up, KeyModifiers::NONE)
+            if state.chat_input.cursor().0 == 0 && state.recall_previous_input() =>
+        {
+            true
+        }
+        (KeyCode::Down, KeyModifiers::NONE)
+            if state.chat_input.cursor().0 + 1 >= state.chat_input.lines().len()
+                && state.recall_next_input() =>
+        {
             true
         }
         (KeyCode::Tab, KeyModifiers::NONE) => {
@@ -2296,10 +2515,10 @@ fn handle_chat_input_key(
             true
         }
         (KeyCode::Esc, _) => {
-            if state.chat_input_is_empty() {
-                state.focus = crate::state::Focus::Work;
-            } else {
+            if !state.chat_input_is_empty() {
                 state.clear_chat_input();
+            } else if !cancel_turn(state) {
+                state.focus = crate::state::Focus::Work;
             }
             true
         }
@@ -2355,7 +2574,7 @@ fn textarea_input_from_key_event(key: crossterm::event::KeyEvent) -> tui_textare
 
 fn handle_window_nav_commands(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if cmd == "/exit" || cmd == "/quit" {
-        state.should_quit = true;
+        request_quit(state);
         return true;
     }
     if let Some(num_str) = cmd.strip_prefix("/x")
@@ -2547,7 +2766,10 @@ fn invoke_skill(
 ) {
     let (base_url, model) = parse_llm_selection(state);
     if base_url.is_empty() {
-        push_assistant_message(state, "No LLM configured. Use /provider to select one.");
+        push_assistant_message(
+            state,
+            "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+        );
         return;
     }
 
@@ -2672,13 +2894,70 @@ fn set_minimize_tokens(state: &mut crate::state::AppState, desired: bool) {
     }
 }
 
+/// Switch `tools.execution_mode` and persist it to `~/.ahma/settings.toml`
+/// (re-read first, so an edit made elsewhere is not clobbered).
+///
+/// A running ahma worker read its mode when it started, so the message says
+/// plainly which sessions the change reaches rather than implying it applied
+/// everywhere at once.
+fn set_execution_mode(
+    state: &mut crate::state::AppState,
+    mode: ahma_common::config::ExecutionPolicy,
+) {
+    let mut settings = ahma_common::config::AhmaSettings::load();
+    settings.tools.execution_mode = mode;
+    match settings.save() {
+        Ok(()) => {
+            state.settings_editor.note_execution_mode(mode);
+            let what = match mode {
+                ahma_common::config::ExecutionPolicy::Sync => "calls wait for their result",
+                ahma_common::config::ExecutionPolicy::Async => {
+                    "calls return an operation id; results are collected with `await`"
+                }
+            };
+            push_assistant_message(
+                state,
+                format!(
+                    "Execution mode is now **{mode}** ({what}), saved to ~/.ahma/settings.toml. \
+                     New ahma sessions use it; sessions already running keep their mode \
+                     until restarted (ask the agent to run the `restart` tool)."
+                ),
+            );
+        }
+        Err(e) => push_assistant_message(
+            state,
+            format!("Could not save execution mode **{mode}** to settings: {e}"),
+        ),
+    }
+}
+
 fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
         "/help" | "/?" => state.modal = crate::state::ModalState::Help,
+        // The guided setup was reachable only by selecting a window with no
+        // LLM configured — i.e. never, once anything was picked.
+        "/setup" | "/connect" => start_llm_setup_wizard(state),
+        "/resume" => {
+            if let Some(home) = ahma_common::config::ahma_home_dir() {
+                resume_transcript(state, &home);
+            }
+        }
+        "/sync" => set_execution_mode(state, ahma_common::config::ExecutionPolicy::Sync),
+        "/async" => set_execution_mode(state, ahma_common::config::ExecutionPolicy::Async),
         "/clear" => state.clear_screen(),
         "/compact" => {
-            state.chat.compact(4);
-            push_assistant_message(state, "Context window compacted (kept 4 latest turns).");
+            const KEEP_TURNS: usize = 4;
+            let dropped = state.chat.compact(KEEP_TURNS);
+            let msg = if dropped == 0 {
+                format!("Nothing to compact: {KEEP_TURNS} turns or fewer.")
+            } else {
+                format!(
+                    "Dropped {dropped} older turn(s); the model now sees the last {KEEP_TURNS}."
+                )
+            };
+            // A footer note, not a transcript entry: a transcript entry would
+            // itself be sent to the model as an assistant message.
+            set_footer_hint(state, msg);
         }
         // The work view is always on screen now, so `/tasks` focuses it. Kept
         // because it is in a lot of muscle memory.
@@ -3355,6 +3634,7 @@ fn request_model_refresh(state: &mut crate::state::AppState) {
         && let Some(tx) = &state.bridge_tx
     {
         crate::llm_bridge::spawn_model_refresh(base_url, tx.clone());
+        state.model_picker_requested = true;
     }
     push_assistant_message(state, "Fetching model list…");
 }
@@ -3383,6 +3663,16 @@ fn open_model_picker(state: &mut crate::state::AppState) {
                 items.push(item);
             }
         }
+    }
+
+    // The current provider may not be a discovered one (configured by hand or
+    // by the setup wizard): its refreshed models live only in
+    // `available_models`. Without this the refresh result opened an empty
+    // picker, which asked for another refresh, forever.
+    // Bare names: submitting one keeps the current provider and swaps only
+    // the model (a `provider / model` row needs a discovered provider).
+    if items.is_empty() {
+        items = state.available_models.clone();
     }
 
     if items.is_empty() {
@@ -3666,62 +3956,34 @@ fn persist_selected_model_to_settings(provider: &str, model: &str, provider_url:
 
 // ─── Bridge event handler ─────────────────────────────────────────────────────
 
-fn virtual_provider_for_instance(label: &str) -> Option<ahma_llm_monitor::LocalProvider> {
-    let normalized = label.to_lowercase();
-    if normalized.contains("cursor") {
-        Some(ahma_llm_monitor::LocalProvider {
-            name: "Cursor (Sampling)".to_string(),
-            base_url: "mcp://Cursor".to_string(),
-            models: vec![
-                "Claude 3.5 Sonnet (IDE subscription)".to_string(),
-                "GPT-4o (IDE subscription)".to_string(),
-                "Gemini 1.5 Pro (IDE subscription)".to_string(),
-            ],
-        })
-    } else if normalized.contains("vscode")
-        || normalized.contains("vs code")
-        || normalized.contains("visual studio code")
-    {
-        Some(ahma_llm_monitor::LocalProvider {
-            name: "VS Code (Sampling)".to_string(),
-            base_url: "mcp://VS Code".to_string(),
-            models: vec![
-                "Claude 3.5 Sonnet (IDE subscription)".to_string(),
-                "GPT-4o (IDE subscription)".to_string(),
-                "Gemini 1.5 Pro (IDE subscription)".to_string(),
-            ],
-        })
-    } else if normalized.contains("antigravity") {
-        Some(ahma_llm_monitor::LocalProvider {
-            name: "Antigravity (Sampling)".to_string(),
-            base_url: "mcp://Antigravity".to_string(),
-            models: vec![
-                "Gemini 1.5 Pro (Google Cloud bill)".to_string(),
-                "Gemini 1.5 Flash (Google Cloud bill)".to_string(),
-            ],
-        })
-    } else if normalized.contains("claude") {
-        Some(ahma_llm_monitor::LocalProvider {
-            name: "Claude Code (Sampling)".to_string(),
-            base_url: "mcp://Claude Code".to_string(),
-            models: vec![
-                "Claude 3.5 Sonnet (Anthropic API bill)".to_string(),
-                "Claude 3 Opus (Anthropic API bill)".to_string(),
-            ],
-        })
-    } else {
-        Some(ahma_llm_monitor::LocalProvider {
-            name: format!("{label} (Sampling)"),
-            base_url: format!("mcp://{label}"),
-            models: vec!["Default Model (IDE subscription)".to_string()],
-        })
+/// An `mcp://` provider for a window whose MCP client can answer prompts with
+/// its own model (MCP sampling).
+///
+/// Only a client that declared the `sampling` capability gets one. This used to
+/// return a provider for *every* instance — hooks and this TUI included — with
+/// invented model names ("Claude 3.5 Sonnet (IDE subscription)"): entries that
+/// could never answer, and because one always existed, an LLM was auto-selected
+/// and the setup wizard never ran. With sampling the client picks the model;
+/// ahma can only state a preference, so the entry says so instead of naming
+/// models it cannot promise.
+fn virtual_provider_for_instance(
+    inst: &ahma_common::daemon_hub::InstanceInfo,
+) -> Option<ahma_llm_monitor::LocalProvider> {
+    if !inst.sampling || inst.mode == "hook" || inst.mode == "tui" {
+        return None;
     }
+    let who = inst.client.as_deref().unwrap_or(&inst.label);
+    Some(ahma_llm_monitor::LocalProvider {
+        name: format!("{who} (its own model)"),
+        base_url: format!("mcp://{}", inst.label),
+        models: vec!["client's choice".to_string()],
+    })
 }
 
 fn rebuild_available_providers(state: &mut crate::state::AppState) {
     let mut combined = state.discovered_providers.clone();
     for inst in &state.active_instances {
-        if let Some(virtual_provider) = virtual_provider_for_instance(&inst.label)
+        if let Some(virtual_provider) = virtual_provider_for_instance(inst)
             && !combined.iter().any(|p| p.name == virtual_provider.name)
         {
             combined.push(virtual_provider);
@@ -3812,6 +4074,14 @@ fn handle_model_refreshed(
     models: Vec<String>,
     state: &mut crate::state::AppState,
 ) {
+    if state
+        .setup_pending
+        .as_ref()
+        .is_some_and(|p| !p.connected && p.base_url == base_url)
+    {
+        handle_setup_models(models, state);
+        return;
+    }
     if let Some(provider) = state
         .available_providers
         .iter_mut()
@@ -3822,7 +4092,12 @@ fn handle_model_refreshed(
 
     if state.current_provider_url.as_deref() == Some(base_url.as_str()) && !models.is_empty() {
         state.available_models = models.clone();
-        open_model_picker(state);
+        // Only a refresh the user asked for (picking a provider, opening an
+        // empty model list) opens the picker; a background one must not
+        // steal focus from whatever they are doing now.
+        if std::mem::take(&mut state.model_picker_requested) {
+            open_model_picker(state);
+        }
     }
 }
 
@@ -4016,11 +4291,6 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
     // direction follows the turn state (thinking shimmers, streaming rains,
     // tool dispatch scrolls right). Done/Error clear it back to blanks below.
     match &event {
-        BridgeEvent::Token(_) => state.mark_stream_activity(crate::state::LivenessState::Streaming),
-        BridgeEvent::Thinking(_) => {
-            state.mark_stream_activity(crate::state::LivenessState::Thinking)
-        }
-        BridgeEvent::Usage(_) => state.mark_stream_activity(state.liveness_state),
         BridgeEvent::ToolCallStarted { .. } => {
             state.mark_stream_activity(crate::state::LivenessState::ToolWait)
         }
@@ -4032,67 +4302,14 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
     }
 
     match event {
-        BridgeEvent::Token(token) => {
-            state.chat.append_token(&token);
-            state.chat_scroll = 0;
-        }
-        BridgeEvent::Thinking(token) => {
-            state.chat.append_thinking(&token);
-            state.chat_scroll = 0;
-        }
-        BridgeEvent::Usage(usage) => {
-            state.token_usage.prompt_tokens += usage.prompt_tokens;
-            state.token_usage.completion_tokens += usage.completion_tokens;
-            state.token_usage.total_tokens += usage.total_tokens;
-            if usage.prompt_tokens > 0 {
-                state.last_prompt_tokens = usage.prompt_tokens;
-            }
-        }
-        BridgeEvent::Done => {
-            state.reset_liveness();
-            state.chat.finish_stream();
-            state.chat.finish_user_timing();
-            if let Some(profile) = &state.active_profile
-                && let Ok(cwd) = std::env::current_dir()
-            {
-                let payload = serde_json::json!({
-                    "timestamp": chrono::Local::now().to_rfc3339(),
-                    "chat_entries": state.chat.entries().len(),
-                    "model": state.selected_model(),
-                });
-                // Blocking file append must not run on the async event loop
-                // (repo rule: no blocking I/O in async context) — hand it to
-                // the blocking pool; best-effort, as before.
-                let profile = profile.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = crate::agent_config::append_transcript_entry(
-                        &cwd,
-                        &profile,
-                        &payload.to_string(),
-                    );
-                });
-            }
-        }
         BridgeEvent::Error(msg) => {
-            state.reset_liveness();
-            state.chat.finish_stream();
-            state.chat.finish_user_timing();
             state.chat.push(ChatEntry::Assistant {
                 content: format!("Error: {msg}"),
                 streaming: false,
             });
             state.chat_scroll = 0;
         }
-        BridgeEvent::Truncated { reason } => {
-            // Never leave a cut-off response looking like a silent hang: a
-            // visible note in the transcript itself, right where the user is
-            // already looking, before the continuation's tokens start arriving.
-            state.chat.push(ChatEntry::Assistant {
-                content: format!("[{reason}]"),
-                streaming: false,
-            });
-            state.chat_scroll = 0;
-        }
+        BridgeEvent::TurnSendFailed(msg) => end_turn_with_error(state, &msg),
         BridgeEvent::Decomposed { steps } => {
             handle_decomposed_event(steps, state);
         }
@@ -4130,9 +4347,6 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
         }
         BridgeEvent::ExternalToolsRefreshed { manager } => {
             handle_external_tools_refreshed(manager, state);
-        }
-        BridgeEvent::RequestApproval { id, tool, args, tx } => {
-            request_tool_approval(state, id, tool, args, Some(tx));
         }
         BridgeEvent::SessionEstablished { session_id } => {
             state.session_id = Some(session_id);
@@ -4502,9 +4716,9 @@ fn append_active_log_lines(active_log_lines: &mut Vec<String>, content: &str) {
 fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate::state::AppState) {
     use crate::mcp_source::SourceEvent;
     match event {
-        SourceEvent::HealthChanged { healthy } => state.server_healthy = healthy,
+        SourceEvent::HealthChanged { healthy } => state.set_server_healthy(healthy),
         SourceEvent::DaemonHealthChanged { healthy } => {
-            state.daemon_healthy = healthy;
+            state.set_daemon_healthy(healthy);
             if let Some(ref tx) = state.mcp_source_tx {
                 let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetDaemonHealthy(
                     healthy,
@@ -4636,13 +4850,113 @@ fn handle_source_gate_event(
     }
 }
 
+/// Where this window's transcript is saved: keyed by the window's durable
+/// identity (client and workspace), not the per-session instance id, so the
+/// next session of the same client in the same workspace finds it.
+fn transcript_path(state: &crate::state::AppState, home: &std::path::Path) -> std::path::PathBuf {
+    // This terminal's own chat is per workspace, like every other window.
+    let key = if state.chat_key.is_empty() {
+        format!("ahma-tui@{}", state.workspace)
+    } else {
+        state.window_llm_key(&state.chat_key)
+    };
+    crate::transcripts::path_for(&crate::transcripts::dir_for(home), &key)
+}
+
+/// Save the current window's transcript after a finished turn. Best-effort,
+/// on the blocking pool.
+fn save_transcript(state: &crate::state::AppState) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(home) = ahma_common::config::ahma_home_dir() else {
+        return;
+    };
+    let path = transcript_path(state, &home);
+    let entries = crate::transcripts::to_saved(&state.chat);
+    if entries.is_empty() {
+        return;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || {
+            if let Err(e) = crate::transcripts::save(&path, &entries) {
+                debug!("Failed to save transcript {}: {e}", path.display());
+            }
+        });
+    }
+}
+
+/// `/resume`: bring back this window's saved conversation.
+fn resume_transcript(state: &mut crate::state::AppState, home: &std::path::Path) {
+    if state.turn.is_some() {
+        set_footer_hint(state, "A reply is still coming — Esc cancels it first");
+        return;
+    }
+    let path = transcript_path(state, home);
+    match crate::transcripts::load(&path) {
+        Ok(Some(entries)) => {
+            let n = entries.len();
+            state.chat = crate::transcripts::from_saved(entries);
+            *state.chat_rows_cache.borrow_mut() = crate::state::ChatRowsCache::default();
+            state.chat_scroll = 0;
+            state.chat_open = true;
+            set_footer_hint(
+                state,
+                format!("Resumed {n} messages from {}", path.display()),
+            );
+        }
+        Ok(None) => push_assistant_message(
+            state,
+            format!(
+                "No saved conversation for this window yet ({}).",
+                path.display()
+            ),
+        ),
+        Err(e) => push_assistant_message(state, format!("Could not read {}: {e}", path.display())),
+    }
+}
+
+/// Append one line per finished turn to the active agent profile's transcript
+/// log, when a profile is active. Best-effort, on the blocking pool (no
+/// blocking I/O on the event loop).
+fn append_profile_transcript(state: &crate::state::AppState) {
+    if let Some(profile) = &state.active_profile
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        let payload = serde_json::json!({
+            "timestamp": chrono::Local::now().to_rfc3339(),
+            "chat_entries": state.chat.entries().len(),
+            "model": state.selected_model(),
+        });
+        // Blocking file append must not run on the async event loop
+        // (repo rule: no blocking I/O in async context) — hand it to
+        // the blocking pool; best-effort, as before.
+        let profile = profile.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ =
+                crate::agent_config::append_transcript_entry(&cwd, &profile, &payload.to_string());
+        });
+    }
+}
+
 fn handle_source_chat_event(
     event: crate::mcp_source::SourceEvent,
     state: &mut crate::state::AppState,
 ) {
     use crate::mcp_source::SourceEvent;
+    // Stream events belong to the turn this TUI started. With none in flight
+    // they are another TUI's turn (the hub broadcasts to every subscriber) or
+    // late output from a turn just cancelled here.
+    let Some(turn) = state.turn.as_mut() else {
+        tracing::debug!("chat event with no turn in flight, ignored: {event:?}");
+        return;
+    };
+    turn.last_event = std::time::Instant::now();
     match event {
         SourceEvent::ChatToken { token } => {
+            if let Some(turn) = state.turn.as_mut() {
+                turn.note_token(&token);
+            }
             state.chat.append_token(&token);
             state.mark_stream_activity(crate::state::LivenessState::Streaming);
             state.chat_scroll = 0;
@@ -4653,18 +4967,11 @@ fn handle_source_chat_event(
             state.chat_scroll = 0;
         }
         SourceEvent::AgentDone => {
-            state.reset_liveness();
-            state.chat.finish_stream();
-            state.chat.finish_user_timing();
+            end_turn(state);
+            append_profile_transcript(state);
+            save_transcript(state);
         }
-        SourceEvent::AgentError { error } => {
-            state.reset_liveness();
-            state.chat.finish_stream();
-            state.chat.push(crate::state::ChatEntry::Assistant {
-                content: format!("Error: {error}"),
-                streaming: false,
-            });
-        }
+        SourceEvent::AgentError { error } => end_turn_with_error(state, &error),
         SourceEvent::Usage {
             prompt_tokens,
             completion_tokens,
@@ -4675,6 +4982,18 @@ fn handle_source_chat_event(
             state.token_usage.total_tokens += total_tokens;
             if prompt_tokens > 0 {
                 state.last_prompt_tokens = prompt_tokens;
+            }
+            let key = crate::state::AppState::usage_key(
+                state
+                    .turn
+                    .as_ref()
+                    .and_then(|t| t.target_instance.as_deref()),
+            );
+            let usage = state.window_usage.entry(key).or_default();
+            usage.prompt_tokens += prompt_tokens;
+            usage.completion_tokens += completion_tokens;
+            if prompt_tokens > 0 {
+                usage.last_prompt_tokens = prompt_tokens;
             }
             state.mark_stream_activity(state.liveness_state);
         }
@@ -4710,13 +5029,20 @@ fn handle_operation_output(
     op_id: &str,
     line: String,
 ) {
-    // Prefer an exact (id, instance) match; fall back to id-only so output
-    // still lands when the op was first seen via the poll path (instance None).
+    // Prefer an exact (id, instance) match; fall back to an op first seen via
+    // the poll path, which carries no instance. Never to another instance's
+    // op with the same id: that would splice one client's output into
+    // another's.
     let op_idx = state
         .operations
         .iter()
         .position(|o| o.id == op_id && o.instance_id == instance_id)
-        .or_else(|| state.operations.iter().position(|o| o.id == op_id));
+        .or_else(|| {
+            state
+                .operations
+                .iter()
+                .position(|o| o.id == op_id && o.instance_id.is_none())
+        });
 
     let Some(idx) = op_idx else {
         // Output for an operation we have not seen yet. This happens when an
@@ -4953,9 +5279,9 @@ fn handle_log_file_nav_command(cmd: &str, state: &mut crate::state::AppState) ->
 
 fn handle_analyze_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if cmd == "/analyze" {
-        let op_id = state.selected_op().map(|op| op.id.clone());
-        if let Some(id) = op_id {
-            analyze_operation(state, &id);
+        let key = state.selected_op().map(crate::state::OpKey::of);
+        if let Some(key) = key {
+            analyze_operation(state, &key);
         } else {
             push_assistant_message(
                 state,
@@ -4971,17 +5297,17 @@ fn handle_analyze_nav_command(cmd: &str, state: &mut crate::state::AppState) -> 
             push_assistant_message(state, "Usage: /analyze [op_id]");
             return true;
         }
-        analyze_operation(state, op_id);
+        analyze_operation(state, &crate::state::OpKey::bare(op_id));
         return true;
     }
 
     false
 }
 
-fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
+fn analyze_operation(state: &mut crate::state::AppState, key: &crate::state::OpKey) {
     let extracted = {
-        let Some(op) = state.operations.iter().find(|o| o.id == op_id) else {
-            push_assistant_message(state, format!("Operation `{op_id}` not found."));
+        let Some(op) = state.find_op(key) else {
+            push_assistant_message(state, format!("Operation `{}` not found.", key.id));
             return;
         };
         let stdout_str = op
@@ -5016,6 +5342,15 @@ fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
         id, tool_name, status, args, alerts_str, stdout_str
     );
 
+    let (base_url, model) = parse_llm_selection(state);
+    if base_url.is_empty() {
+        push_assistant_message(
+            state,
+            "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+        );
+        return;
+    }
+
     state.chat.push(crate::state::ChatEntry::User {
         text: format!("Analyze operation {}", id),
         payload: None,
@@ -5027,12 +5362,6 @@ fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
         streaming: true,
     });
     state.chat_scroll = 0;
-
-    let (base_url, model) = parse_llm_selection(state);
-    if base_url.is_empty() {
-        push_assistant_message(state, "No LLM configured. Use /provider to select one.");
-        return;
-    }
 
     let mut history = collect_chat_history(state);
     if let Some(last_msg) = history.last_mut() {
@@ -5058,13 +5387,17 @@ fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
 
     let system_prompt = state.mcp_enabled.then(|| build_system_prompt(state));
 
-    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitPrompt {
-        messages,
-        system_prompt,
-        provider: Some(base_url),
-        model: Some(model),
-        target_instance_id: None,
-    });
+    state.turn = Some(crate::state::ChatTurn::new(None));
+    send_turn_msg(
+        state,
+        ahma_common::daemon_hub::ClientMsg::SubmitPrompt {
+            messages,
+            system_prompt,
+            provider: Some(base_url),
+            model: Some(model),
+            target_instance_id: None,
+        },
+    );
 }
 
 #[inline]
@@ -5075,32 +5408,18 @@ fn inside_rect(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
 fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::state::AppState) {
     use crate::state::ClickTarget;
     match target {
-        ClickTarget::CancelOperation(op_id) => {
-            let id = op_id.clone();
-            state.push_log(crate::state::LogEntry {
-                timestamp: chrono::Local::now(),
-                level: crate::state::LogLevel::Info,
-                message: format!("Cancel requested: {id}"),
-            });
-            if let Some(tx) = &state.bridge_tx {
-                let mcp_config = mcp_chat_config(state);
-                crate::llm_bridge::spawn_tool_call_task(
-                    "cancel".to_string(),
-                    serde_json::json!({ "id": id }),
-                    mcp_config,
-                    tx.clone(),
-                );
-            }
+        ClickTarget::CancelOperation(key) => {
+            cancel_op(state, key);
             state.focus = crate::state::Focus::Work;
         }
-        ClickTarget::PinOperation(op_id) => {
-            if let Some(op) = state.operations.iter_mut().find(|o| o.id == op_id) {
+        ClickTarget::PinOperation(key) => {
+            if let Some(op) = state.find_op_mut(&key) {
                 op.pinned = !op.pinned;
             }
             state.focus = crate::state::Focus::Work;
         }
-        ClickTarget::AnalyzeOperation(op_id) => {
-            analyze_operation(state, &op_id);
+        ClickTarget::AnalyzeOperation(key) => {
+            analyze_operation(state, &key);
             // The analysis streams into the chat pane. When Analyze is clicked
             // from the full-screen detail overlay, that overlay covers chat — so
             // leaving it up made a working click look like it did nothing. Close
@@ -5132,8 +5451,8 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
         ClickTarget::SectionHeader(key) => {
             activate_window_chat(&key, state);
         }
-        ClickTarget::OpenOperationDetail(op_id) => {
-            state.open_operation_detail(op_id);
+        ClickTarget::OpenOperationDetail(key) => {
+            state.open_operation_detail(key);
         }
         ClickTarget::OpenLogLine(text) => {
             // Clicking the log pane also focuses it, so Esc lands the user back
@@ -5188,7 +5507,7 @@ fn apply_window_hit(hit: Option<WindowHit>, state: &mut crate::state::AppState) 
                 .find(|w| w.id == win_id)
                 .and_then(|w| w.op_id.clone());
             match op_id {
-                Some(id) => state.open_operation_detail(id),
+                Some(id) => state.open_operation_detail(crate::state::OpKey::bare(id)),
                 None => {
                     if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
                         w.collapsed = !w.collapsed;
@@ -5250,6 +5569,13 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
     }
     if inside_rect(col, row, state.chat_area.get()) {
         state.focus = crate::state::Focus::Chat;
+        // A tool-call line is clipped to one row; clicking it opens the whole
+        // call — arguments and result — full-screen (SPEC R24.8.4).
+        if let Some(detail) =
+            crate::ui::chat_entry_at(state, col, row).and_then(|idx| state.tool_call_detail(idx))
+        {
+            state.open_log_line_detail(detail);
+        }
         return;
     }
     if inside_rect(col, row, state.log_area.get()) {
@@ -5491,7 +5817,7 @@ fn update_scroll_animations(state: &mut crate::state::AppState) {
 }
 
 fn chat_in_progress(state: &crate::state::AppState) -> bool {
-    state.liveness_state != crate::state::LivenessState::Idle
+    state.turn.is_some()
 }
 
 #[cfg(test)]
@@ -5500,6 +5826,236 @@ mod tests {
     use super::run_unsandboxed_command;
     use crate::state::AppState;
     use serde_json::json;
+
+    /// A failed turn is over: its elapsed timer must stop just as it does on
+    /// success. The daemon emits `AgentError` for exactly this reason
+    /// (`daemon_hub.rs`), and a timer left running also forced a full
+    /// transcript rebuild on every frame.
+    #[test]
+    fn agent_error_stops_the_turn_timer() {
+        use crate::mcp_source::SourceEvent;
+        use crate::state::ChatEntry;
+
+        let mut state = turn_in_flight();
+        super::handle_source_event(
+            SourceEvent::AgentError {
+                error: "boom".into(),
+            },
+            &mut state,
+        );
+
+        assert!(state.chat.entries().iter().any(|e| matches!(
+            e,
+            ChatEntry::User {
+                duration_ms: Some(_),
+                ..
+            }
+        )));
+        assert!(state.turn.is_none(), "an error ends the turn");
+    }
+
+    /// A state with one submitted prompt whose turn has not ended yet.
+    fn turn_in_flight() -> AppState {
+        use crate::state::ChatEntry;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.chat.push(ChatEntry::User {
+            text: "hi".into(),
+            payload: None,
+            started_at: Some(std::time::Instant::now()),
+            duration_ms: None,
+        });
+        state.chat.push(ChatEntry::Assistant {
+            content: String::new(),
+            streaming: true,
+        });
+        state.turn = Some(crate::state::ChatTurn::new(None));
+        state.focus = crate::state::Focus::Chat;
+        state
+    }
+
+    fn key(
+        code: crossterm::event::KeyCode,
+        mods: crossterm::event::KeyModifiers,
+    ) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, mods)
+    }
+
+    /// Usage is attributed to the window the turn was sent to, so each
+    /// window's header shows its own spend.
+    #[test]
+    fn usage_is_attributed_to_the_turns_window() {
+        use crate::mcp_source::SourceEvent;
+        let mut state = turn_in_flight();
+        state.turn.as_mut().unwrap().target_instance = Some("inst-a".into());
+        super::handle_source_event(
+            SourceEvent::Usage {
+                prompt_tokens: 1200,
+                completion_tokens: 80,
+                total_tokens: 1280,
+            },
+            &mut state,
+        );
+        let a = state.window_usage["inst-a"];
+        assert_eq!(
+            (a.prompt_tokens, a.completion_tokens, a.last_prompt_tokens),
+            (1200, 80, 1200)
+        );
+        assert!(
+            !state.window_usage.contains_key(""),
+            "not charged to the local window"
+        );
+    }
+
+    #[test]
+    fn going_offline_records_since_when() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.set_daemon_healthy(true);
+        assert!(state.daemon_down_since.is_none());
+        state.set_daemon_healthy(false);
+        let since = state.daemon_down_since.expect("down since recorded");
+        state.set_daemon_healthy(false);
+        assert_eq!(
+            state.daemon_down_since,
+            Some(since),
+            "stays the first moment"
+        );
+        state.set_daemon_healthy(true);
+        assert!(state.daemon_down_since.is_none());
+    }
+
+    #[test]
+    fn agent_done_ends_the_turn() {
+        let mut state = turn_in_flight();
+        super::handle_source_event(crate::mcp_source::SourceEvent::AgentDone, &mut state);
+        assert!(state.turn.is_none());
+    }
+
+    /// Stream events belong to the turn this TUI started. With none in flight
+    /// they are another TUI's turn, or late tokens from one just cancelled, and
+    /// must not open a reply that nothing will ever close.
+    #[test]
+    fn stream_events_without_a_turn_are_ignored() {
+        use crate::mcp_source::SourceEvent;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::handle_source_event(
+            SourceEvent::ChatToken {
+                token: "stray".into(),
+            },
+            &mut state,
+        );
+        assert!(state.chat.is_empty());
+    }
+
+    #[test]
+    fn stream_events_keep_the_turn_fresh() {
+        use crate::mcp_source::SourceEvent;
+        let mut state = turn_in_flight();
+        let stale = std::time::Instant::now() - crate::state::TURN_STALL_AFTER;
+        state.turn.as_mut().unwrap().last_event = stale;
+        super::handle_source_event(SourceEvent::ChatToken { token: "a".into() }, &mut state);
+        assert!(
+            !state
+                .turn
+                .as_ref()
+                .unwrap()
+                .is_stalled(std::time::Instant::now())
+        );
+    }
+
+    /// Esc on an empty input stops the running turn right away, even if the
+    /// daemon is unreachable; the instance's own "cancelled" error, arriving
+    /// later, must not print a second end.
+    #[test]
+    fn esc_cancels_a_running_turn() {
+        use crate::mcp_source::SourceEvent;
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut state = turn_in_flight();
+
+        assert!(super::handle_chat_input_key(
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state
+        ));
+        assert!(state.turn.is_none());
+        assert!(!state.should_quit);
+        let ends = |s: &AppState| s.chat.entries().len();
+        let after_cancel = ends(&state);
+
+        super::handle_source_event(
+            SourceEvent::AgentError {
+                error: "Cancelled by user".into(),
+            },
+            &mut state,
+        );
+        assert_eq!(ends(&state), after_cancel, "no duplicate end");
+    }
+
+    /// With text typed, Esc clears it first; the turn keeps running.
+    #[test]
+    fn esc_with_text_clears_input_before_cancelling() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut state = turn_in_flight();
+        state.chat_input.insert_str("draft");
+        super::handle_chat_input_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut state);
+        assert!(state.chat_input_is_empty());
+        assert!(state.turn.is_some());
+    }
+
+    #[test]
+    fn ctrl_c_cancels_the_turn_then_quits_on_a_second_press() {
+        let mut state = turn_in_flight();
+
+        super::interrupt(&mut state);
+        assert!(state.turn.is_none());
+        assert!(!state.should_quit, "first Ctrl-C only cancels");
+
+        super::interrupt(&mut state);
+        assert!(state.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_with_nothing_running_quits_at_once() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::interrupt(&mut state);
+        assert!(state.should_quit);
+    }
+
+    /// `q` must not kill running work without a second, deliberate press.
+    #[test]
+    fn quit_with_running_operations_asks_first() {
+        use crate::state::{OpStatus, Operation};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state
+            .operations
+            .push(Operation::new("op-1", "cargo", OpStatus::Running));
+
+        super::request_quit(&mut state);
+        assert!(!state.should_quit);
+        assert!(
+            state
+                .footer_hint
+                .as_ref()
+                .is_some_and(|(h, _)| h.contains("again"))
+        );
+
+        super::request_quit(&mut state);
+        assert!(state.should_quit);
+    }
+
+    /// A prompt that never reached the daemon ends its turn with a visible
+    /// error instead of spinning forever.
+    #[test]
+    fn a_failed_send_ends_the_turn() {
+        let mut state = turn_in_flight();
+        super::handle_bridge_event(
+            crate::llm_bridge::BridgeEvent::TurnSendFailed("daemon unreachable".into()),
+            &mut state,
+        );
+        assert!(state.turn.is_none());
+        assert!(state.chat.entries().iter().any(|e| matches!(
+            e,
+            crate::state::ChatEntry::Assistant { content, .. } if content.contains("daemon unreachable")
+        )));
+    }
 
     /// The `!` path must actually reach the reporter: a window that reports
     /// nothing is exactly the invisible local command this was built to retire
@@ -5837,6 +6393,307 @@ mod tests {
         // When tool_approval is enabled, all tools need approval
         assert!(needs_approval("read_file", true, &non_mutating));
         assert!(needs_approval("srv::list_dir", true, &non_mutating));
+    }
+
+    /// Two clients each ran an `op-1`. Pinning or opening one must touch
+    /// that one, and live output for one must not land in the other.
+    #[test]
+    fn same_op_id_on_two_instances_stays_separate() {
+        use crate::state::{ClickTarget, OpKey, OpStatus, Operation};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        let mut a = Operation::new("op-1", "cargo", OpStatus::Running);
+        a.instance_id = Some("A".into());
+        let mut b = Operation::new("op-1", "cargo", OpStatus::Running);
+        b.instance_id = Some("B".into());
+        state.operations.push(a);
+        state.operations.push(b);
+
+        let key_b = OpKey::of(&state.operations[1]);
+        super::handle_click_target(ClickTarget::PinOperation(key_b.clone()), &mut state);
+        assert!(!state.operations[0].pinned);
+        assert!(state.operations[1].pinned);
+
+        super::handle_click_target(ClickTarget::OpenOperationDetail(key_b.clone()), &mut state);
+        assert_eq!(state.detail_op_key(), Some(key_b));
+
+        super::handle_operation_output(&mut state, Some("B".into()), "op-1", "from B".into());
+        assert!(
+            state.operations[0]
+                .stdout_tail
+                .iter()
+                .all(|l| l != "from B")
+        );
+        assert!(
+            state.operations[1]
+                .stdout_tail
+                .iter()
+                .any(|l| l == "from B")
+        );
+
+        // Output from a third instance whose op is not materialised yet must
+        // not be spliced into A's or B's op.
+        super::handle_operation_output(&mut state, Some("C".into()), "op-1", "from C".into());
+        assert!(
+            state
+                .operations
+                .iter()
+                .all(|o| o.stdout_tail.iter().all(|l| l != "from C"))
+        );
+    }
+
+    /// `/async` and `/sync` are the discoverable way to switch the mode, and
+    /// they persist it to `~/.ahma/settings.toml` like the settings panel does.
+    #[test]
+    fn slash_async_and_sync_persist_the_execution_mode() {
+        use ahma_common::config::{AhmaSettings, ExecutionPolicy};
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::HOME_SEAM_GUARD.lock();
+        // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", dir.path()) };
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        assert!(super::handle_basic_nav_command("/async", &mut state));
+        assert_eq!(
+            AhmaSettings::load().tools.execution_mode,
+            ExecutionPolicy::Async
+        );
+        assert_eq!(
+            state.settings_editor.settings().tools.execution_mode,
+            ExecutionPolicy::Async,
+            "the settings panel shows the new mode"
+        );
+
+        assert!(super::handle_basic_nav_command("/sync", &mut state));
+        assert_eq!(
+            AhmaSettings::load().tools.execution_mode,
+            ExecutionPolicy::Sync
+        );
+
+        unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+    }
+
+    fn press(state: &mut AppState, code: crossterm::event::KeyCode) {
+        super::handle_chat_input_key(
+            crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            state,
+        );
+    }
+
+    /// ↑ on the first line recalls earlier input, ↓ walks back and restores
+    /// what was being typed — the shell behaviour everyone expects.
+    #[test]
+    fn up_and_down_recall_earlier_input() {
+        use crossterm::event::KeyCode;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = crate::state::Focus::Chat;
+        for msg in ["first", "second"] {
+            state.chat_input.insert_str(msg);
+            super::submit_chat_input(&mut state);
+        }
+        state.chat_input.insert_str("draft");
+
+        press(&mut state, KeyCode::Up);
+        assert_eq!(state.chat_input_text(), "second");
+        press(&mut state, KeyCode::Up);
+        assert_eq!(state.chat_input_text(), "first");
+        press(&mut state, KeyCode::Up);
+        assert_eq!(state.chat_input_text(), "first", "stops at the oldest");
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.chat_input_text(), "second");
+        press(&mut state, KeyCode::Down);
+        assert_eq!(
+            state.chat_input_text(),
+            "draft",
+            "back to what was being typed"
+        );
+    }
+
+    /// A message that happens to look like `x5` is a message; closing window
+    /// 5 is `/x5`. The bare form silently swallowed what the user typed.
+    #[test]
+    fn a_message_like_x5_is_not_swallowed_as_a_window_command() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = crate::state::Focus::Chat;
+        state.chat_input.insert_str("x5");
+        let before = state.chat.len();
+        super::submit_chat_input(&mut state);
+        assert!(
+            state.chat.len() > before,
+            "the input was answered, not dropped"
+        );
+    }
+
+    /// Every chat-input key in the help table is actually handled there.
+    #[test]
+    fn every_documented_chat_key_is_handled() {
+        use crate::keymap::{KeyScope, key_docs};
+        for doc in key_docs(KeyScope::Chat) {
+            for &(code, mods) in doc.keys {
+                let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+                state.focus = crate::state::Focus::Chat;
+                // ↑/↓ recall needs something to recall (and ↓ a place in it);
+                // without history they fall through to cursor movement.
+                state.remember_input("earlier");
+                if code == crossterm::event::KeyCode::Down {
+                    state.recall_previous_input();
+                }
+                let key = crossterm::event::KeyEvent::new(code, mods);
+                assert!(
+                    super::handle_chat_input_key(key, &mut state),
+                    "`{}` ({}) is documented for the chat input but not handled",
+                    doc.label,
+                    doc.action
+                );
+            }
+        }
+    }
+
+    fn say(state: &mut AppState, text: &str) {
+        state.chat.push(crate::state::ChatEntry::User {
+            text: text.into(),
+            payload: None,
+            started_at: None,
+            duration_ms: Some(1),
+        });
+    }
+
+    /// Each window keeps its own conversation: switching windows used to
+    /// carry one transcript over and send it to another instance and model.
+    #[test]
+    fn each_window_keeps_its_own_transcript() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.llm_selection = Some(crate::state::LlmSelection::named("p", "m"));
+        super::activate_window_chat("win-a", &mut state);
+        say(&mut state, "for A");
+
+        super::activate_window_chat("win-b", &mut state);
+        assert!(
+            state.chat.is_empty(),
+            "B starts with its own, empty transcript"
+        );
+        say(&mut state, "for B");
+
+        super::activate_window_chat("win-a", &mut state);
+        let texts: Vec<_> = state
+            .chat
+            .entries()
+            .iter()
+            .filter_map(|e| match e {
+                crate::state::ChatEntry::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["for A"]);
+    }
+
+    /// A running turn streams into the current transcript, so the target
+    /// window cannot change under it.
+    /// `/resume` brings back the window's saved conversation.
+    #[test]
+    fn resume_restores_the_windows_saved_conversation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        say(&mut state, "earlier question");
+        let path = super::transcript_path(&state, workspace.path());
+        crate::transcripts::save(&path, &crate::transcripts::to_saved(&state.chat)).unwrap();
+
+        state.chat.clear();
+        super::resume_transcript(&mut state, workspace.path());
+        assert!(state.chat.entries().iter().any(|e| matches!(
+            e,
+            crate::state::ChatEntry::User { text, .. } if text == "earlier question"
+        )));
+
+        // A window with nothing saved says so rather than failing silently.
+        let empty = tempfile::tempdir().unwrap();
+        state.chat.clear();
+        super::resume_transcript(&mut state, empty.path());
+        assert!(state.chat.entries().iter().any(|e| matches!(
+            e,
+            crate::state::ChatEntry::Assistant { content, .. } if content.contains("No saved conversation")
+        )));
+    }
+
+    #[test]
+    fn switching_windows_waits_for_the_running_turn() {
+        let mut state = turn_in_flight();
+        state.llm_selection = Some(crate::state::LlmSelection::named("p", "m"));
+        state.active_target_instance = None;
+        super::activate_window_chat("win-b", &mut state);
+        assert_eq!(state.active_target_instance, None, "stayed put");
+        assert!(
+            !state.chat.is_empty(),
+            "the running conversation is still shown"
+        );
+        assert!(
+            state
+                .footer_hint
+                .as_ref()
+                .is_some_and(|(h, _)| h.contains("Esc"))
+        );
+    }
+
+    #[test]
+    fn an_unrequested_model_refresh_does_not_open_the_picker() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        // A provider that is not in the discovered list: its models only
+        // arrive through the refresh.
+        state.current_provider_url = Some("http://p/v1".into());
+        super::handle_model_refreshed("http://p/v1".into(), vec!["m1".into()], &mut state);
+        assert_eq!(state.available_models, vec!["m1".to_string()]);
+        assert!(matches!(state.modal, crate::state::ModalState::None));
+
+        state.model_picker_requested = true;
+        super::handle_model_refreshed("http://p/v1".into(), vec!["m1".into()], &mut state);
+        let crate::state::ModalState::ModelPicker(picker) = &state.modal else {
+            panic!("a requested refresh opens the picker");
+        };
+        assert_eq!(picker.selected_item(), Some("m1"));
+        assert!(!state.model_picker_requested);
+    }
+
+    /// Typing a word that starts with `a` must not persist "always allow":
+    /// while the chat input holds text, gate keys are text.
+    #[test]
+    fn approval_keys_are_text_while_typing() {
+        use crate::state::{AppState, ApprovalGate, Focus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+        state.request_approval(ApprovalGate::new("op_1", "write_file", "w"), None);
+        state.chat_input.insert_str("h");
+
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(!super::handle_approval_key(a, &mut state));
+        assert!(state.approval.is_some(), "still pending");
+
+        // With the input empty the user is not typing: the key answers.
+        state.clear_chat_input();
+        let n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(super::handle_approval_key(n, &mut state));
+        assert!(state.approval.is_none());
+    }
+
+    /// Enter while typing sends the message; it must not deny a scope grant.
+    #[test]
+    fn enter_while_typing_does_not_answer_a_scope_grant() {
+        use crate::state::{AppState, Focus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+        state.scope_grant = Some(crate::state::ScopeGrantGate::from_request(
+            ahma_common::scope_grant::ScopeGrantRequest {
+                decision_id: "d1".into(),
+                path: std::path::PathBuf::from("x"),
+                access: ahma_common::config::ScopeAccess::Rw,
+                reason: ahma_common::scope_grant::GrantReason::PreExecViolation,
+                tool: Some("write_file".into()),
+            },
+        ));
+        state.chat_input.insert_str("hello");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!super::handle_scope_grant_key(enter, &mut state));
+        assert!(state.scope_grant.is_some());
     }
 
     #[test]
@@ -6283,8 +7140,8 @@ mod tests {
         };
         state.windows.push(w);
 
-        // Type "x26" in chat input
-        state.chat_input.insert_str("x26");
+        // Closing a window is the `/x26` command; a bare `x26` is a message.
+        state.chat_input.insert_str("/x26");
         super::submit_chat_input(&mut state);
 
         assert!(!state.windows[0].visible);
@@ -6297,15 +7154,12 @@ mod tests {
         state.windows[0].visible = true;
         state.windows[0].status = crate::state::WindowStatus::Running;
 
-        // Type "X26" in chat input
+        // A bare "X26" is a message, not a command: the window is untouched.
         state.chat_input.insert_str("X26");
         super::submit_chat_input(&mut state);
 
-        assert!(!state.windows[0].visible);
-        assert_eq!(
-            state.windows[0].status,
-            crate::state::WindowStatus::Cancelled
-        );
+        assert!(state.windows[0].visible);
+        assert_eq!(state.windows[0].status, crate::state::WindowStatus::Running);
     }
 
     /// Only the log pane zooms now: the work view *is* the screen, so there is
@@ -6729,58 +7583,116 @@ mod tests {
         assert!(matches!(state.modal, ModalState::LlmSetupProvider(_)));
     }
 
+    fn wizard_pick(state: &mut AppState, prefix: &str) {
+        let crate::state::ModalState::LlmSetupProvider(mut picker) =
+            std::mem::take(&mut state.modal)
+        else {
+            panic!("expected the provider step");
+        };
+        picker.select_prefix(prefix);
+        super::submit_llm_setup_provider(picker, state);
+    }
+
+    /// Ollama end to end: the model list is the connection test, step 2 offers
+    /// what the server actually has, and the saved URL carries `/v1` (without
+    /// it every request 404'd).
     #[test]
-    fn test_llm_setup_wizard_flow() {
-        use crate::state::{AppState, Focus, ModalState, PickerState};
+    fn setup_wizard_connects_then_offers_the_servers_models() {
+        use crate::state::{Focus, ModalState};
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         state.active_target_instance = Some("claude-code".to_string());
         state.llm_selection = None;
 
-        // Step 1: Select Ollama
-        let picker = PickerState::new(
-            "Step 1",
-            vec!["Ollama (Local AI - Free, Private, Fast)".to_string()],
+        super::start_llm_setup_wizard(&mut state);
+        wizard_pick(&mut state, super::SETUP_OLLAMA);
+        let pending = state.setup_pending.clone().expect("connecting");
+        assert_eq!(pending.base_url, "http://localhost:11434/v1");
+
+        super::handle_model_refreshed(
+            pending.base_url.clone(),
+            vec!["qwen2.5-coder:32b".into(), "llama3.3".into()],
+            &mut state,
         );
-        super::submit_llm_setup_provider(picker, &mut state);
-
-        let (ollama_picker, base_url) = match std::mem::take(&mut state.modal) {
-            ModalState::LlmSetupOllamaFlavor { picker, base_url } => (picker, base_url),
-            other => panic!("expected LlmSetupOllamaFlavor, got {other:?}"),
+        let ModalState::LlmSetupModel {
+            mut picker,
+            provider_name,
+            base_url,
+        } = std::mem::take(&mut state.modal)
+        else {
+            panic!("expected the model step");
         };
-        assert_eq!(base_url, "http://localhost:11434");
+        assert_eq!(picker.items, vec!["qwen2.5-coder:32b", "llama3.3"]);
+        picker.select_exact("qwen2.5-coder:32b");
+        super::submit_llm_setup_model(picker, provider_name, base_url, &mut state);
 
-        // Step 2: Select Enhanced Ollama API
-        super::submit_llm_setup_ollama_flavor(ollama_picker, base_url, &mut state);
-
-        let (mut model_picker, provider_name, base_url, is_enhanced) =
-            match std::mem::take(&mut state.modal) {
-                ModalState::LlmSetupModel {
-                    picker,
-                    provider_name,
-                    base_url,
-                    is_enhanced_ollama,
-                } => (picker, provider_name, base_url, is_enhanced_ollama),
-                other => panic!("expected LlmSetupModel, got {other:?}"),
-            };
-        assert_eq!(provider_name, "Ollama (Enhanced)");
-        assert!(is_enhanced);
-        assert!(!model_picker.items.is_empty());
-
-        // Step 3: Select model
-        model_picker.select_exact("qwen2.5-coder:32b");
-        super::submit_llm_setup_model(model_picker, provider_name, base_url, &mut state);
-
-        // Completion checks
         assert!(matches!(state.modal, ModalState::None));
         assert!(state.chat_open);
         assert_eq!(state.focus, Focus::Chat);
         let sel = state.llm_selection.as_ref().unwrap();
-        assert_eq!(sel.persistable_provider(), "Ollama (Enhanced)");
+        assert_eq!(sel.persistable_provider(), "Ollama");
         assert_eq!(sel.model, "qwen2.5-coder:32b");
-
+        assert_eq!(
+            state.current_provider_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
         let win_cfg = state.get_window_llm("claude-code").unwrap();
-        assert_eq!(win_cfg.provider, "Ollama (Enhanced)");
         assert_eq!(win_cfg.model, "qwen2.5-coder:32b");
+    }
+
+    /// A server that lists nothing is not silently "connected": the wizard
+    /// says what to fix and saves nothing.
+    #[test]
+    fn setup_wizard_reports_an_unreachable_provider() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.llm_selection = None;
+        super::start_llm_setup_wizard(&mut state);
+        wizard_pick(&mut state, super::SETUP_OLLAMA);
+        super::handle_model_refreshed("http://localhost:11434/v1".into(), vec![], &mut state);
+
+        assert!(state.llm_selection.is_none(), "nothing chosen");
+        assert!(state.setup_pending.is_none());
+        assert!(state.chat.entries().iter().any(|e| matches!(
+            e,
+            crate::state::ChatEntry::Assistant { content, .. } if content.contains("ollama serve")
+        )));
+    }
+
+    /// A cloud provider without its key in the environment stops with how to
+    /// set it — and never asks for the key itself.
+    #[test]
+    fn setup_wizard_asks_for_the_key_in_the_environment() {
+        // SAFETY: nextest runs each test in its own process (SPEC R-ISO.1).
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::start_llm_setup_wizard(&mut state);
+        wizard_pick(&mut state, super::SETUP_OPENAI);
+        assert!(state.setup_pending.is_none());
+        assert!(state.chat.entries().iter().any(|e| matches!(
+            e,
+            crate::state::ChatEntry::Assistant { content, .. } if content.contains("OPENAI_API_KEY")
+        )));
+    }
+
+    /// Only clients that declared MCP sampling are offered as a provider; the
+    /// old list invented one for every window, so the wizard never ran.
+    #[test]
+    fn sampling_is_offered_only_for_clients_that_declare_it() {
+        let inst = |sampling: bool| ahma_common::daemon_hub::InstanceInfo {
+            id: "i".into(),
+            mode: "stdio".into(),
+            label: "ahma".into(),
+            client: Some("vscode".into()),
+            sampling,
+            ..Default::default()
+        };
+        assert!(super::virtual_provider_for_instance(&inst(false)).is_none());
+        let p = super::virtual_provider_for_instance(&inst(true)).expect("declared sampling");
+        assert_eq!(p.name, "vscode (its own model)");
+        assert!(
+            !p.models
+                .iter()
+                .any(|m| m.contains("Claude") || m.contains("GPT"))
+        );
     }
 
     #[test]

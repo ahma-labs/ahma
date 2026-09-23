@@ -39,21 +39,20 @@ Standard tool configurations are compiled into the `ahma` binary. They are only 
 
 | Bundle | Tool Name | Description |
 |------|-----------|-------------|
-| `--tools rust` | `cargo` | Rust build, test, clippy, fmt, etc. |
 | `--tools fileutils` | `file-tools` | Unix file operations (ls, cp, mv, rm, grep, etc.) |
 | `--tools git` | `git` | Git version control |
 | `--tools github` | `gh` | GitHub CLI (PRs, issues, releases) |
 | `--tools python` | `python` | Python interpreter and pip |
 | `--tools simplify` | `simplify` | Code complexity metrics |
 
-Example: `ahma serve stdio --tools rust,git,fileutils`
+Example: `ahma serve stdio --tools git,fileutils` (an unknown bundle name is ignored with a warning).
 
 ### 3. Local `.ahma/` Overrides (automatic)
 If a `.ahma/` directory exists in the current working directory, all `*.json` files in it are loaded automatically at startup — no CLI flag needed.
 
 **Override rule:** If a local `.ahma/*.json` file defines a tool with the same `name` as a bundled tool, the local version **replaces** the bundled one entirely. This lets you customize tool descriptions, options, and subcommands for your project.
 
-Example: placing a `.ahma/rust.json` with `"name": "cargo"` will override the bundled cargo tool definition when `--rust` is also passed.
+Example: placing a `.ahma/git.json` with `"name": "git"` overrides the bundled git tool definition when `--tools git` is also passed.
 
 ## Available Tool Configurations
 
@@ -114,10 +113,11 @@ All tool configurations follow the MCP Tool Definition Format (MTDF) schema. Onl
 }
 ```
 
-Tools run **async-first** by default: if a command finishes within a few seconds
-its result is returned inline, otherwise you get an operation ID and the result
-arrives as a notification. Force synchronous execution globally with the `--sync`
-server flag rather than the per-subcommand `synchronous` field, which is deprecated.
+By default a tool call waits for its result (`tools.execution_mode = "sync"`); with
+`--async` (or `execution_mode = "async"`) a command that is still running after a
+few seconds returns an operation ID to collect with `await`. Choose the mode for
+the server rather than with the per-subcommand `synchronous` field, which is
+deprecated. See [docs/settings.md](../docs/settings.md#sync-or-async-toolsexecution_mode).
 
 ## Validation Tools
 

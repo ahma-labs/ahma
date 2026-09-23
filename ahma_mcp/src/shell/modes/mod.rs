@@ -80,8 +80,15 @@ pub(crate) fn build_stdio_server_args(
     server_args.push(config.monitor_rate_limit_secs.to_string());
     server_args.push("--timeout".to_string());
     server_args.push(config.timeout_secs.to_string());
-    if config.force_sync {
-        server_args.push("--sync".to_string());
+    // Only an explicit CLI choice travels: without one the worker resolves
+    // `tools.execution_mode` from the settings files itself, including the
+    // project file of the workspace it serves.
+    match config.execution_mode_cli {
+        Some(ahma_common::config::ExecutionPolicy::Sync) => server_args.push("--sync".to_string()),
+        Some(ahma_common::config::ExecutionPolicy::Async) => {
+            server_args.push("--async".to_string())
+        }
+        None => {}
     }
     if config.no_temp_files {
         server_args.push("--disable-temp-files".to_string());

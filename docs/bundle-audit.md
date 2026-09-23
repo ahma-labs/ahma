@@ -84,7 +84,7 @@ ahma bundle verify /path/to/bundle-dir
 
 ## First-party bundle index
 
-Ahma ships a built-in index at `assets/bundle-index.json` that lists all first-party bundles (rust, python, git, fileutils, github). These are always trusted.
+Ahma ships a built-in index at `assets/bundle-index.json` that lists all first-party bundles (python, git, fileutils, github). These are always trusted.
 
 Third-party bundles not in the index require explicit `ahma bundle audit` before use.
 

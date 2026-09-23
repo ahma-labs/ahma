@@ -129,6 +129,14 @@ async fn apply_step_delay(step_delay_ms: u64, current_index: usize, total_steps:
     }
 }
 
+/// In sync mode (SPEC R2.1), how long a sequence waits for the steps it
+/// started: the same client-safe window a single call gets, shared by all of
+/// them. `None` in async mode: the sequence returns once its steps started.
+pub struct SequenceWait<'a> {
+    pub monitor: &'a crate::operation_monitor::OperationMonitor,
+    pub window: Duration,
+}
+
 /// Handles execution of sequence tools - tools that invoke multiple other tools in order.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_sequence_tool(
@@ -139,6 +147,7 @@ pub async fn handle_sequence_tool(
     params: CallToolRequestParams,
     context: RequestContext<RoleServer>,
     force_progress_notifications: bool,
+    wait: Option<SequenceWait<'_>>,
 ) -> Result<CallToolResult, McpError> {
     let sequence = config.sequence.as_ref().unwrap(); // Safe due to prior check
     let step_delay_ms = config.step_delay_ms.unwrap_or(SEQUENCE_STEP_DELAY_MS);
@@ -165,6 +174,7 @@ pub async fn handle_sequence_tool(
             sequence,
             step_delay_ms,
             force_progress_notifications,
+            wait,
         )
         .await
     }
@@ -289,9 +299,11 @@ async fn run_async_sequence(
     force_progress_notifications: bool,
     kind: SequenceKind,
     skip_working_directory: Option<&str>,
+    wait: Option<SequenceWait<'_>>,
     mut resolve_step: impl FnMut(&SequenceStep) -> Result<ResolvedStep, McpError>,
 ) -> Result<CallToolResult, McpError> {
     let mut final_result = CallToolResult::success(vec![]);
+    let mut started_ids = Vec::new();
 
     for (index, step) in sequence.iter().enumerate() {
         if let Some(working_directory) = skip_working_directory
@@ -330,6 +342,7 @@ async fn run_async_sequence(
                     .push(ContentBlock::text(format_step_started_message(
                         &kind, step, &id,
                     )));
+                started_ids.push(id);
             }
             Err(e) => {
                 let (prefix, step_name) = match kind {
@@ -346,7 +359,38 @@ async fn run_async_sequence(
         apply_step_delay(step_delay_ms, index, sequence.len()).await;
     }
 
+    if let Some(wait) = wait {
+        append_step_results(&mut final_result, &started_ids, wait).await;
+    }
+
     Ok(final_result)
+}
+
+/// Sync mode: wait for each started step within the shared window and append
+/// its result. Once the window is spent, the steps still running are named
+/// with how to collect them, rather than being dropped from the answer.
+async fn append_step_results(
+    final_result: &mut CallToolResult,
+    ids: &[String],
+    wait: SequenceWait<'_>,
+) {
+    let deadline = tokio::time::Instant::now() + wait.window;
+    for (index, id) in ids.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match common::wait_for_completion(wait.monitor, id, remaining).await {
+            Some(done) => final_result.content.extend(done.content),
+            None => {
+                let pending = ids[index..].join(", ");
+                final_result.content.push(ContentBlock::text(format!(
+                    "Still running after {}s — the longest this client can hold one \
+                     request open: {pending}. They keep running: call `await` to collect \
+                     the results.",
+                    wait.window.as_secs()
+                )));
+                return;
+            }
+        }
+    }
 }
 
 /// Handles asynchronous sequence execution - starts all steps and returns immediately
@@ -360,6 +404,7 @@ async fn handle_sequence_tool_async(
     sequence: &[SequenceStep],
     step_delay_ms: u64,
     force_progress_notifications: bool,
+    wait: Option<SequenceWait<'_>>,
 ) -> Result<CallToolResult, McpError> {
     let parent_args = params.arguments.clone().unwrap_or_default();
     let working_directory = extract_working_directory(adapter, &params);
@@ -373,6 +418,7 @@ async fn handle_sequence_tool_async(
         force_progress_notifications,
         SequenceKind::TopLevel,
         Some(&working_directory),
+        wait,
         |step| {
             let mut merged_args = merge_step_arguments(&parent_args, &step.args);
             merged_args.insert(
@@ -405,6 +451,7 @@ pub async fn handle_subcommand_sequence(
     params: CallToolRequestParams,
     context: RequestContext<RoleServer>,
     force_progress_notifications: bool,
+    wait: Option<SequenceWait<'_>>,
 ) -> Result<CallToolResult, McpError> {
     let sequence = subcommand_config.sequence.as_ref().unwrap(); // Safe due to prior check
     let step_delay_ms = subcommand_config
@@ -421,6 +468,7 @@ pub async fn handle_subcommand_sequence(
         force_progress_notifications,
         SequenceKind::Subcommand,
         None,
+        wait,
         |step| {
             let (step_config, command_parts) = find_subcommand_config_from_args(
                 config,

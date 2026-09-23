@@ -46,7 +46,6 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
         crate::state::ModalState::ProviderPicker(picker)
         | crate::state::ModalState::ModelPicker(picker)
         | crate::state::ModalState::LlmSetupProvider(picker)
-        | crate::state::ModalState::LlmSetupOllamaFlavor { picker, .. }
         | crate::state::ModalState::LlmSetupModel { picker, .. } => {
             draw_picker(frame, picker, theme, full)
         }
@@ -428,7 +427,10 @@ fn draw_operation_detail(
 
     frame.render_widget(Clear, area);
 
-    let op = state.operations.iter().find(|o| o.id == detail.op_id);
+    let op = state.find_op(&crate::state::OpKey {
+        id: detail.op_id.clone(),
+        instance_id: detail.instance_id.clone(),
+    });
     let title = match op {
         Some(op) => format!(" Operation — {} ", truncate(&op.display_name(), 60)),
         None => " Operation (no longer tracked) ".to_string(),
@@ -515,12 +517,16 @@ fn draw_operation_detail(
     let spans = vec![
         register(
             cancel_btn,
-            (!cancel_btn.is_empty()).then(|| ClickTarget::CancelOperation(op.id.clone())),
+            (!cancel_btn.is_empty())
+                .then(|| ClickTarget::CancelOperation(crate::state::OpKey::of(op))),
         ),
-        register(pin_btn, Some(ClickTarget::PinOperation(op.id.clone()))),
+        register(
+            pin_btn,
+            Some(ClickTarget::PinOperation(crate::state::OpKey::of(op))),
+        ),
         register(
             analyze_btn,
-            Some(ClickTarget::AnalyzeOperation(op.id.clone())),
+            Some(ClickTarget::AnalyzeOperation(crate::state::OpKey::of(op))),
         ),
         Span::styled(
             "  Esc close · j/k scroll · g/G top/bottom · c cancel",
@@ -875,11 +881,13 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // Clear window_rects at start of drawing
     state.window_rects.borrow_mut().clear();
 
+    // One header in every layout: what matters (is ahma reachable, how will
+    // calls behave, where is the sandbox, how much is running) must not
+    // depend on which pane happens to be zoomed.
+    draw_status_header(frame, state, theme, header_a);
     if let Some(zoom) = state.zoomed {
-        draw_chat_header(frame, state, theme, header_a);
         draw_zoomed_chat_pane(frame, state, theme, body_a, zoom);
     } else {
-        work::draw_work_header(frame, state, theme, header_a);
         draw_main_body(frame, state, theme, body_a);
     }
 
@@ -946,49 +954,6 @@ fn draw_main_body(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     }
 }
 
-fn get_mcp_label(mcp_enabled: bool, unicode: bool) -> &'static str {
-    match (mcp_enabled, unicode) {
-        (true, true) => " · MCP ✓",
-        (true, false) => " · MCP on",
-        (false, _) => "",
-    }
-}
-
-fn get_health_indicator(
-    server_healthy: bool,
-    unicode: bool,
-    theme: &Theme,
-) -> (&'static str, Style) {
-    // Losing the server says so in a word. A one-character glyph flip is not a
-    // state change a user notices, and the chat input keeps looking live
-    // meanwhile — so the disconnected case is spelled out.
-    match (server_healthy, unicode) {
-        (true, true) => (" ●", theme.healthy()),
-        (true, false) => (" *", theme.healthy()),
-        (false, true) => (" ○ OFFLINE", theme.unhealthy()),
-        (false, false) => (" - OFFLINE", theme.unhealthy()),
-    }
-}
-
-fn get_daemon_indicator(
-    daemon_healthy: bool,
-    unicode: bool,
-    theme: &Theme,
-) -> (&'static str, Style) {
-    let daemon_char = match (daemon_healthy, unicode) {
-        (true, true) => " ● DMON",
-        (true, false) => " * DMON",
-        (false, true) => " ○ DMON",
-        (false, false) => " - DMON",
-    };
-    let daemon_style = if daemon_healthy {
-        theme.healthy()
-    } else {
-        theme.unhealthy()
-    };
-    (daemon_char, daemon_style)
-}
-
 fn get_mcp_connection_counts(
     servers: &[crate::mcp_connections::McpServerConfig],
 ) -> (usize, usize) {
@@ -1039,51 +1004,132 @@ fn format_external_tools_part(state: &AppState) -> String {
     }
 }
 
-fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let mcp_label = get_mcp_label(state.mcp_enabled, state.unicode);
-    let (health_char, health_style) =
-        get_health_indicator(state.server_healthy, state.unicode, theme);
-    let health_span = Span::styled(health_char, health_style);
-    let (daemon_char, daemon_style) =
-        get_daemon_indicator(state.daemon_healthy, state.unicode, theme);
-    let daemon_span = Span::styled(daemon_char, daemon_style);
+/// A server or daemon connection state, spelled out: `● ahma` when up,
+/// `○ ahma OFFLINE 12s` when down. A glyph flip alone is not a state change
+/// anyone notices, and the rest of the screen keeps looking live meanwhile.
+fn connection_span(
+    name: &str,
+    healthy: bool,
+    down_since: Option<std::time::Instant>,
+    unicode: bool,
+    theme: &Theme,
+) -> Span<'static> {
+    let (up, down) = if unicode { ("●", "○") } else { ("*", "-") };
+    if healthy {
+        return Span::styled(format!(" {up} {name}"), theme.healthy());
+    }
+    let for_how_long = down_since
+        .map(|t| format!(" {}", format_elapsed_short(t.elapsed())))
+        .unwrap_or_default();
+    Span::styled(
+        format!(" {down} {name} OFFLINE{for_how_long}"),
+        theme.unhealthy(),
+    )
+}
 
-    let external_part = format_external_tools_part(state);
+/// `12s`, `3m`, `2h` — coarse on purpose, it only has to say "a while".
+fn format_elapsed_short(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        _ => format!("{}h", secs / 3600),
+    }
+}
+
+/// The one status line at the top of every layout.
+///
+/// Left: what is being done (project filter, clients, running/queued/done
+/// tallies). Right: whether ahma is reachable and how it behaves — execution
+/// mode, server and daemon health (with how long they have been down),
+/// transport, and the sandbox actually locked. Per-window facts (model,
+/// tokens, context fill) live on each window instead, since they differ.
+pub(crate) fn draw_status_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let mut left = work::work_header_spans(state, theme);
+
+    let mode = state.settings_editor.settings().tools.execution_mode;
+    let mut right: Vec<Span<'static>> = vec![Span::styled(format!(" {mode}"), theme.dim())];
+    right.push(connection_span(
+        "ahma",
+        state.server_healthy,
+        state.server_down_since,
+        state.unicode,
+        theme,
+    ));
+    right.push(connection_span(
+        "daemon",
+        state.daemon_healthy,
+        state.daemon_down_since,
+        state.unicode,
+        theme,
+    ));
+    right.push(Span::styled(
+        format!(" · {}", state.transport_label),
+        theme.dim(),
+    ));
     let max_path_len = max_header_workspace_len(area.width);
-    let sandbox_style = sandbox_status_style(&state.sandbox_status, theme);
-    let sandbox_part = format_sandbox_part(state, max_path_len);
-    let sandbox_status_part = format_sandbox_status_part(state);
-    let active_skills_part = format_active_skills_part(state);
+    right.push(Span::styled(
+        format_sandbox_part(state, max_path_len),
+        theme.dim(),
+    ));
+    right.push(Span::styled(
+        format_sandbox_status_part(state),
+        sandbox_status_style(&state.sandbox_status, theme),
+    ));
+    right.push(Span::styled(format_external_tools_part(state), theme.dim()));
+    right.push(Span::styled(format_active_skills_part(state), theme.dim()));
+    right.push(Span::raw(" "));
 
-    // Token spend and context fill — the numbers that decide whether to keep
-    // chatting or /compact. Computed all along but only ever rendered by a
-    // header that had no callers; narrow terminals get the context-fill share
-    // alone, since that is the part that changes a decision.
-    let tokens_part = if area.width > 100 {
-        format_tokens_part(state)
-    } else {
-        context_fill_segment(state)
-    };
+    // Right-align the status half; on a narrow terminal the left half gives
+    // way first, because reachability is what a glance at the header is for.
+    let width = area.width as usize;
+    let right_width: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    truncate_row_spans_to_width(&mut left, width.saturating_sub(right_width));
+    let left_width: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    left.push(Span::raw(
+        " ".repeat(width.saturating_sub(left_width + right_width)),
+    ));
+    left.extend(right);
+    truncate_row_spans_to_width(&mut left, width);
+    frame.render_widget(
+        Paragraph::new(Line::from(left)).style(theme.header_bar()),
+        area,
+    );
+}
 
-    let line = Line::from(vec![
-        Span::styled(" ahma chat", theme.title()),
-        Span::styled(
-            format!("  {}", shorten_llm_label(&state.llm_label())),
-            theme.normal(),
-        ),
-        Span::styled(mcp_label, theme.dim()),
-        Span::styled(external_part, theme.dim()),
-        Span::styled(sandbox_part, theme.dim()),
-        Span::styled(sandbox_status_part, sandbox_style),
-        Span::styled(active_skills_part, theme.normal()),
-        Span::styled(tokens_part, theme.dim()),
-        health_span,
-        Span::styled(" · ", theme.dim()),
-        daemon_span,
-        Span::styled(format!("  {}", state.transport_label), theme.dim()),
-    ]);
-
-    frame.render_widget(Paragraph::new(line).style(theme.header_bar()), area);
+/// One window's meter: `ctx 38% (49k/128k) · ↑12.3k ↓2.1k`. Context fill
+/// needs both the last prompt size and the model's window; spend needs the
+/// provider to have reported usage. Empty when nothing is known — no guesses.
+pub(crate) fn window_meter(
+    usage: Option<&crate::state::WindowUsage>,
+    ctx_window: Option<u32>,
+    unicode: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(u) = usage {
+        if let Some(window) = ctx_window.filter(|_| u.last_prompt_tokens > 0) {
+            let pct = ((u.last_prompt_tokens as f64 / window as f64) * 100.0).round() as u32;
+            parts.push(format!(
+                "ctx {}% ({}/{})",
+                pct.min(999),
+                fmt_token_count(u.last_prompt_tokens),
+                fmt_token_count(window)
+            ));
+        }
+        if u.prompt_tokens > 0 || u.completion_tokens > 0 {
+            let (up, down) = if unicode {
+                ("↑", "↓")
+            } else {
+                ("in ", "out ")
+            };
+            parts.push(format!(
+                "{up}{} {down}{}",
+                fmt_token_count(u.prompt_tokens),
+                fmt_token_count(u.completion_tokens)
+            ));
+        }
+    }
+    parts.join(" · ")
 }
 
 /// Honest scope display (SPEC R5.4): once the server reports its locked
@@ -1355,20 +1401,19 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     let mut cache = state.chat_rows_cache.borrow_mut();
     let key = (state.chat.generation(), text_width, state.unicode);
     if transcript_is_live(state) {
-        let logical = build_chat_history_lines(state, theme, text_width);
-        cache.rows = wrap_lines_to_rows(&logical, text_width);
+        (cache.rows, cache.owners) = build_chat_rows(state, theme, text_width);
         // Wall-clock content: valid for this frame only, never for reuse.
         cache.key = None;
     } else if cache.key != Some(key) {
-        let logical = build_chat_history_lines(state, theme, text_width);
-        cache.rows = wrap_lines_to_rows(&logical, text_width);
+        (cache.rows, cache.owners) = build_chat_rows(state, theme, text_width);
         cache.key = Some(key);
     }
-    let rows = &cache.rows;
-    let max_scroll = rows.len().saturating_sub(visible_h);
+    let max_scroll = cache.rows.len().saturating_sub(visible_h);
     state.chat_max_scroll.set(max_scroll);
 
-    let scroll = chat_history_scroll_offset(rows.len(), visible_h, state.chat_scroll);
+    let scroll = chat_history_scroll_offset(cache.rows.len(), visible_h, state.chat_scroll);
+    cache.scroll = scroll;
+    let rows = &cache.rows;
     let visible_rows: Vec<Line<'static>> =
         rows.iter().skip(scroll).take(visible_h).cloned().collect();
     // Rows are already wrapped to `text_width`; render without ratatui's wrap so
@@ -1388,9 +1433,9 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
 fn chat_history_hint(state: &AppState) -> &'static str {
     if state.llm_selection.is_none() {
         if state.unicode {
-            "  No LLM configured — use /provider to select one"
+            "  No LLM configured — /setup connects one"
         } else {
-            "  No LLM configured - use /provider to select one"
+            "  No LLM configured - /setup connects one"
         }
     } else {
         "  Type a message and press Enter to start chatting"
@@ -1417,18 +1462,41 @@ fn transcript_is_live(state: &AppState) -> bool {
         })
 }
 
-fn build_chat_history_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-
+/// The transcript as physical rows at `width`, and the entry each row belongs
+/// to (so a click can open that entry in full).
+fn build_chat_rows(
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let entries = state.chat.entries();
     let count = entries.len();
+    let mut rows = Vec::new();
+    let mut owners = Vec::new();
     for (idx, entry) in entries.iter().enumerate() {
-        let is_last = idx + 1 == count;
-        push_chat_entry_lines(&mut lines, entry, is_last, state, theme, width);
+        let mut lines = Vec::new();
+        push_chat_entry_lines(&mut lines, entry, idx + 1 == count, state, theme, width);
         lines.push(Line::default());
+        let entry_rows = wrap_lines_to_rows(&lines, width);
+        owners.extend(std::iter::repeat_n(idx, entry_rows.len()));
+        rows.extend(entry_rows);
     }
+    (rows, owners)
+}
 
-    lines
+/// The transcript entry drawn at screen position `(col, row)`, if any.
+pub(crate) fn chat_entry_at(state: &AppState, col: u16, row: u16) -> Option<usize> {
+    let area = state.chat_area.get();
+    let inside =
+        col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height;
+    if !inside {
+        return None;
+    }
+    let cache = state.chat_rows_cache.borrow();
+    cache
+        .owners
+        .get(cache.scroll + (row - area.y) as usize)
+        .copied()
 }
 
 fn push_chat_entry_lines(
@@ -1579,35 +1647,32 @@ fn push_assistant_chat_lines(
     state: &AppState,
     theme: &Theme,
 ) {
-    let cursor = assistant_stream_cursor(streaming, state.unicode);
-    let display = format!("{content}{cursor}");
-
     // First-line prefix carries the liveness glyph while streaming (e.g. `⢷ ahma `)
     // and collapses the glyph to a space once the turn is done (` ahma `). The
-    // continuation indent matches the 7-column prefix width so wrapped text stays
-    // aligned under the response.
+    // continuation indent matches the prefix width so the reply stays aligned.
     let prefix = assistant_line_prefix(streaming, state);
     const CONT_INDENT: &str = "        "; // 8 spaces == width of "GG ahma "
 
-    for (index, line_str) in display.lines().enumerate() {
-        if index == 0 {
-            lines.push(Line::from(vec![
-                Span::styled(prefix.clone(), theme.running()),
-                Span::styled(line_str.to_string(), theme.normal()),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(CONT_INDENT, theme.running()),
-                Span::styled(line_str.to_string(), theme.normal()),
-            ]));
+    // Replies are Markdown; render it rather than showing the syntax.
+    let mut rendered = crate::markdown::render(content, theme);
+    let cursor = assistant_stream_cursor(streaming, state.unicode);
+    if !cursor.is_empty() {
+        match rendered.last_mut() {
+            Some(last) => last.spans.push(Span::styled(cursor, theme.normal())),
+            None => rendered.push(Line::from(Span::styled(cursor, theme.dim()))),
         }
     }
 
-    if display.is_empty() && streaming {
-        lines.push(Line::from(vec![
-            Span::styled(prefix, theme.running()),
-            Span::styled(assistant_stream_cursor(true, state.unicode), theme.dim()),
-        ]));
+    for (index, line) in rendered.into_iter().enumerate() {
+        let lead = if index == 0 {
+            Span::styled(prefix.clone(), theme.running())
+        } else {
+            Span::styled(CONT_INDENT, theme.running())
+        };
+        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+        spans.push(lead);
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
     }
 }
 
@@ -1750,10 +1815,46 @@ fn get_input_title_left(state: &AppState, theme: &Theme) -> Line<'static> {
         .left_aligned()
     } else {
         Line::from(Span::styled(
-            format!(" ahma{target_part}: {} ", state.llm_label()),
+            format!(
+                " ahma{target_part}: {} ",
+                shorten_llm_label(&state.llm_label())
+            ),
             theme.title(),
         ))
         .left_aligned()
+    }
+}
+
+/// ` ctx 38% (49k/128k) · ↑12.3k ↓2.1k · 42 tok/s · 12s ` for the window chat
+/// is talking to.
+fn input_title_meter(state: &AppState) -> String {
+    let key = AppState::usage_key(state.active_target_instance.as_deref());
+    let ctx = state
+        .current_provider_url
+        .as_deref()
+        .and_then(|u| state.context_window(u));
+    let usage = state.window_usage.get(&key);
+    let mut parts = vec![window_meter(usage, ctx, state.unicode)];
+    // A provider that reports no usage still gets a counter, marked as the
+    // estimate it is (≈4 characters per token of the visible conversation).
+    if usage.is_none() {
+        let est = estimate_tokens(conversation_chars(state));
+        if est > 0 {
+            parts.push(format!("~{} tok est", fmt_token_count(est)));
+        }
+    }
+    if let Some(turn) = &state.turn {
+        let now = std::time::Instant::now();
+        if let Some(rate) = turn.tokens_per_sec(now) {
+            parts.push(format!("{rate} tok/s"));
+        }
+        parts.push(format_elapsed_short(now.duration_since(turn.started)));
+    }
+    parts.retain(|p| !p.is_empty());
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", parts.join(" · "))
     }
 }
 
@@ -1766,16 +1867,11 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     };
 
     let title_left = get_input_title_left(state, theme);
-    // Same honesty rule as the header: prefer the server-locked scope; the
-    // launch path is a guess until then and is marked with `?`.
-    let title_right = Line::from(Span::styled(
-        match state.locked_scope_root() {
-            Some(root) => format!(" sandbox: {} ", shorten_path(root, 45)),
-            None => format!(" sandbox: {}? ", shorten_path(&state.workspace, 45)),
-        },
-        theme.dim(),
-    ))
-    .right_aligned();
+    // This window's meter, where the eye already is while typing: context
+    // fill and spend, and while a turn streams, its speed and elapsed time.
+    // (The sandbox moved to the status header, shown in every layout.)
+    let title_right =
+        Line::from(Span::styled(input_title_meter(state), theme.dim())).right_aligned();
 
     let block = Block::default()
         .title(title_left)
@@ -1841,41 +1937,69 @@ fn input_text_paragraph(theme: &Theme, rendered_lines: &[String]) -> Paragraph<'
     Paragraph::new(Span::styled(text, style)).wrap(Wrap { trim: false })
 }
 
+/// How long a transient footer hint stays up.
+const FOOTER_HINT_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+
 fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let mode_label = "AHMA";
 
-    let keys: &[(&str, &str)] = match state.focus {
-        Focus::Work => &[
-            ("↑↓", "nav windows"),
-            ("Enter", "chat with window"),
-            ("Space", "fold/unfold"),
-            ("Tab", "cycle panels"),
-            ("i", "toggle chat"),
-            ("/quit", "quit"),
-        ],
-        Focus::Log => &[
-            ("↑↓", "scroll"),
-            ("w", "wrap"),
-            ("l", "files"),
-            ("Tab", "cycle panels"),
-            ("i", "chat"),
-            ("/quit", "quit"),
-        ],
-        _ => &[
-            ("Enter", "send"),
-            ("Shift+Enter", "newline"),
-            ("Esc", "unfocus window"),
-            ("/provider", "change LLM"),
-            ("/", "commands"),
-            ("?", "help"),
-            ("/quit", "quit"),
-        ],
+    // A fresh hint is the one thing the user must read ("press again to
+    // quit"): it replaces the key list until it fades.
+    if let Some((hint, at)) = &state.footer_hint
+        && at.elapsed() < FOOTER_HINT_TTL
+    {
+        let spans = vec![
+            Span::styled(format!(" {mode_label} "), theme.footer_key()),
+            Span::styled(" │  ", theme.dim()),
+            Span::styled(hint.clone(), theme.pending()),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(theme.footer()),
+            area,
+        );
+        return;
+    }
+
+    // From the key table the bindings are tested against: the focused
+    // panel's own keys first, then the global ones that apply there.
+    use crate::keymap::{KeyScope, key_docs};
+    let scopes: &[KeyScope] = match state.focus {
+        Focus::Work => &[KeyScope::Work, KeyScope::Global],
+        Focus::Log => &[KeyScope::Log, KeyScope::Global],
+        _ => &[KeyScope::Chat],
     };
+    let keys: Vec<(&str, &str)> = scopes
+        .iter()
+        .flat_map(|&scope| key_docs(scope))
+        .filter_map(|d| d.footer.map(|short| (d.label, short)))
+        .collect();
 
     let mut spans: Vec<Span> = vec![
         Span::styled(format!(" {mode_label} "), theme.footer_key()),
         Span::styled(" │", theme.dim()),
     ];
+    // A running turn leads with the key that stops it; the key works from
+    // any panel (Ctrl-C) and from the chat input (Esc).
+    if let Some(turn) = &state.turn {
+        let key = if state.focus == Focus::Chat {
+            "  Esc "
+        } else {
+            "  Ctrl-C "
+        };
+        spans.push(Span::styled(key, theme.footer_key()));
+        spans.push(Span::styled("cancel turn", theme.footer()));
+        if turn.is_stalled(std::time::Instant::now()) {
+            let warn = if state.unicode { "⚠" } else { "!" };
+            spans.push(Span::styled(
+                format!(
+                    "  {warn} no response for {}s",
+                    turn.last_event.elapsed().as_secs()
+                ),
+                theme.pending(),
+            ));
+        }
+        spans.push(Span::styled(" │", theme.dim()));
+    }
     for (key, desc) in keys {
         spans.push(Span::styled(format!("  {key} "), theme.footer_key()));
         spans.push(Span::styled(desc.to_string(), theme.footer()));
@@ -2317,36 +2441,6 @@ fn estimate_tokens(chars: usize) -> u32 {
     (chars / STATUS_CHARS_PER_TOKEN) as u32
 }
 
-fn format_tokens_part(state: &AppState) -> String {
-    token_status_segment(
-        state.token_usage.total_tokens,
-        state.token_usage.prompt_tokens,
-        state.token_usage.completion_tokens,
-        state.last_prompt_tokens,
-        conversation_chars(state),
-        state.token_prefs.context_length,
-    )
-}
-
-/// Just the `· NN% ctx` share of [`token_status_segment`], for headers too
-/// narrow to carry the full in/out/total breakdown. Empty when the model's
-/// context window is unknown — a percentage of an unknown whole is noise.
-fn context_fill_segment(state: &AppState) -> String {
-    let Some(window) = state.token_prefs.context_length.filter(|&w| w > 0) else {
-        return String::new();
-    };
-    let used = if state.last_prompt_tokens > 0 {
-        state.last_prompt_tokens
-    } else {
-        estimate_tokens(conversation_chars(state))
-    };
-    if used == 0 {
-        return String::new();
-    }
-    let pct = ((used as f64 / window as f64) * 100.0).round() as u32;
-    format!(" · {}% ctx", pct.min(999))
-}
-
 /// Total characters of the visible conversation — the basis for a token estimate
 /// when the provider does not report usage, and for the context-fill fallback.
 fn conversation_chars(state: &AppState) -> usize {
@@ -2376,49 +2470,6 @@ fn fmt_token_count(n: u32) -> String {
     } else {
         n.to_string()
     }
-}
-
-/// Build the status-bar token segment. Pure, for testability.
-///
-/// - Exact cumulative usage when the provider reports it (`total_tokens > 0`);
-///   otherwise a `~est` derived from the conversation size, so providers that
-///   return no `usage` still show a counter.
-/// - A best-effort context-window fill `%` when the window is known: exact from
-///   the last turn's prompt tokens when available, else estimated.
-fn token_status_segment(
-    total_tokens: u32,
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    last_prompt_tokens: u32,
-    conversation_chars: usize,
-    ctx_window: Option<u32>,
-) -> String {
-    let est_conv = estimate_tokens(conversation_chars);
-    if total_tokens == 0 && est_conv == 0 {
-        return String::new();
-    }
-
-    let mut out = if total_tokens > 0 {
-        format!(
-            " · tkns {} in / {} out ({} ttl)",
-            fmt_token_count(prompt_tokens),
-            fmt_token_count(completion_tokens),
-            fmt_token_count(total_tokens),
-        )
-    } else {
-        format!(" · ~{} tkns est", fmt_token_count(est_conv))
-    };
-
-    if let Some(window) = ctx_window.filter(|&w| w > 0) {
-        let used = if last_prompt_tokens > 0 {
-            last_prompt_tokens
-        } else {
-            est_conv
-        };
-        let pct = ((used as f64 / window as f64) * 100.0).round() as u32;
-        out.push_str(&format!(" · {}% ctx", pct.min(999)));
-    }
-    out
 }
 
 // ─── Operations DAG ───────────────────────────────────────────────────────────
@@ -2713,20 +2764,20 @@ fn draw_op_tree_row(
         theme.dim()
     };
     frame.render_widget(Paragraph::new(Span::styled(" [P] ", pin_style)), pin_a);
-    state
-        .click_targets
-        .borrow_mut()
-        .push((ClickTarget::PinOperation(op.id.clone()), pin_a));
+    state.click_targets.borrow_mut().push((
+        ClickTarget::PinOperation(crate::state::OpKey::of(op)),
+        pin_a,
+    ));
 
     if !op.status.is_terminal() {
         frame.render_widget(
             Paragraph::new(Span::styled(" [X] ", theme.failed())),
             cancel_a,
         );
-        state
-            .click_targets
-            .borrow_mut()
-            .push((ClickTarget::CancelOperation(op.id.clone()), cancel_a));
+        state.click_targets.borrow_mut().push((
+            ClickTarget::CancelOperation(crate::state::OpKey::of(op)),
+            cancel_a,
+        ));
     }
 }
 
@@ -3450,7 +3501,7 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
     };
     let tool = gate.tool.as_deref().unwrap_or("A sandboxed command");
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(tool.to_string(), theme.normal().bold()),
             Span::styled(
@@ -3484,9 +3535,22 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
         ]),
         Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
     ];
+    lines.extend(gate_typing_note(state, theme));
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
+}
+
+/// While the chat input holds text the gate keys type into it instead of
+/// answering (see [`AppState::typing_in_chat`]); say so where the keys are
+/// shown, or the prompt looks broken.
+fn gate_typing_note(state: &AppState, theme: &Theme) -> Option<Line<'static>> {
+    state.typing_in_chat().then(|| {
+        Line::from(Span::styled(
+            "  You are typing — press Esc to clear the input, then answer.",
+            theme.pending(),
+        ))
+    })
 }
 
 fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
@@ -3551,6 +3615,7 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
         ]),
         Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
     ]);
+    lines.extend(gate_typing_note(state, theme));
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
@@ -3666,6 +3731,7 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
             Span::styled(" reject", theme.normal()),
         ]),
     ];
+    lines.extend(gate_typing_note(state, theme));
 
     if let Some(diff) = &gate.diff {
         lines.push(Line::from(""));
@@ -3728,163 +3794,97 @@ fn format_help_rows<'a>(
 /// The help overlay's rows, as `(left, right)` pairs. Section headers have an
 /// empty right cell; a blank pair is a spacer.
 ///
-/// Module-level so the slash commands they advertise can be checked against
-/// `state::SLASH_COMMANDS` — see `help_rows_reference_only_known_commands`.
-const HELP_LEFT_ROWS: &[(&str, &str)] = &[
-    ("GLOBAL", ""),
-    ("q / Ctrl-C", "Quit"),
-    ("Tab / Shift-Tab", "Cycle focus"),
-    ("?", "Toggle this help"),
-    ("Esc / ?", "Close help overlay"),
-    ("", ""),
-    ("CHAT", ""),
-    ("Enter", "Send message"),
-    ("Shift+Enter", "Insert newline"),
-    ("Esc", "Clear current input"),
-    ("Arrows / Home / End", "Move within editor"),
-    ("", ""),
-    ("CHAT INPUT PREFIXES", ""),
-    (
-        "! <command>",
-        "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
-    ),
-    ("# <goal>", "Decompose goal using LLM"),
-    ("/", "Open navigator (from empty input)"),
-    ("", ""),
-    ("PICKERS", ""),
-    ("Type", "Filter providers/models"),
-    ("Up / Down", "Move selection"),
-    ("Enter / Esc", "Choose / cancel"),
-    ("", ""),
-    ("APPROVAL BANNER", ""),
-    ("y", "Approve gate"),
-    ("n", "Reject gate"),
-];
+/// Key rows come from [`crate::keymap::KEY_REFERENCE`], the one table the
+/// bindings are tested against, so help cannot describe a key that does
+/// something else. The rest — prefixes, commands, mouse — are listed here and
+/// the commands are checked against `state::SLASH_COMMANDS`
+/// (`help_rows_reference_only_known_commands`).
+type HelpRow = (&'static str, &'static str);
 
-const HELP_RIGHT_ROWS: &[(&str, &str)] = &[
-    ("COMMAND NAVIGATOR (/)", ""),
-    ("Type", "Narrow commands/tools"),
-    ("Tab", "Complete selected command"),
-    ("Enter", "Run selected command"),
-    ("/help, /?", "Show keyboard reference"),
-    ("/run <tool> {json}", "Run tool with JSON args"),
-    ("/skills", "List Agent Skills; run one with /<name> [args]"),
-    ("", ""),
-    ("WINDOW ACTIONS", ""),
-    ("/n", "Restore/expand window n"),
-    ("/xn", "Close/cancel window n"),
-    ("/quit", "Quit the application"),
-    ("Click [xn]", "Close/cancel window"),
-    ("Click [+]/[-]", "Toggle expand/collapse"),
-    ("Click card", "Open operation details"),
-    ("", ""),
-    ("WORK VIEW", ""),
-    ("j / k / arrows", "Select row"),
-    (
-        "Enter / Click a header",
-        "Open that section, closing the open one",
-    ),
-    (
-        "Space / Click a task",
-        "Expand it into live/historic output (one at a time)",
-    ),
-    ("Enter on a task", "Full-screen operation detail"),
-    ("Wheel", "Scroll the view"),
-    ("i, /chat", "Open or close the chat pane"),
-    ("f", "Toggle this-project / all-projects filter"),
-    ("c", "Cancel selected"),
-    ("p", "Pin selected"),
-    ("a", "Ask for access (on a denied operation)"),
-    ("/analyze [op_id]", "Ask AI to analyze operation"),
-    ("/log file <path>", "Start log monitoring"),
-    ("/scope", "Show sandbox scope & provenance"),
-    ("", ""),
-    ("LOG", ""),
-    ("/", "Start filter (Esc to clear)"),
-    ("j / k", "Scroll"),
-    ("g / G", "Top / bottom"),
-    ("w", "Toggle line wrap"),
-    ("Enter", "Zoom/restore the pane"),
-    ("l", "Switch log file"),
-    ("Click a line", "Open it full-screen, wrapped"),
-];
+fn push_key_section(rows: &mut Vec<HelpRow>, title: &'static str, scope: crate::keymap::KeyScope) {
+    rows.push((title, ""));
+    rows.extend(crate::keymap::key_docs(scope).map(|d| (d.label, d.action)));
+}
 
-const HELP_SINGLE_ROWS: &[(&str, &str)] = &[
-    ("GLOBAL", ""),
-    ("q / Ctrl-C", "Quit"),
-    ("Tab / Shift-Tab", "Cycle focus"),
-    ("?", "Toggle this help"),
-    ("Esc / ? (when help open)", "Close help overlay"),
-    ("", ""),
-    ("CHAT", ""),
-    ("Enter", "Send message"),
-    ("Shift+Enter", "Insert newline"),
-    ("Esc", "Clear current input"),
-    ("Arrow keys / Home / End", "Move within the editor"),
-    ("", ""),
-    ("CHAT INPUT PREFIXES", ""),
-    (
-        "! <command>",
-        "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
-    ),
-    ("# <goal>", "Decompose goal using LLM (e.g. # run tests)"),
-    ("/", "Open command navigator (from empty input)"),
-    ("", ""),
-    ("PICKERS", ""),
-    ("Type", "Filter providers or models"),
-    ("Up / Down", "Move selection"),
-    ("Enter / Esc", "Choose / cancel"),
-    ("", ""),
-    ("WORK VIEW", ""),
-    ("j / k / arrows", "Select row"),
-    (
-        "Enter / Click a header",
-        "Open that section, closing the open one",
-    ),
-    (
-        "Space / Click a task",
-        "Expand it into live/historic output (one at a time)",
-    ),
-    ("Enter on a task", "Full-screen operation detail"),
-    ("Wheel", "Scroll the view"),
-    ("i, /chat", "Open or close the chat pane"),
-    ("f", "Toggle this-project / all-projects filter"),
-    ("c", "Cancel selected"),
-    ("p", "Pin selected"),
-    ("a", "Ask for access (on a denied operation)"),
-    ("/analyze [op_id]", "Ask AI to analyze operation"),
-    ("/log file <path>", "Start log monitoring"),
-    ("/scope", "Show sandbox scope & provenance"),
-    ("", ""),
-    ("LOG", ""),
-    ("/", "Start filter (Esc to clear)"),
-    ("j / k", "Scroll"),
-    ("g / G", "Top / bottom"),
-    ("w", "Toggle line wrap"),
-    ("Enter", "Zoom/restore the pane"),
-    ("l", "Switch log file"),
-    ("Click a line", "Open it full-screen, wrapped"),
-    ("", ""),
-    ("APPROVAL BANNER", ""),
-    ("y", "Approve gate"),
-    ("n", "Reject gate"),
-    ("", ""),
-    ("COMMAND NAVIGATOR (/)", ""),
-    ("Type", "Narrow commands and tools"),
-    ("Tab", "Complete selected command"),
-    ("Enter", "Run selected command"),
-    ("/help, /?", "Show keyboard reference"),
-    ("/run <tool> {json}", "Run a tool manually with JSON args"),
-    ("/skills", "List Agent Skills; run one with /<name> [args]"),
-    ("", ""),
-    ("WINDOW ACTIONS", ""),
-    ("/n", "Restore/expand window n (e.g. /3)"),
-    ("/xn", "Close/cancel window n (e.g. /x3)"),
-    ("/quit", "Quit the application"),
-    ("Mouse Click on Xn", "Close/cancel window"),
-    ("Mouse Click on Window", "Toggle expand/collapse"),
-    ("Mouse Click on a card", "Open operation details"),
-];
+fn help_left_rows() -> Vec<HelpRow> {
+    use crate::keymap::KeyScope;
+    let mut rows = Vec::new();
+    push_key_section(&mut rows, "GLOBAL", KeyScope::Global);
+    rows.push(("", ""));
+    push_key_section(&mut rows, "CHAT INPUT", KeyScope::Chat);
+    rows.extend([
+        ("", ""),
+        ("CHAT INPUT PREFIXES", ""),
+        (
+            "! <command>",
+            "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
+        ),
+        ("# <goal>", "Decompose a goal into steps with the LLM"),
+        ("/sync", "Tool calls wait for results (default, saved)"),
+        ("/async", "Tool calls return ids to await (saved)"),
+        ("/setup", "Connect an LLM (guided)"),
+        ("/resume", "Bring back this window's saved conversation"),
+        ("Click a tool call", "Open its arguments and result in full"),
+        ("", ""),
+    ]);
+    push_key_section(&mut rows, "APPROVAL PROMPTS", KeyScope::Gate);
+    rows.extend([
+        (
+            "While typing",
+            "these keys type — Esc clears the input first",
+        ),
+        ("", ""),
+        ("PICKERS", ""),
+        ("Type", "Filter providers or models"),
+        ("Up / Down", "Move selection"),
+        ("Enter / Esc", "Choose / cancel"),
+    ]);
+    rows
+}
+
+fn help_right_rows() -> Vec<HelpRow> {
+    use crate::keymap::KeyScope;
+    let mut rows = Vec::new();
+    push_key_section(&mut rows, "WORK VIEW", KeyScope::Work);
+    rows.extend([
+        ("Click a header", "Chat with that window"),
+        ("Click a task", "Expand it into its output"),
+        ("Wheel", "Scroll the view"),
+        ("/analyze [op_id]", "Ask the LLM to analyze an operation"),
+        ("/scope", "Show sandbox scope & provenance"),
+        ("", ""),
+    ]);
+    push_key_section(&mut rows, "LOG", KeyScope::Log);
+    rows.extend([
+        ("Click a line", "Open it full-screen, wrapped"),
+        ("/log file <path>", "Start log monitoring"),
+        ("", ""),
+        ("COMMAND NAVIGATOR (/)", ""),
+        ("Type", "Narrow commands and tools"),
+        ("Tab", "Complete selected command"),
+        ("Enter", "Run selected command"),
+        ("/help, /?", "Show keyboard reference"),
+        ("/run <tool> {json}", "Run a tool with JSON args"),
+        ("/skills", "List Agent Skills; run one with /<name> [args]"),
+        ("", ""),
+        ("WINDOW ACTIONS", ""),
+        ("/n", "Restore/expand window n (e.g. /3)"),
+        ("/xn", "Close/cancel window n (e.g. /x3)"),
+        ("/quit", "Quit the application"),
+        ("Click [xn]", "Close/cancel window"),
+        ("Click [+]/[-]", "Toggle expand/collapse"),
+        ("Click a card", "Open operation details"),
+    ]);
+    rows
+}
+
+/// The narrow layout is both columns, stacked.
+fn help_single_rows() -> Vec<HelpRow> {
+    let mut rows = help_left_rows();
+    rows.push(("", ""));
+    rows.extend(help_right_rows());
+    rows
+}
 
 fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let use_two_columns = area.width >= 100;
@@ -3911,11 +3911,9 @@ fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let left_rows: &[(&str, &str)] = HELP_LEFT_ROWS;
-
-    let right_rows: &[(&str, &str)] = HELP_RIGHT_ROWS;
-
-    let single_rows: &[(&str, &str)] = HELP_SINGLE_ROWS;
+    let left_rows = &help_left_rows();
+    let right_rows = &help_right_rows();
+    let single_rows = &help_single_rows();
 
     // The content is taller than the cap on ordinary terminals, so it scrolls
     // and says so — the scrollbar thumb reaching bottom exactly when the
@@ -4066,6 +4064,10 @@ fn format_setting_value(value: &crate::settings_editor::SettingValue) -> String 
         crate::settings_editor::SettingValue::U32(v) => format!("{}", v),
         crate::settings_editor::SettingValue::Usize(v) => format!("{}", v),
         crate::settings_editor::SettingValue::StringList(v) => format!("[{}]", v.join(", ")),
+        // Name the alternatives so it is obvious Space cycles through them.
+        crate::settings_editor::SettingValue::Choice { value, options } => {
+            format!("{value}  ({})", options.join(" | "))
+        }
     }
 }
 
@@ -4333,6 +4335,78 @@ mod tests {
         assert_eq!(expanded_window_line_count(&w), 2);
     }
 
+    fn render_footer(state: &AppState, width: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| draw_chat_footer(frame, state, &theme, Rect::new(0, 0, width, 1)))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    /// While a turn runs the footer names the key that stops it, and says so
+    /// when the turn has gone quiet for too long.
+    #[test]
+    fn footer_offers_cancel_while_a_turn_runs_and_flags_a_stall() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+        assert!(!render_footer(&state, 160).contains("cancel turn"));
+
+        state.turn = Some(crate::state::ChatTurn::new(None));
+        let footer = render_footer(&state, 160);
+        assert!(
+            footer.contains("Esc") && footer.contains("cancel turn"),
+            "{footer}"
+        );
+        assert!(!footer.contains("no response"), "{footer}");
+
+        state.turn.as_mut().unwrap().last_event =
+            std::time::Instant::now() - crate::state::TURN_STALL_AFTER;
+        assert!(render_footer(&state, 160).contains("no response"));
+    }
+
+    /// The footer is one line: every panel's footer keys, including how to
+    /// quit and get help, must fit a 120-column terminal. The help text was
+    /// used once and pushed `q` and `?` off the edge.
+    #[test]
+    fn the_footer_fits_and_always_offers_quit_and_help() {
+        for focus in [Focus::Work, Focus::Log] {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.focus = focus;
+            let footer = render_footer(&state, 120);
+            assert!(
+                footer.contains("quit") && footer.contains("help"),
+                "{focus:?}: {footer}"
+            );
+        }
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+        let footer = render_footer(&state, 120);
+        assert!(
+            footer.contains("send") && footer.contains("help"),
+            "{footer}"
+        );
+    }
+
+    /// A fresh hint replaces the key list; it is the thing the user must read.
+    #[test]
+    fn footer_shows_a_fresh_hint() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.footer_hint = Some(("press again to quit".into(), std::time::Instant::now()));
+        assert!(render_footer(&state, 120).contains("press again to quit"));
+
+        state.footer_hint = Some((
+            "press again to quit".into(),
+            std::time::Instant::now() - FOOTER_HINT_TTL,
+        ));
+        assert!(!render_footer(&state, 120).contains("press again"));
+    }
+
     /// Render a real window and read back the text of each row, so the test
     /// sees exactly what the user sees.
     fn render_window_rows(w: &crate::state::TuiWindow, width: u16, height: u16) -> Vec<String> {
@@ -4419,6 +4493,46 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A tool-call line is clipped to one row; the row still knows which
+    /// entry it is, so a click can open the whole call (SPEC R24.8.4).
+    #[test]
+    fn a_tool_call_row_maps_back_to_its_entry_in_full() {
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.chat.push(ChatEntry::User {
+            text: "build it".into(),
+            payload: None,
+            started_at: None,
+            duration_ms: Some(1),
+        });
+        let long_args = format!("{{\"command\":\"cargo build {}\"}}", "x".repeat(200));
+        state
+            .chat
+            .start_tool_call("c1".into(), "run_terminal_command".into(), long_args);
+        state
+            .chat
+            .finish_tool_call("c1", "Finished in 3s".into(), false);
+        state.chat.finish_stream();
+
+        let screen = render_chat_screen(&state, &theme, 60, 20);
+        let row = screen
+            .lines()
+            .position(|l| l.contains("run_terminal_command"))
+            .expect("the tool call is drawn") as u16;
+
+        let idx = chat_entry_at(&state, 5, row).expect("the row has an owner");
+        let detail = state.tool_call_detail(idx).expect("it is the tool call");
+        assert!(
+            detail.contains(&"x".repeat(200)),
+            "full arguments, not the clipped row"
+        );
+        assert!(detail.contains("Finished in 3s"));
+        assert!(
+            state.tool_call_detail(0).is_none(),
+            "a user message is not a tool call"
+        );
     }
 
     /// The wrapped-transcript cache must be *used* when the transcript is
@@ -4950,9 +5064,8 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
 
-        let last = super::HELP_SINGLE_ROWS
-            .last()
-            .expect("the narrow layout has rows");
+        let rows = super::help_single_rows();
+        let last = rows.last().expect("the narrow layout has rows");
         assert!(
             screen.contains(last.0),
             "the final narrow-layout row `{}` must be reachable by scrolling:\n{screen}",
@@ -4990,14 +5103,16 @@ mod tests {
 
         let top = render(0);
         let bottom = render(200); // clamped to the true maximum
+        let rows = help_single_rows();
+        let (_, last) = rows.last().expect("help has rows");
         assert!(top.contains("GLOBAL"), "top shows the first section");
         assert!(
-            !top.contains("Switch log file"),
+            !top.contains(last),
             "the tail must genuinely be off-screen at rest, else this proves nothing"
         );
         assert!(
-            bottom.contains("Switch log file"),
-            "scrolling to the end must reveal the LOG section:\n{bottom}"
+            bottom.contains(last),
+            "scrolling to the end must reveal the last row `{last}`:\n{bottom}"
         );
     }
 
@@ -5085,57 +5200,72 @@ mod tests {
     }
 
     #[test]
-    fn token_status_segment_empty_when_no_data() {
-        assert_eq!(token_status_segment(0, 0, 0, 0, 0, None), "");
+    fn window_meter_says_only_what_is_known() {
+        use crate::state::WindowUsage;
+        assert_eq!(window_meter(None, Some(8192), true), "");
+        let spent = WindowUsage {
+            prompt_tokens: 12_300,
+            completion_tokens: 2_100,
+            last_prompt_tokens: 4_096,
+        };
+        // No context window known: spend only, no percentage of an unknown whole.
+        assert_eq!(window_meter(Some(&spent), None, true), "↑12.3k ↓2.1k");
+        assert_eq!(
+            window_meter(Some(&spent), Some(8192), true),
+            "ctx 50% (4.1k/8.2k) · ↑12.3k ↓2.1k"
+        );
+        assert_eq!(
+            window_meter(Some(&spent), None, false),
+            "in 12.3k out 2.1k",
+            "ASCII fallback"
+        );
+    }
+
+    /// The header says how long a connection has been down, not just that it is.
+    #[test]
+    fn a_down_connection_says_for_how_long() {
+        let theme = Theme::new(true);
+        let up = connection_span("daemon", true, None, true, &theme);
+        assert_eq!(up.content, " ● daemon");
+        let since = std::time::Instant::now() - std::time::Duration::from_secs(12);
+        let down = connection_span("daemon", false, Some(since), true, &theme);
+        assert_eq!(down.content, " ○ daemon OFFLINE 12s");
     }
 
     #[test]
-    fn token_status_segment_shows_exact_usage() {
-        // Provider reported usage → exact cumulative counts, no context window.
-        let s = token_status_segment(1700, 1200, 500, 1200, 0, None);
-        assert_eq!(s, " · tkns 1.2k in / 500 out (1.7k ttl)");
+    fn elapsed_is_coarse() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed_short(Duration::from_secs(12)), "12s");
+        assert_eq!(format_elapsed_short(Duration::from_secs(185)), "3m");
+        assert_eq!(format_elapsed_short(Duration::from_secs(7300)), "2h");
     }
 
-    /// The narrow-header variant keeps the decision-relevant half (context
-    /// fill) and drops the in/out/total breakdown. With no known context
-    /// window there is no percentage to state, so it renders nothing rather
-    /// than a percentage of an unknown whole.
+    /// Every layout shows the same header, and it carries the facts a glance
+    /// is for: the execution mode and whether the daemon is reachable.
     #[test]
-    fn context_fill_segment_needs_a_known_window() {
-        use crate::state::AppState;
-        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
-        state.token_prefs.context_length = None;
-        state.last_prompt_tokens = 2048;
-        assert_eq!(context_fill_segment(&state), "");
-
-        state.token_prefs.context_length = Some(4096);
-        assert_eq!(context_fill_segment(&state), " · 50% ctx");
-
-        // Nothing sent yet and nothing to estimate → still nothing to say.
-        state.last_prompt_tokens = 0;
-        assert_eq!(context_fill_segment(&state), "");
-    }
-
-    #[test]
-    fn token_status_segment_estimates_when_no_usage() {
-        // No API usage, but a 6000-char conversation → ~1500 token estimate.
-        let s = token_status_segment(0, 0, 0, 0, 6000, None);
-        assert_eq!(s, " · ~1.5k tkns est");
-    }
-
-    #[test]
-    fn token_status_segment_context_pct_exact_from_last_prompt() {
-        // 4096-token window, last turn's prompt was 2048 → 50% (exact).
-        let s = token_status_segment(3000, 2048, 200, 2048, 9999, Some(4096));
-        assert!(s.ends_with(" · 50% ctx"), "got {s:?}");
-    }
-
-    #[test]
-    fn token_status_segment_context_pct_estimated_without_usage() {
-        // No usage at all: % falls back to the conversation estimate.
-        // 8000 chars → 2000 tokens; window 8000 → 25%.
-        let s = token_status_segment(0, 0, 0, 0, 8000, Some(8000));
-        assert_eq!(s, " · ~2.0k tkns est · 25% ctx");
+    fn the_status_header_shows_mode_and_reachability() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut state = crate::state::AppState::new("http://localhost:3000", "HTTP", true);
+        state.set_daemon_healthy(true);
+        state.set_daemon_healthy(false);
+        let theme = Theme::new(true);
+        let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
+        terminal
+            .draw(|f| draw_status_header(f, &state, &theme, Rect::new(0, 0, 160, 1)))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row: String = (0..160)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect();
+        let mode = state
+            .settings_editor
+            .settings()
+            .tools
+            .execution_mode
+            .to_string();
+        assert!(row.contains(&mode), "{row}");
+        assert!(row.contains("daemon OFFLINE"), "{row}");
     }
 
     #[test]
@@ -5474,7 +5604,7 @@ mod tests {
 
 #[cfg(test)]
 mod help_reference_tests {
-    use super::{HELP_LEFT_ROWS, HELP_RIGHT_ROWS, HELP_SINGLE_ROWS};
+    use super::{help_left_rows, help_right_rows, help_single_rows};
     use crate::state::SLASH_COMMANDS;
 
     /// Help rows whose left cell starts with "/" but is not a command name:
@@ -5522,7 +5652,7 @@ mod help_reference_tests {
             })
             .collect();
 
-        for rows in [HELP_LEFT_ROWS, HELP_RIGHT_ROWS, HELP_SINGLE_ROWS] {
+        for rows in [help_left_rows(), help_right_rows(), help_single_rows()] {
             for (left, _) in rows {
                 let Some(cmd) = command_of(left) else {
                     continue;
@@ -5538,7 +5668,7 @@ mod help_reference_tests {
     /// Group rows by their section header and count the rows under each.
     ///
     /// A blank key is a spacer; a row with a key and no description is a
-    /// section header (see the contract above `HELP_LEFT_ROWS`).
+    /// section header (see the contract above `help_left_rows`).
     fn section_sizes(rows: &[(&str, &str)]) -> std::collections::BTreeMap<String, usize> {
         let mut sizes = std::collections::BTreeMap::new();
         let mut current: Option<String> = None;
@@ -5575,14 +5705,13 @@ mod help_reference_tests {
     /// holds the same number of rows.
     #[test]
     fn both_help_layouts_document_the_same_rows() {
-        let two_column: Vec<(&str, &str)> = HELP_LEFT_ROWS
-            .iter()
-            .chain(HELP_RIGHT_ROWS.iter())
-            .copied()
+        let two_column: Vec<(&str, &str)> = help_left_rows()
+            .into_iter()
+            .chain(help_right_rows())
             .collect();
         assert_eq!(
             section_sizes(&two_column),
-            section_sizes(HELP_SINGLE_ROWS),
+            section_sizes(&help_single_rows()),
             "the wide and narrow help layouts document a different set of rows"
         );
     }
@@ -5592,12 +5721,12 @@ mod help_reference_tests {
     /// other is invisible at the other size.
     #[test]
     fn both_help_layouts_document_the_same_commands() {
-        let two_column: std::collections::BTreeSet<String> = HELP_LEFT_ROWS
+        let two_column: std::collections::BTreeSet<String> = help_left_rows()
             .iter()
-            .chain(HELP_RIGHT_ROWS.iter())
+            .chain(help_right_rows().iter())
             .filter_map(|(l, _)| command_of(l))
             .collect();
-        let single: std::collections::BTreeSet<String> = HELP_SINGLE_ROWS
+        let single: std::collections::BTreeSet<String> = help_single_rows()
             .iter()
             .filter_map(|(l, _)| command_of(l))
             .collect();

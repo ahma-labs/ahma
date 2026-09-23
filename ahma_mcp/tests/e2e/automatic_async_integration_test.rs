@@ -6,6 +6,10 @@
 //! — `INLINE_WINDOW_IDLE_SECS` when nothing else is running,
 //! `INLINE_WINDOW_BUSY_SECS` when the caller is already fanning out — so these
 //! tests derive their bounds from those constants rather than restating them.
+//!
+//! These are async-mode behaviours, so every server here runs with `--async`;
+//! sync mode (`tools.execution_mode`, the default) is covered by
+//! `tests/unit/execution_mode_test.rs`.
 
 use ahma_mcp::test_utils::client::ClientBuilder;
 use ahma_mcp::utils::logging::init_test_logging;
@@ -62,6 +66,7 @@ async fn test_automatic_async_fast_shell_returns_inline() -> Result<()> {
     let temp_dir = setup_automatic_async_test_tools().await?;
 
     let client = ClientBuilder::new()
+        .arg("--async")
         .tools_dir(".ahma")
         .working_dir(temp_dir.path())
         .build()
@@ -119,6 +124,7 @@ async fn test_automatic_async_slow_command_returns_async_id() -> Result<()> {
     let temp_dir = setup_automatic_async_test_tools().await?;
 
     let client = ClientBuilder::new()
+        .arg("--async")
         .tools_dir(".ahma")
         .working_dir(temp_dir.path())
         .build()
@@ -195,6 +201,7 @@ async fn test_automatic_async_configured_tool_returns_inline() -> Result<()> {
     let temp_dir = setup_automatic_async_test_tools().await?;
 
     let client = ClientBuilder::new()
+        .arg("--async")
         .tools_dir(".ahma")
         .working_dir(temp_dir.path())
         .build()
@@ -241,6 +248,7 @@ async fn test_automatic_async_does_not_affect_sync_mode() -> Result<()> {
     let temp_dir = setup_automatic_async_test_tools().await?;
 
     let client = ClientBuilder::new()
+        .arg("--async")
         .tools_dir(".ahma")
         .working_dir(temp_dir.path())
         .build()
@@ -302,6 +310,7 @@ async fn test_automatic_async_multiple_fast_commands() -> Result<()> {
     let temp_dir = setup_automatic_async_test_tools().await?;
 
     let client = ClientBuilder::new()
+        .arg("--async")
         .tools_dir(".ahma")
         .working_dir(temp_dir.path())
         .build()

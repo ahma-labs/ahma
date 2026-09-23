@@ -28,6 +28,8 @@ mod client_coverage_test;
 mod config_coverage_test;
 mod development_workflow_invariants_test;
 mod exec_audit_test;
+mod execution_mode_test;
+mod file_edit_tools_test;
 mod file_tools_schema_validation_test;
 mod flattened_tool_test;
 mod graceful_shutdown_test;

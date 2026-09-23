@@ -589,6 +589,9 @@ impl AhmaMcpService {
             progress_token,
             client_type,
             context.peer.clone(),
+            // The operator's `tools.execution_mode` decides; the caller has
+            // no say (SPEC R2.6.3).
+            self.call_wait(false),
             // Async is the *default* path, so this is the error agents
             // actually see: it must carry the same structured
             // `sandbox_denial` + remediation the sync path carries, or a

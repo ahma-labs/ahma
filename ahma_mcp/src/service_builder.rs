@@ -88,7 +88,9 @@ impl<'a> ServiceBuilder<'a> {
             sandbox,
             guidance: Some(GuidanceConfig::default()),
             skip_availability_probes: config.skip_availability_probes,
-            force_synchronous: config.force_sync,
+            // The legacy direct path, only for CLI one-shot mode. The server's
+            // sync/async policy is `config.execution_mode`, read per call.
+            force_synchronous: false,
             defer_sandbox: config.defer_sandbox,
             monitor_rate_limit: config.monitor_rate_limit_secs,
             scope_grant_notifier: None,
@@ -391,19 +393,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_service_builder_new_inherits_force_sync_from_config() {
+    async fn test_service_builder_builds_in_async_mode() {
         let temp = tempdir().unwrap();
         let sandbox = make_test_sandbox(temp.path().to_path_buf());
         let config = AppConfig {
             skip_availability_probes: true,
-            force_sync: true,
+            execution_mode: ahma_common::config::ExecutionPolicy::Async,
             ..AppConfig::default()
         };
 
-        // Builder picks up force_sync from config; build should still succeed.
         let result = ServiceBuilder::new(&config, sandbox).build().await;
 
-        assert!(result.is_ok(), "build with force_sync=true should succeed");
+        assert!(result.is_ok(), "build in async mode should succeed");
     }
 
     #[tokio::test]

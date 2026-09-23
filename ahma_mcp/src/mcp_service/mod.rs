@@ -14,7 +14,7 @@
 //!    the server queries the client for workspace roots to dynamically configure the
 //!    security sandbox for that specific session.
 //! 3. **Tool Discovery (`list_tools`)**: Dynamically transforms MTDF JSON configurations
-//!    and bundled capability flags (like `--rust` or `--git`) into a rich set of
+//!    and bundled capability flags (like `--tools git`) into a rich set of
 //!    tools that the AI can understand and call.
 //! 4. **Execution Routing (`call_tool`)**: Validates incoming arguments against the
 //!    tool's JSON schema and routes the execution request to the [`Adapter`].
@@ -49,7 +49,7 @@ mod subcommand;
 mod types;
 
 pub use types::{
-    ActiveAgentSession, ExtensionToolHandler, GuidanceConfig, META_PARAMS, PromptRunner,
+    ActiveAgentSession, CallWait, ExtensionToolHandler, GuidanceConfig, META_PARAMS, PromptRunner,
     SequenceKind, get_global_prompt_runner, register_global_extension_handler,
     register_global_prompt_runner,
 };
@@ -147,6 +147,11 @@ pub struct AhmaMcpService {
         Arc<parking_lot::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>>>,
     /// Custom file operations backend.
     pub file_ops_provider: Arc<dyn FileOpsProvider>,
+    /// What each file looked like when this session last read or wrote it, so
+    /// an edit is refused if the file was never read or has changed since
+    /// (see `handlers::harness_tools`).
+    pub(crate) file_stamps:
+        Arc<parking_lot::Mutex<HashMap<PathBuf, handlers::harness_tools::FileStamp>>>,
     /// Custom web page fetcher.
     pub web_page_fetcher: Arc<dyn WebPageFetcher>,
     /// LLM completion service used by the livelog pipeline.
@@ -253,6 +258,49 @@ fn progress_enabled(force: bool, client_type: crate::client_type::McpClientType)
 }
 
 impl AhmaMcpService {
+    /// The server's sync/async policy (SPEC R2.1): `tools.execution_mode`, as
+    /// resolved from `--sync`/`--async` and the settings files. A service with
+    /// no `AppConfig` — an embedding that never set one — keeps async, the
+    /// library's historical behaviour; the `ahma` binary always sets one.
+    pub fn execution_policy(&self) -> ahma_common::config::ExecutionPolicy {
+        self.app_config
+            .read()
+            .as_ref()
+            .map(|c| c.execution_mode)
+            .unwrap_or(ahma_common::config::ExecutionPolicy::Async)
+    }
+
+    /// How long this call waits: sync mode waits until done unless the call
+    /// (MTDF `synchronous: false`, `blocking: false`) explicitly asks not to.
+    pub(crate) fn call_wait(&self, opted_out_of_waiting: bool) -> CallWait {
+        match self.execution_policy() {
+            ahma_common::config::ExecutionPolicy::Sync if !opted_out_of_waiting => {
+                CallWait::UntilDone
+            }
+            _ => CallWait::Adaptive,
+        }
+    }
+
+    /// A sequence's share of [`Self::call_wait`]: in sync mode, the steps are
+    /// waited for within the window a single call would get.
+    fn sequence_wait(
+        &self,
+        context: &RequestContext<RoleServer>,
+        opted_out_of_waiting: bool,
+    ) -> Option<sequence::SequenceWait<'_>> {
+        if self.call_wait(opted_out_of_waiting) != CallWait::UntilDone {
+            return None;
+        }
+        let (window, _) = self.sync_call_wait(
+            McpClientType::from_peer(&context.peer),
+            Some(context.peer.clone()),
+        );
+        Some(sequence::SequenceWait {
+            monitor: &self.operation_monitor,
+            window,
+        })
+    }
+
     /// Whether the bridge in front of this subprocess (if any) currently has
     /// a live push channel open to the real client. See the
     /// [`push_channel_open`](Self::push_channel_open) field docs for why a
@@ -454,7 +502,7 @@ impl AhmaMcpService {
                 handlers::sandbox_grant_tool::sandbox_grant_schema(),
             ),
             BuiltinTool::ReadFile => (
-                "Read UTF-8 text from a scoped file, with optional line slicing.",
+                "Read a text file as numbered lines (`  N<tab>text`; the number is not part of the file). Returns up to 2000 lines from start_line and says how to continue; long lines are cut at 2000 characters; binary files are refused. Read a file before editing or overwriting it.",
                 handlers::harness_tools::read_file_schema(),
             ),
             BuiltinTool::ListDir => (
@@ -462,24 +510,32 @@ impl AhmaMcpService {
                 handlers::harness_tools::list_dir_schema(),
             ),
             BuiltinTool::FileSearch => (
-                "Find files by glob pattern inside the sandbox scope.",
+                "Find files by glob pattern (e.g. `**/*.rs`), most recently modified first. Respects .gitignore and skips hidden files, like ripgrep.",
                 handlers::harness_tools::file_search_schema(),
             ),
             BuiltinTool::GrepSearch => (
-                "Search file contents by plain text or regex.",
+                "Search file contents by plain text or regex. Respects .gitignore, skips binary files. output_mode: content (matching lines, optional context), files (paths only), count (matches per file).",
                 handlers::harness_tools::grep_search_schema(),
             ),
             BuiltinTool::FetchWebpage => (
-                "Fetch and extract readable text from an HTTP/HTTPS webpage.",
+                "Fetch an HTTP/HTTPS page and return its readable text (at most 50,000 characters; pass `query` to keep only the lines that mention it).",
                 handlers::harness_tools::fetch_webpage_schema(),
             ),
             BuiltinTool::WriteFile => (
-                "Write UTF-8 content to a scoped file (create or overwrite).",
+                "Create a file, or overwrite one — an existing file must have been read in this session and not changed since. For changes to part of a file prefer replace_in_file, multi_edit or apply_patch.",
                 handlers::harness_tools::write_file_schema(),
             ),
             BuiltinTool::ReplaceInFile => (
-                "Replace exact string occurrences in a scoped UTF-8 file.",
+                "Replace one exact piece of a file: old_str must occur exactly once (add surrounding lines to make it unique) unless replace_all. Read the file first. Returns the edited lines. On a miss, says what is there instead.",
                 handlers::harness_tools::replace_in_file_schema(),
+            ),
+            BuiltinTool::MultiEdit => (
+                "Several exact replacements in one file, applied in order; if any fails, none is applied. Same rules as replace_in_file for each edit.",
+                handlers::harness_tools::multi_edit_schema(),
+            ),
+            BuiltinTool::ApplyPatch => (
+                "Apply a patch that adds, deletes, updates or moves files (the `*** Begin Patch` format). Nothing is written unless every file operation applies. Files updated or deleted must have been read first.",
+                handlers::harness_tools::apply_patch_schema(),
             ),
             BuiltinTool::Agent => (
                 "Delegate a self-contained task to ahma's own agent loop as a sub-agent. ahma runs its full tool-using loop (read/edit files, run commands in the sandbox, search) with the model the user last selected in `ahma tui`, and returns the final answer. Use this to offload a focused sub-task — investigating code, producing a file or report, or answering a question grounded in the workspace — without doing the steps yourself.",
@@ -824,6 +880,7 @@ impl AhmaMcpService {
                 types::get_global_extension_handlers().read().clone(),
             )),
             file_ops_provider: Arc::new(DefaultFileOpsProvider),
+            file_stamps: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             web_page_fetcher: Arc::new(DefaultWebPageFetcher),
             llm_service: Arc::new(DefaultLlmCompletionService),
             last_received_signal: Arc::new(std::sync::atomic::AtomicU64::new(
@@ -1375,10 +1432,12 @@ impl AhmaMcpService {
         progress_token: Option<rmcp::model::ProgressToken>,
         client_type: McpClientType,
         peer: Peer<RoleServer>,
+        wait: CallWait,
         map_start_error: impl FnOnce(&anyhow::Error) -> McpError,
     ) -> Result<CallToolResult, McpError> {
         self.emit_vault_tool_call(&id, tool_name, vault_args_summary)
             .await;
+        let wait_peer = peer.clone();
 
         self.register_progress_if_requested(&id, peer, progress_token, client_type)
             .await;
@@ -1401,21 +1460,46 @@ impl AhmaMcpService {
 
         match job_id {
             Ok(id) => {
-                // Automatic async: wait out the inline window (SPEC R2.6.1) so
-                // fast commands answer without an `await` round-trip.
-                if let Some(result) = handlers::common::try_automatic_async_completion(
-                    &self.operation_monitor,
-                    &id,
-                    self.effective_request_budget(client_type),
-                )
-                .await
-                {
+                let (finished, still_running) = match wait {
+                    // Async: wait out the inline window (SPEC R2.6.1) so fast
+                    // commands answer without an `await` round-trip.
+                    CallWait::Adaptive => {
+                        let finished = handlers::common::try_automatic_async_completion(
+                            &self.operation_monitor,
+                            &id,
+                            self.effective_request_budget(client_type),
+                        )
+                        .await;
+                        (finished, String::new())
+                    }
+                    // Sync: wait for the result, as long as a default `await`
+                    // on it could. Progress keeps flowing to the caller's token
+                    // meanwhile, registered above.
+                    CallWait::UntilDone => {
+                        let (window, clamp_note) =
+                            self.sync_call_wait(client_type, Some(wait_peer));
+                        let finished = handlers::common::wait_for_completion(
+                            &self.operation_monitor,
+                            &id,
+                            window,
+                        )
+                        .await;
+                        let note = format!(
+                            "\n\nStill running after {}s — the longest this client can \
+                             hold one request open. It keeps running: call `await` with \
+                             id `{id}` to collect the result.{}",
+                            window.as_secs(),
+                            clamp_note.unwrap_or_default()
+                        );
+                        (finished, note)
+                    }
+                };
+                if let Some(result) = finished {
                     return Ok(result);
                 }
                 let hint = crate::tool_hints::preview(&id, tool_name);
                 Ok(handlers::common::text_result(format!(
-                    "AHMA ID: {}{}",
-                    id, hint
+                    "AHMA ID: {id}{still_running}{hint}"
                 )))
             }
             Err(e) => {
@@ -1432,7 +1516,8 @@ impl AhmaMcpService {
 #[async_trait::async_trait]
 impl ServerHandler for AhmaMcpService {
     fn get_info(&self) -> ServerInfo {
-        let instructions = ahma_common::mcp_methods::SERVER_INSTRUCTIONS.to_string();
+        let instructions =
+            ahma_common::mcp_methods::server_instructions(self.execution_policy()).to_string();
 
         let mut tools_capability = ToolsCapability::default();
         tools_capability.list_changed = Some(true);
@@ -1476,7 +1561,10 @@ impl ServerHandler for AhmaMcpService {
             // re-register this instance with the hub under the client's name
             // (the TUI task tree groups work by who is driving it).
             if let Some(info) = context.peer.peer_info() {
-                crate::daemon_reporter::set_client_identity(info.client_info.name.clone());
+                crate::daemon_reporter::set_client_identity(
+                    info.client_info.name.clone(),
+                    info.capabilities.sampling.is_some(),
+                );
             }
 
             let peer = &context.peer;
@@ -1789,6 +1877,14 @@ impl AhmaMcpService {
             }
             BuiltinTool::ReadFile => {
                 self.handle_read_file(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            BuiltinTool::MultiEdit => {
+                self.handle_multi_edit(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            BuiltinTool::ApplyPatch => {
+                self.handle_apply_patch(run_params.arguments.unwrap_or_default())
                     .await
             }
             BuiltinTool::ListDir => {
@@ -2148,6 +2244,15 @@ impl AhmaMcpService {
         }
 
         if config.sequence.is_some() {
+            #[allow(deprecated)]
+            let opted_out = config.synchronous == Some(false)
+                || params
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("blocking"))
+                    .and_then(|v| v.as_bool())
+                    == Some(false);
+            let wait = self.sequence_wait(&context, opted_out);
             return sequence::handle_sequence_tool(
                 &self.adapter,
                 &self.progress_push,
@@ -2156,6 +2261,7 @@ impl AhmaMcpService {
                 params,
                 context,
                 self.force_progress_notifications_override(),
+                wait,
             )
             .await;
         }
@@ -2281,6 +2387,13 @@ impl AhmaMcpService {
             }
             crate::adapter::ExecutionMode::AsyncResultPush => {
                 let vault_args_summary = Self::summarize_arguments(&arguments);
+                // In sync mode a tool can still ask to return early: MTDF
+                // `synchronous: false`, or `blocking: false` on the call.
+                #[allow(deprecated)]
+                let opted_out = Self::sync_override_from_config(subcommand_config, config)
+                    == Some(false)
+                    || arguments.get("blocking").and_then(|v| v.as_bool()) == Some(false);
+                let wait = self.call_wait(opted_out);
                 self.call_async_tool(
                     tool_name,
                     id,
@@ -2294,6 +2407,7 @@ impl AhmaMcpService {
                     progress_token,
                     client_type,
                     context.peer.clone(),
+                    wait,
                     |e| {
                         let error_message =
                             format!("Failed to start asynchronous operation: {}", e);
@@ -2329,6 +2443,11 @@ impl AhmaMcpService {
         };
 
         if subcommand_config.sequence.is_some() {
+            #[allow(deprecated)]
+            let opted_out = Self::sync_override_from_config(subcommand_config, &config)
+                == Some(false)
+                || arguments.get("blocking").and_then(|v| v.as_bool()) == Some(false);
+            let wait = self.sequence_wait(&context, opted_out);
             return sequence::handle_subcommand_sequence(
                 &self.adapter,
                 &self.progress_push,
@@ -2337,6 +2456,7 @@ impl AhmaMcpService {
                 params,
                 context,
                 self.force_progress_notifications_override(),
+                wait,
             )
             .await;
         }

@@ -33,6 +33,14 @@ impl Drop for HttpBridgeTestInstance {
 
 /// Spawn a robust HTTP bridge for testing.
 pub async fn spawn_http_bridge() -> anyhow::Result<HttpBridgeTestInstance> {
+    spawn_http_bridge_with_args(&[]).await
+}
+
+/// As [`spawn_http_bridge`], with extra global flags (e.g. `--async`) placed
+/// before the `serve` subcommand. The bridge forwards them to its workers.
+pub async fn spawn_http_bridge_with_args(
+    extra_args: &[&str],
+) -> anyhow::Result<HttpBridgeTestInstance> {
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
 
@@ -51,6 +59,7 @@ pub async fn spawn_http_bridge() -> anyhow::Result<HttpBridgeTestInstance> {
     cmd.arg("--log-to-stderr");
     cmd.arg("--handshake-timeout")
         .arg(TestTimeouts::scale_secs(120).as_secs().to_string());
+    cmd.args(extra_args);
     cmd.args(["serve", "http", "--port", &port.to_string()]);
 
     // Clear unwanted env vars

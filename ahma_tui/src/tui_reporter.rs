@@ -80,6 +80,7 @@ pub fn register_msg(session_id: &str, workspace: &str) -> ClientMsg {
         // are the same one, and that is what makes its section read as "this
         // terminal (you)" rather than as some other window's work.
         client_pid: Some(std::process::id()),
+        sampling: false,
     }
 }
 

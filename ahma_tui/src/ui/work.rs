@@ -228,6 +228,13 @@ fn draw_section_rule(
         ));
     }
 
+    // The window's model and spend: which LLM Enter will chat with here, and
+    // how full its context is, without opening the chat.
+    let llm = section_llm_suffix(state, &section.key);
+    if !llm.is_empty() {
+        spans.push(Span::styled(llm, theme.dim()));
+    }
+
     // A liveness glyph beside a section that is running something, so "which of
     // these is actually doing anything" is answerable at a glance.
     if section.header.running {
@@ -300,8 +307,8 @@ fn draw_empty_state(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// The one-line header bar above the work view.
-pub fn draw_work_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+/// The left half of the status header: project filter, clients, tallies.
+pub fn work_header_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
     let filter = if state.show_all_projects {
         "all projects [f]"
     } else {
@@ -329,10 +336,33 @@ pub fn draw_work_header(frame: &mut Frame, state: &AppState, theme: &Theme, area
         ),
     ];
     spans.extend(instance_tally_spans(&totals, state.unicode, theme));
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(theme.header_bar()),
-        area,
-    );
+    spans
+}
+
+/// ` · qwen2.5-coder · ctx 38% (49k/128k) · ↑12.3k ↓2.1k` for a section: the
+/// LLM this window chats with and what it has spent. Empty when the window
+/// has no LLM of its own and no usage.
+pub(crate) fn section_llm_suffix(state: &AppState, key: &str) -> String {
+    let saved = state.get_window_llm(key);
+    let is_active = state.active_target_instance.as_deref() == Some(key);
+    let (model, base_url) = match saved {
+        Some(cfg) => (Some(cfg.model.clone()), cfg.provider_url.clone()),
+        None if is_active => (
+            state.llm_selection.as_ref().map(|s| s.model.clone()),
+            state.current_provider_url.clone(),
+        ),
+        None => (None, None),
+    };
+    let ctx = base_url.as_deref().and_then(|u| state.context_window(u));
+    let meter = super::window_meter(state.window_usage.get(key), ctx, state.unicode);
+    let mut out = String::new();
+    if let Some(model) = model.filter(|m| !m.is_empty()) {
+        out.push_str(&format!(" · {model}"));
+    }
+    if !meter.is_empty() {
+        out.push_str(&format!(" · {meter}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -353,6 +383,7 @@ mod tests {
             client: Some(client.into()),
             session_id: Some(format!("sess-{id}")),
             client_pid: Some(99),
+            sampling: false,
             ended_epoch_ms: None,
         }
     }
@@ -397,6 +428,35 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A section names the LLM Enter will chat with in it and what that
+    /// window has spent, so the choice is visible without opening the chat.
+    #[test]
+    fn a_section_shows_its_window_model_and_spend() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        assert_eq!(section_llm_suffix(&state, "inst-a"), "");
+
+        state.set_window_llm(
+            "inst-a",
+            crate::session_config::WindowLlmConfig {
+                provider: "Ollama".into(),
+                model: "qwen2.5-coder".into(),
+                provider_url: None,
+            },
+        );
+        state.window_usage.insert(
+            "inst-a".into(),
+            crate::state::WindowUsage {
+                prompt_tokens: 1500,
+                completion_tokens: 300,
+                last_prompt_tokens: 1500,
+            },
+        );
+        assert_eq!(
+            section_llm_suffix(&state, "inst-a"),
+            " · qwen2.5-coder · ↑1.5k ↓300"
+        );
     }
 
     /// The view is rules and rows, not a box. A border would be a second frame

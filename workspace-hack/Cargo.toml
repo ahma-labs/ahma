@@ -26,6 +26,7 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 chrono = { version = "0.4", features = ["serde"] }
 const-oid = { version = "0.9", default-features = false, features = ["db", "std"] }
 crossbeam-channel = { version = "0.5" }
+crossbeam-deque = { version = "0.8" }
 crossbeam-utils = { version = "0.8" }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }

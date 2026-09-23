@@ -86,6 +86,8 @@ pub struct InstanceIdentity {
     pub session_id: Option<String>,
     /// Pid of the client-facing frontend process.
     pub client_pid: Option<u32>,
+    /// The client declared MCP `sampling` at `initialize`.
+    pub sampling: bool,
 }
 
 static INSTANCE_IDENTITY: std::sync::LazyLock<tokio::sync::watch::Sender<InstanceIdentity>> =
@@ -110,16 +112,17 @@ pub fn set_initial_identity(session_id: Option<String>, client_pid: Option<u32>)
 /// Record the MCP client identity for this instance. Called from
 /// `on_initialized` once `clientInfo.name` is known. Idempotent: setting the
 /// same name again does not trigger a hub re-register.
-pub fn set_client_identity(name: impl Into<String>) {
+pub fn set_client_identity(name: impl Into<String>, sampling: bool) {
     let name = name.into();
     if name.is_empty() {
         return;
     }
     INSTANCE_IDENTITY.send_if_modified(|cur| {
-        if cur.client.as_deref() == Some(name.as_str()) {
+        if cur.client.as_deref() == Some(name.as_str()) && cur.sampling == sampling {
             false
         } else {
             cur.client = Some(name);
+            cur.sampling = sampling;
             true
         }
     });
@@ -409,6 +412,7 @@ async fn run_reporter_loop(
             client: identity.client.clone(),
             session_id: identity.session_id.clone(),
             client_pid: identity.client_pid,
+            sampling: identity.sampling,
         };
         if let Err(e) = send_msg(&mut writer, &reg).await {
             debug!("daemon_reporter: register failed ({e})");
@@ -531,6 +535,7 @@ async fn run_reporter_loop(
                         &mut writer,
                         &hub_tx,
                         &session,
+                        &monitor,
                         grant_coordinator.as_ref(),
                         web_coordinator.as_ref(),
                     ).await;
@@ -619,6 +624,7 @@ async fn handle_daemon_msg(
     writer: &mut tokio::io::WriteHalf<DaemonStream>,
     hub_tx: &tokio::sync::mpsc::Sender<ClientMsg>,
     session: &Arc<tokio::sync::Mutex<ActiveAgentSession>>,
+    monitor: &OperationMonitor,
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
     web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
 ) -> bool {
@@ -644,6 +650,13 @@ async fn handle_daemon_msg(
             provider,
             model,
         } => spawn_prompt_run(messages, system_prompt, provider, model, hub_tx, session).await,
+        DaemonMsg::CancelPrompt => cancel_prompt_run(hub_tx, session).await,
+        DaemonMsg::CancelOperation { op_id } => {
+            let cancelled = monitor
+                .cancel_operation_with_reason(&op_id, Some("Cancelled from ahma tui".into()))
+                .await;
+            info!("daemon_reporter: CancelOperation op={op_id} cancelled={cancelled}");
+        }
         DaemonMsg::SubmitApproval { id, approved } => deliver_approval(id, approved, session).await,
         DaemonMsg::SubmitScopeGrant {
             decision_id,
@@ -689,8 +702,9 @@ async fn spawn_prompt_run(
     };
     let runner = runner.clone();
     let hub_tx = hub_tx.clone();
+    let turn_session = session.clone();
     let session = session.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let outcome = runner
             .run_prompt(
                 messages,
@@ -707,6 +721,34 @@ async fn spawn_prompt_run(
         };
         let _ = hub_tx.send(done).await;
     });
+    turn_session.lock().await.turn = Some(handle.abort_handle());
+}
+
+/// `CancelPrompt`: stop the running turn and end it for every subscriber with
+/// one `AgentError`. Pending approvals are dropped, so a waiter wakes with a
+/// closed channel instead of hanging. A turn that already finished has sent
+/// its own `AgentDone`/`AgentError`; cancelling it must not add a second end.
+async fn cancel_prompt_run(
+    hub_tx: &tokio::sync::mpsc::Sender<ClientMsg>,
+    session: &Arc<tokio::sync::Mutex<ActiveAgentSession>>,
+) {
+    let turn = {
+        let mut guard = session.lock().await;
+        guard.approval_tx = None;
+        guard.approvals.clear();
+        guard.turn.take()
+    };
+    let Some(turn) = turn.filter(|t| !t.is_finished()) else {
+        debug!("daemon_reporter: CancelPrompt with no running turn");
+        return;
+    };
+    turn.abort();
+    info!("daemon_reporter: agent turn cancelled by user");
+    let _ = hub_tx
+        .send(ClientMsg::Relay(HubRelay::AgentError {
+            error: "Cancelled by user".to_string(),
+        }))
+        .await;
 }
 
 /// `SubmitApproval`: wake the waiter registered for this call id, or — when the
@@ -1105,6 +1147,52 @@ mod tests {
     use ahma_common::timeouts::TestTimeouts;
     use serde_json::json;
     use tokio::sync::mpsc;
+
+    // ── cancel_prompt_run ─────────────────────────────────────────────────────
+
+    /// Cancelling a running turn stops its task, wakes any approval waiter, and
+    /// ends the turn for subscribers with exactly one `AgentError`.
+    #[tokio::test]
+    async fn cancel_stops_the_running_turn_and_reports_it_once() {
+        let (hub_tx, mut hub_rx) = mpsc::channel(8);
+        let session = Arc::new(tokio::sync::Mutex::new(ActiveAgentSession::default()));
+        let (approval_tx, approval_rx) = tokio::sync::oneshot::channel();
+        let turn = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut guard = session.lock().await;
+            guard.approvals.insert("call-1".into(), approval_tx);
+            guard.turn = Some(turn.abort_handle());
+        }
+
+        cancel_prompt_run(&hub_tx, &session).await;
+
+        assert!(turn.await.unwrap_err().is_cancelled());
+        assert!(approval_rx.await.is_err(), "approval waiter must wake");
+        match hub_rx.try_recv() {
+            Ok(ClientMsg::Relay(HubRelay::AgentError { error })) => {
+                assert!(error.contains("Cancelled"), "{error}")
+            }
+            other => panic!("expected one AgentError, got {other:?}"),
+        }
+
+        // A second cancel has nothing to stop and must not end the turn twice.
+        cancel_prompt_run(&hub_tx, &session).await;
+        assert!(hub_rx.try_recv().is_err());
+    }
+
+    /// A turn that already finished sent its own end; cancel adds nothing.
+    #[tokio::test]
+    async fn cancel_after_the_turn_finished_is_silent() {
+        let (hub_tx, mut hub_rx) = mpsc::channel(8);
+        let session = Arc::new(tokio::sync::Mutex::new(ActiveAgentSession::default()));
+        let turn = tokio::spawn(async {});
+        let abort = turn.abort_handle();
+        turn.await.unwrap();
+        session.lock().await.turn = Some(abort);
+
+        cancel_prompt_run(&hub_tx, &session).await;
+        assert!(hub_rx.try_recv().is_err());
+    }
 
     // ── daemon_event_for ──────────────────────────────────────────────────────
 

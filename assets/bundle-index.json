@@ -2,14 +2,6 @@
   "version": 1,
   "bundles": [
     {
-      "name": "rust",
-      "version": "1.0.0",
-      "description": "Rust/Cargo build and test tools",
-      "author": "ahma-project",
-      "url": null,
-      "sha256": "builtin"
-    },
-    {
       "name": "python",
       "version": "1.0.0",
       "description": "Python 3 tooling",

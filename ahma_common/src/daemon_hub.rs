@@ -220,6 +220,11 @@ pub struct InstanceInfo {
     /// as opposed to `pid`, which is the worker that executes the tools.
     #[serde(default)]
     pub client_pid: Option<u32>,
+    /// Whether the MCP client declared the `sampling` capability at
+    /// `initialize` — i.e. whether a prompt can be answered by the client's
+    /// own model (`mcp://` providers in the TUI). Field-only (R24.5).
+    #[serde(default)]
+    pub sampling: bool,
     /// When this instance disconnected (Unix epoch, milliseconds), for an
     /// instance retained only so its recent operations still have somewhere to
     /// belong. `None` for a live instance.
@@ -456,6 +461,9 @@ pub enum ClientMsg {
         /// Pid of the client-facing frontend process.
         #[serde(default)]
         client_pid: Option<u32>,
+        /// The client declared MCP `sampling` (see [`InstanceInfo::sampling`]).
+        #[serde(default)]
+        sampling: bool,
     },
     /// An operation event from a registered instance.
     Event { payload: DaemonEvent },
@@ -475,6 +483,17 @@ pub enum ClientMsg {
         system_prompt: Option<String>,
         provider: Option<String>,
         model: Option<String>,
+        target_instance_id: Option<String>,
+    },
+    /// Stop the agent turn running on an instance (Esc / Ctrl-C in the TUI).
+    /// The instance answers with one `AgentError` naming the cancellation, so
+    /// every subscriber ends the turn the same way it ends a failed one.
+    CancelPrompt { target_instance_id: Option<String> },
+    /// Cancel an operation on the instance that owns it. Operation ids are
+    /// unique only per instance, and a TUI's own MCP session cannot see
+    /// another client's operations, so the cancel must travel to the owner.
+    CancelOperation {
+        op_id: String,
         target_instance_id: Option<String>,
     },
     /// TUI client response containing user's approval decision.
@@ -547,6 +566,10 @@ pub enum DaemonMsg {
         provider: Option<String>,
         model: Option<String>,
     },
+    /// Forward a TUI's turn cancellation to the instance running the turn.
+    CancelPrompt,
+    /// Forward a TUI's operation cancel to the instance that owns it.
+    CancelOperation { op_id: String },
     /// Forward user approval to registered instance.
     SubmitApproval {
         #[serde(default)]
@@ -1926,6 +1949,7 @@ where
             client,
             session_id,
             client_pid,
+            sampling,
         } => {
             serve_instance(
                 &mut reader,
@@ -1939,6 +1963,7 @@ where
                     client,
                     session_id,
                     client_pid,
+                    sampling,
                 },
             )
             .await
@@ -1983,6 +2008,22 @@ where
                 system_prompt,
                 provider,
                 model,
+            )
+            .await
+        }
+
+        ClientMsg::CancelPrompt { target_instance_id } => {
+            route_to_instance(&hub, target_instance_id, DaemonMsg::CancelPrompt).await
+        }
+
+        ClientMsg::CancelOperation {
+            op_id,
+            target_instance_id,
+        } => {
+            route_to_instance(
+                &hub,
+                target_instance_id,
+                DaemonMsg::CancelOperation { op_id },
             )
             .await
         }
@@ -2204,6 +2245,7 @@ struct Registration {
     client: Option<String>,
     session_id: Option<String>,
     client_pid: Option<u32>,
+    sampling: bool,
 }
 
 /// Serve a registered ahma instance: register it, then exchange events and
@@ -2243,6 +2285,7 @@ async fn serve_instance<R, W>(
         client: reg.client,
         session_id: reg.session_id,
         client_pid: reg.client_pid,
+        sampling: reg.sampling,
         ended_epoch_ms: None,
     };
     let pid = reg.pid;
@@ -2340,7 +2383,9 @@ async fn serve_instance<R, W>(
                         | ClientMsg::Subscribe
                         | ClientMsg::ListInstances
                         | ClientMsg::Shutdown
-                        | ClientMsg::SubmitPrompt { .. }) => {
+                        | ClientMsg::SubmitPrompt { .. }
+                        | ClientMsg::CancelPrompt { .. }
+                        | ClientMsg::CancelOperation { .. }) => {
                         debug!("daemon: ignoring subscriber-only message from instance id={id}");
                     }
                     // Decisions the hub routes *to* an instance. They arrive on
@@ -2586,6 +2631,7 @@ mod tests {
             client: Some("claude-code".into()),
             session_id: Some("sess-1".into()),
             client_pid: Some(99),
+            sampling: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -2827,6 +2873,7 @@ mod tests {
             client: None,
             session_id: None,
             client_pid: None,
+            sampling: false,
         };
         let mut buf = Vec::<u8>::new();
         send_msg(&mut buf, &msg).await.unwrap();
@@ -2943,6 +2990,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
                 ended_epoch_ms: None,
             }],
         };
@@ -3250,6 +3298,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await
@@ -3365,6 +3414,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await
@@ -3969,6 +4019,7 @@ mod tests {
             client: None,
             session_id: None,
             client_pid: None,
+            sampling: false,
             ended_epoch_ms: None,
         }
     }
@@ -4184,6 +4235,7 @@ mod tests {
             client: Some("claude-code".into()),
             session_id: None,
             client_pid: None,
+            sampling: false,
             ended_epoch_ms: None,
         };
         hub.instances.lock().await.insert("i1".into(), info.clone());
@@ -4376,6 +4428,7 @@ mod tests {
                     client: Some("claude-code".into()),
                     session_id: Some("sess-1".into()),
                     client_pid: Some(11),
+                    sampling: false,
                     ended_epoch_ms: None,
                 },
             );
@@ -4513,6 +4566,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
                 ended_epoch_ms: None,
             },
         );
@@ -4644,6 +4698,7 @@ mod tests {
                     client: client.map(str::to_string),
                     session_id: Some("mcp-session-7".into()),
                     client_pid: Some(4242),
+                    sampling: false,
                 },
             )
             .await
@@ -4734,6 +4789,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await
@@ -4929,6 +4985,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await
@@ -4966,6 +5023,37 @@ mod tests {
                 assert_eq!(model.as_deref(), Some("m"));
             }
             other => panic!("expected RunPrompt, got {other:?}"),
+        }
+
+        // CancelPrompt routed to the instance running the turn.
+        let mut tui_cancel = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        send_msg(
+            &mut tui_cancel,
+            &ClientMsg::CancelPrompt {
+                target_instance_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
+            DaemonMsg::CancelPrompt => {}
+            other => panic!("expected CancelPrompt, got {other:?}"),
+        }
+
+        // CancelOperation routed to the instance that owns the operation.
+        let mut tui_cancel_op = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        send_msg(
+            &mut tui_cancel_op,
+            &ClientMsg::CancelOperation {
+                op_id: "op-7".into(),
+                target_instance_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
+            DaemonMsg::CancelOperation { op_id } => assert_eq!(op_id, "op-7"),
+            other => panic!("expected CancelOperation, got {other:?}"),
         }
 
         // SubmitApproval routed.
@@ -5065,6 +5153,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await
