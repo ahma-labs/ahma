@@ -372,6 +372,13 @@ pub enum HubRelay {
         id: String,
         tool: String,
         args: String,
+        /// The workspace the asking agent checks grants against (its locked
+        /// sandbox root). An "always allow" answer must be persisted under this
+        /// exact key, or it never matches and the user is asked again. Optional
+        /// and skipped when absent so the wire stays unchanged for older peers
+        /// (R24.5).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
     },
     /// Raise a "grant access to X?" prompt for an auto-detected out-of-scope
     /// path. Mirrors [`Self::ApprovalRequested`] but the decision is three-valued
@@ -1168,6 +1175,7 @@ struct PendingApproval {
     id: String,
     tool: String,
     args: String,
+    workspace: Option<String>,
 }
 
 /// What the hub does when it is asked to stop.
@@ -2339,13 +2347,19 @@ async fn serve_instance<R, W>(
                         // which instance asked so the answer goes back to that
                         // session and no other (SPEC R-DAEMON.6).
                         match &relay {
-                            HubRelay::ApprovalRequested { id: call_id, tool, args } => {
+                            HubRelay::ApprovalRequested {
+                                id: call_id,
+                                tool,
+                                args,
+                                workspace,
+                            } => {
                                 hub.pending_approvals.lock().await.insert(
                                     id.clone(),
                                     PendingApproval {
                                         id: call_id.clone(),
                                         tool: tool.clone(),
                                         args: args.clone(),
+                                        workspace: workspace.clone(),
                                     },
                                 );
                                 hub.pending_decisions
@@ -2483,6 +2497,7 @@ where
                     id: pending.id,
                     tool: pending.tool,
                     args: pending.args,
+                    workspace: pending.workspace,
                 })
             }),
     );
@@ -4820,12 +4835,13 @@ mod tests {
                 id: "c1".into(),
                 tool: "sh".into(),
                 args: "ls".into(),
+                workspace: None,
             }),
         )
         .await
         .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Relay(HubRelay::ApprovalRequested { id, tool, args }) => {
+            DaemonMsg::Relay(HubRelay::ApprovalRequested { id, tool, args, .. }) => {
                 assert_eq!(id, "c1");
                 assert_eq!(tool, "sh");
                 assert_eq!(args, "ls");
@@ -5375,11 +5391,13 @@ mod relay_wire_compat {
                 id: "a1".into(),
                 tool: "rm".into(),
                 args: "-rf".into(),
+                workspace: None,
             }),
             DaemonMsg::Relay(HubRelay::ApprovalRequested {
                 id: "a1".into(),
                 tool: "rm".into(),
                 args: "-rf".into(),
+                workspace: None,
             }),
             json!({"type": "ApprovalRequested", "id": "a1", "tool": "rm", "args": "-rf"}),
         );

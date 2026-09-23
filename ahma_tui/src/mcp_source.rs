@@ -82,6 +82,8 @@ pub enum SourceEvent {
         id: String,
         tool: String,
         args: String,
+        /// The asking agent's grant key (see `HubRelay::ApprovalRequested`).
+        workspace: Option<String>,
     },
     /// An auto-detected sandbox scope violation: raise the "grant access?" modal.
     ScopeGrantRequested {

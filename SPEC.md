@@ -690,6 +690,8 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
 
 - **R-PERM.1**: **All persistent permissions live in `~/.ahma/`, and nowhere else**: filesystem scope grants (R5.4.4), web-domain grants (R-WEB.5), per-workspace tool approvals, and hook unsandboxed consent (R5.5.3) **must** share a single control-plane directory. `~/.config/ahma/` is retired as a permission store; an existing `approvals.json` there **must** be migrated once, non-destructively, and the legacy file left in place with a `.migrated` suffix. The ledger directory inherits R5.4.8 unchanged: it is never part of any workspace scope, is kernel-unreadable and kernel-unwritable from inside the sandbox, and therefore **cannot** be authored by a sandboxed command.
 - **R-PERM.1.1**: **Tool trust is keyed by workspace, and never leaks between them**: a `tool`-kind grant records the **canonicalized workspace root** it applies to. Approving `cargo_build` in one project **must not** silently approve it in another — the same tool name in a different workspace is a different question, because the code it would run is different. The key is canonicalized (see `workspace_key`) so a symlinked or non-normalized spelling of the same directory still matches the grant the user actually gave, and so a path that merely *looks* different cannot be used to dodge a revocation.
+- **R-PERM.1.2**: **One answer is one question**: a tool call that needs approval is asked about at most once per `(workspace, tool)` at a time. Parallel calls to the same tool in one turn — which models emit routinely — **must** share the question, and each **must** re-check the persisted grants once it holds the question, so an "always allow" (or a trust, R-PERM.1.3) given for the first call covers the ones queued behind it. The grant is persisted under the workspace the *asking agent* checks (its locked sandbox root, carried as `ApprovalRequested.workspace`, field-only per R24.5), never under the answering surface's own working directory.
+- **R-PERM.1.3**: **Trusted folders**: the first time `ahma tui` opens a folder it asks once, "Trust this folder?". Yes records trust for the canonical folder (as the `*` entry of its `tool_approvals`, so an older reader simply keeps asking). In a trusted folder every tool that runs **inside the folder's kernel sandbox** runs without asking. Trust **never** covers what reaches past that boundary: tools on external MCP servers (`server::tool`), `sandbox_grant`, `logs_approve`, `fetch_webpage` (which keeps its own egress gate, R-WEB.6), `!` commands (R-DAEMON.9), or any change to `~/.ahma` or a project's `.ahma/` (R5.4.8, R-HANDOFF.7). Trust is never offered for — and `trust_workspace` refuses — a filesystem root, the home directory, or an ancestor of it. Enter, Esc and `n` answer "ask per tool" (R5.3.1). Revoke with `ahma permissions revoke tool '*' --workspace <dir>`.
 - **R-PERM.2**: **One record shape, one preview, one confirmation**: every grant, of every kind, is representable as `{kind: fs-scope | web-domain | tool | hook-unsandboxed, subject, access, tier, granted_by, granted_at, surface, note}`. `tier` is one of `once` | `session` | `always`. A `once` grant is **never** stored. A `session` grant lives **only** in memory and dies with the instance. Only `always` is written to disk, and only after the preview-and-approve exchange R5.4.5 already mandates for `sandbox_grant`, generalized to every kind: the user is shown the **absolute file path** and the **exact line(s)** that would be written, and nothing is written without explicit approval. The R5.4.5 hard denylist gates **every** write path into the ledger — the MCP tool, the CLI, and any elicitation/TUI answer — not just the `sandbox_grant` tool.
 - **R-PERM.2.1**: **One CLI, one audit trail**: `ahma permissions list | grant | revoke` **must** manage every kind through the same preview-and-confirm path, showing provenance (`granted_by`, `surface`) for each record. Kind-scoped aliases (`ahma sandbox grant|list|revoke`, `ahma web allow|list|revoke`) **must** continue to work, because they are the strings ahma itself emits as remediation. Every persist and revoke **must** append one record to an append-only audit log in `~/.ahma/`.
 - **R-PERM.2.2**: **Recording a decision must never destroy it** — the ledger's availability outranks its bookkeeping. This generalizes R-WEB.9.3 (which stated it for the web audit log alone) to **every** kind in the unified ledger:
@@ -1981,9 +1983,30 @@ correct **at startup**, not only for events that happen afterwards.
     skips them (R24.5), so against an older instance the turn still ends in the
     TUI while that instance finishes it unobserved.
   - **R24.10.2 — A turn ends visibly.** A prompt that cannot be delivered ends
-    its turn with the reason; a turn with no server event for 60 s is marked
-    stalled in the footer beside the key that cancels it. `AgentError` stops the
-    turn's timer exactly as `AgentDone` does.
+    its turn with the reason; a model that has gone quiet for 60 s *while
+    thinking or writing* — or for 10 minutes while still reading its prompt,
+    which is silent by nature — is marked stalled in the footer beside the key
+    that cancels it. Waiting on the user or on a running tool is never a stall.
+    `AgentError` stops the turn's timer exactly as `AgentDone` does.
+  - **R24.10.7 — A running turn always says what it is doing.** A status line
+    pinned under the transcript (outside the scrolled rows) shows the liveness
+    panel and the turn's phase in plain words, from real events only: the model
+    reading its prompt (with the prompt's size and, once this session has
+    measured the model's reading speed, the time left), thinking, writing (with
+    tokens/second), running a named tool, or waiting for the user's answer (a
+    still, dimmed panel — never animated as if the model were busy). When a
+    large prompt on a slow model is the reason for the wait, a dim hint says
+    what the user can do (`/compact`, `/model`). A turn over 10 s leaves a dim
+    one-line summary (time, tokens read, reading and writing speed).
+  - **R24.10.8 — A dropped connection is retried once, visibly.** When a turn
+    fails for a connection reason (timeout, reset, 5xx) before any answer text
+    arrived, the TUI sends the message again once and says so in the
+    transcript; a second failure is reported with what to do next. A request
+    error (4xx, refused tool, cancel) is never retried. These notices are the
+    TUI talking to the user and are never sent to the model. A model on this
+    machine (loopback endpoint) gets a 30-minute read window and no timeout
+    retries: it is silent while it reads the prompt, and re-sending restarts
+    that reading from zero.
   - **R24.10.3 — Stream events belong to a turn.** Chat events arriving while
     this TUI has no turn in flight (another TUI's turn, or output from one just
     cancelled) are ignored rather than opening a reply nothing will close.
@@ -2030,6 +2053,13 @@ correct **at startup**, not only for events that happen afterwards.
     A URL-addressed provider carries its configured key to the agent loop. Only
     a client that declared MCP `sampling` at `initialize` (carried as
     `InstanceInfo.sampling`, field-only per R24.5) is offered as a provider.
+  - **R24.12.5 — Chat stays on a model that exists.** A client's own model
+    (`mcp://`) exists only while that client is connected. When it goes, chat
+    moves to the most recent model ahma runs itself (`.ahma/session.toml`
+    `recent`) — or to none, with a pointer to `/setup` — and says so; when the
+    client returns and the user has not chosen another model meanwhile, chat
+    moves back, also said. Local model servers are looked for again every 30 s
+    while idle.
   - **R24.12.3 — A window's conversation is its own.** Switching windows switches
     transcript, and is refused while a reply is streaming. Transcripts are saved
     after each turn under `~/.ahma/transcripts/` — never in the project — and

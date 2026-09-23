@@ -54,8 +54,50 @@ static HTTP_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|| {
         })
 });
 
-fn build_http_client() -> Client {
-    HTTP_CLIENT.clone()
+/// Read window for a model served on **this machine** (Ollama, LM Studio,
+/// llama-server).
+///
+/// A local server sends nothing at all while it reads (prefills) the prompt,
+/// and on a laptop a 27B model can take minutes over a 40k-token prompt —
+/// longer than [`LLM_READ_TIMEOUT`]. The short window buys nothing locally: a
+/// server that is actually down refuses the connection instantly (a connect
+/// error, still retried), so the only thing a timeout ever caught here was a
+/// busy model, which it then made start over.
+const LLM_LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+static LOCAL_HTTP_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|| {
+    Client::builder()
+        .connect_timeout(LLM_CONNECT_TIMEOUT)
+        .read_timeout(LLM_LOCAL_READ_TIMEOUT)
+        .build()
+        .unwrap_or_else(|e| {
+            warn!("Failed to build local HTTP client with timeouts ({e}); using default client");
+            Client::new()
+        })
+});
+
+fn build_http_client(local: bool) -> Client {
+    if local {
+        LOCAL_HTTP_CLIENT.clone()
+    } else {
+        HTTP_CLIENT.clone()
+    }
+}
+
+/// Whether `base_url` points at this machine (a loopback host).
+pub fn is_loopback_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Maximum number of *retries* (extra attempts) on a transient LLM failure.
@@ -111,10 +153,14 @@ async fn api_error_from_response(response: reqwest::Response) -> LlmMonitorError
 
 /// Send an HTTP request with bounded exponential backoff on transient failures
 /// (timeouts/connect errors and 429/5xx). `build` constructs a fresh request per
-/// attempt. A non-retryable response (success or a non-429 4xx) is returned as
+/// attempt. With `retry_timeouts` false a timeout is returned at once: re-sending
+/// to a local model that is merely slow restarts its prompt reading from zero. A non-retryable response (success or a non-429 4xx) is returned as
 /// `Ok` so the caller's own status handling runs; a non-retryable transport
 /// error, or exhaustion of all retries, returns the last error/response.
-async fn send_with_backoff<F>(build: F) -> Result<reqwest::Response, LlmMonitorError>
+async fn send_with_backoff<F>(
+    build: F,
+    retry_timeouts: bool,
+) -> Result<reqwest::Response, LlmMonitorError>
 where
     F: Fn() -> reqwest::RequestBuilder,
 {
@@ -132,7 +178,9 @@ where
                 return Ok(resp);
             }
             Err(e) => {
-                if is_retryable_transport_err(&e) && attempt < LLM_MAX_RETRIES {
+                let retryable =
+                    is_retryable_transport_err(&e) && (retry_timeouts || !e.is_timeout());
+                if retryable && attempt < LLM_MAX_RETRIES {
                     let delay = backoff_delay(attempt);
                     warn!(error = %e, attempt = attempt + 1, ?delay, "llm: retryable transport error — backing off and retrying");
                     tokio::time::sleep(delay).await;
@@ -252,7 +300,7 @@ impl ChatCompletionResponse {
 }
 
 /// A discovered local LLM provider.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalProvider {
     /// Display name, e.g. "Ollama" or "llama-server".
     pub name: String,
@@ -284,6 +332,8 @@ pub enum ApiFlavor {
 #[derive(Debug, Clone)]
 pub struct LlmClient {
     http: Client,
+    /// The endpoint is on this machine: long read window, no timeout retries.
+    local: bool,
     base_url: String,
     model: String,
     api_key: Option<String>,
@@ -296,6 +346,17 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
+    /// Whole-request cap for a non-streaming completion: two minutes for a
+    /// remote API, the local read window for a model on this machine (which is
+    /// silent until it has read the entire prompt).
+    fn request_timeout(&self) -> Duration {
+        if self.local {
+            LLM_LOCAL_READ_TIMEOUT
+        } else {
+            Duration::from_secs(120)
+        }
+    }
+
     /// Create a new LLM client.
     ///
     /// * `base_url` — Base URL of the OpenAI-compatible API (e.g. `http://localhost:11434/v1`)
@@ -324,8 +385,10 @@ impl LlmClient {
             (ApiFlavor::Anthropic, None) => std::env::var("ANTHROPIC_API_KEY").ok(),
             (_, key) => key,
         };
+        let local = is_loopback_url(&base_url);
         Self {
-            http: build_http_client(),
+            http: build_http_client(local),
+            local,
             base_url,
             model: model.into(),
             api_key,
@@ -633,7 +696,7 @@ impl LlmClient {
             messages = messages.len(),
             tools = tools.len(),
             stream = false,
-            timeout_secs = 120,
+            timeout_secs = self.request_timeout().as_secs(),
             "llm: requesting chat completion with tools (non-streaming)"
         );
 
@@ -642,9 +705,9 @@ impl LlmClient {
                 self.http
                     .post(&url)
                     .json(&body)
-                    .timeout(Duration::from_secs(120)),
+                    .timeout(self.request_timeout()),
             )
-        })
+        }, !self.local)
         .await
         .inspect_err(|e| {
             let elapsed_ms = started.elapsed().as_millis();
@@ -794,7 +857,7 @@ impl LlmClient {
                     .json(&body)
                     .header("Accept", "text/event-stream"),
             )
-        })
+        }, !self.local)
         .await
         .inspect_err(|e| {
             warn!(model = %self.model, elapsed_ms = started.elapsed().as_millis(), error = %e, "llm: streaming chat request failed after retries");
@@ -1447,6 +1510,52 @@ mod tests {
         let typed = LlmMonitorError::from(err);
         assert!(typed.is_timeout(), "{typed}");
         assert!(typed.to_string().contains("timed out"), "{typed}");
+    }
+
+    #[test]
+    fn loopback_urls_are_recognised() {
+        for url in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://[::1]:8080/v1",
+            "http://LOCALHOST:11434",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "https://api.anthropic.com/v1",
+            "http://192.168.1.5:11434/v1",
+            "nonsense",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
+    }
+
+    /// A slow local model must not be re-sent its prompt on a timeout: each
+    /// re-send starts its prompt reading over (and queues behind the first).
+    #[tokio::test]
+    async fn timeouts_are_not_retried_when_retry_timeouts_is_off() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let result = send_with_backoff(
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Client::new()
+                    .get(format!("http://127.0.0.1:{port}/"))
+                    .timeout(Duration::from_millis(100))
+            },
+            false,
+        )
+        .await;
+        drop(listener);
+        assert!(result.is_err_and(|e| e.is_timeout()));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            started.elapsed() < LLM_RETRY_BASE_DELAY * 4,
+            "no backoff sleeps"
+        );
     }
 
     #[test]

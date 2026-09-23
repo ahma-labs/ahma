@@ -562,9 +562,17 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
         DaemonMsg::Relay(relay) => Applied::Event(match relay {
             HubRelay::ChatToken { token } => SourceEvent::ChatToken { token },
             HubRelay::ChatThinking { token } => SourceEvent::ChatThinking { token },
-            HubRelay::ApprovalRequested { id, tool, args } => {
-                SourceEvent::ApprovalRequested { id, tool, args }
-            }
+            HubRelay::ApprovalRequested {
+                id,
+                tool,
+                args,
+                workspace,
+            } => SourceEvent::ApprovalRequested {
+                id,
+                tool,
+                args,
+                workspace,
+            },
             HubRelay::AgentDone => SourceEvent::AgentDone,
             HubRelay::AgentError { error } => SourceEvent::AgentError { error },
             HubRelay::Usage {
@@ -1388,9 +1396,10 @@ mod tests {
                 id: "a1".to_string(),
                 tool: "shell".to_string(),
                 args: "ls".to_string(),
+                workspace: None,
             }),
         ) {
-            Applied::Event(SourceEvent::ApprovalRequested { id, tool, args }) => {
+            Applied::Event(SourceEvent::ApprovalRequested { id, tool, args, .. }) => {
                 assert_eq!(id, "a1");
                 assert_eq!(tool, "shell");
                 assert_eq!(args, "ls");
@@ -1603,11 +1612,12 @@ mod tests {
                 id: "a1".to_string(),
                 tool: "tool".to_string(),
                 args: "args".to_string(),
+                workspace: None,
             }),
         )
         .await;
         match next_ev(&mut rx_s).await {
-            SourceEvent::ApprovalRequested { id, tool, args } => {
+            SourceEvent::ApprovalRequested { id, tool, args, .. } => {
                 assert_eq!(id, "a1");
                 assert_eq!(tool, "tool");
                 assert_eq!(args, "args");
@@ -2068,12 +2078,13 @@ mod tests {
                 id: "a1".to_string(),
                 tool: "shell".to_string(),
                 args: "ls".to_string(),
+                workspace: None,
             }),
         )
         .await
         .unwrap();
         match next_ev(&mut rx).await {
-            SourceEvent::ApprovalRequested { id, tool, args } => {
+            SourceEvent::ApprovalRequested { id, tool, args, .. } => {
                 assert_eq!(id, "a1");
                 assert_eq!(tool, "shell");
                 assert_eq!(args, "ls");

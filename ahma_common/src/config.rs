@@ -1781,6 +1781,43 @@ impl AhmaSettings {
         }
     }
 
+    /// Change `~/.ahma/settings.toml` in place: read the file **as it is on
+    /// disk now**, apply `change`, write it back atomically.
+    ///
+    /// This is the only safe way for a long-running process to write settings.
+    /// Saving a copy loaded earlier puts back whatever the file held at that
+    /// moment, silently undoing every grant another surface recorded since
+    /// (the settings panel did exactly that). And unlike [`Self::load`], a file
+    /// that cannot be read or parsed is an error here, never "defaults": saving
+    /// defaults over a file we could not read would erase every permission in
+    /// it. Only a missing file starts from defaults.
+    pub fn update(change: impl FnOnce(&mut Self)) -> Result<Self> {
+        let path = settings_path().ok_or_else(|| {
+            anyhow::anyhow!("Cannot determine home directory for ~/.ahma/settings.toml")
+        })?;
+        Self::update_at(&path, change)
+    }
+
+    /// [`Self::update`] against an explicit path.
+    pub fn update_at(path: &Path, change: impl FnOnce(&mut Self)) -> Result<Self> {
+        let mut settings = match std::fs::read_to_string(path) {
+            Ok(contents) => Self::parse(&contents).map_err(|e| {
+                anyhow::anyhow!(
+                    "refusing to rewrite {}: it does not parse ({e})",
+                    path.display()
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => anyhow::bail!(
+                "refusing to rewrite {}: cannot read it ({e})",
+                path.display()
+            ),
+        };
+        change(&mut settings);
+        settings.save_to(path)?;
+        Ok(settings)
+    }
+
     /// Save to an explicit path — useful for tests and alternate locations.
     ///
     /// The write is atomic: contents are written to a temporary sibling file
@@ -2557,6 +2594,39 @@ fn atomic_write_toml(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `update` works on the file as it is now, so a grant written by someone
+    /// else after we last looked survives our write.
+    #[test]
+    fn update_keeps_changes_made_on_disk_since_we_last_looked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        AhmaSettings::update_at(&path, |s| {
+            s.permissions
+                .approve_tool(Path::new("/ws"), "list_dir", None, None);
+        })
+        .unwrap();
+        let after = AhmaSettings::update_at(&path, |s| s.tools.max_turns = 7).unwrap();
+        assert_eq!(after.tools.max_turns, 7);
+        assert!(
+            after
+                .permissions
+                .is_tool_approved(Path::new("/ws"), "list_dir")
+        );
+    }
+
+    #[test]
+    fn update_refuses_to_overwrite_a_file_it_cannot_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[permissions\nbroken").unwrap();
+        assert!(AhmaSettings::update_at(&path, |s| s.tools.max_turns = 7).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[permissions\nbroken",
+            "the unreadable file is left exactly as it was"
+        );
+    }
 
     /// Regression for issue #484: a provider addressed by URL must still yield
     /// its declared `kind`, not just its `num_ctx`. Losing `kind` let

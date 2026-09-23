@@ -193,11 +193,29 @@ another terminal, where ahma can neither disclose nor record it.
 
 The header's `sandbox:` label follows the same honesty rule: it shows the server-locked primary write root once reported. Until then it shows the launch directory with a trailing `?` — a guess, not the boundary.
 
+## What the model is doing
+
+While a chat turn runs, a status line pinned under the transcript says what is happening, in words, from real events only:
+
+| You see | Meaning |
+|---|---|
+| `qwen3.8 is reading 37k tokens of context · 1m12s · ~2m left` | The model is reading its whole prompt before answering. Local models are silent while they do this; the time left appears once ahma has measured this model's reading speed in the session |
+| `qwen3.8 is thinking · 5s` / `is writing · 18 tok/s` | Reasoning / answer tokens are arriving |
+| `running cargo build · 42s` | A tool the model asked for is running |
+| `waiting for your answer above` | An approval is open. The panel stops animating: this is your time, not the model's |
+
+When a large prompt on a slow model is why you are waiting, a dim hint suggests `/compact` or `/model`. A turn over 10 s leaves a one-line summary — time taken, tokens read, reading and writing speed — so switching model or shrinking context is an informed choice.
+
+If the connection drops before any answer arrives, ahma sends your message again once and says so; a second failure tells you what to do next. Models on this machine are given 30 minutes to read a prompt and are never re-sent it on a timeout, because re-sending makes a slow model start reading again from the beginning.
+
+If chat is using an MCP client's own model and that client disconnects, chat switches to the model you used most recently that ahma runs itself, and says so; it switches back when the client returns, unless you chose another model meanwhile.
+
 ## Approval gates
 
 The TUI is the primary surface for approving or rejecting actions that require user sign-off:
 
-- **Tool approval** — a chat tool call awaiting your `y`/`n` in the banner above the input.
+- **Trust this folder?** — asked once, the first time you open a folder. **Yes** lets every tool that runs *inside* the folder's kernel sandbox — reads, edits, builds, tests — run without asking. Still asked every time: paths outside the folder, network access, `!` commands, tools on other MCP servers, and settings changes. **No** (or Enter/Esc) keeps per-tool questions. Never offered for your home directory or a filesystem root. Undo with `ahma permissions revoke tool '*' --workspace <dir>`.
+- **Tool approval** — a chat tool call awaiting your `y`/`a`/`n` in the banner above the input. Several calls to the same tool share one question, and `a` (always allow) covers the ones already queued.
 - **Sandbox scope grants** — a sandboxed command was blocked on an out-of-scope path and the "grant access?" modal asks whether to record a persistent grant (Enter/Esc always deny; grants land in `~/.ahma/settings.toml` and apply on the next server start — ask the agent to run the `restart` tool to apply one immediately).
 - **Web egress** — a blocked outbound domain raises the "allow egress?" modal, with three tiers: `[o]` once, `[s]` this session, `[a]` always. Cleartext `http://` is flagged rather than blocked.
 

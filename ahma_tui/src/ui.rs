@@ -71,6 +71,60 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     if state.web_approval.is_some() {
         draw_web_approval_modal(frame, state, theme, full);
     }
+    if state.trust_prompt.is_some() {
+        draw_trust_modal(frame, state, theme, full);
+    }
+}
+
+/// The one-time "trust this folder?" question (SPEC R-PERM.1.3). Says plainly
+/// what yes covers and what it never covers, so one keystroke replaces the
+/// per-tool questions without anyone having to guess what they agreed to.
+fn draw_trust_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let Some(folder) = &state.trust_prompt else {
+        return;
+    };
+    let popup = centered_rect(76, 13, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(" Trust this folder? ", theme.title().bold()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = vec![
+        Line::from(Span::styled(folder.clone(), theme.success().bold())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Yes: tools read, write, build and test inside this folder without asking.",
+            theme.normal(),
+        )),
+        Line::from(Span::styled(
+            "The kernel sandbox still keeps every command inside it.",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            "Always asks: paths outside it, network access, `!` commands, settings.",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            "No: ahma asks before each tool that changes something.",
+            theme.dim(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [y] ", theme.success().bold()),
+            Span::styled("Trust this folder    ", theme.normal().bold()),
+            Span::styled("[n] ", theme.failed().bold()),
+            Span::styled("Ask per tool (default)", theme.normal()),
+        ]),
+        Line::from(Span::styled("  Enter / Esc = ask per tool", theme.dim())),
+    ];
+    lines.extend(gate_typing_note(state, theme));
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
 }
 
 // ─── Chat layout ──────────────────────────────────────────────────────────────
@@ -1028,7 +1082,7 @@ fn connection_span(
 }
 
 /// `12s`, `3m`, `2h` — coarse on purpose, it only has to say "a while".
-fn format_elapsed_short(d: std::time::Duration) -> String {
+pub(crate) fn format_elapsed_short(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     match secs {
         0..=59 => format!("{secs}s"),
@@ -1366,6 +1420,17 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // A running turn pins its status line(s) to the bottom of the transcript,
+    // outside the scrolled region: however far back the user has scrolled,
+    // what the model is doing right now stays in view.
+    let status = turn_status_lines(state, theme);
+    let status_h = (status.len() as u16).min(inner.height.saturating_sub(1));
+    let [inner, status_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(status_h)]).areas(inner);
+    if status_h > 0 {
+        frame.render_widget(Paragraph::new(Text::from(status)), status_area);
+    }
+
     state.chat_area.set(inner);
 
     if state.chat.is_empty() {
@@ -1440,6 +1505,72 @@ fn chat_history_hint(state: &AppState) -> &'static str {
     } else {
         "  Type a message and press Enter to start chatting"
     }
+}
+
+/// The live status line under the transcript while a turn runs: the liveness
+/// panel, then what is happening in plain words (see
+/// [`crate::state::turn_status_text`]), and a dim hint line when the numbers
+/// suggest the user could do something about a slow turn. Empty with no turn.
+fn turn_status_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let Some(turn) = &state.turn else {
+        return Vec::new();
+    };
+    let now = std::time::Instant::now();
+    let label = state.llm_label();
+    let model = shorten_llm_label(&label);
+    let known = state
+        .window_usage
+        .get(&AppState::usage_key(turn.target_instance.as_deref()))
+        .map_or(0, |u| u.last_prompt_tokens);
+    let prompt_tokens = known.max(estimate_tokens(conversation_chars(state)));
+    let rate = state.read_rates.get(&label).copied();
+    let (text, hint) = crate::state::turn_status_text(turn, now, &model, prompt_tokens, rate);
+
+    let waiting_on_you = turn.phase == crate::state::TurnPhase::AwaitingYou;
+    // Waiting on the user is not the model working: hold the panel still and
+    // dim, so it cannot be mistaken for progress.
+    let (glyph, style) = if waiting_on_you {
+        (
+            if state.unicode { "⣿⣿" } else { "||" }.to_string(),
+            theme.pending(),
+        )
+    } else if state.liveness_glyph.trim().is_empty() {
+        (
+            crate::liveness::panel_glyphs(0, 0, turn_pattern(turn), state.unicode),
+            theme.running(),
+        )
+    } else {
+        (state.liveness_glyph.clone(), theme.running())
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(glyph, style),
+        Span::raw(" "),
+        Span::styled(
+            text,
+            if waiting_on_you {
+                theme.pending()
+            } else {
+                theme.dim()
+            },
+        ),
+    ])];
+    if let Some(hint) = hint {
+        lines.push(Line::from(Span::styled(
+            format!("   {hint}"),
+            theme.dim().italic(),
+        )));
+    }
+    lines
+}
+
+/// The panel pattern for a turn that has not produced output yet.
+fn turn_pattern(turn: &crate::state::ChatTurn) -> crate::liveness::PanelPattern {
+    match turn.phase {
+        crate::state::TurnPhase::Tool { .. } => crate::state::LivenessState::ToolWait,
+        crate::state::TurnPhase::Writing => crate::state::LivenessState::Streaming,
+        _ => crate::state::LivenessState::Thinking,
+    }
+    .pattern()
 }
 
 /// Whether the transcript's rendering depends on inputs no cache key can
@@ -1546,6 +1677,13 @@ fn push_chat_entry_lines(
             theme,
             width,
         ),
+        ChatEntry::Notice { text } => {
+            let mark = if state.unicode { "·" } else { "-" };
+            lines.push(Line::from(Span::styled(
+                format!("   {mark} {text}"),
+                theme.dim().italic(),
+            )));
+        }
     }
 }
 
@@ -2459,6 +2597,7 @@ fn conversation_chars(state: &AppState) -> usize {
             ChatEntry::ToolCall { args, result, .. } => {
                 args.len() + result.as_ref().map_or(0, |r| r.len())
             }
+            ChatEntry::Notice { .. } => 0,
         })
         .sum()
 }
@@ -4365,8 +4504,19 @@ mod tests {
         );
         assert!(!footer.contains("no response"), "{footer}");
 
+        // A model reading its prompt is silent by nature: not yet a stall…
         state.turn.as_mut().unwrap().last_event =
             std::time::Instant::now() - crate::state::TURN_STALL_AFTER;
+        assert!(!render_footer(&state, 160).contains("no response"));
+        // …until it has been silent far longer than any prompt takes.
+        state.turn.as_mut().unwrap().last_event =
+            std::time::Instant::now() - crate::state::READING_STALL_AFTER;
+        assert!(render_footer(&state, 160).contains("no response"));
+
+        // A model that started answering and went quiet is flagged at 60 s.
+        let turn = state.turn.as_mut().unwrap();
+        turn.enter(crate::state::TurnPhase::Writing);
+        turn.last_event = std::time::Instant::now() - crate::state::TURN_STALL_AFTER;
         assert!(render_footer(&state, 160).contains("no response"));
     }
 
@@ -4493,6 +4643,38 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A turn that has produced nothing yet still says what is going on, on
+    /// the last row, even with the transcript scrolled back (2026-09-23: qwen
+    /// read a 37k prompt for minutes with no sign of life on screen).
+    #[test]
+    fn a_silent_turn_shows_what_the_model_is_doing_on_the_last_row() {
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.chat.push(ChatEntry::User {
+            text: "read the repo".into(),
+            payload: None,
+            started_at: Some(std::time::Instant::now()),
+            duration_ms: None,
+        });
+        state.turn = Some(crate::state::ChatTurn::new(None));
+        state.chat_scroll = 5;
+
+        let screen = render_chat_screen(&state, &theme, 80, 10);
+        let last = screen.lines().nth(8).unwrap_or_default();
+        assert!(
+            last.contains("reading") || last.contains("waiting for"),
+            "{screen}"
+        );
+
+        state
+            .turn
+            .as_mut()
+            .unwrap()
+            .enter(crate::state::TurnPhase::AwaitingYou);
+        let screen = render_chat_screen(&state, &theme, 80, 10);
+        assert!(screen.contains("waiting for your answer"), "{screen}");
     }
 
     /// A tool-call line is clipped to one row; the row still knows which

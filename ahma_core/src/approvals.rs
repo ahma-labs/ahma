@@ -34,8 +34,8 @@ use std::sync::OnceLock;
 
 use ahma_common::config::{AhmaSettings, settings_path};
 use ahma_common::permissions::{
-    AuditAction, GrantKind, GrantTier, PermissionSettings, append_audit, audit_entry,
-    migrate_legacy_approvals, workspace_key, workspace_key_async,
+    AuditAction, GrantKind, GrantTier, PermissionSettings, TRUSTED_WORKSPACE_TOOL, append_audit,
+    audit_entry, migrate_legacy_approvals, workspace_key, workspace_key_async,
 };
 use tracing::{debug, warn};
 
@@ -181,12 +181,101 @@ pub async fn is_tool_approved(workspace: &Path, tool: &str) -> bool {
     settings.permissions.is_tool_approved(&key, tool)
 }
 
+/// Whether a trusted folder's trust (SPEC R-PERM.1.3) covers `tool`.
+///
+/// Trust means "anything that runs inside this folder's kernel sandbox". It
+/// never covers what reaches past that boundary: a tool on an external MCP
+/// server (`server::tool`, which runs in *that* server's process, not ahma's
+/// sandbox), or a built-in that
+/// [crosses it](ahma_mcp::builtin_tool::BuiltinTool::crosses_sandbox_boundary).
+/// Unknown names are MTDF tools, which ahma runs inside its own sandbox.
+pub fn covered_by_trust(tool: &str) -> bool {
+    if tool.contains("::") {
+        return false;
+    }
+    ahma_mcp::builtin_tool::BuiltinTool::from_name(tool)
+        .is_none_or(|builtin| !builtin.crosses_sandbox_boundary())
+}
+
+/// Whether `tool` may run in `workspace` without asking: it was granted
+/// "always allow" here, or the folder is trusted and trust covers it.
+///
+/// Fails closed exactly like [`is_tool_approved`].
+pub async fn is_tool_allowed(workspace: &Path, tool: &str) -> bool {
+    let settings = AhmaSettings::load_async().await;
+    let key = workspace_key_async(workspace).await;
+    let perms = &settings.permissions;
+    perms.is_tool_approved(&key, tool)
+        || (covered_by_trust(tool) && perms.is_workspace_trusted(&key))
+}
+
+/// Whether `workspace` is a trusted folder (synchronous, for the TUI).
+pub fn is_workspace_trusted(workspace: &Path) -> bool {
+    migrate_once();
+    load_permissions().is_workspace_trusted(&workspace_key(workspace))
+}
+
 /// Persist an "always allow" grant for `tool` in `workspace`.
 ///
 /// Reads the current ledger, inserts the grant idempotently, and writes it back.
 /// Errors are logged and returned; a failed write degrades gracefully to
 /// re-prompting next time.
 pub fn remember_tool_approval(workspace: &Path, tool: &str) -> std::io::Result<()> {
+    persist_workspace_grant(workspace, tool, |perms, key, at, surface| {
+        perms.approve_tool(key, tool, at, surface)
+    })?;
+    debug!("approvals: persisted always-allow for {tool}");
+    Ok(())
+}
+
+/// Whether `workspace` may be offered (and recorded) as a trusted folder.
+///
+/// Never a filesystem root, the home directory, or an ancestor of it: trusting
+/// any of those would auto-approve writes across everything the user owns,
+/// which is the opposite of what a one-keystroke "trust this folder" should
+/// ever mean. `home` is passed in so the rule is testable without the real one.
+pub fn trust_allowed(workspace: &Path, home: Option<&Path>) -> bool {
+    let ws = workspace_key(workspace);
+    if ws.parent().is_none() {
+        return false;
+    }
+    match home.map(workspace_key) {
+        Some(home) => !home.starts_with(&ws),
+        None => true,
+    }
+}
+
+/// Mark `workspace` as a trusted folder (SPEC R-PERM.1.3): every tool that runs
+/// inside its sandbox stops asking. Audit-logged like any other grant.
+///
+/// Refuses the folders [`trust_allowed`] rules out, whoever asks.
+pub fn trust_workspace(workspace: &Path) -> std::io::Result<()> {
+    let home = ahma_common::config::ahma_home_dir();
+    if !trust_allowed(workspace, home.as_deref()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to trust {}: a root, your home directory or one of its \
+                 parents is too broad to trust as one folder",
+                workspace.display()
+            ),
+        ));
+    }
+    persist_workspace_grant(
+        workspace,
+        TRUSTED_WORKSPACE_TOOL,
+        |perms, key, at, surface| perms.trust_workspace(key, at, surface),
+    )?;
+    debug!("approvals: trusted workspace {}", workspace.display());
+    Ok(())
+}
+
+/// The shared write path: strict load, apply `grant`, atomic save, audit.
+fn persist_workspace_grant(
+    workspace: &Path,
+    subject: &str,
+    grant: impl FnOnce(&mut PermissionSettings, &Path, Option<String>, Option<String>) -> bool,
+) -> std::io::Result<()> {
     migrate_once();
     let Some(path) = settings_path() else {
         warn!("approvals: no home directory available; cannot persist grant");
@@ -204,9 +293,9 @@ pub fn remember_tool_approval(workspace: &Path, tool: &str) -> std::io::Result<(
 
     let key = workspace_key(workspace);
     let now = chrono::Local::now();
-    let added = settings.permissions.approve_tool(
+    let added = grant(
+        &mut settings.permissions,
         &key,
-        tool,
         Some(now.format("%Y-%m-%d").to_string()),
         Some("tui".to_string()),
     );
@@ -220,13 +309,12 @@ pub fn remember_tool_approval(workspace: &Path, tool: &str) -> std::io::Result<(
             now.to_rfc3339(),
             AuditAction::Grant,
             GrantKind::Tool,
-            tool,
+            subject,
             None,
             GrantTier::Always,
             Some("tui".to_string()),
         ));
     }
-    debug!("approvals: persisted always-allow for {tool}");
     Ok(())
 }
 
@@ -234,6 +322,24 @@ pub fn remember_tool_approval(workspace: &Path, tool: &str) -> std::io::Result<(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn trust_is_never_offered_for_home_root_or_their_ancestors() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("github").join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        assert!(trust_allowed(&project, Some(home.path())));
+        assert!(
+            !trust_allowed(home.path(), Some(home.path())),
+            "home itself"
+        );
+        assert!(
+            !trust_allowed(home.path().parent().unwrap(), Some(home.path())),
+            "a parent of home"
+        );
+        assert!(!trust_allowed(Path::new("/"), Some(home.path())), "root");
+    }
 
     fn perms(pairs: &[(&str, &[&str])]) -> PermissionSettings {
         let mut p = PermissionSettings::default();

@@ -344,7 +344,39 @@ impl PermissionSettings {
         }
         true
     }
+
+    /// Whether the workspace `key` is a **trusted folder** (SPEC R-PERM.1.3):
+    /// the user answered the one-time "trust this folder?" question with yes.
+    pub fn is_workspace_trusted(&self, key: &Path) -> bool {
+        self.is_tool_approved(key, TRUSTED_WORKSPACE_TOOL)
+    }
+
+    /// Mark `key` as a trusted folder. Idempotent; returns `true` when this
+    /// changed anything.
+    pub fn trust_workspace(
+        &mut self,
+        key: &Path,
+        granted_at: Option<String>,
+        surface: Option<String>,
+    ) -> bool {
+        self.approve_tool(key, TRUSTED_WORKSPACE_TOOL, granted_at, surface)
+    }
 }
+
+/// The tool-approval entry that records a **trusted folder** (SPEC R-PERM.1.3).
+///
+/// Trust is stored as a wildcard tool in the existing `tool_approvals` list
+/// rather than a new `[permissions]` key on purpose: that table is
+/// `deny_unknown_fields`, and a daemon left running from an older release would
+/// refuse to parse a settings file carrying a key it has never heard of —
+/// taking every other grant down with it. An older binary reads `"*"` as a tool
+/// literally named `*`, which never matches a real call, so it simply keeps
+/// prompting: fail-closed. `ahma permissions revoke tool '*' --workspace <dir>`
+/// withdraws the trust.
+///
+/// Trust never covers what crosses the sandbox boundary; that decision lives
+/// with the caller (`ahma_core::approvals::covered_by_trust`), not here.
+pub const TRUSTED_WORKSPACE_TOOL: &str = "*";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Workspace keys
@@ -798,6 +830,23 @@ mod tests {
         assert!(!p.is_tool_approved(&key("/b"), "list_dir"));
         assert!(p.tool_approved_elsewhere(&key("/b"), "list_dir"));
         assert!(!p.workspace_known(&key("/b")));
+    }
+
+    #[test]
+    fn trust_is_workspace_scoped_and_does_not_approve_named_tools() {
+        let mut p = PermissionSettings::default();
+        assert!(!p.is_workspace_trusted(&key("/a")));
+        assert!(p.trust_workspace(&key("/a"), None, None));
+        assert!(!p.trust_workspace(&key("/a"), None, None), "idempotent");
+
+        assert!(p.is_workspace_trusted(&key("/a")));
+        assert!(!p.is_workspace_trusted(&key("/b")));
+        // The wildcard is a marker, not a pattern: it approves no named tool on
+        // its own — which tools trust covers is decided by the caller.
+        assert!(!p.is_tool_approved(&key("/a"), "write_file"));
+
+        assert!(p.revoke_tool(&key("/a"), TRUSTED_WORKSPACE_TOOL));
+        assert!(!p.is_workspace_trusted(&key("/a")));
     }
 
     #[test]

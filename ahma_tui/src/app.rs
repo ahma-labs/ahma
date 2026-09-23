@@ -108,6 +108,7 @@ pub async fn run(
     // in a log file the user was never told about.
     drain_startup_notices(&mut state);
     load_granted_scopes(&mut state);
+    offer_folder_trust(&mut state);
 
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
     state.mcp_source_tx = Some(spawn_mcp_source(
@@ -132,6 +133,11 @@ pub async fn run(
     // Bridge channel carries both provider discovery results and LLM tokens.
     let (bridge_tx, mut bridge_rx) = mpsc::channel::<BridgeEvent>(512);
     spawn_discovery_task(bridge_tx.clone());
+    // Local model servers come and go (Ollama started after the TUI, LM Studio
+    // quit): look again now and then while idle, so the picker and the
+    // fallback work from what is actually running rather than a startup
+    // snapshot.
+    let mut last_discovery = std::time::Instant::now();
     // Populate the external MCP tools counter at startup (avoids needing `/mcp refresh`).
     crate::llm_bridge::spawn_external_tools_refresh(
         state.mcp_connections.clone(),
@@ -213,6 +219,7 @@ pub async fn run(
                             } else if handle_settings_key(key, &mut state)
                                 || handle_help_key(key, &mut state)
                                 || handle_picker_key(key, &mut state)
+                                || handle_trust_key(key, &mut state)
                                 || handle_scope_grant_key(key, &mut state)
                                 || handle_web_approval_key(key, &mut state)
                                 || handle_approval_key(key, &mut state)
@@ -287,6 +294,14 @@ pub async fn run(
                 }) => {
                     // Periodic redraw / animation update
                     let now = std::time::Instant::now();
+                    if !chat_in_progress(&state)
+                        && now.duration_since(last_discovery) >= PROVIDER_REDISCOVERY_EVERY
+                    {
+                        last_discovery = now;
+                        if let Some(tx) = state.bridge_tx.clone() {
+                            spawn_discovery_task(tx);
+                        }
+                    }
                     for w in &mut state.windows {
                         if w.visible && w.finished_at.is_some_and(|t| now.duration_since(t) >= std::time::Duration::from_secs(300)) {
                             w.visible = false;
@@ -1143,14 +1158,20 @@ fn handle_approval_action(
 }
 
 /// "Always allow": persist a grant for this tool+workspace (so it is never
-/// re-prompted), then approve this call. Persistence lives outside the sandbox
-/// in `~/.config/ahma/` — see [`ahma_core::approvals`].
+/// re-prompted), then approve this call. The grant is keyed by the workspace
+/// the asking agent checks ([`crate::state::ApprovalGate::workspace`]), and
+/// lives outside the sandbox in `~/.ahma/settings.toml` — see
+/// [`ahma_core::approvals`].
 fn resolve_approval_always(state: &mut crate::state::AppState) {
     use crate::state::{LogEntry, LogLevel};
 
     if let Some(gate) = state.approval.as_ref() {
         let tool = gate.tool.clone();
-        let workspace = std::path::PathBuf::from(&state.workspace);
+        let workspace = if gate.workspace.is_empty() {
+            std::path::PathBuf::from(&state.workspace)
+        } else {
+            std::path::PathBuf::from(&gate.workspace)
+        };
         match ahma_core::approvals::remember_tool_approval(&workspace, &tool) {
             Ok(()) => state.push_log(LogEntry {
                 timestamp: chrono::Local::now(),
@@ -1229,6 +1250,15 @@ fn resolve_approval(state: &mut crate::state::AppState, approved: bool) {
     let Some(gate) = state.approval.take() else {
         return;
     };
+    if let Some(turn) = state.turn.as_mut() {
+        turn.enter(if approved {
+            crate::state::TurnPhase::Tool {
+                name: gate.tool.clone(),
+            }
+        } else {
+            crate::state::TurnPhase::Reading
+        });
+    }
 
     if let Some(tx) = state.approval_tx.take() {
         let _ = tx.send(approved);
@@ -1542,6 +1572,7 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
         return;
     }
 
+    state.turn_retries = 0;
     state.chat.push(ChatEntry::User {
         text,
         payload: None,
@@ -1632,9 +1663,108 @@ fn end_turn(state: &mut crate::state::AppState) {
 }
 
 fn end_turn_with_error(state: &mut crate::state::AppState, error: &str) {
+    let transient = is_transient_turn_error(error);
+    // Retry by ourselves only when it is safe to: the failure looks like the
+    // connection, not the request, and no answer text has arrived yet (a
+    // half-written reply would otherwise be sent back to the model as if it
+    // had said it). Once per message — a second failure is reported.
+    let retry = transient
+        && state.turn_retries == 0
+        && state.turn.as_ref().is_some_and(|t| t.streamed_chars == 0);
     end_turn(state);
-    push_assistant_message(state, format!("Error: {error}"));
     state.chat_scroll = 0;
+    if retry {
+        let (base_url, model) = parse_llm_selection(state);
+        if !base_url.is_empty() {
+            state.turn_retries += 1;
+            state.chat.push(crate::state::ChatEntry::Notice {
+                text: format!(
+                    "{} dropped the request ({}) — trying again now",
+                    crate::ui::shorten_llm_label(&state.llm_label()),
+                    first_line(error)
+                ),
+            });
+            state.chat.push(crate::state::ChatEntry::Assistant {
+                content: String::new(),
+                streaming: true,
+            });
+            send_chat_turn(state, base_url, model);
+            return;
+        }
+    }
+    push_assistant_message(state, format!("Error: {error}"));
+    if transient {
+        state.chat.push(crate::state::ChatEntry::Notice {
+            text: "The model could not be reached. Your message is still here: send it again \
+                   when ready, or /model to pick another."
+                .to_string(),
+        });
+    }
+}
+
+/// A dim one-line account of a slow turn — how long, how much the model read,
+/// how fast it wrote — so choosing a different model or a smaller context is
+/// an informed decision. Quick turns get none: the numbers only matter when
+/// the wait did.
+fn turn_summary(state: &crate::state::AppState) -> Option<String> {
+    let turn = state.turn.as_ref()?;
+    let now = std::time::Instant::now();
+    let took = now.duration_since(turn.started);
+    if took < std::time::Duration::from_secs(10) {
+        return None;
+    }
+    let label = state.llm_label();
+    let mut parts = vec![
+        crate::ui::shorten_llm_label(&label),
+        format!("took {}", crate::ui::format_elapsed_short(took)),
+    ];
+    let read = state
+        .window_usage
+        .get(&crate::state::AppState::usage_key(
+            turn.target_instance.as_deref(),
+        ))
+        .map_or(0, |u| u.last_prompt_tokens);
+    if read > 0 {
+        let rate = state
+            .read_rates
+            .get(&label)
+            .map(|r| format!(" at {} tok/s", r.round()))
+            .unwrap_or_default();
+        parts.push(format!("read {}k tokens{rate}", read.div_ceil(1000)));
+    }
+    if let Some(rate) = turn.tokens_per_sec(now) {
+        parts.push(format!("wrote {rate} tok/s"));
+    }
+    Some(parts.join(" · "))
+}
+
+/// Whether a turn error is the connection's fault (worth one quiet retry)
+/// rather than the request's (a 4xx, a refused tool, a cancel).
+fn is_transient_turn_error(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    if e.contains("cancel") {
+        return false;
+    }
+    [
+        "timed out",
+        "timeout",
+        "connection",
+        "error sending request",
+        "broken pipe",
+        "unexpected eof",
+        "reset by peer",
+        "502",
+        "503",
+        "504",
+        "overloaded",
+    ]
+    .iter()
+    .any(|needle| e.contains(needle))
+}
+
+/// The first line of a (possibly multi-line) error, for a one-line notice.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or(text).trim()
 }
 
 /// Stop the running turn, if any. The turn ends here at once rather than on
@@ -2277,6 +2407,72 @@ fn handle_approval_key(
     }
 }
 
+/// Raise the one-time "trust this folder?" question (SPEC R-PERM.1.3) when the
+/// workspace is new to ahma. Not offered for a folder that is already trusted,
+/// or for one too broad ever to trust (home, a root — see
+/// [`ahma_core::approvals::trust_allowed`]); there the per-tool questions stay.
+fn offer_folder_trust(state: &mut crate::state::AppState) {
+    let workspace = std::path::Path::new(&state.workspace);
+    if state.workspace.is_empty()
+        || ahma_core::approvals::is_workspace_trusted(workspace)
+        || !ahma_core::approvals::trust_allowed(
+            workspace,
+            ahma_common::config::ahma_home_dir().as_deref(),
+        )
+    {
+        return;
+    }
+    state.trust_prompt = Some(state.workspace.clone());
+}
+
+/// Keys for the trust question. **Enter-safe** like every gate: only `y`
+/// trusts; `n`, Enter and Esc keep asking per tool.
+fn handle_trust_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
+    use crate::state::{LogEntry, LogLevel};
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if state.trust_prompt.is_none()
+        || state.text_entry_modal_open()
+        || state.log_filter_active
+        || state.typing_in_chat()
+    {
+        return false;
+    }
+    let trust = match (key.code, key.modifiers) {
+        (KeyCode::Char('y'), KeyModifiers::NONE) => true,
+        (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => false,
+        _ => return false,
+    };
+    let Some(folder) = state.trust_prompt.take() else {
+        return false;
+    };
+    let (level, message) = if !trust {
+        (
+            LogLevel::Info,
+            format!("Not trusting {folder}: ahma will ask before each tool that changes things"),
+        )
+    } else {
+        match ahma_core::approvals::trust_workspace(std::path::Path::new(&folder)) {
+            Ok(()) => (
+                LogLevel::Info,
+                format!(
+                    "Trusted {folder}: tools run here without asking. Anything outside it, \
+                     network access and settings changes still ask. \
+                     Undo: ahma permissions revoke tool '*' --workspace {folder}"
+                ),
+            ),
+            Err(e) => (LogLevel::Warn, format!("Could not trust {folder}: {e}")),
+        }
+    };
+    set_footer_hint(state, message.clone());
+    state.push_log(LogEntry {
+        timestamp: chrono::Local::now(),
+        level,
+        message,
+    });
+    true
+}
+
 /// Keys for the scope-grant modal. Three-valued and **Enter-safe**: Enter / Esc /
 /// `n` deny (the default), `r` grants read-only, `y` grants read+write. Widening
 /// always requires an explicit non-default key (SPEC R5.3.1).
@@ -2877,11 +3073,10 @@ fn set_minimize_tokens(state: &mut crate::state::AppState, desired: bool) {
     state.minimize_tokens = desired;
     state.token_prefs.minimize_tokens = Some(desired);
 
-    let mut settings = ahma_common::config::AhmaSettings::load();
-    settings.tools.minimize_tokens = desired;
+    let saved = ahma_common::config::AhmaSettings::update(|s| s.tools.minimize_tokens = desired);
     let status = if desired { "on" } else { "off" };
-    match settings.save() {
-        Ok(()) => push_assistant_message(
+    match saved {
+        Ok(_) => push_assistant_message(
             state,
             format!("Token minimization turned **{status}** (saved to settings)."),
         ),
@@ -2904,10 +3099,8 @@ fn set_execution_mode(
     state: &mut crate::state::AppState,
     mode: ahma_common::config::ExecutionPolicy,
 ) {
-    let mut settings = ahma_common::config::AhmaSettings::load();
-    settings.tools.execution_mode = mode;
-    match settings.save() {
-        Ok(()) => {
+    match ahma_common::config::AhmaSettings::update(|s| s.tools.execution_mode = mode) {
+        Ok(_) => {
             state.settings_editor.note_execution_mode(mode);
             let what = match mode {
                 ahma_common::config::ExecutionPolicy::Sync => "calls wait for their result",
@@ -3358,6 +3551,9 @@ fn push_entry_markdown(md: &mut String, entry: &crate::state::ChatEntry) {
             if let Some(result) = result {
                 md.push_str(&format!("Result:\n\n```\n{}\n```\n\n", result));
             }
+        }
+        crate::state::ChatEntry::Notice { text } => {
+            md.push_str(&format!("_{text}_\n\n"));
         }
     }
 }
@@ -3895,12 +4091,8 @@ fn default_provider_base_url(provider_name: &str) -> String {
 }
 
 /// Persist the current session config to `.ahma/session.toml`.
-fn save_session(state: &crate::state::AppState) {
-    if cfg!(test) {
-        return;
-    }
-
-    use crate::session_config::TuiSessionConfig;
+fn save_session(state: &mut crate::state::AppState) {
+    use crate::session_config::{TuiSessionConfig, WindowLlmConfig, push_recent};
 
     // Straight off the typed selection. Splitting the *display* label here is
     // what wrote `provider = "no LLM"` and `provider = "profile:<alias>"` into
@@ -3909,6 +4101,17 @@ fn save_session(state: &crate::state::AppState) {
         Some(sel) => (sel.persistable_provider().to_string(), sel.model.clone()),
         None => (String::new(), String::new()),
     };
+    push_recent(
+        &mut state.recent_llms,
+        WindowLlmConfig {
+            provider: provider.clone(),
+            model: model.clone(),
+            provider_url: state.current_provider_url.clone(),
+        },
+    );
+    if cfg!(test) {
+        return;
+    }
 
     let cfg = TuiSessionConfig {
         provider: provider.clone(),
@@ -3917,6 +4120,7 @@ fn save_session(state: &crate::state::AppState) {
         mcp_enabled: state.mcp_enabled,
         active_profile: state.active_profile.clone(),
         window_llms: state.window_llms.clone(),
+        recent: state.recent_llms.clone(),
     };
 
     if let Ok(cwd) = std::env::current_dir()
@@ -3934,22 +4138,24 @@ fn save_session(state: &crate::state::AppState) {
 /// (the `[agent]` section). Empty values clear the field. Best-effort: a save
 /// failure is logged, never surfaced — the per-project session save is primary.
 fn persist_selected_model_to_settings(provider: &str, model: &str, provider_url: &Option<String>) {
-    let mut settings = ahma_common::config::AhmaSettings::load();
+    let current = ahma_common::config::AhmaSettings::load();
     let to_opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
     let next_provider = to_opt(provider);
     let next_model = to_opt(model);
 
     // Avoid a needless disk write when nothing changed.
-    if settings.agent.provider == next_provider
-        && settings.agent.model == next_model
-        && &settings.agent.provider_url == provider_url
+    if current.agent.provider == next_provider
+        && current.agent.model == next_model
+        && &current.agent.provider_url == provider_url
     {
         return;
     }
-    settings.agent.provider = next_provider;
-    settings.agent.model = next_model;
-    settings.agent.provider_url = provider_url.clone();
-    if let Err(e) = settings.save() {
+    let saved = ahma_common::config::AhmaSettings::update(|s| {
+        s.agent.provider = next_provider;
+        s.agent.model = next_model;
+        s.agent.provider_url = provider_url.clone();
+    });
+    if let Err(e) = saved {
         debug!("Failed to persist selected model to settings: {e}");
     }
 }
@@ -4015,14 +4221,93 @@ fn handle_instances_updated(
 ) {
     state.active_instances = instances;
     rebuild_available_providers(state);
+    follow_client_model_availability(state);
 }
+
+/// Keep chat on a model that exists (see [`crate::session_config::pick_fallback`]).
+///
+/// An MCP client's own model is only there while that client is connected.
+/// When it goes, chat moves to the most recent model ahma runs itself and says
+/// so; when the same client comes back and the user has not picked anything
+/// else meanwhile, chat moves back — also said. Nothing here ever happens
+/// silently: a model change the user did not make is always announced.
+fn follow_client_model_availability(state: &mut crate::state::AppState) {
+    use crate::session_config::is_client_model_url;
+    let available = |state: &crate::state::AppState, url: &str| {
+        state.available_providers.iter().any(|p| p.base_url == url)
+    };
+
+    // The displaced client model is back, and we are still on our stand-in.
+    if let Some((displaced_sel, displaced_url, stand_in)) = state.displaced_client_model.clone()
+        && available(state, &displaced_url)
+    {
+        if state.llm_selection.as_ref() == Some(&stand_in) {
+            let back_to = crate::ui::shorten_llm_label(&displaced_sel.display_label());
+            state.llm_selection = Some(displaced_sel);
+            state.current_provider_url = Some(displaced_url);
+            state.chat.push(crate::state::ChatEntry::Notice {
+                text: format!("{back_to} is back — chat switched back to it"),
+            });
+            save_session(state);
+        }
+        state.displaced_client_model = None;
+        return;
+    }
+
+    let Some(url) = state.current_provider_url.clone() else {
+        return;
+    };
+    if !is_client_model_url(&url) || available(state, &url) {
+        return;
+    }
+    let gone = state.llm_label();
+    let fallback =
+        crate::session_config::pick_fallback(&state.recent_llms, &state.available_providers)
+            .cloned();
+    let text = match fallback {
+        Some(next) => {
+            let previous = state.llm_selection.clone();
+            let stand_in =
+                crate::state::LlmSelection::named(next.provider.clone(), next.model.clone());
+            state.llm_selection = Some(stand_in.clone());
+            state.current_provider_url = next.provider_url.clone();
+            if let Some(previous) = previous {
+                state.displaced_client_model = Some((previous, url, stand_in));
+            }
+            save_session(state);
+            format!(
+                "{} disconnected — chat switched to {}",
+                crate::ui::shorten_llm_label(&gone),
+                crate::ui::shorten_llm_label(&state.llm_label())
+            )
+        }
+        None => {
+            state.llm_selection = None;
+            state.current_provider_url = None;
+            format!(
+                "{} disconnected and no other model is set up — /setup connects one",
+                crate::ui::shorten_llm_label(&gone)
+            )
+        }
+    };
+    state.chat.push(crate::state::ChatEntry::Notice { text });
+}
+
+/// How often the idle TUI looks for local model servers again.
+const PROVIDER_REDISCOVERY_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn handle_providers_discovered(
     providers: Vec<ahma_llm_monitor::LocalProvider>,
     state: &mut crate::state::AppState,
 ) {
+    // Periodic re-discovery reports the same servers most of the time; only a
+    // real change is worth a rebuild (which re-reads config.toml).
+    if providers == state.discovered_providers && !state.available_providers.is_empty() {
+        return;
+    }
     state.discovered_providers = providers.clone();
     rebuild_available_providers(state);
+    follow_client_model_availability(state);
 
     if state.llm_selection.is_none() {
         if let Some(provider) = state.available_providers.first().cloned() {
@@ -4265,6 +4550,7 @@ fn request_tool_approval(
     id: String,
     tool: String,
     args: String,
+    workspace: Option<String>,
     responder: Option<tokio::sync::oneshot::Sender<bool>>,
 ) {
     // Both of these ask the shared approvals mechanism. The preview used to be
@@ -4273,9 +4559,16 @@ fn request_tool_approval(
     // hiding the arguments — the unsafe direction for a prompt whose whole job
     // is to let the operator see what they are authorising.
     let diff = ahma_core::approvals::argument_preview(&tool, &args);
-    let note = ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
+    if let Some(turn) = state.turn.as_mut() {
+        turn.enter(crate::state::TurnPhase::AwaitingYou);
+    }
+    // Grants are keyed by the workspace the *agent* checks; fall back to ours
+    // only for a peer too old to say which that is.
+    let workspace = workspace.unwrap_or_else(|| state.workspace.clone());
+    let note = ahma_core::approvals::reask_note(std::path::Path::new(&workspace), &tool);
     state.request_approval(
         crate::state::ApprovalGate::new(id, tool.clone(), format!("Execute tool {tool}"))
+            .with_workspace(workspace)
             .with_note(note)
             .with_diff(diff),
         responder,
@@ -4821,8 +5114,13 @@ fn handle_source_gate_event(
 ) {
     use crate::mcp_source::SourceEvent;
     match event {
-        SourceEvent::ApprovalRequested { id, tool, args } => {
-            request_tool_approval(state, id, tool, args, None);
+        SourceEvent::ApprovalRequested {
+            id,
+            tool,
+            args,
+            workspace,
+        } => {
+            request_tool_approval(state, id, tool, args, workspace, None);
         }
         SourceEvent::ScopeGrantRequested { request } => {
             state.scope_grant = Some(crate::state::ScopeGrantGate::from_request(request));
@@ -4962,11 +5260,18 @@ fn handle_source_chat_event(
             state.chat_scroll = 0;
         }
         SourceEvent::ChatThinking { token } => {
+            if let Some(turn) = state.turn.as_mut() {
+                turn.enter(crate::state::TurnPhase::Thinking);
+            }
             state.chat.append_thinking(&token);
             state.mark_stream_activity(crate::state::LivenessState::Thinking);
             state.chat_scroll = 0;
         }
         SourceEvent::AgentDone => {
+            state.turn_retries = 0;
+            if let Some(text) = turn_summary(state) {
+                state.chat.push(crate::state::ChatEntry::Notice { text });
+            }
             end_turn(state);
             append_profile_transcript(state);
             save_transcript(state);
@@ -4983,6 +5288,7 @@ fn handle_source_chat_event(
             if prompt_tokens > 0 {
                 state.last_prompt_tokens = prompt_tokens;
             }
+            record_read_rate(state, prompt_tokens);
             let key = crate::state::AppState::usage_key(
                 state
                     .turn
@@ -4998,11 +5304,18 @@ fn handle_source_chat_event(
             state.mark_stream_activity(state.liveness_state);
         }
         SourceEvent::ToolCallStarted { id, name, args } => {
+            if let Some(turn) = state.turn.as_mut() {
+                turn.enter(crate::state::TurnPhase::Tool { name: name.clone() });
+            }
             state.mark_stream_activity(crate::state::LivenessState::ToolWait);
             state.chat.start_tool_call(id, name, args);
             state.chat_scroll = 0;
         }
         SourceEvent::ToolCallFinished { id, result, failed } => {
+            // The result goes back to the model, which reads it all again.
+            if let Some(turn) = state.turn.as_mut() {
+                turn.enter(crate::state::TurnPhase::Reading);
+            }
             state.mark_stream_activity(crate::state::LivenessState::Thinking);
             state.chat.finish_tool_call(&id, result, failed);
             state.chat_scroll = 0;
@@ -5019,6 +5332,23 @@ fn handle_source_chat_event(
         }
         _ => {}
     }
+}
+
+/// Turn the model's last reading time and the prompt size its provider just
+/// reported into a reading speed for that model, so the next wait can say how
+/// long it will likely take instead of just how long it has been.
+fn record_read_rate(state: &mut crate::state::AppState, prompt_tokens: u32) {
+    let Some(prefill) = state.turn.as_mut().and_then(|t| t.last_prefill.take()) else {
+        return;
+    };
+    let secs = prefill.as_secs_f64();
+    if prompt_tokens == 0 || secs < 0.05 {
+        return;
+    }
+    let model = state.llm_label();
+    state
+        .read_rates
+        .insert(model, f64::from(prompt_tokens) / secs);
 }
 
 /// Append one live output line to an operation's tail buffer and refresh the
@@ -6807,6 +7137,162 @@ mod tests {
             state.chat_input_is_empty(),
             "y must not land in the input box"
         );
+    }
+
+    /// A dropped connection before any answer is retried once, visibly; a
+    /// second drop is reported with what to do next, and never loops.
+    #[test]
+    fn a_dropped_turn_is_retried_once_then_explained() {
+        use crate::state::{AppState, ChatEntry, ChatTurn, LlmSelection};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.llm_selection = Some(LlmSelection::named("Ollama", "qwen3.8:27b"));
+        state.current_provider_url = Some("http://localhost:11434/v1".into());
+        state.turn = Some(ChatTurn::new(None));
+
+        let notices = |state: &AppState| {
+            state
+                .chat
+                .entries()
+                .iter()
+                .filter_map(|e| match e {
+                    ChatEntry::Notice { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        super::end_turn_with_error(&mut state, "error sending request: connection reset");
+        assert!(state.turn.is_some(), "the message is sent again");
+        assert!(notices(&state)[0].contains("trying again now"));
+
+        super::end_turn_with_error(&mut state, "error sending request: connection reset");
+        assert!(state.turn.is_none(), "one retry per message");
+        assert!(notices(&state)[1].contains("send it again"));
+
+        // The notices are for the user, never context for the model.
+        assert!(
+            super::collect_chat_history(&state)
+                .iter()
+                .all(|m| !m.content.contains("trying again"))
+        );
+    }
+
+    /// A client's own model goes away with its client: chat moves to the most
+    /// recent model ahma runs itself, says so, and moves back when the client
+    /// returns — unless the user picked something else in between.
+    #[test]
+    fn chat_follows_a_client_model_away_and_back() {
+        use crate::state::{AppState, ChatEntry, LlmSelection};
+        let ollama = ahma_llm_monitor::LocalProvider {
+            name: "Ollama".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            models: vec!["qwen3.8".into()],
+        };
+        let claude = ahma_llm_monitor::LocalProvider {
+            name: "claude-code (its own model)".into(),
+            base_url: "mcp://claude-code".into(),
+            models: vec!["client's choice".into()],
+        };
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.recent_llms = vec![crate::session_config::WindowLlmConfig {
+            provider: "Ollama".into(),
+            model: "qwen3.8".into(),
+            provider_url: Some(ollama.base_url.clone()),
+        }];
+        let client_sel = LlmSelection::named("claude-code (its own model)", "client's choice");
+        state.llm_selection = Some(client_sel.clone());
+        state.current_provider_url = Some(claude.base_url.clone());
+
+        // Client disconnects.
+        state.available_providers = vec![ollama.clone()];
+        super::follow_client_model_availability(&mut state);
+        assert_eq!(
+            state.current_provider_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        let last_notice = |s: &AppState| match s.chat.entries().back() {
+            Some(ChatEntry::Notice { text }) => text.clone(),
+            other => panic!("expected a notice, got {other:?}"),
+        };
+        assert!(last_notice(&state).contains("switched to"));
+
+        // Client returns: back to it, announced.
+        state.available_providers = vec![ollama.clone(), claude.clone()];
+        super::follow_client_model_availability(&mut state);
+        assert_eq!(state.llm_selection.as_ref(), Some(&client_sel));
+        assert!(last_notice(&state).contains("switched back"));
+
+        // Gone again, but this time the user picks a model before it returns.
+        state.available_providers = vec![ollama.clone()];
+        super::follow_client_model_availability(&mut state);
+        state.llm_selection = Some(LlmSelection::named("Ollama", "other-model"));
+        state.available_providers = vec![ollama, claude];
+        super::follow_client_model_availability(&mut state);
+        assert_eq!(state.llm_selection.as_ref().unwrap().model, "other-model");
+    }
+
+    #[test]
+    fn request_errors_are_not_retried() {
+        assert!(!super::is_transient_turn_error(
+            "HTTP 400: model does not support tools"
+        ));
+        assert!(!super::is_transient_turn_error("cancelled by user"));
+        assert!(super::is_transient_turn_error("llm: operation timed out"));
+    }
+
+    /// The trust question: Enter/Esc/`n` never trust; only `y` does, and it
+    /// persists so the next start does not ask again (SPEC R-PERM.1.3).
+    #[test]
+    fn trust_prompt_only_y_trusts_and_it_persists() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::HOME_SEAM_GUARD.lock();
+        // SAFETY: nextest runs this test in its own process; set before any read.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let project = home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.workspace = dunce::canonicalize(&project)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        super::offer_folder_trust(&mut state);
+        assert!(state.trust_prompt.is_some(), "a new folder is asked about");
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('n')] {
+            super::offer_folder_trust(&mut state);
+            assert!(super::handle_trust_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &mut state
+            ));
+            assert!(state.trust_prompt.is_none());
+            assert!(
+                !ahma_core::approvals::is_workspace_trusted(&project),
+                "{code:?} must not trust"
+            );
+        }
+
+        super::offer_folder_trust(&mut state);
+        assert!(super::handle_trust_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut state
+        ));
+        assert!(ahma_core::approvals::is_workspace_trusted(&project));
+
+        super::offer_folder_trust(&mut state);
+        assert!(
+            state.trust_prompt.is_none(),
+            "a trusted folder is not asked again"
+        );
+
+        // Home itself is never offered.
+        state.workspace = home.path().to_string_lossy().into_owned();
+        super::offer_folder_trust(&mut state);
+        assert!(state.trust_prompt.is_none(), "home is too broad to trust");
     }
 
     /// `r` grants read-only and clears the gate.

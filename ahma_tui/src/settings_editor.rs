@@ -399,10 +399,28 @@ impl SettingsEditor {
         }
     }
 
-    /// Save settings to disk.
+    /// Save the panel's edits to disk.
+    ///
+    /// Writes onto the file *as it is now*, not the snapshot taken when the
+    /// panel opened: everything the panel does not edit — tool approvals,
+    /// trusted folders, scope grants, web domains, the chosen model — comes
+    /// from disk, so a grant recorded while the panel was open is kept.
     pub fn save(&mut self) {
-        match self.settings.save() {
-            Ok(()) => {
+        let edited = self.settings.clone();
+        let saved = AhmaSettings::update(|on_disk| {
+            let persistent_scopes = std::mem::take(&mut on_disk.sandbox.persistent_scopes);
+            on_disk.features = edited.features.clone();
+            on_disk.tools = edited.tools.clone();
+            on_disk.sandbox = edited.sandbox.clone();
+            on_disk.sandbox.persistent_scopes = persistent_scopes;
+            on_disk.logging = edited.logging.clone();
+            on_disk.http = edited.http.clone();
+            on_disk.auth = edited.auth.clone();
+            on_disk.instance = edited.instance.clone();
+        });
+        match saved {
+            Ok(fresh) => {
+                self.settings = fresh;
                 self.dirty = false;
                 self.status_message = Some(("✓ Saved".into(), std::time::Instant::now()));
             }
@@ -1545,6 +1563,44 @@ mod tests {
     }
 
     // ── save() via the AHMA_TEST_HOME debug seam (success path) ────────────
+
+    /// Regression: the panel saved the snapshot it took when opened, erasing
+    /// any grant recorded while it was open — which then got asked again.
+    #[test]
+    fn save_keeps_a_grant_recorded_while_the_panel_was_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::HOME_SEAM_GUARD.lock();
+        // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        unsafe {
+            std::env::set_var("AHMA_TEST_HOME", dir.path());
+        }
+        let mut editor = SettingsEditor::default();
+        editor.open();
+
+        // Meanwhile, another surface records an "always allow".
+        AhmaSettings::update(|s| {
+            s.permissions
+                .approve_tool(std::path::Path::new("/ws"), "list_dir", None, None);
+        })
+        .unwrap();
+
+        editor.item_down();
+        editor.toggle_current();
+        editor.dirty = true;
+        editor.save();
+
+        let reloaded = AhmaSettings::load();
+        assert_eq!(reloaded.tools.execution_mode, ExecutionPolicy::Async);
+        assert!(
+            reloaded
+                .permissions
+                .is_tool_approved(std::path::Path::new("/ws"), "list_dir"),
+            "the grant made while the panel was open survives its save"
+        );
+        unsafe {
+            std::env::remove_var("AHMA_TEST_HOME");
+        }
+    }
 
     #[test]
     fn save_writes_to_home_seam_and_reloads() {
