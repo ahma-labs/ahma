@@ -67,6 +67,8 @@ builtin_tools! {
     FetchWebpage => "fetch_webpage",
     WriteFile => "write_file",
     ReplaceInFile => "replace_in_file",
+    MultiEdit => "multi_edit",
+    ApplyPatch => "apply_patch",
     Agent => "agent",
     TodoWrite => "todo_write",
     LogMonitor => "log_monitor",
@@ -114,6 +116,8 @@ impl BuiltinTool {
             | BuiltinTool::FetchWebpage
             | BuiltinTool::WriteFile
             | BuiltinTool::ReplaceInFile
+            | BuiltinTool::MultiEdit
+            | BuiltinTool::ApplyPatch
             | BuiltinTool::Agent
             | BuiltinTool::LogMonitor => false,
         }
@@ -138,6 +142,8 @@ impl BuiltinTool {
             BuiltinTool::ReadFile
             | BuiltinTool::WriteFile
             | BuiltinTool::ReplaceInFile
+            | BuiltinTool::MultiEdit
+            | BuiltinTool::ApplyPatch
             | BuiltinTool::ListDir
             | BuiltinTool::FileSearch
             | BuiltinTool::GrepSearch
@@ -180,6 +186,8 @@ impl BuiltinTool {
             | BuiltinTool::FetchWebpage
             | BuiltinTool::WriteFile
             | BuiltinTool::ReplaceInFile
+            | BuiltinTool::MultiEdit
+            | BuiltinTool::ApplyPatch
             | BuiltinTool::Agent
             | BuiltinTool::TodoWrite
             | BuiltinTool::LogMonitor => false,
@@ -206,6 +214,8 @@ impl BuiltinTool {
         match self {
             BuiltinTool::WriteFile
             | BuiltinTool::ReplaceInFile
+            | BuiltinTool::MultiEdit
+            | BuiltinTool::ApplyPatch
             | BuiltinTool::RunTerminalCommand
             | BuiltinTool::LogsApprove => true,
             BuiltinTool::Await

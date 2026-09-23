@@ -14,7 +14,7 @@
 //!    the server queries the client for workspace roots to dynamically configure the
 //!    security sandbox for that specific session.
 //! 3. **Tool Discovery (`list_tools`)**: Dynamically transforms MTDF JSON configurations
-//!    and bundled capability flags (like `--rust` or `--git`) into a rich set of
+//!    and bundled capability flags (like `--tools git`) into a rich set of
 //!    tools that the AI can understand and call.
 //! 4. **Execution Routing (`call_tool`)**: Validates incoming arguments against the
 //!    tool's JSON schema and routes the execution request to the [`Adapter`].
@@ -147,6 +147,11 @@ pub struct AhmaMcpService {
         Arc<parking_lot::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>>>,
     /// Custom file operations backend.
     pub file_ops_provider: Arc<dyn FileOpsProvider>,
+    /// What each file looked like when this session last read or wrote it, so
+    /// an edit is refused if the file was never read or has changed since
+    /// (see `handlers::harness_tools`).
+    pub(crate) file_stamps:
+        Arc<parking_lot::Mutex<HashMap<PathBuf, handlers::harness_tools::FileStamp>>>,
     /// Custom web page fetcher.
     pub web_page_fetcher: Arc<dyn WebPageFetcher>,
     /// LLM completion service used by the livelog pipeline.
@@ -253,11 +258,6 @@ fn progress_enabled(force: bool, client_type: crate::client_type::McpClientType)
 }
 
 impl AhmaMcpService {
-    /// Whether the bridge in front of this subprocess (if any) currently has
-    /// a live push channel open to the real client. See the
-    /// [`push_channel_open`](Self::push_channel_open) field docs for why a
-    /// future liveness probe must check this before attempting a
-    /// server-initiated request mid-`await`.
     /// The server's sync/async policy (SPEC R2.1): `tools.execution_mode`, as
     /// resolved from `--sync`/`--async` and the settings files. A service with
     /// no `AppConfig` — an embedding that never set one — keeps async, the
@@ -301,6 +301,11 @@ impl AhmaMcpService {
         })
     }
 
+    /// Whether the bridge in front of this subprocess (if any) currently has
+    /// a live push channel open to the real client. See the
+    /// [`push_channel_open`](Self::push_channel_open) field docs for why a
+    /// future liveness probe must check this before attempting a
+    /// server-initiated request mid-`await`.
     pub(crate) fn push_channel_open(&self) -> bool {
         self.push_channel_open
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -497,7 +502,7 @@ impl AhmaMcpService {
                 handlers::sandbox_grant_tool::sandbox_grant_schema(),
             ),
             BuiltinTool::ReadFile => (
-                "Read UTF-8 text from a scoped file, with optional line slicing.",
+                "Read a text file as numbered lines (`  N<tab>text`; the number is not part of the file). Returns up to 2000 lines from start_line and says how to continue; long lines are cut at 2000 characters; binary files are refused. Read a file before editing or overwriting it.",
                 handlers::harness_tools::read_file_schema(),
             ),
             BuiltinTool::ListDir => (
@@ -505,24 +510,32 @@ impl AhmaMcpService {
                 handlers::harness_tools::list_dir_schema(),
             ),
             BuiltinTool::FileSearch => (
-                "Find files by glob pattern inside the sandbox scope.",
+                "Find files by glob pattern (e.g. `**/*.rs`), most recently modified first. Respects .gitignore and skips hidden files, like ripgrep.",
                 handlers::harness_tools::file_search_schema(),
             ),
             BuiltinTool::GrepSearch => (
-                "Search file contents by plain text or regex.",
+                "Search file contents by plain text or regex. Respects .gitignore, skips binary files. output_mode: content (matching lines, optional context), files (paths only), count (matches per file).",
                 handlers::harness_tools::grep_search_schema(),
             ),
             BuiltinTool::FetchWebpage => (
-                "Fetch and extract readable text from an HTTP/HTTPS webpage.",
+                "Fetch an HTTP/HTTPS page and return its readable text (at most 50,000 characters; pass `query` to keep only the lines that mention it).",
                 handlers::harness_tools::fetch_webpage_schema(),
             ),
             BuiltinTool::WriteFile => (
-                "Write UTF-8 content to a scoped file (create or overwrite).",
+                "Create a file, or overwrite one — an existing file must have been read in this session and not changed since. For changes to part of a file prefer replace_in_file, multi_edit or apply_patch.",
                 handlers::harness_tools::write_file_schema(),
             ),
             BuiltinTool::ReplaceInFile => (
-                "Replace exact string occurrences in a scoped UTF-8 file.",
+                "Replace one exact piece of a file: old_str must occur exactly once (add surrounding lines to make it unique) unless replace_all. Read the file first. Returns the edited lines. On a miss, says what is there instead.",
                 handlers::harness_tools::replace_in_file_schema(),
+            ),
+            BuiltinTool::MultiEdit => (
+                "Several exact replacements in one file, applied in order; if any fails, none is applied. Same rules as replace_in_file for each edit.",
+                handlers::harness_tools::multi_edit_schema(),
+            ),
+            BuiltinTool::ApplyPatch => (
+                "Apply a patch that adds, deletes, updates or moves files (the `*** Begin Patch` format). Nothing is written unless every file operation applies. Files updated or deleted must have been read first.",
+                handlers::harness_tools::apply_patch_schema(),
             ),
             BuiltinTool::Agent => (
                 "Delegate a self-contained task to ahma's own agent loop as a sub-agent. ahma runs its full tool-using loop (read/edit files, run commands in the sandbox, search) with the model the user last selected in `ahma tui`, and returns the final answer. Use this to offload a focused sub-task — investigating code, producing a file or report, or answering a question grounded in the workspace — without doing the steps yourself.",
@@ -867,6 +880,7 @@ impl AhmaMcpService {
                 types::get_global_extension_handlers().read().clone(),
             )),
             file_ops_provider: Arc::new(DefaultFileOpsProvider),
+            file_stamps: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             web_page_fetcher: Arc::new(DefaultWebPageFetcher),
             llm_service: Arc::new(DefaultLlmCompletionService),
             last_received_signal: Arc::new(std::sync::atomic::AtomicU64::new(
@@ -1863,6 +1877,14 @@ impl AhmaMcpService {
             }
             BuiltinTool::ReadFile => {
                 self.handle_read_file(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            BuiltinTool::MultiEdit => {
+                self.handle_multi_edit(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            BuiltinTool::ApplyPatch => {
+                self.handle_apply_patch(run_params.arguments.unwrap_or_default())
                     .await
             }
             BuiltinTool::ListDir => {

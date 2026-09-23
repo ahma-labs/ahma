@@ -179,10 +179,11 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     let tools = tools_result.tools;
 
     // Verify only built-in tools are present
+    let builtins = ahma_mcp::builtin_tool::BuiltinTool::ALL.len();
     assert_eq!(
         tools.len(),
-        20,
-        "Should have exactly 20 built-in tools when no .ahma exists. Got: {:?}",
+        builtins,
+        "Should have exactly the {builtins} built-in tools when no .ahma exists. Got: {:?}",
         tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 

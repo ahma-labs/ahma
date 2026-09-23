@@ -7,12 +7,12 @@
 //! `ahma` uses a subcommand model (git/docker style):
 //!
 //! ```text
-//! ahma serve stdio [--tools rust,python,git]
+//! ahma serve stdio [--tools python,git]
 //! ahma serve http  [--port 3000] [--host 127.0.0.1] [--disable-quic] [--disable-http1-1]
 //! ahma tool run <TOOL> [-- <TOOL_ARGS>...]
 //! ahma tool validate [TARGET]
 //! ahma tool list [--server NAME] [--http URL] [--format json|text] [--mcp-config PATH]
-//! ahma tool info [--tools rust,git] [--format json|text] [TOOL]
+//! ahma tool info [--tools git,python] [--format json|text] [TOOL]
 //! ahma hooks install [--platform claude,codex] [--scope user|project]
 //! ahma update [REF] [--force] [--dry-run] [--install-dir PATH]
 //! ahma verify [PATH] [--self]
@@ -81,7 +81,7 @@ pub struct AppConfig {
     pub tools_dir: Option<PathBuf>,
     /// Whether `tools_dir` was explicitly set (vs auto-detected).
     pub explicit_tools_dir: bool,
-    /// Tool bundles to activate (e.g. ["rust", "python"]).
+    /// Tool bundles to activate (e.g. ["git", "python"]).
     pub tool_bundles: Vec<String>,
 
     // ── Execution ───────────────────────────────────────────────────────────
@@ -1056,8 +1056,8 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub settings_path: Option<PathBuf>,
 
-    /// Tool bundles to enable (e.g. --tools rust --tools python,git).
-    /// Repeat or comma-separate. Available: rust, python, git, fileutils, github, simplify.
+    /// Tool bundles to enable (e.g. --tools git --tools python,fileutils).
+    /// Repeat or comma-separate. Available: python, git, fileutils, github, simplify.
     #[arg(
         long = "tools",
         value_name = "NAME",
@@ -1932,11 +1932,11 @@ pub enum PromptsCommand {
   # Serve over stdio (typical mcp.json entry for Cursor / VS Code)
   ahma serve stdio
 
-  # Serve over stdio and enable the rust + git tool bundles
-  ahma serve stdio --tools rust,git
+  # Serve over stdio and enable the git + github tool bundles
+  ahma serve stdio --tools git,github
 
   # Add temp directory to sandbox scope (for compilers / build tools)
-  ahma serve stdio --tools rust --tmp
+  ahma serve stdio --tmp
 
   # Enable live log monitoring with a custom alert rate limit
   ahma serve stdio --log-monitor --monitor-rate-limit 30
@@ -1970,13 +1970,13 @@ pub enum ServeTransport {
   ahma serve stdio
 
   # Enable specific tool bundles
-  ahma serve stdio --tools rust --tools python,git
+  ahma serve stdio --tools git --tools python,fileutils
 
   # Use a custom tools directory
   ahma serve stdio --tools-dir /path/to/.ahma
 
   # Allow compilers / build tools access to the temp directory
-  ahma serve stdio --tools rust --tmp
+  ahma serve stdio --tmp
 
   # Enable live log monitoring with reduced alert rate
   ahma serve stdio --log-monitor --monitor-rate-limit 30
@@ -2127,10 +2127,10 @@ pub enum ToolCommand {
   ahma tool info
 
   # Include built-in bundles
-  ahma tool info --tools rust,git
+  ahma tool info --tools git,github
 
   # JSON output for scripting
-  ahma tool info --tools rust --format json
+  ahma tool info --tools git --format json
 
   # Show details for a specific tool
   ahma tool info cargo")]
@@ -2173,8 +2173,8 @@ pub struct ListArgs {
 /// Arguments for `ahma tool info`.
 #[derive(Parser, Debug)]
 pub struct InfoArgs {
-    /// Tool bundles to include (e.g. --tools rust --tools python,git).
-    /// Repeat or comma-separate. Available: rust, python, git, fileutils, github, simplify.
+    /// Tool bundles to include (e.g. --tools git --tools python,fileutils).
+    /// Repeat or comma-separate. Available: python, git, fileutils, github, simplify.
     #[arg(long = "tools", value_name = "NAME", value_delimiter = ',')]
     pub tool_bundles: Vec<String>,
 

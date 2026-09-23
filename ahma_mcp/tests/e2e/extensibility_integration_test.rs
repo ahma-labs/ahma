@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ahma_harness_tools::{DirEntryInfo, GrepMatch, WebFetchResult};
+use ahma_harness_tools::{DirEntryInfo, WebFetchResult};
 use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
 use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
@@ -60,8 +60,12 @@ impl FileOpsProvider for MockFileOpsProvider {
         _path: &Path,
         _old_str: &str,
         _new_str: &str,
-    ) -> Result<usize> {
-        Ok(0)
+        _replace_all: bool,
+    ) -> Result<ahma_harness_tools::edit::EditOutcome> {
+        Ok(ahma_harness_tools::edit::EditOutcome {
+            replacements: 0,
+            snippet: String::new(),
+        })
     }
 
     async fn file_search(
@@ -77,12 +81,9 @@ impl FileOpsProvider for MockFileOpsProvider {
         &self,
         _scopes: &[PathBuf],
         _base_dir: &Path,
-        _query: &str,
-        _is_regex: bool,
-        _include_pattern: Option<&str>,
-        _max_results: Option<usize>,
-    ) -> Result<Vec<GrepMatch>> {
-        Ok(vec![])
+        _opts: &ahma_harness_tools::GrepOptions,
+    ) -> Result<ahma_harness_tools::GrepOutput> {
+        Ok(ahma_harness_tools::GrepOutput::Matches(vec![]))
     }
 }
 

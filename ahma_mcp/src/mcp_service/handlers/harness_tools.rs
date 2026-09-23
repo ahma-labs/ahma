@@ -4,7 +4,67 @@ use rmcp::model::{CallToolResult, ErrorData as McpError};
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
+/// A file's identity as last seen by this session: modification time and
+/// length. Two reads with the same stamp saw the same file, for any purpose an
+/// edit cares about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl FileStamp {
+    async fn of(path: &Path) -> Option<Self> {
+        let meta = tokio::fs::metadata(path).await.ok()?;
+        Some(Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        })
+    }
+}
+
+/// The key a path is stamped under: canonical when it exists, so `./a` and
+/// `/abs/a` are the same file.
+fn stamp_key(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn bool_arg(args: &Map<String, Value>, key: &str) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
 impl AhmaMcpService {
+    /// Remember what `path` looks like now (after a read or a write).
+    async fn stamp(&self, path: &Path) {
+        if let Some(stamp) = FileStamp::of(path).await {
+            self.file_stamps.lock().insert(stamp_key(path), stamp);
+        }
+    }
+
+    /// An existing file may be changed only if this session read it and it
+    /// has not changed since. Editing blind is how a model overwrites work it
+    /// never saw — the user's, a formatter's, or its own from a step it has
+    /// forgotten. A new file needs no read.
+    async fn ensure_read_and_unchanged(&self, path: &Path) -> Result<(), McpError> {
+        let Some(now) = FileStamp::of(path).await else {
+            return Ok(());
+        };
+        let seen = self.file_stamps.lock().get(&stamp_key(path)).copied();
+        match seen {
+            None => Err(mcp_invalid_params(format!(
+                "{} has not been read in this session. Read it with read_file first — \
+                 edits are made against what you have seen, so nothing is overwritten blind.",
+                path.display()
+            ))),
+            Some(seen) if seen != now => Err(mcp_invalid_params(format!(
+                "{} has changed since you last read it (by you, a tool, or the user). \
+                 Read it again before editing, so the edit is made against what is there now.",
+                path.display()
+            ))),
+            Some(_) => Ok(()),
+        }
+    }
+
     /// Resolves the `base_dir` argument shared by `file_search`/`grep_search`:
     /// the explicit value if given, else the first sandbox scope, else `.`.
     fn resolve_base_dir(&self, args: &Map<String, Value>) -> PathBuf {
@@ -23,14 +83,11 @@ impl AhmaMcpService {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| mcp_invalid_params("'path' is required"))?;
-        let start_line = args
-            .get("start_line")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize);
-        let end_line = args
-            .get("end_line")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize);
+        let num = |key: &str| args.get(key).and_then(Value::as_u64).map(|v| v as usize);
+        // `offset`/`limit` are the names other harnesses use; both spellings work.
+        let start_line = num("start_line").or_else(|| num("offset"));
+        let end_line = num("end_line")
+            .or_else(|| num("limit").map(|limit| start_line.unwrap_or(1) + limit.max(1) - 1));
 
         let scopes = self.adapter.sandbox().scopes().to_vec();
         let result = self
@@ -38,6 +95,7 @@ impl AhmaMcpService {
             .read_file(&scopes, Path::new(path), start_line, end_line)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
+        self.stamp(Path::new(path)).await;
 
         Ok(text_result(result))
     }
@@ -90,34 +148,52 @@ impl AhmaMcpService {
             .get("query")
             .and_then(Value::as_str)
             .ok_or_else(|| mcp_invalid_params("'query' is required"))?;
-        let is_regex = args
-            .get("is_regex")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let include_pattern = args.get("include_pattern").and_then(Value::as_str);
-        let max_results = args
-            .get("max_results")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize);
+        let output_mode = match args.get("output_mode").and_then(Value::as_str) {
+            None | Some("content") => ahma_harness_tools::GrepOutputMode::Content,
+            Some("files") => ahma_harness_tools::GrepOutputMode::Files,
+            Some("count") => ahma_harness_tools::GrepOutputMode::Count,
+            Some(other) => {
+                return Err(mcp_invalid_params(format!(
+                    "output_mode must be content, files or count, got '{other}'"
+                )));
+            }
+        };
+        let opts = ahma_harness_tools::GrepOptions {
+            query: query.to_string(),
+            is_regex: bool_arg(&args, "is_regex"),
+            case_sensitive: args.get("case_sensitive").and_then(Value::as_bool),
+            include_pattern: args
+                .get("include_pattern")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            max_results: args
+                .get("max_results")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize),
+            context: args
+                .get("context")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(20) as usize,
+            output_mode,
+        };
 
         let base_dir = self.resolve_base_dir(&args);
 
         let scopes = self.adapter.sandbox().scopes().to_vec();
-        let matches = self
+        let found = self
             .file_ops_provider
-            .grep_search(
-                &scopes,
-                &base_dir,
-                query,
-                is_regex,
-                include_pattern,
-                max_results,
-            )
+            .grep_search(&scopes, &base_dir, &opts)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
 
-        let body = serde_json::to_string_pretty(&matches)
+        let mut body = serde_json::to_string_pretty(&found)
             .map_err(|e| mcp_internal(format!("Failed to serialize grep_search result: {e}")))?;
+        if found.len() >= opts.max_results.unwrap_or(200) {
+            body.push_str(
+                "\n(result cap reached — narrow with include_pattern, or raise max_results)",
+            );
+        }
         Ok(text_result(body))
     }
 
@@ -355,6 +431,8 @@ impl AhmaMcpService {
             .ok_or_else(|| mcp_invalid_params("'content' is required"))?;
 
         let path_ref = Path::new(path);
+        // Creating is free; overwriting needs to have seen what is there.
+        self.ensure_read_and_unchanged(path_ref).await?;
         let narrowing = self.narrow_container_for(path_ref);
         let scopes = self.adapter.sandbox().scopes().to_vec();
 
@@ -369,6 +447,7 @@ impl AhmaMcpService {
             .write_file(&scopes, path_ref, content)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
+        self.stamp(path_ref).await;
 
         Ok(disclose_exec_config(
             disclose_narrowing(text_result("File written"), narrowing),
@@ -393,27 +472,142 @@ impl AhmaMcpService {
             .and_then(Value::as_str)
             .ok_or_else(|| mcp_invalid_params("'new_str' is required"))?;
 
-        let narrowing = self.narrow_container_for(Path::new(path));
+        let edits = [ahma_harness_tools::edit::Edit {
+            old_str: old_str.to_string(),
+            new_str: new_str.to_string(),
+            replace_all: bool_arg(&args, "replace_all"),
+        }];
+        self.edit_file(Path::new(path), &edits, "replace_in_file")
+            .await
+    }
+
+    /// `multi_edit`: several edits to one file, applied in order, all or
+    /// nothing.
+    pub async fn handle_multi_edit(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| mcp_invalid_params("'path' is required"))?;
+        let list = args
+            .get("edits")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| mcp_invalid_params("'edits' must be a non-empty array"))?;
+        let mut edits = Vec::with_capacity(list.len());
+        for (i, e) in list.iter().enumerate() {
+            let field = |k: &str| {
+                e.get(k)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| mcp_invalid_params(format!("edits[{i}].{k} is required")))
+            };
+            edits.push(ahma_harness_tools::edit::Edit {
+                old_str: field("old_str")?,
+                new_str: field("new_str")?,
+                replace_all: e
+                    .get("replace_all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+        }
+        self.edit_file(Path::new(path), &edits, "multi_edit").await
+    }
+
+    /// The shared edit path: read-before-edit, container narrowing, the
+    /// exec-config guard, the edit itself, a fresh stamp, and a result that
+    /// shows the changed lines.
+    async fn edit_file(
+        &self,
+        path: &Path,
+        edits: &[ahma_harness_tools::edit::Edit],
+        tool: &str,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_read_and_unchanged(path).await?;
+        let narrowing = self.narrow_container_for(path);
         let scopes = self.adapter.sandbox().scopes().to_vec();
 
-        let exec_config_notice = crate::file_ops::exec_config_write_guard(&scopes, Path::new(path))
+        let exec_config_notice = crate::file_ops::exec_config_write_guard(&scopes, path)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?
             .map(crate::file_ops::ExecConfigDisclosure::into_notice);
 
-        let replaced = self
-            .file_ops_provider
-            .replace_in_file(&scopes, Path::new(path), old_str, new_str)
-            .await
-            .map_err(|e| mcp_internal(e.to_string()))?;
+        let outcome = if tool == "multi_edit" {
+            self.file_ops_provider
+                .multi_edit(&scopes, path, edits)
+                .await
+        } else {
+            let e = &edits[0];
+            self.file_ops_provider
+                .replace_in_file(&scopes, path, &e.old_str, &e.new_str, e.replace_all)
+                .await
+        }
+        .map_err(|e| mcp_internal(e.to_string()))?;
+        self.stamp(path).await;
 
+        let summary = format!(
+            "Edited {} ({} replacement{}):\n{}",
+            path.display(),
+            outcome.replacements,
+            if outcome.replacements == 1 { "" } else { "s" },
+            outcome.snippet
+        );
         Ok(disclose_exec_config(
-            disclose_narrowing(
-                text_result(format!("Replaced {replaced} occurrence(s)")),
-                narrowing,
-            ),
+            disclose_narrowing(text_result(summary), narrowing),
             exec_config_notice,
         ))
+    }
+
+    /// `apply_patch`: a Codex-format patch, relative to `base_dir` (default:
+    /// the first sandbox scope). Files it updates or deletes must have been
+    /// read and be unchanged since, like any edit.
+    pub async fn handle_apply_patch(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let patch = args
+            .get("patch")
+            .or_else(|| args.get("input"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| mcp_invalid_params("'patch' is required"))?;
+        let base_dir = self.resolve_base_dir(&args);
+        let scopes = self.adapter.sandbox().scopes().to_vec();
+
+        let ops = ahma_harness_tools::edit::parse_patch(patch)
+            .map_err(|e| mcp_invalid_params(e.to_string()))?;
+        let mut touched = Vec::new();
+        for op in &ops {
+            let existing = match op {
+                ahma_harness_tools::edit::PatchOp::Add { .. } => None,
+                ahma_harness_tools::edit::PatchOp::Delete { path }
+                | ahma_harness_tools::edit::PatchOp::Update { path, .. } => Some(path),
+            };
+            if let Some(p) = existing {
+                let full = ahma_harness_tools::resolve_patch_path(&scopes, &base_dir, p)
+                    .map_err(|e| mcp_invalid_params(e.to_string()))?;
+                self.ensure_read_and_unchanged(&full).await?;
+            }
+            for p in op.paths() {
+                if let Ok(full) = ahma_harness_tools::resolve_patch_path(&scopes, &base_dir, p) {
+                    touched.push(full);
+                }
+            }
+        }
+
+        let outcome = self
+            .file_ops_provider
+            .apply_patch(&scopes, &base_dir, patch)
+            .await
+            .map_err(|e| mcp_internal(e.to_string()))?;
+        for p in &touched {
+            self.stamp(p).await;
+        }
+        Ok(text_result(format!(
+            "Patch applied:\n{}",
+            outcome.changes.join("\n")
+        )))
     }
 
     /// Select the container subtree this write is for, before the write happens
@@ -471,13 +665,60 @@ pub fn read_file_schema() -> Arc<Map<String, Value>> {
     );
     props.insert(
         "start_line".to_string(),
-        schema::integer_property("1-based inclusive start line."),
+        schema::integer_property("1-based first line (alias: offset). Default 1."),
     );
     props.insert(
         "end_line".to_string(),
-        schema::integer_property("1-based inclusive end line."),
+        schema::integer_property(
+            "1-based last line, inclusive. Default: start_line + 1999 (alias: limit = line count).",
+        ),
     );
     schema::object_input_schema(props, &["path"])
+}
+
+fn edit_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "old_str": {"type": "string", "description": "Exact text to replace, copied from read_file output without the line-number prefix. Must occur exactly once unless replace_all."},
+            "new_str": {"type": "string", "description": "Replacement text."},
+            "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one.", "default": false}
+        },
+        "required": ["old_str", "new_str"]
+    })
+}
+
+pub fn multi_edit_schema() -> Arc<Map<String, Value>> {
+    let mut props = Map::new();
+    props.insert(
+        "path".to_string(),
+        schema::string_property("File to edit (read it first)."),
+    );
+    props.insert(
+        "edits".to_string(),
+        json!({
+            "type": "array",
+            "description": "Edits applied in order to the result of the previous one; if any fails, none is applied.",
+            "items": edit_item_schema(),
+            "minItems": 1
+        }),
+    );
+    schema::object_input_schema(props, &["path", "edits"])
+}
+
+pub fn apply_patch_schema() -> Arc<Map<String, Value>> {
+    let mut props = Map::new();
+    props.insert(
+        "patch".to_string(),
+        schema::string_property(
+            "Patch text: `*** Begin Patch`, then `*** Add File: p` (+lines), `*** Delete File: p`, or `*** Update File: p` (optional `*** Move to: q`, `@@ anchor` lines, then ' '/'-'/'+' lines), then `*** End Patch`. Paths are relative to base_dir.",
+        ),
+    );
+    props.insert(
+        "base_dir".to_string(),
+        schema::string_property("Directory patch paths are relative to. Default: the workspace."),
+    );
+    schema::object_input_schema(props, &["patch"])
 }
 
 pub fn list_dir_schema() -> Arc<Map<String, Value>> {
@@ -522,7 +763,19 @@ pub fn grep_search_schema() -> Arc<Map<String, Value>> {
     );
     props.insert(
         "max_results".to_string(),
-        schema::integer_property("Maximum number of matches to return."),
+        schema::integer_property("Maximum matches (or files, in files/count mode). Default 200."),
+    );
+    props.insert(
+        "case_sensitive".to_string(),
+        json!({"type": "boolean", "description": "Default: case-insensitive for plain text, case-sensitive for a regex."}),
+    );
+    props.insert(
+        "context".to_string(),
+        schema::integer_property("Lines of context before and after each match (max 20)."),
+    );
+    props.insert(
+        "output_mode".to_string(),
+        json!({"type": "string", "enum": ["content", "files", "count"], "description": "content: matching lines (default); files: only paths of matching files; count: matches per file.", "default": "content"}),
     );
     schema::object_input_schema(props, &["query"])
 }
@@ -561,11 +814,17 @@ pub fn replace_in_file_schema() -> Arc<Map<String, Value>> {
     );
     props.insert(
         "old_str".to_string(),
-        schema::string_property("Exact string to replace."),
+        schema::string_property(
+            "Exact text to replace, copied from read_file output without the line-number prefix. Must occur exactly once unless replace_all.",
+        ),
     );
     props.insert(
         "new_str".to_string(),
-        schema::string_property("Replacement string."),
+        schema::string_property("Replacement text."),
+    );
+    props.insert(
+        "replace_all".to_string(),
+        json!({"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one.", "default": false}),
     );
     schema::object_input_schema(props, &["path", "old_str", "new_str"])
 }

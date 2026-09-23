@@ -636,7 +636,20 @@ fn builtin_tool_configs(config: &crate::shell::cli::AppConfig) -> Vec<(String, &
         .into_iter()
         .filter_map(|bundle_string| {
             let bundle_name = bundle_string.as_str();
-            builtin_tool_definition(bundle_name).map(|json| (bundle_string, json))
+            let def = builtin_tool_definition(bundle_name);
+            if def.is_none() {
+                // Silently loading nothing is how a removed bundle stayed
+                // "enabled" for months.
+                tracing::warn!(
+                    "Unknown tool bundle '{bundle_name}' ignored. Known bundles: {}",
+                    crate::mcp_service::bundle_registry::BUNDLES
+                        .iter()
+                        .map(|b| b.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            def.map(|json| (bundle_string, json))
         })
         .collect()
 }

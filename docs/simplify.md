@@ -59,7 +59,7 @@ ahma simplify . --diff
 ahma simplify . --verify src/my_module.rs
 ```
 
-Or via the `simplify` MCP tool (requires `--tools simplify` or `--tools rust,simplify` at
+Or via the `simplify` MCP tool (requires `--tools simplify` at
 server startup):
 
 ```

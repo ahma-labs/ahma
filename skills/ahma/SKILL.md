@@ -120,6 +120,8 @@ Terminates the process and frees resources.
 
 ---
 
+Clients without native file tools also get `read_file`, `replace_in_file`, `multi_edit`, `apply_patch`, `grep_search`… — read before editing; one exact match per edit ([docs/file-tools.md](https://github.com/ahma-labs/ahma/blob/main/docs/file-tools.md)).
+
 ## Sync and Async Modes
 
 Every call is a tracked operation (`status`, `ahma tui`, cancellable, full output in

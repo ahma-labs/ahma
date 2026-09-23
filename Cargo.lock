@@ -133,15 +133,15 @@ name = "ahma_harness_tools"
 version = "0.21.3"
 dependencies = [
  "anyhow",
- "glob",
+ "globset",
  "html2text",
+ "ignore",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
- "walkdir",
  "workspace-hack",
 ]
 
@@ -2662,6 +2662,22 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "ignore"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00b69833ed729dc5aa7d19541d96d6cf8e9137194207a04916d658e43168402f"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
 ]
 
 [[package]]
@@ -5674,7 +5690,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -7111,6 +7127,7 @@ dependencies = [
  "chrono",
  "const-oid 0.9.6",
  "crossbeam-channel",
+ "crossbeam-deque",
  "crossbeam-utils",
  "digest 0.10.7",
  "digest 0.11.3",

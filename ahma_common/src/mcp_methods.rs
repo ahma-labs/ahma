@@ -68,7 +68,7 @@ COMPLETE output of the operation; when the inline output is marked truncated, re
 grep that file instead of re-running the command. \
 For reading, searching, and editing files (read, grep, glob, edit) keep using the \
 IDE's native file tools — that is what they are for; ahma withholds its own \
-read_file/write_file/replace_in_file/list_dir/file_search/grep_search from clients \
+read_file/write_file/replace_in_file/multi_edit/apply_patch/list_dir/file_search/grep_search from clients \
 that already have native equivalents."
     };
 }

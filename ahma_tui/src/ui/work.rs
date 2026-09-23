@@ -430,8 +430,6 @@ mod tests {
             .join("\n")
     }
 
-    /// The view is rules and rows, not a box. A border would be a second frame
-    /// drawn around the structure the headers already provide.
     /// A section names the LLM Enter will chat with in it and what that
     /// window has spent, so the choice is visible without opening the chat.
     #[test]
@@ -461,6 +459,8 @@ mod tests {
         );
     }
 
+    /// The view is rules and rows, not a box. A border would be a second frame
+    /// drawn around the structure the headers already provide.
     #[test]
     fn the_work_view_draws_no_box() {
         let screen = render(&state_with_work(), 80, 12);

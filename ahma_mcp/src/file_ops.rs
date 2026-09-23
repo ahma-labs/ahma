@@ -1,7 +1,8 @@
 use crate::sandbox::exec_config::{
     ExecConfigClass, classify, escape_hatch, needs_git_dir_resolution, resolve_git_dirs_async,
 };
-use ahma_harness_tools::{DirEntryInfo, GrepMatch, WebFetchResult};
+use ahma_harness_tools::edit::{Edit, EditOutcome};
+use ahma_harness_tools::{DirEntryInfo, GrepOptions, GrepOutput, PatchOutcome, WebFetchResult};
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -164,13 +165,54 @@ pub trait FileOpsProvider: Send + Sync {
     ) -> Result<String>;
     async fn list_dir(&self, scopes: &[PathBuf], path: &Path) -> Result<Vec<DirEntryInfo>>;
     async fn write_file(&self, scopes: &[PathBuf], path: &Path, content: &str) -> Result<()>;
+    /// Replace `old_str` (which must occur once unless `replace_all`).
     async fn replace_in_file(
         &self,
         scopes: &[PathBuf],
         path: &Path,
         old_str: &str,
         new_str: &str,
-    ) -> Result<usize>;
+        replace_all: bool,
+    ) -> Result<EditOutcome>;
+
+    /// Several edits to one file, all or nothing. The default goes through
+    /// the same write guard and audit record as every other write.
+    async fn multi_edit(
+        &self,
+        scopes: &[PathBuf],
+        path: &Path,
+        edits: &[Edit],
+    ) -> Result<EditOutcome> {
+        let disclosure = exec_config_write_guard(scopes, path).await?;
+        let outcome = ahma_harness_tools::multi_edit(scopes, path, edits).await?;
+        record_trust_handoff_write(disclosure.as_ref(), "multi_edit").await;
+        Ok(outcome)
+    }
+
+    /// A Codex-format patch under `base_dir`. Every path it writes or removes
+    /// (including a move target) passes the write guard before anything is
+    /// changed; each `Disclose`-tier write is audited once it has landed.
+    async fn apply_patch(
+        &self,
+        scopes: &[PathBuf],
+        base_dir: &Path,
+        patch: &str,
+    ) -> Result<PatchOutcome> {
+        let ops = ahma_harness_tools::edit::parse_patch(patch)?;
+        let mut disclosures = Vec::new();
+        for op in &ops {
+            for p in op.paths() {
+                let full = ahma_harness_tools::resolve_patch_path(scopes, base_dir, p)?;
+                disclosures.push(exec_config_write_guard(scopes, &full).await?);
+            }
+        }
+        let outcome = ahma_harness_tools::apply_patch(scopes, base_dir, patch).await?;
+        for d in &disclosures {
+            record_trust_handoff_write(d.as_ref(), "apply_patch").await;
+        }
+        Ok(outcome)
+    }
+
     async fn file_search(
         &self,
         scopes: &[PathBuf],
@@ -181,11 +223,8 @@ pub trait FileOpsProvider: Send + Sync {
         &self,
         scopes: &[PathBuf],
         base_dir: &Path,
-        query: &str,
-        is_regex: bool,
-        include_pattern: Option<&str>,
-        max_results: Option<usize>,
-    ) -> Result<Vec<GrepMatch>>;
+        opts: &GrepOptions,
+    ) -> Result<GrepOutput>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -230,11 +269,14 @@ impl FileOpsProvider for DefaultFileOpsProvider {
         path: &Path,
         old_str: &str,
         new_str: &str,
-    ) -> Result<usize> {
+        replace_all: bool,
+    ) -> Result<EditOutcome> {
         let disclosure = exec_config_write_guard(scopes, path).await?;
-        let replaced = ahma_harness_tools::replace_in_file(scopes, path, old_str, new_str).await?;
+        let outcome =
+            ahma_harness_tools::replace_in_file(scopes, path, old_str, new_str, replace_all)
+                .await?;
         record_trust_handoff_write(disclosure.as_ref(), "replace_in_file").await;
-        Ok(replaced)
+        Ok(outcome)
     }
 
     async fn file_search(
@@ -259,25 +301,14 @@ impl FileOpsProvider for DefaultFileOpsProvider {
         &self,
         scopes: &[PathBuf],
         base_dir: &Path,
-        query: &str,
-        is_regex: bool,
-        include_pattern: Option<&str>,
-        max_results: Option<usize>,
-    ) -> Result<Vec<GrepMatch>> {
-        // Synchronous WalkDir + per-file reads; keep it off the async workers.
+        opts: &GrepOptions,
+    ) -> Result<GrepOutput> {
+        // Synchronous walk + per-file reads; keep it off the async workers.
         let scopes = scopes.to_vec();
         let base_dir = base_dir.to_path_buf();
-        let query = query.to_string();
-        let include_pattern = include_pattern.map(str::to_string);
+        let opts = opts.clone();
         tokio::task::spawn_blocking(move || {
-            ahma_harness_tools::grep_search(
-                &scopes,
-                &base_dir,
-                &query,
-                is_regex,
-                include_pattern.as_deref(),
-                max_results,
-            )
+            ahma_harness_tools::grep_search(&scopes, &base_dir, &opts)
         })
         .await?
     }
@@ -352,7 +383,10 @@ mod tests {
             .read_file(&scopes, &file, None, None)
             .await
             .expect("read_file should succeed");
-        assert_eq!(content, "line one\nline two\nline three");
+        assert_eq!(
+            content,
+            "     1\tline one\n     2\tline two\n     3\tline three"
+        );
     }
 
     #[tokio::test]
@@ -372,7 +406,10 @@ mod tests {
             .read_file(&scopes, &file, Some(2), Some(4))
             .await
             .expect("read_file slice should succeed");
-        assert_eq!(slice, "b\nc\nd");
+        assert_eq!(
+            slice,
+            "     2\tb\n     3\tc\n     4\td\n… 1 more lines (read on with start_line=5)"
+        );
     }
 
     #[tokio::test]
@@ -419,17 +456,17 @@ mod tests {
             .await
             .expect("write_file should succeed");
 
-        let count = provider
-            .replace_in_file(&scopes, &file, "foo", "qux")
+        let outcome = provider
+            .replace_in_file(&scopes, &file, "foo", "qux", true)
             .await
             .expect("replace_in_file should succeed");
-        assert_eq!(count, 3);
+        assert_eq!(outcome.replacements, 3);
 
         let updated = provider
             .read_file(&scopes, &file, None, None)
             .await
             .expect("read updated file");
-        assert_eq!(updated, "qux bar qux baz qux");
+        assert_eq!(updated, "     1\tqux bar qux baz qux");
     }
 
     #[tokio::test]
@@ -445,7 +482,7 @@ mod tests {
             .expect("write_file should succeed");
 
         let result = provider
-            .replace_in_file(&scopes, &file, "missing", "x")
+            .replace_in_file(&scopes, &file, "missing", "x", false)
             .await;
         assert!(result.is_err(), "expected error when old_str not present");
     }
@@ -489,10 +526,17 @@ mod tests {
             .await
             .expect("write grep file");
 
-        let matches = provider
-            .grep_search(&scopes, &base, "target", false, None, None)
+        let opts = ahma_harness_tools::GrepOptions {
+            query: "target".into(),
+            ..Default::default()
+        };
+        let GrepOutput::Matches(matches) = provider
+            .grep_search(&scopes, &base, &opts)
             .await
-            .expect("grep_search should succeed");
+            .expect("grep_search should succeed")
+        else {
+            panic!("content mode");
+        };
 
         assert_eq!(matches.len(), 1, "matches: {matches:?}");
         assert_eq!(matches[0].line_number, 2);
@@ -513,15 +557,21 @@ mod tests {
             .expect("write regex file");
 
         // Regex matches the three lines that contain digit runs.
+        let mut opts = ahma_harness_tools::GrepOptions {
+            query: r"\d+".into(),
+            is_regex: true,
+            ..Default::default()
+        };
         let all = provider
-            .grep_search(&scopes, &base, r"\d+", true, None, None)
+            .grep_search(&scopes, &base, &opts)
             .await
             .expect("regex grep should succeed");
         assert_eq!(all.len(), 3, "matches: {all:?}");
 
         // max_results bound stops scanning early.
+        opts.max_results = Some(2);
         let bounded = provider
-            .grep_search(&scopes, &base, r"\d+", true, None, Some(2))
+            .grep_search(&scopes, &base, &opts)
             .await
             .expect("bounded grep should succeed");
         assert_eq!(bounded.len(), 2, "bounded: {bounded:?}");

@@ -180,7 +180,7 @@ mod tests {
         assert!(!idx.bundles.is_empty(), "builtin index should list bundles");
 
         // Known first-party bundles are present and well-formed.
-        for name in ["rust", "python", "git", "fileutils", "github"] {
+        for name in ["python", "git", "fileutils", "github"] {
             let entry = idx
                 .find(name)
                 .unwrap_or_else(|| panic!("builtin index should contain `{name}`"));
@@ -194,9 +194,11 @@ mod tests {
 
         // Spot-check a specific description so the field is load-bearing.
         assert_eq!(
-            idx.find("rust").unwrap().description,
-            "Rust/Cargo build and test tools"
+            idx.find("git").unwrap().description,
+            "Git version control tools"
         );
+        // Removed with its definition; the index must not vouch for it.
+        assert!(idx.find("rust").is_none());
     }
 
     #[test]

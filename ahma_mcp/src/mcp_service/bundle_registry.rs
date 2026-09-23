@@ -23,12 +23,6 @@ pub struct BundleInfo {
 /// All known bundles. Order determines listing order.
 pub const BUNDLES: &[BundleInfo] = &[
     BundleInfo {
-        name: "rust",
-        config_tool_name: "cargo",
-        description: "Cargo/Rust toolchain — build, test, clippy, fmt, doc, audit, nextest",
-        ai_hint: "Need to compile, test, lint, or format Rust code? Activate 'rust' to get cargo build, test, clippy, fmt, nextest, and doc commands.",
-    },
-    BundleInfo {
         name: "fileutils",
         config_tool_name: "file-tools",
         description: "File operations — ls/dir, cp, mv, rm, grep, find, diff",
@@ -86,7 +80,6 @@ mod tests {
 
     /// Every entry the registry is expected to ship, as (name, config_tool_name).
     const EXPECTED: &[(&str, &str)] = &[
-        ("rust", "cargo"),
         ("fileutils", "file-tools"),
         ("github", "gh"),
         ("git", "git"),
@@ -152,7 +145,7 @@ mod tests {
     #[test]
     fn loaded_bundle_names_returns_matching_subset() {
         let mut keys = HashSet::new();
-        keys.insert("cargo".to_string());
+        keys.insert("gh".to_string());
         keys.insert("git".to_string());
 
         let loaded = loaded_bundle_names(&keys);
@@ -160,8 +153,8 @@ mod tests {
 
         assert_eq!(loaded.len(), 2, "expected exactly two matching bundles");
         assert!(
-            names.contains(&"rust"),
-            "cargo key should yield 'rust' bundle"
+            names.contains(&"github"),
+            "gh key should yield the 'github' bundle"
         );
         assert!(names.contains(&"git"), "git key should yield 'git' bundle");
         assert!(
@@ -203,16 +196,19 @@ mod tests {
 
     #[test]
     fn find_bundle_known_name_returns_some() {
-        let b = find_bundle("rust").expect("'rust' bundle should exist");
-        assert_eq!(b.name, "rust");
-        assert_eq!(b.config_tool_name, "cargo");
+        let b = find_bundle("github").expect("'github' bundle should exist");
+        assert_eq!(b.name, "github");
+        assert_eq!(b.config_tool_name, "gh");
     }
 
     #[test]
     fn find_bundle_unknown_name_returns_none() {
         assert!(find_bundle("nonexistent").is_none());
         // Looking up by config name (not human name) must also miss.
-        assert!(find_bundle("cargo").is_none());
+        assert!(find_bundle("gh").is_none());
+        // `rust` was removed (its cargo.json went with it); it must not be
+        // listed as if it could load.
+        assert!(find_bundle("rust").is_none());
     }
 
     #[test]

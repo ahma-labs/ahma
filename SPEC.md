@@ -30,6 +30,7 @@
 | Built-in `await` Tool | tests-pass | Blocking wait for operation completion; soft timeout (R2.5.1); liveness-probed waits are answered by the bridge iff the push channel is live, and a probe-ended wait reports the time that actually passed (R2.6.5.3, R2.6.5.4) |
 | Built-in `cancel` Tool | tests-pass | Cancel running operations |
 | Built-in `run_terminal_command` | tests-pass | Execute arbitrary shell commands within sandbox |
+| Built-in file tools (R26) | tests-pass | Read-before-edit, unique-match edits, `multi_edit`, `apply_patch`, atomic writes, `.gitignore`-aware bounded search; other harnesses' tool/argument names mapped |
 | Batteries-Included Tools | tests-pass | Built-in MTDF setups activated via CLI flags (e.g. `--python`, `--git`) |
 | MTDF Schema Validation | tests-pass | JSON schema validation at startup |
 | Sequence Tools | tests-pass | Chain multiple commands into workflows |
@@ -2047,6 +2048,35 @@ back into `state.session_id` so every later tool call in the turn — and across
 it instead of racing the bridge's session limit. (This id was referenced from four call sites
 — `ahma_tui/SPEC.md`, `ahma_tui/src/llm_bridge.rs`, `ahma_core/src/agent.rs` — before this
 entry existed here; those citations now resolve.)
+
+#### R26: Built-in file tools
+
+The file tools ahma serves itself (`read_file`, `write_file`, `replace_in_file`,
+`multi_edit`, `apply_patch`, `list_dir`, `file_search`, `grep_search`,
+`fetch_webpage`) follow one contract. User guide: [docs/file-tools.md](docs/file-tools.md).
+
+- **R26.1 — Read before change.** Overwriting or editing an existing file
+  **must** be refused unless this session read it and its modification time and
+  length are unchanged since; a successful write re-records it. New files need
+  no read.
+- **R26.2 — An edit names one place.** `old_str` **must** match exactly once
+  unless `replace_all`; a miss reports the nearest match (whitespace-insensitive,
+  or the first line's position).
+- **R26.3 — All or nothing, atomically.** `multi_edit` and `apply_patch` **must**
+  compute every change before writing any; each file is replaced via a temp file
+  and rename, keeping permissions. A file's CRLF line endings are preserved.
+- **R26.4 — Bounded, and says so.** `read_file` (2000 numbered lines, 2000 chars
+  a line, binary refused), `grep_search` (200), `file_search` (1000),
+  `fetch_webpage` (50,000 chars) **must** state when they cut and how to narrow.
+  Search **must** respect `.gitignore`.
+- **R26.5 — Same guard, same audit.** Every path any of them writes, including an
+  `apply_patch` move target, passes the exec-config write guard and is audited
+  (R-HANDOFF), and is scope-checked including not-yet-existing paths (`..`
+  refused).
+- **R26.6 — Other harnesses' vocabulary.** Tool and argument names models are
+  trained on (`Edit`, `str_replace`, `apply_patch`, `file_path`, `old_string`…)
+  are mapped to these tools by the name/argument healer; a name that is itself a
+  known tool is never remapped.
 
 ---
 

@@ -238,6 +238,7 @@ See [docs/live-log-monitoring.md](docs/live-log-monitoring.md) for setup, the An
 - **Custom tools**: If you want to expose your own command-line tools through ahma, start with [docs/custom-tools.md](docs/custom-tools.md).
 - **Agent skills**: Optional agent-specific setup is documented in [docs/agent-skills.md](docs/agent-skills.md).
 - **Code complexity analysis**: `ahma simplify` analyzes source files and returns structured AI fix instructions. See [docs/simplify.md](docs/simplify.md).
+- **Built-in file tools**: read, edit (unique-match, read-before-edit, atomic), `multi_edit`, `apply_patch`, and `.gitignore`-aware search, for clients without their own. See [docs/file-tools.md](docs/file-tools.md).
 
 ---
 
@@ -283,8 +284,12 @@ animation, and a task inside expands into its live output.
   sessions that have since closed.
 - **Approval gates** — tool approvals, sandbox grants, egress — are answered
   here.
-- **Chat is a toggle** (`i`), not the screen: `/analyze [op_id]` asks the model
-  about an operation, `/monitor file <path>` starts log monitoring.
+- **Chat is a toggle** (`i`), not the screen: `/setup` connects an LLM (checked
+  before it is saved), each window keeps its own conversation (`/resume`), and
+  every window shows its model, context fill and token spend. Esc or Ctrl-C
+  stops a running reply.
+- **Sync or async**: the status header shows how tool calls return; `/sync` and
+  `/async` switch it (saved to settings).
 
 See [docs/tui.md](docs/tui.md).
 

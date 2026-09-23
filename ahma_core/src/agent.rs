@@ -949,7 +949,7 @@ fn inject_harness_hints_into_payload(
         append_hint_to_field(
             obj,
             "output",
-            "\n\u{1f4a1} [Harness Hint: When modifying files that already exist, you MUST use `replace_in_file` with exact old/new string matching. Avoid using `write_file` for existing files.]",
+            "\n\u{1f4a1} [Harness Hint: To change this file use `replace_in_file` (old_str copied without the line-number prefix, matching exactly once) or `multi_edit`; `apply_patch` for several files. Avoid `write_file` for existing files.]",
         );
     }
 }

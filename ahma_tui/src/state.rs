@@ -2738,12 +2738,6 @@ impl AppState {
         }
     }
 
-    /// Insert pasted text into the chat input without submitting it.
-    ///
-    /// The trailing newline that terminals append to a paste (e.g. pasting
-    /// `"somecommand\n"`) is stripped so the paste is shown but not sent — the
-    /// user presses Enter to submit. Interior newlines are preserved, so a
-    /// multi-line paste becomes multiple input lines (one request, not many).
     /// A terminal paste. It goes where the user is typing: the log filter if
     /// that is active, otherwise the chat input — opened and focused first,
     /// because text pasted into a closed or unfocused input is text the user
@@ -2760,6 +2754,12 @@ impl AppState {
         self.paste_into_chat_input(text);
     }
 
+    /// Insert pasted text into the chat input without submitting it.
+    ///
+    /// The trailing newline that terminals append to a paste (e.g. pasting
+    /// `"somecommand\n"`) is stripped so the paste is shown but not sent — the
+    /// user presses Enter to submit. Interior newlines are preserved, so a
+    /// multi-line paste becomes multiple input lines (one request, not many).
     pub fn paste_into_chat_input(&mut self, text: &str) {
         {
             let trimmed = text.trim_end_matches(['\r', '\n']);
@@ -3045,7 +3045,6 @@ impl AppState {
             .and_then(|i| self.operations.get(i))
     }
 
-    /// Open the full-screen detail overlay for one operation.
     /// The full text of a tool call, for the detail overlay: a chat row clips
     /// it to the pane width, and clipped content must be reachable (R24.8.4).
     pub fn tool_call_detail(&self, entry_idx: usize) -> Option<String> {
@@ -3073,6 +3072,7 @@ impl AppState {
         }
     }
 
+    /// Open the full-screen detail overlay for one operation.
     pub fn open_operation_detail(&mut self, key: OpKey) {
         self.detail_max_scroll.set(0);
         self.modal = ModalState::OperationDetail(OperationDetailState {
