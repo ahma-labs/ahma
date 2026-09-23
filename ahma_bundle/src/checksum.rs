@@ -12,25 +12,14 @@
 //! bundle file can regenerate the manifest in the same motion and the check
 //! passes. Nothing here is signed; there is no key, no trust root, and no
 //! attacker this defeats. Tamper-evidence needs a detached signature verified
-//! against a key the attacker cannot write — SPEC §11 tracks that as the v0.8
-//! signed bundle index, and it is not implemented.
+//! against a key the attacker cannot write, and it is not implemented.
 //!
-//! ## Why the naming was changed
+//! ## Naming
 //!
-//! This module previously called itself signing. `BundleSigner::sign` documented
-//! its output as "the SHA-256-like digest map" while computing a 64-bit DJB2
-//! string hash — not a cryptographic primitive, collidable by hand. `verify`
-//! carried a `trusted_key_dir` it never read, and the CLI said "Bundle
-//! verification passed". Every one of those strings told a security-conscious
-//! reader that a bundle had been checked against a trust root, when what had
-//! happened was a non-cryptographic checksum comparing a file to a manifest
-//! sitting next to it.
-//!
-//! An over-promise is worse than a missing feature: a missing feature gets built,
-//! whereas a promise that reads as kept is planned around. So the surface now says
-//! what it does. The digest is SHA-256 because there is no reason for a checksum
-//! to be weaker than the standard one, and because "the manifest says SHA-256"
-//! should be true.
+//! Nothing here may be called signing or a signature, on any surface. An
+//! over-promise is worse than a missing feature: a missing feature gets built,
+//! whereas a promise that reads as kept is planned around. The digest is SHA-256
+//! so that "the manifest says SHA-256" is true.
 
 use std::collections::HashMap;
 use std::path::Path;

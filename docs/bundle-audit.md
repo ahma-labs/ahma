@@ -76,17 +76,12 @@ ahma bundle verify /path/to/bundle-dir
 > `verify` passing is not grounds for trusting a bundle whose origin you do not
 > already trust. Run `ahma bundle audit` — which inspects what the tools actually
 > *do* — rather than treating a manifest match as clearance.
->
-> Earlier releases named this `sign`/`verify`, described the digest as SHA-256
-> while computing a 64-bit DJB2 string hash, and carried a "trusted key ring"
-> path that nothing read. The mechanism has not become weaker; the description
-> has become accurate.
 
-## First-party bundle index
+## Trust
 
-Ahma ships a built-in index at `assets/bundle-index.json` that lists all first-party bundles (python, git, fileutils, github). These are always trusted.
-
-Third-party bundles not in the index require explicit `ahma bundle audit` before use.
+Nothing in ahma gates loading on trust: a bundle placed in a tools directory is loaded
+whether or not it was audited. Run `ahma bundle audit` on any third-party bundle before
+you put it there.
 
 ## Programmatic use (`ahma_mcp`)
 

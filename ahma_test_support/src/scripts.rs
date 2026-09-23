@@ -16,7 +16,7 @@
 //! requirement exists to prevent — one file obeying a rule that binds all of
 //! them (AGENTS.md).
 //!
-//! Note the deliberate asymmetry with `test_utils::path_helpers`: this writes a
+//! Note the deliberate asymmetry with [`crate::path_helpers`]: this writes a
 //! real file, so callers must pass a `tempfile::tempdir()` path, never a
 //! location in the repo tree.
 

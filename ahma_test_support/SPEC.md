@@ -1,7 +1,9 @@
 # ahma_test_support Crate Specification
 
 * **Status**: Approved
-* **Date**: 2026-07-27
+* **License**: MIT OR Apache-2.0 (`publish = false`)
+* **Depends on**: no workspace crate
+* **Used by**: dev-dependency of `ahma_mcp` and `ahma_http_bridge`
 
 ## 1. User Story / Problem Statement
 
@@ -13,6 +15,8 @@
 - **`test_out_of_scope_path()`**: A path guaranteed to fall outside any sandbox scope, for asserting that confinement is enforced.
 - **`test_blocked_device_path()`**: The platform device path — `/dev/null` on Unix, `NUL` on Windows.
 - **`test_abs(&["a", "b"])` and `test_root()`**: Platform-rooted absolute paths, so tests never assume `/` is the filesystem root (`C:\` and UNC roots differ).
+- **`skip::skip_or_fail(reason)`**: the one verdict on whether a test may skip itself. Locally a missing prerequisite skips; when `CI` is set it **fails**, because a skip that reads as a pass hides a regression. Every skip site calls it.
+- **`scripts`**: writes an equivalent Bash or PowerShell script for the current platform, so script-driven tests run unchanged on Windows (R6.3.8).
 - **No Production Dependencies**: MUST NOT depend on production crate internals, so a refactor of `ahma_mcp` cannot break the test harness.
 
 ## 3. Non-Functional Requirements

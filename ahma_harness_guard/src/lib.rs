@@ -2,17 +2,14 @@
 //!
 //! Guards that sit between a (typically small, local) model and ahma's tool
 //! dispatch: heal near-miss tool names and malformed JSON arguments, detect a
-//! model looping on the same call, and inject skill text where a harness needs
-//! it. No I/O and no dependency on the MCP engine — `ahma_mcp` re-exports this
+//! model looping on the same call. No I/O and no dependency on the MCP engine — `ahma_mcp` re-exports this
 //! crate as `ahma_mcp::harness_guard`.
 
 pub mod format_healer;
 pub mod loop_detector;
-pub mod skill_injector;
 
 pub use format_healer::{clean_json_trailing_commas, heal_tool_arguments, heal_tool_name};
 pub use loop_detector::LoopDetector;
-pub use skill_injector::SkillInjector;
 
 use parking_lot::Mutex;
 use serde_json::{Map, Value};

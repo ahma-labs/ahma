@@ -47,7 +47,6 @@ async fn main() -> Result<()> {
     };
 
     // --markdown-help: emit the full CLI reference as Markdown and exit.
-    // Regenerate docs/cli-reference.md with:  ahma --markdown-help > docs/cli-reference.md
     if cli.markdown_help {
         print!("{}", clap_markdown::help_markdown::<Cli>());
         return Ok(());
