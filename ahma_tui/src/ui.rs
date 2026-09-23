@@ -882,11 +882,13 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // Clear window_rects at start of drawing
     state.window_rects.borrow_mut().clear();
 
+    // One header in every layout: what matters (is ahma reachable, how will
+    // calls behave, where is the sandbox, how much is running) must not
+    // depend on which pane happens to be zoomed.
+    draw_status_header(frame, state, theme, header_a);
     if let Some(zoom) = state.zoomed {
-        draw_chat_header(frame, state, theme, header_a);
         draw_zoomed_chat_pane(frame, state, theme, body_a, zoom);
     } else {
-        work::draw_work_header(frame, state, theme, header_a);
         draw_main_body(frame, state, theme, body_a);
     }
 
@@ -953,49 +955,6 @@ fn draw_main_body(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     }
 }
 
-fn get_mcp_label(mcp_enabled: bool, unicode: bool) -> &'static str {
-    match (mcp_enabled, unicode) {
-        (true, true) => " · MCP ✓",
-        (true, false) => " · MCP on",
-        (false, _) => "",
-    }
-}
-
-fn get_health_indicator(
-    server_healthy: bool,
-    unicode: bool,
-    theme: &Theme,
-) -> (&'static str, Style) {
-    // Losing the server says so in a word. A one-character glyph flip is not a
-    // state change a user notices, and the chat input keeps looking live
-    // meanwhile — so the disconnected case is spelled out.
-    match (server_healthy, unicode) {
-        (true, true) => (" ●", theme.healthy()),
-        (true, false) => (" *", theme.healthy()),
-        (false, true) => (" ○ OFFLINE", theme.unhealthy()),
-        (false, false) => (" - OFFLINE", theme.unhealthy()),
-    }
-}
-
-fn get_daemon_indicator(
-    daemon_healthy: bool,
-    unicode: bool,
-    theme: &Theme,
-) -> (&'static str, Style) {
-    let daemon_char = match (daemon_healthy, unicode) {
-        (true, true) => " ● DMON",
-        (true, false) => " * DMON",
-        (false, true) => " ○ DMON",
-        (false, false) => " - DMON",
-    };
-    let daemon_style = if daemon_healthy {
-        theme.healthy()
-    } else {
-        theme.unhealthy()
-    };
-    (daemon_char, daemon_style)
-}
-
 fn get_mcp_connection_counts(
     servers: &[crate::mcp_connections::McpServerConfig],
 ) -> (usize, usize) {
@@ -1046,51 +1005,132 @@ fn format_external_tools_part(state: &AppState) -> String {
     }
 }
 
-fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let mcp_label = get_mcp_label(state.mcp_enabled, state.unicode);
-    let (health_char, health_style) =
-        get_health_indicator(state.server_healthy, state.unicode, theme);
-    let health_span = Span::styled(health_char, health_style);
-    let (daemon_char, daemon_style) =
-        get_daemon_indicator(state.daemon_healthy, state.unicode, theme);
-    let daemon_span = Span::styled(daemon_char, daemon_style);
+/// A server or daemon connection state, spelled out: `● ahma` when up,
+/// `○ ahma OFFLINE 12s` when down. A glyph flip alone is not a state change
+/// anyone notices, and the rest of the screen keeps looking live meanwhile.
+fn connection_span(
+    name: &str,
+    healthy: bool,
+    down_since: Option<std::time::Instant>,
+    unicode: bool,
+    theme: &Theme,
+) -> Span<'static> {
+    let (up, down) = if unicode { ("●", "○") } else { ("*", "-") };
+    if healthy {
+        return Span::styled(format!(" {up} {name}"), theme.healthy());
+    }
+    let for_how_long = down_since
+        .map(|t| format!(" {}", format_elapsed_short(t.elapsed())))
+        .unwrap_or_default();
+    Span::styled(
+        format!(" {down} {name} OFFLINE{for_how_long}"),
+        theme.unhealthy(),
+    )
+}
 
-    let external_part = format_external_tools_part(state);
+/// `12s`, `3m`, `2h` — coarse on purpose, it only has to say "a while".
+fn format_elapsed_short(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        _ => format!("{}h", secs / 3600),
+    }
+}
+
+/// The one status line at the top of every layout.
+///
+/// Left: what is being done (project filter, clients, running/queued/done
+/// tallies). Right: whether ahma is reachable and how it behaves — execution
+/// mode, server and daemon health (with how long they have been down),
+/// transport, and the sandbox actually locked. Per-window facts (model,
+/// tokens, context fill) live on each window instead, since they differ.
+pub(crate) fn draw_status_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let mut left = work::work_header_spans(state, theme);
+
+    let mode = state.settings_editor.settings().tools.execution_mode;
+    let mut right: Vec<Span<'static>> = vec![Span::styled(format!(" {mode}"), theme.dim())];
+    right.push(connection_span(
+        "ahma",
+        state.server_healthy,
+        state.server_down_since,
+        state.unicode,
+        theme,
+    ));
+    right.push(connection_span(
+        "daemon",
+        state.daemon_healthy,
+        state.daemon_down_since,
+        state.unicode,
+        theme,
+    ));
+    right.push(Span::styled(
+        format!(" · {}", state.transport_label),
+        theme.dim(),
+    ));
     let max_path_len = max_header_workspace_len(area.width);
-    let sandbox_style = sandbox_status_style(&state.sandbox_status, theme);
-    let sandbox_part = format_sandbox_part(state, max_path_len);
-    let sandbox_status_part = format_sandbox_status_part(state);
-    let active_skills_part = format_active_skills_part(state);
+    right.push(Span::styled(
+        format_sandbox_part(state, max_path_len),
+        theme.dim(),
+    ));
+    right.push(Span::styled(
+        format_sandbox_status_part(state),
+        sandbox_status_style(&state.sandbox_status, theme),
+    ));
+    right.push(Span::styled(format_external_tools_part(state), theme.dim()));
+    right.push(Span::styled(format_active_skills_part(state), theme.dim()));
+    right.push(Span::raw(" "));
 
-    // Token spend and context fill — the numbers that decide whether to keep
-    // chatting or /compact. Computed all along but only ever rendered by a
-    // header that had no callers; narrow terminals get the context-fill share
-    // alone, since that is the part that changes a decision.
-    let tokens_part = if area.width > 100 {
-        format_tokens_part(state)
-    } else {
-        context_fill_segment(state)
-    };
+    // Right-align the status half; on a narrow terminal the left half gives
+    // way first, because reachability is what a glance at the header is for.
+    let width = area.width as usize;
+    let right_width: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    truncate_row_spans_to_width(&mut left, width.saturating_sub(right_width));
+    let left_width: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    left.push(Span::raw(
+        " ".repeat(width.saturating_sub(left_width + right_width)),
+    ));
+    left.extend(right);
+    truncate_row_spans_to_width(&mut left, width);
+    frame.render_widget(
+        Paragraph::new(Line::from(left)).style(theme.header_bar()),
+        area,
+    );
+}
 
-    let line = Line::from(vec![
-        Span::styled(" ahma chat", theme.title()),
-        Span::styled(
-            format!("  {}", shorten_llm_label(&state.llm_label())),
-            theme.normal(),
-        ),
-        Span::styled(mcp_label, theme.dim()),
-        Span::styled(external_part, theme.dim()),
-        Span::styled(sandbox_part, theme.dim()),
-        Span::styled(sandbox_status_part, sandbox_style),
-        Span::styled(active_skills_part, theme.normal()),
-        Span::styled(tokens_part, theme.dim()),
-        health_span,
-        Span::styled(" · ", theme.dim()),
-        daemon_span,
-        Span::styled(format!("  {}", state.transport_label), theme.dim()),
-    ]);
-
-    frame.render_widget(Paragraph::new(line).style(theme.header_bar()), area);
+/// One window's meter: `ctx 38% (49k/128k) · ↑12.3k ↓2.1k`. Context fill
+/// needs both the last prompt size and the model's window; spend needs the
+/// provider to have reported usage. Empty when nothing is known — no guesses.
+pub(crate) fn window_meter(
+    usage: Option<&crate::state::WindowUsage>,
+    ctx_window: Option<u32>,
+    unicode: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(u) = usage {
+        if let Some(window) = ctx_window.filter(|_| u.last_prompt_tokens > 0) {
+            let pct = ((u.last_prompt_tokens as f64 / window as f64) * 100.0).round() as u32;
+            parts.push(format!(
+                "ctx {}% ({}/{})",
+                pct.min(999),
+                fmt_token_count(u.last_prompt_tokens),
+                fmt_token_count(window)
+            ));
+        }
+        if u.prompt_tokens > 0 || u.completion_tokens > 0 {
+            let (up, down) = if unicode {
+                ("↑", "↓")
+            } else {
+                ("in ", "out ")
+            };
+            parts.push(format!(
+                "{up}{} {down}{}",
+                fmt_token_count(u.prompt_tokens),
+                fmt_token_count(u.completion_tokens)
+            ));
+        }
+    }
+    parts.join(" · ")
 }
 
 /// Honest scope display (SPEC R5.4): once the server reports its locked
@@ -1757,10 +1797,46 @@ fn get_input_title_left(state: &AppState, theme: &Theme) -> Line<'static> {
         .left_aligned()
     } else {
         Line::from(Span::styled(
-            format!(" ahma{target_part}: {} ", state.llm_label()),
+            format!(
+                " ahma{target_part}: {} ",
+                shorten_llm_label(&state.llm_label())
+            ),
             theme.title(),
         ))
         .left_aligned()
+    }
+}
+
+/// ` ctx 38% (49k/128k) · ↑12.3k ↓2.1k · 42 tok/s · 12s ` for the window chat
+/// is talking to.
+fn input_title_meter(state: &AppState) -> String {
+    let key = AppState::usage_key(state.active_target_instance.as_deref());
+    let ctx = state
+        .current_provider_url
+        .as_deref()
+        .and_then(|u| state.context_window(u));
+    let usage = state.window_usage.get(&key);
+    let mut parts = vec![window_meter(usage, ctx, state.unicode)];
+    // A provider that reports no usage still gets a counter, marked as the
+    // estimate it is (≈4 characters per token of the visible conversation).
+    if usage.is_none() {
+        let est = estimate_tokens(conversation_chars(state));
+        if est > 0 {
+            parts.push(format!("~{} tok est", fmt_token_count(est)));
+        }
+    }
+    if let Some(turn) = &state.turn {
+        let now = std::time::Instant::now();
+        if let Some(rate) = turn.tokens_per_sec(now) {
+            parts.push(format!("{rate} tok/s"));
+        }
+        parts.push(format_elapsed_short(now.duration_since(turn.started)));
+    }
+    parts.retain(|p| !p.is_empty());
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", parts.join(" · "))
     }
 }
 
@@ -1773,16 +1849,11 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     };
 
     let title_left = get_input_title_left(state, theme);
-    // Same honesty rule as the header: prefer the server-locked scope; the
-    // launch path is a guess until then and is marked with `?`.
-    let title_right = Line::from(Span::styled(
-        match state.locked_scope_root() {
-            Some(root) => format!(" sandbox: {} ", shorten_path(root, 45)),
-            None => format!(" sandbox: {}? ", shorten_path(&state.workspace, 45)),
-        },
-        theme.dim(),
-    ))
-    .right_aligned();
+    // This window's meter, where the eye already is while typing: context
+    // fill and spend, and while a turn streams, its speed and elapsed time.
+    // (The sandbox moved to the status header, shown in every layout.)
+    let title_right =
+        Line::from(Span::styled(input_title_meter(state), theme.dim())).right_aligned();
 
     let block = Block::default()
         .title(title_left)
@@ -2366,36 +2437,6 @@ fn estimate_tokens(chars: usize) -> u32 {
     (chars / STATUS_CHARS_PER_TOKEN) as u32
 }
 
-fn format_tokens_part(state: &AppState) -> String {
-    token_status_segment(
-        state.token_usage.total_tokens,
-        state.token_usage.prompt_tokens,
-        state.token_usage.completion_tokens,
-        state.last_prompt_tokens,
-        conversation_chars(state),
-        state.token_prefs.context_length,
-    )
-}
-
-/// Just the `· NN% ctx` share of [`token_status_segment`], for headers too
-/// narrow to carry the full in/out/total breakdown. Empty when the model's
-/// context window is unknown — a percentage of an unknown whole is noise.
-fn context_fill_segment(state: &AppState) -> String {
-    let Some(window) = state.token_prefs.context_length.filter(|&w| w > 0) else {
-        return String::new();
-    };
-    let used = if state.last_prompt_tokens > 0 {
-        state.last_prompt_tokens
-    } else {
-        estimate_tokens(conversation_chars(state))
-    };
-    if used == 0 {
-        return String::new();
-    }
-    let pct = ((used as f64 / window as f64) * 100.0).round() as u32;
-    format!(" · {}% ctx", pct.min(999))
-}
-
 /// Total characters of the visible conversation — the basis for a token estimate
 /// when the provider does not report usage, and for the context-fill fallback.
 fn conversation_chars(state: &AppState) -> usize {
@@ -2425,49 +2466,6 @@ fn fmt_token_count(n: u32) -> String {
     } else {
         n.to_string()
     }
-}
-
-/// Build the status-bar token segment. Pure, for testability.
-///
-/// - Exact cumulative usage when the provider reports it (`total_tokens > 0`);
-///   otherwise a `~est` derived from the conversation size, so providers that
-///   return no `usage` still show a counter.
-/// - A best-effort context-window fill `%` when the window is known: exact from
-///   the last turn's prompt tokens when available, else estimated.
-fn token_status_segment(
-    total_tokens: u32,
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    last_prompt_tokens: u32,
-    conversation_chars: usize,
-    ctx_window: Option<u32>,
-) -> String {
-    let est_conv = estimate_tokens(conversation_chars);
-    if total_tokens == 0 && est_conv == 0 {
-        return String::new();
-    }
-
-    let mut out = if total_tokens > 0 {
-        format!(
-            " · tkns {} in / {} out ({} ttl)",
-            fmt_token_count(prompt_tokens),
-            fmt_token_count(completion_tokens),
-            fmt_token_count(total_tokens),
-        )
-    } else {
-        format!(" · ~{} tkns est", fmt_token_count(est_conv))
-    };
-
-    if let Some(window) = ctx_window.filter(|&w| w > 0) {
-        let used = if last_prompt_tokens > 0 {
-            last_prompt_tokens
-        } else {
-            est_conv
-        };
-        let pct = ((used as f64 / window as f64) * 100.0).round() as u32;
-        out.push_str(&format!(" · {}% ctx", pct.min(999)));
-    }
-    out
 }
 
 // ─── Operations DAG ───────────────────────────────────────────────────────────
@@ -5204,57 +5202,72 @@ mod tests {
     }
 
     #[test]
-    fn token_status_segment_empty_when_no_data() {
-        assert_eq!(token_status_segment(0, 0, 0, 0, 0, None), "");
+    fn window_meter_says_only_what_is_known() {
+        use crate::state::WindowUsage;
+        assert_eq!(window_meter(None, Some(8192), true), "");
+        let spent = WindowUsage {
+            prompt_tokens: 12_300,
+            completion_tokens: 2_100,
+            last_prompt_tokens: 4_096,
+        };
+        // No context window known: spend only, no percentage of an unknown whole.
+        assert_eq!(window_meter(Some(&spent), None, true), "↑12.3k ↓2.1k");
+        assert_eq!(
+            window_meter(Some(&spent), Some(8192), true),
+            "ctx 50% (4.1k/8.2k) · ↑12.3k ↓2.1k"
+        );
+        assert_eq!(
+            window_meter(Some(&spent), None, false),
+            "in 12.3k out 2.1k",
+            "ASCII fallback"
+        );
+    }
+
+    /// The header says how long a connection has been down, not just that it is.
+    #[test]
+    fn a_down_connection_says_for_how_long() {
+        let theme = Theme::new(true);
+        let up = connection_span("daemon", true, None, true, &theme);
+        assert_eq!(up.content, " ● daemon");
+        let since = std::time::Instant::now() - std::time::Duration::from_secs(12);
+        let down = connection_span("daemon", false, Some(since), true, &theme);
+        assert_eq!(down.content, " ○ daemon OFFLINE 12s");
     }
 
     #[test]
-    fn token_status_segment_shows_exact_usage() {
-        // Provider reported usage → exact cumulative counts, no context window.
-        let s = token_status_segment(1700, 1200, 500, 1200, 0, None);
-        assert_eq!(s, " · tkns 1.2k in / 500 out (1.7k ttl)");
+    fn elapsed_is_coarse() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed_short(Duration::from_secs(12)), "12s");
+        assert_eq!(format_elapsed_short(Duration::from_secs(185)), "3m");
+        assert_eq!(format_elapsed_short(Duration::from_secs(7300)), "2h");
     }
 
-    /// The narrow-header variant keeps the decision-relevant half (context
-    /// fill) and drops the in/out/total breakdown. With no known context
-    /// window there is no percentage to state, so it renders nothing rather
-    /// than a percentage of an unknown whole.
+    /// Every layout shows the same header, and it carries the facts a glance
+    /// is for: the execution mode and whether the daemon is reachable.
     #[test]
-    fn context_fill_segment_needs_a_known_window() {
-        use crate::state::AppState;
-        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
-        state.token_prefs.context_length = None;
-        state.last_prompt_tokens = 2048;
-        assert_eq!(context_fill_segment(&state), "");
-
-        state.token_prefs.context_length = Some(4096);
-        assert_eq!(context_fill_segment(&state), " · 50% ctx");
-
-        // Nothing sent yet and nothing to estimate → still nothing to say.
-        state.last_prompt_tokens = 0;
-        assert_eq!(context_fill_segment(&state), "");
-    }
-
-    #[test]
-    fn token_status_segment_estimates_when_no_usage() {
-        // No API usage, but a 6000-char conversation → ~1500 token estimate.
-        let s = token_status_segment(0, 0, 0, 0, 6000, None);
-        assert_eq!(s, " · ~1.5k tkns est");
-    }
-
-    #[test]
-    fn token_status_segment_context_pct_exact_from_last_prompt() {
-        // 4096-token window, last turn's prompt was 2048 → 50% (exact).
-        let s = token_status_segment(3000, 2048, 200, 2048, 9999, Some(4096));
-        assert!(s.ends_with(" · 50% ctx"), "got {s:?}");
-    }
-
-    #[test]
-    fn token_status_segment_context_pct_estimated_without_usage() {
-        // No usage at all: % falls back to the conversation estimate.
-        // 8000 chars → 2000 tokens; window 8000 → 25%.
-        let s = token_status_segment(0, 0, 0, 0, 8000, Some(8000));
-        assert_eq!(s, " · ~2.0k tkns est · 25% ctx");
+    fn the_status_header_shows_mode_and_reachability() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut state = crate::state::AppState::new("http://localhost:3000", "HTTP", true);
+        state.set_daemon_healthy(true);
+        state.set_daemon_healthy(false);
+        let theme = Theme::new(true);
+        let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
+        terminal
+            .draw(|f| draw_status_header(f, &state, &theme, Rect::new(0, 0, 160, 1)))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row: String = (0..160)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect();
+        let mode = state
+            .settings_editor
+            .settings()
+            .tools
+            .execution_mode
+            .to_string();
+        assert!(row.contains(&mode), "{row}");
+        assert!(row.contains("daemon OFFLINE"), "{row}");
     }
 
     #[test]

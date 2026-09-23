@@ -2001,6 +2001,22 @@ correct **at startup**, not only for events that happen afterwards.
     the owning instance, since the TUI's own MCP session cannot see another
     client's operations.
 
+- **R24.11 — What a glance is for is always on screen.**
+  - **R24.11.1 — One status header in every layout.** It **must** show the
+    execution mode (R2.1), whether the ahma server and the daemon are reachable
+    — a lost connection spelled out with how long it has been down, never a
+    glyph flip alone — the transport, and the sandbox as locked (R5.4). Showing
+    these only in a zoomed pane hid a dead daemon from anyone in the default
+    layout.
+  - **R24.11.2 — Each window shows its own LLM and spend.** A section's rule
+    names the model its chat uses and, once used, its context fill and tokens
+    in/out; the chat input's title shows the same for the window being typed to,
+    plus tokens/second and elapsed time while a turn streams. Usage is charged to
+    the in-flight turn's window. Context fill is shown only when the model's
+    window size is known (`--context-length` or the provider's `num_ctx`), and
+    cost only when a price is known — neither is guessed; an estimate is labelled
+    as one.
+
 #### R25: Tool-call session reuse (TUI chat)
 
 Chat tool calls from `ahma tui` **must** reuse a single negotiated MCP session rather than

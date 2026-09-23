@@ -24,6 +24,15 @@ pub const CHAT_HISTORY_CAP: usize = 200;
 /// a turn silently lost to a dead daemon is not left looking busy.
 pub const TURN_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Token spend for one window's conversations, as reported by its provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    /// The last turn's prompt size: how full the context window is now.
+    pub last_prompt_tokens: u32,
+}
+
 /// Window in which a second Ctrl-C quits. The first one cancels a running turn.
 pub const CTRL_C_QUIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -37,6 +46,10 @@ pub struct ChatTurn {
     pub last_event: std::time::Instant,
     /// The instance the prompt was routed to, so a cancel goes to the same one.
     pub target_instance: Option<String>,
+    /// When the first answer token arrived, for the live tokens/second meter.
+    pub first_token_at: Option<std::time::Instant>,
+    /// Characters of answer streamed so far this turn.
+    pub streamed_chars: usize,
 }
 
 impl ChatTurn {
@@ -46,7 +59,24 @@ impl ChatTurn {
             started: now,
             last_event: now,
             target_instance,
+            first_token_at: None,
+            streamed_chars: 0,
         }
+    }
+
+    /// Record a streamed answer token.
+    pub fn note_token(&mut self, token: &str) {
+        self.first_token_at
+            .get_or_insert_with(std::time::Instant::now);
+        self.streamed_chars += token.len();
+    }
+
+    /// Approximate output rate (≈4 characters per token), once there is
+    /// enough of a sample to mean something.
+    pub fn tokens_per_sec(&self, now: std::time::Instant) -> Option<u32> {
+        let secs = now.duration_since(self.first_token_at?).as_secs_f64();
+        (secs >= 0.5 && self.streamed_chars >= 16)
+            .then(|| ((self.streamed_chars as f64 / 4.0) / secs).round() as u32)
     }
 
     pub fn is_stalled(&self, now: std::time::Instant) -> bool {
@@ -1785,6 +1815,17 @@ pub struct AppState {
     pub should_quit: bool,
     /// The chat turn in flight, if any (see [`ChatTurn`]).
     pub turn: Option<ChatTurn>,
+    /// Token spend per window (section key; the local section for chat with
+    /// no target window). Usage events carry no instance, but the TUI runs one
+    /// turn at a time, so each belongs to the in-flight turn's window.
+    pub window_usage: HashMap<String, WindowUsage>,
+    /// When the ahma server / the daemon was last seen going down, so the
+    /// header can say for how long rather than just "offline".
+    pub server_down_since: Option<std::time::Instant>,
+    pub daemon_down_since: Option<std::time::Instant>,
+    /// `(base_url, num_ctx)` of the provider last looked up, so the header can
+    /// show context fill each frame without re-reading the config file.
+    pub ctx_window_cache: std::cell::RefCell<Option<(String, Option<u32>)>>,
     /// A model-list refresh the user asked for is in flight; its result may
     /// open the model picker. Unrequested refreshes never do.
     pub model_picker_requested: bool,
@@ -2063,6 +2104,56 @@ impl AppState {
         self.liveness_state = LivenessState::Idle;
         self.last_stream_activity = None;
         self.last_wait_tick = None;
+    }
+
+    /// The window a chat turn belongs to: its target instance, or the local
+    /// section when chat has no target window.
+    pub fn usage_key(target: Option<&str>) -> String {
+        target
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::task_tree::LOCAL_GROUP.to_string())
+    }
+
+    /// Record a health transition, remembering when it went down.
+    pub fn set_server_healthy(&mut self, healthy: bool) {
+        match (self.server_healthy, healthy) {
+            (true, false) => self.server_down_since = Some(std::time::Instant::now()),
+            (_, true) => self.server_down_since = None,
+            _ => {}
+        }
+        self.server_healthy = healthy;
+    }
+
+    pub fn set_daemon_healthy(&mut self, healthy: bool) {
+        match (self.daemon_healthy, healthy) {
+            (true, false) => self.daemon_down_since = Some(std::time::Instant::now()),
+            (_, true) => self.daemon_down_since = None,
+            _ => {}
+        }
+        self.daemon_healthy = healthy;
+    }
+
+    /// The model's context window in tokens: `--context-length`, else the
+    /// selected provider's `num_ctx` from `~/.ahma/config.toml` (looked up
+    /// once per provider). `None` when neither says — a percentage of an
+    /// unknown whole is noise, so it is not guessed.
+    pub fn context_window(&self, base_url: &str) -> Option<u32> {
+        if let Some(n) = self.token_prefs.context_length.filter(|&n| n > 0) {
+            return Some(n);
+        }
+        if base_url.is_empty() {
+            return None;
+        }
+        if let Some((url, n)) = self.ctx_window_cache.borrow().as_ref()
+            && url == base_url
+        {
+            return *n;
+        }
+        let n = ahma_common::config::AhmaConfig::load()
+            .num_ctx_for_base_url(base_url)
+            .filter(|&n| n > 0);
+        *self.ctx_window_cache.borrow_mut() = Some((base_url.to_string(), n));
+        n
     }
 
     /// True while the user is typing into the chat input. Gate keys (`y`/`a`/
@@ -2350,6 +2441,10 @@ impl AppState {
             liveness_glyph: "  ".to_string(),
             liveness_state: LivenessState::Idle,
             turn: None,
+            window_usage: HashMap::new(),
+            server_down_since: None,
+            daemon_down_since: None,
+            ctx_window_cache: std::cell::RefCell::new(None),
             model_picker_requested: false,
             quit_armed_at: None,
             footer_hint: None,

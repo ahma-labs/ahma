@@ -30,8 +30,8 @@ there is live work for this project, its section opens by itself; any keystroke
 takes over.
 
 ```
- ahma · work · this project [f]    3 clients · 2⟳ 1◷ 14✓          Unix socket
-▶─ claude-code (1) · …/github/ahma ── ⢷⡪ ──────────────── 2⟳ 1◷ 14✓ ──
+ ahma · work · this project [f] 3 clients 2⟳ 1◷ 14✓   sync ● ahma ● daemon · Unix socket · sandbox: …/github/ahma [ENFORCED]
+▶─ claude-code (1) · …/github/ahma · qwen2.5-coder · ctx 38% (49k/128k) · ↑52k ↓6.1k ── ⢷⡪ ─── 2⟳ 1◷ 14✓ ──
    ⟳ cargo nextest run              [op_41]  1m12s        [P] [X]
    │ Compiling ahma_core v0.15.4
    │ Compiling ahma_mcp v0.15.4
@@ -44,6 +44,19 @@ takes over.
  ↑↓ move  Enter open  Space tail  f all projects  i chat  ? help  q quit
 ```
 
+- **One status header, in every layout.** Left: the project filter, clients and
+  task tallies. Right: the execution mode (`sync`/`async`, see
+  [settings](settings.md#sync-or-async-toolsexecution_mode)), whether the ahma
+  server and the per-user daemon are reachable — spelled out with how long, e.g.
+  `○ daemon OFFLINE 12s`, when one is not — the transport, and the sandbox the
+  server actually locked.
+- **Each window shows its own LLM and spend.** A section's rule names the model
+  Enter will chat with there and, once it has been used, its context fill and
+  tokens in/out. The chat input's title carries the same meter for the window
+  you are typing to, plus the live tokens/second and elapsed time while a turn
+  streams. Context fill needs the model's window size (`--context-length`, or
+  `num_ctx` for the provider in `~/.ahma/config.toml`); without one it is left
+  out rather than guessed. Providers that report no usage get a `~N tok est`.
 - **A section per client session.** Two windows of the same editor on the same
   project are numbered, so you can tell them apart. Hooked commands fold into
   one `hooks` section — a hook is one instance per command — and your own `!`
@@ -173,7 +186,7 @@ and in particular never one scoped to the directory you happened to open it in
 2. **HTTP/3 (QUIC)** — when the server advertises `Alt-Svc: h3=…` _and_ local TLS material exists at `~/.ahma/tls/`. See [TLS provisioning](#tls-provisioning-for-quic) below.
 3. **HTTP/1.1 / HTTP/2** — plain TCP, always available as a fallback.
 
-The transport in use is shown in the TUI header (e.g. `transport: HTTP/3 (QUIC)` or `transport: Unix socket`).
+The transport in use is shown in the TUI's status header (e.g. `HTTP/3 (QUIC)` or `Unix socket`).
 
 Use `--connect` to bypass detection and force a specific endpoint:
 

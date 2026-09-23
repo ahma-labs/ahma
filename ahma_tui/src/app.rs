@@ -4641,9 +4641,9 @@ fn append_active_log_lines(active_log_lines: &mut Vec<String>, content: &str) {
 fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate::state::AppState) {
     use crate::mcp_source::SourceEvent;
     match event {
-        SourceEvent::HealthChanged { healthy } => state.server_healthy = healthy,
+        SourceEvent::HealthChanged { healthy } => state.set_server_healthy(healthy),
         SourceEvent::DaemonHealthChanged { healthy } => {
-            state.daemon_healthy = healthy;
+            state.set_daemon_healthy(healthy);
             if let Some(ref tx) = state.mcp_source_tx {
                 let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetDaemonHealthy(
                     healthy,
@@ -4813,6 +4813,9 @@ fn handle_source_chat_event(
     turn.last_event = std::time::Instant::now();
     match event {
         SourceEvent::ChatToken { token } => {
+            if let Some(turn) = state.turn.as_mut() {
+                turn.note_token(&token);
+            }
             state.chat.append_token(&token);
             state.mark_stream_activity(crate::state::LivenessState::Streaming);
             state.chat_scroll = 0;
@@ -4837,6 +4840,18 @@ fn handle_source_chat_event(
             state.token_usage.total_tokens += total_tokens;
             if prompt_tokens > 0 {
                 state.last_prompt_tokens = prompt_tokens;
+            }
+            let key = crate::state::AppState::usage_key(
+                state
+                    .turn
+                    .as_ref()
+                    .and_then(|t| t.target_instance.as_deref()),
+            );
+            let usage = state.window_usage.entry(key).or_default();
+            usage.prompt_tokens += prompt_tokens;
+            usage.completion_tokens += completion_tokens;
+            if prompt_tokens > 0 {
+                usage.last_prompt_tokens = prompt_tokens;
             }
             state.mark_stream_activity(state.liveness_state);
         }
@@ -5711,6 +5726,49 @@ mod tests {
         mods: crossterm::event::KeyModifiers,
     ) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent::new(code, mods)
+    }
+
+    /// Usage is attributed to the window the turn was sent to, so each
+    /// window's header shows its own spend.
+    #[test]
+    fn usage_is_attributed_to_the_turns_window() {
+        use crate::mcp_source::SourceEvent;
+        let mut state = turn_in_flight();
+        state.turn.as_mut().unwrap().target_instance = Some("inst-a".into());
+        super::handle_source_event(
+            SourceEvent::Usage {
+                prompt_tokens: 1200,
+                completion_tokens: 80,
+                total_tokens: 1280,
+            },
+            &mut state,
+        );
+        let a = state.window_usage["inst-a"];
+        assert_eq!(
+            (a.prompt_tokens, a.completion_tokens, a.last_prompt_tokens),
+            (1200, 80, 1200)
+        );
+        assert!(
+            !state.window_usage.contains_key(""),
+            "not charged to the local window"
+        );
+    }
+
+    #[test]
+    fn going_offline_records_since_when() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.set_daemon_healthy(true);
+        assert!(state.daemon_down_since.is_none());
+        state.set_daemon_healthy(false);
+        let since = state.daemon_down_since.expect("down since recorded");
+        state.set_daemon_healthy(false);
+        assert_eq!(
+            state.daemon_down_since,
+            Some(since),
+            "stays the first moment"
+        );
+        state.set_daemon_healthy(true);
+        assert!(state.daemon_down_since.is_none());
     }
 
     #[test]
