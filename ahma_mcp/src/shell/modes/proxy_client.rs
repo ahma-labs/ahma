@@ -591,25 +591,28 @@ async fn respawn_after_reconnect_failure(
     }
 }
 
-/// Resolve the frontend handshake deadline: the internal
-/// `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS` override if set (testing), otherwise
+/// Resolve the frontend handshake deadline: in debug builds the test override
+/// `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS` if set (SPEC R-CFG9; release builds
+/// never read it), otherwise
 /// [`FRONTEND_HANDSHAKE_DEADLINE_SECS`](ahma_common::timeouts::FRONTEND_HANDSHAKE_DEADLINE_SECS). A value of `0` disables the deadline
 /// (returns `None`).
 fn frontend_handshake_deadline() -> Option<Duration> {
-    let secs = std::env::var("AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS")
-        .ok()
+    let secs = cfg!(debug_assertions)
+        .then(|| std::env::var("AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS").ok())
+        .flatten()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(ahma_common::timeouts::FRONTEND_HANDSHAKE_DEADLINE_SECS);
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 /// Base backoff between reconnect attempts (multiplied by the attempt number).
-/// Overridable via `AHMA_RECONNECT_BACKOFF_MS` so tests exercising the retry
-/// path stay fast and deterministic instead of waiting on production timing.
+/// Debug builds let tests override it with `AHMA_RECONNECT_BACKOFF_MS`, so the
+/// retry path stays fast and deterministic; release builds never read it (R-CFG9).
 #[cfg(unix)]
 fn reconnect_backoff_base() -> Duration {
-    let ms = std::env::var("AHMA_RECONNECT_BACKOFF_MS")
-        .ok()
+    let ms = cfg!(debug_assertions)
+        .then(|| std::env::var("AHMA_RECONNECT_BACKOFF_MS").ok())
+        .flatten()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(500);
     Duration::from_millis(ms)

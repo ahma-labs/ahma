@@ -184,6 +184,9 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_TEST_BINARY` | Locates the compiled test binary for in-process test helpers |
 | `AHMA_TEST_HTTP_CLIENT_TOKEN_PATH` | Redirects the external-MCP OAuth token file in `ahma_http_mcp_client` tests. Compiled in **debug builds only** — a release binary ignores it |
 | `AHMA_TEST_LOG_DIR` | Redirects the project log directory in `ahma_mcp` unit tests. Read only under `cfg!(test)` — no shipped binary contains the read |
+| `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS` | Shortens the stdio frontend's wait for `initialize` in tests. Debug builds only |
+| `AHMA_RECONNECT_BACKOFF_MS` | Shortens the stdio proxy's reconnect backoff in tests. Debug builds only |
+| `AHMA_CONFIG_DIR` | Relocates the platform config directory holding `log_exceptions.json` and the legacy `approvals.json` read by the one-time migration. Used by tests; see SPEC §11 (known gaps) |
 | `AHMA_TEST_HOME` | Redirects `~` resolution (`ahma_common::config::ahma_home_dir`) at a temp directory so a test can supply its own `~/.ahma/settings.toml`. Compiled in **debug builds only** (`#[cfg(debug_assertions)]`) — a release binary ignores it |
 | `AHMA_TEST_ISOLATION` | Set by test harnesses on spawned ahma binaries: forces private (non-global) bridge/daemon endpoints (SPEC R-ISO.1) |
 | `NEXTEST` / `NEXTEST_RUN_ID` | Set by `cargo nextest`, inherited by spawned binaries; read solely to force the same private-endpoint isolation as `AHMA_TEST_ISOLATION` — the single R-CFG9.2 carve-out (SPEC R-ISO.1) |

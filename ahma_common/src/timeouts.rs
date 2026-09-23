@@ -210,7 +210,7 @@ pub const BRIDGE_TOOL_CALL_CEILING_SECS: u64 = 600;
 ///
 /// This bounds ONLY the pre-handshake window; once the first message is seen the
 /// deadline is disarmed and a live (possibly idle) session is never killed.
-/// Overridable for tests via the internal `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS`
+/// Overridable for tests (debug builds only) via `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS`
 /// env var; `0` disables the deadline.
 pub const FRONTEND_HANDSHAKE_DEADLINE_SECS: u64 = 30;
 
