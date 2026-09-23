@@ -29,15 +29,15 @@
 //!
 //! The bridge has two transport-layer security features that operate independently:
 //!
-//! - **Bearer authentication** — set [`BridgeConfig::require_token`] or
-//!   `--bearer-token` / `AHMA_BEARER_TOKEN` to require `Authorization: Bearer
-//!   <token>` on all requests.  The `/health` endpoint is always exempt so
+//! - **Bearer authentication** — set [`BridgeConfig::require_token`] (the `ahma`
+//!   CLI's `--require-token` / `--require-token-path`) to require
+//!   `Authorization: Bearer <token>` on all requests.  The `/health` endpoint is always exempt so
 //!   load-balancers can probe without a credential.  The comparison is
 //!   constant-time (timing-safe).  The token can be hot-reloaded at runtime via
 //!   SIGHUP without restarting the bridge.
 //!
-//! - **Per-IP rate limiting** — pass `--rate-limit-per-minute` to cap requests
-//!   per client IP using a token-bucket governor.  This protects against both
+//! - **Per-IP rate limiting** — `--rate-limit-rps` / `--rate-limit-burst` cap
+//!   requests per client IP using a token-bucket governor.  This protects against both
 //!   accidental and malicious request floods.
 //!
 //! ## Practical Use
@@ -55,7 +55,7 @@
 //!     // Configure the bridge
 //!     let config = BridgeConfig {
 //!         bind_addr: "127.0.0.1:3000".parse().unwrap(),
-//!         server_command: "ahma_mcp".to_string(), // Path to your MCP server binary
+//!         server_command: "ahma".to_string(), // the binary run as `ahma serve stdio` per session
 //!         // Optional fallback for clients that do not support roots/list
 //!         default_sandbox_scope: Some(PathBuf::from("/path/to/project")),
 //!         ..BridgeConfig::default()
