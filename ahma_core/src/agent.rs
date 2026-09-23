@@ -1509,7 +1509,7 @@ pub async fn get_or_create_session(
     let opts = ConnectOptions {
         // clientInfo.name is load-bearing: the bridge keys `supports_progress`
         // and `request_budget` off it.
-        client_name: "ahma-core-tool".to_string(),
+        client_name: AGENT_TOOL_CLIENT.to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         roots: vec![mcp.workspace_root.clone()],
         notifications: None,
@@ -2078,6 +2078,13 @@ fn daemon_messages_to_chat(messages: Vec<DaemonChatMessage>) -> Vec<ChatMessage>
         })
         .collect()
 }
+
+/// The `clientInfo.name` the agent loop's own tool-execution session announces.
+///
+/// That session is plumbing, not a separate client: its work is the chat's
+/// work, and the TUI files it with the chat's own section rather than showing
+/// a stranger named after an internal crate.
+pub const AGENT_TOOL_CLIENT: &str = "ahma-core-tool";
 
 /// Approval gate that approves every tool call — used by the headless MCP
 /// `agent` sub-agent, which has no interactive surface to ask a human.

@@ -24,6 +24,24 @@ use crate::task_tree::RowKind;
 use crate::theme::Theme;
 use crate::work_view::{self, Hit, Section};
 
+/// Rows of the empty state ([`draw_empty_state`]).
+const EMPTY_STATE_ROWS: u16 = 2;
+
+/// How many rows the work view would use if it had all it wanted — its
+/// sections (at their current, possibly tweening, heights) or its empty state.
+/// The layout gives it this much (capped) and hands the rest to chat, instead
+/// of splitting the leftover space so a two-line view sat on half a screen.
+pub fn content_rows(state: &AppState, now_ms: u64) -> u16 {
+    state.rebuild_work_view(now_ms);
+    let sections = state.work_sections.borrow().clone();
+    if sections.is_empty() {
+        return EMPTY_STATE_ROWS;
+    }
+    let heights = state.section_heights(now_ms);
+    let (_, total) = work_view::layout(&sections, &heights);
+    u16::try_from(total).unwrap_or(u16::MAX)
+}
+
 /// Draw the work view into `area`.
 ///
 /// `now_ms` is passed rather than read so an animation frame can be rendered at
@@ -330,11 +348,15 @@ pub fn work_header_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> 
     let mut spans = vec![
         Span::styled(" ahma · work · ".to_string(), theme.title()),
         Span::styled(filter.to_string(), theme.dim()),
-        Span::styled(
+    ];
+    // Alone in the TUI there is nobody else to count; "0 clients" only made a
+    // solo user wonder what they were supposed to have connected.
+    if clients > 0 {
+        spans.push(Span::styled(
             format!("   {clients} client{}", if clients == 1 { "" } else { "s" }),
             theme.dim(),
-        ),
-    ];
+        ));
+    }
     spans.extend(instance_tally_spans(&totals, state.unicode, theme));
     spans
 }

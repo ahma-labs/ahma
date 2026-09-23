@@ -116,9 +116,15 @@ pub fn build_sections(ops: &[Operation], opts: &SectionOptions<'_>) -> Vec<Secti
 }
 
 /// The section key an operation belongs to.
-fn section_key_for_op(op: &Operation, hook_instances: &HashSet<&str>) -> String {
+fn section_key_for_op(
+    op: &Operation,
+    hook_instances: &HashSet<&str>,
+    agent_instances: &HashSet<&str>,
+) -> String {
     match op.instance_id.as_deref() {
         Some(id) if hook_instances.contains(id) => HOOKS_KEY.to_string(),
+        // The chat agent's own tool session: its work is the chat's work.
+        Some(id) if agent_instances.contains(id) => LOCAL_GROUP.to_string(),
         // A hook whose instance has already gone still belongs with the hooks:
         // the operation carries its own origin, which outlives the registration.
         _ if op.origin.as_deref() == Some("hook") => HOOKS_KEY.to_string(),
@@ -143,6 +149,13 @@ fn bucket_ops_by_section(
         .map(|i| i.id.as_str())
         .collect();
 
+    let agent_instances: HashSet<&str> = opts
+        .instances
+        .iter()
+        .filter(|i| is_agent_tool_session(i))
+        .map(|i| i.id.as_str())
+        .collect();
+
     let shown: HashSet<&str> = opts
         .instances
         .iter()
@@ -153,9 +166,11 @@ fn bucket_ops_by_section(
     let mut out: HashMap<String, Vec<usize>> = HashMap::new();
     for &i in visible {
         let op = &ops[i];
-        let key = section_key_for_op(op, &hook_instances);
+        let key = section_key_for_op(op, &hook_instances, &agent_instances);
         let keep = match op.instance_id.as_deref() {
-            Some(id) => shown.contains(id) || opts.show_all || key == HOOKS_KEY,
+            Some(id) => {
+                shown.contains(id) || opts.show_all || key == HOOKS_KEY || key == LOCAL_GROUP
+            }
             None => true,
         };
         if keep {
@@ -163,6 +178,13 @@ fn bucket_ops_by_section(
         }
     }
     out
+}
+
+/// The chat agent's own tool-execution session (see
+/// [`ahma_core::agent::AGENT_TOOL_CLIENT`]), which is part of this terminal's
+/// chat, not another client.
+pub fn is_agent_tool_session(info: &InstanceInfo) -> bool {
+    info.client.as_deref() == Some(ahma_core::agent::AGENT_TOOL_CLIENT)
 }
 
 fn instance_visible(info: &InstanceInfo, opts: &SectionOptions<'_>) -> bool {
@@ -189,7 +211,11 @@ fn assemble_sections(
     let mut seen: HashSet<String> = HashSet::new();
 
     // A section per attached (or recently ended) instance, hooks folded into one.
-    for info in opts.instances.iter().filter(|i| instance_visible(i, opts)) {
+    for info in opts
+        .instances
+        .iter()
+        .filter(|i| instance_visible(i, opts) && !is_agent_tool_session(i))
+    {
         let key = if info.mode == "hook" {
             HOOKS_KEY.to_string()
         } else {
@@ -600,6 +626,35 @@ mod tests {
             sections.last().unwrap().key,
             LOCAL_GROUP,
             "and it comes last"
+        );
+    }
+
+    /// The chat agent runs its tools through its own MCP session; that work is
+    /// the chat's, so it lands in "this terminal (you)" — not in a section named
+    /// after an internal crate that looks like a stranger connected
+    /// (2026-09-23).
+    #[test]
+    fn the_chat_agents_tool_session_is_part_of_this_terminal() {
+        let instances = vec![instance(
+            "t",
+            Some(ahma_core::agent::AGENT_TOOL_CLIENT),
+            "/work/proj",
+            "http",
+        )];
+        let ops = vec![
+            op("1", Some("t"), OpStatus::Succeeded),
+            op("2", None, OpStatus::Running),
+        ];
+        let collapsed = HashSet::new();
+        let sections = build_sections(&ops, &opts(&instances, &collapsed, None));
+        assert_eq!(sections.len(), 1, "one section: yours");
+        assert_eq!(sections[0].key, LOCAL_GROUP);
+        assert_eq!(sections[0].header.client, "this terminal (you)");
+        let counts = &sections[0].header.counts;
+        assert_eq!(
+            (counts.running, counts.succeeded),
+            (1, 1),
+            "both ops are yours"
         );
     }
 

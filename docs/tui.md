@@ -84,6 +84,15 @@ takes over.
   operation that was still running when its daemon went away is shown
   `interrupted`, not failed: nobody established that it failed.
 
+Alone in the TUI, you see only "this terminal (you)": its `!` commands and the
+tools its chat ran (the chat agent's own tool session is filed here too), and
+the header does not count clients that are not there.
+
+Panes are framed by a single title rule — name on the left, live facts on the
+right — with no border down the screen's edges or under a pane. The work view
+takes the rows it has content for (at most half the screen) and chat fills the
+rest, with a short conversation sitting just above the input.
+
 ## Operation names and exit status
 
 Every operation row shows **what actually ran**, not an internal id:

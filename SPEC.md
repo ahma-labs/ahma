@@ -2041,6 +2041,16 @@ correct **at startup**, not only for events that happen afterwards.
     cost only when a price is known — neither is guessed; an estimate is labelled
     as one.
 
+  - **R24.11.3 — Chrome earns its place.** A pane that is part of the layout
+    (chat, input, command windows, log, `/scope`) is framed by one title rule
+    carrying its name and live facts — never a left, right or bottom border;
+    the terminal's edges already bound it. Only floating overlays (pickers,
+    modals, gates) keep a full border. A scrollable pane keeps its right column
+    for the scrollbar. The work view gets the rows its content needs (at most
+    half the body) and chat fills the rest; a conversation shorter than its pane
+    sits at the bottom against the input. The chat agent's own tool session is
+    part of "this terminal (you)", and a header never counts "0 clients".
+
 - **R24.12 — It does what the user expects.**
   - **R24.12.1 — Help cannot drift from the keys.** The help overlay and footer
     **must** render from the one key table (`keymap::KEY_REFERENCE`) that tests

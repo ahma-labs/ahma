@@ -167,8 +167,8 @@ fn compute_window_layouts(
             let preferred_h = if w.collapsed {
                 1
             } else {
-                // +2 for the top/bottom border.
-                (expanded_window_line_count(w) + 2).clamp(3, 8) as u16
+                // + the title rule.
+                (expanded_window_line_count(w) + PANE_BORDER_ROWS).clamp(2, 7) as u16
             };
             RenderedWindowLayout {
                 orig_idx: i,
@@ -406,6 +406,15 @@ fn build_window_title(w: &crate::state::TuiWindow, width: u16, unicode: bool) ->
     }
 }
 
+/// The frame of a pane that is part of the layout (chat, input, windows,
+/// log): a single top rule carrying the title. The terminal's own edges already
+/// bound the left, right and bottom; drawing them again only costs columns and
+/// rows. Floating overlays (pickers, modals) keep a full border, because they
+/// sit on top of content and need an edge to read as separate from it.
+const PANE_BORDERS: Borders = Borders::TOP;
+/// Rows [`PANE_BORDERS`] takes from a pane's height.
+const PANE_BORDER_ROWS: usize = 1;
+
 fn draw_expanded_window(
     frame: &mut Frame,
     w: &crate::state::TuiWindow,
@@ -417,7 +426,7 @@ fn draw_expanded_window(
 
     let block = Block::default()
         .title(Span::styled(title_combined, theme.normal()))
-        .borders(Borders::ALL)
+        .borders(PANE_BORDERS)
         .border_style(status_style);
 
     let inner = block.inner(area);
@@ -850,7 +859,8 @@ fn draw_windows_layout(
 }
 
 fn compute_chat_input_height(state: &AppState, full_width: u16) -> u16 {
-    let inner_width = full_width.saturating_sub(2);
+    // No side borders (see [`PANE_BORDERS`]): the text gets the full width.
+    let inner_width = full_width;
     let wrapped_line_count = state
         .chat_input_line_count(inner_width as usize)
         .clamp(1, 6);
@@ -863,7 +873,7 @@ fn compute_chat_input_height(state: &AppState, full_width: u16) -> u16 {
         .get()
         .round()
         .clamp(1.0, 6.0) as u16;
-    input_lines + 2 // borders
+    input_lines + PANE_BORDER_ROWS as u16
 }
 
 fn draw_zoomed_chat_pane(
@@ -970,7 +980,15 @@ fn compute_approval_height(state: &AppState) -> u16 {
 
 /// Work view on top, then whichever panes are open beneath it.
 fn draw_main_body(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let mut constraints = vec![Constraint::Min(3)];
+    // With chat open the work view takes the rows it has content for (up to
+    // half the body) and chat fills the rest; alone, it fills the body.
+    let work = if state.chat_open {
+        let wanted = work::content_rows(state, wall_ms()).max(1);
+        Constraint::Length(wanted.min((area.height / 2).max(3)))
+    } else {
+        Constraint::Fill(1)
+    };
+    let mut constraints = vec![work];
 
     let scope_lines = state
         .scope_window_open
@@ -982,7 +1000,7 @@ fn draw_main_body(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
         constraints.push(Constraint::Length((area.height / 3).clamp(6, 16)));
     }
     if state.chat_open {
-        constraints.push(Constraint::Min(4));
+        constraints.push(Constraint::Fill(1));
     }
 
     let areas = Layout::vertical(constraints).split(area);
@@ -1415,7 +1433,9 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     };
 
     let block = Block::default()
-        .borders(Borders::ALL)
+        .title(Span::styled(chat_title(state), theme.title()))
+        .title(Line::from(Span::styled(chat_scroll_hint(state), theme.dim())).right_aligned())
+        .borders(PANE_BORDERS)
         .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1484,10 +1504,22 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     // Rows are already wrapped to `text_width`; render without ratatui's wrap so
     // the rendered height matches the row count exactly. Confine the paragraph to
     // the reserved text column width to leave room for the scrollbar.
+    //
+    // A conversation shorter than the pane sits at its bottom, against the
+    // input, the way a terminal fills — not at the top with a gap below it.
+    let pad = visible_h.saturating_sub(visible_rows.len()) as u16;
     let text_area = Rect {
+        y: inner.y + pad,
+        height: inner.height - pad,
         width: inner.width.saturating_sub(1).max(1),
         ..inner
     };
+    // Clicks map through `chat_area`, so it must be where the rows are drawn.
+    state.chat_area.set(Rect {
+        y: inner.y + pad,
+        height: inner.height - pad,
+        ..inner
+    });
     frame.render_widget(Paragraph::new(Text::from(visible_rows)), text_area);
 
     // Physical-row units so position, viewport, and content length all match
@@ -1504,6 +1536,32 @@ fn chat_history_hint(state: &AppState) -> &'static str {
         }
     } else {
         "  Type a message and press Enter to start chatting"
+    }
+}
+
+/// ` chat ` or ` chat · claude-code `: whose conversation this is.
+fn chat_title(state: &AppState) -> String {
+    let window = state.active_target_instance.as_deref().and_then(|id| {
+        state
+            .active_instances
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.client.clone().unwrap_or_else(|| i.label.clone()))
+    });
+    match window {
+        Some(name) => format!(" chat · {name} "),
+        None => " chat ".to_string(),
+    }
+}
+
+/// ` ↓ newer below ` while the transcript is scrolled back, so it is never a
+/// mystery why new replies are not appearing.
+fn chat_scroll_hint(state: &AppState) -> String {
+    if state.chat_scroll > 0 {
+        let arrow = if state.unicode { "↓" } else { "v" };
+        format!(" {arrow} newer below ")
+    } else {
+        String::new()
     }
 }
 
@@ -2014,7 +2072,7 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     let block = Block::default()
         .title(title_left)
         .title(title_right)
-        .borders(Borders::ALL)
+        .borders(PANE_BORDERS)
         .border_style(border_style)
         .style(theme.input_bg());
     let inner = block.inner(area);
@@ -2357,11 +2415,11 @@ fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
-/// Height for the `/scope` window: sized to its content (+2 border rows),
+/// Height for the `/scope` window: sized to its content (+ its title rule),
 /// never more than half the available area — honest panes (R24.8) budget the
 /// rows the renderer actually draws.
 fn scope_window_height(content_lines: usize, area: Rect) -> u16 {
-    (content_lines as u16 + 2).clamp(4, (area.height / 2).max(4))
+    (content_lines as u16 + PANE_BORDER_ROWS as u16).clamp(3, (area.height / 2).max(3))
 }
 
 /// The persistent sandbox-scope sub-window, toggled with `/scope`. Informational
@@ -2371,7 +2429,7 @@ fn draw_scope_window(frame: &mut Frame, theme: &Theme, area: Rect, lines: Vec<Li
     let block = Block::default()
         .title(Span::styled(" Sandbox · scope ", theme.title()))
         .title(Line::from(Span::styled(" /scope closes ", theme.dim())).right_aligned())
-        .borders(Borders::ALL)
+        .borders(PANE_BORDERS)
         .border_style(theme.border_unfocused());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2701,7 +2759,7 @@ fn draw_empty_ops_hint(frame: &mut Frame, state: &AppState, theme: &Theme, inner
 fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let block = Block::default()
         .title(Span::styled(ops_dag_title(state), theme.title()))
-        .borders(Borders::ALL)
+        .borders(PANE_BORDERS)
         .border_style(ops_dag_border_style(state, theme));
 
     let inner = block.inner(area);
@@ -3395,7 +3453,7 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
     let block = Block::default()
         .title(Span::styled(build_log_title(state), theme.title()))
-        .borders(Borders::ALL)
+        .borders(PANE_BORDERS)
         .border_style(border_style);
 
     let inner = block.inner(area);
@@ -4457,7 +4515,7 @@ mod tests {
         );
 
         let layouts = compute_window_layouts(std::slice::from_ref(&w), 40);
-        let inner_h = layouts[0].height as usize - 2; // borders
+        let inner_h = layouts[0].height as usize - PANE_BORDER_ROWS;
         assert!(
             inner_h >= expanded_window_line_count(&w),
             "window sized {inner_h} rows for {} rendered lines — the answer is cut off",
@@ -4626,6 +4684,62 @@ mod tests {
         );
     }
 
+    /// The whole screen, as the user sees it, at `w`×`h`.
+    fn render_full_screen(state: &AppState, w: u16, h: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| draw(frame, state, &theme)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Minimal chrome (2026-09-23 review): no frame down the screen's left or
+    /// right edge, no bottom rule under a pane, and a short conversation sits
+    /// against the input instead of leaving a band of empty rows above it.
+    #[test]
+    fn panes_have_a_title_rule_only_and_chat_fills_the_screen() {
+        for (w, h) in [(80u16, 24u16), (200, 60)] {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.chat_open = true;
+            state.chat.push(ChatEntry::User {
+                text: "hello there".into(),
+                payload: None,
+                started_at: None,
+                duration_ms: Some(1),
+            });
+            let screen = render_full_screen(&state, w, h);
+
+            for (y, row) in screen.iter().enumerate() {
+                let first = row.chars().next().unwrap_or(' ');
+                let last = row.chars().last().unwrap_or(' ');
+                assert!(
+                    !matches!(first, '│' | '┌' | '└' | '╭' | '╰'),
+                    "{w}x{h} row {y} has a left edge: {row:?}"
+                );
+                assert!(
+                    !matches!(last, '│' | '┐' | '┘' | '╮' | '╯'),
+                    "{w}x{h} row {y} has a right edge: {row:?}"
+                );
+            }
+            let message_row = screen
+                .iter()
+                .position(|r| r.contains("hello there"))
+                .expect("the message is drawn");
+            assert!(
+                message_row >= (h as usize) * 2 / 3,
+                "{w}x{h}: a short conversation sits low, near the input (row {message_row})"
+            );
+        }
+    }
+
     /// Render the chat history pane into a TestBackend and read back the screen.
     fn render_chat_screen(state: &AppState, theme: &Theme, w: u16, h: u16) -> String {
         use ratatui::Terminal;
@@ -4662,7 +4776,7 @@ mod tests {
         state.chat_scroll = 5;
 
         let screen = render_chat_screen(&state, &theme, 80, 10);
-        let last = screen.lines().nth(8).unwrap_or_default();
+        let last = screen.lines().last().unwrap_or_default();
         assert!(
             last.contains("reading") || last.contains("waiting for"),
             "{screen}"
@@ -4844,7 +4958,7 @@ mod tests {
                 .join("\n")
         };
 
-        // Following: pinned to the newest entries (6 inner rows).
+        // Following: pinned to the newest entries (7 rows under the title rule).
         state.log_follow = true;
         let screen = render(&state);
         assert!(
@@ -4853,7 +4967,7 @@ mod tests {
         );
         assert_eq!(
             state.log_max_scroll.get(),
-            50 - 6,
+            50 - 7,
             "scroll bounds must cover the whole buffer, not just the slice"
         );
 
@@ -4875,7 +4989,7 @@ mod tests {
         );
         assert_eq!(
             state.log_max_scroll.get(),
-            11usize.saturating_sub(6),
+            11usize.saturating_sub(7),
             "bounds must be over the filtered rows (line-4, line-40..49)"
         );
     }
@@ -5049,9 +5163,10 @@ mod tests {
                 .draw(|frame| draw_ops_dag(frame, &state, &theme, Rect::new(0, 0, w, h)))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
-            // Column w-2 is inside the block border, where the bar renders.
-            (1..h - 1)
-                .map(|y| buf.cell((w - 2, y)).unwrap().bg.into())
+            // The bar is the pane's last column (there is no right border), on
+            // every row under the title rule.
+            (1..h)
+                .map(|y| buf.cell((w - 1, y)).unwrap().bg.into())
                 .collect()
         };
 
