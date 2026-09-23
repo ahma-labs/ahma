@@ -827,7 +827,6 @@ This matters for design:
 | macOS AppSandbox entitlements | `com.apple.security.network.client` enable/disable | Process-level `default_policy` |
 | Little Snitch / LuLu | Per-connection prompts; once / always; domain patterns | Three-tier approval + TUI modal |
 | Burp Suite intercept | Every request, show full URL, user decides | "Allow once" option |
-| `docs/egress-sandbox.md` (subprocess proxy) | Per-vault allowlist, deny-by-default | Persistent allowlist format and pattern syntax |
 | DNS-based blocklists (Pi-hole) | Domain block/allow with wildcard | Pattern matching rules |
 
 **What this design explicitly does NOT do, and why:**
@@ -842,7 +841,7 @@ This matters for design:
 ### R-WEB.1: Scope
 
 This section governs **tool-level outbound HTTP requests made by the ahma process itself** — currently `fetch_webpage`, and any future tool that uses `EgressClient` (R-WEB.14). It does **not** govern:
-- Subprocess HTTP traffic inside task vaults (that is the HTTP proxy described in `docs/egress-sandbox.md`, formalized in R-WEB.16).
+- Subprocess HTTP traffic (the `--restrict-network` proxy, R-WEB.16; user guide `docs/network-egress.md`).
 - The ahma process's own MCP client connections (LLM provider `base_url`) — those are operator-configured endpoints, not agent-driven requests.
 - Inbound connections to the ahma MCP server.
 
@@ -1094,25 +1093,25 @@ Users who need path-level or header-level egress control should route traffic th
 
 ---
 
-### R-WEB.16: Subprocess egress sandbox (task vault HTTP proxy)
+### R-WEB.16: Subprocess egress sandbox (`--restrict-network` proxy)
 
-> Design narrative: `docs/egress-sandbox.md`. This section provides the SPEC-level requirements that were previously missing.
+> User guide: `docs/network-egress.md`.
 
-The subprocess egress sandbox is a complementary mechanism that covers HTTP traffic from **subprocesses spawned inside a task vault** — not the ahma process itself (which is governed by R-WEB.1–R-WEB.15).
+The subprocess egress sandbox covers HTTP traffic from **sandboxed subprocesses** when `--restrict-network` / `[network] restrict = true` is set — not the ahma process itself (governed by R-WEB.1–R-WEB.15). It is off by default (R-PERM.5.3 explains why it stays opt-in).
 
-- **R-WEB.16.1**: When `ahma serve` starts with a `--task-vault <path>`, it **must** bind an HTTP proxy to a random localhost port and inject `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY=127.0.0.1,::1,localhost` into the subprocess environment.
-- **R-WEB.16.2**: Requests from subprocesses to domains **not** in `egress.allowlist` **must** receive `407 Proxy Authentication Required` (CONNECT / HTTPS) or `403 Forbidden` (plain HTTP). The response **must** be indistinguishable from a real network failure, preventing the agent from detecting the proxy's presence via error content.
-- **R-WEB.16.3**: `egress.allowlist` pattern syntax matches R-WEB.4. An empty or absent file means deny all.
+- **R-WEB.16.1**: When restriction is on, `ahma serve` **must** bind an HTTP proxy to a random localhost port and inject `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY=127.0.0.1,::1,localhost` into the subprocess environment.
+- **R-WEB.16.2**: Requests from subprocesses to domains **not** on the effective allowlist (`[network] allow` ∪ enabled profiles' hosts, R-PERM.5.3) **must** receive `407 Proxy Authentication Required` (CONNECT / HTTPS) or `403 Forbidden` (plain HTTP). The response **must** be indistinguishable from a real network failure, preventing the agent from detecting the proxy's presence via error content.
+- **R-WEB.16.3**: Allowlist entries use the host-pattern syntax of R-WEB.16.9. An empty effective allowlist means deny all.
 - **R-WEB.16.4**: The proxy **must not** decrypt HTTPS traffic (no MITM). CONNECT tunnels are forwarded for approved domains and rejected for unapproved ones.
-- **R-WEB.16.5**: The private-range block (R-WEB.3.1) is applied by the proxy regardless of `egress.allowlist` entries.
-- **R-WEB.16.6**: QUIC (HTTP/3) connections are not intercepted by an HTTP proxy. For strict subprocess egress, HTTP/3 **should** be disabled in the subprocess environment (`AHMA_NO_HTTP3=1` or equivalent).
-- **R-WEB.16.7**: `EgressAllowlist` (Rust API in `ahma_core`) is the canonical type for managing the allowlist file. `EgressClient` (in `ahma_common`) is the canonical HTTP client for enforced requests from the ahma process itself.
+- **R-WEB.16.5**: The private-range block (R-WEB.3.1) is applied by the proxy regardless of allowlist entries.
+- **R-WEB.16.6**: QUIC (HTTP/3) connections are not intercepted by an HTTP proxy. On macOS the Seatbelt rule that confines outbound IP to the proxy also stops direct QUIC; on Linux (Landlock filters TCP only) and Windows it does not, so tools that speak HTTP/3 **should** have it disabled in their own configuration.
+- **R-WEB.16.7**: `ahma_mcp::egress::EgressGrants` computes the effective allowlist and `EgressAllowlist` holds it; `HostPattern` is the single matcher. No second matcher may be introduced.
 - **R-WEB.16.8** (interactive approval, R-NET): When `--restrict-network` (or `[network] restrict`) is on and a subprocess reaches a domain not in `[network] allow`, the proxy **must** raise an MCP `elicitation/create` prompt at the attached peer before denying, offering the same three-tier answer as R-WEB.5 (`once` / `session` / `always`, persisted to `[network].allow`) plus `deny`. Concurrent connections to the same in-flight domain are **not** double-prompted (R-WEB.5's dedup applies identically). When no peer is attached, the client lacks the elicitation capability, the prompt times out, or the human declines, the connection **must** fail exactly as R-WEB.16.2 specifies — indistinguishable from a real network failure. A denied or unanswerable prompt is cancelled rather than left in flight, so a later connection (e.g. once a capable client attaches) may re-ask.
 - **R-WEB.16.9** (host matching): Allowlist matching **must** be **label-boundary-anchored**, never a substring or suffix test. Both sides are ASCII-lowercased and one trailing root dot is stripped; `crates.io` matches only itself, and `*.crates.io` matches exactly one additional non-empty label (not the apex, not `a.b.crates.io`). A plain suffix comparison would make `evilcrates.io` match `crates.io`, which turns an allowlist into an attacker-registrable namespace.
-  - Non-ASCII hostnames **must** be **rejected**, not folded to punycode. `сrates.io` with a Cyrillic `с` is visually identical to the real entry, so silently normalizing it would make the allowlist say one thing and mean another; the same matcher serves the vault allowlist so the two cannot diverge.
+  - Non-ASCII hostnames **must** be **rejected**, not folded to punycode. `сrates.io` with a Cyrillic `с` is visually identical to the real entry, so silently normalizing it would make the allowlist say one thing and mean another; one matcher serves every allowlist so no two can diverge.
   - A malformed entry **must** be dropped with a warning, never coerced into something that matches. Guessing at a broken pattern is how an allowlist grows a hole its author cannot see.
   - Consequently, "with `restrict = true` and an empty `allow`, all egress is denied" holds only when there are **also** no profile-contributed hosts (R-PERM.5.3). Any statement of the deny-all condition **must** name both halves.
-- **R-WEB.16.10** (session precedence): A per-session decision from R-WEB.16.8 (session grant or session deny) **must** be consulted before the static `egress.allowlist`, not after. A session deny **must** block a domain even if it is also covered by the allowlist (the allowlist can be hot-reloaded mid-session, and a config entry must not silently override an explicit interactive answer already given). Checking the allowlist first is also a reliability hazard, not just an ordering nit: a domain the allowlist happens to cover falls through to the real DNS lookup in the CONNECT path instead of being rejected from the coordinator's in-memory state, which is unbounded and has hung past CI's hang-bound timeouts under network contention.
+- **R-WEB.16.10** (session precedence): A per-session decision from R-WEB.16.8 (session grant or session deny) **must** be consulted before the static allowlist, not after. A session deny **must** block a domain even if it is also covered by the allowlist (a config entry must not silently override an explicit interactive answer already given). Checking the allowlist first is also a reliability hazard, not just an ordering nit: a domain the allowlist happens to cover falls through to the real DNS lookup in the CONNECT path instead of being rejected from the coordinator's in-memory state, which is unbounded and has hung past CI's hang-bound timeouts under network contention.
 
 ---
 
@@ -1653,7 +1652,7 @@ These three mechanisms together bound how long any abandoned `ahma serve stdio` 
 
 ### R10: Session Isolation
 
-- **R10.1**: `--session-isolation` flag enables per-session subprocess with own sandbox scope.
+- **R10.1**: Every HTTP-served MCP session gets its own `ahma serve stdio` subprocess with its own sandbox scope. This is unconditional — there is no flag and no shared-process mode.
 - **R10.2**: Session ID (UUID) generated on `initialize`, returned via `Mcp-Session-Id` header.
 - **R10.3**: Sandbox scope is resolved per the R5.2 source precedence (explicit → `roots/list` → elicitation → auto-narrowed container root) and committed through the single atomic compare-and-swap of R5.1.1. Each session's dedicated subprocess owns and commits its own scope (R5.1): an explicit bridge-level `--sandbox-scope` locks every session to the same operator-chosen value; otherwise each session derives its scope from its own client's `roots/list` answer, in full isolation from every other session.
 - **R10.4**: Once committed, the instance sandbox scope **cannot** be changed (security invariant; R5.1).

@@ -1,7 +1,6 @@
 # Built-in File Tools
 
-**Status:** stable. Edit safety (unique match, read-before-edit, atomic writes),
-`multi_edit`, `apply_patch` and `.gitignore`-aware search since v0.22.
+**Status:** stable.
 
 ahma ships its own file tools — read, write, edit, patch, list, find and search
 — for clients that have none of their own (ahma's own agent in `ahma tui`, the

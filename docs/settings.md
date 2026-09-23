@@ -1,7 +1,8 @@
 # Ahma Settings File (`~/.ahma/settings.toml`)
 
 The settings file is the primary way to configure Ahma's behaviour.  
-It replaces the old `AHMA_*` environment variables with a single, self-documenting file.
+`AHMA_*` environment variables are **not** a configuration source: they are retired and
+ignored with a warning ([environment-variables.md](environment-variables.md)).
 
 ## Getting started
 
@@ -34,10 +35,13 @@ ahma --settings-path /path/to/my.toml serve stdio
 
 ## Priority order (highest wins)
 
-1. **CLI flags** (`--timeout 600`, `--no-sandbox`, `--tmp`, …)
-2. **`~/.ahma/settings.toml`**
-3. **`AHMA_*` environment variables** _(deprecated — emit a warning)_
+1. **CLI flags** (`--timeout 600`, `--tmp`, …)
+2. **`<workspace>/.ahma/settings.toml`** — preference keys only ([below](#project-settings-workspaceahmasettingstoml))
+3. **`~/.ahma/settings.toml`**
 4. **Compiled-in defaults**
+
+Two switches are CLI-flag-only and cannot be set from any file, so they are always
+visible where ahma is launched: `--no-sandbox` and `--insecure-skip-verify` (SPEC R-CFG2.3).
 
 ---
 
@@ -70,10 +74,11 @@ Run `ahma settings init` to generate this file automatically.
 #                          # client can wait for); "async": return an operation id
 #                          # after a short window, collect with `await`. See below.
 # skip_probes  = false    # skip availability probes at startup
+# minimize_tokens     = false # `ahma tui` chat: ask the model for terse answers
+# small_model_harness = false # `ahma tui` chat: tighter result/conversation budgets
 
 # ── Sandbox & filesystem security ────────────────────────────────────────────
 # [sandbox]
-# disable      = false    # UNSAFE: disable kernel sandbox entirely
 # tmp_access   = false    # add system temp dir to sandbox scope
 # disable_temp = false    # block all access to system temp dir (overrides tmp_access)
 # defer        = false    # defer sandbox lock until client provides roots/list
@@ -136,97 +141,19 @@ Details: SPEC R2.1, R2.4.
 
 ---
 
-## LM Studio configuration
+## Small models and token budgets (`ahma tui` chat)
 
-[LM Studio](https://lmstudio.ai/) runs local LLMs and exposes an OpenAI-compatible
-API through its built-in **Local Server**. Ahma auto-registers an `lmstudio`
-provider from these settings.
+These shape what the TUI's chat agent sends to its model; they do not change what
+tools run or return to other MCP clients.
 
-### Starting the server
+| Flag | Settings key | Effect |
+|------|--------------|--------|
+| `--context-length <tokens>` | — | Model window size. Caps one tool result at ¼ of it and the whole conversation at ¾ (≈4 chars/token), and enables proactive compaction |
+| `--small-model-harness` / `--no-…` | `tools.small_model_harness` | Without `--context-length`: tool results capped at 8 000 chars and the conversation at 24 000 (default 60 000 / 240 000); adds error and read hints after tool calls |
+| `--minimize-tokens` / `--no-…` | `tools.minimize_tokens` | Appends a conciseness rule to the system prompt. Toggle live with `/minimize` |
 
-Open LM Studio, load a model, then go to the **Developer** tab and click
-**Start Server**. Or start it headless:
-
-```bash
-# Start the server (loads the last-used model)
-lms server start
-```
-
-The server listens on `http://localhost:1234/v1` by default.
-
-### Changing the model in settings.toml
-
-Set `model` to the identifier of the model loaded in LM Studio (shown next to the
-loaded model in the app):
-
-```toml
-[lmstudio]
-model = "openai/gpt-oss-20b"
-```
-
-### Using LM Studio as a named provider in tool definitions
-
-The LM Studio settings are exposed as a named provider available in `livelog`
-tools:
-
-```json
-{
-  "tool_type": "livelog",
-  "livelog": {
-    "llm_provider": {
-      "base_url": "http://localhost:1234/v1",
-      "model": "openai/gpt-oss-20b"
-    }
-  }
-}
-```
-
-> **Tip**: You can reference the LM Studio base URL and model from `settings.toml`
-> directly — the `ahma settings show` command prints the currently configured values.
-
----
-
-## Migration from environment variables
-
-If you previously used `AHMA_*` environment variables, Ahma will emit a
-`WARN` log entry for each one it reads as a fallback, guiding you to move
-it to settings.
-
-| Old env var | New settings.toml key |
-|-------------|----------------------|
-| `AHMA_TIMEOUT` | `[tools] timeout_secs` |
-| `AHMA_SYNC` | `[tools] execution_mode = "sync"` (now the default; the interim `force_sync` key is ignored) |
-| `AHMA_SKIP_PROBES` | `[tools] skip_probes` |
-| `AHMA_DISABLE_SANDBOX` | `[sandbox] disable` |
-| `AHMA_TMP_ACCESS` | `[sandbox] tmp_access` |
-| `AHMA_DISABLE_TEMP` | `[sandbox] disable_temp` |
-| `AHMA_SANDBOX_DEFER` | `[sandbox] defer` |
-| `AHMA_LOG_TARGET` | `[logging] target` |
-| `AHMA_LOG_MONITOR` | `[logging] log_monitor` |
-| `AHMA_MONITOR_RATE_LIMIT` | `[logging] monitor_rate_limit_secs` |
-| `AHMA_LOG_DIR` | `[logging] dir` (or the `--log-dir` flag) |
-| `AHMA_REVEAL_PROFILE` | — (progressive disclosure was removed; nothing to set) |
-| `AHMA_HANDSHAKE_TIMEOUT` | `[http] handshake_timeout_secs` |
-| `AHMA_DISABLE_QUIC` | `[http] disable_quic` |
-| `AHMA_DISABLE_HTTP1_1` | `[http] disable_http1_1` |
-| `AHMA_REQUIRE_TOKEN_PATH` | `[auth] require_token_path` |
-| `AHMA_RATE_LIMIT_RPS` | `[auth] rate_limit_rps` |
-| `AHMA_RATE_LIMIT_BURST` | `[auth] rate_limit_burst` |
-| `AHMA_INSTANCE_LABEL` | `[instance] label` |
-
-### Env vars that are NOT migrated (still required)
-
-These are system/process-level conventions that belong in the environment, not a user file:
-
-| Variable | Purpose |
-|----------|---------|
-| `RUST_LOG` | Standard Rust log filter (e.g. `debug`, `info`) |
-| `OTEL_*` | OpenTelemetry standard variables |
-| `AHMA_TOOLS_DIR` | Override the tools directory (useful in CI scripts) |
-| `AHMA_SANDBOX_SCOPE` | Colon-separated sandbox scope paths (multi-path lists don't fit well in TOML) |
-| `AHMA_WORKING_DIRS` | Fallback working directories for deferred sandbox |
-| `AHMA_DAEMON_SOCK` | Unix socket path for daemon IPC (low-level override) |
-| `AHMA_TASK_VAULT` | Task vault root path (typically set by orchestration scripts) |
+Truncated results keep the head and tail; the complete output is always in the
+operation's `output_file`.
 
 ---
 

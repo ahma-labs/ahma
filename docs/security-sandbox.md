@@ -140,7 +140,7 @@ The shape-matched rules are application-layer on *every* platform by constructio
 
 ## Network egress
 
-The filesystem sandbox says nothing about the network, and **egress is unrestricted by default**. Pass `--restrict-network` (or set `[network] restrict = true`) to route sandboxed subprocesses through a guarded local proxy that forwards only the domains in `[network] allow` — deny-all when that list is empty — and refuses private, loopback and cloud-metadata addresses. The README's *What the sandbox does not cover* section states what that restriction is and is not on each platform. The per-vault `egress.allowlist` described under [Task Vaults](#task-vaults) is a separate, vault-only mechanism and does not apply to an ordinary workspace session.
+The filesystem sandbox says nothing about the network, and **egress is unrestricted by default**. Pass `--restrict-network` (or set `[network] restrict = true`) to route sandboxed subprocesses through a guarded local proxy that forwards only the domains in `[network] allow` — deny-all when that list is empty — and refuses private, loopback and cloud-metadata addresses. The README's *What the sandbox does not cover* section states what that restriction is and is not on each platform. How the allowlist is built, and the hosts each sandbox profile contributes: [network-egress.md](network-egress.md).
 
 ## Nested Sandbox Environments (Cursor, VS Code, Docker)
 
@@ -189,7 +189,7 @@ If ahma cannot apply its own sandbox and this is not a recognized nesting case, 
 
 ## HTTP Transport Authentication
 
-When running in HTTP mode (`ahma serve http`), all `/mcp` endpoints are protected by **bearer token authentication**:
+When `ahma serve http` is started with `--require-token <token>` or `--require-token-path <file>`, every `/mcp` endpoint requires **bearer token authentication** (without either, there is none — bind to loopback):
 
 ```jsonc
 // mcp.json
@@ -223,7 +223,7 @@ Common `mcp.json` for nested environments (VS Code with workspace scoping):
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["--tmp", "--livelog", "--simplify"]
+            "args": ["--tmp", "--log-monitor"]
         }
     }
 }
@@ -318,114 +318,15 @@ By default, the system temp directory is accessible only via platform-implicit r
 
 **Security considerations**: `/tmp` is shared by all users and processes. Use `mktemp` with random suffixes to avoid TOCTOU attacks. Clean up sensitive temp files after use.
 
-## Live Log Monitoring (`--livelog`)
+## Live Log Monitoring (`--log-monitor`)
 
-The `--livelog` flag grants additional read-only access to specific log files via symlinks in the `.ahma/logs/` directory at server startup — see [live-log-monitoring.md](live-log-monitoring.md) and [SPEC.md R9](../SPEC.md).
-
----
+With `--log-monitor` (or `[logging] log_monitor = true`) the sandbox also grants read-only
+access to the targets of symlinks in `.ahma/logs/` at startup, so a `livelog` tool can
+follow a log file that lives outside the workspace. A target outside the workspace is
+added only once approved with the `logs_approve` tool — see
+[live-log-monitoring.md](live-log-monitoring.md) and SPEC R9.
 
 ## Task Vaults
 
-A **Task Vault** is a per-question isolated working directory that promotes the "dedicated folder per task" security principle from user discipline to a kernel-enforced architectural guarantee.
-
-### Why task vaults?
-
-Cowork's user guidance says: _"Create a per-task working folder. Copy in inputs."_ This is good advice, but it relies on users remembering to follow it. In Ahma, a vault is the only way to start a task — there is no "grant my whole Documents folder" option.
-
-### Directory layout
-
-```
-~/.ahma/tasks/<utc-date>-<slug>-<hex>/
-  inputs/       — copies of user-provided files (read intent; never modified in-place)
-  workdir/      — kernel sandbox scope root; all agent commands run here
-  outputs/      — artifacts produced by tools (HTML reports, CSV exports, etc.)
-  trash/        — staged-deletion holding area (two-phase delete)
-  audit.jsonl   — append-only JSONL audit log of all operations
-```
-
-### Creating a vault
-
-```bash
-# Create a vault and print its root path
-VAULT=$(ahma vault create summarise-q4-report)
-echo $VAULT
-# ~/.ahma/tasks/20260520T120000Z-summarise-q4-report-a1b2c3d4e5f60001/
-
-# Start an ahma HTTP bridge scoped to that vault's workdir
-ahma serve http --task-vault "$VAULT"
-```
-
-Or in a single `mcp.json` entry:
-
-```json
-{
-    "servers": {
-        "Ahma (vault)": {
-            "type": "stdio",
-            "command": "sh",
-            "args": ["-c", "ahma serve stdio --task-vault \"$(ahma vault create $SLUG)\""]
-        }
-    }
-}
-```
-
-### Security properties
-
-| Property | Detail |
-|----------|--------|
-| **Kernel-enforced scope** | The sandbox scope is `<vault>/workdir/` — writes outside it are rejected by the kernel on Linux and macOS (see the platform table at the top of this page for what *reads* do, and for Windows) |
-| **Inputs are copies** | The agent never touches original files — only copies placed in `inputs/` |
-| **Two-phase delete** | `trash/` holds staged deletions; `purge` requires explicit confirmation |
-| **Append-only audit** | `audit.jsonl` records every tool call, artifact write, and elevation grant |
-| **Egress allowlist** | `egress.allowlist` in the vault root controls outbound network access |
-
-### Two-phase delete
-
-The AI can never permanently delete a file in one step. The `TrashManager` enforces:
-
-1. **Stage** — the file is moved to `trash/<timestamp>_<filename>`; the original location is empty immediately.
-2. **Review** — `ahma vault list-staged <vault>` shows what is waiting.
-3. **Purge** — only after explicit per-batch confirmation does `purge()` permanently remove staged entries.
-
-This limits the blast radius of a confused `rm -rf` to a recoverable staging operation.
-
-### Audit log format
-
-Each line in `audit.jsonl` is a JSON object:
-
-```json
-{"timestamp":"2026-05-20T12:00:01Z","type":"tool_call","operation_id":"op_1","tool_name":"cargo_build","args_summary":"--release"}
-{"timestamp":"2026-05-20T12:00:04Z","type":"tool_complete","operation_id":"op_1","success":true,"duration_ms":3200}
-{"timestamp":"2026-05-20T12:00:05Z","type":"artifact_written","path":"outputs/result.html","size_bytes":4096}
-```
-
-### Renewal contract
-
-A task vault session that runs unattended for more than `T_renew` seconds (default 5 minutes) is automatically halted with a checkpoint written to the vault. The user must re-approve before the operation continues. This closes Cowork's "scheduled task drift" vulnerability where a re-injection can steer a long unattended run without the user knowing.
-
----
-
-## Egress Sandbox
-
-The **egress sandbox** closes the network egress carve-out present in Cowork (web-fetch and MCP connections bypass org egress policies).
-
-Each task vault can have an `egress.allowlist` file:
-
-```
-# ahma egress allowlist — one domain pattern per line
-api.openai.com          # explicit allow
-*.anthropic.com         # wildcard subdomain
-# (empty = deny all outbound connections)
-```
-
-When `ahma serve http --task-vault <vault>` starts, an egress proxy is bound to a random localhost port and injected into the subprocess environment:
-
-```
-HTTP_PROXY=http://127.0.0.1:<port>
-HTTPS_PROXY=http://127.0.0.1:<port>
-NO_PROXY=127.0.0.1,::1,localhost
-```
-
-Requests to domains not in the allowlist receive `407 Proxy Authentication Required` (CONNECT) or `403 Forbidden` (plain HTTP), indistinguishable from a real network failure — the subprocess learns nothing about which domains are blocked.
-
-On Linux and macOS the kernel FS sandbox blocks the subprocess from modifying `/etc/hosts` or `/etc/resolv.conf`, closing the DNS-rebinding route around the proxy. On Windows that write is not OS-blocked yet (SPEC R6.3.9), so treat the proxy there as the only control.
+`--task-vault <dir>` makes a per-task directory's `workdir/` the whole sandbox scope and
+turns `rm` into a recoverable move to `trash/`. See [task-vault.md](task-vault.md).

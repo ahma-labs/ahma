@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// The session-health fields (`pending_grants`, `reconnects`) are `#[serde(default)]`
 /// so old and new peers stay wire-compatible in both directions: an old payload
 /// deserializes here with zeros, and an old peer ignores the extra fields
-/// (issue #485, `docs/session-health-notifications.md` §3.1).
+/// (SPEC R8.8.4; `docs/session-health-notifications.md` "Heartbeat convergence fields").
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct HeartbeatPayload {
     /// Application version (e.g., "0.11.9")

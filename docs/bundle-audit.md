@@ -1,6 +1,6 @@
 # Bundle Checksums and Supply-Chain Audit
 
-> **Experimental** — introduced in v0.7.
+> **Experimental.**
 
 Ahma can audit and verify MTDF tool bundles (directories of `.ahma/*.json` files) for supply-chain risks. This closes the "plugin marketplace contains malware" attack class by treating third-party bundles as untrusted by default.
 
@@ -113,11 +113,8 @@ let ok = BundleVerifier::new().verify(Path::new("/path/to/bundle"))?;
 ## Roadmap
 
 Real signing — a detached signature over the manifest, verified against a trusted
-key the bundle cannot supply — is tracked in SPEC.md §11 as the v0.8 signed bundle
-index. Until it lands, nothing in ahma provides tamper-evidence for a bundle;
+key the bundle cannot supply — is not implemented. Until it is, nothing in ahma provides tamper-evidence for a bundle;
 `ahma bundle audit` (which reads what the tools do) is the control that exists.
-Integration with a hosted first-party index and an `--allow-unsigned` flag follow
-from it.
 
 ## See also
 

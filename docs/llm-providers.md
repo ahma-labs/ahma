@@ -49,8 +49,8 @@ api_key       = "${AZURE_OPENAI_KEY}"
 }
 ```
 
-> **Note**: Named provider refs (`llm_provider_ref`) are coming in v0.8. For now,
-> inline the connection details and use `${ENV_VAR}` for any API key field.
+> **Note**: tool files cannot yet reference a named provider; inline the connection
+> details and use `${ENV_VAR}` for any API key field.
 
 ## API key security
 
@@ -79,6 +79,54 @@ ahma serve stdio
 
 Or in a `.env` file that is **not committed to version control**.
 
+## LM Studio (`[lmstudio]` in `~/.ahma/settings.toml`)
+
+[LM Studio](https://lmstudio.ai/) runs local LLMs and exposes an OpenAI-compatible
+API through its built-in **Local Server**. Ahma auto-registers an `lmstudio`
+provider from these settings.
+
+### Starting the server
+
+Open LM Studio, load a model, then go to the **Developer** tab and click
+**Start Server**. Or start it headless:
+
+```bash
+# Start the server (loads the last-used model)
+lms server start
+```
+
+The server listens on `http://localhost:1234/v1` by default.
+
+### Changing the model in settings.toml
+
+Set `model` to the identifier of the model loaded in LM Studio (shown next to the
+loaded model in the app):
+
+```toml
+[lmstudio]
+model = "openai/gpt-oss-20b"
+```
+
+### Using LM Studio as a named provider in tool definitions
+
+The LM Studio settings are exposed as a named provider available in `livelog`
+tools:
+
+```json
+{
+  "tool_type": "livelog",
+  "livelog": {
+    "llm_provider": {
+      "base_url": "http://localhost:1234/v1",
+      "model": "openai/gpt-oss-20b"
+    }
+  }
+}
+```
+
+> **Tip**: You can reference the LM Studio base URL and model from `settings.toml`
+> directly — the `ahma settings show` command prints the currently configured values.
+
 ## Provider compatibility table
 
 | Provider | `base_url` pattern | Notes |
@@ -103,4 +151,5 @@ curl http://localhost:11434/v1/chat/completions \
 
 ## See also
 
-- [docs/task-vault.md](task-vault.md) — per-task egress allowlist for network calls
+- [docs/settings.md](settings.md) — `[lmstudio]`, `[agent]` and the chat token budgets
+- [docs/live-log-monitoring.md](live-log-monitoring.md) — `livelog` tools, the main provider consumer

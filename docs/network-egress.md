@@ -4,8 +4,7 @@ How `--restrict-network` decides which hostnames a sandboxed subprocess may
 reach, and why turning it on no longer breaks your first build.
 
 Related: [security-sandbox.md](security-sandbox.md#network-egress) for the
-platform enforcement story, [egress-sandbox.md](egress-sandbox.md) for the
-separate per-vault allowlist, [permissions.md](permissions.md) for the wider
+platform enforcement story, [permissions.md](permissions.md) for the wider
 grant model.
 
 ## The problem this fixes
