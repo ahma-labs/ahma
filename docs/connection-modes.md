@@ -225,7 +225,7 @@ curl -X GET http://localhost:3000/mcp \
 
 ## Session Isolation
 
-In HTTP mode, each MCP session gets its own sandbox scope derived from the `roots/list` response. See [docs/session-isolation.md](session-isolation.md) for details.
+In HTTP mode, each MCP session gets its own sandbox scope derived from the `roots/list` response. See [docs/session-isolation.md](session-isolation.md) for details. A client that wants to show reconnects and pending sandbox grants can listen for ahma's session-health notifications: [docs/session-health-notifications.md](session-health-notifications.md).
 
 ### Cursor shared-process and empty roots
 

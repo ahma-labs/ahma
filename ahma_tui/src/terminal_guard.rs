@@ -13,7 +13,7 @@
 //! version of a crash — the terminal stays raw and on the alternate screen, so
 //! the panic message itself is written somewhere the user cannot see, and they
 //! are left with a shell that appears dead and no explanation of why.
-//! `ahma_tui/SPEC.md` §3 requires the restore to hold "even upon panic"; this
+//! `ahma_tui/SPEC.md` (Non-Functional Requirements) requires the restore to hold "even upon panic"; this
 //! module is what makes that true.
 //!
 //! Two mechanisms, because neither alone is enough:
@@ -264,7 +264,7 @@ mod tests {
             calls.lock().len(),
             1,
             "Drop is what covers an unwind: without it a panic in the event loop \
-             leaves the terminal raw and on the alternate screen (ahma_tui/SPEC.md §3)"
+             leaves the terminal raw and on the alternate screen (ahma_tui/SPEC.md, Non-Functional Requirements)"
         );
     }
 

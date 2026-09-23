@@ -238,21 +238,21 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Live log monitoring | [docs/live-log-monitoring.md](docs/live-log-monitoring.md) | §5.5 |
 | Environment variables | [docs/environment-variables.md](docs/environment-variables.md) | — |
 | Installation | [docs/installation.md](docs/installation.md) | — |
-| Session isolation | [docs/session-isolation.md](docs/session-isolation.md) | R10 |
-| Task vaults | [docs/task-vault.md](docs/task-vault.md) | §5.8 |
-| TUI | [docs/tui.md](docs/tui.md) | R24, R24.9 |
+| Session isolation | [docs/session-isolation.md](docs/session-isolation.md) | R10 (`ahma_http_bridge/SPEC.md`) |
+| Task vaults | [docs/task-vault.md](docs/task-vault.md) | `ahma_vault/SPEC.md` |
+| TUI | [docs/tui.md](docs/tui.md) | R24, R25 (`ahma_tui/SPEC.md`) |
 | Per-user daemon | [docs/daemon.md](docs/daemon.md) | R-DAEMON |
 | Network egress (`--restrict-network`) | [docs/network-egress.md](docs/network-egress.md) | R-WEB.16, R-PERM.5.3 |
 | Execution audit log | [docs/execution-audit-log.md](docs/execution-audit-log.md) | R-HANDOFF.10 |
-| Bundle audit | [docs/bundle-audit.md](docs/bundle-audit.md) | — |
-| ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | — |
-| Code complexity analysis (`simplify`) | [docs/simplify.md](docs/simplify.md) | §9.5 |
+| Bundle audit | [docs/bundle-audit.md](docs/bundle-audit.md) | `ahma_bundle/SPEC.md` |
+| ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | `ahma_core/SPEC.md` |
+| Code complexity analysis (`simplify`) | [docs/simplify.md](docs/simplify.md) | `ahma_simplify/SPEC.md` |
 | Built-in file tools | [docs/file-tools.md](docs/file-tools.md) | R26 |
 | Doctor (`ahma doctor`, `/doctor`) | [docs/doctor.md](docs/doctor.md) | R-DOCTOR |
 | Settings file, sync/async execution mode | [docs/settings.md](docs/settings.md) | R-CFG, R2.1, R2.4 |
 | Permissions and grants | [docs/permissions.md](docs/permissions.md) | R-PERM |
 | LLM providers | [docs/llm-providers.md](docs/llm-providers.md) | §5.5 |
-| Session-health notifications | [docs/session-health-notifications.md](docs/session-health-notifications.md) | R8.8 |
+| Session-health notifications | [docs/session-health-notifications.md](docs/session-health-notifications.md) | R8.8 (`ahma_http_bridge/SPEC.md`) |
 | Release signing and provenance | [docs/release-signing.md](docs/release-signing.md) | R-SIGN |
 
 ### Maintenance Checklist

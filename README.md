@@ -324,7 +324,7 @@ See [docs/connection-modes.md](docs/connection-modes.md) for `mcp.json` examples
 Issues and pull requests are welcome. This project is AI friendly and provides the following:
 
 - **`AGENTS.md`/`CLAUDE.md`**: Instructions for AI agents to use the MCP server to contribute to the project.
-- **`SPEC.md`**: This is the **single source of truth** for the project requirements. AI keeps it up to date as you work on the project.
+- **`SPEC.md`**: the product requirements and how the parts fit together; each crate's own `SPEC.md` holds the requirements that crate implements. AI keeps them current as you work.
 - **[docs/build-and-test-performance.md](docs/build-and-test-performance.md)**: why `target/` used to grow to tens of GB, what the build/test layout does about it, and the measurements behind the rules in `AGENTS.md`.
 
 ## Working well with Claude (Sonnet / Opus)

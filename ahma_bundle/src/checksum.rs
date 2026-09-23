@@ -138,7 +138,7 @@ impl BundleChecksummer {
 /// The struct carries no key ring. It used to hold a `trusted_key_dir` that
 /// nothing ever read — a field kept alive by `#[allow(dead_code)]`, which was the
 /// clearest single tell that this had never been verification against a trust
-/// root. When there is a real signing scheme (SPEC §11) it will need a key
+/// root. When there is a real signing scheme (`ahma_bundle/SPEC.md`) it will need a key
 /// parameter; inventing one before it has a consumer only makes the surface look
 /// like it checks more than it does.
 #[derive(Debug, Default, Clone, Copy)]

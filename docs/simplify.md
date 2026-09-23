@@ -522,4 +522,4 @@ To add simplify to your own CI pipeline:
 
 - [agent-skills.md](agent-skills.md) — AI agent skill configuration
 - [../README.md](../README.md) — Main Ahma documentation
-- [../SPEC.md](../SPEC.md) §9.5 — Full specification for `ahma simplify`
+- [../ahma_simplify/SPEC.md](../ahma_simplify/SPEC.md) — Full specification for `ahma simplify`
