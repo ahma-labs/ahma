@@ -71,4 +71,7 @@ saying what that would let tools do.
 - [docs/tui.md](tui.md) — `/intro`, `/settings`, and the rest of the TUI
 - [docs/permissions.md](permissions.md) — the permission ledger and audit log
 - [docs/settings.md](settings.md) — every setting
+- [docs/system-assistant-plan.md](system-assistant-plan.md) — the plan for
+  letting a local model change system settings under the same
+  "model proposes, ahma disposes" rule
 - SPEC: R-DOCTOR, R-PERM, R5.4.8
