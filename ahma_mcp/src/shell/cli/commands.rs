@@ -44,11 +44,6 @@ fn setting_rows(
             });
         };
     }
-    row!("features.simplify", features.simplify);
-    row!("features.vault", features.vault);
-    row!("features.egress", features.egress);
-    row!("features.artifact", features.artifact);
-    row!("features.decompose", features.decompose);
     row!("lmstudio.base_url", lmstudio.base_url);
     row!("lmstudio.model", lmstudio.model);
     row!("tools.timeout_secs", tools.timeout_secs);

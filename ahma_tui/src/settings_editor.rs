@@ -4,14 +4,13 @@
 //! navigator.  Users can browse categorized settings, toggle booleans with
 //! Space, edit numbers/strings, and persist changes to `~/.ahma/settings.toml`.
 
-use ahma_common::config::{AhmaSettings, FeatureSettings};
+use ahma_common::config::AhmaSettings;
 
 // ─── Setting categories ───────────────────────────────────────────────────────
 
 /// A category of settings in the editor sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsCategory {
-    Features,
     Tools,
     /// What this folder is trusted with, and what ahma has been allowed to
     /// reach outside it (SPEC R-PERM). Changes here ask for confirmation.
@@ -39,7 +38,6 @@ impl SettingsCategory {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Features => "Features",
             Self::Tools => "Tools",
             Self::Access => "Access & trust",
             Self::Model => "Model",
@@ -56,7 +54,6 @@ impl SettingsCategory {
     /// crate's unicode detection, so a non-Unicode terminal got mojibake.
     pub fn icon(self) -> &'static str {
         match self {
-            Self::Features => "-",
             Self::Tools => "T",
             Self::Access => "P",
             Self::Model => "M",
@@ -110,7 +107,7 @@ impl std::fmt::Display for SettingValue {
 /// One row in the settings panel.
 #[derive(Debug, Clone)]
 pub struct SettingItem {
-    /// TOML key path, e.g. "features.simplify"
+    /// TOML key path, e.g. "tools.timeout_secs"
     pub key: &'static str,
     /// Human-readable label
     pub label: &'static str,
@@ -470,7 +467,6 @@ impl SettingsEditor {
         let edited = self.settings.clone();
         let saved = AhmaSettings::update(|on_disk| {
             let persistent_scopes = std::mem::take(&mut on_disk.sandbox.persistent_scopes);
-            on_disk.features = edited.features.clone();
             on_disk.tools = edited.tools.clone();
             on_disk.sandbox = edited.sandbox.clone();
             on_disk.sandbox.persistent_scopes = persistent_scopes;
@@ -507,7 +503,6 @@ impl SettingsEditor {
     pub fn items_for_category(&self, category: SettingsCategory) -> Vec<SettingItem> {
         let defaults = AhmaSettings::default();
         match category {
-            SettingsCategory::Features => self.feature_items(&defaults),
             SettingsCategory::Tools => self.tool_items(&defaults),
             SettingsCategory::Access => self.access_items(),
             SettingsCategory::Model => self.model_items(),
@@ -520,53 +515,6 @@ impl SettingsEditor {
     }
 
     // ── Category item builders ────────────────────────────────────────────
-
-    fn feature_items(&self, defaults: &AhmaSettings) -> Vec<SettingItem> {
-        let f = &self.settings.features;
-        let d = &defaults.features;
-        vec![
-            SettingItem {
-                key: "features.simplify",
-                label: "Simplify",
-                description: "Code complexity analysis (ahma simplify)",
-                value: SettingValue::Bool(f.simplify),
-                default_value: SettingValue::Bool(d.simplify),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "features.vault",
-                label: "Vault",
-                description: "Task vault isolation (per-session directories)",
-                value: SettingValue::Bool(f.vault),
-                default_value: SettingValue::Bool(d.vault),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "features.egress",
-                label: "Egress",
-                description: "Network egress proxy for sandboxed tasks",
-                value: SettingValue::Bool(f.egress),
-                default_value: SettingValue::Bool(d.egress),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "features.artifact",
-                label: "Artifact",
-                description: "HTML artifact output channel",
-                value: SettingValue::Bool(f.artifact),
-                default_value: SettingValue::Bool(d.artifact),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "features.decompose",
-                label: "Decompose",
-                description: "LLM-powered task decomposition",
-                value: SettingValue::Bool(f.decompose),
-                default_value: SettingValue::Bool(d.decompose),
-                security_tier: false,
-            },
-        ]
-    }
 
     fn tool_items(&self, defaults: &AhmaSettings) -> Vec<SettingItem> {
         let t = &self.settings.tools;
@@ -951,7 +899,6 @@ impl SettingsEditor {
         value: &SettingValue,
     ) {
         match category {
-            SettingsCategory::Features => self.apply_feature(index, value),
             SettingsCategory::Tools => self.apply_tool(index, value),
             // Access changes are applied (confirmed) immediately, never via
             // save; Model is changed with /model. Neither is edited here.
@@ -961,21 +908,6 @@ impl SettingsEditor {
             SettingsCategory::Http => self.apply_http(index, value),
             SettingsCategory::Auth => self.apply_auth(index, value),
             SettingsCategory::Instance => self.apply_instance(index, value),
-        }
-    }
-
-    fn apply_feature(&mut self, index: usize, value: &SettingValue) {
-        let SettingValue::Bool(v) = value else {
-            return;
-        };
-        let f = &mut self.settings.features;
-        match index {
-            0 => f.simplify = *v,
-            1 => f.vault = *v,
-            2 => f.egress = *v,
-            3 => f.artifact = *v,
-            4 => f.decompose = *v,
-            _ => {}
         }
     }
 
@@ -1048,12 +980,6 @@ impl SettingsEditor {
         }
     }
 
-    /// Apply the features from this editor to a mutable `FeatureSettings` reference.
-    /// Useful for propagating changes without restart.
-    pub fn feature_settings(&self) -> &FeatureSettings {
-        &self.settings.features
-    }
-
     /// Clear the status message if it's been shown for more than 3 seconds.
     pub fn tick_status(&mut self) {
         if let Some((_, when)) = &self.status_message
@@ -1072,9 +998,7 @@ mod tests {
     use ahma_common::config::ExecutionPolicy;
 
     #[test]
-    /// The panel opens on Tools now: the old first category (Features) held
-    /// five switches nothing in the workspace reads, so a user's first
-    /// interaction with settings was toggling controls wired to nothing.
+    /// The panel opens on Tools.
     fn toggle_first_category_item() {
         let mut editor = SettingsEditor::default();
         assert_eq!(editor.current_category(), SettingsCategory::Tools);
@@ -1238,7 +1162,6 @@ mod tests {
 
     #[test]
     fn category_label_and_icon_cover_all_variants() {
-        // Features is intentionally absent from ALL: its switches were inert.
         // Markers are ASCII — SPEC R22.3 forbids emoji in terminal output.
         let expected = [
             (SettingsCategory::Tools, "Tools", "T"),
@@ -1466,7 +1389,7 @@ mod tests {
     #[test]
     fn item_navigation_clamps_at_bounds() {
         let mut editor = SettingsEditor::default();
-        // Features has 5 items.
+        // Tools has 5 items.
         assert_eq!(editor.selected_item, 0);
         editor.item_up(); // already at top, stays
         assert_eq!(editor.selected_item, 0);
@@ -1508,10 +1431,6 @@ mod tests {
     #[test]
     fn items_for_category_counts_all_categories() {
         let editor = SettingsEditor::default();
-        assert_eq!(
-            editor.items_for_category(SettingsCategory::Features).len(),
-            5
-        );
         assert_eq!(editor.items_for_category(SettingsCategory::Tools).len(), 5);
         assert_eq!(
             editor.items_for_category(SettingsCategory::Sandbox).len(),
@@ -1590,27 +1509,6 @@ mod tests {
     }
 
     // ── apply_* per-index, wrong-type, and out-of-range branches ──────────
-
-    #[test]
-    fn apply_feature_all_indices_and_guards() {
-        let mut e = SettingsEditor::default();
-        e.apply_feature(0, &SettingValue::Bool(false));
-        e.apply_feature(1, &SettingValue::Bool(true));
-        e.apply_feature(2, &SettingValue::Bool(false));
-        e.apply_feature(3, &SettingValue::Bool(false));
-        e.apply_feature(4, &SettingValue::Bool(false));
-        assert!(!e.settings().features.simplify);
-        assert!(e.settings().features.vault);
-        assert!(!e.settings().features.egress);
-        assert!(!e.settings().features.artifact);
-        assert!(!e.settings().features.decompose);
-        // Out-of-range index: no-op, no panic.
-        e.apply_feature(99, &SettingValue::Bool(true));
-        // Wrong value type: early return guard.
-        let before = e.settings().features.vault;
-        e.apply_feature(1, &SettingValue::U64(1));
-        assert_eq!(e.settings().features.vault, before);
-    }
 
     #[test]
     fn apply_tool_all_indices_and_guards() {
@@ -1742,7 +1640,6 @@ mod tests {
     #[test]
     fn apply_item_to_settings_dispatches_each_category() {
         let mut e = SettingsEditor::default();
-        e.apply_item_to_settings(SettingsCategory::Features, 0, &SettingValue::Bool(false));
         e.apply_item_to_settings(SettingsCategory::Tools, 0, &SettingValue::U64(7));
         e.apply_item_to_settings(SettingsCategory::Sandbox, 1, &SettingValue::Bool(true));
         e.apply_item_to_settings(
@@ -1757,23 +1654,12 @@ mod tests {
             0,
             &SettingValue::String("n".into()),
         );
-        assert!(!e.settings().features.simplify);
         assert_eq!(e.settings().tools.timeout_secs, 7);
         assert!(e.settings().sandbox.tmp_access);
         assert_eq!(e.settings().logging.target, "stderr");
         assert_eq!(e.settings().http.handshake_timeout_secs, 11);
         assert_eq!(e.settings().auth.rate_limit_rps, 3);
         assert_eq!(e.settings().instance.label, "n");
-    }
-
-    #[test]
-    fn accessors_settings_and_feature_settings() {
-        let editor = SettingsEditor::default();
-        // Both accessors point at the same underlying features.
-        assert_eq!(
-            editor.settings().features.simplify,
-            editor.feature_settings().simplify
-        );
     }
 
     // ── save() via the AHMA_TEST_HOME debug seam (success path) ────────────
