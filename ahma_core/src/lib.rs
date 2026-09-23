@@ -8,17 +8,19 @@
 //!
 //! This crate is licensed under **MIT OR Apache-2.0**.
 //!
-//! ## Key re-exports
+//! ## Contents
 //!
-//! | Type | From | Purpose |
-//! |------|------|---------|
-//! | [`Sandbox`] | `ahma_mcp::sandbox` | Kernel-level FS sandbox |
-//! | [`SandboxMode`] | `ahma_mcp::sandbox` | Sandbox enforcement mode |
-//! | [`OperationMonitor`] | `ahma_mcp::operation_monitor` | Async operation tracking |
-//! | [`OperationStatus`] | `ahma_mcp::operation_monitor` | Operation status enum |
-//! | [`MonitorConfig`] | `ahma_mcp::operation_monitor` | Monitor configuration |
-//! | [`AhmaMcpService`] | `ahma_mcp` | Full MCP server service |
-//! | [`LlmClient`] | `ahma_llm_monitor` | OpenAI-compatible LLM client |
+//! | Item | Purpose |
+//! |------|---------|
+//! | [`Sandbox`], [`SandboxMode`] | Kernel-level filesystem sandbox (from `ahma_mcp::sandbox`) |
+//! | [`OperationMonitor`], [`OperationStatus`], [`MonitorConfig`] | Operation tracking (from `ahma_mcp::operation_monitor`) |
+//! | [`Adapter`], [`AhmaMcpService`] | Tool execution and the full MCP service (from `ahma_mcp`) |
+//! | [`LlmClient`] | OpenAI- and Anthropic-compatible LLM client (from `ahma_llm_monitor`) |
+//! | [`agent`] | The chat agent loop that drives ahma's tools ([`execute_agent_turn`]) |
+//! | [`approvals`] | Persistent per-workspace "always allow" tool grants |
+//! | [`tool_menu`] | Which tools a model is offered, and how a small model asks for more |
+//!
+//! Requirements: `ahma_core/SPEC.md`.
 //!
 //! ## AGPL-licensed sibling crates
 //!
@@ -28,7 +30,7 @@
 //!
 //! | Crate | License | Primitives |
 //! |-------|---------|-----------|
-//! | `ahma_tui` | AGPL-3.0 | `TuiApp`, `TuiEvent`, `run_tui` |
+//! | `ahma_tui` | AGPL-3.0 | `run_tui` and the terminal UI |
 //!
 //! Linking any of these AGPL crates into a binary means any modified version
 //! offered to remote users over a network must provide source access per
