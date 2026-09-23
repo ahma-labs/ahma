@@ -63,6 +63,9 @@ pub struct ChatTurn {
     /// request to its first token or thought). Paired with the prompt size the
     /// next `Usage` reports, it becomes the model's measured reading speed.
     pub last_prefill: Option<std::time::Duration>,
+    /// What a small model is offered this turn (`core`, `core + git`), when
+    /// the instance says (SPEC R24.12.8).
+    pub tools: Option<String>,
 }
 
 /// What a running turn is doing, derived only from real events — never a guess
@@ -70,8 +73,12 @@ pub struct ChatTurn {
 /// reads as "busy reading 37k tokens", not as dead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnPhase {
+    /// A local model is being loaded into memory before it can read anything
+    /// (reported by the instance from Ollama's `/api/ps`).
+    Loading,
     /// The request is with the model and it has not produced anything yet:
-    /// it is loading, or reading (prefilling) the whole prompt.
+    /// it is reading (prefilling) the whole prompt — or loading, when the
+    /// server cannot tell us which.
     Reading,
     /// The model is reasoning (thinking tokens are arriving).
     Thinking,
@@ -95,6 +102,7 @@ impl ChatTurn {
             phase: TurnPhase::Reading,
             phase_since: now,
             last_prefill: None,
+            tools: None,
         }
     }
 
@@ -139,7 +147,7 @@ impl ChatTurn {
         let quiet = now.duration_since(self.last_event);
         match self.phase {
             TurnPhase::Thinking | TurnPhase::Writing => quiet >= TURN_STALL_AFTER,
-            TurnPhase::Reading => quiet >= READING_STALL_AFTER,
+            TurnPhase::Loading | TurnPhase::Reading => quiet >= READING_STALL_AFTER,
             TurnPhase::Tool { .. } | TurnPhase::AwaitingYou => false,
         }
     }
@@ -161,6 +169,12 @@ pub fn turn_status_text(
     let in_phase = now.duration_since(turn.phase_since);
     let clock = fmt_duration_short(in_phase);
     match &turn.phase {
+        TurnPhase::Loading => {
+            let hint = (in_phase.as_secs() >= 30).then(|| {
+                "the first load is slow; later turns with this model are faster".to_string()
+            });
+            (format!("{model} is loading into memory · {clock}"), hint)
+        }
         TurnPhase::Reading => {
             let mut text = if prompt_tokens > 0 {
                 format!(
@@ -180,6 +194,9 @@ pub fn turn_status_text(
                     }
                     _ => text.push_str(" · taking longer than last time"),
                 }
+            }
+            if let Some(tools) = turn.tools.as_deref().filter(|t| *t != "all") {
+                text.push_str(&format!(" · tools: {tools}"));
             }
             let slow = read_rate.is_some_and(|r| r < 200.0) || in_phase.as_secs() >= 60;
             let hint = (slow && prompt_tokens >= 20_000).then(|| {
@@ -3654,6 +3671,48 @@ mod tests {
                 .0
                 .contains("waiting for your answer")
         );
+    }
+
+    /// Ollama loading a model into memory is its own wait, and says so; the
+    /// reading clock (and the measured reading speed) starts after it.
+    #[test]
+    fn loading_a_local_model_is_named_and_does_not_count_as_reading() {
+        let (loading, now) = turn_in(TurnPhase::Loading, 12);
+        let (text, hint) = turn_status_text(&loading, now, "qwen3.8", 13_000, Some(150.0));
+        assert_eq!(text, "qwen3.8 is loading into memory · 12s");
+        assert!(hint.is_none(), "too early for a hint");
+        let (slow, now) = turn_in(TurnPhase::Loading, 45);
+        let (_, hint) = turn_status_text(&slow, now, "qwen3.8", 0, None);
+        assert!(
+            hint.unwrap().contains("first load"),
+            "slow load explains itself"
+        );
+
+        let mut turn = ChatTurn::new(None);
+        turn.enter(TurnPhase::Loading);
+        turn.enter(TurnPhase::Reading);
+        turn.note_token("x");
+        assert!(
+            turn.last_prefill.is_some(),
+            "prefill is measured from reading"
+        );
+        assert!(
+            !loading.is_stalled(loading.last_event + TURN_STALL_AFTER * 2),
+            "loading gets the reading allowance"
+        );
+    }
+
+    /// A small model is offered a subset of the tools; the reading line says
+    /// which, so "why did it not use git?" has a visible answer.
+    #[test]
+    fn the_reading_line_says_which_tools_a_small_model_has() {
+        let (mut turn, now) = turn_in(TurnPhase::Reading, 3);
+        turn.tools = Some("core + git".into());
+        let (text, _) = turn_status_text(&turn, now, "m", 4_000, None);
+        assert!(text.ends_with("· tools: core + git"), "{text}");
+        turn.tools = Some("all".into());
+        let (text, _) = turn_status_text(&turn, now, "m", 4_000, None);
+        assert!(!text.contains("tools:"), "the full set is not news: {text}");
     }
 
     #[test]

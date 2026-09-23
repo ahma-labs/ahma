@@ -840,7 +840,6 @@ impl AhmaMcpService {
     /// * `guidance` - Optional guidance configuration for AI usage hints.
     /// * `force_synchronous` - If true, overrides async defaults (e.g., for debugging).
     /// * `defer_sandbox` - If true, delays sandbox initialization (for HTTP bridge scenarios).
-    /// * `progressive_disclosure` - If true, only built-in + activate_tools shown initially.
     pub async fn new(
         adapter: Arc<Adapter>,
         operation_monitor: Arc<crate::operation_monitor::OperationMonitor>,

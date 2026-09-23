@@ -323,3 +323,47 @@ async fn chat_completion_does_not_retry_4xx() {
     assert!(err.to_string().contains("400"), "got: {err}");
     // `expect(1)` is verified on server drop: exactly one request was made.
 }
+
+// ── Ollama `/api/ps`: which models are resident (the "loading" phase) ──────
+
+#[tokio::test]
+async fn loaded_local_models_reads_ollama_ps_beside_the_v1_api() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "models": [{"name": "qwen3:8b", "model": "qwen3:8b", "size": 1}]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = LlmClient::new(format!("{}/v1", server.uri()), "qwen3:8b", None);
+    let loaded = client
+        .loaded_local_models()
+        .await
+        .expect("an Ollama answer");
+    assert_eq!(loaded, vec!["qwen3:8b".to_string()]);
+    assert!(client.is_model_resident(&loaded));
+
+    let other = LlmClient::new(format!("{}/v1", server.uri()), "llama3", None);
+    assert!(!other.is_model_resident(&loaded));
+}
+
+#[tokio::test]
+async fn loaded_local_models_is_none_for_a_server_that_is_not_ollama() {
+    let server = MockServer::start().await; // 404 for everything
+    let client = LlmClient::new(format!("{}/v1", server.uri()), "m", None);
+    assert_eq!(client.loaded_local_models().await, None);
+}
+
+#[tokio::test]
+async fn loaded_local_models_never_asks_a_remote_endpoint() {
+    let client = LlmClient::new("https://api.example.invalid/v1", "m", None);
+    assert_eq!(client.loaded_local_models().await, None);
+}
+
+#[test]
+fn a_latest_tag_is_the_same_model() {
+    let client = LlmClient::new("http://127.0.0.1:1/v1", "llama3", None);
+    assert!(client.is_model_resident(&["llama3:latest".to_string()]));
+}

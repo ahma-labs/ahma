@@ -2012,7 +2012,13 @@ correct **at startup**, not only for events that happen afterwards.
     thinking or writing* — or for 10 minutes while still reading its prompt,
     which is silent by nature — is marked stalled in the footer beside the key
     that cancels it. Waiting on the user or on a running tool is never a stall.
-    `AgentError` stops the turn's timer exactly as `AgentDone` does.
+    `AgentError` stops the turn's timer exactly as `AgentDone` does. A model
+    on this machine that Ollama is still loading into memory is its own phase
+    ("loading into memory", from `GET /api/ps`, asked only of a loopback
+    server and only until the model is resident or output starts; carried as
+    `HubRelay::ChatStatus`, a new message older TUIs skip per R24.5). It gets
+    the reading allowance, and the reading clock — and the measured reading
+    speed — starts only once it is loaded.
   - **R24.10.7 — A running turn always says what it is doing.** A status line
     pinned under the transcript (outside the scrolled rows) shows the liveness
     panel and the turn's phase in plain words, from real events only: the model
@@ -2101,6 +2107,19 @@ correct **at startup**, not only for events that happen afterwards.
     audited ledger path as the gates (R-PERM.2.1); everything else in that
     category names the command that changes it. `/settings <words>` jumps to
     the first matching row.
+  - **R24.12.8 — A small model starts with the core tools and asks for
+    more.** Every tool schema is prompt the model re-reads on every turn. When
+    the small-model harness is on (always, for a model on this machine), the
+    agent offers the core tools — read, list, search, write, edit, patch, run a
+    command, await/status/cancel, todo — plus `more_tools`, which lists the
+    other groups (one per bundle, `web`, `logs`, `sandbox`, `edit`, `project`,
+    one per MCP server) and opens one from the next request on. Opened groups
+    stay open for that folder while the process runs. Opening a group is not a
+    permission: every tool still goes through approval. A tool that exists but
+    was not offered is refused with the group that holds it, never run. The
+    reading line names what is offered (`tools: core + git`); a cloud model is
+    offered everything, as before. `more_tools` exists only inside ahma's own
+    agent loop — it is never listed to MCP clients.
   - **R24.12.5 — Chat stays on a model that exists.** A client's own model
     (`mcp://`) exists only while that client is connected. When it goes, chat
     moves to the most recent model ahma runs itself (`.ahma/session.toml`

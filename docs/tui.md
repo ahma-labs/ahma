@@ -228,12 +228,15 @@ While a chat turn runs, a status line pinned under the transcript says what is h
 
 | You see | Meaning |
 |---|---|
+| `qwen3.8 is loading into memory · 24s` | Ollama is loading the model from disk before it can read anything. The first load is slow; later turns are faster while the model stays loaded |
 | `qwen3.8 is reading 37k tokens of context · 1m12s · ~2m left` | The model is reading its whole prompt before answering. Local models are silent while they do this; the time left appears once ahma has measured this model's reading speed in the session |
 | `qwen3.8 is thinking · 5s` / `is writing · 18 tok/s` | Reasoning / answer tokens are arriving |
 | `running cargo build · 42s` | A tool the model asked for is running |
 | `waiting for your answer above` | An approval is open. The panel stops animating: this is your time, not the model's |
 
 When a large prompt on a slow model is why you are waiting, a dim hint suggests `/compact` or `/model`. A turn over 10 s leaves a one-line summary — time taken, tokens read, reading and writing speed — so switching model or shrinking context is an informed choice.
+
+A model on this machine starts with the core tools only — read, search, edit, run a command — plus `more_tools`, which it calls to open a group (`git`, `github`, `web`, `logs`, a project's own tools, each MCP server) when the task needs one. Every tool schema is prompt the model re-reads each turn, so this is the biggest single saving for a local model. The reading line ends with what it has (`tools: core + git`), and an opened group stays open for this folder until ahma restarts. Opening a group grants nothing: the tools in it still ask as usual. `--no-small-model-harness` offers every tool again.
 
 If the connection drops before any answer arrives, ahma sends your message again once and says so; a second failure tells you what to do next. Models on this machine are given 30 minutes to read a prompt and are never re-sent it on a timeout, because re-sending makes a slow model start reading again from the beginning.
 

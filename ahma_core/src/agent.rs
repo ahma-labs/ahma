@@ -40,6 +40,14 @@ pub enum AgentEvent {
     Truncated {
         reason: String,
     },
+    /// What the model is doing when no token says so (SPEC R24.10.2): `loading`
+    /// (a local model is being loaded into memory; `detail` names it),
+    /// `reading` (loaded, now reading the prompt), `tools` (`detail` is what
+    /// the model is offered: `core`, `core + git`, `all`).
+    Status {
+        phase: String,
+        detail: String,
+    },
 }
 
 #[async_trait]
@@ -70,6 +78,9 @@ pub struct McpChatConfig {
     /// pure, synchronous function. See that method's doc for the fail-closed
     /// default this implies for any name not in the set.
     pub non_mutating_tool_names: Arc<std::collections::HashSet<String>>,
+    /// What this run offers the model, set by [`spawn_agent_task`] (SPEC
+    /// R24.12.8). `None` offers every tool it was given.
+    pub tool_menu: Option<Arc<crate::tool_menu::ToolMenu>>,
 }
 
 // ─── Context budgets (small-model support) ───────────────────────────────────
@@ -603,6 +614,12 @@ pub fn spawn_chat_task(
     });
 }
 
+/// Rough token cost of the tool schemas sent with every request, for the log:
+/// the part of the prompt a user never sees and a local model reads every turn.
+fn schema_tokens(tool_defs: &[serde_json::Value]) -> usize {
+    tool_defs.iter().map(|d| d.to_string().len()).sum::<usize>() / CHARS_PER_TOKEN
+}
+
 fn prepare_tool_definitions(
     available_tools: Vec<ahma_mcp::mcp_client::ToolInfo>,
 ) -> Vec<serde_json::Value> {
@@ -677,6 +694,38 @@ async fn execute_single_tool_call(
 ) -> (String, String, serde_json::Value, bool) {
     let args_value = call.arguments;
     let args_str = serde_json::to_string(&args_value).unwrap_or_default();
+
+    // The menu answers `more_tools` itself and refuses a tool the model was
+    // never offered (SPEC R24.12.8) — before approval: neither runs anything.
+    if let Some(menu) = &cfg.tool_menu {
+        let answer = if call.name == crate::tool_menu::MORE_TOOLS {
+            Some(menu.open(&args_value))
+        } else {
+            menu.refusal_for(&call.name).map(|text| (text, true))
+        };
+        if let Some((text, failed)) = answer {
+            let _ = tx
+                .send(AgentEvent::ToolCallStarted {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: args_str,
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::ToolCallFinished {
+                    id: call.id.clone(),
+                    result: text.clone(),
+                    failed,
+                })
+                .await;
+            let payload = if failed {
+                serde_json::json!({"error": text})
+            } else {
+                serde_json::json!({"output": text})
+            };
+            return (call.id, call.name, payload, failed);
+        }
+    }
 
     let approved = resolve_tool_approval(&call.id, &call.name, cfg, &args_str, gate.as_ref()).await;
 
@@ -804,8 +853,15 @@ async fn stream_completion_via_http(
 ) -> Result<ahma_llm_monitor::client::ChatCompletionResponse, ahma_llm_monitor::LlmMonitorError> {
     let (dtx, mut drx) = tokio::sync::mpsc::channel::<ahma_llm_monitor::client::StreamDelta>(64);
     let tx_fwd = tx.clone();
+    let first_delta = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loading_watch = tokio::spawn(watch_model_loading(
+        client.clone(),
+        tx.clone(),
+        first_delta.clone(),
+    ));
     let forwarder = tokio::spawn(async move {
         while let Some(d) = drx.recv().await {
+            first_delta.store(true, std::sync::atomic::Ordering::Relaxed);
             let evt = match d {
                 ahma_llm_monitor::client::StreamDelta::Content(s) => AgentEvent::Token(s),
                 ahma_llm_monitor::client::StreamDelta::Thinking(s) => AgentEvent::Thinking(s),
@@ -818,8 +874,47 @@ async fn stream_completion_via_http(
     let result = client
         .chat_completion_with_tools_streaming(msg_json, tool_defs, dtx)
         .await;
+    loading_watch.abort();
     let _ = forwarder.await;
     result
+}
+
+/// While a request waits for its first delta, say whether a local model is
+/// still being loaded into memory (SPEC R24.10.2): Ollama sends nothing while
+/// it loads, and without this the user sees "reading" for a minute that is
+/// really disk I/O. Asks only a server on this machine, and only until the
+/// model is resident or output starts; says nothing when it cannot tell.
+async fn watch_model_loading(
+    client: LlmClient,
+    tx: Sender<AgentEvent>,
+    first_delta: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let started = || first_delta.load(std::sync::atomic::Ordering::Relaxed);
+    let Some(loaded) = client.loaded_local_models().await else {
+        return;
+    };
+    if client.is_model_resident(&loaded) || started() {
+        return;
+    }
+    let status = |phase: &str| AgentEvent::Status {
+        phase: phase.to_string(),
+        detail: client.model().to_string(),
+    };
+    let _ = tx.send(status("loading")).await;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if started() {
+            return;
+        }
+        match client.loaded_local_models().await {
+            Some(loaded) if client.is_model_resident(&loaded) => {
+                let _ = tx.send(status("reading")).await;
+                return;
+            }
+            Some(_) => {}
+            None => return,
+        }
+    }
 }
 
 /// Handle a failed HTTP chat-completion attempt: retry the turn without tools
@@ -1245,7 +1340,19 @@ pub fn spawn_agent_task(
         let sys_prompt = system_prompt_for_run(system_prompt, &mcp);
         let mut msg_json = initial_msg_json(&sys_prompt, &messages);
 
-        let tool_defs = prepare_tool_definitions(available_tools);
+        let mut mcp = mcp;
+        let menu = mcp.as_ref().map(|cfg| {
+            Arc::new(crate::tool_menu::ToolMenu::new(
+                available_tools.clone(),
+                cfg.small_model_harness,
+                &cfg.workspace_root,
+            ))
+        });
+        if let (Some(cfg), Some(menu)) = (mcp.as_mut(), &menu) {
+            cfg.tool_menu = Some(menu.clone());
+        }
+        let all_tool_defs = prepare_tool_definitions(available_tools);
+        let mut offered_label = String::new();
 
         let max_turns = mcp.as_ref().map(|c| c.max_turns).unwrap_or(8);
         let mut completed = false;
@@ -1256,12 +1363,33 @@ pub fn spawn_agent_task(
         info!(
             max_turns,
             initial_messages = msg_json.len(),
-            tool_defs = tool_defs.len(),
+            tool_defs = all_tool_defs.len(),
             "agent: starting agentic loop"
         );
 
         for turn in 0..max_turns {
             info!(turn = turn + 1, max_turns, "agent: turn start");
+            let tool_defs = match &menu {
+                Some(menu) => {
+                    let label = menu.label();
+                    if menu.is_lean() && label != offered_label {
+                        let _ = tx
+                            .send(AgentEvent::Status {
+                                phase: "tools".to_string(),
+                                detail: label.clone(),
+                            })
+                            .await;
+                        offered_label = label;
+                    }
+                    menu.definitions()
+                }
+                None => all_tool_defs.clone(),
+            };
+            info!(
+                offered = tool_defs.len(),
+                schema_tokens = schema_tokens(&tool_defs),
+                "agent: tools offered this turn"
+            );
             if !execute_agent_turn(
                 &client,
                 &mut msg_json,
@@ -1874,6 +2002,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
                     total_tokens: usage.total_tokens,
                 },
                 AgentEvent::Truncated { reason } => HubRelay::Truncated { reason },
+                AgentEvent::Status { phase, detail } => HubRelay::ChatStatus { phase, detail },
             };
             let client_msg = ClientMsg::from(relay);
 
@@ -2056,6 +2185,7 @@ fn assemble_hub_chat_config(
         small_model_harness: settings.tools.small_model_harness,
         context_length: num_ctx,
         non_mutating_tool_names,
+        tool_menu: None,
     }
 }
 
@@ -2174,6 +2304,7 @@ mod tests {
             small_model_harness,
             context_length,
             non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
+            tool_menu: None,
         }
     }
 
@@ -2372,6 +2503,158 @@ mod tests {
         );
     }
 
+    /// Ollama loading a model says "loading", then "reading" once `/api/ps`
+    /// shows it resident; a server that is not Ollama says nothing.
+    #[tokio::test]
+    async fn a_local_model_being_loaded_is_reported_until_it_is_resident() {
+        let polls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen = polls.clone();
+        let router = axum::Router::new().route(
+            "/api/ps",
+            axum::routing::get(move || {
+                let seen = seen.clone();
+                async move {
+                    let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let models = if n == 0 {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!([{"name": "qwen3:8b"}])
+                    };
+                    axum::Json(serde_json::json!({ "models": models }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = LlmClient::new(format!("http://{addr}/v1"), "qwen3:8b", None);
+        let (tx, mut rx) = mpsc::channel(10);
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        watch_model_loading(client, tx, started).await;
+
+        let mut phases = Vec::new();
+        while let Ok(AgentEvent::Status { phase, detail }) = rx.try_recv() {
+            assert_eq!(detail, "qwen3:8b");
+            phases.push(phase);
+        }
+        assert_eq!(phases, ["loading", "reading"]);
+
+        // No `/api/ps` at all: silence, not a guess.
+        let quiet = LlmClient::new(format!("http://{addr}/nope/v1"), "m", None);
+        let (tx, mut rx) = mpsc::channel(10);
+        watch_model_loading(quiet, tx, Arc::default()).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A small model starts with the core tools, opens a group when it needs
+    /// one, and is refused — not served — a tool it was never offered.
+    #[tokio::test]
+    async fn a_small_model_starts_lean_and_opens_groups_on_request() {
+        let requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let seen = requests.clone();
+        let llm_router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        let n = {
+                            let mut seen = seen.lock().unwrap();
+                            seen.push(body);
+                            seen.len()
+                        };
+                        let body = match n {
+                            1 => "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"more_tools\",\"arguments\":\"{\\\"group\\\":\\\"git\\\"}\"}}]}}]}\ndata: [DONE]\n",
+                            2 => "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c2\",\"function\":{\"name\":\"fetch_webpage\",\"arguments\":\"{}\"}}]}}]}\ndata: [DONE]\n",
+                            _ => "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\ndata: [DONE]\n",
+                        };
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(body.to_string())
+                            .unwrap()
+                    }
+                },
+            ),
+        );
+        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm_addr = llm_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(llm_listener, llm_router).await.unwrap();
+        });
+
+        let ws = tempfile::tempdir().unwrap();
+        let mcp = McpChatConfig {
+            workspace_root: ws.path().to_path_buf(),
+            small_model_harness: true,
+            max_turns: 4,
+            ..empty_mcp_config("http://127.0.0.1:1")
+        };
+        let tools = ["read_file", "fetch_webpage", "git_status"]
+            .into_iter()
+            .map(|name| ahma_mcp::mcp_client::ToolInfo {
+                name: name.to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            })
+            .collect();
+        let client = LlmClient::new(format!("http://{llm_addr}"), "m", None);
+        let (tx, mut rx) = mpsc::channel(100);
+        spawn_agent_task(
+            client,
+            vec![ChatMessage::user("go")],
+            None,
+            Some(mcp),
+            tools,
+            tx,
+            Arc::new(AutoApproveGate),
+        );
+
+        let mut events = Vec::new();
+        while let Some(evt) = rx.recv().await {
+            let done = matches!(evt, AgentEvent::Done | AgentEvent::Error(_));
+            events.push(evt);
+            if done {
+                break;
+            }
+        }
+
+        let offered = |i: usize| -> Vec<String> {
+            requests.lock().unwrap()[i]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(offered(0), ["read_file", "more_tools"]);
+        assert!(
+            offered(1).contains(&"git_status".to_string()),
+            "{:?}",
+            offered(1)
+        );
+        assert!(!offered(1).contains(&"fetch_webpage".to_string()));
+
+        let refused = events.iter().any(|e| {
+            matches!(e, AgentEvent::ToolCallFinished { result, failed: true, .. }
+                if result.contains("not available yet") && result.contains("\"web\""))
+        });
+        assert!(
+            refused,
+            "an unoffered tool is refused with its group: {events:?}"
+        );
+        let labels: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Status { phase, detail } if phase == "tools" => Some(detail.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["core", "core + git"], "{events:?}");
+    }
+
     #[tokio::test]
     async fn test_agent_task_tool_call_loop() {
         let llm_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -2475,6 +2758,7 @@ mod tests {
             small_model_harness: false,
             context_length: None,
             non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
+            tool_menu: None,
         };
 
         let (tx, mut rx) = mpsc::channel(100);
@@ -2643,6 +2927,7 @@ mod tests {
             small_model_harness: false,
             context_length: None,
             non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
+            tool_menu: None,
         };
 
         let (tx, mut rx) = mpsc::channel(100);
@@ -2790,6 +3075,7 @@ mod tests {
             small_model_harness: false,
             context_length: None,
             non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
+            tool_menu: None,
         };
 
         let client = reqwest::Client::new();
@@ -2849,6 +3135,7 @@ mod tests {
             small_model_harness: false,
             context_length: None,
             non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
+            tool_menu: None,
         }
     }
 
@@ -3036,6 +3323,7 @@ mod tests {
             small_model_harness: true,
             context_length: None,
             non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
+            tool_menu: None,
         }
     }
 

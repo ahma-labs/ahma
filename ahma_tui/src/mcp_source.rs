@@ -134,6 +134,12 @@ pub enum SourceEvent {
     Truncated {
         reason: String,
     },
+    /// What the model is doing when no token says so: `loading`, `reading`,
+    /// or which `tools` it is offered (`HubRelay::ChatStatus`).
+    ChatStatus {
+        phase: String,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone)]
