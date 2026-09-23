@@ -24,7 +24,7 @@ pub const SESSION_EVENT_METHOD: &str = "notifications/ahma/session_event";
 pub const MESSAGE_METHOD: &str = "notifications/message";
 
 /// What happened to the session. `detail` schemas are documented in
-/// `docs/session-health-notifications.md` §3.2.
+/// `docs/session-health-notifications.md` "Event reference".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEventKind {
@@ -81,7 +81,7 @@ pub struct SessionEventParams {
     /// Per-emitter monotonic sequence number so a client can detect gaps.
     pub seq: u64,
     /// Kind-specific detail (schemas:
-    /// `docs/session-health-notifications.md` §3.2).
+    /// `docs/session-health-notifications.md` "Event reference").
     pub detail: serde_json::Value,
 }
 

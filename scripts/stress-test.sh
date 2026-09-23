@@ -99,7 +99,7 @@ if $VERBOSE; then
     # Verbose: show all server output
     "$PROJECT_ROOT/target/release/ahma" \
         serve http \
-        --http-port 0 \
+        --port 0 \
         --sync \
         --tools-dir "$TOOLS_DIR" \
         --sandbox-scope "$SANDBOX_SCOPE" \
@@ -109,7 +109,7 @@ else
     # Normal: only capture, don't show
     "$PROJECT_ROOT/target/release/ahma" \
         serve http \
-        --http-port 0 \
+        --port 0 \
         --sync \
         --tools-dir "$TOOLS_DIR" \
         --sandbox-scope "$SANDBOX_SCOPE" \

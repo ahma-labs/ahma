@@ -5,15 +5,15 @@ Ahma's livelog feature turns any long-running streaming command into an LLM-powe
 ## How It Works
 
 ```
-source_command  →  chunk accumulator  →  LLM  →  ProgressUpdate::LogAlert
-  (adb logcat)      (50 lines / 30s)    detect      (pushed to MCP client)
+source_command  →  chunk accumulator  →  LLM  →  Alert event on the operation
+  (adb logcat)      (50 lines / 30s)    detect      (pushed as notifications/progress)
 ```
 
-1. `tools/call` on a livelog tool returns an `operation_id` immediately (async).
+1. `tools/call` on a livelog tool starts a long-running operation and returns its `operation_id` (a livelog tool never waits for completion, whatever `tools.execution_mode` is).
 2. A background pipeline spawns the `source_command` inside Ahma's kernel sandbox.
 3. Lines are buffered until `chunk_max_lines` is reached or `chunk_max_seconds` elapses.
 4. The chunk is sent to the LLM with your `detection_prompt`.
-5. If the LLM detects an issue (any response other than `"CLEAN"`), a `LogAlert` notification is pushed to the MCP client — but only if the `cooldown_seconds` window has elapsed since the last alert.
+5. If the LLM detects an issue (any response other than `"CLEAN"`), an `Alert` event is recorded on the operation and pushed to the MCP client as a progress notification (and shown in `ahma tui`) — but only if the `cooldown_seconds` window has elapsed since the last alert.
 6. Use `cancel <operation_id>` to stop monitoring.
 
 ## Android Logcat Monitoring
@@ -24,7 +24,6 @@ source_command  →  chunk accumulator  →  LLM  →  ProgressUpdate::LogAlert
 - Device or emulator connected (`adb devices` should show it)
 - **Ollama** running locally: `brew install ollama && ollama serve`
 - `lfm2.5:8b` model pulled: `ollama pull lfm2.5:8b` (the default; a modern 8B model triages crash-vs-noise far better than an older 3B one). To use a smaller/faster model, pull it and set `AHMA_LIVELOG_MODEL`, e.g. `AHMA_LIVELOG_MODEL=llama3.2`.
-- `--livelog` flag added to your Ahma `mcp.json` args (enables the livelog symlink sandbox feature)
 
 ### Setup
 
@@ -37,21 +36,7 @@ cp /path/to/ahma/.ahma/android-logcat.json .ahma/
 
 Or create `.ahma/android-logcat.json` with the content below.
 
-2. Add `--livelog` to your `mcp.json` (VS Code example):
-
-```json
-{
-    "servers": {
-        "Ahma": {
-            "type": "stdio",
-            "command": "ahma",
-            "args": ["--tmp", "--livelog"]
-        }
-    }
-}
-```
-
-3. Reload your MCP server configuration (restart VS Code or run "MCP: Restart Server").
+2. Reload your MCP server configuration (restart VS Code or run "MCP: Restart Server").
 
 ### Example Tool Definition
 

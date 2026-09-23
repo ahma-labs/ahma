@@ -59,4 +59,4 @@ async fn main() -> anyhow::Result<()> {
 ## See also
 
 - [docs/task-vault.md](task-vault.md)
-- [docs/egress-sandbox.md](egress-sandbox.md)
+- [docs/network-egress.md](network-egress.md)

@@ -11,7 +11,7 @@ _Use your existing command line workflows through MCP with a repo-scoped sandbox
 
 |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |                                     |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------: |
-| [![CI](https://github.com/ahma-labs/ahma/actions/workflows/build.yml/badge.svg)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml) [![Coverage Report](https://img.shields.io/badge/Coverage-Report-blue)](https://ahma-labs.github.io/ahma/html/) [![Rust Docs](https://img.shields.io/badge/Rust-Docs-blue)](https://ahma-labs.github.io/ahma/doc/) [![Code Simplicity](https://img.shields.io/badge/Code-Simplicity-green)](https://ahma-labs.github.io/ahma/CODE_SIMPLICITY.html) [![Prebuilt Binaries](https://img.shields.io/badge/Prebuilt-Binaries-blueviolet)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) [![License: Per Crate](https://img.shields.io/badge/License-Per--Crate-6f42c1)](#license) [![Rust](https://img.shields.io/badge/Rust-1.93%2B-B7410E.svg)](https://www.rust-lang.org/) | ![Ahma Logo](./assets/ahma.png) |
+| [![CI](https://github.com/ahma-labs/ahma/actions/workflows/build.yml/badge.svg)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml) [![Coverage Report](https://img.shields.io/badge/Coverage-Report-blue)](https://ahma-labs.github.io/ahma/html/) [![Rust Docs](https://img.shields.io/badge/Rust-Docs-blue)](https://ahma-labs.github.io/ahma/doc/) [![Code Simplicity](https://img.shields.io/badge/Code-Simplicity-green)](https://ahma-labs.github.io/ahma/CODE_SIMPLICITY.html) [![Prebuilt Binaries](https://img.shields.io/badge/Prebuilt-Binaries-blueviolet)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) [![License: Per Crate](https://img.shields.io/badge/License-Per--Crate-6f42c1)](#license) [![Rust](https://img.shields.io/badge/Rust-1.95%2B-B7410E.svg)](https://www.rust-lang.org/) | ![Ahma Logo](./assets/ahma.png) |
 
 Ahma is an MCP server for running real project work through existing CLI tools with tighter filesystem boundaries and less blocking. It is aimed at the common case: builds, tests, formatters, git operations, log inspection, and other deterministic command-line tasks that agents already try to run.
 
@@ -242,29 +242,7 @@ See [docs/live-log-monitoring.md](docs/live-log-monitoring.md) for setup, the An
 
 ---
 
-## v0.7 Experimental Features
-
-The following capabilities were introduced in v0.7. They are functional and tested but their APIs and configuration formats may change before stabilisation. Each is opt-in — existing workflows are unaffected.
-
-### Security rationale
-
-Every v0.7 feature was designed around the principle that **the kernel sandbox is the trust boundary, not a classifier or a user-discipline rule**. The design was informed by documented weaknesses in cloud agent tools:
-
-- Prompt injection can bypass any filter with non-zero probability. Ahma's response is to make the *consequences* of a successful injection bounded by the kernel sandbox scope, not to prevent injection entirely.
-- Folder-level permission grants that survive a whole session give too much access for too long. Task vaults enforce the per-task folder discipline that responsible users already practice — but make it the only option.
-- Network egress from agent subprocesses is not controlled by filesystem sandboxing alone. The egress sandbox adds a deny-by-default HTTP proxy layer.
-
-### Task Vaults — isolated per-question working directories
-
-```bash
-VAULT=$(ahma vault create my-question)
-ahma serve stdio --task-vault "$VAULT"
-ahma vault list
-```
-
-Each vault gets its own kernel sandbox scope (`workdir/`), input copies, output directory, two-phase delete staging (`trash/`), and append-only audit log. There is no "grant my whole Documents folder" option — the vault is the only scope.
-
-See [docs/task-vault.md](docs/task-vault.md).
+## More features
 
 ### TUI — one view of everything being done for you
 
@@ -308,19 +286,7 @@ project.
 
 See [docs/daemon.md](docs/daemon.md).
 
-### Egress Sandbox — per-task outbound network control
-
-Every vault has an `egress.allowlist` file. An HTTP proxy enforces it for all subprocess traffic. Default: deny all outbound connections. Local Ollama (localhost) is always excluded from the proxy.
-
-See [docs/egress-sandbox.md](docs/egress-sandbox.md).
-
-### Interactive HTML Artifacts
-
-Tools can emit `outputs/result.html` — a self-contained artifact with embedded data, rendered tables, and a local-LLM chat widget. The user opens it in a browser and keeps iterating without re-engaging the agent.
-
-See [docs/artifacts.md](docs/artifacts.md).
-
-### Bundle Audit — supply-chain security for MTDF bundles
+### Bundle Audit — supply-chain checks for MTDF bundles *(experimental)*
 
 ```bash
 ahma bundle audit    /path/to/bundle
@@ -328,7 +294,7 @@ ahma bundle checksum /path/to/bundle
 ahma bundle verify   /path/to/bundle
 ```
 
-`audit` scans for embedded secrets, missing path validation, and prompt-injection payloads in tool JSON files before they are loaded. `checksum`/`verify` record and re-check a SHA-256 manifest — a **corruption** check, not a signature: the manifest is unsigned and sits inside the bundle, so anyone who can edit a bundle file can rewrite it too. Real tamper-evidence is the v0.8 signed bundle index, which is not implemented; `audit` is the control that exists today.
+`audit` scans for embedded secrets, missing path validation, and prompt-injection payloads in tool JSON files before they are loaded. `checksum`/`verify` record and re-check a SHA-256 manifest — a **corruption** check, not a signature: the manifest is unsigned and sits inside the bundle, so anyone who can edit a bundle file can rewrite it too. Real tamper-evidence needs a signed bundle index, which is not implemented; `audit` is the control that exists today.
 
 See [docs/bundle-audit.md](docs/bundle-audit.md).
 
@@ -337,6 +303,15 @@ See [docs/bundle-audit.md](docs/bundle-audit.md).
 The `ahma_core` crate exposes the sandbox, MCP service, and local-LLM agent runtime as a library for embedding in other Rust applications.
 
 See [docs/ahma-core-library.md](docs/ahma-core-library.md).
+
+### Task Vaults — one directory per task *(experimental)*
+
+```bash
+ahma serve stdio --task-vault ~/.ahma/tasks/my-question
+```
+
+The vault's `workdir/` becomes the entire sandbox scope, and `rm` moves its targets to the
+vault's `trash/` instead of deleting them. See [docs/task-vault.md](docs/task-vault.md).
 
 ## MCP Server Connection Modes
 
@@ -351,7 +326,6 @@ Issues and pull requests are welcome. This project is AI friendly and provides t
 - **`AGENTS.md`/`CLAUDE.md`**: Instructions for AI agents to use the MCP server to contribute to the project.
 - **`SPEC.md`**: This is the **single source of truth** for the project requirements. AI keeps it up to date as you work on the project.
 - **[docs/build-and-test-performance.md](docs/build-and-test-performance.md)**: why `target/` used to grow to tens of GB, what the build/test layout does about it, and the measurements behind the rules in `AGENTS.md`.
-- **Design records**: completed plans kept for the *why*, not as current documentation — [docs/control-plane-redesign.md](docs/control-plane-redesign.md) (why `ahma tui` is a thin client over the `ahma serve` daemon), [docs/permissions-ux-execution-plan.md](docs/permissions-ux-execution-plan.md) (why the permissions ladder is shaped the way it is), and [docs/token-optimization.md](docs/token-optimization.md) (the small-model harness research, with an implementation-status table).
 
 ## Working well with Claude (Sonnet / Opus)
 

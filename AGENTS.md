@@ -17,7 +17,7 @@ SPEC, not here and not only in code.
 
 ### Prerequisites and Toolchain
 
-* Rust 2024 Edition (MSRV in `Cargo.toml`, currently 1.93+).
+* Rust 2024 Edition (MSRV is `rust-version` in the root `Cargo.toml`).
 * Standard cargo commands. Package names use **underscores** (`-p ahma_http_bridge`, not `ahma-http-bridge`).
 * Prefer `cargo nextest run` over `cargo test`.
 * **One canonical build flavour: default features, whole workspace.** `cargo build`,
@@ -222,7 +222,8 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 * **R-DOC.3 — SPEC.md accuracy**: When a feature's behaviour is changed, the corresponding SPEC.md section and its `docs/<feature>.md` page **must** be updated in the same commit or PR.
 * **R-DOC.4 — Experimental graduation**: When an experimental feature is stabilised, its doc page **must** remove the "Experimental" notice, update SPEC.md status to `tests-pass`, and move its README entry from the "Experimental" section to the appropriate stable section.
 * **R-DOC.5 — Removal**: When a feature is removed, its `docs/<feature>.md` **must** be deleted and all README and SPEC.md references **must** be removed in the same commit.
-* **R-DOC.6 — No orphan docs**: Every file in `docs/` **must** be referenced from at least one of: `README.md`, `SPEC.md`, or another `docs/*.md` file. Orphan documentation is misleading and should not accumulate.
+* **R-DOC.6 — No orphan docs**: Every file in `docs/` (except `docs/templates/`) **must** be referenced from at least one of: `README.md`, `SPEC.md`, or another `docs/*.md` file. Orphan documentation is misleading and should not accumulate.
+* **R-DOC.8 — Current features only**: `docs/` describes what ahma does now. Plans, research notes and design records do not live there — a completed plan's *why* belongs in the SPEC requirement it produced, and the rest in git history and the PR that landed it.
 * **R-DOC.7 — CLI Help Text Guidelines**: Command-line interface help descriptions **must** follow two strict guidelines:
   - **Contiguous Layout**: Descriptions for arguments, flags, and subcommands **must** be written as contiguous blocks of text without blank lines (double carriage returns). Since Clap outputs help text inside lists, internal blank lines disrupt the alignment and layout.
   - **Educational Context**: Help text for complex or non-obvious features (e.g., `--task-vault`) **must** be educational. It must explain what the feature is and why/when a user or tool would use it, while remaining concise and precise.
@@ -241,16 +242,18 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Task vaults | [docs/task-vault.md](docs/task-vault.md) | §5.8 |
 | TUI | [docs/tui.md](docs/tui.md) | R24, R24.9 |
 | Per-user daemon | [docs/daemon.md](docs/daemon.md) | R-DAEMON |
-| Egress sandbox | [docs/egress-sandbox.md](docs/egress-sandbox.md) | — |
-| Network egress (subprocess) | [docs/network-egress.md](docs/network-egress.md) | R-WEB.16, R-PERM.5.3 |
+| Network egress (`--restrict-network`) | [docs/network-egress.md](docs/network-egress.md) | R-WEB.16, R-PERM.5.3 |
 | Execution audit log | [docs/execution-audit-log.md](docs/execution-audit-log.md) | R-HANDOFF.10 |
-| Artifacts | [docs/artifacts.md](docs/artifacts.md) | — |
 | Bundle audit | [docs/bundle-audit.md](docs/bundle-audit.md) | — |
 | ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | — |
 | Code complexity analysis (`simplify`) | [docs/simplify.md](docs/simplify.md) | §9.5 |
 | Built-in file tools | [docs/file-tools.md](docs/file-tools.md) | R26 |
 | Doctor (`ahma doctor`, `/doctor`) | [docs/doctor.md](docs/doctor.md) | R-DOCTOR |
-| Sync/async execution mode | [docs/settings.md](docs/settings.md#sync-or-async-toolsexecution_mode) | R2.1, R2.4 |
+| Settings file, sync/async execution mode | [docs/settings.md](docs/settings.md) | R-CFG, R2.1, R2.4 |
+| Permissions and grants | [docs/permissions.md](docs/permissions.md) | R-PERM |
+| LLM providers | [docs/llm-providers.md](docs/llm-providers.md) | §5.5 |
+| Session-health notifications | [docs/session-health-notifications.md](docs/session-health-notifications.md) | R8.8 |
+| Release signing and provenance | [docs/release-signing.md](docs/release-signing.md) | R-SIGN |
 
 ### Maintenance Checklist
 

@@ -46,11 +46,8 @@ Session isolation resolves these issues by spinning up a dedicated, isolated `ah
 
 ## Configuration and Usage
 
-To enable session isolation, pass the `--session-isolation` flag when starting the HTTP bridge:
-
-```bash
-ahma serve http --session-isolation
-```
+Session isolation is not optional and has no flag: every HTTP-served MCP session — the
+per-user daemon's and an explicit `ahma serve http`'s alike — gets its own subprocess.
 
 ## Security Invariants
 
@@ -65,9 +62,6 @@ exits when no MCP sessions **and** no hub subscribers have been attached for
 `[daemon] idle_timeout_secs`. What follows describes an explicitly started
 bridge given `--idle-timeout`:
 
-- The bridge runs with `--idle-timeout N` (default: 10 seconds).
-- Once `active_sessions` drops to zero and stays there for N seconds, the bridge calls `terminate_all` and exits cleanly.
+- With `--idle-timeout N`, once `active_sessions` drops to zero and stays there for N seconds, the bridge calls `terminate_all` and exits cleanly. Without it (the default) there is no idle exit.
 - The bridge also handles SIGINT/SIGTERM gracefully: it terminates all sessions, removes the Unix socket file (if applicable), and exits.
 - Clients that disconnect send `DELETE /mcp` (HTTP proxy) or call `transport.close()` (Unix proxy, TUI) to decrement `active_sessions` immediately.
-
-Bridges started explicitly with `ahma serve http` or `ahma serve unix` do **not** have an idle timeout by default and remain running until stopped by the user.

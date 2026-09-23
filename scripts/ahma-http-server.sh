@@ -69,7 +69,7 @@ echo
 
 (cd "$PROJECT_ROOT" && cargo run $RELEASE_FLAG -p ahma_bin --bin ahma -- \
     serve http \
-    --http-port 3000 \
+    --port 3000 \
     --tools-dir "$TOOLS_DIR" \
     --sandbox-scope "$SANDBOX_SCOPE" \
 )

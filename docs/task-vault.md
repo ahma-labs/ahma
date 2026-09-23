@@ -1,126 +1,81 @@
 # Task Vaults
 
-> **Experimental** — introduced in v0.7. API and directory layout may change before stabilisation.
+> **Experimental.** A vault is created and used through one flag, `--task-vault`; there is
+> no management CLI yet, and the layout may change.
 
-A **task vault** is a per-question isolated working directory that promotes the "dedicated folder per task" security principle from user discipline to a kernel-enforced guarantee. Every vault gets its own sandbox scope, two-phase trash, and append-only audit log.
+A **task vault** is a per-task working directory that ahma uses as the *entire* sandbox
+scope. It turns the advice "give the agent a dedicated folder per task, never your whole
+home directory" into something the kernel enforces.
 
 ## Why task vaults?
 
-Cloud agent tools give users guidance like _"create a per-task folder; never grant your whole Documents tree."_ That works, but it relies on users remembering every time. Ahma vaults invert the default: there is no way to start a session that accesses arbitrary paths — the only scope available is the vault's `workdir/`.
-
-This closes the most common practical failure mode: an agent granted convenient broad access running amok because the user accepted a wide scope for comfort.
-
-## Directory layout
-
-```
-~/.ahma/tasks/<utc-date>-<slug>-<hex>/
-  inputs/        — copies of user-provided files (read intent; originals untouched)
-  workdir/       — kernel sandbox scope root for all agent commands
-  outputs/       — artifacts produced by tools (HTML reports, CSV exports, etc.)
-  trash/         — staged-deletion holding area (two-phase delete)
-  audit.jsonl    — append-only JSONL event log
-  egress.allowlist  — per-task outbound network domain allowlist
-```
+The safest scope is the smallest one, but people widen scopes for convenience. With
+`--task-vault` there is no wider scope to accept: the agent can write only inside the
+vault's `workdir/` (plus its own `trash/` and `audit.jsonl`), and deletions are recoverable.
 
 ## Quickstart
 
 ```bash
-# Create a vault and note its path
-VAULT=$(ahma vault create summarise-q4-report)
-echo $VAULT
-# ~/.ahma/tasks/20260520T120000Z-summarise-q4-report-a1b2c3d4/
-
-# Start an ahma stdio server scoped to that vault
-ahma serve stdio --task-vault "$VAULT"
-
-# Or HTTP bridge
-ahma serve http --task-vault "$VAULT"
-
-# List all existing vaults
-ahma vault list
+ahma serve stdio --task-vault ~/.ahma/tasks/summarise-q4-report
 ```
 
-## Two-phase delete
+The directory is created with the layout below if it does not exist, and reused if it
+does. `[sandbox] task_vault` in `settings.toml` sets the same thing. The vault takes
+precedence over every other scope source (`--sandbox-scope`, `roots/list`).
 
-The AI cannot permanently delete a file in a single step.
+## Directory layout
 
-1. **Stage** — the file moves to `trash/<timestamp>_<filename>`; the original location is immediately empty, but the data survives.
-2. **Review** — an agent or human can list what is staged before committing.
-3. **Purge** — only after explicit per-batch confirmation does `purge()` permanently remove staged entries.
+```
+<vault>/
+  inputs/       — copies of user-provided files (originals stay untouched)
+  workdir/      — the sandbox scope; commands run here
+  outputs/      — artifacts produced by tools
+  trash/        — staged deletions
+  audit.jsonl   — append-only event log
+```
 
-This limits the blast radius of a confused deletion command to a recoverable staging operation.
+## Recoverable deletes
+
+In vault mode, an `rm` issued through `run_terminal_command`, or through an MTDF tool whose
+command is `rm`, does not delete: its targets are **moved** to `trash/<timestamp>_<name>`
+and a `file_staged` event is appended to `audit.jsonl`. Nothing in ahma purges `trash/`;
+you empty it yourself after review.
 
 ## Audit log
 
-Every significant action inside a vault is recorded in `audit.jsonl` as a single JSON line:
+In vault mode, `audit.jsonl` receives one JSON line per event — `tool_call` and
+`tool_complete` for each tool call, `file_staged` for each staged deletion:
 
 ```json
-{"timestamp":"2026-05-20T12:00:01Z","type":"vault_created","vault_path":"...","slug":"summarise-q4-report"}
-{"timestamp":"2026-05-20T12:00:04Z","type":"tool_call","operation_id":"op_1","tool_name":"cargo_build","args_summary":"--release"}
-{"timestamp":"2026-05-20T12:00:07Z","type":"tool_complete","operation_id":"op_1","success":true,"duration_ms":3200}
-{"timestamp":"2026-05-20T12:00:08Z","type":"artifact_written","path":"outputs/result.html","size_bytes":4096}
+{"timestamp":"…","type":"tool_call","operation_id":"op_1","tool_name":"cargo_build","args_summary":"--release"}
+{"timestamp":"…","type":"tool_complete","operation_id":"op_1","success":true,"duration_ms":3200}
+{"timestamp":"…","type":"file_staged","original_path":"…","trash_path":"…"}
 ```
 
-The log is append-only. Individual events cannot be silently removed after the fact.
-
-Event kinds: `vault_created`, `tool_call`, `tool_complete`, `artifact_written`, `file_staged`, `trash_purged`, `elevation_requested`, `sub_task_dispatched`, `sub_task_completed`, `renewal_checkpoint`, `task_halted`, `worker_executed`, `egress_decision`.
+The same schema (`ahma_vault::audit::AuditEvent`) is the wire format of the
+[execution audit log](execution-audit-log.md), which records every tool call under the
+project log directory whether or not a vault is in use.
 
 ## Security properties
 
 | Property | Detail |
 |----------|--------|
-| Kernel-enforced scope | Sandbox scope is `workdir/` — writes outside it are OS-rejected on Linux and macOS (not yet on Windows, SPEC R6.3.9). Reads are scoped only on Linux (SPEC R6.2.2) |
-| Inputs are copies | Agent never touches originals — only copies in `inputs/` |
-| Two-phase delete | `trash/` holds staged deletions; permanent removal requires explicit confirmation |
-| Append-only audit | `audit.jsonl` records every operation; events cannot be silently deleted |
-| Network allowlist | `egress.allowlist` controls outbound connections — default deny-all |
+| Kernel-enforced scope | Writes outside `workdir/`, `trash/` and `audit.jsonl` are OS-rejected on Linux and macOS; Windows has no OS filesystem boundary yet (SPEC R6.3). Reads are confined only on Linux (SPEC R6.2.2) |
+| Recoverable deletes | `rm` targets are staged in `trash/`, never unlinked |
+| Network | Unchanged by vault mode. Use [`--restrict-network`](network-egress.md) to gate egress |
 
 ## Embedding in Rust
 
-The `ahma_core` crate exposes vault primitives directly:
-
 ```rust
-use ahma_core::{TaskVault, AuditWriter, TrashManager};
+use ahma_vault::TaskVault;
 
-let vault = TaskVault::create("my-task")?;
-let audit = vault.audit_writer();
-audit.vault_created(&vault.path().display().to_string(), "my-task").await?;
+let vault = TaskVault::create_at("/path/to/vault".into())?;
+println!("sandbox scope: {}", vault.sandbox_scope().display());
+# Ok::<(), anyhow::Error>(())
 ```
-
-## Egress allowlist
-
-Each vault has an `egress.allowlist` file that controls which outbound hosts the task may
-contact. If the file is absent (the default), the vault is **loopback-only** — only
-`localhost`, `127.*`, and `::1` are reachable. This is the secure-by-default posture:
-tools cannot phone home or exfiltrate data unless you explicitly permit it.
-
-### File format
-
-```
-# Lines starting with # are comments; blank lines are ignored.
-# Exact hostname match:
-api.example.com
-# Wildcard subdomain (matches foo.internal but NOT internal):
-*.internal
-# Allow all outbound (not recommended; emits a warning at load time):
-*
-```
-
-The allowlist is case-insensitive. `localhost`, `127.0.0.1`/`127.*`, and `::1` are always
-allowed regardless of the file contents — they cannot be blocked.
-
-### Example: granting access to a specific API
-
-```bash
-echo 'api.openai.com' >> ~/.ahma/tasks/<vault>/egress.allowlist
-echo '*.googleapis.com' >> ~/.ahma/tasks/<vault>/egress.allowlist
-```
-
-Every allow/deny decision is recorded in `audit.jsonl` as an `egress_decision` event.
 
 ## See also
 
-- [docs/security-sandbox.md](security-sandbox.md) — kernel sandbox and egress proxy details
-- [docs/egress-sandbox.md](egress-sandbox.md) — per-task network allowlist
-- [SPEC.md §5.8](../SPEC.md) — MTDF vault integration specification
-
+- [security-sandbox.md](security-sandbox.md) — the kernel sandbox the vault scope feeds
+- [network-egress.md](network-egress.md) — restricting outbound network access
+- [execution-audit-log.md](execution-audit-log.md) — the always-on audit log
