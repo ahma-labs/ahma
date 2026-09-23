@@ -69,6 +69,11 @@ pub enum SettingValue {
     U32(u32),
     Usize(usize),
     StringList(Vec<String>),
+    /// One of a fixed set of words (e.g. `sync` / `async`); Space cycles.
+    Choice {
+        value: &'static str,
+        options: &'static [&'static str],
+    },
 }
 
 impl std::fmt::Display for SettingValue {
@@ -79,6 +84,7 @@ impl std::fmt::Display for SettingValue {
             Self::U64(v) => write!(f, "{v}"),
             Self::U32(v) => write!(f, "{v}"),
             Self::Usize(v) => write!(f, "{v}"),
+            Self::Choice { value, .. } => write!(f, "{value}"),
             Self::StringList(v) => {
                 if v.is_empty() {
                     write!(f, "[]")
@@ -113,11 +119,20 @@ impl SettingItem {
         if self.security_tier {
             return false;
         }
-        if let SettingValue::Bool(ref mut v) = self.value {
-            *v = !*v;
-            true
-        } else {
-            false
+        match &mut self.value {
+            SettingValue::Bool(v) => {
+                *v = !*v;
+                true
+            }
+            SettingValue::Choice { value, options } => {
+                let next = options
+                    .iter()
+                    .position(|o| o == value)
+                    .map_or(0, |i| (i + 1) % options.len());
+                *value = options[next];
+                true
+            }
+            _ => false,
         }
     }
 
@@ -132,6 +147,9 @@ impl SettingItem {
             (SettingValue::U64(a), SettingValue::U64(b)) => a == b,
             (SettingValue::U32(a), SettingValue::U32(b)) => a == b,
             (SettingValue::Usize(a), SettingValue::Usize(b)) => a == b,
+            (SettingValue::Choice { value: a, .. }, SettingValue::Choice { value: b, .. }) => {
+                a == b
+            }
             _ => false,
         };
         if same {
@@ -149,6 +167,9 @@ impl SettingItem {
             (SettingValue::U64(a), SettingValue::U64(b)) => a != b,
             (SettingValue::U32(a), SettingValue::U32(b)) => a != b,
             (SettingValue::Usize(a), SettingValue::Usize(b)) => a != b,
+            (SettingValue::Choice { value: a, .. }, SettingValue::Choice { value: b, .. }) => {
+                a != b
+            }
             _ => true,
         }
     }
@@ -188,6 +209,20 @@ impl FromSettingValue for u32 {
         }
     }
 }
+
+impl FromSettingValue for ahma_common::config::ExecutionPolicy {
+    fn from_setting_value(value: &SettingValue) -> Option<Self> {
+        use ahma_common::config::ExecutionPolicy;
+        match value {
+            SettingValue::Choice { value: "sync", .. } => Some(ExecutionPolicy::Sync),
+            SettingValue::Choice { value: "async", .. } => Some(ExecutionPolicy::Async),
+            _ => None,
+        }
+    }
+}
+
+/// The choices the execution-mode row cycles through.
+pub const EXECUTION_MODE_OPTIONS: &[&str] = &["sync", "async"];
 
 impl FromSettingValue for String {
     fn from_setting_value(value: &SettingValue) -> Option<Self> {
@@ -378,6 +413,12 @@ impl SettingsEditor {
         }
     }
 
+    /// Reflect an execution mode saved outside the panel (`/sync`, `/async`)
+    /// so the panel and the header show it without a reload.
+    pub fn note_execution_mode(&mut self, mode: ahma_common::config::ExecutionPolicy) {
+        self.settings.tools.execution_mode = mode;
+    }
+
     /// Get the current settings snapshot (for reading feature flags).
     pub fn settings(&self) -> &AhmaSettings {
         &self.settings
@@ -459,11 +500,17 @@ impl SettingsEditor {
                 security_tier: false,
             },
             SettingItem {
-                key: "tools.force_sync",
-                label: "Force sync",
-                description: "Run all tools synchronously",
-                value: SettingValue::Bool(t.force_sync),
-                default_value: SettingValue::Bool(d.force_sync),
+                key: "tools.execution_mode",
+                label: "Execution",
+                description: "sync: wait for results · async: return ids, collect with await",
+                value: SettingValue::Choice {
+                    value: t.execution_mode.as_str(),
+                    options: EXECUTION_MODE_OPTIONS,
+                },
+                default_value: SettingValue::Choice {
+                    value: d.execution_mode.as_str(),
+                    options: EXECUTION_MODE_OPTIONS,
+                },
                 security_tier: false,
             },
             SettingItem {
@@ -708,7 +755,7 @@ impl SettingsEditor {
         let t = &mut self.settings.tools;
         match index {
             0 => assign_setting(&mut t.timeout_secs, value),
-            1 => assign_setting(&mut t.force_sync, value),
+            1 => assign_setting(&mut t.execution_mode, value),
             2 => assign_setting(&mut t.skip_probes, value),
             3 => assign_setting(&mut t.minimize_tokens, value),
             4 => assign_setting(&mut t.small_model_harness, value),
@@ -794,6 +841,7 @@ impl SettingsEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahma_common::config::ExecutionPolicy;
 
     #[test]
     /// The panel opens on Tools now: the old first category (Features) held
@@ -802,21 +850,39 @@ mod tests {
     fn toggle_first_category_item() {
         let mut editor = SettingsEditor::default();
         assert_eq!(editor.current_category(), SettingsCategory::Tools);
-        editor.item_down(); // index 1 = force_sync (bool)
-        assert!(!editor.settings().tools.force_sync);
+        editor.item_down(); // index 1 = execution_mode (sync|async)
+        assert_eq!(
+            editor.settings().tools.execution_mode,
+            ExecutionPolicy::Sync
+        );
         editor.toggle_current();
-        assert!(editor.settings().tools.force_sync);
+        assert_eq!(
+            editor.settings().tools.execution_mode,
+            ExecutionPolicy::Async
+        );
         assert!(editor.dirty);
+        editor.toggle_current();
+        assert_eq!(
+            editor.settings().tools.execution_mode,
+            ExecutionPolicy::Sync,
+            "Space cycles back"
+        );
     }
 
     #[test]
     fn reset_to_default() {
         let mut editor = SettingsEditor::default();
-        editor.item_down(); // Tools → force_sync (bool, default false)
+        editor.item_down(); // Tools → execution_mode (default sync)
         editor.toggle_current();
-        assert!(editor.settings().tools.force_sync);
+        assert_eq!(
+            editor.settings().tools.execution_mode,
+            ExecutionPolicy::Async
+        );
         editor.reset_current();
-        assert!(!editor.settings().tools.force_sync);
+        assert_eq!(
+            editor.settings().tools.execution_mode,
+            ExecutionPolicy::Sync
+        );
     }
 
     #[test]
@@ -851,14 +917,21 @@ mod tests {
         let path = dir.path().join("settings.toml");
 
         let mut editor = SettingsEditor::default();
-        editor.item_down(); // Tools → force_sync (bool)
-        editor.toggle_current();
+        editor.item_down(); // Tools → execution_mode
+        editor.toggle_current(); // sync → async
 
         editor.settings.save_to(&path).unwrap();
 
-        let reloaded = AhmaSettings::load_from(&path);
+        // The user's choice is persisted as a documented, active line.
+        let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            reloaded.tools.force_sync,
+            text.contains("\nexecution_mode = \"async\"\n"),
+            "saved file carries the choice:\n{text}"
+        );
+        let reloaded = AhmaSettings::load_from(&path);
+        assert_eq!(
+            reloaded.tools.execution_mode,
+            ExecutionPolicy::Async,
             "the edit round-trips through disk"
         );
     }
@@ -1243,11 +1316,23 @@ mod tests {
     fn toggle_current_tools_bool_field() {
         let mut editor = SettingsEditor::default();
         assert_eq!(editor.current_category(), SettingsCategory::Tools);
-        editor.item_down(); // index 1 = force_sync (bool)
-        assert!(!editor.settings().tools.force_sync);
+        editor.item_down(); // index 1 = execution_mode (sync|async)
+        assert_eq!(
+            editor.settings().tools.execution_mode,
+            ExecutionPolicy::Sync
+        );
         editor.toggle_current();
-        assert!(editor.settings().tools.force_sync);
+        assert_eq!(
+            editor.settings().tools.execution_mode,
+            ExecutionPolicy::Async
+        );
         assert!(editor.dirty);
+        editor.toggle_current();
+        assert_eq!(
+            editor.settings().tools.execution_mode,
+            ExecutionPolicy::Sync,
+            "Space cycles back"
+        );
     }
 
     #[test]
@@ -1299,13 +1384,19 @@ mod tests {
     fn apply_tool_all_indices_and_guards() {
         let mut e = SettingsEditor::default();
         e.apply_tool(0, &SettingValue::U64(123));
-        e.apply_tool(1, &SettingValue::Bool(true));
+        e.apply_tool(
+            1,
+            &SettingValue::Choice {
+                value: "async",
+                options: EXECUTION_MODE_OPTIONS,
+            },
+        );
         e.apply_tool(2, &SettingValue::Bool(true));
         e.apply_tool(3, &SettingValue::Bool(true));
         e.apply_tool(4, &SettingValue::Bool(true));
         let t = &e.settings().tools;
         assert_eq!(t.timeout_secs, 123);
-        assert!(t.force_sync);
+        assert_eq!(t.execution_mode, ExecutionPolicy::Async);
         assert!(t.skip_probes);
         assert!(t.minimize_tokens);
         assert!(t.small_model_harness);
@@ -1313,7 +1404,7 @@ mod tests {
         e.apply_tool(0, &SettingValue::Bool(true));
         assert_eq!(e.settings().tools.timeout_secs, 123);
         e.apply_tool(1, &SettingValue::U64(0));
-        assert!(e.settings().tools.force_sync);
+        assert_eq!(e.settings().tools.execution_mode, ExecutionPolicy::Async);
         // Out-of-range index.
         e.apply_tool(42, &SettingValue::Bool(true));
     }
@@ -1465,8 +1556,8 @@ mod tests {
         }
         let mut editor = SettingsEditor::default();
         // Mutate a value, then persist via the no-arg save() (uses settings_path()).
-        editor.item_down(); // Tools → force_sync (bool, default false)
-        editor.toggle_current();
+        editor.item_down(); // Tools → execution_mode (default sync)
+        editor.toggle_current(); // → async
         editor.dirty = true;
         editor.save();
 
@@ -1479,7 +1570,11 @@ mod tests {
 
         // Round-trip: a fresh load through the same home seam sees the change.
         let reloaded = AhmaSettings::load();
-        assert!(reloaded.tools.force_sync);
+        assert_eq!(
+            reloaded.tools.execution_mode,
+            ExecutionPolicy::Async,
+            "switching to async in the TUI persists to ~/.ahma/settings.toml"
+        );
 
         unsafe {
             std::env::remove_var("AHMA_TEST_HOME");

@@ -10,6 +10,17 @@ use std::sync::Arc;
 
 use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
 
+/// How long a tool call waits for the operation it started before answering
+/// (SPEC R2.1). Either way the call is a tracked operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallWait {
+    /// The adaptive inline window (SPEC R2.6.1), then an operation id.
+    Adaptive,
+    /// Until it finishes, bounded by what the client tolerates (the bound a
+    /// default `await` gets); past that, an id and a note to `await` it.
+    UntilDone,
+}
+
 /// Tracks approval sender for the active agent turn.
 #[derive(Default)]
 pub struct ActiveAgentSession {

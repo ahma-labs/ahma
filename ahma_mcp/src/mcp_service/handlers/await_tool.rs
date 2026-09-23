@@ -357,6 +357,27 @@ impl AhmaMcpService {
         }
     }
 
+    /// How long a sync-mode tool call may wait for its operation (SPEC R2.1),
+    /// and the note to add if that wait was shortened: exactly what a default
+    /// `await` on it would get. Sync mode is "the call, then its `await`", so it
+    /// must never hold a request open longer than the client tolerates — a
+    /// result written into a connection nobody reads is a result lost.
+    pub(crate) fn sync_call_wait(
+        &self,
+        client_type: crate::client_type::McpClientType,
+        peer: Option<rmcp::service::Peer<rmcp::service::RoleServer>>,
+    ) -> (std::time::Duration, Option<String>) {
+        let caller = AwaitCaller {
+            peer,
+            progress_token: None,
+            client_type: Some(client_type),
+            push_channel_open: self.push_channel_open(),
+        };
+        let bound =
+            self.bounded_await_timeout_secs(self.resolved_await_timeout_secs(None) as f64, &caller);
+        (std::time::Duration::from_secs_f64(bound.secs), bound.note())
+    }
+
     /// Handles the 'await' tool call with no caller context (CLI, tests).
     pub async fn handle_await(
         &self,

@@ -31,7 +31,9 @@ async fn test_calculate_intelligent_timeout() -> Result<()> {
 #[tokio::test]
 async fn test_handle_await_with_pending_ops() -> Result<()> {
     init_test_logging();
-    let client = ClientBuilder::new().build().await?;
+    // `await` needs a call that hands back an id: async mode (sync, the
+    // default, would wait for the command instead).
+    let client = ClientBuilder::new().arg("--async").build().await?;
 
     // Start a command that outlives the inline window, so the call hands back an
     // operation id instead of answering inline (SPEC R2.6.1). Sized from the

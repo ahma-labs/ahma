@@ -440,6 +440,14 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/agent delete <name>", "delete an agent profile"),
     ("/export markdown", "export chat transcript to markdown"),
     ("/settings", "open settings panel (edit & persist)"),
+    (
+        "/sync",
+        "tool calls wait for their result (default; saved to settings)",
+    ),
+    (
+        "/async",
+        "tool calls return an id, collect with await (saved to settings)",
+    ),
     ("/analyze [op_id]", "ask the LLM to analyze an operation"),
     (
         "/compact",

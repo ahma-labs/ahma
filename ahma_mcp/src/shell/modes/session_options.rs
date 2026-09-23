@@ -90,6 +90,12 @@ const OPTIONS: &[Opt] = &[
         repeatable: false,
     },
     Opt {
+        query: "async",
+        flag: "--async",
+        takes_value: false,
+        repeatable: false,
+    },
+    Opt {
         query: "scratch",
         flag: "--scratch",
         takes_value: false,
@@ -139,7 +145,14 @@ pub fn session_query_from_config(config: &AppConfig) -> String {
     for (name, enabled) in [
         ("no_sandbox", config.no_sandbox),
         ("skip_probes", config.skip_availability_probes),
-        ("sync", config.force_sync),
+        (
+            "sync",
+            config.execution_mode_cli == Some(ahma_common::config::ExecutionPolicy::Sync),
+        ),
+        (
+            "async",
+            config.execution_mode_cli == Some(ahma_common::config::ExecutionPolicy::Async),
+        ),
         ("scratch", config.use_scratch_dir),
         ("tmp", config.tmp_access),
         ("disable_temp_files", config.no_temp_files),

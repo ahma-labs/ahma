@@ -62,11 +62,13 @@ Run `ahma settings init` to generate this file automatically.
 
 # ── Tool execution ───────────────────────────────────────────────────────────
 # [tools]
-# timeout_secs = 360      # default tool timeout (seconds)
+# timeout_secs = 600      # default tool timeout (seconds)
 # await_timeout_secs = 540 # default `await` soft timeout (seconds); does not cancel the operation
 # request_budget_override_secs = 0 # override the fallback single-request budget (SPEC R2.6.5); 0 = unset, use the built-in default
 # force_progress_notifications = false # send progress to Cursor despite its client-side logging quirk
-# force_sync   = false    # run all tools synchronously instead of async-first
+# execution_mode = "sync"  # "sync": wait for each command's result (within what the
+#                          # client can wait for); "async": return an operation id
+#                          # after a short window, collect with `await`. See below.
 # skip_probes  = false    # skip availability probes at startup
 
 # ── Sandbox & filesystem security ────────────────────────────────────────────
@@ -84,10 +86,6 @@ Run `ahma settings init` to generate this file automatically.
 # log_monitor             = false    # enable live log monitoring via LLM
 # monitor_rate_limit_secs = 60       # min seconds between log-monitor alerts
 # dir                     = ""       # log directory; "" resolves automatically
-
-# ── Progressive disclosure ────────────────────────────────────────────────────
-# [disclosure]
-# reveal_profile = "minimal"   # "minimal" | "balanced" | "full"
 
 # ── HTTP server (ahma serve http only) ───────────────────────────────────────
 # [http]
@@ -110,6 +108,31 @@ Run `ahma settings init` to generate this file automatically.
 #                          # no TUI — before the per-user daemon exits. 0 keeps
 #                          # it running. See docs/daemon.md.
 ```
+
+---
+
+## Sync or async (`tools.execution_mode`)
+
+Every tool call runs as a tracked operation — it shows in `status` and the TUI,
+can be cancelled, and writes its complete output to an `output_file`. The mode
+only decides how long the call waits before answering:
+
+| Mode | What a call returns | Use it when |
+|---|---|---|
+| `sync` (default) | The command's result, once it finishes. If it outlasts what the client can hold one request open for, the call returns the operation id and says to `await` it — the result is never lost to a closed connection. | Almost always: run a command, read its output, like a terminal. |
+| `async` | The result if the command finishes within a short adaptive window (≈10 s idle, ≈1 s when other work is running), otherwise an operation id to collect with `await`. | A model that deliberately starts several long builds or test runs in parallel. |
+
+Set it any of these ways (highest priority first):
+
+- `--sync` / `--async` on the command line (the last one given wins);
+- `execution_mode = "async"` under `[tools]` in a project's `.ahma/settings.toml`;
+- the same in `~/.ahma/settings.toml`;
+- in `ahma tui`: `/sync` or `/async`, or **Settings → Tools → Execution** (Space
+  cycles, `s` saves). Both write `~/.ahma/settings.toml`.
+
+A running ahma session read its mode when it started: a change reaches new
+sessions, and a running one after it restarts (the agent's `restart` tool).
+Details: SPEC R2.1, R2.4.
 
 ---
 
@@ -172,7 +195,7 @@ it to settings.
 | Old env var | New settings.toml key |
 |-------------|----------------------|
 | `AHMA_TIMEOUT` | `[tools] timeout_secs` |
-| `AHMA_SYNC` | `[tools] force_sync` |
+| `AHMA_SYNC` | `[tools] execution_mode = "sync"` (now the default; the interim `force_sync` key is ignored) |
 | `AHMA_SKIP_PROBES` | `[tools] skip_probes` |
 | `AHMA_DISABLE_SANDBOX` | `[sandbox] disable` |
 | `AHMA_TMP_ACCESS` | `[sandbox] tmp_access` |
@@ -182,7 +205,7 @@ it to settings.
 | `AHMA_LOG_MONITOR` | `[logging] log_monitor` |
 | `AHMA_MONITOR_RATE_LIMIT` | `[logging] monitor_rate_limit_secs` |
 | `AHMA_LOG_DIR` | `[logging] dir` (or the `--log-dir` flag) |
-| `AHMA_REVEAL_PROFILE` | `[disclosure] reveal_profile` |
+| `AHMA_REVEAL_PROFILE` | — (progressive disclosure was removed; nothing to set) |
 | `AHMA_HANDSHAKE_TIMEOUT` | `[http] handshake_timeout_secs` |
 | `AHMA_DISABLE_QUIC` | `[http] disable_quic` |
 | `AHMA_DISABLE_HTTP1_1` | `[http] disable_http1_1` |

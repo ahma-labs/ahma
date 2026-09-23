@@ -2807,9 +2807,48 @@ fn set_minimize_tokens(state: &mut crate::state::AppState, desired: bool) {
     }
 }
 
+/// Switch `tools.execution_mode` and persist it to `~/.ahma/settings.toml`
+/// (re-read first, so an edit made elsewhere is not clobbered).
+///
+/// A running ahma worker read its mode when it started, so the message says
+/// plainly which sessions the change reaches rather than implying it applied
+/// everywhere at once.
+fn set_execution_mode(
+    state: &mut crate::state::AppState,
+    mode: ahma_common::config::ExecutionPolicy,
+) {
+    let mut settings = ahma_common::config::AhmaSettings::load();
+    settings.tools.execution_mode = mode;
+    match settings.save() {
+        Ok(()) => {
+            state.settings_editor.note_execution_mode(mode);
+            let what = match mode {
+                ahma_common::config::ExecutionPolicy::Sync => "calls wait for their result",
+                ahma_common::config::ExecutionPolicy::Async => {
+                    "calls return an operation id; results are collected with `await`"
+                }
+            };
+            push_assistant_message(
+                state,
+                format!(
+                    "Execution mode is now **{mode}** ({what}), saved to ~/.ahma/settings.toml. \
+                     New ahma sessions use it; sessions already running keep their mode \
+                     until restarted (ask the agent to run the `restart` tool)."
+                ),
+            );
+        }
+        Err(e) => push_assistant_message(
+            state,
+            format!("Could not save execution mode **{mode}** to settings: {e}"),
+        ),
+    }
+}
+
 fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
         "/help" | "/?" => state.modal = crate::state::ModalState::Help,
+        "/sync" => set_execution_mode(state, ahma_common::config::ExecutionPolicy::Sync),
+        "/async" => set_execution_mode(state, ahma_common::config::ExecutionPolicy::Async),
         "/clear" => state.clear_screen(),
         "/compact" => {
             const KEEP_TURNS: usize = 4;
@@ -6190,6 +6229,37 @@ mod tests {
                 .iter()
                 .all(|o| o.stdout_tail.iter().all(|l| l != "from C"))
         );
+    }
+
+    /// `/async` and `/sync` are the discoverable way to switch the mode, and
+    /// they persist it to `~/.ahma/settings.toml` like the settings panel does.
+    #[test]
+    fn slash_async_and_sync_persist_the_execution_mode() {
+        use ahma_common::config::{AhmaSettings, ExecutionPolicy};
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::HOME_SEAM_GUARD.lock();
+        // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", dir.path()) };
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        assert!(super::handle_basic_nav_command("/async", &mut state));
+        assert_eq!(
+            AhmaSettings::load().tools.execution_mode,
+            ExecutionPolicy::Async
+        );
+        assert_eq!(
+            state.settings_editor.settings().tools.execution_mode,
+            ExecutionPolicy::Async,
+            "the settings panel shows the new mode"
+        );
+
+        assert!(super::handle_basic_nav_command("/sync", &mut state));
+        assert_eq!(
+            AhmaSettings::load().tools.execution_mode,
+            ExecutionPolicy::Sync
+        );
+
+        unsafe { std::env::remove_var("AHMA_TEST_HOME") };
     }
 
     #[test]

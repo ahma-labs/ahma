@@ -138,7 +138,17 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 
 /// Default `tools/call` request timeout in seconds
 /// (see [`SessionManagerConfig::tool_call_timeout_secs`]).
-pub const DEFAULT_TOOL_CALL_TIMEOUT_SECS: u64 = 60;
+///
+/// The same headroom `await` gets: the worker's ceiling plus a margin. In sync
+/// mode (SPEC R2.1, the default) every call waits for its result the way a
+/// default `await` does, and every in-process path bounds its own wait — the
+/// sync wait by the client's request budget, the async window at 10 s, a
+/// legacy blocking call by the tool timeout — then answers gracefully. The
+/// bridge's cut-off is only the last resort behind those, so it must not fire
+/// first: at the old 60 s it guillotined a 90 s build the worker was about to
+/// report.
+pub const DEFAULT_TOOL_CALL_TIMEOUT_SECS: u64 =
+    ahma_common::timeouts::BRIDGE_TOOL_CALL_CEILING_SECS + 60;
 
 /// Default cap on concurrent sessions
 /// (see [`SessionManagerConfig::max_sessions`]).
@@ -613,7 +623,8 @@ pub struct SessionManagerConfig {
     pub request_timeout_secs: u64,
     /// Default timeout in seconds for `tools/call` requests, unless the
     /// caller's `timeout_seconds` argument overrides it (still capped at
-    /// `BRIDGE_TOOL_CALL_CEILING_SECS`). Defaults to 60 seconds.
+    /// `BRIDGE_TOOL_CALL_CEILING_SECS`). Defaults to
+    /// [`DEFAULT_TOOL_CALL_TIMEOUT_SECS`] (the ceiling plus a margin).
     pub tool_call_timeout_secs: u64,
     /// Maximum concurrent sessions allowed.
     pub max_sessions: usize,

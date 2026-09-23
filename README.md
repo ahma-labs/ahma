@@ -1,11 +1,11 @@
 # Ahma
 
-_Use your existing command line workflows through MCP with a repo-scoped sandbox, async execution, and less pressure to fall back to insecure terminal access._
+_Use your existing command line workflows through MCP with a repo-scoped sandbox, tracked and cancellable operations, and less pressure to fall back to insecure terminal access._
 
 ## Why Ahma helps
 
 - **When the agent only needs the repo, broad terminal access is too much**: ahma starts inside a kernel-enforced workspace boundary, so normal project work does not require wider filesystem access.
-- **When builds, tests, and checks take time, blocked agents waste time**: ahma runs commands async-first so long-running work can continue in the background while the agent keeps moving.
+- **When builds, tests, and checks take time, you still want to see and stop them**: every command is a tracked operation — visible in `ahma tui`, cancellable, with its full output kept in a file. By default a call waits for its result like a terminal; switch to `async` ([docs/settings.md](docs/settings.md#sync-or-async-toolsexecution_mode)) to let the agent start several long jobs in parallel and collect them with `await`.
 - **When independent tasks are forced through one terminal, work gets serialized**: ahma can start separate operations concurrently and track them cleanly.
 - **When safety is noisy, people disable it**: ahma aims to make the safe path the practical path, reducing pressure to use broad or insecure override modes just to get work done.
 
@@ -132,7 +132,7 @@ With ahma, that workflow stays inside the repo boundary and the long-running ste
 |---|---|---|
 | **Filesystem access** | Often tied to a broad terminal with a larger blast radius | Kernel-enforced to the workspace scope |
 | **Approval friction** | Repeated trust decisions or pressure to relax safety settings | Repo-scoped access is established up front |
-| **Long-running work** | One blocked terminal session at a time | Async-first operations with status tracking |
+| **Long-running work** | One blocked terminal session at a time | Tracked, cancellable operations; results returned when done (sync) or collected later (async) |
 | **Parallel tasks** | Often serialized | Independent tasks can start and run concurrently |
 | **Operational visibility** | Raw terminal output | Operation IDs, progress notifications, and structured tool calls |
 
@@ -143,10 +143,9 @@ Ahma complements IDE and CLI MCP clients by making normal command-line work safe
 | Capability | Native IDE/CLI terminal | Ahma `run_terminal_command` |
 |---|---|---|
 | **Write protection** | None — full filesystem access | Kernel-enforced to workspace only (Seatbelt on macOS, Landlock on Linux) |
-| **Async execution** | Synchronous — AI blocks until done | Async-first — AI continues working while commands run in background |
+| **Execution** | Synchronous — AI blocks until done, nothing to watch or stop | `sync` (default) returns the result within what the client can wait for, else an id to `await`; `async` lets the AI keep working while commands run |
 | **Parallel operations** | Sequential tool calls | True concurrent operations with per-operation status tracking |
 | **Structured tool schema** | Raw shell strings | Typed parameters, validation, subcommands via `.ahma/*.json` |
-| **Progressive disclosure** | All tools always listed | Bundles revealed on demand — preserves AI context window |
 | **Live log monitoring** | Raw output only | Pattern-matched alerts streamed to AI (error/warn/info levels) |
 | **PoLP enforcement** | Any command, any argument | Call directly, or define a JSON file to restrict which arguments can be passed to a command line tool |
 

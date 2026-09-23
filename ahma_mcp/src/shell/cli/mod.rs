@@ -104,8 +104,14 @@ pub struct AppConfig {
     /// `--force-progress-notifications` CLI flag or
     /// `tools.force_progress_notifications` in settings.toml.
     pub force_progress_notifications: bool,
-    /// Run all tools synchronously (AHMA_SYNC=1).
-    pub force_sync: bool,
+    /// How tool calls return: wait for the result (`sync`, the default) or
+    /// return an operation id after a short window (`async`). CLI `--sync` /
+    /// `--async` > project/user `tools.execution_mode` > default.
+    pub execution_mode: ahma_common::config::ExecutionPolicy,
+    /// The mode given explicitly on the command line, if any. Only this is
+    /// forwarded to worker processes: a worker resolves the rest from the
+    /// settings files itself, including a project file the frontend never read.
+    pub execution_mode_cli: Option<ahma_common::config::ExecutionPolicy>,
     /// Skip tool availability probes at startup (AHMA_SKIP_PROBES=1).
     pub skip_availability_probes: bool,
     /// Enable output compression and token minimization (AHMA_MINIMIZE_TOKENS=1).
@@ -260,7 +266,8 @@ impl Default for AppConfig {
             await_timeout_secs: ahma_common::config::default_await_timeout_secs(),
             request_budget_override_secs: None,
             force_progress_notifications: false,
-            force_sync: false,
+            execution_mode: ahma_common::config::ExecutionPolicy::default(),
+            execution_mode_cli: None,
             skip_availability_probes: false,
             minimize_tokens: false,
             small_model_harness: false,
@@ -1165,14 +1172,19 @@ pub struct Cli {
     #[arg(long = "force-progress-notifications", global = true)]
     pub force_progress_notifications: bool,
 
-    /// Force all tools to run synchronously.
-    /// By default, tools are async-first: ahma waits an adaptive inline window
-    /// (SPEC R2.6.1) and returns the result inline if the command finishes in time;
-    /// otherwise an operation ID is returned and the result is pushed as a
-    /// notification. This flag is a server-operator decision — models never get to
-    /// choose synchronous execution (R2.6.3).
-    #[arg(long = "sync", global = true)]
+    /// Wait for each command to finish and return its result (the default;
+    /// overrides `tools.execution_mode = "async"`). The call still runs as a
+    /// tracked operation, visible in status and the TUI and cancellable; a
+    /// command that outlasts what the client can wait for returns its id and
+    /// is collected with await.
+    #[arg(long = "sync", global = true, overrides_with = "async_mode")]
     pub sync: bool,
+
+    /// Return an operation id after a short inline window instead of waiting
+    /// for the result; collect it with the await tool. Lets a model start
+    /// several long commands in parallel. Overrides `tools.execution_mode`.
+    #[arg(long = "async", global = true, overrides_with = "sync")]
+    pub async_mode: bool,
 
     /// OTLP endpoint for distributed tracing export.
     /// Providing this flag enables tracing.
@@ -1671,7 +1683,6 @@ fn project_origin(cli: &Cli) -> Option<ProjectOrigin> {
 
 fn collect_boolean_flag_overrides(cli: &Cli, out: &mut Vec<(&'static str, String)>) {
     let boolean_flags: &[(&'static str, bool)] = &[
-        ("tools.force_sync", cli.sync),
         ("tools.skip_probes", cli.skip_probes),
         ("sandbox.disable", cli.no_sandbox),
         ("sandbox.defer", cli.defer_sandbox),
@@ -1689,6 +1700,9 @@ fn collect_boolean_flag_overrides(cli: &Cli, out: &mut Vec<(&'static str, String
     }
     if cli.log_to_stderr {
         out.push(("logging.target", "\"stderr\"".to_string()));
+    }
+    if let Some(mode) = cli_execution_mode(cli) {
+        out.push(("tools.execution_mode", format!("\"{mode}\"")));
     }
 }
 
@@ -2614,8 +2628,20 @@ struct ExecutionSettings {
     await_timeout_secs: u64,
     request_budget_override_secs: Option<u64>,
     force_progress_notifications: bool,
-    force_sync: bool,
+    execution_mode: ahma_common::config::ExecutionPolicy,
+    execution_mode_cli: Option<ahma_common::config::ExecutionPolicy>,
     skip_availability_probes: bool,
+}
+
+/// The execution mode chosen on the command line, if either flag was given.
+/// The flags override each other, so the last one given is the only one set.
+fn cli_execution_mode(cli: &Cli) -> Option<ahma_common::config::ExecutionPolicy> {
+    use ahma_common::config::ExecutionPolicy;
+    match (cli.sync, cli.async_mode) {
+        (_, true) => Some(ExecutionPolicy::Async),
+        (true, false) => Some(ExecutionPolicy::Sync),
+        (false, false) => None,
+    }
 }
 
 fn parse_execution_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> ExecutionSettings {
@@ -2633,7 +2659,10 @@ fn parse_execution_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
             .or(s.tools.request_budget_override_secs),
         force_progress_notifications: cli.force_progress_notifications
             || s.tools.force_progress_notifications,
-        force_sync: cli.sync || s.tools.force_sync,
+        // A choice, not an OR of booleans (R-CFG1.4): either flag overrides
+        // either settings value.
+        execution_mode: cli_execution_mode(cli).unwrap_or(s.tools.execution_mode),
+        execution_mode_cli: cli_execution_mode(cli),
         skip_availability_probes: cli.skip_probes || s.tools.skip_probes,
     }
 }
@@ -3043,7 +3072,8 @@ pub fn build_app_config_with_settings(
         await_timeout_secs: exec.await_timeout_secs,
         request_budget_override_secs: exec.request_budget_override_secs,
         force_progress_notifications: exec.force_progress_notifications,
-        force_sync: exec.force_sync,
+        execution_mode: exec.execution_mode,
+        execution_mode_cli: exec.execution_mode_cli,
         skip_availability_probes: exec.skip_availability_probes,
         minimize_tokens,
         small_model_harness,
@@ -4498,12 +4528,70 @@ mod tests {
         let mut s = ahma_common::config::AhmaSettings::default();
         s.tools.timeout_secs = 42;
         s.tools.await_timeout_secs = 24;
-        s.tools.force_sync = true;
+        s.tools.execution_mode = ahma_common::config::ExecutionPolicy::Async;
         s.tools.skip_probes = true;
         let exec = parse_execution_settings(&cli, &s);
         assert_eq!(exec.timeout_secs, 42);
         assert_eq!(exec.await_timeout_secs, 24);
-        assert!(exec.force_sync && exec.skip_availability_probes);
+        assert_eq!(
+            exec.execution_mode,
+            ahma_common::config::ExecutionPolicy::Async
+        );
+        assert_eq!(exec.execution_mode_cli, None, "no flag, nothing to forward");
+        assert!(exec.skip_availability_probes);
+    }
+
+    /// R-CFG1.4: each flag overrides either settings value — the old
+    /// `cli.sync || settings.force_sync` could never be turned off.
+    #[test]
+    fn execution_mode_flags_override_settings_both_ways() {
+        use ahma_common::config::ExecutionPolicy;
+        init_test();
+        let mut s = ahma_common::config::AhmaSettings::default();
+
+        s.tools.execution_mode = ExecutionPolicy::Sync;
+        let cli = Cli::parse_from(["ahma", "--async", "serve", "stdio"]);
+        let exec = parse_execution_settings(&cli, &s);
+        assert_eq!(exec.execution_mode, ExecutionPolicy::Async);
+        assert_eq!(exec.execution_mode_cli, Some(ExecutionPolicy::Async));
+
+        s.tools.execution_mode = ExecutionPolicy::Async;
+        let cli = Cli::parse_from(["ahma", "--sync", "serve", "stdio"]);
+        assert_eq!(
+            parse_execution_settings(&cli, &s).execution_mode,
+            ExecutionPolicy::Sync
+        );
+
+        // No flag: the settings value stands; with no settings, sync.
+        let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
+        assert_eq!(
+            parse_execution_settings(&cli, &s).execution_mode,
+            ExecutionPolicy::Async
+        );
+        let d = ahma_common::config::AhmaSettings::default();
+        assert_eq!(
+            parse_execution_settings(&cli, &d).execution_mode,
+            ExecutionPolicy::Sync
+        );
+    }
+
+    /// A worker gets the daemon's flags first and the session's after them,
+    /// so the last of `--sync` / `--async` must win rather than conflict.
+    #[test]
+    fn the_last_execution_mode_flag_wins() {
+        use ahma_common::config::ExecutionPolicy;
+        init_test();
+        let s = ahma_common::config::AhmaSettings::default();
+        let cli = Cli::parse_from(["ahma", "--sync", "--async", "serve", "stdio"]);
+        assert_eq!(
+            parse_execution_settings(&cli, &s).execution_mode,
+            ExecutionPolicy::Async
+        );
+        let cli = Cli::parse_from(["ahma", "--async", "--sync", "serve", "stdio"]);
+        assert_eq!(
+            parse_execution_settings(&cli, &s).execution_mode,
+            ExecutionPolicy::Sync
+        );
     }
 
     #[test]
@@ -4524,7 +4612,11 @@ mod tests {
         let exec = parse_execution_settings(&cli, &s);
         assert_eq!(exec.timeout_secs, 120);
         assert_eq!(exec.await_timeout_secs, 180);
-        assert!(exec.force_sync && exec.skip_availability_probes);
+        assert_eq!(
+            exec.execution_mode_cli,
+            Some(ahma_common::config::ExecutionPolicy::Sync)
+        );
+        assert!(exec.skip_availability_probes);
     }
 
     // ─── parse_sandbox_settings ──────────────────────────────────────────────
@@ -4866,7 +4958,11 @@ mod tests {
         let cli = Cli::parse_from(["ahma", "--no-settings", "serve", "stdio"]);
         let cfg = build_app_config(&cli);
         assert_eq!(cfg.timeout_secs, 600);
-        assert!(!cfg.force_sync);
+        assert_eq!(
+            cfg.execution_mode,
+            ahma_common::config::ExecutionPolicy::Sync,
+            "sync is the default"
+        );
         assert_eq!(cfg.http_host, "127.0.0.1");
         assert_eq!(cfg.http_port, 3000);
         assert!(!cfg.is_server_child);
@@ -4884,7 +4980,7 @@ mod tests {
             "--no-settings",
             "--timeout",
             "222",
-            "--sync",
+            "--async",
             "--max-sessions",
             "3",
             "--server-child",
@@ -4895,7 +4991,10 @@ mod tests {
         ]);
         let cfg = build_app_config(&cli);
         assert_eq!(cfg.timeout_secs, 222);
-        assert!(cfg.force_sync);
+        assert_eq!(
+            cfg.execution_mode,
+            ahma_common::config::ExecutionPolicy::Async
+        );
         assert_eq!(cfg.http_port, 8081);
         assert_eq!(cfg.max_sessions, 3);
         assert!(

@@ -1,5 +1,7 @@
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
-use ahma_mcp::test_utils::http::{HttpMcpTestClient, spawn_http_bridge};
+use ahma_mcp::test_utils::http::{
+    HttpMcpTestClient, spawn_http_bridge, spawn_http_bridge_with_args,
+};
 use serde_json::json;
 use tokio::time::sleep;
 
@@ -244,7 +246,9 @@ fn operation_id(text: &str) -> Option<String> {
 /// modes.
 #[tokio::test]
 async fn test_http_await_takes_over_the_progress_stream() -> anyhow::Result<()> {
-    let server = spawn_http_bridge().await?;
+    // Needs a call that hands back an id for `await` to take over: async mode.
+    // `--async` on the bridge also proves it reaches the worker.
+    let server = spawn_http_bridge_with_args(&["--async"]).await?;
     let mut client = HttpMcpTestClient::new(server.base_url());
 
     // The bridge is spawned with an explicit `--sandbox-scope` (SPEC R5.2.2), so

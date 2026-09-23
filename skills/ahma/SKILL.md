@@ -120,18 +120,23 @@ Terminates the process and frees resources.
 
 ---
 
-## Async-First Workflow
+## Sync and Async Modes
 
-Most tools run **asynchronously** by default, returning an `operation_id` immediately:
+Every call is a tracked operation (`status`, `ahma tui`, cancellable, full output in
+`output_file`). `tools.execution_mode` decides how long a call waits (the server
+`instructions` say which); humans switch it with `--sync`/`--async` or `/sync`/`/async`:
+
+- **`sync` (default)** — a call returns the command's result when it finishes. If it outlasts
+  what your client can hold one request open for, you get an `operation_id` and a line saying
+  it is still running: `await` that id to collect it.
+- **`async`** (`--async`) — a call returns inline only if it finishes within a few seconds,
+  otherwise an `operation_id`; start several, then `await` them:
 
 ```
-result = cargo_build(subcommand="build")        # → { "operation_id": "op_abc123", "status": "started" }
+result = cargo_build(subcommand="build")        # → "AHMA ID: op_abc123 … running in the background"
 status(id="op_abc123")                          # → { "status": "running", ... }  (non-blocking)
 await(id="op_abc123", timeout_seconds=120)      # → { "status": "complete", "exit_code": 0, ... }
 ```
-
-**Force synchronous** for state-modifying commands (e.g. `cargo add`): set `"synchronous":
-true` in the tool's MTDF JSON, or start the server with `--sync`.
 
 > **The completion push needs you to still be listening.** It rides the same live connection
 > that started the operation — nothing is queued or replayed for a caller who has disconnected.
@@ -230,8 +235,8 @@ Validate configs: `ahma tool validate .ahma/`
 | CLI flag / Settings key | Default | Purpose |
 |----------|---------|---------|
 | `--tools-dir` / `tools.tools_dir` | `.ahma/` | Custom tools directory path |
-| `--timeout` / `tools.timeout_secs` | `360` | Default tool timeout (seconds) |
-| `--sync` / `tools.force_sync` | off | Force all tools synchronous |
+| `--timeout` / `tools.timeout_secs` | `600` | Default tool timeout (seconds) |
+| `--sync` / `--async` / `tools.execution_mode` | `sync` | `sync`: calls return results; `async`: calls return ids to `await` |
 | `--no-sandbox` / `sandbox.disable` | off | Disable kernel sandbox (UNSAFE) |
 | `--sandbox-scope` / `sandbox.scopes` | cwd | Sandbox scope paths |
 | `sandbox.container_root` | unset | Directory holding your projects; scope fallback when the client reports no roots |

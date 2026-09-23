@@ -238,7 +238,18 @@ pub async fn try_automatic_async_completion(
     budget: std::time::Duration,
 ) -> Option<rmcp::model::CallToolResult> {
     let window = inline_window(monitor, op_id, budget).await;
+    wait_for_completion(monitor, op_id, window).await
+}
 
+/// Wait up to `window` for operation `op_id` to finish, returning its result
+/// in the inline format (identity line first, SPEC R2.6.2), or `None` if it is
+/// still running when the window ends. The operation is not affected either
+/// way: it keeps running and `await` can collect it.
+pub async fn wait_for_completion(
+    monitor: &crate::operation_monitor::OperationMonitor,
+    op_id: &str,
+    window: std::time::Duration,
+) -> Option<rmcp::model::CallToolResult> {
     // First check if already completed (race: task finished before we got here)
     if let Some(op) = monitor.check_completion_history_pub(op_id).await {
         return Some(format_completed_operation(&op));

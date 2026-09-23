@@ -49,7 +49,7 @@ mod subcommand;
 mod types;
 
 pub use types::{
-    ActiveAgentSession, ExtensionToolHandler, GuidanceConfig, META_PARAMS, PromptRunner,
+    ActiveAgentSession, CallWait, ExtensionToolHandler, GuidanceConfig, META_PARAMS, PromptRunner,
     SequenceKind, get_global_prompt_runner, register_global_extension_handler,
     register_global_prompt_runner,
 };
@@ -258,6 +258,49 @@ impl AhmaMcpService {
     /// [`push_channel_open`](Self::push_channel_open) field docs for why a
     /// future liveness probe must check this before attempting a
     /// server-initiated request mid-`await`.
+    /// The server's sync/async policy (SPEC R2.1): `tools.execution_mode`, as
+    /// resolved from `--sync`/`--async` and the settings files. A service with
+    /// no `AppConfig` — an embedding that never set one — keeps async, the
+    /// library's historical behaviour; the `ahma` binary always sets one.
+    pub fn execution_policy(&self) -> ahma_common::config::ExecutionPolicy {
+        self.app_config
+            .read()
+            .as_ref()
+            .map(|c| c.execution_mode)
+            .unwrap_or(ahma_common::config::ExecutionPolicy::Async)
+    }
+
+    /// How long this call waits: sync mode waits until done unless the call
+    /// (MTDF `synchronous: false`, `blocking: false`) explicitly asks not to.
+    pub(crate) fn call_wait(&self, opted_out_of_waiting: bool) -> CallWait {
+        match self.execution_policy() {
+            ahma_common::config::ExecutionPolicy::Sync if !opted_out_of_waiting => {
+                CallWait::UntilDone
+            }
+            _ => CallWait::Adaptive,
+        }
+    }
+
+    /// A sequence's share of [`Self::call_wait`]: in sync mode, the steps are
+    /// waited for within the window a single call would get.
+    fn sequence_wait(
+        &self,
+        context: &RequestContext<RoleServer>,
+        opted_out_of_waiting: bool,
+    ) -> Option<sequence::SequenceWait<'_>> {
+        if self.call_wait(opted_out_of_waiting) != CallWait::UntilDone {
+            return None;
+        }
+        let (window, _) = self.sync_call_wait(
+            McpClientType::from_peer(&context.peer),
+            Some(context.peer.clone()),
+        );
+        Some(sequence::SequenceWait {
+            monitor: &self.operation_monitor,
+            window,
+        })
+    }
+
     pub(crate) fn push_channel_open(&self) -> bool {
         self.push_channel_open
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1375,10 +1418,12 @@ impl AhmaMcpService {
         progress_token: Option<rmcp::model::ProgressToken>,
         client_type: McpClientType,
         peer: Peer<RoleServer>,
+        wait: CallWait,
         map_start_error: impl FnOnce(&anyhow::Error) -> McpError,
     ) -> Result<CallToolResult, McpError> {
         self.emit_vault_tool_call(&id, tool_name, vault_args_summary)
             .await;
+        let wait_peer = peer.clone();
 
         self.register_progress_if_requested(&id, peer, progress_token, client_type)
             .await;
@@ -1401,21 +1446,46 @@ impl AhmaMcpService {
 
         match job_id {
             Ok(id) => {
-                // Automatic async: wait out the inline window (SPEC R2.6.1) so
-                // fast commands answer without an `await` round-trip.
-                if let Some(result) = handlers::common::try_automatic_async_completion(
-                    &self.operation_monitor,
-                    &id,
-                    self.effective_request_budget(client_type),
-                )
-                .await
-                {
+                let (finished, still_running) = match wait {
+                    // Async: wait out the inline window (SPEC R2.6.1) so fast
+                    // commands answer without an `await` round-trip.
+                    CallWait::Adaptive => {
+                        let finished = handlers::common::try_automatic_async_completion(
+                            &self.operation_monitor,
+                            &id,
+                            self.effective_request_budget(client_type),
+                        )
+                        .await;
+                        (finished, String::new())
+                    }
+                    // Sync: wait for the result, as long as a default `await`
+                    // on it could. Progress keeps flowing to the caller's token
+                    // meanwhile, registered above.
+                    CallWait::UntilDone => {
+                        let (window, clamp_note) =
+                            self.sync_call_wait(client_type, Some(wait_peer));
+                        let finished = handlers::common::wait_for_completion(
+                            &self.operation_monitor,
+                            &id,
+                            window,
+                        )
+                        .await;
+                        let note = format!(
+                            "\n\nStill running after {}s — the longest this client can \
+                             hold one request open. It keeps running: call `await` with \
+                             id `{id}` to collect the result.{}",
+                            window.as_secs(),
+                            clamp_note.unwrap_or_default()
+                        );
+                        (finished, note)
+                    }
+                };
+                if let Some(result) = finished {
                     return Ok(result);
                 }
                 let hint = crate::tool_hints::preview(&id, tool_name);
                 Ok(handlers::common::text_result(format!(
-                    "AHMA ID: {}{}",
-                    id, hint
+                    "AHMA ID: {id}{still_running}{hint}"
                 )))
             }
             Err(e) => {
@@ -1432,7 +1502,8 @@ impl AhmaMcpService {
 #[async_trait::async_trait]
 impl ServerHandler for AhmaMcpService {
     fn get_info(&self) -> ServerInfo {
-        let instructions = ahma_common::mcp_methods::SERVER_INSTRUCTIONS.to_string();
+        let instructions =
+            ahma_common::mcp_methods::server_instructions(self.execution_policy()).to_string();
 
         let mut tools_capability = ToolsCapability::default();
         tools_capability.list_changed = Some(true);
@@ -2148,6 +2219,15 @@ impl AhmaMcpService {
         }
 
         if config.sequence.is_some() {
+            #[allow(deprecated)]
+            let opted_out = config.synchronous == Some(false)
+                || params
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("blocking"))
+                    .and_then(|v| v.as_bool())
+                    == Some(false);
+            let wait = self.sequence_wait(&context, opted_out);
             return sequence::handle_sequence_tool(
                 &self.adapter,
                 &self.progress_push,
@@ -2156,6 +2236,7 @@ impl AhmaMcpService {
                 params,
                 context,
                 self.force_progress_notifications_override(),
+                wait,
             )
             .await;
         }
@@ -2281,6 +2362,13 @@ impl AhmaMcpService {
             }
             crate::adapter::ExecutionMode::AsyncResultPush => {
                 let vault_args_summary = Self::summarize_arguments(&arguments);
+                // In sync mode a tool can still ask to return early: MTDF
+                // `synchronous: false`, or `blocking: false` on the call.
+                #[allow(deprecated)]
+                let opted_out = Self::sync_override_from_config(subcommand_config, config)
+                    == Some(false)
+                    || arguments.get("blocking").and_then(|v| v.as_bool()) == Some(false);
+                let wait = self.call_wait(opted_out);
                 self.call_async_tool(
                     tool_name,
                     id,
@@ -2294,6 +2382,7 @@ impl AhmaMcpService {
                     progress_token,
                     client_type,
                     context.peer.clone(),
+                    wait,
                     |e| {
                         let error_message =
                             format!("Failed to start asynchronous operation: {}", e);
@@ -2329,6 +2418,11 @@ impl AhmaMcpService {
         };
 
         if subcommand_config.sequence.is_some() {
+            #[allow(deprecated)]
+            let opted_out = Self::sync_override_from_config(subcommand_config, &config)
+                == Some(false)
+                || arguments.get("blocking").and_then(|v| v.as_bool()) == Some(false);
+            let wait = self.sequence_wait(&context, opted_out);
             return sequence::handle_subcommand_sequence(
                 &self.adapter,
                 &self.progress_push,
@@ -2337,6 +2431,7 @@ impl AhmaMcpService {
                 params,
                 context,
                 self.force_progress_notifications_override(),
+                wait,
             )
             .await;
         }

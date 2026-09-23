@@ -35,7 +35,7 @@
       "minimum": 0
     },
     "synchronous": {
-      "description": "Override the default execution mode for this tool.\n- `true`: Always run synchronously (blocking, returns result immediately)\n- `false`: Always run asynchronously (non-blocking, returns operation ID)\n- `null`/omitted: Use server default (async unless --sync CLI flag)\n\nInheritance: Subcommand-level settings override tool-level settings.",
+      "description": "Override the default execution mode for this tool.\n- `true`: Always run on the legacy direct path (blocking, untracked)\n- `false`: Return after the adaptive window, even in sync mode\n- `null`/omitted: Use the server's `tools.execution_mode` (sync by default)\n\nInheritance: Subcommand-level settings override tool-level settings.",
       "type": [
         "boolean",
         "null"

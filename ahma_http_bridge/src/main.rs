@@ -55,8 +55,10 @@ struct Args {
     request_timeout_secs: u64,
 
     /// Default timeout in seconds for `tools/call` requests, unless the
-    /// caller's `timeout_seconds` argument overrides it.
-    #[arg(long, default_value = "60")]
+    /// caller's `timeout_seconds` argument overrides it. Generous on purpose:
+    /// in sync mode a call waits for its result, and the worker already ends
+    /// every wait gracefully before this fires.
+    #[arg(long, default_value_t = ahma_http_bridge::DEFAULT_TOOL_CALL_TIMEOUT_SECS)]
     tool_call_timeout_secs: u64,
 
     /// OTLP endpoint for distributed tracing export.

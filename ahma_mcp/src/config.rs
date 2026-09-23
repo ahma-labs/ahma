@@ -16,8 +16,7 @@
 //!   `build` and `test`, as well as custom hints for any subcommand.
 //!
 //! - **`CommandOverride`**: Allows for overriding default behaviors for specific subcommands.
-//!   For example, a `test` subcommand could be given a longer timeout or be forced to run
-//!   synchronously, even if the CLI --async flag is set.
+//!   For example, a `test` subcommand could be given a longer timeout.
 //!
 //! ## Configuration Loading
 //!
@@ -63,9 +62,9 @@ pub struct ToolConfig {
     /// Default timeout for operations in seconds
     pub timeout_seconds: Option<u64>,
     /// Override the default execution mode for this tool.
-    /// - `true`: Always run synchronously (blocking, returns result immediately)
-    /// - `false`: Always run asynchronously (non-blocking, returns operation ID)
-    /// - `null`/omitted: Use server default (async unless --sync CLI flag)
+    /// - `true`: Always run on the legacy direct path (blocking, untracked)
+    /// - `false`: Return after the adaptive window, even in sync mode
+    /// - `null`/omitted: Use the server's `tools.execution_mode` (sync by default)
     ///
     /// Inheritance: Subcommand-level settings override tool-level settings.
     #[serde(

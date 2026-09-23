@@ -672,6 +672,41 @@ pub struct AgentSettings {
     pub provider_url: Option<String>,
 }
 
+/// How a tool call returns (SPEC R2.1, R2.4): `tools.execution_mode`.
+///
+/// Both modes start every call as a tracked operation, so it shows in `status`,
+/// the TUI and the audit log, can be cancelled, and spills long output to a
+/// file. They differ only in how long the call waits before answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionPolicy {
+    /// Wait for the command to finish and return its result, as long as the
+    /// client can hold the request open (the same bound `await` uses). A
+    /// command still running at that bound returns its id with a note to call
+    /// `await`, rather than a result lost to a closed connection.
+    #[default]
+    Sync,
+    /// Wait only a short adaptive inline window (SPEC R2.6.1), then return an
+    /// operation id; the caller collects the result with `await`. Lets a model
+    /// start several long commands in parallel.
+    Async,
+}
+
+impl ExecutionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Async => "async",
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Tool execution settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -699,13 +734,13 @@ pub struct ToolSettings {
     /// want progress notifications back.
     /// Default: `false`
     pub force_progress_notifications: bool,
-    /// Run all tools synchronously.  By default tools are async-first: ahma waits
-    /// an adaptive inline window (SPEC R2.6.1) — longer when nothing else is
-    /// running, short when the caller is already fanning out — and returns the
-    /// result inline if it arrives in time; otherwise an operation ID is returned
-    /// and the result is pushed as a notification.
-    /// Default: `false`
-    pub force_sync: bool,
+    /// `"sync"` waits for each command to finish and returns its result;
+    /// `"async"` returns an operation id after a short inline window and the
+    /// caller collects the result with `await` (see [`ExecutionPolicy`]).
+    /// Replaces the retired `force_sync` key, which is still parsed and ignored
+    /// (sync is now the default it used to opt into).
+    /// Default: `"sync"`
+    pub execution_mode: ExecutionPolicy,
     /// Skip tool availability probes at startup.  Probes detect whether required
     /// executables (e.g. `cargo`, `git`) are installed and hide tools whose
     /// prerequisites are missing.  Skip to reduce startup latency when all tools
@@ -748,7 +783,7 @@ impl Default for ToolSettings {
             await_timeout_secs: default_await_timeout_secs(),
             request_budget_override_secs: None,
             force_progress_notifications: false,
-            force_sync: false,
+            execution_mode: ExecutionPolicy::default(),
             skip_probes: false,
             tools_dir: None,
             tool_bundles: Vec::new(),
@@ -1949,10 +1984,11 @@ impl AhmaSettings {
             d.tools.force_progress_notifications.to_string(),
         );
         w.setting(
-            "Run all tools synchronously instead of async-first.",
-            "force_sync",
-            self.tools.force_sync.to_string(),
-            d.tools.force_sync.to_string(),
+            "\"sync\": wait for each command and return its result. \"async\": return \
+             an operation id after a short window; collect results with `await`.",
+            "execution_mode",
+            toml_str(self.tools.execution_mode.as_str()),
+            toml_str(d.tools.execution_mode.as_str()),
         );
         w.setting(
             "Skip tool-availability probes at startup.",
@@ -2720,7 +2756,7 @@ mod tests {
                 await_timeout_secs: 456,
                 request_budget_override_secs: Some(120),
                 force_progress_notifications: true,
-                force_sync: true,
+                execution_mode: ExecutionPolicy::Async,
                 skip_probes: true,
                 tools_dir: Some(PathBuf::from("/opt/tools")),
                 tool_bundles: vec!["rust".into(), "git".into()],
@@ -2902,7 +2938,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
         // A file that asserts a default (timeout_secs = 600) and an override.
-        std::fs::write(&path, "[tools]\ntimeout_secs = 600\nforce_sync = true\n").unwrap();
+        std::fs::write(
+            &path,
+            "[tools]\ntimeout_secs = 600\nexecution_mode = \"async\"\n",
+        )
+        .unwrap();
 
         assert!(AhmaSettings::ensure_current(&path).unwrap());
         let text = std::fs::read_to_string(&path).unwrap();
@@ -2912,7 +2952,7 @@ mod tests {
             "default value de-asserted into a comment; got:\n{text}"
         );
         assert!(
-            text.contains("\nforce_sync = true\n"),
+            text.contains("\nexecution_mode = \"async\"\n"),
             "override preserved as active; got:\n{text}"
         );
         // Now idempotent.
@@ -3316,7 +3356,7 @@ default_model = "llama3.2"
     fn ahma_settings_default_tools_values() {
         let s = AhmaSettings::default();
         assert_eq!(s.tools.timeout_secs, 600);
-        assert!(!s.tools.force_sync);
+        assert_eq!(s.tools.execution_mode, crate::config::ExecutionPolicy::Sync);
         assert!(!s.tools.skip_probes);
     }
 
@@ -3374,7 +3414,7 @@ timeout_secs = 600
         assert_eq!(s.tools.timeout_secs, 600);
         // Non-overridden values stay at defaults
         assert_eq!(s.lmstudio.base_url, "http://localhost:1234/v1");
-        assert!(!s.tools.force_sync);
+        assert_eq!(s.tools.execution_mode, crate::config::ExecutionPolicy::Sync);
         assert_eq!(s.logging.target, "file");
     }
 
@@ -3672,9 +3712,38 @@ mod removed_key_compat_tests {
     /// user with an unreadable settings file.
     #[test]
     fn retired_hot_reload_key_is_ignored_not_fatal() {
-        let s = AhmaSettings::parse("[tools]\nhot_reload = true\nforce_sync = true\n")
+        let s = AhmaSettings::parse("[tools]\nhot_reload = true\nskip_probes = true\n")
             .expect("a retired key must not make the settings file unparseable");
-        assert!(s.tools.force_sync, "sibling keys must still apply");
+        assert!(s.tools.skip_probes, "sibling keys must still apply");
+    }
+
+    /// `force_sync` was replaced by `execution_mode`. Old files still carry it
+    /// — `force_sync = true` from users who opted in, and nothing else, since
+    /// defaults were written as comments — so it must parse, and the only
+    /// value it could hold, `true`, is what the new default already does.
+    #[test]
+    fn retired_force_sync_key_is_ignored_and_sync_is_the_default() {
+        let s = AhmaSettings::parse("[tools]\nforce_sync = true\n")
+            .expect("the retired force_sync key must not make the file unparseable");
+        assert_eq!(s.tools.execution_mode, crate::config::ExecutionPolicy::Sync);
+        let s = AhmaSettings::parse("[tools]\nforce_sync = false\n").unwrap();
+        assert_eq!(
+            s.tools.execution_mode,
+            crate::config::ExecutionPolicy::Sync,
+            "an explicit false never meant async; async is opt-in via execution_mode"
+        );
+    }
+
+    #[test]
+    fn execution_mode_parses_both_values_and_rejects_others() {
+        let s = AhmaSettings::parse("[tools]\nexecution_mode = \"async\"\n").unwrap();
+        assert_eq!(
+            s.tools.execution_mode,
+            crate::config::ExecutionPolicy::Async
+        );
+        let s = AhmaSettings::parse("[tools]\nexecution_mode = \"sync\"\n").unwrap();
+        assert_eq!(s.tools.execution_mode, crate::config::ExecutionPolicy::Sync);
+        assert!(AhmaSettings::parse("[tools]\nexecution_mode = \"fast\"\n").is_err());
     }
 }
 

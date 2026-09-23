@@ -55,7 +55,7 @@ All previously accepted. Now ignored with a `WARN`. Use `~/.ahma/settings.toml` 
 |---|---|---|
 | `AHMA_TOOLS_DIR` | `--tools-dir` CLI flag or `tools.tools_dir` in settings.toml | auto-detect `.ahma/` |
 | `AHMA_TIMEOUT` | `--timeout` flag or `tools.timeout_secs` in settings.toml | `360` |
-| `AHMA_SYNC` | `--sync` flag or `tools.force_sync = true` in settings.toml | `false` |
+| `AHMA_SYNC` | `--sync` / `--async`, or `tools.execution_mode` in settings.toml | `"sync"` |
 | `AHMA_HOT_RELOAD` | none — tool hot-reload was removed entirely (agent-writable tools dir); use the `restart` tool | n/a |
 | `AHMA_SKIP_PROBES` | `--skip-probes` flag or `tools.skip_probes = true` in settings.toml | `false` |
 | `AHMA_MINIMIZE_TOKENS` | `--minimize-tokens` flag or `tools.minimize_tokens = true` in settings.toml | `false` |

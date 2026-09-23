@@ -4132,6 +4132,10 @@ fn format_setting_value(value: &crate::settings_editor::SettingValue) -> String 
         crate::settings_editor::SettingValue::U32(v) => format!("{}", v),
         crate::settings_editor::SettingValue::Usize(v) => format!("{}", v),
         crate::settings_editor::SettingValue::StringList(v) => format!("[{}]", v.join(", ")),
+        // Name the alternatives so it is obvious Space cycles through them.
+        crate::settings_editor::SettingValue::Choice { value, options } => {
+            format!("{value}  ({})", options.join(" | "))
+        }
     }
 }
 

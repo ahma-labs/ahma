@@ -114,10 +114,11 @@ All tool configurations follow the MCP Tool Definition Format (MTDF) schema. Onl
 }
 ```
 
-Tools run **async-first** by default: if a command finishes within a few seconds
-its result is returned inline, otherwise you get an operation ID and the result
-arrives as a notification. Force synchronous execution globally with the `--sync`
-server flag rather than the per-subcommand `synchronous` field, which is deprecated.
+By default a tool call waits for its result (`tools.execution_mode = "sync"`); with
+`--async` (or `execution_mode = "async"`) a command that is still running after a
+few seconds returns an operation ID to collect with `await`. Choose the mode for
+the server rather than with the per-subcommand `synchronous` field, which is
+deprecated. See [docs/settings.md](../docs/settings.md#sync-or-async-toolsexecution_mode).
 
 ## Validation Tools
 

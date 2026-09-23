@@ -89,7 +89,7 @@
 //! | `AHMA_TMP_ACCESS` | `--tmp` |
 //! | `AHMA_DISABLE_TEMP` | `--disable-temp-files` |
 //! | `AHMA_TOOLS_DIR` | `--tools-dir <PATH>` |
-//! | `AHMA_TIMEOUT` / `AHMA_SYNC` / `AHMA_SKIP_PROBES` | `--timeout <SECS>` / `--sync` / `--skip-probes` |
+//! | `AHMA_TIMEOUT` / `AHMA_SYNC` / `AHMA_SKIP_PROBES` | `--timeout <SECS>` / `--sync` or `--async` / `--skip-probes` |
 //! | `AHMA_HOT_RELOAD` | none — tool hot-reload was removed; use the `restart` tool |
 //! | `AHMA_LOG_TARGET` | `--log-to-stderr` or `[logging] target` in settings.toml |
 //! | `AHMA_LOG_MONITOR` / `AHMA_MONITOR_RATE_LIMIT` | `--log-monitor` / `--monitor-rate-limit <SECS>` |

@@ -44,12 +44,41 @@ pub const SERVER_DISCOVER_METHOD: &str = "server/discover";
 /// Modern MCP (2026-07-28 / SEP-2575) subscriptions listen method.
 pub const SUBSCRIPTIONS_LISTEN_METHOD: &str = "subscriptions/listen";
 
-/// Canonical server instructions for MCP initialization and discovery.
-pub const SERVER_INSTRUCTIONS: &str = "\
+// The server instructions are one text with a mode-specific middle; the
+// shared parts are macros so both variants are compile-time constants that
+// cannot drift apart.
+macro_rules! instructions_head {
+    () => {
+        "\
 Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
 kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
 Job Objects on Windows). Prefer `run_terminal_command` over the native terminal when: \
-(1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; \
+(1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; "
+    };
+}
+
+macro_rules! instructions_tail {
+    () => {
+        "\
+A soft `await` timeout is not completion — before declaring a task done, `status` \
+or `await` every operation_id you started and confirm each reached a terminal state, \
+not \"still running\". \
+Results include a bounded stdout/stderr window plus an `output_file` path holding the \
+COMPLETE output of the operation; when the inline output is marked truncated, read or \
+grep that file instead of re-running the command. \
+For reading, searching, and editing files (read, grep, glob, edit) keep using the \
+IDE's native file tools — that is what they are for; ahma withholds its own \
+read_file/write_file/replace_in_file/list_dir/file_search/grep_search from clients \
+that already have native equivalents."
+    };
+}
+
+/// Canonical server instructions for an **async-mode** server
+/// (`tools.execution_mode = "async"`), and for stateless discovery, which
+/// cannot know a session's mode. See [`server_instructions`].
+pub const SERVER_INSTRUCTIONS: &str = concat!(
+    instructions_head!(),
+    "\
 (2) the command is long-running — `run_terminal_command` returns an operation_id immediately \
 and you can `status`, `await`, or `cancel` it without blocking; \
 (3) the command's output should be watched for errors — set `monitor_level` and ahma \
@@ -60,17 +89,32 @@ completion is also pushed via notifications, so avoid polling `status` in a loop
 Push notifications only arrive over a live, actively-listening connection — if you \
 might stop generating before an operation finishes (ending your turn, handing off, \
 or exiting), call `await` and let it block rather than counting on a notification to \
-resume you; a push sent while you are not listening is not queued or replayed. \
-A soft `await` timeout is not completion — before declaring a task done, `status` \
-or `await` every operation_id you started and confirm each reached a terminal state, \
-not \"still running\". \
-Results include a bounded stdout/stderr window plus an `output_file` path holding the \
-COMPLETE output of the operation; when the inline output is marked truncated, read or \
-grep that file instead of re-running the command. \
-For reading, searching, and editing files (read, grep, glob, edit) keep using the \
-IDE's native file tools — that is what they are for; ahma withholds its own \
-read_file/write_file/replace_in_file/list_dir/file_search/grep_search from clients \
-that already have native equivalents.";
+resume you; a push sent while you are not listening is not queued or replayed. ",
+    instructions_tail!()
+);
+
+/// Server instructions for a **sync-mode** server (`tools.execution_mode =
+/// "sync"`, the default): calls return their result, and an operation id is
+/// the exception a model must know how to handle, not the workflow.
+pub const SERVER_INSTRUCTIONS_SYNC: &str = concat!(
+    instructions_head!(),
+    "\
+(2) the command's output should be watched for errors — set `monitor_level` and ahma \
+streams alerts when matching lines appear. \
+Each call waits for the command to finish and returns its result, like a terminal. \
+If a command outlasts what your client can wait for on one request, the call returns an \
+operation_id and says it is still running: call `await` with that id to collect the \
+result (it blocks; do not poll `status` in a loop), or `cancel` it. ",
+    instructions_tail!()
+);
+
+/// The server instructions for a server in this mode.
+pub fn server_instructions(policy: crate::config::ExecutionPolicy) -> &'static str {
+    match policy {
+        crate::config::ExecutionPolicy::Sync => SERVER_INSTRUCTIONS_SYNC,
+        crate::config::ExecutionPolicy::Async => SERVER_INSTRUCTIONS,
+    }
+}
 
 /// Client → server request invoking a tool.
 pub const TOOLS_CALL_METHOD: &str = "tools/call";

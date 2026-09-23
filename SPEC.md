@@ -7,7 +7,7 @@
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Core Tool Execution | tests-pass | `ahma` adapter executes CLI tools via MTDF JSON |
-| Async-First Operations | tests-pass | Operations return `id`, push results via MCP notifications |
+| Tracked Operations, Sync by Default (R2.1) | tests-pass | Every call is a monitored, cancellable operation; `tools.execution_mode` = `sync` (default: wait for the result within the client's budget) or `async` (return an `id`, collect with `await`) |
 | Shell Pool | removed | Dead prewarmed pool removed — commands spawn directly (~6ms median measured by `latency_guard_test`); `shell_pool` module retains platform shell selection + command timeout config |
 | Unified Operation Event Stream | tests-pass | Single `OperationEvent` stream (`ahma_common::event_dispatcher`); `OperationMonitor` is the sole lifecycle emitter; subscribers: MCP progress push, daemon hub, vault audit, TUI |
 | Output Spill Files | tests-pass | Complete per-operation output at `<log dir>/operations/<id>.log`; advertised as `output_file` in results; retention-cleaned |
@@ -106,7 +106,7 @@ These tools are always available regardless of JSON configuration:
 
 **Note**: These internal tools are hardcoded into the `AhmaMcpService` and are guaranteed to be available even when no `.ahma` directory exists or when all external tool configurations fail to load.
 
-### 2.3 Async-First Architecture
+### 2.3 Operation Architecture
 
 ```text
 ┌─────────────────┐         ┌──────────────────┐
@@ -162,24 +162,30 @@ All operation lifecycle data flows through ONE broadcast stream of
   as `output_file` in results, so agents query big outputs with file tools
   instead of re-running commands.
 
-### 2.4 Synchronous Setting Inheritance
+### 2.4 Execution Mode Resolution
+
+Every call runs as a tracked operation (R2.1); the mode decides only how long
+the call waits for it before answering.
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                    EXECUTION MODE RESOLUTION                     │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│  1. CLI Flag (highest priority)                                  │
-│     └── --sync flag forces ALL tools to run synchronously        │
+│  1. CLI flag (highest priority; last one given wins)             │
+│     └── --sync / --async                                         │
 │                                                                  │
-│  2. Subcommand Config                                            │
-│     └── "synchronous": true/false in subcommand definition       │
+│  2. Settings: tools.execution_mode = "sync" | "async"            │
+│     └── project .ahma/settings.toml over ~/.ahma/settings.toml   │
 │                                                                  │
-│  3. Tool Config                                                  │
-│     └── "synchronous": true/false at tool level                  │
+│  3. Default (lowest priority)                                    │
+│     └── SYNC — wait for the result, within the client's budget   │
 │                                                                  │
-│  4. Default (lowest priority)                                    │
-│     └── ASYNC - operations run in background by default          │
+│  Per call, in sync mode only: an MTDF tool with                  │
+│  "synchronous": false, or a call with "blocking": false, returns │
+│  after the adaptive window instead (run_terminal_command has no  │
+│  such argument — R2.6.3). "blocking": true / "synchronous": true │
+│  still select the legacy direct path in either mode.             │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -225,13 +231,18 @@ All operation lifecycle data flows through ONE broadcast stream of
   may call it, and whether it is a harness file tool withheld from clients with
   native equivalents. These are exhaustive matches, not membership lists.
 
-### R2: Async-First Architecture
+### R2: Tracked Operations, Sync by Default
 
-- **R2.1**: Operations **must** execute asynchronously by default, returning an `id` immediately.
+- **R2.1**: **Every call is a tracked operation; the mode decides how long it waits.** A tool call **must** start its command as an operation in `OperationMonitor` in both modes, so it is visible to `status`, the TUI and the audit log, cancellable, and spills its full output to `output_file`. `tools.execution_mode` (`--sync` / `--async`, resolved per §2.4) then decides the answer:
+  - **`sync` (the default)** — the call waits for the operation to finish and returns its result in the inline format (R2.6.2). The wait is bounded exactly as a default `await` on it would be (R2.5, R2.6.5, R2.6.5.3), because a result written into a connection the client has abandoned is lost; an operation still running at that bound returns its id with a statement that it is still running and how to collect it (`await`). Progress keeps flowing to the call's token during the wait. A sequence waits for its steps within one such window.
+  - **`async`** — the call waits the adaptive inline window (R2.6.1), then returns the operation id; the caller collects the result with `await`. This lets a model start several long commands in parallel.
+  - The server `instructions` **must** describe the mode the session is actually in.
+  - The legacy direct execution path (not a tracked operation) is used only by CLI one-shot mode and by the deprecated `blocking: true` / `"synchronous": true` (R2.3).
+  - Sync became the default in v0.22: async-first made the common case — run a command, read its output — cost an extra `await` round trip, while the reason given for it (clients abandoning long requests) is handled by bounding the sync wait instead.
 - **R2.2**: On completion, the system **must** store results reliably in `OperationMonitor` (pull channel) and **should** push a best-effort MCP progress notification. Clients rely on the `await` tool for guaranteed result delivery; the push notification is an optimistic shortcut to avoid a round-trip.
 - **R2.2.1**: **A per-client progress suppression must be overridable, and must say so when it isn't measured.** `McpClientType::supports_progress()` may suppress R2.2's push for a specific client (currently: Cursor, believed to log a client-side error for valid progress tokens). Because MCP notifications are one-way — no response, no ack — ahma has no way to observe whether the behavior it is working around still exists, or ever did; unlike the request-budget and elicitation-budget tables (R2.6.5, R5.3.1), which are set from a captured, timestamped measurement, a progress suppression **must** say in its own doc comment when it is asserted rather than measured, so it is not read as equally trustworthy. `tools.force_progress_notifications` / `--force-progress-notifications` **must** let an operator override the suppression uniformly once it is known to be stale.
 - **R2.3**: **Static Synchronous Flag (DEPRECATED)**: The static `"synchronous": true/false` configuration in tool and subcommand JSON definitions is deprecated. Code calling tools should not rely on static config.
-- **R2.4**: **Dynamic Resolution**: Execution mode (blocking/synchronous vs non-blocking/asynchronous) is resolved dynamically per-invocation using the `blocking` boolean parameter in the MCP `tools/call` arguments. If not specified, tool execution defaults to asynchronous.
+- **R2.4**: **Resolution**: the server's mode is `tools.execution_mode`, resolved per §2.4 — `--sync`/`--async` over the project and user settings over the default, `sync` — and is a server-operator decision. On an MTDF tool a call may still pass `blocking: false` to return after the adaptive window in sync mode; `run_terminal_command` has no such argument (R2.6.3). The retired `tools.force_sync` key is parsed and ignored: the only value it could hold, `true`, is the new default. `--sync` and `--async` override each other (last one wins), because a worker receives its daemon's flags first and its session's after them.
 - **R2.5**: **`await` soft timeout.** The `await` tool waits at most `tools.await_timeout_secs` seconds (default `540`, i.e. 9 minutes — under the 10-minute idle disconnect used by common MCP clients). Resolution order: the call's optional `timeout_seconds` argument, then the `--await-timeout` CLI flag, then `tools.await_timeout_secs` in `settings.toml`, then the compiled-in default. When awaiting by tool filter and no explicit `timeout_seconds` is given, the effective wait is `max(default, longest pending operation timeout)` so a legitimately long operation is never cut short by a shorter await default.
 - **R2.5.1**: The timeout is **soft**: expiry **must not** cancel the awaited operation(s), and the returned text **must** state that the work is still running in the background and that the client should call `await` again (by `id` where one was given) to keep waiting. This distinguishes "your wait ended" from "your operation died" — the two were previously indistinguishable to an agent.
 - **R2.5.2**: The resolved timeout from R2.5 **must** be the only deadline on the wait — no inner bound may pre-empt it. `OperationMonitor::wait_for_operation`'s own default cap is shorter than the await default, so `await` **must** opt out of it (`wait_for_operation_bounded(id, None)`). Otherwise expiry past that inner cap is misreported as "completed but no result available" (by `id`) or silently drops a still-running operation from an apparently successful result (by tool filter), defeating R2.5.1.
@@ -246,13 +257,13 @@ round-trip, and one that takes minutes must not hold an MCP request open. Which
 of the two is happening is not known when the call arrives, so ahma waits a
 bounded window and decides from the outcome.
 
-- **R2.6.1**: **Adaptive inline window.** A `tools/call` that spawns an async operation **must** wait a bounded window for it to finish and return the result inline if it does; otherwise it returns the operation id. The window is **not** a fixed constant — it is chosen from whether the session has other operations in flight:
+- **R2.6.1**: **Adaptive inline window (async mode).** A `tools/call` that spawns an async operation **must** wait a bounded window for it to finish and return the result inline if it does; otherwise it returns the operation id. The window is **not** a fixed constant — it is chosen from whether the session has other operations in flight:
   - **nothing else running** → the long window (`INLINE_WINDOW_IDLE_SECS`). The model has nothing to overlap with and its next move would be `await` anyway, so the wait is free wall-clock and may save a whole LLM turn.
   - **operations already in flight** → the short window (`INLINE_WINDOW_BUSY_SECS`). The model is fanning out; holding this response delays the next command.
 
   The window **must** additionally be clamped to at most half the caller's single-request budget (R2.6.5), so the call that was meant to save a round-trip can never instead exceed what the client will wait for.
 - **R2.6.2**: **A completed operation always states its outcome.** An inline result **must** begin with the operation identity line (R24.7) — what ran, exit code, duration — followed by the command's output, or `(no output)` when it produced none. Returning bare stdout is not sufficient: a successful silent command (`cargo fmt --check` on clean code) then yields an empty result, which a model cannot distinguish from a broken tool. The exit code and duration exist regardless; a progress notification is best-effort (R2.2) and **must not** be the only place they appear.
-- **R2.6.3**: **No caller-selectable synchronous mode on `run_terminal_command`.** Its input schema **must not** advertise `sync`, `blocking`, `execution_mode`, or any equivalent. Models do not use such a flag selectively — they default to it — and a synchronous `cargo` build blocks one MCP request for longer than several clients tolerate, so the flag breaks precisely the case it is reached for. `execution_mode` remains accepted but unadvertised as the CLI/test escape hatch; `--sync` (R2.4, `force_synchronous`) remains a server-operator decision.
+- **R2.6.3**: **No caller-selectable synchronous mode on `run_terminal_command`.** Its input schema **must not** advertise `sync`, `blocking`, `execution_mode`, or any equivalent. Models do not use such a flag selectively — they default to it — and a synchronous `cargo` build blocks one MCP request for longer than several clients tolerate, so the flag breaks precisely the case it is reached for. `execution_mode` remains accepted but unadvertised as the CLI/test escape hatch; the server's `tools.execution_mode` (R2.1, R2.4) remains a server-operator decision. In sync mode (the default) a command still returns its result without the model asking — the wait is bounded by the client's budget, which is what makes it safe here.
 - **R2.6.4**: **Ignored arguments are disclosed.** When `run_terminal_command` receives arguments it does not act on, it **must** execute normally and name them in the result. Silently dropping an argument leaves a model believing it took effect — an observed session had a model send `"sync": true`, receive no error, and conclude from the (then empty, see R2.6.2) result that ahma was broken rather than that its parameter was imaginary.
 - **R2.6.5**: **Fallback single-request budget.** ahma **must** apply a conservative bound on how long it holds one MCP request open when there is no better signal available (R2.6.5.3 supplies the better signal when it can). This is **not** a per-`clientInfo.name` table: guessing which *product* deserves more trust was a proxy for the thing that actually matters — is the connection right now still alive — and the proxy was exactly as reliable as the guess behind it, silently wrong for any client whose name didn't match. Both the R2.6.1 window ceiling and the R2.5 `await` default are bounded by it, uniformly, regardless of client identity.
 - **R2.6.5.1**: **A shortened wait says so.** When the fallback budget cuts an `await` below the timeout that was resolved for it, the result **must** state the wait that was applied, the wait that was asked for, and that the operation is still running. A caller who requested 540s and received a timeout at 20s cannot otherwise tell a deliberate cap from a hung operation, and "call `await` again" is the wrong conclusion to have to infer. An explicit `timeout_seconds` argument is honoured verbatim (R2.5.1) and **must not** be reported as capped.
