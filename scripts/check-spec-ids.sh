@@ -5,8 +5,8 @@
 # docs so a reader can find the rule a line obeys. When a SPEC section is edited,
 # moved to a crate SPEC, or renumbered, those citations silently dangle and the
 # rule they pointed at is lost. This check fails when a cited id appears in no
-# `SPEC.md` (root or crate) and not in `AGENTS.md` (which owns the R13-R16
-# testing rules).
+# `SPEC.md` (root or crate) and not in `AGENTS.md` (which owns the testing
+# rules).
 #
 # Usage: ./scripts/check-spec-ids.sh
 set -euo pipefail
