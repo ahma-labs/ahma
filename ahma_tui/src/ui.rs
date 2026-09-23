@@ -42,6 +42,9 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     match &state.modal {
         crate::state::ModalState::None => {}
         crate::state::ModalState::Help => draw_help(frame, state, theme, full),
+        crate::state::ModalState::Intro { selected, expanded } => {
+            draw_intro(frame, theme, full, *selected, *expanded)
+        }
         crate::state::ModalState::Navigator(_) => draw_navigator(frame, state, theme, full),
         crate::state::ModalState::ProviderPicker(picker)
         | crate::state::ModalState::ModelPicker(picker)
@@ -4083,6 +4086,64 @@ fn help_single_rows() -> Vec<HelpRow> {
     rows
 }
 
+/// The `/intro` tour (SPEC R24.12.6): one line per topic, the highlighted
+/// one's second level opened beneath it on Enter.
+fn draw_intro(frame: &mut Frame, theme: &Theme, area: Rect, selected: usize, expanded: bool) {
+    let topics = crate::intro::TOPICS;
+    let detail_rows = if expanded {
+        topics.get(selected).map_or(0, |t| t.detail.len() + 1)
+    } else {
+        0
+    };
+    let w = 96u16.min(area.width);
+    let h = (topics.len() as u16 * 2 + detail_rows as u16 + 4).min(area.height);
+    let popup = centered_rect(w, h, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(" ahma in one screen ", theme.title().bold()))
+        .title(
+            Line::from(Span::styled(
+                " ↑↓ choose · Enter more · Esc done ",
+                theme.dim(),
+            ))
+            .right_aligned(),
+        )
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = Vec::new();
+    for (i, topic) in topics.iter().enumerate() {
+        let here = i == selected;
+        let marker = match (here, expanded) {
+            (true, true) => "▾ ",
+            (true, false) => "▸ ",
+            _ => "  ",
+        };
+        let title_style = if here {
+            theme.title().bold()
+        } else {
+            theme.normal().bold()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, theme.title()),
+            Span::styled(topic.title, title_style),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", topic.summary),
+            if here { theme.normal() } else { theme.dim() },
+        )));
+        if here && expanded {
+            for d in topic.detail {
+                lines.push(Line::from(Span::styled(format!("    {d}"), theme.dim())));
+            }
+            lines.push(Line::default());
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let use_two_columns = area.width >= 100;
 
@@ -4101,7 +4162,10 @@ fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
-        .title(Span::styled(" Help — ahma TUI ", theme.title()))
+        .title(Span::styled(
+            " Help — ahma TUI · new here? /intro ",
+            theme.title(),
+        ))
         .title(Line::from(Span::styled(" ↑↓ scroll · Esc closes ", theme.dim())).right_aligned())
         .borders(Borders::ALL)
         .border_style(theme.border_focused());
@@ -4738,6 +4802,21 @@ mod tests {
                 "{w}x{h}: a short conversation sits low, near the input (row {message_row})"
             );
         }
+    }
+
+    #[test]
+    fn intro_shows_every_topic_and_the_open_ones_detail() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.modal = crate::state::ModalState::Intro {
+            selected: 1,
+            expanded: true,
+        };
+        let screen = render_full_screen(&state, 120, 40).join("\n");
+        for topic in crate::intro::TOPICS {
+            assert!(screen.contains(topic.title), "missing {}", topic.title);
+        }
+        assert!(screen.contains(crate::intro::TOPICS[1].detail[0].trim()));
+        assert!(!screen.contains(crate::intro::TOPICS[0].detail[0].trim()));
     }
 
     /// Render the chat history pane into a TestBackend and read back the screen.

@@ -6,7 +6,8 @@
 //! the env var per test process; nextest runs each test in its own process).
 
 use ahma_core::approvals::{
-    covered_by_trust, is_tool_allowed, is_workspace_trusted, trust_workspace,
+    covered_by_trust, forget_tool_approvals, is_tool_allowed, is_workspace_trusted,
+    remember_tool_approval, trust_workspace, untrust_workspace,
 };
 use tempfile::TempDir;
 
@@ -55,4 +56,13 @@ async fn trusting_a_folder_allows_sandboxed_tools_but_not_boundary_crossing_ones
     // Trust is per folder.
     assert!(!is_workspace_trusted(other_dir.path()));
     assert!(!is_tool_allowed(other_dir.path(), "write_file").await);
+
+    // Withdrawing trust and forgetting grants are separate, and each says
+    // whether it changed anything.
+    remember_tool_approval(ws, "fetch_webpage").unwrap();
+    assert_eq!(forget_tool_approvals(ws).unwrap(), 1);
+    assert!(is_workspace_trusted(ws), "forgetting grants keeps trust");
+    assert!(untrust_workspace(ws).unwrap());
+    assert!(!untrust_workspace(ws).unwrap(), "already untrusted");
+    assert!(!is_tool_allowed(ws, "write_file").await);
 }

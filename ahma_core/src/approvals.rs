@@ -270,6 +270,57 @@ pub fn trust_workspace(workspace: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Stop trusting `workspace` (SPEC R-PERM.1.3). Its tools ask again; any
+/// individual "always allow" grants there are kept. Returns whether it was
+/// trusted.
+pub fn untrust_workspace(workspace: &Path) -> std::io::Result<bool> {
+    revoke_workspace_tools(workspace, |tool| tool == TRUSTED_WORKSPACE_TOOL)
+        .map(|removed| removed > 0)
+}
+
+/// Forget every "always allow" tool grant for `workspace` (trust, if any, is
+/// kept). Returns how many were removed.
+pub fn forget_tool_approvals(workspace: &Path) -> std::io::Result<usize> {
+    revoke_workspace_tools(workspace, |tool| tool != TRUSTED_WORKSPACE_TOOL)
+}
+
+/// Revoke the `workspace` entries `which` selects, auditing each.
+fn revoke_workspace_tools(
+    workspace: &Path,
+    which: impl Fn(&str) -> bool,
+) -> std::io::Result<usize> {
+    let key = workspace_key(workspace);
+    let mut removed: Vec<String> = Vec::new();
+    AhmaSettings::update(|s| {
+        let tools: Vec<String> = s
+            .permissions
+            .tool_approvals
+            .iter()
+            .filter(|a| a.workspace == key)
+            .flat_map(|a| a.tools.iter().filter(|t| which(t)).cloned())
+            .collect();
+        for tool in tools {
+            if s.permissions.revoke_tool(&key, &tool) {
+                removed.push(tool);
+            }
+        }
+    })
+    .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+    let now = chrono::Local::now().to_rfc3339();
+    for tool in &removed {
+        append_audit(&audit_entry(
+            now.clone(),
+            AuditAction::Revoke,
+            GrantKind::Tool,
+            tool,
+            None,
+            GrantTier::Always,
+            Some("tui".to_string()),
+        ));
+    }
+    Ok(removed.len())
+}
+
 /// The shared write path: strict load, apply `grant`, atomic save, audit.
 fn persist_workspace_grant(
     workspace: &Path,

@@ -2063,6 +2063,19 @@ correct **at startup**, not only for events that happen afterwards.
     A URL-addressed provider carries its configured key to the agent loop. Only
     a client that declared MCP `sampling` at `initialize` (carried as
     `InstanceInfo.sampling`, field-only per R24.5) is offered as a provider.
+  - **R24.12.6 — Two levels of explanation.** `/intro` (alias
+    `/getting-started`) shows ahma in one screen — one line per topic — and
+    Enter opens a topic's second level. It opens by itself once, on the first
+    run (marker `~/.ahma/intro-shown`). It names only commands that exist
+    (tested against the command list).
+  - **R24.12.7 — Every setting has a place in `/settings`.** Besides the
+    editable tables, the panel shows what this folder is trusted with and has
+    been allowed (trust, always-allowed tools, folders granted outside it, web
+    allow/deny lists) and which model chat uses. Trust and the folder's tool
+    grants change there only on a confirming second keypress, through the same
+    audited ledger path as the gates (R-PERM.2.1); everything else in that
+    category names the command that changes it. `/settings <words>` jumps to
+    the first matching row.
   - **R24.12.5 — Chat stays on a model that exists.** A client's own model
     (`mcp://`) exists only while that client is connected. When it goes, chat
     moves to the most recent model ahma runs itself (`.ahma/session.toml`

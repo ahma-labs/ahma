@@ -202,6 +202,20 @@ another terminal, where ahma can neither disclose nor record it.
 
 The header's `sandbox:` label follows the same honesty rule: it shows the server-locked primary write root once reported. Until then it shows the launch directory with a trailing `?` — a guess, not the boundary.
 
+## New here, and finding settings
+
+`/intro` (or `/getting-started`) is ahma in one screen: eight one-line answers,
+each opening into more detail with Enter. It shows itself once, the first time
+you run `ahma tui`.
+
+`/settings` shows every setting, grouped by what you would be looking for:
+Tools, Sandbox, **Access & trust** (is this folder trusted, which tools you
+always allow here, folders granted outside it, web allow/deny lists), **Model**,
+Logging, HTTP, Auth and Instance. `/settings <words>` jumps straight to the
+first matching row — `/settings trust`, `/settings timeout`. Changing trust or
+forgetting this folder's always-allowed tools takes a second, confirming Space;
+security switches show the command-line flag that sets them.
+
 ## What the model is doing
 
 While a chat turn runs, a status line pinned under the transcript says what is happening, in words, from real events only:

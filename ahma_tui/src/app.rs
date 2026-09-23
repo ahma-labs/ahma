@@ -109,6 +109,7 @@ pub async fn run(
     drain_startup_notices(&mut state);
     load_granted_scopes(&mut state);
     offer_folder_trust(&mut state);
+    maybe_show_intro_on_first_run(&mut state);
 
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
     state.mcp_source_tx = Some(spawn_mcp_source(
@@ -220,6 +221,7 @@ pub async fn run(
                                 || handle_help_key(key, &mut state)
                                 || handle_picker_key(key, &mut state)
                                 || handle_trust_key(key, &mut state)
+                                || handle_intro_key(key, &mut state)
                                 || handle_scope_grant_key(key, &mut state)
                                 || handle_web_approval_key(key, &mut state)
                                 || handle_approval_key(key, &mut state)
@@ -2277,6 +2279,58 @@ fn handle_settings_key(
     true
 }
 
+fn open_intro(state: &mut crate::state::AppState) {
+    state.modal = crate::state::ModalState::Intro {
+        selected: 0,
+        expanded: false,
+    };
+}
+
+/// Show the tour by itself once, on the very first run (a marker in `~/.ahma`
+/// remembers it was shown). A missing home just skips it.
+fn maybe_show_intro_on_first_run(state: &mut crate::state::AppState) {
+    let Some(marker) =
+        ahma_common::config::ahma_home_dir().map(|h| h.join(".ahma").join("intro-shown"))
+    else {
+        return;
+    };
+    if marker.exists() {
+        return;
+    }
+    open_intro(state);
+    if let Some(dir) = marker.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&marker, "The /intro tour was shown on first run.\n");
+}
+
+/// Keys for the `/intro` tour.
+fn handle_intro_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let crate::state::ModalState::Intro { selected, expanded } = &mut state.modal else {
+        return false;
+    };
+    let last = crate::intro::TOPICS.len().saturating_sub(1);
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+            interrupt(state);
+        }
+        (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => state.close_modal(),
+        (KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab, _) => {
+            *selected = (*selected + 1).min(last);
+            *expanded = false;
+        }
+        (KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab, _) => {
+            *selected = selected.saturating_sub(1);
+            *expanded = false;
+        }
+        (KeyCode::Enter | KeyCode::Right | KeyCode::Char(' '), _) => *expanded = !*expanded,
+        (KeyCode::Left, _) => *expanded = false,
+        _ => {}
+    }
+    true
+}
+
 fn handle_help_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
     use crossterm::event::KeyCode;
 
@@ -3127,6 +3181,7 @@ fn set_execution_mode(
 fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
         "/help" | "/?" => state.modal = crate::state::ModalState::Help,
+        "/intro" | "/getting-started" => open_intro(state),
         // The guided setup was reachable only by selecting a window with no
         // LLM configured — i.e. never, once anything was picked.
         "/setup" | "/connect" => start_llm_setup_wizard(state),
@@ -3176,11 +3231,18 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
     true
 }
 
+/// `/settings`, or `/settings <words>` to jump to the first matching row
+/// (`/settings timeout`, `/settings trust`).
 fn handle_settings_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
-    if cmd != "/settings" {
-        return false;
-    }
-    state.settings_editor.open();
+    let query = match cmd.strip_prefix("/settings") {
+        Some("") => "",
+        // Picked from the menu, the entry's own `[search]` placeholder arrives.
+        Some(rest) if rest.trim().starts_with('[') => "",
+        Some(rest) if rest.starts_with(' ') => rest.trim(),
+        _ => return false,
+    };
+    let workspace = std::path::PathBuf::from(&state.workspace);
+    state.settings_editor.open_at(&workspace, query);
     true
 }
 
@@ -7136,6 +7198,49 @@ mod tests {
         assert!(
             state.chat_input_is_empty(),
             "y must not land in the input box"
+        );
+    }
+
+    /// `/intro`: arrows choose a topic, Enter opens its second level, moving
+    /// on closes it again, Esc leaves.
+    #[test]
+    fn intro_opens_topics_one_level_deeper_on_enter() {
+        use crate::state::{AppState, ModalState};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::dispatch_nav_command("/intro", &mut state);
+        assert!(matches!(
+            state.modal,
+            ModalState::Intro {
+                selected: 0,
+                expanded: false
+            }
+        ));
+
+        super::handle_intro_key(key(KeyCode::Down), &mut state);
+        super::handle_intro_key(key(KeyCode::Enter), &mut state);
+        assert!(matches!(
+            state.modal,
+            ModalState::Intro {
+                selected: 1,
+                expanded: true
+            }
+        ));
+        super::handle_intro_key(key(KeyCode::Down), &mut state);
+        assert!(matches!(
+            state.modal,
+            ModalState::Intro {
+                selected: 2,
+                expanded: false
+            }
+        ));
+
+        assert!(super::handle_intro_key(key(KeyCode::Esc), &mut state));
+        assert!(matches!(state.modal, ModalState::None));
+        assert!(
+            !super::handle_intro_key(key(KeyCode::Esc), &mut state),
+            "closed: not ours"
         );
     }
 

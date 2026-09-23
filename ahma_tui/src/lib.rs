@@ -13,6 +13,7 @@ pub mod agent_config;
 pub mod app;
 pub mod connection;
 pub mod daemon_source;
+pub mod intro;
 pub mod keymap;
 pub mod liveness;
 pub mod llm_bridge;

@@ -618,7 +618,12 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/agent load <name>", "load an agent profile"),
     ("/agent delete <name>", "delete an agent profile"),
     ("/export markdown", "export chat transcript to markdown"),
-    ("/settings", "open settings panel (edit & persist)"),
+    ("/intro", "ahma in one screen — Enter on a line for more"),
+    ("/getting-started", "same as /intro"),
+    (
+        "/settings [search]",
+        "every setting: model, trust & access, tools, sandbox — [search] jumps to a row",
+    ),
     (
         "/sync",
         "tool calls wait for their result (default; saved to settings)",
@@ -1532,6 +1537,9 @@ pub enum ModalState {
     None,
     /// The help screen.
     Help,
+    /// The two-level `/intro` tour: the highlighted topic, and whether its
+    /// second level is open.
+    Intro { selected: usize, expanded: bool },
     /// The `/` command navigator.
     Navigator(CommandNavigator),
     /// The inline provider picker.
