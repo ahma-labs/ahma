@@ -54,8 +54,9 @@ pub const TOPICS: &[Topic] = &[
             "Ollama, LM Studio and llama-server on this machine are found by themselves;",
             "cloud keys come from environment variables and are never stored. An editor's own",
             "model is offered only while it is connected — if it goes, chat moves to your last",
-            "local model and tells you. Slow? The status line shows why: try a smaller model,",
-            "/compact, or a larger context in /provider numctx.",
+            "local model and tells you. A local model starts with the core tools and asks for",
+            "more when it needs them. Slow? The status line shows why: loading, reading N",
+            "tokens — try a smaller model, /compact, or a larger context in /provider numctx.",
         ],
     },
     Topic {

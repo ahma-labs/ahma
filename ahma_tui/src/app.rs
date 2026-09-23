@@ -477,6 +477,7 @@ fn approve_symlink(state: &mut crate::state::AppState) {
             non_mutating_tool_names: std::sync::Arc::new(
                 ahma_core::agent::builtin_non_mutating_tool_names(),
             ),
+            tool_menu: None,
         };
         tokio::spawn(async move {
             crate::llm_bridge::spawn_tool_call_task(
@@ -2172,6 +2173,7 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
         non_mutating_tool_names: std::sync::Arc::new(
             ahma_core::agent::builtin_non_mutating_tool_names(),
         ),
+        tool_menu: None,
     }
 }
 
@@ -5284,7 +5286,8 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         | SourceEvent::Usage { .. }
         | SourceEvent::ToolCallStarted { .. }
         | SourceEvent::ToolCallFinished { .. }
-        | SourceEvent::Truncated { .. } => {
+        | SourceEvent::Truncated { .. }
+        | SourceEvent::ChatStatus { .. } => {
             handle_source_chat_event(event, state);
         }
     }
@@ -5530,6 +5533,22 @@ fn handle_source_chat_event(
             state.mark_stream_activity(crate::state::LivenessState::Thinking);
             state.chat.finish_tool_call(&id, result, failed);
             state.chat_scroll = 0;
+        }
+        SourceEvent::ChatStatus { phase, detail } => {
+            if let Some(turn) = state.turn.as_mut() {
+                // Loading and reading only ever come before output; a late one
+                // must not pull a turn that is already writing back.
+                let before_output = matches!(
+                    turn.phase,
+                    crate::state::TurnPhase::Loading | crate::state::TurnPhase::Reading
+                );
+                match phase.as_str() {
+                    "loading" if before_output => turn.enter(crate::state::TurnPhase::Loading),
+                    "reading" if before_output => turn.enter(crate::state::TurnPhase::Reading),
+                    "tools" => turn.tools = Some(detail),
+                    _ => {}
+                }
+            }
         }
         SourceEvent::Truncated { reason } => {
             // Same rendering as the in-process BridgeEvent::Truncated: a

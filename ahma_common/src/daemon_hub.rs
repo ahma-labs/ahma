@@ -428,6 +428,11 @@ pub enum HubRelay {
     /// instance until it is restarted (see the module doc's wire-compat note
     /// — this is the accepted, one-time cost of a real addition).
     Truncated { reason: String },
+    /// What the model is doing when no token says so — `loading` a local
+    /// model into memory, `reading` the prompt, or which `tools` it is
+    /// offered (SPEC R24.10.2, R24.12.8). A new message: a TUI that predates it
+    /// skips it (R24.5) and shows its ordinary "reading" line.
+    ChatStatus { phase: String, detail: String },
 }
 
 impl From<HubRelay> for ClientMsg {
@@ -5338,6 +5343,17 @@ mod relay_wire_compat {
                 reason: "length".into(),
             }),
             json!({"type": "Truncated", "reason": "length"}),
+        );
+        assert_same_bytes_both_directions(
+            ClientMsg::Relay(HubRelay::ChatStatus {
+                phase: "loading".into(),
+                detail: "qwen3:8b".into(),
+            }),
+            DaemonMsg::Relay(HubRelay::ChatStatus {
+                phase: "loading".into(),
+                detail: "qwen3:8b".into(),
+            }),
+            json!({"type": "ChatStatus", "phase": "loading", "detail": "qwen3:8b"}),
         );
     }
 

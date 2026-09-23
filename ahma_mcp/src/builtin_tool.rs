@@ -253,11 +253,64 @@ impl BuiltinTool {
             BuiltinTool::LogsApprove | BuiltinTool::SandboxGrant | BuiltinTool::FetchWebpage
         )
     }
+
+    /// Which on-demand group a small (local) model finds this tool in, or
+    /// `None` for the core set it is offered from the start (SPEC R24.12.8).
+    ///
+    /// Every tool schema is re-read by the model on every turn; a local model
+    /// reading ~60 of them spent most of a 13k-token first prompt, and minutes
+    /// of prefill, on tools the task never touched. The core set is what nearly
+    /// every coding turn needs: look, search, edit, run, wait.
+    pub const fn small_model_group(self) -> Option<&'static str> {
+        match self {
+            BuiltinTool::ReadFile
+            | BuiltinTool::ListDir
+            | BuiltinTool::FileSearch
+            | BuiltinTool::GrepSearch
+            | BuiltinTool::WriteFile
+            | BuiltinTool::ReplaceInFile
+            | BuiltinTool::ApplyPatch
+            | BuiltinTool::RunTerminalCommand
+            | BuiltinTool::Await
+            | BuiltinTool::Status
+            | BuiltinTool::Cancel
+            | BuiltinTool::TodoWrite => None,
+            BuiltinTool::MultiEdit => Some("edit"),
+            BuiltinTool::FetchWebpage => Some("web"),
+            BuiltinTool::LogsList
+            | BuiltinTool::LogsApprove
+            | BuiltinTool::LogsRead
+            | BuiltinTool::LogsSearch
+            | BuiltinTool::LogMonitor => Some("logs"),
+            BuiltinTool::SandboxGrant | BuiltinTool::Restart => Some("sandbox"),
+            BuiltinTool::Agent => Some("agent"),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The core set is small, and everything outside it is reachable.
+    #[test]
+    fn small_models_start_with_a_small_core() {
+        let core: Vec<_> = BuiltinTool::ALL
+            .iter()
+            .filter(|t| t.small_model_group().is_none())
+            .map(|t| t.name())
+            .collect();
+        assert_eq!(core.len(), 12, "{core:?}");
+        for must in [
+            "read_file",
+            "replace_in_file",
+            "run_terminal_command",
+            "await",
+        ] {
+            assert!(core.contains(&must), "{must} is core");
+        }
+        assert_eq!(BuiltinTool::FetchWebpage.small_model_group(), Some("web"));
+    }
 
     #[test]
     fn sandbox_boundary_tools_are_the_ones_that_leave_the_workspace() {

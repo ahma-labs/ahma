@@ -479,6 +479,58 @@ impl LlmClient {
         &self.base_url
     }
 
+    /// The model this client asks for.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The models an Ollama server on this machine has loaded in memory, from
+    /// its native `GET /api/ps` beside the OpenAI-compatible `/v1` root.
+    ///
+    /// `None` when that cannot be known — a remote endpoint (never asked), a
+    /// server that is not Ollama, or any error. Short timeout: this only
+    /// decides whether the status line says "loading" or "reading", and must
+    /// never hold up the request it describes.
+    pub async fn loaded_local_models(&self) -> Option<Vec<String>> {
+        if !self.local {
+            return None;
+        }
+        let root = self.base_url.trim_end_matches('/');
+        let root = root.strip_suffix("/v1").unwrap_or(root);
+        let response = self
+            .http
+            .get(format!("{root}/api/ps"))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body: Value = response.json().await.ok()?;
+        let models = body.get("models")?.as_array()?;
+        Some(
+            models
+                .iter()
+                .filter_map(|m| m.get("name").or_else(|| m.get("model")))
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
+    /// Whether this client's model is among `loaded` (as reported by
+    /// [`Self::loaded_local_models`]); Ollama names an untagged model
+    /// `<name>:latest`.
+    pub fn is_model_resident(&self, loaded: &[String]) -> bool {
+        loaded.iter().any(|name| {
+            name == &self.model
+                || name
+                    .strip_suffix(":latest")
+                    .is_some_and(|base| base == self.model)
+        })
+    }
+
     /// Apply flavor-appropriate auth/version headers to a request.
     ///
     /// OpenAI uses `Authorization: Bearer`; Anthropic uses `x-api-key` plus the

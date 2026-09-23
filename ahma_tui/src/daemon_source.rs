@@ -597,6 +597,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 SourceEvent::WebApprovalRequested { request }
             }
             HubRelay::Truncated { reason } => SourceEvent::Truncated { reason },
+            HubRelay::ChatStatus { phase, detail } => SourceEvent::ChatStatus { phase, detail },
         }),
         // Instance-bound; a subscriber never receives it.
         DaemonMsg::SubmitScopeGrant { .. } | DaemonMsg::SubmitWebApproval { .. } => Applied::None,

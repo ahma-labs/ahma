@@ -1,8 +1,8 @@
 //! # Bundle Registry
 //!
-//! Maps CLI bundle flags to tool config names. This is the single source of truth
-//! for progressive disclosure: when a user calls `activate_tools reveal <bundle>`,
-//! the registry determines which tool configs to expose.
+//! Maps CLI bundle flags to tool config names, and names each bundle for the
+//! groups a small model opens with `more_tools` (`ahma_core::tool_menu`,
+//! SPEC R24.12.8).
 
 use std::collections::HashSet;
 
@@ -13,10 +13,9 @@ pub struct BundleInfo {
     pub name: &'static str,
     /// The `ToolConfig.name` value produced by the bundle's JSON.
     pub config_tool_name: &'static str,
-    /// Short description shown by `activate_tools list`.
+    /// Short description, also the group summary `more_tools` lists.
     pub description: &'static str,
-    /// Action-oriented hint for the AI. Appears in the `activate_tools` description
-    /// to tell the AI exactly WHEN it should activate this bundle.
+    /// Action-oriented hint for the AI saying when this bundle is the right one.
     pub ai_hint: &'static str,
 }
 
