@@ -92,7 +92,7 @@ pub struct UpdateArgs {
     pub dry_run: bool,
 
     /// Skip Sigstore attestation verification (insecure — for offline/air-gapped use only).
-    /// Equivalent to setting `AHMA_INSECURE_SKIP_VERIFY=1`.
+    /// CLI-flag-only by design (SPEC R-CFG2.3): no settings key or env var can set it.
     #[arg(long, alias = "insecure-skip-signature")]
     pub insecure_skip_verify: bool,
 

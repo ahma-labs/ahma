@@ -513,7 +513,7 @@
       ]
     },
     "LivelogConfig": {
-      "description": "Configuration for a `tool_type: livelog` tool.\n\nA livelog tool spawns a long-running source command (e.g. `adb logcat`),\naccumulates output into chunks, and periodically asks an LLM whether the chunk\ncontains issues matching the `detection_prompt`.  When an issue is found, a\n`ProgressUpdate::LogAlert` notification is pushed to the MCP client.",
+      "description": "Configuration for a `tool_type: livelog` tool.\n\nA livelog tool spawns a long-running source command (e.g. `adb logcat`),\naccumulates output into chunks, and periodically asks an LLM whether the chunk\ncontains issues matching the `detection_prompt`.  When an issue is found, a\nan `Alert` event is recorded on the operation and pushed to the MCP client\nas a progress notification.",
       "type": "object",
       "properties": {
         "source_command": {

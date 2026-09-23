@@ -1,14 +1,11 @@
-//! # Egress Sandbox
+//! # Network egress
 //!
-//! Closes the network egress carve-out that Cowork's model has (web-fetch and
-//! MCP connections bypass org egress policies).  The ahma egress sandbox:
-//!
-//! 1. Runs a lightweight HTTP proxy (`ahma egress`) that each task subprocess
-//!    uses via `HTTP_PROXY` / `HTTPS_PROXY` environment variables.
-//! 2. Consults a per-vault `egress.allowlist` to decide whether to forward or
-//!    reject each request.
-//! 3. Defaults to **deny-all** — the cloud LLM domain is only added when the
-//!    user explicitly opts the task into a cloud model.
+//! With `--restrict-network` (or `[network] restrict = true`) every sandboxed
+//! subprocess is pointed at a local HTTP proxy through `HTTP_PROXY` /
+//! `HTTPS_PROXY`, and the proxy forwards only hosts on the effective allowlist:
+//! the operator's `[network] allow` plus the hosts each enabled sandbox profile
+//! declares (SPEC R-WEB.16, R-PERM.5.3). Restriction is off by default. The same
+//! module holds the approval prompts for `fetch_webpage` (R-WEB).
 //!
 //! ## Security properties
 //!
@@ -22,28 +19,20 @@
 //! - The kernel FS sandbox additionally prevents the subprocess from modifying
 //!   its own `/etc/hosts` or `/etc/resolv.conf`.
 //! - The proxy is bound to `127.0.0.1` only; no external network access.
-//! - Each task gets a distinct port allocated by the OS (`0`), preventing
-//!   cross-task traffic snooping.
+//! - Each server gets its own OS-allocated port (`0`).
 //!
 //! ## Default allowlist
 //!
-//! An empty `egress.allowlist` means **no egress** — not even `localhost`.
-//! Compile-time built-in additions:
-//!
-//! | Domain | Added when |
-//! |--------|------------|
-//! | (none) | Default |
-//! | `api.openai.com` | User opts task into OpenAI |
-//! | `generativelanguage.googleapis.com` | User opts task into Gemini |
+//! An empty effective allowlist forwards nothing. Loopback is not proxied at
+//! all (`NO_PROXY`, below).
 //!
 //! ## Where the server's allowlist comes from
 //!
-//! For `--restrict-network` (the MCP server path, as opposed to a vault's own
-//! file) the allowlist is the union computed by [`host_grants::EgressGrants`](crate::egress::host_grants::EgressGrants):
+//! The allowlist is the union computed by [`host_grants::EgressGrants`](crate::egress::host_grants::EgressGrants):
 //! the operator's `[network] allow` plus the hostnames each **enabled sandbox
 //! profile** declares for its toolchain. Read that module first — it explains why
 //! restriction stayed unused without it, and why the default is still off.
-//! [`host_pattern::HostPattern`](crate::egress::host_pattern::HostPattern) is the single matcher both paths share.
+//! [`host_pattern::HostPattern`](crate::egress::host_pattern::HostPattern) is the single matcher.
 //!
 //! ## Environment variables injected into sandboxed subprocesses
 //!

@@ -2,7 +2,7 @@
 //!
 //! Two producers feed the same list:
 //!
-//! * the operator's `[network] allow` (and a per-vault `egress.allowlist` file), and
+//! * the operator's `[network] allow`, and
 //! * the hosts contributed by enabled sandbox profiles ([`super::host_grants`]).
 //!
 //! Both are parsed and matched by [`HostPattern`] — see that module for the exact

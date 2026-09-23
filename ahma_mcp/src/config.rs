@@ -206,7 +206,8 @@ pub struct ResolvedLlmProvider {
 /// A livelog tool spawns a long-running source command (e.g. `adb logcat`),
 /// accumulates output into chunks, and periodically asks an LLM whether the chunk
 /// contains issues matching the `detection_prompt`.  When an issue is found, a
-/// `ProgressUpdate::LogAlert` notification is pushed to the MCP client.
+/// an `Alert` event is recorded on the operation and pushed to the MCP client
+/// as a progress notification.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LivelogConfig {
     /// The executable to run as the log source (e.g. `"adb"`, `"ssh"`, `"tail"`).

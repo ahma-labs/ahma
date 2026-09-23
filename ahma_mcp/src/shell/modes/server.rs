@@ -129,7 +129,7 @@ async fn maybe_start_egress_proxy(
              would be unreachable by the very subprocesses it exists to gate, and network egress \
              would be unrestricted for any tool that opens its own socket. Pick one: run without \
              --restrict-network (AppContainer filesystem isolation stays), or disable the sandbox \
-             with --disable-sandbox to get proxy-based egress gating without it."
+             with --no-sandbox to get proxy-based egress gating without it."
         );
         return None;
     }

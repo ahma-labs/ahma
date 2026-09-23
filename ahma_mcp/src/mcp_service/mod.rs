@@ -171,8 +171,6 @@ pub struct AhmaMcpService {
     /// dropped by the bridge, so probing without this signal would
     /// misreport a healthy client as unresponsive.
     pub push_channel_open: Arc<std::sync::atomic::AtomicBool>,
-    /// Token minimization and output optimizer context.
-    pub output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     /// Safety harness guard context.
     pub harness_guard: Arc<tokio::sync::Mutex<crate::harness_guard::HarnessGuard>>,
     /// The agent's current task plan (the `todo_write` checklist). One list per
@@ -887,9 +885,6 @@ impl AhmaMcpService {
             )),
             is_ahma_peer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             push_channel_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            output_optimizer: Arc::new(tokio::sync::Mutex::new(
-                crate::output_optimizer::OutputOptimizer::new(false, None),
-            )),
             // Self-correction (tool-name/argument healing + failure-loop
             // detection) is on by default — see `set_app_config` for why.
             harness_guard: Arc::new(tokio::sync::Mutex::new(
@@ -982,9 +977,6 @@ impl AhmaMcpService {
     pub fn set_app_config(&self, config: Arc<crate::shell::cli::AppConfig>) {
         if let Some(dir) = config.tools_dir.clone() {
             *self.current_tools_dir.write() = Some(dir);
-        }
-        if let Ok(mut opt) = self.output_optimizer.try_lock() {
-            opt.enabled = config.minimize_tokens;
         }
         // Self-correction (tool-name/argument healing + failure-loop detection)
         // is universally safe and is exactly what stops a model from burning its
@@ -4262,7 +4254,6 @@ mod tests {
         service.set_app_config(Arc::new(cfg));
 
         assert_eq!(*service.current_tools_dir.read(), Some(tools_dir));
-        assert!(service.output_optimizer.lock().await.enabled);
         assert!(service.harness_guard.lock().await.enabled);
     }
 

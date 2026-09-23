@@ -1029,7 +1029,7 @@ mod tests {
         let log_dir = tempdir().unwrap();
         std::fs::write(log_dir.path().join("alpha.log"), "first line\nsecond line").unwrap();
         std::fs::write(log_dir.path().join("beta.log"), "needle here\nother").unwrap();
-        let _guard = EnvVarGuard::set("AHMA_LOG_DIR", log_dir.path());
+        let _guard = EnvVarGuard::set("AHMA_TEST_LOG_DIR", log_dir.path());
 
         // list
         let list = service.handle_logs_list(Map::new()).await.unwrap();
@@ -1071,7 +1071,7 @@ mod tests {
         // A path separator fails validation before any filesystem access, so no
         // valid log dir is required — but set one anyway for determinism.
         let log_dir = tempdir().unwrap();
-        let _guard = EnvVarGuard::set("AHMA_LOG_DIR", log_dir.path());
+        let _guard = EnvVarGuard::set("AHMA_TEST_LOG_DIR", log_dir.path());
 
         let mut args = Map::new();
         args.insert(
@@ -1091,7 +1091,7 @@ mod tests {
         let (service, _scope) = build_test_service().await.unwrap();
         let log_dir = tempdir().unwrap();
         std::fs::write(log_dir.path().join("x.log"), "content").unwrap();
-        let _guard = EnvVarGuard::set("AHMA_LOG_DIR", log_dir.path());
+        let _guard = EnvVarGuard::set("AHMA_TEST_LOG_DIR", log_dir.path());
 
         let mut args = Map::new();
         args.insert("file".to_string(), Value::String("x.log".to_string()));
@@ -1105,7 +1105,7 @@ mod tests {
         let (service, _scope) = build_test_service().await.unwrap();
         let log_dir = tempdir().unwrap();
         std::fs::write(log_dir.path().join("plain.log"), "not a symlink").unwrap();
-        let _guard = EnvVarGuard::set("AHMA_LOG_DIR", log_dir.path());
+        let _guard = EnvVarGuard::set("AHMA_TEST_LOG_DIR", log_dir.path());
 
         // Path-like name rejected before touching the filesystem.
         let mut bad = Map::new();
@@ -1144,7 +1144,7 @@ mod tests {
         std::fs::write(&external_file, "external content").unwrap();
         symlink(&external_file, log_dir.path().join("sys.log")).unwrap();
 
-        let _log_guard = EnvVarGuard::set("AHMA_LOG_DIR", log_dir.path());
+        let _log_guard = EnvVarGuard::set("AHMA_TEST_LOG_DIR", log_dir.path());
         let _cfg_guard = EnvVarGuard::set("AHMA_CONFIG_DIR", config.path());
 
         let mut args = Map::new();

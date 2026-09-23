@@ -113,13 +113,13 @@ pub fn detect_log_role_from_startup() -> &'static str {
 static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Log directory from `[logging] dir` in `~/.ahma/settings.toml`. Lower
-/// priority than `--log-dir` / `AHMA_LOG_DIR`, higher than the sandbox scope:
+/// priority than `--log-dir`, higher than the sandbox scope:
 /// the scope is discovered at runtime, whereas this is a choice the user wrote
 /// down, and a written-down choice must not be overridden by a discovery.
 static LOG_DIR_FROM_SETTINGS: OnceLock<PathBuf> = OnceLock::new();
 
 /// Log directory derived from the primary sandbox scope after `roots/list`.
-/// Lower priority than `--log-dir` / `AHMA_LOG_DIR` / settings, higher than the
+/// Lower priority than `--log-dir` / settings, higher than the
 /// workspace-root fallback.
 static LOG_DIR_FROM_SCOPE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -149,17 +149,20 @@ pub fn set_log_dir_from_scope(dir: PathBuf) {
 
 /// Project log directory, checked in priority order:
 /// 1. `--log-dir` CLI flag
-/// 2. `AHMA_LOG_DIR` env var (deprecated)
-/// 3. `[logging] dir` in `~/.ahma/settings.toml`
-/// 4. Primary sandbox scope `<scope>/.ahma/logs` (set after `roots/list`)
-/// 5. `<workspace-root>/.ahma/logs` if writable — see `log_anchor_dir`
-/// 6. `~/.ahma/logs/<project-namespace>` — a per-project subdirectory, not one
+/// 2. `[logging] dir` in `~/.ahma/settings.toml`
+/// 3. Primary sandbox scope `<scope>/.ahma/logs` (set after `roots/list`)
+/// 4. `<workspace-root>/.ahma/logs` if writable — see `log_anchor_dir`
+/// 5. `~/.ahma/logs/<project-namespace>` — a per-project subdirectory, not one
 ///    shared flat file: the sandbox already enforces per-project isolation on
 ///    disk, and a single shared log would quietly undo that at the
 ///    observability layer (one project's commands/paths/errors readable
 ///    alongside every other project ahma has ever touched).
 ///
-/// Cases 4 and 5 nest logs under `.ahma/`, ahma's own per-project directory,
+/// `AHMA_LOG_DIR` is retired (SPEC R-CFG1.2) and ignored. Unit tests redirect
+/// the directory with `AHMA_TEST_LOG_DIR` instead, a read `cfg!(test)` removes
+/// from every non-test build (R-CFG9.1).
+///
+/// Cases 3 and 4 nest logs under `.ahma/`, ahma's own per-project directory,
 /// rather than directly at the workspace root: `.ahma/.gitignore` (see
 /// [`ensure_gitignore_entry`]) then keeps plaintext logs out of the tracked
 /// tree without ever touching the project's own top-level `.gitignore`.
@@ -168,12 +171,10 @@ pub fn project_log_dir() -> PathBuf {
         return dir.clone();
     }
 
-    if let Ok(val) = std::env::var("AHMA_LOG_DIR")
+    if cfg!(test)
+        && let Ok(val) = std::env::var("AHMA_TEST_LOG_DIR")
         && !val.is_empty()
     {
-        tracing::warn!(
-            "Deprecated: AHMA_LOG_DIR environment variable is set. Use the --log-dir flag instead."
-        );
         return PathBuf::from(val);
     }
 
@@ -793,15 +794,28 @@ mod tests {
     }
 
     #[test]
-    fn test_project_log_dir_env_override() {
+    fn test_project_log_dir_test_seam_override() {
         unsafe {
-            std::env::set_var("AHMA_LOG_DIR", "/custom/log/dir");
+            std::env::set_var("AHMA_TEST_LOG_DIR", "/custom/log/dir");
+        }
+        let dir = project_log_dir();
+        unsafe {
+            std::env::remove_var("AHMA_TEST_LOG_DIR");
+        }
+        assert_eq!(dir, PathBuf::from("/custom/log/dir"));
+    }
+
+    /// SPEC R-CFG1.2: `AHMA_LOG_DIR` is retired — setting it must not move the logs.
+    #[test]
+    fn project_log_dir_ignores_retired_ahma_log_dir() {
+        unsafe {
+            std::env::set_var("AHMA_LOG_DIR", "/retired/log/dir");
         }
         let dir = project_log_dir();
         unsafe {
             std::env::remove_var("AHMA_LOG_DIR");
         }
-        assert_eq!(dir, PathBuf::from("/custom/log/dir"));
+        assert_ne!(dir, PathBuf::from("/retired/log/dir"));
     }
 
     #[test]

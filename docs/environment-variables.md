@@ -104,6 +104,7 @@ meant setting one changed the chat client's behaviour but not the server's.
 | `AHMA_LOG_TARGET` | `logging.target = "stderr"` in settings.toml or `--log-to-stderr` CLI flag |
 | `AHMA_LOG_MONITOR` | `--log-monitor` CLI flag or `logging.log_monitor = true` in settings.toml |
 | `AHMA_MONITOR_RATE_LIMIT` | `--monitor-rate-limit` flag or `logging.monitor_rate_limit_secs` in settings.toml |
+| `AHMA_LOG_DIR` | `--log-dir` CLI flag or `logging.dir` in settings.toml |
 
 ---
 
@@ -182,6 +183,7 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_DAEMON_PORT` | Isolates each test process's daemon to a unique TCP port (Windows) |
 | `AHMA_TEST_BINARY` | Locates the compiled test binary for in-process test helpers |
 | `AHMA_TEST_HTTP_CLIENT_TOKEN_PATH` | Redirects the external-MCP OAuth token file in `ahma_http_mcp_client` tests. Compiled in **debug builds only** — a release binary ignores it |
+| `AHMA_TEST_LOG_DIR` | Redirects the project log directory in `ahma_mcp` unit tests. Read only under `cfg!(test)` — no shipped binary contains the read |
 | `AHMA_TEST_HOME` | Redirects `~` resolution (`ahma_common::config::ahma_home_dir`) at a temp directory so a test can supply its own `~/.ahma/settings.toml`. Compiled in **debug builds only** (`#[cfg(debug_assertions)]`) — a release binary ignores it |
 | `AHMA_TEST_ISOLATION` | Set by test harnesses on spawned ahma binaries: forces private (non-global) bridge/daemon endpoints (SPEC R-ISO.1) |
 | `NEXTEST` / `NEXTEST_RUN_ID` | Set by `cargo nextest`, inherited by spawned binaries; read solely to force the same private-endpoint isolation as `AHMA_TEST_ISOLATION` — the single R-CFG9.2 carve-out (SPEC R-ISO.1) |

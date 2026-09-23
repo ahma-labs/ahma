@@ -1,9 +1,10 @@
-//! # Ahma Core
+//! # ahma_mcp — the Ahma engine
 //!
-//! Ahma (Finnish for wolverine) is the foundational engine for building high-performance,
-//! secure Model Context Protocol (MCP) servers. This crate provides the core library that
-//! powers all Ahma interfaces, including the standard `ahma` binary (Stdio/CLI) and
-//! the `ahma-http-bridge`.
+//! Ahma (Finnish for wolverine) runs CLI tools for AI agents as MCP tools inside a
+//! kernel-enforced sandbox. This crate is the engine behind every Ahma surface: tool
+//! definitions (MTDF), sandboxed execution, operation tracking, the MCP service and its
+//! built-in tools, and the `ahma` command line itself (`shell::cli`). The binary in
+//! `ahma_bin` is a thin `main` over it. Requirements: `ahma_mcp/SPEC.md`.
 //!
 //! ## Foundational Philosophy
 //!
@@ -17,9 +18,11 @@
 //!    run unconstrained. It uses OS-native mechanisms (Landlock on Linux, Seatbelt on macOS)
 //!    to enforce strict filesystem boundaries that are immutable once the session starts.
 //!
-//! 2. **Async-First Execution**: Long-running operations like builds or tests shouldn't
-//!    block the agent's thought process. Ahma returns operation IDs immediately and
-//!    pushes results back via notifications when complete.
+//! 2. **Tracked Operations**: every tool call is an operation in the
+//!    [`OperationMonitor`](crate::operation_monitor::OperationMonitor) — visible,
+//!    cancellable, and spilled in full to an output file. By default a call waits for
+//!    its result (`sync`); in `async` mode it returns an operation id after a short
+//!    window and the agent collects it with `await` (SPEC R2).
 //!
 //! 3. **Persistent Shell Sessions**: Stateful PTY shell sessions
 //!    ([`ShellSessionManager`](crate::shell_session::ShellSessionManager)) let agents keep
@@ -46,7 +49,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     // 1. Initialize core tracking and performance components
+//!     // 1. Operation tracking, the default command timeout, and the sandbox
 //!     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(300))));
 //!     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
 //!     let sandbox = Arc::new(Sandbox::new(Vec::new(), SandboxMode::Strict, false, false, false)?);
@@ -117,13 +120,15 @@
 //! - **[`sandbox`]**: Platform-agnostic security enforcement using kernel features.
 //! - **[`config`]**: Support for the Multi-Tool Definition Format (MTDF) JSON schema.
 //! - **[`operation_monitor`]**: Real-time tracking and control (cancellation/status) of background tasks.
-//! - **[`shell_pool`]**: The performance engine that keeps shells warm and ready.
+//! - **[`shell`]**: The `ahma` command line — every subcommand and the server modes.
+//! - **[`shell_pool`]**: Platform shell selection and the default command timeout.
 
 // Public modules
 /// Core adapter for tool execution.
 pub mod adapter;
-/// Client helpers for talking to Ahma.
+/// The names of ahma's built-in tools, and which of them run without a sandbox scope.
 pub mod builtin_tool;
+/// Client helpers for talking to Ahma.
 pub mod client;
 /// Client type helpers and compatibility flags.
 pub mod client_type;
@@ -135,10 +140,9 @@ pub mod constants;
 pub mod daemon_reporter;
 /// File operations provider.
 pub mod file_ops;
-/// External terminal hook management for supported AI tools.
 /// The AI harnesses ahma can configure, and the facts that describe each.
 pub mod harness_target;
-
+/// External terminal hook management for supported AI tools.
 pub mod hooks;
 /// Live log monitoring pipeline (LLM-powered issue detection).
 pub mod livelog;
@@ -168,7 +172,7 @@ pub mod session_events;
 pub mod setup;
 /// CLI shell entry points.
 pub mod shell;
-/// Shell pooling and execution.
+/// Platform shell selection and the default command timeout.
 pub mod shell_pool;
 /// Persistent stateful shell sessions (`session_id`).
 pub mod shell_session;
@@ -191,18 +195,12 @@ pub mod validation;
 /// The numeric multi-select prompt shared by the setup and uninstall wizards.
 mod wizard_prompt;
 
-// ── New modules (roadmap milestones) ─────────────────────────────────────────
-//
-// The following milestone modules have been extracted into dedicated
-// AGPL-3.0 crates to allow this library to
-// remain MIT OR Apache-2.0:
-//
-//   ahma_tui       — ratatui TUI control plane               (AGPL-3.0)
-//
-// These crates live in the same workspace and depend on this library;
-// they must NOT be depended on from this crate.
+// This crate is MIT OR Apache-2.0. The AGPL-3.0 crates (`ahma_tui`, `ahma_bin`)
+// depend on it and must never become dependencies of it
+// (`scripts/check-license-boundaries.sh`).
 
-/// Egress sandbox: per-task HTTP proxy with domain allowlist.
+/// Network egress: the `--restrict-network` proxy, its allowlist, and the
+/// `fetch_webpage` approval prompts.
 pub mod egress;
 
 /// Bundle supply-chain auditor and content checksum (the `ahma_bundle` crate,

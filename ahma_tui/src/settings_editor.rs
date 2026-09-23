@@ -576,7 +576,7 @@ impl SettingsEditor {
             SettingItem {
                 key: "sandbox.disable",
                 label: "Disable sandbox",
-                description: "⚠ UNSAFE: disable kernel sandbox",
+                description: "Ignored — only the --no-sandbox flag disables the sandbox",
                 value: SettingValue::Bool(s.disable),
                 default_value: SettingValue::Bool(d.disable),
                 security_tier: true,
