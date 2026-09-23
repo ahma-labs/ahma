@@ -220,6 +220,11 @@ pub struct InstanceInfo {
     /// as opposed to `pid`, which is the worker that executes the tools.
     #[serde(default)]
     pub client_pid: Option<u32>,
+    /// Whether the MCP client declared the `sampling` capability at
+    /// `initialize` — i.e. whether a prompt can be answered by the client's
+    /// own model (`mcp://` providers in the TUI). Field-only (R24.5).
+    #[serde(default)]
+    pub sampling: bool,
     /// When this instance disconnected (Unix epoch, milliseconds), for an
     /// instance retained only so its recent operations still have somewhere to
     /// belong. `None` for a live instance.
@@ -456,6 +461,9 @@ pub enum ClientMsg {
         /// Pid of the client-facing frontend process.
         #[serde(default)]
         client_pid: Option<u32>,
+        /// The client declared MCP `sampling` (see [`InstanceInfo::sampling`]).
+        #[serde(default)]
+        sampling: bool,
     },
     /// An operation event from a registered instance.
     Event { payload: DaemonEvent },
@@ -1941,6 +1949,7 @@ where
             client,
             session_id,
             client_pid,
+            sampling,
         } => {
             serve_instance(
                 &mut reader,
@@ -1954,6 +1963,7 @@ where
                     client,
                     session_id,
                     client_pid,
+                    sampling,
                 },
             )
             .await
@@ -2235,6 +2245,7 @@ struct Registration {
     client: Option<String>,
     session_id: Option<String>,
     client_pid: Option<u32>,
+    sampling: bool,
 }
 
 /// Serve a registered ahma instance: register it, then exchange events and
@@ -2274,6 +2285,7 @@ async fn serve_instance<R, W>(
         client: reg.client,
         session_id: reg.session_id,
         client_pid: reg.client_pid,
+        sampling: reg.sampling,
         ended_epoch_ms: None,
     };
     let pid = reg.pid;
@@ -2619,6 +2631,7 @@ mod tests {
             client: Some("claude-code".into()),
             session_id: Some("sess-1".into()),
             client_pid: Some(99),
+            sampling: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -2860,6 +2873,7 @@ mod tests {
             client: None,
             session_id: None,
             client_pid: None,
+            sampling: false,
         };
         let mut buf = Vec::<u8>::new();
         send_msg(&mut buf, &msg).await.unwrap();
@@ -2976,6 +2990,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
                 ended_epoch_ms: None,
             }],
         };
@@ -3283,6 +3298,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await
@@ -3398,6 +3414,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await
@@ -4002,6 +4019,7 @@ mod tests {
             client: None,
             session_id: None,
             client_pid: None,
+            sampling: false,
             ended_epoch_ms: None,
         }
     }
@@ -4217,6 +4235,7 @@ mod tests {
             client: Some("claude-code".into()),
             session_id: None,
             client_pid: None,
+            sampling: false,
             ended_epoch_ms: None,
         };
         hub.instances.lock().await.insert("i1".into(), info.clone());
@@ -4409,6 +4428,7 @@ mod tests {
                     client: Some("claude-code".into()),
                     session_id: Some("sess-1".into()),
                     client_pid: Some(11),
+                    sampling: false,
                     ended_epoch_ms: None,
                 },
             );
@@ -4546,6 +4566,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
                 ended_epoch_ms: None,
             },
         );
@@ -4677,6 +4698,7 @@ mod tests {
                     client: client.map(str::to_string),
                     session_id: Some("mcp-session-7".into()),
                     client_pid: Some(4242),
+                    sampling: false,
                 },
             )
             .await
@@ -4767,6 +4789,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await
@@ -4962,6 +4985,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await
@@ -5129,6 +5153,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await

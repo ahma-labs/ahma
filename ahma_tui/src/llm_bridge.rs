@@ -20,7 +20,12 @@ pub fn build_configured_client(base_url: impl Into<String>, model: impl Into<Str
 
     let base_url = base_url.into();
     let config = ahma_common::config::AhmaConfig::load();
-    let client = LlmClient::new(base_url.clone(), model.into(), None);
+    // The entry's key too, or every call to a keyed cloud provider is a 401.
+    let api_key = config
+        .provider_for_base_url(&base_url)
+        .and_then(|e| e.resolve().ok())
+        .and_then(|r| r.api_key);
+    let client = LlmClient::new(base_url.clone(), model.into(), api_key);
     let client = match config.kind_for_base_url(&base_url) {
         Some(ProviderKind::Anthropic) => client.with_flavor(ahma_llm_monitor::ApiFlavor::Anthropic),
         Some(ProviderKind::OpenAi) => client.with_flavor(ahma_llm_monitor::ApiFlavor::OpenAi),
@@ -98,7 +103,26 @@ pub fn spawn_discovery_task(tx: Sender<BridgeEvent>) {
 
 pub fn spawn_model_refresh(base_url: String, tx: Sender<BridgeEvent>) {
     tokio::spawn(async move {
-        let client = LlmClient::new(base_url.clone(), "", None);
+        let client = build_configured_client(base_url.clone(), "");
+        let models = client.list_model().await;
+        let _ = tx
+            .send(BridgeEvent::ModelsRefreshed { base_url, models })
+            .await;
+    });
+}
+
+/// As [`spawn_model_refresh`], with an explicit key — the setup wizard checks
+/// a cloud provider before it is registered, so no config entry holds it yet.
+pub fn spawn_model_refresh_with_key(
+    base_url: String,
+    api_key: Option<String>,
+    tx: Sender<BridgeEvent>,
+) {
+    tokio::spawn(async move {
+        let client = match api_key {
+            Some(key) => LlmClient::new(base_url.clone(), "", Some(key)),
+            None => build_configured_client(base_url.clone(), ""),
+        };
         let models = client.list_model().await;
         let _ = tx
             .send(BridgeEvent::ModelsRefreshed { base_url, models })

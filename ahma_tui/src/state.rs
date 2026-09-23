@@ -373,6 +373,11 @@ impl ChatHistory {
 pub struct ChatRowsCache {
     pub key: Option<(u64, usize, bool)>,
     pub rows: Vec<ratatui::text::Line<'static>>,
+    /// The transcript entry each row belongs to, so a click on a row can open
+    /// that entry in full.
+    pub owners: Vec<usize>,
+    /// First visible row as last drawn, for mapping a click to a row.
+    pub scroll: usize,
 }
 
 // ─── Command navigator ────────────────────────────────────────────────────────
@@ -427,6 +432,7 @@ pub struct SandboxScopeInfo {
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show keyboard reference"),
     ("/?", "show keyboard reference (alias)"),
+    ("/setup", "connect an LLM, step by step (alias /connect)"),
     ("/provider", "select LLM provider"),
     ("/model", "select model for current provider"),
     (
@@ -461,6 +467,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/approve", "approve pending gate"),
     ("/reject", "reject pending gate"),
     ("/clear", "clear chat & finished windows (logs kept)"),
+    (
+        "/resume",
+        "bring back this window's saved conversation (~/.ahma/transcripts)",
+    ),
     ("/agent list", "list saved agent profiles"),
     (
         "/agent save <name>",
@@ -1390,18 +1400,32 @@ pub enum ModalState {
     LogLineDetail(LogLineDetailState),
     /// Step 1 of LLM setup wizard: select provider.
     LlmSetupProvider(PickerState),
-    /// Step 2 of LLM setup wizard: select Ollama API flavor (Enhanced vs Standard).
-    LlmSetupOllamaFlavor {
-        picker: PickerState,
-        base_url: String,
-    },
-    /// Step 3 of LLM setup wizard: select model.
+    /// Step 2 of LLM setup wizard: pick one of the models the provider listed
+    /// (the listing was also the connection test).
     LlmSetupModel {
         picker: PickerState,
         provider_name: String,
         base_url: String,
-        is_enhanced_ollama: bool,
     },
+}
+
+/// A cloud provider the setup wizard registers in `~/.ahma/config.toml` once a
+/// model is chosen. The key is stored as a `${VAR}` reference, never the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudSetup {
+    pub config_name: &'static str,
+    pub kind: ahma_common::config::ProviderKind,
+    pub key_env: &'static str,
+}
+
+/// A provider chosen in wizard step 1, waiting for its model list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupPending {
+    pub provider_name: String,
+    pub base_url: String,
+    pub cloud: Option<CloudSetup>,
+    /// The listing arrived and the model picker is open.
+    pub connected: bool,
 }
 
 /// State of the full-screen log-line detail overlay.
@@ -1815,6 +1839,20 @@ pub struct AppState {
     pub should_quit: bool,
     /// The chat turn in flight, if any (see [`ChatTurn`]).
     pub turn: Option<ChatTurn>,
+    /// The setup wizard's provider, while its connection is being checked.
+    pub setup_pending: Option<SetupPending>,
+    /// The other windows' transcripts, by section key (the current one is
+    /// `chat`, belonging to `chat_key`).
+    pub transcripts: HashMap<String, ChatHistory>,
+    /// The section key `chat` belongs to (`""` = this terminal).
+    pub chat_key: String,
+    /// Messages sent from the chat input, oldest first, for ↑/↓ recall.
+    pub input_history: VecDeque<String>,
+    /// Where ↑/↓ recall currently is in `input_history`; `None` when editing
+    /// fresh input.
+    pub history_pos: Option<usize>,
+    /// What was being typed before recall started, restored by ↓ past the end.
+    pub history_draft: String,
     /// Token spend per window (section key; the local section for chat with
     /// no target window). Usage events carry no instance, but the TUI runs one
     /// turn at a time, so each belongs to the in-flight turn's window.
@@ -2114,6 +2152,21 @@ impl AppState {
             .unwrap_or_else(|| crate::task_tree::LOCAL_GROUP.to_string())
     }
 
+    /// Show window `key`'s conversation, putting the current one away. The
+    /// wrapped-row cache is keyed on a per-transcript generation counter, so it
+    /// must be dropped here or it could serve the other window's rows.
+    pub fn switch_transcript(&mut self, key: &str) {
+        if self.chat_key == key {
+            return;
+        }
+        let incoming = self.transcripts.remove(key).unwrap_or_default();
+        let outgoing = std::mem::replace(&mut self.chat, incoming);
+        let old_key = std::mem::replace(&mut self.chat_key, key.to_string());
+        self.transcripts.insert(old_key, outgoing);
+        *self.chat_rows_cache.borrow_mut() = ChatRowsCache::default();
+        self.chat_scroll = 0;
+    }
+
     /// Record a health transition, remembering when it went down.
     pub fn set_server_healthy(&mut self, healthy: bool) {
         match (self.server_healthy, healthy) {
@@ -2174,7 +2227,6 @@ impl AppState {
                 | ModalState::ProviderPicker(_)
                 | ModalState::ModelPicker(_)
                 | ModalState::LlmSetupProvider(_)
-                | ModalState::LlmSetupOllamaFlavor { .. }
                 | ModalState::LlmSetupModel { .. }
         )
     }
@@ -2255,26 +2307,14 @@ impl AppState {
         }
     }
 
-    /// Close the LLM setup Ollama flavor picker and return its state and base URL.
-    pub fn take_llm_setup_ollama_flavor(&mut self) -> Option<(PickerState, String)> {
-        match std::mem::take(&mut self.modal) {
-            ModalState::LlmSetupOllamaFlavor { picker, base_url } => Some((picker, base_url)),
-            other => {
-                self.modal = other;
-                None
-            }
-        }
-    }
-
     /// Close the LLM setup model picker and return its state and provider details.
-    pub fn take_llm_setup_model(&mut self) -> Option<(PickerState, String, String, bool)> {
+    pub fn take_llm_setup_model(&mut self) -> Option<(PickerState, String, String)> {
         match std::mem::take(&mut self.modal) {
             ModalState::LlmSetupModel {
                 picker,
                 provider_name,
                 base_url,
-                is_enhanced_ollama,
-            } => Some((picker, provider_name, base_url, is_enhanced_ollama)),
+            } => Some((picker, provider_name, base_url)),
             other => {
                 self.modal = other;
                 None
@@ -2441,6 +2481,12 @@ impl AppState {
             liveness_glyph: "  ".to_string(),
             liveness_state: LivenessState::Idle,
             turn: None,
+            setup_pending: None,
+            transcripts: HashMap::new(),
+            chat_key: String::new(),
+            input_history: VecDeque::new(),
+            history_pos: None,
+            history_draft: String::new(),
             window_usage: HashMap::new(),
             server_down_since: None,
             daemon_down_since: None,
@@ -2633,6 +2679,59 @@ impl AppState {
         self.chat_input_text().trim().is_empty()
     }
 
+    /// Remember a sent message for ↑ recall (consecutive repeats once).
+    pub fn remember_input(&mut self, text: &str) {
+        const INPUT_HISTORY_CAP: usize = 200;
+        self.history_pos = None;
+        if self.input_history.back().map(String::as_str) == Some(text) {
+            return;
+        }
+        if self.input_history.len() >= INPUT_HISTORY_CAP {
+            self.input_history.pop_front();
+        }
+        self.input_history.push_back(text.to_string());
+    }
+
+    /// ↑: step to the previous sent message. Returns false when there is
+    /// nothing earlier, so the key can fall through to cursor movement.
+    pub fn recall_previous_input(&mut self) -> bool {
+        let pos = match self.history_pos {
+            None if self.input_history.is_empty() => return false,
+            None => {
+                self.history_draft = self.chat_input_text();
+                self.input_history.len() - 1
+            }
+            Some(0) => return true,
+            Some(p) => p - 1,
+        };
+        self.history_pos = Some(pos);
+        let text = self.input_history[pos].clone();
+        self.replace_chat_input(&text);
+        true
+    }
+
+    /// ↓: step to the next sent message, or back to the draft past the end.
+    pub fn recall_next_input(&mut self) -> bool {
+        let Some(pos) = self.history_pos else {
+            return false;
+        };
+        if pos + 1 < self.input_history.len() {
+            self.history_pos = Some(pos + 1);
+            let text = self.input_history[pos + 1].clone();
+            self.replace_chat_input(&text);
+        } else {
+            self.history_pos = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.replace_chat_input(&draft);
+        }
+        true
+    }
+
+    fn replace_chat_input(&mut self, text: &str) {
+        self.clear_chat_input();
+        self.chat_input.insert_str(text);
+    }
+
     pub fn clear_chat_input(&mut self) {
         {
             self.chat_input = TextArea::default();
@@ -2645,6 +2744,22 @@ impl AppState {
     /// `"somecommand\n"`) is stripped so the paste is shown but not sent — the
     /// user presses Enter to submit. Interior newlines are preserved, so a
     /// multi-line paste becomes multiple input lines (one request, not many).
+    /// A terminal paste. It goes where the user is typing: the log filter if
+    /// that is active, otherwise the chat input — opened and focused first,
+    /// because text pasted into a closed or unfocused input is text the user
+    /// cannot see until it is sent.
+    pub fn handle_paste(&mut self, text: &str) {
+        if self.log_filter_active {
+            let first_line = text.lines().next().unwrap_or_default();
+            self.log_filter.push_str(first_line);
+            self.log_scroll = 0;
+            return;
+        }
+        self.chat_open = true;
+        self.focus = Focus::Chat;
+        self.paste_into_chat_input(text);
+    }
+
     pub fn paste_into_chat_input(&mut self, text: &str) {
         {
             let trimmed = text.trim_end_matches(['\r', '\n']);
@@ -2931,6 +3046,33 @@ impl AppState {
     }
 
     /// Open the full-screen detail overlay for one operation.
+    /// The full text of a tool call, for the detail overlay: a chat row clips
+    /// it to the pane width, and clipped content must be reachable (R24.8.4).
+    pub fn tool_call_detail(&self, entry_idx: usize) -> Option<String> {
+        match self.chat.entries().get(entry_idx)? {
+            ChatEntry::ToolCall {
+                name,
+                args,
+                result,
+                failed,
+                ..
+            } => {
+                let args = serde_json::from_str::<serde_json::Value>(args)
+                    .and_then(|v| serde_json::to_string_pretty(&v))
+                    .unwrap_or_else(|_| args.clone());
+                let outcome = match (result, failed) {
+                    (None, _) => "(still running)".to_string(),
+                    (Some(r), true) => format!("FAILED\n{r}"),
+                    (Some(r), false) => r.clone(),
+                };
+                Some(format!(
+                    "{name}\n\nArguments:\n{args}\n\nResult:\n{outcome}"
+                ))
+            }
+            _ => None,
+        }
+    }
+
     pub fn open_operation_detail(&mut self, key: OpKey) {
         self.detail_max_scroll.set(0);
         self.modal = ModalState::OperationDetail(OperationDetailState {
@@ -3408,6 +3550,7 @@ mod tests {
             client: Some(client.into()),
             session_id: Some(format!("sess-{id}")),
             client_pid: None,
+            sampling: false,
             ended_epoch_ms: None,
         }
     }
@@ -4130,6 +4273,22 @@ mod tests {
             Some("qwen")
         );
         assert_eq!(s.window_llms.len(), 1);
+    }
+
+    #[test]
+    fn a_paste_lands_where_the_user_can_see_it() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.chat_open = false;
+        s.focus = Focus::Work;
+        s.handle_paste("cargo test\n");
+        assert!(s.chat_open && s.focus == Focus::Chat);
+        assert_eq!(s.chat_input_text(), "cargo test");
+
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.log_filter_active = true;
+        s.handle_paste("ERROR\nignored");
+        assert_eq!(s.log_filter, "ERROR");
+        assert!(s.chat_input_is_empty());
     }
 
     #[test]

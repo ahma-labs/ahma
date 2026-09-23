@@ -1740,10 +1740,24 @@ fn resolve_llm_connection(
             // (issue #484 — a lost `num_ctx` silently disables compaction, and
             // a lost `kind` sends the wrong wire format to a proxied provider).
             let entry = config.provider_for_base_url(&p_name);
+            // The key too: the TUI addresses cloud providers by URL, and a
+            // dropped key is a 401 on every turn. `${VAR}` references resolve
+            // in this process's environment; an unset one is an error worth
+            // stating rather than an anonymous request.
+            let api_key = match entry {
+                Some(e) => {
+                    e.resolve()
+                        .map_err(|err| {
+                            format!("Provider '{}' API key could not be resolved: {err}", e.name)
+                        })?
+                        .api_key
+                }
+                None => None,
+            };
             return Ok(LlmConnection {
                 base_url: p_name,
                 model: model.unwrap_or_default(),
-                api_key: None,
+                api_key,
                 num_ctx: entry.and_then(|e| e.num_ctx),
                 kind: entry.map(|e| e.kind),
             });
@@ -3359,6 +3373,30 @@ mod tests {
         assert_eq!(conn.base_url, "http://localhost:1234/v1");
         assert_eq!(conn.model, "my-model");
         assert!(conn.api_key.is_none());
+    }
+
+    /// The TUI addresses every provider by URL, so the URL path must carry
+    /// the matching config entry's API key: it dropped it, and every
+    /// OpenAI-compatible cloud provider picked in the TUI got a 401 (only
+    /// Anthropic worked, via its own env fallback in `LlmClient::new`).
+    #[test]
+    fn a_url_provider_carries_its_configured_api_key() {
+        let mut config = ahma_common::config::AhmaConfig::default();
+        config.providers.push(ahma_common::config::ProviderEntry {
+            name: "together".into(),
+            kind: ahma_common::config::ProviderKind::OpenAi,
+            base_url: "https://api.together.xyz/v1".into(),
+            default_model: "m".into(),
+            api_key: Some("sk-literal".into()),
+            num_ctx: None,
+        });
+        let conn = resolve_llm_connection(
+            Some("https://api.together.xyz/v1".to_string()),
+            Some("m".to_string()),
+            &config,
+        )
+        .expect("resolves");
+        assert_eq!(conn.api_key.as_deref(), Some("sk-literal"));
     }
 
     #[test]

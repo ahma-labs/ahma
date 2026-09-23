@@ -2017,6 +2017,27 @@ correct **at startup**, not only for events that happen afterwards.
     cost only when a price is known — neither is guessed; an estimate is labelled
     as one.
 
+- **R24.12 — It does what the user expects.**
+  - **R24.12.1 — Help cannot drift from the keys.** The help overlay and footer
+    **must** render from the one key table (`keymap::KEY_REFERENCE`) that tests
+    check both ways: every documented key does something, and every bound key
+    is documented.
+  - **R24.12.2 — Setup is checked, and keys are not handled.** `/setup` fetches
+    the provider's model list before saving (the connection test) and offers
+    only models the provider has. A cloud key is read from the environment and
+    registered as a `${VAR}` reference; the TUI never asks for or stores the key.
+    A URL-addressed provider carries its configured key to the agent loop. Only
+    a client that declared MCP `sampling` at `initialize` (carried as
+    `InstanceInfo.sampling`, field-only per R24.5) is offered as a provider.
+  - **R24.12.3 — A window's conversation is its own.** Switching windows switches
+    transcript, and is refused while a reply is streaming. Transcripts are saved
+    after each turn under `~/.ahma/transcripts/` — never in the project — and
+    restored with `/resume`.
+  - **R24.12.4 — Input behaves like a terminal.** ↑/↓ recall earlier input; a
+    paste goes where the user is typing and is visible; replies render Markdown;
+    a clipped tool call opens in full on click (R24.8.4); `x3` is a message and
+    `/x3` the command.
+
 #### R25: Tool-call session reuse (TUI chat)
 
 Chat tool calls from `ahma tui` **must** reuse a single negotiated MCP session rather than

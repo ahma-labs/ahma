@@ -256,7 +256,7 @@ pub async fn run(
                             // it does not trigger a send; the user must press Enter themselves.
                             // Interior newlines are kept, so a multi-line paste appears as
                             // multiple lines in one input rather than many separate requests.
-                            state.paste_into_chat_input(&text);
+                            state.handle_paste(&text);
                         }
                         Some(Err(e)) => {
                             debug!("terminal event error: {e}");
@@ -599,12 +599,7 @@ fn submit_active_picker(state: &mut crate::state::AppState) {
         return;
     }
 
-    if let Some((picker, base_url)) = state.take_llm_setup_ollama_flavor() {
-        submit_llm_setup_ollama_flavor(picker, base_url, state);
-        return;
-    }
-
-    if let Some((picker, provider_name, base_url, _is_enhanced)) = state.take_llm_setup_model() {
+    if let Some((picker, provider_name, base_url)) = state.take_llm_setup_model() {
         submit_llm_setup_model(picker, provider_name, base_url, state);
     }
 }
@@ -672,7 +667,6 @@ fn close_active_pickers(state: &mut crate::state::AppState) {
         crate::state::ModalState::ProviderPicker(_)
             | crate::state::ModalState::ModelPicker(_)
             | crate::state::ModalState::LlmSetupProvider(_)
-            | crate::state::ModalState::LlmSetupOllamaFlavor { .. }
             | crate::state::ModalState::LlmSetupModel { .. }
     ) {
         state.close_modal();
@@ -690,6 +684,15 @@ fn selected_instance_header_key(state: &crate::state::AppState) -> Option<String
 
 fn activate_window_chat(key: &str, state: &mut crate::state::AppState) {
     let now = crate::ui::wall_ms();
+    // A running turn streams into the transcript on screen; changing window
+    // under it would pour one window's answer into another's conversation.
+    if state.turn.is_some() && state.active_target_instance.as_deref() != Some(key) {
+        set_footer_hint(
+            state,
+            "A reply is still coming — Esc cancels it, then switch windows",
+        );
+        return;
+    }
     if state.open_section.as_deref() == Some(key)
         && (state.focus == crate::state::Focus::Chat || state.llm_selection.is_none())
     {
@@ -697,11 +700,13 @@ fn activate_window_chat(key: &str, state: &mut crate::state::AppState) {
         state.chat_open = false;
         state.focus = crate::state::Focus::Work;
         state.active_target_instance = None;
+        state.switch_transcript("");
         return;
     }
 
     state.open_section(key, now);
     state.active_target_instance = Some(key.to_string());
+    state.switch_transcript(key);
 
     // Restore or assign default LLM for this window
     if let Some(win_cfg) = state.get_window_llm(key).cloned() {
@@ -732,29 +737,43 @@ fn activate_window_chat(key: &str, state: &mut crate::state::AppState) {
     }
 }
 
+const SETUP_OLLAMA: &str = "Ollama — local, free, private";
+const SETUP_LM_STUDIO: &str = "LM Studio — local";
+const SETUP_ANTHROPIC: &str = "Anthropic Claude — key from $ANTHROPIC_API_KEY";
+const SETUP_OPENAI: &str = "OpenAI — key from $OPENAI_API_KEY";
+const SETUP_OTHER: &str = "Another OpenAI-compatible server — see /provider add";
+const SETUP_SAMPLING: &str = "Use the client's own model: ";
+
+/// Step 1 of `/setup`: choose where the model runs.
+///
+/// Every choice is checked before it is saved: the provider's model list is
+/// fetched (that *is* the connection test) and the picker in step 2 offers
+/// what it actually has, rather than a hard-coded list of names that may not
+/// exist there.
 fn start_llm_setup_wizard(state: &mut crate::state::AppState) {
     use crate::state::PickerState;
-    let mut items = vec![
-        "Ollama (Local AI - Free, Private, Fast)".to_string(),
-        "OpenAI-Compatible (LM Studio, vLLM, OpenAI, Groq)".to_string(),
-        "Anthropic Claude (Claude 3.5 Sonnet, Claude 3 Opus)".to_string(),
-    ];
-
+    let mut ollama = SETUP_OLLAMA.to_string();
     if state
         .available_providers
         .iter()
         .any(|p| p.name.to_lowercase().contains("ollama"))
     {
-        items[0].push_str(" · [detected running]");
+        ollama.push_str(" · running");
     }
-
+    let mut items = vec![
+        ollama,
+        SETUP_LM_STUDIO.to_string(),
+        SETUP_ANTHROPIC.to_string(),
+        SETUP_OPENAI.to_string(),
+    ];
     for inst in &state.active_instances {
-        if let Some(virtual_p) = virtual_provider_for_instance(&inst.label) {
-            items.push(format!("IDE Sampling: {} ({})", virtual_p.name, inst.label));
+        if let Some(p) = virtual_provider_for_instance(inst) {
+            items.push(format!("{SETUP_SAMPLING}{}", p.name));
         }
     }
+    items.push(SETUP_OTHER.to_string());
 
-    let picker = PickerState::new("Connect AI: Step 1/3 - Select Provider", items);
+    let picker = PickerState::new("Connect an LLM · step 1/2 — where does it run?", items);
     state.modal = crate::state::ModalState::LlmSetupProvider(picker);
 }
 
@@ -762,110 +781,153 @@ fn submit_llm_setup_provider(
     picker: crate::state::PickerState,
     state: &mut crate::state::AppState,
 ) {
-    let Some(item) = picker.selected_item() else {
+    use crate::state::{CloudSetup, SetupPending};
+    use ahma_common::config::ProviderKind;
+    let Some(item) = picker.selected_item().map(str::to_string) else {
         return;
     };
-    if item.starts_with("Ollama") {
-        let picker = crate::state::PickerState::new(
-            "Connect AI: Step 2/3 - Ollama API Flavor",
-            vec![
-                "Enhanced Ollama API (Recommended - Context control, thinking tags, streaming)"
-                    .to_string(),
-                "Standard OpenAI-Compatible API (/v1)".to_string(),
-            ],
-        );
-        state.modal = crate::state::ModalState::LlmSetupOllamaFlavor {
-            picker,
-            base_url: "http://localhost:11434".to_string(),
+    let local = |name: &str, url: &str| SetupPending {
+        provider_name: name.to_string(),
+        base_url: url.to_string(),
+        cloud: None,
+        connected: false,
+    };
+    if item.starts_with(SETUP_OLLAMA) {
+        // `/v1`: the client posts to `{base}/chat/completions`, which Ollama
+        // serves under `/v1` only. The bare port 404'd every request.
+        begin_setup_connect(state, local("Ollama", "http://localhost:11434/v1"), None);
+    } else if item.starts_with(SETUP_LM_STUDIO) {
+        begin_setup_connect(state, local("LM Studio", "http://localhost:1234/v1"), None);
+    } else if item.starts_with(SETUP_ANTHROPIC) {
+        let cloud = CloudSetup {
+            config_name: "anthropic",
+            kind: ProviderKind::Anthropic,
+            key_env: "ANTHROPIC_API_KEY",
         };
-    } else if item.starts_with("OpenAI-Compatible") {
-        let picker = crate::state::PickerState::new(
-            "Connect AI: Step 2/2 - Select Model",
-            vec![
-                "gpt-4o".to_string(),
-                "gpt-4o-mini".to_string(),
-                "o3-mini".to_string(),
-                "local-model".to_string(),
-            ],
-        );
-        state.modal = crate::state::ModalState::LlmSetupModel {
-            picker,
-            provider_name: "OpenAI-Compatible".to_string(),
-            base_url: "http://localhost:1234/v1".to_string(),
-            is_enhanced_ollama: false,
+        begin_cloud_setup(state, "Anthropic", "https://api.anthropic.com/v1", cloud);
+    } else if item.starts_with(SETUP_OPENAI) {
+        let cloud = CloudSetup {
+            config_name: "openai",
+            kind: ProviderKind::OpenAi,
+            key_env: "OPENAI_API_KEY",
         };
-    } else if item.starts_with("Anthropic") {
-        let picker = crate::state::PickerState::new(
-            "Connect AI: Step 2/2 - Select Model",
-            vec![
-                "claude-3-5-sonnet-latest".to_string(),
-                "claude-3-5-haiku-latest".to_string(),
-                "claude-3-opus-latest".to_string(),
-            ],
+        begin_cloud_setup(state, "OpenAI", "https://api.openai.com/v1", cloud);
+    } else if item.starts_with(SETUP_OTHER) {
+        push_assistant_message(
+            state,
+            "Register any OpenAI-compatible server with\n\
+             `/provider add <name> <base_url> <model> - ${YOUR_KEY_VAR}`\n\
+             (e.g. `/provider add groq https://api.groq.com/openai/v1 llama-3.3-70b - ${GROQ_API_KEY}`), \
+             then choose it with /provider.",
         );
-        state.modal = crate::state::ModalState::LlmSetupModel {
-            picker,
-            provider_name: "Anthropic".to_string(),
-            base_url: "https://api.anthropic.com".to_string(),
-            is_enhanced_ollama: false,
-        };
-    } else if item.starts_with("IDE Sampling:") {
-        for inst in &state.active_instances {
-            if let Some(virtual_p) = virtual_provider_for_instance(&inst.label)
-                && (item.contains(&inst.label) || item.contains(&virtual_p.name))
-            {
-                let model = virtual_p.models.first().cloned().unwrap_or_default();
-                finish_llm_setup(virtual_p.name, model, Some(virtual_p.base_url), state);
-                return;
-            }
+    } else if let Some(name) = item.strip_prefix(SETUP_SAMPLING) {
+        let chosen = state
+            .active_instances
+            .iter()
+            .find_map(|inst| virtual_provider_for_instance(inst).filter(|p| p.name == name));
+        if let Some(p) = chosen {
+            let model = p.models.first().cloned().unwrap_or_default();
+            finish_llm_setup(p.name, model, Some(p.base_url), state);
         }
     }
 }
 
-fn submit_llm_setup_ollama_flavor(
-    picker: crate::state::PickerState,
-    base_url: String,
+/// A cloud provider needs its key in the environment first. The key is never
+/// typed into the TUI or written anywhere: the provider is registered with a
+/// `${VAR}` reference that ahma resolves when it calls the API.
+fn begin_cloud_setup(
     state: &mut crate::state::AppState,
+    name: &str,
+    base_url: &str,
+    cloud: crate::state::CloudSetup,
 ) {
-    let Some(item) = picker.selected_item() else {
+    let key = std::env::var(cloud.key_env)
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    let Some(key) = key else {
+        push_assistant_message(
+            state,
+            format!(
+                "{name} needs an API key in the environment: set `{var}` (e.g. \
+                 `export {var}=…` in your shell profile), restart `ahma tui` from that \
+                 shell, and run /setup again. The key is never typed here or stored — \
+                 ahma reads it from `${var}` when it calls {name}.",
+                var = cloud.key_env
+            ),
+        );
         return;
     };
-    let is_enhanced = item.starts_with("Enhanced");
+    let pending = crate::state::SetupPending {
+        provider_name: name.to_string(),
+        base_url: base_url.to_string(),
+        cloud: Some(cloud),
+        connected: false,
+    };
+    begin_setup_connect(state, pending, Some(key));
+}
 
-    let mut models: Vec<String> = state
-        .available_providers
-        .iter()
-        .find(|p| p.name.to_lowercase().contains("ollama"))
-        .map(|p| p.models.clone())
-        .unwrap_or_default();
-
-    if models.is_empty() {
-        models = vec![
-            "qwen2.5-coder:7b".to_string(),
-            "qwen2.5-coder:14b".to_string(),
-            "qwen2.5-coder:32b".to_string(),
-            "llama3.2:3b".to_string(),
-            "llama3.3:70b".to_string(),
-            "deepseek-r1:8b".to_string(),
-            "deepseek-r1:14b".to_string(),
-            "mistral:7b".to_string(),
-        ];
+/// Fetch the provider's model list; its arrival (or its absence) is the
+/// connection test. See [`handle_setup_models`].
+fn begin_setup_connect(
+    state: &mut crate::state::AppState,
+    pending: crate::state::SetupPending,
+    api_key: Option<String>,
+) {
+    push_assistant_message(
+        state,
+        format!(
+            "Connecting to {} at {}…",
+            pending.provider_name, pending.base_url
+        ),
+    );
+    if let Some(tx) = &state.bridge_tx {
+        crate::llm_bridge::spawn_model_refresh_with_key(
+            pending.base_url.clone(),
+            api_key,
+            tx.clone(),
+        );
     }
+    state.setup_pending = Some(pending);
+}
 
-    let provider_label = if is_enhanced {
-        "Ollama (Enhanced)".to_string()
-    } else {
-        "Ollama".to_string()
+/// The wizard's connection result: a model list opens step 2; nothing means
+/// the provider is not reachable (or the key is wrong), and says what to fix.
+fn handle_setup_models(models: Vec<String>, state: &mut crate::state::AppState) {
+    let Some(mut pending) = state.setup_pending.take() else {
+        return;
     };
-
-    let model_picker =
-        crate::state::PickerState::new("Connect AI: Step 3/3 - Select Ollama Model", models);
+    if models.is_empty() {
+        let advice = match (&pending.cloud, pending.provider_name.as_str()) {
+            (Some(cloud), name) => format!(
+                "{name} did not return a model list. Check that `${}` holds a valid key, \
+                 then /setup.",
+                cloud.key_env
+            ),
+            (None, "Ollama") => "No models from Ollama. Is it running (`ollama serve`) with a \
+                 model pulled (e.g. `ollama pull qwen2.5-coder`)? Then /setup."
+                .to_string(),
+            (None, name) => format!(
+                "No models from {name} at {}. Start its server with a model loaded, then /setup.",
+                pending.base_url
+            ),
+        };
+        push_assistant_message(state, advice);
+        return;
+    }
+    let picker = crate::state::PickerState::new(
+        format!(
+            "Connect an LLM · step 2/2 — {} model",
+            pending.provider_name
+        ),
+        models,
+    );
     state.modal = crate::state::ModalState::LlmSetupModel {
-        picker: model_picker,
-        provider_name: provider_label,
-        base_url,
-        is_enhanced_ollama: is_enhanced,
+        picker,
+        provider_name: pending.provider_name.clone(),
+        base_url: pending.base_url.clone(),
     };
+    pending.connected = true;
+    state.setup_pending = Some(pending);
 }
 
 fn submit_llm_setup_model(
@@ -877,6 +939,27 @@ fn submit_llm_setup_model(
     let Some(model) = picker.selected_item().map(|s| s.to_string()) else {
         return;
     };
+    let pending = state.setup_pending.take();
+    if let Some(cloud) = pending.and_then(|p| p.cloud).filter(|_| {
+        ahma_common::config::AhmaConfig::load()
+            .provider_for_base_url(&base_url)
+            .is_none()
+    }) {
+        let entry = ahma_common::config::ProviderEntry {
+            name: cloud.config_name.to_string(),
+            kind: cloud.kind,
+            base_url: base_url.clone(),
+            default_model: model.clone(),
+            api_key: Some(format!("${{{}}}", cloud.key_env)),
+            num_ctx: None,
+        };
+        if let Err(e) = ahma_common::config::AhmaConfig::add_provider(entry) {
+            push_assistant_message(
+                state,
+                format!("Could not register {provider_name} in ~/.ahma/config.toml: {e}"),
+            );
+        }
+    }
     finish_llm_setup(provider_name, model, Some(base_url), state);
 }
 
@@ -1306,20 +1389,6 @@ fn backspace_chat_input(state: &mut crate::state::AppState) {
     });
 }
 
-fn maybe_close_window_shortcut(text: &str, state: &mut crate::state::AppState) -> bool {
-    let lower = text.to_lowercase();
-    if lower.starts_with('x')
-        && !lower[1..].is_empty()
-        && lower[1..].chars().all(|c| c.is_ascii_digit())
-        && let Ok(win_id) = lower[1..].parse::<usize>()
-    {
-        close_window_by_id(win_id, state);
-        true
-    } else {
-        false
-    }
-}
-
 fn maybe_decompose_goal(
     text: &str,
     base_url: &str,
@@ -1335,7 +1404,10 @@ fn maybe_decompose_goal(
             return true;
         }
         if base_url.is_empty() {
-            push_assistant_message(state, "No LLM configured. Use /provider to select one.");
+            push_assistant_message(
+                state,
+                "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+            );
             return true;
         }
         state.push_log(LogEntry {
@@ -1445,10 +1517,7 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
         return;
     }
     state.clear_chat_input();
-
-    if maybe_close_window_shortcut(&text, state) {
-        return;
-    }
+    state.remember_input(&text);
 
     if text.starts_with('/') {
         dispatch_nav_command(&text, state);
@@ -1466,7 +1535,10 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     }
 
     if base_url.is_empty() {
-        push_assistant_message(state, "No LLM configured. Use /provider to select one.");
+        push_assistant_message(
+            state,
+            "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+        );
         return;
     }
 
@@ -2162,7 +2234,6 @@ fn active_picker_mut(state: &mut crate::state::AppState) -> Option<&mut crate::s
         crate::state::ModalState::ProviderPicker(p)
         | crate::state::ModalState::ModelPicker(p)
         | crate::state::ModalState::LlmSetupProvider(p)
-        | crate::state::ModalState::LlmSetupOllamaFlavor { picker: p, .. }
         | crate::state::ModalState::LlmSetupModel { picker: p, .. } => Some(p),
         _ => None,
     }
@@ -2410,6 +2481,19 @@ fn handle_chat_input_key(
                 nav.refresh_completions(&tools);
                 state.modal = crate::state::ModalState::Navigator(nav);
             }
+            true
+        }
+        // Recall earlier input from the first line, later from the last;
+        // anywhere else the arrows move the cursor.
+        (KeyCode::Up, KeyModifiers::NONE)
+            if state.chat_input.cursor().0 == 0 && state.recall_previous_input() =>
+        {
+            true
+        }
+        (KeyCode::Down, KeyModifiers::NONE)
+            if state.chat_input.cursor().0 + 1 >= state.chat_input.lines().len()
+                && state.recall_next_input() =>
+        {
             true
         }
         (KeyCode::Tab, KeyModifiers::NONE) => {
@@ -2682,7 +2766,10 @@ fn invoke_skill(
 ) {
     let (base_url, model) = parse_llm_selection(state);
     if base_url.is_empty() {
-        push_assistant_message(state, "No LLM configured. Use /provider to select one.");
+        push_assistant_message(
+            state,
+            "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+        );
         return;
     }
 
@@ -2847,6 +2934,14 @@ fn set_execution_mode(
 fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
         "/help" | "/?" => state.modal = crate::state::ModalState::Help,
+        // The guided setup was reachable only by selecting a window with no
+        // LLM configured — i.e. never, once anything was picked.
+        "/setup" | "/connect" => start_llm_setup_wizard(state),
+        "/resume" => {
+            if let Some(home) = ahma_common::config::ahma_home_dir() {
+                resume_transcript(state, &home);
+            }
+        }
         "/sync" => set_execution_mode(state, ahma_common::config::ExecutionPolicy::Sync),
         "/async" => set_execution_mode(state, ahma_common::config::ExecutionPolicy::Async),
         "/clear" => state.clear_screen(),
@@ -3861,62 +3956,34 @@ fn persist_selected_model_to_settings(provider: &str, model: &str, provider_url:
 
 // ─── Bridge event handler ─────────────────────────────────────────────────────
 
-fn virtual_provider_for_instance(label: &str) -> Option<ahma_llm_monitor::LocalProvider> {
-    let normalized = label.to_lowercase();
-    if normalized.contains("cursor") {
-        Some(ahma_llm_monitor::LocalProvider {
-            name: "Cursor (Sampling)".to_string(),
-            base_url: "mcp://Cursor".to_string(),
-            models: vec![
-                "Claude 3.5 Sonnet (IDE subscription)".to_string(),
-                "GPT-4o (IDE subscription)".to_string(),
-                "Gemini 1.5 Pro (IDE subscription)".to_string(),
-            ],
-        })
-    } else if normalized.contains("vscode")
-        || normalized.contains("vs code")
-        || normalized.contains("visual studio code")
-    {
-        Some(ahma_llm_monitor::LocalProvider {
-            name: "VS Code (Sampling)".to_string(),
-            base_url: "mcp://VS Code".to_string(),
-            models: vec![
-                "Claude 3.5 Sonnet (IDE subscription)".to_string(),
-                "GPT-4o (IDE subscription)".to_string(),
-                "Gemini 1.5 Pro (IDE subscription)".to_string(),
-            ],
-        })
-    } else if normalized.contains("antigravity") {
-        Some(ahma_llm_monitor::LocalProvider {
-            name: "Antigravity (Sampling)".to_string(),
-            base_url: "mcp://Antigravity".to_string(),
-            models: vec![
-                "Gemini 1.5 Pro (Google Cloud bill)".to_string(),
-                "Gemini 1.5 Flash (Google Cloud bill)".to_string(),
-            ],
-        })
-    } else if normalized.contains("claude") {
-        Some(ahma_llm_monitor::LocalProvider {
-            name: "Claude Code (Sampling)".to_string(),
-            base_url: "mcp://Claude Code".to_string(),
-            models: vec![
-                "Claude 3.5 Sonnet (Anthropic API bill)".to_string(),
-                "Claude 3 Opus (Anthropic API bill)".to_string(),
-            ],
-        })
-    } else {
-        Some(ahma_llm_monitor::LocalProvider {
-            name: format!("{label} (Sampling)"),
-            base_url: format!("mcp://{label}"),
-            models: vec!["Default Model (IDE subscription)".to_string()],
-        })
+/// An `mcp://` provider for a window whose MCP client can answer prompts with
+/// its own model (MCP sampling).
+///
+/// Only a client that declared the `sampling` capability gets one. This used to
+/// return a provider for *every* instance — hooks and this TUI included — with
+/// invented model names ("Claude 3.5 Sonnet (IDE subscription)"): entries that
+/// could never answer, and because one always existed, an LLM was auto-selected
+/// and the setup wizard never ran. With sampling the client picks the model;
+/// ahma can only state a preference, so the entry says so instead of naming
+/// models it cannot promise.
+fn virtual_provider_for_instance(
+    inst: &ahma_common::daemon_hub::InstanceInfo,
+) -> Option<ahma_llm_monitor::LocalProvider> {
+    if !inst.sampling || inst.mode == "hook" || inst.mode == "tui" {
+        return None;
     }
+    let who = inst.client.as_deref().unwrap_or(&inst.label);
+    Some(ahma_llm_monitor::LocalProvider {
+        name: format!("{who} (its own model)"),
+        base_url: format!("mcp://{}", inst.label),
+        models: vec!["client's choice".to_string()],
+    })
 }
 
 fn rebuild_available_providers(state: &mut crate::state::AppState) {
     let mut combined = state.discovered_providers.clone();
     for inst in &state.active_instances {
-        if let Some(virtual_provider) = virtual_provider_for_instance(&inst.label)
+        if let Some(virtual_provider) = virtual_provider_for_instance(inst)
             && !combined.iter().any(|p| p.name == virtual_provider.name)
         {
             combined.push(virtual_provider);
@@ -4007,6 +4074,14 @@ fn handle_model_refreshed(
     models: Vec<String>,
     state: &mut crate::state::AppState,
 ) {
+    if state
+        .setup_pending
+        .as_ref()
+        .is_some_and(|p| !p.connected && p.base_url == base_url)
+    {
+        handle_setup_models(models, state);
+        return;
+    }
     if let Some(provider) = state
         .available_providers
         .iter_mut()
@@ -4775,6 +4850,72 @@ fn handle_source_gate_event(
     }
 }
 
+/// Where this window's transcript is saved: keyed by the window's durable
+/// identity (client and workspace), not the per-session instance id, so the
+/// next session of the same client in the same workspace finds it.
+fn transcript_path(state: &crate::state::AppState, home: &std::path::Path) -> std::path::PathBuf {
+    // This terminal's own chat is per workspace, like every other window.
+    let key = if state.chat_key.is_empty() {
+        format!("ahma-tui@{}", state.workspace)
+    } else {
+        state.window_llm_key(&state.chat_key)
+    };
+    crate::transcripts::path_for(&crate::transcripts::dir_for(home), &key)
+}
+
+/// Save the current window's transcript after a finished turn. Best-effort,
+/// on the blocking pool.
+fn save_transcript(state: &crate::state::AppState) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(home) = ahma_common::config::ahma_home_dir() else {
+        return;
+    };
+    let path = transcript_path(state, &home);
+    let entries = crate::transcripts::to_saved(&state.chat);
+    if entries.is_empty() {
+        return;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || {
+            if let Err(e) = crate::transcripts::save(&path, &entries) {
+                debug!("Failed to save transcript {}: {e}", path.display());
+            }
+        });
+    }
+}
+
+/// `/resume`: bring back this window's saved conversation.
+fn resume_transcript(state: &mut crate::state::AppState, home: &std::path::Path) {
+    if state.turn.is_some() {
+        set_footer_hint(state, "A reply is still coming — Esc cancels it first");
+        return;
+    }
+    let path = transcript_path(state, home);
+    match crate::transcripts::load(&path) {
+        Ok(Some(entries)) => {
+            let n = entries.len();
+            state.chat = crate::transcripts::from_saved(entries);
+            *state.chat_rows_cache.borrow_mut() = crate::state::ChatRowsCache::default();
+            state.chat_scroll = 0;
+            state.chat_open = true;
+            set_footer_hint(
+                state,
+                format!("Resumed {n} messages from {}", path.display()),
+            );
+        }
+        Ok(None) => push_assistant_message(
+            state,
+            format!(
+                "No saved conversation for this window yet ({}).",
+                path.display()
+            ),
+        ),
+        Err(e) => push_assistant_message(state, format!("Could not read {}: {e}", path.display())),
+    }
+}
+
 /// Append one line per finished turn to the active agent profile's transcript
 /// log, when a profile is active. Best-effort, on the blocking pool (no
 /// blocking I/O on the event loop).
@@ -4828,6 +4969,7 @@ fn handle_source_chat_event(
         SourceEvent::AgentDone => {
             end_turn(state);
             append_profile_transcript(state);
+            save_transcript(state);
         }
         SourceEvent::AgentError { error } => end_turn_with_error(state, &error),
         SourceEvent::Usage {
@@ -5202,7 +5344,10 @@ fn analyze_operation(state: &mut crate::state::AppState, key: &crate::state::OpK
 
     let (base_url, model) = parse_llm_selection(state);
     if base_url.is_empty() {
-        push_assistant_message(state, "No LLM configured. Use /provider to select one.");
+        push_assistant_message(
+            state,
+            "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+        );
         return;
     }
 
@@ -5424,6 +5569,13 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
     }
     if inside_rect(col, row, state.chat_area.get()) {
         state.focus = crate::state::Focus::Chat;
+        // A tool-call line is clipped to one row; clicking it opens the whole
+        // call — arguments and result — full-screen (SPEC R24.8.4).
+        if let Some(detail) =
+            crate::ui::chat_entry_at(state, col, row).and_then(|idx| state.tool_call_detail(idx))
+        {
+            state.open_log_line_detail(detail);
+        }
         return;
     }
     if inside_rect(col, row, state.log_area.get()) {
@@ -6320,6 +6472,167 @@ mod tests {
         unsafe { std::env::remove_var("AHMA_TEST_HOME") };
     }
 
+    fn press(state: &mut AppState, code: crossterm::event::KeyCode) {
+        super::handle_chat_input_key(
+            crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            state,
+        );
+    }
+
+    /// ↑ on the first line recalls earlier input, ↓ walks back and restores
+    /// what was being typed — the shell behaviour everyone expects.
+    #[test]
+    fn up_and_down_recall_earlier_input() {
+        use crossterm::event::KeyCode;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = crate::state::Focus::Chat;
+        for msg in ["first", "second"] {
+            state.chat_input.insert_str(msg);
+            super::submit_chat_input(&mut state);
+        }
+        state.chat_input.insert_str("draft");
+
+        press(&mut state, KeyCode::Up);
+        assert_eq!(state.chat_input_text(), "second");
+        press(&mut state, KeyCode::Up);
+        assert_eq!(state.chat_input_text(), "first");
+        press(&mut state, KeyCode::Up);
+        assert_eq!(state.chat_input_text(), "first", "stops at the oldest");
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.chat_input_text(), "second");
+        press(&mut state, KeyCode::Down);
+        assert_eq!(
+            state.chat_input_text(),
+            "draft",
+            "back to what was being typed"
+        );
+    }
+
+    /// A message that happens to look like `x5` is a message; closing window
+    /// 5 is `/x5`. The bare form silently swallowed what the user typed.
+    #[test]
+    fn a_message_like_x5_is_not_swallowed_as_a_window_command() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = crate::state::Focus::Chat;
+        state.chat_input.insert_str("x5");
+        let before = state.chat.len();
+        super::submit_chat_input(&mut state);
+        assert!(
+            state.chat.len() > before,
+            "the input was answered, not dropped"
+        );
+    }
+
+    /// Every chat-input key in the help table is actually handled there.
+    #[test]
+    fn every_documented_chat_key_is_handled() {
+        use crate::keymap::{KeyScope, key_docs};
+        for doc in key_docs(KeyScope::Chat) {
+            for &(code, mods) in doc.keys {
+                let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+                state.focus = crate::state::Focus::Chat;
+                // ↑/↓ recall needs something to recall (and ↓ a place in it);
+                // without history they fall through to cursor movement.
+                state.remember_input("earlier");
+                if code == crossterm::event::KeyCode::Down {
+                    state.recall_previous_input();
+                }
+                let key = crossterm::event::KeyEvent::new(code, mods);
+                assert!(
+                    super::handle_chat_input_key(key, &mut state),
+                    "`{}` ({}) is documented for the chat input but not handled",
+                    doc.label,
+                    doc.action
+                );
+            }
+        }
+    }
+
+    fn say(state: &mut AppState, text: &str) {
+        state.chat.push(crate::state::ChatEntry::User {
+            text: text.into(),
+            payload: None,
+            started_at: None,
+            duration_ms: Some(1),
+        });
+    }
+
+    /// Each window keeps its own conversation: switching windows used to
+    /// carry one transcript over and send it to another instance and model.
+    #[test]
+    fn each_window_keeps_its_own_transcript() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.llm_selection = Some(crate::state::LlmSelection::named("p", "m"));
+        super::activate_window_chat("win-a", &mut state);
+        say(&mut state, "for A");
+
+        super::activate_window_chat("win-b", &mut state);
+        assert!(
+            state.chat.is_empty(),
+            "B starts with its own, empty transcript"
+        );
+        say(&mut state, "for B");
+
+        super::activate_window_chat("win-a", &mut state);
+        let texts: Vec<_> = state
+            .chat
+            .entries()
+            .iter()
+            .filter_map(|e| match e {
+                crate::state::ChatEntry::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["for A"]);
+    }
+
+    /// A running turn streams into the current transcript, so the target
+    /// window cannot change under it.
+    /// `/resume` brings back the window's saved conversation.
+    #[test]
+    fn resume_restores_the_windows_saved_conversation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        say(&mut state, "earlier question");
+        let path = super::transcript_path(&state, workspace.path());
+        crate::transcripts::save(&path, &crate::transcripts::to_saved(&state.chat)).unwrap();
+
+        state.chat.clear();
+        super::resume_transcript(&mut state, workspace.path());
+        assert!(state.chat.entries().iter().any(|e| matches!(
+            e,
+            crate::state::ChatEntry::User { text, .. } if text == "earlier question"
+        )));
+
+        // A window with nothing saved says so rather than failing silently.
+        let empty = tempfile::tempdir().unwrap();
+        state.chat.clear();
+        super::resume_transcript(&mut state, empty.path());
+        assert!(state.chat.entries().iter().any(|e| matches!(
+            e,
+            crate::state::ChatEntry::Assistant { content, .. } if content.contains("No saved conversation")
+        )));
+    }
+
+    #[test]
+    fn switching_windows_waits_for_the_running_turn() {
+        let mut state = turn_in_flight();
+        state.llm_selection = Some(crate::state::LlmSelection::named("p", "m"));
+        state.active_target_instance = None;
+        super::activate_window_chat("win-b", &mut state);
+        assert_eq!(state.active_target_instance, None, "stayed put");
+        assert!(
+            !state.chat.is_empty(),
+            "the running conversation is still shown"
+        );
+        assert!(
+            state
+                .footer_hint
+                .as_ref()
+                .is_some_and(|(h, _)| h.contains("Esc"))
+        );
+    }
+
     #[test]
     fn an_unrequested_model_refresh_does_not_open_the_picker() {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
@@ -6827,8 +7140,8 @@ mod tests {
         };
         state.windows.push(w);
 
-        // Type "x26" in chat input
-        state.chat_input.insert_str("x26");
+        // Closing a window is the `/x26` command; a bare `x26` is a message.
+        state.chat_input.insert_str("/x26");
         super::submit_chat_input(&mut state);
 
         assert!(!state.windows[0].visible);
@@ -6841,15 +7154,12 @@ mod tests {
         state.windows[0].visible = true;
         state.windows[0].status = crate::state::WindowStatus::Running;
 
-        // Type "X26" in chat input
+        // A bare "X26" is a message, not a command: the window is untouched.
         state.chat_input.insert_str("X26");
         super::submit_chat_input(&mut state);
 
-        assert!(!state.windows[0].visible);
-        assert_eq!(
-            state.windows[0].status,
-            crate::state::WindowStatus::Cancelled
-        );
+        assert!(state.windows[0].visible);
+        assert_eq!(state.windows[0].status, crate::state::WindowStatus::Running);
     }
 
     /// Only the log pane zooms now: the work view *is* the screen, so there is
@@ -7273,58 +7583,116 @@ mod tests {
         assert!(matches!(state.modal, ModalState::LlmSetupProvider(_)));
     }
 
+    fn wizard_pick(state: &mut AppState, prefix: &str) {
+        let crate::state::ModalState::LlmSetupProvider(mut picker) =
+            std::mem::take(&mut state.modal)
+        else {
+            panic!("expected the provider step");
+        };
+        picker.select_prefix(prefix);
+        super::submit_llm_setup_provider(picker, state);
+    }
+
+    /// Ollama end to end: the model list is the connection test, step 2 offers
+    /// what the server actually has, and the saved URL carries `/v1` (without
+    /// it every request 404'd).
     #[test]
-    fn test_llm_setup_wizard_flow() {
-        use crate::state::{AppState, Focus, ModalState, PickerState};
+    fn setup_wizard_connects_then_offers_the_servers_models() {
+        use crate::state::{Focus, ModalState};
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         state.active_target_instance = Some("claude-code".to_string());
         state.llm_selection = None;
 
-        // Step 1: Select Ollama
-        let picker = PickerState::new(
-            "Step 1",
-            vec!["Ollama (Local AI - Free, Private, Fast)".to_string()],
+        super::start_llm_setup_wizard(&mut state);
+        wizard_pick(&mut state, super::SETUP_OLLAMA);
+        let pending = state.setup_pending.clone().expect("connecting");
+        assert_eq!(pending.base_url, "http://localhost:11434/v1");
+
+        super::handle_model_refreshed(
+            pending.base_url.clone(),
+            vec!["qwen2.5-coder:32b".into(), "llama3.3".into()],
+            &mut state,
         );
-        super::submit_llm_setup_provider(picker, &mut state);
-
-        let (ollama_picker, base_url) = match std::mem::take(&mut state.modal) {
-            ModalState::LlmSetupOllamaFlavor { picker, base_url } => (picker, base_url),
-            other => panic!("expected LlmSetupOllamaFlavor, got {other:?}"),
+        let ModalState::LlmSetupModel {
+            mut picker,
+            provider_name,
+            base_url,
+        } = std::mem::take(&mut state.modal)
+        else {
+            panic!("expected the model step");
         };
-        assert_eq!(base_url, "http://localhost:11434");
+        assert_eq!(picker.items, vec!["qwen2.5-coder:32b", "llama3.3"]);
+        picker.select_exact("qwen2.5-coder:32b");
+        super::submit_llm_setup_model(picker, provider_name, base_url, &mut state);
 
-        // Step 2: Select Enhanced Ollama API
-        super::submit_llm_setup_ollama_flavor(ollama_picker, base_url, &mut state);
-
-        let (mut model_picker, provider_name, base_url, is_enhanced) =
-            match std::mem::take(&mut state.modal) {
-                ModalState::LlmSetupModel {
-                    picker,
-                    provider_name,
-                    base_url,
-                    is_enhanced_ollama,
-                } => (picker, provider_name, base_url, is_enhanced_ollama),
-                other => panic!("expected LlmSetupModel, got {other:?}"),
-            };
-        assert_eq!(provider_name, "Ollama (Enhanced)");
-        assert!(is_enhanced);
-        assert!(!model_picker.items.is_empty());
-
-        // Step 3: Select model
-        model_picker.select_exact("qwen2.5-coder:32b");
-        super::submit_llm_setup_model(model_picker, provider_name, base_url, &mut state);
-
-        // Completion checks
         assert!(matches!(state.modal, ModalState::None));
         assert!(state.chat_open);
         assert_eq!(state.focus, Focus::Chat);
         let sel = state.llm_selection.as_ref().unwrap();
-        assert_eq!(sel.persistable_provider(), "Ollama (Enhanced)");
+        assert_eq!(sel.persistable_provider(), "Ollama");
         assert_eq!(sel.model, "qwen2.5-coder:32b");
-
+        assert_eq!(
+            state.current_provider_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
         let win_cfg = state.get_window_llm("claude-code").unwrap();
-        assert_eq!(win_cfg.provider, "Ollama (Enhanced)");
         assert_eq!(win_cfg.model, "qwen2.5-coder:32b");
+    }
+
+    /// A server that lists nothing is not silently "connected": the wizard
+    /// says what to fix and saves nothing.
+    #[test]
+    fn setup_wizard_reports_an_unreachable_provider() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.llm_selection = None;
+        super::start_llm_setup_wizard(&mut state);
+        wizard_pick(&mut state, super::SETUP_OLLAMA);
+        super::handle_model_refreshed("http://localhost:11434/v1".into(), vec![], &mut state);
+
+        assert!(state.llm_selection.is_none(), "nothing chosen");
+        assert!(state.setup_pending.is_none());
+        assert!(state.chat.entries().iter().any(|e| matches!(
+            e,
+            crate::state::ChatEntry::Assistant { content, .. } if content.contains("ollama serve")
+        )));
+    }
+
+    /// A cloud provider without its key in the environment stops with how to
+    /// set it — and never asks for the key itself.
+    #[test]
+    fn setup_wizard_asks_for_the_key_in_the_environment() {
+        // SAFETY: nextest runs each test in its own process (SPEC R-ISO.1).
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::start_llm_setup_wizard(&mut state);
+        wizard_pick(&mut state, super::SETUP_OPENAI);
+        assert!(state.setup_pending.is_none());
+        assert!(state.chat.entries().iter().any(|e| matches!(
+            e,
+            crate::state::ChatEntry::Assistant { content, .. } if content.contains("OPENAI_API_KEY")
+        )));
+    }
+
+    /// Only clients that declared MCP sampling are offered as a provider; the
+    /// old list invented one for every window, so the wizard never ran.
+    #[test]
+    fn sampling_is_offered_only_for_clients_that_declare_it() {
+        let inst = |sampling: bool| ahma_common::daemon_hub::InstanceInfo {
+            id: "i".into(),
+            mode: "stdio".into(),
+            label: "ahma".into(),
+            client: Some("vscode".into()),
+            sampling,
+            ..Default::default()
+        };
+        assert!(super::virtual_provider_for_instance(&inst(false)).is_none());
+        let p = super::virtual_provider_for_instance(&inst(true)).expect("declared sampling");
+        assert_eq!(p.name, "vscode (its own model)");
+        assert!(
+            !p.models
+                .iter()
+                .any(|m| m.contains("Claude") || m.contains("GPT"))
+        );
     }
 
     #[test]

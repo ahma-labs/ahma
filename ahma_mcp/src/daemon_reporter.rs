@@ -86,6 +86,8 @@ pub struct InstanceIdentity {
     pub session_id: Option<String>,
     /// Pid of the client-facing frontend process.
     pub client_pid: Option<u32>,
+    /// The client declared MCP `sampling` at `initialize`.
+    pub sampling: bool,
 }
 
 static INSTANCE_IDENTITY: std::sync::LazyLock<tokio::sync::watch::Sender<InstanceIdentity>> =
@@ -110,16 +112,17 @@ pub fn set_initial_identity(session_id: Option<String>, client_pid: Option<u32>)
 /// Record the MCP client identity for this instance. Called from
 /// `on_initialized` once `clientInfo.name` is known. Idempotent: setting the
 /// same name again does not trigger a hub re-register.
-pub fn set_client_identity(name: impl Into<String>) {
+pub fn set_client_identity(name: impl Into<String>, sampling: bool) {
     let name = name.into();
     if name.is_empty() {
         return;
     }
     INSTANCE_IDENTITY.send_if_modified(|cur| {
-        if cur.client.as_deref() == Some(name.as_str()) {
+        if cur.client.as_deref() == Some(name.as_str()) && cur.sampling == sampling {
             false
         } else {
             cur.client = Some(name);
+            cur.sampling = sampling;
             true
         }
     });
@@ -409,6 +412,7 @@ async fn run_reporter_loop(
             client: identity.client.clone(),
             session_id: identity.session_id.clone(),
             client_pid: identity.client_pid,
+            sampling: identity.sampling,
         };
         if let Err(e) = send_msg(&mut writer, &reg).await {
             debug!("daemon_reporter: register failed ({e})");

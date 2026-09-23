@@ -268,6 +268,7 @@ mod tests {
             client: Some("claude-code".into()),
             session_id: Some("sess".into()),
             client_pid: Some(11),
+            sampling: false,
             ended_epoch_ms: None,
         }
     }

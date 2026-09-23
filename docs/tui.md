@@ -106,6 +106,10 @@ than showing a fabricated `exit 0`.
 
 ## Key bindings
 
+The in-app help (`?`) and the footer are generated from the same table the key
+bindings are tested against, so what they say is what the keys do. The most
+useful ones:
+
 | Key | Action |
 |-----|--------|
 | Ctrl-C | Cancel the running chat turn; press again (within 2 s) to quit |
@@ -125,6 +129,33 @@ than showing a fabricated `exit 0`.
 | `y` / `a` / `n` | Approve / always allow / reject a pending gate. While you are typing in the chat input these keys type; press `Esc` to clear the input first |
 | `/` | Command navigator (from an empty input) |
 | `?` | Help |
+| `↑`/`↓` (chat input) | Earlier / later message, from the first / last line |
+| Click a tool call in chat | Open its full arguments and result |
+
+## Chatting
+
+- **Connect an LLM with `/setup`** (also offered when you first chat with a
+  window). It checks the provider before saving anything: the model list is
+  fetched from the provider — that is the connection test — and the models you
+  pick from are the ones it actually has. Cloud providers read their key from
+  the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`); the key is never typed
+  into the TUI or stored — the provider is registered in `~/.ahma/config.toml`
+  with a `${VAR}` reference. A window whose client supports MCP sampling can also
+  answer with the client's own model. Any other OpenAI-compatible server:
+  `/provider add`.
+- **Each window has its own conversation.** Switching windows switches
+  transcript, so a question for one client's model is never sent to another.
+  After each turn the conversation is saved under `~/.ahma/transcripts/` (not in
+  the project, so it cannot be committed by accident); `/resume` brings it back
+  in a later session.
+- **Replies are rendered Markdown**: headings, lists, emphasis, and code blocks
+  that read as code.
+- **A paste lands where you can see it**: in the log filter when that is open,
+  otherwise in the chat input, which opens and takes focus.
+- **Window commands need their slash**: `/x3` closes window 3; a message that
+  happens to start `x3` is sent as a message.
+- `/compact` keeps the last four turns so the model sees less; `/sync` and
+  `/async` switch how tool calls return (see the status header).
 
 ## Chat input prefixes
 

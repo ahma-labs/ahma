@@ -109,6 +109,31 @@ impl Theme {
     pub fn normal(&self) -> Style {
         self.c(Style::default())
     }
+
+    // ── Markdown (assistant replies) ─────────────────────────────────────────
+
+    pub fn md_heading(&self) -> Style {
+        self.c(Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD))
+    }
+    /// Inline `code` and code blocks: a tinted background so code reads as
+    /// code even under `NO_COLOR` loses the tint (it keeps nothing else).
+    pub fn md_code(&self) -> Style {
+        self.c(Style::default()
+            .fg(Color::Rgb(230, 219, 116))
+            .bg(Color::Rgb(40, 44, 52)))
+    }
+    pub fn md_quote(&self) -> Style {
+        self.c(Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::ITALIC))
+    }
+    pub fn md_link(&self) -> Style {
+        self.c(Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::UNDERLINED))
+    }
     pub fn dim(&self) -> Style {
         self.c(Style::default().fg(Color::DarkGray))
     }

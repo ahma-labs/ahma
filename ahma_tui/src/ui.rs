@@ -46,7 +46,6 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
         crate::state::ModalState::ProviderPicker(picker)
         | crate::state::ModalState::ModelPicker(picker)
         | crate::state::ModalState::LlmSetupProvider(picker)
-        | crate::state::ModalState::LlmSetupOllamaFlavor { picker, .. }
         | crate::state::ModalState::LlmSetupModel { picker, .. } => {
             draw_picker(frame, picker, theme, full)
         }
@@ -1402,20 +1401,19 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     let mut cache = state.chat_rows_cache.borrow_mut();
     let key = (state.chat.generation(), text_width, state.unicode);
     if transcript_is_live(state) {
-        let logical = build_chat_history_lines(state, theme, text_width);
-        cache.rows = wrap_lines_to_rows(&logical, text_width);
+        (cache.rows, cache.owners) = build_chat_rows(state, theme, text_width);
         // Wall-clock content: valid for this frame only, never for reuse.
         cache.key = None;
     } else if cache.key != Some(key) {
-        let logical = build_chat_history_lines(state, theme, text_width);
-        cache.rows = wrap_lines_to_rows(&logical, text_width);
+        (cache.rows, cache.owners) = build_chat_rows(state, theme, text_width);
         cache.key = Some(key);
     }
-    let rows = &cache.rows;
-    let max_scroll = rows.len().saturating_sub(visible_h);
+    let max_scroll = cache.rows.len().saturating_sub(visible_h);
     state.chat_max_scroll.set(max_scroll);
 
-    let scroll = chat_history_scroll_offset(rows.len(), visible_h, state.chat_scroll);
+    let scroll = chat_history_scroll_offset(cache.rows.len(), visible_h, state.chat_scroll);
+    cache.scroll = scroll;
+    let rows = &cache.rows;
     let visible_rows: Vec<Line<'static>> =
         rows.iter().skip(scroll).take(visible_h).cloned().collect();
     // Rows are already wrapped to `text_width`; render without ratatui's wrap so
@@ -1435,9 +1433,9 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
 fn chat_history_hint(state: &AppState) -> &'static str {
     if state.llm_selection.is_none() {
         if state.unicode {
-            "  No LLM configured — use /provider to select one"
+            "  No LLM configured — /setup connects one"
         } else {
-            "  No LLM configured - use /provider to select one"
+            "  No LLM configured - /setup connects one"
         }
     } else {
         "  Type a message and press Enter to start chatting"
@@ -1464,18 +1462,41 @@ fn transcript_is_live(state: &AppState) -> bool {
         })
 }
 
-fn build_chat_history_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-
+/// The transcript as physical rows at `width`, and the entry each row belongs
+/// to (so a click can open that entry in full).
+fn build_chat_rows(
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let entries = state.chat.entries();
     let count = entries.len();
+    let mut rows = Vec::new();
+    let mut owners = Vec::new();
     for (idx, entry) in entries.iter().enumerate() {
-        let is_last = idx + 1 == count;
-        push_chat_entry_lines(&mut lines, entry, is_last, state, theme, width);
+        let mut lines = Vec::new();
+        push_chat_entry_lines(&mut lines, entry, idx + 1 == count, state, theme, width);
         lines.push(Line::default());
+        let entry_rows = wrap_lines_to_rows(&lines, width);
+        owners.extend(std::iter::repeat_n(idx, entry_rows.len()));
+        rows.extend(entry_rows);
     }
+    (rows, owners)
+}
 
-    lines
+/// The transcript entry drawn at screen position `(col, row)`, if any.
+pub(crate) fn chat_entry_at(state: &AppState, col: u16, row: u16) -> Option<usize> {
+    let area = state.chat_area.get();
+    let inside =
+        col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height;
+    if !inside {
+        return None;
+    }
+    let cache = state.chat_rows_cache.borrow();
+    cache
+        .owners
+        .get(cache.scroll + (row - area.y) as usize)
+        .copied()
 }
 
 fn push_chat_entry_lines(
@@ -1626,35 +1647,32 @@ fn push_assistant_chat_lines(
     state: &AppState,
     theme: &Theme,
 ) {
-    let cursor = assistant_stream_cursor(streaming, state.unicode);
-    let display = format!("{content}{cursor}");
-
     // First-line prefix carries the liveness glyph while streaming (e.g. `⢷ ahma `)
     // and collapses the glyph to a space once the turn is done (` ahma `). The
-    // continuation indent matches the 7-column prefix width so wrapped text stays
-    // aligned under the response.
+    // continuation indent matches the prefix width so the reply stays aligned.
     let prefix = assistant_line_prefix(streaming, state);
     const CONT_INDENT: &str = "        "; // 8 spaces == width of "GG ahma "
 
-    for (index, line_str) in display.lines().enumerate() {
-        if index == 0 {
-            lines.push(Line::from(vec![
-                Span::styled(prefix.clone(), theme.running()),
-                Span::styled(line_str.to_string(), theme.normal()),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(CONT_INDENT, theme.running()),
-                Span::styled(line_str.to_string(), theme.normal()),
-            ]));
+    // Replies are Markdown; render it rather than showing the syntax.
+    let mut rendered = crate::markdown::render(content, theme);
+    let cursor = assistant_stream_cursor(streaming, state.unicode);
+    if !cursor.is_empty() {
+        match rendered.last_mut() {
+            Some(last) => last.spans.push(Span::styled(cursor, theme.normal())),
+            None => rendered.push(Line::from(Span::styled(cursor, theme.dim()))),
         }
     }
 
-    if display.is_empty() && streaming {
-        lines.push(Line::from(vec![
-            Span::styled(prefix, theme.running()),
-            Span::styled(assistant_stream_cursor(true, state.unicode), theme.dim()),
-        ]));
+    for (index, line) in rendered.into_iter().enumerate() {
+        let lead = if index == 0 {
+            Span::styled(prefix.clone(), theme.running())
+        } else {
+            Span::styled(CONT_INDENT, theme.running())
+        };
+        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+        spans.push(lead);
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
     }
 }
 
@@ -1942,33 +1960,20 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         return;
     }
 
-    let keys: &[(&str, &str)] = match state.focus {
-        Focus::Work => &[
-            ("↑↓", "nav windows"),
-            ("Enter", "chat with window"),
-            ("Space", "fold/unfold"),
-            ("Tab", "cycle panels"),
-            ("i", "toggle chat"),
-            ("/quit", "quit"),
-        ],
-        Focus::Log => &[
-            ("↑↓", "scroll"),
-            ("w", "wrap"),
-            ("l", "files"),
-            ("Tab", "cycle panels"),
-            ("i", "chat"),
-            ("/quit", "quit"),
-        ],
-        _ => &[
-            ("Enter", "send"),
-            ("Shift+Enter", "newline"),
-            ("Esc", "unfocus window"),
-            ("/provider", "change LLM"),
-            ("/", "commands"),
-            ("?", "help"),
-            ("/quit", "quit"),
-        ],
+    // From the key table the bindings are tested against: the focused
+    // panel's own keys first, then the global ones that apply there.
+    use crate::keymap::{KeyScope, key_docs};
+    let scopes: &[KeyScope] = match state.focus {
+        Focus::Work => &[KeyScope::Work, KeyScope::Global],
+        Focus::Log => &[KeyScope::Log, KeyScope::Global],
+        _ => &[KeyScope::Chat],
     };
+    let keys: Vec<(&str, &str)> = scopes
+        .iter()
+        .flat_map(|&scope| key_docs(scope))
+        .filter(|d| d.footer)
+        .map(|d| (d.label, d.action))
+        .collect();
 
     let mut spans: Vec<Span> = vec![
         Span::styled(format!(" {mode_label} "), theme.footer_key()),
@@ -3790,165 +3795,97 @@ fn format_help_rows<'a>(
 /// The help overlay's rows, as `(left, right)` pairs. Section headers have an
 /// empty right cell; a blank pair is a spacer.
 ///
-/// Module-level so the slash commands they advertise can be checked against
-/// `state::SLASH_COMMANDS` — see `help_rows_reference_only_known_commands`.
-const HELP_LEFT_ROWS: &[(&str, &str)] = &[
-    ("GLOBAL", ""),
-    ("Ctrl-C", "Cancel the running turn; press again to quit"),
-    ("q", "Quit (press again if work is still running)"),
-    ("Tab / Shift-Tab", "Cycle focus"),
-    ("?", "Toggle this help"),
-    ("Esc / ?", "Close help overlay"),
-    ("", ""),
-    ("CHAT", ""),
-    ("Enter", "Send message"),
-    ("Shift+Enter", "Insert newline"),
-    ("Esc", "Clear input; if empty, cancel the running turn"),
-    ("Arrows / Home / End", "Move within editor"),
-    ("", ""),
-    ("CHAT INPUT PREFIXES", ""),
-    (
-        "! <command>",
-        "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
-    ),
-    ("# <goal>", "Decompose goal using LLM"),
-    ("/", "Open navigator (from empty input)"),
-    ("", ""),
-    ("PICKERS", ""),
-    ("Type", "Filter providers/models"),
-    ("Up / Down", "Move selection"),
-    ("Enter / Esc", "Choose / cancel"),
-    ("", ""),
-    ("APPROVAL BANNER", ""),
-    ("y", "Approve gate"),
-    ("n", "Reject gate"),
-];
+/// Key rows come from [`crate::keymap::KEY_REFERENCE`], the one table the
+/// bindings are tested against, so help cannot describe a key that does
+/// something else. The rest — prefixes, commands, mouse — are listed here and
+/// the commands are checked against `state::SLASH_COMMANDS`
+/// (`help_rows_reference_only_known_commands`).
+type HelpRow = (&'static str, &'static str);
 
-const HELP_RIGHT_ROWS: &[(&str, &str)] = &[
-    ("COMMAND NAVIGATOR (/)", ""),
-    ("Type", "Narrow commands/tools"),
-    ("Tab", "Complete selected command"),
-    ("Enter", "Run selected command"),
-    ("/help, /?", "Show keyboard reference"),
-    ("/run <tool> {json}", "Run tool with JSON args"),
-    ("/skills", "List Agent Skills; run one with /<name> [args]"),
-    ("", ""),
-    ("WINDOW ACTIONS", ""),
-    ("/n", "Restore/expand window n"),
-    ("/xn", "Close/cancel window n"),
-    ("/quit", "Quit the application"),
-    ("Click [xn]", "Close/cancel window"),
-    ("Click [+]/[-]", "Toggle expand/collapse"),
-    ("Click card", "Open operation details"),
-    ("", ""),
-    ("WORK VIEW", ""),
-    ("j / k / arrows", "Select row"),
-    (
-        "Enter / Click a header",
-        "Open that section, closing the open one",
-    ),
-    (
-        "Space / Click a task",
-        "Expand it into live/historic output (one at a time)",
-    ),
-    ("Enter on a task", "Full-screen operation detail"),
-    ("Wheel", "Scroll the view"),
-    ("i, /chat", "Open or close the chat pane"),
-    ("f", "Toggle this-project / all-projects filter"),
-    ("c", "Cancel selected"),
-    ("p", "Pin selected"),
-    ("a", "Ask for access (on a denied operation)"),
-    ("/analyze [op_id]", "Ask AI to analyze operation"),
-    ("/log file <path>", "Start log monitoring"),
-    ("/scope", "Show sandbox scope & provenance"),
-    ("", ""),
-    ("LOG", ""),
-    ("/", "Start filter (Esc to clear)"),
-    ("j / k", "Scroll"),
-    ("g / G", "Top / bottom"),
-    ("w", "Toggle line wrap"),
-    ("Enter", "Zoom/restore the pane"),
-    ("l", "Switch log file"),
-    ("Click a line", "Open it full-screen, wrapped"),
-];
+fn push_key_section(rows: &mut Vec<HelpRow>, title: &'static str, scope: crate::keymap::KeyScope) {
+    rows.push((title, ""));
+    rows.extend(crate::keymap::key_docs(scope).map(|d| (d.label, d.action)));
+}
 
-const HELP_SINGLE_ROWS: &[(&str, &str)] = &[
-    ("GLOBAL", ""),
-    ("Ctrl-C", "Cancel the running turn; press again to quit"),
-    ("q", "Quit (press again if work is still running)"),
-    ("Tab / Shift-Tab", "Cycle focus"),
-    ("?", "Toggle this help"),
-    ("Esc / ? (when help open)", "Close help overlay"),
-    ("", ""),
-    ("CHAT", ""),
-    ("Enter", "Send message"),
-    ("Shift+Enter", "Insert newline"),
-    ("Esc", "Clear input; if empty, cancel the running turn"),
-    ("Arrow keys / Home / End", "Move within the editor"),
-    ("", ""),
-    ("CHAT INPUT PREFIXES", ""),
-    (
-        "! <command>",
-        "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
-    ),
-    ("# <goal>", "Decompose goal using LLM (e.g. # run tests)"),
-    ("/", "Open command navigator (from empty input)"),
-    ("", ""),
-    ("PICKERS", ""),
-    ("Type", "Filter providers or models"),
-    ("Up / Down", "Move selection"),
-    ("Enter / Esc", "Choose / cancel"),
-    ("", ""),
-    ("WORK VIEW", ""),
-    ("j / k / arrows", "Select row"),
-    (
-        "Enter / Click a header",
-        "Open that section, closing the open one",
-    ),
-    (
-        "Space / Click a task",
-        "Expand it into live/historic output (one at a time)",
-    ),
-    ("Enter on a task", "Full-screen operation detail"),
-    ("Wheel", "Scroll the view"),
-    ("i, /chat", "Open or close the chat pane"),
-    ("f", "Toggle this-project / all-projects filter"),
-    ("c", "Cancel selected"),
-    ("p", "Pin selected"),
-    ("a", "Ask for access (on a denied operation)"),
-    ("/analyze [op_id]", "Ask AI to analyze operation"),
-    ("/log file <path>", "Start log monitoring"),
-    ("/scope", "Show sandbox scope & provenance"),
-    ("", ""),
-    ("LOG", ""),
-    ("/", "Start filter (Esc to clear)"),
-    ("j / k", "Scroll"),
-    ("g / G", "Top / bottom"),
-    ("w", "Toggle line wrap"),
-    ("Enter", "Zoom/restore the pane"),
-    ("l", "Switch log file"),
-    ("Click a line", "Open it full-screen, wrapped"),
-    ("", ""),
-    ("APPROVAL BANNER", ""),
-    ("y", "Approve gate"),
-    ("n", "Reject gate"),
-    ("", ""),
-    ("COMMAND NAVIGATOR (/)", ""),
-    ("Type", "Narrow commands and tools"),
-    ("Tab", "Complete selected command"),
-    ("Enter", "Run selected command"),
-    ("/help, /?", "Show keyboard reference"),
-    ("/run <tool> {json}", "Run a tool manually with JSON args"),
-    ("/skills", "List Agent Skills; run one with /<name> [args]"),
-    ("", ""),
-    ("WINDOW ACTIONS", ""),
-    ("/n", "Restore/expand window n (e.g. /3)"),
-    ("/xn", "Close/cancel window n (e.g. /x3)"),
-    ("/quit", "Quit the application"),
-    ("Mouse Click on Xn", "Close/cancel window"),
-    ("Mouse Click on Window", "Toggle expand/collapse"),
-    ("Mouse Click on a card", "Open operation details"),
-];
+fn help_left_rows() -> Vec<HelpRow> {
+    use crate::keymap::KeyScope;
+    let mut rows = Vec::new();
+    push_key_section(&mut rows, "GLOBAL", KeyScope::Global);
+    rows.push(("", ""));
+    push_key_section(&mut rows, "CHAT INPUT", KeyScope::Chat);
+    rows.extend([
+        ("", ""),
+        ("CHAT INPUT PREFIXES", ""),
+        (
+            "! <command>",
+            "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
+        ),
+        ("# <goal>", "Decompose a goal into steps with the LLM"),
+        ("/sync", "Tool calls wait for results (default, saved)"),
+        ("/async", "Tool calls return ids to await (saved)"),
+        ("/setup", "Connect an LLM (guided)"),
+        ("/resume", "Bring back this window's saved conversation"),
+        ("Click a tool call", "Open its arguments and result in full"),
+        ("", ""),
+    ]);
+    push_key_section(&mut rows, "APPROVAL PROMPTS", KeyScope::Gate);
+    rows.extend([
+        (
+            "While typing",
+            "these keys type — Esc clears the input first",
+        ),
+        ("", ""),
+        ("PICKERS", ""),
+        ("Type", "Filter providers or models"),
+        ("Up / Down", "Move selection"),
+        ("Enter / Esc", "Choose / cancel"),
+    ]);
+    rows
+}
+
+fn help_right_rows() -> Vec<HelpRow> {
+    use crate::keymap::KeyScope;
+    let mut rows = Vec::new();
+    push_key_section(&mut rows, "WORK VIEW", KeyScope::Work);
+    rows.extend([
+        ("Click a header", "Chat with that window"),
+        ("Click a task", "Expand it into its output"),
+        ("Wheel", "Scroll the view"),
+        ("/analyze [op_id]", "Ask the LLM to analyze an operation"),
+        ("/scope", "Show sandbox scope & provenance"),
+        ("", ""),
+    ]);
+    push_key_section(&mut rows, "LOG", KeyScope::Log);
+    rows.extend([
+        ("Click a line", "Open it full-screen, wrapped"),
+        ("/log file <path>", "Start log monitoring"),
+        ("", ""),
+        ("COMMAND NAVIGATOR (/)", ""),
+        ("Type", "Narrow commands and tools"),
+        ("Tab", "Complete selected command"),
+        ("Enter", "Run selected command"),
+        ("/help, /?", "Show keyboard reference"),
+        ("/run <tool> {json}", "Run a tool with JSON args"),
+        ("/skills", "List Agent Skills; run one with /<name> [args]"),
+        ("", ""),
+        ("WINDOW ACTIONS", ""),
+        ("/n", "Restore/expand window n (e.g. /3)"),
+        ("/xn", "Close/cancel window n (e.g. /x3)"),
+        ("/quit", "Quit the application"),
+        ("Click [xn]", "Close/cancel window"),
+        ("Click [+]/[-]", "Toggle expand/collapse"),
+        ("Click a card", "Open operation details"),
+    ]);
+    rows
+}
+
+/// The narrow layout is both columns, stacked.
+fn help_single_rows() -> Vec<HelpRow> {
+    let mut rows = help_left_rows();
+    rows.push(("", ""));
+    rows.extend(help_right_rows());
+    rows
+}
 
 fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let use_two_columns = area.width >= 100;
@@ -3975,11 +3912,9 @@ fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let left_rows: &[(&str, &str)] = HELP_LEFT_ROWS;
-
-    let right_rows: &[(&str, &str)] = HELP_RIGHT_ROWS;
-
-    let single_rows: &[(&str, &str)] = HELP_SINGLE_ROWS;
+    let left_rows = &help_left_rows();
+    let right_rows = &help_right_rows();
+    let single_rows = &help_single_rows();
 
     // The content is taller than the cap on ordinary terminals, so it scrolls
     // and says so — the scrollbar thumb reaching bottom exactly when the
@@ -4421,7 +4356,7 @@ mod tests {
     fn footer_offers_cancel_while_a_turn_runs_and_flags_a_stall() {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         state.focus = Focus::Chat;
-        assert!(!render_footer(&state, 160).contains("cancel"));
+        assert!(!render_footer(&state, 160).contains("cancel turn"));
 
         state.turn = Some(crate::state::ChatTurn::new(None));
         let footer = render_footer(&state, 160);
@@ -4536,6 +4471,46 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A tool-call line is clipped to one row; the row still knows which
+    /// entry it is, so a click can open the whole call (SPEC R24.8.4).
+    #[test]
+    fn a_tool_call_row_maps_back_to_its_entry_in_full() {
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.chat.push(ChatEntry::User {
+            text: "build it".into(),
+            payload: None,
+            started_at: None,
+            duration_ms: Some(1),
+        });
+        let long_args = format!("{{\"command\":\"cargo build {}\"}}", "x".repeat(200));
+        state
+            .chat
+            .start_tool_call("c1".into(), "run_terminal_command".into(), long_args);
+        state
+            .chat
+            .finish_tool_call("c1", "Finished in 3s".into(), false);
+        state.chat.finish_stream();
+
+        let screen = render_chat_screen(&state, &theme, 60, 20);
+        let row = screen
+            .lines()
+            .position(|l| l.contains("run_terminal_command"))
+            .expect("the tool call is drawn") as u16;
+
+        let idx = chat_entry_at(&state, 5, row).expect("the row has an owner");
+        let detail = state.tool_call_detail(idx).expect("it is the tool call");
+        assert!(
+            detail.contains(&"x".repeat(200)),
+            "full arguments, not the clipped row"
+        );
+        assert!(detail.contains("Finished in 3s"));
+        assert!(
+            state.tool_call_detail(0).is_none(),
+            "a user message is not a tool call"
+        );
     }
 
     /// The wrapped-transcript cache must be *used* when the transcript is
@@ -5067,9 +5042,8 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
 
-        let last = super::HELP_SINGLE_ROWS
-            .last()
-            .expect("the narrow layout has rows");
+        let rows = super::help_single_rows();
+        let last = rows.last().expect("the narrow layout has rows");
         assert!(
             screen.contains(last.0),
             "the final narrow-layout row `{}` must be reachable by scrolling:\n{screen}",
@@ -5107,14 +5081,16 @@ mod tests {
 
         let top = render(0);
         let bottom = render(200); // clamped to the true maximum
+        let rows = help_single_rows();
+        let (_, last) = rows.last().expect("help has rows");
         assert!(top.contains("GLOBAL"), "top shows the first section");
         assert!(
-            !top.contains("Switch log file"),
+            !top.contains(last),
             "the tail must genuinely be off-screen at rest, else this proves nothing"
         );
         assert!(
-            bottom.contains("Switch log file"),
-            "scrolling to the end must reveal the LOG section:\n{bottom}"
+            bottom.contains(last),
+            "scrolling to the end must reveal the last row `{last}`:\n{bottom}"
         );
     }
 
@@ -5606,7 +5582,7 @@ mod tests {
 
 #[cfg(test)]
 mod help_reference_tests {
-    use super::{HELP_LEFT_ROWS, HELP_RIGHT_ROWS, HELP_SINGLE_ROWS};
+    use super::{help_left_rows, help_right_rows, help_single_rows};
     use crate::state::SLASH_COMMANDS;
 
     /// Help rows whose left cell starts with "/" but is not a command name:
@@ -5654,7 +5630,7 @@ mod help_reference_tests {
             })
             .collect();
 
-        for rows in [HELP_LEFT_ROWS, HELP_RIGHT_ROWS, HELP_SINGLE_ROWS] {
+        for rows in [help_left_rows(), help_right_rows(), help_single_rows()] {
             for (left, _) in rows {
                 let Some(cmd) = command_of(left) else {
                     continue;
@@ -5670,7 +5646,7 @@ mod help_reference_tests {
     /// Group rows by their section header and count the rows under each.
     ///
     /// A blank key is a spacer; a row with a key and no description is a
-    /// section header (see the contract above `HELP_LEFT_ROWS`).
+    /// section header (see the contract above `help_left_rows`).
     fn section_sizes(rows: &[(&str, &str)]) -> std::collections::BTreeMap<String, usize> {
         let mut sizes = std::collections::BTreeMap::new();
         let mut current: Option<String> = None;
@@ -5707,14 +5683,13 @@ mod help_reference_tests {
     /// holds the same number of rows.
     #[test]
     fn both_help_layouts_document_the_same_rows() {
-        let two_column: Vec<(&str, &str)> = HELP_LEFT_ROWS
-            .iter()
-            .chain(HELP_RIGHT_ROWS.iter())
-            .copied()
+        let two_column: Vec<(&str, &str)> = help_left_rows()
+            .into_iter()
+            .chain(help_right_rows())
             .collect();
         assert_eq!(
             section_sizes(&two_column),
-            section_sizes(HELP_SINGLE_ROWS),
+            section_sizes(&help_single_rows()),
             "the wide and narrow help layouts document a different set of rows"
         );
     }
@@ -5724,12 +5699,12 @@ mod help_reference_tests {
     /// other is invisible at the other size.
     #[test]
     fn both_help_layouts_document_the_same_commands() {
-        let two_column: std::collections::BTreeSet<String> = HELP_LEFT_ROWS
+        let two_column: std::collections::BTreeSet<String> = help_left_rows()
             .iter()
-            .chain(HELP_RIGHT_ROWS.iter())
+            .chain(help_right_rows().iter())
             .filter_map(|(l, _)| command_of(l))
             .collect();
-        let single: std::collections::BTreeSet<String> = HELP_SINGLE_ROWS
+        let single: std::collections::BTreeSet<String> = help_single_rows()
             .iter()
             .filter_map(|(l, _)| command_of(l))
             .collect();

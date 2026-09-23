@@ -636,6 +636,7 @@ mod tests {
             client: None,
             session_id: None,
             client_pid: None,
+            sampling: false,
             ended_epoch_ms: None,
         }
     }
@@ -1921,6 +1922,7 @@ mod tests {
                 client: None,
                 session_id: None,
                 client_pid: None,
+                sampling: false,
             },
         )
         .await
