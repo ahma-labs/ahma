@@ -1,25 +1,52 @@
 # ahma_http_mcp_client Crate Specification
 
 * **Status**: Approved
-* **Date**: 2026-06-09
+* **License**: MIT OR Apache-2.0
+* **Depends on**: `ahma_common`
+* **Used by**: `ahma_mcp` (stdio proxy, `ahma tool list --http`, external HTTP MCP tools),
+  `ahma_core` (chat agent), `ahma_tui` (live view)
 
 ## 1. User Story / Problem Statement
 
-*As the Ahma server, I want to connect to remote external HTTP/SSE MCP servers with authentication so that I can dispatch subtasks to third-party endpoints securely.*
+*As an in-workspace component that must talk MCP over HTTP — to the ahma bridge or to an
+external server — I want one client implementation of the Streamable HTTP handshake, so that
+no consumer can get the handshake order, the sandbox gate or protocol-version negotiation
+subtly wrong on its own.*
 
 ## 2. Acceptance Criteria
 
-- **HTTP Client Transport**: Implements outbound HTTP POST requests with support for bearer token authentication.
-- **SSE Stream Listener**: Listens to server-sent events from the remote MCP server in a background task.
-- **OAuth 2.0 + PKCE**: Implements secure PKCE auth flow for remote HTTP MCP servers requiring user authorization.
-- **Token Storage**: Securely persists tokens locally.
-- **Token Refresh**: (Planned) Automatically refreshes expired tokens using saved refresh tokens.
+**Shared Streamable HTTP client (`streamable`)**
+- Implements the handshake in this order, and only this order: `initialize` (no session
+  header) → open the `GET /mcp` SSE stream **before** `notifications/initialized` → send
+  `notifications/initialized` → answer the server's `roots/list` over SSE with the same
+  JSON-RPC id → only then `tools/call`. This is the AGENTS.md hard invariant; every
+  in-workspace consumer uses this client rather than its own copy.
+- A `tools/call` before the sandbox locks gets HTTP 409 / JSON-RPC `-32001`; the caller
+  chooses to surface it (`ConflictRetryPolicy::NONE`, `ToolCallOutcome::SandboxInitializing`)
+  or retry on a bounded policy.
+- Negotiates the protocol version at `initialize` and echoes the server's answer in
+  `MCP-Protocol-Version` on every later request (R8.3.5, via `ahma_common::mcp_protocol`).
+- `clientInfo.name` is passed through verbatim — the server keys real behaviour
+  (`supports_progress`, request budget) off it, so it is never normalized.
+- Every timeout is supplied by the caller; nothing is hardcoded here.
+- `delete_session` ends a session with `DELETE /mcp` (R8.3.6).
+
+**Other transports**
+- `client::HttpMcpTransport`: an `rmcp` `Transport` over HTTP POST + SSE for external MCP
+  servers, with optional OAuth 2.0 authorization-code + PKCE. The OAuth endpoints are
+  currently Atlassian's (`auth.atlassian.com`). The callback listens on `127.0.0.1` only.
+- Tokens persist in `~/.ahma/mcp_http_token.json` (file `0600`, directory `0700` on Unix),
+  outside every sandbox scope. The retired `AHMA_HTTP_CLIENT_TOKEN_PATH` is ignored with a
+  warning (R-CFG1.2).
+- `unix_client` (Unix only): the same Streamable HTTP transport over a Unix domain socket,
+  for `ahma serve unix` and the per-user daemon.
 
 ## 3. Non-Functional Requirements
 
-- **Transport Safety**: Outbound calls must respect HTTP/3 client preference where available.
-- **Robustness**: Handles network disconnections and connection drops gracefully.
+- **HTTP/3 preference**: outbound `reqwest` clients prefer HTTP/3 and fall back
+  transparently (R8.7).
 
 ## 4. Out of Scope
 
-- Hosting an MCP server endpoint (handled by `ahma_mcp` / `ahma_http_bridge`).
+- Hosting an MCP endpoint (`ahma_http_bridge`).
+- OAuth token refresh and provider-configurable OAuth endpoints (not implemented).

@@ -57,8 +57,10 @@ const OAUTH_CALLBACK_PORT: u16 = 8080;
 const OAUTH_CALLBACK_ADDR: &str = "127.0.0.1:8080";
 
 const TOKEN_FILE_NAME: &str = "mcp_http_token.json";
-/// Environment variable to override the token storage path.
-const TOKEN_PATH_ENV: &str = "AHMA_HTTP_CLIENT_TOKEN_PATH";
+/// Test seam redirecting the token file. Read only in debug builds
+/// (`cfg!(debug_assertions)`, like `AHMA_TEST_HOME`), so no release binary
+/// honours it; the former `AHMA_HTTP_CLIENT_TOKEN_PATH` is retired (R-CFG1.2).
+const TOKEN_PATH_ENV: &str = "AHMA_TEST_HTTP_CLIENT_TOKEN_PATH";
 
 /// HTTP Transport implementation for the Model Context Protocol (MCP).
 ///
@@ -68,9 +70,8 @@ const TOKEN_PATH_ENV: &str = "AHMA_HTTP_CLIENT_TOKEN_PATH";
 ///
 /// # Token Storage
 ///
-/// Tokens are stored in a JSON file. By default, this is `mcp_http_token.json` in the system's
-/// temporary directory. You can override the full path to this file by setting the
-/// `AHMA_HTTP_CLIENT_TOKEN_PATH` environment variable.
+/// Tokens are stored in `~/.ahma/mcp_http_token.json` (file mode `0600`, directory `0700`
+/// on Unix), outside every sandbox scope.
 pub struct HttpMcpTransport {
     client: reqwest::Client,
     mcp_url: Url,
@@ -507,9 +508,12 @@ fn save_token(token: &StoredToken) -> Result<()> {
 }
 
 fn token_file_path() -> Result<PathBuf> {
-    if let Some(path) = env::var_os(TOKEN_PATH_ENV) {
+    if cfg!(debug_assertions)
+        && let Some(path) = env::var_os(TOKEN_PATH_ENV)
+    {
         return Ok(PathBuf::from(path));
     }
+    ahma_common::config::warn_retired_env("AHMA_HTTP_CLIENT_TOKEN_PATH");
     let home = ahma_common::config::ahma_home_dir()
         .ok_or_else(|| McpHttpError::Custom("Could not determine home directory".to_string()))?;
     Ok(home.join(".ahma").join(TOKEN_FILE_NAME))
@@ -586,6 +590,24 @@ mod tests {
         unsafe {
             env::remove_var(TOKEN_PATH_ENV);
         }
+    }
+
+    /// SPEC R-CFG1.2: `AHMA_HTTP_CLIENT_TOKEN_PATH` is retired — setting it
+    /// must not move where OAuth tokens are read or written.
+    #[test]
+    fn token_file_path_ignores_retired_env_var() {
+        let _guard = token_env_guard().lock();
+        unsafe {
+            env::set_var("AHMA_HTTP_CLIENT_TOKEN_PATH", "/retired/token.json");
+        }
+
+        let path = token_file_path().unwrap();
+
+        unsafe {
+            env::remove_var("AHMA_HTTP_CLIENT_TOKEN_PATH");
+        }
+        assert_ne!(path.to_str().unwrap(), "/retired/token.json");
+        assert!(path.ends_with(TOKEN_FILE_NAME));
     }
 
     #[test]
