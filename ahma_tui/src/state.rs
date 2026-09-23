@@ -1822,10 +1822,10 @@ pub struct AppState {
     pub window_llms: HashMap<String, crate::session_config::WindowLlmConfig>,
     /// Token/context preferences resolved from CLI flags (`--minimize-tokens`,
     /// `--small-model-harness`, `--context-length`).  Flag values override
-    /// settings.toml and the deprecated env vars.
+    /// settings.toml.
     pub token_prefs: crate::TokenPrefs,
     /// Effective token-minimization state for display and the `/minimize` switch.
-    /// Resolved once at startup (flag > env > settings) and kept in sync by the
+    /// Resolved once at startup (flag > settings) and kept in sync by the
     /// `/minimize on|off` command, which also persists `settings.tools`.
     pub minimize_tokens: bool,
     /// Prompt (input) token count of the **most recent** model turn. Unlike the

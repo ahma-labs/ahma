@@ -2,8 +2,8 @@
 
 > **License**: `ahma_core` is dual-licensed under **MIT OR Apache-2.0**.
 
-`ahma_core` is a re-export crate that exposes Ahma's permissive secure execution
-primitives as an embeddable Rust library.
+`ahma_core` exposes Ahma's permissive secure execution primitives, and the chat agent
+that drives ahma's tools, as an embeddable Rust library.
 
 ## Adding to your project
 
@@ -21,7 +21,10 @@ ahma_core = { git = "https://github.com/ahma-labs/ahma.git" }
 | `MonitorConfig` / `OperationStatus` | Monitor configuration and status |
 | `AhmaMcpService` | Full MCP server service |
 | `Adapter` | CLI tool execution adapter |
-| `LlmClient` | OpenAI-compatible LLM client |
+| `LlmClient` | OpenAI- and Anthropic-compatible LLM client |
+| `agent::execute_agent_turn`, `McpChatConfig`, `AgentEvent` | One chat turn: model reply plus the ahma tool calls it makes, over MCP |
+| `approvals` | Per-workspace "always allow" tool grants in the permission ledger |
+| `tool_menu` | Which tools a model is offered; how a small model asks for more |
 
 ## AGPL-licensed sibling crates
 
@@ -31,7 +34,7 @@ those crates.
 
 | Crate | License | Key types |
 |-------|---------|----------|
-| `ahma_tui` | AGPL-3.0 | `TuiApp`, `TuiEvent`, `run_tui` |
+| `ahma_tui` | AGPL-3.0 | `run_tui` and the terminal UI |
 
 Embedding any of these AGPL crates means any modified version offered to remote users
 over a network must publish its modified source code (AGPL-3.0 §13).

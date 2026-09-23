@@ -2,7 +2,8 @@
 //!
 //! A `ratatui`-based terminal UI providing a unified chat and dashboard interface:
 //! multi-line input sends messages to a local LLM, `/` opens a command
-//! navigator, and slash commands (e.g. `/tasks`, `/log`) open full-width sub-window views.
+//! navigator, and slash commands (e.g. `/tasks` focuses the work view, `/log` opens the log).
+//! Requirements: `ahma_tui/SPEC.md`.
 //!
 //! ## License
 //!
@@ -52,7 +53,7 @@ pub static HOME_SEAM_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(())
 ///
 /// `Some(true)` / `Some(false)` are explicit on/off from the
 /// `--minimize-tokens` / `--no-minimize-tokens` (and small-model-harness)
-/// flags; `None` falls back to settings.toml, then the deprecated env vars.
+/// flags; `None` falls back to settings.toml (`AHMA_*` env vars are ignored).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenPrefs {
     pub minimize_tokens: Option<bool>,
