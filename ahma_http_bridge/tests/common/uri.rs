@@ -39,7 +39,6 @@ pub fn normalize_path_for_comparison(path: &str) -> String {
 /// `output.contains(path.to_string_lossy())` whenever the output may
 /// come from a shell command on Windows.
 pub fn paths_equivalent(haystack: &str, needle: &Path) -> bool {
-    let norm_hay = normalize_path_for_comparison(haystack);
     // Resolve Windows 8.3 short paths (e.g., RUNNER~1) to long names if possible.
     // Use dunce::canonicalize to avoid Windows \\?\ prefix and prevent symlink escapes.
     let needle_str = if let Ok(canonical) = dunce::canonicalize(needle) {
@@ -48,7 +47,31 @@ pub fn paths_equivalent(haystack: &str, needle: &Path) -> bool {
         needle.to_string_lossy().into_owned()
     };
     let norm_needle = normalize_path_for_comparison(&needle_str);
-    norm_hay.contains(&norm_needle)
+    // Line by line: the MSYS `/c/` prefix is only recognised at the start of a
+    // string, and a tool result leads with its identity line (`✓ pwd · … exit
+    // 0`, SPEC R2.6.2) with the command's output below it.
+    haystack
+        .lines()
+        .any(|line| normalize_path_for_comparison(line).contains(&norm_needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An MSYS path on the line after an identity line still matches.
+    #[test]
+    fn a_path_below_an_identity_line_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let needle = dunce::canonicalize(dir.path()).unwrap();
+        let shown = needle.to_string_lossy().replace('\\', "/");
+        let msys = match shown.split_once(":/") {
+            Some((drive, rest)) => format!("/{}/{rest}", drive.to_lowercase()),
+            None => shown,
+        };
+        let result = format!("✓ pwd · x · exit 0 · 0.1s\n{msys}");
+        assert!(paths_equivalent(&result, &needle), "{result}");
+    }
 }
 
 /// Create a minimal `pwd` tool config file inside `tools_dir`.
