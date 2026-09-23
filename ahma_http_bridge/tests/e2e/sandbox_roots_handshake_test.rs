@@ -1063,7 +1063,7 @@ async fn test_mixed_valid_invalid_uris() {
 }
 
 // =============================================================================
-// Test: Post-Lock Roots Rejection (R8.4.6)
+// Test: Post-Lock Roots Rejection (R10.5)
 // =============================================================================
 
 /// SECURITY TEST: a `roots/list_changed` after sandbox lock must NOT widen the

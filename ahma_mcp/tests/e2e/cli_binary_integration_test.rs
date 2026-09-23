@@ -6,7 +6,7 @@
 //!
 //! Test philosophy:
 //! - Each binary should have tests for: --help, --version, basic functionality
-//! - Tests use temp directories as per R13.5 (Test File Isolation)
+//! - Tests use temp directories per AGENTS.md "Test File Isolation"
 //! - Tests verify exit codes and output content
 //!
 //! Performance optimization:

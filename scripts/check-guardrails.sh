@@ -125,6 +125,9 @@ if [ "$SKILL_VER_FAIL" -ne 0 ]; then
 fi
 echo "OK Version strings consistent (v${CARGO_VER})"
 
+echo "=== Guardrail: requirement ids cited in code are defined in a spec ==="
+./scripts/check-spec-ids.sh
+
 echo "=== Guardrail: crate root preflight (src/lib.rs or src/main.rs) ==="
 missing=0
 while IFS= read -r manifest; do

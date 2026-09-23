@@ -605,6 +605,10 @@ Capture full logs (`<cmd> 2>&1 | tee …`) and reduce concurrency to a single te
 - **R-GUARD.6**: Guardrail scripts **must** reject any `skills/*/SKILL.md` over the SPEC.md
   R-SK3 500-line cap, so a skill can grow with every feature PR without anyone noticing it
   drifted out of compliance.
+- **R-GUARD.7**: Guardrail scripts and PR CI **must** run `scripts/check-spec-ids.sh`, which
+  fails when a requirement id cited in code (`R5.4`, `R-DAEMON.2`, …) is written in no
+  `SPEC.md` and not in this file. Moving a requirement between SPECs keeps its id; the check
+  is what makes a move that drops one visible.
 
 ---
 

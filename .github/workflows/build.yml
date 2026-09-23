@@ -154,7 +154,7 @@ permissions:
 # taiki-e/install-action, delete the source-build/cache/log-capture steps in sccache-ghac, delete
 # the `SCCACHE_GHA_VERSION` env blocks on job-cargo-nextest and job-android-nextest, put
 # job-android-nextest back to `mode: read-only`, and drop the retry-count reporting added to
-# sccache-verify's summary and its log-upload step. Tracked in SPEC.md R13.2.8.
+# sccache-verify's summary and its log-upload step. Tracked in AGENTS.md §6 "Distributed Caching".
 #
 # Every ghac failure mode is silent, which is why `sccache-verify` asserts rather than prints.
 # Read against sccache v0.17.0 + opendal 0.55.0:
@@ -574,6 +574,9 @@ jobs:
 
       - name: Check workspace license boundaries
         run: bash ./scripts/check-license-boundaries.sh
+
+      - name: Check requirement ids cited in code are defined in a spec
+        run: bash ./scripts/check-spec-ids.sh
 
   #######################################
 

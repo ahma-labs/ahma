@@ -111,7 +111,7 @@ runs:
     #
     # Revert when: mozilla/sccache#2821 lands in a released sccache version, or by January 2027 if
     # it has not landed by then, whichever comes first -- see the "EXPERIMENTAL FORK OF SCCACHE"
-    # note in build.yml (and SPEC.md R13.2.8) for the full revert checklist.
+    # note in build.yml (and AGENTS.md §6 "Distributed Caching") for the full revert checklist.
     - name: Install workflow tools
       if: inputs.extra-tools != ''
       uses: taiki-e/install-action@v2

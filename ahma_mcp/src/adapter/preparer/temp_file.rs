@@ -24,8 +24,8 @@ impl TempFileManager {
             .context("Failed to create temporary file for multi-line argument")?;
 
         // Perform the blocking write on Tokio's blocking thread pool.
-        // Note: spawn_blocking is appropriate here per R16.3 - the tempfile crate
-        // only offers synchronous write APIs.
+        // spawn_blocking is appropriate here (AGENTS.md reserves it for sync-only
+        // third-party APIs): the tempfile crate only offers synchronous writes.
         let temp_file = {
             // Move the NamedTempFile into the blocking task and return it after write.
             let content = content.to_owned();

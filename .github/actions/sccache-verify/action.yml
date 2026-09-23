@@ -82,7 +82,7 @@ runs:
 
         # EXPERIMENT (mozilla/sccache#2821, temporary along with the source build in
         # sccache-ghac; revert when the fix lands upstream or by January 2027, whichever comes
-        # first -- see build.yml's "EXPERIMENTAL FORK OF SCCACHE" note and SPEC.md R13.2.8).
+        # first -- see build.yml's "EXPERIMENTAL FORK OF SCCACHE" note and AGENTS.md §6 "Distributed Caching").
         # Zero write errors is not by itself evidence that the RetryLayer works --
         # a run that was never throttled reports the same zero. What distinguishes them is
         # whether any request had to be retried at all. opendal's RetryLayer logs one
