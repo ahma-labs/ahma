@@ -1,7 +1,9 @@
 # generate_tool_schema Crate Specification
 
 * **Status**: Approved
-* **Date**: 2026-07-27
+* **License**: MIT OR Apache-2.0
+* **Depends on**: `ahma_mcp`
+* **Used by**: developers and `schema_sync_test`
 
 ## 1. User Story / Problem Statement
 

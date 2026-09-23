@@ -24,14 +24,9 @@ pub async fn discover_local_providers() -> Result<Vec<LocalProvider>, LlmMonitor
     let results = futures::future::join_all(probes).await;
 
     let mut discovered = Vec::new();
-    let mut seen_urls = std::collections::HashSet::new();
     let mut seen_names = std::collections::HashSet::new();
 
     for (name, url, models) in results {
-        if seen_urls.contains(url) {
-            continue;
-        }
-
         if !models.is_empty() {
             if seen_names.contains(name) {
                 continue;
@@ -41,7 +36,6 @@ pub async fn discover_local_providers() -> Result<Vec<LocalProvider>, LlmMonitor
                 base_url: url.to_string(),
                 models,
             });
-            seen_urls.insert(url.to_string());
             seen_names.insert(name.to_string());
         }
     }

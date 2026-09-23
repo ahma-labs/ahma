@@ -1,4 +1,3 @@
-#!/usr/bin/env rust-script
 //! # Generate Tool Schema
 //!
 //! A CLI tool that generates the JSON Schema for the Multi-Tool Definition Format (MTDF).
@@ -14,6 +13,10 @@
 //!
 //! If `OUTPUT_DIR` is not provided, it defaults to `docs`.
 //! The schema file is written to `[OUTPUT_DIR]/mtdf-schema.json`.
+//!
+//! This is a binary-only crate, so the examples below are illustrative
+//! (`ignore`): rustdoc does not run doctests for binaries. The unit tests
+//! cover the same behaviour.
 
 use ahma_mcp::config::ToolConfig;
 use ahma_mcp::utils::logging::init_logging;
@@ -24,7 +27,7 @@ use std::path::PathBuf;
 /// Generates the JSON schema for [`ToolConfig`] as a pretty-printed JSON string.
 ///
 /// This function uses `schemars` to introspect the `ToolConfig` struct and produce
-/// a standard JSON Schema (draft-07).
+/// a JSON Schema (draft 2020-12).
 ///
 /// # Returns
 ///
@@ -33,7 +36,7 @@ use std::path::PathBuf;
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// // returns valid JSON string representing the schema
 /// let schema = generate_tool_schema::generate_schema_json().unwrap();
 /// assert!(schema.contains("\"$schema\":"));
@@ -55,7 +58,7 @@ pub fn generate_schema_json() -> Result<String, serde_json::Error> {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use std::path::PathBuf;
 /// use generate_tool_schema::parse_output_dir;
 ///
@@ -93,7 +96,7 @@ where
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use std::path::PathBuf;
 /// use generate_tool_schema::write_schema_to_file;
 ///
@@ -128,7 +131,7 @@ pub fn write_schema_to_file(
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use generate_tool_schema::generate_preview;
 ///
 /// let json = "{\n  \"key\": \"val\"\n}";

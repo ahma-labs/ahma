@@ -1,7 +1,9 @@
 # ahma_bin Crate Specification
 
 * **Status**: Approved
-* **Date**: 2026-06-09
+* **License**: AGPL-3.0
+* **Depends on**: `ahma_mcp`, `ahma_core`, `ahma_tui`, `ahma_common`; `ahma_simplify` (optional, feature `simplify`)
+* **Used by**: end users (the `ahma` binary)
 
 ## 1. User Story / Problem Statement
 
@@ -9,23 +11,24 @@
 
 ## 2. Acceptance Criteria
 
-- **Subcommand Dispatch**: Implements clap-based parser CLI dispatching to:
-  - `serve stdio` — standard stdio MCP server mode
-  - `serve http` — HTTP bridge proxy mode
-  - `tool run/validate/list/info` — run or query tools directly from CLI
-  - `tui` — launch terminal user interface
-  - `tls init/rotate/status` — manage local self-signed TLS certificates
-  - `llm list/add/remove/test` — manage LLM providers in configuration
-  - `settings init/show` — write and inspect the settings file, with provenance
-  - `permissions list/grant/revoke` — the unified permission ledger (root SPEC R-PERM)
-  - `bundle audit/checksum/verify` — supply-chain audit and a SHA-256 content manifest
-- **PowerShell Check (Windows)**: Emits a startup warning and exits if Windows PowerShell (5.1+, built into Windows 10/11) is not present. Root SPEC R6.3.6 governs; the runtime requirement is `powershell`, not `pwsh`.
-- **Markdown Help**: Emits the full CLI command reference as Markdown when invoked with `--markdown-help`.
-- **Settings Loader**: Reads `~/.ahma/settings.toml`, then layers `<workspace>/.ahma/settings.toml` over it for preference-tier keys only (root SPEC R-CFG3). `--no-settings` ignores both; `--settings-path` replaces the user file.
+- **Thin entry point**: `main` parses `ahma_mcp::shell::cli::Cli` and dispatches. The
+  subcommand set is the `Subcommands` enum in `ahma_mcp/src/shell/cli/mod.rs` (run
+  `ahma --help`); this crate adds only the handlers that need AGPL crates — `tui`,
+  `simplify`, `llm` — and never duplicates the list.
+- **AppContainer re-entry first**: on Windows, `ahma.exe` re-executes itself to launch each
+  sandboxed command, so `appcontainer_launcher_hook()` runs before clap parses anything.
+- **Hooks fail open on a parse error**: a malformed `ahma hooks exec …` (for example a hook
+  file written by another ahma version) emits a concise `allow` decision and exits 0, rather
+  than a usage banner the editor would show as "Hook blocked". `--help`/`--version` still
+  print normally.
+- **Markdown help**: `ahma --markdown-help` prints the whole CLI reference as Markdown.
+- **PowerShell check (Windows)**: warns and exits if Windows PowerShell 5.1+ is missing
+  (R6.3.6; the requirement is `powershell`, not `pwsh`).
+- **Features**: `simplify` (default) links `ahma_simplify`; without it `ahma simplify` fails
+  with an error naming the feature. `otel` enables OpenTelemetry export; `full` = both.
 
 ## 3. Non-Functional Requirements
 
-- **Binary Portability**: Compiles cleanly into a single static binary.
 - **License Compliance**: Subject to the AGPL-3.0 license, enforcing source disclosure for distributed changes.
 
 ## 4. Out of Scope

@@ -149,9 +149,25 @@ fn update_other_stale_files(root: &Path, new_ver: &str) {
             println!("  {label}: already at {new_ver} ✓");
         }
     }
+    let lock_stale = fs::read_to_string(root.join("Cargo.lock"))
+        .map(|lock| lockfile_needs_refresh(&lock, new_ver))
+        .unwrap_or(true);
+    if lock_stale {
+        println!("  Cargo.lock: workspace members lag {new_ver}; refreshing");
+        refresh_cargo_lock(root, new_ver);
+        any_updated = true;
+    } else {
+        println!("  Cargo.lock: already at {new_ver} ✓");
+    }
     if !any_updated {
         println!("All files already at {new_ver} — nothing to do.");
     }
+}
+
+/// Whether `Cargo.lock` must be refreshed for `new_ver`: true unless the
+/// `ahma_bin` workspace member is already recorded at exactly that version.
+fn lockfile_needs_refresh(lock_contents: &str, new_ver: &str) -> bool {
+    package_version_in_lock(lock_contents, "ahma_bin").as_deref() != Some(new_ver)
 }
 
 fn perform_normal_bump(root: &Path, cargo_toml_path: &Path, cur_ver: &str, new_ver: &str) {
@@ -2110,6 +2126,21 @@ mod clean_stale_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// A re-run at the current version must still repair a stale lockfile:
+    /// every CI build uses `--locked`, so a stale `Cargo.lock` is exactly the
+    /// failure the idempotent path exists to fix (xtask/SPEC.md).
+    #[test]
+    fn lockfile_needs_refresh_when_members_lag_the_version() {
+        let stale = "[[package]]\nname = \"ahma_bin\"\nversion = \"0.1.0\"\n";
+        let fresh = "[[package]]\nname = \"ahma_bin\"\nversion = \"0.2.0\"\n";
+        assert!(super::lockfile_needs_refresh(stale, "0.2.0"));
+        assert!(!super::lockfile_needs_refresh(fresh, "0.2.0"));
+        assert!(
+            super::lockfile_needs_refresh("", "0.2.0"),
+            "a lockfile without ahma_bin cannot be trusted"
+        );
+    }
 
     #[test]
     fn test_replace_substring_updates_all_occurrences() {

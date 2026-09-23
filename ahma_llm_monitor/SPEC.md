@@ -1,7 +1,9 @@
 # ahma_llm_monitor Crate Specification
 
 * **Status**: Approved
-* **Date**: 2026-07-27
+* **License**: MIT OR Apache-2.0
+* **Depends on**: `ahma_common`
+* **Used by**: `ahma_mcp` (livelog, log monitor), `ahma_core` (chat agent), `ahma_tui`
 
 ## 1. User Story / Problem Statement
 
@@ -14,12 +16,13 @@
 - **Log Analysis**: Accepts a log chunk plus a natural-language `detection_prompt` and returns whether the chunk warrants an alert, backing the `livelog` tool type and `--log-monitor`.
 - **Streaming Chat**: `chat_stream` yields incremental tokens for the TUI chat interface rather than blocking to completion.
 - **Tool Calls**: `ChatToolCall` carries provider tool-invocation requests back to the caller.
+- **Local Model Residency**: `loaded_local_models` / `is_model_resident` report which models a local server has loaded, so the TUI can show a "loading model" phase instead of an unexplained wait; `num_ctx` is sent only to endpoints that accept it (Ollama).
+- **Loopback Detection**: `is_loopback_url` is the one test for "this provider runs on this machine".
 - **Local Provider Discovery**: `discover_local_providers` probes well-known local endpoints (e.g. Ollama, LM Studio) and reports which are reachable, so a local model can be chosen without manual configuration.
 - **Typed Errors**: Failures surface as `LlmMonitorError` variants — `Api` (with an `ApiErrorKind` classification: rate-limited, auth, context-length exceeded, invalid request, server; plus the provider-reported message and any `Retry-After`), `Connect`, `Timeout`, `Http`, `Parse`. Classification of a provider error response happens once, in this crate; consumers MUST branch on the typed variants/kinds (e.g. `is_tools_rejected`, `is_timeout`), never by substring-matching rendered error text. The provider's raw message stays available on the error for display and logging.
 
 ## 3. Non-Functional Requirements
 
-- **Rate Limiting**: Alert emission is rate-limited by the caller (`--monitor-rate-limit`, default 60s) so a noisy log cannot flood the agent with notifications.
 - **Failure Isolation**: An unreachable or erroring LLM provider MUST degrade to "no alert" and log the failure. It MUST NOT fail the monitored operation, which is unrelated to the analysis.
 - **No Cloud Egress By Default**: Discovery prefers local providers; a remote provider is used only when explicitly configured.
 
