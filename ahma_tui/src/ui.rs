@@ -1971,8 +1971,7 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     let keys: Vec<(&str, &str)> = scopes
         .iter()
         .flat_map(|&scope| key_docs(scope))
-        .filter(|d| d.footer)
-        .map(|d| (d.label, d.action))
+        .filter_map(|d| d.footer.map(|short| (d.label, short)))
         .collect();
 
     let mut spans: Vec<Span> = vec![
@@ -4369,6 +4368,29 @@ mod tests {
         state.turn.as_mut().unwrap().last_event =
             std::time::Instant::now() - crate::state::TURN_STALL_AFTER;
         assert!(render_footer(&state, 160).contains("no response"));
+    }
+
+    /// The footer is one line: every panel's footer keys, including how to
+    /// quit and get help, must fit a 120-column terminal. The help text was
+    /// used once and pushed `q` and `?` off the edge.
+    #[test]
+    fn the_footer_fits_and_always_offers_quit_and_help() {
+        for focus in [Focus::Work, Focus::Log] {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.focus = focus;
+            let footer = render_footer(&state, 120);
+            assert!(
+                footer.contains("quit") && footer.contains("help"),
+                "{focus:?}: {footer}"
+            );
+        }
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+        let footer = render_footer(&state, 120);
+        assert!(
+            footer.contains("send") && footer.contains("help"),
+            "{footer}"
+        );
     }
 
     /// A fresh hint replaces the key list; it is the thing the user must read.
