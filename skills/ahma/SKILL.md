@@ -185,7 +185,7 @@ ahma hooks uninstall --platform copilot --scope user
 
 Key points: **installed ≠ active** (only active when an ahma MCP server is detected for that
 client, unless forced with `AHMA_HOOKS=on|off`); **fail-safe, not silent** (a command ahma can't
-sandbox is blocked, not run unsandboxed — `ahma hooks doctor` diagnoses it); hooks and the MCP
+sandbox is blocked, not run unsandboxed — `ahma hooks doctor` diagnoses it; `ahma doctor` checks ahma overall and fixes only on `y`); hooks and the MCP
 server are complementary, not redundant (they sandbox different command streams, so running
 both is safe).
 

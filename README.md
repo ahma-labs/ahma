@@ -290,8 +290,13 @@ animation, and a task inside expands into its live output.
   stops a running reply.
 - **Sync or async**: the status header shows how tool calls return; `/sync` and
   `/async` switch it (saved to settings).
+- **Trust a folder once**: the first open asks "Trust this folder?"; yes lets
+  tools work inside it without asking, while anything outside it, network
+  access and settings changes still ask.
+- **New here?** `/intro` is ahma in one screen; `/settings <words>` finds any
+  setting; `/doctor` checks ahma's health and fixes things only with your OK.
 
-See [docs/tui.md](docs/tui.md).
+See [docs/tui.md](docs/tui.md) and [docs/doctor.md](docs/doctor.md).
 
 ### One daemon per user
 

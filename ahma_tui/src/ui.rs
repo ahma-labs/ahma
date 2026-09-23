@@ -77,6 +77,44 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     if state.trust_prompt.is_some() {
         draw_trust_modal(frame, state, theme, full);
     }
+    if state.doctor_confirm.is_some() {
+        draw_doctor_confirm(frame, state, theme, full);
+    }
+}
+
+/// "Apply this fix?" for `/doctor fix <n>`: the exact change, then `y`.
+fn draw_doctor_confirm(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let Some(fix) = &state.doctor_confirm else {
+        return;
+    };
+    let popup = centered_rect(76, 9, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(
+            " Doctor · apply this fix? ",
+            theme.title().bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let mut lines = vec![
+        Line::from(Span::styled(fix.describe(), theme.normal())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Recorded in ~/.ahma/permissions-audit.jsonl.",
+            theme.dim(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [y] ", theme.success().bold()),
+            Span::styled("Apply    ", theme.normal().bold()),
+            Span::styled("[n] ", theme.failed().bold()),
+            Span::styled("Leave it (default)", theme.normal()),
+        ]),
+    ];
+    lines.extend(gate_typing_note(state, theme));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// The one-time "trust this folder?" question (SPEC R-PERM.1.3). Says plainly

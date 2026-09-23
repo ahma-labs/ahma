@@ -216,6 +216,12 @@ first matching row — `/settings trust`, `/settings timeout`. Changing trust or
 forgetting this folder's always-allowed tools takes a second, confirming Space;
 security switches show the command-line flag that sets them.
 
+`/doctor` checks ahma's own health — settings, granted folders that no longer
+exist, the daemon's build, trust, repeating log warnings — and `/doctor fix <n>`
+applies a fix only after you see it and press `y`. `/doctor <question>` asks the
+chat model about ahma with that report in hand; it can advise, never apply. See
+[docs/doctor.md](doctor.md).
+
 ## What the model is doing
 
 While a chat turn runs, a status line pinned under the transcript says what is happening, in words, from real events only:

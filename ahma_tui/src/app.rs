@@ -221,6 +221,7 @@ pub async fn run(
                                 || handle_help_key(key, &mut state)
                                 || handle_picker_key(key, &mut state)
                                 || handle_trust_key(key, &mut state)
+                                || handle_doctor_confirm_key(key, &mut state)
                                 || handle_intro_key(key, &mut state)
                                 || handle_scope_grant_key(key, &mut state)
                                 || handle_web_approval_key(key, &mut state)
@@ -2854,6 +2855,7 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
         || handle_agent_nav_command(cmd, state)
         || handle_export_nav_command(cmd, state)
         || handle_settings_nav_command(cmd, state)
+        || handle_doctor_nav_command(cmd, state)
         || handle_tools_nav_command(cmd, state)
         || handle_approval_nav_command(cmd, state)
         || handle_provider_admin_command(cmd, state)
@@ -3228,6 +3230,153 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
         _ => return false,
     }
 
+    true
+}
+
+/// `/doctor` (SPEC R-DOCTOR): the shared health report; `/doctor fix <n>` to
+/// apply one of its fixes after a `y`; `/doctor <question>` to ask the chat
+/// model about ahma with the report as context. The model can explain and
+/// suggest; only the user applies a fix.
+fn handle_doctor_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    let rest = match cmd.strip_prefix("/doctor") {
+        Some(rest) if rest.is_empty() || rest.starts_with(' ') => rest.trim(),
+        _ => return false,
+    };
+    // Picked from the menu: the entry's own placeholder.
+    if rest.starts_with('[') || rest.starts_with('<') {
+        run_doctor_report(state);
+        return true;
+    }
+    if let Some(n) = rest.strip_prefix("fix") {
+        let n = n.trim();
+        match n.parse::<usize>().ok().and_then(|n| n.checked_sub(1)) {
+            Some(i) if i < state.doctor_fixes.len() => {
+                state.doctor_confirm = Some(state.doctor_fixes[i].clone());
+            }
+            _ => push_assistant_message(
+                state,
+                format!(
+                    "There is no fix {n:?}. Run /doctor for the current list ({} fix(es)).",
+                    state.doctor_fixes.len()
+                ),
+            ),
+        }
+        return true;
+    }
+    if rest.is_empty() {
+        run_doctor_report(state);
+    } else {
+        ask_doctor(state, rest, cmd);
+    }
+    true
+}
+
+fn doctor_findings(state: &crate::state::AppState) -> Vec<ahma_common::doctor::Finding> {
+    let workspace = std::path::PathBuf::from(&state.workspace);
+    ahma_common::doctor::run(&ahma_common::doctor::DoctorInput::for_workspace(&workspace))
+}
+
+fn run_doctor_report(state: &mut crate::state::AppState) {
+    let findings = doctor_findings(state);
+    state.doctor_fixes = ahma_common::doctor::fixes(&findings);
+    let mut text = format!(
+        "**ahma doctor**\n\n```\n{}```\n",
+        ahma_common::doctor::render(&findings)
+    );
+    if state.doctor_fixes.is_empty() {
+        text.push_str("\nNothing to fix.");
+    } else {
+        text.push_str("\n`/doctor fix <n>` applies a fix — it is shown again and needs your `y`.");
+    }
+    text.push_str(" Ask about anything with `/doctor <question>`.");
+    push_assistant_message(state, text);
+    state.chat_open = true;
+    state.chat_scroll = 0;
+}
+
+/// `/doctor <question>`: a chat turn whose payload carries the report and the
+/// rules the model must keep; the transcript shows only what was typed.
+fn ask_doctor(state: &mut crate::state::AppState, question: &str, typed: &str) {
+    let (base_url, model) = parse_llm_selection(state);
+    if base_url.is_empty() {
+        run_doctor_report(state);
+        push_assistant_message(
+            state,
+            "No model is set up to answer questions yet — /setup connects one. The report above \
+             needs no model.",
+        );
+        return;
+    }
+    let findings = doctor_findings(state);
+    state.doctor_fixes = ahma_common::doctor::fixes(&findings);
+    let payload = format!(
+        "You are ahma's doctor: you help the user understand and adjust ahma, the sandboxed \
+         local agent and tool server they are running.\n\n\
+         Rules you must keep:\n\
+         - You cannot change ahma's settings or permissions, and must not try: ~/.ahma is \
+           outside every sandbox by design. Say exactly what the user can do instead — a \
+           `/settings <words>` row, a `/doctor fix <n>` from the report, or an `ahma` command.\n\
+         - Never suggest widening access (trusting a folder, granting a path, allowing a \
+           domain, disabling the sandbox) without saying plainly what it would let tools do.\n\
+         - Be brief. Lead with the answer.\n\n\
+         Current health report (fixes are numbered for `/doctor fix <n>`):\n```\n{}```\n\
+         This folder: {}\nChat model: {}\n\n\
+         The user asks: {question}",
+        ahma_common::doctor::render(&findings),
+        state.workspace,
+        state.llm_label(),
+    );
+    state.turn_retries = 0;
+    state.chat.push(crate::state::ChatEntry::User {
+        text: typed.to_string(),
+        payload: Some(payload),
+        started_at: Some(std::time::Instant::now()),
+        duration_ms: None,
+    });
+    state.chat.push(crate::state::ChatEntry::Assistant {
+        content: String::new(),
+        streaming: true,
+    });
+    state.chat_open = true;
+    state.chat_scroll = 0;
+    send_chat_turn(state, base_url, model);
+}
+
+/// Keys for the doctor's "apply this fix?" question: only `y` applies.
+fn handle_doctor_confirm_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut crate::state::AppState,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if state.doctor_confirm.is_none()
+        || state.text_entry_modal_open()
+        || state.log_filter_active
+        || state.typing_in_chat()
+    {
+        return false;
+    }
+    let apply = match (key.code, key.modifiers) {
+        (KeyCode::Char('y'), KeyModifiers::NONE) => true,
+        (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => false,
+        _ => return false,
+    };
+    let Some(fix) = state.doctor_confirm.take() else {
+        return false;
+    };
+    let message = if apply {
+        match fix.apply(&chrono::Local::now().to_rfc3339()) {
+            Ok(done) => format!("{done}."),
+            Err(e) => format!("Could not apply the fix: {e:#}"),
+        }
+    } else {
+        "Fix not applied.".to_string()
+    };
+    state
+        .chat
+        .push(crate::state::ChatEntry::Notice { text: message });
+    // The numbering belonged to that report; make the next fix come from a
+    // fresh one.
+    state.doctor_fixes.clear();
     true
 }
 
@@ -7198,6 +7347,66 @@ mod tests {
         assert!(
             state.chat_input_is_empty(),
             "y must not land in the input box"
+        );
+    }
+
+    /// `/doctor` reports; `/doctor fix 1` shows the exact change; only `y`
+    /// makes it (SPEC R-DOCTOR.2).
+    #[test]
+    fn doctor_fixes_only_what_the_user_confirmed() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::HOME_SEAM_GUARD.lock();
+        // SAFETY: nextest runs this test in its own process; set before any read.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let gone = std::path::PathBuf::from("/opt/doctor-test-gone");
+        ahma_common::config::AhmaSettings::update(|s| {
+            s.sandbox
+                .persistent_scopes
+                .push(ahma_common::config::PersistentScope {
+                    path: gone.clone(),
+                    access: ahma_common::config::ScopeAccess::Rw,
+                    granted_by: Some("cargo_build".into()),
+                    granted_at: None,
+                    note: None,
+                });
+        })
+        .unwrap();
+        let scopes = || {
+            ahma_common::config::AhmaSettings::load()
+                .sandbox
+                .persistent_scopes
+                .len()
+        };
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.workspace = home.path().to_string_lossy().into_owned();
+        super::dispatch_nav_command("/doctor", &mut state);
+        assert_eq!(state.doctor_fixes.len(), 1);
+
+        super::dispatch_nav_command("/doctor fix 1", &mut state);
+        assert!(state.doctor_confirm.is_some(), "shown, not applied");
+        assert_eq!(scopes(), 1);
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        assert!(super::handle_doctor_confirm_key(
+            key(KeyCode::Enter),
+            &mut state
+        ));
+        assert_eq!(scopes(), 1, "Enter leaves it");
+
+        super::dispatch_nav_command("/doctor", &mut state);
+        super::dispatch_nav_command("/doctor fix 1", &mut state);
+        assert!(super::handle_doctor_confirm_key(
+            key(KeyCode::Char('y')),
+            &mut state
+        ));
+        assert_eq!(scopes(), 0, "y applies it");
+
+        super::dispatch_nav_command("/doctor fix 7", &mut state);
+        assert!(
+            state.doctor_confirm.is_none(),
+            "no such fix, nothing to confirm"
         );
     }
 

@@ -549,7 +549,31 @@ pub fn ahma_home_dir() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("AHMA_TEST_HOME") {
         return Some(PathBuf::from(p));
     }
+    #[cfg(debug_assertions)]
+    if crate::test_isolation::spawned_under_test_harness() {
+        return Some(test_run_home());
+    }
     dirs::home_dir()
+}
+
+/// The home a test gets when it did not choose one: private to this test run,
+/// never the developer's real one.
+///
+/// Tests that exercise a persisting path without setting `AHMA_TEST_HOME`
+/// used to write straight into the real `~/.ahma/settings.toml` — a permission
+/// broker test granted `/opt/two` read+write "by cargo_build" on every run,
+/// and every later ahma session tried to add it to its sandbox (2026-09-23).
+/// Debug builds only: a shipped binary always uses the real home.
+///
+/// Under the user cache directory rather than the temp directory: tests of the
+/// sandbox's temp-dir rules must not find ahma's own home inside the path they
+/// are reasoning about.
+#[cfg(debug_assertions)]
+fn test_run_home() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ahma-test-homes")
+        .join(crate::test_isolation::test_run_discriminator())
 }
 
 /// Returns the canonical path to `~/.ahma/config.toml`, or `None` if the home
@@ -2594,6 +2618,24 @@ fn atomic_write_toml(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under the test harness, a test that did not choose a home never gets
+    /// the developer's real one (see `test_run_home`).
+    #[test]
+    fn a_test_without_a_chosen_home_never_touches_the_real_one() {
+        // SAFETY: nextest runs this test in its own process.
+        unsafe {
+            std::env::remove_var("AHMA_TEST_HOME");
+            std::env::set_var("AHMA_TEST_ISOLATION", "1");
+        }
+        let home = ahma_home_dir().unwrap();
+        assert_ne!(Some(home.clone()), dirs::home_dir());
+        assert!(
+            home.to_string_lossy().contains("ahma-test-homes"),
+            "{}",
+            home.display()
+        );
+    }
 
     /// `update` works on the file as it is now, so a grant written by someone
     /// else after we last looked survives our write.

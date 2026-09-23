@@ -46,6 +46,8 @@
 | Logging (File + Stderr) | tests-pass | Daily rolling logs, `--log-to-stderr` for debug |
 | Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
 | TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
+| Trusted folders, one question per tool (R-PERM.1.2, R-PERM.1.3) | tests-pass | One "Trust this folder?" per folder covers everything inside its sandbox; boundary-crossing tools still ask; parallel calls share one question |
+| Doctor (R-DOCTOR) | tests-pass | `ahma doctor [--fix]` and TUI `/doctor`: shared read-only checks (settings, missing grants, daemon build, trust, log warnings); fixes applied only after a per-fix `y`; `/doctor <question>` lets the chat model explain with the report as context |
 | Unified Work View (R24, R24.9, R24.10) | tests-pass | The TUI's home view: one borderless section per client session (hooks and this terminal folded), one open at a time with a 300 ms eased tween, chat on a toggle. Current at startup via daemon replay with true timestamps and the retained output window; ordering independent of activity; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
 | Configuration Standard (R-CFG) | in-progress | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5). Done: Security-tier `AHMA_*` retirement (warn-and-ignore, R-CFG1.2/R-CFG7.1), settings-file/`--no-settings` resolution, settings provenance (`ahma settings show --origin`, R-CFG5.1), trust tiers (`settings_tier`, with a drift test over every key), and the project-tier settings file (R-CFG3: Preference-only, Security keys refused and named). Pending: R-CFG5.2 per-setting startup log lines, R-CFG6.2 unknown-key abort for `[sandbox]`/`[auth]` in the *user* file, R-CFG6.3 permissions warning |
 | Unified Permissions (R-PERM) | tests-pass | One ledger under `~/.ahma` (fs scopes, web domains, tool approvals; legacy `approvals.json` migrated); question ladder (harness elicitation → TUI modal → fail-closed with paste-able remediation); sandbox profiles replace the hard-coded toolchain carve-outs; hooks enabled per client. User guide: `docs/permissions.md` |
@@ -698,6 +700,29 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
   - An **audit-log write failure is non-fatal** and **must not** fail the grant it is recording. The grant was already confirmed by a human and is safely in the settings file; losing the *record* of it is a lesser harm than losing the *grant*. Failures are logged, not propagated.
   - A **legacy-migration failure (R-PERM.1) must never block startup**. The worst case is that the user re-approves a tool once; refusing to start because an old `approvals.json` could not be read would turn a bookkeeping problem into an outage.
   - Neither relaxation may ever run the *other* way: a failure to **persist a grant** is fatal to that grant and **must** be reported, because silently continuing would leave the user believing they had granted something they had not.
+
+#### R-DOCTOR: ahma explains itself, and repairs only with consent
+
+- **R-DOCTOR.1 — One set of checks.** `ahma doctor` and the TUI's `/doctor` run
+  the same checks (`ahma_common::doctor`): settings parse, granted folders that
+  no longer exist, approvals for folders that no longer exist, the daemon's
+  build against this binary's, this folder's trust, and the most repeated
+  warnings in the latest log. Each finding says what it costs and what would
+  fix it. The checks are read-only.
+- **R-DOCTOR.2 — A fix is shown, then confirmed, one at a time.** A fix
+  changes nothing until the user answered `y` to that exact fix (TUI modal, or
+  `--fix` on a terminal; without a terminal nothing changes). Every fix writes
+  through `AhmaSettings::update` and is recorded in the permission audit log.
+- **R-DOCTOR.3 — The model advises; it never applies.** `/doctor <question>`
+  sends the report and the question to the chat model with rules it must keep:
+  it cannot change settings (they are outside every sandbox, R5.4.8), it names
+  the `/settings` row, `/doctor fix <n>` or `ahma` command the user can use
+  instead, and it never suggests widening access without saying what that
+  would allow. Nothing in its answer reaches a fix.
+- **R-DOCTOR.4 — Tests never touch the real home.** In debug builds under a
+  test harness, a test that did not choose a home (`AHMA_TEST_HOME`) gets a
+  private per-run one: a test once wrote a `/opt/two` grant into the
+  developer's real settings on every run.
 
 #### The question ladder (where a permission question is asked)
 

@@ -59,6 +59,45 @@ mod ahma_mcp_tests {
         );
     }
 
+    /// `ahma doctor` reports on a chosen home and folder, changes nothing
+    /// without --fix, and says what fixing would do (SPEC R-DOCTOR).
+    #[test]
+    fn test_ahma_doctor_reports_and_changes_nothing_by_default() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+        let home = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let settings = home.path().join(".ahma").join("settings.toml");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            "[sandbox]\npersistent_scopes = [{ path = \"/opt/ahma-doctor-e2e-gone\" }]\n",
+        )
+        .unwrap();
+
+        let output = test_command(&binary)
+            .env("AHMA_TEST_HOME", home.path())
+            .args(["doctor", "--path"])
+            .arg(ws.path())
+            .output()
+            .expect("Failed to execute ahma doctor");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("Granted folders that no longer exist"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("ahma doctor --fix"), "{stdout}");
+        let after = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            after.contains("/opt/ahma-doctor-e2e-gone"),
+            "without --fix the grant is still there"
+        );
+    }
+
     #[test]
     fn test_ahma_mcp_version() {
         let binary = build_binary_cached("ahma_bin", "ahma");

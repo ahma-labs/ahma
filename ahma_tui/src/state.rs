@@ -619,6 +619,14 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/agent delete <name>", "delete an agent profile"),
     ("/export markdown", "export chat transcript to markdown"),
     ("/intro", "ahma in one screen — Enter on a line for more"),
+    (
+        "/doctor [question]",
+        "check ahma's health; ask it anything about ahma; fixes only with your OK",
+    ),
+    (
+        "/doctor fix <n>",
+        "apply fix n from the last /doctor report (asks first)",
+    ),
     ("/getting-started", "same as /intro"),
     (
         "/settings [search]",
@@ -1844,6 +1852,10 @@ pub struct AppState {
     /// the canonical folder it is about. `None` once answered, or when the
     /// folder is already trusted or may never be (home, a root).
     pub trust_prompt: Option<String>,
+    /// Fixes the last `/doctor` report offered, numbered from 1 in order.
+    pub doctor_fixes: Vec<ahma_common::doctor::Fix>,
+    /// A doctor fix waiting for the user's `y` (SPEC R-DOCTOR.2).
+    pub doctor_confirm: Option<ahma_common::doctor::Fix>,
     pub tools_list: Vec<crate::mcp_connections::ToolInfo>,
     pub mcp_connections: McpConnectionManager,
 
@@ -2587,6 +2599,8 @@ impl AppState {
                 .unwrap_or_default(),
             displaced_client_model: None,
             trust_prompt: None,
+            doctor_fixes: Vec::new(),
+            doctor_confirm: None,
             tools_list: vec![],
             mcp_connections,
 

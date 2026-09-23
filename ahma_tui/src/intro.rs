@@ -85,11 +85,11 @@ pub const TOPICS: &[Topic] = &[
     },
     Topic {
         title: "When something is off",
-        summary: "/log shows what ahma itself is doing; /scope shows what the sandbox allows.",
+        summary: "/doctor checks ahma and explains; it fixes things only with your OK.",
         detail: &[
-            "The header says whether ahma and its daemon are reachable, and for how long one",
-            "has been down. A blocked command says what it was denied — press a on it to be",
-            "asked about that path again.",
+            "It checks settings, granted folders, the daemon's build, trust and the logs. Ask",
+            "it anything about ahma with /doctor <question>. /log shows ahma's own log live;",
+            "/scope shows what the sandbox allows.",
         ],
     },
 ];
