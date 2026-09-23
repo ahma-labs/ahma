@@ -93,6 +93,7 @@ meant setting one changed the chat client's behaviour but not the server's.
 | `AHMA_REQUIRE_TOKEN_PATH` | `--require-token-path` CLI flag or `auth.require_token_path` in settings.toml |
 | `AHMA_RATE_LIMIT_RPS` | `--rate-limit-rps` CLI flag or `auth.rate_limit_rps` in settings.toml |
 | `AHMA_RATE_LIMIT_BURST` | `--rate-limit-burst` flag or `auth.rate_limit_burst` in settings.toml |
+| `AHMA_HTTP_CLIENT_TOKEN_PATH` | none — OAuth tokens for external HTTP MCP servers always live in `~/.ahma/mcp_http_token.json` |
 
 ---
 
@@ -180,6 +181,7 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_DAEMON_SOCK` | Isolates each test process's daemon to a unique Unix socket path |
 | `AHMA_DAEMON_PORT` | Isolates each test process's daemon to a unique TCP port (Windows) |
 | `AHMA_TEST_BINARY` | Locates the compiled test binary for in-process test helpers |
+| `AHMA_TEST_HTTP_CLIENT_TOKEN_PATH` | Redirects the external-MCP OAuth token file in `ahma_http_mcp_client` tests. Compiled in **debug builds only** — a release binary ignores it |
 | `AHMA_TEST_HOME` | Redirects `~` resolution (`ahma_common::config::ahma_home_dir`) at a temp directory so a test can supply its own `~/.ahma/settings.toml`. Compiled in **debug builds only** (`#[cfg(debug_assertions)]`) — a release binary ignores it |
 | `AHMA_TEST_ISOLATION` | Set by test harnesses on spawned ahma binaries: forces private (non-global) bridge/daemon endpoints (SPEC R-ISO.1) |
 | `NEXTEST` / `NEXTEST_RUN_ID` | Set by `cargo nextest`, inherited by spawned binaries; read solely to force the same private-endpoint isolation as `AHMA_TEST_ISOLATION` — the single R-CFG9.2 carve-out (SPEC R-ISO.1) |

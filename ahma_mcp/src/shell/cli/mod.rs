@@ -1111,8 +1111,8 @@ pub struct Cli {
 
     /// Route every sandboxed subprocess through a guarded egress proxy, so tools
     /// reach only the domains in `[network] allow` (deny-all when empty) and never
-    /// private/loopback/cloud-metadata addresses. Advisory (a tool that ignores
-    /// HTTP_PROXY is not contained); see the README network-restriction limits.
+    /// private/loopback/cloud-metadata addresses. Kernel-enforced on macOS and
+    /// Linux 6.7+ (TCP only on Linux); advisory elsewhere — see docs/network-egress.md.
     /// Equivalent to `[network] restrict = true`.
     #[arg(long = "restrict-network", global = true)]
     pub restrict_network: bool,

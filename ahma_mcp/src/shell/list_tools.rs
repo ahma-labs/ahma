@@ -7,17 +7,17 @@
 //!
 //! Connect via command-line arguments:
 //! ```bash
-//! ahma_mcp --list-tools -- /path/to/ahma_mcp --tools-dir ./tools
+//! ahma tool list -- /path/to/ahma serve stdio --tools-dir ./tools
 //! ```
 //!
 //! Connect via mcp.json:
 //! ```bash
-//! ahma_mcp --list-tools --mcp-config /path/to/mcp.json --server Ahma
+//! ahma tool list --mcp-config /path/to/mcp.json --server Ahma
 //! ```
 //!
 //! Connect to HTTP server:
 //! ```bash
-//! ahma_mcp --list-tools --http http://localhost:3000
+//! ahma tool list --http http://localhost:3000
 //! ```
 
 use ahma_http_mcp_client::client::HttpMcpTransport;

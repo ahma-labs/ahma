@@ -14,7 +14,7 @@ use tempfile::tempdir;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const TOKEN_PATH_ENV: &str = "AHMA_HTTP_CLIENT_TOKEN_PATH";
+const TOKEN_PATH_ENV: &str = "AHMA_TEST_HTTP_CLIENT_TOKEN_PATH";
 
 /// Guard to serialize tests that modify TOKEN_PATH_ENV
 fn token_env_guard() -> &'static StdMutex<()> {
@@ -22,7 +22,7 @@ fn token_env_guard() -> &'static StdMutex<()> {
     GUARD.get_or_init(|| StdMutex::new(()))
 }
 
-/// RAII guard for tests that point `AHMA_HTTP_CLIENT_TOKEN_PATH` at an
+/// RAII guard for tests that point `AHMA_TEST_HTTP_CLIENT_TOKEN_PATH` at an
 /// isolated path: serializes against other such tests via [`token_env_guard`]
 /// and restores the environment on drop, including on an early return or a
 /// panic (`assert!`/`expect` failures previously skipped the `remove_var`

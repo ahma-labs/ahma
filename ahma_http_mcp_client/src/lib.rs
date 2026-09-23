@@ -1,14 +1,15 @@
 //! # Ahma HTTP MCP Client
 //!
-//! This crate provides an HTTP transport implementation for the Model Context Protocol (MCP).
-//! It is designed to communicate with MCP servers over HTTP/HTTPS, including support for
-//! OAuth2 authentication workflows (currently optimized for Atlassian services).
+//! Outbound MCP over HTTP for every in-workspace consumer. Requirements:
+//! `ahma_http_mcp_client/SPEC.md`.
 //!
-//! ## Key Features
-//!
-//! - **HTTP Transport**: Implements `rmcp::transport::Transport` for sending and receiving JSON-RPC messages.
-//! - **OAuth2 Support**: Built-in flow to authenticate with providers (e.g., Atlassian) using code grant with PKCE.
-//! - **Token Management**: Automatically handles token storage and retrieval from a local file.
+//! - [`streamable`]: the one implementation of the Streamable HTTP handshake
+//!   (initialize → SSE → initialized → `roots/list` → `tools/call`) used for the
+//!   ahma bridge and daemon.
+//! - [`client::HttpMcpTransport`]: an `rmcp` `Transport` for external MCP servers,
+//!   with optional OAuth 2.0 + PKCE. The OAuth endpoints are currently Atlassian's.
+//!   Tokens persist in `~/.ahma/mcp_http_token.json`.
+//! - `unix_client` (Unix only): the same transport over a Unix domain socket.
 //!
 //! ## Usage
 //!
