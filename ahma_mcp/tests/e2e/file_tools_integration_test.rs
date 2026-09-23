@@ -4,7 +4,7 @@
 //! They provide coverage for the file operations in a real integration scenario.
 //!
 //! Test philosophy:
-//! - Tests use temp directories as per R13.5 (Test File Isolation)
+//! - Tests use temp directories per AGENTS.md "Test File Isolation"
 //! - Tests verify exit codes and output content
 //! - Tests skip gracefully if the tool is disabled (enabled: false in JSON config)
 

@@ -1529,7 +1529,7 @@ async fn handle_not_found() -> impl IntoResponse {
     StatusCode::NOT_FOUND
 }
 
-/// Handle DELETE requests to terminate a session (R8.4.7)
+/// Handle DELETE requests to terminate a session (R8.3.6)
 ///
 /// Per MCP specification: HTTP DELETE with `Mcp-Session-Id` header terminates
 /// the session and its subprocess.

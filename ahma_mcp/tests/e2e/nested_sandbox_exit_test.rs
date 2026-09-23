@@ -3,8 +3,8 @@
 //! This test verifies that when ahma_mcp is running inside another sandbox,
 //! it exits with a clear error message instructing the user to use --no-sandbox.
 //!
-//! Per R7.6.2: "Upon detection, the system **must** exit with a clear error message
-//! instructing the user to disable the internal sandbox using the --no-sandbox flag."
+//! Per R7.3: if ahma cannot apply its own sandbox it **must** fail loudly, with
+//! instructions to defer to the host explicitly using the `--no-sandbox` flag.
 //! The retired AHMA_DISABLE_SANDBOX environment variable is ignored (R-CFG2.3).
 //!
 //! ## Running These Tests
@@ -134,7 +134,7 @@ fn test_nested_sandbox_detection_exits_with_error() {
     eprintln!("stderr:\n{}", stderr);
     eprintln!("stdout:\n{}", stdout);
 
-    // Assert: process exits with non-zero code (per R7.6.2)
+    // Assert: process exits with non-zero code (per R7.3)
     assert!(
         !output.status.success(),
         "ahma_mcp should exit with non-zero when nested sandbox is detected"

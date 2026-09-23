@@ -1,9 +1,9 @@
-//! HTTP DELETE Session Termination Tests (R8.4.7)
+//! HTTP DELETE Session Termination Tests (R8.3.6)
 //!
 //! These tests verify that HTTP DELETE with `Mcp-Session-Id` header properly
 //! terminates sessions and their subprocesses.
 //!
-//! Per MCP specification (R8.4.7): HTTP DELETE with `Mcp-Session-Id` terminates
+//! Per MCP specification (R8.3.6): HTTP DELETE with `Mcp-Session-Id` terminates
 //! session and subprocess.
 
 use crate::common;
@@ -35,7 +35,7 @@ async fn delete_session(
     req.send().await.expect("DELETE request should complete")
 }
 
-/// Test that DELETE with valid session ID returns 204 and terminates the session (R8.4.7)
+/// Test that DELETE with valid session ID returns 204 and terminates the session (R8.3.6)
 #[tokio::test]
 async fn test_delete_session_terminates_subprocess() {
     let server = start_server().await;
