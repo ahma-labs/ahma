@@ -32,11 +32,9 @@
 //! api_key       = "${ANTHROPIC_API_KEY}"
 //! ```
 //!
-//! MTDF tools can then reference a provider by name:
-//! ```json
-//! { "llm_provider_ref": "ollama-local" }
-//! ```
-//! instead of inlining connection details (and possibly API keys) in every tool file.
+//! The TUI and `ahma llm …` resolve providers by name
+//! ([`AhmaConfig::resolve_provider`]). MTDF tool files cannot reference one yet:
+//! a `livelog` tool inlines its `llm_provider` connection details.
 
 use std::path::{Path, PathBuf};
 
