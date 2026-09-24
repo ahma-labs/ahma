@@ -1,6 +1,6 @@
 //! GitHub release metadata and asset resolution.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use super::platform::Platform;
@@ -67,20 +67,16 @@ async fn fetch_tagged_asset_impl(
 }
 
 async fn fetch_release_json(client: &reqwest::Client, url: &str) -> Result<GitHubRelease> {
-    let response = client
-        .get(url)
-        .header("User-Agent", "ahma-updater")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .with_context(|| format!("Failed to fetch release metadata from {url}"))?;
+    let response = crate::github::get(&format!("release metadata from {url}"), || {
+        client
+            .get(url)
+            .header("User-Agent", "ahma-updater")
+            .header("Accept", "application/vnd.github+json")
+    })
+    .await?;
 
     if !response.status().is_success() {
-        bail!(
-            "GitHub release lookup failed (HTTP {}): {}",
-            response.status(),
-            response.text().await.unwrap_or_default()
-        );
+        return Err(crate::github::status_error("GitHub release lookup", response).await);
     }
 
     response
@@ -340,12 +336,46 @@ mod tests {
         let client = reqwest::Client::new();
         let url = format!("{}/releases/tags/v9.9.9", server.uri());
         let err = fetch_release_json(&client, &url).await.unwrap_err();
-        let msg = err.to_string();
+        let msg = ahma_common::http_retry::user_message(&err);
+        assert!(
+            msg.starts_with("GitHub couldn't complete the request."),
+            "summary first (SPEC R-HTTP.3): {msg}"
+        );
         assert!(
             msg.contains("GitHub release lookup failed"),
             "unexpected error: {msg}"
         );
         assert!(msg.contains("404"), "expected HTTP status in error: {msg}");
+    }
+
+    /// A GitHub hiccup (503, rate-limit burst) is retried, not reported.
+    #[tokio::test]
+    async fn release_lookup_retries_through_a_503() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/releases/latest"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/releases/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tag_name": "v1.0.0",
+                "assets": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/releases/latest", server.uri());
+        let release = fetch_release_json(&client, &url).await.unwrap();
+        assert_eq!(release.tag_name, "v1.0.0");
     }
 
     /// Parse-error path: 200 response but body is not valid JSON.

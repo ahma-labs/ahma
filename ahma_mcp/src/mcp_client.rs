@@ -176,8 +176,17 @@ impl McpConnectionManager {
                 });
         let results = futures::future::join_all(fetches).await;
         for (name, result) in results {
-            if let Ok(tools) = result {
-                self.tools_by_server.insert(name, tools);
+            match result {
+                Ok(tools) => {
+                    self.tools_by_server.insert(name, tools);
+                }
+                // One unreachable server must not hide the others' tools, but
+                // it must not vanish silently either: say which, and why.
+                Err(e) => tracing::warn!(
+                    server = %name,
+                    "external MCP server '{name}' is unavailable; its tools are hidden: {}",
+                    ahma_common::http_retry::user_message(&e)
+                ),
             }
         }
     }

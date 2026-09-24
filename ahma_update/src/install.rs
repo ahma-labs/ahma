@@ -63,13 +63,10 @@ pub async fn install_release_asset(
 }
 
 async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("Failed to download {url}"))?
-        .error_for_status()
-        .with_context(|| format!("Download failed for {url}"))?;
+    let response = crate::github::get(url, || client.get(url)).await?;
+    if !response.status().is_success() {
+        return Err(crate::github::status_error(&format!("Download of {url}"), response).await);
+    }
 
     let bytes = response
         .bytes()
@@ -103,7 +100,7 @@ async fn fetch_archive_checksum(
             )
         });
 
-    let response = client.get(&sums_url).send().await?;
+    let response = crate::github::get(&sums_url, || client.get(&sums_url)).await?;
     if !response.status().is_success() {
         return Ok(None);
     }

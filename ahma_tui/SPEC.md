@@ -269,7 +269,10 @@ correct **at startup**, not only for events that happen afterwards.
     fails for a connection reason (timeout, reset, 5xx) before any answer text
     arrived, the TUI sends the message again once and says so in the
     transcript; a second failure is reported with what to do next. A request
-    error (4xx, refused tool, cancel) is never retried. These notices are the
+    error (4xx, refused tool, cancel) is never retried. Which is which comes
+    from the typed `transient` flag the agent sends with the error (R-HTTP.2),
+    never from the error's text. Both the notice and the final error lead with
+    the plain one-line summary of which service failed (R-HTTP.3). These notices are the
     TUI talking to the user and are never sent to the model. A model on this
     machine (loopback endpoint) gets a 30-minute read window and no timeout
     retries: it is silent while it reads the prompt, and re-sending restarts

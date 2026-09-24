@@ -594,3 +594,122 @@ async fn delete_session_sends_delete_with_session_header() {
 
     server.abort();
 }
+
+// ─── Retry and failure wording (SPEC R-HTTP) ────────────────────────────────
+
+/// Fast retries for tests; the backoff maths is covered in `ahma_common`.
+const FAST_RETRY: ahma_common::http_retry::RetryPolicy = ahma_common::http_retry::RetryPolicy {
+    max_retries: 3,
+    base_delay: std::time::Duration::from_millis(1),
+    max_delay: std::time::Duration::from_millis(4),
+    max_retry_after: std::time::Duration::from_millis(20),
+    retry_timeouts: true,
+};
+
+/// A router answering each POST with the next status in `script`, then
+/// delegating to the normal mock; counts every POST.
+async fn spawn_scripted(
+    script: Vec<StatusCode>,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let posts = Arc::new(AtomicUsize::new(0));
+    let counter = posts.clone();
+    let state = MockState::default();
+    let router = Router::new().route(
+        "/mcp",
+        post(move |body: Json<Value>| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let scripted = script.get(n).copied();
+            let state = state.clone();
+            async move {
+                match scripted {
+                    Some(status) => (status, "scripted").into_response(),
+                    None => mock_post(State(state), body).await,
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://127.0.0.1:{port}/mcp"), posts, server)
+}
+
+fn attach_fast(mcp_url: &str) -> StreamableHttpMcpClient {
+    StreamableHttpMcpClient::attach(
+        reqwest::Client::new(),
+        mcp_url,
+        "retry-session",
+        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    )
+    .with_retry_policy(FAST_RETRY)
+}
+
+/// A tool may already have run when the server answers 500, so `tools/call`
+/// is never re-sent on one (SPEC R-HTTP.2).
+#[tokio::test]
+async fn call_tool_is_not_resent_after_a_500() {
+    let (mcp_url, posts, server) = spawn_scripted(vec![StatusCode::INTERNAL_SERVER_ERROR]).await;
+    let outcome = attach_fast(&mcp_url)
+        .call_tool("x", json!({}), ConflictRetryPolicy::NONE)
+        .await
+        .expect("an HTTP error is an outcome");
+    assert!(
+        matches!(outcome, ToolCallOutcome::HttpError { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+/// A draining daemon answers 503: nothing ran, so even `tools/call` retries.
+#[tokio::test]
+async fn call_tool_retries_through_a_503() {
+    let (mcp_url, posts, server) = spawn_scripted(vec![StatusCode::SERVICE_UNAVAILABLE]).await;
+    let outcome = attach_fast(&mcp_url)
+        .call_tool("x", json!({}), ConflictRetryPolicy::NONE)
+        .await
+        .expect("retried to success");
+    assert!(
+        matches!(outcome, ToolCallOutcome::Success(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn tools_list_retries_through_a_502() {
+    let (mcp_url, posts, server) = spawn_scripted(vec![StatusCode::BAD_GATEWAY]).await;
+    let tools = attach_fast(&mcp_url)
+        .tools_list()
+        .await
+        .expect("retried to success");
+    assert_eq!(tools.len(), 2);
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn unreachable_server_error_leads_with_a_plain_summary() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let err = attach_fast(&format!("http://127.0.0.1:{port}/mcp"))
+        .call_tool("x", json!({}), ConflictRetryPolicy::NONE)
+        .await
+        .expect_err("nothing is listening");
+    let shown = ahma_common::http_retry::user_message(&err);
+    assert_eq!(
+        shown.lines().next().unwrap(),
+        format!("Couldn't reach the MCP server at 127.0.0.1:{port}."),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("tools/call request"),
+        "details name the call: {shown}"
+    );
+    assert!(shown.contains("gave up after 4 attempts"), "{shown}");
+}

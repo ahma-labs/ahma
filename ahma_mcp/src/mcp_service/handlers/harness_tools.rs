@@ -410,7 +410,10 @@ impl AhmaMcpService {
             .web_page_fetcher
             .fetch_with_redirect_guard(url, query, redirect_guard)
             .await
-            .map_err(|e| mcp_internal(e.to_string()))?;
+            // Summary first when the site is down (SPEC R-HTTP.3), and the
+            // whole cause chain either way — `to_string` kept only the
+            // outermost context, so the agent never learned why.
+            .map_err(|e| mcp_internal(ahma_common::http_retry::user_message(&e)))?;
 
         let body = serde_json::to_string_pretty(&result)
             .map_err(|e| mcp_internal(format!("Failed to serialize fetch_webpage result: {e}")))?;

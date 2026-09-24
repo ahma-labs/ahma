@@ -12,7 +12,7 @@
 //! |------|---------|
 //! | Configuration | [`config`] (settings schema, trust tiers, provider registry, retired-env handling) |
 //! | Permissions and scope | [`permissions`], [`workspace_scope`], [`scope_decision`], [`scope_grant`], [`sandbox_state`], [`elicitation`], [`hook_consent`] |
-//! | Network policy | [`web_policy`], [`web_approval`], [`net_approval`] |
+//! | Network policy and outbound HTTP | [`web_policy`], [`web_approval`], [`net_approval`], [`http_retry`] |
 //! | Operations | [`event_dispatcher`], [`op_identity`] |
 //! | Per-user daemon | [`daemon_hub`], [`daemon_endpoint`], [`daemon_history`] |
 //! | MCP wire | [`mcp_methods`], [`mcp_protocol`], [`session_event`], [`keepalive`], [`sse`], [`peer_factory`] |
@@ -46,6 +46,7 @@ pub mod file_uri;
 pub mod fs_lock;
 pub mod hook_consent;
 pub mod hostname;
+pub mod http_retry;
 pub mod keepalive;
 pub mod local_tls;
 pub mod mcp_methods;

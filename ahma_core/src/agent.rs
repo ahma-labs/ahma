@@ -1,4 +1,7 @@
 use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage, HubRelay};
+use ahma_common::http_retry::{
+    Idempotency, RetryPolicy, ServiceError, classify_status, find_service_error, send_with_retry,
+};
 use ahma_http_mcp_client::streamable::{
     ConflictRetryPolicy, ConnectOptions, Connector, StreamableHttpMcpClient, ToolCallOutcome,
 };
@@ -14,6 +17,55 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
+/// A failed agent turn, as the person reading the TUI should see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentError {
+    /// Summary first, then what to do, then `Details:` (SPEC R-HTTP.3).
+    pub message: String,
+    /// The connection's fault rather than the request's, so the same turn may
+    /// succeed if sent again (SPEC R-HTTP.2). The TUI's one automatic retry
+    /// keys off this, never off the text.
+    pub transient: bool,
+}
+
+impl AgentError {
+    /// A model endpoint's failure, worded by which endpoint it was.
+    pub fn from_llm(error: ahma_llm_monitor::LlmMonitorError, base_url: &str) -> Self {
+        let error = error.into_service_error(base_url);
+        Self {
+            transient: error.is_transient(),
+            message: error.to_string(),
+        }
+    }
+
+    /// A failure of the request itself (bad configuration, a refused tool):
+    /// retrying the same turn cannot help.
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: false,
+        }
+    }
+}
+
+impl From<String> for AgentError {
+    fn from(message: String) -> Self {
+        Self::permanent(message)
+    }
+}
+
+impl From<&str> for AgentError {
+    fn from(message: &str) -> Self {
+        Self::permanent(message)
+    }
+}
+
+impl std::fmt::Display for AgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Token(String),
@@ -21,7 +73,7 @@ pub enum AgentEvent {
     /// contrast so the user can see it is thinking without it dominating.
     Thinking(String),
     Done,
-    Error(String),
+    Error(AgentError),
     ToolCallStarted {
         id: String,
         name: String,
@@ -442,7 +494,7 @@ async fn call_mcp_sampling_routed(
     target_label: &str,
     messages: &[serde_json::Value],
     system_prompt: Option<&str>,
-) -> Result<ahma_llm_monitor::client::ChatCompletionResponse, String> {
+) -> Result<ahma_llm_monitor::client::ChatCompletionResponse, AgentError> {
     let (client, url) = build_sampling_client(mcp)?;
     let session_id = get_or_create_session(&client, &url, mcp).await?;
 
@@ -464,40 +516,52 @@ async fn call_mcp_sampling_routed(
         "params": params
     });
 
-    let resp = client
-        .post(&url)
-        .header("mcp-session-id", &session_id)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to send sampling request: {e}"))?;
+    // Not idempotent: a sampling request that arrived may already be running
+    // on the client's model (SPEC R-HTTP.2).
+    let (resp, _) = send_with_retry(
+        DAEMON_SERVICE,
+        &RetryPolicy::DEFAULT,
+        Idempotency::NotIdempotent,
+        || {
+            client
+                .post(&url)
+                .header("mcp-session-id", &session_id)
+                .json(&payload)
+        },
+    )
+    .await
+    .map_err(|failure| daemon_error(ServiceError::from_transport(DAEMON_SERVICE, failure)))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
+    let status = resp.status();
+    if let Some(failure) = classify_status(status) {
         let body_text = resp.text().await.unwrap_or_default();
-        return Err(format!("HTTP {status}: {body_text}"));
+        return Err(daemon_error(ServiceError::new(
+            DAEMON_SERVICE,
+            failure,
+            anyhow::anyhow!("sampling/createMessage: HTTP {status}: {body_text}"),
+        )));
     }
 
     let response_json = resp
         .json::<serde_json::Value>()
         .await
-        .map_err(|e| format!("Failed to parse response: {e}"))?;
+        .map_err(|e| AgentError::permanent(format!("Failed to parse response: {e}")))?;
 
     if let Some(error) = response_json.get("error") {
         let msg = error
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown error");
-        return Err(msg.to_string());
+        return Err(msg.into());
     }
 
     let result = response_json
         .get("result")
-        .ok_or_else(|| "Missing result in response".to_string())?;
+        .ok_or_else(|| AgentError::permanent("Missing result in response"))?;
     let content_arr = result
         .get("content")
         .and_then(|c| c.as_array())
-        .ok_or_else(|| "Missing or invalid content in result".to_string())?;
+        .ok_or_else(|| AgentError::permanent("Missing or invalid content in result"))?;
 
     let completion_text = extract_sampling_completion_text(content_arr);
 
@@ -567,7 +631,9 @@ async fn run_streaming_chat(
             Ok(token) => token,
             Err(e) => {
                 warn!(provider = %base_url, error = %e, "chat: stream error");
-                let _ = tx.send(AgentEvent::Error(e.to_string())).await;
+                let _ = tx
+                    .send(AgentEvent::Error(AgentError::from_llm(e, &base_url)))
+                    .await;
                 return;
             }
         };
@@ -595,9 +661,7 @@ pub fn spawn_chat_task(
         if client.base_url().starts_with("mcp://") {
             let Some(mcp_cfg) = mcp else {
                 let _ = tx
-                    .send(AgentEvent::Error(
-                        "MCP config missing for sampling".to_string(),
-                    ))
+                    .send(AgentEvent::Error("MCP config missing for sampling".into()))
                     .await;
                 return;
             };
@@ -826,9 +890,7 @@ async fn fetch_completion_via_mcp_sampling(
 ) -> Option<(ahma_llm_monitor::client::ChatCompletionResponse, bool)> {
     let Some(mcp_cfg) = mcp else {
         let _ = tx
-            .send(AgentEvent::Error(
-                "MCP config missing for sampling".to_string(),
-            ))
+            .send(AgentEvent::Error("MCP config missing for sampling".into()))
             .await;
         return None;
     };
@@ -932,7 +994,7 @@ async fn handle_completion_stream_error(
         info!(error = %e, "agent: model rejected tools — falling back to plain chat (no tool use this turn)");
         let _ = tx
             .send(AgentEvent::Error(
-                "Model does not support tools. Falling back to standard chat.".to_string(),
+                "Model does not support tools. Falling back to standard chat.".into(),
             ))
             .await;
         spawn_chat_task(
@@ -944,7 +1006,12 @@ async fn handle_completion_stream_error(
         );
     } else {
         warn!(error = %e, "agent: chat completion failed (non-recoverable) — ending turn");
-        let _ = tx.send(AgentEvent::Error(e.to_string())).await;
+        let _ = tx
+            .send(AgentEvent::Error(AgentError::from_llm(
+                e,
+                client.base_url(),
+            )))
+            .await;
     }
 }
 
@@ -1195,7 +1262,7 @@ pub async fn execute_agent_turn(
     let Some(mcp_cfg) = mcp.as_ref() else {
         let _ = tx
             .send(AgentEvent::Error(
-                "Model requested tools but MCP is not configured".to_string(),
+                "Model requested tools but MCP is not configured".into(),
             ))
             .await;
         return false;
@@ -1471,10 +1538,10 @@ async fn finish_with_limit_summary(
         None => {
             // fetch_completion already surfaced the concrete error to the UI.
             let _ = tx
-                .send(AgentEvent::Error(format!(
+                .send(AgentEvent::Error(AgentError::permanent(format!(
                     "Agent stopped after {max_turns} tool-call turns without completing the task, \
                      and the closing summary could not be generated."
-                )))
+                ))))
                 .await;
         }
     }
@@ -1649,7 +1716,7 @@ pub async fn get_or_create_session(
     };
     let session = StreamableHttpMcpClient::connect(connector, opts)
         .await
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| daemon_message(&e))?;
     let sid = session.session_id().to_string();
 
     SESSION_CACHE.lock().insert(cache_key, sid.clone());
@@ -1736,7 +1803,7 @@ pub async fn call_mcp_tool_http(
     match session
         .call_tool(tool, arguments, retry)
         .await
-        .map_err(|e| format!("{e:#}"))?
+        .map_err(|e| daemon_message(&e))?
     {
         ToolCallOutcome::Success(json_resp) => Ok(parse_mcp_response(&json_resp)),
         ToolCallOutcome::SandboxInitializing { body } => Err(format!("HTTP 409 Conflict: {body}")),
@@ -1937,6 +2004,32 @@ fn resolve_llm_connection(
     Ok(LlmConnection::from_resolved(resolved, model))
 }
 
+/// How the agent names the bridge it sends tool calls and sampling requests
+/// to, in the first line of a failure (SPEC R-HTTP.3).
+const DAEMON_SERVICE: &str = "the ahma daemon";
+
+/// What to do when [`DAEMON_SERVICE`] is not answering.
+const DAEMON_HINT: &str = "It normally starts on its own: try again, or run `ahma doctor`.";
+
+/// A daemon failure as the agent reports it: summary first, then the hint.
+fn daemon_error(error: ServiceError) -> AgentError {
+    let error = error.with_hint(DAEMON_HINT);
+    AgentError {
+        transient: error.is_transient(),
+        message: error.to_string(),
+    }
+}
+
+/// Render a failure talking to the bridge for a person: a [`ServiceError`]
+/// from the MCP client is re-attributed to [`DAEMON_SERVICE`]; anything else
+/// keeps its full cause chain.
+fn daemon_message(error: &anyhow::Error) -> String {
+    match find_service_error(error) {
+        Some(service) => daemon_error(service.for_service(DAEMON_SERVICE)).message,
+        None => format!("{error:#}"),
+    }
+}
+
 /// A PromptRunner implementation that executes the agent loop inside ahma_core.
 pub struct CorePromptRunner;
 
@@ -1985,7 +2078,10 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
                 AgentEvent::Token(t) => HubRelay::ChatToken { token: t },
                 AgentEvent::Thinking(t) => HubRelay::ChatThinking { token: t },
                 AgentEvent::Done => HubRelay::AgentDone,
-                AgentEvent::Error(e) => HubRelay::AgentError { error: e },
+                AgentEvent::Error(e) => HubRelay::AgentError {
+                    error: e.message,
+                    transient: e.transient,
+                },
                 // Tool-call lifecycle events are NOT approval requests — the
                 // approval prompt is raised separately by the HubApprovalGate.
                 // These drive the TUI's live "which tool is running" display and
@@ -2058,7 +2154,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         while let Some(evt) = rx.recv().await {
             match evt {
                 AgentEvent::Token(t) => out.push_str(&t),
-                AgentEvent::Error(e) => return Err(e),
+                AgentEvent::Error(e) => return Err(e.message),
                 AgentEvent::Done => break,
                 _ => {}
             }
@@ -3931,6 +4027,11 @@ mod tests {
         let err = call_mcp_sampling_routed(&cfg, "label", &[], None)
             .await
             .expect_err("non-2xx must error");
+        let err = err.message;
+        assert!(
+            err.starts_with("The ahma daemon stopped responding."),
+            "summary first: {err}"
+        );
         assert!(err.contains("HTTP 500"), "{err}");
         assert!(err.contains("boom-body"), "body surfaced: {err}");
     }
@@ -3942,7 +4043,7 @@ mod tests {
         let err = call_mcp_sampling_routed(&cfg, "label", &[], Some("sys"))
             .await
             .expect_err("JSON-RPC error must propagate");
-        assert_eq!(err, "nope");
+        assert_eq!(err.message, "nope");
     }
 
     #[tokio::test]
@@ -3952,7 +4053,7 @@ mod tests {
         let err = call_mcp_sampling_routed(&cfg, "label", &[], None)
             .await
             .expect_err("missing result must error");
-        assert_eq!(err, "Missing result in response");
+        assert_eq!(err.message, "Missing result in response");
     }
 
     #[tokio::test]
@@ -3962,7 +4063,7 @@ mod tests {
         let err = call_mcp_sampling_routed(&cfg, "label", &[], None)
             .await
             .expect_err("missing content array must error");
-        assert_eq!(err, "Missing or invalid content in result");
+        assert_eq!(err.message, "Missing or invalid content in result");
     }
 
     // ── call_mcp_tool_http error & retry paths ────────────────────────────────
@@ -4118,7 +4219,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         spawn_chat_task(client, vec![ChatMessage::user("hi")], None, None, tx);
         match rx.recv().await.unwrap() {
-            AgentEvent::Error(e) => assert!(e.contains("MCP config missing"), "{e}"),
+            AgentEvent::Error(e) => assert!(e.message.contains("MCP config missing"), "{e}"),
             o => panic!("unexpected {o:?}"),
         }
     }
@@ -4418,7 +4519,7 @@ mod tests {
 
         assert!(!cont);
         match rx.recv().await.unwrap() {
-            AgentEvent::Error(e) => assert!(e.contains("MCP is not configured"), "{e}"),
+            AgentEvent::Error(e) => assert!(e.message.contains("MCP is not configured"), "{e}"),
             o => panic!("unexpected {o:?}"),
         }
     }
@@ -4546,7 +4647,7 @@ mod tests {
         let mut saw_mcp_not_configured_error = false;
         while let Ok(evt) = rx.try_recv() {
             if let AgentEvent::Error(e) = evt
-                && e.contains("MCP is not configured")
+                && e.message.contains("MCP is not configured")
             {
                 saw_mcp_not_configured_error = true;
             }
@@ -4796,7 +4897,7 @@ mod tests {
         let res = fetch_completion(&client, &[], &[], &None, &tx, &[], &None).await;
         assert!(res.is_none());
         match rx.recv().await.unwrap() {
-            AgentEvent::Error(e) => assert!(e.contains("MCP config missing"), "{e}"),
+            AgentEvent::Error(e) => assert!(e.message.contains("MCP config missing"), "{e}"),
             o => panic!("unexpected {o:?}"),
         }
     }
@@ -4857,7 +4958,7 @@ mod tests {
         assert!(res.is_none());
         // The fallback emits an explanatory error before re-dispatching as chat.
         match rx.recv().await.unwrap() {
-            AgentEvent::Error(e) => assert!(e.contains("does not support tools"), "{e}"),
+            AgentEvent::Error(e) => assert!(e.message.contains("does not support tools"), "{e}"),
             o => panic!("unexpected {o:?}"),
         }
     }
@@ -4890,13 +4991,59 @@ mod tests {
         assert!(res.is_none());
         match rx.recv().await.unwrap() {
             AgentEvent::Error(e) => {
-                assert!(e.contains("500"), "raw error surfaced: {e}");
+                let first = e.message.lines().next().unwrap_or_default();
                 assert!(
-                    !e.contains("does not support tools"),
+                    first.ends_with("had an internal error."),
+                    "summary first (SPEC R-HTTP.3): {e}"
+                );
+                assert!(e.message.contains("500"), "raw error kept in details: {e}");
+                assert!(e.transient, "a 5xx is the server's fault, worth a retry");
+                assert!(
+                    !e.message.contains("does not support tools"),
                     "no tool fallback for 500"
                 );
             }
             o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    /// The failure a person actually hits most: the local model server is not
+    /// running. The first line must say so plainly, and the TUI must learn it
+    /// is worth retrying from a typed flag, not by reading the text.
+    #[tokio::test]
+    async fn fetch_completion_refused_local_server_is_transient_and_named() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let client = LlmClient::new(format!("http://localhost:{port}/v1"), "m", None);
+        let (tx, mut rx) = mpsc::channel(16);
+        let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let res = fetch_completion(
+            &client,
+            &msgs,
+            &[],
+            &None,
+            &tx,
+            &[ChatMessage::user("hi")],
+            &None,
+        )
+        .await;
+        assert!(res.is_none());
+        loop {
+            match rx.recv().await.unwrap() {
+                AgentEvent::Error(e) => {
+                    assert_eq!(
+                        e.message.lines().next().unwrap(),
+                        format!("Couldn't reach your local model server at localhost:{port}.")
+                    );
+                    assert!(e.message.contains("\nDetails: "), "{e}");
+                    assert!(e.transient);
+                    break;
+                }
+                AgentEvent::Status { .. } => continue,
+                o => panic!("unexpected {o:?}"),
+            }
         }
     }
 }

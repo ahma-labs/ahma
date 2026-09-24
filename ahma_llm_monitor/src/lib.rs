@@ -18,4 +18,4 @@ pub use client::{
     LocalProvider,
 };
 pub use discovery::discover_local_providers;
-pub use error::{ApiErrorKind, LlmMonitorError};
+pub use error::{ApiErrorKind, LlmMonitorError, llm_service_name};

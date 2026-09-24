@@ -5,6 +5,7 @@
 //! JSON-RPC traffic to the running server.
 
 use crate::transport_patch::PatchedStdioTransport;
+use ahma_common::http_retry::{Idempotency, RetryPolicy, ServiceError, send_with_retry};
 #[cfg(unix)]
 use ahma_common::mcp_methods::ROOTS_LIST_METHOD;
 use ahma_common::mcp_methods::{
@@ -1183,6 +1184,33 @@ where
 /// bridge, forward the response back to stdio, and return the negotiated
 /// session id and protocol version — every subsequent request on this
 /// connection must echo both.
+/// POST to the bridge, retrying per SPEC R-HTTP.2 (`idempotency` decides
+/// whether a timeout or 5xx may be re-sent), and reporting a final failure
+/// that names the bridge first (SPEC R-HTTP.3).
+async fn proxy_post<F>(
+    mcp_url: &str,
+    method: &str,
+    idempotency: Idempotency,
+    build: F,
+) -> Result<reqwest::Response>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let service = format!("the ahma bridge at {mcp_url}");
+    send_with_retry(&service, &RetryPolicy::DEFAULT, idempotency, build)
+        .await
+        .map(|(response, _)| response)
+        .map_err(|failure| {
+            ServiceError::new(
+                &service,
+                failure.failure,
+                anyhow::Error::new(failure.error).context(format!("{method} request")),
+            )
+            .with_attempts(failure.attempts)
+            .into()
+        })
+}
+
 async fn perform_http_initialize(
     client: &reqwest::Client,
     mcp_url: &str,
@@ -1226,14 +1254,14 @@ async fn perform_http_initialize(
 
         let synth_init = synthesize_initialize_request(&val);
 
-        let response = client
-            .post(mcp_url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "application/json")
-            .json(&synth_init)
-            .send()
-            .await
-            .with_context(|| format!("Proxy HTTP initialize POST failed for {mcp_url}"))?;
+        let response = proxy_post(mcp_url, "initialize", Idempotency::NotIdempotent, || {
+            client
+                .post(mcp_url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::ACCEPT, "application/json")
+                .json(&synth_init)
+        })
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1329,14 +1357,14 @@ async fn perform_http_initialize(
     }
     let init_val = val;
 
-    let response = client
-        .post(mcp_url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(reqwest::header::ACCEPT, "application/json")
-        .json(&init_val)
-        .send()
-        .await
-        .with_context(|| format!("Proxy HTTP initialize POST failed for {mcp_url}"))?;
+    let response = proxy_post(mcp_url, "initialize", Idempotency::NotIdempotent, || {
+        client
+            .post(mcp_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&init_val)
+    })
+    .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1574,22 +1602,30 @@ async fn run_http_proxy_loop(
                     continue;
                 }
 
-                let mut req = client.post(mcp_url)
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .header("mcp-session-id", session_id)
-                    .header(
-                        ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER,
-                        protocol_version,
-                    )
-                    .json(&val);
-
-                if has_id && is_request {
-                    req = req.header(reqwest::header::ACCEPT, "application/json");
-                }
-
-                let resp = req.send().await.with_context(|| {
-                    format!("Proxy HTTP POST to {mcp_url} failed (session={session_id})")
-                })?;
+                let method = val.get("method").and_then(|m| m.as_str()).unwrap_or("response");
+                let idempotency = match method {
+                    "tools/list" | "resources/list" | "prompts/list" | "ping" => {
+                        Idempotency::Idempotent
+                    }
+                    _ => Idempotency::NotIdempotent,
+                };
+                let resp = proxy_post(mcp_url, method, idempotency, || {
+                    let req = client.post(mcp_url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .header("mcp-session-id", session_id)
+                        .header(
+                            ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER,
+                            protocol_version,
+                        )
+                        .json(&val);
+                    if has_id && is_request {
+                        req.header(reqwest::header::ACCEPT, "application/json")
+                    } else {
+                        req
+                    }
+                })
+                .await
+                .with_context(|| format!("proxy session {session_id}"))?;
                 if has_id && is_request {
                     if !resp.status().is_success() {
                         tracing::warn!(

@@ -106,6 +106,8 @@ pub enum SourceEvent {
     AgentDone,
     AgentError {
         error: String,
+        /// Whether sending the turn again may work (SPEC R-HTTP.2).
+        transient: bool,
     },
     /// Token usage for the latest model turn, forwarded over the daemon hub so
     /// the status-bar counter updates on the hub path (not just in-process).

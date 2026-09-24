@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use ahma_common::config::warn_if_looks_like_literal_secret;
+use ahma_common::http_retry::{Idempotency, RetryPolicy, send_with_retry};
 
 use crate::anthropic;
 use crate::error::LlmMonitorError;
@@ -100,43 +101,15 @@ pub fn is_loopback_url(base_url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Maximum number of *retries* (extra attempts) on a transient LLM failure.
-const LLM_MAX_RETRIES: u32 = 3;
-/// Backoff before the first retry; doubles each attempt up to [`LLM_RETRY_MAX_DELAY`].
-const LLM_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
-const LLM_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
-
-/// HTTP statuses worth retrying — transient overload/server conditions. Other
-/// 4xx (400/401/403/404) are caller errors and must never be retried.
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
-}
-
-/// Transport errors worth retrying: a timed-out or momentarily unreachable
-/// endpoint — not a malformed request or a decoding error.
-fn is_retryable_transport_err(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect()
-}
-
-/// Exponential backoff for retry `attempt` (0-based), capped.
-fn backoff_delay(attempt: u32) -> Duration {
-    LLM_RETRY_BASE_DELAY
-        .saturating_mul(1u32 << attempt.min(5))
-        .min(LLM_RETRY_MAX_DELAY)
-}
-
-/// `Retry-After` from a response's headers, when present as (possibly
-/// fractional) delta-seconds. HTTP-date form is rare on LLM endpoints and is
-/// ignored rather than mis-parsed.
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let secs: f64 = headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
+/// Retry policy for LLM requests: the workspace default (SPEC R-HTTP.1),
+/// minus timeout retries for a model on this machine — re-sending to a local
+/// model that is merely slow restarts its prompt reading from zero.
+fn llm_retry_policy(retry_timeouts: bool) -> RetryPolicy {
+    if retry_timeouts {
+        RetryPolicy::DEFAULT
+    } else {
+        RetryPolicy::DEFAULT.without_timeout_retries()
+    }
 }
 
 /// Convert a non-success HTTP response into a typed [`LlmMonitorError::Api`],
@@ -145,18 +118,19 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 /// is shorter than the full body.
 async fn api_error_from_response(response: reqwest::Response) -> LlmMonitorError {
     let status = response.status();
-    let retry_after = parse_retry_after(response.headers());
+    let retry_after = ahma_common::http_retry::parse_retry_after(response.headers());
     let body_text = response.text().await.unwrap_or_default();
     warn!(status = %status, body = %body_text, "llm: HTTP error from LLM endpoint");
     LlmMonitorError::from_api_response(status.as_u16(), retry_after, &body_text)
 }
 
-/// Send an HTTP request with bounded exponential backoff on transient failures
-/// (timeouts/connect errors and 429/5xx). `build` constructs a fresh request per
-/// attempt. With `retry_timeouts` false a timeout is returned at once: re-sending
-/// to a local model that is merely slow restarts its prompt reading from zero. A non-retryable response (success or a non-429 4xx) is returned as
-/// `Ok` so the caller's own status handling runs; a non-retryable transport
-/// error, or exhaustion of all retries, returns the last error/response.
+/// Send an LLM request through the shared retry helper (SPEC R-HTTP):
+/// transient failures (connect errors, dropped connections, 429/5xx) are
+/// retried with backoff, honouring `Retry-After`. A completion has no side
+/// effects, so it is sent as idempotent. `build` constructs a fresh request
+/// per attempt. With `retry_timeouts` false a timeout is returned at once.
+/// A response is returned as `Ok` whatever its status once retrying stops, so
+/// the caller's own status handling runs.
 async fn send_with_backoff<F>(
     build: F,
     retry_timeouts: bool,
@@ -164,33 +138,15 @@ async fn send_with_backoff<F>(
 where
     F: Fn() -> reqwest::RequestBuilder,
 {
-    let mut attempt = 0u32;
-    loop {
-        match build().send().await {
-            Ok(resp) => {
-                if is_retryable_status(resp.status()) && attempt < LLM_MAX_RETRIES {
-                    let delay = backoff_delay(attempt);
-                    warn!(status = %resp.status(), attempt = attempt + 1, ?delay, "llm: retryable HTTP status — backing off and retrying");
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue;
-                }
-                return Ok(resp);
-            }
-            Err(e) => {
-                let retryable =
-                    is_retryable_transport_err(&e) && (retry_timeouts || !e.is_timeout());
-                if retryable && attempt < LLM_MAX_RETRIES {
-                    let delay = backoff_delay(attempt);
-                    warn!(error = %e, attempt = attempt + 1, ?delay, "llm: retryable transport error — backing off and retrying");
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue;
-                }
-                return Err(LlmMonitorError::from(e));
-            }
-        }
-    }
+    send_with_retry(
+        "LLM endpoint",
+        &llm_retry_policy(retry_timeouts),
+        Idempotency::Idempotent,
+        build,
+    )
+    .await
+    .map(|(response, _)| response)
+    .map_err(|failure| LlmMonitorError::from(failure.error))
 }
 
 // ─── Chat types ───────────────────────────────────────────────────────────────
@@ -598,12 +554,15 @@ impl LlmClient {
             self.base_url
         );
 
-        let request = self.apply_auth(self.http.post(url).json(&body).timeout(timeout));
-
-        let response = tokio::time::timeout(timeout, request.send())
-            .await
-            .map_err(|_| LlmMonitorError::Timeout(None))?
-            .map_err(LlmMonitorError::from)?;
+        let response = tokio::time::timeout(
+            timeout,
+            send_with_backoff(
+                || self.apply_auth(self.http.post(&url).json(&body).timeout(timeout)),
+                !self.local,
+            ),
+        )
+        .await
+        .map_err(|_| LlmMonitorError::Timeout(None))??;
 
         if !response.status().is_success() {
             return Err(api_error_from_response(response).await);
@@ -691,6 +650,7 @@ impl LlmClient {
         let http = self.http.clone();
         let api_key = self.api_key.clone();
         let flavor = self.flavor;
+        let retry_timeouts = !self.local;
         info!(
             model = %self.model,
             messages = messages.len(),
@@ -705,6 +665,7 @@ impl LlmClient {
                 api_key,
                 body,
                 flavor,
+                retry_timeouts,
             },
             |state| async move {
                 match state {
@@ -714,7 +675,8 @@ impl LlmClient {
                         api_key,
                         body,
                         flavor,
-                    } => chat_stream_start(http, url, api_key, body, flavor).await,
+                        retry_timeouts,
+                    } => chat_stream_start(http, url, api_key, body, flavor, retry_timeouts).await,
                     ChatStreamState::Streaming {
                         stream,
                         buffer,
@@ -1111,6 +1073,7 @@ enum ChatStreamState {
         api_key: Option<String>,
         body: Value,
         flavor: ApiFlavor,
+        retry_timeouts: bool,
     },
     Streaming {
         stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, LlmMonitorError>> + Send>>,
@@ -1146,29 +1109,34 @@ async fn chat_stream_start(
     api_key: Option<String>,
     body: Value,
     flavor: ApiFlavor,
+    retry_timeouts: bool,
 ) -> Option<(Result<String, LlmMonitorError>, ChatStreamState)> {
-    let mut req = http
-        .post(&url)
-        .json(&body)
-        .header("Accept", "text/event-stream");
-    req = match flavor {
-        ApiFlavor::OpenAi => match &api_key {
-            Some(key) => req.bearer_auth(key),
-            None => req,
-        },
-        ApiFlavor::Anthropic => {
-            let req = req.header("anthropic-version", anthropic::ANTHROPIC_VERSION);
-            match &api_key {
-                Some(key) => req.header("x-api-key", key),
+    let build = || {
+        let req = http
+            .post(&url)
+            .json(&body)
+            .header("Accept", "text/event-stream");
+        match flavor {
+            ApiFlavor::OpenAi => match &api_key {
+                Some(key) => req.bearer_auth(key),
                 None => req,
+            },
+            ApiFlavor::Anthropic => {
+                let req = req.header("anthropic-version", anthropic::ANTHROPIC_VERSION);
+                match &api_key {
+                    Some(key) => req.header("x-api-key", key),
+                    None => req,
+                }
             }
         }
     };
 
-    let resp = match req.send().await {
+    // Retried only until the stream opens: once tokens flow, a re-send would
+    // duplicate text the caller has already shown.
+    let resp = match send_with_backoff(build, retry_timeouts).await {
         Err(e) => {
             warn!(error = %e, "llm: chat stream request failed");
-            return Some((Err(LlmMonitorError::from(e)), ChatStreamState::Done));
+            return Some((Err(e), ChatStreamState::Done));
         }
         Ok(resp) => resp,
     };
@@ -1487,44 +1455,6 @@ mod tests {
         assert_eq!(client.base_url(), "https://api.anthropic.com");
     }
 
-    #[test]
-    fn retryable_status_classification() {
-        use reqwest::StatusCode;
-        for s in [429u16, 500, 502, 503, 504] {
-            assert!(is_retryable_status(StatusCode::from_u16(s).unwrap()), "{s}");
-        }
-        for s in [200u16, 400, 401, 403, 404] {
-            assert!(
-                !is_retryable_status(StatusCode::from_u16(s).unwrap()),
-                "{s}"
-            );
-        }
-    }
-
-    #[test]
-    fn retry_after_header_parses_integer_and_fractional_seconds() {
-        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
-
-        let mut headers = HeaderMap::new();
-        assert_eq!(parse_retry_after(&headers), None);
-
-        headers.insert(RETRY_AFTER, HeaderValue::from_static("17"));
-        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(17)));
-
-        headers.insert(RETRY_AFTER, HeaderValue::from_static("0.5"));
-        assert_eq!(
-            parse_retry_after(&headers),
-            Some(Duration::from_millis(500))
-        );
-
-        // HTTP-date (or garbage) is ignored rather than mis-parsed.
-        headers.insert(
-            RETRY_AFTER,
-            HeaderValue::from_static("Fri, 31 Dec 1999 23:59:59 GMT"),
-        );
-        assert_eq!(parse_retry_after(&headers), None);
-    }
-
     #[tokio::test]
     async fn connect_refused_classifies_as_connect_error() {
         // Bind then drop a listener so the port actively refuses connections.
@@ -1605,18 +1535,9 @@ mod tests {
         assert!(result.is_err_and(|e| e.is_timeout()));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
-            started.elapsed() < LLM_RETRY_BASE_DELAY * 4,
+            started.elapsed() < RetryPolicy::DEFAULT.base_delay * 4,
             "no backoff sleeps"
         );
-    }
-
-    #[test]
-    fn backoff_grows_and_caps() {
-        assert_eq!(backoff_delay(0), LLM_RETRY_BASE_DELAY);
-        assert!(backoff_delay(1) > backoff_delay(0));
-        assert!(backoff_delay(2) > backoff_delay(1));
-        // Never exceeds the cap, even for large attempt counts.
-        assert!(backoff_delay(20) <= LLM_RETRY_MAX_DELAY);
     }
 
     #[test]
