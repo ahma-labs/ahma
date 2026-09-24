@@ -688,34 +688,29 @@ fn pin_skipped_dependencies(root: &Path, rows: &[Row]) {
     if skipped.is_empty() {
         return;
     }
-    println!(
-        "  Batch-pinning {} skipped dependencies offline…",
-        skipped.len()
-    );
+    println!("  Pinning {} skipped dependencies…", skipped.len());
 
-    let mut args = vec!["update".to_string(), "--offline".to_string()];
     for row in skipped {
-        args.extend([
-            "-p".to_string(),
-            format!("{}@{}", row.name, row.old_ver),
-            "--precise".to_string(),
-            row.old_ver.clone(),
-        ]);
-    }
-
-    let offline_succeeded = std::process::Command::new("cargo")
-        .args(&args)
-        .current_dir(root)
-        .status()
-        .is_ok_and(|s| s.success());
-    if !offline_succeeded {
-        // Fallback without --offline if offline fails
-        let mut online_args = args;
-        online_args.remove(1); // remove "--offline"
-        let _ = std::process::Command::new("cargo")
-            .args(&online_args)
+        let pkg_spec = format!("{}@{}", row.name, row.old_ver);
+        let offline_succeeded = std::process::Command::new("cargo")
+            .args([
+                "update",
+                "--offline",
+                "-p",
+                &pkg_spec,
+                "--precise",
+                &row.old_ver,
+            ])
             .current_dir(root)
-            .status();
+            .status()
+            .is_ok_and(|s| s.success());
+        if !offline_succeeded {
+            // Fallback without --offline if offline fails
+            let _ = std::process::Command::new("cargo")
+                .args(["update", "-p", &pkg_spec, "--precise", &row.old_ver])
+                .current_dir(root)
+                .status();
+        }
     }
 }
 
@@ -1719,11 +1714,18 @@ fn apply_upgrade(root: &Path, up: &Upgrade, is_direct: bool) -> ApplyResult {
     let result = (|| {
         if is_direct {
             // `cargo upgrade -p name@new` already carries a version, so it is
-            // unambiguous; it rewrites the Cargo.toml requirement.
+            // unambiguous; it rewrites the Cargo.toml requirement and updates Cargo.lock.
             run_cargo_capture(
                 root,
                 &["upgrade", "-p", &format!("{}@{}", up.name, up.new_ver)],
             )?;
+            // If cargo upgrade already updated Cargo.lock to up.new_ver, pinning is complete.
+            let lock_path = root.join("Cargo.lock");
+            if let Ok(content) = fs::read_to_string(&lock_path)
+                && package_version_in_lock(&content, &up.name).as_deref() == Some(&up.new_ver)
+            {
+                return Ok(());
+            }
         }
         // Pin Cargo.lock. `name@old --precise new` disambiguates when several
         // versions of `name` coexist — the bare `-p name` form errors as
