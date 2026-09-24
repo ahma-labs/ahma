@@ -4371,7 +4371,9 @@ fn format_setting_value(value: &crate::settings_editor::SettingValue) -> String 
 }
 
 fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let popup = centered_rect(90, 22, area);
+    let popup_w = area.width.saturating_sub(4).max(60).min(area.width);
+    let popup_h = area.height.saturating_sub(2).max(14).min(area.height);
+    let popup = centered_rect(popup_w, popup_h, area);
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -4382,7 +4384,7 @@ fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area:
     frame.render_widget(block, popup);
 
     // Split inner area into sidebar (left) and content (right)
-    let chunks = Layout::horizontal([Constraint::Length(20), Constraint::Min(20)]).split(inner);
+    let chunks = Layout::horizontal([Constraint::Length(22), Constraint::Min(20)]).split(inner);
 
     let sidebar_area = chunks[0];
     let content_area = chunks[1];
@@ -4396,11 +4398,22 @@ fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area:
     );
     frame.render_widget(sidebar_list, sidebar_area);
 
+    // Register click targets for each category row in the sidebar
+    for i in 0..crate::settings_editor::SettingsCategory::ALL.len() {
+        let row_y = sidebar_area.y + i as u16;
+        if row_y < sidebar_area.y + sidebar_area.height {
+            let cat_rect = Rect::new(sidebar_area.x, row_y, sidebar_area.width, 1);
+            state
+                .click_targets
+                .borrow_mut()
+                .push((crate::state::ClickTarget::SettingsCategory(i), cat_rect));
+        }
+    }
+
     // 2. Draw content pane (settings items for selected category)
     use crate::settings_editor::SettingsCategory;
     let selected_cat = SettingsCategory::ALL[state.settings_editor.selected_category];
     let items = state.settings_editor.items_for_category(selected_cat);
-    let content_items = build_settings_content_items(state, theme, &items);
 
     // Split content area into items list (top) and footer/hints (bottom)
     let content_chunks =
@@ -4409,25 +4422,82 @@ fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area:
     let list_area = content_chunks[0];
     let footer_area = content_chunks[1];
 
-    // Keep the selected row on screen and tell the truth about overflow — a
-    // category taller than the fixed popup silently lost its tail (R24.8.1).
+    let (content_items, item_heights) =
+        build_settings_content_items(state, theme, &items, list_area.width as usize);
+
     let total = content_items.len();
     let visible = list_area.height as usize;
-    let offset = state
-        .settings_editor
-        .selected_item
-        .saturating_sub(visible.saturating_sub(1))
-        .min(total.saturating_sub(visible));
+    let offset = calculate_list_offset(state.settings_editor.selected_item, &item_heights, visible);
     let content_list = List::new(content_items);
     let mut list_state = ListState::default().with_offset(offset);
     frame.render_stateful_widget(content_list, list_area, &mut list_state);
     draw_scrollbar(frame, theme, total, visible, offset, list_area);
+
+    // Register click targets for visible content items
+    let mut cur_y = list_area.y;
+    for (idx, &h) in item_heights.iter().enumerate().skip(offset) {
+        if cur_y >= list_area.y + list_area.height {
+            break;
+        }
+        let item_h = (h as u16).min(list_area.y + list_area.height - cur_y);
+        let item_rect = Rect::new(list_area.x, cur_y, list_area.width, item_h);
+        state
+            .click_targets
+            .borrow_mut()
+            .push((crate::state::ClickTarget::SettingsItem(idx), item_rect));
+        cur_y += h as u16;
+    }
 
     // Draw status message and action hints
     frame.render_widget(
         Paragraph::new(settings_footer_line(state, theme)),
         footer_area,
     );
+}
+
+/// Helper to calculate list offset ensuring the selected item is visible
+/// even with variable-height wrapped items.
+fn calculate_list_offset(selected: usize, heights: &[usize], visible_rows: usize) -> usize {
+    if selected >= heights.len() || visible_rows == 0 {
+        return 0;
+    }
+    let mut offset = 0;
+    while offset < selected {
+        let used_rows: usize = heights[offset..=selected].iter().sum();
+        if used_rows <= visible_rows {
+            break;
+        }
+        offset += 1;
+    }
+    offset
+}
+
+/// Wrap a string across word boundaries up to `max_width`.
+fn wrap_settings_text(text: &str, max_width: usize) -> Vec<String> {
+    if text.is_empty() || max_width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+
+    for word in text.split_whitespace() {
+        if current_line.is_empty() {
+            current_line.push_str(word);
+        } else if current_line.len() + 1 + word.len() <= max_width {
+            current_line.push(' ');
+            current_line.push_str(word);
+        } else {
+            lines.push(current_line);
+            current_line = word.to_string();
+        }
+    }
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// One `ListItem` per settings category, highlighting the currently selected one.
@@ -4443,51 +4513,83 @@ fn build_settings_sidebar_items(state: &AppState, theme: &Theme) -> Vec<ListItem
             } else {
                 theme.normal()
             };
-            let label = format!(" {} {}", cat.icon(), cat.label());
+            let label = format!(" [{}] {}", i + 1, cat.label());
             ListItem::new(Line::from(vec![Span::styled(label, style)]))
         })
         .collect()
 }
 
-/// One `ListItem` per setting in the selected category: label, current value,
-/// an optional `[locked]` indicator for security-tier settings, and description.
+/// Returns list items and their line heights for the selected category.
 fn build_settings_content_items(
     state: &AppState,
     theme: &Theme,
     items: &[crate::settings_editor::SettingItem],
-) -> Vec<ListItem<'static>> {
-    items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            settings_content_item(item, theme, state.settings_editor.selected_item == i)
-        })
-        .collect()
+    content_width: usize,
+) -> (Vec<ListItem<'static>>, Vec<usize>) {
+    let mut list_items = Vec::with_capacity(items.len());
+    let mut heights = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let (list_item, h) = settings_content_item(
+            item,
+            theme,
+            state.settings_editor.selected_item == i,
+            content_width,
+        );
+        list_items.push(list_item);
+        heights.push(h);
+    }
+    (list_items, heights)
 }
 
-/// One settings row: label, current value, the row-kind indicator, description.
+/// One settings row: label, current value, the row-kind indicator, and description.
+/// Wraps description across lines if it cannot fit within available content width.
 fn settings_content_item(
     item: &crate::settings_editor::SettingItem,
     theme: &Theme,
     is_selected: bool,
-) -> ListItem<'static> {
+    content_width: usize,
+) -> (ListItem<'static>, usize) {
     let (label_style, row_style) = if is_selected {
         (theme.title(), theme.selected_item())
     } else {
         (theme.normal(), theme.normal())
     };
 
-    let line = Line::from(vec![
-        Span::styled(format!("  {: <25}", item.label), label_style),
-        Span::styled(
-            format!("  {: <15}", format_setting_value(&item.value)),
-            theme.success(),
-        ),
-        setting_kind_indicator(item, theme),
-        Span::styled(format!("  — {}", item.description), theme.dim()),
-    ]);
+    let label_str = format!("  {: <24}", item.label);
+    let val_str = format!("  {: <16}", format_setting_value(&item.value));
+    let kind_span = setting_kind_indicator(item, theme);
 
-    ListItem::new(line).style(row_style)
+    // Prefix width: 2 + 24 + 2 + 16 + indicator (approx 9) + 4 ("  — ") = 57
+    let prefix_len = label_str.len() + val_str.len() + 9 + 4;
+
+    if prefix_len + item.description.len() <= content_width {
+        let line = Line::from(vec![
+            Span::styled(label_str, label_style),
+            Span::styled(val_str, theme.success()),
+            kind_span,
+            Span::styled(format!("  — {}", item.description), theme.dim()),
+        ]);
+        (ListItem::new(line).style(row_style), 1)
+    } else {
+        let line1 = Line::from(vec![
+            Span::styled(label_str, label_style),
+            Span::styled(val_str, theme.success()),
+            kind_span,
+        ]);
+        let wrap_w = content_width.saturating_sub(8).max(20);
+        let desc_lines = wrap_settings_text(item.description, wrap_w);
+        let mut lines = Vec::with_capacity(1 + desc_lines.len());
+        lines.push(line1);
+        for (i, dl) in desc_lines.into_iter().enumerate() {
+            let prefix = if i == 0 { "      — " } else { "        " };
+            lines.push(Line::from(vec![Span::styled(
+                format!("{}{}", prefix, dl),
+                theme.dim(),
+            )]));
+        }
+        let count = lines.len();
+        (ListItem::new(lines).style(row_style), count)
+    }
 }
 
 /// Distinguish the three kinds of row the panel actually holds. Without this, a
@@ -4511,17 +4613,17 @@ fn setting_kind_indicator(
 /// Footer line: status/dirty message on the left, key hints on the right.
 fn settings_footer_line(state: &AppState, theme: &Theme) -> Line<'static> {
     let status_str = if let Some((msg, _)) = &state.settings_editor.status_message {
-        msg.clone()
+        format!("  {}  · ", msg)
     } else if state.settings_editor.dirty {
-        "● Unsaved changes".to_string()
+        "  ● Unsaved changes  · ".to_string()
     } else {
-        "".to_string()
+        "  ".to_string()
     };
 
     Line::from(vec![
-        Span::styled(format!("  {}", status_str), theme.pending()),
+        Span::styled(status_str, theme.pending()),
         Span::styled(
-            "  [Space] Toggle  [r] Reset  [s] Save  [Esc/q] Close   ([file] = edit settings.toml)",
+            "[Tab/←/→] Category  [1-8] Jump  [↑/↓] Item  [Space] Toggle  [r] Reset  [s] Save  [Esc] Close",
             theme.dim(),
         ),
     ])
@@ -6147,6 +6249,69 @@ mod help_reference_tests {
         assert_eq!(
             two_column, single,
             "the wide and narrow help layouts document different commands"
+        );
+    }
+}
+
+#[cfg(test)]
+mod settings_ui_tests {
+    use super::*;
+    use crate::state::{AppState, ClickTarget};
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn test_wrap_settings_text() {
+        let text = "sync: wait for results · async: return ids, collect with await";
+        let wrapped = wrap_settings_text(text, 30);
+        assert!(wrapped.len() > 1);
+        for line in &wrapped {
+            assert!(line.len() <= 30);
+        }
+        assert_eq!(wrapped.join(" "), text);
+    }
+
+    #[test]
+    fn test_calculate_list_offset() {
+        let heights = vec![1, 2, 2, 1, 3];
+        // Visible rows = 4. If selected = 0, offset = 0.
+        assert_eq!(calculate_list_offset(0, &heights, 4), 0);
+        // If selected = 1 (height 2, item 0 height 1 -> total 3 rows <= 4), offset = 0.
+        assert_eq!(calculate_list_offset(1, &heights, 4), 0);
+        // If selected = 2 (items 0..=2 = 1+2+2 = 5 > 4), offset must advance to 1 (items 1..=2 = 4 <= 4).
+        assert_eq!(calculate_list_offset(2, &heights, 4), 1);
+    }
+
+    #[test]
+    fn test_settings_sidebar_registers_click_targets() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.settings_editor.open = true;
+        let theme = Theme::new(true);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                draw_settings_panel(f, &state, &theme, area);
+            })
+            .unwrap();
+
+        let targets = state.click_targets.borrow();
+        let cat_targets: Vec<_> = targets
+            .iter()
+            .filter(|(t, _)| matches!(t, ClickTarget::SettingsCategory(_)))
+            .collect();
+        assert_eq!(
+            cat_targets.len(),
+            crate::settings_editor::SettingsCategory::ALL.len()
+        );
+
+        let item_targets: Vec<_> = targets
+            .iter()
+            .filter(|(t, _)| matches!(t, ClickTarget::SettingsItem(_)))
+            .collect();
+        assert!(
+            !item_targets.is_empty(),
+            "visible settings items should have click targets"
         );
     }
 }

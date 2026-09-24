@@ -391,6 +391,21 @@ impl SettingsEditor {
         }
     }
 
+    /// Jump directly to a specific category by index.
+    pub fn select_category(&mut self, index: usize) {
+        if index < SettingsCategory::ALL.len() {
+            self.selected_category = index;
+            self.selected_item = 0;
+        }
+    }
+
+    /// Jump directly to a specific category variant.
+    pub fn select_category_variant(&mut self, category: SettingsCategory) {
+        if let Some(pos) = SettingsCategory::ALL.iter().position(|&c| c == category) {
+            self.select_category(pos);
+        }
+    }
+
     /// Move item selection up within the current category.
     pub fn item_up(&mut self) {
         if self.selected_item > 0 {
@@ -1001,6 +1016,7 @@ mod tests {
     /// The panel opens on Tools.
     fn toggle_first_category_item() {
         let mut editor = SettingsEditor::default();
+        editor.settings.tools.execution_mode = ExecutionPolicy::Sync;
         assert_eq!(editor.current_category(), SettingsCategory::Tools);
         editor.item_down(); // index 1 = execution_mode (sync|async)
         assert_eq!(
@@ -1024,6 +1040,7 @@ mod tests {
     #[test]
     fn reset_to_default() {
         let mut editor = SettingsEditor::default();
+        editor.settings.tools.execution_mode = ExecutionPolicy::Sync;
         editor.item_down(); // Tools → execution_mode (default sync)
         editor.toggle_current();
         assert_eq!(
@@ -1061,6 +1078,16 @@ mod tests {
         // Should not go below 0
         editor.category_up();
         assert_eq!(editor.current_category(), SettingsCategory::Tools);
+
+        // Direct selection by index
+        editor.select_category(1);
+        assert_eq!(editor.current_category(), SettingsCategory::Sandbox);
+        editor.select_category(999); // Out of bounds is no-op
+        assert_eq!(editor.current_category(), SettingsCategory::Sandbox);
+
+        // Direct selection by variant
+        editor.select_category_variant(SettingsCategory::Logging);
+        assert_eq!(editor.current_category(), SettingsCategory::Logging);
     }
 
     #[test]
