@@ -2,6 +2,7 @@
 //!
 //! This crate is licensed under **AGPL-3.0**.
 
+use ahma_common::http_retry::{Idempotency, RetryPolicy, ServiceError, send_with_retry};
 use anyhow::{Context, Result};
 use clap::Parser as _;
 
@@ -15,6 +16,20 @@ use ahma_mcp::utils::logging::{
 };
 #[tokio::main]
 async fn main() -> Result<()> {
+    let result = run().await;
+    // A failed outside service (GitHub, a model server, the daemon) is shown
+    // summary-first (SPEC R-HTTP.3), not in anyhow's `Error: … Caused by:`
+    // form, which would print its cause chain twice.
+    if let Err(e) = &result
+        && ahma_common::http_retry::find_service_error(e).is_some()
+    {
+        eprintln!("{}", ahma_common::http_retry::user_message(e));
+        std::process::exit(1);
+    }
+    result
+}
+
+async fn run() -> Result<()> {
     // Windows AppContainer launcher re-entry. Must come before *anything* else,
     // and specifically before clap: `ahma.exe` re-executes itself to spawn each
     // sandboxed command inside an AppContainer (the only way to attach
@@ -338,14 +353,31 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
 
             print!("Testing '{}' at {} ... ", test_args.name, model_url);
 
-            let mut req = reqwest::Client::new().get(&model_url);
-            if let Some(key) = &resolved.api_key {
-                req = req.bearer_auth(key);
-            }
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("Failed to reach {model_url}"))?;
+            let service = format!(
+                "the model provider '{}' at {}",
+                test_args.name, resolved.base_url
+            );
+            let client = reqwest::Client::new();
+            let resp = match send_with_retry(
+                &service,
+                &RetryPolicy::DEFAULT,
+                Idempotency::Idempotent,
+                || {
+                    let req = client.get(&model_url);
+                    match &resolved.api_key {
+                        Some(key) => req.bearer_auth(key),
+                        None => req,
+                    }
+                },
+            )
+            .await
+            {
+                Ok((resp, _)) => resp,
+                Err(failure) => {
+                    println!("FAIL");
+                    return Err(ServiceError::from_transport(&service, failure).into());
+                }
+            };
 
             let status = resp.status();
             if status.is_success() {

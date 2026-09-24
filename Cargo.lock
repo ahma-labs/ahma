@@ -79,6 +79,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "rcgen",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -132,6 +133,7 @@ dependencies = [
 name = "ahma_harness_tools"
 version = "0.21.3"
 dependencies = [
+ "ahma_common",
  "anyhow",
  "globset",
  "html2text",
@@ -7158,7 +7160,6 @@ dependencies = [
  "num-traits",
  "objc2",
  "objc2-core-foundation",
- "once_cell",
  "percent-encoding",
  "portable-atomic",
  "proc-macro2",
@@ -7183,7 +7184,6 @@ dependencies = [
  "subtle",
  "syn 2.0.119",
  "syn 3.0.3",
- "sync_wrapper",
  "thiserror 2.0.20",
  "time",
  "tokio",

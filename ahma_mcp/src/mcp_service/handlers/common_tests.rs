@@ -16,6 +16,34 @@ fn make_op(id: &str, tool: &str, status: OperationStatus) -> Operation {
     op
 }
 
+/// An outside service's failure reaches the agent summary-first (SPEC
+/// R-HTTP.3); any other error keeps its whole cause chain.
+#[test]
+fn execution_error_leads_with_a_failed_service_and_keeps_other_causes() {
+    use ahma_common::http_retry::{Failure, ServiceError};
+
+    let service: anyhow::Error = ServiceError::new(
+        "GitHub",
+        Failure::NotDelivered,
+        anyhow::anyhow!("dns error"),
+    )
+    .into();
+    let mcp = execution_error(&service.context("fetching release"));
+    assert!(
+        mcp.message.starts_with("Couldn't reach GitHub."),
+        "{}",
+        mcp.message
+    );
+    assert!(mcp.message.contains("dns error"), "{}", mcp.message);
+
+    let plain = anyhow::anyhow!("root cause").context("outer");
+    let mcp = execution_error(&plain);
+    assert_eq!(
+        mcp.message,
+        "Synchronous execution failed: outer: root cause"
+    );
+}
+
 #[test]
 fn execution_error_attaches_structured_sandbox_denial() {
     use crate::sandbox::SandboxError;

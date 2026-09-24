@@ -146,10 +146,7 @@ pub async fn verify_artifact(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent("ahma-updater")
-        .build()
-        .context("Failed to create HTTP client for attestation lookup")?;
+    let client = crate::github::client()?;
 
     verify_artifact_via(&client, GITHUB_API_BASE, path).await
 }

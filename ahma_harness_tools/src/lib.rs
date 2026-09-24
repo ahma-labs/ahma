@@ -21,6 +21,9 @@
 //! | [`grep_search`] | Text/regex search with context and output modes, .gitignore-aware |
 //! | [`fetch_webpage`] | Fetch a URL and render its HTML as plain text |
 
+use ahma_common::http_retry::{
+    Failure, Idempotency, RetryPolicy, ServiceError, classify_transport, send_with_retry_classified,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -646,6 +649,14 @@ pub async fn fetch_webpage_with_redirect_guard(
     fetch_webpage_guarded(url, query, true, Some(domain_guard)).await
 }
 
+/// A plain name for the server behind `url` (SPEC R-HTTP.3).
+fn web_service_name(url: &str) -> String {
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string));
+    format!("the web server at {}", host.as_deref().unwrap_or(url))
+}
+
 /// Implementation of [`fetch_webpage`] with the SSRF private-range block as a
 /// parameter. `block_private` is always `true` in production; tests set it
 /// `false` to reach a loopback mock server (the R-WEB.3.3 dev opt-out).
@@ -660,11 +671,37 @@ async fn fetch_webpage_guarded(
     egress_guard::check_url(url, block_private)?;
     let client = egress_guard::guarded_client(block_private, domain_guard)
         .context("Failed to build guarded HTTP client")?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("Failed to fetch URL: {url}"))?;
+    // A page fetch is idempotent: transient failures are retried (SPEC
+    // R-HTTP.1/2), except a guard refusal, which is policy, not weather.
+    let service = web_service_name(url);
+    let (resp, _) = send_with_retry_classified(
+        &service,
+        &RetryPolicy::DEFAULT,
+        Idempotency::Idempotent,
+        || client.get(url),
+        |e| {
+            if egress_guard::is_egress_blocked(e) {
+                Failure::Permanent
+            } else {
+                classify_transport(e)
+            }
+        },
+    )
+    .await
+    .map_err(|failure| -> anyhow::Error {
+        if egress_guard::is_egress_blocked(&failure.error) {
+            anyhow::Error::new(failure.error).context(format!("Failed to fetch URL: {url}"))
+        } else {
+            ServiceError::new(
+                &service,
+                failure.failure,
+                anyhow::Error::new(failure.error).context(format!("fetching {url}")),
+            )
+            .with_attempts(failure.attempts)
+            .with_hint("Check the URL and your network connection, then try again.")
+            .into()
+        }
+    })?;
     let body = resp.text().await.context("Failed to read response body")?;
     render_webpage(url, &body, query)
 }
@@ -960,6 +997,44 @@ mod tests {
     async fn fetch_webpage_invalid_url() {
         let res = fetch_webpage("http://this-is-a-completely-invalid-url-domain.xyz", None).await;
         assert!(res.is_err());
+    }
+
+    /// A site that is down is retried, then reported summary-first (SPEC
+    /// R-HTTP.3) with the technical cause kept.
+    #[tokio::test]
+    async fn fetch_webpage_unreachable_leads_with_which_server() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = fetch_webpage_guarded(&format!("http://127.0.0.1:{port}/"), None, false, None)
+            .await
+            .expect_err("nothing is listening");
+        let shown = ahma_common::http_retry::user_message(&err);
+        assert!(
+            shown.starts_with("Couldn't reach the web server at 127.0.0.1."),
+            "{shown}"
+        );
+        assert!(shown.contains("gave up after 4 attempts"), "{shown}");
+    }
+
+    /// The SSRF guard's refusal is policy: not retried, and not dressed up as
+    /// the site being down.
+    #[tokio::test]
+    async fn fetch_webpage_guard_refusal_is_not_retried_or_called_an_outage() {
+        let started = std::time::Instant::now();
+        let err = fetch_webpage("http://localhost:9/", None)
+            .await
+            .expect_err("loopback is blocked");
+        assert!(
+            ahma_common::http_retry::find_service_error(&err).is_none(),
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("egress blocked"), "{err:#}");
+        assert!(
+            started.elapsed() < RetryPolicy::DEFAULT.base_delay,
+            "no backoff for a policy refusal"
+        );
     }
 
     #[tokio::test]

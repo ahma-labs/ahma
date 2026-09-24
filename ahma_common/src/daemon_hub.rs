@@ -418,7 +418,16 @@ pub enum HubRelay {
     /// The agent turn is done.
     AgentDone,
     /// The agent turn encountered an error.
-    AgentError { error: String },
+    AgentError {
+        /// What to show the user, summary first (SPEC R-HTTP.3).
+        error: String,
+        /// The connection's fault rather than the request's, so trying again
+        /// may work (SPEC R-HTTP.2). Typed so the TUI never has to guess from
+        /// the text; absent on the wire from older builds, which reads as
+        /// `false`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        transient: bool,
+    },
     /// The model's response was cut short (length limit, provider truncation).
     /// Kept distinct from [`Self::ChatToken`] so the TUI can render it as a
     /// system note rather than model output — previously folded onto
@@ -2139,6 +2148,7 @@ async fn route_submit_prompt(
                     Make sure an ahma server is connected (it normally \
                     auto-starts); try reopening the TUI."
                 .to_string(),
+            transient: false,
         }));
     }
 }
@@ -2871,7 +2881,7 @@ mod tests {
         .expect("subscriber connection open");
 
         match msg {
-            DaemonMsg::Relay(HubRelay::AgentError { error }) => {
+            DaemonMsg::Relay(HubRelay::AgentError { error, .. }) => {
                 assert!(
                     error.contains("No ahma instance"),
                     "unexpected error text: {error}"
@@ -4967,12 +4977,13 @@ mod tests {
             &mut iw,
             &ClientMsg::Relay(HubRelay::AgentError {
                 error: "boom".into(),
+                transient: false,
             }),
         )
         .await
         .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Relay(HubRelay::AgentError { error }) => assert_eq!(error, "boom"),
+            DaemonMsg::Relay(HubRelay::AgentError { error, .. }) => assert_eq!(error, "boom"),
             other => panic!("expected AgentError, got {other:?}"),
         }
     }
@@ -5329,9 +5340,11 @@ mod relay_wire_compat {
         assert_same_bytes_both_directions(
             ClientMsg::Relay(HubRelay::AgentError {
                 error: "boom".into(),
+                transient: false,
             }),
             DaemonMsg::Relay(HubRelay::AgentError {
                 error: "boom".into(),
+                transient: false,
             }),
             json!({"type": "AgentError", "error": "boom"}),
         );

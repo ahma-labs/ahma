@@ -7,6 +7,7 @@
 //! configs after an install lives in `ahma_mcp::update`, which re-exports this
 //! crate wholesale.
 
+mod github;
 pub mod install;
 pub mod platform;
 pub mod ref_mode;
@@ -165,10 +166,7 @@ pub async fn run_release_update(
     }
     let insecure_skip_verify = args.insecure_skip_verify;
 
-    let client = reqwest::Client::builder()
-        .user_agent("ahma-updater")
-        .build()
-        .context("Failed to create HTTP client")?;
+    let client = github::client()?;
 
     let asset = match mode {
         UpdateMode::LatestRelease => fetch_latest_asset(&client, platform).await?,

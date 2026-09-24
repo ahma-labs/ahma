@@ -33,6 +33,10 @@ project's CI, and to never leave me with a half-installed or unrunnable binary.*
 ## 3. Non-Functional Requirements
 
 - No MCP-engine dependency: this crate can be tested without starting a server.
+- Every GitHub request (release lookup, download, `SHA256SUMS`, attestations) goes through
+  `github::get`: bounded connect and read timeouts, transient failures retried with backoff,
+  and a final failure that leads with "Couldn't reach GitHub." or "GitHub … " before the
+  technical detail (root SPEC R-HTTP).
 
 ## 4. Out of Scope
 

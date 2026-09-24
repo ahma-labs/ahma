@@ -696,6 +696,7 @@ async fn spawn_prompt_run(
         let _ = hub_tx
             .send(ClientMsg::Relay(HubRelay::AgentError {
                 error: "No prompt runner registered on this instance".to_string(),
+                transient: false,
             }))
             .await;
         return;
@@ -717,7 +718,10 @@ async fn spawn_prompt_run(
             .await;
         let done = match outcome {
             Ok(_) => ClientMsg::Relay(HubRelay::AgentDone),
-            Err(e) => ClientMsg::Relay(HubRelay::AgentError { error: e }),
+            Err(e) => ClientMsg::Relay(HubRelay::AgentError {
+                error: e,
+                transient: false,
+            }),
         };
         let _ = hub_tx.send(done).await;
     });
@@ -747,6 +751,7 @@ async fn cancel_prompt_run(
     let _ = hub_tx
         .send(ClientMsg::Relay(HubRelay::AgentError {
             error: "Cancelled by user".to_string(),
+            transient: false,
         }))
         .await;
 }
@@ -1169,7 +1174,7 @@ mod tests {
         assert!(turn.await.unwrap_err().is_cancelled());
         assert!(approval_rx.await.is_err(), "approval waiter must wake");
         match hub_rx.try_recv() {
-            Ok(ClientMsg::Relay(HubRelay::AgentError { error })) => {
+            Ok(ClientMsg::Relay(HubRelay::AgentError { error, .. })) => {
                 assert!(error.contains("Cancelled"), "{error}")
             }
             other => panic!("expected one AgentError, got {other:?}"),

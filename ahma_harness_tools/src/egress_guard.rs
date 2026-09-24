@@ -112,6 +112,32 @@ pub fn is_blocked_ip(ip: &IpAddr) -> bool {
     }
 }
 
+/// The guard refused a destination. Typed so a caller can tell a policy
+/// refusal from a network failure anywhere in a `reqwest` error's source
+/// chain — the refusal must never be retried or reported as an outage.
+#[derive(Debug)]
+pub struct EgressBlocked(String);
+
+impl std::fmt::Display for EgressBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EgressBlocked {}
+
+/// Whether `error` was caused by the guard refusing its destination.
+pub fn is_egress_blocked(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if e.is::<EgressBlocked>() {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
 /// A [`reqwest`] DNS resolver that drops blocked addresses from every
 /// resolution. If a name resolves *only* to blocked addresses the resolution
 /// fails, so the connection is never attempted.
@@ -135,10 +161,11 @@ impl Resolve for GuardedResolver {
                 .filter(|a| !is_blocked_ip(&a.ip()))
                 .collect();
             if allowed.is_empty() {
-                return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                return Err(Box::new(EgressBlocked(format!(
                     "egress blocked: '{host}' resolves only to private/loopback/link-local \
                      addresses (SSRF protection)"
-                )));
+                )))
+                    as Box<dyn std::error::Error + Send + Sync>);
             }
             let out: Addrs = Box::new(allowed.into_iter());
             Ok(out)

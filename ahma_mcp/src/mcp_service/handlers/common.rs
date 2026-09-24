@@ -115,8 +115,14 @@ pub fn async_execution_error(e: &anyhow::Error) -> McpError {
 fn denial_aware_error(context: &str, e: &anyhow::Error) -> McpError {
     use crate::sandbox::SandboxError;
 
-    let message = format!("{context}: {e}");
-    tracing::error!("{message}");
+    // An outside service's failure leads with which one, in plain words
+    // (SPEC R-HTTP.3); anything else keeps its whole cause chain, which a bare
+    // `{e}` would cut to the outermost context.
+    let message = match ahma_common::http_retry::find_service_error(e) {
+        Some(_) => ahma_common::http_retry::user_message(e),
+        None => format!("{context}: {e:#}"),
+    };
+    tracing::error!("{context}: {e:#}");
 
     if let Some(SandboxError::PathOutsideSandbox { path, scopes }) =
         e.downcast_ref::<SandboxError>()

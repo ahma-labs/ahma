@@ -163,6 +163,7 @@ what is missing named; `dormant` means present but not active.
 | Per-user daemon (R-DAEMON) | tests-pass | Windows still uses fixed loopback ports (R-DAEMON.2) |
 | HTTP MCP client, OAuth 2.0 + PKCE | tests-pass | OAuth endpoints are Atlassian's; no token refresh |
 | Web egress policy for `fetch_webpage` (R-WEB) | tests-pass | Three-tier approval, private-range block, redirect guard |
+| Outbound HTTP retry and failure wording (R-HTTP) | tests-pass | `ahma_common::http_retry`; SSE stream reconnect and `xtask` not covered (R-HTTP.4) |
 | Subprocess egress restriction (R-WEB.16) | tests-pass | Opt-in `--restrict-network`; kernel-enforced on macOS and Linux 6.7+ |
 | Live log monitoring (`livelog`, `--log-monitor`) | tests-pass | §5.5, R9 |
 | TUI (R24, R25) | tests-pass | `ahma_tui/SPEC.md` |
@@ -1064,6 +1065,45 @@ The subprocess egress sandbox covers HTTP traffic from **sandboxed subprocesses*
 | `block_private_ranges` cannot be overridden by any domain pattern | R-WEB.3.1 |
 
 ---
+
+## 4.7 Outbound HTTP (R-HTTP)
+
+ahma talks to model providers, the per-user daemon, external MCP servers, GitHub and arbitrary
+web pages. Each of those fails transiently — a local model server dropping the connection while
+it loads a model, a daemon mid-upgrade answering 503, GitHub rate-limiting — and each used to
+handle it differently or not at all: one crate had backoff, the rest failed on the first error
+and reported whatever `reqwest` printed ("error sending request for url (…)"), which names
+neither the service nor what to do. One helper, `ahma_common::http_retry`, now holds both rules.
+
+- **R-HTTP.1 — Retry with backoff.** Every outbound HTTP request retries transient failures with
+  capped exponential backoff and jitter (default: 3 retries, 500 ms doubling to 8 s), through
+  `send_with_retry`. A server's `Retry-After` is honoured as a floor, capped at 60 s so a
+  confused server cannot park a request indefinitely.
+- **R-HTTP.2 — Retry only what is safe, and decide it from types.** A failure is classified once,
+  from the `reqwest` error kind or the status code, never from rendered text:
+  - *Not delivered* (refused connection, DNS, TLS handshake) and *throttled* (429, 503): always
+    retried — the server did nothing, or asked to be asked again.
+  - *Interrupted* (timeout, dropped connection, 408/500/502/504): retried only for idempotent
+    requests — GETs, `tools/list`, downloads, LLM completions. **Never** for `tools/call`,
+    `initialize` or `sampling/createMessage`: a tool may already have run, and each
+    `initialize` that arrives creates a session.
+  - Any other 4xx, a decode error, or a policy refusal (the `fetch_webpage` SSRF guard): never
+    retried.
+  - A model on this machine gets no timeout retries: re-sending makes a slow local model start
+    reading its prompt again (`ahma_tui` R24.10.8).
+  - Whether a failure is transient travels as a typed flag to whoever decides on a further
+    retry (the TUI's one automatic chat retry reads `HubRelay::AgentError.transient`).
+- **R-HTTP.3 — A failure leads with a plain summary.** What a person reads first names the
+  service that is not working and its state, in plain words ("Couldn't reach your local model
+  server at localhost:11434."); then, where the call site knows, what to do; then `Details:`
+  with the full technical cause chain and the number of attempts. `ServiceError` renders this
+  shape and rides inside `anyhow` chains, so every surface — CLI, TUI, MCP tool errors, agent
+  events — finds it with `find_service_error` / `user_message` and shows the same thing. Errors
+  that are not a service failure render their full chain (`{:#}`), never only the outermost
+  context.
+- **R-HTTP.4 — Not covered.** Re-opening a dropped SSE stream (stream resumption is its own
+  design, R8.6.4), the `--restrict-network` egress proxy (a proxy must not retry on its client's
+  behalf), best-effort health probes that already poll, and `xtask` (developer tooling).
 
 ## 5. Tool Definition (MTDF Schema)
 

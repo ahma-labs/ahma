@@ -30,6 +30,12 @@ subtly wrong on its own.*
   (`supports_progress`, request budget) off it, so it is never normalized.
 - Every timeout is supplied by the caller; nothing is hardcoded here.
 - `delete_session` ends a session with `DELETE /mcp` (R8.3.6).
+- Every POST retries per root SPEC R-HTTP: a request that never arrived, or that the server
+  answered 429/503 (a draining daemon), is re-sent; a timeout or 5xx is re-sent only for the
+  read-only `*/list` methods, never for `tools/call` or `initialize`. A retried request keeps
+  its JSON-RPC id. A final failure is a `ServiceError` naming "the MCP server at host:port";
+  callers that know better (the agent: "the ahma daemon") re-attribute it with
+  `ServiceError::for_service`. `with_retry_policy` overrides the default policy.
 - JSON-RPC request ids are unique across **every** client in the process, not per client:
   callers `attach` a fresh client per call against one shared session and run calls
   concurrently, and the bridge refuses an id that is already in flight (R8.3.7).

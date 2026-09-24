@@ -693,7 +693,7 @@ pub fn spawn_window_llm_task(
                             let _ = tx.send(BridgeEvent::WindowFinished {
                                 window_id,
                                 success: false,
-                                summary: format!("LLM error: {e}"),
+                                summary: e.to_string(),
                             }).await;
                             return;
                         }

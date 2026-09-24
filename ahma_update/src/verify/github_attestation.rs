@@ -72,20 +72,19 @@ pub(crate) async fn fetch_bundles(
 ) -> Result<Vec<serde_json::Value>> {
     let url = format!("{api_base}/repos/{owner}/{repo}/attestations/sha256:{digest}");
 
-    let mut request = client
-        .get(&url)
-        .header("User-Agent", "ahma-updater")
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-        .query(&[("per_page", PER_PAGE.to_string())]);
-    if let Some(token) = token {
-        request = request.header("Authorization", format!("Bearer {token}"));
-    }
-
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("Failed to fetch attestations from {url}"))?;
+    let response = crate::github::get(&format!("attestations from {url}"), || {
+        let request = client
+            .get(&url)
+            .header("User-Agent", "ahma-updater")
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .query(&[("per_page", PER_PAGE.to_string())]);
+        match token {
+            Some(token) => request.header("Authorization", format!("Bearer {token}")),
+            None => request,
+        }
+    })
+    .await?;
 
     // 404 means "no attestation for this digest", not an error: the previous
     // implementation returned an empty list here and the caller renders the
@@ -94,12 +93,7 @@ pub(crate) async fn fetch_bundles(
         return Ok(Vec::new());
     }
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable body>".to_string());
-        bail!("GitHub attestation API returned {status}: {body}");
+        return Err(crate::github::status_error("GitHub attestation lookup", response).await);
     }
 
     let parsed: AttestationsResponse = response
@@ -125,18 +119,17 @@ pub(crate) async fn fetch_bundles(
 /// do the same. No credentials are attached: the URL is already a signed,
 /// short-lived blob URL on a different host than the API.
 async fn download_bundle(client: &reqwest::Client, bundle_url: &str) -> Result<serde_json::Value> {
-    let response = client
-        .get(bundle_url)
-        .header("User-Agent", "ahma-updater")
-        .send()
-        .await
-        .with_context(|| format!("Failed to download attestation bundle from {bundle_url}"))?;
+    let response = crate::github::get(&format!("attestation bundle from {bundle_url}"), || {
+        client.get(bundle_url).header("User-Agent", "ahma-updater")
+    })
+    .await?;
 
     if !response.status().is_success() {
-        bail!(
-            "Attestation bundle download from {bundle_url} returned {}",
-            response.status()
-        );
+        return Err(crate::github::status_error(
+            &format!("Attestation bundle download from {bundle_url}"),
+            response,
+        )
+        .await);
     }
 
     let snappy = response

@@ -1651,7 +1651,9 @@ fn send_turn_msg(state: &crate::state::AppState, msg: ahma_common::daemon_hub::C
         {
             let _ = tx
                 .send(crate::llm_bridge::BridgeEvent::TurnSendFailed(format!(
-                    "Could not reach the ahma daemon: {e}"
+                    "Couldn't reach the ahma daemon.\n\
+                     It normally starts on its own; try again, or run `ahma doctor`.\n\
+                     Details: {e:#}"
                 )))
                 .await;
         }
@@ -1666,10 +1668,12 @@ fn end_turn(state: &mut crate::state::AppState) {
     state.chat.finish_user_timing();
 }
 
-fn end_turn_with_error(state: &mut crate::state::AppState, error: &str) {
-    let transient = is_transient_turn_error(error);
-    // Retry by ourselves only when it is safe to: the failure looks like the
-    // connection, not the request, and no answer text has arrived yet (a
+/// End the running turn with `error`, a message that already leads with a
+/// plain summary (SPEC R-HTTP.3). `transient` is the sender's typed verdict on
+/// whether the connection, not the request, failed (SPEC R-HTTP.2).
+fn end_turn_with_error(state: &mut crate::state::AppState, error: &str, transient: bool) {
+    // Retry by ourselves only when it is safe to: the failure is the
+    // connection's, not the request's, and no answer text has arrived yet (a
     // half-written reply would otherwise be sent back to the model as if it
     // had said it). Once per message — a second failure is reported.
     let retry = transient
@@ -1682,11 +1686,7 @@ fn end_turn_with_error(state: &mut crate::state::AppState, error: &str) {
         if !base_url.is_empty() {
             state.turn_retries += 1;
             state.chat.push(crate::state::ChatEntry::Notice {
-                text: format!(
-                    "{} dropped the request ({}) — trying again now",
-                    crate::ui::shorten_llm_label(&state.llm_label()),
-                    first_line(error)
-                ),
+                text: format!("{} Trying again now…", first_line(error)),
             });
             state.chat.push(crate::state::ChatEntry::Assistant {
                 content: String::new(),
@@ -1696,11 +1696,11 @@ fn end_turn_with_error(state: &mut crate::state::AppState, error: &str) {
             return;
         }
     }
-    push_assistant_message(state, format!("Error: {error}"));
+    push_assistant_message(state, error.to_string());
     if transient {
         state.chat.push(crate::state::ChatEntry::Notice {
-            text: "The model could not be reached. Your message is still here: send it again \
-                   when ready, or /model to pick another."
+            text: "Your message is still here: send it again when ready, or /model to pick \
+                   another."
                 .to_string(),
         });
     }
@@ -1740,30 +1740,6 @@ fn turn_summary(state: &crate::state::AppState) -> Option<String> {
         parts.push(format!("wrote {rate} tok/s"));
     }
     Some(parts.join(" · "))
-}
-
-/// Whether a turn error is the connection's fault (worth one quiet retry)
-/// rather than the request's (a 4xx, a refused tool, a cancel).
-fn is_transient_turn_error(error: &str) -> bool {
-    let e = error.to_ascii_lowercase();
-    if e.contains("cancel") {
-        return false;
-    }
-    [
-        "timed out",
-        "timeout",
-        "connection",
-        "error sending request",
-        "broken pipe",
-        "unexpected eof",
-        "reset by peer",
-        "502",
-        "503",
-        "504",
-        "overloaded",
-    ]
-    .iter()
-    .any(|needle| e.contains(needle))
 }
 
 /// The first line of a (possibly multi-line) error, for a one-line notice.
@@ -4815,7 +4791,7 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             });
             state.chat_scroll = 0;
         }
-        BridgeEvent::TurnSendFailed(msg) => end_turn_with_error(state, &msg),
+        BridgeEvent::TurnSendFailed(msg) => end_turn_with_error(state, &msg, true),
         BridgeEvent::Decomposed { steps } => {
             handle_decomposed_event(steps, state);
         }
@@ -5490,7 +5466,9 @@ fn handle_source_chat_event(
             append_profile_transcript(state);
             save_transcript(state);
         }
-        SourceEvent::AgentError { error } => end_turn_with_error(state, &error),
+        SourceEvent::AgentError { error, transient } => {
+            end_turn_with_error(state, &error, transient)
+        }
         SourceEvent::Usage {
             prompt_tokens,
             completion_tokens,
@@ -6400,6 +6378,7 @@ mod tests {
         super::handle_source_event(
             SourceEvent::AgentError {
                 error: "boom".into(),
+                transient: false,
             },
             &mut state,
         );
@@ -6543,6 +6522,7 @@ mod tests {
         super::handle_source_event(
             SourceEvent::AgentError {
                 error: "Cancelled by user".into(),
+                transient: false,
             },
             &mut state,
         );
@@ -7495,11 +7475,17 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        super::end_turn_with_error(&mut state, "error sending request: connection reset");
+        let dropped = "Your local model server at localhost:11434 dropped the connection.\n\
+                       Details: error sending request: connection reset";
+        super::end_turn_with_error(&mut state, dropped, true);
         assert!(state.turn.is_some(), "the message is sent again");
-        assert!(notices(&state)[0].contains("trying again now"));
+        assert_eq!(
+            notices(&state)[0],
+            "Your local model server at localhost:11434 dropped the connection. Trying again now…",
+            "the notice leads with the plain summary, not the technical detail"
+        );
 
-        super::end_turn_with_error(&mut state, "error sending request: connection reset");
+        super::end_turn_with_error(&mut state, dropped, true);
         assert!(state.turn.is_none(), "one retry per message");
         assert!(notices(&state)[1].contains("send it again"));
 
@@ -7507,7 +7493,7 @@ mod tests {
         assert!(
             super::collect_chat_history(&state)
                 .iter()
-                .all(|m| !m.content.contains("trying again"))
+                .all(|m| !m.content.contains("Trying again"))
         );
     }
 
@@ -7565,13 +7551,24 @@ mod tests {
         assert_eq!(state.llm_selection.as_ref().unwrap().model, "other-model");
     }
 
+    /// The retry decision follows the sender's typed flag, never the text: a
+    /// request error whose details happen to mention a timeout is not retried
+    /// (SPEC R-HTTP.2).
     #[test]
-    fn request_errors_are_not_retried() {
-        assert!(!super::is_transient_turn_error(
-            "HTTP 400: model does not support tools"
-        ));
-        assert!(!super::is_transient_turn_error("cancelled by user"));
-        assert!(super::is_transient_turn_error("llm: operation timed out"));
+    fn request_errors_are_not_retried_whatever_their_text_says() {
+        use crate::state::{AppState, ChatTurn, LlmSelection};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.llm_selection = Some(LlmSelection::named("Ollama", "qwen3.8:27b"));
+        state.current_provider_url = Some("http://localhost:11434/v1".into());
+        state.turn = Some(ChatTurn::new(None));
+
+        super::end_turn_with_error(
+            &mut state,
+            "The model provider rejected the request.\nDetails: upstream timed out (HTTP 400)",
+            false,
+        );
+        assert!(state.turn.is_none(), "a request error ends the turn");
+        assert_eq!(state.turn_retries, 0);
     }
 
     /// The trust question: Enter/Esc/`n` never trust; only `y` does, and it
