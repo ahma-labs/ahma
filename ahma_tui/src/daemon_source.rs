@@ -574,7 +574,9 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 workspace,
             },
             HubRelay::AgentDone => SourceEvent::AgentDone,
-            HubRelay::AgentError { error } => SourceEvent::AgentError { error },
+            HubRelay::AgentError { error, transient } => {
+                SourceEvent::AgentError { error, transient }
+            }
             HubRelay::Usage {
                 prompt_tokens,
                 completion_tokens,
@@ -1425,9 +1427,10 @@ mod tests {
             &mut s,
             DaemonMsg::Relay(HubRelay::AgentError {
                 error: "boom".to_string(),
+                transient: false,
             }),
         ) {
-            Applied::Event(SourceEvent::AgentError { error: e }) => assert_eq!(e, "boom"),
+            Applied::Event(SourceEvent::AgentError { error: e, .. }) => assert_eq!(e, "boom"),
             _ => panic!("must map to SourceEvent::AgentError"),
         }
     }
@@ -1662,11 +1665,12 @@ mod tests {
             &mut st,
             DaemonMsg::Relay(HubRelay::AgentError {
                 error: "boom".to_string(),
+                transient: false,
             }),
         )
         .await;
         match next_ev(&mut rx_s).await {
-            SourceEvent::AgentError { error } => assert_eq!(error, "boom"),
+            SourceEvent::AgentError { error, .. } => assert_eq!(error, "boom"),
             other => panic!("expected AgentError, got {other:?}"),
         }
 
@@ -2221,12 +2225,13 @@ mod tests {
             &mut inst_w,
             &ClientMsg::Relay(HubRelay::AgentError {
                 error: "boom".to_string(),
+                transient: false,
             }),
         )
         .await
         .unwrap();
         match next_ev(&mut rx).await {
-            SourceEvent::AgentError { error } => assert_eq!(error, "boom"),
+            SourceEvent::AgentError { error, .. } => assert_eq!(error, "boom"),
             other => panic!("expected AgentError, got {other:?}"),
         }
 

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use ahma_common::http_retry::{Failure, ServiceError, capitalise, classify_transport};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -145,6 +146,108 @@ impl LlmMonitorError {
                 }
             }
             _ => false,
+        }
+    }
+}
+
+/// A plain name for the LLM endpoint at `base_url`, for the first line of a
+/// failure message (SPEC R-HTTP.3): whether it runs on this machine decides
+/// what the reader should check.
+pub fn llm_service_name(base_url: &str) -> String {
+    let authority = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?.to_string();
+            Some(match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        })
+        .unwrap_or_else(|| base_url.to_string());
+    if crate::client::is_loopback_url(base_url) {
+        format!("your local model server at {authority}")
+    } else {
+        format!("the model provider at {authority}")
+    }
+}
+
+impl LlmMonitorError {
+    /// How this failure classifies for retry and transience (SPEC R-HTTP.2).
+    pub fn failure(&self) -> Failure {
+        match self {
+            Self::Connect(_) => Failure::NotDelivered,
+            Self::Timeout(_) => Failure::Interrupted,
+            Self::Http(e) => classify_transport(e),
+            Self::Api { kind, .. } => match kind {
+                ApiErrorKind::RateLimited => Failure::Throttled,
+                ApiErrorKind::Server => Failure::Interrupted,
+                ApiErrorKind::Auth
+                | ApiErrorKind::ContextLengthExceeded
+                | ApiErrorKind::InvalidRequest
+                | ApiErrorKind::Other => Failure::Permanent,
+            },
+            Self::Parse(_) => Failure::Permanent,
+        }
+    }
+
+    /// This error as a person should read it (SPEC R-HTTP.3): which endpoint
+    /// is not working and what to do first, then the technical detail.
+    pub fn into_service_error(self, base_url: &str) -> ServiceError {
+        let service = llm_service_name(base_url);
+        let local = crate::client::is_loopback_url(base_url);
+        let failure = self.failure();
+        let (summary, hint): (Option<String>, &str) = match &self {
+            Self::Connect(_) if local => (
+                None,
+                "Check the model server is running, then send your message again.",
+            ),
+            Self::Connect(_) => (None, "Check your network connection, then try again."),
+            Self::Timeout(_) => (
+                Some(format!("{} didn't answer in time.", capitalise(&service))),
+                "The model may still be loading, or the prompt may be too long for it. \
+                 Try again, or pick a smaller model.",
+            ),
+            Self::Http(_) => (
+                Some(format!("{} dropped the connection.", capitalise(&service))),
+                "Send your message again.",
+            ),
+            Self::Api { kind, .. } => match kind {
+                ApiErrorKind::RateLimited => (
+                    Some(format!(
+                        "{} is rate-limiting requests.",
+                        capitalise(&service)
+                    )),
+                    "Wait a moment, then try again.",
+                ),
+                ApiErrorKind::Auth => (
+                    Some(format!("{} rejected the API key.", capitalise(&service))),
+                    "Check the API key configured for this provider.",
+                ),
+                ApiErrorKind::ContextLengthExceeded => (
+                    Some("The conversation is too long for this model.".to_string()),
+                    "Shorten the conversation, or pick a model with a larger context window.",
+                ),
+                ApiErrorKind::Server => (
+                    Some(format!("{} had an internal error.", capitalise(&service))),
+                    "This is usually temporary. Try again shortly.",
+                ),
+                ApiErrorKind::InvalidRequest | ApiErrorKind::Other => (
+                    Some(format!("{} rejected the request.", capitalise(&service))),
+                    "The details below say why.",
+                ),
+            },
+            Self::Parse(_) => (
+                Some(format!(
+                    "{} sent a response ahma couldn't read.",
+                    capitalise(&service)
+                )),
+                "Check that the endpoint is OpenAI- or Anthropic-compatible.",
+            ),
+        };
+        let error = ServiceError::new(&service, failure, self).with_hint(hint);
+        match summary {
+            Some(summary) => error.with_summary(summary),
+            None => error,
         }
     }
 }
@@ -320,5 +423,73 @@ mod tests {
         let err = LlmMonitorError::Timeout(None);
         assert_eq!(err.to_string(), "LLM request timed out");
         assert!(err.is_timeout());
+    }
+
+    #[tokio::test]
+    async fn refused_local_model_leads_with_which_server_is_down() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let base = format!("http://localhost:{port}/v1");
+        let transport = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .expect_err("closed port");
+        let service = LlmMonitorError::from(transport).into_service_error(&base);
+        let text = service.to_string();
+        let first = text.lines().next().unwrap();
+        assert_eq!(
+            first,
+            format!("Couldn't reach your local model server at localhost:{port}.")
+        );
+        assert!(text.contains("\nDetails: "), "{text}");
+        assert!(service.is_transient());
+    }
+
+    #[test]
+    fn api_errors_get_plain_summaries_by_kind() {
+        let base = "https://api.example.com/v1";
+        let auth =
+            LlmMonitorError::from_api_response(401, None, r#"{"error":{"message":"bad key"}}"#)
+                .into_service_error(base);
+        assert_eq!(
+            auth.summary(),
+            "The model provider at api.example.com rejected the API key."
+        );
+        assert!(!auth.is_transient());
+        assert!(auth.details().contains("bad key"), "{}", auth.details());
+
+        let busy =
+            LlmMonitorError::from_api_response(429, None, "slow down").into_service_error(base);
+        assert!(
+            busy.summary().contains("rate-limiting"),
+            "{}",
+            busy.summary()
+        );
+        assert!(busy.is_transient());
+
+        let overflow = LlmMonitorError::from_api_response(
+            400,
+            None,
+            r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#,
+        )
+        .into_service_error(base);
+        assert_eq!(
+            overflow.summary(),
+            "The conversation is too long for this model."
+        );
+    }
+
+    #[test]
+    fn service_names_distinguish_local_from_remote() {
+        assert_eq!(
+            llm_service_name("http://127.0.0.1:1234/v1"),
+            "your local model server at 127.0.0.1:1234"
+        );
+        assert_eq!(
+            llm_service_name("https://api.anthropic.com"),
+            "the model provider at api.anthropic.com"
+        );
+        assert_eq!(llm_service_name("garbage"), "the model provider at garbage");
     }
 }

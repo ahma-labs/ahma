@@ -343,8 +343,13 @@ fn print_cli_error(error: &anyhow::Error) {
         );
     } else if error_message.to_lowercase().contains("cancel") {
         eprintln!("Operation cancelled: {}", error_message);
+    } else if ahma_common::http_retry::find_service_error(error).is_some() {
+        // An outside service failed: lead with which one, in plain words
+        // (SPEC R-HTTP.3).
+        eprintln!("{}", ahma_common::http_retry::user_message(error));
     } else {
-        eprintln!("Error executing tool: {}", error);
+        // `{:#}`: the whole cause chain, not just the outermost context.
+        eprintln!("Error executing tool: {error:#}");
     }
 }
 

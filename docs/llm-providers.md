@@ -149,6 +149,25 @@ curl http://localhost:11434/v1/chat/completions \
   -d '{"model":"llama3.2","messages":[{"role":"user","content":"ping"}],"max_tokens":5}'
 ```
 
+`ahma llm test <name>` does the same against a named provider's `/models` endpoint.
+
+### When a provider is unreachable
+
+Requests to a provider retry transient failures — a refused connection, a dropped connection,
+HTTP 429 or 5xx — up to three times with backoff, honouring `Retry-After`. A model on this
+machine is not re-sent its prompt after a timeout: it is slow, not gone, and a re-send makes it
+start reading again. If every attempt fails, the message leads with which endpoint is down and
+what to check, then the technical detail:
+
+```text
+Couldn't reach your local model server at localhost:11434.
+Check the model server is running, then send your message again.
+Details: error sending request for url (http://localhost:11434/v1/chat/completions): … Connection refused (gave up after 4 attempts over 3.4s)
+```
+
+In `ahma tui`, a turn that fails this way before any answer arrived is sent again once
+automatically. The rules are in [SPEC.md](../SPEC.md) R-HTTP.
+
 ## See also
 
 - [docs/settings.md](settings.md) — `[lmstudio]`, `[agent]` and the chat token budgets

@@ -21,6 +21,9 @@
 //! categories — nothing is hardcoded here).
 
 use ahma_common::file_uri::encode_file_uri;
+use ahma_common::http_retry::{
+    Idempotency, RetryPolicy, ServiceError, TransportFailure, classify_status, send_with_retry,
+};
 use ahma_common::mcp_methods::{INITIALIZED_METHOD, ROOTS_LIST_METHOD, SANDBOX_CONFIGURED_METHOD};
 use ahma_common::mcp_protocol::{MCP_PROTOCOL_VERSION_HEADER, negotiated_protocol_version};
 use ahma_common::sse::{event_data_to_json, pop_next_sse_event};
@@ -147,6 +150,7 @@ pub struct StreamableHttpMcpClient {
     /// `MCP-Protocol-Version` negotiation) — echoed on every subsequent
     /// request via [`MCP_PROTOCOL_VERSION_HEADER`].
     protocol_version: String,
+    retry: RetryPolicy,
 }
 
 impl std::fmt::Debug for StreamableHttpMcpClient {
@@ -288,7 +292,16 @@ impl StreamableHttpMcpClient {
             mcp_url: mcp_url.into(),
             session_id: session_id.into(),
             protocol_version: protocol_version.into(),
+            retry: RetryPolicy::DEFAULT,
         }
+    }
+
+    /// Override how transient failures are retried (SPEC R-HTTP.1). The
+    /// default is [`RetryPolicy::DEFAULT`].
+    #[must_use]
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 
     /// The negotiated session id.
@@ -311,6 +324,13 @@ impl StreamableHttpMcpClient {
     /// POST one JSON-RPC request with the session header and a fresh request
     /// id — unique across every client in this process (see
     /// `NEXT_REQUEST_ID`) — returning the raw HTTP response.
+    ///
+    /// Transient failures are retried per SPEC R-HTTP.2: a request that never
+    /// arrived, or that the server asked to be retried (429/503), always; a
+    /// timeout or 5xx only for the read-only `*/list` methods, since a
+    /// `tools/call` may already have run. A retried request keeps its id — it
+    /// is the same request. Giving up yields a [`ServiceError`] naming the
+    /// server.
     pub async fn post_json_rpc(&self, method: &str, params: Value) -> Result<reqwest::Response> {
         let req_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let body = json!({
@@ -319,16 +339,19 @@ impl StreamableHttpMcpClient {
             "method": method,
             "params": params
         });
-        self.post_client
-            .post(&self.mcp_url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .header(SESSION_ID_HEADER, &self.session_id)
-            .header(MCP_PROTOCOL_VERSION_HEADER, &self.protocol_version)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("{method} request to {} failed", self.mcp_url))
+        let service = mcp_service_name(&self.mcp_url);
+        send_with_retry(&service, &self.retry, method_idempotency(method), || {
+            self.post_client
+                .post(&self.mcp_url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header(SESSION_ID_HEADER, &self.session_id)
+                .header(MCP_PROTOCOL_VERSION_HEADER, &self.protocol_version)
+                .json(&body)
+        })
+        .await
+        .map(|(response, _)| response)
+        .map_err(|failure| transport_error(&service, method, &self.mcp_url, failure))
     }
 
     /// Invoke `tools/call`, applying `retry` to the HTTP 409 sandbox gate.
@@ -380,9 +403,14 @@ impl StreamableHttpMcpClient {
     pub async fn tools_list(&self) -> Result<Vec<ToolDescriptor>> {
         let resp = self.post_json_rpc("tools/list", json!({})).await?;
         let status = resp.status();
-        if !status.is_success() {
+        if let Some(failure) = classify_status(status) {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("tools/list failed: HTTP {status}: {body}"));
+            return Err(ServiceError::new(
+                &mcp_service_name(&self.mcp_url),
+                failure,
+                anyhow!("tools/list failed: HTTP {status}: {body}"),
+            )
+            .into());
         }
         let val = resp
             .json::<Value>()
@@ -403,6 +431,48 @@ impl StreamableHttpMcpClient {
             .send()
             .await;
     }
+}
+
+/// A plain name for the MCP server at `mcp_url`, for the first line of a
+/// failure message (SPEC R-HTTP.3).
+pub fn mcp_service_name(mcp_url: &str) -> String {
+    let authority = reqwest::Url::parse(mcp_url).ok().and_then(|url| {
+        let host = url.host_str()?.to_string();
+        Some(match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        })
+    });
+    format!(
+        "the MCP server at {}",
+        authority.as_deref().unwrap_or(mcp_url)
+    )
+}
+
+/// Whether a JSON-RPC method may be re-sent after a timeout or 5xx. Only the
+/// read-only listings: anything else may already have acted.
+fn method_idempotency(method: &str) -> Idempotency {
+    match method {
+        "tools/list" | "resources/list" | "prompts/list" | "ping" => Idempotency::Idempotent,
+        _ => Idempotency::NotIdempotent,
+    }
+}
+
+/// The error for a request that exhausted its retries: a [`ServiceError`]
+/// whose details name the method and URL.
+fn transport_error(
+    service: &str,
+    method: &str,
+    url: &str,
+    failure: TransportFailure,
+) -> anyhow::Error {
+    ServiceError::new(
+        service,
+        failure.failure,
+        anyhow::Error::new(failure.error).context(format!("{method} request to {url}")),
+    )
+    .with_attempts(failure.attempts)
+    .into()
 }
 
 /// First request id used after `initialize` (which always uses id 1). Starting
@@ -471,14 +541,24 @@ async fn initialize_session(
         }
     });
 
-    let resp = client
-        .post(mcp_url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .json(&init_body)
-        .send()
-        .await
-        .with_context(|| format!("initialize request to {mcp_url} failed"))?;
+    // Not idempotent: each `initialize` that arrives creates a session (and,
+    // on the ahma bridge, a subprocess), so only a request that never arrived
+    // or was explicitly refused-for-now is sent again (SPEC R-HTTP.2).
+    let service = mcp_service_name(mcp_url);
+    let (resp, _) = send_with_retry(
+        &service,
+        &RetryPolicy::DEFAULT,
+        Idempotency::NotIdempotent,
+        || {
+            client
+                .post(mcp_url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .json(&init_body)
+        },
+    )
+    .await
+    .map_err(|failure| transport_error(&service, "initialize", mcp_url, failure))?;
 
     let Some(sid) = resp
         .headers()
@@ -494,12 +574,16 @@ async fn initialize_session(
         } else {
             snippet
         };
-        return Err(anyhow!(
+        let diagnostic = anyhow!(
             "No {SESSION_ID_HEADER} header in initialize response (HTTP {status}). \
              This usually means the request reached something other than an MCP \
              Streamable-HTTP server — check auth, session limits, and that the URL \
              is correct. Response body: {body_note}"
-        ));
+        );
+        return Err(match classify_status(status) {
+            Some(failure) => ServiceError::new(&service, failure, diagnostic).into(),
+            None => diagnostic,
+        });
     };
 
     // The negotiated version is in the `initialize` result body, not a

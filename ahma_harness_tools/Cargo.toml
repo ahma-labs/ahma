@@ -13,6 +13,7 @@ name = "ahma_harness_tools"
 path = "src/lib.rs"
 
 [dependencies]
+ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true
 globset = "0.4"
 html2text = "0.17"
