@@ -147,7 +147,6 @@ pub struct StreamableHttpMcpClient {
     /// `MCP-Protocol-Version` negotiation) — echoed on every subsequent
     /// request via [`MCP_PROTOCOL_VERSION_HEADER`].
     protocol_version: String,
-    next_id: AtomicU64,
 }
 
 impl std::fmt::Debug for StreamableHttpMcpClient {
@@ -289,7 +288,6 @@ impl StreamableHttpMcpClient {
             mcp_url: mcp_url.into(),
             session_id: session_id.into(),
             protocol_version: protocol_version.into(),
-            next_id: AtomicU64::new(FIRST_REQUEST_ID),
         }
     }
 
@@ -310,10 +308,11 @@ impl StreamableHttpMcpClient {
         &self.mcp_url
     }
 
-    /// POST one JSON-RPC request with the session header and a fresh
-    /// monotonically increasing request id, returning the raw HTTP response.
+    /// POST one JSON-RPC request with the session header and a fresh request
+    /// id — unique across every client in this process (see
+    /// `NEXT_REQUEST_ID`) — returning the raw HTTP response.
     pub async fn post_json_rpc(&self, method: &str, params: Value) -> Result<reqwest::Response> {
-        let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let req_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let body = json!({
             "jsonrpc": "2.0",
             "id": req_id,
@@ -409,6 +408,14 @@ impl StreamableHttpMcpClient {
 /// First request id used after `initialize` (which always uses id 1). Starting
 /// above a small gap keeps handshake ids visually distinct in wire logs.
 const FIRST_REQUEST_ID: u64 = 10;
+
+/// The next JSON-RPC request id, shared by **every** client in the process.
+///
+/// Per-client counters collided: callers `attach` a fresh client per tool call
+/// against one shared session and run a turn's calls concurrently, so each
+/// sent the same id, and the bridge — which keys in-flight requests by id —
+/// could answer only one of them (SPEC R8.3.7).
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(FIRST_REQUEST_ID);
 
 /// Parse a `tools/list` JSON-RPC response body into descriptors. Items
 /// without a `name` are skipped; a missing `inputSchema` falls back to the

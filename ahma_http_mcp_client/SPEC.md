@@ -30,6 +30,9 @@ subtly wrong on its own.*
   (`supports_progress`, request budget) off it, so it is never normalized.
 - Every timeout is supplied by the caller; nothing is hardcoded here.
 - `delete_session` ends a session with `DELETE /mcp` (R8.3.6).
+- JSON-RPC request ids are unique across **every** client in the process, not per client:
+  callers `attach` a fresh client per call against one shared session and run calls
+  concurrently, and the bridge refuses an id that is already in flight (R8.3.7).
 
 **Other transports**
 - `client::HttpMcpTransport`: an `rmcp` `Transport` over HTTP POST + SSE for external MCP

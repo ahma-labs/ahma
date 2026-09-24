@@ -45,6 +45,16 @@ pub enum BridgeError {
     #[error("Invalid configuration: {0}")]
     Config(String),
 
+    /// A request arrived carrying a JSON-RPC id that is already in flight on the
+    /// same session. Several HTTP clients may share one session, so the bridge
+    /// must refuse the newcomer rather than let it orphan the earlier request's
+    /// response (SPEC R8.3.7). Answered HTTP 400 / JSON-RPC -32600.
+    #[error("request id {id} is already in flight on this session; each request needs a unique id")]
+    DuplicateRequestId {
+        /// The colliding JSON-RPC id, rendered as the bridge keys it.
+        id: String,
+    },
+
     /// Protocol or communication failure with subprocess
     #[error("Communication error: {0}")]
     Communication(String),
