@@ -1327,6 +1327,20 @@ async fn forward_request(
                 session_id,
             )
         }
+        // The client's fault, not the bridge's: an invalid request (SPEC R8.3.7).
+        // The earlier request with this id is untouched and still in flight.
+        Err(e @ BridgeError::DuplicateRequestId { .. }) => {
+            warn!(session_id = %session_id, "Rejected request: {}", e);
+            with_session_header(
+                error_response_with_status(
+                    StatusCode::BAD_REQUEST,
+                    payload_id(payload),
+                    -32600,
+                    &e.to_string(),
+                ),
+                session_id,
+            )
+        }
         Err(e) => {
             error!(session_id = %session_id, "Failed to send request: {}", e);
             error_response(

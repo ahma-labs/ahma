@@ -737,15 +737,27 @@ fn extract_request_id(request: &Value) -> Option<String> {
 }
 
 /// Register a pending request and return the receiver used to await its response.
+///
+/// An id that is already in flight is refused (SPEC R8.3.7): replacing its
+/// sender would drop the earlier request's response channel, failing a
+/// healthy request with "Response channel closed".
 fn register_pending_request(
     pending: &DashMap<String, oneshot::Sender<Value>>,
     id: Option<&String>,
-) -> Option<oneshot::Receiver<Value>> {
-    id.map(|id| {
-        let (tx, rx) = oneshot::channel();
-        pending.insert(id.clone(), tx);
-        rx
-    })
+) -> Result<Option<oneshot::Receiver<Value>>> {
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    match pending.entry(id.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            Err(BridgeError::DuplicateRequestId { id: id.clone() })
+        }
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            let (tx, rx) = oneshot::channel();
+            slot.insert(tx);
+            Ok(Some(rx))
+        }
+    }
 }
 
 /// Remove a pending request registration if one exists.
@@ -1768,7 +1780,7 @@ impl SessionManager {
 
         let id_opt = extract_request_id(request);
 
-        let response_rx = register_pending_request(&session.pending_requests, id_opt.as_ref());
+        let response_rx = register_pending_request(&session.pending_requests, id_opt.as_ref())?;
 
         // Send the request
         let json_str = serde_json::to_string(request)?;
@@ -2989,7 +3001,7 @@ mod session_logic_tests {
     fn register_and_take_pending_request() {
         let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
         let id = Some("r1".to_string());
-        let rx = register_pending_request(&pending, id.as_ref());
+        let rx = register_pending_request(&pending, id.as_ref()).unwrap();
         assert!(rx.is_some());
         assert!(pending.contains_key("r1"));
 
@@ -3003,7 +3015,7 @@ mod session_logic_tests {
     #[test]
     fn register_pending_request_none_id_registers_nothing() {
         let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
-        assert!(register_pending_request(&pending, None).is_none());
+        assert!(register_pending_request(&pending, None).unwrap().is_none());
         assert_eq!(pending.len(), 0);
     }
 
@@ -3559,6 +3571,7 @@ mod session_logic_tests {
         let session = mgr.sessions.get(&session_id).unwrap().clone();
 
         let rx = register_pending_request(&session.pending_requests, Some(&"7".to_string()))
+            .unwrap()
             .expect("a request is now in flight");
 
         mgr.terminate_session(&session_id, SessionTerminationReason::ClientRequested)
@@ -3575,6 +3588,43 @@ mod session_logic_tests {
             message.contains("shutting down") || message.contains("restarting"),
             "the error must say why the request died, got: {message}"
         );
+    }
+
+    /// A second request reusing an in-flight id must be refused — never allowed
+    /// to replace the first request's response channel.
+    ///
+    /// Regression: `pending.insert` silently overwrote the earlier sender, so
+    /// the first request failed instantly with "Response channel closed"
+    /// (surfaced as HTTP 500) while the subprocess was perfectly healthy. Seen
+    /// whenever the TUI agent ran two tool calls in parallel.
+    #[tokio::test]
+    async fn duplicate_in_flight_request_id_is_rejected_and_first_survives() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let session_id = mgr.create_session().await.unwrap();
+        let session = mgr.sessions.get(&session_id).unwrap().clone();
+
+        let first_rx = register_pending_request(&session.pending_requests, Some(&"10".to_string()))
+            .unwrap()
+            .expect("first request is in flight");
+
+        let err = mgr
+            .send_request(
+                &session_id,
+                &json!({"jsonrpc": "2.0", "id": 10, "method": "tools/call"}),
+                None,
+            )
+            .await
+            .expect_err("a duplicate in-flight id must be refused");
+        assert!(
+            matches!(&err, BridgeError::DuplicateRequestId { id } if id == "10"),
+            "expected DuplicateRequestId, got {err:?}"
+        );
+
+        // The first request's channel is untouched and still deliverable.
+        let sender = take_pending_request(&session.pending_requests, "10")
+            .expect("the original request must still be registered");
+        sender.send(json!({"id": 10, "result": "ok"})).unwrap();
+        assert_eq!(first_rx.await.unwrap()["result"], "ok");
     }
 
     /// A peer that refuses to die must not strand the client.
@@ -3596,6 +3646,7 @@ mod session_logic_tests {
         *session.peer_shutdown.lock().await = Some(hangs_forever);
 
         let rx = register_pending_request(&session.pending_requests, Some(&"9".to_string()))
+            .unwrap()
             .expect("a request is now in flight");
 
         // Termination must COMPLETE despite the hung peer.

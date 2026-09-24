@@ -39,6 +39,8 @@ struct MockState {
     conflicts_before_success: Arc<AtomicUsize>,
     /// Recorded DELETE session ids.
     deleted_sessions: Arc<Mutex<Vec<String>>>,
+    /// JSON-RPC ids carried by every `tools/call` POST, in arrival order.
+    tool_call_ids: Arc<Mutex<Vec<Value>>>,
 }
 
 async fn mock_post(State(st): State<MockState>, Json(body): Json<Value>) -> Response {
@@ -72,6 +74,7 @@ async fn mock_post(State(st): State<MockState>, Json(body): Json<Value>) -> Resp
         }
         "tools/call" => {
             st.tool_calls.fetch_add(1, Ordering::SeqCst);
+            st.tool_call_ids.lock().push(id.clone());
             let remaining = st.conflicts_before_success.load(Ordering::SeqCst);
             if remaining > 0 {
                 st.conflicts_before_success.fetch_sub(1, Ordering::SeqCst);
@@ -398,6 +401,42 @@ async fn call_tool_no_retry_surfaces_sandbox_initializing() {
         state.tool_calls.load(Ordering::SeqCst),
         1,
         "policy NONE must not retry"
+    );
+
+    server.abort();
+}
+
+/// Regression: the agent `attach`es a fresh client per tool call and runs a
+/// turn's calls concurrently. Every client used to start at the same request
+/// id, so two parallel calls on one session both sent `"id": 10`; the bridge
+/// keys in-flight requests by id, so one call's response channel was dropped
+/// and it failed with HTTP 500 "Response channel closed".
+#[tokio::test]
+async fn attached_clients_in_one_process_never_reuse_a_request_id() {
+    let state = MockState::default();
+    let (mcp_url, server) = spawn_mock(state.clone()).await;
+
+    let attach = || {
+        StreamableHttpMcpClient::attach(
+            reqwest::Client::new(),
+            &mcp_url,
+            "shared-session",
+            ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+        )
+    };
+    let (first, second) = (attach(), attach());
+    let (a, b) = tokio::join!(
+        first.call_tool("read_file", json!({}), ConflictRetryPolicy::NONE),
+        second.call_tool("list_dir", json!({}), ConflictRetryPolicy::NONE),
+    );
+    a.expect("first call");
+    b.expect("second call");
+
+    let ids = state.tool_call_ids.lock().clone();
+    assert_eq!(ids.len(), 2, "both calls must reach the server: {ids:?}");
+    assert_ne!(
+        ids[0], ids[1],
+        "two clients sharing a session must not send the same JSON-RPC id"
     );
 
     server.abort();
