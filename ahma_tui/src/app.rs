@@ -2276,6 +2276,54 @@ fn handle_settings_key(
         KeyCode::Char('s') => state.settings_editor.save(),
         KeyCode::Tab => state.settings_editor.category_down(),
         KeyCode::BackTab => state.settings_editor.category_up(),
+        KeyCode::Char('1') => state.settings_editor.select_category(0),
+        KeyCode::Char('2') => state.settings_editor.select_category(1),
+        KeyCode::Char('3') => state.settings_editor.select_category(2),
+        KeyCode::Char('4') => state.settings_editor.select_category(3),
+        KeyCode::Char('5') => state.settings_editor.select_category(4),
+        KeyCode::Char('6') => state.settings_editor.select_category(5),
+        KeyCode::Char('7') => state.settings_editor.select_category(6),
+        KeyCode::Char('8') => state.settings_editor.select_category(7),
+        KeyCode::Char('S') => {
+            state
+                .settings_editor
+                .select_category_variant(crate::settings_editor::SettingsCategory::Sandbox);
+        }
+        KeyCode::Char('T') | KeyCode::Char('t') => {
+            state
+                .settings_editor
+                .select_category_variant(crate::settings_editor::SettingsCategory::Tools);
+        }
+        KeyCode::Char('P') | KeyCode::Char('p') => {
+            state
+                .settings_editor
+                .select_category_variant(crate::settings_editor::SettingsCategory::Access);
+        }
+        KeyCode::Char('M') | KeyCode::Char('m') => {
+            state
+                .settings_editor
+                .select_category_variant(crate::settings_editor::SettingsCategory::Model);
+        }
+        KeyCode::Char('L') => {
+            state
+                .settings_editor
+                .select_category_variant(crate::settings_editor::SettingsCategory::Logging);
+        }
+        KeyCode::Char('H') => {
+            state
+                .settings_editor
+                .select_category_variant(crate::settings_editor::SettingsCategory::Http);
+        }
+        KeyCode::Char('A') | KeyCode::Char('a') => {
+            state
+                .settings_editor
+                .select_category_variant(crate::settings_editor::SettingsCategory::Auth);
+        }
+        KeyCode::Char('I') | KeyCode::Char('i') => {
+            state
+                .settings_editor
+                .select_category_variant(crate::settings_editor::SettingsCategory::Instance);
+        }
         _ => {}
     }
 
@@ -6020,6 +6068,25 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
             state.focus = crate::state::Focus::Log;
             state.open_log_line_detail(text);
         }
+        ClickTarget::SettingsCategory(cat_idx) => {
+            state.settings_editor.select_category(cat_idx);
+        }
+        ClickTarget::SettingsItem(item_idx) => {
+            if state.settings_editor.selected_item == item_idx {
+                state.settings_editor.toggle_current();
+            } else {
+                state.settings_editor.selected_item = item_idx;
+            }
+        }
+        ClickTarget::SettingsSave => {
+            state.settings_editor.save();
+        }
+        ClickTarget::SettingsReset => {
+            state.settings_editor.reset_current();
+        }
+        ClickTarget::SettingsClose => {
+            state.settings_editor.close();
+        }
     }
 }
 
@@ -6119,6 +6186,10 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
         }
     }
 
+    if state.settings_editor.open {
+        return;
+    }
+
     if handle_window_rect_click(col, row, state) {
         return;
     }
@@ -6199,6 +6270,14 @@ fn scroll_log(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) 
 }
 
 fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
+    if state.settings_editor.open {
+        if up {
+            state.settings_editor.item_up();
+        } else {
+            state.settings_editor.item_down();
+        }
+        return;
+    }
     if scroll_overlay(up, state)
         || scroll_work(col, row, up, state)
         || scroll_chat(col, row, up, state)
@@ -8692,5 +8771,49 @@ mod tests {
             let history = super::super::collect_chat_history(&state);
             assert_eq!(history.last().unwrap().content, "full instructions");
         }
+    }
+
+    #[test]
+    fn test_handle_settings_key_navigation() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = crate::state::AppState::new("http://localhost:3000", "HTTP", true);
+        state.settings_editor.open = true;
+
+        // Press '2' -> Sandbox (index 1)
+        let key_2 = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE);
+        assert!(super::handle_settings_key(key_2, &mut state));
+        assert_eq!(state.settings_editor.selected_category, 1);
+
+        // Press '1' -> Tools (index 0)
+        let key_1 = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert!(super::handle_settings_key(key_1, &mut state));
+        assert_eq!(state.settings_editor.selected_category, 0);
+
+        // Press 'S' -> Sandbox
+        let key_s_upper = KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT);
+        assert!(super::handle_settings_key(key_s_upper, &mut state));
+        assert_eq!(state.settings_editor.selected_category, 1);
+
+        // Tab -> next category
+        let key_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(super::handle_settings_key(key_tab, &mut state));
+        assert_eq!(state.settings_editor.selected_category, 2);
+    }
+
+    #[test]
+    fn test_settings_click_targets() {
+        use crate::state::ClickTarget;
+
+        let mut state = crate::state::AppState::new("http://localhost:3000", "HTTP", true);
+        state.settings_editor.open = true;
+
+        // Click on category 1 (Sandbox)
+        super::handle_click_target(ClickTarget::SettingsCategory(1), &mut state);
+        assert_eq!(state.settings_editor.selected_category, 1);
+
+        // Click on item 2
+        super::handle_click_target(ClickTarget::SettingsItem(2), &mut state);
+        assert_eq!(state.settings_editor.selected_item, 2);
     }
 }

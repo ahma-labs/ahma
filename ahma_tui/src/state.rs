@@ -1539,6 +1539,16 @@ pub enum ClickTarget {
     /// at draw time because the log is re-derived (and re-filtered) every frame,
     /// so a row index would not survive until the click is handled.
     OpenLogLine(String),
+    /// Select a category in the settings panel sidebar.
+    SettingsCategory(usize),
+    /// Select or toggle an item in the settings panel.
+    SettingsItem(usize),
+    /// Save settings changes.
+    SettingsSave,
+    /// Reset current setting to default.
+    SettingsReset,
+    /// Close the settings editor panel.
+    SettingsClose,
 }
 
 // ─── Modal overlays ───────────────────────────────────────────────────────────
