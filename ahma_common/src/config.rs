@@ -182,6 +182,12 @@ pub struct ProviderEntry {
     pub num_ctx: Option<u32>,
 }
 
+/// Default context window (in tokens) assumed for local Ollama endpoints
+/// when neither `--context-length`, `settings.tools.context_length`, nor a provider
+/// `num_ctx` is configured. Ensures proactive compaction and context budgets have
+/// a reasonable denominator rather than remaining inert and falling back to reactive hard-drops.
+pub const DEFAULT_OLLAMA_NUM_CTX: u32 = 16_384;
+
 /// Whether an endpoint accepts a per-request context-window override
 /// (`options.num_ctx`).
 ///
@@ -808,6 +814,10 @@ pub struct ToolSettings {
     /// Enable small-model harness adaptations.
     /// Default: `false`
     pub small_model_harness: bool,
+    /// Default context length in tokens when not specified on the CLI or provider entry.
+    /// Used as the denominator for context budgets and proactive context compaction.
+    /// Default: `None`
+    pub context_length: Option<u32>,
     /// Maximum number of agent tool-call turns before the interactive chat agent
     /// stops and summarises. Each turn is one model call that may request tools;
     /// multi-step tasks (read → edit → build → fix) need several. Too low and the
@@ -838,6 +848,7 @@ impl Default for ToolSettings {
             tool_bundles: Vec::new(),
             minimize_tokens: false,
             small_model_harness: false,
+            context_length: None,
             max_turns: default_max_turns(),
             mutex_groups: default_mutex_groups(),
         }
@@ -2031,6 +2042,12 @@ impl AhmaSettings {
             d.tools.small_model_harness.to_string(),
         );
         w.setting(
+            "Default context window in tokens for context budgets and proactive compaction (0 = unset).",
+            "context_length",
+            toml_opt_u32(self.tools.context_length),
+            toml_opt_u32(d.tools.context_length),
+        );
+        w.setting(
             "Max agent tool-call turns before the chat agent stops and summarises.",
             "max_turns",
             self.tools.max_turns.to_string(),
@@ -2415,6 +2432,11 @@ fn toml_opt_path(o: &Option<PathBuf>) -> String {
 /// Render an optional integer; `None` is shown as `0`, an out-of-range sentinel
 /// for a "seconds" field, so an unset value reads as an obvious placeholder.
 fn toml_opt_u64(o: Option<u64>) -> String {
+    o.map(|v| v.to_string()).unwrap_or_else(|| "0".to_string())
+}
+
+/// Render an optional 32-bit integer; `None` is shown as `0` placeholder.
+fn toml_opt_u32(o: Option<u32>) -> String {
     o.map(|v| v.to_string()).unwrap_or_else(|| "0".to_string())
 }
 
@@ -2835,6 +2857,7 @@ mod tests {
                 tool_bundles: vec!["rust".into(), "git".into()],
                 minimize_tokens: true,
                 small_model_harness: true,
+                context_length: Some(32_768),
                 max_turns: 7,
                 mutex_groups: vec![MutexGroupConfig {
                     name: "gradle".into(),

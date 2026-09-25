@@ -760,6 +760,7 @@ impl LlmClient {
                     "model": self.model,
                     "messages": messages,
                     "temperature": 0.2,
+                    "max_tokens": 8192,
                     "stream": false,
                 });
                 if !tools.is_empty() {
@@ -844,6 +845,7 @@ impl LlmClient {
             "model": self.model,
             "messages": messages,
             "temperature": 0.2,
+            "max_tokens": 8192,
             "stream": true,
             "stream_options": { "include_usage": true },
         });
@@ -1243,6 +1245,53 @@ async fn forward_stream_deltas(
     }
 }
 
+/// Check if the trailing suffix of `text` is stuck in an autoregressive
+/// repetition loop (e.g. `'spawn_supervised_with_sync', 'spawn_supervised_with_async'`).
+///
+/// Returns `Some((period, repeat_count))` if cyclic repetition is detected.
+pub fn detect_repetition_loop(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    if n < 80 {
+        return None;
+    }
+
+    // Inspect up to the last 2000 bytes for performance
+    let search_window = n.min(2000);
+    let slice = &bytes[n - search_window..];
+    let len = slice.len();
+
+    // Check periods from 3 bytes up to 300 bytes
+    let max_period = (len / 2).min(300);
+    for period in 3..=max_period {
+        let pattern = &slice[len - period..];
+        let mut count = 1;
+        let mut cursor = len - period;
+        while cursor >= period && &slice[cursor - period..cursor] == pattern {
+            count += 1;
+            cursor -= period;
+        }
+
+        // Require at least 4 repetitions and a total repeated length >= 120 bytes,
+        // or for short periods (3-6 bytes) at least 15 repetitions.
+        if (count >= 4 && period * count >= 120) || (count >= 15 && period * count >= 60) {
+            return Some((period, count));
+        }
+    }
+
+    None
+}
+
+/// Truncate excess repetitions from the end of `text`, leaving one copy.
+pub fn truncate_repeated_tail(text: &mut String, period: usize, count: usize) {
+    if count > 1 && text.len() >= (count - 1) * period {
+        let keep_len = text.len() - (count - 1) * period;
+        if text.is_char_boundary(keep_len) {
+            text.truncate(keep_len);
+        }
+    }
+}
+
 /// Drain an OpenAI-compatible SSE byte stream to completion, forwarding
 /// content/thinking deltas live via `deltas`, and return the accumulated
 /// `{choices:[{message}]}` JSON (with `usage`, if seen) once the stream
@@ -1283,6 +1332,29 @@ async fn drain_streaming_deltas(
                 &mut first_token_logged,
             )
             .await;
+
+            if let Some((p, c)) = detect_repetition_loop(&acc.content) {
+                warn!(
+                    model = %model,
+                    period = p,
+                    repeats = c,
+                    "llm: content repetition loop detected — halting runaway generation"
+                );
+                truncate_repeated_tail(&mut acc.content, p, c);
+                finish_reason = Some("repetition_detected".to_string());
+                break 'outer;
+            }
+            if let Some((p, c)) = detect_repetition_loop(&acc.thinking) {
+                warn!(
+                    model = %model,
+                    period = p,
+                    repeats = c,
+                    "llm: thinking repetition loop detected — halting runaway generation"
+                );
+                truncate_repeated_tail(&mut acc.thinking, p, c);
+                finish_reason = Some("repetition_detected".to_string());
+                break 'outer;
+            }
         }
         match byte_stream.next().await {
             None => break,
@@ -1722,5 +1794,46 @@ mod tests {
             .unwrap();
         let resp = parse_chat_completion_response(json).unwrap();
         assert!(!resp.is_length_truncated());
+    }
+
+    #[test]
+    fn test_detect_repetition_loop() {
+        assert_eq!(detect_repetition_loop("short text"), None);
+        assert_eq!(
+            detect_repetition_loop(
+                "The quick brown fox jumps over the lazy dog repeatedly without any cyclic looping pattern here."
+            ),
+            None
+        );
+
+        let repeating_pattern = "`spawn_supervised_with_sync`, `spawn_supervised_with_async`, ";
+        let cyclic_text = repeating_pattern.repeat(5);
+        let result = detect_repetition_loop(&cyclic_text);
+        assert!(result.is_some(), "Expected repetition loop to be detected");
+        let (period, count) = result.unwrap();
+        assert_eq!(period, repeating_pattern.len());
+        assert_eq!(count, 5);
+
+        let mut truncated = cyclic_text.clone();
+        truncate_repeated_tail(&mut truncated, period, count);
+        assert_eq!(truncated, repeating_pattern);
+    }
+
+    #[tokio::test]
+    async fn drain_streaming_deltas_halts_on_repetition_loop() {
+        let pattern = "foo_bar_baz_qux_1234567890_repeating_cycle_token_";
+        let chunk =
+            format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{pattern}\"}}}}]}}\n\n");
+        let stream_chunks: Vec<_> = (0..6)
+            .map(|_| Ok::<_, reqwest::Error>(bytes::Bytes::from(chunk.clone())))
+            .collect();
+        let stream = futures::stream::iter(stream_chunks);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let json = drain_streaming_deltas(stream, &tx, "test-model", std::time::Instant::now())
+            .await
+            .unwrap();
+        let resp = parse_chat_completion_response(json).unwrap();
+        assert_eq!(resp.finish_reason.as_deref(), Some("repetition_detected"));
+        assert_eq!(resp.content, pattern);
     }
 }

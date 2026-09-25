@@ -1978,12 +1978,20 @@ fn resolve_llm_connection(
                 }
                 None => None,
             };
+            let kind = entry.map(|e| e.kind);
+            let is_ollama_or_local = ahma_common::config::endpoint_supports_num_ctx(
+                &p_name,
+                kind.unwrap_or(ahma_common::config::ProviderKind::OpenAi),
+            ) || ahma_llm_monitor::client::is_loopback_url(&p_name);
+            let num_ctx = entry.and_then(|e| e.num_ctx).or_else(|| {
+                is_ollama_or_local.then_some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX)
+            });
             return Ok(LlmConnection {
                 base_url: p_name,
                 model: model.unwrap_or_default(),
                 api_key,
-                num_ctx: entry.and_then(|e| e.num_ctx),
-                kind: entry.map(|e| e.kind),
+                num_ctx,
+                kind,
             });
         }
         let resolved = config
@@ -2201,8 +2209,11 @@ async fn build_agent_run_context(
     // before the join above rather than after it.
     let ahma_config = ahma_common::config::AhmaConfig::load_async_with(&settings).await;
     let conn = resolve_llm_connection(provider, model, &ahma_config)?;
-    let num_ctx = conn.num_ctx;
     let local_model = ahma_llm_monitor::client::is_loopback_url(&conn.base_url);
+    let num_ctx = conn
+        .num_ctx
+        .or(settings.tools.context_length)
+        .or_else(|| local_model.then_some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX));
     let client = conn.into_client();
 
     let workspace_root = service
@@ -2269,6 +2280,7 @@ fn assemble_hub_chat_config(
     interactive: bool,
     non_mutating_tool_names: Arc<std::collections::HashSet<String>>,
 ) -> McpChatConfig {
+    let context_length = num_ctx.or(settings.tools.context_length);
     McpChatConfig {
         base_url: local_mcp_base_url,
         workspace_root,
@@ -2279,7 +2291,7 @@ fn assemble_hub_chat_config(
         mcp_connections,
         minimize_tokens: settings.tools.minimize_tokens,
         small_model_harness: settings.tools.small_model_harness,
-        context_length: num_ctx,
+        context_length,
         non_mutating_tool_names,
         tool_menu: None,
     }
@@ -2440,6 +2452,39 @@ mod tests {
             Arc::new(std::collections::HashSet::new()),
         );
         assert_eq!(cfg.context_length, None);
+    }
+
+    #[test]
+    fn hub_chat_config_respects_settings_tools_context_length() {
+        let mut settings = ahma_common::config::AhmaSettings::default();
+        settings.tools.context_length = Some(32_768);
+        let cfg = assemble_hub_chat_config(
+            "http://localhost:3000".to_string(),
+            PathBuf::from("/tmp"),
+            ahma_mcp::mcp_client::McpConnectionManager::default(),
+            &settings,
+            None,
+            None,
+            true,
+            Arc::new(std::collections::HashSet::new()),
+        );
+        assert_eq!(cfg.context_length, Some(32_768));
+        assert!(cfg.compaction_threshold().is_some());
+    }
+
+    #[test]
+    fn resolve_llm_connection_defaults_context_length_for_ollama_endpoints() {
+        let config = ahma_common::config::AhmaConfig::default();
+        let conn = resolve_llm_connection(
+            Some("http://127.0.0.1:11434/v1".to_string()),
+            Some("qwen3.8:27b-mlx".to_string()),
+            &config,
+        )
+        .expect("resolves");
+        assert_eq!(
+            conn.num_ctx,
+            Some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX)
+        );
     }
 
     #[test]
