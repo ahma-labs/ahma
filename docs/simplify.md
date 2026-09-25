@@ -43,6 +43,12 @@ misunderstanding and regression risk concentrate.
 ## Quick Start
 
 ```bash
+# Auto mode: run all lenses, prioritize fixes, and generate plans for the top 6 fixes
+ahma simplify . --auto 6
+
+# Auto mode with default (top 10 fixes)
+ahma simplify --auto
+
 # Analyze the current directory and get fix instructions for the worst file
 ahma simplify . --ai-fix 1
 
@@ -63,6 +69,7 @@ Or via the `simplify` MCP tool (requires `--tools simplify` at
 server startup):
 
 ```
+simplify(directory=".", auto=6)
 simplify(directory=".", ai_fix=1)
 ```
 
@@ -211,7 +218,8 @@ Authoritative source: `ahma_common/src/simplify_args.rs` (`SimplifyArgs`).
 
 | Flag | Type | Default | Purpose |
 |------|------|---------|---------|
-| `directory` (positional) | path | — | Project root to analyze |
+| `directory` (positional) | path | `.` | Project root to analyze |
+| `--auto` | integer (optional) | `10` (when flag given) | Run all lenses, prioritize fixes across lenses by impact, and output prioritized plans for top N fixes |
 | `--output` / `-o` | path | `analysis_results` | Working directory for intermediate per-file metrics; cleared and recreated on each run |
 | `--limit` / `-l` | integer | `50` | Number of issues shown in the report |
 | `--open` | flag | off | Open the generated report automatically after writing it |
@@ -232,7 +240,8 @@ Tool name: `simplify` (requires `--tools simplify` at ahma startup).
 
 | Argument | Type | Default | Purpose |
 |----------|------|---------|---------|
-| `directory` | path (required) | — | Project root to analyze |
+| `directory` | path | `.` | Project root to analyze |
+| `auto` | integer | — | Run all lenses, prioritize findings, and output action plans for top N fixes |
 | `ai_fix` | integer | — | Issue number for fix prompt (1 = worst file) |
 | `limit` | integer | 50 | Issues to include in report |
 | `verify` | path | — | Re-analyze a file vs. baseline |
@@ -247,11 +256,13 @@ Tool name: `simplify` (requires `--tools simplify` at ahma startup).
 
 ```
 # Via /ahma simplify skill subcommand
+/ahma simplify --auto 6
 /ahma simplify
 /ahma simplify rust
 /ahma simplify kotlin 2
 
 # Direct MCP tool call
+simplify(directory=".", auto=6)
 simplify(directory=".", ai_fix=1)
 simplify(directory=".", extensions=["rs"], ai_fix=1)
 simplify(directory=".", verify="src/my_module.rs")

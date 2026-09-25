@@ -13,9 +13,11 @@
 //! this dependency; it is re-exported here as [`SimplifyArgs`].
 
 pub mod analysis;
+pub mod auto;
 pub mod models;
 pub mod report;
 pub mod subcommand;
 
 pub use ahma_common::simplify_args::{DEFAULT_EXTENSIONS, SimplifyArgs};
+pub use auto::{PrioritizedFix, create_auto_report_md, prioritize_fixes};
 pub use subcommand::run;

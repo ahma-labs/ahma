@@ -31,6 +31,11 @@
                     "description": "Issue number to generate AI fix instructions for (1 = most complex file, 2 = second most complex, etc.). When set, outputs the full report plus a structured prompt to simplify that file."
                 },
                 {
+                    "name": "auto",
+                    "type": "integer",
+                    "description": "Run all analysis lenses, prioritize findings across all lenses, and output prioritized fix actions for the top N most valuable items (default: 10). Example: ahma simplify --auto 6"
+                },
+                {
                     "name": "limit",
                     "alias": "l",
                     "type": "integer",

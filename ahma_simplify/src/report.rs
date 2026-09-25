@@ -119,32 +119,37 @@ pub fn generate_report(
     fs::write(report_output_dir.join("CODE_SIMPLICITY.md"), &md_content)?;
 
     if generate_html {
-        let mut options = pulldown_cmark::Options::empty();
-        options.insert(pulldown_cmark::Options::ENABLE_TABLES);
-        options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
-        let parser = pulldown_cmark::Parser::new_ext(&md_content, options);
-        let mut html_output = String::new();
-        pulldown_cmark::html::push_html(&mut html_output, parser);
-
-        let style = "
-                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #24292e; max-width: 900px; margin: 0 auto; padding: 40px 20px; background-color: #f6f8fa; }
-                h1, h2, h3 { color: #1b1f23; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; margin-top: 1.5em; }
-                pre { background-color: #f6f8fa; padding: 16px; border-radius: 6px; overflow: auto; }
-                code { font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace; background-color: rgba(27,31,35,0.05); padding: 0.2em 0.4em; border-radius: 3px; }
-                blockquote { padding: 0 1em; color: #6a737d; border-left: 0.25em solid #dfe2e1; margin: 0; }
-                table { border-spacing: 0; border-collapse: collapse; width: 100%; margin: 1em 0; }
-                table td, table th { padding: 6px 13px; border: 1px solid #dfe2e1; }
-                table tr { background-color: #fff; border-top: 1px solid #c6cbd1; }
-                table tr:nth-child(2n) { background-color: #f6f8fa; }
-            ";
-
-        let full_html = format!(
-            "<!DOCTYPE html>\n<html>\n<head>\n<meta charset='UTF-8'>\n<title>Code Simplicity Report</title>\n<style>\n{}\n</style>\n</head>\n<body>\n{}\n</body>\n</html>",
-            style, html_output
-        );
+        let full_html = render_markdown_to_html(&md_content, "Code Simplicity Report");
         fs::write(report_output_dir.join("CODE_SIMPLICITY.html"), full_html)?;
     }
     Ok(())
+}
+
+/// Convert markdown report content into a styled HTML document.
+pub fn render_markdown_to_html(md_content: &str, title: &str) -> String {
+    let mut options = pulldown_cmark::Options::empty();
+    options.insert(pulldown_cmark::Options::ENABLE_TABLES);
+    options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+    let parser = pulldown_cmark::Parser::new_ext(md_content, options);
+    let mut html_output = String::new();
+    pulldown_cmark::html::push_html(&mut html_output, parser);
+
+    let style = "
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #24292e; max-width: 900px; margin: 0 auto; padding: 40px 20px; background-color: #f6f8fa; }
+            h1, h2, h3 { color: #1b1f23; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; margin-top: 1.5em; }
+            pre { background-color: #f6f8fa; padding: 16px; border-radius: 6px; overflow: auto; }
+            code { font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace; background-color: rgba(27,31,35,0.05); padding: 0.2em 0.4em; border-radius: 3px; }
+            blockquote { padding: 0 1em; color: #6a737d; border-left: 0.25em solid #dfe2e1; margin: 0; }
+            table { border-spacing: 0; border-collapse: collapse; width: 100%; margin: 1em 0; }
+            table td, table th { padding: 6px 13px; border: 1px solid #dfe2e1; }
+            table tr { background-color: #fff; border-top: 1px solid #c6cbd1; }
+            table tr:nth-child(2n) { background-color: #f6f8fa; }
+        ";
+
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset='UTF-8'>\n<title>{}</title>\n<style>\n{}\n</style>\n</head>\n<body>\n{}\n</body>\n</html>",
+        title, style, html_output
+    )
 }
 
 pub fn create_report_md(
@@ -531,7 +536,7 @@ fn write_emergencies(report: &mut String, files: &[FileSimplicity], limit: usize
     }
 }
 
-fn identify_culprit(f: &FileSimplicity) -> &'static str {
+pub fn identify_culprit(f: &FileSimplicity) -> &'static str {
     // Use per-function max complexity when available to distinguish files where
     // the total is driven by many simple functions vs. a few genuinely complex ones.
     let max_fn_cognitive = f

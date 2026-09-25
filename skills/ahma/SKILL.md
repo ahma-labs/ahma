@@ -409,66 +409,47 @@ score formula, fail-closed rule):
 ### Syntax
 
 ```
-/ahma simplify                  # Auto-fix top 10 issues concurrently (DEFAULT)
+/ahma simplify --auto [N]       # Run all lenses, prioritize fixes, implement top N (DEFAULT: 10)
+/ahma simplify --auto 6         # Run all lenses, prioritize, and implement top 6 fixes
+/ahma simplify                  # Alias for --auto 10 (auto-fix top 10 issues)
 /ahma simplify top 5            # Auto-fix top 5 issues concurrently
 /ahma simplify rust             # Auto-fix top 10 Rust issues concurrently
-/ahma simplify rust top 3       # Auto-fix top 3 Rust issues concurrently
 /ahma simplify 3                # Manual mode: get fix prompt for issue #3 only
-/ahma simplify kotlin 2         # Manual mode: Kotlin issue #2 only
 /ahma simplify --lens reuse     # Reuse lens only — duplicate-code candidates
 /ahma simplify --lens dead-code # Dead-code lens only — unreferenced exports
 /ahma simplify --lens altitude  # Altitude lens only — delegation chains
 /ahma simplify --diff           # Only files changed in git, instead of the whole tree
 ```
 
-**Mode selection:** `top N`, or no trailing integer → **auto mode** (concurrent subagents). A
-bare trailing integer without `top` → **manual mode** (single-file, sequential). `--lens` and
-`--diff` narrow *what* gets analyzed and combine with either mode.
+**Mode selection:** `--auto [N]`, `top N`, or bare `/ahma simplify` → **auto mode**. A
+bare trailing integer without `top`/`--auto` → **manual mode** (single-file, sequential).
+`--auto [N]` automatically runs all analysis lenses, prioritizes candidate fixes across
+all lenses by impact, and implements the top N fixes (default 10).
 
 **Lenses** (`--lens`/`lens`, default `all`): `complexity` (metrics/hotspots); `reuse`
-(duplicate-code candidates — evaluate each before extracting, don't auto-spawn a fix per
-finding); `dead-code` (unreferenced exports, Rust/TS/JS/Python/Java only — a candidate, never a
-verdict, verify before deleting); `altitude` (thin-wrapper delegation chains, same 5 languages —
-a forwarding layer is often intentional). Full per-lens blind spots and mitigations are in the
-docs page linked above.
+(duplicate-code candidates); `dead-code` (unreferenced exports, verify before deleting);
+`altitude` (thin-wrapper delegation chains). Full per-lens blind spots and mitigations are in
+the docs page linked above.
 
-### Auto Mode — Concurrent Simplification (DEFAULT)
+### Auto Mode — Prioritized Multi-Lens Simplification (DEFAULT)
 
-**Phase 1 — Analyze (parent agent):** run `simplify(directory="<root>", ai_fix=1)` (or `ahma
-simplify <root> --ai-fix 1`); parse the ranked file list and set `N =
-min(requested_count, total_issues)` (default `requested_count` 10). Tell the user how many
-issues were found and that N subagents are being spawned.
+**Phase 1 — Analyze & Prioritize (parent agent):** run `simplify(directory="<root>", auto=N)`
+(or `ahma simplify <root> --auto <N>`). Runs all analysis lenses, ranks candidate findings
+by estimated value/impact, and outputs the top N action plans (default N = 10, e.g. `--auto 6`).
 
-**Phase 2 — Spawn subagents (concurrent):** spawn **one subagent per issue, in the same
-response**, so they run concurrently — each edits a different file, so there are no conflicts.
-No subagent tool? Launch N background tasks, or run sequentially as a last resort.
+**Phase 2 — Implement Fixes:** apply the top N fixes in order of priority:
+1. *Complexity*: refactor hotspot functions (guard clauses, early returns, helper extraction).
+2. *Reuse*: extract duplicated blocks into a shared helper in a common module.
+3. *Altitude*: collapse redundant forwarding delegation chains.
+4. *Dead Code*: remove unreferenced internal exports after checking visibility.
+Antigravity / single-agent: run sequentially, verifying each with tests.
+Multi-agent: spawn subagents per independent fix.
 
-> [!IMPORTANT]
-> **Antigravity**: no general-purpose subagent tool exists (only `browser_subagent`, for
-> browser tasks). Run issues **sequentially**, default to **N = 1** unless the user asked for
-> more, verify each file with `--verify` before the next, and get user approval between files.
-
-Each subagent's prompt:
-
-```
-Fix complexity issue #<N> in project root <PROJECT_ROOT>.
-
-1. Run `ahma simplify <PROJECT_ROOT> --ai-fix <N>` (or simplify(directory=<PROJECT_ROOT>,
-   ai_fix=<N>)) and read the fix prompt: file path, hotspot functions, evaluation, constraints.
-2. Evaluate critically — if complexity is volume-driven (many match arms, config fields)
-   rather than genuinely hard to follow, report "No changes needed" and STOP.
-3. Otherwise edit ONLY the listed hotspot functions: no signature/API/behavior changes, no
-   surrounding refactors, no cargo fmt/clippy/test (the parent runs those once at the end).
-   Prefer guard clauses, helper extraction, named predicates. Skip test files unless one test
-   function is individually complex.
-4. Report what changed (or why nothing did).
-```
-
-**Phase 3 — Verify (parent agent, after ALL subagents complete):**
+**Phase 3 — Verify & Report (parent agent):**
 1. `cargo fmt --all && cargo clippy --all-targets`
-2. `cargo nextest run` — on failure, identify and revert/fix the responsible subagent's change
-3. Re-run `ahma simplify <project-root> --ai-fix 1`; report the before/after project score
-4. Summarize per-issue results in a table (file, action, result)
+2. `cargo nextest run` — on failure, identify and revert/fix the offending change
+3. Re-run `ahma simplify <project-root> --auto <N>` to show improvement
+4. Summarize per-issue results in a before/after table (file, action, result)
 
 ### Manual Mode — Single-Issue Workflow
 

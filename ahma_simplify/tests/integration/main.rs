@@ -6,6 +6,7 @@
 //! override applies. Add suites as `tests/integration/<name>.rs` + `mod` below.
 
 mod altitude_lens_test;
+mod auto_test;
 mod dead_code_lens_test;
 mod report_test;
 mod reuse_lens_test;

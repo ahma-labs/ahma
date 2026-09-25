@@ -2090,17 +2090,32 @@ fn resolve_token_prefs(state: &crate::state::AppState) -> (bool, bool, Option<u3
         .token_prefs
         .small_model_harness
         .unwrap_or(settings.tools.small_model_harness);
-    // Explicit --context-length wins; otherwise fall back to the selected
-    // provider's declared window (`num_ctx` in ~/.ahma/config.toml) so
+    // Explicit --context-length wins; then settings.tools.context_length;
+    // then the selected provider's declared window (`num_ctx` in ~/.ahma/config.toml);
+    // then for Ollama/local endpoints a sensible default (16_384 tokens) so
     // proactive compaction has a denominator without any flag (issue #484).
-    let context_length = state.token_prefs.context_length.or_else(|| {
-        let (base_url, _model) = parse_llm_selection(state);
-        if base_url.is_empty() {
-            None
-        } else {
-            provider_num_ctx(&base_url)
-        }
-    });
+    let context_length = state
+        .token_prefs
+        .context_length
+        .or(settings.tools.context_length)
+        .or_else(|| {
+            let (base_url, _model) = parse_llm_selection(state);
+            if base_url.is_empty() {
+                None
+            } else {
+                provider_num_ctx(&base_url).or_else(|| {
+                    if ahma_common::config::endpoint_supports_num_ctx(
+                        &base_url,
+                        ahma_common::config::ProviderKind::OpenAi,
+                    ) || ahma_llm_monitor::client::is_loopback_url(&base_url)
+                    {
+                        Some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX)
+                    } else {
+                        None
+                    }
+                })
+            }
+        });
     (minimize_tokens, small_model_harness, context_length)
 }
 
@@ -2850,7 +2865,7 @@ fn textarea_input_from_key_event(key: crossterm::event::KeyEvent) -> tui_textare
 }
 
 fn handle_window_nav_commands(cmd: &str, state: &mut crate::state::AppState) -> bool {
-    if cmd == "/exit" || cmd == "/quit" {
+    if cmd == "/exit" || cmd == "/quit" || cmd == "/q" {
         request_quit(state);
         return true;
     }
@@ -6801,6 +6816,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_token_prefs_defaults_ollama_endpoints_to_default_num_ctx() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.llm_selection = Some(crate::state::LlmSelection::named(
+            "http://localhost:11434/v1",
+            "qwen3.8:27b-mlx",
+        ));
+        let (_min, _small, context_length) = super::resolve_token_prefs(&state);
+        assert_eq!(
+            context_length,
+            Some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX)
+        );
+    }
+
+    #[test]
     fn parse_run_command_defaults_to_empty_object() {
         let (tool, args) = parse_run_command("status").unwrap();
         assert_eq!(tool, "status");
@@ -6989,10 +7018,15 @@ mod tests {
         assert!(handled_quit);
         assert!(state_quit.should_quit);
 
-        // Test /exit (unadvertised alias) also quit
+        // Test /exit and /q (unadvertised aliases) also quit
         let handled_exit = super::handle_window_nav_commands("/exit", &mut state);
         assert!(handled_exit);
         assert!(state.should_quit);
+
+        let mut state_q = AppState::new("http://localhost:3000", "HTTP", true);
+        let handled_q = super::handle_window_nav_commands("/q", &mut state_q);
+        assert!(handled_q);
+        assert!(state_q.should_quit);
     }
 
     #[test]

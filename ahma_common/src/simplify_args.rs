@@ -52,6 +52,7 @@ pub const DEFAULT_EXTENSIONS: &str =
 )]
 pub struct SimplifyArgs {
     /// Directory to analyze (absolute or relative)
+    #[arg(default_value = ".")]
     pub directory: PathBuf,
 
     /// Output directory for analysis results
@@ -111,6 +112,13 @@ pub struct SimplifyArgs {
     /// instructing the AI to plan and implement a fix for that issue.
     #[arg(long)]
     pub ai_fix: Option<usize>,
+
+    /// Automatically run all analysis lenses, prioritize findings across all lenses by
+    /// impact, and generate actionable fix plans for the top N most valuable items (defaults to 10).
+    /// Example: `ahma simplify --auto 6` runs all lenses, prioritizes the fixes,
+    /// and implements/outputs instructions for the 6 most valuable.
+    #[arg(long, num_args = 0..=1, default_missing_value = "10")]
+    pub auto: Option<usize>,
 
     /// Verify improvement by re-analyzing a specific file and comparing
     /// against the baseline from the previous analysis run. Shows before/after
