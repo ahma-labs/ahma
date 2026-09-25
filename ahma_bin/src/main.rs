@@ -471,4 +471,22 @@ mod tests {
         let args: ahma_simplify::SimplifyArgs = args;
         assert_eq!(args.limit, 3);
     }
+
+    #[cfg(feature = "simplify")]
+    #[test]
+    fn simplify_with_auto_parses_analyzer_args() {
+        let cli = Cli::try_parse_from(["ahma", "simplify", "--auto", "6"]).unwrap();
+        let Subcommands::Simplify(args) = cli.command else {
+            panic!("expected simplify subcommand");
+        };
+        let args: ahma_simplify::SimplifyArgs = args;
+        assert_eq!(args.auto, Some(6));
+        assert_eq!(args.directory, std::path::PathBuf::from("."));
+
+        let cli_default = Cli::try_parse_from(["ahma", "simplify", "--auto"]).unwrap();
+        let Subcommands::Simplify(args_default) = cli_default.command else {
+            panic!("expected simplify subcommand");
+        };
+        assert_eq!(args_default.auto, Some(10));
+    }
 }

@@ -47,7 +47,12 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
 
     let is_workspace = is_cargo_workspace(&args.directory);
     let extensions = resolve_extensions(&args.extensions);
-    let lenses = parse_lenses(&args.lens)?;
+    let auto_count = args.auto;
+    let lenses = if auto_count.is_some() {
+        parse_lenses(&["all".to_string()])?
+    } else {
+        parse_lenses(&args.lens)?
+    };
 
     // Build the external analyzer registry unless the user requested rca-only.
     let registry = build_registry(args.no_external);
@@ -118,12 +123,49 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
         altitude_chains,
         ..Default::default()
     };
+    let project_name = get_project_name(&directory);
+
+    if let Some(count) = auto_count {
+        let fixes = crate::auto::prioritize_fixes(&lens_report, count, &directory);
+        let auto_md = crate::auto::create_auto_report_md(
+            &lens_report,
+            &fixes,
+            count,
+            &directory,
+            &project_name,
+        );
+
+        let write_to_file = args.output_path.is_some() || args.html || args.open;
+        if write_to_file {
+            let report_output_dir = determine_report_output_dir(&args.output_path)?;
+            fs::create_dir_all(&report_output_dir)
+                .context("Failed to create report output directory")?;
+            fs::write(report_output_dir.join("CODE_SIMPLICITY.md"), &auto_md)
+                .context("Failed to write auto report markdown")?;
+
+            if args.html {
+                let html_title = format!("Auto Simplification Plan - {}", project_name);
+                let html_content = report::render_markdown_to_html(&auto_md, &html_title);
+                fs::write(report_output_dir.join("CODE_SIMPLICITY.html"), html_content)
+                    .context("Failed to write auto report HTML")?;
+            }
+
+            print_report_locations(&report_output_dir, args.html);
+            if args.open
+                && let Err(e) = open_report(&report_output_dir, args.html)
+            {
+                eprintln!("Warning: Failed to open report: {}", e);
+            }
+        } else {
+            println!("{}", auto_md);
+        }
+        return Ok(());
+    }
+
     if lens_report.is_empty() {
         eprintln!("No findings: nothing matched the selected lenses.");
         return Ok(());
     }
-
-    let project_name = get_project_name(&directory);
 
     // Determine output mode: write to file if --output-path, --html, or --open is set
     let write_to_file = args.output_path.is_some() || args.html || args.open;
@@ -639,5 +681,32 @@ mod tests {
     fn test_cli_parsing_without_verify() {
         let args = parse(&["test", "."]);
         assert_eq!(args.verify, None);
+    }
+
+    #[test]
+    fn test_cli_parsing_auto_default() {
+        let args = parse(&["test", "--auto"]);
+        assert_eq!(args.auto, Some(10));
+        assert_eq!(args.directory, PathBuf::from("."));
+    }
+
+    #[test]
+    fn test_cli_parsing_auto_with_count() {
+        let args = parse(&["test", "--auto", "6"]);
+        assert_eq!(args.auto, Some(6));
+        assert_eq!(args.directory, PathBuf::from("."));
+    }
+
+    #[test]
+    fn test_cli_parsing_auto_with_explicit_directory_and_count() {
+        let args = parse(&["test", ".", "--auto", "6"]);
+        assert_eq!(args.auto, Some(6));
+        assert_eq!(args.directory, PathBuf::from("."));
+    }
+
+    #[test]
+    fn test_cli_parsing_without_auto() {
+        let args = parse(&["test", "."]);
+        assert_eq!(args.auto, None);
     }
 }

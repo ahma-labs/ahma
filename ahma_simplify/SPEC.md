@@ -20,6 +20,9 @@ fix instructions, so that refactoring effort goes where it matters.* User guide:
   reserve the subcommand without depending on this crate.
 - Built without the `simplify` feature, `ahma simplify` fails with a clear error naming the
   feature.
+- `--auto [COUNT]` runs all analysis lenses (complexity, reuse, dead-code, altitude),
+  prioritizes candidate fixes across all lenses by estimated impact, and outputs actionable
+  implementation plans for the top N most valuable fixes (defaulting to 10).
 
 ### Feature matrix
 
@@ -30,8 +33,9 @@ fix instructions, so that refactoring effort goes where it matters.* User guide:
 | Markdown report | PASS | `CODE_SIMPLICITY.md`, worst-to-best file ranking with per-file function hotspots; printed to stdout unless `--output-path`/`--html`/`--open` is set |
 | HTML report | PASS | `CODE_SIMPLICITY.html` generated alongside the Markdown report with `--html` or `--heml` |
 | AI fix prompt | PASS | `--ai-fix N` / MCP `ai_fix` appends a structured prompt naming the Nth-worst file's hotspot functions and instructing targeted-only changes |
+| `--auto [COUNT]` prioritized planning | PASS | Runs all lenses (complexity, reuse, dead-code, altitude), ranks candidate findings into a unified impact score, and outputs prioritized actionable fix instructions for the top N most valuable items (default: 10) |
 | `--verify` before/after comparison | PASS | Re-analyzes a file against the rust-code-analysis TOML baseline from the previous run and reports a verdict; not supported for Kotlin/Swift/ObjC (no persisted external baseline) |
-| MCP `simplify` tool | PASS | Exposes `directory`, `ai_fix`, `limit`, `verify`, `extensions`, `exclude`, `output_path`, `html`, `lens`, `diff` (requires `--tools simplify` at startup) |
+| MCP `simplify` tool | PASS | Exposes `directory`, `auto`, `ai_fix`, `limit`, `verify`, `extensions`, `exclude`, `output_path`, `html`, `lens`, `diff` (requires `--tools simplify` at startup) |
 | `--lens` analysis selection | PASS | Comma-separated `complexity`/`reuse`/`dead-code`/`altitude`/`all` (default `all`; `dead-code` also accepts `dead_code`/`deadcode`, case-insensitive); unknown values are a hard error listing the valid options. Selecting only non-complexity lenses skips the rust-code-analysis parse entirely |
 | Reuse lens — duplicate code detection | PASS | Language-agnostic, text-based duplicate-block detector: strips comments per language, collapses whitespace, finds repeated blocks of 4+ lines. Deterministic output. Reports candidates for extraction, not defects. Known limitation: a comment delimiter inside a string literal is misread as a comment start. Adds a `## Duplicate Code (Reuse Lens)` report section capped by `--limit` |
 | Dead-code lens — unreferenced exports | PASS | AST-based reachability lens (Rust, TypeScript, JavaScript, Python, Java only — no grammar for other languages, and Kotlin's call-expression nodes lack field names so it is excluded even though complexity/reuse cover it) that flags exported functions/methods with exactly one identifier occurrence in the scanned corpus (their own definition). Reports candidates, not verdicts: cannot see a downstream crate's use of a public API, macro-generated call sites, trait-object dispatch, or reflection by string name. Skips private functions, `main`, `test_`-prefixed functions, `tests/`-directory and `*_test(s).rs` files, functions preceded by a suppression marker (`#[allow(dead_code)]`, `#[cfg(test)]`, `@SuppressWarnings`, `# noqa`, `eslint-disable`, `pub use`), and, for Rust, common trait-required names (`new`, `default`, `from`, `try_from`, `fmt`, `drop`, `clone`, `eq`, `hash`, `next`, `poll`). Deterministic output, sorted by file then line. Adds a `## Possibly Unreferenced Exports (Dead Code Lens)` report section capped by `--limit` |
