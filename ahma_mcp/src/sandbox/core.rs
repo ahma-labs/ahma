@@ -548,6 +548,20 @@ impl Sandbox {
         self
     }
 
+    /// Add a live scope grant immediately to the active session.
+    ///
+    /// Called when a human or elicitation confirms a `sandbox_grant`.
+    /// Updates the in-memory scopes so subsequent tool executions in this session
+    /// take effect immediately without requiring a full server restart.
+    pub fn add_live_grant(&self, path: &Path, access: ahma_common::config::ScopeAccess) {
+        let canon = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if access.is_write() {
+            append_missing_scopes(&mut self.scopes.write(), &[canon]);
+        } else {
+            append_missing_scopes(&mut self.read_scopes.write(), &[canon]);
+        }
+    }
+
     /// Commit the sandbox scope by **replacing** the provisional scopes with
     /// `scopes` — the single door through which a scope becomes locked (SPEC
     /// R5.1.1).

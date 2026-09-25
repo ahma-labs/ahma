@@ -205,13 +205,65 @@ pub struct HooksObserveArgs {
     pub managed_id: String,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct HooksRunShellArgs {
+    /// Legacy or compact base64-encoded payload JSON (contains cwd, command, session_id).
     #[arg(long = "payload-base64")]
-    pub payload_base64: String,
+    pub payload_base64: Option<String>,
 
-    #[arg(long, hide = true, default_value = WRAPPED_BY_MARKER)]
+    /// Working directory for command execution.
+    #[arg(long = "cwd")]
+    pub cwd: Option<PathBuf>,
+
+    /// Session ID for grouping hooked commands in the daemon / TUI.
+    #[arg(long = "session-id")]
+    pub session_id: Option<String>,
+
+    /// The command to execute.
+    #[arg(long = "command")]
+    pub command: Option<String>,
+
+    /// Wrapped-by marker for recursion prevention.
+    #[arg(long, default_value = WRAPPED_BY_MARKER)]
     pub wrapped_by: String,
+
+    /// Raw command and arguments (optional trailing args if not using `--command`).
+    #[arg(last = true)]
+    pub raw_command: Vec<String>,
+}
+
+impl HooksRunShellArgs {
+    pub fn resolve_payload(self) -> Result<WrappedShellPayload> {
+        if let Some(ref b64) = self.payload_base64 {
+            return decode_wrapped_shell_payload(b64);
+        }
+
+        let cwd = self
+            .cwd
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| ".".to_string());
+
+        let command = if let Some(cmd) = self.command {
+            cmd
+        } else if !self.raw_command.is_empty() {
+            self.raw_command.join(" ")
+        } else {
+            anyhow::bail!(
+                "hooks run-shell requires either --command, trailing command arguments, or --payload-base64"
+            );
+        };
+
+        Ok(WrappedShellPayload {
+            cwd,
+            command,
+            session_id: self.session_id,
+        })
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -405,16 +457,16 @@ impl BinaryReference {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct WrappedShellPayload {
-    cwd: String,
-    command: String,
+pub struct WrappedShellPayload {
+    pub cwd: String,
+    pub command: String,
     /// The editor session this command belongs to, when the hook input named
     /// one. Lets a TUI group hooked work with the session that caused it
     /// (SPEC R-DAEMON.6). `#[serde(default)]` so a command wrapped by an older
     /// ahma — the payload is base64 in someone's shell history, with no version
     /// to negotiate — still decodes.
     #[serde(default)]
-    session_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1245,8 +1297,111 @@ async fn flush_hook_report(mut reporter: crate::daemon_reporter::ReporterHandle)
     }
 }
 
+/// Walk up from `start` looking for a `.git` entry (a directory for a normal
+/// clone, a file for a worktree or submodule), returning the repo/worktree root when
+/// found.
+fn find_git_root_or_worktree(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// If `git_root` is a worktree whose `.git` file points to a parent git directory,
+/// resolve the main repository root containing that git directory.
+fn resolve_worktree_main_repo(git_root: &Path) -> Option<PathBuf> {
+    let git_entry = git_root.join(".git");
+    if !git_entry.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&git_entry).ok()?;
+    let line = content
+        .lines()
+        .find(|l| l.trim_start().starts_with("gitdir:"))?;
+    let raw_gitdir = line.trim_start()["gitdir:".len()..].trim();
+    let gitdir_path = Path::new(raw_gitdir);
+    let resolved = if gitdir_path.is_relative() {
+        git_root.join(gitdir_path)
+    } else {
+        gitdir_path.to_path_buf()
+    };
+    let canon_gitdir = dunce::canonicalize(&resolved).unwrap_or(resolved);
+    let parent = canon_gitdir.parent()?;
+    let grandparent = parent.parent()?;
+    let great_grandparent = grandparent.parent()?;
+    if grandparent.file_name().and_then(|n| n.to_str()) == Some(".git") {
+        Some(great_grandparent.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Resolve the sandbox scopes for a hooked command starting from `cwd`.
+///
+/// In addition to `cwd`, if `cwd` is inside a git repository or git worktree,
+/// this discovers the repository root (and any connected worktree / main repo
+/// root) so intra-repo builds, target directories, and submodule writes do
+/// not fail with unexpected sandbox denials (SPEC R5.2.1).
+pub fn resolve_hook_sandbox_scopes(cwd: &Path) -> Vec<PathBuf> {
+    let canon_cwd = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let home = ahma_common::config::ahma_home_dir();
+    let canon_home = home
+        .as_deref()
+        .map(|h| dunce::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
+
+    let mut raw_scopes = Vec::new();
+    if let Some(git_root) = find_git_root_or_worktree(&canon_cwd) {
+        let canon_git_root = dunce::canonicalize(&git_root).unwrap_or(git_root);
+        let is_too_broad = canon_git_root.parent().is_none()
+            || canon_home.as_ref().is_some_and(|h| h == &canon_git_root);
+
+        if !is_too_broad {
+            if let Some(main_repo) = resolve_worktree_main_repo(&canon_git_root) {
+                let canon_main = dunce::canonicalize(&main_repo).unwrap_or(main_repo);
+                let main_too_broad = canon_main.parent().is_none()
+                    || canon_home.as_ref().is_some_and(|h| h == &canon_main);
+                if !main_too_broad {
+                    raw_scopes.push(canon_main);
+                }
+            }
+            raw_scopes.push(canon_git_root);
+        }
+    }
+    raw_scopes.push(canon_cwd);
+
+    let mut deduped: Vec<PathBuf> = Vec::new();
+    for scope in raw_scopes {
+        if !deduped.contains(&scope) {
+            deduped.push(scope);
+        }
+    }
+
+    let mut final_scopes = Vec::new();
+    for i in 0..deduped.len() {
+        let is_sub = deduped
+            .iter()
+            .enumerate()
+            .any(|(j, other)| i != j && deduped[i] != *other && deduped[i].starts_with(other));
+        if !is_sub {
+            final_scopes.push(deduped[i].clone());
+        }
+    }
+
+    if final_scopes.is_empty() {
+        vec![cwd.to_path_buf()]
+    } else {
+        final_scopes
+    }
+}
+
 async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
-    let payload = decode_wrapped_shell_payload(&args.payload_base64)?;
+    let payload = args.resolve_payload()?;
+    let hook_scopes = resolve_hook_sandbox_scopes(Path::new(&payload.cwd));
     std::env::set_current_dir(&payload.cwd)
         .with_context(|| format!("Failed to change directory to {}", payload.cwd))?;
 
@@ -1254,15 +1409,10 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         run_tool: Some("run_terminal_command".to_string()),
         run_tool_args: vec![payload.command.clone()],
         skip_availability_probes: true,
-        // Sandbox the command in the working directory the IDE hook explicitly
-        // handed us. This is not a spoofable CWD inference (SPEC R5.2.1): the IDE
-        // passes the command's own execution directory in the hook payload, which
-        // is exactly the scope this command should be confined to — the same role
-        // roots/list plays for the MCP server, and the same reasoning that lets
-        // the TUI treat its launch directory as an explicit choice (R5.2.1.1).
-        // Without this the hook would have no scope at all and would block every
-        // command (fail-closed, R5.5.3).
-        sandbox_scopes: vec![PathBuf::from(&payload.cwd)],
+        // Sandbox the command in the discovered hook scopes (enclosing git repo
+        // or worktree root, plus cwd). This ensures intra-repo builds, target dirs,
+        // and shared worktree dependencies do not hit false sandbox denials (SPEC R5.2.1).
+        sandbox_scopes: hook_scopes,
         use_scratch_dir: false,
         ..cfg
     };
@@ -1886,6 +2036,16 @@ fn build_antigravity_permission_override(wrapped_command: &str) -> String {
     const WRAPPED_BY_FLAG: &str = "--wrapped-by";
 
     let pattern = (|| {
+        // Modern human-readable format: match everything up to --wrapped-by <marker>
+        if let Some(wrapped_by_idx) = wrapped_command.find(WRAPPED_BY_FLAG) {
+            let marker_end = wrapped_command[wrapped_by_idx..]
+                .find(WRAPPED_BY_MARKER)
+                .map(|i| wrapped_by_idx + i + WRAPPED_BY_MARKER.len())
+                .unwrap_or(wrapped_by_idx + WRAPPED_BY_FLAG.len());
+            let prefix = &wrapped_command[..marker_end];
+            return Some(format!("{}.*", regex::escape(prefix)));
+        }
+        // Legacy base64 format:
         let payload_flag_end = wrapped_command.find(PAYLOAD_FLAG)? + PAYLOAD_FLAG.len();
         let wrapped_by_start =
             wrapped_command[payload_flag_end..].find(WRAPPED_BY_FLAG)? + payload_flag_end;
@@ -1967,20 +2127,20 @@ fn build_wrapped_shell_command(
     command: &str,
     session_id: Option<String>,
 ) -> Result<String> {
-    let payload = WrappedShellPayload {
-        cwd: cwd.to_string(),
-        command: command.to_string(),
-        session_id,
-    };
-    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
-    let args = vec![
+    let mut args = vec![
         "hooks".to_string(),
         "run-shell".to_string(),
-        "--payload-base64".to_string(),
-        encoded,
         "--wrapped-by".to_string(),
         WRAPPED_BY_MARKER.to_string(),
+        "--cwd".to_string(),
+        cwd.to_string(),
     ];
+    if let Some(ref sid) = session_id {
+        args.push("--session-id".to_string());
+        args.push(sid.clone());
+    }
+    args.push("--command".to_string());
+    args.push(command.to_string());
 
     Ok(BinaryReference::for_scope(env, scope).build_command(&args))
 }
@@ -2007,7 +2167,7 @@ fn install_platform_hook(
         HookPlatform::Claude => install_claude_hook(document, scope, env),
         HookPlatform::Codex => install_codex_hook(document, scope, env),
         HookPlatform::Copilot => install_copilot_hook(document, scope, env),
-        HookPlatform::Antigravity => install_grouped_hook(document, platform, scope, env),
+        HookPlatform::Antigravity => install_antigravity_hook(document, platform, scope, env),
     }
 }
 
@@ -2126,6 +2286,66 @@ fn install_grouped_hook(
     let entries = ensure_child_array(hooks, platform.event_key())?;
     entries.retain(|entry| !is_managed_group_entry(entry));
     entries.push(entry);
+    Ok(())
+}
+
+fn install_antigravity_hook(
+    document: &mut Value,
+    platform: HookPlatform,
+    scope: HookScope,
+    env: &HookEnvironment,
+) -> Result<()> {
+    install_grouped_hook(document, platform, scope, env)?;
+    if scope == HookScope::User {
+        let _ = ensure_antigravity_global_permission_grants(env);
+    }
+    Ok(())
+}
+
+fn ensure_antigravity_global_permission_grants(env: &HookEnvironment) -> Result<()> {
+    let config_path = env
+        .home_dir
+        .join(".gemini")
+        .join("config")
+        .join("config.json");
+    let mut doc: Value = if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    let root = ensure_root_object(&mut doc)?;
+    let user_settings = ensure_child_object(root, "userSettings")?;
+    let global_grants = ensure_child_object(user_settings, "globalPermissionGrants")?;
+    let allow_entries = ensure_child_array(global_grants, "allow")?;
+
+    let grant_strings = vec![
+        "command(ahma hooks run-shell)".to_string(),
+        format!(
+            "command('{}' 'hooks' 'run-shell')",
+            env.current_exe.display()
+        ),
+        format!("command({} hooks run-shell)", env.current_exe.display()),
+    ];
+
+    let mut modified = false;
+    for grant in grant_strings {
+        let val = Value::String(grant);
+        if !allow_entries.contains(&val) {
+            allow_entries.push(val);
+            modified = true;
+        }
+    }
+
+    if modified {
+        if let Some(parent) = config_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let formatted = serde_json::to_string_pretty(&doc)?;
+        std::fs::write(&config_path, formatted)?;
+    }
+
     Ok(())
 }
 
@@ -3880,25 +4100,118 @@ mod tests {
             build_wrapped_shell_command(HookScope::Project, &env, "/work", "cargo build", None)
                 .unwrap();
         assert!(cmd.starts_with("ahma hooks run-shell"));
-        assert!(cmd.contains("--payload-base64"));
+        assert!(cmd.contains("--wrapped-by"));
         assert!(cmd.contains(WRAPPED_BY_MARKER));
+        assert!(cmd.contains("--cwd"));
+        assert!(cmd.contains("--command"));
     }
 
     #[test]
-    fn test_build_wrapped_shell_command_roundtrip_payload() {
+    fn test_build_wrapped_shell_command_is_human_readable() {
         let env = test_env();
         let cmd =
             build_wrapped_shell_command(HookScope::Project, &env, "/work/dir", "echo x", None)
                 .unwrap();
-        // Pull the base64 token (3rd whitespace-separated field after run-shell).
-        let token = cmd
-            .split_whitespace()
-            .skip_while(|t| *t != "--payload-base64")
-            .nth(1)
-            .unwrap();
-        let payload = decode_wrapped_shell_payload(token).unwrap();
-        assert_eq!(payload.cwd, "/work/dir");
-        assert_eq!(payload.command, "echo x");
+        assert!(cmd.contains("/work/dir"));
+        assert!(cmd.contains("echo x"));
+    }
+
+    #[test]
+    fn test_hooks_run_shell_args_resolves_human_readable() {
+        let args = HooksRunShellArgs {
+            payload_base64: None,
+            cwd: Some(PathBuf::from("/my/cwd")),
+            session_id: Some("session-42".to_string()),
+            command: Some("cargo test".to_string()),
+            wrapped_by: WRAPPED_BY_MARKER.to_string(),
+            raw_command: Vec::new(),
+        };
+        let payload = args.resolve_payload().unwrap();
+        assert_eq!(payload.cwd, "/my/cwd");
+        assert_eq!(payload.command, "cargo test");
+        assert_eq!(payload.session_id, Some("session-42".to_string()));
+    }
+
+    #[test]
+    fn test_hooks_run_shell_args_resolves_raw_command_trailing() {
+        let args = HooksRunShellArgs {
+            payload_base64: None,
+            cwd: Some(PathBuf::from("/my/cwd")),
+            session_id: None,
+            command: None,
+            wrapped_by: WRAPPED_BY_MARKER.to_string(),
+            raw_command: vec![
+                "cargo".to_string(),
+                "check".to_string(),
+                "-p".to_string(),
+                "stat3".to_string(),
+            ],
+        };
+        let payload = args.resolve_payload().unwrap();
+        assert_eq!(payload.cwd, "/my/cwd");
+        assert_eq!(payload.command, "cargo check -p stat3");
+    }
+
+    #[test]
+    fn test_hooks_run_shell_args_resolves_base64_backward_compatible() {
+        let original = WrappedShellPayload {
+            cwd: "/work/old".to_string(),
+            command: "echo old".to_string(),
+            session_id: None,
+        };
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&original).unwrap());
+        let args = HooksRunShellArgs {
+            payload_base64: Some(encoded),
+            cwd: None,
+            session_id: None,
+            command: None,
+            wrapped_by: WRAPPED_BY_MARKER.to_string(),
+            raw_command: Vec::new(),
+        };
+        let payload = args.resolve_payload().unwrap();
+        assert_eq!(payload.cwd, "/work/old");
+        assert_eq!(payload.command, "echo old");
+    }
+
+    #[test]
+    fn test_resolve_hook_sandbox_scopes_git_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("my-repo");
+        let sub = repo.join("sub").join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let scopes = resolve_hook_sandbox_scopes(&sub);
+        let canon_repo = dunce::canonicalize(&repo).unwrap();
+        assert_eq!(scopes, vec![canon_repo]);
+    }
+
+    #[test]
+    fn test_resolve_hook_sandbox_scopes_git_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_repo = tmp.path().join("main-repo");
+        let gitdir_worktree = main_repo.join(".git").join("worktrees").join("branch-pass");
+        std::fs::create_dir_all(&gitdir_worktree).unwrap();
+
+        let worktree = main_repo
+            .join(".claude")
+            .join("worktrees")
+            .join("branch-pass");
+        let worktree_sub = worktree.join("rust");
+        std::fs::create_dir_all(&worktree_sub).unwrap();
+
+        // Write worktree .git file pointing to main repo gitdir
+        let git_file = worktree.join(".git");
+        std::fs::write(
+            &git_file,
+            format!("gitdir: {}\n", gitdir_worktree.display()),
+        )
+        .unwrap();
+
+        let scopes = resolve_hook_sandbox_scopes(&worktree_sub);
+        let canon_main = dunce::canonicalize(&main_repo).unwrap();
+        // Since worktree is inside main_repo, the broadest enclosing scope is main_repo
+        assert_eq!(scopes, vec![canon_main]);
     }
 
     #[test]
@@ -4627,6 +4940,44 @@ mod tests {
             entries.len(),
             1,
             "re-install must not duplicate the managed entry"
+        );
+    }
+
+    #[test]
+    fn test_ensure_antigravity_global_permission_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let gemini_config = home.join(".gemini").join("config");
+        std::fs::create_dir_all(&gemini_config).unwrap();
+        let config_file = gemini_config.join("config.json");
+        std::fs::write(
+            &config_file,
+            r#"{"userSettings":{"globalPermissionGrants":{"allow":["command(git status)"]}}}"#,
+        )
+        .unwrap();
+
+        let env = HookEnvironment {
+            home_dir: home.clone(),
+            project_root: tmp.path().join("proj"),
+            current_exe: PathBuf::from("/usr/local/bin/ahma"),
+        };
+
+        ensure_antigravity_global_permission_grants(&env).unwrap();
+
+        let content = std::fs::read_to_string(&config_file).unwrap();
+        let doc: Value = serde_json::from_str(&content).unwrap();
+        let allows = doc["userSettings"]["globalPermissionGrants"]["allow"]
+            .as_array()
+            .unwrap();
+        assert!(
+            allows
+                .iter()
+                .any(|v| v.as_str() == Some("command(ahma hooks run-shell)"))
+        );
+        assert!(
+            allows
+                .iter()
+                .any(|v| v.as_str() == Some("command('/usr/local/bin/ahma' 'hooks' 'run-shell')"))
         );
     }
 }

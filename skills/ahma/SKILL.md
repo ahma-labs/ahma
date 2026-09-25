@@ -298,7 +298,7 @@ ahma tls status    # Show cert path, age, and rotation recommendation
 **not** add `--sandbox-scope ~/.cargo` — that grants write to the whole cargo home including
 credentials. The built-in `package_cache_write` feature (on by default) already handles
 `cargo add`/`update`. For installs into `~/.cargo/bin`, use the `sandbox_grant` tool (preview,
-then `confirm: true`) + `restart`, or install into the workspace instead
+then `confirm: true`) — it takes effect immediately and persists — or install into the workspace instead
 (`cargo install --root <workspace>/.tools`). Full rationale:
 [docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs](https://github.com/ahma-labs/ahma/blob/main/docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs).
 

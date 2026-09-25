@@ -72,9 +72,11 @@ exact line.
 
 - **Terminal hooks**: on your **next command**. Hooks re-derive the sandbox each
   time, so there's nothing to restart.
-- **The MCP server** (your IDE's connection): on the **next server start**. The
-  sandbox scope is locked for the life of a session on purpose — a running session
-  can never have a hole punched in it. Use the `restart` tool to apply it now.
+- **The MCP server** (your IDE's connection): when granted interactively via the
+  `sandbox_grant` MCP tool with human confirmation, it takes effect **immediately**
+  for the active session in addition to persisting. For offline configuration edits
+  (`ahma sandbox grant` CLI or direct `~/.ahma/settings.toml` edits), it takes effect
+  on the next server start (or after using the `restart` tool).
 
 ## What ahma will never grant
 
@@ -82,7 +84,8 @@ Some paths are refused outright, with no override flag, no matter who asks — y
 the AI, or a confirmed prompt:
 
 - your home directory itself, or a filesystem root
-- any parent of your workspace (that would widen the sandbox above your project)
+- any parent of your workspace (that would widen the sandbox above your project;
+  the enclosing git repository root of a worktree or subdirectory workspace is allowed)
 - credential directories: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`,
   `~/.config/gh`, `~/.config/gcloud`
 - `~/.ahma` itself — the ledger cannot authorize access to the ledger
