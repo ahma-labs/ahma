@@ -6050,6 +6050,11 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
             state.focus = crate::state::Focus::Work;
         }
         ClickTarget::SectionHeader(key) => {
+            let sections = state.work_sections.borrow().clone();
+            if let Some(idx) = crate::ui::work::nav_index_of_header(&sections, &key) {
+                state.ops_selected = idx;
+                state.work_follow_selection.set(true);
+            }
             activate_window_chat(&key, state);
         }
         ClickTarget::OpenOperationDetail(key) => {
