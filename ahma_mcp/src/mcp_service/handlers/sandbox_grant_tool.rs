@@ -320,7 +320,9 @@ fn is_enclosing_git_repo(scope: &Path, candidate_parent: &Path) -> bool {
             }
             if git.is_file()
                 && let Ok(content) = std::fs::read_to_string(&git)
-                && let Some(line) = content.lines().find(|l| l.trim_start().starts_with("gitdir:"))
+                && let Some(line) = content
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("gitdir:"))
             {
                 let raw_gitdir = line.trim_start()["gitdir:".len()..].trim();
                 let gitdir_path = Path::new(raw_gitdir);

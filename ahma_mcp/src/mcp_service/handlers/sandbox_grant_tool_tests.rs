@@ -679,7 +679,10 @@ async fn handler_persists_grant_for_external_client_with_no_peer_and_reports_upd
         .filter_map(|c| c.as_text().map(|t| t.text.clone()))
         .collect::<String>();
     assert!(first_text.contains("✓ Granted"), "{first_text}");
-    assert!(first_text.contains("takes effect immediately for this session"), "{first_text}");
+    assert!(
+        first_text.contains("takes effect immediately for this session"),
+        "{first_text}"
+    );
 
     let second_text = second
         .expect("re-granting the same path should update, not fail")
