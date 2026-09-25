@@ -66,7 +66,7 @@ pub struct ShellPoolConfig {
 impl Default for ShellPoolConfig {
     fn default() -> Self {
         Self {
-            command_timeout: Duration::from_secs(300),
+            command_timeout: Duration::from_secs(1800),
         }
     }
 }
@@ -246,7 +246,7 @@ mod tests {
     fn test_shell_pool_config_default_timeout() {
         init_test_logging();
         let config = ShellPoolConfig::default();
-        assert_eq!(config.command_timeout, Duration::from_secs(300));
+        assert_eq!(config.command_timeout, Duration::from_secs(1800));
     }
 
     #[test]

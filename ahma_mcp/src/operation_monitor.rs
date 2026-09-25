@@ -43,7 +43,7 @@ const MAX_COMPLETION_HISTORY: usize = 1000;
 /// *shorter* than the `await` tool's configurable timeout, so `await` must opt out of
 /// it via [`OperationMonitor::wait_for_operation_bounded`] with `None` rather than
 /// inherit it.
-pub const DEFAULT_WAIT_FOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_WAIT_FOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(1800);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Represents the current state of an operation

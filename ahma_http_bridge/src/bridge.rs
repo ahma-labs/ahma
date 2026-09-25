@@ -1645,11 +1645,27 @@ impl<S> Drop for CleanupStream<S> {
         let session_id = self.session_id.clone();
         let session_manager = self.session_manager.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            if let Some(session) = session_manager.get_session(&session_id)
-                && session.sse_receivers() == 0
-            {
-                tracing::info!(session_id = %session_id, "No active SSE subscribers after disconnect - terminating session");
+            let grace = if ahma_common::test_isolation::spawned_under_test_harness() {
+                std::time::Duration::from_secs(5)
+            } else {
+                std::time::Duration::from_secs(60)
+            };
+            tokio::time::sleep(grace).await;
+            if let Some(session) = session_manager.get_session(&session_id) {
+                if session.sse_receivers() > 0 {
+                    return;
+                }
+                if session.has_pending_requests() {
+                    tracing::info!(
+                        session_id = %session_id,
+                        "SSE stream dropped, but pending requests remain in flight; preserving session"
+                    );
+                    return;
+                }
+                tracing::info!(
+                    session_id = %session_id,
+                    "No active SSE subscribers and no in-flight requests after disconnect grace period - terminating session"
+                );
                 let _ = session_manager
                     .terminate_session(
                         &session_id,
@@ -1683,7 +1699,17 @@ fn resolve_sse_session(
 
     match state.session_manager.get_session(&session_id) {
         Some(session) if !session.is_terminated() => Ok((session_id, session)),
-        _ => Err(Box::new(StatusCode::NOT_FOUND.into_response())),
+        _ => {
+            if let Some(info) = state.session_manager.terminated_session_info(&session_id) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    reason = ?info.reason,
+                    elapsed_secs = info.terminated_at.elapsed().as_secs(),
+                    "SSE GET request received for terminated session"
+                );
+            }
+            Err(Box::new(StatusCode::NOT_FOUND.into_response()))
+        }
     }
 }
 

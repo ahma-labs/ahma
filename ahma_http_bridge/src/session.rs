@@ -168,6 +168,17 @@ pub enum SessionTerminationReason {
     Unresponsive,
 }
 
+/// Diagnostic summary of a terminated session retained in memory.
+#[derive(Debug, Clone)]
+pub struct TerminatedSessionInfo {
+    /// Why the session was terminated
+    pub reason: SessionTerminationReason,
+    /// When termination occurred
+    pub terminated_at: Instant,
+    /// Optional human-readable detail
+    pub detail: Option<String>,
+}
+
 /// Represents an active client session.
 pub struct Session {
     /// Unique session identifier
@@ -396,8 +407,13 @@ impl Session {
 
     /// How long it has been since the real client last sent the bridge a
     /// request on this session.
-    fn idle_since_last_activity(&self) -> Duration {
+    pub fn idle_since_last_activity(&self) -> Duration {
         self.last_client_activity.lock().elapsed()
+    }
+
+    /// Whether any client requests are currently in flight to the subprocess.
+    pub fn has_pending_requests(&self) -> bool {
+        !self.pending_requests.is_empty()
     }
 
     /// Record `n` events lost due to broadcast receiver lag.
@@ -724,6 +740,8 @@ pub struct SessionManager {
     /// run to completion, new ones are refused so they are not started inside a
     /// process that is about to go (SPEC R-DAEMON.5).
     pub draining: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Retained history of recently terminated sessions with their termination reason.
+    terminated_sessions: DashMap<String, TerminatedSessionInfo>,
 }
 
 /// Extract the request ID from a JSON-RPC request value.
@@ -1060,8 +1078,7 @@ fn answer_subprocess_ping(session: &Arc<Session>, id: Value) {
     if subscribers == 0 {
         warn!(
             session_id = %session.id,
-            "Subprocess liveness ping left unanswered: no SSE subscriber, so there is \
-             no live push channel to vouch for the client (SPEC R2.6.5.3)"
+            "Subprocess liveness ping left unanswered: no SSE subscriber to vouch for the client (SPEC R2.6.5.3)"
         );
         return;
     }
@@ -1256,6 +1273,7 @@ impl SessionManager {
             config,
             active_sessions: None,
             draining: None,
+            terminated_sessions: DashMap::new(),
         }
     }
 
@@ -1922,6 +1940,25 @@ impl SessionManager {
                 "Terminating session"
             );
 
+            // Record in terminated_sessions for diagnostics, keeping size bounded.
+            if self.terminated_sessions.len() >= 200
+                && let Some(oldest) = self
+                    .terminated_sessions
+                    .iter()
+                    .next()
+                    .map(|r| r.key().clone())
+            {
+                self.terminated_sessions.remove(&oldest);
+            }
+            self.terminated_sessions.insert(
+                session_id.to_string(),
+                TerminatedSessionInfo {
+                    reason,
+                    terminated_at: Instant::now(),
+                    detail: None,
+                },
+            );
+
             session.set_terminated(true);
 
             // Answer in-flight requests FIRST.
@@ -1982,6 +2019,11 @@ impl SessionManager {
             .get(session_id)
             .map(|s| !s.is_terminated())
             .unwrap_or(false)
+    }
+
+    /// Look up diagnostic info about a terminated session, if recently recorded.
+    pub fn terminated_session_info(&self, session_id: &str) -> Option<TerminatedSessionInfo> {
+        self.terminated_sessions.get(session_id).map(|r| r.clone())
     }
 
     /// Get session count (for metrics/debugging)
@@ -2941,6 +2983,27 @@ mod session_logic_tests {
             rx.try_recv().is_err(),
             "no push channel: the ping must not be answered on the client's behalf"
         );
+    }
+
+    #[tokio::test]
+    async fn session_manager_retains_terminated_session_info() {
+        let mgr = SessionManager::new(SessionManagerConfig::default());
+        let (session, _rx) = make_test_session();
+        let session_id = session.id.clone();
+        mgr.sessions.insert(session_id.clone(), session);
+
+        assert!(mgr.session_exists(&session_id));
+        assert!(mgr.terminated_session_info(&session_id).is_none());
+
+        mgr.terminate_session(&session_id, SessionTerminationReason::Timeout)
+            .await
+            .unwrap();
+
+        assert!(!mgr.session_exists(&session_id));
+        let info = mgr
+            .terminated_session_info(&session_id)
+            .expect("must retain termination info");
+        assert_eq!(info.reason, SessionTerminationReason::Timeout);
     }
 
     #[test]

@@ -693,14 +693,19 @@ pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234/v1";
 /// names elsewhere; read them from settings (which is seeded from this const).
 pub const DEFAULT_LMSTUDIO_MODEL: &str = "openai/gpt-oss-20b";
 
+/// Built-in default timeout for tool execution, in seconds (30 minutes).
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 1800;
+
 /// Built-in default timeout for the `await` tool, in seconds.
 ///
-/// Chosen to sit under the 10-minute idle disconnect common MCP clients apply, so a
-/// long wait returns a soft timeout before the client drops the connection. This is
-/// the single source of truth — do not hardcode `540` elsewhere; read it from
+/// Chosen to allow long-running operations up to 30 minutes. This is
+/// the single source of truth — do not hardcode `1800` elsewhere; read it from
 /// settings (which is seeded from this const) or from
 /// [`default_await_timeout_secs`].
-pub const DEFAULT_AWAIT_TIMEOUT_SECS: u64 = 540;
+pub const DEFAULT_AWAIT_TIMEOUT_SECS: u64 = 1800;
+
+/// Built-in default idle-output watchdog timeout, in seconds (30 minutes).
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
 
 impl Default for LmStudioSettings {
     fn default() -> Self {
@@ -768,12 +773,19 @@ impl std::fmt::Display for ExecutionPolicy {
 pub struct ToolSettings {
     /// Default tool execution timeout in seconds.
     /// Individual tools can override this via `timeout_seconds` in their JSON definition.
-    /// Default: `600`
+    /// Default: `1800`
+    #[serde(default = "default_tool_timeout_secs")]
     pub timeout_secs: u64,
     /// Default timeout for the `await` tool in seconds.
-    /// Default: [`DEFAULT_AWAIT_TIMEOUT_SECS`] (9 minutes)
+    /// Default: [`DEFAULT_AWAIT_TIMEOUT_SECS`] (30 minutes)
     #[serde(default = "default_await_timeout_secs")]
     pub await_timeout_secs: u64,
+    /// Idle output watchdog timeout in seconds: if an operation produces no output
+    /// and burns no CPU for this long, it is timed out as stalled. `0` disables the
+    /// watchdog.
+    /// Default: `1800` (30 minutes)
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
     /// Override for the fallback single-request budget (SPEC R2.6.5): how long
     /// ahma may hold one MCP request open before assuming the client has
     /// stopped listening, when there is no confirmed live push channel to
@@ -838,8 +850,9 @@ pub struct ToolSettings {
 impl Default for ToolSettings {
     fn default() -> Self {
         Self {
-            timeout_secs: 600,
+            timeout_secs: default_tool_timeout_secs(),
             await_timeout_secs: default_await_timeout_secs(),
+            idle_timeout_secs: default_idle_timeout_secs(),
             request_budget_override_secs: None,
             force_progress_notifications: false,
             execution_mode: ExecutionPolicy::default(),
@@ -855,9 +868,19 @@ impl Default for ToolSettings {
     }
 }
 
+/// Default tool timeout in seconds (see [`DEFAULT_TOOL_TIMEOUT_SECS`]).
+pub fn default_tool_timeout_secs() -> u64 {
+    DEFAULT_TOOL_TIMEOUT_SECS
+}
+
 /// Default await tool timeout in seconds (see [`DEFAULT_AWAIT_TIMEOUT_SECS`]).
 pub fn default_await_timeout_secs() -> u64 {
     DEFAULT_AWAIT_TIMEOUT_SECS
+}
+
+/// Default idle watchdog timeout in seconds (see [`DEFAULT_IDLE_TIMEOUT_SECS`]).
+pub fn default_idle_timeout_secs() -> u64 {
+    DEFAULT_IDLE_TIMEOUT_SECS
 }
 
 /// Default maximum agent tool-call turns (see [`ToolSettings::max_turns`]).
@@ -1988,6 +2011,12 @@ impl AhmaSettings {
             d.tools.await_timeout_secs.to_string(),
         );
         w.setting(
+            "Idle output watchdog timeout in seconds (0 = disabled).",
+            "idle_timeout_secs",
+            self.tools.idle_timeout_secs.to_string(),
+            d.tools.idle_timeout_secs.to_string(),
+        );
+        w.setting(
             "Override the fallback single-request budget (SPEC R2.6.5) in \
              seconds — how long ahma may hold one MCP request open before \
              assuming the client stopped listening, when there is no \
@@ -2849,6 +2878,7 @@ mod tests {
             tools: ToolSettings {
                 timeout_secs: 123,
                 await_timeout_secs: 456,
+                idle_timeout_secs: 789,
                 request_budget_override_secs: Some(120),
                 force_progress_notifications: true,
                 execution_mode: ExecutionPolicy::Async,
@@ -3020,10 +3050,10 @@ mod tests {
             assert!(text.contains(table), "missing section header {table}");
         }
         // Defaults are visible as commented documentation.
-        assert!(text.contains("# timeout_secs = 600"));
+        assert!(text.contains("# timeout_secs = 1800"));
         assert!(text.contains(&format!("# model = \"{DEFAULT_LMSTUDIO_MODEL}\"")));
         // And every option states its default in the doc line.
-        assert!(text.contains("(default: 600)"));
+        assert!(text.contains("(default: 1800)"));
     }
 
     #[test]
@@ -3054,10 +3084,10 @@ mod tests {
         // genuine overrides remain active.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
-        // A file that asserts a default (timeout_secs = 600) and an override.
+        // A file that asserts a default (timeout_secs = 1800) and an override.
         std::fs::write(
             &path,
-            "[tools]\ntimeout_secs = 600\nexecution_mode = \"async\"\n",
+            "[tools]\ntimeout_secs = 1800\nexecution_mode = \"async\"\n",
         )
         .unwrap();
 
@@ -3065,7 +3095,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         // The default assertion is gone (now a comment), the override stays.
         assert!(
-            text.contains("# timeout_secs = 600"),
+            text.contains("# timeout_secs = 1800"),
             "default value de-asserted into a comment; got:\n{text}"
         );
         assert!(
@@ -3472,7 +3502,9 @@ default_model = "llama3.2"
     #[test]
     fn ahma_settings_default_tools_values() {
         let s = AhmaSettings::default();
-        assert_eq!(s.tools.timeout_secs, 600);
+        assert_eq!(s.tools.timeout_secs, 1800);
+        assert_eq!(s.tools.await_timeout_secs, 1800);
+        assert_eq!(s.tools.idle_timeout_secs, 1800);
         assert_eq!(s.tools.execution_mode, crate::config::ExecutionPolicy::Sync);
         assert!(!s.tools.skip_probes);
     }
@@ -3511,7 +3543,7 @@ default_model = "llama3.2"
         let s = AhmaSettings::load_from(&path);
         // Verify we get defaults, not an error
         assert_eq!(s.lmstudio.model, "openai/gpt-oss-20b");
-        assert_eq!(s.tools.timeout_secs, 600);
+        assert_eq!(s.tools.timeout_secs, 1800);
     }
 
     #[test]
