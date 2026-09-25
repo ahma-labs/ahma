@@ -702,6 +702,10 @@ fn uninstall_single_platform_hook(
     dry_run: bool,
     env: &HookEnvironment,
 ) -> Result<()> {
+    if platform == HookPlatform::Antigravity && scope == HookScope::User && !dry_run {
+        let _ = remove_antigravity_permissions(env);
+    }
+
     let path = env.config_path(platform, scope);
     if !path.exists() {
         println!(
@@ -1070,6 +1074,10 @@ fn run_exec(args: HooksExecArgs) -> Result<()> {
             return emit_decision(decision, args.platform);
         }
     };
+
+    if args.platform == HookPlatform::Antigravity && args.scope == HookScope::User {
+        let _ = ensure_antigravity_global_permission_grants(&env);
+    }
 
     let decision = compute_exec_decision(&stdin, args.scope, &env);
     emit_decision(decision, args.platform)
@@ -1997,7 +2005,11 @@ fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
             // contract), rather than relying on the user's "always allow" cache
             // (which keys on the same unique-per-call string and never matches
             // twice).
-            "permissionOverrides": [build_antigravity_permission_override(&wrapped_command)],
+            "permissionOverrides": [
+                build_antigravity_permission_override(&wrapped_command),
+                "command(ahma hooks run-shell)".to_string(),
+                "command(regex:.*ahma.* hooks run-shell)".to_string(),
+            ],
         }),
         HooksDecision::AllowWithWarning { user_message, .. } => json!({
             "decision": "allow",
@@ -2014,52 +2026,41 @@ fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
     }
 }
 
-/// Builds an agy `permissionOverrides` pattern (`command(<regex>)`) that
-/// matches ANY ahma-wrapped shell command of this shape, regardless of its
-/// `--payload-base64` value.
+/// Builds an agy `permissionOverrides` grant (`command(<prefix>)`) that
+/// matches ANY ahma-wrapped shell command.
 ///
-/// `wrapped_command` is one concrete instance, e.g.
-/// `ahma hooks run-shell --payload-base64 <blob> --wrapped-by ahma-hooks-wrapper-v1`
-/// (or the same with a quoted absolute binary path at `HookScope::User`). The
-/// `--payload-base64`/`--wrapped-by` flags are literal and always present —
-/// only the argument between them varies per call — so everything up to and
-/// including `--payload-base64` and everything from `--wrapped-by` onward is
-/// regex-escaped and kept verbatim; the varying payload argument between them
-/// becomes `.*`.
-///
-/// Falls back to a fully-escaped literal match (today's narrower, per-call
-/// behaviour) if the expected markers are not found, rather than panicking —
-/// this runs synchronously inside a hook response to an external agent tool
-/// call, so it must never crash the invocation it is trying to allow.
+/// In agy, `commandutils.MatchesConfig` decomposes commands into words (`argv`)
+/// and performs prefix token matching. A grant of `command(/path/to/ahma hooks run-shell)`
+/// matches any command whose first three words match, covering all underlying subcommands
+/// and flags without requiring regex escapes or trailing `.*`.
 fn build_antigravity_permission_override(wrapped_command: &str) -> String {
-    const PAYLOAD_FLAG: &str = "--payload-base64";
-    const WRAPPED_BY_FLAG: &str = "--wrapped-by";
-
-    let pattern = (|| {
-        // Modern human-readable format: match everything up to --wrapped-by <marker>
-        if let Some(wrapped_by_idx) = wrapped_command.find(WRAPPED_BY_FLAG) {
-            let marker_end = wrapped_command[wrapped_by_idx..]
-                .find(WRAPPED_BY_MARKER)
-                .map(|i| wrapped_by_idx + i + WRAPPED_BY_MARKER.len())
-                .unwrap_or(wrapped_by_idx + WRAPPED_BY_FLAG.len());
-            let prefix = &wrapped_command[..marker_end];
-            return Some(format!("{}.*", regex::escape(prefix)));
+    let trimmed = wrapped_command.trim();
+    let (exe, rest) = if let Some(stripped) = trimmed.strip_prefix('\'') {
+        if let Some(end) = stripped.find('\'') {
+            (&stripped[..end], stripped[end + 1..].trim_start())
+        } else {
+            (trimmed, "")
         }
-        // Legacy base64 format:
-        let payload_flag_end = wrapped_command.find(PAYLOAD_FLAG)? + PAYLOAD_FLAG.len();
-        let wrapped_by_start =
-            wrapped_command[payload_flag_end..].find(WRAPPED_BY_FLAG)? + payload_flag_end;
-        let prefix = &wrapped_command[..payload_flag_end];
-        let suffix = &wrapped_command[wrapped_by_start..];
-        Some(format!(
-            "{}.*{}",
-            regex::escape(prefix),
-            regex::escape(suffix)
-        ))
-    })()
-    .unwrap_or_else(|| regex::escape(wrapped_command));
+    } else if let Some(stripped) = trimmed.strip_prefix('"') {
+        if let Some(end) = stripped.find('"') {
+            (&stripped[..end], stripped[end + 1..].trim_start())
+        } else {
+            (trimmed, "")
+        }
+    } else if let Some((first, remainder)) = trimmed.split_once(char::is_whitespace) {
+        (first, remainder.trim_start())
+    } else {
+        (trimmed, "")
+    };
 
-    format!("command({pattern})")
+    let rest_parts: Vec<&str> = rest.split_whitespace().collect();
+    if rest_parts.len() >= 2
+        && rest_parts[0].trim_matches('\'').trim_matches('"') == "hooks"
+        && rest_parts[1].trim_matches('\'').trim_matches('"') == "run-shell"
+    {
+        return format!("command({exe} hooks run-shell)");
+    }
+    format!("command({trimmed})")
 }
 
 fn build_structured_hook_output(decision: HooksDecision) -> Value {
@@ -2302,49 +2303,177 @@ fn install_antigravity_hook(
     Ok(())
 }
 
-fn ensure_antigravity_global_permission_grants(env: &HookEnvironment) -> Result<()> {
-    let config_path = env
-        .home_dir
-        .join(".gemini")
-        .join("config")
-        .join("config.json");
-    let mut doc: Value = if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
+fn ensure_antigravity_permissions_in_file(
+    file_path: &Path,
+    env: &HookEnvironment,
+    use_user_settings_wrapper: bool,
+) -> Result<()> {
+    let mut doc: Value = if file_path.exists() {
+        let content = std::fs::read_to_string(file_path)?;
         serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
     } else {
         json!({})
     };
 
     let root = ensure_root_object(&mut doc)?;
-    let user_settings = ensure_child_object(root, "userSettings")?;
-    let global_grants = ensure_child_object(user_settings, "globalPermissionGrants")?;
-    let allow_entries = ensure_child_array(global_grants, "allow")?;
+    let raw_exe = env.current_exe.display().to_string();
 
-    let grant_strings = vec![
+    let clean_grants = vec![
+        format!("command({raw_exe} hooks run-shell)"),
         "command(ahma hooks run-shell)".to_string(),
-        format!(
-            "command('{}' 'hooks' 'run-shell')",
-            env.current_exe.display()
-        ),
-        format!("command({} hooks run-shell)", env.current_exe.display()),
+        "command(regex:.*ahma.* hooks run-shell)".to_string(),
+        format!("command({raw_exe} hooks run-shell --wrapped-by {WRAPPED_BY_MARKER})"),
+        format!("command(ahma hooks run-shell --wrapped-by {WRAPPED_BY_MARKER})"),
+        format!("command(regex:.*ahma.* hooks run-shell --wrapped-by {WRAPPED_BY_MARKER})"),
     ];
 
     let mut modified = false;
-    for grant in grant_strings {
-        let val = Value::String(grant);
-        if !allow_entries.contains(&val) {
-            allow_entries.push(val);
+
+    let filter_and_add = |entries: &mut Vec<Value>| -> bool {
+        let mut changed = false;
+        let len_before = entries.len();
+        entries.retain(|v| {
+            if let Some(s) = v.as_str() {
+                if s.contains("regex:") {
+                    return true;
+                }
+                let is_bloated = s.contains("hooks")
+                    && s.contains("run-shell")
+                    && (s.contains("--command")
+                        || s.contains("--payload-base64")
+                        || s.contains("--cwd"));
+                let is_malformed = s.contains("ahma")
+                    && (s.contains(".*") || s.contains(r"\.") || s.contains('\n'));
+                if is_bloated || is_malformed {
+                    return false;
+                }
+            }
+            true
+        });
+        if entries.len() != len_before {
+            changed = true;
+        }
+
+        for grant in &clean_grants {
+            let val = Value::String(grant.clone());
+            if !entries.contains(&val) {
+                entries.push(val);
+                changed = true;
+            }
+        }
+        changed
+    };
+
+    if use_user_settings_wrapper {
+        let user_settings = ensure_child_object(root, "userSettings")?;
+        let global_grants = ensure_child_object(user_settings, "globalPermissionGrants")?;
+        let allow_entries = ensure_child_array(global_grants, "allow")?;
+        if filter_and_add(allow_entries) {
             modified = true;
         }
     }
 
+    let permissions = ensure_child_object(root, "permissions")?;
+    let allow_entries = ensure_child_array(permissions, "allow")?;
+    if filter_and_add(allow_entries) {
+        modified = true;
+    }
+
     if modified {
-        if let Some(parent) = config_path.parent() {
+        if let Some(parent) = file_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let formatted = serde_json::to_string_pretty(&doc)?;
-        std::fs::write(&config_path, formatted)?;
+        std::fs::write(file_path, formatted)?;
     }
+
+    Ok(())
+}
+
+fn remove_antigravity_permissions(env: &HookEnvironment) -> Result<()> {
+    let cli_path = env
+        .home_dir
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("settings.json");
+    let config_path = env
+        .home_dir
+        .join(".gemini")
+        .join("config")
+        .join("config.json");
+    for path in [&cli_path, &config_path] {
+        if !path.exists() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(mut doc) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let mut modified = false;
+        if let Some(obj) = doc.as_object_mut() {
+            if let Some(perms) = obj.get_mut("permissions").and_then(|p| p.as_object_mut())
+                && let Some(allow) = perms.get_mut("allow").and_then(|a| a.as_array_mut())
+            {
+                let len_before = allow.len();
+                allow.retain(|v| {
+                    if let Some(s) = v.as_str()
+                        && s.starts_with("command(")
+                        && s.contains("ahma")
+                    {
+                        return false;
+                    }
+                    true
+                });
+                if allow.len() != len_before {
+                    modified = true;
+                }
+            }
+            if let Some(user_settings) = obj.get_mut("userSettings").and_then(|u| u.as_object_mut())
+                && let Some(gpg) = user_settings
+                    .get_mut("globalPermissionGrants")
+                    .and_then(|g| g.as_object_mut())
+                && let Some(allow) = gpg.get_mut("allow").and_then(|a| a.as_array_mut())
+            {
+                let len_before = allow.len();
+                allow.retain(|v| {
+                    if let Some(s) = v.as_str()
+                        && s.starts_with("command(")
+                        && s.contains("ahma")
+                    {
+                        return false;
+                    }
+                    true
+                });
+                if allow.len() != len_before {
+                    modified = true;
+                }
+            }
+        }
+        if modified && let Ok(formatted) = serde_json::to_string_pretty(&doc) {
+            let _ = std::fs::write(path, formatted);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_antigravity_global_permission_grants(env: &HookEnvironment) -> Result<()> {
+    // 1. Antigravity CLI: ~/.gemini/antigravity-cli/settings.json
+    let cli_path = env
+        .home_dir
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("settings.json");
+    let _ = ensure_antigravity_permissions_in_file(&cli_path, env, false);
+
+    // 2. Global Gemini config: ~/.gemini/config/config.json
+    let config_path = env
+        .home_dir
+        .join(".gemini")
+        .join("config")
+        .join("config.json");
+    let _ = ensure_antigravity_permissions_in_file(&config_path, env, true);
 
     Ok(())
 }
@@ -3140,12 +3269,21 @@ mod tests {
         let overrides = output_a["permissionOverrides"]
             .as_array()
             .expect("Antigravity rewrite must self-register a permission override");
-        assert_eq!(overrides.len(), 1);
+        assert!(!overrides.is_empty());
         let pattern = overrides[0].as_str().unwrap();
-        assert!(pattern.starts_with("command("));
-        assert!(pattern.ends_with(')'));
-        let inner = &pattern["command(".len()..pattern.len() - 1];
-        let re = regex::Regex::new(inner).expect("override must be a valid regex");
+        assert_eq!(pattern, "command(ahma hooks run-shell)");
+
+        // Canonical grants are present:
+        assert!(
+            overrides
+                .iter()
+                .any(|v| v.as_str() == Some("command(ahma hooks run-shell)"))
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|v| v.as_str() == Some("command(regex:.*ahma.* hooks run-shell)"))
+        );
 
         let wrapped_a = output_a["overwrite"]["CommandLine"].as_str().unwrap();
         let wrapped_b = output_b["overwrite"]["CommandLine"].as_str().unwrap();
@@ -3153,15 +3291,12 @@ mod tests {
             wrapped_a, wrapped_b,
             "the two commands must actually produce distinct payloads"
         );
-        assert!(re.is_match(wrapped_a), "must match payload from command A");
-        assert!(re.is_match(wrapped_b), "must match payload from command B");
+        assert!(wrapped_a.starts_with("ahma hooks run-shell"));
+        assert!(wrapped_b.starts_with("ahma hooks run-shell"));
 
         // The pattern itself must be identical across calls — a shifting pattern
         // would never accumulate into a durable allow rule.
         assert_eq!(output_b["permissionOverrides"][0].as_str(), Some(pattern));
-
-        // Sanity: it must not degenerate into matching an unrelated command.
-        assert!(!re.is_match("rm -rf /"));
     }
 
     #[test]
@@ -3175,13 +3310,12 @@ mod tests {
             compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
         let output = build_exec_output(decision, HookPlatform::Antigravity);
 
-        let pattern = output["permissionOverrides"][0].as_str().unwrap();
-        let inner = &pattern["command(".len()..pattern.len() - 1];
-        let re = regex::Regex::new(inner).expect("override must be a valid regex");
+        let overrides = output["permissionOverrides"].as_array().unwrap();
+        let pattern = overrides[0].as_str().unwrap();
+        let raw_exe = env.current_exe.display().to_string();
+        assert_eq!(pattern, &format!("command({raw_exe} hooks run-shell)"));
+
         let wrapped = output["overwrite"]["CommandLine"].as_str().unwrap();
-        assert!(re.is_match(wrapped));
-        // User scope quotes the absolute binary path — confirm it is present
-        // (unescaped literally) rather than the bare `ahma` PATH lookup.
         assert!(wrapped.contains(&env.current_exe.to_string_lossy().to_string()));
     }
 
@@ -4956,6 +5090,15 @@ mod tests {
         )
         .unwrap();
 
+        let cli_dir = home.join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        let cli_settings = cli_dir.join("settings.json");
+        std::fs::write(
+            &cli_settings,
+            r#"{"permissions":{"allow":["command(\\./generate-swift-bindings\\.sh)"]}}"#,
+        )
+        .unwrap();
+
         let env = HookEnvironment {
             home_dir: home.clone(),
             project_root: tmp.path().join("proj"),
@@ -4964,6 +5107,7 @@ mod tests {
 
         ensure_antigravity_global_permission_grants(&env).unwrap();
 
+        // 1. Check ~/.gemini/config/config.json
         let content = std::fs::read_to_string(&config_file).unwrap();
         let doc: Value = serde_json::from_str(&content).unwrap();
         let allows = doc["userSettings"]["globalPermissionGrants"]["allow"]
@@ -4977,7 +5121,54 @@ mod tests {
         assert!(
             allows
                 .iter()
-                .any(|v| v.as_str() == Some("command('/usr/local/bin/ahma' 'hooks' 'run-shell')"))
+                .any(|v| v.as_str() == Some("command(/usr/local/bin/ahma hooks run-shell)"))
+        );
+
+        // 2. Check ~/.gemini/antigravity-cli/settings.json
+        let cli_content = std::fs::read_to_string(&cli_settings).unwrap();
+        let cli_doc: Value = serde_json::from_str(&cli_content).unwrap();
+        let cli_allows = cli_doc["permissions"]["allow"].as_array().unwrap();
+        assert!(
+            cli_allows
+                .iter()
+                .any(|v| v.as_str() == Some("command(\\./generate-swift-bindings\\.sh)"))
+        );
+        assert!(cli_allows.iter().any(|v| {
+            v.as_str()
+                .is_some_and(|s| s.contains("ahma-hooks-wrapper-v1"))
+        }));
+
+        // 3. Test removal on uninstall
+        remove_antigravity_permissions(&env).unwrap();
+
+        let content_after = std::fs::read_to_string(&config_file).unwrap();
+        let doc_after: Value = serde_json::from_str(&content_after).unwrap();
+        let allows_after = doc_after["userSettings"]["globalPermissionGrants"]["allow"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !allows_after
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s.contains("ahma")))
+        );
+        assert!(
+            allows_after
+                .iter()
+                .any(|v| v.as_str() == Some("command(git status)"))
+        );
+
+        let cli_content_after = std::fs::read_to_string(&cli_settings).unwrap();
+        let cli_doc_after: Value = serde_json::from_str(&cli_content_after).unwrap();
+        let cli_allows_after = cli_doc_after["permissions"]["allow"].as_array().unwrap();
+        assert!(
+            !cli_allows_after
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s.contains("ahma")))
+        );
+        assert!(
+            cli_allows_after
+                .iter()
+                .any(|v| v.as_str() == Some("command(\\./generate-swift-bindings\\.sh)"))
         );
     }
 }

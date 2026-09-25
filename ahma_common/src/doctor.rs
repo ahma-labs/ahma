@@ -60,6 +60,13 @@ pub enum Fix {
     RemoveMissingScopes(Vec<PathBuf>),
     /// Forget approvals and trust recorded for folders that no longer exist.
     ForgetMissingWorkspaces(Vec<PathBuf>),
+    /// Clean up bloated one-off and malformed grants in ~/.gemini configs, ensuring clean ahma command grants.
+    RepairAntigravityPermissions {
+        cli_settings: Option<PathBuf>,
+        config_file: Option<PathBuf>,
+        ide_mcp: Option<PathBuf>,
+        clean_grants: Vec<String>,
+    },
 }
 
 impl Fix {
@@ -76,6 +83,9 @@ impl Fix {
                 paths.len(),
                 join_paths(paths)
             ),
+            Fix::RepairAntigravityPermissions { .. } => {
+                "Clean up bloated one-off and malformed grants in ~/.gemini configs, and repair Antigravity MCP settings".to_string()
+            }
         }
     }
 
@@ -123,6 +133,38 @@ impl Fix {
                 }
                 Ok(format!("Forgot approvals for {} folder(s)", paths.len()))
             }
+            Fix::RepairAntigravityPermissions {
+                cli_settings,
+                config_file,
+                ide_mcp,
+                clean_grants,
+            } => {
+                let mut files_cleaned = 0;
+                if let Some(path) = cli_settings {
+                    clean_antigravity_file(path, clean_grants, false)?;
+                    files_cleaned += 1;
+                }
+                if let Some(path) = config_file {
+                    clean_antigravity_file(path, clean_grants, true)?;
+                    files_cleaned += 1;
+                }
+                if let Some(path) = ide_mcp {
+                    clean_antigravity_ide_mcp(path)?;
+                    files_cleaned += 1;
+                }
+                append_audit(&audit_entry(
+                    now,
+                    AuditAction::Grant,
+                    GrantKind::Tool,
+                    "antigravity-permissions",
+                    None,
+                    GrantTier::Always,
+                    Some("doctor".to_string()),
+                ));
+                Ok(format!(
+                    "Cleaned Antigravity permissions in {files_cleaned} file(s)"
+                ))
+            }
         }
     }
 }
@@ -140,6 +182,10 @@ fn join_paths(paths: &[PathBuf]) -> String {
 pub struct DoctorInput {
     /// The settings file (`~/.ahma/settings.toml`).
     pub settings_file: Option<PathBuf>,
+    /// User home directory (`~`).
+    pub home_dir: Option<PathBuf>,
+    /// Current ahma binary path.
+    pub current_exe: Option<PathBuf>,
     /// The folder the user is working in.
     pub workspace: PathBuf,
     /// The daemon's runtime directory, if known.
@@ -154,6 +200,10 @@ impl DoctorInput {
     pub fn for_workspace(workspace: &Path) -> Self {
         Self {
             settings_file: settings_path(),
+            home_dir: crate::config::ahma_home_dir(),
+            current_exe: std::env::current_exe()
+                .ok()
+                .map(|p| dunce::canonicalize(&p).unwrap_or(p)),
             workspace: workspace.to_path_buf(),
             runtime_dir: crate::daemon_hub::runtime_dir(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -172,6 +222,11 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
         check_trust(settings, &input.workspace, &mut findings);
     }
     check_daemon(input, &mut findings);
+    check_antigravity_permissions(
+        input.home_dir.as_deref(),
+        input.current_exe.as_deref(),
+        &mut findings,
+    );
     check_logs(&input.workspace, &mut findings);
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
     findings
@@ -336,6 +391,289 @@ fn check_daemon(input: &DoctorInput, out: &mut Vec<Finding>) {
     out.push(finding);
 }
 
+fn is_bloated_ahma_grant(s: &str) -> bool {
+    s.contains("hooks")
+        && s.contains("run-shell")
+        && (s.contains("--command") || s.contains("--payload-base64") || s.contains("--cwd"))
+}
+
+fn is_malformed_ahma_grant(s: &str) -> bool {
+    if s.contains("regex:") {
+        return false;
+    }
+    s.contains("ahma") && (s.contains(".*") || s.contains(r"\.") || s.contains('\n'))
+}
+
+fn clean_grants_vec(
+    grants: &[serde_json::Value],
+    clean_grants: &[String],
+) -> (Vec<serde_json::Value>, usize, usize) {
+    let mut cleaned = Vec::new();
+    let mut bloated_count = 0;
+    let mut malformed_count = 0;
+
+    for g in grants {
+        if let Some(s) = g.as_str() {
+            if is_bloated_ahma_grant(s) {
+                bloated_count += 1;
+                continue;
+            }
+            if is_malformed_ahma_grant(s) {
+                malformed_count += 1;
+                continue;
+            }
+            if !cleaned.contains(g) {
+                cleaned.push(g.clone());
+            }
+        }
+    }
+
+    for add in clean_grants {
+        let val = serde_json::Value::String(add.clone());
+        if !cleaned.contains(&val) {
+            cleaned.push(val);
+        }
+    }
+
+    (cleaned, bloated_count, malformed_count)
+}
+
+fn clean_antigravity_file(
+    path: &Path,
+    clean_grants: &[String],
+    is_config_file: bool,
+) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(path)?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
+    let Some(root) = doc.as_object_mut() else {
+        anyhow::bail!("Root of {} is not an object", path.display());
+    };
+
+    if let Some(perms) = root.get_mut("permissions").and_then(|p| p.as_object_mut())
+        && let Some(allow) = perms.get("allow").and_then(|a| a.as_array())
+    {
+        let (cleaned, _, _) = clean_grants_vec(allow, clean_grants);
+        perms.insert("allow".to_string(), serde_json::Value::Array(cleaned));
+    }
+
+    if is_config_file
+        && let Some(user_settings) = root.get_mut("userSettings").and_then(|u| u.as_object_mut())
+        && let Some(gpg) = user_settings
+            .get_mut("globalPermissionGrants")
+            .and_then(|g| g.as_object_mut())
+        && let Some(allow) = gpg.get("allow").and_then(|a| a.as_array())
+    {
+        let (cleaned, _, _) = clean_grants_vec(allow, clean_grants);
+        gpg.insert("allow".to_string(), serde_json::Value::Array(cleaned));
+    }
+
+    let formatted = serde_json::to_string_pretty(&doc)?;
+    std::fs::write(path, formatted)?;
+    Ok(())
+}
+
+fn clean_antigravity_ide_mcp(path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(path)?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
+    let mut modified = false;
+    if let Some(servers) = doc.get_mut("mcpServers").and_then(|s| s.as_object_mut())
+        && let Some(ahma) = servers.get_mut("Ahma").and_then(|a| a.as_object_mut())
+        && let Some(args) = ahma.get_mut("args").and_then(|a| a.as_array_mut())
+    {
+        let before_len = args.len();
+        args.retain(|arg| arg.as_str() != Some("--tmp"));
+        if args.len() != before_len {
+            modified = true;
+        }
+        for arg in args.iter_mut() {
+            if let Some(s) = arg.as_str()
+                && s.contains("--tmp")
+            {
+                let cleaned = s
+                    .replace("--tmp ", "")
+                    .replace(" --tmp", "")
+                    .replace("--tmp", "");
+                *arg = serde_json::Value::String(cleaned);
+                modified = true;
+            }
+        }
+    }
+    if modified {
+        let formatted = serde_json::to_string_pretty(&doc)?;
+        std::fs::write(path, formatted)?;
+    }
+    Ok(())
+}
+
+fn check_antigravity_permissions(
+    home: Option<&Path>,
+    current_exe: Option<&Path>,
+    out: &mut Vec<Finding>,
+) {
+    let Some(home) = home else { return };
+    let cli_path = home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("settings.json");
+    let config_path = home.join(".gemini").join("config").join("config.json");
+    let ide_path = home.join(".antigravity").join("mcp.json");
+
+    if !cli_path.exists() && !config_path.exists() && !ide_path.exists() {
+        return;
+    }
+
+    let raw_exe = current_exe
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "ahma".to_string());
+
+    let clean_grants = vec![
+        format!("command({raw_exe} hooks run-shell)"),
+        "command(ahma hooks run-shell)".to_string(),
+        "command(regex:.*ahma.* hooks run-shell)".to_string(),
+        format!("command({raw_exe} hooks run-shell --wrapped-by ahma-hooks-wrapper-v1)"),
+        "command(ahma hooks run-shell --wrapped-by ahma-hooks-wrapper-v1)".to_string(),
+        "command(regex:.*ahma.* hooks run-shell --wrapped-by ahma-hooks-wrapper-v1)".to_string(),
+    ];
+
+    let mut total_bloated = 0;
+    let mut total_malformed = 0;
+    let mut missing_clean = false;
+
+    let scan_file = |path: &Path, is_config: bool| -> (usize, usize, bool) {
+        if !path.exists() {
+            return (0, 0, false);
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return (0, 0, false);
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return (0, 0, false);
+        };
+        let mut b = 0;
+        let mut m = 0;
+        let mut missing = false;
+
+        let check_array = |arr: &serde_json::Value| -> (usize, usize, bool) {
+            let Some(items) = arr.as_array() else {
+                return (0, 0, false);
+            };
+            let mut sub_b = 0;
+            let mut sub_m = 0;
+            for item in items {
+                if let Some(s) = item.as_str() {
+                    if is_bloated_ahma_grant(s) {
+                        sub_b += 1;
+                    } else if is_malformed_ahma_grant(s) {
+                        sub_m += 1;
+                    }
+                }
+            }
+            let sub_missing = clean_grants
+                .iter()
+                .any(|cg| !items.iter().any(|i| i.as_str() == Some(cg.as_str())));
+            (sub_b, sub_m, sub_missing)
+        };
+
+        if let Some(perms_allow) = doc.get("permissions").and_then(|p| p.get("allow")) {
+            let (sb, sm, smiss) = check_array(perms_allow);
+            b += sb;
+            m += sm;
+            if smiss {
+                missing = true;
+            }
+        } else {
+            missing = true;
+        }
+
+        if is_config {
+            if let Some(gpg_allow) = doc
+                .get("userSettings")
+                .and_then(|u| u.get("globalPermissionGrants"))
+                .and_then(|g| g.get("allow"))
+            {
+                let (sb, sm, smiss) = check_array(gpg_allow);
+                b += sb;
+                m += sm;
+                if smiss {
+                    missing = true;
+                }
+            } else {
+                missing = true;
+            }
+        }
+
+        (b, m, missing)
+    };
+
+    let (cb, cm, cmiss) = scan_file(&cli_path, false);
+    total_bloated += cb;
+    total_malformed += cm;
+    if cli_path.exists() && cmiss {
+        missing_clean = true;
+    }
+
+    let (gb, gm, gmiss) = scan_file(&config_path, true);
+    total_bloated += gb;
+    total_malformed += gm;
+    if config_path.exists() && gmiss {
+        missing_clean = true;
+    }
+
+    let mut ide_has_retired_tmp = false;
+    if ide_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&ide_path)
+        && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(ahma) = doc.get("mcpServers").and_then(|s| s.get("Ahma"))
+        && let Some(args) = ahma.get("args").and_then(|a| a.as_array())
+        && args
+            .iter()
+            .any(|arg| arg.as_str().is_some_and(|s| s.contains("--tmp")))
+    {
+        ide_has_retired_tmp = true;
+    }
+
+    if total_bloated > 0 || total_malformed > 0 || missing_clean || ide_has_retired_tmp {
+        let level = if total_bloated > 0 || total_malformed > 0 || ide_has_retired_tmp {
+            Level::Warn
+        } else {
+            Level::Info
+        };
+        let mut detail = format!(
+            "Found {total_bloated} bloated one-off wrapped command(s) and {total_malformed} malformed grant(s) across ~/.gemini settings. \
+             These cause Antigravity to repeatedly prompt for permission on every tool call."
+        );
+        if ide_has_retired_tmp {
+            detail.push_str(" Also found retired --tmp flag in ~/.antigravity/mcp.json.");
+        }
+        out.push(Finding {
+            level,
+            title: "Antigravity permission grants need cleanup".into(),
+            detail,
+            fix: Some(Fix::RepairAntigravityPermissions {
+                cli_settings: cli_path.exists().then_some(cli_path),
+                config_file: config_path.exists().then_some(config_path),
+                ide_mcp: (ide_path.exists() && ide_has_retired_tmp).then_some(ide_path),
+                clean_grants,
+            }),
+        });
+    } else {
+        out.push(Finding {
+            level: Level::Ok,
+            title: "Antigravity command permissions are clean".into(),
+            detail: "Clean prefix grants are active in ~/.gemini config files; no bloated or malformed entries found.".into(),
+            fix: None,
+        });
+    }
+}
+
 /// The newest log under `<workspace>/.ahma/logs`, its size, and its most
 /// repeated warnings and errors.
 fn check_logs(workspace: &Path, out: &mut Vec<Finding>) {
@@ -454,6 +792,8 @@ mod tests {
     fn input(home: &Path, workspace: &Path) -> DoctorInput {
         DoctorInput {
             settings_file: Some(home.join("settings.toml")),
+            home_dir: Some(home.to_path_buf()),
+            current_exe: Some(PathBuf::from("/usr/local/bin/ahma")),
             workspace: workspace.to_path_buf(),
             runtime_dir: None,
             version: "1".into(),
@@ -526,5 +866,171 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
         .unwrap();
         let text = render(&run(&input(home.path(), ws.path())));
         assert!(text.contains("2× daemon unavailable"), "{text}");
+    }
+
+    #[test]
+    fn antigravity_bloated_and_malformed_grants_are_reported_and_repaired() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+
+        let cli_dir = home.path().join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        let cli_file = cli_dir.join("settings.json");
+        let initial_cli = serde_json::json!({
+            "permissions": {
+                "allow": [
+                    "mcp(Ahma/run_terminal_command)",
+                    "command('/usr/local/bin/ahma' 'hooks' 'run-shell' '--wrapped-by' 'ahma-hooks-wrapper-v1' '--cwd' '/some/dir' '--command' 'tail -n 100 /path/to/log')",
+                    "command(/usr/local/bin/\\ahma hooks run-shell.*)",
+                    "command(git status)"
+                ]
+            }
+        });
+        std::fs::write(
+            &cli_file,
+            serde_json::to_string_pretty(&initial_cli).unwrap(),
+        )
+        .unwrap();
+
+        let config_dir = home.path().join(".gemini").join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join("config.json");
+        let initial_config = serde_json::json!({
+            "userSettings": {
+                "globalPermissionGrants": {
+                    "allow": [
+                        "command(xcodebuild)",
+                        "command(/usr/local/bin/ahma hooks run-shell.*)",
+                        "command('/usr/local/bin/ahma' 'hooks' 'run-shell'.*)"
+                    ]
+                }
+            },
+            "permissions": {
+                "allow": [
+                    "command(/usr/local/bin/ahma hooks run-shell.*)"
+                ]
+            }
+        });
+        std::fs::write(
+            &config_file,
+            serde_json::to_string_pretty(&initial_config).unwrap(),
+        )
+        .unwrap();
+
+        let ide_dir = home.path().join(".antigravity");
+        std::fs::create_dir_all(&ide_dir).unwrap();
+        let ide_file = ide_dir.join("mcp.json");
+        let initial_ide = serde_json::json!({
+            "mcpServers": {
+                "Ahma": {
+                    "command": "ahma",
+                    "args": ["serve", "stdio", "--tools", "simplify", "--tmp", "--log-monitor"]
+                }
+            }
+        });
+        std::fs::write(
+            &ide_file,
+            serde_json::to_string_pretty(&initial_ide).unwrap(),
+        )
+        .unwrap();
+
+        let findings = run(&input(home.path(), ws.path()));
+        let report = render(&findings);
+        assert!(
+            report.contains("Antigravity permission grants need cleanup"),
+            "{report}"
+        );
+        assert!(
+            report.contains("retired --tmp flag in ~/.antigravity/mcp.json"),
+            "{report}"
+        );
+
+        let fix_list = fixes(&findings);
+        assert_eq!(fix_list.len(), 1);
+        let Fix::RepairAntigravityPermissions { .. } = &fix_list[0] else {
+            panic!("Expected RepairAntigravityPermissions fix");
+        };
+
+        let result = fix_list[0].apply("2026-09-25T12:00:00Z").unwrap();
+        assert!(result.contains("Cleaned Antigravity permissions in 3 file(s)"));
+
+        let cli_content = std::fs::read_to_string(&cli_file).unwrap();
+        let cli_doc: serde_json::Value = serde_json::from_str(&cli_content).unwrap();
+        let cli_allow = cli_doc["permissions"]["allow"].as_array().unwrap();
+        assert!(
+            !cli_allow
+                .iter()
+                .any(|v| v.as_str().unwrap().contains("--command"))
+        );
+        assert!(
+            !cli_allow
+                .iter()
+                .any(|v| v.as_str().unwrap().ends_with(".*)"))
+        );
+        assert!(
+            !cli_allow
+                .iter()
+                .any(|v| v.as_str().unwrap().contains(r"\."))
+        );
+        assert!(
+            cli_allow
+                .iter()
+                .any(|v| v.as_str() == Some("mcp(Ahma/run_terminal_command)"))
+        );
+        assert!(
+            cli_allow
+                .iter()
+                .any(|v| v.as_str() == Some("command(git status)"))
+        );
+        assert!(
+            cli_allow
+                .iter()
+                .any(|v| v.as_str() == Some("command(/usr/local/bin/ahma hooks run-shell)"))
+        );
+        assert!(
+            cli_allow
+                .iter()
+                .any(|v| v.as_str() == Some("command(ahma hooks run-shell)"))
+        );
+        assert!(
+            cli_allow
+                .iter()
+                .any(|v| v.as_str() == Some("command(regex:.*ahma.* hooks run-shell)"))
+        );
+
+        let config_content = std::fs::read_to_string(&config_file).unwrap();
+        let config_doc: serde_json::Value = serde_json::from_str(&config_content).unwrap();
+        let gpg_allow = config_doc["userSettings"]["globalPermissionGrants"]["allow"]
+            .as_array()
+            .unwrap();
+        assert!(
+            gpg_allow
+                .iter()
+                .any(|v| v.as_str() == Some("command(xcodebuild)"))
+        );
+        assert!(
+            !gpg_allow
+                .iter()
+                .any(|v| v.as_str().unwrap().ends_with(".*)"))
+        );
+        assert!(
+            gpg_allow
+                .iter()
+                .any(|v| v.as_str() == Some("command(/usr/local/bin/ahma hooks run-shell)"))
+        );
+
+        let ide_content = std::fs::read_to_string(&ide_file).unwrap();
+        let ide_doc: serde_json::Value = serde_json::from_str(&ide_content).unwrap();
+        let ide_args = ide_doc["mcpServers"]["Ahma"]["args"].as_array().unwrap();
+        assert!(!ide_args.iter().any(|v| v.as_str() == Some("--tmp")));
+        assert!(ide_args.iter().any(|v| v.as_str() == Some("--log-monitor")));
+
+        let findings_after = run(&input(home.path(), ws.path()));
+        assert!(
+            findings_after
+                .iter()
+                .any(|f| f.title == "Antigravity command permissions are clean")
+        );
+        assert!(fixes(&findings_after).is_empty());
     }
 }

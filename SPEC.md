@@ -419,7 +419,7 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 - **R5.4.2**: **Default install carries no scope and no downgrade**: The MCP server configuration installed by `ahma setup` for Cursor, VSCode, Claude, Antigravity, Codex, and LM Studio **must not** include `--tmp` (a downgrade, R5.2.5) and **must not** inject a sandbox scope the user did not choose — no `--sandbox-scope`, and no directory pre-created as a side effect of setup. These files are **client-owned**: anyone who configures the client can edit them, which is precisely why R5.2.3 keeps the container root out of them. A client that reports no usable roots reaches its scope through elicitation (R5.3.1) or the user's container root (R5.2.3).
   - Generated configs **must not** carry `--sandbox`. It never toggled the kernel sandbox — it is a deprecated alias for `--scratch`, which appends an auxiliary scratch directory — so it advertises a protection it does not provide.
   - **Antigravity supports `roots/list`**, verified on the wire: it declares `roots: {listChanged: true}` and `elicitation: {form: {}, url: {}}` at `initialize` (protocol `2025-11-25`, `clientInfo.name = "antigravity-client"`), and it *answers* `roots/list` — with `{"roots": []}`. It is roots-**empty**, not roots-**less**, which is R5.2.7, not a missing capability. Client capability claims in this document **must** cite wire evidence; an inferred client limitation that turns out to be false produces exactly the wrong remediation.
-  - **Antigravity's `PreToolUse` allow-cache keys on the exact literal command, so a rewriting hook must self-register its own pattern.** Verified against agy's own embedded `PreToolUse` contract docs (extracted from the shipped `agy` binary) and against a real `~/.gemini/antigravity-cli/settings.json`, whose `permissions.allow` entries are `command(<regex>)` strings compiled with Go's `regexp` package (confirmed via the `regexp.Compile`/`regexp.QuoteMeta`/`(*Regexp).MatchString` symbols present in the binary, and by a live regex-escaped entry — `command(\./generate-swift-bindings\.sh)` — that predates this change). Wrapped shell commands format as human-readable arguments (`--wrapped-by ahma-hooks-wrapper-v1 --cwd <cwd> [--session-id <id>] --command <cmd>`) and self-register permission patterns in `permissionOverrides` as well as user global grants (`~/.gemini/config/config.json`) so the user is never endlessly prompted.
+  - **Antigravity's grant matching is token-based word prefix matching, so a rewriting hook must self-register clean token-prefix patterns.** Verified via reverse engineering of the shipped `agy` binary (`cortex/utils/commandutils.MatchesConfig` and `cortex/shared.coversCommand`): `agy` decomposes commands into words (`argv`) and matches tokens sequentially against the config. Non-regex tokens match byte-for-byte; tokens starting with `regex:` match via Go's `regexp`. Because matching operates as a prefix match on tokens, a clean grant like `command(/path/to/ahma hooks run-shell)` matches any command beginning with those words, covering all trailing flags and wrapped commands (`--wrapped-by`, `--cwd`, `--command`, etc.) without requiring per-invocation permissions. Bare regex syntax without `regex:` (such as trailing `.*`, character classes, or backslash escapes `\.`) and single quotes inside `command(...)` tokens are matched literally and **must not** be used, as they fail to match and cause repeated prompts. Wrapped shell commands format as human-readable arguments (`--wrapped-by ahma-hooks-wrapper-v1 --cwd <cwd> [--session-id <id>] --command <cmd>`) and self-register clean prefix patterns in `permissionOverrides` as well as user grants in `~/.gemini/antigravity-cli/settings.json` (`permissions.allow`) and `~/.gemini/config/config.json`.
 - **R5.4.3**: **Write Protection**: The system **must** block any attempt to write outside the locked scope, including via command arguments (e.g. `touch /outside/file`).
 
 #### Persistent scope grants (external tool directories)
@@ -671,6 +671,17 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
   test harness, a test that did not choose a home (`AHMA_TEST_HOME`) gets a
   private per-run one: a test once wrote a `/opt/two` grant into the
   developer's real settings on every run.
+- **R-DOCTOR.5 — Antigravity permission health and repair.** `ahma doctor`
+  and `ahma doctor --fix` **must** inspect Antigravity CLI and Gemini
+  configuration files (`~/.gemini/antigravity-cli/settings.json` and
+  `~/.gemini/config/config.json`). When Antigravity prompts repeatedly, it
+  accumulates bloated one-off wrapped command entries (`command(...)`
+  containing `hooks run-shell` and `--command`, `--payload-base64`, or
+  `--cwd`) or malformed entries (`.*`, `\.`, or multiline entries without
+  `regex:`). `ahma doctor` reports these as warnings and `--fix` prunes the
+  bloated and malformed entries while ensuring clean prefix token grants
+  (`command({exe} hooks run-shell)`, `command(ahma hooks run-shell)`, etc.)
+  are installed.
 
 #### The question ladder (where a permission question is asked)
 

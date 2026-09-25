@@ -317,6 +317,14 @@ fn remove_platform_mcp(
         )
     })?;
 
+    if platform == Platform::Antigravity {
+        let ide_path = home.join(".antigravity").join("mcp.json");
+        if ide_path.exists() {
+            remove_mcp_entry(&ide_path, "mcpServers", dry_run)
+                .with_context(|| format!("Antigravity IDE MCP config at {}", ide_path.display()))?;
+        }
+    }
+
     Ok(Some(platform.mcp_display_name()))
 }
 
@@ -1473,8 +1481,23 @@ mod tests {
             &home.join(".gemini").join("config").join("mcp_config.json"),
             r#"{"mcpServers":{"Ahma":{"type":"stdio"}}}"#,
         );
+        write_json(
+            &home.join(".antigravity").join("mcp.json"),
+            r#"{"mcpServers":{"Ahma":{"type":"stdio"},"Other":{"type":"stdio"}}}"#,
+        );
         let name = remove_platform_mcp(Platform::Antigravity, home, false)?;
         assert_eq!(name, Some("Antigravity"));
+
+        let cli_content =
+            std::fs::read_to_string(home.join(".gemini").join("config").join("mcp_config.json"))?;
+        let cli_parsed: Value = serde_json::from_str(&cli_content)?;
+        assert!(cli_parsed["mcpServers"]["Ahma"].is_null());
+
+        let ide_content = std::fs::read_to_string(home.join(".antigravity").join("mcp.json"))?;
+        let ide_parsed: Value = serde_json::from_str(&ide_content)?;
+        assert!(ide_parsed["mcpServers"]["Ahma"].is_null());
+        assert!(!ide_parsed["mcpServers"]["Other"].is_null());
+
         Ok(())
     }
 

@@ -98,6 +98,21 @@ fn configure_mcp(
         }
     }
 
+    if platform == Platform::Antigravity {
+        let ide_dir = home.join(".antigravity");
+        if ide_dir.exists() {
+            let ide_path = ide_dir.join("mcp.json");
+            let entry = select_mcp_json_entry(
+                platform,
+                transport,
+                servers_entry,
+                scoped_servers_entry,
+                home,
+            );
+            let _ = merge_mcp_json(&ide_path, "mcpServers", entry);
+        }
+    }
+
     Ok(Some(platform.mcp_display_name()))
 }
 

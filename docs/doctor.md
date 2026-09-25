@@ -52,6 +52,7 @@ Example report:
 | Daemon running a different build than this binary | warn | none — quit ahma sessions and the next one starts the new build |
 | Whether this folder is trusted, and what is always allowed here | info | none — `/settings trust` |
 | Log size, and the most repeated warnings in the newest log | info / warn | none |
+| Antigravity permission grants (`~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/config.json`) | warn / info | prune bloated one-off/malformed entries and install clean prefix token grants |
 
 Every applied fix is written through the same strict read-modify-write the
 rest of ahma uses (it will not rewrite a file it cannot parse) and appended to
