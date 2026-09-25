@@ -2034,7 +2034,12 @@ fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
 /// matches any command whose first three words match, covering all underlying subcommands
 /// and flags without requiring regex escapes or trailing `.*`.
 fn build_antigravity_permission_override(wrapped_command: &str) -> String {
-    let trimmed = wrapped_command.trim();
+    let mut trimmed = wrapped_command.trim();
+    if let Some(idx) = trimmed.find("& { & ") {
+        trimmed = trimmed[idx + "& { & ".len()..].trim_start();
+    } else if let Some(idx) = trimmed.find("& ") {
+        trimmed = trimmed[idx + 2..].trim_start();
+    }
     let (exe, rest) = if let Some(stripped) = trimmed.strip_prefix('\'') {
         if let Some(end) = stripped.find('\'') {
             (&stripped[..end], stripped[end + 1..].trim_start())
@@ -3317,6 +3322,16 @@ mod tests {
 
         let wrapped = output["overwrite"]["CommandLine"].as_str().unwrap();
         assert!(wrapped.contains(&env.current_exe.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn test_antigravity_permission_override_powershell_windows_pattern() {
+        let cmd = r#"powershell -NoProfile -Command "& { & 'C:\Program Files\ahma\ahma.exe' 'hooks' 'run-shell' '--wrapped-by' 'ahma-hooks-wrapper-v1' '--cwd' 'C:\repo' '--command' 'cargo test' }""#;
+        let pattern = build_antigravity_permission_override(cmd);
+        assert_eq!(
+            pattern,
+            r#"command(C:\Program Files\ahma\ahma.exe hooks run-shell)"#
+        );
     }
 
     #[test]
