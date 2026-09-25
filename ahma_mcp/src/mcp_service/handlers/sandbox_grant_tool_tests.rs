@@ -47,6 +47,29 @@ fn refused_strict_ancestor_of_live_scope() {
 }
 
 #[test]
+fn allows_enclosing_git_repo_ancestor_of_live_scope() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let worktree_or_subdir = repo
+        .join(".claude")
+        .join("worktrees")
+        .join("feature")
+        .join("rust");
+    std::fs::create_dir_all(&worktree_or_subdir).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+    let canon_repo = dunce::canonicalize(&repo).unwrap();
+    let canon_sub = dunce::canonicalize(&worktree_or_subdir).unwrap();
+
+    let scopes = vec![canon_sub];
+    let risk = classify_grant_risk(&canon_repo, Some(tmp.path()), &scopes);
+    assert!(
+        !matches!(risk, GrantRisk::Refused(_)),
+        "enclosing git repo of a scope must not be refused: {risk:?}"
+    );
+}
+
+#[test]
 fn refused_credential_dirs() {
     let home = PathBuf::from("/home/u");
     for dir in [".ssh", ".aws", ".gnupg", ".kube", ".docker", ".ahma"] {
@@ -274,7 +297,7 @@ fn preview_text_surfaces_high_risk_warnings() {
 }
 
 #[test]
-fn success_text_added_points_to_restart() {
+fn success_text_added_reports_immediate_effect() {
     let text = success_text(
         Path::new("/cache/sccache"),
         ScopeAccess::Rw,
@@ -284,8 +307,8 @@ fn success_text_added_points_to_restart() {
         &GrantRisk::Normal,
     );
     assert!(text.contains("✓ Granted"));
-    assert!(text.contains("restart"));
-    assert!(text.contains("next server start"));
+    assert!(text.contains("takes effect immediately for this session"));
+    assert!(text.contains("persists"));
 }
 
 // ── handler integration (real service, real scopes) ─────────────────────────
@@ -656,7 +679,10 @@ async fn handler_persists_grant_for_external_client_with_no_peer_and_reports_upd
         .filter_map(|c| c.as_text().map(|t| t.text.clone()))
         .collect::<String>();
     assert!(first_text.contains("✓ Granted"), "{first_text}");
-    assert!(first_text.contains("next server start"), "{first_text}");
+    assert!(
+        first_text.contains("takes effect immediately for this session"),
+        "{first_text}"
+    );
 
     let second_text = second
         .expect("re-granting the same path should update, not fail")
@@ -753,5 +779,54 @@ fn denylist_holds_when_home_is_reached_through_a_symlink() {
             GrantRisk::Refused(_)
         ),
         "granting ~/.ssh must be refused even when $HOME is a symlink"
+    );
+}
+
+#[tokio::test]
+async fn handler_applies_confirmed_grant_immediately_to_live_sandbox() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    unsafe { std::env::set_var("AHMA_TEST_HOME", &home) };
+
+    let (service, _scope) = crate::test_utils::in_process::build_test_service()
+        .await
+        .unwrap();
+
+    let external_dir = tmp.path().join("external_cache");
+    std::fs::create_dir_all(&external_dir).unwrap();
+    let canon_external = dunce::canonicalize(&external_dir).unwrap();
+
+    // Verify initially NOT in scope
+    assert!(!service.adapter.sandbox().is_path_in_scope(&canon_external));
+
+    let result = service
+        .handle_sandbox_grant(
+            args(&[
+                ("path", json!(canon_external.to_string_lossy())),
+                ("access", json!("rw")),
+                ("confirm", json!(true)),
+            ]),
+            crate::client_type::McpClientType::Cursor,
+        )
+        .await;
+
+    unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+
+    let tool_result = result.expect("confirmed grant must succeed");
+    let text = tool_result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<String>();
+    assert!(
+        text.contains("takes effect immediately for this session"),
+        "{text}"
+    );
+
+    // Verify it is NOW immediately in scope without a server restart!
+    assert!(
+        service.adapter.sandbox().is_path_in_scope(&canon_external),
+        "confirmed grant must immediately widen the live sandbox session"
     );
 }

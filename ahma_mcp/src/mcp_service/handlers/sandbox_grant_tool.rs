@@ -34,8 +34,8 @@
 //!    (writes nothing) and shows the exact file and line. The default is Deny.
 //!
 //! The grant is written to `~/.ahma/settings.toml`, which lives outside every
-//! sandbox scope and only takes effect on the next server start — never the live
-//! session (SPEC R5.4.7 session-immutability). The tool converges on the same
+//! sandbox scope. Once confirmed, it applies immediately to the live sandbox
+//! and persists for subsequent server starts. The tool converges on the same
 //! [`persist_grant`] code path as the CLI `ahma sandbox grant` and the TUI prompt.
 
 use super::common;
@@ -231,6 +231,9 @@ impl AhmaMcpService {
             ))
         })?;
 
+        // Apply grant immediately to the live session
+        self.adapter.sandbox().add_live_grant(&path, access);
+
         Ok(common::text_result(success_text(
             &path,
             access,
@@ -300,6 +303,55 @@ fn clean_path(p: &Path) -> PathBuf {
     out
 }
 
+/// Check if `candidate_parent` is the enclosing git repository root (or main repo of a worktree)
+/// of `scope`. When true, granting `candidate_parent` is not widening above the workspace;
+/// it is granting the workspace root itself.
+fn is_enclosing_git_repo(scope: &Path, candidate_parent: &Path) -> bool {
+    let canon_scope = dunce::canonicalize(scope).unwrap_or_else(|_| scope.to_path_buf());
+    let canon_parent =
+        dunce::canonicalize(candidate_parent).unwrap_or_else(|_| candidate_parent.to_path_buf());
+
+    let mut dir = canon_scope.clone();
+    while dir.starts_with(&canon_parent) {
+        let git = dir.join(".git");
+        if git.exists() {
+            if dir == canon_parent {
+                return true;
+            }
+            if git.is_file()
+                && let Ok(content) = std::fs::read_to_string(&git)
+                && let Some(line) = content
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("gitdir:"))
+            {
+                let raw_gitdir = line.trim_start()["gitdir:".len()..].trim();
+                let gitdir_path = Path::new(raw_gitdir);
+                let resolved = if gitdir_path.is_relative() {
+                    dir.join(gitdir_path)
+                } else {
+                    gitdir_path.to_path_buf()
+                };
+                let canon_gitdir = dunce::canonicalize(&resolved).unwrap_or(resolved);
+                if let Some(main) = canon_gitdir
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|gp| gp.parent())
+                {
+                    let canon_main =
+                        dunce::canonicalize(main).unwrap_or_else(|_| main.to_path_buf());
+                    if canon_main == canon_parent {
+                        return true;
+                    }
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    false
+}
+
 /// Classify the risk of granting `path`.
 ///
 /// `path` is expected to arrive canonicalized (see [`resolve_grant_path`]).
@@ -337,6 +389,10 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
     //    workspace. (Equality is merely redundant — handled as a High warning.)
     for scope in scopes {
         if scope != path && scope.starts_with(path) {
+            if is_enclosing_git_repo(scope, path) {
+                // Not widening above the workspace; it is the enclosing workspace/repo root itself!
+                continue;
+            }
             return GrantRisk::Refused(format!(
                 "it is a parent of the active sandbox scope {} — granting it would widen the \
                  sandbox above your workspace",
@@ -587,8 +643,8 @@ fn success_text(
     format!(
         "{headline}{high_note}\n\n\
          Wrote to {file}:\n  {line}\n\n\
-         This takes effect on the next server start, NOT the live session. To apply it now, run \
-         the `restart` tool, then re-run the command that was blocked.",
+         This grant takes effect immediately for this session and persists to {file} \
+         for future sessions. You can now re-run the command that was blocked.",
         headline = headline,
         high_note = high_note,
         file = settings_file.display(),
@@ -636,8 +692,8 @@ fn grant_prompt_message(
     format!(
         "Grant {access} sandbox access to '{path}'?\n\n\
          {banner}\n\n\
-         This appends to {file} (outside every sandbox scope) and takes effect on the \
-         next server start:\n  {line}\n\n\
+         This appends to {file} (outside every sandbox scope) and takes effect \
+         immediately for this session and persists for future sessions:\n  {line}\n\n\
          Answer 'approve' to persist, or 'deny' to refuse (the default).",
         access = access.label(),
         path = path.display(),
