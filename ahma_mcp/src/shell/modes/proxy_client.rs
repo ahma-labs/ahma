@@ -674,6 +674,65 @@ fn append_session_query(base: &str, session_query: &str) -> String {
     }
 }
 
+/// Detects a specific client name for modern MCP clients that probe via `server/discover`.
+fn detect_modern_client_name() -> &'static str {
+    // 1. Check known environment variables passed by Antigravity IDE
+    if std::env::var("ANTIGRAVITY_EDITOR_APP_ROOT").is_ok()
+        || std::env::var("__CFBundleIdentifier").as_deref() == Ok("com.google.antigravity-ide")
+        || std::env::var("ANTIGRAVITY_AGENT").is_ok()
+        || std::env::var("VSCODE_IPC_HOOK")
+            .map(|s| s.contains("Antigravity"))
+            .unwrap_or(false)
+    {
+        return "Antigravity IDE";
+    }
+
+    // 2. Check known environment variables for Antigravity CLI (agy)
+    if std::env::var("GEMINI_CLI").is_ok() || std::env::var("ANTIGRAVITY_CLI").is_ok() {
+        return "agy";
+    }
+
+    // 3. Inspect parent process on Unix
+    #[cfg(unix)]
+    {
+        let ppid = unsafe { libc::getppid() };
+        if ppid > 1 {
+            use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+            let mut sys = System::new();
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet),
+            );
+            let mut cur_pid = Some(Pid::from_u32(ppid as u32));
+            for _ in 0..3 {
+                let Some(pid) = cur_pid else { break };
+                let Some(proc) = sys.process(pid) else { break };
+                let name = proc.name().to_string_lossy().to_lowercase();
+                let cmd: String = proc
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase();
+                if name == "agy" || cmd.contains("agy") || cmd.contains("antigravity-cli") {
+                    return "agy";
+                }
+                if name.contains("antigravity")
+                    || cmd.contains("antigravity-ide")
+                    || cmd.contains("com.google.antigravity-ide")
+                {
+                    return "Antigravity IDE";
+                }
+                cur_pid = proc.parent();
+            }
+        }
+    }
+
+    "Antigravity"
+}
+
 /// Synthesizes a standard `initialize` JSON-RPC message from a `server/discover` probe.
 fn synthesize_initialize_request(val: &serde_json::Value) -> serde_json::Value {
     let client_info = val
@@ -686,7 +745,7 @@ fn synthesize_initialize_request(val: &serde_json::Value) -> serde_json::Value {
         .cloned()
         .unwrap_or_else(|| {
             serde_json::json!({
-                "name": "modern-client",
+                "name": detect_modern_client_name(),
                 "version": "1.0.0"
             })
         });

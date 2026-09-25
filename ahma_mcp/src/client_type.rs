@@ -57,7 +57,12 @@ impl McpClientType {
     pub fn from_client_name(name: &str) -> Self {
         let name_lower = name.to_lowercase();
 
-        if name_lower.contains("antigravity") || name_lower.starts_with("local-agent-mode") {
+        if name_lower.contains("antigravity")
+            || name_lower.starts_with("local-agent-mode")
+            || name_lower == "agy"
+            || name_lower.starts_with("agy-")
+            || name_lower.starts_with("agy ")
+        {
             McpClientType::Antigravity
         } else if name_lower == "ahma"
             || name_lower.starts_with("ahma-")
@@ -469,6 +474,14 @@ mod tests {
         );
         assert_eq!(
             McpClientType::from_client_name("local-agent-mode-Ahma"),
+            McpClientType::Antigravity
+        );
+        assert_eq!(
+            McpClientType::from_client_name("agy"),
+            McpClientType::Antigravity
+        );
+        assert_eq!(
+            McpClientType::from_client_name("Antigravity IDE"),
             McpClientType::Antigravity
         );
     }

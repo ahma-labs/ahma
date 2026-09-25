@@ -166,7 +166,7 @@ fn draw_hit_row(
 }
 
 /// The navigable index of a section's header row.
-fn nav_index_of_header(sections: &[Section], key: &str) -> Option<usize> {
+pub(crate) fn nav_index_of_header(sections: &[Section], key: &str) -> Option<usize> {
     let mut nav = 0usize;
     for section in sections {
         if section.key == key {
@@ -288,7 +288,7 @@ fn draw_section_rule(
     // Fill to the right edge so the rule is a rule and not a ragged line.
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let width = area.width as usize;
-    let fill = width.saturating_sub(used + tally_width + 3);
+    let fill = width.saturating_sub(used + tally_width + 4);
     let rule_style = if section.header.running {
         theme.section_rule_live()
     } else {

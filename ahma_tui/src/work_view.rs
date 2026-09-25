@@ -185,6 +185,7 @@ fn bucket_ops_by_section(
 /// chat, not another client.
 pub fn is_agent_tool_session(info: &InstanceInfo) -> bool {
     info.client.as_deref() == Some(ahma_core::agent::AGENT_TOOL_CLIENT)
+        || info.client.as_deref() == Some("ahma-tui")
 }
 
 fn instance_visible(info: &InstanceInfo, opts: &SectionOptions<'_>) -> bool {
@@ -306,8 +307,8 @@ fn kind_for(key: &str, info: Option<&InstanceInfo>) -> SectionKind {
         return SectionKind::Local;
     }
     match info {
-        Some(i) if i.mode == "tui" => SectionKind::Local,
         Some(i) if i.ended_epoch_ms.is_some() => SectionKind::Ended,
+        Some(i) if i.mode == "tui" => SectionKind::Local,
         Some(_) => SectionKind::Client,
         // Work whose instance is gone from the list entirely.
         None => SectionKind::Ended,
@@ -322,8 +323,27 @@ fn client_name(key: &str, info: Option<&InstanceInfo>) -> String {
         return "this terminal (you)".to_string();
     }
     match info {
-        Some(i) if i.mode == "tui" => "this terminal (you)".to_string(),
-        Some(i) => i.client.clone().unwrap_or_else(|| i.label.clone()),
+        Some(i) if i.mode == "tui" => {
+            if i.ended_epoch_ms.is_some() {
+                "ended session".to_string()
+            } else if i.pid == std::process::id() {
+                "this terminal (you)".to_string()
+            } else {
+                format!("terminal (pid {})", i.pid)
+            }
+        }
+        Some(i) => {
+            let name = i.client.as_deref().unwrap_or(&i.label);
+            if name == "modern-client" {
+                if i.scope.is_empty() {
+                    "agy".to_string()
+                } else {
+                    "Antigravity IDE".to_string()
+                }
+            } else {
+                name.to_string()
+            }
+        }
         None => "ended session".to_string(),
     }
 }
@@ -916,5 +936,22 @@ mod tests {
         assert!(footnote.contains("pid 7"));
         assert!(footnote.contains("session sess-a"));
         assert_eq!(identity_footnote(None), "");
+    }
+
+    #[test]
+    fn modern_client_is_disambiguated_and_ahma_tui_folded() {
+        let agy_inst = instance("agy-1", Some("modern-client"), "", "unix");
+        assert_eq!(client_name("agy-1", Some(&agy_inst)), "agy");
+
+        let ide_inst = instance("ide-1", Some("modern-client"), "/Users/proj", "unix");
+        assert_eq!(client_name("ide-1", Some(&ide_inst)), "Antigravity IDE");
+
+        let tui_inst = instance("tui-tool", Some("ahma-tui"), "/Users/proj", "unix");
+        assert!(is_agent_tool_session(&tui_inst));
+
+        let mut ended_tui = instance("old-tui", Some("ahma-tui"), "/Users/proj", "tui");
+        ended_tui.ended_epoch_ms = Some(1234567);
+        assert_eq!(kind_for("old-tui", Some(&ended_tui)), SectionKind::Ended);
+        assert_eq!(client_name("old-tui", Some(&ended_tui)), "ended session");
     }
 }

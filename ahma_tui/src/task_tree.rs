@@ -430,13 +430,30 @@ pub(crate) fn display_label(info: &InstanceInfo) -> String {
     format!("{}:{}", base, info.pid)
 }
 
-/// Shorten a scope path for the header line: home-relative when possible,
-/// then last two components.
+/// Shorten a scope path for the header line: home-relative (`~/...`) when possible,
+/// preserving meaningful workspace paths unless they exceed the column budget.
 pub(crate) fn short_path(p: &str) -> String {
+    if p.is_empty() {
+        return String::new();
+    }
     let normalized = p.replace('\\', "/");
-    let parts: Vec<&str> = normalized.trim_end_matches('/').split('/').collect();
+    let home = std::env::var("HOME").unwrap_or_default().replace('\\', "/");
+    let home_trimmed = home.trim_end_matches('/');
+    let path = if !home_trimmed.is_empty()
+        && (normalized == home_trimmed || normalized.starts_with(&format!("{}/", home_trimmed)))
+    {
+        format!("~{}", &normalized[home_trimmed.len()..])
+    } else {
+        normalized
+    };
+
+    if path.chars().count() <= 40 {
+        return path;
+    }
+
+    let parts: Vec<&str> = path.trim_end_matches('/').split('/').collect();
     if parts.len() <= 2 {
-        return p.to_string();
+        return path;
     }
     format!("…/{}", parts[parts.len() - 2..].join("/"))
 }
@@ -761,5 +778,22 @@ mod tests {
             panic!("expected header");
         };
         assert_eq!(counts.total(), 0);
+    }
+
+    #[test]
+    fn short_path_replaces_home_and_preserves_short_paths() {
+        if let Ok(home) = std::env::var("HOME") {
+            let home_trimmed = home.trim_end_matches('/');
+            let proj = format!("{home_trimmed}/github/ahma");
+            assert_eq!(short_path(&proj), "~/github/ahma");
+            assert_eq!(short_path(home_trimmed), "~");
+        }
+
+        let non_home = "/opt/project/my-app";
+        assert_eq!(short_path(non_home), "/opt/project/my-app");
+
+        let long_path =
+            "/a/very/deep/and/long/nested/directory/structure/that/exceeds/the/limit/proj";
+        assert!(short_path(long_path).starts_with("…/"));
     }
 }
