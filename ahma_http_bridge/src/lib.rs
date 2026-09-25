@@ -84,7 +84,7 @@ pub use peer::{PeerFactory, PeerShutdownFn, PeerStreams, SubprocessPeerFactory};
 pub use session::{
     DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_MAX_SESSIONS, DEFAULT_REQUEST_TIMEOUT_SECS,
     DEFAULT_TOOL_CALL_TIMEOUT_SECS, McpRoot, Session, SessionManager, SessionManagerConfig,
-    SessionTerminationReason,
+    SessionTerminationReason, TerminatedSessionInfo,
 };
 
 /// Request handler for HTTP bridge.

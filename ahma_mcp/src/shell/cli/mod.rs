@@ -85,13 +85,17 @@ pub struct AppConfig {
     pub tool_bundles: Vec<String>,
 
     // ── Execution ───────────────────────────────────────────────────────────
-    /// Default command timeout in seconds (default 600). Override with the
+    /// Default command timeout in seconds (default 1800). Override with the
     /// `--timeout` CLI flag or `tools.timeout_secs` in settings.toml; individual
     /// tools can override via `timeout_seconds` in their JSON definition.
     pub timeout_secs: u64,
     /// Default timeout for the `await` tool in seconds. Override with the
     /// `--await-timeout` CLI flag or `tools.await_timeout_secs` in settings.toml.
     pub await_timeout_secs: u64,
+    /// Idle output watchdog timeout in seconds: if an operation produces no output
+    /// and burns no CPU for this long, it is timed out as stalled. 0 disables the
+    /// watchdog. From `tools.idle_timeout_secs` in settings.toml.
+    pub tool_idle_timeout_secs: u64,
     /// Override for the SPEC R2.6.5 fallback single-request budget — used
     /// only when there is no confirmed live push channel to verify liveness
     /// directly (SPEC R2.6.5.3). `None` means trust the built-in conservative
@@ -262,8 +266,9 @@ impl Default for AppConfig {
             tools_dir: None,
             explicit_tools_dir: false,
             tool_bundles: vec![],
-            timeout_secs: 600,
+            timeout_secs: 1800,
             await_timeout_secs: ahma_common::config::default_await_timeout_secs(),
+            tool_idle_timeout_secs: ahma_common::config::default_idle_timeout_secs(),
             request_budget_override_secs: None,
             force_progress_notifications: false,
             execution_mode: ahma_common::config::ExecutionPolicy::default(),
@@ -2639,6 +2644,7 @@ fn load_user_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
 struct ExecutionSettings {
     timeout_secs: u64,
     await_timeout_secs: u64,
+    tool_idle_timeout_secs: u64,
     request_budget_override_secs: Option<u64>,
     force_progress_notifications: bool,
     execution_mode: ahma_common::config::ExecutionPolicy,
@@ -2667,6 +2673,7 @@ fn parse_execution_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
     ExecutionSettings {
         timeout_secs: cli.timeout.unwrap_or(s.tools.timeout_secs),
         await_timeout_secs: cli.await_timeout.unwrap_or(s.tools.await_timeout_secs),
+        tool_idle_timeout_secs: s.tools.idle_timeout_secs,
         request_budget_override_secs: cli
             .request_budget_secs
             .or(s.tools.request_budget_override_secs),
@@ -3093,6 +3100,7 @@ pub fn build_app_config_with_settings(
         tool_bundles,
         timeout_secs: exec.timeout_secs,
         await_timeout_secs: exec.await_timeout_secs,
+        tool_idle_timeout_secs: exec.tool_idle_timeout_secs,
         request_budget_override_secs: exec.request_budget_override_secs,
         force_progress_notifications: exec.force_progress_notifications,
         execution_mode: exec.execution_mode,
@@ -4505,7 +4513,7 @@ mod tests {
     fn test_load_settings_no_settings_returns_defaults() {
         let cli = Cli::parse_from(["ahma", "--no-settings", "serve", "stdio"]);
         let s = load_settings(&cli);
-        assert_eq!(s.tools.timeout_secs, 600);
+        assert_eq!(s.tools.timeout_secs, 1800);
     }
 
     #[test]
@@ -4537,7 +4545,7 @@ mod tests {
         ]);
         let s = load_settings(&cli);
         assert_eq!(
-            s.tools.timeout_secs, 600,
+            s.tools.timeout_secs, 1800,
             "a missing settings file is not an error; defaults are used"
         );
     }
@@ -5009,7 +5017,8 @@ mod tests {
         unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
         let cli = Cli::parse_from(["ahma", "--no-settings", "serve", "stdio"]);
         let cfg = build_app_config(&cli);
-        assert_eq!(cfg.timeout_secs, 600);
+        assert_eq!(cfg.timeout_secs, 1800);
+        assert_eq!(cfg.tool_idle_timeout_secs, 1800);
         assert_eq!(
             cfg.execution_mode,
             ahma_common::config::ExecutionPolicy::Sync,

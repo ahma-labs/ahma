@@ -66,8 +66,9 @@ Run `ahma settings init` to generate this file automatically.
 
 # ── Tool execution ───────────────────────────────────────────────────────────
 # [tools]
-# timeout_secs = 600      # default tool timeout (seconds)
-# await_timeout_secs = 540 # default `await` soft timeout (seconds); does not cancel the operation
+# timeout_secs = 1800     # default tool timeout (seconds; 30 minutes)
+# await_timeout_secs = 1800 # default `await` soft timeout (seconds); does not cancel the operation
+# idle_timeout_secs = 1800  # tool execution idle timeout (seconds without output); 0 disables
 # request_budget_override_secs = 0 # override the fallback single-request budget (SPEC R2.6.5); 0 = unset, use the built-in default
 # force_progress_notifications = false # send progress to Cursor despite its client-side logging quirk
 # execution_mode = "sync"  # "sync": wait for each command's result (within what the

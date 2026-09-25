@@ -1879,7 +1879,7 @@ mod budget_tests {
         let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
         add_stuck_op(&service, "op_stuck_1", "run_terminal_command").await;
 
-        // No `timeout_seconds`: the default (540s) is what gets clamped, and the
+        // No `timeout_seconds`: the default (1800s) is what gets clamped, and the
         // default is what models actually use.
         let params = CallToolRequestParams::new("await");
         let result = service
@@ -1904,7 +1904,7 @@ mod budget_tests {
              indistinguishable from a hung operation. Got: {text}"
         );
         assert!(
-            text.contains("540s"),
+            text.contains("1800s"),
             "the result must state the wait that was asked for, so the gap is \
              visible. Got: {text}"
         );

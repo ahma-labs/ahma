@@ -170,6 +170,20 @@ fn session_not_found_response(id: Value) -> Response {
     )
 }
 
+fn session_terminated_response(
+    session_id: &str,
+    info: crate::session::TerminatedSessionInfo,
+    id: Value,
+) -> Response {
+    let msg = format!(
+        "Session '{}' was terminated ({:?}) {:.1}s ago. Send a new initialize request to start a session.",
+        session_id,
+        info.reason,
+        info.terminated_at.elapsed().as_secs_f64()
+    );
+    error_response_with_status(StatusCode::NOT_FOUND, id, -32600, &msg)
+}
+
 async fn session_has_sampling(s: &crate::session::Session) -> bool {
     let caps = s.capabilities.lock().await;
     caps.as_ref().and_then(|c| c.get("sampling")).is_some()
@@ -722,8 +736,18 @@ fn check_session_exists(
     request_id: Value,
 ) -> Option<Response> {
     if !session_manager.session_exists(session_id) {
-        warn!(session_id = %session_id, "Request for non-existent or terminated session");
-        Some(session_not_found_response(request_id))
+        if let Some(info) = session_manager.terminated_session_info(session_id) {
+            warn!(
+                session_id = %session_id,
+                reason = ?info.reason,
+                elapsed_secs = info.terminated_at.elapsed().as_secs(),
+                "Request for terminated session"
+            );
+            Some(session_terminated_response(session_id, info, request_id))
+        } else {
+            warn!(session_id = %session_id, "Request for non-existent session");
+            Some(session_not_found_response(request_id))
+        }
     } else {
         None
     }
@@ -2057,11 +2081,11 @@ mod tests {
     }
 
     #[test]
-    fn calculate_tool_timeout_caps_at_600() {
+    fn calculate_tool_timeout_caps_at_ceiling() {
         let payload = json!({"params": {"arguments": {"timeout_seconds": 9999}}});
         assert_eq!(
             calculate_tool_timeout(&payload, 60),
-            Duration::from_secs(600)
+            Duration::from_secs(BRIDGE_TOOL_CALL_CEILING_SECS)
         );
     }
 
@@ -2092,8 +2116,8 @@ mod tests {
         );
         const {
             assert!(
-                AWAIT_TOOL_BRIDGE_TIMEOUT_SECS > 600,
-                "await bridge budget must exceed the 600s in-process await ceiling"
+                AWAIT_TOOL_BRIDGE_TIMEOUT_SECS > BRIDGE_TOOL_CALL_CEILING_SECS,
+                "await bridge budget must exceed the in-process await ceiling"
             )
         };
         // The extended budget applies regardless of any client-sent timeout arg.

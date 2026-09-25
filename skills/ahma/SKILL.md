@@ -105,7 +105,7 @@ Returns `running`/`complete`/`failed`/`cancelled`/`timeout`. Non-blocking, safe 
 await(id="op_abc123", timeout_seconds=60)
 ```
 
-Blocks until completion or timeout (default 540s / `tools.await_timeout_secs`). The timeout is
+Blocks until completion or timeout (default 1800s / `tools.await_timeout_secs`). The timeout is
 **soft** — it ends your wait, not the operation; call `await` again with the same `id`, or
 `cancel` to stop it. A wait can also end early if the liveness probe of your connection goes
 unanswered — treat that the same as a timeout and `await` again.
