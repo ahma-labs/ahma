@@ -35,6 +35,8 @@ tempfile.workspace = true
 tree-sitter = "=0.26.9"
 toml.workspace = true
 walkdir = "2.5"
+globset = "0.4"
+ignore = "0.4"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
