@@ -90,8 +90,8 @@ pub struct SimplifyArgs {
     )]
     pub extensions: Vec<String>,
 
-    /// Additional paths/patterns to exclude, as a comma-separated list.
-    /// Example: --exclude "**/generated/**,**/vendor/**"
+    /// Additional paths/patterns to exclude, comma-separated (e.g. stat3.kt, /generated/, *.custom).
+    /// Default exclusions automatically skip .gitignore entries, build caches, generated bindings, migrations, and test fixtures.
     #[arg(short = 'x', long, value_delimiter = ',')]
     pub exclude: Vec<String>,
 

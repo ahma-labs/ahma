@@ -2,10 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 use super::conversion::analyze_file;
-use super::exclusion::should_exclude;
+use super::exclusion::{ExclusionMatcher, is_generated_content};
 use super::external::{AnalyzerRegistry, ExternalMetrics};
 use super::workspace::workspace_analysis_dirs;
 use crate::models::Language;
@@ -87,8 +86,18 @@ fn is_matching_source_file(
     path: &Path,
     allowed_exts: &HashSet<&str>,
     options: &ScanOptions<'_>,
+    matcher: &ExclusionMatcher,
 ) -> bool {
-    if should_exclude(path, options.excludes) {
+    let has_valid_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            allowed_exts.is_empty() || allowed_exts.contains(ext.to_lowercase().as_str())
+        });
+    if !has_valid_ext {
+        return false;
+    }
+    if matcher.is_excluded_path(path) {
         return false;
     }
     if let Some(changed) = options.changed
@@ -96,25 +105,37 @@ fn is_matching_source_file(
     {
         return false;
     }
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            allowed_exts.is_empty() || allowed_exts.contains(ext.to_lowercase().as_str())
-        })
+    if is_generated_content(path) {
+        return false;
+    }
+    true
 }
 
 /// Iterate source files in `dir` matching extension and exclusion filters.
+/// Respects `.gitignore`, `.ignore`, global gitignore, and skips hidden directories.
 fn source_files<'a>(
     dir: &'a Path,
     allowed_exts: &'a std::collections::HashSet<&'a str>,
     options: &'a ScanOptions<'a>,
 ) -> impl Iterator<Item = PathBuf> + 'a {
-    WalkDir::new(dir)
-        .into_iter()
+    let matcher = ExclusionMatcher::new(options.excludes);
+    let filter_matcher = matcher.clone();
+    ignore::WalkBuilder::new(dir)
+        .standard_filters(true)
+        .hidden(true)
+        .require_git(false)
+        .filter_entry(move |entry| {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                !filter_matcher.is_excluded_dir(entry.path())
+            } else {
+                true
+            }
+        })
+        .build()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(walkdir::DirEntry::into_path)
-        .filter(move |path| is_matching_source_file(path, allowed_exts, options))
+        .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+        .map(ignore::DirEntry::into_path)
+        .filter(move |path| is_matching_source_file(path, allowed_exts, options, &matcher))
 }
 
 /// Ensure the parent directory of `path` exists.

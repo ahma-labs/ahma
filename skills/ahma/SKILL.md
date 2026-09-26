@@ -425,6 +425,7 @@ score formula, fail-closed rule):
 /ahma simplify --lens dead-code # Dead-code lens only — unreferenced exports
 /ahma simplify --lens altitude  # Altitude lens only — delegation chains
 /ahma simplify --diff           # Only files changed in git, instead of the whole tree
+/ahma simplify --exclude "..."   # Exclude extra paths/globs (default automatically skips .gitignore, build caches & codegen)
 ```
 
 **Mode selection:** `--auto [N]`, `top N`, or bare `/ahma simplify` → **auto mode**. A

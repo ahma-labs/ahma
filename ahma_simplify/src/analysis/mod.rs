@@ -16,6 +16,7 @@ pub mod source_tree;
 pub mod swiftlint;
 pub mod workspace;
 
+pub use exclusion::{DEFAULT_EXCLUDES, is_generated_content, should_exclude, should_exclude_dir};
 pub use external::{AnalyzerRegistry, ExternalIssue, ExternalMetrics, Severity};
 pub use paths::{get_package_name, get_relative_path};
 pub use pipeline::{ScanOptions, ScanResult, perform_analysis, run_analysis};
