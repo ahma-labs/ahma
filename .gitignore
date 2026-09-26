@@ -67,3 +67,6 @@ ahma-release-new.pem
 *.p12
 *.p8
 *.certSigningRequest
+
+# Local example logs for debugging
+example-logs/

@@ -1893,9 +1893,9 @@ async fn record_failure_diagnostics(
     // contamination — produces no kernel event and would otherwise surface
     // as a bare `os error 1`. Diagnose it and attach the remediation as an
     // alert so the user gets an actionable line, not an errno.
-    if let Some(hint) = sandbox::build_diagnostics::diagnose(stderr_str) {
+    if let Some(hint) = sandbox::build_diagnostics::diagnose_streams(stderr_str, stdout_str) {
         tracing::warn!(
-            "Operation {} failed with sandbox build contamination ({:?}): {}",
+            "Operation {} failed with sandbox diagnostic ({:?}): {}",
             op_id,
             hint.kind,
             hint.remediation

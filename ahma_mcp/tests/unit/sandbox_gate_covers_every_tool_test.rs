@@ -43,6 +43,7 @@ const EXEMPT: &[&str] = &[
     "await",
     "cancel",
     "sandbox_grant",
+    "network_grant",
     "restart",
     "todo_write",
 ];

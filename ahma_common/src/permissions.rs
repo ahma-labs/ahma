@@ -61,6 +61,8 @@ pub enum GrantKind {
     FsScope,
     /// An outbound web domain the egress policy permits (`[web]`).
     WebDomain,
+    /// An outbound host or domain permitted by the subprocess network egress policy (`[network].allow`).
+    NetHost,
     /// A tool the agent may run in a workspace without re-asking (`[permissions]`).
     Tool,
     /// Consent for terminal hooks to run a command unsandboxed (session-scoped by
@@ -74,6 +76,7 @@ impl GrantKind {
         match self {
             GrantKind::FsScope => "fs-scope",
             GrantKind::WebDomain => "web-domain",
+            GrantKind::NetHost => "net-host",
             GrantKind::Tool => "tool",
             GrantKind::HookUnsandboxed => "hook-unsandboxed",
         }
@@ -201,6 +204,20 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
                 scope_note: None,
             });
         }
+    }
+
+    for host in &settings.network.allow {
+        out.push(GrantRecord {
+            kind: GrantKind::NetHost,
+            subject: host.clone(),
+            access: None,
+            tier: GrantTier::Always,
+            granted_by: None,
+            granted_at: None,
+            surface: None,
+            note: None,
+            scope_note: None,
+        });
     }
 
     for approval in &settings.permissions.tool_approvals {
@@ -1089,17 +1106,22 @@ mod tests {
             note: None,
         });
         s.web.always_allow.push("api.github.com".into());
+        s.network.allow.push("crates.io".into());
         s.permissions
             .approve_tool(&key("/ws"), "cargo_build", None, None);
 
         let rows = records(&s);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].kind, GrantKind::FsScope);
         assert_eq!(rows[0].access.as_deref(), Some("rw"));
         assert_eq!(rows[1].kind, GrantKind::WebDomain);
-        assert_eq!(rows[2].kind, GrantKind::Tool);
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == GrantKind::NetHost && r.subject == "crates.io")
+        );
+        let tool_row = rows.iter().find(|r| r.kind == GrantKind::Tool).unwrap();
         // A tool approval is qualified by its workspace, never conflated with it.
-        assert_eq!(rows[2].subject, "cargo_build");
-        assert_eq!(rows[2].scope_note.as_deref(), Some("/ws"));
+        assert_eq!(tool_row.subject, "cargo_build");
+        assert_eq!(tool_row.scope_note.as_deref(), Some("/ws"));
     }
 }

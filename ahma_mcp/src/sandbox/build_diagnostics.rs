@@ -56,6 +56,9 @@ pub enum ContaminationKind {
     /// The error message carries no `target/` path, so it slips past the
     /// [`ProvenanceResidue`](Self::ProvenanceResidue) heuristic.
     BuildScriptCopy,
+    /// SSH publickey authentication failed because `~/.ssh/id_*` private keys are
+    /// blocked from reading by the sandbox and the key was not loaded into ssh-agent.
+    SshPublicKeyAuth,
 }
 
 /// True for a token that looks like a Rust build artifact path (the things a
@@ -84,13 +87,33 @@ fn looks_like_build_script_copy(line: &str) -> bool {
         || line.contains("during build setup")
 }
 
-/// Scan a failed build's `stderr` for a sandbox-contamination signature.
-///
-/// Returns `Some` with a remediation hint when the failure matches the
-/// provenance-residue or sccache-wrapper pattern, `None` otherwise. Pure line
-/// iteration (no regex), so it cannot backtrack pathologically; returns on the
-/// first match to avoid duplicate hints from a multi-line failure.
+fn looks_like_ssh_publickey_failure(line: &str) -> bool {
+    line.contains("Permission denied (publickey)")
+        || (line.contains("fatal: Could not read from remote repository")
+            && line.contains("publickey"))
+}
+
+/// Scan a failed command's `stderr` for a sandbox-contamination signature.
 pub fn diagnose(stderr: &str) -> Option<ContaminationHint> {
+    diagnose_streams(stderr, "")
+}
+
+/// Scan a failed command's `stderr` then `stdout` for a sandbox-contamination or credential signature.
+///
+/// Returns `Some` with a remediation hint when the failure matches a signature,
+/// `None` otherwise. Pure line iteration (no regex), so it cannot backtrack pathologically;
+/// returns on the first match to avoid duplicate hints from a multi-line failure.
+pub fn diagnose_streams(stderr: &str, stdout: &str) -> Option<ContaminationHint> {
+    // Check both streams for SSH publickey failure first
+    for line in stderr.lines().chain(stdout.lines()) {
+        if looks_like_ssh_publickey_failure(line) {
+            return Some(ContaminationHint {
+                kind: ContaminationKind::SshPublicKeyAuth,
+                remediation: SSH_PUBLICKEY_REMEDIATION.to_string(),
+            });
+        }
+    }
+
     let mentions_sccache = stderr.contains("sccache");
 
     for line in stderr.lines() {
@@ -151,6 +174,11 @@ provenance-stamped source file. It is most common when a host sandbox (Cursor/VS
 Fix: re-run the build with the host's full-permission/unsandboxed approval, set \
 `AHMA_PREFER_OWN_SANDBOX=1` so ahma applies its own sandbox (which keeps the build inside the \
 workspace), or clear the redirected build cache and rebuild.";
+
+const SSH_PUBLICKEY_REMEDIATION: &str = "SSH authentication failed (`Permission denied (publickey)`). \
+Ahma's sandbox secures private keys in `~/.ssh/` from direct file reads, but forwards `$SSH_AUTH_SOCK`. \
+To allow sandboxed git operations to authenticate via SSH, run `ssh-add` on the host to load your key into \
+the SSH agent (e.g. `ssh-add ~/.ssh/id_ed25519`).";
 
 #[cfg(test)]
 mod tests {
@@ -274,5 +302,15 @@ mod tests {
             "error writing `/p/target/debug/deps/x.rlib`: Operation not permitted (os error 1)";
         let hit = diagnose(stderr).unwrap();
         assert_eq!(hit.kind, ContaminationKind::ProvenanceResidue);
+    }
+
+    #[test]
+    fn ssh_publickey_denial_is_diagnosed() {
+        let stdout = "git@github.com: Permission denied (publickey).\n\
+            fatal: Could not read from remote repository.";
+        let hit = diagnose_streams("", stdout).expect("ssh publickey failure should match");
+        assert_eq!(hit.kind, ContaminationKind::SshPublicKeyAuth);
+        assert!(hit.remediation.contains("ssh-add"));
+        assert!(hit.remediation.contains("SSH_AUTH_SOCK"));
     }
 }

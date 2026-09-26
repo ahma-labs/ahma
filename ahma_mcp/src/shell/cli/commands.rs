@@ -6,9 +6,9 @@
 
 use super::{
     AppConfig, BundleArgs, BundleAuditArgs, BundleChecksumArgs, BundleChecksumVerifyArgs,
-    BundleCommand, InfoArgs, LogsArgs, LogsCommand, PermissionsArgs, PermissionsCommand,
-    PromptsArgs, PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs, SettingsCommand,
-    SettingsOriginCtx, WebArgs, WebCommand,
+    BundleCommand, InfoArgs, LogsArgs, LogsCommand, NetworkArgs, NetworkCommand, PermissionsArgs,
+    PermissionsCommand, PromptsArgs, PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs,
+    SettingsCommand, SettingsOriginCtx, WebArgs, WebCommand,
 };
 use crate::shell::{list_tools, resolution};
 use anyhow::{Context, Result};
@@ -749,9 +749,10 @@ fn parse_kind(s: &str) -> Result<GrantKind> {
     match s {
         "fs-scope" | "fs" | "scope" => Ok(GrantKind::FsScope),
         "web-domain" | "web" | "domain" => Ok(GrantKind::WebDomain),
+        "net-host" | "net" | "network" | "host" => Ok(GrantKind::NetHost),
         "tool" => Ok(GrantKind::Tool),
         other => anyhow::bail!(
-            "unknown permission kind '{other}' (expected: fs-scope, web-domain, or tool)"
+            "unknown permission kind '{other}' (expected: fs-scope, web-domain, net-host, or tool)"
         ),
     }
 }
@@ -1045,6 +1046,34 @@ fn preview_revoke_tool(
     ))
 }
 
+/// Preview a network host revoke; see [`preview_revoke_fs_scope`] for the `None` contract.
+fn preview_revoke_net_host(
+    settings: &ahma_common::config::AhmaSettings,
+    subject: &str,
+) -> Option<(String, RevokeFn)> {
+    let pattern = subject.to_string();
+    if !settings
+        .network
+        .allow
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(&pattern))
+    {
+        println!("No network host matching {subject} is in the allow list.");
+        println!("Run `ahma permissions list` to see what is.");
+        return None;
+    }
+    Some((
+        format!("remove the network host {subject} from [network].allow"),
+        Box::new(move |s: &mut ahma_common::config::AhmaSettings| {
+            let before = s.network.allow.len();
+            s.network
+                .allow
+                .retain(|p| !p.eq_ignore_ascii_case(&pattern));
+            s.network.allow.len() != before
+        }),
+    ))
+}
+
 fn revoke_permission(
     file: &std::path::Path,
     mut settings: ahma_common::config::AhmaSettings,
@@ -1060,6 +1089,7 @@ fn revoke_permission(
     let preview = match kind {
         GrantKind::FsScope => preview_revoke_fs_scope(&settings, subject),
         GrantKind::WebDomain => preview_revoke_web_domain(&settings, subject),
+        GrantKind::NetHost => preview_revoke_net_host(&settings, subject),
         GrantKind::Tool => preview_revoke_tool(&settings, subject, workspace),
         GrantKind::HookUnsandboxed => anyhow::bail!(
             "hook consent is session-scoped and never persisted; revoke it with \
@@ -1277,6 +1307,87 @@ fn format_decision(decision: &ahma_common::web_policy::WebDecision) -> String {
         WebDecision::Deny { reason } => format!("DENY ({reason})"),
         WebDecision::Prompt { domain } => {
             format!("PROMPT — '{domain}' would require approval (default_policy = deny)")
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Network command (SPEC R-NET)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub(crate) fn run_network_command(args: NetworkArgs) -> Result<()> {
+    use ahma_common::config::settings_path;
+    let file = settings_path()
+        .context("Cannot determine ~/.ahma/settings.toml (home directory not found)")?;
+    network_command_at(&file, args.command)
+}
+
+fn network_command_at(file: &std::path::Path, command: NetworkCommand) -> Result<()> {
+    use crate::egress::host_pattern::HostPattern;
+    use ahma_common::config::AhmaSettings;
+
+    let load = || -> Result<AhmaSettings> {
+        AhmaSettings::load_from_result(file).map_err(|e| anyhow::anyhow!(e))
+    };
+
+    match command {
+        NetworkCommand::Allow { host } => {
+            let _ = HostPattern::parse(&host)
+                .map_err(|e| anyhow::anyhow!("invalid host pattern '{host}': {e}"))?;
+
+            let newly_added = ahma_common::net_approval::persist_net_allow(file, &host)?;
+            if newly_added {
+                println!("✓ Added `{host}` to [network].allow");
+            } else {
+                println!("`{host}` is already in [network].allow; nothing to do.");
+            }
+            println!();
+            println!("Recorded in: {}", file.display());
+            println!("  This file lives outside every sandbox scope, so a sandboxed tool cannot");
+            println!(
+                "  edit it. Takes effect immediately for the active session and persists across restarts."
+            );
+            Ok(())
+        }
+        NetworkCommand::List => {
+            let settings = load()?;
+            println!("# Subprocess network-egress policy");
+            println!("# File: {}", file.display());
+            println!();
+            println!("restrict_network = {}", settings.network.restrict);
+            println!();
+            println!("allow (permitted outbound hosts):");
+            if settings.network.allow.is_empty() {
+                println!("  (none)");
+            } else {
+                for h in &settings.network.allow {
+                    println!("  • {h}");
+                }
+            }
+            println!();
+            println!("Manage with: ahma network allow|revoke <HOST>, or `ahma permissions list`.");
+            Ok(())
+        }
+        NetworkCommand::Revoke { host } => {
+            let mut settings = load()?;
+            let pattern = host.trim().to_ascii_lowercase();
+            let before = settings.network.allow.len();
+            settings
+                .network
+                .allow
+                .retain(|h| h.trim().to_ascii_lowercase() != pattern);
+            if settings.network.allow.len() == before {
+                println!("No `{host}` entry found in [network].allow.");
+                println!("Run `ahma network list` to see current entries.");
+                return Ok(());
+            }
+            settings
+                .save_to(file)
+                .with_context(|| format!("Failed to write {}", file.display()))?;
+            println!("✓ Removed `{host}` from [network].allow");
+            println!();
+            println!("Updated: {}", file.display());
+            Ok(())
         }
     }
 }
@@ -2790,5 +2901,89 @@ mod tests {
             command: PermissionsCommand::List { kind: None },
         })
         .expect("listing an empty ledger succeeds");
+    }
+
+    #[test]
+    fn network_command_allow_list_revoke_lifecycle() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("settings.toml");
+
+        // 1. Allow crates.io
+        network_command_at(
+            &file,
+            NetworkCommand::Allow {
+                host: "crates.io".into(),
+            },
+        )
+        .unwrap();
+        let s = ahma_common::config::AhmaSettings::load_from_result(&file).unwrap();
+        assert_eq!(s.network.allow, vec!["crates.io".to_string()]);
+
+        // 2. Allow again (dedup)
+        network_command_at(
+            &file,
+            NetworkCommand::Allow {
+                host: "crates.io".into(),
+            },
+        )
+        .unwrap();
+        let s = ahma_common::config::AhmaSettings::load_from_result(&file).unwrap();
+        assert_eq!(s.network.allow, vec!["crates.io".to_string()]);
+
+        // 3. List
+        network_command_at(&file, NetworkCommand::List).unwrap();
+
+        // 4. Revoke
+        network_command_at(
+            &file,
+            NetworkCommand::Revoke {
+                host: "crates.io".into(),
+            },
+        )
+        .unwrap();
+        let s = ahma_common::config::AhmaSettings::load_from_result(&file).unwrap();
+        assert!(s.network.allow.is_empty());
+    }
+
+    #[test]
+    fn permissions_revoke_net_host_works() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let file = ledger(home.path());
+
+        // Setup host in settings
+        network_command_at(
+            &file,
+            NetworkCommand::Allow {
+                host: "crates.io".into(),
+            },
+        )
+        .unwrap();
+
+        // Preview revoke with yes: false
+        run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::Revoke {
+                kind: "net-host".into(),
+                subject: "crates.io".into(),
+                workspace: None,
+                yes: false,
+            },
+        })
+        .unwrap();
+        let s = ahma_common::config::AhmaSettings::load_from_result(&file).unwrap();
+        assert_eq!(s.network.allow, vec!["crates.io".to_string()]);
+
+        // Confirmed revoke with yes: true
+        run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::Revoke {
+                kind: "net-host".into(),
+                subject: "crates.io".into(),
+                workspace: None,
+                yes: true,
+            },
+        })
+        .unwrap();
+        let s = ahma_common::config::AhmaSettings::load_from_result(&file).unwrap();
+        assert!(s.network.allow.is_empty());
     }
 }
