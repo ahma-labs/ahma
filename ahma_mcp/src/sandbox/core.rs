@@ -211,21 +211,42 @@ fn container_child_name(container: &Path, requested: &Path) -> Option<std::ffi::
     Some(relative.components().next()?.as_os_str().to_os_string())
 }
 
-fn canonicalize_with_fallback(full_path: &Path) -> PathBuf {
-    // Only use the parent-canonicalize shortcut when the last component is a
-    // real name (not `..`).  If `file_name()` returns `None` the path ends in
-    // a `ParentDir` component; on Windows `dunce::canonicalize` can resolve the
-    // parent (which has one fewer `..`) to a path *inside* the sandbox scope
-    // even though the full path with one more `..` would escape it.  Falling
-    // through to `normalize_path_lexically` handles `..` components correctly
-    // on every platform without filesystem access.
-    if let Some(parent) = full_path.parent()
-        && let Ok(parent_canonical) = dunce::canonicalize(parent)
-        && let Some(name) = full_path.file_name()
-    {
-        return parent_canonical.join(name);
+pub(crate) fn canonicalize_deepest_ancestor(full_path: &Path) -> PathBuf {
+    if let Ok(c) = dunce::canonicalize(full_path) {
+        return c;
     }
-    scopes::normalize_path_lexically(full_path)
+
+    let normalized = scopes::normalize_path_lexically(full_path);
+    if let Ok(c) = dunce::canonicalize(&normalized) {
+        return c;
+    }
+
+    let mut current = normalized.as_path();
+    let mut suffix = Vec::new();
+
+    while let Some(parent) = current.parent() {
+        if parent.parent().is_none() {
+            // Do not canonicalize a bare filesystem root (e.g. "/" or "C:\").
+            // A root cannot be a symlink, and on Windows dunce::canonicalize("/")
+            // attaches the current drive letter (e.g. "D:\").
+            break;
+        }
+        if let Some(name) = current.file_name() {
+            suffix.push(name);
+            if let Ok(parent_canonical) = dunce::canonicalize(parent) {
+                let mut result = parent_canonical;
+                for component in suffix.into_iter().rev() {
+                    result.push(component);
+                }
+                return result;
+            }
+            current = parent;
+        } else {
+            break;
+        }
+    }
+
+    normalized
 }
 
 /// Append every path in `additions` that `target` does not already contain,
@@ -978,6 +999,16 @@ impl Sandbox {
         }
     }
 
+    /// Whether `path` resolves to a location inside current scopes, resolving relative
+    /// paths against `working_dir`.
+    pub fn is_path_in_scope_in_dir(&self, path: &Path, working_dir: &Path) -> bool {
+        let scopes_guard = self.scopes();
+        match self.resolve_path_in_dir(path, working_dir, &scopes_guard) {
+            Ok(canonical) => self.is_path_allowed(&canonical, &scopes_guard),
+            Err(_) => false,
+        }
+    }
+
     /// Resolve `path` to canonical form **without any scope check** — the
     /// `SandboxMode::Test` (`--no-sandbox`) half of [`Self::validate_path`],
     /// where scope is still resolved but never enforced.
@@ -998,7 +1029,8 @@ impl Sandbox {
             base.join(path)
         };
 
-        dunce::canonicalize(&full_path).unwrap_or_else(|_| canonicalize_with_fallback(&full_path))
+        dunce::canonicalize(&full_path)
+            .unwrap_or_else(|_| canonicalize_deepest_ancestor(&full_path))
     }
 
     fn resolve_path(&self, path: &Path, scopes_guard: &[PathBuf]) -> Result<PathBuf> {
@@ -1012,10 +1044,26 @@ impl Sandbox {
         };
 
         Ok(dunce::canonicalize(&full_path)
-            .unwrap_or_else(|_| canonicalize_with_fallback(&full_path)))
+            .unwrap_or_else(|_| canonicalize_deepest_ancestor(&full_path)))
     }
 
-    fn is_path_allowed(&self, canonical: &Path, scopes_guard: &[PathBuf]) -> bool {
+    pub fn resolve_path_in_dir(
+        &self,
+        path: &Path,
+        working_dir: &Path,
+        _scopes_guard: &[PathBuf],
+    ) -> Result<PathBuf> {
+        let full_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            working_dir.join(path)
+        };
+
+        Ok(dunce::canonicalize(&full_path)
+            .unwrap_or_else(|_| canonicalize_deepest_ancestor(&full_path)))
+    }
+
+    pub fn is_path_allowed(&self, canonical: &Path, scopes_guard: &[PathBuf]) -> bool {
         path_within_scopes(canonical, scopes_guard)
     }
 
@@ -1244,5 +1292,36 @@ mod scope_view_tests {
         )
         .unwrap();
         assert!(sb.is_tmp_access());
+    }
+
+    #[test]
+    fn test_is_path_in_scope_resolves_symlink_deepest_ancestor() {
+        let ws = tempdir().unwrap();
+        let ext = tempdir().unwrap();
+
+        let ws_canon = dunce::canonicalize(ws.path()).unwrap();
+        let ext_canon = dunce::canonicalize(ext.path()).unwrap();
+
+        let target_symlink = ws_canon.join("target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&ext_canon, &target_symlink).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&ext_canon, &target_symlink).unwrap();
+
+        let sb = Sandbox::new(
+            vec![ws_canon.clone()],
+            SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // A nested non-existent path under target symlink
+        let non_existent_nested = target_symlink.join("debug").join("build");
+        assert!(
+            !sb.is_path_in_scope(&non_existent_nested),
+            "Nested non-existent path under external symlink must NOT be considered in scope"
+        );
     }
 }

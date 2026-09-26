@@ -109,7 +109,7 @@ pub fn scan_denial(stderr: &str) -> Option<DenialHit> {
 
         // Track a path on this line as the candidate for a later keyword line,
         // and age out a previously tracked path so it cannot match too far away.
-        if let Some(path) = extract_abs_path(line) {
+        if let Some(path) = extract_path(line) {
             recent_path = Some((path, 0));
         } else if let Some((path, age)) = recent_path.take()
             && age < MULTILINE_LOOKBACK
@@ -160,7 +160,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     // reveal the exact operation, so the access level is unambiguous.
     if is_seatbelt
         && (line.contains("file-write") || line.contains("file-create"))
-        && let Some(path) = extract_abs_path(line)
+        && let Some(path) = extract_path(line)
     {
         return Some(DenialHit {
             path,
@@ -170,7 +170,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     }
     if is_seatbelt
         && line.contains("file-read")
-        && let Some(path) = extract_abs_path(line)
+        && let Some(path) = extract_path(line)
     {
         return Some(DenialHit {
             path,
@@ -191,7 +191,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     if (lower.contains("read-only file system")
         || lower.contains("read-only path")
         || lower.contains("operation not permitted"))
-        && let Some(path) = extract_abs_path(line)
+        && let Some(path) = extract_path(line)
     {
         return Some(DenialHit {
             path,
@@ -207,7 +207,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     // when the path is a Windows path — otherwise a Unix I/O error would be
     // misread as a grant prompt.
     if (line.contains("Access is denied") || line.contains("os error 5"))
-        && let Some(path) = extract_abs_path(line)
+        && let Some(path) = extract_path(line)
     {
         let is_access_denied =
             line.contains("Access is denied") || is_windows_abs(path.to_str().unwrap_or(""));
@@ -224,7 +224,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     // the human can choose read+write at the prompt. (Linux Landlock surfaces as
     // `EACCES` ⇒ "Permission denied", caught here.)
     if line.contains("Permission denied")
-        && let Some(path) = extract_abs_path(line)
+        && let Some(path) = extract_path(line)
     {
         return Some(DenialHit {
             path,
@@ -236,29 +236,117 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     None
 }
 
-/// Pull the first absolute path token out of a line, trimming surrounding
+/// Pull the first candidate path token out of a line, trimming surrounding
 /// quotes/backticks and trailing punctuation. Recognises both Unix (`/`-rooted)
 /// and Windows (drive-letter `C:\…` / `C:/…`, or UNC `\\server\share`) absolute
-/// paths. Returns `None` when the line has no plausible absolute path (a bare
-/// `/` does not count). Paths containing spaces cannot be recovered (the scan is
-/// whitespace-tokenised) — an accepted heuristic limitation.
-fn extract_abs_path(line: &str) -> Option<PathBuf> {
+/// paths, as well as relative paths with directory separators or quoted target/build paths.
+/// Returns `None` when the line has no plausible path.
+fn extract_path(line: &str) -> Option<PathBuf> {
+    // Pass 1: Absolute paths (Unix or Windows) - most specific
     for raw in line.split_whitespace() {
-        // Trim the message's own grammar from both ends in one pass: surrounding
-        // quotes/brackets and trailing punctuation can be interleaved (e.g. the
-        // token `` `/path`: `` ends with a backtick *then* a colon). A Windows
-        // drive colon (`C:`) is internal, so end-trimming `:` never harms it.
-        let token = raw.trim_matches(|c| {
-            matches!(
-                c,
-                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '<' | '>' | ':' | ',' | '.' | ';'
-            )
-        });
+        let token = trim_path_token(raw);
         if (token.len() > 1 && token.starts_with('/')) || is_windows_abs(token) {
             return Some(PathBuf::from(token));
         }
     }
+
+    // Pass 2: Relative paths with path separators or explicit quotes
+    for raw in line.split_whitespace() {
+        let is_quoted = raw.starts_with('\'')
+            || raw.starts_with('`')
+            || raw.starts_with('"')
+            || raw.ends_with('\'')
+            || raw.ends_with('`')
+            || raw.ends_with('"');
+        let token = trim_path_token(raw);
+        if is_relative_path_candidate(token, is_quoted, line) {
+            return Some(PathBuf::from(token));
+        }
+    }
+
     None
+}
+
+fn trim_path_token(raw: &str) -> &str {
+    raw.trim_matches(|c| {
+        matches!(
+            c,
+            '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '<' | '>' | ':' | ',' | '.' | ';'
+        )
+    })
+}
+
+fn is_relative_path_candidate(token: &str, is_quoted: bool, line: &str) -> bool {
+    if token.is_empty() || token == "." || token == ".." {
+        return false;
+    }
+    // Reject common English slash words or URL schemas
+    if token.contains("://")
+        || matches!(
+            token,
+            "and/or"
+                | "read/write"
+                | "r/w"
+                | "ro/rw"
+                | "rw/ro"
+                | "true/false"
+                | "yes/no"
+                | "in/out"
+                | "stdin/stdout"
+                | "either/or"
+        )
+    {
+        return false;
+    }
+
+    // Case A: token has a directory separator (e.g. target/debug, rust/target/debug, ./foo)
+    if token.contains('/') || token.contains('\\') {
+        let mut parts = token.split(['/', '\\']);
+        if let (Some(first), Some(second)) = (parts.next(), parts.next())
+            && (!first.is_empty() || !second.is_empty())
+        {
+            return true;
+        }
+    }
+
+    // Case B: quoted token that looks like a directory or file
+    if is_quoted {
+        if token == "target" || token.starts_with("target") {
+            return true;
+        }
+        let lower_line = line.to_ascii_lowercase();
+        let has_context = lower_line.contains("directory")
+            || lower_line.contains("file")
+            || lower_line.contains("path")
+            || lower_line.contains("mkdir")
+            || lower_line.contains("create")
+            || lower_line.contains("open");
+        if has_context {
+            return true;
+        }
+        if let Some((_, ext)) = token.rsplit_once('.')
+            && matches!(
+                ext,
+                "rs" | "rlib"
+                    | "rmeta"
+                    | "d"
+                    | "json"
+                    | "lock"
+                    | "toml"
+                    | "txt"
+                    | "a"
+                    | "so"
+                    | "dylib"
+                    | "o"
+                    | "dll"
+                    | "exe"
+            )
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// True for a Windows absolute path: a drive-letter root (`X:\…` or `X:/…`) or a
@@ -555,5 +643,51 @@ Caused by:
         let stdout = "error: failed to create directory `/opt/from-stdout`: Read-only file system";
         let hit = scan_denial_streams(stderr, stdout).expect("stderr matches");
         assert_eq!(hit.path, PathBuf::from("/opt/from-stderr"));
+    }
+
+    #[test]
+    fn cargo_target_relative_multiline_is_detected() {
+        let stderr = "\
+error: failed to create directory 'target/debug'
+
+Caused by:
+  Operation not permitted (os error 1)";
+        let hit = scan_denial(stderr).expect("cargo target/debug denial must be detected");
+        assert_eq!(hit.path, PathBuf::from("target/debug"));
+        assert_eq!(hit.access, ScopeAccess::Rw);
+        assert_eq!(hit.pattern, "multi-line denial");
+    }
+
+    #[test]
+    fn cargo_target_backticked_relative_multiline_is_detected() {
+        let stderr = "\
+error: failed to open `target/.rustc_info.json`
+
+Caused by:
+  Permission denied (os error 13)";
+        let hit = scan_denial(stderr).expect("cargo backticked target denial must be detected");
+        assert_eq!(hit.path, PathBuf::from("target/.rustc_info.json"));
+        assert_eq!(hit.access, ScopeAccess::Ro);
+    }
+
+    #[test]
+    fn cargo_target_singleline_relative_is_detected() {
+        let stderr = "error: failed to create directory 'rust/target/debug': Operation not permitted (os error 1)";
+        let hit =
+            scan_denial(stderr).expect("single-line rust/target/debug denial must be detected");
+        assert_eq!(hit.path, PathBuf::from("rust/target/debug"));
+        assert_eq!(hit.access, ScopeAccess::Rw);
+    }
+
+    #[test]
+    fn cargo_target_quoted_dir_is_detected() {
+        let stderr = "\
+error: failed to create directory 'target'
+
+Caused by:
+  Operation not permitted (os error 1)";
+        let hit = scan_denial(stderr).expect("quoted directory 'target' must be detected");
+        assert_eq!(hit.path, PathBuf::from("target"));
+        assert_eq!(hit.access, ScopeAccess::Rw);
     }
 }

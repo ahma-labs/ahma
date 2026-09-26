@@ -64,3 +64,80 @@ async fn adapter_uses_global_sandbox_scope_not_adapter_root_path() {
         "expected pwd output to end with {dir_name:?}, got: {trimmed:?}"
     );
 }
+
+#[tokio::test]
+async fn adapter_sync_denial_on_symlinked_target_returns_runtime_denial() {
+    let ws = tempfile::tempdir().expect("ws");
+    let ext = tempfile::tempdir().expect("ext");
+
+    let ws_canon = dunce::canonicalize(ws.path()).unwrap();
+    let ext_canon = dunce::canonicalize(ext.path()).unwrap();
+
+    let target_symlink = ws_canon.join("target");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&ext_canon, &target_symlink).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&ext_canon, &target_symlink).unwrap();
+
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![ws_canon.clone()],
+            ahma_mcp::sandbox::SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
+
+    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(5));
+    let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
+
+    let shell_pool_config = ShellPoolConfig {
+        command_timeout: Duration::from_secs(5),
+    };
+    let shell_pool = Arc::new(ShellPoolManager::new(shell_pool_config));
+
+    let adapter = Adapter::new(operation_monitor, shell_pool, sandbox).expect("adapter");
+
+    #[cfg(unix)]
+    {
+        let script = ws_canon.join("fail.sh");
+        std::fs::write(&script, "printf \"error: failed to create directory 'target/debug'\\nCaused by:\\n  Operation not permitted (os error 1)\\n\" >&2\nexit 1\n").unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let script = ws_canon.join("fail.bat");
+        std::fs::write(
+            &script,
+            "@echo error: failed to create directory 'target\\debug' 1>&2\r\n@echo Caused by: 1>&2\r\n@echo   Operation not permitted (os error 1) 1>&2\r\n@exit /b 1\r\n",
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    let cmd = "sh fail.sh";
+    #[cfg(windows)]
+    let cmd = "cmd /c fail.bat";
+
+    let res = adapter
+        .execute_sync_in_dir(cmd, None, &ws_canon.to_string_lossy(), Some(5), None)
+        .await;
+
+    assert!(res.is_err(), "command must fail");
+    let err = res.unwrap_err();
+    let sandbox_err = err
+        .downcast_ref::<ahma_mcp::sandbox::SandboxError>()
+        .expect("must return typed SandboxError::RuntimeDenial");
+
+    match sandbox_err {
+        ahma_mcp::sandbox::SandboxError::RuntimeDenial { path, access, .. } => {
+            assert_eq!(
+                path, &ext_canon,
+                "denial path must be the external symlink target"
+            );
+            assert_eq!(*access, ahma_common::config::ScopeAccess::Rw);
+        }
+        other => panic!("expected RuntimeDenial, got: {:?}", other),
+    }
+}

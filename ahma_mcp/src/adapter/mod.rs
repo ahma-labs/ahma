@@ -68,6 +68,7 @@ use anyhow::Result;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, VecDeque},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -630,7 +631,7 @@ impl Adapter {
         let result = interpret_sync_command_output(output);
         if result.is_err() {
             return self
-                .finalize_sync_denial(command, op_id, exit_code, &stdout, &stderr, result)
+                .finalize_sync_denial(command, op_id, exit_code, &stdout, &stderr, safe_wd, result)
                 .await;
         }
         SyncRun {
@@ -645,6 +646,7 @@ impl Adapter {
     ///
     /// Split out of [`Self::run_sync_prepared`] so the happy path there stays a
     /// straight line; this is the async-path twin of `record_failure_diagnostics`.
+    #[allow(clippy::too_many_arguments)]
     async fn finalize_sync_denial(
         &self,
         command: &str,
@@ -652,14 +654,16 @@ impl Adapter {
         exit_code: Option<i32>,
         stdout: &str,
         stderr: &str,
+        safe_wd: &std::path::Path,
         result: Result<String, anyhow::Error>,
     ) -> SyncRun {
-        sandbox::grant_channel::notify_stderr_denial(
+        sandbox::grant_channel::notify_stderr_denial_in_dir(
             &self.sandbox,
             self.scope_grant_notifier.as_ref(),
             stderr,
             stdout,
             command,
+            Some(safe_wd),
         )
         .await;
         // When the failure was a kernel denial on an out-of-scope path, return
@@ -673,16 +677,21 @@ impl Adapter {
                 result,
             };
         };
-        if !self.sandbox.is_path_in_scope(&hit.path) {
+        if !self.sandbox.is_path_in_scope_in_dir(&hit.path, safe_wd) {
+            let target = sandbox::grant_channel::resolve_grant_target(
+                &hit.path,
+                Some(safe_wd),
+                &self.sandbox,
+            );
             // Same payload, durable copy: the structured error reaches the
             // agent now, the audit line survives the session (SPEC R5.4.7).
-            audit::record_sandbox_denial(Some(op_id), &hit.path, hit.access.label(), command).await;
+            audit::record_sandbox_denial(Some(op_id), &target, hit.access.label(), command).await;
             let details = result.err().map(|e| e.to_string()).unwrap_or_default();
             return SyncRun {
                 outcome: audit::Outcome::Failed,
                 exit_code,
                 result: Err(sandbox::SandboxError::RuntimeDenial {
-                    path: hit.path,
+                    path: target,
                     access: hit.access,
                     scopes: self.sandbox.scopes().to_vec(),
                     details,
@@ -1290,6 +1299,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         &sandbox,
         scope_grant_notifier.as_ref(),
         &command,
+        &wd_path,
     )
     .await;
     audit_complete(outcome, exit_code).await;
@@ -1569,6 +1579,7 @@ async fn execute_with_streaming(
     sandbox: &Arc<sandbox::Sandbox>,
     scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
     tool: &str,
+    working_dir: &Path,
 ) -> (audit::Outcome, Option<i32>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1785,6 +1796,7 @@ async fn execute_with_streaming(
         sandbox,
         scope_grant_notifier,
         tool,
+        working_dir,
     )
     .await
 }
@@ -1858,13 +1870,15 @@ async fn record_failure_diagnostics(
     tool: &str,
     stdout_str: &str,
     stderr_str: &str,
+    working_dir: Option<&Path>,
 ) {
-    sandbox::grant_channel::notify_stderr_denial(
+    sandbox::grant_channel::notify_stderr_denial_in_dir(
         sandbox,
         scope_grant_notifier,
         stderr_str,
         stdout_str,
         tool,
+        working_dir,
     )
     .await;
 
@@ -1872,35 +1886,52 @@ async fn record_failure_diagnostics(
     // the async path (the result is delivered later as text), so attach the
     // grant -> restart -> retry remediation as an operation alert. Mirrors the
     // typed `RuntimeDenial` the sync path returns.
-    if let Some(hit) = sandbox::scan_denial_streams(stderr_str, stdout_str)
-        && !sandbox.is_path_in_scope(&hit.path)
+    let target_and_access = if let Some(hit) = sandbox::scan_denial_streams(stderr_str, stdout_str)
     {
+        let base_scope = sandbox.scopes().first().cloned();
+        let base_wd = working_dir.or(base_scope.as_deref());
+        let in_scope = if let Some(wd) = base_wd {
+            sandbox.is_path_in_scope_in_dir(&hit.path, wd)
+        } else {
+            sandbox.is_path_in_scope(&hit.path)
+        };
+        if !in_scope {
+            let target = sandbox::grant_channel::resolve_grant_target(&hit.path, base_wd, sandbox);
+            Some((target, hit.access))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((target, access)) = target_and_access {
         // The alert below is transient; this line is the durable copy of the
         // same structured denial (SPEC R5.4.7).
-        audit::record_sandbox_denial(Some(op_id), &hit.path, hit.access.label(), tool).await;
-        let remediation = sandbox::grant_channel::runtime_denial_remediation(&hit.path, hit.access);
+        audit::record_sandbox_denial(Some(op_id), &target, access.label(), tool).await;
+        let remediation = sandbox::grant_channel::runtime_denial_remediation(&target, access);
         tracing::warn!(
             "Operation {} hit an out-of-scope sandbox denial on {}: {}",
             op_id,
-            hit.path.display(),
+            target.display(),
             remediation
         );
         op_monitor.append_alert(op_id, remediation).await;
-    }
-
-    // The grant flow above only fires for *out-of-scope* denials. The
-    // sibling failure — an in-scope EPERM from macOS provenance/sccache
-    // contamination — produces no kernel event and would otherwise surface
-    // as a bare `os error 1`. Diagnose it and attach the remediation as an
-    // alert so the user gets an actionable line, not an errno.
-    if let Some(hint) = sandbox::build_diagnostics::diagnose_streams(stderr_str, stdout_str) {
-        tracing::warn!(
-            "Operation {} failed with sandbox diagnostic ({:?}): {}",
-            op_id,
-            hint.kind,
-            hint.remediation
-        );
-        op_monitor.append_alert(op_id, hint.remediation).await;
+    } else {
+        // The grant flow above only fires for *out-of-scope* denials. The
+        // sibling failure — an in-scope EPERM from macOS provenance/sccache
+        // contamination — produces no kernel event and would otherwise surface
+        // as a bare `os error 1`. Diagnose it and attach the remediation as an
+        // alert so the user gets an actionable line, not an errno.
+        if let Some(hint) = sandbox::build_diagnostics::diagnose_streams(stderr_str, stdout_str) {
+            tracing::warn!(
+                "Operation {} failed with sandbox diagnostic ({:?}): {}",
+                op_id,
+                hint.kind,
+                hint.remediation
+            );
+            op_monitor.append_alert(op_id, hint.remediation).await;
+        }
     }
 
     // A non-path capability denial (the sandbox refused the OS credential
@@ -1928,6 +1959,7 @@ async fn finalize_streaming_operation(
     sandbox: &Arc<sandbox::Sandbox>,
     scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
     tool: &str,
+    working_dir: &Path,
 ) -> (audit::Outcome, Option<i32>) {
     let exit_status = child.wait().await;
     let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -1954,6 +1986,7 @@ async fn finalize_streaming_operation(
             tool,
             &stdout_str,
             &stderr_str,
+            Some(working_dir),
         )
         .await;
     }
