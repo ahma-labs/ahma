@@ -262,18 +262,47 @@ pub async fn notify_stderr_denial(
     stdout: &str,
     tool: &str,
 ) {
+    notify_stderr_denial_in_dir(sandbox, notifier, stderr, stdout, tool, None).await;
+}
+
+/// Variant of [`notify_stderr_denial`] that resolves relative candidate paths
+/// against the command's actual working directory.
+pub async fn notify_stderr_denial_in_dir(
+    sandbox: &super::Sandbox,
+    notifier: Option<&Arc<dyn ScopeGrantNotifier>>,
+    stderr: &str,
+    stdout: &str,
+    tool: &str,
+    working_dir: Option<&Path>,
+) {
     let Some(n) = notifier else { return };
     // stdout too: a merged pipeline (`… 2>&1 | tail`) leaves stderr empty, and a
     // denial that disappears when a caller adds `2>&1` is a trap, not a feature.
     let Some(hit) = super::denial_scan::scan_denial_streams(stderr, stdout) else {
         return;
     };
-    if sandbox.is_path_in_scope(&hit.path) {
+    let (in_scope, target) = {
+        let scopes_guard = sandbox.scopes();
+        let base_wd = working_dir.or_else(|| scopes_guard.first().map(|p| p.as_path()));
+        let in_scope = if let Some(wd) = base_wd {
+            sandbox.is_path_in_scope_in_dir(&hit.path, wd)
+        } else {
+            sandbox.is_path_in_scope(&hit.path)
+        };
+        let target = if !in_scope {
+            resolve_grant_target(&hit.path, base_wd, sandbox)
+        } else {
+            PathBuf::new()
+        };
+        (in_scope, target)
+    };
+    if in_scope {
         return;
     }
     // The denial usually names a single cache file; offer its parent directory so
     // one grant covers the whole cache rather than re-prompting per file (P1c).
-    let target = grant_dir_for(&hit.path);
+    // When the path was reached through a symlink to an out-of-scope tree (e.g. a
+    // symlinked `target/` directory), offer the canonical external target root.
     n.notify_violation(
         &target,
         hit.access,
@@ -281,6 +310,45 @@ pub async fn notify_stderr_denial(
         Some(tool.to_string()),
     )
     .await;
+}
+
+/// Resolve the candidate path from a denial into the directory that should actually
+/// be offered for a grant.
+///
+/// Follows symlinks within the workspace (e.g. `target -> /shared/target`) to
+/// recommend granting the external target root directly rather than an individual
+/// non-existent leaf.
+pub fn resolve_grant_target(
+    path: &Path,
+    working_dir: Option<&Path>,
+    sandbox: &super::Sandbox,
+) -> PathBuf {
+    let scopes_guard = sandbox.scopes();
+    let full_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(wd) = working_dir {
+        wd.join(path)
+    } else if let Some(first_scope) = scopes_guard.first() {
+        first_scope.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    // Check if any ancestor (from full_path up to root) is a symlink pointing outside scope
+    let mut current = full_path.as_path();
+    while let Some(parent) = current.parent() {
+        if let Ok(meta) = std::fs::symlink_metadata(current)
+            && meta.file_type().is_symlink()
+            && let Ok(canon) = dunce::canonicalize(current)
+            && !sandbox.is_path_allowed(&canon, &scopes_guard)
+        {
+            return canon;
+        }
+        current = parent;
+    }
+
+    let canon = super::core::canonicalize_deepest_ancestor(&full_path);
+    grant_dir_for(&canon)
 }
 
 #[cfg(test)]
@@ -489,11 +557,43 @@ mod tests {
         notify_stderr_denial(&sandbox, Some(&notifier), stderr, "", "sccache").await;
 
         let seen = rec.seen.lock();
-        assert_eq!(seen.len(), 1);
         assert_eq!(
             seen[0].0,
             PathBuf::from("/opt/ext/sccache/0"),
             "the cache file's parent dir is offered, not the leaf file"
         );
+    }
+
+    #[tokio::test]
+    async fn stderr_denial_symlinked_target_notifies_external_target_dir() {
+        let ws = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+
+        let ws_canon = dunce::canonicalize(ws.path()).unwrap();
+        let ext_canon = dunce::canonicalize(ext.path()).unwrap();
+
+        let target_symlink = ws_canon.join("target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&ext_canon, &target_symlink).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&ext_canon, &target_symlink).unwrap();
+
+        let sandbox = test_sandbox(&ws_canon);
+        let rec = Arc::new(RecordingNotifier::default());
+        let notifier: Arc<dyn ScopeGrantNotifier> = rec.clone();
+
+        let stderr = "\
+error: failed to create directory 'target/debug'
+
+Caused by:
+  Operation not permitted (os error 1)";
+
+        notify_stderr_denial(&sandbox, Some(&notifier), stderr, "", "cargo").await;
+
+        let seen = rec.seen.lock();
+        assert_eq!(seen.len(), 1, "out-of-scope symlink denial must notify");
+        assert_eq!(seen[0].0, ext_canon);
+        assert_eq!(seen[0].1, ScopeAccess::Rw);
+        assert_eq!(seen[0].2, GrantReason::StderrHeuristic);
     }
 }
