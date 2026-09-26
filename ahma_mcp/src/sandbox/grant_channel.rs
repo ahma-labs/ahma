@@ -324,7 +324,8 @@ pub fn resolve_grant_target(
     sandbox: &super::Sandbox,
 ) -> PathBuf {
     let scopes_guard = sandbox.scopes();
-    let full_path = if path.is_absolute() {
+    let is_rooted = path.is_absolute() || path.has_root();
+    let full_path = if is_rooted {
         path.to_path_buf()
     } else if let Some(wd) = working_dir {
         wd.join(path)
@@ -337,6 +338,9 @@ pub fn resolve_grant_target(
     // Check if any ancestor (from full_path up to root) is a symlink pointing outside scope
     let mut current = full_path.as_path();
     while let Some(parent) = current.parent() {
+        if parent.parent().is_none() {
+            break;
+        }
         if let Ok(meta) = std::fs::symlink_metadata(current)
             && meta.file_type().is_symlink()
             && let Ok(canon) = dunce::canonicalize(current)
@@ -347,7 +351,7 @@ pub fn resolve_grant_target(
         current = parent;
     }
 
-    if path.is_absolute() {
+    if is_rooted {
         grant_dir_for(path)
     } else {
         grant_dir_for(&full_path)

@@ -225,6 +225,12 @@ pub(crate) fn canonicalize_deepest_ancestor(full_path: &Path) -> PathBuf {
     let mut suffix = Vec::new();
 
     while let Some(parent) = current.parent() {
+        if parent.parent().is_none() {
+            // Do not canonicalize a bare filesystem root (e.g. "/" or "C:\").
+            // A root cannot be a symlink, and on Windows dunce::canonicalize("/")
+            // attaches the current drive letter (e.g. "D:\").
+            break;
+        }
         if let Some(name) = current.file_name() {
             suffix.push(name);
             if let Ok(parent_canonical) = dunce::canonicalize(parent) {

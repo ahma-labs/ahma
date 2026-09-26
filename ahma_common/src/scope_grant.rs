@@ -309,26 +309,15 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     }
     // Path may not exist (or a component is missing): canonicalize the deepest
     // existing ancestor and re-attach the remainder.
-    let mut current = expanded.as_path();
-    let mut suffix = Vec::new();
-
-    while let Some(parent) = current.parent() {
-        if let Some(name) = current.file_name() {
-            suffix.push(name);
-            if let Ok(parent_canonical) = dunce::canonicalize(parent) {
-                let mut result = parent_canonical;
-                for component in suffix.into_iter().rev() {
-                    result.push(component);
-                }
-                return result;
+    match (expanded.parent(), expanded.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            match dunce::canonicalize(parent) {
+                Ok(c) => c.join(name),
+                Err(_) => expanded,
             }
-            current = parent;
-        } else {
-            break;
         }
+        _ => expanded,
     }
-
-    expanded
 }
 
 /// Persist an approved grant to the settings file — the single chokepoint that
