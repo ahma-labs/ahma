@@ -73,14 +73,14 @@ exact line.
 - **Terminal hooks**: on your **next command**. Hooks re-derive the sandbox each
   time, so there's nothing to restart.
 - **The MCP server** (your IDE's connection): when granted interactively via the
-  `sandbox_grant` MCP tool with human confirmation, it takes effect **immediately**
+  `sandbox_grant` or `network_grant` MCP tools with human confirmation, it takes effect **immediately**
   for the active session in addition to persisting. For offline configuration edits
-  (`ahma sandbox grant` CLI or direct `~/.ahma/settings.toml` edits), it takes effect
+  (`ahma sandbox grant` or `ahma network allow` CLI, or direct `~/.ahma/settings.toml` edits), it takes effect
   on the next server start (or after using the `restart` tool).
 
 ## What ahma will never grant
 
-Some paths are refused outright, with no override flag, no matter who asks — you,
+Some paths and network destinations are refused outright, with no override flag, no matter who asks — you,
 the AI, or a confirmed prompt:
 
 - your home directory itself, or a filesystem root
@@ -90,6 +90,7 @@ the AI, or a confirmed prompt:
   `~/.config/gh`, `~/.config/gcloud`
 - `~/.ahma` itself — the ledger cannot authorize access to the ledger
 - OS system directories
+- for network egress: blanket `*` wildcard (refused via AI grant tool; only human editing or explicit CLI can author), `localhost`, private RFC 1918 IP addresses, and link-local or cloud-metadata IPs (`169.254.169.254`)
 
 If a tool genuinely needs something under one of these, grant the *specific
 subdirectory* it needs. There's no flag to override this, deliberately: every
@@ -150,19 +151,27 @@ disclosed loudly when written. That deny tier is kernel-enforced on macOS,
 See [`docs/security-sandbox.md`](security-sandbox.md#writable-but-not-everything-trust-handoff)
 and SPEC R-HANDOFF.
 
+**SSH credentials and agent authentication**: On macOS, Seatbelt denies direct disk reads to private keys (`~/.ssh/id_*`) from sandboxed commands. Ahma forwards `$SSH_AUTH_SOCK` into the sandbox, so SSH operations (such as `git fetch` or `git push` over SSH) authenticate seamlessly via the SSH agent. If a command fails with `Permission denied (publickey)`, run `ssh-add` on the host to load your key into the agent (e.g. `ssh-add ~/.ssh/id_ed25519`).
+
 ## Command reference
 
 ```bash
 ahma permissions list                          # every grant, of every kind
 ahma permissions list --kind fs-scope          # just filesystem scopes
+ahma permissions list --kind net-host          # just network hosts
 ahma permissions revoke fs-scope ~/cache --yes # revoke (previews without --yes)
+ahma permissions revoke net-host crates.io --yes # revoke network host
 ahma permissions revoke tool cargo_build       # per-workspace tool approval
 
 ahma sandbox grant ~/cache [--read-only]       # kind-scoped shortcut
 ahma sandbox list
 ahma sandbox revoke ~/cache
 
-ahma web allow api.github.com                  # outbound domains
+ahma network allow crates.io                   # subprocess egress hosts
+ahma network list
+ahma network revoke crates.io
+
+ahma web allow api.github.com                  # outbound domains (HTTP fetch tools)
 ahma web list
 ```
 

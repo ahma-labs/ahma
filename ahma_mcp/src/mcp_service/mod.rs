@@ -191,6 +191,9 @@ pub struct AhmaMcpService {
     /// grant/deny snapshots are threaded into the `[web]` policy decision on every
     /// `fetch_webpage`, so a session approval takes effect without a restart.
     pub web_approval: Arc<ahma_common::web_approval::WebApprovalCoordinator>,
+    /// Session-scoped network-egress approvals (R-NET). Holds the domains granted or
+    /// denied for this session.
+    pub net_approval: Arc<ahma_common::net_approval::NetApprovalCoordinator>,
     /// Optional sink for delivering a web-approval prompt to a connected TUI over
     /// the daemon hub (R-WEB.6), set in daemon/server mode. When a `fetch_webpage`
     /// hits an unknown domain and the MCP client cannot do interactive
@@ -498,6 +501,10 @@ impl AhmaMcpService {
             BuiltinTool::SandboxGrant => (
                 "Propose adding an out-of-scope path as a persistent sandbox root in ~/.ahma/settings.toml. Call this when a command fails with a `sandbox_denial` error. WITHOUT `confirm: true` it only PREVIEWS — it returns the full settings-file path, the exact line it would add, and a risk assessment so you can show the human and get approval first. Catastrophic paths (filesystem root, $HOME, credential dirs, system dirs, workspace parents) are REFUSED even with confirmation. On `confirm: true` it writes the grant; run `restart` to apply, then re-run the blocked command.",
                 handlers::sandbox_grant_tool::sandbox_grant_schema(),
+            ),
+            BuiltinTool::NetworkGrant => (
+                "Propose adding a hostname or domain pattern to [network].allow in ~/.ahma/settings.toml for subprocess network egress. WITHOUT `confirm: true` it only PREVIEWS — returning the settings file path, the exact line to add, and a risk assessment. Catastrophic destinations (blanket `*`, localhost, private/loopback/cloud-metadata IPs) are REFUSED even with confirmation. On `confirm: true` it persists the grant and applies immediately to the live session.",
+                handlers::network_grant_tool::network_grant_schema(),
             ),
             BuiltinTool::ReadFile => (
                 "Read a text file as numbered lines (`  N<tab>text`; the number is not part of the file). Returns up to 2000 lines from start_line and says how to continue; long lines are cut at 2000 characters; binary files are refused. Read a file before editing or overwriting it.",
@@ -897,6 +904,7 @@ impl AhmaMcpService {
                 crate::mcp_client::McpConnectionManager::default(),
             )),
             web_approval: Arc::new(ahma_common::web_approval::WebApprovalCoordinator::new()),
+            net_approval: Arc::new(ahma_common::net_approval::NetApprovalCoordinator::new()),
             web_approval_tx: Arc::new(parking_lot::Mutex::new(None)),
             grant_coordinator: Arc::new(RwLock::new(None)),
         };
@@ -1844,6 +1852,11 @@ impl AhmaMcpService {
             BuiltinTool::SandboxGrant => {
                 let client_type = McpClientType::from_peer(&context.peer);
                 self.handle_sandbox_grant(run_params.arguments.unwrap_or_default(), client_type)
+                    .await
+            }
+            BuiltinTool::NetworkGrant => {
+                let client_type = McpClientType::from_peer(&context.peer);
+                self.handle_network_grant(run_params.arguments.unwrap_or_default(), client_type)
                     .await
             }
             BuiltinTool::LogsList => {
@@ -4020,7 +4033,7 @@ mod tests {
         }
 
         // The two tools the drift had silently dropped.
-        for expected in ["cancel", "sandbox_grant"] {
+        for expected in ["cancel", "sandbox_grant", "network_grant"] {
             assert!(
                 agent_tools.iter().any(|n| n == expected),
                 "agent toolset is missing {expected}"

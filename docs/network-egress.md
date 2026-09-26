@@ -247,6 +247,29 @@ The same note is in the code, in
 `ahma_common::config::NetworkSettings::restrict`, so a later reader does not
 "finish the job" by flipping it.
 
+## Managing network grants and permissions
+
+Allowed hosts can be managed from the command line, inspected in the permission ledger, or requested interactively by AI models via the `network_grant` MCP tool.
+
+### CLI commands
+
+```bash
+ahma network allow crates.io        # add host to [network].allow
+ahma network list                   # view current allowlist and restrictions
+ahma network revoke crates.io       # remove host from [network].allow
+
+ahma permissions list --kind net-host             # view network grants in ledger
+ahma permissions revoke net-host crates.io --yes  # revoke via unified ledger
+```
+
+### The `network_grant` MCP tool
+
+When an AI agent encounters a network block, it can invoke the `network_grant` tool:
+- **Two-phase confirmation**: Calling `network_grant` without `confirm: true` returns a preview with risk analysis and the exact line that would be added to `~/.ahma/settings.toml`.
+- **Hard denylist**: Blanket `*`, `localhost`, and private/loopback/cloud-metadata IP addresses (`169.254.169.254`) are refused outright even with confirmation.
+- **Human approval gate**: Autonomous in-process agents cannot self-persist network grants; external clients raise interactive elicitation prompts for human confirmation.
+- **Immediate effect**: Confirmed grants take effect immediately for the active session and persist to `~/.ahma/settings.toml` across restarts.
+
 ## Limits you still have
 
 * Interactive approval still applies: a subprocess reaching an unlisted host

@@ -219,6 +219,13 @@ impl NetApprovalCoordinator {
     pub fn is_in_flight(&self, decision_id: &str) -> bool {
         self.inner.lock().in_flight.contains_key(decision_id)
     }
+
+    /// Add a domain to the session grant set directly (e.g. from an explicit grant tool).
+    pub fn add_session_grant(&self, domain: &str) {
+        let domain = norm(domain);
+        let mut inner = self.inner.lock();
+        inner.session_grants.insert(domain);
+    }
 }
 
 /// Persist an approved domain to `[network].allow` in the settings file — the
@@ -419,5 +426,14 @@ mod tests {
         assert!(c.session_grants().is_empty());
         assert!(c.session_denies().is_empty());
         assert!(c.begin("gone.example", "gone.example:443").is_some());
+    }
+
+    #[test]
+    fn add_session_grant_directly_records_grant() {
+        let c = coord();
+        assert!(!c.is_session_granted("crates.io"));
+        c.add_session_grant("Crates.io");
+        assert!(c.is_session_granted("crates.io"));
+        assert_eq!(c.session_grants(), vec!["crates.io".to_string()]);
     }
 }

@@ -5,6 +5,7 @@ pub mod common;
 pub mod harness_tools;
 pub mod livelog_tool;
 pub mod log_tools;
+pub mod network_grant_tool;
 pub mod restart_tool;
 pub mod sandbox_grant_tool;
 pub mod shell_tool;

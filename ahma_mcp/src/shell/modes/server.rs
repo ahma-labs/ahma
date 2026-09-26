@@ -888,7 +888,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // sandbox does not lock (and no subprocess can spawn) until then, so
     // starting the proxy here does not weaken the existing enforcement timing.
     let net_approval = crate::egress::NetApprovalContext {
-        coordinator: Arc::new(ahma_common::net_approval::NetApprovalCoordinator::new()),
+        coordinator: service_handler.net_approval.clone(),
         peer: service_handler.peer.clone(),
     };
     let _egress_proxy = maybe_start_egress_proxy(&config, &sandbox, net_approval).await;

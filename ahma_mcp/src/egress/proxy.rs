@@ -354,7 +354,7 @@ async fn resolve_egress_approval(
         net_approval.coordinator.cancel(&req.decision_id);
         warn!(
             "Egress proxy: no interactive surface available to approve '{host}'; denying \
-             (add it to [network] allow in ~/.ahma/settings.toml to permit)"
+             (run `ahma network allow {host}` or add to [network].allow in ~/.ahma/settings.toml to permit)"
         );
         return false;
     };

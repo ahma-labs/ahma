@@ -56,6 +56,7 @@ builtin_tools! {
     Restart => "restart",
     Cancel => "cancel",
     SandboxGrant => "sandbox_grant",
+    NetworkGrant => "network_grant",
     ReadFile => "read_file",
     ListDir => "list_dir",
     FileSearch => "file_search",
@@ -97,6 +98,7 @@ impl BuiltinTool {
             | BuiltinTool::Await
             | BuiltinTool::Cancel
             | BuiltinTool::SandboxGrant
+            | BuiltinTool::NetworkGrant
             | BuiltinTool::Restart
             | BuiltinTool::TodoWrite => true,
             BuiltinTool::RunTerminalCommand
@@ -153,6 +155,7 @@ impl BuiltinTool {
             | BuiltinTool::Restart
             | BuiltinTool::Cancel
             | BuiltinTool::SandboxGrant
+            | BuiltinTool::NetworkGrant
             | BuiltinTool::FetchWebpage
             | BuiltinTool::Agent
             | BuiltinTool::LogMonitor => false,
@@ -174,6 +177,7 @@ impl BuiltinTool {
             | BuiltinTool::Restart => true,
             BuiltinTool::RunTerminalCommand
             | BuiltinTool::SandboxGrant
+            | BuiltinTool::NetworkGrant
             | BuiltinTool::ReadFile
             | BuiltinTool::ListDir
             | BuiltinTool::FileSearch
@@ -221,6 +225,7 @@ impl BuiltinTool {
             | BuiltinTool::Restart
             | BuiltinTool::Cancel
             | BuiltinTool::SandboxGrant
+            | BuiltinTool::NetworkGrant
             | BuiltinTool::ReadFile
             | BuiltinTool::ListDir
             | BuiltinTool::FileSearch
@@ -245,7 +250,10 @@ impl BuiltinTool {
     pub const fn crosses_sandbox_boundary(self) -> bool {
         matches!(
             self,
-            BuiltinTool::LogsApprove | BuiltinTool::SandboxGrant | BuiltinTool::FetchWebpage
+            BuiltinTool::LogsApprove
+                | BuiltinTool::SandboxGrant
+                | BuiltinTool::NetworkGrant
+                | BuiltinTool::FetchWebpage
         )
     }
 
@@ -277,7 +285,9 @@ impl BuiltinTool {
             | BuiltinTool::LogsRead
             | BuiltinTool::LogsSearch
             | BuiltinTool::LogMonitor => Some("logs"),
-            BuiltinTool::SandboxGrant | BuiltinTool::Restart => Some("sandbox"),
+            BuiltinTool::SandboxGrant | BuiltinTool::NetworkGrant | BuiltinTool::Restart => {
+                Some("sandbox")
+            }
             BuiltinTool::Agent => Some("agent"),
         }
     }
@@ -312,6 +322,7 @@ mod tests {
         for tool in [
             BuiltinTool::LogsApprove,
             BuiltinTool::SandboxGrant,
+            BuiltinTool::NetworkGrant,
             BuiltinTool::FetchWebpage,
         ] {
             assert!(tool.crosses_sandbox_boundary(), "{}", tool.name());

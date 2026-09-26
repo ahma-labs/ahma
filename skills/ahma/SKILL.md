@@ -14,7 +14,7 @@ description: >
   "simplify", "reduce complexity", "too complex", "hard to read", "refactor",
   "maintainability", "cognitive complexity", "cyclomatic complexity", "simplicity score",
   "code quality metrics", "hotspot", "ahma simplify", "ahma help", "ahma ?",
-  "ahma update", "ahma tui", "/ahma tui".
+  "ahma update", "ahma tui", "/ahma tui", "network_grant", "ahma network", "network grant".
 user-invocable: true
 ---
 
@@ -117,6 +117,22 @@ cancel(id="op_abc123")
 ```
 
 Terminates the process and frees resources.
+
+### `sandbox_grant` — Request persistent filesystem scope
+
+```
+sandbox_grant(path="/opt/ext/sccache", access="rw", confirm=false)
+```
+
+Propose adding an out-of-scope path as a persistent sandbox root in `~/.ahma/settings.toml`. Call this when a command fails with a `sandbox_denial` error. Without `confirm: true` it only previews. On `confirm: true` with human approval, it writes the grant and applies immediately to the live session.
+
+### `network_grant` — Request persistent network egress grant
+
+```
+network_grant(host="crates.io", confirm=false)
+```
+
+Propose adding a hostname or pattern to `[network].allow` in `~/.ahma/settings.toml` for subprocess egress. Without `confirm: true` it only previews. Hard denylist blocks `*`, `localhost`, and private/metadata IPs (`169.254.169.254`). On `confirm: true` with human approval, it writes the grant and applies immediately to the live session.
 
 ---
 
@@ -249,67 +265,57 @@ Validate configs: `ahma tool validate .ahma/`
 | `--log-to-stderr` / `logging.target` | file | Log to stderr |
 | `--log-monitor` / `logging.log_monitor` | off | Enable live log monitoring |
 | `--monitor-rate-limit` / `logging.monitor_rate_limit_secs` | `60` | Min seconds between log alerts |
+| `--restrict-network` / `network.restrict` | off | Restrict sandboxed subprocess network egress via local proxy |
+| `network.allow` | `[]` | Outbound host patterns permitted for sandboxed subprocesses |
 | `RUST_LOG` (env) | `info` | Log verbosity (e.g. `ahma_mcp=debug`) |
+
+---
+
+## Permissions & Network Management
+
+Every permission lives in `~/.ahma/settings.toml`, outside every sandbox scope.
+
+```bash
+ahma permissions list                          # every grant across all kinds
+ahma permissions list --kind net-host          # just network hosts
+ahma permissions revoke net-host <host> --yes  # revoke network grant
+
+ahma network allow <host>                      # allow subprocess egress to host
+ahma network list                              # view active allowlist
+ahma network revoke <host>                     # remove host from allowlist
+```
 
 ---
 
 ## CLI Reference
 
 ```bash
-# Start MCP server (stdio — for IDE integration)
+# Start MCP server (stdio / HTTP / Unix socket)
 ahma serve stdio [--tools git,fileutils] [--sandbox] [--log-monitor]
-
-# Start HTTP server (local development, multiple clients)
 ahma serve http [--port 3000] [--host 0.0.0.0] [--disable-quic]
-
-# Start Unix socket server (IPC / Kubernetes sidecars)
 ahma serve unix [--socket-path <path>]   # default: the per-user runtime dir
 
-# Run a single tool from the CLI
+# Tool execution & inspection
 ahma tool run run_terminal_command -- "echo hello"
-
-# Validate .ahma/ tool configs
 ahma tool validate [.ahma/]
-
-# Show locally configured tools with descriptions (use this, not `ahma tool list`, for local configs)
-ahma tool info [--tools git,fileutils]
+ahma tool info [--tools git,fileutils]   # use this, not tool list, for local configs
 
 # Local TLS certificate management (required for QUIC/HTTP3 transport)
-ahma tls init      # Generate cert at ~/.ahma/tls/ (idempotent)
-ahma tls rotate    # Replace the certificate with a new one
-ahma tls status    # Show cert path, age, and rotation recommendation
+ahma tls init && ahma tls status        # ahma tls rotate replaces certificate
 ```
 
 ---
 
 ## Troubleshooting
 
-**Tool not found**: check the tool's bundle is in `--tools` at startup (e.g. `--tools git,fileutils`).
-
-**Timeout**: `--timeout 600` in mcp.json args, or `tools.timeout_secs = 600` in `~/.ahma/settings.toml`.
-
-**Permission denied / sandbox error**: the path is outside the sandbox scope — check
-`--sandbox-scope`, set `[sandbox] container_root`, or add `--tmp` for temp-file access.
-
-**"sandbox scope is your container root"**: the session scope spans every project; pass
-`working_directory` naming the project subdirectory so ahma knows which subtree to narrow to.
-
-**Cargo/tool-install permission errors** (`cargo add`, `cargo install`, `npm i -g`, …): do
-**not** add `--sandbox-scope ~/.cargo` — that grants write to the whole cargo home including
-credentials. The built-in `package_cache_write` feature (on by default) already handles
-`cargo add`/`update`. For installs into `~/.cargo/bin`, use the `sandbox_grant` tool (preview,
-then `confirm: true`) — it takes effect immediately and persists — or install into the workspace instead
-(`cargo install --root <workspace>/.tools`). Full rationale:
-[docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs](https://github.com/ahma-labs/ahma/blob/main/docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs).
-
-**"ahma is DEFERRING to … sandbox"**: ahma is inside an outer sandbox it can't nest inside
-(macOS Seatbelt refuses nesting). Commands still run, confined by the outer sandbox — expected
-when running ahma's own test suite or a nested `ahma serve`. For ahma's own enforcement, start
-it from a plain terminal.
-
-**Tool still running**: `status(operation_id)` to check, or `cancel(operation_id)`.
-
-**Linux old kernel**: Landlock needs kernel 5.13+; use `--no-sandbox` on older systems.
+* **Tool not found**: check the tool's bundle is in `--tools` at startup (e.g. `--tools git,fileutils`).
+* **Timeout**: `--timeout 600` in mcp.json args, or `tools.timeout_secs = 600` in `~/.ahma/settings.toml`.
+* **Permission denied / sandbox error**: the path is outside the sandbox scope — check `--sandbox-scope`, set `[sandbox] container_root`, or add `--tmp` for temp-file access.
+* **"sandbox scope is your container root"**: the session scope spans every project; pass `working_directory` naming the project subdirectory so ahma knows which subtree to narrow to.
+* **Cargo/tool-install permission errors** (`cargo add`, `cargo install`, `npm i -g`, …): do **not** add `--sandbox-scope ~/.cargo` — that grants write to the whole cargo home including credentials. The built-in `package_cache_write` feature (on by default) already handles `cargo add`/`update`. For installs into `~/.cargo/bin`, use the `sandbox_grant` tool (preview, then `confirm: true`) — it takes effect immediately and persists — or install into the workspace instead (`cargo install --root <workspace>/.tools`). Full rationale: [docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs](https://github.com/ahma-labs/ahma/blob/main/docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs).
+* **"ahma is DEFERRING to … sandbox"**: ahma is inside an outer sandbox it can't nest inside (macOS Seatbelt refuses nesting). Commands still run, confined by the outer sandbox — expected when running ahma's own test suite or a nested `ahma serve`. For ahma's own enforcement, start it from a plain terminal.
+* **Tool still running**: `status(operation_id)` to check, or `cancel(operation_id)`.
+* **Linux old kernel**: Landlock needs kernel 5.13+; use `--no-sandbox` on older systems.
 
 ---
 

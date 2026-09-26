@@ -1006,6 +1006,10 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in web-egress policy management mode");
             commands::run_web_command(args)
         }
+        Subcommands::Network(args) => {
+            tracing::info!("Running in network-egress policy management mode");
+            commands::run_network_command(args)
+        }
         Subcommands::Permissions(args) => {
             tracing::info!("Running in permission-ledger management mode");
             commands::run_permissions_command(args)
@@ -1424,6 +1428,8 @@ pub enum Subcommands {
     /// `~/.ahma/settings.toml`, outside every sandbox scope, so a sandboxed tool
     /// cannot edit them. See `ahma web --help`.
     Web(WebArgs),
+    /// Manage the subprocess network-egress allow policy (`--restrict-network`). Governs outbound network connections made by sandboxed subprocesses. Allowed hosts and patterns are stored in `[network].allow` in `~/.ahma/settings.toml`, outside every sandbox scope, so a sandboxed tool cannot edit them. See `ahma network --help`.
+    Network(NetworkArgs),
     /// Manage where ahma writes its operational logs (see `ahma logs --help`).
     Logs(LogsArgs),
     /// List and revoke **every** permission ahma has been granted, of every kind
@@ -1860,6 +1866,34 @@ pub enum WebCommand {
         /// URL to evaluate (e.g. `https://api.github.com/x`).
         #[arg(value_name = "URL")]
         url: String,
+    },
+}
+
+// ── network ──────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma network`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct NetworkArgs {
+    #[command(subcommand)]
+    pub command: NetworkCommand,
+}
+
+/// Subcommands for `ahma network` — manage subprocess network egress (SPEC R-NET). Governs outbound network connections made by sandboxed subprocesses. Allowed hosts and patterns are stored in `[network].allow` in `~/.ahma/settings.toml`, outside every sandbox scope, so a sandboxed tool cannot edit them.
+#[derive(Subcommand, Debug, Clone)]
+pub enum NetworkCommand {
+    /// Allow a host or domain pattern for subprocess egress (add to `[network].allow`).
+    Allow {
+        /// Hostname or pattern to permit (e.g. `crates.io`, `*.github.com`, or `*`).
+        #[arg(value_name = "HOST")]
+        host: String,
+    },
+    /// Show the active network-egress allow list and restrictions.
+    List,
+    /// Remove a host or pattern from `[network].allow`.
+    Revoke {
+        /// Hostname or pattern to remove.
+        #[arg(value_name = "HOST")]
+        host: String,
     },
 }
 
