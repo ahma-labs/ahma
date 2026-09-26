@@ -1355,6 +1355,39 @@ fn resolve_worktree_main_repo(git_root: &Path) -> Option<PathBuf> {
 /// this discovers the repository root (and any connected worktree / main repo
 /// root) so intra-repo builds, target directories, and submodule writes do
 /// not fail with unexpected sandbox denials (SPEC R5.2.1).
+fn is_scope_too_broad(path: &Path, canon_home: Option<&Path>) -> bool {
+    path.parent().is_none() || canon_home.is_some_and(|h| h == path)
+}
+
+fn collect_git_scopes(canon_cwd: &Path, canon_home: Option<&Path>, scopes: &mut Vec<PathBuf>) {
+    let Some(git_root) = find_git_root_or_worktree(canon_cwd) else {
+        return;
+    };
+    let canon_git_root = dunce::canonicalize(&git_root).unwrap_or(git_root);
+    if is_scope_too_broad(&canon_git_root, canon_home) {
+        return;
+    }
+    if let Some(main_repo) = resolve_worktree_main_repo(&canon_git_root) {
+        let canon_main = dunce::canonicalize(&main_repo).unwrap_or(main_repo);
+        if !is_scope_too_broad(&canon_main, canon_home) {
+            scopes.push(canon_main);
+        }
+    }
+    scopes.push(canon_git_root);
+}
+
+fn filter_enclosing_scopes(deduped: &[PathBuf]) -> Vec<PathBuf> {
+    deduped
+        .iter()
+        .filter(|scope| {
+            !deduped
+                .iter()
+                .any(|other| *scope != other && scope.starts_with(other))
+        })
+        .cloned()
+        .collect()
+}
+
 pub fn resolve_hook_sandbox_scopes(cwd: &Path) -> Vec<PathBuf> {
     let canon_cwd = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let home = ahma_common::config::ahma_home_dir();
@@ -1363,23 +1396,7 @@ pub fn resolve_hook_sandbox_scopes(cwd: &Path) -> Vec<PathBuf> {
         .map(|h| dunce::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
 
     let mut raw_scopes = Vec::new();
-    if let Some(git_root) = find_git_root_or_worktree(&canon_cwd) {
-        let canon_git_root = dunce::canonicalize(&git_root).unwrap_or(git_root);
-        let is_too_broad = canon_git_root.parent().is_none()
-            || canon_home.as_ref().is_some_and(|h| h == &canon_git_root);
-
-        if !is_too_broad {
-            if let Some(main_repo) = resolve_worktree_main_repo(&canon_git_root) {
-                let canon_main = dunce::canonicalize(&main_repo).unwrap_or(main_repo);
-                let main_too_broad = canon_main.parent().is_none()
-                    || canon_home.as_ref().is_some_and(|h| h == &canon_main);
-                if !main_too_broad {
-                    raw_scopes.push(canon_main);
-                }
-            }
-            raw_scopes.push(canon_git_root);
-        }
-    }
+    collect_git_scopes(&canon_cwd, canon_home.as_deref(), &mut raw_scopes);
     raw_scopes.push(canon_cwd);
 
     let mut deduped: Vec<PathBuf> = Vec::new();
@@ -1389,17 +1406,7 @@ pub fn resolve_hook_sandbox_scopes(cwd: &Path) -> Vec<PathBuf> {
         }
     }
 
-    let mut final_scopes = Vec::new();
-    for i in 0..deduped.len() {
-        let is_sub = deduped
-            .iter()
-            .enumerate()
-            .any(|(j, other)| i != j && deduped[i] != *other && deduped[i].starts_with(other));
-        if !is_sub {
-            final_scopes.push(deduped[i].clone());
-        }
-    }
-
+    let final_scopes = filter_enclosing_scopes(&deduped);
     if final_scopes.is_empty() {
         vec![cwd.to_path_buf()]
     } else {
@@ -2033,30 +2040,35 @@ fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
 /// and performs prefix token matching. A grant of `command(/path/to/ahma hooks run-shell)`
 /// matches any command whose first three words match, covering all underlying subcommands
 /// and flags without requiring regex escapes or trailing `.*`.
-fn build_antigravity_permission_override(wrapped_command: &str) -> String {
-    let mut trimmed = wrapped_command.trim();
+fn strip_powershell_call_prefix(cmd: &str) -> &str {
+    let trimmed = cmd.trim();
     if let Some(idx) = trimmed.find("& { & ") {
-        trimmed = trimmed[idx + "& { & ".len()..].trim_start();
+        trimmed[idx + "& { & ".len()..].trim_start()
     } else if let Some(idx) = trimmed.find("& ") {
-        trimmed = trimmed[idx + 2..].trim_start();
-    }
-    let (exe, rest) = if let Some(stripped) = trimmed.strip_prefix('\'') {
-        if let Some(end) = stripped.find('\'') {
-            (&stripped[..end], stripped[end + 1..].trim_start())
-        } else {
-            (trimmed, "")
-        }
-    } else if let Some(stripped) = trimmed.strip_prefix('"') {
-        if let Some(end) = stripped.find('"') {
-            (&stripped[..end], stripped[end + 1..].trim_start())
-        } else {
-            (trimmed, "")
-        }
-    } else if let Some((first, remainder)) = trimmed.split_once(char::is_whitespace) {
-        (first, remainder.trim_start())
+        trimmed[idx + 2..].trim_start()
     } else {
-        (trimmed, "")
-    };
+        trimmed
+    }
+}
+
+fn split_first_token(input: &str) -> (&str, &str) {
+    if let Some(stripped) = input.strip_prefix('\'') {
+        if let Some(end) = stripped.find('\'') {
+            return (&stripped[..end], stripped[end + 1..].trim_start());
+        }
+    } else if let Some(stripped) = input.strip_prefix('"') {
+        if let Some(end) = stripped.find('"') {
+            return (&stripped[..end], stripped[end + 1..].trim_start());
+        }
+    } else if let Some((first, remainder)) = input.split_once(char::is_whitespace) {
+        return (first, remainder.trim_start());
+    }
+    (input, "")
+}
+
+fn build_antigravity_permission_override(wrapped_command: &str) -> String {
+    let trimmed = strip_powershell_call_prefix(wrapped_command);
+    let (exe, rest) = split_first_token(trimmed);
 
     let rest_parts: Vec<&str> = rest.split_whitespace().collect();
     if rest_parts.len() >= 2
@@ -2322,65 +2334,22 @@ fn ensure_antigravity_permissions_in_file(
 
     let root = ensure_root_object(&mut doc)?;
     let raw_exe = env.current_exe.display().to_string();
-
-    let clean_grants = vec![
-        format!("command({raw_exe} hooks run-shell)"),
-        "command(ahma hooks run-shell)".to_string(),
-        "command(regex:.*ahma.* hooks run-shell)".to_string(),
-        format!("command({raw_exe} hooks run-shell --wrapped-by {WRAPPED_BY_MARKER})"),
-        format!("command(ahma hooks run-shell --wrapped-by {WRAPPED_BY_MARKER})"),
-        format!("command(regex:.*ahma.* hooks run-shell --wrapped-by {WRAPPED_BY_MARKER})"),
-    ];
+    let clean_grants = antigravity_clean_hook_grants(&raw_exe);
 
     let mut modified = false;
-
-    let filter_and_add = |entries: &mut Vec<Value>| -> bool {
-        let mut changed = false;
-        let len_before = entries.len();
-        entries.retain(|v| {
-            if let Some(s) = v.as_str() {
-                if s.contains("regex:") {
-                    return true;
-                }
-                let is_bloated = s.contains("hooks")
-                    && s.contains("run-shell")
-                    && (s.contains("--command")
-                        || s.contains("--payload-base64")
-                        || s.contains("--cwd"));
-                let is_malformed = s.contains("ahma")
-                    && (s.contains(".*") || s.contains(r"\.") || s.contains('\n'));
-                if is_bloated || is_malformed {
-                    return false;
-                }
-            }
-            true
-        });
-        if entries.len() != len_before {
-            changed = true;
-        }
-
-        for grant in &clean_grants {
-            let val = Value::String(grant.clone());
-            if !entries.contains(&val) {
-                entries.push(val);
-                changed = true;
-            }
-        }
-        changed
-    };
 
     if use_user_settings_wrapper {
         let user_settings = ensure_child_object(root, "userSettings")?;
         let global_grants = ensure_child_object(user_settings, "globalPermissionGrants")?;
         let allow_entries = ensure_child_array(global_grants, "allow")?;
-        if filter_and_add(allow_entries) {
+        if filter_and_add_grants(allow_entries, &clean_grants) {
             modified = true;
         }
     }
 
     let permissions = ensure_child_object(root, "permissions")?;
     let allow_entries = ensure_child_array(permissions, "allow")?;
-    if filter_and_add(allow_entries) {
+    if filter_and_add_grants(allow_entries, &clean_grants) {
         modified = true;
     }
 
@@ -2393,6 +2362,87 @@ fn ensure_antigravity_permissions_in_file(
     }
 
     Ok(())
+}
+
+fn antigravity_clean_hook_grants(raw_exe: &str) -> Vec<String> {
+    vec![
+        format!("command({raw_exe} hooks run-shell)"),
+        "command(ahma hooks run-shell)".to_string(),
+        "command(regex:.*ahma.* hooks run-shell)".to_string(),
+        format!("command({raw_exe} hooks run-shell --wrapped-by {WRAPPED_BY_MARKER})"),
+        format!("command(ahma hooks run-shell --wrapped-by {WRAPPED_BY_MARKER})"),
+        format!("command(regex:.*ahma.* hooks run-shell --wrapped-by {WRAPPED_BY_MARKER})"),
+    ]
+}
+
+fn is_bloated_or_malformed_grant(s: &str) -> bool {
+    if s.contains("regex:") {
+        return false;
+    }
+    let is_bloated = s.contains("hooks")
+        && s.contains("run-shell")
+        && (s.contains("--command") || s.contains("--payload-base64") || s.contains("--cwd"));
+    let is_malformed =
+        s.contains("ahma") && (s.contains(".*") || s.contains(r"\.") || s.contains('\n'));
+    is_bloated || is_malformed
+}
+
+fn filter_and_add_grants(entries: &mut Vec<Value>, clean_grants: &[String]) -> bool {
+    let mut changed = false;
+    let len_before = entries.len();
+    entries.retain(|v| {
+        if let Some(s) = v.as_str() {
+            return !is_bloated_or_malformed_grant(s);
+        }
+        true
+    });
+    if entries.len() != len_before {
+        changed = true;
+    }
+
+    for grant in clean_grants {
+        let val = Value::String(grant.clone());
+        if !entries.contains(&val) {
+            entries.push(val);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn strip_ahma_command_grants(allow: &mut Vec<Value>) -> bool {
+    let len_before = allow.len();
+    allow.retain(|v| {
+        if let Some(s) = v.as_str()
+            && s.starts_with("command(")
+            && s.contains("ahma")
+        {
+            return false;
+        }
+        true
+    });
+    allow.len() != len_before
+}
+
+fn remove_antigravity_permissions_from_doc(doc: &mut Value) -> bool {
+    let Some(obj) = doc.as_object_mut() else {
+        return false;
+    };
+    let mut modified = false;
+    if let Some(perms) = obj.get_mut("permissions").and_then(|p| p.as_object_mut())
+        && let Some(allow) = perms.get_mut("allow").and_then(|a| a.as_array_mut())
+    {
+        modified |= strip_ahma_command_grants(allow);
+    }
+    if let Some(user_settings) = obj.get_mut("userSettings").and_then(|u| u.as_object_mut())
+        && let Some(gpg) = user_settings
+            .get_mut("globalPermissionGrants")
+            .and_then(|g| g.as_object_mut())
+        && let Some(allow) = gpg.get_mut("allow").and_then(|a| a.as_array_mut())
+    {
+        modified |= strip_ahma_command_grants(allow);
+    }
+    modified
 }
 
 fn remove_antigravity_permissions(env: &HookEnvironment) -> Result<()> {
@@ -2416,47 +2466,9 @@ fn remove_antigravity_permissions(env: &HookEnvironment) -> Result<()> {
         let Ok(mut doc) = serde_json::from_str::<Value>(&content) else {
             continue;
         };
-        let mut modified = false;
-        if let Some(obj) = doc.as_object_mut() {
-            if let Some(perms) = obj.get_mut("permissions").and_then(|p| p.as_object_mut())
-                && let Some(allow) = perms.get_mut("allow").and_then(|a| a.as_array_mut())
-            {
-                let len_before = allow.len();
-                allow.retain(|v| {
-                    if let Some(s) = v.as_str()
-                        && s.starts_with("command(")
-                        && s.contains("ahma")
-                    {
-                        return false;
-                    }
-                    true
-                });
-                if allow.len() != len_before {
-                    modified = true;
-                }
-            }
-            if let Some(user_settings) = obj.get_mut("userSettings").and_then(|u| u.as_object_mut())
-                && let Some(gpg) = user_settings
-                    .get_mut("globalPermissionGrants")
-                    .and_then(|g| g.as_object_mut())
-                && let Some(allow) = gpg.get_mut("allow").and_then(|a| a.as_array_mut())
-            {
-                let len_before = allow.len();
-                allow.retain(|v| {
-                    if let Some(s) = v.as_str()
-                        && s.starts_with("command(")
-                        && s.contains("ahma")
-                    {
-                        return false;
-                    }
-                    true
-                });
-                if allow.len() != len_before {
-                    modified = true;
-                }
-            }
-        }
-        if modified && let Ok(formatted) = serde_json::to_string_pretty(&doc) {
+        if remove_antigravity_permissions_from_doc(&mut doc)
+            && let Ok(formatted) = serde_json::to_string_pretty(&doc)
+        {
             let _ = std::fs::write(path, formatted);
         }
     }

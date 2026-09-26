@@ -93,80 +93,97 @@ impl Fix {
     /// file it cannot parse) and records each removal in the audit log,
     /// stamped `now` (RFC 3339, supplied by the caller).
     pub fn apply(&self, now: &str) -> anyhow::Result<String> {
-        let now = now.to_string();
         match self {
-            Fix::RemoveMissingScopes(paths) => {
-                AhmaSettings::update(|s| {
-                    s.sandbox
-                        .persistent_scopes
-                        .retain(|scope| !paths.contains(&scope.path));
-                })?;
-                for path in paths {
-                    append_audit(&audit_entry(
-                        now.clone(),
-                        AuditAction::Revoke,
-                        GrantKind::FsScope,
-                        path.display().to_string(),
-                        None,
-                        GrantTier::Always,
-                        Some("doctor".to_string()),
-                    ));
-                }
-                Ok(format!("Removed {} granted folder(s)", paths.len()))
-            }
-            Fix::ForgetMissingWorkspaces(paths) => {
-                AhmaSettings::update(|s| {
-                    s.permissions
-                        .tool_approvals
-                        .retain(|a| !paths.contains(&a.workspace));
-                })?;
-                for path in paths {
-                    append_audit(&audit_entry(
-                        now.clone(),
-                        AuditAction::Revoke,
-                        GrantKind::Tool,
-                        "*",
-                        None,
-                        GrantTier::Always,
-                        Some(format!("doctor: {}", path.display())),
-                    ));
-                }
-                Ok(format!("Forgot approvals for {} folder(s)", paths.len()))
-            }
+            Fix::RemoveMissingScopes(paths) => apply_remove_missing_scopes(paths, now),
+            Fix::ForgetMissingWorkspaces(paths) => apply_forget_missing_workspaces(paths, now),
             Fix::RepairAntigravityPermissions {
                 cli_settings,
                 config_file,
                 ide_mcp,
                 clean_grants,
-            } => {
-                let mut files_cleaned = 0;
-                if let Some(path) = cli_settings {
-                    clean_antigravity_file(path, clean_grants, false)?;
-                    files_cleaned += 1;
-                }
-                if let Some(path) = config_file {
-                    clean_antigravity_file(path, clean_grants, true)?;
-                    files_cleaned += 1;
-                }
-                if let Some(path) = ide_mcp {
-                    clean_antigravity_ide_mcp(path)?;
-                    files_cleaned += 1;
-                }
-                append_audit(&audit_entry(
-                    now,
-                    AuditAction::Grant,
-                    GrantKind::Tool,
-                    "antigravity-permissions",
-                    None,
-                    GrantTier::Always,
-                    Some("doctor".to_string()),
-                ));
-                Ok(format!(
-                    "Cleaned Antigravity permissions in {files_cleaned} file(s)"
-                ))
-            }
+            } => apply_repair_antigravity_permissions(
+                cli_settings.as_ref(),
+                config_file.as_ref(),
+                ide_mcp.as_ref(),
+                clean_grants,
+                now,
+            ),
         }
     }
+}
+
+fn apply_remove_missing_scopes(paths: &[PathBuf], now: &str) -> anyhow::Result<String> {
+    AhmaSettings::update(|s| {
+        s.sandbox
+            .persistent_scopes
+            .retain(|scope| !paths.contains(&scope.path));
+    })?;
+    for path in paths {
+        append_audit(&audit_entry(
+            now.to_string(),
+            AuditAction::Revoke,
+            GrantKind::FsScope,
+            path.display().to_string(),
+            None,
+            GrantTier::Always,
+            Some("doctor".to_string()),
+        ));
+    }
+    Ok(format!("Removed {} granted folder(s)", paths.len()))
+}
+
+fn apply_forget_missing_workspaces(paths: &[PathBuf], now: &str) -> anyhow::Result<String> {
+    AhmaSettings::update(|s| {
+        s.permissions
+            .tool_approvals
+            .retain(|a| !paths.contains(&a.workspace));
+    })?;
+    for path in paths {
+        append_audit(&audit_entry(
+            now.to_string(),
+            AuditAction::Revoke,
+            GrantKind::Tool,
+            "*",
+            None,
+            GrantTier::Always,
+            Some(format!("doctor: {}", path.display())),
+        ));
+    }
+    Ok(format!("Forgot approvals for {} folder(s)", paths.len()))
+}
+
+fn apply_repair_antigravity_permissions(
+    cli_settings: Option<&PathBuf>,
+    config_file: Option<&PathBuf>,
+    ide_mcp: Option<&PathBuf>,
+    clean_grants: &[String],
+    now: &str,
+) -> anyhow::Result<String> {
+    let mut files_cleaned = 0;
+    if let Some(path) = cli_settings {
+        clean_antigravity_file(path, clean_grants, false)?;
+        files_cleaned += 1;
+    }
+    if let Some(path) = config_file {
+        clean_antigravity_file(path, clean_grants, true)?;
+        files_cleaned += 1;
+    }
+    if let Some(path) = ide_mcp {
+        clean_antigravity_ide_mcp(path)?;
+        files_cleaned += 1;
+    }
+    append_audit(&audit_entry(
+        now.to_string(),
+        AuditAction::Grant,
+        GrantKind::Tool,
+        "antigravity-permissions",
+        None,
+        GrantTier::Always,
+        Some("doctor".to_string()),
+    ));
+    Ok(format!(
+        "Cleaned Antigravity permissions in {files_cleaned} file(s)"
+    ))
 }
 
 fn join_paths(paths: &[PathBuf]) -> String {
@@ -404,6 +421,18 @@ fn is_malformed_ahma_grant(s: &str) -> bool {
     s.contains("ahma") && (s.contains(".*") || s.contains(r"\.") || s.contains('\n'))
 }
 
+fn is_grant_unwanted(s: &str, bloated: &mut usize, malformed: &mut usize) -> bool {
+    if is_bloated_ahma_grant(s) {
+        *bloated += 1;
+        true
+    } else if is_malformed_ahma_grant(s) {
+        *malformed += 1;
+        true
+    } else {
+        false
+    }
+}
+
 fn clean_grants_vec(
     grants: &[serde_json::Value],
     clean_grants: &[String],
@@ -413,18 +442,12 @@ fn clean_grants_vec(
     let mut malformed_count = 0;
 
     for g in grants {
-        if let Some(s) = g.as_str() {
-            if is_bloated_ahma_grant(s) {
-                bloated_count += 1;
-                continue;
-            }
-            if is_malformed_ahma_grant(s) {
-                malformed_count += 1;
-                continue;
-            }
-            if !cleaned.contains(g) {
-                cleaned.push(g.clone());
-            }
+        let Some(s) = g.as_str() else { continue };
+        if is_grant_unwanted(s, &mut bloated_count, &mut malformed_count) {
+            continue;
+        }
+        if !cleaned.contains(g) {
+            cleaned.push(g.clone());
         }
     }
 
@@ -476,6 +499,26 @@ fn clean_antigravity_file(
     Ok(())
 }
 
+fn remove_tmp_from_args(args: &mut Vec<serde_json::Value>) -> bool {
+    let before_len = args.len();
+    args.retain(|arg| arg.as_str() != Some("--tmp"));
+    let mut modified = args.len() != before_len;
+
+    for arg in args.iter_mut() {
+        if let Some(s) = arg.as_str()
+            && s.contains("--tmp")
+        {
+            let cleaned = s
+                .replace("--tmp ", "")
+                .replace(" --tmp", "")
+                .replace("--tmp", "");
+            *arg = serde_json::Value::String(cleaned);
+            modified = true;
+        }
+    }
+    modified
+}
+
 fn clean_antigravity_ide_mcp(path: &Path) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
@@ -484,33 +527,124 @@ fn clean_antigravity_ide_mcp(path: &Path) -> anyhow::Result<()> {
     let mut doc: serde_json::Value =
         serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
     let mut modified = false;
-    if let Some(servers) = doc.get_mut("mcpServers").and_then(|s| s.as_object_mut())
-        && let Some(ahma) = servers.get_mut("Ahma").and_then(|a| a.as_object_mut())
-        && let Some(args) = ahma.get_mut("args").and_then(|a| a.as_array_mut())
+    if let Some(args) = doc
+        .get_mut("mcpServers")
+        .and_then(|s| s.get_mut("Ahma"))
+        .and_then(|a| a.get_mut("args"))
+        .and_then(|a| a.as_array_mut())
     {
-        let before_len = args.len();
-        args.retain(|arg| arg.as_str() != Some("--tmp"));
-        if args.len() != before_len {
-            modified = true;
-        }
-        for arg in args.iter_mut() {
-            if let Some(s) = arg.as_str()
-                && s.contains("--tmp")
-            {
-                let cleaned = s
-                    .replace("--tmp ", "")
-                    .replace(" --tmp", "")
-                    .replace("--tmp", "");
-                *arg = serde_json::Value::String(cleaned);
-                modified = true;
-            }
-        }
+        modified = remove_tmp_from_args(args);
     }
     if modified {
         let formatted = serde_json::to_string_pretty(&doc)?;
         std::fs::write(path, formatted)?;
     }
     Ok(())
+}
+
+fn antigravity_clean_grants(current_exe: Option<&Path>) -> Vec<String> {
+    let raw_exe = current_exe
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "ahma".to_string());
+
+    vec![
+        format!("command({raw_exe} hooks run-shell)"),
+        "command(ahma hooks run-shell)".to_string(),
+        "command(regex:.*ahma.* hooks run-shell)".to_string(),
+        format!("command({raw_exe} hooks run-shell --wrapped-by ahma-hooks-wrapper-v1)"),
+        "command(ahma hooks run-shell --wrapped-by ahma-hooks-wrapper-v1)".to_string(),
+        "command(regex:.*ahma.* hooks run-shell --wrapped-by ahma-hooks-wrapper-v1)".to_string(),
+    ]
+}
+
+fn check_grant_array(arr: &serde_json::Value, clean_grants: &[String]) -> (usize, usize, bool) {
+    let Some(items) = arr.as_array() else {
+        return (0, 0, false);
+    };
+    let mut bloated = 0;
+    let mut malformed = 0;
+    for item in items {
+        if let Some(s) = item.as_str() {
+            if is_bloated_ahma_grant(s) {
+                bloated += 1;
+            } else if is_malformed_ahma_grant(s) {
+                malformed += 1;
+            }
+        }
+    }
+    let missing = clean_grants
+        .iter()
+        .any(|cg| !items.iter().any(|i| i.as_str() == Some(cg.as_str())));
+    (bloated, malformed, missing)
+}
+
+fn scan_antigravity_file(
+    path: &Path,
+    is_config: bool,
+    clean_grants: &[String],
+) -> (usize, usize, bool) {
+    if !path.exists() {
+        return (0, 0, false);
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return (0, 0, false);
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return (0, 0, false);
+    };
+    let mut total_bloated = 0;
+    let mut total_malformed = 0;
+    let mut missing = false;
+
+    if let Some(perms_allow) = doc.get("permissions").and_then(|p| p.get("allow")) {
+        let (sb, sm, smiss) = check_grant_array(perms_allow, clean_grants);
+        total_bloated += sb;
+        total_malformed += sm;
+        if smiss {
+            missing = true;
+        }
+    } else {
+        missing = true;
+    }
+
+    if is_config {
+        if let Some(gpg_allow) = doc
+            .get("userSettings")
+            .and_then(|u| u.get("globalPermissionGrants"))
+            .and_then(|g| g.get("allow"))
+        {
+            let (sb, sm, smiss) = check_grant_array(gpg_allow, clean_grants);
+            total_bloated += sb;
+            total_malformed += sm;
+            if smiss {
+                missing = true;
+            }
+        } else {
+            missing = true;
+        }
+    }
+
+    (total_bloated, total_malformed, missing)
+}
+
+fn check_ide_has_retired_tmp(ide_path: &Path) -> bool {
+    if !ide_path.exists() {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(ide_path) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    doc.get("mcpServers")
+        .and_then(|s| s.get("Ahma"))
+        .and_then(|a| a.get("args"))
+        .and_then(|a| a.as_array())
+        .is_some_and(|args| {
+            args.iter()
+                .any(|arg| arg.as_str().is_some_and(|s| s.contains("--tmp")))
+        })
 }
 
 fn check_antigravity_permissions(
@@ -530,115 +664,15 @@ fn check_antigravity_permissions(
         return;
     }
 
-    let raw_exe = current_exe
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "ahma".to_string());
+    let clean_grants = antigravity_clean_grants(current_exe);
 
-    let clean_grants = vec![
-        format!("command({raw_exe} hooks run-shell)"),
-        "command(ahma hooks run-shell)".to_string(),
-        "command(regex:.*ahma.* hooks run-shell)".to_string(),
-        format!("command({raw_exe} hooks run-shell --wrapped-by ahma-hooks-wrapper-v1)"),
-        "command(ahma hooks run-shell --wrapped-by ahma-hooks-wrapper-v1)".to_string(),
-        "command(regex:.*ahma.* hooks run-shell --wrapped-by ahma-hooks-wrapper-v1)".to_string(),
-    ];
+    let (cb, cm, cmiss) = scan_antigravity_file(&cli_path, false, &clean_grants);
+    let (gb, gm, gmiss) = scan_antigravity_file(&config_path, true, &clean_grants);
 
-    let mut total_bloated = 0;
-    let mut total_malformed = 0;
-    let mut missing_clean = false;
-
-    let scan_file = |path: &Path, is_config: bool| -> (usize, usize, bool) {
-        if !path.exists() {
-            return (0, 0, false);
-        }
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return (0, 0, false);
-        };
-        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
-            return (0, 0, false);
-        };
-        let mut b = 0;
-        let mut m = 0;
-        let mut missing = false;
-
-        let check_array = |arr: &serde_json::Value| -> (usize, usize, bool) {
-            let Some(items) = arr.as_array() else {
-                return (0, 0, false);
-            };
-            let mut sub_b = 0;
-            let mut sub_m = 0;
-            for item in items {
-                if let Some(s) = item.as_str() {
-                    if is_bloated_ahma_grant(s) {
-                        sub_b += 1;
-                    } else if is_malformed_ahma_grant(s) {
-                        sub_m += 1;
-                    }
-                }
-            }
-            let sub_missing = clean_grants
-                .iter()
-                .any(|cg| !items.iter().any(|i| i.as_str() == Some(cg.as_str())));
-            (sub_b, sub_m, sub_missing)
-        };
-
-        if let Some(perms_allow) = doc.get("permissions").and_then(|p| p.get("allow")) {
-            let (sb, sm, smiss) = check_array(perms_allow);
-            b += sb;
-            m += sm;
-            if smiss {
-                missing = true;
-            }
-        } else {
-            missing = true;
-        }
-
-        if is_config {
-            if let Some(gpg_allow) = doc
-                .get("userSettings")
-                .and_then(|u| u.get("globalPermissionGrants"))
-                .and_then(|g| g.get("allow"))
-            {
-                let (sb, sm, smiss) = check_array(gpg_allow);
-                b += sb;
-                m += sm;
-                if smiss {
-                    missing = true;
-                }
-            } else {
-                missing = true;
-            }
-        }
-
-        (b, m, missing)
-    };
-
-    let (cb, cm, cmiss) = scan_file(&cli_path, false);
-    total_bloated += cb;
-    total_malformed += cm;
-    if cli_path.exists() && cmiss {
-        missing_clean = true;
-    }
-
-    let (gb, gm, gmiss) = scan_file(&config_path, true);
-    total_bloated += gb;
-    total_malformed += gm;
-    if config_path.exists() && gmiss {
-        missing_clean = true;
-    }
-
-    let mut ide_has_retired_tmp = false;
-    if ide_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&ide_path)
-        && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
-        && let Some(ahma) = doc.get("mcpServers").and_then(|s| s.get("Ahma"))
-        && let Some(args) = ahma.get("args").and_then(|a| a.as_array())
-        && args
-            .iter()
-            .any(|arg| arg.as_str().is_some_and(|s| s.contains("--tmp")))
-    {
-        ide_has_retired_tmp = true;
-    }
+    let total_bloated = cb + gb;
+    let total_malformed = cm + gm;
+    let missing_clean = (cli_path.exists() && cmiss) || (config_path.exists() && gmiss);
+    let ide_has_retired_tmp = check_ide_has_retired_tmp(&ide_path);
 
     if total_bloated > 0 || total_malformed > 0 || missing_clean || ide_has_retired_tmp {
         let level = if total_bloated > 0 || total_malformed > 0 || ide_has_retired_tmp {
@@ -674,13 +708,8 @@ fn check_antigravity_permissions(
     }
 }
 
-/// The newest log under `<workspace>/.ahma/logs`, its size, and its most
-/// repeated warnings and errors.
-fn check_logs(workspace: &Path, out: &mut Vec<Finding>) {
-    let dir = workspace.join(".ahma").join("logs");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
-    };
+fn inspect_log_dir(dir: &Path) -> Option<(u64, Option<PathBuf>)> {
+    let entries = std::fs::read_dir(dir).ok()?;
     let mut total: u64 = 0;
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in entries.flatten() {
@@ -689,8 +718,7 @@ fn check_logs(workspace: &Path, out: &mut Vec<Finding>) {
             continue;
         }
         total += meta.len();
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("ahma.log") {
+        if !entry.file_name().to_string_lossy().starts_with("ahma.log") {
             continue;
         }
         let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -698,6 +726,16 @@ fn check_logs(workspace: &Path, out: &mut Vec<Finding>) {
             newest = Some((modified, entry.path()));
         }
     }
+    Some((total, newest.map(|(_, p)| p)))
+}
+
+/// The newest log under `<workspace>/.ahma/logs`, its size, and its most
+/// repeated warnings and errors.
+fn check_logs(workspace: &Path, out: &mut Vec<Finding>) {
+    let dir = workspace.join(".ahma").join("logs");
+    let Some((total, newest)) = inspect_log_dir(&dir) else {
+        return;
+    };
     const LARGE: u64 = 500 * 1024 * 1024;
     if total > LARGE {
         out.push(Finding {
@@ -711,7 +749,7 @@ fn check_logs(workspace: &Path, out: &mut Vec<Finding>) {
             fix: None,
         });
     }
-    let Some((_, newest)) = newest else { return };
+    let Some(newest) = newest else { return };
     let Ok(text) = std::fs::read_to_string(&newest) else {
         return;
     };
