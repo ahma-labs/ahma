@@ -347,8 +347,11 @@ pub fn resolve_grant_target(
         current = parent;
     }
 
-    let canon = super::core::canonicalize_deepest_ancestor(&full_path);
-    grant_dir_for(&canon)
+    if path.is_absolute() {
+        grant_dir_for(path)
+    } else {
+        grant_dir_for(&full_path)
+    }
 }
 
 #[cfg(test)]

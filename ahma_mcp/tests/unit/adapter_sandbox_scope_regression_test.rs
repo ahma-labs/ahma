@@ -110,7 +110,7 @@ async fn adapter_sync_denial_on_symlinked_target_returns_runtime_denial() {
         let script = ws_canon.join("fail.bat");
         std::fs::write(
             &script,
-            "@echo error: failed to create directory 'target\\debug' 1>&2\r\n@exit /b 1\r\n",
+            "@echo error: failed to create directory 'target\\debug' 1>&2\r\n@echo Caused by: 1>&2\r\n@echo   Operation not permitted (os error 1) 1>&2\r\n@exit /b 1\r\n",
         )
         .unwrap();
     }
