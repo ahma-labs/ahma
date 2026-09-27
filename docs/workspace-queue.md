@@ -88,7 +88,7 @@ missing or broken ahma cannot block editing.
 | **Lease** | An exclusive operation takes its workspace's lease before it spawns and holds it until its whole process tree exits. |
 | **Order** | A place in line is taken the moment the call arrives. Within one ahma process the order is strict FIFO; between processes the kernel lock guarantees one writer at a time. |
 | **Kernel lock** | `flock` / `LockFileEx` on a file in the per-user runtime directory (`$XDG_RUNTIME_DIR/ahma/locks`, else `~/.ahma/locks`; `%LOCALAPPDATA%\ahma\run\locks` on Windows). Released by the kernel when the holder exits for any reason — no stale locks, nothing to clean up, and the file is outside every workspace so no command can delete it while it is held. |
-| **Nesting** | A command run under a lease carries `AHMA_HELD_WORKSPACE_LEASE`; an ahma it starts (ahma's own test suite, run through ahma) does not wait for the lease its ancestor holds. |
+| **Nesting** | A command run under a lease carries `AHMA_HELD_WORKSPACE_LEASE`; an ahma it starts (ahma's own test suite, run through ahma) does not wait for the lease its ancestor holds. The per-user daemon never inherits it, since it outlives that command. |
 | **Timeouts** | A queued command's wait counts against its own timeout, and it is cancellable while queued. Once it starts, its duration and timeout measure the command, not the wait; the wait is stated in its result. |
 
 ### Lanes
@@ -103,7 +103,13 @@ The read-only lane exists only where the kernel can enforce it. On **Windows** (
 filesystem boundary yet, R6.3.3), in Test-mode sandboxes, and in a macOS ahma nested inside
 another Seatbelt profile, every command is exclusive.
 
-A custom tool declares its lane in MTDF (subcommand overrides tool):
+The bundled tools declare theirs: `file-tools` reads (`ls`, `cat`, `grep`, `find`, `head`,
+`tail`, `diff`, `pwd`, `cd`), `git` `status` and `log`, and the `gh` list/view commands are
+`read_only`; `gh run_watch`, which follows a CI run for minutes, is `service`. Everything
+else — `sed`, `rm`, `git commit`, `gh run_download` — stays `exclusive`.
+
+A custom tool declares its lane in MTDF. A declaration on the tool applies to every
+subcommand; the nearest one wins:
 
 ```json
 { "name": "status", "description": "git status", "concurrency": "read_only" }
@@ -129,8 +135,12 @@ A custom tool declares its lane in MTDF (subcommand overrides tool):
 - **Cross-process order is mutual exclusion, not FIFO.** Two sessions queued on the same
   workspace never overlap, but the kernel lock does not promise which goes first.
 - **The drift report is by modification time**, skips `.gitignore`d paths and `.git/`,
-  names at most 20 files, and cannot tell who wrote a file — a writer that also edits
+  never walks outside the sandbox scope, names at most 20 files, and cannot tell who wrote a file — a writer that also edits
   sources (`cargo fmt`) is listed too.
+- **A synchronous call waits at most its own timeout.** Terminal hooks, CLI one-shots and
+  `synchronous: true` tools have no operation id to hand back while they wait, so they say
+  once that they are waiting (a hook writes it to stderr, which the client shows) and, if the
+  workspace stays busy for the whole timeout, fail with `Not run: …` naming the holder.
 - **A long-running command in the exclusive lane holds the workspace** until it ends. Run
   servers and log followers through `livelog` (or declare them `service`), or `cancel` the
   holder the queued result names.

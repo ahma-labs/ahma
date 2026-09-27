@@ -44,7 +44,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -970,6 +970,23 @@ async fn try_connect() -> bool {
 /// the opposite reason to an owned child (R-PROC.2) — `setpgid(0,0)` puts the
 /// daemon in its own group so it is *not* killed when the spawning terminal/IDE
 /// exits, rather than so it can be reaped with us.
+/// The command that starts a detached hub daemon: no stdio, its own process
+/// group, and none of the spawning tree's supervision markers
+/// ([`crate::process_guard::NOT_INHERITED_BY_DAEMON`]).
+fn detached_daemon_command(exe: &Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for key in crate::process_guard::NOT_INHERITED_BY_DAEMON {
+        cmd.env_remove(key);
+    }
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd
+}
+
 fn spawn_detached_daemon() -> Result<()> {
     // Never from a test binary (SPEC R-ISO.1). `current_exe()` inside one is
     // the *test harness*, not `ahma`, so this would re-run the test binary with
@@ -984,15 +1001,7 @@ fn spawn_detached_daemon() -> Result<()> {
         );
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ahma"));
-    let mut cmd = tokio::process::Command::new(&exe);
-    cmd.arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    #[cfg(unix)]
-    cmd.process_group(0);
-
+    let mut cmd = detached_daemon_command(&exe);
     if let Err(e) = cmd.spawn() {
         bail!("Failed to spawn ahma daemon: {e}");
     }
@@ -2605,6 +2614,29 @@ fn local_instance_id() -> String {
 #[cfg(test)]
 mod tests {
     use crate::timeouts::TestTimeouts;
+
+    /// SPEC R2.7.7: the detached daemon outlives whoever started it, so it
+    /// must not inherit that process tree's lease — or it and all its workers
+    /// would skip the workspace lock for good.
+    #[test]
+    fn the_detached_daemon_inherits_no_supervision_marker() {
+        let cmd = super::detached_daemon_command(std::path::Path::new("ahma"));
+        let removed: Vec<_> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for key in [
+            crate::process_guard::HELD_WORKSPACE_LEASE_ENV,
+            "AHMA_SERVER_CHILD",
+        ] {
+            assert!(
+                removed.iter().any(|r| r == key),
+                "{key} must be removed: {removed:?}"
+            );
+        }
+    }
     // ── Wire compatibility for the R24.7 identity fields ─────────────────────
 
     /// A *new* event must deserialize into an *old* reader.

@@ -57,8 +57,8 @@ use tokio_util::sync::CancellationToken;
 /// Environment variable naming the workspace lease(s) the current process tree
 /// already runs under. Internal supervision marker, like `AHMA_SERVER_CHILD` —
 /// not configuration (SPEC R-CFG): it only ever *skips a wait* for a lease an
-/// ancestor provably holds.
-pub const HELD_LEASE_ENV: &str = "AHMA_HELD_WORKSPACE_LEASE";
+/// ancestor provably holds. Never inherited by the detached daemon.
+pub const HELD_LEASE_ENV: &str = ahma_common::process_guard::HELD_WORKSPACE_LEASE_ENV;
 
 /// How an operation participates in the workspace queue.
 #[derive(
@@ -159,6 +159,27 @@ pub fn workspace_key(working_dir: &Path, scopes: &[PathBuf]) -> PathBuf {
     scopes
         .iter()
         .map(|s| dunce::canonicalize(s).unwrap_or_else(|_| s.clone()))
+        .filter(|s| wd.starts_with(s))
+        .max_by_key(|s| s.components().count())
+        .unwrap_or(wd)
+}
+
+/// Where the drift probe (SPEC R2.7.6) may walk for an operation keyed on
+/// `key`: the key itself when a sandbox scope contains it, otherwise the
+/// longest scope containing `working_dir`, otherwise `working_dir`. The lease
+/// key may lie above every scope (a `.git` in `$HOME`); the walk runs in the
+/// server process, so it must not list files the sandbox hides from the model.
+pub fn drift_root(key: &Path, scopes: &[PathBuf], working_dir: &Path) -> PathBuf {
+    let scopes: Vec<PathBuf> = scopes
+        .iter()
+        .map(|s| dunce::canonicalize(s).unwrap_or_else(|_| s.clone()))
+        .collect();
+    if scopes.iter().any(|s| key.starts_with(s)) {
+        return key.to_path_buf();
+    }
+    let wd = dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+    scopes
+        .into_iter()
         .filter(|s| wd.starts_with(s))
         .max_by_key(|s| s.components().count())
         .unwrap_or(wd)
@@ -448,6 +469,39 @@ impl WorkspaceQueue {
         }
     }
 
+    /// [`Self::probe`] for a path about to be edited, from a caller that may
+    /// not know the sandbox scopes (the harness edit hook, SPEC R2.7.8).
+    /// Returns the busy workspace and its holder, or `None` when it is free.
+    ///
+    /// Inside a git repository the key is the repository, the same as the
+    /// server's. Outside one the server keys by its sandbox scope, which the
+    /// hook cannot see, so every ancestor of the path whose rendezvous file
+    /// exists is probed too — never creating one for a directory that was
+    /// never a workspace.
+    pub fn probe_path(
+        &self,
+        path: &Path,
+        scopes: &[PathBuf],
+    ) -> Option<(PathBuf, Option<HolderInfo>)> {
+        let key = workspace_key_for_path(path, scopes);
+        if let LeaseProbe::Held { holder } = self.probe(&key) {
+            return Some((key, holder));
+        }
+        if key.join(".git").exists() {
+            return None;
+        }
+        let start = path.ancestors().find(|a| a.is_dir()).unwrap_or(path);
+        let start = dunce::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+        start
+            .ancestors()
+            .filter(|a| *a != key)
+            .filter(|a| self.lock_path(a).is_some_and(|p| p.exists()))
+            .find_map(|a| match self.probe(a) {
+                LeaseProbe::Held { holder } => Some((a.to_path_buf(), holder)),
+                LeaseProbe::Free => None,
+            })
+    }
+
     /// Why `op_id` has not started: the operations ahead of it, if it is still
     /// waiting in a line (SPEC R2.7.3). `None` when it is not queued at all or
     /// already runs. An empty list means it is next, and waiting only for
@@ -488,6 +542,16 @@ impl WorkspaceQueue {
         let path = self.holder_path(key)?;
         let text = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&text).ok()
+    }
+}
+
+/// Write the holder record beside the lock, atomically — to a private temp
+/// file, then renamed over the record — so a reader never sees half a JSON
+/// document and mistakes a held workspace for an anonymous holder.
+async fn publish_holder(path: &Path, json: String) {
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if tokio::fs::write(&tmp, json).await.is_ok() && tokio::fs::rename(&tmp, path).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
 }
 
@@ -556,7 +620,15 @@ impl Ticket {
             (Some(path), false) => {
                 let mut backoff = Duration::from_millis(20);
                 loop {
-                    match FsLock::try_acquire(path) {
+                    // open + flock are blocking syscalls: keep them off the
+                    // async worker threads.
+                    let attempt = {
+                        let path = path.clone();
+                        tokio::task::spawn_blocking(move || FsLock::try_acquire(&path))
+                            .await
+                            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+                    };
+                    match attempt {
                         Ok(Some(lock)) => break Some(lock),
                         Ok(None) => {}
                         Err(e) => {
@@ -571,11 +643,11 @@ impl Ticket {
                         }
                     }
                     if last_observed.elapsed() >= OBSERVE_EVERY {
-                        let elsewhere = self
-                            .holder_path
-                            .as_ref()
-                            .and_then(|p| std::fs::read_to_string(p).ok())
-                            .and_then(|t| serde_json::from_str::<HolderInfo>(&t).ok());
+                        let elsewhere = match &self.holder_path {
+                            Some(p) => tokio::fs::read_to_string(p).await.ok(),
+                            None => None,
+                        }
+                        .and_then(|t| serde_json::from_str::<HolderInfo>(&t).ok());
                         observe(&elsewhere.into_iter().collect::<Vec<_>>());
                         last_observed = Instant::now();
                     }
@@ -597,7 +669,7 @@ impl Ticket {
             && let Some(path) = &self.holder_path
             && let Ok(json) = serde_json::to_string(&holder)
         {
-            let _ = std::fs::write(path, json);
+            publish_holder(path, json).await;
         }
 
         self.lane.mark_granted(self.seq);
@@ -612,7 +684,6 @@ impl Ticket {
                 None
             },
             _fs_lock: fs_lock,
-            queued_for: Duration::from_secs(unix_now().saturating_sub(self.holder.since_unix)),
         })
     }
 }
@@ -634,17 +705,11 @@ pub struct Lease {
     key: PathBuf,
     holder_path: Option<PathBuf>,
     _fs_lock: Option<FsLock>,
-    queued_for: Duration,
 }
 
 impl Lease {
     pub fn key(&self) -> &Path {
         &self.key
-    }
-
-    /// How long the ticket waited before the lease was granted.
-    pub fn queued_for(&self) -> Duration {
-        self.queued_for
     }
 }
 
@@ -705,6 +770,36 @@ mod tests {
         std::fs::create_dir_all(&wd).unwrap();
         let key = workspace_key(&wd, &[outer.clone(), inner.clone()]);
         assert_eq!(key, dunce::canonicalize(&inner).unwrap());
+    }
+
+    /// SPEC R2.7.6: a `.git` above the sandbox scope (a dotfiles repository in
+    /// `$HOME`) may key the lease, but the drift walk never leaves the scope —
+    /// it would list files the sandbox forbids the model to see.
+    #[test]
+    fn the_drift_root_never_leaves_the_sandbox_scope() {
+        let td = tempdir().unwrap();
+        let home = td.path().join("home");
+        let project = home.join("project");
+        let wd = project.join("src");
+        std::fs::create_dir_all(&wd).unwrap();
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let scopes = vec![project.clone()];
+        let key = workspace_key(&wd, &scopes);
+        assert_eq!(
+            key,
+            dunce::canonicalize(&home).unwrap(),
+            "the lease key is the repo"
+        );
+        assert_eq!(
+            drift_root(&key, &scopes, &wd),
+            dunce::canonicalize(&project).unwrap(),
+            "the walk is clipped to the scope"
+        );
+
+        // Inside the scope, the repository root is the walk root.
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let key = workspace_key(&wd, &scopes);
+        assert_eq!(drift_root(&key, &scopes, &wd), key);
     }
 
     #[test]
@@ -896,7 +991,7 @@ mod tests {
             ticket
                 .acquire(&CancellationToken::new(), &no_observe)
                 .await
-                .map(|lease| lease.queued_for())
+                .map(drop)
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!handle.is_finished(), "must wait for the foreign holder");

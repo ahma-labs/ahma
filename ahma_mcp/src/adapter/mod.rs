@@ -234,6 +234,10 @@ pub struct Adapter {
     /// process. Disabled unless the embedder opts in
     /// ([`Self::with_workspace_queue`]); the `ahma` binary always does.
     workspace_queue: workspace_queue::WorkspaceQueue,
+    /// Told once when a synchronous call has to wait for its workspace (SPEC
+    /// R2.7.1): a terminal hook writes it to stderr, so the harness's own
+    /// shell result explains the delay instead of hanging silently.
+    queue_wait_notice: Option<QueueWaitNotice>,
     /// Optional sink for auto-detected sandbox scope violations. When set, an
     /// out-of-scope path (rejected up front, or surfaced by a stderr denial) raises
     /// a "grant access to X?" prompt through this notifier. `None` disables
@@ -292,6 +296,7 @@ impl Adapter {
             shell_sessions: crate::shell_session::ShellSessionManager::new(),
             mutex_registry,
             workspace_queue: workspace_queue::WorkspaceQueue::disabled(),
+            queue_wait_notice: None,
             scope_grant_notifier: None,
         })
     }
@@ -299,6 +304,13 @@ impl Adapter {
     /// Enable (or replace) the workspace write queue (SPEC R2.7).
     pub fn with_workspace_queue(mut self, queue: workspace_queue::WorkspaceQueue) -> Self {
         self.workspace_queue = queue;
+        self
+    }
+
+    /// Where a synchronous call says that it is waiting for its workspace
+    /// (SPEC R2.7.1). Without one the wait is logged at `info`.
+    pub fn with_queue_wait_notice(mut self, notice: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.queue_wait_notice = Some(QueueWaitNotice(notice));
         self
     }
 
@@ -551,11 +563,9 @@ impl Adapter {
         let title = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| format!("{program} {}", args_vec.join(" ")));
+        let timeout = self.sync_timeout(timeout_seconds);
         let lease = match self.enqueue_exclusive(lane, &safe_wd, &op_id, &title) {
-            Some(ticket) => ticket
-                .acquire(&tokio_util::sync::CancellationToken::new(), &|_| {})
-                .await
-                .ok(),
+            Some(ticket) => Some(self.acquire_for_sync(ticket, timeout).await?),
             None => None,
         };
 
@@ -577,7 +587,7 @@ impl Adapter {
                 &program,
                 &args_vec,
                 &safe_wd,
-                timeout_seconds,
+                timeout,
                 lane,
                 lease.as_ref(),
             )
@@ -591,6 +601,51 @@ impl Adapter {
         )
         .await;
         run.result
+    }
+
+    /// The synchronous path's timeout: the caller's, else the pool default.
+    fn sync_timeout(&self, timeout_seconds: Option<u64>) -> Duration {
+        timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| self.shell_pool.config().command_timeout)
+    }
+
+    /// Wait for a synchronous call's turn in its workspace (SPEC R2.7.1). The
+    /// synchronous path has no operation to show as queued, so the wait is
+    /// bounded by the command's own timeout and announced once; a turn that
+    /// never comes is an error saying the command did **not** run and who held
+    /// the workspace, never a silent hang until the caller gives up.
+    async fn acquire_for_sync(
+        &self,
+        ticket: workspace_queue::Ticket,
+        timeout: Duration,
+    ) -> Result<workspace_queue::Lease, anyhow::Error> {
+        let last_ahead = parking_lot::Mutex::new(Vec::new());
+        let announced = std::sync::atomic::AtomicBool::new(false);
+        let observe = |ahead: &[workspace_queue::HolderInfo]| {
+            *last_ahead.lock() = ahead.to_vec();
+            if !announced.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let line = format!("ahma: {}", queued_message(ahead));
+                match &self.queue_wait_notice {
+                    Some(notice) => (notice.0)(&line),
+                    None => tracing::info!("{line}"),
+                }
+            }
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        match tokio::time::timeout(timeout, ticket.acquire(&cancel, &observe)).await {
+            Ok(Ok(lease)) => Ok(lease),
+            Ok(Err(e)) => Err(anyhow::anyhow!("Not run: {e}")),
+            Err(_) => {
+                let ahead = last_ahead.lock().clone();
+                Err(anyhow::anyhow!(
+                    "Not run: the workspace stayed busy for its whole {}s timeout. {}. \
+                     Retry once that finishes, or cancel it.",
+                    timeout.as_secs(),
+                    queued_message(&ahead)
+                ))
+            }
+        }
     }
 
     /// Spawn, wait for, and interpret one prepared synchronous command.
@@ -608,14 +663,10 @@ impl Adapter {
         program: &str,
         args_vec: &[String],
         safe_wd: &std::path::Path,
-        timeout_seconds: Option<u64>,
+        timeout: Duration,
         lane: workspace_queue::Lane,
         lease: Option<&workspace_queue::Lease>,
     ) -> SyncRun {
-        let timeout = timeout_seconds
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| self.shell_pool.config().command_timeout);
-
         // Create sandboxed command.
         // `create_shell_command` is only needed for raw /bin/sh invocations where
         // the caller has NOT already added the -c flag via a subcommand config.
@@ -973,6 +1024,7 @@ impl Adapter {
         // synchronously, before anything is spawned.
         let lane = self.resolve_lane(args.as_ref(), subcommand_config);
         let workspace = self.workspace_key_for(&safe_wd);
+        let drift_root = workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd);
         let holder_title = operation
             .command
             .clone()
@@ -1025,6 +1077,7 @@ impl Adapter {
             lane,
             ticket,
             workspace,
+            drift_root,
             display_command,
         }));
 
@@ -1346,9 +1399,11 @@ struct AsyncOperationRun {
     lane: workspace_queue::Lane,
     /// Place in the workspace line, for an exclusive operation.
     ticket: Option<workspace_queue::Ticket>,
-    /// The workspace key (SPEC R2.7.2): the drift probe's root and the mutex
-    /// groups' key.
+    /// The workspace key (SPEC R2.7.2): the mutex groups' key.
     workspace: std::path::PathBuf,
+    /// Where the drift probe walks: the workspace, clipped to the sandbox
+    /// scope (SPEC R2.7.6).
+    drift_root: std::path::PathBuf,
     /// The command line as the caller wrote it (for a shell tool, the shell
     /// string — `command` is then just the shell program).
     display_command: String,
@@ -1374,6 +1429,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         lane,
         ticket,
         workspace,
+        drift_root,
         display_command,
     } = ctx;
 
@@ -1486,8 +1542,8 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         .map(|t| t * 1000)
         .unwrap_or_else(|| shell_pool.config().command_timeout.as_millis() as u64);
 
-    let drift = (lane != workspace_queue::Lane::Service).then(|| DriftProbe {
-        root: workspace.clone(),
+    let drift = (lane != workspace_queue::Lane::Service).then_some(DriftProbe {
+        root: drift_root,
         lane,
     });
 
@@ -1570,6 +1626,17 @@ async fn wait_for_lease(
         monitor.left_queue(op_id, waited).await;
     }
     Ok(Some(lease))
+}
+
+/// Where a synchronous call announces a wait for its workspace; see
+/// [`Adapter::with_queue_wait_notice`].
+#[derive(Clone)]
+struct QueueWaitNotice(Arc<dyn Fn(&str) + Send + Sync>);
+
+impl std::fmt::Debug for QueueWaitNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueueWaitNotice")
+    }
 }
 
 /// A wait shorter than this is not worth a line in the result.
@@ -2725,6 +2792,55 @@ mod tests {
             Lane::Exclusive,
             "only a shell command line (c_flag) is classified"
         );
+    }
+
+    /// SPEC R2.7.1: the synchronous path (terminal hooks, CLI one-shots,
+    /// `synchronous: true` tools) waits for the workspace no longer than its
+    /// own timeout, says it is waiting, and — if the turn never comes — reports
+    /// that the command did not run and who held the workspace.
+    #[tokio::test]
+    async fn a_sync_call_waits_for_the_workspace_no_longer_than_its_timeout() {
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let notices = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let sink = notices.clone();
+        let adapter = adapter
+            .with_workspace_queue(workspace_queue::WorkspaceQueue::with_lock_dir(
+                true,
+                Some(td.path().join("locks")),
+            ))
+            .with_queue_wait_notice(Arc::new(move |line: &str| {
+                sink.lock().push(line.to_string())
+            }));
+        let key = adapter.workspace_key_for(td.path());
+        let _held = adapter
+            .workspace_queue()
+            .enqueue(
+                &key,
+                workspace_queue::HolderInfo::new("op_holder", "cargo nextest run"),
+            )
+            .unwrap()
+            .acquire(&tokio_util::sync::CancellationToken::new(), &|_| {})
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let err = adapter
+            .execute_sync_in_dir("echo", None, &td.path().to_string_lossy(), Some(1), None)
+            .await
+            .expect_err("the workspace never frees up, so the command must not run");
+        let text = err.to_string();
+        assert!(text.contains("Not run"), "{text}");
+        assert!(text.contains("op_holder"), "names the holder: {text}");
+        assert!(
+            started.elapsed()
+                < ahma_common::timeouts::TestTimeouts::get(
+                    ahma_common::timeouts::TimeoutCategory::Quick
+                ),
+            "bounded by its own one-second timeout"
+        );
+        let notices = notices.lock();
+        assert_eq!(notices.len(), 1, "one notice per wait: {notices:?}");
+        assert!(notices[0].contains("op_holder"), "{notices:?}");
     }
 
     #[test]

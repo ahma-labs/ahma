@@ -29,9 +29,7 @@ use super::{
     PATH_LOOKUP_BINARY, build_windows_absolute_command, ensure_child_array, ensure_child_object,
     ensure_root_object, remove_managed_hook_entries, shell_quote_posix,
 };
-use crate::adapter::workspace_queue::{
-    LeaseProbe, WorkspaceQueue, edit_refusal, workspace_key_for_path,
-};
+use crate::adapter::workspace_queue::{WorkspaceQueue, edit_refusal};
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 use std::io::Read;
@@ -161,6 +159,9 @@ fn collect_paths(value: &Value, out: &mut Vec<String>) {
                             if let Some(s) = item.as_str() {
                                 if key == "files" {
                                     out.push(s.to_string());
+                                } else {
+                                    // `["apply_patch", "*** Begin Patch…"]`
+                                    out.extend(patch_paths(s));
                                 }
                             } else {
                                 collect_paths(item, out);
@@ -178,8 +179,13 @@ fn collect_paths(value: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// The files named in a Codex-format patch (`*** Update File: …`).
+/// The files named in a Codex-format patch (`*** Update File: …`). Only a
+/// string that *is* a patch counts: a file's content that merely quotes a
+/// patch header (documentation about Codex, say) names no edited path.
 fn patch_paths(text: &str) -> Vec<String> {
+    if !text.trim_start().starts_with("*** Begin Patch") {
+        return Vec::new();
+    }
     const HEADERS: &[&str] = &[
         "*** Add File: ",
         "*** Update File: ",
@@ -223,9 +229,8 @@ pub fn refusal(payload: &Value, queue: &WorkspaceQueue) -> Option<String> {
         let Some(path) = absolute(&raw, cwd) else {
             continue;
         };
-        let key = workspace_key_for_path(&path, &[]);
-        if let LeaseProbe::Held { holder } = queue.probe(&key) {
-            return Some(edit_refusal(&path, &key, holder.as_ref()));
+        if let Some((workspace, holder)) = queue.probe_path(&path, &[]) {
+            return Some(edit_refusal(&path, &workspace, holder.as_ref()));
         }
     }
     None
@@ -490,6 +495,47 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(reason.contains("cargo nextest run"), "{reason}");
+    }
+
+    /// Outside a git repository the server keys a workspace by its sandbox
+    /// scope, which the hook cannot know: a lease on any ancestor of the
+    /// edited file must still refuse the edit.
+    #[tokio::test]
+    async fn an_edit_in_a_non_git_workspace_is_denied() {
+        let td = tempdir().unwrap();
+        let project = td.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        let project = dunce::canonicalize(&project).unwrap();
+        let queue = WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")));
+        let _lease = queue
+            .enqueue(&project, HolderInfo::new("op_5", "make test"))
+            .unwrap()
+            .acquire(&CancellationToken::new(), &|_| {})
+            .await
+            .unwrap();
+        let path = project.join("src/lib.rs").to_string_lossy().into_owned();
+        let payload = json!({"tool_name": "Edit", "tool_input": {"file_path": path}});
+        let out = decide(Some(HookPlatform::Claude), &payload, &queue).expect("deny");
+        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
+
+    /// A `Write` whose *content* merely quotes a Codex patch header edits one
+    /// file, not the files the quoted patch names.
+    #[test]
+    fn a_patch_passed_as_an_argv_element_is_read() {
+        let input = json!({
+            "command": ["apply_patch", "*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch"]
+        });
+        assert_eq!(edited_paths(&input), vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn patch_headers_inside_file_content_are_not_edited_paths() {
+        let input = json!({
+            "file_path": "/docs/codex.md",
+            "content": "Codex patches look like:\n*** Update File: src/other.rs\n"
+        });
+        assert_eq!(edited_paths(&input), vec!["/docs/codex.md"]);
     }
 
     #[tokio::test]

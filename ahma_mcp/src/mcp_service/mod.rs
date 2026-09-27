@@ -1780,22 +1780,10 @@ impl ServerHandler for AhmaMcpService {
                 self.guard_sandbox_ready_for_tool_calls().await?;
             }
 
-            let awaited_id = (builtin == Some(BuiltinTool::Await))
-                .then(|| {
-                    run_params
-                        .arguments
-                        .as_ref()
-                        .and_then(|a| a.get("id"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                })
-                .flatten();
             let result = self
                 .dispatch_tool_call(tool_name.as_ref(), run_params, context)
                 .await;
-            let result = self
-                .deliver_finished_operations(builtin, awaited_id.as_deref(), result)
-                .await;
+            let result = self.deliver_finished_operations(result).await;
 
             if is_guard_active {
                 self.record_result_in_loop_detector(
@@ -1852,33 +1840,14 @@ fn append_external_mcp_tools(
 
 impl AhmaMcpService {
     /// Settle the undelivered-results ledger after a tool call (SPEC R2.7.5):
-    /// what an `await` just returned is delivered; anything else that has
-    /// finished since is prepended to this result.
+    /// anything that has finished and was not already rendered by this call
+    /// is prepended to its result. `await` settles what it renders itself
+    /// (`delivered_by_await`), so an `await` that did not show a finished
+    /// operation — it was not waiting for it — still delivers it here.
     async fn deliver_finished_operations(
         &self,
-        builtin: Option<BuiltinTool>,
-        awaited_id: Option<&str>,
         result: Result<CallToolResult, McpError>,
     ) -> Result<CallToolResult, McpError> {
-        if builtin == Some(BuiltinTool::Await) {
-            // An `await` delivers what it saw finish: the id it named, or —
-            // without one — everything pending. A soft timeout delivered
-            // nothing, so only operations that have actually finished count.
-            let candidates = match awaited_id {
-                Some(id) => vec![id.to_string()],
-                None => self.undelivered.pending(),
-            };
-            for id in candidates {
-                if self
-                    .operation_monitor
-                    .check_completion_history_pub(&id)
-                    .await
-                    .is_some()
-                {
-                    self.undelivered.delivered(&id);
-                }
-            }
-        }
         let Ok(result) = result else {
             return result;
         };

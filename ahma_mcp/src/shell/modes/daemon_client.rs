@@ -182,14 +182,15 @@ async fn drain_and_wait(socket_path: Option<&str>, http_url: Option<&str>) -> bo
     false
 }
 
-/// Start the daemon, detached, and wait for it to answer.
-async fn spawn_daemon(
+/// The command that starts the detached per-user daemon (SPEC R-PROC.3).
+/// None of the spawning tree's supervision markers survive into it
+/// ([`ahma_common::process_guard::NOT_INHERITED_BY_DAEMON`]).
+fn daemon_command(
+    exe: &std::path::Path,
     socket_path: Option<&str>,
-    http_url: Option<&str>,
     idle_timeout_secs: Option<u64>,
-) -> Result<()> {
-    let exe = std::env::current_exe().context("Failed to get current executable path")?;
-    let mut cmd = tokio::process::Command::new(&exe);
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("daemon");
     if let Some(path) = socket_path {
         cmd.args(["--unix-socket-path", path]);
@@ -210,8 +211,12 @@ async fn spawn_daemon(
         ahma_common::process_guard::SPAWN_DEPTH_ENV,
         ahma_common::process_guard::child_spawn_depth(),
     );
-    // Never inherited: it would make the daemon believe it is a session worker.
-    cmd.env_remove("AHMA_SERVER_CHILD");
+    // Never inherited: `AHMA_SERVER_CHILD` would make the daemon believe it is
+    // a session worker; an inherited workspace lease would make it skip that
+    // workspace's lock for the rest of its life (SPEC R2.7.7).
+    for key in ahma_common::process_guard::NOT_INHERITED_BY_DAEMON {
+        cmd.env_remove(key);
+    }
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
@@ -223,7 +228,19 @@ async fn spawn_daemon(
     {
         cmd.creation_flags(crate::shell_pool::CREATE_NO_WINDOW);
     }
-    cmd.spawn().context("Failed to spawn the ahma daemon")?;
+    cmd
+}
+
+/// Start the daemon, detached, and wait for it to answer.
+async fn spawn_daemon(
+    socket_path: Option<&str>,
+    http_url: Option<&str>,
+    idle_timeout_secs: Option<u64>,
+) -> Result<()> {
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
+    daemon_command(&exe, socket_path, idle_timeout_secs)
+        .spawn()
+        .context("Failed to spawn the ahma daemon")?;
 
     let timeout =
         ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick);
@@ -268,6 +285,29 @@ pub fn socket_is_stale(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// SPEC R2.7.7: the daemon outlives whoever started it, so it inherits
+    /// neither that tree's worker marker nor its workspace lease.
+    #[test]
+    fn the_daemon_inherits_no_supervision_marker() {
+        let cmd = super::daemon_command(std::path::Path::new("ahma"), None, None);
+        let removed: Vec<_> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for key in ahma_common::process_guard::NOT_INHERITED_BY_DAEMON {
+            assert!(
+                removed.iter().any(|r| r == key),
+                "{key} must be removed: {removed:?}"
+            );
+        }
+        assert!(
+            ahma_common::process_guard::NOT_INHERITED_BY_DAEMON
+                .contains(&crate::adapter::workspace_queue::HELD_LEASE_ENV)
+        );
+    }
     use super::*;
 
     const OURS: &str = "0.20.2";

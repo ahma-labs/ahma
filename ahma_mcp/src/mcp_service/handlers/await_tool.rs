@@ -589,6 +589,7 @@ impl AhmaMcpService {
 
         match wait_result {
             Ok(Some(completed_op)) => {
+                self.delivered_by_await(std::slice::from_ref(&completed_op));
                 let contents =
                     common::serialize_operations_to_content(std::slice::from_ref(&completed_op));
                 Ok(build_completion_result(contents, wait_start))
@@ -624,6 +625,7 @@ impl AhmaMcpService {
         else {
             return common::text_result(format!("Operation {} not found", op_id));
         };
+        self.delivered_by_await(std::slice::from_ref(&completed_op));
         let mut contents = vec![ContentBlock::text(format!(
             "Operation {} already completed",
             op_id
@@ -632,6 +634,15 @@ impl AhmaMcpService {
             std::slice::from_ref(&completed_op),
         ));
         CallToolResult::success(contents)
+    }
+
+    /// Settle the undelivered-results ledger (SPEC R2.7.5) for exactly the
+    /// operations this `await` renders in its answer — never for what it did
+    /// not show, which is then piggybacked on the same result instead.
+    fn delivered_by_await(&self, ops: &[Operation]) {
+        for op in ops {
+            self.undelivered.delivered(&op.id);
+        }
     }
 
     async fn pending_operations_for_filters(&self, tool_filters: &[String]) -> Vec<Operation> {
@@ -673,6 +684,7 @@ impl AhmaMcpService {
                     .into_iter()
                     .flatten()
                     .collect();
+                self.delivered_by_await(&completed);
                 common::serialize_operations_to_content(&completed)
             },
         )
@@ -698,6 +710,7 @@ impl AhmaMcpService {
         if relevant_completed.is_empty() {
             return None;
         }
+        self.delivered_by_await(&relevant_completed);
 
         let mut contents = vec![ContentBlock::text(format!(
             "No pending operations for tools: {}. However, these operations recently completed:",

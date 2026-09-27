@@ -243,7 +243,7 @@ impl CommandMutexRegistry {
         })
     }
 
-    /// Returns the number of `(group, dir)` semaphores currently tracked.
+    /// Where the cross-process rendezvous files live (tests).
     #[cfg(test)]
     pub fn lock_dir(&self) -> Option<&Path> {
         self.lock_dir.as_deref()

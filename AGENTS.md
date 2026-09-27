@@ -671,9 +671,12 @@ version bump is what triggers a release**: a push to `main` publishes GitHub Rel
 `v<X.Y.Z>` only when it bumps to a version whose tag does not yet exist; an ordinary land that
 doesn't change the version runs the test matrix but publishes nothing.
 
-Install local git guardrail hook:
+Install local git hooks — the guardrails before push, and a `commit-msg` hook that strips AI
+attribution trailers (`Co-Authored-By: Claude`, `🤖 Generated with [Claude Code]`,
+`Claude-Session:`), which would otherwise land on `main` through the squash body:
 ```bash
 cp scripts/check-guardrails.sh .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+cp scripts/commit-msg.sh .git/hooks/commit-msg && chmod +x .git/hooks/commit-msg
 ```
 
 ### Repo-Local Skills

@@ -20,6 +20,10 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "ls",
     "cat",
     "head",
+    // `tail -f` included: a follower never ends, so in the exclusive lane it
+    // would hold the workspace — and stall every later writer — for its whole
+    // life. It never writes, which is exactly what the read-only lane enforces.
+    "tail",
     "wc",
     "stat",
     "file",
@@ -141,11 +145,6 @@ pub fn classify_shell_command(command: &str) -> Lane {
     }
     let read_only = match program.as_str() {
         "git" => git_is_read_only(args),
-        // `tail -f` never ends; it is read-only but belongs in no queue anyway,
-        // and in the exclusive lane it would at least be visible as the holder.
-        "tail" => !args.iter().any(|a| {
-            a == "-f" || a == "-F" || a.starts_with("--follow") || a.starts_with("--retry")
-        }),
         "find" => !args.iter().any(|a| {
             matches!(
                 a.as_str(),
@@ -210,6 +209,10 @@ mod tests {
             "ls -la",
             "cat Cargo.toml",
             "tail -n 50 build.log",
+            // A follower never ends and never writes: holding the workspace
+            // for its whole life would stall every later writer.
+            "tail -f build.log",
+            "tail --follow=name build.log",
             "find . -name '*.rs'",
             "wc -l src/lib.rs",
         ] {
@@ -262,8 +265,6 @@ mod tests {
             "git -c core.fsmonitor=evil status",
             "git -C other status",
             "git diff --output=patch.diff",
-            "tail -f log",
-            "tail --follow=name log",
         ] {
             assert_eq!(lane(cmd), Lane::Exclusive, "{cmd}");
         }

@@ -1518,7 +1518,10 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         )?
         .with_workspace_queue(crate::adapter::workspace_queue::WorkspaceQueue::new(
             cfg.workspace_queue,
-        )),
+        ))
+        // The harness shows this command's stderr to the model: a wait for
+        // the workspace is explained there, not left as a silent hang.
+        .with_queue_wait_notice(std::sync::Arc::new(|line: &str| eprintln!("{line}"))),
     );
 
     let mut adapter_args = serde_json::Map::new();

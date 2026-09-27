@@ -79,14 +79,11 @@ impl AhmaMcpService {
             return Ok(());
         }
         let scopes = self.adapter.sandbox().scopes().to_vec();
-        let key = crate::adapter::workspace_queue::workspace_key_for_path(path, &scopes);
-        match self.adapter.workspace_queue().probe(&key) {
-            crate::adapter::workspace_queue::LeaseProbe::Free => Ok(()),
-            crate::adapter::workspace_queue::LeaseProbe::Held { holder } => {
-                Err(mcp_invalid_params(
-                    crate::adapter::workspace_queue::edit_refusal(path, &key, holder.as_ref()),
-                ))
-            }
+        match self.adapter.workspace_queue().probe_path(path, &scopes) {
+            None => Ok(()),
+            Some((workspace, holder)) => Err(mcp_invalid_params(
+                crate::adapter::workspace_queue::edit_refusal(path, &workspace, holder.as_ref()),
+            )),
         }
     }
 

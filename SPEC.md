@@ -271,7 +271,11 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   restart, so its reported duration and its timeout measure the command, and the wait is
   recorded (`queue_wait_ms`) and stated in its result. Every execution path takes part: the
   async path, the synchronous path (terminal hooks, CLI one-shots, `synchronous: true`
-  tools), PTY and persistent-session commands. `tools.workspace_queue = false` turns it off.
+  tools), PTY and persistent-session commands. The synchronous path has no operation to show
+  as queued, so it **must** announce a wait once (a terminal hook writes it to stderr, where
+  the harness shows it) and, if its turn does not come within the command's own timeout,
+  fail saying the command was **not run** and who held the workspace — never hang silently
+  until the caller gives up. `tools.workspace_queue = false` turns it off.
 - **R2.7.2**: **The workspace is the repository.** The key is the nearest ancestor of the
   working directory that contains `.git` (a directory, or the file of a linked worktree — so
   worktrees are separate workspaces and the unit of parallelism); without one, the longest
@@ -295,20 +299,30 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   read-only lane **must not** exist and every command is exclusive. *Service* — long-lived by
   design, like the log monitors (`livelog`) — takes no lease, because holding it for a
   server's life would stall every later command. Lanes come from an MTDF tool's
-  `concurrency` (`exclusive` | `read_only` | `service`, subcommand over tool); for a shell
-  command line, from a conservative classifier that knows plain readers (`git
-  status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, …) and treats anything with a shell
-  operator, redirection, substitution or unknown program as exclusive.
+  `concurrency` (`exclusive` | `read_only` | `service`), the nearest declaration winning
+  (subcommand over parent subcommand over tool), resolved once when the definition is
+  parsed; for a shell command line, from a conservative classifier that knows plain readers
+  (`git status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, `tail` — followers included, since
+  a reader that never ends must not hold the workspace for its whole life, …) and treats
+  anything with a shell operator, redirection, substitution or unknown program as
+  exclusive. The bundled tools **must** declare their lanes, because the default is
+  exclusive: their plain reads (`file-tools` `ls`/`cat`/`grep`/…, `git` `status`/`log`,
+  `gh` list/view commands) are `read_only`, and `gh run_watch`, which follows a CI run for
+  minutes, is `service`.
 - **R2.7.5**: **No result is lost to a forgotten `await`.** Each session remembers every
   operation it started whose call returned without the result. Once one has finished, its
   outcome (identity line, output tail, output file) **must** be prepended to the next tool
-  result the session returns, whatever the tool, exactly once. An `await` that returned an
-  operation delivers it.
+  result the session returns, whatever the tool, exactly once. An `await` delivers exactly
+  the operations it renders in its answer — never one it did not show (an `await` without an
+  id waits only for operations still running, and a `tools` filter excludes others), which
+  is then prepended to that same answer instead.
 - **R2.7.6**: **Drift is reported, because not every writer can be ordered.** A harness's
   own editor (Claude Code's `Edit`) never passes through ahma. After an operation of at
   least two seconds that is not a service, ahma **must** list the files in its workspace
   whose modification time falls inside its run — `.gitignore`d paths, `.git/` and ahma's log
-  directory excluded, at most 20 named, the walk bounded — in the result
+  directory excluded, at most 20 named, the walk bounded, and never outside the sandbox
+  scope (a `.git` above every scope may key the lease, but the walk is clipped to the
+  longest scope containing the working directory) — in the result
   (`changed_during_run`), saying who could have written them: anyone including the command,
   or, for a read-only command, someone else. It is detection, not prevention: optimistic
   concurrency, with no watcher and nothing to clean up.
@@ -319,7 +333,9 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   any reason; no lock is ever represented by a file's existence. The holder publishes who it
   is beside it (advisory; the kernel lock is authoritative). A command run under a lease
   inherits `AHMA_HELD_WORKSPACE_LEASE`, and an ahma it starts does not wait for a lease its
-  ancestor holds (which would deadlock). If the rendezvous file cannot be opened, ordering
+  ancestor holds (which would deadlock). The detached per-user daemon **must not** inherit
+  it: it outlives the tree that started it, and it and every session worker it spawns would
+  otherwise skip that workspace's lock for good. If the rendezvous file cannot be opened, ordering
   degrades to in-process only, with a `warn` — it never wedges. Within one process the order
   is strict FIFO; across processes the kernel lock guarantees mutual exclusion but not
   arrival order.
@@ -334,7 +350,11 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   waits, always exits 0, and emits only a deny; otherwise no decision where the client's
   contract defines "no decision", and the plain `allow` ahma's shell hook already sends where
   that is unverified (Cursor, Antigravity; R5.5.5). Tool names are checked in the hook too,
-  because some hosts (VS Code's Local agent) ignore matchers. A client with no pre-edit hook,
+  because some hosts (VS Code's Local agent) ignore matchers. The hook cannot see the
+  server's sandbox scopes, so outside a git repository it also probes every ancestor of the
+  edited file that has a rendezvous file — the server keys such a workspace by its scope.
+  A patch is read for paths only when a string *is* a patch (`*** Begin Patch`), never when
+  file content merely quotes one. A client with no pre-edit hook,
   or one that does not enforce the deny, is covered by R2.7.6 alone.
 
 ### R3: Performance

@@ -309,3 +309,66 @@ async fn a_timed_out_await_does_not_count_as_delivery() -> Result<()> {
     let _ = mcp.client.cancel().await;
     Ok(())
 }
+
+/// Start a command that prints `marker`, and let it finish without collecting
+/// it through any tool. Returns its operation id.
+async fn finished_uncollected(
+    mcp: &InProcessMcp,
+    wd: &std::path::Path,
+    marker: &str,
+) -> Result<String> {
+    let command = if cfg!(windows) {
+        format!("Start-Sleep -Seconds 2; Write-Output {marker}")
+    } else {
+        format!("sleep 2; echo {marker}")
+    };
+    let id = op_id(&run(mcp, &command, wd).await?);
+    mcp.service.operation_monitor.wait_for_operation(&id).await;
+    Ok(id)
+}
+
+/// R2.7.5: an `await` without an id waits only for operations still running,
+/// so it never renders one that had already finished — that result must still
+/// reach the model, exactly once, rather than be counted as delivered.
+#[tokio::test]
+async fn an_await_without_id_never_swallows_an_already_finished_result() -> Result<()> {
+    init_test_logging();
+    let (mcp, temp) = server().await?;
+    let wd = temp.path().join("ws");
+    let marker = "finished-before-await";
+    finished_uncollected(&mcp, &wd, marker).await?;
+
+    let awaited = result_text(&call(&mcp, "await", json!({})).await?);
+    assert!(
+        awaited.contains(marker),
+        "the finished result must be in the await's answer, got: {awaited}"
+    );
+    let next = result_text(&call(&mcp, "status", json!({})).await?);
+    assert!(
+        !next.contains("Finished since your last call"),
+        "and not delivered twice, got: {next}"
+    );
+
+    let _ = mcp.client.cancel().await;
+    Ok(())
+}
+
+/// R2.7.5: an `await` filtered to other tools does not deliver what it did
+/// not show.
+#[tokio::test]
+async fn a_filtered_await_never_swallows_a_result_it_did_not_show() -> Result<()> {
+    init_test_logging();
+    let (mcp, temp) = server().await?;
+    let wd = temp.path().join("ws");
+    let marker = "filtered-out-result";
+    finished_uncollected(&mcp, &wd, marker).await?;
+
+    let awaited = result_text(&call(&mcp, "await", json!({ "tools": "no_such_tool" })).await?);
+    assert!(
+        awaited.contains(marker),
+        "the finished result must arrive with this call, got: {awaited}"
+    );
+
+    let _ = mcp.client.cancel().await;
+    Ok(())
+}
