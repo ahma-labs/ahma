@@ -1,4 +1,4 @@
-//! Session management for HTTP brige session isolation mode.
+//! Session management for HTTP bridge session isolation mode.
 //!
 //! Per R8D, session isolation allows multiple IDE instances to share a single
 //! HTTP server with per-session sandbox scopes. Each session spawns a separate
