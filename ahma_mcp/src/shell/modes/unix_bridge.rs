@@ -20,9 +20,9 @@ use std::env;
 /// # Errors
 /// Returns an error if the bridge fails to start.
 pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
-    // Per-user runtime dir, not the retired machine-global /tmp/ahma.sock
-    // (SPEC R-HUB.2); an explicit --socket-path still wins.
-    let socket_path = ahma_common::hub::mcp_socket_path(
+    // Per-user runtime dir, not the retired machine-global /tmp/ahma.sock,
+    // and not the hub's own socket (SPEC R-HUB.2); an explicit path wins.
+    let socket_path = ahma_common::hub::serve_unix_socket_path(
         Some(config.unix_socket_path.as_str()).filter(|p| !p.is_empty()),
     );
 
@@ -94,6 +94,7 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         bound_port_tx: None,
         // Explicitly started bridge: it owns its process (SPEC R-HUB.1).
         exit: None,
+        hub_events: None,
         // Session options are a hub feature (SPEC R-HUB.4).
         session_options: None,
     };

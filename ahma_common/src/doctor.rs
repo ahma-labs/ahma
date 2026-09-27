@@ -222,7 +222,7 @@ impl DoctorInput {
                 .ok()
                 .map(|p| dunce::canonicalize(&p).unwrap_or(p)),
             workspace: workspace.to_path_buf(),
-            hub: probe_hub_blocking(Path::new(&crate::hub::mcp_socket_path(None))),
+            hub: probe_hub_blocking(&crate::hub::default_socket_path()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             build_id: crate::BUILD_ID.to_string(),
         }
@@ -380,16 +380,16 @@ pub enum HubStatus {
 /// hub that takes longer is itself worth reporting as not answering.
 const HUB_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Ask the hub at `mcp_socket` for its `/health`.
+/// Ask the hub at `socket` for its `/health`.
 ///
 /// The socket answering is what says a hub is running: nothing is read
 /// from a file that could outlive it, and the lock is left alone, so a doctor
 /// run can never make a starting hub lose its own lock and stand down.
-pub async fn probe_hub(mcp_socket: &Path) -> HubStatus {
+pub async fn probe_hub(socket: &Path) -> HubStatus {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let exchange = async {
-        let mut stream = crate::local_socket::LocalStream::connect(mcp_socket)
+        let mut stream = crate::local_socket::LocalStream::connect(socket)
             .await
             .ok()?;
         let mut reply = Vec::new();
@@ -422,14 +422,14 @@ fn health_version(response: &[u8]) -> Option<String> {
 
 /// [`probe_hub`] for a synchronous caller, inside a tokio runtime or not:
 /// it runs on a thread of its own with a runtime of its own.
-pub fn probe_hub_blocking(mcp_socket: &Path) -> HubStatus {
-    let mcp_socket = mcp_socket.to_path_buf();
+pub fn probe_hub_blocking(socket: &Path) -> HubStatus {
+    let socket = socket.to_path_buf();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .ok()?;
-        Some(runtime.block_on(probe_hub(&mcp_socket)))
+        Some(runtime.block_on(probe_hub(&socket)))
     })
     .join()
     .ok()

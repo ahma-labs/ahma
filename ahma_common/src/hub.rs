@@ -8,15 +8,18 @@
 //! ## Transport
 //!
 //! One `AF_UNIX` socket, `hub.sock` in the per-user [`runtime_dir`], on
-//! every OS — Windows included, through [`crate::local_socket`]. Override the
-//! path with the `--hub-socket` CLI flag; tests are isolated through the
-//! `AHMA_HUB_SOCK` variable (see [`default_socket_path`]).
+//! every OS — Windows included, through [`crate::local_socket`]. It is the
+//! hub's only socket: the per-user hub serves `/mcp` and `/health` on it as
+//! HTTP too. Override the path with `--unix-socket-path`; tests are isolated
+//! through the `AHMA_HUB_SOCK` variable (see [`default_socket_path`]).
 //!
 //! ## Protocol
 //!
-//! All messages are newline-delimited JSON (NDJ).  Each line is one serialised
-//! [`ClientMsg`] (instance → hub or subscriber → hub) or [`HubMsg`]
-//! (hub → subscriber).
+//! A client asks for the event stream with an HTTP/1.1 upgrade — `GET`
+//! [`EVENTS_PATH`] with `Upgrade:` [`EVENTS_UPGRADE`] — and once the hub
+//! answers `101`, the connection carries newline-delimited JSON (NDJ). Each
+//! line is one serialised [`ClientMsg`] (instance → hub or subscriber → hub)
+//! or [`HubMsg`] (hub → subscriber). [`connect_to_hub`] does the upgrade.
 //!
 //! ## Who owns the rendezvous
 //!
@@ -565,11 +568,13 @@ pub enum HubMsg {
 // Socket path
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Process-wide socket path override set from the `--hub-socket` CLI flag.
+/// Process-wide socket path override, set from `--unix-socket-path` or
+/// `[http] unix_socket_path`.
 static SOCKET_PATH_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// Set the hub socket path from the `--hub-socket` CLI flag.
-/// Call once, early in startup. Takes precedence over `AHMA_HUB_SOCK`.
+/// Set the hub socket path from `--unix-socket-path` or `[http]
+/// unix_socket_path`. Call once, early in startup. Takes precedence over
+/// `AHMA_HUB_SOCK`.
 pub fn set_socket_path_override(path: PathBuf) {
     let _ = SOCKET_PATH_OVERRIDE.set(path);
 }
@@ -597,10 +602,12 @@ pub fn init_test_hub_isolation() {
     });
 }
 
-/// Return the platform-default socket path for the hub.
+/// The hub's socket: where it serves `/mcp`, `/health` and the event stream
+/// (SPEC R-HUB.2).
 ///
 /// Resolution order:
-/// 1. `--hub-socket` CLI flag (`set_socket_path_override`).
+/// 1. `--unix-socket-path` or `[http] unix_socket_path`
+///    (`set_socket_path_override`).
 /// 2. `AHMA_HUB_SOCK` env var — accepted for backward compat and test isolation;
 ///    emits a deprecation warning in production if not set by `init_test_hub_isolation`.
 /// 3. `hub.sock` in [`runtime_dir`], on every OS.
@@ -611,11 +618,12 @@ pub fn default_socket_path() -> PathBuf {
     if let Ok(v) = std::env::var("AHMA_HUB_SOCK") {
         // Allow the var in test builds without a warning; in production builds
         // it is only valid when set by the CLI flag path (via set_socket_path_override)
-        // or by test isolation. Direct user configuration should use --hub-socket.
+        // or by test isolation. Direct user configuration should use
+        // --unix-socket-path.
         #[cfg(not(test))]
         warn!(
             "Deprecated: AHMA_HUB_SOCK is set but IGNORED for production config. \
-             Use the --hub-socket flag instead."
+             Use the --unix-socket-path flag instead."
         );
         return PathBuf::from(v);
     }
@@ -632,7 +640,7 @@ pub fn default_socket_path() -> PathBuf {
         ));
     }
 
-    platform_default_socket_path()
+    platform_hub_socket_path()
 }
 
 /// The per-user runtime directory holding every hub rendezvous file
@@ -743,7 +751,10 @@ pub fn verify_runtime_dir_secure(dir: &std::path::Path) -> Result<()> {
 /// Step 3 of [`default_socket_path`]'s resolution order: the platform default,
 /// ignoring every override. Creates the parent directory as a side effect so the
 /// returned path is immediately bindable.
-fn platform_default_socket_path() -> PathBuf {
+///
+/// This is the per-user hub every client shares, which is why a test must
+/// never resolve it (SPEC R-ISO.1).
+pub fn platform_hub_socket_path() -> PathBuf {
     match runtime_dir() {
         Some(dir) => dir.join("hub.sock"),
         None => std::env::temp_dir().join("ahma-hub.sock"),
@@ -757,49 +768,21 @@ pub fn lock_path_for(socket: &Path) -> PathBuf {
     socket.with_extension("lock")
 }
 
-/// The per-user MCP endpoint socket, ignoring test isolation and any explicit
-/// override — the path the hub binds in production.
+/// The socket an operator-started `ahma serve unix` binds when it is not
+/// given one.
 ///
-/// It lives beside the hub socket in [`runtime_dir`] rather than at the old
-/// machine-global `/tmp/ahma.sock`, which every local user could see and, since
-/// nothing owned the path, pre-create.
-pub fn platform_mcp_socket_path() -> PathBuf {
-    match runtime_dir() {
-        Some(dir) => dir.join("mcp.sock"),
-        None => PathBuf::from("/tmp/ahma-mcp.sock"),
-    }
-}
-
-/// The hub socket that belongs with `mcp_socket`.
+/// Not the hub's: that is [`default_socket_path`], and a server that took it
+/// without the hub's lock would be squatting on the rendezvous every client
+/// starts the hub against. So it has a name of its own, `mcp.sock`, in the
+/// same per-user [`runtime_dir`].
 ///
-/// The rendezvous is a **pair**, and the hub half is the mutex: a hub told
-/// to serve a private MCP socket but left on the shared hub socket would lose
-/// the bind to whichever hub already held it, stand down, and leave nobody
-/// serving the path its caller asked for. So an explicitly chosen MCP socket
-/// brings its own hub, beside it.
-pub fn hub_socket_beside(mcp_socket: &str) -> PathBuf {
-    let mcp = PathBuf::from(mcp_socket);
-    if mcp == platform_mcp_socket_path() {
-        return platform_default_socket_path();
-    }
-    let dir = mcp.parent().map(PathBuf::from).unwrap_or_default();
-    let stem = mcp
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "ahma".to_string());
-    dir.join(format!("{stem}.hub.sock"))
-}
-
-/// Resolve the MCP endpoint socket path (SPEC R-HUB.2).
-///
-/// Resolution order, mirroring [`default_socket_path`] so the two rendezvous
-/// files can never disagree about which run they belong to:
-/// 1. `explicit` — the `--unix-socket-path` flag or `[http] unix_socket_path`.
+/// Resolution order:
+/// 1. `explicit` — `--socket-path`, `--unix-socket-path` or `[http]
+///    unix_socket_path`.
 /// 2. Under a test harness, a private per-run path keyed by the same
-///    discriminator as the hub socket (SPEC R-ISO.1). Parent and child
-///    processes in one test run therefore agree without plumbing.
-/// 3. [`platform_mcp_socket_path`].
-pub fn mcp_socket_path(explicit: Option<&str>) -> String {
+///    discriminator as the hub socket (SPEC R-ISO.1).
+/// 3. `mcp.sock` in [`runtime_dir`].
+pub fn serve_unix_socket_path(explicit: Option<&str>) -> String {
     if let Some(p) = explicit.filter(|p| !p.is_empty()) {
         return p.to_string();
     }
@@ -812,7 +795,161 @@ pub fn mcp_socket_path(explicit: Option<&str>) -> String {
             .to_string_lossy()
             .into_owned();
     }
-    platform_mcp_socket_path().to_string_lossy().into_owned()
+    match runtime_dir() {
+        Some(dir) => dir.join("mcp.sock"),
+        None => PathBuf::from("/tmp/ahma-mcp.sock"),
+    }
+    .to_string_lossy()
+    .into_owned()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The event stream: an HTTP upgrade on the hub's one socket
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Where the event stream lives on the hub's socket (SPEC R-HUB.2).
+///
+/// The hub serves everything on one socket: `/mcp` and `/health` as HTTP,
+/// and the event stream as a `GET` to this path that upgrades to the NDJSON
+/// protocol below. One socket means one path to configure, one file to secure
+/// and one thing for a client to find.
+pub const EVENTS_PATH: &str = "/events";
+
+/// The protocol the event-stream request upgrades to, as named in its
+/// `Upgrade` header.
+pub const EVENTS_UPGRADE: &str = "ahma-hub";
+
+/// How long either side of the upgrade handshake waits for the other. The
+/// peer is a local process, so anything this slow is not going to answer.
+const UPGRADE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on an upgrade request's or response's head. Real ones are a few
+/// hundred bytes; the cap is what stops a peer that is not speaking HTTP at
+/// all from being read forever.
+const MAX_UPGRADE_HEAD: usize = 8 * 1024;
+
+/// The request a client sends to switch a fresh connection to the event
+/// stream.
+fn events_upgrade_request() -> String {
+    format!(
+        "GET {EVENTS_PATH} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+         Upgrade: {EVENTS_UPGRADE}\r\n\r\n"
+    )
+}
+
+/// Read an HTTP head — everything up to the blank line — one byte at a time.
+///
+/// A byte at a time on purpose: the NDJSON stream follows immediately, and
+/// buffering past the blank line would swallow its first message. Heads are
+/// tiny, so the cost is nothing.
+///
+/// Gives up at the end of the first line if it is not an HTTP one, which is
+/// what a pre-upgrade client sends: a bare JSON line and then a wait for an
+/// answer that, read to a blank line, would never come.
+async fn read_http_head<S>(stream: &mut S) -> std::io::Result<String>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        if stream.read(&mut byte).await? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            return Ok(String::from_utf8_lossy(&head).into_owned());
+        }
+        let first_line_ended = byte[0] == b'\n' && !head[..head.len() - 1].contains(&b'\n');
+        if first_line_ended && !head.ends_with(b"\r\n") || head.len() > MAX_UPGRADE_HEAD {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not an HTTP head",
+            ));
+        }
+    }
+}
+
+/// True when an HTTP request head asks for the event stream.
+fn is_events_upgrade_request(head: &str) -> bool {
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let is_get_events = parts.next() == Some("GET") && parts.next() == Some(EVENTS_PATH);
+    is_get_events
+        && lines.any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("upgrade")
+                    && value.trim().eq_ignore_ascii_case(EVENTS_UPGRADE)
+            })
+        })
+}
+
+/// True when an HTTP response head accepts the upgrade.
+fn is_switching_protocols(head: &str) -> bool {
+    head.lines()
+        .next()
+        .and_then(|status_line| status_line.split_whitespace().nth(1))
+        == Some("101")
+}
+
+/// Switch a fresh connection to the event stream: send the upgrade and wait
+/// for the hub to accept it.
+async fn upgrade_to_events<S>(stream: &mut S) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let handshake = async {
+        stream
+            .write_all(events_upgrade_request().as_bytes())
+            .await?;
+        read_http_head(stream).await
+    };
+    let head = tokio::time::timeout(UPGRADE_HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .map_err(|_| anyhow::anyhow!("the hub did not answer the event-stream upgrade"))??;
+    if !is_switching_protocols(&head) {
+        let status = head.lines().next().unwrap_or_default().to_string();
+        bail!("this server does not host the ahma event stream ({status})");
+    }
+    Ok(())
+}
+
+/// Answer an event-stream upgrade on a raw connection: the hub's side of
+/// [`connect_to_hub_at`]'s handshake, for a [`HubServer`] serving its own
+/// socket — and for a test playing the hub.
+///
+/// Anything else is refused with a status and the connection closed. The
+/// per-user hub does not come through here: its socket is served by the MCP
+/// bridge, whose HTTP server performs the same upgrade.
+pub async fn accept_events_upgrade<S>(stream: &mut S) -> std::result::Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let head = tokio::time::timeout(UPGRADE_HANDSHAKE_TIMEOUT, read_http_head(stream))
+        .await
+        .map_err(|_| "no upgrade request arrived".to_string())?;
+    let (reply, outcome) = match head {
+        Ok(head) if is_events_upgrade_request(&head) => (
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
+                 Upgrade: {EVENTS_UPGRADE}\r\n\r\n"
+            ),
+            Ok(()),
+        ),
+        Ok(_) => (
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            Err("a request for something other than the event stream".to_string()),
+        ),
+        Err(e) => (
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            Err(format!("not an upgrade request: {e}")),
+        ),
+    };
+    let _ = stream.write_all(reply.as_bytes()).await;
+    outcome
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -820,24 +957,31 @@ pub fn mcp_socket_path(explicit: Option<&str>) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The stream [`connect_to_hub`] returns: one `AF_UNIX` connection on
-/// every OS.
+/// every OS, already switched to the event stream.
 pub type HubStream = LocalStream;
 
-/// Try to connect to the hub.
+/// Try to connect to the hub's event stream.
 ///
 /// Returns `Ok(stream)` on success, or an error if the hub is not running.
 /// Never starts one.
 pub async fn connect_to_hub() -> Result<HubStream> {
-    Ok(LocalStream::connect(&default_socket_path()).await?)
+    connect_to_hub_at(&default_socket_path()).await
+}
+
+/// Connect to the event stream of the hub at an explicit socket.
+///
+/// Takes the path rather than resolving it so a test can address the hub it
+/// started, and so a diagnostic can address one that is not the default.
+pub async fn connect_to_hub_at(socket_path: &Path) -> Result<HubStream> {
+    let mut stream = LocalStream::connect(socket_path).await?;
+    upgrade_to_events(&mut stream).await?;
+    Ok(stream)
 }
 
 /// One-shot query of a hub at an explicit socket: connect, ask for the
 /// instance list, read the answer, hang up.
-///
-/// Takes the path rather than resolving it so a test can address the hub it
-/// started, and so a diagnostic can address one that is not the default.
 pub async fn list_instances_at(socket_path: &std::path::Path) -> Result<Vec<InstanceInfo>> {
-    let stream = LocalStream::connect(socket_path).await?;
+    let stream = connect_to_hub_at(socket_path).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     send_msg(&mut write_half, &ClientMsg::ListInstances).await?;
@@ -1498,21 +1642,56 @@ impl std::fmt::Display for HubBindError {
 
 impl std::error::Error for HubBindError {}
 
-/// A bound, not-yet-serving hub, and the owner of its rendezvous.
+/// The owner of a hub rendezvous, and the hub state behind it.
 ///
 /// Binding, serving and stopping are separate so one process can host the hub
 /// *and* the MCP endpoint on one runtime with a single idle policy and a single
 /// exit path (SPEC R-HUB.3).
 ///
+/// Two ways to have one. [`HubServer::bind_at`] takes the rendezvous and binds
+/// the socket, and [`HubServer::serve`] then answers event-stream upgrades on
+/// it — a hub on its own. [`HubServer::lock_at`] takes the rendezvous and
+/// leaves the socket to a host that serves more than the event stream on it:
+/// the per-user hub's MCP bridge, which hands each upgraded connection to
+/// [`HubServer::events`].
+///
 /// Dropping it unlinks the socket and only then releases the lock, so the next
 /// owner can never have its fresh socket unlinked by the previous one.
 pub struct HubServer {
-    listener: LocalListener,
+    /// `None` when the host binds and serves the socket.
+    listener: Option<LocalListener>,
     hub: Arc<Hub>,
     socket_path: PathBuf,
     /// Held for as long as this server exists; declared last so it is the
     /// last thing released.
     _lock: crate::fs_lock::FsLock,
+}
+
+/// A handle that serves event-stream connections into one hub.
+///
+/// What an HTTP host that answered the `GET /events` upgrade itself hands the
+/// upgraded connection to. Cheap to clone.
+#[derive(Clone)]
+pub struct HubEvents {
+    hub: Arc<Hub>,
+}
+
+impl HubEvents {
+    /// Serve one connection whose upgrade has already been accepted, until the
+    /// peer hangs up.
+    pub async fn serve<S>(&self, stream: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        self.hub.connection_count.fetch_add(1, Ordering::Relaxed);
+        handle_connection(stream, self.hub.clone()).await;
+    }
+}
+
+impl std::fmt::Debug for HubEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubEvents").finish_non_exhaustive()
+    }
 }
 
 impl HubServer {
@@ -1524,6 +1703,27 @@ impl HubServer {
     /// still answers is never removed even by the lock holder (SPEC R-ISO.2) —
     /// a hub from before the lock existed is live, not stale.
     pub async fn bind_at(socket_path: PathBuf) -> std::result::Result<Self, HubBindError> {
+        let mut server = Self::lock_at(socket_path).await?;
+        let listener = LocalListener::bind(&server.socket_path).map_err(|e| {
+            HubBindError::Failed(anyhow::anyhow!(
+                "ahma hub: failed to bind {}: {e}",
+                server.socket_path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        restrict_unix_socket_permissions(&server.socket_path);
+        info!("ahma hub: listening on {}", server.socket_path.display());
+        server.listener = Some(listener);
+        Ok(server)
+    }
+
+    /// Take the rendezvous at `socket_path` and clear the way for a host to
+    /// bind it: the same rules as [`HubServer::bind_at`], without the bind.
+    ///
+    /// The host must bind the path itself before anything can connect, and
+    /// must not remove it — dropping this server does that, while the lock is
+    /// still held (SPEC R-ISO.3).
+    pub async fn lock_at(socket_path: PathBuf) -> std::result::Result<Self, HubBindError> {
         let lock_path = lock_path_for(&socket_path);
         let lock = match crate::fs_lock::FsLock::try_acquire(&lock_path) {
             Ok(Some(lock)) => lock,
@@ -1539,28 +1739,20 @@ impl HubServer {
             return Err(HubBindError::AlreadyRunning);
         }
         crate::fs_lock::remove_stale_socket(&socket_path);
-        let listener = LocalListener::bind(&socket_path).map_err(|e| {
-            HubBindError::Failed(anyhow::anyhow!(
-                "ahma hub: failed to bind {}: {e}",
-                socket_path.display()
-            ))
-        })?;
-        #[cfg(unix)]
-        restrict_unix_socket_permissions(&socket_path);
-
-        info!("ahma hub: listening on {}", socket_path.display());
         let (hub, _) = Hub::new();
         Ok(Self {
-            listener,
+            listener: None,
             hub: Arc::new(hub),
             socket_path,
             _lock: lock,
         })
     }
 
-    /// Bind at the platform default hub socket.
-    pub async fn bind() -> std::result::Result<Self, HubBindError> {
-        Self::bind_at(default_socket_path()).await
+    /// The handle a host serves upgraded event-stream connections through.
+    pub fn events(&self) -> HubEvents {
+        HubEvents {
+            hub: self.hub.clone(),
+        }
     }
 
     /// Live connection count (instances, subscribers and one-shot queries).
@@ -1570,7 +1762,7 @@ impl HubServer {
         self.hub.connection_count.clone()
     }
 
-    /// The path this server bound.
+    /// The path this server owns.
     pub fn socket_path(&self) -> &std::path::Path {
         &self.socket_path
     }
@@ -1607,13 +1799,25 @@ impl HubServer {
         Some(writer)
     }
 
-    /// Accept and serve connections until dropped.
+    /// Accept connections, answer each one's event-stream upgrade and serve
+    /// it, until dropped.
     pub async fn serve(&self) -> Result<()> {
+        let Some(listener) = self.listener.as_ref() else {
+            bail!(
+                "this hub's socket {} is served by its host, not by the hub",
+                self.socket_path.display()
+            );
+        };
         loop {
-            match self.listener.accept().await {
-                Ok(stream) => {
-                    self.hub.connection_count.fetch_add(1, Ordering::Relaxed);
-                    tokio::spawn(handle_connection(stream, self.hub.clone()));
+            match listener.accept().await {
+                Ok(mut stream) => {
+                    let events = self.events();
+                    tokio::spawn(async move {
+                        match accept_events_upgrade(&mut stream).await {
+                            Ok(()) => events.serve(stream).await,
+                            Err(why) => debug!("hub: refused a connection: {why}"),
+                        }
+                    });
                 }
                 Err(e) => {
                     warn!("ahma hub: accept error: {e}");
@@ -2558,14 +2762,14 @@ mod tests {
         tokio::spawn(async move { server.serve().await });
 
         // Subscribe over the socket before sending, so the broadcast is observed.
-        let mut sub = LocalStream::connect(&socket_path).await.unwrap();
+        let mut sub = connect_to_hub_at(&socket_path).await.unwrap();
         send_msg(&mut sub, &ClientMsg::Subscribe).await.unwrap();
         let mut sub_reader = BufReader::new(sub);
         // Drain the initial InstanceList so the next read is the AgentError.
         let _ = recv_msg::<_, HubMsg>(&mut sub_reader).await.unwrap();
 
         // Connect as a client and submit a prompt with no instances registered.
-        let mut client = LocalStream::connect(&socket_path).await.unwrap();
+        let mut client = connect_to_hub_at(&socket_path).await.unwrap();
         send_msg(
             &mut client,
             &ClientMsg::SubmitPrompt {
@@ -2995,9 +3199,7 @@ mod tests {
         start_hub(&sock).await;
 
         // ── Subscriber connects ────────────────────────────────────────────
-        let sub = LocalStream::connect(&sock)
-            .await
-            .expect("connect subscriber");
+        let sub = connect_to_hub_at(&sock).await.expect("connect subscriber");
         let (sr, sw) = tokio::io::split(sub);
         let mut sub_reader = BufReader::new(sr);
         let mut sub_writer = sw;
@@ -3013,7 +3215,7 @@ mod tests {
         assert!(instances.is_empty(), "no instances registered yet");
 
         // ── Instance registers ─────────────────────────────────────────────
-        let inst = LocalStream::connect(&sock).await.expect("connect instance");
+        let inst = connect_to_hub_at(&sock).await.expect("connect instance");
         let (_, mut iw) = tokio::io::split(inst);
         send_msg(
             &mut iw,
@@ -3124,7 +3326,7 @@ mod tests {
         start_hub(&sock).await;
 
         // Register one instance.
-        let inst = LocalStream::connect(&sock).await.unwrap();
+        let inst = connect_to_hub_at(&sock).await.unwrap();
         let (_, mut iw) = tokio::io::split(inst);
         send_msg(
             &mut iw,
@@ -3146,7 +3348,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         // One-shot ListInstances query.
-        let q = LocalStream::connect(&sock).await.unwrap();
+        let q = connect_to_hub_at(&sock).await.unwrap();
         let (qr, mut qw) = tokio::io::split(q);
         let mut qrdr = BufReader::new(qr);
         send_msg(&mut qw, &ClientMsg::ListInstances).await.unwrap();
@@ -3340,32 +3542,23 @@ mod tests {
         }
     }
 
-    /// R-ISO.1: the MCP endpoint must be per-run private under a harness, and
-    /// must key off the *same* discriminator as the hub socket — a test whose
-    /// frontend and hub disagree about which run they belong to rendezvouses
-    /// on nothing (or, worse, on the developer's live endpoint).
+    /// R-ISO.1: an operator's `serve unix` default must be per-run private
+    /// under a harness too, keyed by the *same* discriminator as the hub
+    /// socket, so a test and the binaries it spawns agree on it.
     #[test]
-    fn mcp_socket_path_is_private_under_test_harness_and_shares_the_hub_discriminator() {
+    fn serve_unix_socket_path_is_private_under_test_harness() {
         let _g = ENV_MUTEX.lock();
         let prev_nextest = std::env::var_os("NEXTEST");
         unsafe { std::env::set_var("NEXTEST", "1") };
 
-        let mcp = PathBuf::from(mcp_socket_path(None));
-        let name = mcp.file_name().unwrap().to_string_lossy().into_owned();
+        let path = PathBuf::from(serve_unix_socket_path(None));
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let disc = crate::test_isolation::test_run_discriminator();
-        assert_eq!(
-            name,
-            format!("ahma-test-mcp-{disc}.sock"),
-            "harness fallback must be a private per-run MCP socket"
-        );
+        assert_eq!(name, format!("ahma-test-mcp-{disc}.sock"));
         assert!(
-            mcp.starts_with(std::env::temp_dir()),
-            "private MCP socket must live in the temp dir, got {}",
-            mcp.display()
-        );
-        assert!(
-            name.contains(&disc),
-            "MCP socket must carry the same run discriminator the hub socket uses"
+            path.starts_with(std::env::temp_dir()),
+            "the private socket must live in the temp dir, got {}",
+            path.display()
         );
 
         match prev_nextest {
@@ -3375,34 +3568,136 @@ mod tests {
     }
 
     #[test]
-    fn mcp_socket_path_explicit_override_wins() {
+    fn serve_unix_socket_path_explicit_override_wins() {
         let _g = ENV_MUTEX.lock();
         assert_eq!(
-            mcp_socket_path(Some("/run/custom/ahma.sock")),
+            serve_unix_socket_path(Some("/run/custom/ahma.sock")),
             "/run/custom/ahma.sock",
-            "an explicit --unix-socket-path is used verbatim"
+            "an explicit path is used verbatim"
         );
         // An empty string is "unset" throughout AppConfig, not a path.
-        assert_ne!(mcp_socket_path(Some("")), "");
+        assert_ne!(serve_unix_socket_path(Some("")), "");
     }
 
-    /// The two rendezvous files live side by side, so one `runtime_dir` check
-    /// covers both (SPEC R-HUB.2).
+    /// The hub has one socket (SPEC R-HUB.2), and an operator's own `serve
+    /// unix` does not default to it: a server there without the hub's lock
+    /// would squat on the rendezvous every client starts the hub against.
     #[test]
-    fn mcp_socket_path_lives_beside_the_hub_socket() {
-        let hub = platform_default_socket_path();
-        let mcp = platform_mcp_socket_path();
+    fn serve_unix_defaults_beside_the_hub_and_not_on_it() {
+        let _g = ENV_MUTEX.lock();
+        let hub = platform_hub_socket_path();
+        assert_eq!(hub.file_name().unwrap(), "hub.sock");
         assert_eq!(
             hub.parent(),
-            mcp.parent(),
-            "hub and MCP sockets must share the per-user runtime directory"
+            runtime_dir().as_deref(),
+            "per-user runtime dir"
         );
-        assert_eq!(mcp.file_name().unwrap(), "mcp.sock");
         assert_ne!(
-            mcp.to_string_lossy(),
-            "/tmp/ahma.sock",
-            "the machine-global socket is retired"
+            PathBuf::from(serve_unix_socket_path(None)),
+            default_socket_path(),
+            "never the hub's socket, under a harness or not"
         );
+    }
+
+    /// The event stream is an HTTP upgrade on the hub's socket (SPEC
+    /// R-HUB.2), so a client that does not ask for it is refused with a
+    /// status rather than being fed NDJSON — which is what lets the same
+    /// socket also serve `/mcp`.
+    #[tokio::test]
+    async fn the_event_stream_is_an_upgrade_and_nothing_else_is_served() {
+        use tokio::io::AsyncReadExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("upgrade.sock");
+        let server = Arc::new(HubServer::bind_at(sock.clone()).await.unwrap());
+        let serving = {
+            let server = server.clone();
+            tokio::spawn(async move { server.serve().await })
+        };
+
+        assert!(
+            list_instances_at(&sock).await.unwrap().is_empty(),
+            "an upgraded connection speaks the event protocol"
+        );
+
+        let reply_to = |request: &'static [u8]| {
+            let sock = sock.clone();
+            async move {
+                let mut raw = LocalStream::connect(&sock).await.unwrap();
+                raw.write_all(request).await.unwrap();
+                let mut reply = String::new();
+                raw.read_to_string(&mut reply).await.unwrap();
+                reply
+            }
+        };
+        let reply = reply_to(b"{\"type\":\"list_instances\"}\n").await;
+        assert!(
+            reply.starts_with("HTTP/1.1 400"),
+            "a bare protocol line is not an upgrade: {reply:?}"
+        );
+        let reply = reply_to(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(
+            reply.starts_with("HTTP/1.1 404"),
+            "a hub alone serves only the event stream: {reply:?}"
+        );
+
+        serving.abort();
+    }
+
+    /// A hub whose host serves its socket takes the rendezvous without binding
+    /// it, and still cleans the file up on the way out, lock held (SPEC
+    /// R-ISO.3).
+    #[tokio::test]
+    async fn a_hub_that_only_locks_leaves_the_bind_to_its_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hosted.sock");
+
+        let hub = HubServer::lock_at(sock.clone())
+            .await
+            .expect("free rendezvous");
+        assert!(!sock.exists(), "the host binds, not the hub");
+        assert!(
+            hub.serve().await.is_err(),
+            "a hub with no listener must say so rather than idle forever"
+        );
+        assert!(
+            matches!(
+                HubServer::lock_at(sock.clone()).await,
+                Err(HubBindError::AlreadyRunning)
+            ),
+            "the lock is the mutex whether or not the hub bound the socket"
+        );
+
+        // The host's listener, serving upgrades into the hub it was handed.
+        let listener = LocalListener::bind(&sock).unwrap();
+        let events = hub.events();
+        let hosting = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            accept_events_upgrade(&mut stream).await.unwrap();
+            events.serve(stream).await;
+        });
+        assert!(list_instances_at(&sock).await.unwrap().is_empty());
+        hosting.await.unwrap();
+
+        drop(hub);
+        assert!(!sock.exists(), "dropping the hub unlinks the hosted socket");
+    }
+
+    #[test]
+    fn the_upgrade_handshake_recognises_its_own_request_and_reply() {
+        assert!(is_events_upgrade_request(&events_upgrade_request()));
+        assert!(is_events_upgrade_request(
+            "GET /events HTTP/1.1\r\nupgrade:  AHMA-HUB \r\n\r\n"
+        ));
+        assert!(!is_events_upgrade_request(
+            "GET /events HTTP/1.1\r\nUpgrade: websocket\r\n\r\n"
+        ));
+        assert!(!is_events_upgrade_request(
+            "POST /events HTTP/1.1\r\nUpgrade: ahma-hub\r\n\r\n"
+        ));
+        assert!(is_switching_protocols(
+            "HTTP/1.1 101 Switching Protocols\r\n\r\n"
+        ));
+        assert!(!is_switching_protocols("HTTP/1.1 404 Not Found\r\n\r\n"));
     }
 
     /// A runtime directory another local user can read or write is refused:
@@ -4333,7 +4628,7 @@ mod tests {
         }));
         tokio::spawn(async move { server.serve().await });
 
-        let mut client = LocalStream::connect(&sock).await.unwrap();
+        let mut client = connect_to_hub_at(&sock).await.unwrap();
         send_msg(&mut client, &ClientMsg::Shutdown).await.unwrap();
 
         let reason = tokio::time::timeout(crate::timeouts::TestTimeouts::scale_secs(5), rx.recv())
@@ -4361,7 +4656,7 @@ mod tests {
         tokio::spawn(async move { server.serve().await });
 
         async fn register_once(sock: &std::path::Path, client: Option<&str>) -> String {
-            let stream = LocalStream::connect(sock).await.unwrap();
+            let stream = connect_to_hub_at(sock).await.unwrap();
             let (r, mut w) = tokio::io::split(stream);
             let reader = BufReader::new(r);
             send_msg(
@@ -4443,7 +4738,7 @@ mod tests {
         start_hub(&sock).await;
 
         // Subscriber connects first.
-        let sub = LocalStream::connect(&sock).await.unwrap();
+        let sub = connect_to_hub_at(&sock).await.unwrap();
         let (sr, mut sw) = tokio::io::split(sub);
         let mut srdr = BufReader::new(sr);
         send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();
@@ -4453,7 +4748,7 @@ mod tests {
         ));
 
         // Instance registers.
-        let inst = LocalStream::connect(&sock).await.unwrap();
+        let inst = connect_to_hub_at(&sock).await.unwrap();
         let (_ir, mut iw) = tokio::io::split(inst);
         send_msg(
             &mut iw,
@@ -4645,7 +4940,7 @@ mod tests {
         start_hub(&sock).await;
 
         // Instance registers and keeps its connection to receive routed messages.
-        let inst = LocalStream::connect(&sock).await.unwrap();
+        let inst = connect_to_hub_at(&sock).await.unwrap();
         let (ir, mut iw) = tokio::io::split(inst);
         let mut irdr = BufReader::new(ir);
         send_msg(
@@ -4667,7 +4962,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // SubmitPrompt with no explicit target → routed (delivered) to the only instance.
-        let mut tui = LocalStream::connect(&sock).await.unwrap();
+        let mut tui = connect_to_hub_at(&sock).await.unwrap();
         send_msg(
             &mut tui,
             &ClientMsg::SubmitPrompt {
@@ -4699,7 +4994,7 @@ mod tests {
         }
 
         // CancelPrompt routed to the instance running the turn.
-        let mut tui_cancel = LocalStream::connect(&sock).await.unwrap();
+        let mut tui_cancel = connect_to_hub_at(&sock).await.unwrap();
         send_msg(
             &mut tui_cancel,
             &ClientMsg::CancelPrompt {
@@ -4714,7 +5009,7 @@ mod tests {
         }
 
         // CancelOperation routed to the instance that owns the operation.
-        let mut tui_cancel_op = LocalStream::connect(&sock).await.unwrap();
+        let mut tui_cancel_op = connect_to_hub_at(&sock).await.unwrap();
         send_msg(
             &mut tui_cancel_op,
             &ClientMsg::CancelOperation {
@@ -4730,7 +5025,7 @@ mod tests {
         }
 
         // SubmitApproval routed.
-        let mut tui2 = LocalStream::connect(&sock).await.unwrap();
+        let mut tui2 = connect_to_hub_at(&sock).await.unwrap();
         send_msg(
             &mut tui2,
             &ClientMsg::SubmitApproval {
@@ -4747,7 +5042,7 @@ mod tests {
         }
 
         // SubmitScopeGrant routed.
-        let mut tui3 = LocalStream::connect(&sock).await.unwrap();
+        let mut tui3 = connect_to_hub_at(&sock).await.unwrap();
         send_msg(
             &mut tui3,
             &ClientMsg::SubmitScopeGrant {
@@ -4777,7 +5072,7 @@ mod tests {
         start_hub(&sock).await;
 
         // Pong is not a valid first/role message → server hits the `_` arm and closes.
-        let client = LocalStream::connect(&sock).await.unwrap();
+        let client = connect_to_hub_at(&sock).await.unwrap();
         let (cr, mut cw) = tokio::io::split(client);
         let mut crdr = BufReader::new(cr);
         send_msg(&mut cw, &ClientMsg::Pong { seq: 1 })
@@ -4804,7 +5099,7 @@ mod tests {
         start_hub(&sock).await;
 
         // Instance registers and runs one op to completion BEFORE any subscriber.
-        let inst = LocalStream::connect(&sock).await.unwrap();
+        let inst = connect_to_hub_at(&sock).await.unwrap();
         let (_ir, mut iw) = tokio::io::split(inst);
         send_msg(
             &mut iw,
@@ -4863,7 +5158,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
 
         // A late subscriber must receive the instance list AND the replayed history.
-        let sub = LocalStream::connect(&sock).await.unwrap();
+        let sub = connect_to_hub_at(&sock).await.unwrap();
         let (sr, mut sw) = tokio::io::split(sub);
         let mut srdr = BufReader::new(sr);
         send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();

@@ -1531,8 +1531,8 @@ Operation ids are counters, and counters restart with the process that issues th
 - **R-HUB.2 — Rendezvous.** A per-user runtime directory
   (`$XDG_RUNTIME_DIR/ahma`, else `~/.ahma`; `%LOCALAPPDATA%\ahma\run` on
   Windows), created `0700` and verified to be owned by the caller with no group
-  or other bits before use. It holds `hub.lock`, `hub.sock` (the hub) and
-  `mcp.sock`, the sockets `0600`. The machine-global `/tmp/ahma.sock` is
+  or other bits before use. It holds `hub.lock` and `hub.sock`, the socket
+  `0600`. The machine-global `/tmp/ahma.sock` is
   retired: every local user could see it and, since nothing owned the path,
   pre-create it. A `0600` socket inside a lax directory is still squattable,
   which is why the directory is checked and not merely the socket.
@@ -1546,10 +1546,23 @@ Operation ids are counters, and counters restart with the process that issues th
     allowed, since the bind can only be retried after someone has unlinked
     the path. A socket that still answers is never removed, even by the holder
     (R-ISO.2): that is a hub from before the lock.
-  - **Both sockets are `AF_UNIX` on every OS**, Windows 10 1803+ included,
-    through `ahma_common::local_socket`: the hub, and the MCP endpoint the
-    stdio proxy speaks Streamable HTTP to
-    (`ahma_http_mcp_client::local_socket_client`). The hub binds no TCP
+  - **One socket carries both halves.** `hub.sock` serves the MCP endpoint
+    (`/mcp`, `/health`) as HTTP, and the event stream as an HTTP/1.1 upgrade:
+    `GET /events` with `Upgrade: ahma-hub`, after which the connection
+    carries the NDJSON hub protocol. There used to be a second socket for
+    the MCP endpoint, which made the rendezvous a *pair*: a second path to
+    configure (`--hub-socket` beside `--unix-socket-path`), a second file to
+    clean up, and room for the two to disagree — a hub given an explicit MCP
+    socket had to derive its hub socket beside it, while the TUI's event
+    stream kept looking at the default. One path, set by
+    `--unix-socket-path` or `[http] unix_socket_path`, now names the hub for
+    every process: the hub itself, the frontends that start it, the workers
+    that report to it (told it explicitly) and the TUI. An operator's own
+    `ahma serve unix` defaults to `mcp.sock` beside it, never onto it: a
+    server there without the hub's lock would squat on the rendezvous.
+  - **The socket is `AF_UNIX` on every OS**, Windows 10 1803+ included,
+    through `ahma_common::local_socket`, and the stdio proxy speaks Streamable
+    HTTP to it (`ahma_http_mcp_client::local_socket_client`). The hub binds no TCP
     port, and the frontend has no HTTP fallback: a probe of the `serve http`
     port only ever found some *other* server (R-ISO.1). Until this held on
     Windows the MCP endpoint there was a loopback TCP port no client could
@@ -1564,12 +1577,8 @@ Operation ids are counters, and counters restart with the process that issues th
     others *and* lacks the sticky bit that stops them unlinking our socket, that
     is disclosed rather than refused (R7: ahma's own posture is never something
     a user has to infer).
-  - The two sockets are a **pair**. A hub told to serve an explicit MCP
-    socket derives its hub socket beside it; left on the shared hub it would
-    lose the bind to whichever hub already held it, stand down, and leave
-    nobody serving the endpoint it was asked for.
   - Nothing else is written to the runtime directory to say who the hub
-    is. `ahma doctor` asks the hub itself: `/health` on its MCP socket
+    is. `ahma doctor` asks the hub itself: `/health` on its socket
     reports its version and build id. A descriptor file outlives a crash, and
     probing the lock instead could make a starting hub lose it and stand
     down.
@@ -1698,7 +1707,7 @@ Operation ids are counters, and counters restart with the process that issues th
 
 > **Problem (confirmed live failure, 2026-07-14).** The proxy, bridge, and hub rendezvous on machine-global singleton endpoints (`/tmp/ahma.sock`, `~/.ahma/hub.sock`, the Windows hub TCP port). Test isolation existed but was opt-in per spawn site (`AHMA_TEST_ISOLATION`, set only by `test_utils::cli::test_command`); harnesses in other crates spawned the real binary without it. A full `cargo nextest run` therefore unlinked the live `/tmp/ahma.sock` while binding test bridges and dispatched a `RunPrompt` to the live hub — tearing down the developer's active MCP session mid-conversation (surfaced to the client as `-32002` then a full server disconnect).
 
-- **R-ISO.1 (fail-closed test detection).** Any ahma process spawned directly or transitively under a test harness MUST resolve private, test-scoped endpoints **and state** instead of the shared ones: the hub socket, the MCP socket and the history file (R-HUB.10). A test that wrote the developer's history would also read it back into its own assertions. It MUST also refuse to *spawn* a hub at all: `current_exe` inside a test binary is the test harness, so spawning it re-runs the tests, each copy spawning again — a fork bomb that empties the machine's process table. Detection is `ahma_common::test_isolation::spawned_under_test_harness()`: the explicit `AHMA_TEST_ISOLATION` plumbing variable OR the `NEXTEST` variable that `cargo nextest` exports to every test process (inherited by all children), so a spawn site that forgets the explicit variable can no longer reach live endpoints. Per-run endpoint names that parent and child processes must agree on use `NEXTEST_RUN_ID` (not the PID). Test harnesses that spawn the binary SHOULD still set `AHMA_TEST_ISOLATION=1` explicitly (plain `cargo test` sets no distinctive variable).
+- **R-ISO.1 (fail-closed test detection).** Any ahma process spawned directly or transitively under a test harness MUST resolve private, test-scoped endpoints **and state** instead of the shared ones: the hub socket, the default `serve unix` socket and the history file (R-HUB.10). A test that wrote the developer's history would also read it back into its own assertions. It MUST also refuse to *spawn* a hub at all: `current_exe` inside a test binary is the test harness, so spawning it re-runs the tests, each copy spawning again — a fork bomb that empties the machine's process table. Detection is `ahma_common::test_isolation::spawned_under_test_harness()`: the explicit `AHMA_TEST_ISOLATION` plumbing variable OR the `NEXTEST` variable that `cargo nextest` exports to every test process (inherited by all children), so a spawn site that forgets the explicit variable can no longer reach live endpoints. Per-run endpoint names that parent and child processes must agree on use `NEXTEST_RUN_ID` (not the PID). Test harnesses that spawn the binary SHOULD still set `AHMA_TEST_ISOLATION=1` explicitly (plain `cargo test` sets no distinctive variable).
   - **Isolating some endpoints and not others is worse than isolating none**, because it hides itself. The socket was per-run and the HTTP port was not, and the HTTP port is the *fallback* every discovery probe tries once the socket answers nothing. So an E2E test whose hub failed to start reached the developer's live bridge on the machine-global 3000, read its `/health`, and reported success. Every E2E test that drives the real binary passed on that borrowed server for as long as one was running, and failed the moment CI — which has none — ran the same code. R-ISO exists to stop a test corrupting live state; this is the same coupling in the other direction, and it costs more, because it converts a broken build into a green run. A discovery path's *last* resort must be isolated as carefully as its first — and the better fix, taken once the hub's endpoint was a socket on every OS, is to have no fallback at all (R-HUB.2).
 - **R-ISO.2 (never steal a live socket).** A Unix-socket listener MUST NOT unlink an existing socket file without first probe-connecting it: a successful connection means a live server owns the path and binding MUST fail loudly (naming the conflict and the `--socket-path` remedy); only a refused/absent connection marks the file stale and safe to remove. (The hub probes before removing even when it holds the rendezvous lock; the HTTP bridge's Unix listener must probe too.)
 - **R-ISO.3 (remove only what you own).** On shutdown a server MUST remove its socket file only if the path still refers to the socket it bound (device+inode match). The hub meets this with its rendezvous lock instead (R-HUB.2): every would-be owner must take the lock before touching the path, and the hub unlinks before releasing it. If another process has since replaced the path, deleting it would orphan *that* server's live socket.

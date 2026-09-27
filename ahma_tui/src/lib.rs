@@ -86,7 +86,9 @@ pub async fn run_tui(
         // launch directory: that used to lock every editor session that
         // arrived afterwards to whichever folder a terminal happened to be in
         // (SPEC R-HUB.9).
-        let socket = ahma_common::hub::mcp_socket_path(None);
+        let socket = ahma_common::hub::default_socket_path()
+            .to_string_lossy()
+            .into_owned();
         match ahma_mcp::shell::modes::hub_client::ensure_hub(&socket, None).await {
             Ok(outcome) => {
                 if let Some(notice) = ahma_mcp::shell::modes::hub_client::disclosure(&outcome) {

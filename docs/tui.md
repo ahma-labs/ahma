@@ -261,7 +261,7 @@ Persistent grants and revocations are appended to `~/.ahma/permissions-audit.jso
 and in particular never one scoped to the directory you happened to open it in
 (SPEC R-HUB.9). It picks the best available transport in order:
 
-1. **Unix socket** — the hub's `mcp.sock` in your per-user runtime directory
+1. **Unix socket** — the hub's `hub.sock` in your per-user runtime directory
    (`$XDG_RUNTIME_DIR/ahma`, else `~/.ahma`), or `[http] unix_socket_path` in
    `~/.ahma/settings.toml`. Lowest latency, local only, and the same `AF_UNIX` socket on
    Windows (10 1803 or later). `$AHMA_UNIX_SOCKET` is retired (R-CFG1.2) and ignored by the TUI as it is by `ahma serve`.
@@ -277,7 +277,7 @@ Use `--connect` to bypass detection and force a specific endpoint:
 ahma tui --connect http://localhost:8080
 
 # Force the Unix socket path
-ahma tui --connect unix:///run/ahma/mcp.sock
+ahma tui --connect unix:///run/ahma/hub.sock
 ```
 
 Start the server with `--disable-quic` (or set `[http] disable_quic = true` in `~/.ahma/settings.toml`) to prevent the HTTP/3 upgrade even when it would otherwise be advertised. `AHMA_DISABLE_QUIC` is retired and ignored.

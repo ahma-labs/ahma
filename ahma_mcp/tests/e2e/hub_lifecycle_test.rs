@@ -1,7 +1,7 @@
 //! The per-user hub, end to end (SPEC R-HUB.1, R-HUB.3).
 //!
 //! E2E rather than in-process by necessity: what is under test is that *one
-//! process* serves both rendezvous points, that a second one recognises the
+//! process* serves both halves on one socket, that a second one recognises the
 //! first and stands down, and that the process actually exits when nothing is
 //! attached. None of those are observable without a real process.
 
@@ -10,11 +10,10 @@ use ahma_mcp::test_utils::cli::{build_binary_cached, test_command};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-/// Sockets for one test, isolated from the developer's live hub (R-ISO.1).
+/// The socket for one test, isolated from the developer's live hub (R-ISO.1).
 struct Rendezvous {
     dir: tempfile::TempDir,
     hub: PathBuf,
-    mcp: PathBuf,
 }
 
 impl Rendezvous {
@@ -42,20 +41,13 @@ impl Rendezvous {
                 .expect("chmod 700 the test runtime dir");
         }
         let hub = dir.path().join("hub.sock");
-        let mcp = dir.path().join("mcp.sock");
-        Self { dir, hub, mcp }
+        Self { dir, hub }
     }
 }
 
 fn spawn_hub(binary: &Path, r: &Rendezvous, idle_secs: u64) -> std::process::Child {
     let mut cmd = test_command(binary);
-    cmd.args([
-        "hub",
-        "--hub-socket",
-        &r.hub.to_string_lossy(),
-        "--unix-socket-path",
-        &r.mcp.to_string_lossy(),
-    ]);
+    cmd.args(["hub", "--unix-socket-path", &r.hub.to_string_lossy()]);
     cmd.args(["--idle-timeout", &idle_secs.to_string()]);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
@@ -89,45 +81,57 @@ fn kill(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// One process binds *both* rendezvous points, and both are owner-only. Two
-/// singletons with two lifetimes is what this replaces.
+/// One process serves both halves — the MCP endpoint and the event stream —
+/// on one owner-only socket (SPEC R-HUB.2). Two singletons with two
+/// lifetimes, and then one process with two sockets, is what this replaces.
 ///
-/// On every OS: both are `AF_UNIX` sockets on Windows too (SPEC R-HUB.2).
-/// The mode check alone is Unix-only, because Windows has no mode bits.
+/// On every OS: it is an `AF_UNIX` socket on Windows too. The mode check
+/// alone is Unix-only, because Windows has no mode bits.
 #[tokio::test]
-async fn the_hub_serves_both_rendezvous_points() {
+async fn the_hub_serves_both_halves_on_one_socket() {
     let binary = build_binary_cached("ahma_bin", "ahma");
     let r = Rendezvous::new();
     let mut child = spawn_hub(&binary, &r, 3);
 
-    let hub_up = wait_for(&r.hub, true).await;
-    let mcp_up = wait_for(&r.mcp, true).await;
-    if !hub_up || !mcp_up {
+    if !wait_for(&r.hub, true).await {
         let log = r.log();
         kill(&mut child);
-        panic!("hub did not bind both sockets (hub={hub_up}, mcp={mcp_up}); hub said:\n{log}");
+        panic!("hub did not bind its socket; it said:\n{log}");
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for path in [&r.hub, &r.mcp] {
-            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(
-                mode,
-                0o600,
-                "{} must be owner-only: anything that can connect runs commands as this user",
-                path.display()
-            );
-        }
+        let mode = std::fs::metadata(&r.hub).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} must be owner-only: anything that can connect runs commands as this user",
+            r.hub.display()
+        );
     }
 
-    // The hub answers: a one-shot query returns an (empty) instance list.
+    // The event stream: a one-shot query returns an (empty) instance list.
     let listed = ahma_common::hub::list_instances_at(&r.hub).await;
+    assert!(listed.is_ok(), "the event stream must answer: {listed:?}");
+
+    // The MCP endpoint's `/health`, on the same socket.
+    let health = ahma_common::doctor::probe_hub(&r.hub).await;
     assert!(
-        listed.is_ok(),
-        "the hub must answer on its socket: {listed:?}"
+        matches!(
+            health,
+            ahma_common::doctor::HubStatus::Running { version: Some(_) }
+        ),
+        "/health must answer on the same socket: {health:?}"
     );
+
+    let sockets: Vec<_> = std::fs::read_dir(r.dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".sock"))
+        .collect();
+    assert_eq!(sockets, ["hub.sock"], "one socket, nothing beside it");
 
     kill(&mut child);
 }
@@ -162,7 +166,7 @@ async fn a_second_hub_stands_down() {
     kill(&mut first);
 }
 
-/// With nothing attached the hub goes, and takes its sockets with it — so a
+/// With nothing attached the hub goes, and takes its socket with it — so a
 /// later client sees a clean absence rather than a stale file.
 #[tokio::test]
 async fn the_hub_exits_when_nothing_is_attached() {
@@ -194,7 +198,6 @@ async fn the_hub_exits_when_nothing_is_attached() {
     assert!(exited, "an idle hub must exit on its own");
     assert!(
         wait_for(&r.hub, false).await,
-        "and unlink the hub socket it bound"
+        "and unlink the socket it bound"
     );
-    assert!(wait_for(&r.mcp, false).await, "and the MCP socket it bound");
 }

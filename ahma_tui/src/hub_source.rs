@@ -361,7 +361,10 @@ async fn connect_or_retry_hub(
     }
     // The subscriber is what keeps a hub around for the TUI (SPEC
     // R-HUB.9), so it starts one — through the one path that does.
-    if let Err(e) = ahma_mcp::shell::modes::hub_client::ensure_hub_events().await {
+    let socket = ahma_common::hub::default_socket_path();
+    if let Err(e) =
+        ahma_mcp::shell::modes::hub_client::ensure_hub(&socket.to_string_lossy(), None).await
+    {
         debug!("hub_source: hub unavailable ({e}); retry in {:?}", *backoff);
         let _ = tx
             .send(SourceEvent::HubHealthChanged { healthy: false })

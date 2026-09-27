@@ -24,7 +24,7 @@
 
 use super::common::text_result;
 use crate::AhmaMcpService;
-use crate::shell::modes::server::{global_mcp_socket_path, is_test_isolated};
+use crate::shell::modes::server::{global_hub_socket_path, is_test_isolated};
 use rmcp::model::{CallToolResult, ErrorData as McpError};
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -52,7 +52,7 @@ impl AhmaMcpService {
                 .as_ref()
                 .map(|config| config.unix_socket_path.clone())
                 .filter(|path| !path.is_empty())
-                .unwrap_or_else(global_mcp_socket_path)
+                .unwrap_or_else(global_hub_socket_path)
         };
         tracing::info!("Tool 'restart' called. Triggering bridge server restart...");
 

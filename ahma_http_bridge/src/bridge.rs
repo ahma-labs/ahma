@@ -216,6 +216,13 @@ pub struct BridgeConfig {
     /// and a history file, and exiting from whichever task noticed first would
     /// skip all of it.
     pub exit: Option<Arc<HubExit>>,
+
+    /// The hub's event stream, served on this listener as an HTTP upgrade at
+    /// `GET /events` (SPEC R-HUB.2).
+    ///
+    /// Set only by the per-user hub, whose one socket carries both `/mcp` and
+    /// the event stream; everywhere else the route answers 404.
+    pub hub_events: Option<ahma_common::hub::HubEvents>,
 }
 
 impl Default for BridgeConfig {
@@ -244,6 +251,7 @@ impl Default for BridgeConfig {
             bound_port_tx: None,
             session_options: None,
             exit: None,
+            hub_events: None,
         }
     }
 }
@@ -278,6 +286,7 @@ impl std::fmt::Debug for BridgeConfig {
                 &self.bound_port_tx.as_ref().map(|_| "<Sender>"),
             )
             .field("exit", &self.exit.as_ref().map(|_| "<HubExit>"))
+            .field("hub_events", &self.hub_events)
             .finish_non_exhaustive()
     }
 }
@@ -303,6 +312,7 @@ impl Clone for BridgeConfig {
             active_sessions: self.active_sessions.clone(),
             idle_timeout_secs: self.idle_timeout_secs,
             exit: self.exit.clone(),
+            hub_events: self.hub_events.clone(),
             session_options: self.session_options.clone(),
             max_sessions: self.max_sessions,
             peer_factory: self.peer_factory.clone(),
@@ -445,6 +455,8 @@ pub struct BridgeState {
     /// Set when this bridge is hosted by the per-user hub, which owns the
     /// process's exit path.
     exit: Option<Arc<HubExit>>,
+    /// The hub's event stream, when this bridge shares the hub's socket.
+    hub_events: Option<ahma_common::hub::HubEvents>,
 }
 
 /// Build a CORS layer appropriate for the bind address.
@@ -748,6 +760,7 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
         listener_kind: config.listener_kind.clone(),
         exit: config.exit.clone(),
+        hub_events: config.hub_events.clone(),
     })
 }
 
@@ -848,6 +861,7 @@ fn build_mcp_router(
                 .delete(handle_session_delete),
         )
         .route("/restart", post(handle_restart))
+        .route(ahma_common::hub::EVENTS_PATH, get(handle_hub_events))
         .fallback(handle_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1176,7 +1190,8 @@ async fn serve_unix_connection(stream: ahma_common::local_socket::LocalStream, a
         });
     if let Err(e) =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-            .serve_connection(io, hyper_svc)
+            // With upgrades: the hub's event stream is one (SPEC R-HUB.2).
+            .serve_connection_with_upgrades(io, hyper_svc)
             .await
     {
         tracing::debug!("Unix socket HTTP connection closed: {:#}", e);
@@ -1472,6 +1487,57 @@ async fn shut_down_after_restart(
         ahma_common::fs_lock::remove_stale_socket(path);
     }
     std::process::exit(0);
+}
+
+/// Handler for `GET /events`: switch the connection to the hub's event
+/// stream (SPEC R-HUB.2).
+///
+/// Only a bridge hosted by the per-user hub has one; anywhere else this is a
+/// 404 like any unknown path. The upgrade itself is hyper's, so the NDJSON
+/// that follows is served on the same connection once the `101` is out.
+async fn handle_hub_events(
+    State(state): State<Arc<BridgeState>>,
+    request: axum::extract::Request,
+) -> Response {
+    let Some(events) = state.hub_events.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let asks_for_events = request
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.trim()
+                .eq_ignore_ascii_case(ahma_common::hub::EVENTS_UPGRADE)
+        });
+    if !asks_for_events {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            [(
+                axum::http::header::UPGRADE,
+                ahma_common::hub::EVENTS_UPGRADE,
+            )],
+        )
+            .into_response();
+    }
+    let on_upgrade = hyper::upgrade::on(request);
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => events.serve(hyper_util::rt::TokioIo::new(upgraded)).await,
+            Err(e) => debug!("hub event-stream upgrade failed: {e}"),
+        }
+    });
+    (
+        StatusCode::SWITCHING_PROTOCOLS,
+        [
+            (axum::http::header::CONNECTION, "upgrade"),
+            (
+                axum::http::header::UPGRADE,
+                ahma_common::hub::EVENTS_UPGRADE,
+            ),
+        ],
+    )
+        .into_response()
 }
 
 /// Handler for POST /restart
@@ -1991,6 +2057,7 @@ mod tests {
             peer_factory: None,
             bound_port_tx: None,
             exit: None,
+            hub_events: None,
             session_options: None,
         };
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
@@ -2035,6 +2102,7 @@ mod tests {
             require_token: ArcSwapOption::new(None),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
             exit: None,
+            hub_events: None,
         })
     }
 
@@ -2772,6 +2840,7 @@ for line in sys.stdin:
             require_token: ArcSwapOption::new(token.map(|s| Arc::new(s.to_owned()))),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
             exit: None,
+            hub_events: None,
         });
         let loopback_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         Router::new()
@@ -3162,6 +3231,82 @@ for line in sys.stdin:
         bridge.abort();
     }
 
+    /// Wait for a bridge to listen on `path`, then run `probe` against it.
+    async fn once_listening<T, F, Fut>(path: &std::path::Path, probe: F) -> T
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(5);
+        loop {
+            match probe().await {
+                Ok(value) => return value,
+                Err(e) => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "nothing usable on {} in time: {e:#}",
+                    path.display()
+                ),
+            }
+            tokio::time::sleep(TestTimeouts::poll_interval()).await;
+        }
+    }
+
+    /// The per-user hub has one socket (SPEC R-HUB.2): its event stream is
+    /// an upgrade on the same listener that serves `/mcp` and `/health`.
+    #[tokio::test]
+    async fn the_hub_event_stream_shares_the_bridge_socket() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("hub.sock");
+        let hub = ahma_common::hub::HubServer::lock_at(path.clone())
+            .await
+            .expect("a free rendezvous");
+        let config = BridgeConfig {
+            listener_kind: ListenerKind::Unix(path.to_string_lossy().into_owned()),
+            enable_quic: false,
+            hub_events: Some(hub.events()),
+            ..BridgeConfig::default()
+        };
+        let bridge = tokio::spawn(start_bridge(config));
+
+        let instances = once_listening(&path, || ahma_common::hub::list_instances_at(&path)).await;
+        assert!(instances.is_empty(), "{instances:?}");
+        assert!(
+            matches!(
+                ahma_common::doctor::probe_hub(&path).await,
+                ahma_common::doctor::HubStatus::Running { version: Some(_) }
+            ),
+            "/health answers on the same socket"
+        );
+        bridge.abort();
+    }
+
+    /// Only the hub's own bridge has an event stream. Anywhere else the
+    /// upgrade is refused, and the client says which server it reached.
+    #[tokio::test]
+    async fn a_bridge_without_a_hub_refuses_the_event_stream() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("plain.sock");
+        let config = BridgeConfig {
+            listener_kind: ListenerKind::Unix(path.to_string_lossy().into_owned()),
+            enable_quic: false,
+            ..BridgeConfig::default()
+        };
+        let bridge = tokio::spawn(start_bridge(config));
+
+        let refusal = once_listening(&path, || async {
+            match ahma_common::hub::connect_to_hub_at(&path).await {
+                Ok(_) => Ok(Err("a plain bridge accepted the upgrade".to_string())),
+                // Not listening yet: keep waiting.
+                Err(e) if e.downcast_ref::<std::io::Error>().is_some() => Err(e),
+                Err(e) => Ok(Ok(e.to_string())),
+            }
+        })
+        .await
+        .expect("the upgrade is refused");
+        assert!(refusal.contains("404"), "{refusal}");
+        bridge.abort();
+    }
+
     /// A too-long socket path must fail with ahma's actionable message, not
     /// libstd's bare "path must be shorter than SUN_LEN". The length check
     /// runs before any filesystem access, so the path need not exist on disk.
@@ -3273,6 +3418,7 @@ mod transport_guard_tests {
             require_token: ArcSwapOption::new(None),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
             exit: None,
+            hub_events: None,
         });
         let loopback: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         let app = build_mcp_router(state, build_cors_layer(&loopback), None, 0, 0)
