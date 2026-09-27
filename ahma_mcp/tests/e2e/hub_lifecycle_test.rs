@@ -201,3 +201,48 @@ async fn the_hub_exits_when_nothing_is_attached() {
         "and unlink the socket it bound"
     );
 }
+
+/// A hub whose socket is removed gives way (SPEC R-HUB.3). No client can
+/// find it by that path any more — `$XDG_RUNTIME_DIR` cleared at logout does
+/// this — and a hub that stayed would sit beside the one the next client
+/// starts. It must go on its own, and must not take anything with it.
+#[tokio::test]
+async fn a_hub_whose_socket_is_removed_gives_way() {
+    let binary = build_binary_cached("ahma_bin", "ahma");
+    let r = Rendezvous::new();
+    // Long enough that only the lost socket can explain an exit.
+    let child = spawn_hub(&binary, &r, 3600);
+    let started = wait_for(&r.hub, true).await;
+    if started {
+        std::fs::remove_file(&r.hub).expect("remove the hub's socket");
+    }
+
+    let exited = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        let deadline = std::time::Instant::now() + TestTimeouts::get(TimeoutCategory::ProcessSpawn);
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) => std::thread::sleep(TestTimeouts::poll_interval()),
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        false
+    })
+    .await
+    .expect("join");
+
+    assert!(started, "hub must start; it said:\n{}", r.log());
+    assert!(
+        exited,
+        "a hub nobody can reach must exit on its own; it said:\n{}",
+        r.log()
+    );
+    assert!(
+        r.log().contains("removed or replaced"),
+        "and say why: {}",
+        r.log()
+    );
+}
