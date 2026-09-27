@@ -231,7 +231,7 @@ pub struct AppConfig {
     /// log is initialized at `<vault>/audit.jsonl`.
     pub task_vault: Option<PathBuf>,
 
-    // ── HTTP authentication / rate limiting / daemon ────────────────────────
+    // ── HTTP authentication / rate limiting / hub ────────────────────────
     /// Required token for HTTP access (AHMA_REQUIRE_TOKEN).
     pub require_token: Option<String>,
     /// Path to a file containing the required token (AHMA_REQUIRE_TOKEN_PATH).
@@ -240,18 +240,18 @@ pub struct AppConfig {
     pub rate_limit_rps: u64,
     /// Rate limit burst allowance (AHMA_RATE_LIMIT_BURST).
     pub rate_limit_burst: u32,
-    /// Daemon instance label (AHMA_INSTANCE_LABEL).
+    /// Hub instance label (AHMA_INSTANCE_LABEL).
     pub instance_label: String,
     /// Idle timeout in seconds before the background bridge shuts down (default 10).
     pub idle_timeout_secs: Option<u64>,
-    /// Seconds the per-user daemon stays alive with nothing attached — no MCP
-    /// sessions and no hub subscribers (`[daemon] idle_timeout_secs`).
-    pub daemon_idle_timeout_secs: u64,
+    /// Seconds the per-user hub stays alive with nothing attached — no MCP
+    /// sessions and no hub subscribers (`[hub] idle_timeout_secs`).
+    pub hub_idle_timeout_secs: u64,
     /// Maximum concurrent HTTP server sessions.
     pub max_sessions: usize,
-    /// True when `--daemon-socket` named the hub rendezvous explicitly, so the
-    /// daemon must not derive one beside its MCP socket.
-    pub daemon_socket_explicit: bool,
+    /// True when `--hub-socket` named the hub rendezvous explicitly, so the
+    /// hub must not derive one beside its MCP socket.
+    pub hub_socket_explicit: bool,
     /// The MCP session this worker serves (from `--session-id`).
     pub session_id: Option<String>,
     /// Pid of the client-facing frontend process (from `--client-pid`).
@@ -325,8 +325,8 @@ impl Default for AppConfig {
             instance_label: "ahma".to_string(),
             idle_timeout_secs: None,
             max_sessions: 50,
-            daemon_idle_timeout_secs: 60,
-            daemon_socket_explicit: false,
+            hub_idle_timeout_secs: 60,
+            hub_socket_explicit: false,
             session_id: None,
             client_pid: None,
             is_server_child: false,
@@ -897,14 +897,14 @@ async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
             modes::run_http_bridge_mode(cfg).await
         }
         Some(ServeTransport::Unix(u)) => {
-            let path = ahma_common::daemon_hub::mcp_socket_path(u.socket_path.as_deref());
+            let path = ahma_common::hub::mcp_socket_path(u.socket_path.as_deref());
             tracing::info!("Running in Unix socket bridge mode on {}", path);
             modes::run_unix_bridge_mode(cfg).await
         }
         None => {
             tracing::info!(
                 "Running in Unix socket bridge mode on {}",
-                ahma_common::daemon_hub::mcp_socket_path(None)
+                ahma_common::hub::mcp_socket_path(None)
             );
             modes::run_unix_bridge_mode(cfg).await
         }
@@ -990,11 +990,11 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in uninstall mode");
             crate::uninstall::run(args).await
         }
-        Subcommands::Daemon(_) => {
+        Subcommands::Hub(_) => {
             anyhow::bail!(
-                "daemon is provided by the ahma_bin crate. \
-                 If you are running a custom binary, implement daemon dispatch \
-                 using ahma_common::daemon_hub::run_daemon."
+                "hub is provided by the ahma_bin crate. \
+                 If you are running a custom binary, implement hub dispatch \
+                 using ahma_common::hub::run_hub."
             )
         }
         Subcommands::Settings(args) => {
@@ -1344,16 +1344,16 @@ pub struct Cli {
     #[arg(long = "tls-dir", value_name = "PATH", global = true)]
     pub tls_dir: Option<PathBuf>,
 
-    /// Hub daemon socket path (an `AF_UNIX` socket on every OS).
-    /// Replaces the retired AHMA_DAEMON_SOCK environment variable.
-    #[arg(long = "daemon-socket", value_name = "PATH", global = true)]
-    pub daemon_socket: Option<PathBuf>,
+    /// Hub socket path (an `AF_UNIX` socket on every OS).
+    /// Replaces the retired AHMA_HUB_SOCK environment variable.
+    #[arg(long = "hub-socket", value_name = "PATH", global = true)]
+    pub hub_socket: Option<PathBuf>,
 
     /// Indicate that this process is spawned as a child server subprocess.
     #[arg(long = "server-child", global = true)]
     pub server_child: bool,
 
-    /// The MCP session this worker serves, passed by the daemon that spawned
+    /// The MCP session this worker serves, passed by the hub that spawned
     /// it. Stable for the session's life, so the hub keeps one instance
     /// identity across re-registration and a reader can tell two windows on the
     /// same project apart. Internal plumbing; not for users.
@@ -1419,10 +1419,10 @@ pub enum Subcommands {
     /// agent skills, and optionally the ahma binary). Mirrors `ahma setup` with the same
     /// "what / which platforms" prompts when no flags are given.
     Uninstall(UninstallArgs),
-    /// Start the TUI hub daemon for multi-instance aggregation. The daemon collects
+    /// Start the TUI hub for multi-instance aggregation. The hub collects
     /// operation events from running ahma instances (including stdio processes spawned
     /// by IDEs) and fans them to TUI subscribers. Starts automatically on first use.
-    Daemon(DaemonArgs),
+    Hub(HubArgs),
     /// Manage the settings file (`~/.ahma/settings.toml`). The primary place to
     /// configure Ahma behaviour, superseding environment variables and providing a
     /// single, auditable, self-documented source of truth.
@@ -1452,7 +1452,7 @@ pub enum Subcommands {
     /// it has been trusted with nor grant itself more. `ahma sandbox` and
     /// `ahma web` remain as kind-scoped shortcuts into the same ledger.
     Permissions(PermissionsArgs),
-    /// Check ahma's own health and say what would fix what it finds: settings that do not parse, granted folders that no longer exist, a daemon running a different build, the warnings repeating in the logs, and whether this folder is trusted. Read-only unless you pass --fix, and even then every fix is shown and asked about first. The same checks run as /doctor in `ahma tui`.
+    /// Check ahma's own health and say what would fix what it finds: settings that do not parse, granted folders that no longer exist, a hub running a different build, the warnings repeating in the logs, and whether this folder is trusted. Read-only unless you pass --fix, and even then every fix is shown and asked about first. The same checks run as /doctor in `ahma tui`.
     Doctor(DoctorArgs),
 }
 
@@ -1591,12 +1591,12 @@ pub struct UninstallArgs {
     pub dry_run: bool,
 }
 
-/// Arguments for `ahma daemon`.
+/// Arguments for `ahma hub`.
 ///
-/// The daemon is configured via `~/.ahma/settings.toml` or the `AHMA_DAEMON_SOCK`
+/// The hub is configured via `~/.ahma/settings.toml` or the `AHMA_HUB_SOCK`
 /// environment variable (socket path override only).
 #[derive(clap::Args, Debug, Clone)]
-pub struct DaemonArgs {}
+pub struct HubArgs {}
 
 // ── settings ─────────────────────────────────────────────────────────────────
 
@@ -2271,7 +2271,7 @@ pub struct TuiArgs {
     /// URL of the ahma server to monitor.
     ///
     /// When omitted, `ahma tui` probes local transports in order:
-    /// the per-user daemon's Unix socket (or `[http] unix_socket_path`
+    /// the per-user hub's Unix socket (or `[http] unix_socket_path`
     /// in `~/.ahma/settings.toml`), then `http://localhost:3000`.
     ///
     /// Supported URL formats:
@@ -2456,18 +2456,18 @@ fn unix_socket_path_from_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -
                 .socket_path
                 .clone()
                 .or_else(|| s.http.unix_socket_path.clone())
-                .unwrap_or_else(|| ahma_common::daemon_hub::mcp_socket_path(None)),
+                .unwrap_or_else(|| ahma_common::hub::mcp_socket_path(None)),
             _ => s
                 .http
                 .unix_socket_path
                 .clone()
-                .unwrap_or_else(|| ahma_common::daemon_hub::mcp_socket_path(None)),
+                .unwrap_or_else(|| ahma_common::hub::mcp_socket_path(None)),
         },
         _ => s
             .http
             .unix_socket_path
             .clone()
-            .unwrap_or_else(|| ahma_common::daemon_hub::mcp_socket_path(None)),
+            .unwrap_or_else(|| ahma_common::hub::mcp_socket_path(None)),
     }
 }
 
@@ -2932,8 +2932,8 @@ fn apply_process_wide_cli_overrides(cli: &Cli) {
     if let Some(dir) = &cli.tls_dir {
         ahma_common::local_tls::LocalTlsConfig::set_dir_override(dir.clone());
     }
-    if let Some(path) = &cli.daemon_socket {
-        ahma_common::daemon_hub::set_socket_path_override(path.clone());
+    if let Some(path) = &cli.hub_socket {
+        ahma_common::hub::set_socket_path_override(path.clone());
     }
 }
 
@@ -3191,8 +3191,8 @@ pub fn build_app_config_with_settings(
         instance_label: auth.instance_label,
         idle_timeout_secs,
         max_sessions: cli.max_sessions.unwrap_or(10),
-        daemon_idle_timeout_secs: s.daemon.idle_timeout_secs,
-        daemon_socket_explicit: cli.daemon_socket.is_some(),
+        hub_idle_timeout_secs: s.hub.idle_timeout_secs,
+        hub_socket_explicit: cli.hub_socket.is_some(),
         session_id: cli.session_id.clone(),
         client_pid: cli.client_pid,
         is_server_child: cli.server_child || std::env::var("AHMA_SERVER_CHILD").is_ok(),
@@ -4646,7 +4646,7 @@ mod tests {
         );
     }
 
-    /// A worker gets the daemon's flags first and the session's after them,
+    /// A worker gets the hub's flags first and the session's after them,
     /// so the last of `--sync` / `--async` must win rather than conflict.
     #[test]
     fn the_last_execution_mode_flag_wins() {
@@ -5038,9 +5038,9 @@ mod tests {
         let s = ahma_common::config::AhmaSettings::default();
         assert_eq!(
             unix_socket_path_from_cli(&cli, &s),
-            ahma_common::daemon_hub::mcp_socket_path(None),
-            "with nothing configured the CLI resolves the per-user daemon socket \
-             (SPEC R-DAEMON.2), never the retired machine-global /tmp/ahma.sock"
+            ahma_common::hub::mcp_socket_path(None),
+            "with nothing configured the CLI resolves the per-user hub socket \
+             (SPEC R-HUB.2), never the retired machine-global /tmp/ahma.sock"
         );
     }
 
@@ -5165,10 +5165,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_subcommand_daemon_bails() {
-        let err = dispatch_subcommand(Subcommands::Daemon(DaemonArgs {}), make_cfg())
+    async fn test_dispatch_subcommand_hub_bails() {
+        let err = dispatch_subcommand(Subcommands::Hub(HubArgs {}), make_cfg())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("daemon is provided"));
+        assert!(err.to_string().contains("hub is provided"));
     }
 }

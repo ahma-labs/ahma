@@ -89,9 +89,9 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
         max_sessions: config.max_sessions,
         peer_factory: None,
         bound_port_tx: None,
-        // Explicitly started bridge: it owns its process (SPEC R-DAEMON.1).
+        // Explicitly started bridge: it owns its process (SPEC R-HUB.1).
         exit: None,
-        // Session options are a daemon feature (SPEC R-DAEMON.4).
+        // Session options are a hub feature (SPEC R-HUB.4).
         session_options: None,
     };
 

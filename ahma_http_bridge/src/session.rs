@@ -661,13 +661,13 @@ pub struct SessionManagerConfig {
     /// Translates a session's query string into worker arguments.
     ///
     /// The allowlist that decides which options exist lives in `ahma_mcp`,
-    /// which depends on this crate; the daemon injects the translator here so
+    /// which depends on this crate; the hub injects the translator here so
     /// the dependency does not have to point the other way.
     pub session_options: Option<SessionOptionTranslator>,
 }
 
 /// Turns a session's URL query into worker arguments, or explains why it will
-/// not (SPEC R-DAEMON.4).
+/// not (SPEC R-HUB.4).
 pub type SessionOptionTranslator =
     Arc<dyn Fn(&str) -> std::result::Result<Vec<String>, String> + Send + Sync>;
 
@@ -736,9 +736,9 @@ pub struct SessionManager {
     config: SessionManagerConfig,
     /// Shared atomic counter tracking active connections.
     pub active_sessions: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    /// Set once the hosting daemon has been asked to drain: existing sessions
+    /// Set once the hosting hub has been asked to drain: existing sessions
     /// run to completion, new ones are refused so they are not started inside a
-    /// process that is about to go (SPEC R-DAEMON.5).
+    /// process that is about to go (SPEC R-HUB.5).
     pub draining: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Retained history of recently terminated sessions with their termination reason.
     terminated_sessions: DashMap<String, TerminatedSessionInfo>,
@@ -1472,7 +1472,7 @@ impl SessionManager {
     /// or the `~/sandbox` fallback), if any. Exposed via `/health` (SPEC R7)
     /// so a client deciding whether to reuse an already-running bridge can
     /// tell whether it is actually scoped to the project the client wants,
-    /// instead of silently reusing a stale daemon pinned to a different
+    /// instead of silently reusing a stale hub pinned to a different
     /// (or fallback) directory.
     pub fn default_scope(&self) -> Option<&std::path::Path> {
         self.config.default_scope.as_deref()
@@ -1616,10 +1616,10 @@ impl SessionManager {
     }
 
     /// Turn a session's query string into worker arguments, refusing an option
-    /// this build does not know (SPEC R-DAEMON.4).
+    /// this build does not know (SPEC R-HUB.4).
     ///
     /// The allowlist lives in `ahma_mcp`, which depends on this crate, so the
-    /// daemon injects the translator rather than this crate reaching upwards.
+    /// hub injects the translator rather than this crate reaching upwards.
     pub fn worker_args_for_query(&self, query: &str) -> std::result::Result<Vec<String>, String> {
         if query.is_empty() {
             return Ok(Vec::new());
@@ -1627,11 +1627,11 @@ impl SessionManager {
         match &self.config.session_options {
             Some(translate) => translate(query),
             // No translator installed (an explicitly started bridge): options
-            // are a daemon feature, and silently dropping them would be worse
+            // are a hub feature, and silently dropping them would be worse
             // than saying so.
             None => Err(
                 "this server does not accept per-session options; they are a feature of the \
-                 ahma daemon"
+                 ahma hub"
                     .to_string(),
             ),
         }
@@ -1656,7 +1656,7 @@ impl SessionManager {
     }
 
     /// Create a session whose worker carries `worker_args` — the options this
-    /// client asked for, and nobody else (SPEC R-DAEMON.4).
+    /// client asked for, and nobody else (SPEC R-HUB.4).
     pub async fn create_session_with_args(&self, worker_args: Vec<String>) -> Result<String> {
         self.ensure_session_capacity().await?;
 

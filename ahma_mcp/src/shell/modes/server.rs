@@ -498,7 +498,7 @@ pub async fn query_tcp_health(url: &str) -> Option<BridgeHealth> {
     None
 }
 
-/// The version the daemon at `socket_path` reports, or `None` if nothing
+/// The version the hub at `socket_path` reports, or `None` if nothing
 /// answers there.
 pub async fn get_bridge_version(socket_path: &str) -> Option<String> {
     query_uds_health(socket_path).await.map(|h| h.version)
@@ -511,9 +511,9 @@ pub async fn trigger_uds_restart(path: &str) -> bool {
 
 /// POST `/restart` over the Unix socket, optionally with a `mode` query.
 ///
-/// `Some("drain")` asks a daemon to stop accepting new sessions and go once the
+/// `Some("drain")` asks a hub to stop accepting new sessions and go once the
 /// live ones end, which is how a version handoff avoids ending sessions that
-/// belong to other windows (SPEC R-DAEMON.5).
+/// belong to other windows (SPEC R-HUB.5).
 pub async fn trigger_uds_restart_with_mode(path: &str, mode: Option<&str>) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let connect = ahma_common::local_socket::LocalStream::connect(std::path::Path::new(path));
@@ -555,19 +555,19 @@ pub async fn trigger_tcp_restart_with_mode(url: &str, mode: Option<&str>) -> boo
     false
 }
 
-/// True when a test-isolated process has been pointed at the shared daemon's
+/// True when a test-isolated process has been pointed at the shared hub's
 /// socket, which it must never ask to stop.
 ///
-/// A test must never shut down a daemon it does not own. A test-spawned ahma is
+/// A test must never shut down a hub it does not own. A test-spawned ahma is
 /// a freshly built binary, so it carries a different BUILD_ID; pointed at the
-/// shared endpoint it decides the running daemon is "stale" and restarts
+/// shared endpoint it decides the running hub is "stale" and restarts
 /// whatever owns it — the developer's live MCP server. A test driving its own
 /// bridge on a private socket is legitimate, so only the shared one is refused.
 fn is_shared_socket_under_test(socket_path: &str) -> bool {
     let shared = is_test_isolated() && socket_path == global_mcp_socket_path();
     if shared {
         tracing::warn!(
-            "Test-isolated process may not restart the shared daemon; ignoring {socket_path}"
+            "Test-isolated process may not restart the shared hub; ignoring {socket_path}"
         );
     }
     shared
@@ -577,8 +577,8 @@ pub async fn trigger_bridge_restart(socket_path: &str) -> bool {
     trigger_bridge_restart_with_mode(socket_path, None).await
 }
 
-/// Ask the daemon to drain: finish the sessions it has, accept no new ones,
-/// then exit (SPEC R-DAEMON.5).
+/// Ask the hub to drain: finish the sessions it has, accept no new ones,
+/// then exit (SPEC R-HUB.5).
 pub async fn trigger_bridge_drain(socket_path: &str) -> bool {
     trigger_bridge_restart_with_mode(socket_path, Some("drain")).await
 }
@@ -617,16 +617,16 @@ fn open_capture_file_sync(path: &std::path::Path, banner: &str) -> Option<std::f
     }
 }
 
-/// The per-user MCP endpoint the daemon binds (SPEC R-DAEMON.2).
+/// The per-user MCP endpoint the hub binds (SPEC R-HUB.2).
 ///
-/// It is a per-user singleton *by design*: several MCP clients share one daemon.
+/// It is a per-user singleton *by design*: several MCP clients share one hub.
 /// That sharing is exactly why a test must never resolve it — see
 /// [`is_test_isolated`] and this module's socket resolution. It used to be the
 /// machine-global `/tmp/ahma.sock`, which every local user could see and, since
 /// nothing owned the path, pre-create; it now lives beside the hub socket in the
 /// 0700 per-user runtime directory.
 pub fn global_mcp_socket_path() -> String {
-    ahma_common::daemon_hub::platform_mcp_socket_path()
+    ahma_common::hub::platform_mcp_socket_path()
         .to_string_lossy()
         .into_owned()
 }
@@ -654,10 +654,10 @@ pub fn is_test_isolated() -> bool {
 /// Under test isolation this is a per-process private path, so a test can never
 /// reach — much less restart — a bridge it does not own.
 fn default_socket_path() -> String {
-    // One resolver for both rendezvous files (SPEC R-DAEMON.2, R-ISO.1): the
+    // One resolver for both rendezvous files (SPEC R-HUB.2, R-ISO.1): the
     // harness fallback keys off the test-run discriminator, not this process's
     // pid, so a test and the binaries it spawns agree on the same private path.
-    ahma_common::daemon_hub::mcp_socket_path(None)
+    ahma_common::hub::mcp_socket_path(None)
 }
 
 /// Returns true when the process is running as a server-child subprocess.
@@ -673,13 +673,13 @@ fn is_test_or_server_child(config: &AppConfig) -> bool {
     std::env::var("AHMA_SERVER_CHILD").is_ok() || config.is_server_child
 }
 
-/// The daemon socket this frontend proxies to: the configured one, or the
+/// The hub socket this frontend proxies to: the configured one, or the
 /// per-user default (private under a test harness, SPEC R-ISO.1).
 ///
-/// There is no HTTP fallback. The daemon serves its MCP endpoint on this socket
-/// on every OS (SPEC R-DAEMON.2); a fallback to the `serve http` port only ever
+/// There is no HTTP fallback. The hub serves its MCP endpoint on this socket
+/// on every OS (SPEC R-HUB.2); a fallback to the `serve http` port only ever
 /// found some *other* server — on a developer's machine, their live one, which
-/// is how a daemon that never started once produced a green local test run.
+/// is how a hub that never started once produced a green local test run.
 fn resolve_bridge_socket(config: &AppConfig) -> String {
     // AHMA_UNIX_SOCKET is retired per R-CFG1.2. Use --unix-socket-path CLI flag or
     // settings.toml instead. The value comes from AppConfig.unix_socket_path which
@@ -708,7 +708,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     //
     // An editor spawned us over a stdin/stdout pipe. Everything that actually
     // serves MCP — the adapter, the shell pool, the sandbox — belongs to the
-    // per-user daemon and its per-session workers (SPEC R-DAEMON.1), so this
+    // per-user hub and its per-session workers (SPEC R-HUB.1), so this
     // process builds none of it and registers nothing with the hub. It used to
     // build a complete service it never served, and register it, which is why a
     // TUI showed a phantom instance that could not run anything.
@@ -791,7 +791,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // Web-approval TUI surface (R-WEB.6): the service's own `WebApprovalCoordinator`
     // drives both the prompt delivery (via this sender) and the answer resolution
     // (the reporter shares the same coordinator), so a TUI approval takes effect for
-    // the live session. Wired only in this daemon/server path.
+    // the live session. Wired only in this hub/server path.
     let (web_req_tx, web_req_rx) = tokio::sync::mpsc::unbounded_channel();
     service_handler.set_web_approval_sender(web_req_tx);
     let web_coordinator = service_handler.web_approval.clone();
@@ -810,17 +810,17 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let label = config.instance_label.clone();
-        crate::daemon_reporter::set_initial_identity(config.session_id.clone(), config.client_pid);
-        crate::daemon_reporter::spawn_reporter(
+        crate::hub_reporter::set_initial_identity(config.session_id.clone(), config.client_pid);
+        crate::hub_reporter::spawn_reporter(
             operation_monitor.clone(),
             "stdio",
             scope_str,
             label,
-            Some(crate::daemon_reporter::GrantReporting {
+            Some(crate::hub_reporter::GrantReporting {
                 coordinator: grant_coordinator,
                 req_rx: grant_req_rx,
             }),
-            Some(crate::daemon_reporter::WebApprovalReporting {
+            Some(crate::hub_reporter::WebApprovalReporting {
                 coordinator: web_coordinator,
                 req_rx: web_req_rx,
             }),
@@ -905,9 +905,9 @@ async fn serve_stdio_until_shutdown(
 /// sessions. The detached background process is deliberately NOT armed (it
 /// outlives its spawner by design and self-terminates on idle).
 async fn ensure_backend(config: &AppConfig, socket_path: &str) -> Result<()> {
-    use crate::shell::modes::daemon_client;
-    let outcome = daemon_client::ensure_daemon(socket_path, config.idle_timeout_secs).await?;
-    if let Some(notice) = daemon_client::disclosure(&outcome) {
+    use crate::shell::modes::hub_client;
+    let outcome = hub_client::ensure_hub(socket_path, config.idle_timeout_secs).await?;
+    if let Some(notice) = hub_client::disclosure(&outcome) {
         // R7: never let ahma's own state be something the user has to infer.
         tracing::warn!("{notice}");
     }
@@ -918,9 +918,9 @@ async fn ensure_backend(config: &AppConfig, socket_path: &str) -> Result<()> {
 /// over a stdin/stdout pipe and proxies to the shared background process, which
 /// [`ensure_backend`] has found or started.
 async fn run_as_frontend(config: &AppConfig, socket_path: &str) -> Result<()> {
-    use crate::shell::modes::daemon_client;
+    use crate::shell::modes::hub_client;
 
-    // Respawn hook: if the daemon later dies or its socket vanishes (killed
+    // Respawn hook: if the hub later dies or its socket vanishes (killed
     // out-of-band, or it exited on idle between our calls), the proxy's
     // reconnect loop brings one back instead of re-dialing a gone endpoint.
     let respawn_bridge: crate::shell::modes::proxy_client::BridgeRespawnFn = {
@@ -928,16 +928,12 @@ async fn run_as_frontend(config: &AppConfig, socket_path: &str) -> Result<()> {
         let idle = config.idle_timeout_secs;
         Box::new(move || {
             let socket_path = socket_path.clone();
-            Box::pin(async move {
-                daemon_client::ensure_daemon(&socket_path, idle)
-                    .await
-                    .map(|_| ())
-            })
+            Box::pin(async move { hub_client::ensure_hub(&socket_path, idle).await.map(|_| ()) })
         })
     };
 
     // This client's own options travel with its session, so its `--tools` or
-    // `--sandbox-scope` shape its worker and nobody else's (SPEC R-DAEMON.4).
+    // `--sandbox-scope` shape its worker and nobody else's (SPEC R-HUB.4).
     let session_query = crate::shell::modes::session_options::session_query_from_config(config);
 
     crate::shell::modes::proxy_client::run_proxy_client_with_options(
@@ -1023,8 +1019,8 @@ mod tests {
             workspace_queue: true,
             edit_guard: true,
             settings_origin: crate::shell::cli::SettingsOriginCtx::default(),
-            daemon_idle_timeout_secs: 60,
-            daemon_socket_explicit: false,
+            hub_idle_timeout_secs: 60,
+            hub_socket_explicit: false,
             session_id: None,
             client_pid: None,
         }
@@ -1254,7 +1250,7 @@ mod tests {
         assert_ne!(
             socket,
             global_mcp_socket_path(),
-            "a test must not resolve the shared daemon socket"
+            "a test must not resolve the shared hub socket"
         );
         // Keyed by the test-run discriminator, not this pid: a test and the
         // binaries it spawns must agree on one private path (SPEC R-ISO.1).
@@ -1268,20 +1264,20 @@ mod tests {
     }
 
     /// Defence in depth: even if a test somehow resolves the shared endpoint, it
-    /// is refused the ability to shut that daemon down.
+    /// is refused the ability to shut that hub down.
     #[tokio::test]
     async fn trigger_bridge_restart_refuses_the_global_endpoint_under_test_isolation() {
         assert!(
             !trigger_bridge_restart(&global_mcp_socket_path()).await,
-            "a test must never restart the shared daemon"
+            "a test must never restart the shared hub"
         );
     }
 
-    /// The frontend finds, versions and restarts its daemon through the socket
+    /// The frontend finds, versions and restarts its hub through the socket
     /// on every OS — there is no HTTP fallback left to find it by (SPEC
-    /// R-DAEMON.2). On Windows this used to be a TCP port nobody could discover.
+    /// R-HUB.2). On Windows this used to be a TCP port nobody could discover.
     #[tokio::test]
-    async fn the_daemon_is_probed_and_restarted_over_its_socket() {
+    async fn the_hub_is_probed_and_restarted_over_its_socket() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let tmp = tempdir().unwrap();

@@ -136,14 +136,14 @@ pub mod client_type;
 pub mod config;
 /// Constants used for guidance and tool hints.
 pub mod constants;
-/// Background reporter that registers this instance with the hub daemon.
-pub mod daemon_reporter;
 /// File operations provider.
 pub mod file_ops;
 /// The AI harnesses ahma can configure, and the facts that describe each.
 pub mod harness_target;
 /// External terminal hook management for supported AI tools.
 pub mod hooks;
+/// Background reporter that registers this instance with the hub.
+pub mod hub_reporter;
 /// Live log monitoring pipeline (LLM-powered issue detection).
 pub mod livelog;
 /// LLM Completion Service provider.

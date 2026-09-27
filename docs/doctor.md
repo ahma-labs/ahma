@@ -5,7 +5,7 @@
 ## Why
 
 When ahma misbehaves, the cause is usually in its own state rather than in
-your project: a grant for a folder that no longer exists, a daemon still
+your project: a grant for a folder that no longer exists, a hub still
 running an older build, a settings file that stopped parsing, a warning that
 repeats thousands of times in the log. You should not have to know where each
 of those lives. The doctor looks, says what it found and what it costs, and
@@ -35,8 +35,8 @@ Example report:
 [!] Granted folders that no longer exist
     /opt/two — every ahma session tries to add these to its sandbox and logs a warning.
     fix 1: Remove 1 granted folder(s) that no longer exist from ~/.ahma/settings.toml: /opt/two
-[!] Daemon is a different build
-    The daemon is ahma 0.21.3+4437961, this is 0.21.3+7ffb5749. …
+[!] Hub is a different build
+    The hub is ahma 0.21.3+4437961, this is 0.21.3+7ffb5749. …
 [i] This folder is not trusted
     Tools that change something ask first (always allowed here: list_dir, read_file). /settings trust to trust it.
 [ok] Settings file reads cleanly
@@ -49,7 +49,7 @@ Example report:
 | Settings file parses | problem if not | none — the message names the line; ahma never overwrites a file it cannot read |
 | Granted folders (`[sandbox] persistent_scopes`) that no longer exist | warn | remove them |
 | Tool approvals for folders that no longer exist | info | forget them |
-| Daemon running a different build than this binary | warn | none — quit ahma sessions and the next one starts the new build |
+| Hub running a different build than this binary | warn | none — quit ahma sessions and the next one starts the new build |
 | Whether this folder is trusted, and what is always allowed here | info | none — `/settings trust` |
 | Log size, and the most repeated warnings in the newest log | info / warn | none |
 | Antigravity permission grants (`~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/config.json`) | warn / info | prune bloated one-off/malformed entries and install clean prefix token grants |

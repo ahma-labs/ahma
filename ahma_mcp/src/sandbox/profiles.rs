@@ -538,7 +538,7 @@ pub fn platform_enforcement() -> PlatformEnforcement {
         // expressed to the kernel at all.
         notes.push(
             "Linux: the workspace is kernel-scoped, but the trust-handoff deny list (git \
-             hook directories, the project's own .ahma/, daemon sockets) is enforced only \
+             hook directories, the project's own .ahma/, hub sockets) is enforced only \
              in ahma's own file tools — Landlock cannot carve a denied hole inside an \
              allowed directory. A command run through run_terminal_command can still write \
              those paths.",

@@ -803,7 +803,7 @@ fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Li
     lines.push(kv("status", status, theme.op_status_style(&op.status)));
     // Loud, and second only to the outcome: this command was not confined by
     // the kernel, and no other line on this pane would tell the reader so
-    // (SPEC R-DAEMON.9).
+    // (SPEC R-HUB.9).
     if op.unsandboxed {
         lines.push(kv(
             "sandbox",
@@ -1117,7 +1117,7 @@ fn format_external_tools_part(state: &AppState) -> String {
     }
 }
 
-/// A server or daemon connection state, spelled out: `● ahma` when up,
+/// A server or hub connection state, spelled out: `● ahma` when up,
 /// `○ ahma OFFLINE 12s` when down. A glyph flip alone is not a state change
 /// anyone notices, and the rest of the screen keeps looking live meanwhile.
 fn connection_span(
@@ -1154,7 +1154,7 @@ pub(crate) fn format_elapsed_short(d: std::time::Duration) -> String {
 ///
 /// Left: what is being done (project filter, clients, running/queued/done
 /// tallies). Right: whether ahma is reachable and how it behaves — execution
-/// mode, server and daemon health (with how long they have been down),
+/// mode, server and hub health (with how long they have been down),
 /// transport, and the sandbox actually locked. Per-window facts (model,
 /// tokens, context fill) live on each window instead, since they differ.
 pub(crate) fn draw_status_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
@@ -1170,9 +1170,9 @@ pub(crate) fn draw_status_header(frame: &mut Frame, state: &AppState, theme: &Th
         theme,
     ));
     right.push(connection_span(
-        "daemon",
-        state.daemon_healthy,
-        state.daemon_down_since,
+        "hub",
+        state.hub_healthy,
+        state.hub_down_since,
         state.unicode,
         theme,
     ));
@@ -2262,7 +2262,7 @@ fn unscoped_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> 
         }
         _ => {
             "No sandbox report received on this connection yet \
-             (daemon-only attach, or an older server)."
+             (hub-only attach, or an older server)."
         }
     };
     lines.push(Line::from(Span::styled(
@@ -5741,11 +5741,11 @@ mod tests {
     #[test]
     fn a_down_connection_says_for_how_long() {
         let theme = Theme::new(true);
-        let up = connection_span("daemon", true, None, true, &theme);
-        assert_eq!(up.content, " ● daemon");
+        let up = connection_span("hub", true, None, true, &theme);
+        assert_eq!(up.content, " ● hub");
         let since = std::time::Instant::now() - std::time::Duration::from_secs(12);
-        let down = connection_span("daemon", false, Some(since), true, &theme);
-        assert_eq!(down.content, " ○ daemon OFFLINE 12s");
+        let down = connection_span("hub", false, Some(since), true, &theme);
+        assert_eq!(down.content, " ○ hub OFFLINE 12s");
     }
 
     #[test]
@@ -5757,14 +5757,14 @@ mod tests {
     }
 
     /// Every layout shows the same header, and it carries the facts a glance
-    /// is for: the execution mode and whether the daemon is reachable.
+    /// is for: the execution mode and whether the hub is reachable.
     #[test]
     fn the_status_header_shows_mode_and_reachability() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut state = crate::state::AppState::new("http://localhost:3000", "HTTP", true);
-        state.set_daemon_healthy(true);
-        state.set_daemon_healthy(false);
+        state.set_hub_healthy(true);
+        state.set_hub_healthy(false);
         let theme = Theme::new(true);
         let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
         terminal
@@ -5781,7 +5781,7 @@ mod tests {
             .execution_mode
             .to_string();
         assert!(row.contains(&mode), "{row}");
-        assert!(row.contains("daemon OFFLINE"), "{row}");
+        assert!(row.contains("hub OFFLINE"), "{row}");
     }
 
     #[test]

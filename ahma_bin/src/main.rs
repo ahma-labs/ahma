@@ -50,7 +50,7 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let result = run().await;
-    // A failed outside service (GitHub, a model server, the daemon) is shown
+    // A failed outside service (GitHub, a model server, the hub) is shown
     // summary-first (SPEC R-HTTP.3), not in anyhow's `Error: … Caused by:`
     // form, which would print its cause chain twice.
     if let Err(e) = &result
@@ -177,11 +177,11 @@ async fn run() -> Result<()> {
             tracing::info!("Dispatching llm subcommand");
             dispatch_llm(llm_args).await
         }
-        Subcommands::Daemon(_) => {
-            tracing::info!("Starting the per-user ahma daemon");
+        Subcommands::Hub(_) => {
+            tracing::info!("Starting the per-user ahma hub");
             // Hosts both the observability hub and the MCP endpoint in one
-            // process, with one idle policy and one exit path (SPEC R-DAEMON.1).
-            ahma_mcp::shell::modes::daemon::run_daemon_mode(cfg).await
+            // process, with one idle policy and one exit path (SPEC R-HUB.1).
+            ahma_mcp::shell::modes::hub::run_hub_mode(cfg).await
         }
         Subcommands::Simplify(simplify_args) => {
             tracing::info!("Running in simplify mode");

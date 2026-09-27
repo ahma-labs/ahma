@@ -1434,7 +1434,7 @@ impl Default for AuthSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InstanceSettings {
-    /// Human-readable instance name shown in the TUI and daemon event stream.
+    /// Human-readable instance name shown in the TUI and hub event stream.
     /// Default: `"ahma"`
     pub label: String,
 }
@@ -1447,31 +1447,35 @@ impl Default for InstanceSettings {
     }
 }
 
-/// Per-user daemon settings (SPEC R-DAEMON.3).
+/// Per-user hub settings (SPEC R-HUB.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct DaemonSettings {
-    /// Seconds the daemon stays alive with nothing attached — no MCP sessions
+pub struct HubSettings {
+    /// Seconds the hub stays alive with nothing attached — no MCP sessions
     /// and no hub subscribers — before exiting. `0` keeps it running forever.
     ///
-    /// The daemon is cheap to restart and holds no state a client depends on
+    /// The hub is cheap to restart and holds no state a client depends on
     /// (history is on disk), so the default trades a fraction of a second on
     /// the next connect for not leaving a process running all night. Under a
-    /// test harness the default drops to ten seconds, so a test-spawned daemon
+    /// test harness the default drops to ten seconds, so a test-spawned hub
     /// cannot outlive the run that started it by a minute.
     pub idle_timeout_secs: u64,
 }
 
-impl Default for DaemonSettings {
+impl Default for HubSettings {
     fn default() -> Self {
         Self {
-            idle_timeout_secs: if crate::test_isolation::spawned_under_test_harness() {
-                10
-            } else {
-                60
-            },
+            idle_timeout_secs: hub_idle_timeout_default(
+                crate::test_isolation::spawned_under_test_harness(),
+            ),
         }
     }
+}
+
+/// `[hub] idle_timeout_secs` when the settings file does not say (SPEC
+/// R-HUB.3): an hour, or ten seconds under a test harness.
+pub fn hub_idle_timeout_default(under_test_harness: bool) -> u64 {
+    if under_test_harness { 10 } else { 3600 }
 }
 
 /// Default policy for outbound HTTP made by ahma's own tools (`fetch_webpage`).
@@ -1664,8 +1668,10 @@ pub struct AhmaSettings {
     pub auth: AuthSettings,
     /// Instance identity settings.
     pub instance: InstanceSettings,
-    /// Per-user daemon lifetime settings.
-    pub daemon: DaemonSettings,
+    /// Per-user hub lifetime settings. `[daemon]`, its name before the
+    /// rename, is still read.
+    #[serde(alias = "daemon")]
+    pub hub: HubSettings,
     /// LLM provider/model most recently selected in `ahma tui`, persisted so the
     /// MCP sub-agent and the next session can reuse it.
     pub agent: AgentSettings,
@@ -1741,7 +1747,7 @@ impl AhmaSettings {
     ///
     /// This is the **runtime-safe** loader: a parse error is logged and the
     /// compiled-in defaults are returned, so a settings file corrupted while a
-    /// long-running process (TUI, daemon) is live cannot hard-kill it. The
+    /// long-running process (TUI, hub) is live cannot hard-kill it. The
     /// **fail-closed** behavior required at startup (R-CFG6.1) is implemented by
     /// the startup resolution path via [`Self::load_from_result`], which surfaces the
     /// error so the launcher can abort before the sandbox is built.
@@ -2322,19 +2328,19 @@ impl AhmaSettings {
         // ── Instance identity ────────────────────────────────────────────────
         w.section("Instance identity", "instance");
         w.setting(
-            "Instance name shown in the TUI and daemon event stream.",
+            "Instance name shown in the TUI and hub event stream.",
             "label",
             toml_str(&self.instance.label),
             toml_str(&d.instance.label),
         );
 
-        // ── Daemon ───────────────────────────────────────────────────────────
-        w.section("Per-user daemon (ahma daemon)", "daemon");
+        // ── Hub ───────────────────────────────────────────────────────────
+        w.section("Per-user hub (ahma hub)", "hub");
         w.setting(
-            "Seconds with nothing attached — no MCP sessions and no TUI — before the daemon exits. 0 keeps it running forever.",
+            "Seconds with nothing attached — no MCP sessions and no TUI — before the hub exits. 0 keeps it running forever.",
             "idle_timeout_secs",
-            self.daemon.idle_timeout_secs.to_string(),
-            d.daemon.idle_timeout_secs.to_string(),
+            self.hub.idle_timeout_secs.to_string(),
+            d.hub.idle_timeout_secs.to_string(),
         );
 
         w.section("Agent (last-selected LLM, written by ahma tui)", "agent");
@@ -2976,7 +2982,7 @@ mod tests {
             instance: InstanceSettings {
                 label: "custom-label".into(),
             },
-            daemon: DaemonSettings {
+            hub: HubSettings {
                 idle_timeout_secs: 321,
             },
             agent: AgentSettings {
@@ -3530,6 +3536,34 @@ default_model = "llama3.2"
         let s = AhmaSettings::default();
         assert_eq!(s.lmstudio.model, "openai/gpt-oss-20b");
         assert_eq!(s.lmstudio.base_url, "http://localhost:1234/v1");
+    }
+
+    /// An hour with nothing attached, not a minute (SPEC R-HUB.3): a hub that
+    /// exits between two tool calls a minute apart makes every such pause a
+    /// cold start. Under a test harness it stays short, so a test-spawned hub
+    /// cannot outlive its run.
+    #[test]
+    fn the_hub_idles_for_an_hour_by_default() {
+        assert_eq!(hub_idle_timeout_default(false), 3600);
+        assert_eq!(hub_idle_timeout_default(true), 10);
+    }
+
+    /// A settings file from before the rename keeps its `[daemon]` table
+    /// working, and the next save writes it back as `[hub]`.
+    #[test]
+    fn an_old_daemon_table_still_sets_the_hub() {
+        let s = AhmaSettings::parse("[daemon]\nidle_timeout_secs = 42\n").unwrap();
+        assert_eq!(s.hub.idle_timeout_secs, 42);
+        let rendered = s.render_documented();
+        assert!(rendered.contains("[hub]"), "{rendered}");
+        assert!(!rendered.contains("[daemon]"), "{rendered}");
+        assert_eq!(
+            AhmaSettings::parse(&rendered)
+                .unwrap()
+                .hub
+                .idle_timeout_secs,
+            42
+        );
     }
 
     #[test]
@@ -4148,7 +4182,7 @@ mod tier_tests {
             ("tools", "tools_dir"),
             ("logging", "target"),
             ("instance", "label"),
-            ("daemon", "idle_timeout_secs"),
+            ("hub", "idle_timeout_secs"),
             ("http", "handshake_timeout_secs"),
         ] {
             assert_eq!(

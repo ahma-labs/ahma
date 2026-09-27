@@ -334,8 +334,8 @@ impl AhmaMcpService {
             };
         }
 
-        // Second choice: deliver the prompt to a connected TUI over the daemon hub
-        // (R-WEB.6). The answer arrives asynchronously (the daemon reporter routes
+        // Second choice: deliver the prompt to a connected TUI over the hub
+        // (R-WEB.6). The answer arrives asynchronously (the hub reporter routes
         // it back into `web_approval`), so — like a scope grant — it cannot unblock
         // *this* fetch. Deny it with a "prompt raised, approve and retry" hint and
         // leave the decision in flight so the TUI answer resolves it; the
@@ -650,7 +650,7 @@ impl AhmaMcpService {
         if narrowing.is_some() {
             // The scope just shrank to one project; re-register so the hub
             // stops advertising the container (SPEC R24.3).
-            crate::daemon_reporter::publish_committed_scope(self.adapter.sandbox());
+            crate::hub_reporter::publish_committed_scope(self.adapter.sandbox());
         }
         narrowing
     }

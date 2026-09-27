@@ -1,8 +1,8 @@
-use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage, HubRelay};
 use ahma_common::http_retry::{
     Idempotency, RetryPolicy, ServiceError, classify_status, find_service_error,
     send_with_retry_using,
 };
+use ahma_common::hub::{ClientMsg, HubChatMessage, HubRelay};
 use ahma_http_mcp_client::http_client::{HttpClient, classify_send_error};
 use ahma_http_mcp_client::streamable::{
     ConflictRetryPolicy, ConnectOptions, Connector, StreamableHttpMcpClient, ToolCallOutcome,
@@ -521,7 +521,7 @@ async fn call_mcp_sampling_routed(
     // Not idempotent: a sampling request that arrived may already be running
     // on the client's model (SPEC R-HTTP.2).
     let (resp, _) = send_with_retry_using(
-        DAEMON_SERVICE,
+        HUB_SERVICE,
         &RetryPolicy::DEFAULT,
         Idempotency::NotIdempotent,
         || {
@@ -535,13 +535,13 @@ async fn call_mcp_sampling_routed(
         classify_send_error,
     )
     .await
-    .map_err(|failure| daemon_error(ServiceError::from_transport(DAEMON_SERVICE, failure)))?;
+    .map_err(|failure| hub_error(ServiceError::from_transport(HUB_SERVICE, failure)))?;
 
     let status = resp.status();
     if let Some(failure) = classify_status(status) {
         let body_text = resp.text().await.unwrap_or_default();
-        return Err(daemon_error(ServiceError::new(
-            DAEMON_SERVICE,
+        return Err(hub_error(ServiceError::new(
+            HUB_SERVICE,
             failure,
             anyhow::anyhow!("sampling/createMessage: HTTP {status}: {body_text}"),
         )));
@@ -1564,7 +1564,7 @@ static HTTP_CLIENT_CACHE: std::sync::LazyLock<
 
 /// Return the effective request base URL and a cached [`HttpClient`] for an
 /// MCP bridge `base_url`. A `unix://<path>` URL is the local socket at
-/// `<path>`, on every OS (SPEC R-DAEMON.2), addressed as `http://localhost`;
+/// `<path>`, on every OS (SPEC R-HUB.2), addressed as `http://localhost`;
 /// any other URL gets a plain TCP client and is used as-is.
 pub fn cached_http_client(base_url: &str) -> Result<(String, HttpClient), String> {
     let mut cache = HTTP_CLIENT_CACHE.lock();
@@ -1701,7 +1701,7 @@ pub async fn get_or_create_session(
     };
     let session = StreamableHttpMcpClient::connect(connector, opts)
         .await
-        .map_err(|e| daemon_message(&e))?;
+        .map_err(|e| hub_message(&e))?;
     let sid = session.session_id().to_string();
 
     SESSION_CACHE.lock().insert(cache_key, sid.clone());
@@ -1788,7 +1788,7 @@ pub async fn call_mcp_tool_http(
     match session
         .call_tool(tool, arguments, retry)
         .await
-        .map_err(|e| daemon_message(&e))?
+        .map_err(|e| hub_message(&e))?
     {
         ToolCallOutcome::Success(json_resp) => Ok(parse_mcp_response(&json_resp)),
         ToolCallOutcome::SandboxInitializing { body } => Err(format!("HTTP 409 Conflict: {body}")),
@@ -1999,14 +1999,14 @@ fn resolve_llm_connection(
 
 /// How the agent names the bridge it sends tool calls and sampling requests
 /// to, in the first line of a failure (SPEC R-HTTP.3).
-const DAEMON_SERVICE: &str = "the ahma daemon";
+const HUB_SERVICE: &str = "the ahma hub";
 
-/// What to do when [`DAEMON_SERVICE`] is not answering.
-const DAEMON_HINT: &str = "It normally starts on its own: try again, or run `ahma doctor`.";
+/// What to do when [`HUB_SERVICE`] is not answering.
+const HUB_HINT: &str = "It normally starts on its own: try again, or run `ahma doctor`.";
 
-/// A daemon failure as the agent reports it: summary first, then the hint.
-fn daemon_error(error: ServiceError) -> AgentError {
-    let error = error.with_hint(DAEMON_HINT);
+/// A hub failure as the agent reports it: summary first, then the hint.
+fn hub_error(error: ServiceError) -> AgentError {
+    let error = error.with_hint(HUB_HINT);
     AgentError {
         transient: error.is_transient(),
         message: error.to_string(),
@@ -2014,11 +2014,11 @@ fn daemon_error(error: ServiceError) -> AgentError {
 }
 
 /// Render a failure talking to the bridge for a person: a [`ServiceError`]
-/// from the MCP client is re-attributed to [`DAEMON_SERVICE`]; anything else
+/// from the MCP client is re-attributed to [`HUB_SERVICE`]; anything else
 /// keeps its full cause chain.
-fn daemon_message(error: &anyhow::Error) -> String {
+fn hub_message(error: &anyhow::Error) -> String {
     match find_service_error(error) {
-        Some(service) => daemon_error(service.for_service(DAEMON_SERVICE)).message,
+        Some(service) => hub_error(service.for_service(HUB_SERVICE)).message,
         None => format!("{error:#}"),
     }
 }
@@ -2030,7 +2030,7 @@ pub struct CorePromptRunner;
 impl ahma_mcp::PromptRunner for CorePromptRunner {
     async fn run_prompt(
         &self,
-        messages: Vec<DaemonChatMessage>,
+        messages: Vec<HubChatMessage>,
         system_prompt: Option<String>,
         provider: Option<String>,
         model: Option<String>,
@@ -2041,7 +2041,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         // prompts the TUI), and convert the inbound messages.
         let (client, mcp_config, available_tools) =
             build_agent_run_context(provider, model, None, true).await?;
-        let chat_messages = daemon_messages_to_chat(messages);
+        let chat_messages = hub_messages_to_chat(messages);
 
         // Spawn the agent task with the hub approval gate and an event channel.
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -2062,7 +2062,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
             gate,
         );
 
-        // Receive events from the agent loop and forward them to the hub daemon
+        // Receive events from the agent loop and forward them to the hub
         while let Some(evt) = rx.recv().await {
             // Everything the agent loop emits is relayed to the TUI untouched,
             // so this maps to `HubRelay` and wraps once at the end rather than
@@ -2105,7 +2105,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
 
     async fn run_prompt_to_completion(
         &self,
-        messages: Vec<DaemonChatMessage>,
+        messages: Vec<HubChatMessage>,
         system_prompt: Option<String>,
         provider: Option<String>,
         model: Option<String>,
@@ -2129,7 +2129,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         let (client, mcp_config, available_tools) =
             build_agent_run_context(provider, model, max_turns, false).await?;
 
-        let chat_messages = daemon_messages_to_chat(messages);
+        let chat_messages = hub_messages_to_chat(messages);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         spawn_agent_task(
@@ -2246,7 +2246,7 @@ async fn build_agent_run_context(
 /// `num_ctx` is the provider's declared context window from
 /// `~/.ahma/config.toml`; it becomes [`McpChatConfig::context_length`] so
 /// proactive compaction and the context budgets have a denominator on the
-/// daemon-hub `SubmitPrompt` path (issue #484 — a `None` here made both
+/// hub `SubmitPrompt` path (issue #484 — a `None` here made both
 /// features silently inert for every hub-routed chat).
 ///
 /// `interactive` becomes [`McpChatConfig::tool_approval`]: an interactive run
@@ -2282,8 +2282,8 @@ fn assemble_hub_chat_config(
     }
 }
 
-/// Convert hub `DaemonChatMessage`s into agent `ChatMessage`s.
-fn daemon_messages_to_chat(messages: Vec<DaemonChatMessage>) -> Vec<ChatMessage> {
+/// Convert hub `HubChatMessage`s into agent `ChatMessage`s.
+fn hub_messages_to_chat(messages: Vec<HubChatMessage>) -> Vec<ChatMessage> {
     messages
         .into_iter()
         .map(|msg| {
@@ -3112,11 +3112,11 @@ mod tests {
         assert_handshake_then_tool_call(&format!("http://{addr}"), &roots_answered).await;
     }
 
-    /// The agent reaches the daemon at a `unix://` base URL on every OS: the
-    /// daemon's MCP endpoint is an `AF_UNIX` socket on Windows too, which
-    /// `reqwest` cannot connect to there (SPEC R-DAEMON.2).
+    /// The agent reaches the hub at a `unix://` base URL on every OS: the
+    /// hub's MCP endpoint is an `AF_UNIX` socket on Windows too, which
+    /// `reqwest` cannot connect to there (SPEC R-HUB.2).
     #[tokio::test]
-    async fn a_tool_call_reaches_the_daemon_over_the_local_socket() {
+    async fn a_tool_call_reaches_the_hub_over_the_local_socket() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("mcp.sock");
         let roots_answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4110,7 +4110,7 @@ mod tests {
             .expect_err("non-2xx must error");
         let err = err.message;
         assert!(
-            err.starts_with("The ahma daemon stopped responding."),
+            err.starts_with("The ahma hub stopped responding."),
             "summary first: {err}"
         );
         assert!(err.contains("HTTP 500"), "{err}");

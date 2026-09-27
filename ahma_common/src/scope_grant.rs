@@ -63,7 +63,7 @@ pub enum GrantReason {
 /// A request to **persist** a new sandbox scope grant (widen-on-next-start, never
 /// live). Fanned to every capable surface under one `decision_id`.
 ///
-/// `Serialize`/`Deserialize` so it can travel over the daemon hub (TUI) and inside
+/// `Serialize`/`Deserialize` so it can travel over the hub (TUI) and inside
 /// an MCP `elicitation/create` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeGrantRequest {

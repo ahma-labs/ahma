@@ -898,7 +898,7 @@ impl SettingsEditor {
         vec![SettingItem {
             key: "instance.label",
             label: "Instance label",
-            description: "Name shown in TUI and daemon",
+            description: "Name shown in TUI and hub",
             value: SettingValue::String(i.label.clone()),
             default_value: SettingValue::String(d.label.clone()),
             security_tier: false,

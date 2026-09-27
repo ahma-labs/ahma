@@ -223,7 +223,7 @@ pub struct HooksRunShellArgs {
     #[arg(long = "cwd")]
     pub cwd: Option<PathBuf>,
 
-    /// Session ID for grouping hooked commands in the daemon / TUI.
+    /// Session ID for grouping hooked commands in the hub / TUI.
     #[arg(long = "session-id")]
     pub session_id: Option<String>,
 
@@ -470,7 +470,7 @@ pub struct WrappedShellPayload {
     pub command: String,
     /// The editor session this command belongs to, when the hook input named
     /// one. Lets a TUI group hooked work with the session that caused it
-    /// (SPEC R-DAEMON.6). `#[serde(default)]` so a command wrapped by an older
+    /// (SPEC R-HUB.6). `#[serde(default)]` so a command wrapped by an older
     /// ahma — the payload is base64 in someone's shell history, with no version
     /// to negotiate — still decodes.
     #[serde(default)]
@@ -1305,7 +1305,7 @@ fn write_exec_output(output: &Value) -> Result<()> {
     Ok(())
 }
 
-/// How long a hooked command waits for its report to reach the daemon.
+/// How long a hooked command waits for its report to reach the hub.
 const HOOK_REPORT_FLUSH: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Wait, briefly, for this command's terminal event to be written to the hub.
@@ -1313,11 +1313,11 @@ const HOOK_REPORT_FLUSH: std::time::Duration = std::time::Duration::from_millis(
 /// The operation id is not known to this function, so it waits for *any*
 /// terminal event: a hook process runs exactly one command, so the first one is
 /// this one.
-async fn flush_hook_report(mut reporter: crate::daemon_reporter::ReporterHandle) {
+async fn flush_hook_report(mut reporter: crate::hub_reporter::ReporterHandle) {
     let flushed = reporter.wait_for_any_finished(HOOK_REPORT_FLUSH).await;
     if !flushed {
         tracing::debug!(
-            "hook: no ahma daemon took this command's report within {HOOK_REPORT_FLUSH:?}; \
+            "hook: no ahma hub took this command's report within {HOOK_REPORT_FLUSH:?}; \
              the command itself is unaffected"
         );
     }
@@ -1486,17 +1486,17 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         &cfg.mutex_groups,
     ));
 
-    // Report this command to the daemon, so hooked work is visible in the TUI
-    // alongside everything else (SPEC R-DAEMON.8). A hook is an instance for the
+    // Report this command to the hub, so hooked work is visible in the TUI
+    // alongside everything else (SPEC R-HUB.8). A hook is an instance for the
     // length of one command, which is exactly why it was invisible before: it
     // was always already gone by the time anyone looked.
     //
-    // Detached and non-blocking: if no daemon is reachable, the command runs
-    // exactly as it would have. This never spawns a daemon — a hook is a
+    // Detached and non-blocking: if no hub is reachable, the command runs
+    // exactly as it would have. This never spawns a hub — a hook is a
     // latency-sensitive path, and starting one here would put a process launch
     // in front of the user's command.
-    crate::daemon_reporter::set_initial_identity(payload.session_id.clone(), None);
-    let reporter = crate::daemon_reporter::spawn_reporter(
+    crate::hub_reporter::set_initial_identity(payload.session_id.clone(), None);
+    let reporter = crate::hub_reporter::spawn_reporter(
         operation_monitor.clone(),
         "hook",
         payload.cwd.clone(),
@@ -1588,8 +1588,8 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         .await;
 
     // The command is done; give its terminal event a brief moment to reach the
-    // daemon before this process exits. Bounded and short (SPEC R-DAEMON.8): a
-    // user's command must never wait on observability, so a daemon that is
+    // hub before this process exits. Bounded and short (SPEC R-HUB.8): a
+    // user's command must never wait on observability, so a hub that is
     // absent or slow costs this much and no more.
     flush_hook_report(reporter).await;
 

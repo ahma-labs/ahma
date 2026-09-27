@@ -327,7 +327,7 @@ impl Sandbox {
         // would then be emitted raw, and never match, because `/var` is a
         // symlink to `/private/var` and the kernel matches the canonical vnode.
         // Canonicalizing the *parent directory* (which does exist) and rejoining
-        // the file name yields a rule that fires the moment the daemon starts,
+        // the file name yields a rule that fires the moment the hub starts,
         // while keeping the raw spelling for the case where the parent itself is
         // absent. A socket deny that only works when the socket already exists
         // is a deny that fails open exactly when it matters.

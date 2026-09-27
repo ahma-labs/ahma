@@ -109,12 +109,13 @@ Run `ahma settings init` to generate this file automatically.
 
 # ── Instance identity ────────────────────────────────────────────────────────
 # [instance]
-# label = "ahma"   # instance name shown in TUI and daemon event stream
+# label = "ahma"   # instance name shown in TUI and hub event stream
 
-# [daemon]
-# idle_timeout_secs = 60   # seconds with nothing attached — no MCP sessions and
-#                          # no TUI — before the per-user daemon exits. 0 keeps
-#                          # it running. See docs/daemon.md.
+# [hub]
+# idle_timeout_secs = 3600 # seconds with nothing attached — no MCP sessions and
+#                          # no TUI — before the per-user hub exits. 0 keeps
+#                          # it running. `[daemon]` (its old name) is still
+#                          # read. See docs/hub.md.
 ```
 
 ---

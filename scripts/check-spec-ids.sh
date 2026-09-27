@@ -1,7 +1,7 @@
 #!/bin/bash
 # Every requirement id cited from code must be written down in a spec.
 #
-# Code cites SPEC requirement ids (`R5.4`, `R-DAEMON.2`, …) in comments and test
+# Code cites SPEC requirement ids (`R5.4`, `R-HUB.2`, …) in comments and test
 # docs so a reader can find the rule a line obeys. When a SPEC section is edited,
 # moved to a crate SPEC, or renumbered, those citations silently dangle and the
 # rule they pointed at is lost. This check fails when a cited id appears in no

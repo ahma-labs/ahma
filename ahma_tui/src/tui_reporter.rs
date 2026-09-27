@@ -1,4 +1,4 @@
-//! The TUI's own reporter connection (SPEC R-DAEMON.9, R24.9).
+//! The TUI's own reporter connection (SPEC R-HUB.9, R24.9).
 //!
 //! The TUI is a subscriber first — it watches everyone else's work — but it is
 //! also a place work *happens*: a `!` command typed into the chat input runs
@@ -16,22 +16,22 @@
 //!
 //! Two things this deliberately does **not** do:
 //!
-//! * **Start a daemon.** The subscriber already ensures one; a reporter that
+//! * **Start a hub.** The subscriber already ensures one; a reporter that
 //!   raced it would spawn a second process for the sake of bookkeeping.
 //! * **Block the TUI.** `report` never awaits and never fails loudly. If the
-//!   daemon is down, the command still runs and the local window still shows
+//!   hub is down, the command still runs and the local window still shows
 //!   its output — the report is what is lost, not the work.
 
 use std::time::Duration;
 
-use ahma_common::daemon_hub::{ClientMsg, DaemonEvent, connect_to_daemon, send_msg};
+use ahma_common::hub::{ClientMsg, HubEvent, connect_to_hub, send_msg};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-/// How many events may queue while the daemon is unreachable.
+/// How many events may queue while the hub is unreachable.
 ///
 /// Bounded because the alternative is a TUI whose memory grows for as long as
-/// the daemon is down. A `!` command that overruns this loses report lines, not
+/// the hub is down. A `!` command that overruns this loses report lines, not
 /// output: the window the user is watching is fed separately.
 const REPORT_QUEUE: usize = 512;
 
@@ -42,9 +42,9 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 /// Where the TUI sends its own work.
 #[derive(Debug, Clone)]
 pub struct TuiReporter {
-    tx: mpsc::Sender<DaemonEvent>,
+    tx: mpsc::Sender<HubEvent>,
     /// This TUI's session id, stable for the life of the process, so the hub
-    /// keeps one instance identity across reconnects (SPEC R-DAEMON.6).
+    /// keeps one instance identity across reconnects (SPEC R-HUB.6).
     session_id: String,
 }
 
@@ -59,7 +59,7 @@ impl TuiReporter {
     /// Deliberately infallible and synchronous: every call site is on the UI
     /// path, where an await would stall a keystroke and an error would be a
     /// dialog about telemetry.
-    pub fn report(&self, event: DaemonEvent) {
+    pub fn report(&self, event: HubEvent) {
         if self.tx.try_send(event).is_err() {
             debug!("tui_reporter: dropping an event (queue full or reporter stopped)");
         }
@@ -89,8 +89,8 @@ pub fn register_msg(session_id: &str, workspace: &str) -> ClientMsg {
 /// `unsandboxed` is not a parameter: this constructor exists for exactly one
 /// kind of work, and a caller that could pass `false` would be a caller that
 /// could mislabel an unconfined command as a confined one.
-pub fn bang_started(op_id: &str, command: &str, cwd: &str) -> DaemonEvent {
-    DaemonEvent::OpStarted {
+pub fn bang_started(op_id: &str, command: &str, cwd: &str) -> HubEvent {
+    HubEvent::OpStarted {
         id: op_id.to_string(),
         tool_name: "shell".to_string(),
         description: format!("Execute {command} in {cwd}"),
@@ -128,7 +128,7 @@ fn now_ms() -> Option<u64> {
 /// Start the reporter connection. Returns immediately.
 pub fn spawn_tui_reporter(workspace: String) -> TuiReporter {
     let session_id = uuid::Uuid::new_v4().to_string();
-    let (tx, rx) = mpsc::channel::<DaemonEvent>(REPORT_QUEUE);
+    let (tx, rx) = mpsc::channel::<HubEvent>(REPORT_QUEUE);
     let handle = TuiReporter {
         tx,
         session_id: session_id.clone(),
@@ -140,12 +140,12 @@ pub fn spawn_tui_reporter(workspace: String) -> TuiReporter {
 /// Connect, register, forward; on any failure, back off and start again.
 ///
 /// Events raised while disconnected wait in the channel and go out on the next
-/// connection — which is what makes a `!` command run before the daemon came up
+/// connection — which is what makes a `!` command run before the hub came up
 /// still show its finish.
-async fn reporter_task(session_id: String, workspace: String, mut rx: mpsc::Receiver<DaemonEvent>) {
+async fn reporter_task(session_id: String, workspace: String, mut rx: mpsc::Receiver<HubEvent>) {
     let mut backoff = RETRY_START;
     loop {
-        match connect_to_daemon().await {
+        match connect_to_hub().await {
             Ok(stream) => {
                 backoff = RETRY_START;
                 let (_read, mut writer) = tokio::io::split(stream);
@@ -181,7 +181,7 @@ async fn reporter_task(session_id: String, workspace: String, mut rx: mpsc::Rece
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahma_common::daemon_hub::{DaemonMsg, HubServer, recv_msg};
+    use ahma_common::hub::{HubMsg, HubServer, recv_msg};
     use ahma_common::timeouts::TestTimeouts;
     use tokio::io::BufReader;
 
@@ -189,7 +189,7 @@ mod tests {
     fn isolate() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", dir.path().join("d.sock")) };
+        unsafe { std::env::set_var("AHMA_HUB_SOCK", dir.path().join("d.sock")) };
         dir
     }
 
@@ -198,30 +198,30 @@ mod tests {
     #[tokio::test]
     async fn a_bang_command_reaches_the_hub_as_an_unsandboxed_tui_instance() {
         let _guard = isolate();
-        let hub = HubServer::bind_at(ahma_common::daemon_hub::default_socket_path())
+        let hub = HubServer::bind_at(ahma_common::hub::default_socket_path())
             .await
             .expect("this test owns a freshly isolated socket");
         let hub_task = tokio::spawn(async move { hub.serve().await });
 
         // A subscriber standing in for a second TUI watching this one.
-        let sub = connect_to_daemon().await.expect("subscriber connect");
+        let sub = connect_to_hub().await.expect("subscriber connect");
         let (sr, mut sw) = tokio::io::split(sub);
         let mut sub_reader = BufReader::new(sr);
         send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();
         // The initial snapshot.
-        let _ = recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap();
+        let _ = recv_msg::<_, HubMsg>(&mut sub_reader).await.unwrap();
 
         let reporter = spawn_tui_reporter("/work/project".to_string());
         let op = next_bang_op_id(reporter.session_id());
         reporter.report(bang_started(&op, "rm -rf build", "/work/project"));
-        reporter.report(DaemonEvent::OpOutput {
+        reporter.report(HubEvent::OpOutput {
             id: op.clone(),
             line: "removed".to_string(),
             is_stderr: false,
         });
-        reporter.report(DaemonEvent::OpFinished {
+        reporter.report(HubEvent::OpFinished {
             id: op.clone(),
-            status: ahma_common::daemon_hub::OpStatus::Completed,
+            status: ahma_common::hub::OpStatus::Completed,
             result_summary: Some("Completed".to_string()),
             duration_ms: 12,
             ended_epoch_ms: None,
@@ -239,14 +239,14 @@ mod tests {
         {
             let Ok(Ok(msg)) = tokio::time::timeout(
                 TestTimeouts::scale_secs(5),
-                recv_msg::<_, DaemonMsg>(&mut sub_reader),
+                recv_msg::<_, HubMsg>(&mut sub_reader),
             )
             .await
             else {
                 break;
             };
             match msg {
-                DaemonMsg::InstanceRegistered { instance } if instance.mode == "tui" => {
+                HubMsg::InstanceRegistered { instance } if instance.mode == "tui" => {
                     registered_tui = true;
                     assert_eq!(instance.client.as_deref(), Some("ahma-tui"));
                     assert_eq!(instance.scope, "/work/project");
@@ -256,8 +256,8 @@ mod tests {
                         "the instance must carry the session id the reporter minted"
                     );
                 }
-                DaemonMsg::Event { payload, .. } => match payload {
-                    DaemonEvent::OpStarted {
+                HubMsg::Event { payload, .. } => match payload {
+                    HubEvent::OpStarted {
                         origin,
                         unsandboxed,
                         title,
@@ -268,11 +268,11 @@ mod tests {
                         assert!(unsandboxed, "a `!` command ran outside the sandbox");
                         assert_eq!(title.as_deref(), Some("rm -rf build"));
                     }
-                    DaemonEvent::OpOutput { line, .. } => {
+                    HubEvent::OpOutput { line, .. } => {
                         saw_output = true;
                         assert_eq!(line, "removed");
                     }
-                    DaemonEvent::OpFinished { exit_code, .. } => {
+                    HubEvent::OpFinished { exit_code, .. } => {
                         saw_finished = true;
                         assert_eq!(exit_code, Some(0));
                     }
@@ -291,10 +291,10 @@ mod tests {
         hub_task.abort();
     }
 
-    /// The report path must survive a daemon that is not there: the command
+    /// The report path must survive a hub that is not there: the command
     /// still runs, and nothing waits on the socket.
     #[tokio::test]
-    async fn reporting_without_a_daemon_neither_blocks_nor_panics() {
+    async fn reporting_without_a_hub_neither_blocks_nor_panics() {
         let _guard = isolate();
         let reporter = spawn_tui_reporter("/work".to_string());
         for i in 0..10 {

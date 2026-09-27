@@ -183,7 +183,7 @@ impl PermissionBroker {
         }
     }
 
-    /// The coordinator this broker gates on — shared with the daemon reporter so a
+    /// The coordinator this broker gates on — shared with the hub reporter so a
     /// TUI answer resolves the same decision the broker raised.
     pub fn coordinator(&self) -> &Arc<GrantCoordinator> {
         &self.coordinator

@@ -13,7 +13,7 @@ pub mod accordion;
 pub mod agent_config;
 pub mod app;
 pub mod connection;
-pub mod daemon_source;
+pub mod hub_source;
 pub mod intro;
 pub mod keymap;
 pub mod liveness;
@@ -81,15 +81,15 @@ pub async fn run_tui(
     }
 
     if connect.is_none() {
-        // Ensure the one per-user daemon exists. The TUI does **not** start a
+        // Ensure the one per-user hub exists. The TUI does **not** start a
         // server of its own, and above all does not start one scoped to its
         // launch directory: that used to lock every editor session that
         // arrived afterwards to whichever folder a terminal happened to be in
-        // (SPEC R-DAEMON.9).
-        let socket = ahma_common::daemon_hub::mcp_socket_path(None);
-        match ahma_mcp::shell::modes::daemon_client::ensure_daemon(&socket, None).await {
+        // (SPEC R-HUB.9).
+        let socket = ahma_common::hub::mcp_socket_path(None);
+        match ahma_mcp::shell::modes::hub_client::ensure_hub(&socket, None).await {
             Ok(outcome) => {
-                if let Some(notice) = ahma_mcp::shell::modes::daemon_client::disclosure(&outcome) {
+                if let Some(notice) = ahma_mcp::shell::modes::hub_client::disclosure(&outcome) {
                     startup_notices::push(startup_notices::Level::Warn, notice);
                 }
             }
@@ -98,7 +98,7 @@ pub async fn run_tui(
                 // one — but never silent.
                 startup_notices::push(
                     startup_notices::Level::Warn,
-                    format!("Could not reach or start the ahma daemon: {e:#}"),
+                    format!("Could not reach or start the ahma hub: {e:#}"),
                 );
             }
         }

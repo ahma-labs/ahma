@@ -1,27 +1,27 @@
-//! Ahma Hub Daemon – lightweight IPC hub for multi-instance aggregation.
+//! Ahma Hub – lightweight IPC hub for multi-instance aggregation.
 //!
-//! The hub daemon is a tiny user-space process that:
+//! The hub is a tiny user-space process that:
 //! * Accepts connections from all running ahma instances (stdio, http, unix).
 //! * Accepts subscription connections from TUI clients.
 //! * Fans out operation events to all subscribers in real time.
 //!
 //! ## Transport
 //!
-//! One `AF_UNIX` socket, `daemon.sock` in the per-user [`runtime_dir`], on
+//! One `AF_UNIX` socket, `hub.sock` in the per-user [`runtime_dir`], on
 //! every OS — Windows included, through [`crate::local_socket`]. Override the
-//! path with the `--daemon-socket` CLI flag; tests are isolated through the
-//! `AHMA_DAEMON_SOCK` variable (see [`default_socket_path`]).
+//! path with the `--hub-socket` CLI flag; tests are isolated through the
+//! `AHMA_HUB_SOCK` variable (see [`default_socket_path`]).
 //!
 //! ## Protocol
 //!
 //! All messages are newline-delimited JSON (NDJ).  Each line is one serialised
-//! [`ClientMsg`] (instance → daemon or subscriber → daemon) or [`DaemonMsg`]
-//! (daemon → subscriber).
+//! [`ClientMsg`] (instance → hub or subscriber → hub) or [`HubMsg`]
+//! (hub → subscriber).
 //!
 //! ## Who owns the rendezvous
 //!
-//! The lock beside the socket ([`lock_path_for`]: `daemon.sock` →
-//! `daemon.lock`) is the mutex (SPEC R-DAEMON.2). [`HubServer::bind_at`] takes
+//! The lock beside the socket ([`lock_path_for`]: `hub.sock` →
+//! `hub.lock`) is the mutex (SPEC R-HUB.2). [`HubServer::bind_at`] takes
 //! it first; a loser gets [`HubBindError::AlreadyRunning`] and connects to the
 //! winner. Only the holder touches the socket file: it removes a stale one
 //! before binding and unlinks its own on the way out, before the lock goes. A
@@ -29,9 +29,9 @@
 //! cleaned up by probing — and no process can unlink a socket another one is
 //! serving.
 //!
-//! Nothing in this module starts a daemon. That is one path, in `ahma_mcp`'s
-//! `daemon_client`; a hooked command or a session worker only ever connects
-//! (SPEC R-DAEMON.8).
+//! Nothing in this module starts a hub. That is one path, in `ahma_mcp`'s
+//! `hub_client`; a hooked command or a session worker only ever connects
+//! (SPEC R-HUB.8).
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -66,7 +66,7 @@ const MAX_OPS_PER_INSTANCE: usize = 500;
 pub const MAX_TAIL_LINES: usize = 100;
 
 /// How long a finished operation — and an instance that has since
-/// disconnected — stays replayable (SPEC R-DAEMON.7). One hour is what a
+/// disconnected — stays replayable (SPEC R-HUB.7). One hour is what a
 /// developer means by "what just happened".
 pub const HISTORY_REPLAY_WINDOW: Duration = Duration::from_secs(3600);
 
@@ -79,9 +79,9 @@ const MAX_RETAINED_OPS: usize = 2000;
 // Protocol types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A chat message sent over the daemon hub protocol.
+/// A chat message sent over the hub protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DaemonChatMessage {
+pub struct HubChatMessage {
     pub role: String,
     pub content: String,
 }
@@ -124,7 +124,7 @@ pub enum OpStatus {
 /// Metadata about a registered ahma instance.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceInfo {
-    /// Random UUID assigned by the daemon at registration time.
+    /// Random UUID assigned by the hub at registration time.
     pub id: String,
     pub pid: u32,
     /// "stdio", "http", or "unix"
@@ -142,7 +142,7 @@ pub struct InstanceInfo {
     ///
     /// Three Claude Code windows open on one repository register with the same
     /// pid-less identity — same `client`, same `label`, same `scope` — so
-    /// without this they are indistinguishable, and the daemon-minted `id`
+    /// without this they are indistinguishable, and the hub-minted `id`
     /// changes on every reconnect-to-relabel, which reshuffles them in any view
     /// that sorts by it. The session id is stable for the life of the session,
     /// so the hub keys an instance's identity off it.
@@ -164,10 +164,10 @@ pub struct InstanceInfo {
     pub ended_epoch_ms: Option<u64>,
 }
 
-/// An operation event forwarded from an instance to the daemon.
+/// An operation event forwarded from an instance to the hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
-pub enum DaemonEvent {
+pub enum HubEvent {
     OpStarted {
         id: String,
         tool_name: String,
@@ -205,7 +205,7 @@ pub enum DaemonEvent {
         origin: Option<String>,
         /// True when this start record was **reconstructed** from the
         /// operation's terminal event, because the original was never seen or
-        /// had aged out — a hook whose command outlived a daemon restart, say.
+        /// had aged out — a hook whose command outlived a hub restart, say.
         /// The outcome is true; the preamble (tool, command, working directory)
         /// is genuinely unknown, and a reader must say so rather than render
         /// blanks as fact.
@@ -213,7 +213,7 @@ pub enum DaemonEvent {
         partial: bool,
         /// The operation ran **outside** the kernel sandbox, at the user's full
         /// privilege. Today that is only the TUI's human-typed `!` escape
-        /// (SPEC R-DAEMON.9), and a unified view that drew it like any other
+        /// (SPEC R-HUB.9), and a unified view that drew it like any other
         /// row would be hiding the one thing about it worth knowing.
         ///
         /// Absent means confined: a producer that predates this field had no
@@ -251,7 +251,7 @@ pub enum DaemonEvent {
         #[serde(default)]
         denial: Option<OpDenial>,
         /// The operation did not finish so much as stop being observed: it was
-        /// still running when the daemon that was watching it went away, and
+        /// still running when the hub that was watching it went away, and
         /// this record was reconstructed from the history file at the next
         /// start. Its exit is genuinely unknown — the command may well have
         /// completed — so a reader must say "interrupted", not "failed".
@@ -277,20 +277,20 @@ pub enum DaemonEvent {
 /// watching it.
 ///
 /// These used to be written out twice — once in [`ClientMsg`] for the leg into
-/// the hub, once in [`DaemonMsg`] for the leg out — with a hand-written arm in
+/// the hub, once in [`HubMsg`] for the leg out — with a hand-written arm in
 /// the hub copying each one across. Two declarations of the same payload drift,
 /// and the copying arm is where the drift shows up: a variant added to one side
 /// and not the other compiles fine and is silently dropped at run time.
 ///
 /// Naming the set once removes the possibility. The hub's forwarding is now
-/// `ClientMsg::Relay(r) => DaemonMsg::Relay(r)`, so a message added here is
+/// `ClientMsg::Relay(r) => HubMsg::Relay(r)`, so a message added here is
 /// carried in both directions without the hub being touched at all.
 ///
 /// **The wire is unchanged.** `#[serde(untagged)]` on the `Relay` variant of the
 /// two outer enums means these serialize exactly as they did when they were flat
 /// variants — `{"type":"ChatToken","token":"…"}`, not a nested envelope. That is
 /// a requirement, not a nicety: the hub socket has no protocol version (R24.5
-/// evolves it by adding fields), so a daemon left running across an upgrade must
+/// evolves it by adding fields), so a hub left running across an upgrade must
 /// keep understanding a newer instance. `relay_wire_compat` pins the bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -364,7 +364,7 @@ pub enum HubRelay {
     /// Kept distinct from [`Self::ChatToken`] so the TUI can render it as a
     /// system note rather than model output — previously folded onto
     /// `ChatToken` (`[{reason}]`) because this variant did not exist yet; a
-    /// daemon running a version of this crate from before this variant was
+    /// hub running a version of this crate from before this variant was
     /// added will fail to deserialize a `Truncated` relay from a newer
     /// instance until it is restarted (see the module doc's wire-compat note
     /// — this is the accepted, one-time cost of a real addition).
@@ -382,13 +382,13 @@ impl From<HubRelay> for ClientMsg {
     }
 }
 
-impl From<HubRelay> for DaemonMsg {
+impl From<HubRelay> for HubMsg {
     fn from(relay: HubRelay) -> Self {
-        DaemonMsg::Relay(relay)
+        HubMsg::Relay(relay)
     }
 }
 
-/// Message from any client (instance or TUI subscriber) to the daemon.
+/// Message from any client (instance or TUI subscriber) to the hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMsg {
@@ -396,7 +396,7 @@ pub enum ClientMsg {
     /// When the MCP client identity becomes known after registration (the
     /// `initialize` handshake happens later), the instance reconnects and
     /// re-registers with `client` set — field-only protocol evolution keeps
-    /// mixed-version daemons working.
+    /// mixed-version hubs working.
     Register {
         pid: u32,
         mode: String,
@@ -419,20 +419,20 @@ pub enum ClientMsg {
         sampling: bool,
     },
     /// An operation event from a registered instance.
-    Event { payload: DaemonEvent },
+    Event { payload: HubEvent },
     /// A TUI/subscriber requesting the live event stream.
     Subscribe,
     /// A TUI/subscriber requesting a one-shot snapshot of current instances.
     ListInstances,
     /// An instance gracefully unregistering (optional — EOF works too).
     Unregister,
-    /// Liveness response to a hub [`DaemonMsg::Ping`].
+    /// Liveness response to a hub [`HubMsg::Ping`].
     Pong { seq: u32 },
-    /// Ask the daemon to shut down and exit immediately.
+    /// Ask the hub to shut down and exit immediately.
     Shutdown,
     /// Submit a user prompt to start/resume an agent loop.
     SubmitPrompt {
-        messages: Vec<DaemonChatMessage>,
+        messages: Vec<HubChatMessage>,
         system_prompt: Option<String>,
         provider: Option<String>,
         model: Option<String>,
@@ -494,10 +494,10 @@ pub enum ClientMsg {
     Relay(HubRelay),
 }
 
-/// Message from the daemon to a subscriber (TUI).
+/// Message from the hub to a subscriber (TUI).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum DaemonMsg {
+pub enum HubMsg {
     /// Sent once in response to `Subscribe` or `ListInstances`.
     InstanceList { instances: Vec<InstanceInfo> },
     /// Broadcast whenever a new instance registers.
@@ -507,14 +507,14 @@ pub enum DaemonMsg {
     /// An event forwarded from a registered instance.
     Event {
         instance_id: String,
-        payload: DaemonEvent,
+        payload: HubEvent,
     },
     /// Liveness probe sent from hub to a connected instance.
     /// The instance should respond with a matching [`ClientMsg::Pong`].
     Ping { seq: u32 },
     /// Forward prompt run command to registered instance.
     RunPrompt {
-        messages: Vec<DaemonChatMessage>,
+        messages: Vec<HubChatMessage>,
         system_prompt: Option<String>,
         provider: Option<String>,
         model: Option<String>,
@@ -565,69 +565,69 @@ pub enum DaemonMsg {
 // Socket path
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Process-wide socket path override set from the `--daemon-socket` CLI flag.
+/// Process-wide socket path override set from the `--hub-socket` CLI flag.
 static SOCKET_PATH_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// Set the daemon socket path from the `--daemon-socket` CLI flag.
-/// Call once, early in startup. Takes precedence over `AHMA_DAEMON_SOCK`.
+/// Set the hub socket path from the `--hub-socket` CLI flag.
+/// Call once, early in startup. Takes precedence over `AHMA_HUB_SOCK`.
 pub fn set_socket_path_override(path: PathBuf) {
     let _ = SOCKET_PATH_OVERRIDE.set(path);
 }
 
 #[cfg(test)]
-static DAEMON_ISOLATION_INIT: std::sync::Once = std::sync::Once::new();
+static HUB_ISOLATION_INIT: std::sync::Once = std::sync::Once::new();
 #[cfg(test)]
-static DAEMON_SOCK_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HUB_SOCK_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Point this test process's hub socket at a private path.
 ///
-/// Call this at the top of any test that exercises the daemon. It is idempotent
+/// Call this at the top of any test that exercises the hub. It is idempotent
 /// (guarded by a `Once`). Only compiled into test builds.
 #[cfg(test)]
-pub fn init_test_daemon_isolation() {
-    DAEMON_ISOLATION_INIT.call_once(|| {
-        if std::env::var_os("AHMA_DAEMON_SOCK").is_none() {
+pub fn init_test_hub_isolation() {
+    HUB_ISOLATION_INIT.call_once(|| {
+        if std::env::var_os("AHMA_HUB_SOCK").is_none() {
             let pid = std::process::id();
-            let count = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let count = HUB_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let socket_path = std::env::temp_dir().join(format!("ah_t_{pid}_{count}.sock"));
             unsafe {
-                std::env::set_var("AHMA_DAEMON_SOCK", socket_path);
+                std::env::set_var("AHMA_HUB_SOCK", socket_path);
             }
         }
     });
 }
 
-/// Return the platform-default socket path for the hub daemon.
+/// Return the platform-default socket path for the hub.
 ///
 /// Resolution order:
-/// 1. `--daemon-socket` CLI flag (`set_socket_path_override`).
-/// 2. `AHMA_DAEMON_SOCK` env var — accepted for backward compat and test isolation;
-///    emits a deprecation warning in production if not set by `init_test_daemon_isolation`.
-/// 3. `daemon.sock` in [`runtime_dir`], on every OS.
+/// 1. `--hub-socket` CLI flag (`set_socket_path_override`).
+/// 2. `AHMA_HUB_SOCK` env var — accepted for backward compat and test isolation;
+///    emits a deprecation warning in production if not set by `init_test_hub_isolation`.
+/// 3. `hub.sock` in [`runtime_dir`], on every OS.
 pub fn default_socket_path() -> PathBuf {
     if let Some(p) = SOCKET_PATH_OVERRIDE.get() {
         return p.clone();
     }
-    if let Ok(v) = std::env::var("AHMA_DAEMON_SOCK") {
+    if let Ok(v) = std::env::var("AHMA_HUB_SOCK") {
         // Allow the var in test builds without a warning; in production builds
         // it is only valid when set by the CLI flag path (via set_socket_path_override)
-        // or by test isolation. Direct user configuration should use --daemon-socket.
+        // or by test isolation. Direct user configuration should use --hub-socket.
         #[cfg(not(test))]
         warn!(
-            "Deprecated: AHMA_DAEMON_SOCK is set but IGNORED for production config. \
-             Use the --daemon-socket flag instead."
+            "Deprecated: AHMA_HUB_SOCK is set but IGNORED for production config. \
+             Use the --hub-socket flag instead."
         );
         return PathBuf::from(v);
     }
 
     // Safety net (SPEC R-ISO.1): a test-spawned process that did not go through
-    // `init_test_daemon_isolation` (which sets AHMA_DAEMON_SOCK, handled above)
-    // must still never rendezvous on the developer's live daemon socket. The
+    // `init_test_hub_isolation` (which sets AHMA_HUB_SOCK, handled above)
+    // must still never rendezvous on the developer's live hub socket. The
     // discriminator is stable across the whole test run's process tree, so a
     // test and the binaries it spawns agree on the same private path.
     if crate::test_isolation::spawned_under_test_harness() {
         return std::env::temp_dir().join(format!(
-            "ahma-test-daemon-{}.sock",
+            "ahma-test-hub-{}.sock",
             crate::test_isolation::test_run_discriminator()
         ));
     }
@@ -635,8 +635,8 @@ pub fn default_socket_path() -> PathBuf {
     platform_default_socket_path()
 }
 
-/// The per-user runtime directory holding every daemon rendezvous file
-/// (SPEC R-DAEMON.2): the lock, the hub socket, the MCP socket and the
+/// The per-user runtime directory holding every hub rendezvous file
+/// (SPEC R-HUB.2): the lock, the hub socket, the MCP socket and the
 /// endpoint descriptor.
 ///
 /// Prefers `$XDG_RUNTIME_DIR/ahma` (per-user, tmpfs, cleaned at logout) and
@@ -673,9 +673,9 @@ pub fn runtime_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Refuse a runtime directory another local user can reach (SPEC R-DAEMON.2).
+/// Refuse a runtime directory another local user can reach (SPEC R-HUB.2).
 ///
-/// The daemon executes shell and build commands on behalf of anything that can
+/// The hub executes shell and build commands on behalf of anything that can
 /// connect to its sockets, so the directory holding them must be the caller's
 /// own and unreachable by group or other — the same rule sshd applies to
 /// `~/.ssh`. A socket chmodded `0600` inside a `0777` directory is still
@@ -745,20 +745,20 @@ pub fn verify_runtime_dir_secure(dir: &std::path::Path) -> Result<()> {
 /// returned path is immediately bindable.
 fn platform_default_socket_path() -> PathBuf {
     match runtime_dir() {
-        Some(dir) => dir.join("daemon.sock"),
-        None => std::env::temp_dir().join("ahma-daemon.sock"),
+        Some(dir) => dir.join("hub.sock"),
+        None => std::env::temp_dir().join("ahma-hub.sock"),
     }
 }
 
 /// The lock that decides who owns the hub socket at `socket` (SPEC
-/// R-DAEMON.2): the same name with a `.lock` extension, so `daemon.sock` is
-/// guarded by `daemon.lock` and an explicitly placed socket brings its own.
+/// R-HUB.2): the same name with a `.lock` extension, so `hub.sock` is
+/// guarded by `hub.lock` and an explicitly placed socket brings its own.
 pub fn lock_path_for(socket: &Path) -> PathBuf {
     socket.with_extension("lock")
 }
 
 /// The per-user MCP endpoint socket, ignoring test isolation and any explicit
-/// override — the path the daemon binds in production.
+/// override — the path the hub binds in production.
 ///
 /// It lives beside the hub socket in [`runtime_dir`] rather than at the old
 /// machine-global `/tmp/ahma.sock`, which every local user could see and, since
@@ -772,9 +772,9 @@ pub fn platform_mcp_socket_path() -> PathBuf {
 
 /// The hub socket that belongs with `mcp_socket`.
 ///
-/// The rendezvous is a **pair**, and the hub half is the mutex: a daemon told
+/// The rendezvous is a **pair**, and the hub half is the mutex: a hub told
 /// to serve a private MCP socket but left on the shared hub socket would lose
-/// the bind to whichever daemon already held it, stand down, and leave nobody
+/// the bind to whichever hub already held it, stand down, and leave nobody
 /// serving the path its caller asked for. So an explicitly chosen MCP socket
 /// brings its own hub, beside it.
 pub fn hub_socket_beside(mcp_socket: &str) -> PathBuf {
@@ -790,7 +790,7 @@ pub fn hub_socket_beside(mcp_socket: &str) -> PathBuf {
     dir.join(format!("{stem}.hub.sock"))
 }
 
-/// Resolve the MCP endpoint socket path (SPEC R-DAEMON.2).
+/// Resolve the MCP endpoint socket path (SPEC R-HUB.2).
 ///
 /// Resolution order, mirroring [`default_socket_path`] so the two rendezvous
 /// files can never disagree about which run they belong to:
@@ -819,37 +819,37 @@ pub fn mcp_socket_path(explicit: Option<&str>) -> String {
 // Client-side transport abstraction
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The stream [`connect_to_daemon`] returns: one `AF_UNIX` connection on
+/// The stream [`connect_to_hub`] returns: one `AF_UNIX` connection on
 /// every OS.
-pub type DaemonStream = LocalStream;
+pub type HubStream = LocalStream;
 
-/// Try to connect to the hub daemon.
+/// Try to connect to the hub.
 ///
-/// Returns `Ok(stream)` on success, or an error if the daemon is not running.
+/// Returns `Ok(stream)` on success, or an error if the hub is not running.
 /// Never starts one.
-pub async fn connect_to_daemon() -> Result<DaemonStream> {
+pub async fn connect_to_hub() -> Result<HubStream> {
     Ok(LocalStream::connect(&default_socket_path()).await?)
 }
 
-/// One-shot query of a daemon at an explicit socket: connect, ask for the
+/// One-shot query of a hub at an explicit socket: connect, ask for the
 /// instance list, read the answer, hang up.
 ///
-/// Takes the path rather than resolving it so a test can address the daemon it
+/// Takes the path rather than resolving it so a test can address the hub it
 /// started, and so a diagnostic can address one that is not the default.
 pub async fn list_instances_at(socket_path: &std::path::Path) -> Result<Vec<InstanceInfo>> {
     let stream = LocalStream::connect(socket_path).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     send_msg(&mut write_half, &ClientMsg::ListInstances).await?;
-    match recv_msg::<_, DaemonMsg>(&mut reader).await? {
-        DaemonMsg::InstanceList { instances } => Ok(instances),
+    match recv_msg::<_, HubMsg>(&mut reader).await? {
+        HubMsg::InstanceList { instances } => Ok(instances),
         other => bail!("expected an instance list, got {other:?}"),
     }
 }
 
-/// Stop the running hub daemon immediately.
-pub async fn stop_daemon() -> Result<()> {
-    if let Ok(mut stream) = connect_to_daemon().await {
+/// Stop the running hub immediately.
+pub async fn stop_hub() -> Result<()> {
+    if let Ok(mut stream) = connect_to_hub().await {
         send_msg(&mut stream, &ClientMsg::Shutdown).await?;
     }
     Ok(())
@@ -881,7 +881,7 @@ where
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
-            bail!("daemon connection closed (EOF)");
+            bail!("hub connection closed (EOF)");
         }
         let line = line.trim();
         if line.is_empty() {
@@ -890,7 +890,7 @@ where
         match serde_json::from_str(line) {
             Ok(msg) => return Ok(msg),
             // A message this build does not know is skipped, not fatal. This
-            // socket has no version to negotiate (R24.5), so a daemon left
+            // socket has no version to negotiate (R24.5), so a hub left
             // running across an upgrade is the reader that decides — and it
             // used to decide by dropping the connection, which turned every
             // future message addition into a hard incompatibility. Skipping is
@@ -913,7 +913,7 @@ where
 fn is_unknown_message(e: &serde_json::Error) -> bool {
     e.is_data() && {
         let msg = e.to_string();
-        // `ClientMsg`/`DaemonMsg` carry an untagged `Relay` variant, so an
+        // `ClientMsg`/`HubMsg` carry an untagged `Relay` variant, so an
         // unrecognised `"type"` surfaces as "did not match any variant" rather
         // than "unknown variant"; both mean the same thing here.
         msg.contains("unknown variant")
@@ -933,8 +933,8 @@ fn is_unknown_message(e: &serde_json::Error) -> bool {
 struct OpSnapshot {
     /// Monotonic insertion order, used to evict the oldest finished op first.
     seq: u64,
-    started: DaemonEvent,
-    finished: Option<DaemonEvent>,
+    started: HubEvent,
+    finished: Option<HubEvent>,
     /// The last [`MAX_TAIL_LINES`] output lines, replayed after `started` so a
     /// subscriber that attaches mid-operation sees what it has been printing.
     /// Bounded on purpose: this is a window, not a log — the complete output
@@ -955,12 +955,12 @@ type InstanceOpHistory = std::collections::HashMap<String, OpSnapshot>;
 use crate::keepalive::current_timestamp_ms as now_epoch_ms;
 
 /// The operation id an event refers to, if it is about an operation at all.
-fn op_id_of(event: &DaemonEvent) -> Option<String> {
+fn op_id_of(event: &HubEvent) -> Option<String> {
     match event {
-        DaemonEvent::OpStarted { id, .. }
-        | DaemonEvent::OpFinished { id, .. }
-        | DaemonEvent::OpOutput { id, .. } => Some(id.clone()),
-        DaemonEvent::LogLine { .. } => None,
+        HubEvent::OpStarted { id, .. }
+        | HubEvent::OpFinished { id, .. }
+        | HubEvent::OpOutput { id, .. } => Some(id.clone()),
+        HubEvent::LogLine { .. } => None,
     }
 }
 
@@ -972,15 +972,15 @@ fn op_id_of(event: &DaemonEvent) -> Option<String> {
 /// left empty rather than guessed.
 fn synthetic_started(
     op_id: &str,
-    finished: &DaemonEvent,
+    finished: &HubEvent,
     duration_ms: u64,
     ended_epoch_ms: Option<u64>,
-) -> DaemonEvent {
+) -> HubEvent {
     let summary = match finished {
-        DaemonEvent::OpFinished { result_summary, .. } => result_summary.clone(),
+        HubEvent::OpFinished { result_summary, .. } => result_summary.clone(),
         _ => None,
     };
-    DaemonEvent::OpStarted {
+    HubEvent::OpStarted {
         id: op_id.to_string(),
         tool_name: String::new(),
         description: summary.clone().unwrap_or_default(),
@@ -1000,7 +1000,7 @@ fn synthetic_started(
     }
 }
 
-/// Internal shared state for the running daemon.
+/// Internal shared state for the running hub.
 #[derive(Debug, Clone)]
 struct PendingApproval {
     id: String,
@@ -1013,17 +1013,16 @@ struct PendingApproval {
 ///
 /// The hub used to call [`std::process::exit`] from inside a connection
 /// handler. That is wrong for anything that hosts the hub alongside something
-/// else: the per-user daemon also owns an MCP endpoint with live sessions and a
+/// else: the per-user hub also owns an MCP endpoint with live sessions and a
 /// history file to flush, so "stop" has to run one shutdown choreography, not
-/// `exit(0)` from whichever task noticed first. The daemon installs a hook; a
+/// `exit(0)` from whichever task noticed first. The hub installs a hook; a
 /// hub without one (embedded in a test, say) refuses the request.
 type ExitHook = Arc<dyn Fn(&str) + Send + Sync>;
 
-struct DaemonHub {
+struct Hub {
     instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
-    instance_txs:
-        Arc<Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<DaemonMsg>>>>,
-    broadcast: broadcast::Sender<DaemonMsg>,
+    instance_txs: Arc<Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<HubMsg>>>>,
+    broadcast: broadcast::Sender<HubMsg>,
     /// Last-known operation state per instance. The `broadcast` channel only
     /// reaches subscribers connected at send time, so without this a TUI opened
     /// (or reconnected) after calls already ran would show the instance with an
@@ -1041,7 +1040,7 @@ struct DaemonHub {
     /// back to the session that asked the question.
     pending_decisions: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Instances that have disconnected but whose operations are still inside
-    /// the replay window, stamped with when they went (SPEC R-DAEMON.7).
+    /// the replay window, stamped with when they went (SPEC R-HUB.7).
     ///
     /// History used to be dropped the instant an instance disconnected, which
     /// made a whole class of work invisible: a hooked command is an instance
@@ -1052,12 +1051,12 @@ struct DaemonHub {
     /// the request (see [`HubServer::set_exit_hook`]).
     exit_hook: parking_lot::Mutex<Option<ExitHook>>,
     /// Appends operation history to disk so it outlives this process
-    /// (SPEC R-DAEMON.7). `None` keeps history in memory only.
-    history: parking_lot::Mutex<Option<Arc<crate::daemon_history::HistoryWriter>>>,
+    /// (SPEC R-HUB.7). `None` keeps history in memory only.
+    history: parking_lot::Mutex<Option<Arc<crate::hub_history::HistoryWriter>>>,
 }
 
-impl DaemonHub {
-    fn new() -> (Self, broadcast::Receiver<DaemonMsg>) {
+impl Hub {
+    fn new() -> (Self, broadcast::Receiver<HubMsg>) {
         let (tx, rx) = broadcast::channel(512);
         (
             Self {
@@ -1094,15 +1093,15 @@ impl DaemonHub {
     /// Record an operation event so it can be replayed to subscribers that join
     /// later: `OpStarted`, a bounded window of the output that followed it, and
     /// the terminal `OpFinished`. Log lines are live-only.
-    async fn record_op_event(&self, instance_id: &str, payload: &DaemonEvent) {
+    async fn record_op_event(&self, instance_id: &str, payload: &HubEvent) {
         match payload {
-            DaemonEvent::OpStarted { id, .. } => {
+            HubEvent::OpStarted { id, .. } => {
                 self.record_op_started(instance_id, id, payload).await
             }
-            DaemonEvent::OpFinished { id, .. } => {
+            HubEvent::OpFinished { id, .. } => {
                 self.record_op_finished(instance_id, id, payload).await
             }
-            DaemonEvent::OpOutput {
+            HubEvent::OpOutput {
                 id,
                 line,
                 is_stderr,
@@ -1110,7 +1109,7 @@ impl DaemonHub {
                 self.record_op_output(instance_id, id, line, *is_stderr)
                     .await
             }
-            DaemonEvent::LogLine { .. } => {}
+            HubEvent::LogLine { .. } => {}
         }
     }
 
@@ -1129,7 +1128,7 @@ impl DaemonHub {
 
     /// Retain `started` as the new head of `op_id`'s history, enforcing the
     /// per-instance retention cap.
-    async fn record_op_started(&self, instance_id: &str, op_id: &str, started: &DaemonEvent) {
+    async fn record_op_started(&self, instance_id: &str, op_id: &str, started: &HubEvent) {
         let history = self.history.lock().clone();
         if let Some(writer) = history {
             // The instance travels with the record so a replayed op still has a
@@ -1144,7 +1143,7 @@ impl DaemonHub {
                     id: instance_id.to_string(),
                     ..Default::default()
                 });
-            writer.record(crate::daemon_history::HistoryRecord::Started {
+            writer.record(crate::hub_history::HistoryRecord::Started {
                 ts: now_epoch_ms(),
                 instance,
                 event: started.clone(),
@@ -1171,12 +1170,12 @@ impl DaemonHub {
     /// Attach the terminal event to `op_id`'s retained snapshot.
     ///
     /// An op whose `OpStarted` the hub never saw — because it was evicted, or
-    /// because the daemon restarted while the op was running — is reconstructed
+    /// because the hub restarted while the op was running — is reconstructed
     /// from the terminal event alone and flagged `partial`. Dropping it instead
     /// (the old behaviour) lost the outcome of exactly the work a user is most
     /// likely to ask about, and left the instance's tallies wrong.
-    async fn record_op_finished(&self, instance_id: &str, op_id: &str, finished: &DaemonEvent) {
-        let DaemonEvent::OpFinished {
+    async fn record_op_finished(&self, instance_id: &str, op_id: &str, finished: &HubEvent) {
+        let HubEvent::OpFinished {
             duration_ms,
             ended_epoch_ms,
             ..
@@ -1195,7 +1194,7 @@ impl DaemonHub {
                 .get(op_id)
                 .map(|s| s.tail.iter().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
-            writer.record(crate::daemon_history::HistoryRecord::Finished {
+            writer.record(crate::hub_history::HistoryRecord::Finished {
                 ts: now_epoch_ms(),
                 instance_id: instance_id.to_string(),
                 event: finished.clone(),
@@ -1226,15 +1225,15 @@ impl DaemonHub {
         }
     }
 
-    /// Restore history written by a previous daemon (SPEC R-DAEMON.7).
+    /// Restore history written by a previous hub (SPEC R-HUB.7).
     ///
     /// An operation that has a start record but no terminal one was still
-    /// running when that daemon went away. Its real outcome is unknowable — the
+    /// running when that hub went away. Its real outcome is unknowable — the
     /// command may well have finished — so it is closed as `interrupted`
     /// rather than left running forever (a spinner that never resolves) or
     /// called failed (an invention).
-    async fn load_history(&self, records: Vec<crate::daemon_history::HistoryRecord>) {
-        use crate::daemon_history::HistoryRecord as R;
+    async fn load_history(&self, records: Vec<crate::hub_history::HistoryRecord>) {
+        use crate::hub_history::HistoryRecord as R;
         let mut hist = self.op_history.lock().await;
         let mut ended = self.ended_instances.lock().await;
         let mut ended_at: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
@@ -1315,7 +1314,7 @@ impl DaemonHub {
     /// message or a field on `OpStarted`: every subscriber already appends
     /// those to the right pane, so replay is byte-for-byte the shape the live
     /// stream has, and there is no second code path to keep in step (R24.5).
-    async fn replay_events(&self) -> Vec<DaemonMsg> {
+    async fn replay_events(&self) -> Vec<HubMsg> {
         let hist = self.op_history.lock().await;
         let mut snaps: Vec<(String, OpSnapshot)> = hist
             .iter()
@@ -1325,14 +1324,14 @@ impl DaemonHub {
         let mut out = Vec::with_capacity(snaps.len() * 2);
         for (instance_id, snap) in snaps {
             let op_id = op_id_of(&snap.started).unwrap_or_default();
-            out.push(DaemonMsg::Event {
+            out.push(HubMsg::Event {
                 instance_id: instance_id.clone(),
                 payload: snap.started,
             });
             for (line, is_stderr) in snap.tail {
-                out.push(DaemonMsg::Event {
+                out.push(HubMsg::Event {
                     instance_id: instance_id.clone(),
-                    payload: DaemonEvent::OpOutput {
+                    payload: HubEvent::OpOutput {
                         id: op_id.clone(),
                         line,
                         is_stderr,
@@ -1340,7 +1339,7 @@ impl DaemonHub {
                 });
             }
             if let Some(finished) = snap.finished {
-                out.push(DaemonMsg::Event {
+                out.push(HubMsg::Event {
                     instance_id,
                     payload: finished,
                 });
@@ -1379,7 +1378,7 @@ impl DaemonHub {
 
 /// Evict finished operations oldest-first, across every instance, until the
 /// global retained-op count is at or under `max` (part of
-/// [`DaemonHub::prune_history`]'s ceiling enforcement).
+/// [`Hub::prune_history`]'s ceiling enforcement).
 ///
 /// A running op is never a candidate — only `s.finished.is_some()` entries are
 /// considered — so this can leave `hist` above `max` when everything left is
@@ -1411,9 +1410,9 @@ fn evict_oldest_finished_until_ceiling(
 }
 
 /// Give every retained-but-ended instance an `ended_epoch_ms` (part of
-/// [`DaemonHub::load_history`]'s restore).
+/// [`Hub::load_history`]'s restore).
 ///
-/// Nothing loaded from disk is attached: this daemon has only just started.
+/// Nothing loaded from disk is attached: this hub has only just started.
 /// Anything without a recorded end is stamped now, so it still ages out of
 /// the replay window.
 fn stamp_instance_end_times(
@@ -1432,10 +1431,10 @@ fn stamp_instance_end_times(
 }
 
 /// Close every operation left without a terminal event as `interrupted`
-/// (part of [`DaemonHub::load_history`]'s restore; SPEC R-DAEMON.7).
+/// (part of [`Hub::load_history`]'s restore; SPEC R-HUB.7).
 ///
 /// An operation that has a start record but no terminal one was still
-/// running when the previous daemon went away. Its real outcome is
+/// running when the previous hub went away. Its real outcome is
 /// unknowable — the command may well have finished — so it is closed as
 /// `interrupted` rather than left running forever (a spinner that never
 /// resolves) or called failed (an invention). Returns how many operations
@@ -1454,13 +1453,13 @@ fn mark_unfinished_ops_interrupted(
             };
             interrupted += 1;
             snap.finished_at_ms = Some(now_epoch_ms());
-            snap.finished = Some(DaemonEvent::OpFinished {
+            snap.finished = Some(HubEvent::OpFinished {
                 id: op_id,
                 // "Failed" is what a reader that predates `interrupted` sees;
                 // a current one renders the flag instead (R24.5).
                 status: OpStatus::Failed,
                 result_summary: Some(
-                    "interrupted: the daemon watching this operation exited".to_string(),
+                    "interrupted: the hub watching this operation exited".to_string(),
                 ),
                 duration_ms: 0,
                 ended_epoch_ms: snap.finished_at_ms,
@@ -1481,7 +1480,7 @@ fn mark_unfinished_ops_interrupted(
 #[derive(Debug)]
 pub enum HubBindError {
     /// A live hub already owns the rendezvous. There is exactly one hub per
-    /// user by design (SPEC R-DAEMON.1), so this is an ordinary outcome for the
+    /// user by design (SPEC R-HUB.1), so this is an ordinary outcome for the
     /// loser of a startup race, not a failure: connect to the winner instead.
     AlreadyRunning,
     /// The bind genuinely failed (permissions, a bad path).
@@ -1503,13 +1502,13 @@ impl std::error::Error for HubBindError {}
 ///
 /// Binding, serving and stopping are separate so one process can host the hub
 /// *and* the MCP endpoint on one runtime with a single idle policy and a single
-/// exit path (SPEC R-DAEMON.3).
+/// exit path (SPEC R-HUB.3).
 ///
 /// Dropping it unlinks the socket and only then releases the lock, so the next
 /// owner can never have its fresh socket unlinked by the previous one.
 pub struct HubServer {
     listener: LocalListener,
-    hub: Arc<DaemonHub>,
+    hub: Arc<Hub>,
     socket_path: PathBuf,
     /// Held for as long as this server exists; declared last so it is the
     /// last thing released.
@@ -1520,7 +1519,7 @@ impl HubServer {
     /// Take the rendezvous at `socket_path` and bind it.
     ///
     /// The lock beside the socket ([`lock_path_for`]) decides who owns it
-    /// (SPEC R-DAEMON.2): whoever holds it may remove a stale socket file and
+    /// (SPEC R-HUB.2): whoever holds it may remove a stale socket file and
     /// bind; anyone else gets [`HubBindError::AlreadyRunning`]. A socket that
     /// still answers is never removed even by the lock holder (SPEC R-ISO.2) —
     /// a hub from before the lock existed is live, not stale.
@@ -1550,7 +1549,7 @@ impl HubServer {
         restrict_unix_socket_permissions(&socket_path);
 
         info!("ahma hub: listening on {}", socket_path.display());
-        let (hub, _) = DaemonHub::new();
+        let (hub, _) = Hub::new();
         Ok(Self {
             listener,
             hub: Arc::new(hub),
@@ -1565,7 +1564,7 @@ impl HubServer {
     }
 
     /// Live connection count (instances, subscribers and one-shot queries).
-    /// Shared with the caller so a composed daemon can fold it into one idle
+    /// Shared with the caller so a composed hub can fold it into one idle
     /// policy alongside its MCP session count.
     pub fn connection_count(&self) -> Arc<AtomicUsize> {
         self.hub.connection_count.clone()
@@ -1591,10 +1590,10 @@ impl HubServer {
     pub async fn attach_history(
         &self,
         path: Option<PathBuf>,
-    ) -> Option<Arc<crate::daemon_history::HistoryWriter>> {
+    ) -> Option<Arc<crate::hub_history::HistoryWriter>> {
         let path = path?;
-        let cutoff = crate::daemon_history::replay_cutoff_ms(now_epoch_ms());
-        let records = crate::daemon_history::load_recent(&path, cutoff).await;
+        let cutoff = crate::hub_history::replay_cutoff_ms(now_epoch_ms());
+        let records = crate::hub_history::load_recent(&path, cutoff).await;
         if !records.is_empty() {
             info!(
                 "ahma hub: restoring {} history record(s) from {}",
@@ -1603,7 +1602,7 @@ impl HubServer {
             );
             self.hub.load_history(records).await;
         }
-        let writer = Arc::new(crate::daemon_history::HistoryWriter::start(Some(path))?);
+        let writer = Arc::new(crate::hub_history::HistoryWriter::start(Some(path))?);
         *self.hub.history.lock() = Some(writer.clone());
         Some(writer)
     }
@@ -1668,7 +1667,7 @@ pub fn restrict_unix_socket_permissions(_path: &std::path::Path) {}
 
 // ── Per-connection handler (generic over stream type) ─────────────────────────
 
-async fn handle_connection<S>(stream: S, hub: Arc<DaemonHub>)
+async fn handle_connection<S>(stream: S, hub: Arc<Hub>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -1680,7 +1679,7 @@ where
     let first = match recv_msg::<_, ClientMsg>(&mut reader).await {
         Ok(m) => m,
         Err(e) => {
-            debug!("daemon: connection closed before first message: {e}");
+            debug!("hub: connection closed before first message: {e}");
             hub.connection_count.fetch_sub(1, Ordering::Relaxed);
             return;
         }
@@ -1722,19 +1721,19 @@ where
 
         ClientMsg::ListInstances => {
             let instances = hub.instance_snapshot().await;
-            let _ = send_msg(&mut writer, &DaemonMsg::InstanceList { instances }).await;
+            let _ = send_msg(&mut writer, &HubMsg::InstanceList { instances }).await;
             // One-shot query — connection closes after response.
         }
 
         ClientMsg::Shutdown => {
-            info!("daemon: shutdown requested");
+            info!("hub: shutdown requested");
             let hook = hub.exit_hook.lock().clone();
             match hook {
                 // The composer owns the shutdown choreography (live MCP
                 // sessions to terminate, history to flush, two sockets to
                 // unlink) — it must not be short-circuited from here.
                 Some(hook) => hook("client requested shutdown"),
-                None => warn!("daemon: no exit hook installed; ignoring the shutdown request"),
+                None => warn!("hub: no exit hook installed; ignoring the shutdown request"),
             }
         }
 
@@ -1757,20 +1756,13 @@ where
         }
 
         ClientMsg::CancelPrompt { target_instance_id } => {
-            route_to_instance(&hub, target_instance_id, DaemonMsg::CancelPrompt).await
+            route_to_instance(&hub, target_instance_id, HubMsg::CancelPrompt).await
         }
 
         ClientMsg::CancelOperation {
             op_id,
             target_instance_id,
-        } => {
-            route_to_instance(
-                &hub,
-                target_instance_id,
-                DaemonMsg::CancelOperation { op_id },
-            )
-            .await
-        }
+        } => route_to_instance(&hub, target_instance_id, HubMsg::CancelOperation { op_id }).await,
 
         ClientMsg::SubmitApproval {
             id,
@@ -1787,7 +1779,7 @@ where
                 &hub,
                 target_instance_id,
                 &decision_id,
-                DaemonMsg::SubmitScopeGrant {
+                HubMsg::SubmitScopeGrant {
                     decision_id: decision_id.clone(),
                     decision,
                 },
@@ -1804,7 +1796,7 @@ where
                 &hub,
                 target_instance_id,
                 &decision_id,
-                DaemonMsg::SubmitWebApproval {
+                HubMsg::SubmitWebApproval {
                     decision_id: decision_id.clone(),
                     decision,
                 },
@@ -1820,13 +1812,13 @@ where
             route_to_instance(
                 &hub,
                 target_instance_id,
-                DaemonMsg::ReRaiseScopeGrant { path, access },
+                HubMsg::ReRaiseScopeGrant { path, access },
             )
             .await
         }
 
         _ => {
-            debug!("daemon: unexpected message, closing connection");
+            debug!("hub: unexpected message, closing connection");
         }
     }
 
@@ -1838,9 +1830,9 @@ where
 /// feedback — silently dropping the prompt leaves the user staring at a
 /// forever-incrementing timer with no answer and no error.
 async fn route_submit_prompt(
-    hub: &Arc<DaemonHub>,
+    hub: &Arc<Hub>,
     target_instance_id: Option<String>,
-    messages: Vec<DaemonChatMessage>,
+    messages: Vec<HubChatMessage>,
     system_prompt: Option<String>,
     provider: Option<String>,
     model: Option<String>,
@@ -1850,7 +1842,7 @@ async fn route_submit_prompt(
     let delivered = match target_id {
         Some(tid) => match hub.instance_txs.lock().await.get(&tid).cloned() {
             Some(tx) => tx
-                .send(DaemonMsg::RunPrompt {
+                .send(HubMsg::RunPrompt {
                     messages,
                     system_prompt,
                     provider,
@@ -1864,8 +1856,8 @@ async fn route_submit_prompt(
     };
 
     if !delivered {
-        warn!("daemon: SubmitPrompt could not be routed — no instance available to run it");
-        let _ = hub.broadcast.send(DaemonMsg::Relay(HubRelay::AgentError {
+        warn!("hub: SubmitPrompt could not be routed — no instance available to run it");
+        let _ = hub.broadcast.send(HubMsg::Relay(HubRelay::AgentError {
             error: "No ahma instance is available to run the prompt. \
                     Make sure an ahma server is connected (it normally \
                     auto-starts); try reopening the TUI."
@@ -1878,7 +1870,7 @@ async fn route_submit_prompt(
 /// Route a `SubmitApproval` to the chosen instance, clearing the pending
 /// approval so it isn't replayed to newly-connected subscribers.
 async fn route_submit_approval(
-    hub: &Arc<DaemonHub>,
+    hub: &Arc<Hub>,
     id: Option<String>,
     approved: bool,
     target_instance_id: Option<String>,
@@ -1896,7 +1888,7 @@ async fn route_submit_approval(
             .retain(|_, owner| owner != &tid);
         hub.pending_approvals.lock().await.remove(&tid);
         if let Some(tx) = hub.instance_txs.lock().await.get(&tid) {
-            let _ = tx.send(DaemonMsg::SubmitApproval { id, approved }).await;
+            let _ = tx.send(HubMsg::SubmitApproval { id, approved }).await;
         }
     }
 }
@@ -1910,11 +1902,7 @@ async fn route_submit_approval(
 /// instance has gone is deliberate and the reason there is no error to return —
 /// a decision for an instance that disconnected has nowhere to be applied, and
 /// the TUI has already closed its modal.
-async fn route_to_instance(
-    hub: &Arc<DaemonHub>,
-    target_instance_id: Option<String>,
-    msg: DaemonMsg,
-) {
+async fn route_to_instance(hub: &Arc<Hub>, target_instance_id: Option<String>, msg: HubMsg) {
     if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await
         && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
     {
@@ -1922,7 +1910,7 @@ async fn route_to_instance(
     }
 }
 
-/// Resolve which instance a TUI request targets (SPEC R-DAEMON.6).
+/// Resolve which instance a TUI request targets (SPEC R-HUB.6).
 ///
 /// An explicit id must name a **live** instance; one that has gone resolves to
 /// nothing rather than falling through to somebody else's session. Without an
@@ -1933,7 +1921,7 @@ async fn route_to_instance(
 ///
 /// Hook and TUI instances are not candidates for an untargeted request: a hook
 /// has no agent loop to run a prompt, and the TUI is the thing asking.
-async fn resolve_target(hub: &DaemonHub, target: Option<&str>) -> Option<String> {
+async fn resolve_target(hub: &Hub, target: Option<&str>) -> Option<String> {
     let instances = hub.instances.lock().await;
     match target {
         Some(tid) => instances.contains_key(tid).then(|| tid.to_string()),
@@ -1959,7 +1947,7 @@ async fn resolve_target(hub: &DaemonHub, target: Option<&str>) -> Option<String>
 
 /// Which instance raised `decision_id`, so its answer goes back to the session
 /// that asked rather than to whichever one happens to be first.
-async fn instance_for_decision(hub: &DaemonHub, decision_id: &str) -> Option<String> {
+async fn instance_for_decision(hub: &Hub, decision_id: &str) -> Option<String> {
     hub.pending_decisions.lock().await.get(decision_id).cloned()
 }
 
@@ -1969,10 +1957,10 @@ async fn instance_for_decision(hub: &DaemonHub, decision_id: &str) -> Option<Str
 /// fallback when no instance is on record for `decision_id`, never as a guess
 /// that overrides it.
 async fn route_decision_to_instance(
-    hub: &Arc<DaemonHub>,
+    hub: &Arc<Hub>,
     target_instance_id: Option<String>,
     decision_id: &str,
-    msg: DaemonMsg,
+    msg: HubMsg,
 ) {
     let target = match instance_for_decision(hub, decision_id).await {
         Some(owner) => Some(owner),
@@ -1998,7 +1986,7 @@ struct Registration {
 async fn serve_instance<R, W>(
     reader: &mut BufReader<R>,
     writer: &mut W,
-    hub: &Arc<DaemonHub>,
+    hub: &Arc<Hub>,
     reg: Registration,
 ) where
     R: tokio::io::AsyncRead + Unpin,
@@ -2036,13 +2024,13 @@ async fn serve_instance<R, W>(
     let pid = reg.pid;
     hub.instances.lock().await.insert(id.clone(), info.clone());
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<DaemonMsg>(100);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<HubMsg>(100);
     hub.instance_txs.lock().await.insert(id.clone(), tx);
 
     let _ = hub
         .broadcast
-        .send(DaemonMsg::InstanceRegistered { instance: info });
-    info!("daemon: instance registered id={id} pid={pid}");
+        .send(HubMsg::InstanceRegistered { instance: info });
+    info!("hub: instance registered id={id} pid={pid}");
 
     // Exchange events and liveness pings until the instance disconnects.
     let mut ping_interval =
@@ -2058,22 +2046,22 @@ async fn serve_instance<R, W>(
                 match msg {
                     Ok(ClientMsg::Event { payload }) => {
                         hub.record_op_event(&id, &payload).await;
-                        let _ = hub.broadcast.send(DaemonMsg::Event {
+                        let _ = hub.broadcast.send(HubMsg::Event {
                             instance_id: id.clone(),
                             payload,
                         });
                     }
                     Ok(ClientMsg::Pong { .. }) => {
                         // Liveness confirmed — nothing else to do for now.
-                        debug!("daemon: pong received from id={id}");
+                        debug!("hub: pong received from id={id}");
                     }
                     Ok(ClientMsg::ScopeGrantResolved { decision_id }) => {
                         hub.pending_decisions.lock().await.remove(&decision_id);
-                        let _ = hub.broadcast.send(DaemonMsg::ScopeGrantDismiss { decision_id });
+                        let _ = hub.broadcast.send(HubMsg::ScopeGrantDismiss { decision_id });
                     }
                     Ok(ClientMsg::WebApprovalResolved { decision_id }) => {
                         hub.pending_decisions.lock().await.remove(&decision_id);
-                        let _ = hub.broadcast.send(DaemonMsg::WebApprovalDismiss { decision_id });
+                        let _ = hub.broadcast.send(HubMsg::WebApprovalDismiss { decision_id });
                     }
                     // Everything the hub forwards untouched. One arm, so a new
                     // HubRelay message reaches subscribers without this loop
@@ -2082,7 +2070,7 @@ async fn serve_instance<R, W>(
                         // Relays with a side effect: remember the question so a
                         // TUI attaching mid-prompt is still shown it, and record
                         // which instance asked so the answer goes back to that
-                        // session and no other (SPEC R-DAEMON.6).
+                        // session and no other (SPEC R-HUB.6).
                         match &relay {
                             HubRelay::ApprovalRequested {
                                 id: call_id,
@@ -2118,7 +2106,7 @@ async fn serve_instance<R, W>(
                             }
                             _ => {}
                         }
-                        let _ = hub.broadcast.send(DaemonMsg::Relay(relay));
+                        let _ = hub.broadcast.send(HubMsg::Relay(relay));
                     }
                     Ok(ClientMsg::Unregister) | Err(_) => break,
 
@@ -2137,7 +2125,7 @@ async fn serve_instance<R, W>(
                         | ClientMsg::SubmitPrompt { .. }
                         | ClientMsg::CancelPrompt { .. }
                         | ClientMsg::CancelOperation { .. }) => {
-                        debug!("daemon: ignoring subscriber-only message from instance id={id}");
+                        debug!("hub: ignoring subscriber-only message from instance id={id}");
                     }
                     // Decisions the hub routes *to* an instance. They arrive on
                     // the TUI's connection and are forwarded from there; an
@@ -2146,13 +2134,13 @@ async fn serve_instance<R, W>(
                         | ClientMsg::SubmitScopeGrant { .. }
                         | ClientMsg::ReRaiseScopeGrant { .. }
                         | ClientMsg::SubmitWebApproval { .. }) => {
-                        debug!("daemon: ignoring instance-bound decision from instance id={id}");
+                        debug!("hub: ignoring instance-bound decision from instance id={id}");
                     }
                 }
             }
 
-            daemon_msg = rx.recv() => {
-                match daemon_msg {
+            incoming = rx.recv() => {
+                match incoming {
                     Some(msg) if send_msg(writer, &msg).await.is_ok() => {}
                     _ => break,
                 }
@@ -2160,8 +2148,8 @@ async fn serve_instance<R, W>(
 
             _ = ping_interval.tick() => {
                 ping_seq = ping_seq.wrapping_add(1);
-                debug!("daemon: sending ping to id={id} seq={ping_seq}");
-                if send_msg(writer, &DaemonMsg::Ping { seq: ping_seq })
+                debug!("hub: sending ping to id={id} seq={ping_seq}");
+                if send_msg(writer, &HubMsg::Ping { seq: ping_seq })
                     .await
                     .is_err()
                 {
@@ -2178,7 +2166,7 @@ async fn serve_instance<R, W>(
         .lock()
         .await
         .retain(|_, owner| owner != &id);
-    // The operation history deliberately stays (SPEC R-DAEMON.7): it ages out
+    // The operation history deliberately stays (SPEC R-HUB.7): it ages out
     // of the replay window instead, so work done by a session that has since
     // closed — or by a hook, which is an instance for the length of one
     // command — is still there when someone opens a TUI a minute later.
@@ -2189,20 +2177,20 @@ async fn serve_instance<R, W>(
     hub.prune_history(now_epoch_ms()).await;
     let _ = hub
         .broadcast
-        .send(DaemonMsg::InstanceUnregistered { id: id.clone() });
-    info!("daemon: instance unregistered id={id}");
+        .send(HubMsg::InstanceUnregistered { id: id.clone() });
+    info!("hub: instance unregistered id={id}");
 }
 
 /// Serve a TUI subscriber: send the current instance list, replay retained op
 /// history, then stream live events until the connection closes.
-async fn serve_subscriber<W>(writer: &mut W, hub: &Arc<DaemonHub>)
+async fn serve_subscriber<W>(writer: &mut W, hub: &Arc<Hub>)
 where
     W: AsyncWriteExt + Unpin,
 {
     // Send current instance list, then stream events.
     let instances = hub.instance_snapshot().await;
-    if let Err(e) = send_msg(writer, &DaemonMsg::InstanceList { instances }).await {
-        debug!("daemon: subscriber write failed: {e}");
+    if let Err(e) = send_msg(writer, &HubMsg::InstanceList { instances }).await {
+        debug!("hub: subscriber write failed: {e}");
         return;
     }
 
@@ -2218,7 +2206,7 @@ where
     stream_subscriber_events(writer, rx, hub).await;
 }
 
-async fn replay_subscriber_backlog<W>(writer: &mut W, hub: &Arc<DaemonHub>) -> Result<(), ()>
+async fn replay_subscriber_backlog<W>(writer: &mut W, hub: &Arc<Hub>) -> Result<(), ()>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -2230,7 +2218,7 @@ where
             .values()
             .cloned()
             .map(|pending| {
-                DaemonMsg::Relay(HubRelay::ApprovalRequested {
+                HubMsg::Relay(HubRelay::ApprovalRequested {
                     id: pending.id,
                     tool: pending.tool,
                     args: pending.args,
@@ -2240,7 +2228,7 @@ where
     );
     for msg in backlog {
         if let Err(e) = send_msg(writer, &msg).await {
-            debug!("daemon: subscriber backlog replay write failed: {e}");
+            debug!("hub: subscriber backlog replay write failed: {e}");
             return Err(());
         }
     }
@@ -2249,8 +2237,8 @@ where
 
 async fn stream_subscriber_events<W>(
     writer: &mut W,
-    mut rx: broadcast::Receiver<DaemonMsg>,
-    hub: &Arc<DaemonHub>,
+    mut rx: broadcast::Receiver<HubMsg>,
+    hub: &Arc<Hub>,
 ) where
     W: AsyncWriteExt + Unpin,
 {
@@ -2258,7 +2246,7 @@ async fn stream_subscriber_events<W>(
         match rx.recv().await {
             Ok(msg) => {
                 if let Err(e) = send_msg(writer, &msg).await {
-                    debug!("daemon: subscriber write failed: {e}");
+                    debug!("hub: subscriber write failed: {e}");
                     break;
                 }
             }
@@ -2269,7 +2257,7 @@ async fn stream_subscriber_events<W>(
                 // resolves. Re-send the authoritative state instead — the same
                 // snapshot a fresh subscriber gets — so the gap is repaired
                 // rather than merely survived.
-                warn!("daemon: subscriber lagged by {n} messages; resynchronising");
+                warn!("hub: subscriber lagged by {n} messages; resynchronising");
                 if resync_subscriber(writer, hub).await.is_err() {
                     break;
                 }
@@ -2281,12 +2269,12 @@ async fn stream_subscriber_events<W>(
 
 /// Re-send the instance list and the retained history to one subscriber, after
 /// its stream fell behind far enough to drop messages.
-async fn resync_subscriber<W>(writer: &mut W, hub: &Arc<DaemonHub>) -> Result<(), ()>
+async fn resync_subscriber<W>(writer: &mut W, hub: &Arc<Hub>) -> Result<(), ()>
 where
     W: AsyncWriteExt + Unpin,
 {
     let instances = hub.instance_snapshot().await;
-    send_msg(writer, &DaemonMsg::InstanceList { instances })
+    send_msg(writer, &HubMsg::InstanceList { instances })
         .await
         .map_err(|_| ())?;
     replay_subscriber_backlog(writer, hub).await
@@ -2329,7 +2317,7 @@ mod tests {
 
     /// A *new* event must deserialize into an *old* reader.
     ///
-    /// R24.5 permits field-only evolution precisely so mixed-version daemon /
+    /// R24.5 permits field-only evolution precisely so mixed-version hub /
     /// instance / TUI combinations keep working. If a new field made an old reader
     /// fail, upgrading one component would silently blind the others.
     #[test]
@@ -2340,7 +2328,7 @@ mod tests {
             tool_name: String,
         }
 
-        let new = DaemonEvent::OpStarted {
+        let new = HubEvent::OpStarted {
             id: "op_1".into(),
             tool_name: "run_terminal_command".into(),
             description: "d".into(),
@@ -2360,7 +2348,7 @@ mod tests {
         assert_eq!(old.tool_name, "run_terminal_command");
     }
 
-    /// A daemon left running across an upgrade is the reader that decides
+    /// A hub left running across an upgrade is the reader that decides
     /// (R24.5), so a `Register` carrying the session fields must still parse
     /// into one that has never heard of them.
     #[test]
@@ -2388,7 +2376,7 @@ mod tests {
             json.contains("\"session_id\":\"sess-1\"") && json.contains("\"client_pid\":99"),
             "the new fields must actually be on the wire: {json}"
         );
-        let old: OldRegister = serde_json::from_str(&json).expect("old daemons still parse");
+        let old: OldRegister = serde_json::from_str(&json).expect("old hubs still parse");
         assert_eq!(old.pid, 4242);
         assert_eq!(old.mode, "stdio");
         assert_eq!(old.scope, "/ws");
@@ -2396,7 +2384,7 @@ mod tests {
     }
 
     /// ...and the reverse: an instance built before these fields existed still
-    /// registers against a new daemon.
+    /// registers against a new hub.
     #[test]
     fn a_new_reader_accepts_a_registration_without_the_session_fields() {
         let old_json = serde_json::json!({
@@ -2445,9 +2433,9 @@ mod tests {
         })
         .to_string();
 
-        let ev: DaemonEvent = serde_json::from_str(&old_json).expect("old events still parse");
+        let ev: HubEvent = serde_json::from_str(&old_json).expect("old events still parse");
         match ev {
-            DaemonEvent::OpStarted { title, origin, .. } => {
+            HubEvent::OpStarted { title, origin, .. } => {
                 assert!(title.is_none(), "no title from a pre-R24.7 server");
                 assert!(origin.is_none());
             }
@@ -2464,7 +2452,7 @@ mod tests {
     /// no unsandboxed path to report.
     #[test]
     fn the_unsandboxed_flag_round_trips_and_defaults_to_confined() {
-        let ev = DaemonEvent::OpStarted {
+        let ev = HubEvent::OpStarted {
             id: "op_1".into(),
             tool_name: "shell".into(),
             description: "d".into(),
@@ -2483,8 +2471,8 @@ mod tests {
             json.contains("\"unsandboxed\":true"),
             "the flag must be on the wire: {json}"
         );
-        match serde_json::from_str::<DaemonEvent>(&json).unwrap() {
-            DaemonEvent::OpStarted { unsandboxed, .. } => assert!(unsandboxed),
+        match serde_json::from_str::<HubEvent>(&json).unwrap() {
+            HubEvent::OpStarted { unsandboxed, .. } => assert!(unsandboxed),
             other => panic!("expected OpStarted, got {other:?}"),
         }
 
@@ -2496,8 +2484,8 @@ mod tests {
             "scope": "/ws"
         })
         .to_string();
-        match serde_json::from_str::<DaemonEvent>(&old).expect("old events still parse") {
-            DaemonEvent::OpStarted { unsandboxed, .. } => assert!(
+        match serde_json::from_str::<HubEvent>(&old).expect("old events still parse") {
+            HubEvent::OpStarted { unsandboxed, .. } => assert!(
                 !unsandboxed,
                 "a producer with no unsandboxed path must not be read as having used one"
             ),
@@ -2509,7 +2497,7 @@ mod tests {
     /// actionable.
     #[test]
     fn the_exit_code_round_trips() {
-        let ev = DaemonEvent::OpFinished {
+        let ev = HubEvent::OpFinished {
             id: "op_1".into(),
             status: OpStatus::Failed,
             result_summary: None,
@@ -2519,9 +2507,9 @@ mod tests {
             denial: None,
             interrupted: false,
         };
-        let back: DaemonEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        let back: HubEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         match back {
-            DaemonEvent::OpFinished { exit_code, .. } => assert_eq!(exit_code, Some(101)),
+            HubEvent::OpFinished { exit_code, .. } => assert_eq!(exit_code, Some(101)),
             other => panic!("expected OpFinished, got {other:?}"),
         }
     }
@@ -2574,7 +2562,7 @@ mod tests {
         send_msg(&mut sub, &ClientMsg::Subscribe).await.unwrap();
         let mut sub_reader = BufReader::new(sub);
         // Drain the initial InstanceList so the next read is the AgentError.
-        let _ = recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap();
+        let _ = recv_msg::<_, HubMsg>(&mut sub_reader).await.unwrap();
 
         // Connect as a client and submit a prompt with no instances registered.
         let mut client = LocalStream::connect(&socket_path).await.unwrap();
@@ -2593,14 +2581,14 @@ mod tests {
 
         let msg = tokio::time::timeout(
             TestTimeouts::scale_secs(2),
-            recv_msg::<_, DaemonMsg>(&mut sub_reader),
+            recv_msg::<_, HubMsg>(&mut sub_reader),
         )
         .await
         .expect("AgentError should be broadcast, not dropped")
         .expect("subscriber connection open");
 
         match msg {
-            DaemonMsg::Relay(HubRelay::AgentError { error, .. }) => {
+            HubMsg::Relay(HubRelay::AgentError { error, .. }) => {
                 assert!(
                     error.contains("No ahma instance"),
                     "unexpected error text: {error}"
@@ -2657,14 +2645,14 @@ mod tests {
     /// Wire back-compat: messages serialized by a pre-causality peer (no
     /// `parent_id` / `started_epoch_ms` / `ended_epoch_ms` / `client` fields)
     /// must still deserialize — the task-tree protocol evolution is
-    /// field-only, so mixed-version daemon/instance/TUI combinations keep
+    /// field-only, so mixed-version hub/instance/TUI combinations keep
     /// working (SPEC R24.5).
     #[test]
     fn old_wire_format_without_causality_fields_still_parses() {
         let old_started = r#"{"kind":"OpStarted","id":"op-1","tool_name":"cargo_build","description":"Build","scope":"/w"}"#;
-        let ev: DaemonEvent = serde_json::from_str(old_started).unwrap();
+        let ev: HubEvent = serde_json::from_str(old_started).unwrap();
         match ev {
-            DaemonEvent::OpStarted {
+            HubEvent::OpStarted {
                 parent_id,
                 started_epoch_ms,
                 ..
@@ -2676,9 +2664,9 @@ mod tests {
         }
 
         let old_finished = r#"{"kind":"OpFinished","id":"op-1","status":"Completed","result_summary":null,"duration_ms":5}"#;
-        let ev: DaemonEvent = serde_json::from_str(old_finished).unwrap();
+        let ev: HubEvent = serde_json::from_str(old_finished).unwrap();
         match ev {
-            DaemonEvent::OpFinished { ended_epoch_ms, .. } => assert_eq!(ended_epoch_ms, None),
+            HubEvent::OpFinished { ended_epoch_ms, .. } => assert_eq!(ended_epoch_ms, None),
             other => panic!("expected OpFinished, got {other:?}"),
         }
 
@@ -2698,7 +2686,7 @@ mod tests {
     /// New causality/timing fields survive an NDJ round-trip intact.
     #[test]
     fn causality_fields_roundtrip() {
-        let ev = DaemonEvent::OpStarted {
+        let ev = HubEvent::OpStarted {
             id: "op-2".into(),
             tool_name: "run_terminal_command".into(),
             description: "cargo nextest run".into(),
@@ -2713,9 +2701,9 @@ mod tests {
             unsandboxed: false,
         };
         let json = serde_json::to_string(&ev).unwrap();
-        let back: DaemonEvent = serde_json::from_str(&json).unwrap();
+        let back: HubEvent = serde_json::from_str(&json).unwrap();
         match back {
-            DaemonEvent::OpStarted {
+            HubEvent::OpStarted {
                 parent_id,
                 started_epoch_ms,
                 ..
@@ -2728,8 +2716,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ndj_roundtrip_daemon_msg_instance_list() {
-        let msg = DaemonMsg::InstanceList {
+    async fn ndj_roundtrip_incoming_instance_list() {
+        let msg = HubMsg::InstanceList {
             instances: vec![InstanceInfo {
                 id: "abc123".to_string(),
                 pid: 99,
@@ -2747,9 +2735,9 @@ mod tests {
         send_msg(&mut buf, &msg).await.unwrap();
 
         let mut reader = BufReader::new(&buf[..]);
-        let decoded: DaemonMsg = recv_msg(&mut reader).await.unwrap();
+        let decoded: HubMsg = recv_msg(&mut reader).await.unwrap();
         match decoded {
-            DaemonMsg::InstanceList { instances } => {
+            HubMsg::InstanceList { instances } => {
                 assert_eq!(instances.len(), 1);
                 assert_eq!(instances[0].id, "abc123");
                 assert_eq!(instances[0].label, "Cursor");
@@ -2759,10 +2747,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ndj_roundtrip_daemon_event_op_started() {
-        let msg = DaemonMsg::Event {
+    async fn ndj_roundtrip_hub_event_op_started() {
+        let msg = HubMsg::Event {
             instance_id: "inst-1".to_string(),
-            payload: DaemonEvent::OpStarted {
+            payload: HubEvent::OpStarted {
                 id: "op-1".to_string(),
                 tool_name: "cargo_build".to_string(),
                 description: "Build workspace".to_string(),
@@ -2781,11 +2769,11 @@ mod tests {
         send_msg(&mut buf, &msg).await.unwrap();
 
         let mut reader = BufReader::new(&buf[..]);
-        let decoded: DaemonMsg = recv_msg(&mut reader).await.unwrap();
+        let decoded: HubMsg = recv_msg(&mut reader).await.unwrap();
         match decoded {
-            DaemonMsg::Event {
+            HubMsg::Event {
                 instance_id,
-                payload: DaemonEvent::OpStarted { id, tool_name, .. },
+                payload: HubEvent::OpStarted { id, tool_name, .. },
             } => {
                 assert_eq!(instance_id, "inst-1");
                 assert_eq!(id, "op-1");
@@ -2796,10 +2784,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ndj_roundtrip_daemon_event_op_finished() {
-        let msg = DaemonMsg::Event {
+    async fn ndj_roundtrip_hub_event_op_finished() {
+        let msg = HubMsg::Event {
             instance_id: "inst-2".to_string(),
-            payload: DaemonEvent::OpFinished {
+            payload: HubEvent::OpFinished {
                 id: "op-2".to_string(),
                 status: OpStatus::Completed,
                 result_summary: Some("success".to_string()),
@@ -2814,10 +2802,10 @@ mod tests {
         send_msg(&mut buf, &msg).await.unwrap();
 
         let mut reader = BufReader::new(&buf[..]);
-        let decoded: DaemonMsg = recv_msg(&mut reader).await.unwrap();
+        let decoded: HubMsg = recv_msg(&mut reader).await.unwrap();
         match decoded {
-            DaemonMsg::Event {
-                payload: DaemonEvent::OpFinished { id, status, .. },
+            HubMsg::Event {
+                payload: HubEvent::OpFinished { id, status, .. },
                 ..
             } => {
                 assert_eq!(id, "op-2");
@@ -2920,19 +2908,19 @@ mod tests {
             assert_eq!(format!("{msg:?}"), format!("{back:?}"));
         }
 
-        // DaemonMsg side (hub → TUI, and hub → instance).
+        // HubMsg side (hub → TUI, and hub → instance).
         for msg in [
-            DaemonMsg::Relay(HubRelay::ScopeGrantRequested { request }),
-            DaemonMsg::SubmitScopeGrant {
+            HubMsg::Relay(HubRelay::ScopeGrantRequested { request }),
+            HubMsg::SubmitScopeGrant {
                 decision_id: "dec-42".into(),
                 decision: GrantDecision::Deny,
             },
-            DaemonMsg::ScopeGrantDismiss {
+            HubMsg::ScopeGrantDismiss {
                 decision_id: "dec-42".into(),
             },
         ] {
             let json = serde_json::to_string(&msg).unwrap();
-            let back: DaemonMsg = serde_json::from_str(&json).unwrap();
+            let back: HubMsg = serde_json::from_str(&json).unwrap();
             assert_eq!(format!("{msg:?}"), format!("{back:?}"));
         }
     }
@@ -2967,19 +2955,19 @@ mod tests {
             assert_eq!(format!("{msg:?}"), format!("{back:?}"));
         }
 
-        // DaemonMsg side (hub → TUI, and hub → instance).
+        // HubMsg side (hub → TUI, and hub → instance).
         for msg in [
-            DaemonMsg::Relay(HubRelay::WebApprovalRequested { request }),
-            DaemonMsg::SubmitWebApproval {
+            HubMsg::Relay(HubRelay::WebApprovalRequested { request }),
+            HubMsg::SubmitWebApproval {
                 decision_id: "web-7".into(),
                 decision: WebApprovalDecision::Deny,
             },
-            DaemonMsg::WebApprovalDismiss {
+            HubMsg::WebApprovalDismiss {
                 decision_id: "web-7".into(),
             },
         ] {
             let json = serde_json::to_string(&msg).unwrap();
-            let back: DaemonMsg = serde_json::from_str(&json).unwrap();
+            let back: HubMsg = serde_json::from_str(&json).unwrap();
             assert_eq!(format!("{msg:?}"), format!("{back:?}"));
         }
     }
@@ -3001,9 +2989,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_subscribe_register_event_unregister_flow() {
+    async fn hub_subscribe_register_event_unregister_flow() {
         let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("daemon.sock");
+        let sock = tmp.path().join("hub.sock");
         start_hub(&sock).await;
 
         // ── Subscriber connects ────────────────────────────────────────────
@@ -3018,8 +3006,8 @@ mod tests {
             .unwrap();
 
         // Initial InstanceList should be empty.
-        let first: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
-        let DaemonMsg::InstanceList { instances } = first else {
+        let first: HubMsg = recv_msg(&mut sub_reader).await.unwrap();
+        let HubMsg::InstanceList { instances } = first else {
             panic!("expected InstanceList, got {first:?}");
         };
         assert!(instances.is_empty(), "no instances registered yet");
@@ -3044,8 +3032,8 @@ mod tests {
         .unwrap();
 
         // Subscriber receives InstanceRegistered.
-        let reg: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
-        let DaemonMsg::InstanceRegistered { instance } = reg else {
+        let reg: HubMsg = recv_msg(&mut sub_reader).await.unwrap();
+        let HubMsg::InstanceRegistered { instance } = reg else {
             panic!("expected InstanceRegistered, got {reg:?}");
         };
         assert_eq!(instance.label, "TestInstance");
@@ -3056,7 +3044,7 @@ mod tests {
         send_msg(
             &mut iw,
             &ClientMsg::Event {
-                payload: DaemonEvent::OpStarted {
+                payload: HubEvent::OpStarted {
                     id: "op-001".to_string(),
                     tool_name: "cargo_test".to_string(),
                     description: "Run tests".to_string(),
@@ -3075,11 +3063,11 @@ mod tests {
         .await
         .unwrap();
 
-        let ev: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
+        let ev: HubMsg = recv_msg(&mut sub_reader).await.unwrap();
         match ev {
-            DaemonMsg::Event {
+            HubMsg::Event {
                 instance_id: iid,
-                payload: DaemonEvent::OpStarted { id, tool_name, .. },
+                payload: HubEvent::OpStarted { id, tool_name, .. },
             } => {
                 assert_eq!(iid, instance_id);
                 assert_eq!(id, "op-001");
@@ -3092,7 +3080,7 @@ mod tests {
         send_msg(
             &mut iw,
             &ClientMsg::Event {
-                payload: DaemonEvent::OpFinished {
+                payload: HubEvent::OpFinished {
                     id: "op-001".to_string(),
                     status: OpStatus::Completed,
                     result_summary: Some("success".to_string()),
@@ -3107,10 +3095,10 @@ mod tests {
         .await
         .unwrap();
 
-        let fin: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
+        let fin: HubMsg = recv_msg(&mut sub_reader).await.unwrap();
         match fin {
-            DaemonMsg::Event {
-                payload: DaemonEvent::OpFinished { id, status, .. },
+            HubMsg::Event {
+                payload: HubEvent::OpFinished { id, status, .. },
                 ..
             } => {
                 assert_eq!(id, "op-001");
@@ -3122,15 +3110,15 @@ mod tests {
         // ── Unregister ─────────────────────────────────────────────────────
         send_msg(&mut iw, &ClientMsg::Unregister).await.unwrap();
 
-        let unreg: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
+        let unreg: HubMsg = recv_msg(&mut sub_reader).await.unwrap();
         match unreg {
-            DaemonMsg::InstanceUnregistered { id } => assert_eq!(id, instance_id),
+            HubMsg::InstanceUnregistered { id } => assert_eq!(id, instance_id),
             other => panic!("expected InstanceUnregistered, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn daemon_list_instances_query() {
+    async fn hub_list_instances_query() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("list.sock");
         start_hub(&sock).await;
@@ -3154,7 +3142,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Give the daemon time to process the registration.
+        // Give the hub time to process the registration.
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         // One-shot ListInstances query.
@@ -3163,9 +3151,9 @@ mod tests {
         let mut qrdr = BufReader::new(qr);
         send_msg(&mut qw, &ClientMsg::ListInstances).await.unwrap();
 
-        let resp: DaemonMsg = recv_msg(&mut qrdr).await.unwrap();
+        let resp: HubMsg = recv_msg(&mut qrdr).await.unwrap();
         match resp {
-            DaemonMsg::InstanceList { instances } => {
+            HubMsg::InstanceList { instances } => {
                 assert_eq!(instances.len(), 1, "expected 1 registered instance");
                 assert_eq!(instances[0].label, "HttpBridge");
                 assert_eq!(instances[0].mode, "http");
@@ -3176,12 +3164,12 @@ mod tests {
 
     #[tokio::test]
     async fn op_history_replays_started_and_finished_in_order() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
 
         // op-1 runs to completion; op-2 is still running.
         hub.record_op_event(
             "i1",
-            &DaemonEvent::OpStarted {
+            &HubEvent::OpStarted {
                 id: "op-1".into(),
                 tool_name: "cargo_build".into(),
                 description: "build".into(),
@@ -3199,7 +3187,7 @@ mod tests {
         .await;
         hub.record_op_event(
             "i1",
-            &DaemonEvent::OpFinished {
+            &HubEvent::OpFinished {
                 id: "op-1".into(),
                 status: OpStatus::Completed,
                 result_summary: Some("ok".into()),
@@ -3213,7 +3201,7 @@ mod tests {
         .await;
         hub.record_op_event(
             "i1",
-            &DaemonEvent::OpStarted {
+            &HubEvent::OpStarted {
                 id: "op-2".into(),
                 tool_name: "cargo_test".into(),
                 description: "test".into(),
@@ -3240,7 +3228,7 @@ mod tests {
         assert!(
             matches!(
                 &replay[0],
-                DaemonMsg::Event { instance_id, payload: DaemonEvent::OpStarted { id, .. } }
+                HubMsg::Event { instance_id, payload: HubEvent::OpStarted { id, .. } }
                     if instance_id == "i1" && id == "op-1"
             ),
             "first replayed event is op-1 OpStarted"
@@ -3248,14 +3236,14 @@ mod tests {
         assert!(
             matches!(
                 &replay[1],
-                DaemonMsg::Event { payload: DaemonEvent::OpFinished { id, .. }, .. } if id == "op-1"
+                HubMsg::Event { payload: HubEvent::OpFinished { id, .. }, .. } if id == "op-1"
             ),
             "op-1 OpFinished follows its OpStarted"
         );
         assert!(
             matches!(
                 &replay[2],
-                DaemonMsg::Event { payload: DaemonEvent::OpStarted { id, .. }, .. } if id == "op-2"
+                HubMsg::Event { payload: HubEvent::OpStarted { id, .. }, .. } if id == "op-2"
             ),
             "still-running op-2 is replayed as OpStarted only"
         );
@@ -3263,12 +3251,12 @@ mod tests {
 
     #[tokio::test]
     async fn op_history_drops_unregistered_instance_and_ignores_output() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
 
         // Streaming output is a live tail — never retained for replay.
         hub.record_op_event(
             "i1",
-            &DaemonEvent::OpOutput {
+            &HubEvent::OpOutput {
                 id: "op-1".into(),
                 line: "compiling…".into(),
                 is_stderr: false,
@@ -3282,7 +3270,7 @@ mod tests {
 
         hub.record_op_event(
             "i1",
-            &DaemonEvent::OpStarted {
+            &HubEvent::OpStarted {
                 id: "op-1".into(),
                 tool_name: "t".into(),
                 description: "d".into(),
@@ -3316,23 +3304,23 @@ mod tests {
 
     // ── default_socket_path (env-driven) ──────────────────────────────────────
 
-    /// R-ISO.1: a test-harness process without explicit daemon-socket isolation
-    /// must still resolve a private per-run socket, never the live daemon's.
+    /// R-ISO.1: a test-harness process without explicit hub-socket isolation
+    /// must still resolve a private per-run socket, never the live hub's.
     #[test]
     fn default_socket_path_private_under_test_harness() {
         let _g = ENV_MUTEX.lock();
         if SOCKET_PATH_OVERRIDE.get().is_some() {
             return;
         }
-        let prev_sock = std::env::var_os("AHMA_DAEMON_SOCK");
+        let prev_sock = std::env::var_os("AHMA_HUB_SOCK");
         let prev_nextest = std::env::var_os("NEXTEST");
-        unsafe { std::env::remove_var("AHMA_DAEMON_SOCK") };
+        unsafe { std::env::remove_var("AHMA_HUB_SOCK") };
         unsafe { std::env::set_var("NEXTEST", "1") };
 
         let path = default_socket_path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
-            name.starts_with("ahma-test-daemon-"),
+            name.starts_with("ahma-test-hub-"),
             "test-harness fallback must be a private per-run socket, got {}",
             path.display()
         );
@@ -3343,8 +3331,8 @@ mod tests {
         );
 
         match prev_sock {
-            Some(v) => unsafe { std::env::set_var("AHMA_DAEMON_SOCK", v) },
-            None => unsafe { std::env::remove_var("AHMA_DAEMON_SOCK") },
+            Some(v) => unsafe { std::env::set_var("AHMA_HUB_SOCK", v) },
+            None => unsafe { std::env::remove_var("AHMA_HUB_SOCK") },
         }
         match prev_nextest {
             Some(v) => unsafe { std::env::set_var("NEXTEST", v) },
@@ -3354,7 +3342,7 @@ mod tests {
 
     /// R-ISO.1: the MCP endpoint must be per-run private under a harness, and
     /// must key off the *same* discriminator as the hub socket — a test whose
-    /// frontend and daemon disagree about which run they belong to rendezvouses
+    /// frontend and hub disagree about which run they belong to rendezvouses
     /// on nothing (or, worse, on the developer's live endpoint).
     #[test]
     fn mcp_socket_path_is_private_under_test_harness_and_shares_the_hub_discriminator() {
@@ -3399,7 +3387,7 @@ mod tests {
     }
 
     /// The two rendezvous files live side by side, so one `runtime_dir` check
-    /// covers both (SPEC R-DAEMON.2).
+    /// covers both (SPEC R-HUB.2).
     #[test]
     fn mcp_socket_path_lives_beside_the_hub_socket() {
         let hub = platform_default_socket_path();
@@ -3471,19 +3459,19 @@ mod tests {
         if SOCKET_PATH_OVERRIDE.get().is_some() {
             return;
         }
-        let prev = std::env::var_os("AHMA_DAEMON_SOCK");
+        let prev = std::env::var_os("AHMA_HUB_SOCK");
         let want = std::env::temp_dir().join("ahma_dsp_unit_test.sock");
-        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &want) };
+        unsafe { std::env::set_var("AHMA_HUB_SOCK", &want) };
 
         assert_eq!(
             default_socket_path(),
             want,
-            "AHMA_DAEMON_SOCK should be returned verbatim in test builds"
+            "AHMA_HUB_SOCK should be returned verbatim in test builds"
         );
 
         match prev {
-            Some(v) => unsafe { std::env::set_var("AHMA_DAEMON_SOCK", v) },
-            None => unsafe { std::env::remove_var("AHMA_DAEMON_SOCK") },
+            Some(v) => unsafe { std::env::set_var("AHMA_HUB_SOCK", v) },
+            None => unsafe { std::env::remove_var("AHMA_HUB_SOCK") },
         }
     }
 
@@ -3491,14 +3479,14 @@ mod tests {
 
     #[tokio::test]
     async fn record_op_event_evicts_oldest_finished_when_over_cap() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
 
         // Fill to the cap with fully-finished ops.
         for i in 0..MAX_OPS_PER_INSTANCE {
             let id = format!("op-{i}");
             hub.record_op_event(
                 "i1",
-                &DaemonEvent::OpStarted {
+                &HubEvent::OpStarted {
                     id: id.clone(),
                     tool_name: "t".into(),
                     description: "d".into(),
@@ -3516,7 +3504,7 @@ mod tests {
             .await;
             hub.record_op_event(
                 "i1",
-                &DaemonEvent::OpFinished {
+                &HubEvent::OpFinished {
                     id,
                     status: OpStatus::Completed,
                     result_summary: None,
@@ -3537,7 +3525,7 @@ mod tests {
         // One more started op pushes over the cap → oldest finished (op-0) evicted.
         hub.record_op_event(
             "i1",
-            &DaemonEvent::OpStarted {
+            &HubEvent::OpStarted {
                 id: "op-new".into(),
                 tool_name: "t".into(),
                 description: "d".into(),
@@ -3570,14 +3558,14 @@ mod tests {
 
     #[tokio::test]
     async fn record_op_event_keeps_all_when_none_finished_to_evict() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
 
         // Insert cap+1 *running* ops — none are eligible for eviction, so the
         // history is allowed to exceed the cap (running ops are never dropped).
         for i in 0..=MAX_OPS_PER_INSTANCE {
             hub.record_op_event(
                 "i1",
-                &DaemonEvent::OpStarted {
+                &HubEvent::OpStarted {
                     id: format!("op-{i}"),
                     tool_name: "t".into(),
                     description: "d".into(),
@@ -3609,14 +3597,14 @@ mod tests {
     /// reconstruction is a *separate* row and never corrupts a live one.
     #[tokio::test]
     async fn a_finish_for_another_op_never_terminates_the_running_one() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         hub.record_op_event("i1", &started_ev("real")).await;
         hub.record_op_event("i1", &finished_ev("other", Some(now_epoch_ms())))
             .await;
 
         let replay = hub.replay_events().await;
         let real_finished = replay.iter().any(|m| {
-            matches!(m, DaemonMsg::Event { payload: DaemonEvent::OpFinished { id, .. }, .. } if id == "real")
+            matches!(m, HubMsg::Event { payload: HubEvent::OpFinished { id, .. }, .. } if id == "real")
         });
         assert!(
             !real_finished,
@@ -3625,7 +3613,7 @@ mod tests {
         let other_rows = replay
             .iter()
             .filter(|m| {
-                matches!(m, DaemonMsg::Event { payload, .. }
+                matches!(m, HubMsg::Event { payload, .. }
                     if op_id_of(payload).as_deref() == Some("other"))
             })
             .count();
@@ -3657,7 +3645,7 @@ mod tests {
     /// at an id another session had since been given.
     #[tokio::test]
     async fn resolve_target_explicit_must_name_a_live_instance() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         assert_eq!(
             resolve_target(&hub, Some("ghost")).await,
             None,
@@ -3679,7 +3667,7 @@ mod tests {
     /// to another window's question; the hub now refuses to guess.
     #[tokio::test]
     async fn resolve_target_refuses_to_guess_among_several_instances() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         {
             let mut instances = hub.instances.lock().await;
             instances.insert("a".into(), instance_with_mode("a", "stdio"));
@@ -3697,7 +3685,7 @@ mod tests {
     /// them excluded, one real session is still unambiguous.
     #[tokio::test]
     async fn resolve_target_ignores_hook_and_tui_instances() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         {
             let mut instances = hub.instances.lock().await;
             instances.insert("hook".into(), instance_with_mode("hook", "hook"));
@@ -3714,7 +3702,7 @@ mod tests {
     /// happens to be registered.
     #[tokio::test]
     async fn a_decision_routes_to_the_instance_that_raised_it() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         {
             let mut instances = hub.instances.lock().await;
             instances.insert("asker".into(), instance_with_mode("asker", "stdio"));
@@ -3739,8 +3727,8 @@ mod tests {
     // ── retention: output tails, ended instances, window and cap ──────────────
 
     /// Helper: a minimal started event for retention tests.
-    fn started_ev(id: &str) -> DaemonEvent {
-        DaemonEvent::OpStarted {
+    fn started_ev(id: &str) -> HubEvent {
+        HubEvent::OpStarted {
             id: id.into(),
             tool_name: "run_terminal_command".into(),
             description: "d".into(),
@@ -3757,8 +3745,8 @@ mod tests {
     }
 
     /// Helper: a terminal event that ended `ago_ms` milliseconds ago.
-    fn finished_ev(id: &str, ended_epoch_ms: Option<u64>) -> DaemonEvent {
-        DaemonEvent::OpFinished {
+    fn finished_ev(id: &str, ended_epoch_ms: Option<u64>) -> HubEvent {
+        HubEvent::OpFinished {
             id: id.into(),
             status: OpStatus::Completed,
             result_summary: Some("ok".into()),
@@ -3771,15 +3759,15 @@ mod tests {
     }
 
     /// The retained output window is bounded: it is what a late subscriber
-    /// needs to see, not a log (SPEC R-DAEMON.7).
+    /// needs to see, not a log (SPEC R-HUB.7).
     #[tokio::test]
     async fn op_output_tail_is_bounded_to_max_tail_lines() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         hub.record_op_event("i1", &started_ev("op-1")).await;
         for n in 0..(MAX_TAIL_LINES * 2) {
             hub.record_op_event(
                 "i1",
-                &DaemonEvent::OpOutput {
+                &HubEvent::OpOutput {
                     id: "op-1".into(),
                     line: format!("line {n}"),
                     is_stderr: false,
@@ -3793,8 +3781,8 @@ mod tests {
             .await
             .into_iter()
             .filter_map(|m| match m {
-                DaemonMsg::Event {
-                    payload: DaemonEvent::OpOutput { line, .. },
+                HubMsg::Event {
+                    payload: HubEvent::OpOutput { line, .. },
                     ..
                 } => Some(line),
                 _ => None,
@@ -3817,11 +3805,11 @@ mod tests {
     /// finished — so a subscriber needs no second code path for history.
     #[tokio::test]
     async fn replay_emits_started_then_tail_then_finished_in_order() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         hub.record_op_event("i1", &started_ev("op-1")).await;
         hub.record_op_event(
             "i1",
-            &DaemonEvent::OpOutput {
+            &HubEvent::OpOutput {
                 id: "op-1".into(),
                 line: "compiling".into(),
                 is_stderr: false,
@@ -3836,11 +3824,11 @@ mod tests {
             .await
             .iter()
             .map(|m| match m {
-                DaemonMsg::Event { payload, .. } => match payload {
-                    DaemonEvent::OpStarted { .. } => "started",
-                    DaemonEvent::OpOutput { .. } => "output",
-                    DaemonEvent::OpFinished { .. } => "finished",
-                    DaemonEvent::LogLine { .. } => "log",
+                HubMsg::Event { payload, .. } => match payload {
+                    HubEvent::OpStarted { .. } => "started",
+                    HubEvent::OpOutput { .. } => "output",
+                    HubEvent::OpFinished { .. } => "finished",
+                    HubEvent::LogLine { .. } => "log",
                 },
                 _ => "other",
             })
@@ -3853,7 +3841,7 @@ mod tests {
     /// by the time anyone looked, the instance had always already gone.
     #[tokio::test]
     async fn history_survives_unregister_and_the_instance_is_listed_as_ended() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         let info = InstanceInfo {
             id: "i1".into(),
             pid: 7,
@@ -3897,7 +3885,7 @@ mod tests {
     /// however long it takes.
     #[tokio::test]
     async fn replay_window_evicts_finished_ops_older_than_the_window() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         let now = now_epoch_ms();
         let long_ago = now - HISTORY_REPLAY_WINDOW.as_millis() as u64 - 60_000;
 
@@ -3917,8 +3905,8 @@ mod tests {
             .await
             .iter()
             .filter_map(|m| match m {
-                DaemonMsg::Event {
-                    payload: DaemonEvent::OpStarted { id, .. },
+                HubMsg::Event {
+                    payload: HubEvent::OpStarted { id, .. },
                     ..
                 } => Some(id.clone()),
                 _ => None,
@@ -3934,10 +3922,10 @@ mod tests {
 
     /// The per-instance cap is unbounded in the number of instances, and a hook
     /// registers one per hooked command; the global ceiling is what actually
-    /// bounds the daemon's memory.
+    /// bounds the hub's memory.
     #[tokio::test]
     async fn global_retention_cap_evicts_oldest_finished_first() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         let now = now_epoch_ms();
         for i in 0..(MAX_RETAINED_OPS + 50) {
             let inst = format!("hook-{i}");
@@ -3958,8 +3946,8 @@ mod tests {
             .await
             .iter()
             .filter_map(|m| match m {
-                DaemonMsg::Event {
-                    payload: DaemonEvent::OpStarted { id, .. },
+                HubMsg::Event {
+                    payload: HubEvent::OpStarted { id, .. },
                     ..
                 } => Some(id.clone()),
                 _ => None,
@@ -3977,7 +3965,7 @@ mod tests {
     /// exactly the work a user is most likely to ask about.
     #[tokio::test]
     async fn finished_without_started_is_retained_as_partial() {
-        let (hub, _rx) = DaemonHub::new();
+        let (hub, _rx) = Hub::new();
         let now = now_epoch_ms();
         hub.record_op_event("i1", &finished_ev("orphan", Some(now)))
             .await;
@@ -3986,15 +3974,15 @@ mod tests {
         let started = replay
             .iter()
             .find_map(|m| match m {
-                DaemonMsg::Event {
-                    payload: payload @ DaemonEvent::OpStarted { .. },
+                HubMsg::Event {
+                    payload: payload @ HubEvent::OpStarted { .. },
                     ..
                 } => Some(payload.clone()),
                 _ => None,
             })
             .expect("a reconstructed start record");
         match started {
-            DaemonEvent::OpStarted {
+            HubEvent::OpStarted {
                 id,
                 partial,
                 title,
@@ -4015,8 +4003,8 @@ mod tests {
         assert!(
             replay.iter().any(|m| matches!(
                 m,
-                DaemonMsg::Event {
-                    payload: DaemonEvent::OpFinished { .. },
+                HubMsg::Event {
+                    payload: HubEvent::OpFinished { .. },
                     ..
                 }
             )),
@@ -4024,17 +4012,17 @@ mod tests {
         );
     }
 
-    /// The daemon exits when idle, so without a file "what ran twenty minutes
+    /// The hub exits when idle, so without a file "what ran twenty minutes
     /// ago" is answerable only while the process that saw it happen is still
-    /// alive. A fresh daemon must restore the window from disk — including the
+    /// alive. A fresh hub must restore the window from disk — including the
     /// output tail, and including operations that were still running when the
-    /// previous daemon went away (SPEC R-DAEMON.7).
+    /// previous hub went away (SPEC R-HUB.7).
     #[tokio::test]
     async fn a_fresh_hub_replays_the_last_hour_from_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let history = tmp.path().join("history.jsonl");
 
-        // ── Daemon 1: does some work, then goes away mid-operation ───────────
+        // ── Hub 1: does some work, then goes away mid-operation ───────────
         {
             let server = HubServer::bind_at(tmp.path().join("first.sock"))
                 .await
@@ -4062,7 +4050,7 @@ mod tests {
             hub.record_op_event("i1", &started_ev("done")).await;
             hub.record_op_event(
                 "i1",
-                &DaemonEvent::OpOutput {
+                &HubEvent::OpOutput {
                     id: "done".into(),
                     line: "Compiling ahma_core".into(),
                     is_stderr: false,
@@ -4071,12 +4059,12 @@ mod tests {
             .await;
             hub.record_op_event("i1", &finished_ev("done", Some(now_epoch_ms())))
                 .await;
-            // ...and one that never finishes: the daemon dies under it.
+            // ...and one that never finishes: the hub dies under it.
             hub.record_op_event("i1", &started_ev("in-flight")).await;
             writer.flush().await;
         }
 
-        // ── Daemon 2: a fresh process, nothing attached ──────────────────────
+        // ── Hub 2: a fresh process, nothing attached ──────────────────────
         let server = HubServer::bind_at(tmp.path().join("second.sock"))
             .await
             .expect("bind");
@@ -4097,8 +4085,8 @@ mod tests {
         let output: Vec<String> = replay
             .iter()
             .filter_map(|m| match m {
-                DaemonMsg::Event {
-                    payload: DaemonEvent::OpOutput { line, .. },
+                HubMsg::Event {
+                    payload: HubEvent::OpOutput { line, .. },
                     ..
                 } => Some(line.clone()),
                 _ => None,
@@ -4113,9 +4101,9 @@ mod tests {
         let interrupted: Vec<(String, bool)> = replay
             .iter()
             .filter_map(|m| match m {
-                DaemonMsg::Event {
+                HubMsg::Event {
                     payload:
-                        DaemonEvent::OpFinished {
+                        HubEvent::OpFinished {
                             id, interrupted, ..
                         },
                     ..
@@ -4129,14 +4117,14 @@ mod tests {
         );
         assert!(
             interrupted.contains(&("in-flight".to_string(), true)),
-            "an op still running when the daemon died is closed as interrupted, \
+            "an op still running when the hub died is closed as interrupted, \
              neither left spinning forever nor called failed: {interrupted:?}"
         );
     }
 
     /// A message a build does not understand is skipped, not fatal.
     ///
-    /// This socket carries no version (R24.5), so a daemon left running across
+    /// This socket carries no version (R24.5), so a hub left running across
     /// an upgrade is the reader that decides — and it used to decide by
     /// dropping the connection, which made every future message addition a hard
     /// incompatibility. Skipping is the property that has to ship *before* any
@@ -4220,7 +4208,7 @@ mod tests {
 
     /// A live hub is never stolen: the loser of a startup race is told so and
     /// connects to the winner instead of unlinking a socket in use
-    /// (SPEC R-DAEMON.1, R-ISO.2).
+    /// (SPEC R-HUB.1, R-ISO.2).
     #[tokio::test]
     async fn bind_hub_reports_already_running_when_a_live_hub_owns_the_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4265,7 +4253,7 @@ mod tests {
     }
 
     /// The lock, not the socket, decides who owns the rendezvous (SPEC
-    /// R-DAEMON.2). A hub that holds it but has not bound yet must not be
+    /// R-HUB.2). A hub that holds it but has not bound yet must not be
     /// raced, and a process without it must not touch the socket file — that
     /// is what used to let two starters unlink each other's sockets.
     #[tokio::test]
@@ -4318,23 +4306,20 @@ mod tests {
             .expect("a successor binds the freed rendezvous");
     }
 
-    /// `daemon.sock` is guarded by `daemon.lock`, the file the daemon already
-    /// held before the lock became the mutex, so an old and a new daemon agree
+    /// `hub.sock` is guarded by `hub.lock`, the file the hub already
+    /// held before the lock became the mutex, so an old and a new hub agree
     /// on who owns the default rendezvous.
     #[test]
     fn the_lock_sits_beside_its_socket() {
         let dir = std::path::Path::new("run");
-        assert_eq!(
-            lock_path_for(&dir.join("daemon.sock")),
-            dir.join("daemon.lock")
-        );
+        assert_eq!(lock_path_for(&dir.join("hub.sock")), dir.join("hub.lock"));
         assert_eq!(
             lock_path_for(&dir.join("mcp.hub.sock")),
             dir.join("mcp.hub.lock")
         );
     }
 
-    /// `Shutdown` must not shortcut a composed daemon's shutdown: with a hook
+    /// `Shutdown` must not shortcut a composed hub's shutdown: with a hook
     /// installed the hub delegates instead of calling `process::exit`.
     #[tokio::test]
     async fn shutdown_message_invokes_exit_hook_instead_of_exiting() {
@@ -4367,7 +4352,7 @@ mod tests {
     /// its sandbox scope. With a fresh id each time, a TUI saw one instance
     /// leave and a stranger arrive — losing the section's expansion state and
     /// reshuffling any view sorted by id. The session id keeps it the same
-    /// instance (SPEC R-DAEMON.6).
+    /// instance (SPEC R-HUB.6).
     #[tokio::test]
     async fn reregister_with_the_same_session_keeps_the_instance_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -4450,7 +4435,7 @@ mod tests {
     // ── serve_instance event forwarding ───────────────────────────────────────
 
     #[tokio::test]
-    async fn daemon_forwards_instance_events_to_subscriber() {
+    async fn hub_forwards_instance_events_to_subscriber() {
         use crate::scope_grant::{GrantReason, ScopeGrantRequest};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4463,8 +4448,8 @@ mod tests {
         let mut srdr = BufReader::new(sr);
         send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();
         assert!(matches!(
-            recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap(),
-            DaemonMsg::InstanceList { .. }
+            recv_msg::<_, HubMsg>(&mut srdr).await.unwrap(),
+            HubMsg::InstanceList { .. }
         ));
 
         // Instance registers.
@@ -4486,8 +4471,8 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap(),
-            DaemonMsg::InstanceRegistered { .. }
+            recv_msg::<_, HubMsg>(&mut srdr).await.unwrap(),
+            HubMsg::InstanceRegistered { .. }
         ));
 
         // ChatToken → ChatToken.
@@ -4499,8 +4484,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Relay(HubRelay::ChatToken { token }) => assert_eq!(token, "tok"),
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::Relay(HubRelay::ChatToken { token }) => assert_eq!(token, "tok"),
             other => panic!("expected ChatToken, got {other:?}"),
         }
 
@@ -4516,8 +4501,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Relay(HubRelay::ApprovalRequested { id, tool, args, .. }) => {
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::Relay(HubRelay::ApprovalRequested { id, tool, args, .. }) => {
                 assert_eq!(id, "c1");
                 assert_eq!(tool, "sh");
                 assert_eq!(args, "ls");
@@ -4539,8 +4524,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Relay(HubRelay::ScopeGrantRequested { request }) => {
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::Relay(HubRelay::ScopeGrantRequested { request }) => {
                 assert_eq!(request.decision_id, "d9")
             }
             other => panic!("expected ScopeGrantRequested, got {other:?}"),
@@ -4555,8 +4540,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d9"),
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d9"),
             other => panic!("expected ScopeGrantDismiss, got {other:?}"),
         }
 
@@ -4571,8 +4556,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Relay(HubRelay::ToolCallStarted { id, name, .. }) => {
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::Relay(HubRelay::ToolCallStarted { id, name, .. }) => {
                 assert_eq!(id, "t1");
                 assert_eq!(name, "read_file");
             }
@@ -4590,8 +4575,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Relay(HubRelay::ToolCallFinished { id, failed, .. }) => {
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::Relay(HubRelay::ToolCallFinished { id, failed, .. }) => {
                 assert_eq!(id, "t1");
                 assert!(!failed);
             }
@@ -4609,8 +4594,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Relay(HubRelay::Usage {
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::Relay(HubRelay::Usage {
                 prompt_tokens,
                 total_tokens,
                 ..
@@ -4628,8 +4613,8 @@ mod tests {
         send_msg(&mut iw, &ClientMsg::Relay(HubRelay::AgentDone))
             .await
             .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Relay(HubRelay::AgentDone) => {}
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::Relay(HubRelay::AgentDone) => {}
             other => panic!("expected AgentDone (Pong must not broadcast), got {other:?}"),
         }
 
@@ -4643,8 +4628,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Relay(HubRelay::AgentError { error, .. }) => assert_eq!(error, "boom"),
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::Relay(HubRelay::AgentError { error, .. }) => assert_eq!(error, "boom"),
             other => panic!("expected AgentError, got {other:?}"),
         }
     }
@@ -4652,7 +4637,7 @@ mod tests {
     // ── handle_connection routing arms ────────────────────────────────────────
 
     #[tokio::test]
-    async fn daemon_routes_tui_requests_to_instance() {
+    async fn hub_routes_tui_requests_to_instance() {
         use crate::scope_grant::GrantDecision;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4686,7 +4671,7 @@ mod tests {
         send_msg(
             &mut tui,
             &ClientMsg::SubmitPrompt {
-                messages: vec![DaemonChatMessage {
+                messages: vec![HubChatMessage {
                     role: "user".into(),
                     content: "hi".into(),
                 }],
@@ -4698,8 +4683,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
-            DaemonMsg::RunPrompt {
+        match recv_msg::<_, HubMsg>(&mut irdr).await.unwrap() {
+            HubMsg::RunPrompt {
                 messages,
                 system_prompt,
                 provider,
@@ -4723,8 +4708,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
-            DaemonMsg::CancelPrompt => {}
+        match recv_msg::<_, HubMsg>(&mut irdr).await.unwrap() {
+            HubMsg::CancelPrompt => {}
             other => panic!("expected CancelPrompt, got {other:?}"),
         }
 
@@ -4739,8 +4724,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
-            DaemonMsg::CancelOperation { op_id } => assert_eq!(op_id, "op-7"),
+        match recv_msg::<_, HubMsg>(&mut irdr).await.unwrap() {
+            HubMsg::CancelOperation { op_id } => assert_eq!(op_id, "op-7"),
             other => panic!("expected CancelOperation, got {other:?}"),
         }
 
@@ -4756,8 +4741,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
-            DaemonMsg::SubmitApproval { id: _, approved } => assert!(approved),
+        match recv_msg::<_, HubMsg>(&mut irdr).await.unwrap() {
+            HubMsg::SubmitApproval { id: _, approved } => assert!(approved),
             other => panic!("expected SubmitApproval, got {other:?}"),
         }
 
@@ -4773,8 +4758,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
-            DaemonMsg::SubmitScopeGrant {
+        match recv_msg::<_, HubMsg>(&mut irdr).await.unwrap() {
+            HubMsg::SubmitScopeGrant {
                 decision_id,
                 decision,
             } => {
@@ -4786,7 +4771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_unexpected_first_message_closes_connection() {
+    async fn hub_unexpected_first_message_closes_connection() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("unexpected.sock");
         start_hub(&sock).await;
@@ -4813,7 +4798,7 @@ mod tests {
     // ── serve_subscriber replay path ──────────────────────────────────────────
 
     #[tokio::test]
-    async fn daemon_replays_history_to_late_subscriber() {
+    async fn hub_replays_history_to_late_subscriber() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("replay.sock");
         start_hub(&sock).await;
@@ -4839,7 +4824,7 @@ mod tests {
         send_msg(
             &mut iw,
             &ClientMsg::Event {
-                payload: DaemonEvent::OpStarted {
+                payload: HubEvent::OpStarted {
                     id: "op-A".into(),
                     tool_name: "cargo_build".into(),
                     description: "b".into(),
@@ -4860,7 +4845,7 @@ mod tests {
         send_msg(
             &mut iw,
             &ClientMsg::Event {
-                payload: DaemonEvent::OpFinished {
+                payload: HubEvent::OpFinished {
                     id: "op-A".into(),
                     status: OpStatus::Completed,
                     result_summary: Some("ok".into()),
@@ -4874,7 +4859,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // Allow the daemon to register the instance and record both events.
+        // Allow the hub to register the instance and record both events.
         tokio::time::sleep(Duration::from_millis(80)).await;
 
         // A late subscriber must receive the instance list AND the replayed history.
@@ -4883,20 +4868,20 @@ mod tests {
         let mut srdr = BufReader::new(sr);
         send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();
 
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::InstanceList { instances } => assert_eq!(instances.len(), 1),
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::InstanceList { instances } => assert_eq!(instances.len(), 1),
             other => panic!("expected InstanceList, got {other:?}"),
         }
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Event {
-                payload: DaemonEvent::OpStarted { id, .. },
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::Event {
+                payload: HubEvent::OpStarted { id, .. },
                 ..
             } => assert_eq!(id, "op-A"),
             other => panic!("expected replayed OpStarted, got {other:?}"),
         }
-        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
-            DaemonMsg::Event {
-                payload: DaemonEvent::OpFinished { id, status, .. },
+        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
+            HubMsg::Event {
+                payload: HubEvent::OpFinished { id, status, .. },
                 ..
             } => {
                 assert_eq!(id, "op-A");
@@ -4910,23 +4895,23 @@ mod tests {
 /// Golden wire bytes for the messages the hub relays verbatim.
 ///
 /// The hub socket carries **no protocol version**: R24.5 lets it evolve by
-/// adding fields, which is why a daemon and an instance from different builds
+/// adding fields, which is why a hub and an instance from different builds
 /// still understand each other. Restructuring the Rust types is therefore only
 /// safe while the JSON stays identical, and "identical" is not something a
 /// round-trip test can check — a round-trip passes just as happily after the
 /// tag changes, because both ends changed together. These assertions pin the
-/// actual bytes, so a refactor that would strand a running daemon fails here.
+/// actual bytes, so a refactor that would strand a running hub fails here.
 #[cfg(test)]
 mod relay_wire_compat {
     use super::*;
     use serde_json::json;
 
     /// The same payload must appear on the wire whether it is travelling
-    /// instance → hub ([`ClientMsg`]) or hub → TUI ([`DaemonMsg`]). The hub
+    /// instance → hub ([`ClientMsg`]) or hub → TUI ([`HubMsg`]). The hub
     /// forwards these untouched, so any asymmetry would be a bug in itself.
     fn assert_same_bytes_both_directions(
         client: ClientMsg,
-        daemon: DaemonMsg,
+        hub: HubMsg,
         expected: serde_json::Value,
     ) {
         assert_eq!(
@@ -4935,12 +4920,12 @@ mod relay_wire_compat {
             "ClientMsg wire changed"
         );
         assert_eq!(
-            serde_json::to_value(&daemon).unwrap(),
+            serde_json::to_value(&hub).unwrap(),
             expected,
-            "DaemonMsg wire changed"
+            "HubMsg wire changed"
         );
         assert_one_tag(&serde_json::to_string(&client).unwrap());
-        assert_one_tag(&serde_json::to_string(&daemon).unwrap());
+        assert_one_tag(&serde_json::to_string(&hub).unwrap());
     }
 
     /// Comparing `to_value` is not enough on its own.
@@ -4966,12 +4951,12 @@ mod relay_wire_compat {
     fn chat_tokens_keep_their_wire_bytes() {
         assert_same_bytes_both_directions(
             ClientMsg::Relay(HubRelay::ChatToken { token: "hi".into() }),
-            DaemonMsg::Relay(HubRelay::ChatToken { token: "hi".into() }),
+            HubMsg::Relay(HubRelay::ChatToken { token: "hi".into() }),
             json!({"type": "ChatToken", "token": "hi"}),
         );
         assert_same_bytes_both_directions(
             ClientMsg::Relay(HubRelay::ChatThinking { token: "mm".into() }),
-            DaemonMsg::Relay(HubRelay::ChatThinking { token: "mm".into() }),
+            HubMsg::Relay(HubRelay::ChatThinking { token: "mm".into() }),
             json!({"type": "ChatThinking", "token": "mm"}),
         );
     }
@@ -4980,7 +4965,7 @@ mod relay_wire_compat {
     fn agent_lifecycle_keeps_its_wire_bytes() {
         assert_same_bytes_both_directions(
             ClientMsg::Relay(HubRelay::AgentDone),
-            DaemonMsg::Relay(HubRelay::AgentDone),
+            HubMsg::Relay(HubRelay::AgentDone),
             json!({"type": "AgentDone"}),
         );
         assert_same_bytes_both_directions(
@@ -4988,7 +4973,7 @@ mod relay_wire_compat {
                 error: "boom".into(),
                 transient: false,
             }),
-            DaemonMsg::Relay(HubRelay::AgentError {
+            HubMsg::Relay(HubRelay::AgentError {
                 error: "boom".into(),
                 transient: false,
             }),
@@ -4998,7 +4983,7 @@ mod relay_wire_compat {
             ClientMsg::Relay(HubRelay::Truncated {
                 reason: "length".into(),
             }),
-            DaemonMsg::Relay(HubRelay::Truncated {
+            HubMsg::Relay(HubRelay::Truncated {
                 reason: "length".into(),
             }),
             json!({"type": "Truncated", "reason": "length"}),
@@ -5008,7 +4993,7 @@ mod relay_wire_compat {
                 phase: "loading".into(),
                 detail: "qwen3:8b".into(),
             }),
-            DaemonMsg::Relay(HubRelay::ChatStatus {
+            HubMsg::Relay(HubRelay::ChatStatus {
                 phase: "loading".into(),
                 detail: "qwen3:8b".into(),
             }),
@@ -5024,7 +5009,7 @@ mod relay_wire_compat {
                 name: "cargo".into(),
                 args: "{}".into(),
             }),
-            DaemonMsg::Relay(HubRelay::ToolCallStarted {
+            HubMsg::Relay(HubRelay::ToolCallStarted {
                 id: "c1".into(),
                 name: "cargo".into(),
                 args: "{}".into(),
@@ -5037,7 +5022,7 @@ mod relay_wire_compat {
                 result: "ok".into(),
                 failed: false,
             }),
-            DaemonMsg::Relay(HubRelay::ToolCallFinished {
+            HubMsg::Relay(HubRelay::ToolCallFinished {
                 id: "c1".into(),
                 result: "ok".into(),
                 failed: false,
@@ -5050,7 +5035,7 @@ mod relay_wire_compat {
                 completion_tokens: 2,
                 total_tokens: 3,
             }),
-            DaemonMsg::Relay(HubRelay::Usage {
+            HubMsg::Relay(HubRelay::Usage {
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 total_tokens: 3,
@@ -5068,7 +5053,7 @@ mod relay_wire_compat {
                 args: "-rf".into(),
                 workspace: None,
             }),
-            DaemonMsg::Relay(HubRelay::ApprovalRequested {
+            HubMsg::Relay(HubRelay::ApprovalRequested {
                 id: "a1".into(),
                 tool: "rm".into(),
                 args: "-rf".into(),
@@ -5089,7 +5074,7 @@ mod relay_wire_compat {
             ClientMsg::Relay(HubRelay::ScopeGrantRequested {
                 request: scope.clone(),
             }),
-            DaemonMsg::Relay(HubRelay::ScopeGrantRequested { request: scope }),
+            HubMsg::Relay(HubRelay::ScopeGrantRequested { request: scope }),
             json!({"type": "ScopeGrantRequested", "request": expected_scope}),
         );
 
@@ -5104,7 +5089,7 @@ mod relay_wire_compat {
             ClientMsg::Relay(HubRelay::WebApprovalRequested {
                 request: web.clone(),
             }),
-            DaemonMsg::Relay(HubRelay::WebApprovalRequested { request: web }),
+            HubMsg::Relay(HubRelay::WebApprovalRequested { request: web }),
             json!({"type": "WebApprovalRequested", "request": expected_web}),
         );
     }
@@ -5113,16 +5098,16 @@ mod relay_wire_compat {
     /// variants were collapsed must still read what this build writes, and this
     /// build must still read what it writes.
     ///
-    /// `LegacyDaemonMsg` is that older reader — the flat shape, transcribed. It
+    /// `LegacyHubMsg` is that older reader — the flat shape, transcribed. It
     /// is deliberately a separate declaration rather than a reference to
-    /// [`DaemonMsg`]: a test that reuses the live type cannot fail, because the
-    /// live type moves with the code. The daemon left running across an upgrade
+    /// [`HubMsg`]: a test that reuses the live type cannot fail, because the
+    /// live type moves with the code. The hub left running across an upgrade
     /// does not.
     #[test]
-    fn a_daemon_from_before_the_collapse_still_reads_and_writes_these() {
+    fn a_hub_from_before_the_collapse_still_reads_and_writes_these() {
         #[derive(Debug, Serialize, Deserialize)]
         #[serde(tag = "type")]
-        enum LegacyDaemonMsg {
+        enum LegacyHubMsg {
             ChatToken {
                 token: String,
             },
@@ -5142,54 +5127,54 @@ mod relay_wire_compat {
         // New writes → old reads.
         for (new, expect) in [
             (
-                DaemonMsg::Relay(HubRelay::ChatToken { token: "hi".into() }),
+                HubMsg::Relay(HubRelay::ChatToken { token: "hi".into() }),
                 r#"ChatToken { token: "hi" }"#,
             ),
-            (DaemonMsg::Relay(HubRelay::AgentDone), "AgentDone"),
+            (HubMsg::Relay(HubRelay::AgentDone), "AgentDone"),
             (
-                DaemonMsg::ScopeGrantDismiss {
+                HubMsg::ScopeGrantDismiss {
                     decision_id: "d1".into(),
                 },
                 r#"ScopeGrantDismiss { decision_id: "d1" }"#,
             ),
         ] {
             let json = serde_json::to_string(&new).unwrap();
-            let old: LegacyDaemonMsg = serde_json::from_str(&json)
-                .unwrap_or_else(|e| panic!("a pre-collapse daemon could not read {json}: {e}"));
+            let old: LegacyHubMsg = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("a pre-collapse hub could not read {json}: {e}"));
             assert_eq!(format!("{old:?}"), expect);
         }
 
         // Old writes → new reads.
-        let legacy = serde_json::to_string(&LegacyDaemonMsg::ToolCallFinished {
+        let legacy = serde_json::to_string(&LegacyHubMsg::ToolCallFinished {
             id: "c1".into(),
             result: "ok".into(),
             failed: true,
         })
         .unwrap();
-        let now: DaemonMsg = serde_json::from_str(&legacy)
-            .unwrap_or_else(|e| panic!("this build could not read a pre-collapse daemon: {e}"));
+        let now: HubMsg = serde_json::from_str(&legacy)
+            .unwrap_or_else(|e| panic!("this build could not read a pre-collapse hub: {e}"));
         assert!(matches!(
             now,
-            DaemonMsg::Relay(HubRelay::ToolCallFinished { failed: true, .. })
+            HubMsg::Relay(HubRelay::ToolCallFinished { failed: true, .. })
         ));
     }
 
-    /// Deserialization must also stay put: an old daemon's bytes have to land in
+    /// Deserialization must also stay put: an old hub's bytes have to land in
     /// the right variant, which is the half of compatibility that serialization
     /// tests cannot see.
     #[test]
     fn relayed_bytes_still_deserialize_into_the_right_variant() {
         let c: ClientMsg = serde_json::from_str(r#"{"type":"ChatToken","token":"hi"}"#).unwrap();
         assert!(matches!(c, ClientMsg::Relay(HubRelay::ChatToken { ref token }) if token == "hi"));
-        let d: DaemonMsg = serde_json::from_str(r#"{"type":"AgentDone"}"#).unwrap();
-        assert!(matches!(d, DaemonMsg::Relay(HubRelay::AgentDone)));
-        let u: DaemonMsg = serde_json::from_str(
+        let d: HubMsg = serde_json::from_str(r#"{"type":"AgentDone"}"#).unwrap();
+        assert!(matches!(d, HubMsg::Relay(HubRelay::AgentDone)));
+        let u: HubMsg = serde_json::from_str(
             r#"{"type":"Usage","prompt_tokens":1,"completion_tokens":2,"total_tokens":3}"#,
         )
         .unwrap();
         assert!(matches!(
             u,
-            DaemonMsg::Relay(HubRelay::Usage {
+            HubMsg::Relay(HubRelay::Usage {
                 total_tokens: 3,
                 ..
             })

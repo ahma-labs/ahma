@@ -369,7 +369,7 @@ async fn handshake_opens_sse_before_initialized_http3() {
 /// `ahma serve unix` is the default local transport, so the race must be proven
 /// gone here too. The mock MCP server is served over a Unix domain socket and
 /// the TUI connects via `ResolvedTransport::UnixSocket` — on every OS, since
-/// the socket is `AF_UNIX` on Windows too (SPEC R-DAEMON.2).
+/// the socket is `AF_UNIX` on Windows too (SPEC R-HUB.2).
 #[tokio::test]
 async fn handshake_opens_sse_before_initialized_unix() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

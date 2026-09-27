@@ -1,7 +1,7 @@
 //! One HTTP client for ahma's MCP endpoints, over TCP or the local socket.
 //!
-//! The per-user daemon serves MCP on an `AF_UNIX` socket on every OS (SPEC
-//! R-DAEMON.2), but `reqwest` reaches such a socket only on Unix: on Windows it
+//! The per-user hub serves MCP on an `AF_UNIX` socket on every OS (SPEC
+//! R-HUB.2), but `reqwest` reaches such a socket only on Unix: on Windows it
 //! offers named pipes instead, and its connector cannot be replaced. So
 //! [`HttpClient`](crate::http_client::HttpClient) builds every request with
 //! `reqwest` as before and chooses how to *send* it: through `reqwest` over
@@ -46,7 +46,7 @@ impl From<reqwest::Client> for HttpClient {
 /// Sends requests over a local socket, one connection per request.
 ///
 /// No pooling: the endpoint is local, a connect is cheap, and a fresh connect
-/// is what lets a respawned daemon be picked up by the very next request.
+/// is what lets a respawned hub be picked up by the very next request.
 #[derive(Clone, Debug)]
 pub struct LocalSocketSender {
     path: Arc<PathBuf>,
@@ -270,9 +270,9 @@ mod tests {
         )
     }
 
-    /// The TUI and the agent reach the daemon through this client, so it must
-    /// work where the daemon listens: an `AF_UNIX` socket on every OS, Windows
-    /// included, where `reqwest` cannot connect to one (SPEC R-DAEMON.2).
+    /// The TUI and the agent reach the hub through this client, so it must
+    /// work where the hub listens: an `AF_UNIX` socket on every OS, Windows
+    /// included, where `reqwest` cannot connect to one (SPEC R-HUB.2).
     #[tokio::test]
     async fn a_request_is_sent_over_the_local_socket() {
         let dir = tempfile::tempdir().unwrap();

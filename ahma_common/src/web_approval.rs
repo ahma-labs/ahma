@@ -52,7 +52,7 @@ use crate::config::AhmaSettings;
 /// A request to approve outbound web access to `domain`, fanned to every capable
 /// surface under one `decision_id`.
 ///
-/// `Serialize`/`Deserialize` so it can travel over the daemon hub (TUI) and inside
+/// `Serialize`/`Deserialize` so it can travel over the hub (TUI) and inside
 /// an MCP `elicitation/create` payload, exactly like
 /// [`crate::scope_grant::ScopeGrantRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

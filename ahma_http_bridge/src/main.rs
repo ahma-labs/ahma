@@ -160,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
         bound_port_tx: None,
         // Standalone bridge: it owns its process and exits directly.
         exit: None,
-        // Session options are a daemon feature (SPEC R-DAEMON.4).
+        // Session options are a hub feature (SPEC R-HUB.4).
         session_options: None,
     };
 

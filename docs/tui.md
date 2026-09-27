@@ -24,13 +24,13 @@ ahma tui --connect http://localhost:8080
 
 Open `ahma tui` in a project directory while your editors are working and their
 work is **already there** (SPEC R24.2): every ahma instance reports to the
-per-user daemon, which replays recent history — with true start and end times,
+per-user hub, which replays recent history — with true start and end times,
 and the output each command was printing — the moment the TUI subscribes. If
 there is live work for this project, its section opens by itself; any keystroke
 takes over.
 
 ```
- ahma · work · this project [f] 3 clients 2⟳ 1◷ 14✓   sync ● ahma ● daemon · Unix socket · sandbox: …/github/ahma [ENFORCED]
+ ahma · work · this project [f] 3 clients 2⟳ 1◷ 14✓   sync ● ahma ● hub · Unix socket · sandbox: …/github/ahma [ENFORCED]
 ▶─ claude-code (1) · …/github/ahma · qwen2.5-coder · ctx 38% (49k/128k) · ↑52k ↓6.1k ── ⢷⡪ ─── 2⟳ 1◷ 14✓ ──
    ⟳ cargo nextest run              [op_41]  1m12s        [P] [X]
    │ Compiling ahma_core v0.15.4
@@ -47,8 +47,8 @@ takes over.
 - **One status header, in every layout.** Left: the project filter, clients and
   task tallies. Right: the execution mode (`sync`/`async`, see
   [settings](settings.md#sync-or-async-toolsexecution_mode)), whether the ahma
-  server and the per-user daemon are reachable — spelled out with how long, e.g.
-  `○ daemon OFFLINE 12s`, when one is not — the transport, and the sandbox the
+  server and the per-user hub are reachable — spelled out with how long, e.g.
+  `○ hub OFFLINE 12s`, when one is not — the transport, and the sandbox the
   server actually locked.
 - **Each window shows its own LLM and spend.** A section's rule names the model
   Enter will chat with there and, once it has been used, its context fill and
@@ -63,7 +63,7 @@ takes over.
   commands and chat tool calls are *this terminal (you)*.
 - **`!` commands are marked.** Anything you run with `!` runs outside the
   sandbox, at your full privilege, and its row carries a `!` and its detail
-  pane says `UNSANDBOXED`. It is reported to the daemon like any other work, so
+  pane says `UNSANDBOXED`. It is reported to the hub like any other work, so
   it is in the history, and a second TUI sees it too.
 - **A closed section still tells you something**: what it is running now, or
   what it last ran. You should not have to open each one to find the one you
@@ -78,10 +78,10 @@ takes over.
 - **Project-scoped by default**; `f` shows every project. A session that has not
   established its scope yet reads *no scope yet* rather than disappearing.
 - **Recent work survives.** Finished work stays for an hour — including work
-  from a session that has since closed, and from a daemon that has since exited,
-  because the daemon writes a bounded history beside its sockets, in the
+  from a session that has since closed, and from a hub that has since exited,
+  because the hub writes a bounded history beside its sockets, in the
   per-user runtime directory. An
-  operation that was still running when its daemon went away is shown
+  operation that was still running when its hub went away is shown
   `interrupted`, not failed: nobody established that it failed.
 
 Alone in the TUI, you see only "this terminal (you)": its `!` commands and the
@@ -217,7 +217,7 @@ forgetting this folder's always-allowed tools takes a second, confirming Space;
 security switches show the command-line flag that sets them.
 
 `/doctor` checks ahma's own health — settings, granted folders that no longer
-exist, the daemon's build, trust, repeating log warnings — and `/doctor fix <n>`
+exist, the hub's build, trust, repeating log warnings — and `/doctor fix <n>`
 applies a fix only after you see it and press `y`. `/doctor <question>` asks the
 chat model about ahma with that report in hand; it can advise, never apply. See
 [docs/doctor.md](doctor.md).
@@ -257,11 +257,11 @@ Persistent grants and revocations are appended to `~/.ahma/permissions-audit.jso
 
 ## Transport auto-detection
 
-`ahma tui` attaches to the per-user daemon; it never starts a server of its own,
+`ahma tui` attaches to the per-user hub; it never starts a server of its own,
 and in particular never one scoped to the directory you happened to open it in
-(SPEC R-DAEMON.9). It picks the best available transport in order:
+(SPEC R-HUB.9). It picks the best available transport in order:
 
-1. **Unix socket** — the daemon's `mcp.sock` in your per-user runtime directory
+1. **Unix socket** — the hub's `mcp.sock` in your per-user runtime directory
    (`$XDG_RUNTIME_DIR/ahma`, else `~/.ahma`), or `[http] unix_socket_path` in
    `~/.ahma/settings.toml`. Lowest latency, local only, and the same `AF_UNIX` socket on
    Windows (10 1803 or later). `$AHMA_UNIX_SOCKET` is retired (R-CFG1.2) and ignored by the TUI as it is by `ahma serve`.

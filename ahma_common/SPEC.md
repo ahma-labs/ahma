@@ -9,7 +9,7 @@
 
 *As a crate anywhere in the ahma workspace, I want one authoritative implementation of each
 contract that more than one surface must honour — configuration, permissions, the event
-stream, the daemon's wire format, egress policy, timeouts — so that no two surfaces can
+stream, the hub's wire format, egress policy, timeouts — so that no two surfaces can
 implement the same rule differently.*
 
 A rule that binds two surfaces lives here (or in the SPEC it cites), never as a copy in each.
@@ -33,13 +33,13 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
 - `doctor`: the read-only checks shared by `ahma doctor` and the TUI's `/doctor`
   (R-DOCTOR); fixes are applied by callers, only with consent.
 
-**Operations and the daemon**
+**Operations and the hub**
 - `event_dispatcher`: the single `OperationEvent` stream. Ordering invariant: history
   write → watch signal → event (R15.3 in AGENTS.md).
 - `op_identity`: one operation identity (title, cwd, command, origin, exit code), computed
   where the operation starts and carried on the wire (R24.7).
-- `daemon_hub`, `daemon_history`: the per-user daemon's hub state and its bounded on-disk
-  history (R-DAEMON).
+- `hub`, `hub_history`: the per-user hub state and its bounded on-disk
+  history (R-HUB).
 - `session_event`, `keepalive`: session-health events and heartbeat payloads (R8.8).
   Added fields are `#[serde(default)]`, so old and new peers interoperate both ways.
 - `mcp_methods`, `mcp_protocol`, `sse`: MCP method names, protocol-version negotiation for
@@ -76,7 +76,7 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
 - **No upward dependencies**: never depends on another workspace crate.
 - **Cross-platform parity**: every primitive behaves the same on Linux, macOS and Windows,
   or states the difference.
-- **Wire stability**: types that cross a process boundary (events, heartbeats, daemon
+- **Wire stability**: types that cross a process boundary (events, heartbeats, hub
   records) only gain fields, each `#[serde(default)]` (R24.5).
 
 ## 4. Out of Scope

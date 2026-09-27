@@ -351,7 +351,7 @@ enum ResponseMode {
 ///
 /// `session_query` is the MCP URL's query, carrying the options this client
 /// asked for. It shapes the session an `initialize` creates and is ignored on
-/// every other request (SPEC R-DAEMON.4).
+/// every other request (SPEC R-HUB.4).
 pub async fn handle_session_isolated_request(
     session_manager: Arc<SessionManager>,
     headers: HeaderMap,
@@ -646,7 +646,7 @@ fn encode_initialize_response(
 
 /// Create a new session or return an error response.
 ///
-/// Distinguishes a draining daemon (HTTP 503, retryable in a moment) from the
+/// Distinguishes a draining hub (HTTP 503, retryable in a moment) from the
 /// session limit (HTTP 429) and from other failures (HTTP 500).
 async fn create_session_or_error(
     session_manager: &Arc<SessionManager>,
@@ -655,7 +655,7 @@ async fn create_session_or_error(
 ) -> Result<String, Response> {
     // An option this build does not know is refused rather than ignored: a
     // client that misspells one should be told, not quietly served something
-    // else (SPEC R-DAEMON.4).
+    // else (SPEC R-HUB.4).
     let worker_args = match session_manager.worker_args_for_query(session_query) {
         Ok(args) => args,
         Err(message) => {
@@ -682,7 +682,7 @@ async fn create_session_or_error(
 fn session_creation_error_response(e: BridgeError, request_id: Value) -> Response {
     match e {
         BridgeError::Draining => {
-            // The successor daemon is on its way up; this is a "try again
+            // The successor hub is on its way up; this is a "try again
             // in a second", not a failure of the request.
             let mut resp = error_response_with_status(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,

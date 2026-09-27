@@ -191,7 +191,7 @@ impl AhmaMcpService {
         match self.adapter.sandbox().commit_scopes(new_scopes) {
             Ok(crate::sandbox::ScopeCommit::Applied) => {
                 tracing::info!("Sandbox scopes committed successfully");
-                crate::daemon_reporter::publish_committed_scope(self.adapter.sandbox());
+                crate::hub_reporter::publish_committed_scope(self.adapter.sandbox());
             }
             Ok(crate::sandbox::ScopeCommit::AlreadyCommitted) => {
                 tracing::warn!(
@@ -527,7 +527,7 @@ impl AhmaMcpService {
                 return true;
             }
             crate::sandbox::ScopeCommit::Applied => {
-                crate::daemon_reporter::publish_committed_scope(sandbox);
+                crate::hub_reporter::publish_committed_scope(sandbox);
                 tracing::info!(
                     "Explicit sandbox scope committed without querying roots/list \
                      (SPEC R5.2.2): {:?}",
@@ -636,7 +636,7 @@ impl AhmaMcpService {
                 return false;
             }
             crate::sandbox::ScopeCommit::Applied => {
-                crate::daemon_reporter::publish_committed_scope(self.adapter.sandbox());
+                crate::hub_reporter::publish_committed_scope(self.adapter.sandbox());
             }
         }
         tracing::info!(
@@ -677,7 +677,7 @@ impl AhmaMcpService {
         self.maybe_load_per_client_tools(discovery_root.clone())
             .await;
 
-        // Load external MCP servers and discovery for client workspace on the daemon/serve side
+        // Load external MCP servers and discovery for client workspace on the hub/serve side
         if let Some(ref root) = discovery_root {
             match crate::mcp_client::McpConnectionManager::load(root) {
                 Ok(mut manager) => {

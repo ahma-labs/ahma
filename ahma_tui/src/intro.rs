@@ -88,7 +88,7 @@ pub const TOPICS: &[Topic] = &[
         title: "When something is off",
         summary: "/doctor checks ahma and explains; it fixes things only with your OK.",
         detail: &[
-            "It checks settings, granted folders, the daemon's build, trust and the logs. Ask",
+            "It checks settings, granted folders, the hub's build, trust and the logs. Ask",
             "it anything about ahma with /doctor <question>. /log shows ahma's own log live;",
             "/scope shows what the sandbox allows.",
         ],

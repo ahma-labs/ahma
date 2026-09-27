@@ -36,7 +36,7 @@ pub fn build_configured_client(base_url: impl Into<String>, model: impl Into<Str
 
 pub enum BridgeEvent {
     Error(String),
-    /// A chat turn's message could not be delivered to the daemon; the turn
+    /// A chat turn's message could not be delivered to the hub; the turn
     /// is ended with this reason rather than left spinning.
     TurnSendFailed(String),
     ToolCallStarted {
@@ -192,15 +192,15 @@ pub fn spawn_tool_call_task(
 
         if is_local_default_server(&mcp.base_url) {
             // The chat's tool calls run in an ordinary MCP session on the
-            // per-user daemon, scoped by this TUI's own `roots/list` answer —
-            // not by a server started for this directory (SPEC R-DAEMON.9).
-            let socket = ahma_common::daemon_hub::mcp_socket_path(None);
-            let res = ahma_mcp::shell::modes::daemon_client::ensure_daemon(&socket, None).await;
+            // per-user hub, scoped by this TUI's own `roots/list` answer —
+            // not by a server started for this directory (SPEC R-HUB.9).
+            let socket = ahma_common::hub::mcp_socket_path(None);
+            let res = ahma_mcp::shell::modes::hub_client::ensure_hub(&socket, None).await;
             if let Err(e) = res {
                 let _ = tx
                     .send(BridgeEvent::ToolCallFinished {
                         id: id.clone(),
-                        result: format!("Error reaching the ahma daemon: {e}"),
+                        result: format!("Error reaching the ahma hub: {e}"),
                         failed: true,
                     })
                     .await;
@@ -405,7 +405,7 @@ pub fn spawn_decompose_task(client: LlmClient, goal: String, tx: Sender<BridgeEv
 /// Where a `!` command's progress is reported besides the local window.
 ///
 /// `Option`-wrapped at the call site rather than baked in, because the same
-/// runner is used by tests that have no daemon and no hub to talk to.
+/// runner is used by tests that have no hub and no hub to talk to.
 #[derive(Debug, Clone)]
 pub struct BangReport {
     pub reporter: crate::tui_reporter::TuiReporter,
@@ -414,23 +414,22 @@ pub struct BangReport {
 
 impl BangReport {
     fn output(&self, line: &str, is_stderr: bool) {
-        self.reporter
-            .report(ahma_common::daemon_hub::DaemonEvent::OpOutput {
-                id: self.op_id.clone(),
-                line: line.to_string(),
-                is_stderr,
-            });
+        self.reporter.report(ahma_common::hub::HubEvent::OpOutput {
+            id: self.op_id.clone(),
+            line: line.to_string(),
+            is_stderr,
+        });
     }
 
     fn finished(
         &self,
-        status: ahma_common::daemon_hub::OpStatus,
+        status: ahma_common::hub::OpStatus,
         summary: &str,
         exit_code: Option<i64>,
         started: std::time::Instant,
     ) {
         self.reporter
-            .report(ahma_common::daemon_hub::DaemonEvent::OpFinished {
+            .report(ahma_common::hub::HubEvent::OpFinished {
                 id: self.op_id.clone(),
                 status,
                 result_summary: Some(summary.to_string()),
@@ -450,14 +449,14 @@ impl BangReport {
 /// bundled together so `finish_window` takes one value instead of six.
 struct WindowOutcome {
     window_id: usize,
-    op_status: ahma_common::daemon_hub::OpStatus,
+    op_status: ahma_common::hub::OpStatus,
     success: bool,
     summary: String,
     exit_code: Option<i64>,
     started: std::time::Instant,
 }
 
-/// Emits both the daemon-hub completion record (if this window is a
+/// Emits both the hub completion record (if this window is a
 /// reported `!` command) and the TUI's own `WindowFinished` event, so every
 /// exit path of `spawn_window_cli_task` updates both places the same way.
 async fn finish_window(
@@ -525,7 +524,7 @@ pub fn spawn_window_cli_task(
                     &report,
                     WindowOutcome {
                         window_id,
-                        op_status: ahma_common::daemon_hub::OpStatus::Failed,
+                        op_status: ahma_common::hub::OpStatus::Failed,
                         success: false,
                         summary,
                         exit_code: None,
@@ -583,7 +582,7 @@ pub fn spawn_window_cli_task(
                     &report,
                     WindowOutcome {
                         window_id,
-                        op_status: ahma_common::daemon_hub::OpStatus::Cancelled,
+                        op_status: ahma_common::hub::OpStatus::Cancelled,
                         success: false,
                         summary: "Cancelled".to_string(),
                         exit_code: None,
@@ -604,9 +603,9 @@ pub fn spawn_window_cli_task(
                             format!("Failed with exit code {:?}", status.code())
                         };
                         let op_status = if success {
-                            ahma_common::daemon_hub::OpStatus::Completed
+                            ahma_common::hub::OpStatus::Completed
                         } else {
-                            ahma_common::daemon_hub::OpStatus::Failed
+                            ahma_common::hub::OpStatus::Failed
                         };
                         finish_window(
                             &tx,
@@ -629,7 +628,7 @@ pub fn spawn_window_cli_task(
                             &report,
                             WindowOutcome {
                                 window_id,
-                                op_status: ahma_common::daemon_hub::OpStatus::Failed,
+                                op_status: ahma_common::hub::OpStatus::Failed,
                                 success: false,
                                 summary,
                                 exit_code: None,
@@ -715,34 +714,34 @@ pub fn spawn_window_llm_task(
 mod tests {
     use super::*;
 
-    /// A `!` command's whole life reaches the daemon: the lines it printed and
+    /// A `!` command's whole life reaches the hub: the lines it printed and
     /// the code it exited with, not just the fact that it happened.
     ///
     /// Without this the unified view could show that the user ran something
     /// unconfined and nothing about how it went — which is the half that
-    /// matters after the window has scrolled away (SPEC R-DAEMON.9).
+    /// matters after the window has scrolled away (SPEC R-HUB.9).
     #[cfg(unix)]
     #[tokio::test]
     async fn a_reported_window_command_streams_its_output_and_exit_code() {
-        use ahma_common::daemon_hub::{ClientMsg, DaemonEvent, DaemonMsg, HubServer, recv_msg};
+        use ahma_common::hub::{ClientMsg, HubEvent, HubMsg, HubServer, recv_msg};
         use ahma_common::timeouts::TestTimeouts;
 
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: nextest runs each test in its own process (SPEC R-ISO.1).
-        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", dir.path().join("d.sock")) };
+        unsafe { std::env::set_var("AHMA_HUB_SOCK", dir.path().join("d.sock")) };
 
-        let hub = HubServer::bind_at(ahma_common::daemon_hub::default_socket_path())
+        let hub = HubServer::bind_at(ahma_common::hub::default_socket_path())
             .await
             .expect("this test owns a freshly isolated socket");
         let hub_task = tokio::spawn(async move { hub.serve().await });
 
-        let sub = ahma_common::daemon_hub::connect_to_daemon().await.unwrap();
+        let sub = ahma_common::hub::connect_to_hub().await.unwrap();
         let (sr, mut sw) = tokio::io::split(sub);
         let mut sub_reader = tokio::io::BufReader::new(sr);
-        ahma_common::daemon_hub::send_msg(&mut sw, &ClientMsg::Subscribe)
+        ahma_common::hub::send_msg(&mut sw, &ClientMsg::Subscribe)
             .await
             .unwrap();
-        let _snapshot = recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap();
+        let _snapshot = recv_msg::<_, HubMsg>(&mut sub_reader).await.unwrap();
 
         let reporter = crate::tui_reporter::spawn_tui_reporter(dir.path().display().to_string());
         let op_id = crate::tui_reporter::next_bang_op_id(reporter.session_id());
@@ -773,18 +772,16 @@ mod tests {
         while tokio::time::Instant::now() < deadline && (line.is_none() || exit.is_none()) {
             let Ok(Ok(msg)) = tokio::time::timeout(
                 TestTimeouts::scale_secs(5),
-                recv_msg::<_, DaemonMsg>(&mut sub_reader),
+                recv_msg::<_, HubMsg>(&mut sub_reader),
             )
             .await
             else {
                 break;
             };
-            if let DaemonMsg::Event { payload, .. } = msg {
+            if let HubMsg::Event { payload, .. } = msg {
                 match payload {
-                    DaemonEvent::OpOutput { id, line: l, .. } if id == op_id => line = Some(l),
-                    DaemonEvent::OpFinished { id, exit_code, .. } if id == op_id => {
-                        exit = exit_code
-                    }
+                    HubEvent::OpOutput { id, line: l, .. } if id == op_id => line = Some(l),
+                    HubEvent::OpFinished { id, exit_code, .. } if id == op_id => exit = exit_code,
                     _ => {}
                 }
             }

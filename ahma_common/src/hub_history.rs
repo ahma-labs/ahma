@@ -1,6 +1,6 @@
-//! On-disk operation history for the per-user daemon (SPEC R-DAEMON.7).
+//! On-disk operation history for the per-user hub (SPEC R-HUB.7).
 //!
-//! The hub's in-memory history dies with the daemon, and the daemon exits when
+//! The hub's in-memory history dies with the hub, and the hub exits when
 //! it has been idle. Without a file, "what ran in this project half an hour
 //! ago" is answerable only while the process that happened to observe it is
 //! still alive — which is exactly the case a user does not think about before
@@ -8,9 +8,9 @@
 //!
 //! ## Shape
 //!
-//! One JSON object per line, append-only. This is the daemon's own format, not
+//! One JSON object per line, append-only. This is the hub's own format, not
 //! the hub wire, so it is an ordinary tagged enum: nothing outside this process
-//! reads it, and it is rewritten wholesale by whichever daemon owns the file.
+//! reads it, and it is rewritten wholesale by whichever hub owns the file.
 //!
 //! * `Started` — the operation's start record, with the instance it belongs to,
 //!   so a replayed op still has a section to appear under.
@@ -27,7 +27,7 @@
 //! warning rather than treated as corruption, as is a record whose `kind` this
 //! version does not know.
 
-use crate::daemon_hub::{DaemonEvent, HISTORY_REPLAY_WINDOW, InstanceInfo};
+use crate::hub::{HISTORY_REPLAY_WINDOW, HubEvent, InstanceInfo};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -37,7 +37,7 @@ use tracing::{debug, warn};
 pub const HISTORY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Upper bound on lines read back at startup, so a pathological file cannot
-/// stall the daemon's start.
+/// stall the hub's start.
 const MAX_LINES_LOADED: usize = 20_000;
 
 /// One line of the history file.
@@ -48,13 +48,13 @@ pub enum HistoryRecord {
     Started {
         ts: u64,
         instance: InstanceInfo,
-        event: DaemonEvent,
+        event: HubEvent,
     },
     /// An operation finished, with the output window as it stood at the end.
     Finished {
         ts: u64,
         instance_id: String,
-        event: DaemonEvent,
+        event: HubEvent,
         #[serde(default)]
         tail: Vec<(String, bool)>,
     },
@@ -86,7 +86,7 @@ pub fn history_path() -> Option<PathBuf> {
             crate::test_isolation::test_run_discriminator()
         )));
     }
-    crate::daemon_hub::runtime_dir().map(|dir| live_history_path(&dir))
+    crate::hub::runtime_dir().map(|dir| live_history_path(&dir))
 }
 
 /// The history file inside a given runtime directory.
@@ -133,7 +133,7 @@ impl HistoryWriter {
                         if let Err(e) = append_record(&path, &record).await {
                             // A history file that cannot be written is a lost
                             // convenience, never a reason to stop serving.
-                            debug!("daemon history: append failed: {e}");
+                            debug!("hub history: append failed: {e}");
                         }
                     }
                     WriterMsg::Flush(ack) => {
@@ -155,7 +155,7 @@ impl HistoryWriter {
     }
 
     /// Wait until everything queued so far has been written. Called on the
-    /// shutdown path so an exiting daemon does not lose the last few records.
+    /// shutdown path so an exiting hub does not lose the last few records.
     pub async fn flush(&self) {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         if self.tx.send(WriterMsg::Flush(ack_tx)).is_ok() {
@@ -203,7 +203,7 @@ async fn append_record(path: &Path, record: &HistoryRecord) -> std::io::Result<(
 ///
 /// Reads the rotated predecessor before the current file so ordering survives a
 /// rotation. Tolerant by design: a line that does not parse — the torn last
-/// write of a killed daemon, or a record from a newer version — is skipped with
+/// write of a killed hub, or a record from a newer version — is skipped with
 /// a warning. A history file is a convenience; refusing to start because one
 /// line of it is malformed would trade a small loss for a total one.
 pub async fn load_recent(path: &Path, cutoff_ms: u64) -> Vec<HistoryRecord> {
@@ -235,7 +235,7 @@ pub async fn load_recent(path: &Path, cutoff_ms: u64) -> Vec<HistoryRecord> {
         }
         if skipped > 0 {
             warn!(
-                "daemon history: skipped {skipped} unreadable line(s) in {} \
+                "hub history: skipped {skipped} unreadable line(s) in {} \
                  (a torn final write, or records from a newer ahma)",
                 candidate.display()
             );
@@ -256,7 +256,7 @@ pub fn replay_cutoff_ms(now_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon_hub::OpStatus;
+    use crate::hub::OpStatus;
 
     fn instance(id: &str) -> InstanceInfo {
         InstanceInfo {
@@ -273,8 +273,8 @@ mod tests {
         }
     }
 
-    fn started(id: &str) -> DaemonEvent {
-        DaemonEvent::OpStarted {
+    fn started(id: &str) -> HubEvent {
+        HubEvent::OpStarted {
             id: id.into(),
             tool_name: "run_terminal_command".into(),
             description: "d".into(),
@@ -290,8 +290,8 @@ mod tests {
         }
     }
 
-    fn finished(id: &str) -> DaemonEvent {
-        DaemonEvent::OpFinished {
+    fn finished(id: &str) -> HubEvent {
+        HubEvent::OpFinished {
             id: id.into(),
             status: OpStatus::Completed,
             result_summary: Some("ok".into()),
@@ -436,11 +436,11 @@ mod tests {
     }
 
     /// The history belongs beside the sockets, in the directory whose
-    /// ownership and mode the daemon actually checks.
+    /// ownership and mode the hub actually checks.
     ///
     /// It used to resolve to `~/.ahma` unconditionally while the sockets
     /// resolved to `$XDG_RUNTIME_DIR/ahma`. On any Linux desktop — where that
-    /// variable is set — that split the daemon's state across two directories
+    /// variable is set — that split the hub's state across two directories
     /// and, worse, put the record of every command every client ran into the
     /// one of the two that `verify_runtime_dir_secure` never examines. The
     /// 0700-and-owned guarantee is made about the runtime directory; the file

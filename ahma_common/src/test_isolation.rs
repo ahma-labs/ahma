@@ -1,11 +1,11 @@
 //! Detection of processes spawned (directly or transitively) by a test harness.
 //!
-//! ahma's proxy, bridge, and daemon rendezvous on machine-global singleton
-//! endpoints (`/tmp/ahma.sock`, `~/.ahma/daemon.sock`, the Windows daemon TCP
+//! ahma's proxy, bridge, and hub rendezvous on machine-global singleton
+//! endpoints (`/tmp/ahma.sock`, `~/.ahma/hub.sock`, the Windows hub TCP
 //! port). A test-spawned `ahma` binary that resolves those endpoints can tear
 //! down a developer's *live* MCP session: it may restart the shared bridge
 //! (version mismatch), unlink its socket while binding its own, or dispatch
-//! work to the live daemon hub.
+//! work to the live hub.
 //!
 //! `cfg!(test)` cannot protect against this: integration tests spawn ordinary
 //! debug/release binaries in which `cfg!(test)` is `false`. The

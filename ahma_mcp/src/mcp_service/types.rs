@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
+use ahma_common::hub::{ClientMsg, HubChatMessage};
 
 /// How long a tool call waits for the operation it started before answering
 /// (SPEC R2.1). Either way the call is a tracked operation.
@@ -35,7 +35,7 @@ pub struct ActiveAgentSession {
 pub trait PromptRunner: Send + Sync {
     async fn run_prompt(
         &self,
-        messages: Vec<DaemonChatMessage>,
+        messages: Vec<HubChatMessage>,
         system_prompt: Option<String>,
         provider: Option<String>,
         model: Option<String>,
@@ -51,7 +51,7 @@ pub trait PromptRunner: Send + Sync {
     /// overrides the configured default when set.
     async fn run_prompt_to_completion(
         &self,
-        messages: Vec<DaemonChatMessage>,
+        messages: Vec<HubChatMessage>,
         system_prompt: Option<String>,
         provider: Option<String>,
         model: Option<String>,

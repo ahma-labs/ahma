@@ -88,7 +88,7 @@ missing or broken ahma cannot block editing.
 | **Lease** | An exclusive operation takes its workspace's lease before it spawns and holds it until its whole process tree exits. |
 | **Order** | A place in line is taken the moment the call arrives. Within one ahma process the order is strict FIFO; between processes the kernel lock guarantees one writer at a time. |
 | **Kernel lock** | `flock` / `LockFileEx` on a file in the per-user runtime directory (`$XDG_RUNTIME_DIR/ahma/locks`, else `~/.ahma/locks`; `%LOCALAPPDATA%\ahma\run\locks` on Windows). Released by the kernel when the holder exits for any reason — no stale locks, nothing to clean up, and the file is outside every workspace so no command can delete it while it is held. |
-| **Nesting** | A command run under a lease carries `AHMA_HELD_WORKSPACE_LEASE`; an ahma it starts (ahma's own test suite, run through ahma) does not wait for the lease its ancestor holds. The per-user daemon never inherits it, since it outlives that command. |
+| **Nesting** | A command run under a lease carries `AHMA_HELD_WORKSPACE_LEASE`; an ahma it starts (ahma's own test suite, run through ahma) does not wait for the lease its ancestor holds. The per-user hub never inherits it, since it outlives that command. |
 | **Timeouts** | A queued command's wait counts against its own timeout, and it is cancellable while queued. Once it starts, its duration and timeout measure the command, not the wait; the wait is stated in its result. |
 
 ### Lanes

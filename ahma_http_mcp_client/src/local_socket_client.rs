@@ -1,7 +1,7 @@
 //! MCP Streamable HTTP over the per-user local socket, on every OS.
 //!
-//! The per-user daemon serves its MCP endpoint on an `AF_UNIX` socket on every
-//! OS (SPEC R-DAEMON.2), and the stdio proxy an editor spawns reaches it through
+//! The per-user hub serves its MCP endpoint on an `AF_UNIX` socket on every
+//! OS (SPEC R-HUB.2), and the stdio proxy an editor spawns reaches it through
 //! [`LocalSocketHttpClient`](crate::local_socket_client::LocalSocketHttpClient). rmcp ships an equivalent, `UnixSocketHttpClient`,
 //! but it is built on `tokio::net::UnixStream` and so does not exist on Windows,
 //! where tokio cannot register `AF_UNIX` sockets. This is that client with the
@@ -11,7 +11,7 @@
 //! close to the original so a future rmcp fix is easy to carry across.
 //!
 //! One connection per request, no pooling: the endpoint is local, a connect is
-//! cheap, and it is what lets a respawned daemon be picked up by the very next
+//! cheap, and it is what lets a respawned hub be picked up by the very next
 //! request.
 
 use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
@@ -412,9 +412,9 @@ mod tests {
         .expect("a ping request")
     }
 
-    /// The proxy reaches the daemon's MCP endpoint through this client, so it
-    /// must work where the daemon now listens: an `AF_UNIX` socket on every OS,
-    /// Windows included (SPEC R-DAEMON.2). rmcp's own client is Unix-only.
+    /// The proxy reaches the hub's MCP endpoint through this client, so it
+    /// must work where the hub now listens: an `AF_UNIX` socket on every OS,
+    /// Windows included (SPEC R-HUB.2). rmcp's own client is Unix-only.
     #[tokio::test]
     async fn a_request_round_trips_over_the_local_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -460,7 +460,7 @@ mod tests {
         }
     }
 
-    /// The proxy recovers a gone endpoint by respawning the daemon, and it
+    /// The proxy recovers a gone endpoint by respawning the hub, and it
     /// recognises "gone" by the io error kind. That has to survive the trip
     /// through this client, whatever the OS calls the error.
     #[tokio::test]

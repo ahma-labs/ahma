@@ -2429,7 +2429,7 @@ async fn finalize_streaming_operation(
         OperationStatus::Failed
     };
     // The terminal event emitted by this transition carries the result to all
-    // subscribers (MCP progress push, daemon hub, TUI).
+    // subscribers (MCP progress push, hub, TUI).
     op_monitor
         .update_status(op_id, status, Some(final_output))
         .await;
@@ -2533,7 +2533,7 @@ async fn process_streaming_line(
     {
         // The full notification snapshot (trigger + recent context) is stored
         // and emitted as a single `Alert` event so every subscriber — MCP
-        // progress push, daemon hub, TUI — gets the same rich content.
+        // progress push, hub, TUI — gets the same rich content.
         op_monitor
             .append_alert(op_id, snapshot.format_for_notification())
             .await;

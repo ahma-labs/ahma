@@ -376,7 +376,7 @@ impl AuditLog {
     /// But "never pruned" was being read as "never bounded", and it is not the
     /// same claim: one session on a busy workspace produced a 2.5 MB
     /// `audit.jsonl` in a day, and nothing stopped that growing without limit on
-    /// a long-lived daemon. Rotation preserves every record that fits in the
+    /// a long-lived hub. Rotation preserves every record that fits in the
     /// retained generations while bounding any single file, so the invariant the
     /// test protects still holds — what it forbids is silent loss, not an
     /// ordered move.
@@ -768,7 +768,7 @@ mod tests {
     /// relocates them. Bounding one file's size is compatible with keeping every
     /// record, so "never pruned" never implied "never bounded" — that reading
     /// was an unexamined consequence, and it left the log growing without limit
-    /// on a long-lived daemon.
+    /// on a long-lived hub.
     #[tokio::test]
     async fn rotation_moves_records_rather_than_dropping_them() {
         let dir = tempfile::tempdir().unwrap();

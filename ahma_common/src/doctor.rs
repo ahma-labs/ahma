@@ -205,9 +205,9 @@ pub struct DoctorInput {
     pub current_exe: Option<PathBuf>,
     /// The folder the user is working in.
     pub workspace: PathBuf,
-    /// What the per-user daemon says about itself, if it is running.
-    pub daemon: DaemonStatus,
-    /// This binary's version and build id, to compare with the daemon's.
+    /// What the per-user hub says about itself, if it is running.
+    pub hub: HubStatus,
+    /// This binary's version and build id, to compare with the hub's.
     pub version: String,
     pub build_id: String,
 }
@@ -222,7 +222,7 @@ impl DoctorInput {
                 .ok()
                 .map(|p| dunce::canonicalize(&p).unwrap_or(p)),
             workspace: workspace.to_path_buf(),
-            daemon: probe_daemon_blocking(Path::new(&crate::daemon_hub::mcp_socket_path(None))),
+            hub: probe_hub_blocking(Path::new(&crate::hub::mcp_socket_path(None))),
             version: env!("CARGO_PKG_VERSION").to_string(),
             build_id: crate::BUILD_ID.to_string(),
         }
@@ -238,7 +238,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
         check_missing_workspaces(settings, &mut findings);
         check_trust(settings, &input.workspace, &mut findings);
     }
-    check_daemon(input, &mut findings);
+    check_hub(input, &mut findings);
     check_antigravity_permissions(
         input.home_dir.as_deref(),
         input.current_exe.as_deref(),
@@ -365,10 +365,10 @@ fn check_trust(settings: &AhmaSettings, workspace: &Path, out: &mut Vec<Finding>
     });
 }
 
-/// Whether the per-user daemon is running, and which build, as it says
-/// itself (SPEC R-DAEMON.2).
+/// Whether the per-user hub is running, and which build, as it says
+/// itself (SPEC R-HUB.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DaemonStatus {
+pub enum HubStatus {
     /// Nothing answers on its socket.
     NotRunning,
     /// It answers; `version` is its `/health` version (`semver+build_id`), if
@@ -376,16 +376,16 @@ pub enum DaemonStatus {
     Running { version: Option<String> },
 }
 
-/// How long the doctor waits for the daemon to answer. It is local, so a
-/// daemon that takes longer is itself worth reporting as not answering.
-const DAEMON_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long the doctor waits for the hub to answer. It is local, so a
+/// hub that takes longer is itself worth reporting as not answering.
+const HUB_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Ask the daemon at `mcp_socket` for its `/health`.
+/// Ask the hub at `mcp_socket` for its `/health`.
 ///
-/// The socket answering is what says a daemon is running: nothing is read
+/// The socket answering is what says a hub is running: nothing is read
 /// from a file that could outlive it, and the lock is left alone, so a doctor
-/// run can never make a starting daemon lose its own lock and stand down.
-pub async fn probe_daemon(mcp_socket: &Path) -> DaemonStatus {
+/// run can never make a starting hub lose its own lock and stand down.
+pub async fn probe_hub(mcp_socket: &Path) -> HubStatus {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let exchange = async {
@@ -400,11 +400,11 @@ pub async fn probe_daemon(mcp_socket: &Path) -> DaemonStatus {
             && stream.read_to_end(&mut reply).await.is_ok();
         Some(answered.then_some(reply).and_then(|r| health_version(&r)))
     };
-    match tokio::time::timeout(DAEMON_PROBE_TIMEOUT, exchange).await {
-        Ok(Some(version)) => DaemonStatus::Running { version },
-        Ok(None) => DaemonStatus::NotRunning,
+    match tokio::time::timeout(HUB_PROBE_TIMEOUT, exchange).await {
+        Ok(Some(version)) => HubStatus::Running { version },
+        Ok(None) => HubStatus::NotRunning,
         // Connected, then said nothing in time.
-        Err(_) => DaemonStatus::Running { version: None },
+        Err(_) => HubStatus::Running { version: None },
     }
 }
 
@@ -420,55 +420,55 @@ fn health_version(response: &[u8]) -> Option<String> {
     Some(json.get("version")?.as_str()?.to_string())
 }
 
-/// [`probe_daemon`] for a synchronous caller, inside a tokio runtime or not:
+/// [`probe_hub`] for a synchronous caller, inside a tokio runtime or not:
 /// it runs on a thread of its own with a runtime of its own.
-pub fn probe_daemon_blocking(mcp_socket: &Path) -> DaemonStatus {
+pub fn probe_hub_blocking(mcp_socket: &Path) -> HubStatus {
     let mcp_socket = mcp_socket.to_path_buf();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .ok()?;
-        Some(runtime.block_on(probe_daemon(&mcp_socket)))
+        Some(runtime.block_on(probe_hub(&mcp_socket)))
     })
     .join()
     .ok()
     .flatten()
-    .unwrap_or(DaemonStatus::NotRunning)
+    .unwrap_or(HubStatus::NotRunning)
 }
 
-fn check_daemon(input: &DoctorInput, out: &mut Vec<Finding>) {
+fn check_hub(input: &DoctorInput, out: &mut Vec<Finding>) {
     let ours = format!("{}+{}", input.version, input.build_id);
-    let finding = match &input.daemon {
-        DaemonStatus::Running {
+    let finding = match &input.hub {
+        HubStatus::Running {
             version: Some(theirs),
         } if *theirs == ours => Finding {
             level: Level::Ok,
-            title: "Daemon is running this build".into(),
+            title: "Hub is running this build".into(),
             detail: format!("ahma {theirs}"),
             fix: None,
         },
-        DaemonStatus::Running {
+        HubStatus::Running {
             version: Some(theirs),
         } => Finding {
             level: Level::Warn,
-            title: "Daemon is a different build".into(),
+            title: "Hub is a different build".into(),
             detail: format!(
-                "The daemon is ahma {theirs}, this is {ours}. Behaviour follows the daemon \
+                "The hub is ahma {theirs}, this is {ours}. Behaviour follows the hub \
                  until it restarts: quit every ahma window and editor session using ahma, and \
                  the next one starts the new build."
             ),
             fix: None,
         },
-        DaemonStatus::Running { version: None } => Finding {
+        HubStatus::Running { version: None } => Finding {
             level: Level::Info,
-            title: "Daemon is running".into(),
+            title: "Hub is running".into(),
             detail: "It did not say which build it is.".into(),
             fix: None,
         },
-        DaemonStatus::NotRunning => Finding {
+        HubStatus::NotRunning => Finding {
             level: Level::Info,
-            title: "Daemon is not running".into(),
+            title: "Hub is not running".into(),
             detail: "It starts by itself when needed.".into(),
             fix: None,
         },
@@ -901,7 +901,7 @@ mod tests {
             home_dir: Some(home.to_path_buf()),
             current_exe: Some(PathBuf::from("/usr/local/bin/ahma")),
             workspace: workspace.to_path_buf(),
-            daemon: DaemonStatus::NotRunning,
+            hub: HubStatus::NotRunning,
             version: "1".into(),
             build_id: "b".into(),
         }
@@ -967,11 +967,11 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
         std::fs::create_dir_all(&logs).unwrap();
         std::fs::write(
             logs.join("ahma.log"),
-            "x 2026  WARN t: daemon unavailable\nx 2026  WARN t: daemon unavailable\n",
+            "x 2026  WARN t: hub unavailable\nx 2026  WARN t: hub unavailable\n",
         )
         .unwrap();
         let text = render(&run(&input(home.path(), ws.path())));
-        assert!(text.contains("2× daemon unavailable"), "{text}");
+        assert!(text.contains("2× hub unavailable"), "{text}");
     }
 
     #[test]
@@ -1140,34 +1140,34 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
         assert!(fixes(&findings_after).is_empty());
     }
 
-    fn daemon_finding(daemon: DaemonStatus) -> Finding {
+    fn hub_finding(hub: HubStatus) -> Finding {
         let home = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
         let mut input = input(home.path(), ws.path());
         input.version = "0.21.9".into();
         input.build_id = "abc1234".into();
-        input.daemon = daemon;
+        input.hub = hub;
         run(&input)
             .into_iter()
-            .find(|f| f.title.starts_with("Daemon"))
-            .expect("the daemon always gets a finding")
+            .find(|f| f.title.starts_with("Hub"))
+            .expect("the hub always gets a finding")
     }
 
-    /// The doctor names the daemon's build from what the daemon says about
-    /// itself on its socket (SPEC R-DAEMON.2), not from a descriptor file
+    /// The doctor names the hub's build from what the hub says about
+    /// itself on its socket (SPEC R-HUB.2), not from a descriptor file
     /// that could outlive it.
     #[test]
-    fn the_daemon_is_reported_from_its_own_health() {
-        let same = daemon_finding(DaemonStatus::Running {
+    fn the_hub_is_reported_from_its_own_health() {
+        let same = hub_finding(HubStatus::Running {
             version: Some("0.21.9+abc1234".into()),
         });
-        assert_eq!(same.title, "Daemon is running this build");
+        assert_eq!(same.title, "Hub is running this build");
         assert_eq!(same.level, Level::Ok);
 
-        let other = daemon_finding(DaemonStatus::Running {
+        let other = hub_finding(HubStatus::Running {
             version: Some("0.21.8+old0000".into()),
         });
-        assert_eq!(other.title, "Daemon is a different build");
+        assert_eq!(other.title, "Hub is a different build");
         assert_eq!(other.level, Level::Warn);
         assert!(
             other.detail.contains("0.21.8+old0000") && other.detail.contains("0.21.9+abc1234"),
@@ -1175,11 +1175,11 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
             other.detail
         );
 
-        let mute = daemon_finding(DaemonStatus::Running { version: None });
-        assert_eq!(mute.title, "Daemon is running");
+        let mute = hub_finding(HubStatus::Running { version: None });
+        assert_eq!(mute.title, "Hub is running");
 
-        let absent = daemon_finding(DaemonStatus::NotRunning);
-        assert_eq!(absent.title, "Daemon is not running");
+        let absent = hub_finding(HubStatus::NotRunning);
+        assert_eq!(absent.title, "Hub is not running");
         assert_eq!(absent.level, Level::Info);
     }
 
@@ -1201,19 +1201,19 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
     }
 
     #[tokio::test]
-    async fn the_daemon_is_probed_over_its_socket() {
+    async fn the_hub_is_probed_over_its_socket() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("mcp.sock");
         serve_health_once(&socket, r#"{"status":"OK","version":"0.21.9+abc1234"}"#);
         assert_eq!(
-            probe_daemon(&socket).await,
-            DaemonStatus::Running {
+            probe_hub(&socket).await,
+            HubStatus::Running {
                 version: Some("0.21.9+abc1234".into())
             }
         );
         assert_eq!(
-            probe_daemon(&dir.path().join("absent.sock")).await,
-            DaemonStatus::NotRunning
+            probe_hub(&dir.path().join("absent.sock")).await,
+            HubStatus::NotRunning
         );
     }
 
@@ -1223,8 +1223,8 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
     async fn the_blocking_probe_works_inside_a_runtime() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            probe_daemon_blocking(&dir.path().join("absent.sock")),
-            DaemonStatus::NotRunning
+            probe_hub_blocking(&dir.path().join("absent.sock")),
+            HubStatus::NotRunning
         );
     }
 }

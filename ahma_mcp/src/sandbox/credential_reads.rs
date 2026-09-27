@@ -62,7 +62,7 @@ const DEFAULT_DENY_RELATIVE: [&str; 7] = [
 ///
 /// Reaching a container daemon is a *total* sandbox escape and does not require
 /// breaking anything: talk to `docker.sock`, ask for a `--privileged` container
-/// with `/` bind-mounted, and the daemon — a root process entirely outside the
+/// with `/` bind-mounted, and the hub — a root process entirely outside the
 /// sandbox — performs the write on your behalf. Nothing in a filesystem policy
 /// scoped to the workspace can see that write happen.
 ///

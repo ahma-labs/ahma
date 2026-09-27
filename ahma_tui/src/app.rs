@@ -37,7 +37,7 @@ pub async fn run(
     use ratatui::{Terminal, backend::CrosstermBackend};
     use tokio::sync::mpsc;
 
-    use crate::daemon_source::spawn_daemon_source;
+    use crate::hub_source::spawn_hub_source;
     use crate::keymap::map_key;
     use crate::llm_bridge::{BridgeEvent, spawn_discovery_task};
     use crate::mcp_source::{SourceEvent, spawn_mcp_source};
@@ -117,16 +117,16 @@ pub async fn run(
         mcp_tx.clone(),
         workspace_path,
     ));
-    // The TUI is always a subscriber, never the hub (SPEC R-DAEMON.9). It used
+    // The TUI is always a subscriber, never the hub (SPEC R-HUB.9). It used
     // to bind the hub socket itself when it started first, which made the
     // observability of every other client depend on this window staying open:
     // quitting the TUI unlinked the socket and every attached instance lost its
-    // event stream until it reconnected. The per-user daemon owns the hub; this
+    // event stream until it reconnected. The per-user hub owns the hub; this
     // process only watches it, and quitting sends nothing but EOF.
-    spawn_daemon_source(mcp_tx.clone());
+    spawn_hub_source(mcp_tx.clone());
     // ...and a second, outgoing connection, because the TUI is also a place
     // work happens: a `!` command runs here, unsandboxed, and used to be the
-    // one kind of work the unified view could not see (SPEC R-DAEMON.9).
+    // one kind of work the unified view could not see (SPEC R-HUB.9).
     state.tui_reporter = Some(crate::tui_reporter::spawn_tui_reporter(
         state.workspace.clone(),
     ));
@@ -1221,7 +1221,7 @@ fn reraise_grant_for_selected_op(state: &mut crate::state::AppState) {
         return;
     };
 
-    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::ReRaiseScopeGrant {
+    send_incoming(ahma_common::hub::ClientMsg::ReRaiseScopeGrant {
         path: path.clone(),
         access,
         target_instance_id: op.instance_id.clone(),
@@ -1233,16 +1233,16 @@ fn reraise_grant_for_selected_op(state: &mut crate::state::AppState) {
     });
 }
 
-fn send_daemon_msg(msg: ahma_common::daemon_hub::ClientMsg) {
+fn send_incoming(msg: ahma_common::hub::ClientMsg) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
-            if let Ok(mut stream) = ahma_common::daemon_hub::connect_to_daemon().await {
-                let _ = ahma_common::daemon_hub::send_msg(&mut stream, &msg).await;
+            if let Ok(mut stream) = ahma_common::hub::connect_to_hub().await {
+                let _ = ahma_common::hub::send_msg(&mut stream, &msg).await;
             }
         });
     } else {
         tracing::debug!(
-            "send_daemon_msg: no active tokio runtime, skipping message: {:?}",
+            "send_incoming: no active tokio runtime, skipping message: {:?}",
             msg
         );
     }
@@ -1268,7 +1268,7 @@ fn resolve_approval(state: &mut crate::state::AppState, approved: bool) {
         let _ = tx.send(approved);
     }
 
-    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitApproval {
+    send_incoming(ahma_common::hub::ClientMsg::SubmitApproval {
         id: Some(gate.op_id.clone()),
         approved,
         target_instance_id: None,
@@ -1317,7 +1317,7 @@ fn request_cancel_selected_op(state: &mut crate::state::AppState) {
 }
 
 /// Cancel one operation where it lives. An operation from another client is
-/// cancelled on that client's instance through the daemon; the TUI's own MCP
+/// cancelled on that client's instance through the hub; the TUI's own MCP
 /// session cannot see it, so the `cancel` tool there would miss. Without a
 /// known instance the TUI's own session is the only place to ask.
 fn cancel_op(state: &mut crate::state::AppState, key: crate::state::OpKey) {
@@ -1328,7 +1328,7 @@ fn cancel_op(state: &mut crate::state::AppState, key: crate::state::OpKey) {
         message: format!("Cancel requested: {}", key.id),
     });
     match key.instance_id {
-        Some(instance) => send_daemon_msg(ahma_common::daemon_hub::ClientMsg::CancelOperation {
+        Some(instance) => send_incoming(ahma_common::hub::ClientMsg::CancelOperation {
             op_id: key.id,
             target_instance_id: Some(instance),
         }),
@@ -1502,9 +1502,9 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
         crate::ui::shorten_path(&working_dir, 20)
     );
 
-    // The command is about to run outside the sandbox; say so to the daemon
+    // The command is about to run outside the sandbox; say so to the hub
     // before it starts, so the row exists in every view for as long as the
-    // command does (SPEC R-DAEMON.9).
+    // command does (SPEC R-HUB.9).
     let report = state.bang_report();
     if let Some(r) = &report {
         r.reporter.report(crate::tui_reporter::bang_started(
@@ -1592,7 +1592,7 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     send_chat_turn(state, base_url, model);
 }
 
-/// Collect the current conversation and submit it to the daemon LLM loop.
+/// Collect the current conversation and submit it to the hub LLM loop.
 fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: String) {
     let messages = collect_chat_history(state)
         .into_iter()
@@ -1604,7 +1604,7 @@ fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: S
                 ahma_llm_monitor::ChatRole::Tool => "tool",
             }
             .to_string();
-            ahma_common::daemon_hub::DaemonChatMessage {
+            ahma_common::hub::HubChatMessage {
                 role,
                 content: msg.content,
             }
@@ -1622,7 +1622,7 @@ fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: S
     state.turn = Some(crate::state::ChatTurn::new(target_instance_id.clone()));
     send_turn_msg(
         state,
-        ahma_common::daemon_hub::ClientMsg::SubmitPrompt {
+        ahma_common::hub::ClientMsg::SubmitPrompt {
             messages,
             system_prompt,
             provider: Some(base_url),
@@ -1632,18 +1632,18 @@ fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: S
     );
 }
 
-/// Send a message a chat turn depends on. Unlike [`send_daemon_msg`], a
+/// Send a message a chat turn depends on. Unlike [`send_incoming`], a
 /// failure is not swallowed: the turn is ended with the reason, because a
-/// prompt that never reached the daemon otherwise spins forever.
-fn send_turn_msg(state: &crate::state::AppState, msg: ahma_common::daemon_hub::ClientMsg) {
+/// prompt that never reached the hub otherwise spins forever.
+fn send_turn_msg(state: &crate::state::AppState, msg: ahma_common::hub::ClientMsg) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::debug!("send_turn_msg: no active tokio runtime, skipping message: {msg:?}");
         return;
     };
     let failed_tx = state.bridge_tx.clone();
     handle.spawn(async move {
-        let sent = match ahma_common::daemon_hub::connect_to_daemon().await {
-            Ok(mut stream) => ahma_common::daemon_hub::send_msg(&mut stream, &msg).await,
+        let sent = match ahma_common::hub::connect_to_hub().await {
+            Ok(mut stream) => ahma_common::hub::send_msg(&mut stream, &msg).await,
             Err(e) => Err(e),
         };
         if let Err(e) = sent
@@ -1651,7 +1651,7 @@ fn send_turn_msg(state: &crate::state::AppState, msg: ahma_common::daemon_hub::C
         {
             let _ = tx
                 .send(crate::llm_bridge::BridgeEvent::TurnSendFailed(format!(
-                    "Couldn't reach the ahma daemon.\n\
+                    "Couldn't reach the ahma hub.\n\
                      It normally starts on its own; try again, or run `ahma doctor`.\n\
                      Details: {e:#}"
                 )))
@@ -1748,13 +1748,13 @@ fn first_line(text: &str) -> &str {
 }
 
 /// Stop the running turn, if any. The turn ends here at once rather than on
-/// the instance's reply, so Esc works even when the daemon is gone; the
+/// the instance's reply, so Esc works even when the hub is gone; the
 /// instance's own "cancelled" error then finds no turn and is ignored.
 fn cancel_turn(state: &mut crate::state::AppState) -> bool {
     let Some(turn) = state.turn.take() else {
         return false;
     };
-    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::CancelPrompt {
+    send_incoming(ahma_common::hub::ClientMsg::CancelPrompt {
         target_instance_id: turn.target_instance,
     });
     end_turn(state);
@@ -2604,7 +2604,7 @@ fn handle_scope_grant_key(
     }
 }
 
-/// Resolve the pending scope-grant prompt: send the decision to the daemon (which
+/// Resolve the pending scope-grant prompt: send the decision to the hub (which
 /// resolves + persists for the next start — never the live session) and log it.
 fn resolve_scope_grant(
     state: &mut crate::state::AppState,
@@ -2617,7 +2617,7 @@ fn resolve_scope_grant(
         return;
     };
 
-    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitScopeGrant {
+    send_incoming(ahma_common::hub::ClientMsg::SubmitScopeGrant {
         decision_id: gate.decision_id,
         decision,
         target_instance_id: None,
@@ -2692,7 +2692,7 @@ fn handle_web_approval_key(
     }
 }
 
-/// Resolve the pending web-approval prompt: send the decision to the daemon (which
+/// Resolve the pending web-approval prompt: send the decision to the hub (which
 /// applies it to the live session and, for `always`, persists it) and log it. The
 /// request that raised the prompt was already denied, so the user retries it.
 fn resolve_web_approval(
@@ -2706,7 +2706,7 @@ fn resolve_web_approval(
         return;
     };
 
-    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitWebApproval {
+    send_incoming(ahma_common::hub::ClientMsg::SubmitWebApproval {
         decision_id: gate.decision_id,
         decision,
         target_instance_id: None,
@@ -3133,7 +3133,7 @@ fn skill_nav_commands(state: &crate::state::AppState) -> Vec<crate::state::NavCo
 /// `/minimize [on|off]` — toggle token minimization (concise prompting + output
 /// compression for small models). With no argument it reports the current state.
 /// The choice is applied live and persisted to `settings.tools.minimize_tokens`
-/// so the daemon agent loop (which reads settings) and the next session both
+/// so the hub agent loop (which reads settings) and the next session both
 /// honour it. Default is off.
 fn handle_minimize_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     let Some(rest) = cmd.strip_prefix("/minimize") else {
@@ -4425,7 +4425,7 @@ fn persist_selected_model_to_settings(provider: &str, model: &str, provider_url:
 /// ahma can only state a preference, so the entry says so instead of naming
 /// models it cannot promise.
 fn virtual_provider_for_instance(
-    inst: &ahma_common::daemon_hub::InstanceInfo,
+    inst: &ahma_common::hub::InstanceInfo,
 ) -> Option<ahma_llm_monitor::LocalProvider> {
     if !inst.sampling || inst.mode == "hook" || inst.mode == "tui" {
         return None;
@@ -4468,7 +4468,7 @@ fn rebuild_available_providers(state: &mut crate::state::AppState) {
 }
 
 fn handle_instances_updated(
-    instances: Vec<ahma_common::daemon_hub::InstanceInfo>,
+    instances: Vec<ahma_common::hub::InstanceInfo>,
     state: &mut crate::state::AppState,
 ) {
     state.active_instances = instances;
@@ -4794,7 +4794,7 @@ fn handle_external_tools_refreshed(
 }
 
 /// Build an `ApprovalGate` for a requested tool call and hand it to
-/// `AppState::request_approval`. Shared by the daemon-hub (`SourceEvent`)
+/// `AppState::request_approval`. Shared by the hub (`SourceEvent`)
 /// and in-process (`BridgeEvent`) approval-request paths, which differ only
 /// in whether a responder channel is present.
 fn request_tool_approval(
@@ -5262,12 +5262,10 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
     use crate::mcp_source::SourceEvent;
     match event {
         SourceEvent::HealthChanged { healthy } => state.set_server_healthy(healthy),
-        SourceEvent::DaemonHealthChanged { healthy } => {
-            state.set_daemon_healthy(healthy);
+        SourceEvent::HubHealthChanged { healthy } => {
+            state.set_hub_healthy(healthy);
             if let Some(ref tx) = state.mcp_source_tx {
-                let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetDaemonHealthy(
-                    healthy,
-                ));
+                let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetHubHealthy(healthy));
             }
         }
         SourceEvent::OperationsUpdated { ops } => {
@@ -5648,7 +5646,7 @@ fn handle_operation_output(
     let Some(idx) = op_idx else {
         // Output for an operation we have not seen yet. This happens when an
         // OpOutput line outruns the snapshot that materialises the op (e.g.
-        // after a daemon-hub reconnect, which replays OpStarted/OpFinished but
+        // after a hub reconnect, which replays OpStarted/OpFinished but
         // not OpOutput). Buffer the line instead of dropping it; it is flushed
         // into the op's tail by `upsert_operation` once the op appears — so
         // fast commands like `!pwd` no longer lose their output.
@@ -5978,7 +5976,7 @@ fn analyze_operation(state: &mut crate::state::AppState, key: &crate::state::OpK
                 ahma_llm_monitor::ChatRole::Tool => "tool",
             }
             .to_string();
-            ahma_common::daemon_hub::DaemonChatMessage {
+            ahma_common::hub::HubChatMessage {
                 role,
                 content: msg.content,
             }
@@ -5990,7 +5988,7 @@ fn analyze_operation(state: &mut crate::state::AppState, key: &crate::state::OpK
     state.turn = Some(crate::state::ChatTurn::new(None));
     send_turn_msg(
         state,
-        ahma_common::daemon_hub::ClientMsg::SubmitPrompt {
+        ahma_common::hub::ClientMsg::SubmitPrompt {
             messages,
             system_prompt,
             provider: Some(base_url),
@@ -6464,8 +6462,8 @@ mod tests {
     use serde_json::json;
 
     /// A failed turn is over: its elapsed timer must stop just as it does on
-    /// success. The daemon emits `AgentError` for exactly this reason
-    /// (`daemon_hub.rs`), and a timer left running also forced a full
+    /// success. The hub emits `AgentError` for exactly this reason
+    /// (`hub.rs`), and a timer left running also forced a full
     /// transcript rebuild on every frame.
     #[test]
     fn agent_error_stops_the_turn_timer() {
@@ -6546,18 +6544,14 @@ mod tests {
     #[test]
     fn going_offline_records_since_when() {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
-        state.set_daemon_healthy(true);
-        assert!(state.daemon_down_since.is_none());
-        state.set_daemon_healthy(false);
-        let since = state.daemon_down_since.expect("down since recorded");
-        state.set_daemon_healthy(false);
-        assert_eq!(
-            state.daemon_down_since,
-            Some(since),
-            "stays the first moment"
-        );
-        state.set_daemon_healthy(true);
-        assert!(state.daemon_down_since.is_none());
+        state.set_hub_healthy(true);
+        assert!(state.hub_down_since.is_none());
+        state.set_hub_healthy(false);
+        let since = state.hub_down_since.expect("down since recorded");
+        state.set_hub_healthy(false);
+        assert_eq!(state.hub_down_since, Some(since), "stays the first moment");
+        state.set_hub_healthy(true);
+        assert!(state.hub_down_since.is_none());
     }
 
     #[test]
@@ -6600,7 +6594,7 @@ mod tests {
     }
 
     /// Esc on an empty input stops the running turn right away, even if the
-    /// daemon is unreachable; the instance's own "cancelled" error, arriving
+    /// hub is unreachable; the instance's own "cancelled" error, arriving
     /// later, must not print a second end.
     #[test]
     fn esc_cancels_a_running_turn() {
@@ -6679,25 +6673,25 @@ mod tests {
         assert!(state.should_quit);
     }
 
-    /// A prompt that never reached the daemon ends its turn with a visible
+    /// A prompt that never reached the hub ends its turn with a visible
     /// error instead of spinning forever.
     #[test]
     fn a_failed_send_ends_the_turn() {
         let mut state = turn_in_flight();
         super::handle_bridge_event(
-            crate::llm_bridge::BridgeEvent::TurnSendFailed("daemon unreachable".into()),
+            crate::llm_bridge::BridgeEvent::TurnSendFailed("hub unreachable".into()),
             &mut state,
         );
         assert!(state.turn.is_none());
         assert!(state.chat.entries().iter().any(|e| matches!(
             e,
-            crate::state::ChatEntry::Assistant { content, .. } if content.contains("daemon unreachable")
+            crate::state::ChatEntry::Assistant { content, .. } if content.contains("hub unreachable")
         )));
     }
 
     /// The `!` path must actually reach the reporter: a window that reports
     /// nothing is exactly the invisible local command this was built to retire
-    /// (SPEC R-DAEMON.9).
+    /// (SPEC R-HUB.9).
     ///
     /// Asserted through the window rather than the socket because the window is
     /// where the two halves have to agree — the card the user is looking at and
@@ -6707,7 +6701,7 @@ mod tests {
     async fn a_bang_command_is_reported_and_its_window_carries_the_operation_id() {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: nextest runs each test in its own process (SPEC R-ISO.1).
-        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", dir.path().join("d.sock")) };
+        unsafe { std::env::set_var("AHMA_HUB_SOCK", dir.path().join("d.sock")) };
 
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         state.workspace = dir.path().display().to_string();
@@ -8610,7 +8604,7 @@ mod tests {
     /// old list invented one for every window, so the wizard never ran.
     #[test]
     fn sampling_is_offered_only_for_clients_that_declare_it() {
-        let inst = |sampling: bool| ahma_common::daemon_hub::InstanceInfo {
+        let inst = |sampling: bool| ahma_common::hub::InstanceInfo {
             id: "i".into(),
             mode: "stdio".into(),
             label: "ahma".into(),

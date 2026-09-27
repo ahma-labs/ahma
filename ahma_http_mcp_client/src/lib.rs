@@ -5,7 +5,7 @@
 //!
 //! - [`streamable`]: the one implementation of the Streamable HTTP handshake
 //!   (initialize → SSE → initialized → `roots/list` → `tools/call`) used for the
-//!   ahma bridge and daemon.
+//!   ahma bridge and hub.
 //! - [`client::HttpMcpTransport`]: an `rmcp` `Transport` for external MCP servers,
 //!   with optional OAuth 2.0 + PKCE. The OAuth endpoints are currently Atlassian's.
 //!   Tokens persist in `~/.ahma/mcp_http_token.json`.
