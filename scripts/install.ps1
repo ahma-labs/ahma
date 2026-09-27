@@ -182,11 +182,14 @@ Actual:   $actualHash
     # Expand archive
     Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
 
-    # Clean up running instances to avoid locked files or stale running versions
-    Write-Host "Stopping running ahma processes..."
-    Get-Process -Name ahma, ahma-http-bridge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-
     # ── Install binaries ───────────────────────────────────────────────────────
+    # Nothing running is stopped. Windows will not replace a running
+    # executable, but it will rename one: the new binary is staged and
+    # verified beside the old one, the old one is moved aside to ahma.old, and
+    # the new one takes the path. The running hub notices the new file and
+    # hands over to it once the work in flight is done; open editor sessions
+    # reconnect on their own, and the next start removes ahma.old
+    # (docs/hub.md, "Upgrades").
     Write-Host "Installing binaries to $installDir ..."
 
     $src = Join-Path $tempDir "ahma.exe"
@@ -194,29 +197,42 @@ Actual:   $actualHash
         Write-Error "ahma.exe not found in archive"
         exit 1
     }
-    Copy-Item -Path $src -Destination $installDir -Force
-    Write-Host "  Installed ahma.exe"
-
-    # Cryptographic verification: confirm the installed binary has a valid GitHub Build Provenance
-    # Attestation (Sigstore SLSA Level 3) from the official ahma-labs/ahma CI pipeline.
     $mcpBin = Join-Path $installDir "ahma.exe"
+    $stagedBin = Join-Path $installDir "ahma.new.exe"
+    Copy-Item -Path $src -Destination $stagedBin -Force
+
+    # Cryptographic verification: confirm the new binary has a valid GitHub Build Provenance
+    # Attestation (Sigstore SLSA Level 3) from the official ahma-labs/ahma CI pipeline. It runs
+    # before the binary takes the install path, so a failure leaves the previous install untouched.
     if (-not $shouldSkipVerify) {
         Write-Host "Verifying Sigstore Build Provenance Attestation..."
-        & $mcpBin verify --self
+        & $stagedBin verify --self
         if ($LASTEXITCODE -ne 0) {
             Write-Error @"
 ########################################################################
 CRITICAL SECURITY ERROR: Sigstore attestation verification FAILED!
-The installed binary failed GitHub Build Provenance Attestation.
-Removing $mcpBin.
+The downloaded binary failed GitHub Build Provenance Attestation.
+Removing $stagedBin; the existing install is unchanged.
 ########################################################################
 "@
-            Remove-Item -Force $mcpBin -ErrorAction SilentlyContinue
+            Remove-Item -Force $stagedBin -ErrorAction SilentlyContinue
             exit 1
         }
     } else {
         Write-Warning "Sigstore attestation verification bypassed (--insecure-skip-verify)."
     }
+
+    if (Test-Path $mcpBin) {
+        $aside = Join-Path $installDir "ahma.old"
+        Remove-Item -Force $aside -ErrorAction SilentlyContinue
+        if (Test-Path $aside) {
+            # An earlier ahma.old is itself still running.
+            $aside = Join-Path $installDir ("ahma.{0}.old" -f [DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+        }
+        Move-Item -Path $mcpBin -Destination $aside -Force
+    }
+    Move-Item -Path $stagedBin -Destination $mcpBin -Force
+    Write-Host "  Installed ahma.exe"
 } finally {
     Remove-Item -Recurse -Force -Path $tempDir -ErrorAction SilentlyContinue
 }

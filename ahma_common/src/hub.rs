@@ -991,14 +991,6 @@ pub async fn list_instances_at(socket_path: &std::path::Path) -> Result<Vec<Inst
     }
 }
 
-/// Stop the running hub immediately.
-pub async fn stop_hub() -> Result<()> {
-    if let Ok(mut stream) = connect_to_hub().await {
-        send_msg(&mut stream, &ClientMsg::Shutdown).await?;
-    }
-    Ok(())
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Framing helpers
 // ─────────────────────────────────────────────────────────────────────────────

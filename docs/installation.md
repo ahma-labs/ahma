@@ -15,6 +15,13 @@ ahma update --install-hooks    # also install user-scoped terminal hooks
 Use `--force` to reinstall when the version already matches. Use `--dry-run` to preview actions.
 When run interactively, `ahma update` now offers user-scoped terminal hook installation if none are currently managed.
 
+You can update while ahma is in use. Nothing running is stopped: the new binary
+is put in place beside the old one, and the running hub hands over to it once the
+work in flight is done — your editors reconnect on their own. On Windows, where a
+running `.exe` cannot be replaced, the old one is moved aside to `ahma.old` and
+removed the next time the hub starts. The install scripts behave the same way.
+See [docs/hub.md](hub.md#upgrades).
+
 Custom install location: `--install-dir ~/.local/bin`. `AHMA_INSTALL_DIR` is retired
 (R-CFG1.2) and ignored by `ahma update` / `ahma uninstall`; only the bootstrap installer
 scripts still read it, because they run before any `ahma` binary exists.
