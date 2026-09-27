@@ -36,7 +36,7 @@ Example report:
     /opt/two — every ahma session tries to add these to its sandbox and logs a warning.
     fix 1: Remove 1 granted folder(s) that no longer exist from ~/.ahma/settings.toml: /opt/two
 [!] Daemon is a different build
-    The daemon is ahma 0.21.3 (4437961), this is 0.21.3 (7ffb5749). …
+    The daemon is ahma 0.21.3+4437961, this is 0.21.3+7ffb5749. …
 [i] This folder is not trusted
     Tools that change something ask first (always allowed here: list_dir, read_file). /settings trust to trust it.
 [ok] Settings file reads cleanly

@@ -205,8 +205,8 @@ pub struct DoctorInput {
     pub current_exe: Option<PathBuf>,
     /// The folder the user is working in.
     pub workspace: PathBuf,
-    /// The daemon's runtime directory, if known.
-    pub runtime_dir: Option<PathBuf>,
+    /// What the per-user daemon says about itself, if it is running.
+    pub daemon: DaemonStatus,
     /// This binary's version and build id, to compare with the daemon's.
     pub version: String,
     pub build_id: String,
@@ -222,7 +222,7 @@ impl DoctorInput {
                 .ok()
                 .map(|p| dunce::canonicalize(&p).unwrap_or(p)),
             workspace: workspace.to_path_buf(),
-            runtime_dir: crate::daemon_hub::runtime_dir(),
+            daemon: probe_daemon_blocking(Path::new(&crate::daemon_hub::mcp_socket_path(None))),
             version: env!("CARGO_PKG_VERSION").to_string(),
             build_id: crate::BUILD_ID.to_string(),
         }
@@ -365,40 +365,108 @@ fn check_trust(settings: &AhmaSettings, workspace: &Path, out: &mut Vec<Finding>
     });
 }
 
-fn check_daemon(input: &DoctorInput, out: &mut Vec<Finding>) {
-    let Some(dir) = &input.runtime_dir else {
-        return;
+/// Whether the per-user daemon is running, and which build, as it says
+/// itself (SPEC R-DAEMON.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonStatus {
+    /// Nothing answers on its socket.
+    NotRunning,
+    /// It answers; `version` is its `/health` version (`semver+build_id`), if
+    /// it gave a readable one.
+    Running { version: Option<String> },
+}
+
+/// How long the doctor waits for the daemon to answer. It is local, so a
+/// daemon that takes longer is itself worth reporting as not answering.
+const DAEMON_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Ask the daemon at `mcp_socket` for its `/health`.
+///
+/// The socket answering is what says a daemon is running: nothing is read
+/// from a file that could outlive it, and the lock is left alone, so a doctor
+/// run can never make a starting daemon lose its own lock and stand down.
+pub async fn probe_daemon(mcp_socket: &Path) -> DaemonStatus {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let exchange = async {
+        let mut stream = crate::local_socket::LocalStream::connect(mcp_socket)
+            .await
+            .ok()?;
+        let mut reply = Vec::new();
+        let answered = stream
+            .write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .await
+            .is_ok()
+            && stream.read_to_end(&mut reply).await.is_ok();
+        Some(answered.then_some(reply).and_then(|r| health_version(&r)))
     };
-    let finding = match crate::daemon_endpoint::probe(dir) {
-        crate::daemon_endpoint::EndpointState::Live(endpoint) => {
-            if endpoint.version == input.version && endpoint.build_id == input.build_id {
-                Finding {
-                    level: Level::Ok,
-                    title: "Daemon is running this build".into(),
-                    detail: format!("ahma {} (pid {})", endpoint.version, endpoint.pid),
-                    fix: None,
-                }
-            } else {
-                Finding {
-                    level: Level::Warn,
-                    title: "Daemon is a different build".into(),
-                    detail: format!(
-                        "The daemon is ahma {} ({}), this is {} ({}). Behaviour follows the \
-                         daemon until it restarts: quit every ahma window and editor session \
-                         using ahma, and the next one starts the new build.",
-                        endpoint.version, endpoint.build_id, input.version, input.build_id
-                    ),
-                    fix: None,
-                }
-            }
-        }
-        crate::daemon_endpoint::EndpointState::Stale => Finding {
-            level: Level::Info,
-            title: "Daemon left a stale descriptor".into(),
-            detail: "It will be cleaned up when the next daemon starts.".into(),
+    match tokio::time::timeout(DAEMON_PROBE_TIMEOUT, exchange).await {
+        Ok(Some(version)) => DaemonStatus::Running { version },
+        Ok(None) => DaemonStatus::NotRunning,
+        // Connected, then said nothing in time.
+        Err(_) => DaemonStatus::Running { version: None },
+    }
+}
+
+/// The `version` of a raw HTTP `/health` response, if it is a 2xx with one.
+fn health_version(response: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(response).ok()?;
+    let (head, body) = text.split_once("\r\n\r\n")?;
+    let status = head.lines().next()?.split_whitespace().nth(1)?;
+    if !status.starts_with('2') {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(json.get("version")?.as_str()?.to_string())
+}
+
+/// [`probe_daemon`] for a synchronous caller, inside a tokio runtime or not:
+/// it runs on a thread of its own with a runtime of its own.
+pub fn probe_daemon_blocking(mcp_socket: &Path) -> DaemonStatus {
+    let mcp_socket = mcp_socket.to_path_buf();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        Some(runtime.block_on(probe_daemon(&mcp_socket)))
+    })
+    .join()
+    .ok()
+    .flatten()
+    .unwrap_or(DaemonStatus::NotRunning)
+}
+
+fn check_daemon(input: &DoctorInput, out: &mut Vec<Finding>) {
+    let ours = format!("{}+{}", input.version, input.build_id);
+    let finding = match &input.daemon {
+        DaemonStatus::Running {
+            version: Some(theirs),
+        } if *theirs == ours => Finding {
+            level: Level::Ok,
+            title: "Daemon is running this build".into(),
+            detail: format!("ahma {theirs}"),
             fix: None,
         },
-        crate::daemon_endpoint::EndpointState::Absent => Finding {
+        DaemonStatus::Running {
+            version: Some(theirs),
+        } => Finding {
+            level: Level::Warn,
+            title: "Daemon is a different build".into(),
+            detail: format!(
+                "The daemon is ahma {theirs}, this is {ours}. Behaviour follows the daemon \
+                 until it restarts: quit every ahma window and editor session using ahma, and \
+                 the next one starts the new build."
+            ),
+            fix: None,
+        },
+        DaemonStatus::Running { version: None } => Finding {
+            level: Level::Info,
+            title: "Daemon is running".into(),
+            detail: "It did not say which build it is.".into(),
+            fix: None,
+        },
+        DaemonStatus::NotRunning => Finding {
             level: Level::Info,
             title: "Daemon is not running".into(),
             detail: "It starts by itself when needed.".into(),
@@ -833,7 +901,7 @@ mod tests {
             home_dir: Some(home.to_path_buf()),
             current_exe: Some(PathBuf::from("/usr/local/bin/ahma")),
             workspace: workspace.to_path_buf(),
-            runtime_dir: None,
+            daemon: DaemonStatus::NotRunning,
             version: "1".into(),
             build_id: "b".into(),
         }
@@ -1070,5 +1138,93 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
                 .any(|f| f.title == "Antigravity command permissions are clean")
         );
         assert!(fixes(&findings_after).is_empty());
+    }
+
+    fn daemon_finding(daemon: DaemonStatus) -> Finding {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let mut input = input(home.path(), ws.path());
+        input.version = "0.21.9".into();
+        input.build_id = "abc1234".into();
+        input.daemon = daemon;
+        run(&input)
+            .into_iter()
+            .find(|f| f.title.starts_with("Daemon"))
+            .expect("the daemon always gets a finding")
+    }
+
+    /// The doctor names the daemon's build from what the daemon says about
+    /// itself on its socket (SPEC R-DAEMON.2), not from a descriptor file
+    /// that could outlive it.
+    #[test]
+    fn the_daemon_is_reported_from_its_own_health() {
+        let same = daemon_finding(DaemonStatus::Running {
+            version: Some("0.21.9+abc1234".into()),
+        });
+        assert_eq!(same.title, "Daemon is running this build");
+        assert_eq!(same.level, Level::Ok);
+
+        let other = daemon_finding(DaemonStatus::Running {
+            version: Some("0.21.8+old0000".into()),
+        });
+        assert_eq!(other.title, "Daemon is a different build");
+        assert_eq!(other.level, Level::Warn);
+        assert!(
+            other.detail.contains("0.21.8+old0000") && other.detail.contains("0.21.9+abc1234"),
+            "{}",
+            other.detail
+        );
+
+        let mute = daemon_finding(DaemonStatus::Running { version: None });
+        assert_eq!(mute.title, "Daemon is running");
+
+        let absent = daemon_finding(DaemonStatus::NotRunning);
+        assert_eq!(absent.title, "Daemon is not running");
+        assert_eq!(absent.level, Level::Info);
+    }
+
+    /// Answer one `/health` request on `socket` with `body`.
+    fn serve_health_once(socket: &Path, body: &'static str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = crate::local_socket::LocalListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+
+    #[tokio::test]
+    async fn the_daemon_is_probed_over_its_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mcp.sock");
+        serve_health_once(&socket, r#"{"status":"OK","version":"0.21.9+abc1234"}"#);
+        assert_eq!(
+            probe_daemon(&socket).await,
+            DaemonStatus::Running {
+                version: Some("0.21.9+abc1234".into())
+            }
+        );
+        assert_eq!(
+            probe_daemon(&dir.path().join("absent.sock")).await,
+            DaemonStatus::NotRunning
+        );
+    }
+
+    /// `ahma doctor` and the TUI's `/doctor` are synchronous and the TUI's
+    /// runs inside its runtime, so the blocking probe must be callable there.
+    #[tokio::test]
+    async fn the_blocking_probe_works_inside_a_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            probe_daemon_blocking(&dir.path().join("absent.sock")),
+            DaemonStatus::NotRunning
+        );
     }
 }

@@ -334,8 +334,7 @@ impl Sandbox {
         // spawn-depth backstop. These vars are set deliberately only on intentional
         // `ahma serve` children (spawn_background_bridge / SubprocessPeerFactory).
         cmd.env_remove("AHMA_SERVER_CHILD")
-            .env_remove(ahma_common::process_guard::SPAWN_DEPTH_ENV)
-            .env_remove("AHMA_RESTARTED");
+            .env_remove(ahma_common::process_guard::SPAWN_DEPTH_ENV);
 
         // Stamp the child with *which* ahma sandboxed it (SPEC R7.6). A nested
         // ahma inside this command — the test suite, or an `ahma serve` run

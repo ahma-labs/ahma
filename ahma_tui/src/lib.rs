@@ -73,17 +73,6 @@ pub async fn run_tui(
     path: Option<std::path::PathBuf>,
     token_prefs: TokenPrefs,
 ) -> Result<()> {
-    // Set by the previous process image when it re-exec'd itself to match a
-    // newer running daemon (see `daemon_client::ensure_daemon`). The
-    // user saw the screen flicker and was never told why; the restarted
-    // process is the only one that can still say so.
-    if std::env::var("AHMA_RESTARTED").is_ok() {
-        startup_notices::push(
-            startup_notices::Level::Warn,
-            "This TUI restarted itself to match the newer ahma daemon already running.",
-        );
-    }
-
     // Pre-flight the directory this TUI will answer `roots/list` with, so a
     // typo or a `$HOME` launch is named here rather than surfacing later as a
     // per-session sandbox rejection (SPEC R5.2.4, R5.2.1.1).

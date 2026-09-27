@@ -592,30 +592,6 @@ pub async fn check_bridge_running(socket_path: &str) -> bool {
     get_bridge_version(socket_path).await.is_some()
 }
 
-pub fn re_exec_current_process() -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(&args);
-    cmd.env("AHMA_RESTARTED", "1");
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = cmd.exec();
-        Err(anyhow::anyhow!("Failed to re-exec client process: {}", err))
-    }
-    #[cfg(not(unix))]
-    {
-        let mut child = cmd
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()?;
-        let status = child.wait()?;
-        std::process::exit(status.code().unwrap_or(0));
-    }
-}
-
 /// Split a version string of the form `"semver+build_id"` into `(semver, Option<build_id>)`.
 /// If there is no `+` separator, the build_id portion is `None`.
 pub(crate) fn split_version_and_build_id(v: &str) -> (&str, Option<&str>) {
