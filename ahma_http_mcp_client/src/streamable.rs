@@ -20,9 +20,11 @@
 //! explicit durations; see `ahma_common::timeouts` for the semantic
 //! categories — nothing is hardcoded here).
 
+use crate::http_client::{HttpClient, SendError, classify_send_error};
 use ahma_common::file_uri::encode_file_uri;
 use ahma_common::http_retry::{
-    Idempotency, RetryPolicy, ServiceError, TransportFailure, classify_status, send_with_retry,
+    Idempotency, RetryPolicy, ServiceError, TransportFailure, classify_status,
+    send_with_retry_using,
 };
 use ahma_common::mcp_methods::{INITIALIZED_METHOD, ROOTS_LIST_METHOD, SANDBOX_CONFIGURED_METHOD};
 use ahma_common::mcp_protocol::{MCP_PROTOCOL_VERSION_HEADER, negotiated_protocol_version};
@@ -47,9 +49,9 @@ pub const SESSION_ID_HEADER: &str = "mcp-session-id";
 /// constant.
 pub const PROTOCOL_VERSION: &str = ahma_common::mcp_protocol::REQUESTED_PROTOCOL_VERSION;
 
-/// How to reach the server: the full `/mcp` endpoint URL plus the reqwest
+/// How to reach the server: the full `/mcp` endpoint URL plus the HTTP
 /// clients to use. Callers construct the clients themselves so
-/// consumer-specific concerns (per-base-URL caching, Unix-socket binding,
+/// consumer-specific concerns (per-base-URL caching, TCP or the local socket,
 /// request timeouts) stay with the consumer. `sse_client` must have **no
 /// request timeout** — the SSE stream is long-lived by design.
 #[derive(Clone)]
@@ -57,9 +59,9 @@ pub struct Connector {
     /// Full MCP endpoint URL, e.g. `http://127.0.0.1:3000/mcp`.
     pub mcp_url: String,
     /// Client for JSON-RPC POSTs (may carry a request timeout).
-    pub post_client: reqwest::Client,
+    pub post_client: HttpClient,
     /// Client for the long-lived GET SSE stream (must not time out).
-    pub sse_client: reqwest::Client,
+    pub sse_client: HttpClient,
 }
 
 /// Parameters for the full handshake ([`StreamableHttpMcpClient::connect`]).
@@ -143,7 +145,7 @@ pub struct ToolDescriptor {
 /// the process exits), matching how consumers cache bare session ids. Call
 /// [`delete_session`](Self::delete_session) to end the session eagerly.
 pub struct StreamableHttpMcpClient {
-    post_client: reqwest::Client,
+    post_client: HttpClient,
     mcp_url: String,
     session_id: String,
     /// The version the server answered in `initialize` (2025-06-18
@@ -282,13 +284,13 @@ impl StreamableHttpMcpClient {
     /// negotiated; pass [`ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION`]
     /// if the caller never captured it.
     pub fn attach(
-        post_client: reqwest::Client,
+        post_client: impl Into<HttpClient>,
         mcp_url: impl Into<String>,
         session_id: impl Into<String>,
         protocol_version: impl Into<String>,
     ) -> Self {
         Self {
-            post_client,
+            post_client: post_client.into(),
             mcp_url: mcp_url.into(),
             session_id: session_id.into(),
             protocol_version: protocol_version.into(),
@@ -340,15 +342,23 @@ impl StreamableHttpMcpClient {
             "params": params
         });
         let service = mcp_service_name(&self.mcp_url);
-        send_with_retry(&service, &self.retry, method_idempotency(method), || {
-            self.post_client
-                .post(&self.mcp_url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header(SESSION_ID_HEADER, &self.session_id)
-                .header(MCP_PROTOCOL_VERSION_HEADER, &self.protocol_version)
-                .json(&body)
-        })
+        send_with_retry_using(
+            &service,
+            &self.retry,
+            method_idempotency(method),
+            || {
+                self.post_client.send(
+                    self.post_client
+                        .post(&self.mcp_url)
+                        .header("Content-Type", "application/json")
+                        .header("Accept", "application/json")
+                        .header(SESSION_ID_HEADER, &self.session_id)
+                        .header(MCP_PROTOCOL_VERSION_HEADER, &self.protocol_version)
+                        .json(&body),
+                )
+            },
+            classify_send_error,
+        )
         .await
         .map(|(response, _)| response)
         .map_err(|failure| transport_error(&service, method, &self.mcp_url, failure))
@@ -424,11 +434,13 @@ impl StreamableHttpMcpClient {
     pub async fn delete_session(&self, timeout: Duration) {
         let _ = self
             .post_client
-            .delete(&self.mcp_url)
-            .header(SESSION_ID_HEADER, &self.session_id)
-            .header(MCP_PROTOCOL_VERSION_HEADER, &self.protocol_version)
-            .timeout(timeout)
-            .send()
+            .send(
+                self.post_client
+                    .delete(&self.mcp_url)
+                    .header(SESSION_ID_HEADER, &self.session_id)
+                    .header(MCP_PROTOCOL_VERSION_HEADER, &self.protocol_version)
+                    .timeout(timeout),
+            )
             .await;
     }
 }
@@ -464,7 +476,7 @@ fn transport_error(
     service: &str,
     method: &str,
     url: &str,
-    failure: TransportFailure,
+    failure: TransportFailure<SendError>,
 ) -> anyhow::Error {
     ServiceError::new(
         service,
@@ -525,7 +537,7 @@ pub fn parse_tools_list(val: &Value) -> Vec<ToolDescriptor> {
 /// "missing header" message hides all of those, so surface status + a bounded
 /// body snippet.
 async fn initialize_session(
-    client: &reqwest::Client,
+    client: &HttpClient,
     mcp_url: &str,
     client_name: &str,
     client_version: &str,
@@ -545,17 +557,20 @@ async fn initialize_session(
     // on the ahma bridge, a subprocess), so only a request that never arrived
     // or was explicitly refused-for-now is sent again (SPEC R-HTTP.2).
     let service = mcp_service_name(mcp_url);
-    let (resp, _) = send_with_retry(
+    let (resp, _) = send_with_retry_using(
         &service,
         &RetryPolicy::DEFAULT,
         Idempotency::NotIdempotent,
         || {
-            client
-                .post(mcp_url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .json(&init_body)
+            client.send(
+                client
+                    .post(mcp_url)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .json(&init_body),
+            )
         },
+        classify_send_error,
     )
     .await
     .map_err(|failure| transport_error(&service, "initialize", mcp_url, failure))?;
@@ -613,12 +628,11 @@ async fn post_initialized(
     if accept_json {
         req = req.header("Accept", "application/json");
     }
-    let _ = req
+    let req = req
         .header(SESSION_ID_HEADER, session_id)
         .header(MCP_PROTOCOL_VERSION_HEADER, protocol_version)
-        .json(&json!({ "jsonrpc": "2.0", "method": INITIALIZED_METHOD }))
-        .send()
-        .await;
+        .json(&json!({ "jsonrpc": "2.0", "method": INITIALIZED_METHOD }));
+    let _ = connector.post_client.send(req).await;
 }
 
 /// Long-lived SSE listener for a session: opens the GET stream, signals
@@ -635,13 +649,14 @@ async fn run_sse_listener(
     ready_tx: tokio::sync::oneshot::Sender<()>,
     mut locked_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
-    let response = connector
-        .sse_client
-        .get(&connector.mcp_url)
-        .header("Accept", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header(SESSION_ID_HEADER, &session_id)
-        .send()
+    let sse = &connector.sse_client;
+    let response = sse
+        .send(
+            sse.get(&connector.mcp_url)
+                .header("Accept", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .header(SESSION_ID_HEADER, &session_id),
+        )
         .await
         .context("SSE GET failed")?;
 
@@ -743,13 +758,15 @@ async fn respond_to_roots_list(
         "result": { "roots": roots_json }
     });
     debug!("answering roots/list: {roots_response:?}");
-    let _ = connector
-        .post_client
-        .post(&connector.mcp_url)
-        .header("Content-Type", "application/json")
-        .header(SESSION_ID_HEADER, session_id)
-        .header(MCP_PROTOCOL_VERSION_HEADER, protocol_version)
-        .json(&roots_response)
-        .send()
+    let client = &connector.post_client;
+    let _ = client
+        .send(
+            client
+                .post(&connector.mcp_url)
+                .header("Content-Type", "application/json")
+                .header(SESSION_ID_HEADER, session_id)
+                .header(MCP_PROTOCOL_VERSION_HEADER, protocol_version)
+                .json(&roots_response),
+        )
         .await;
 }

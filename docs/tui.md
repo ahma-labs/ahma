@@ -263,7 +263,8 @@ and in particular never one scoped to the directory you happened to open it in
 
 1. **Unix socket** — the daemon's `mcp.sock` in your per-user runtime directory
    (`$XDG_RUNTIME_DIR/ahma`, else `~/.ahma`), or `[http] unix_socket_path` in
-   `~/.ahma/settings.toml`. Lowest latency, local only. `$AHMA_UNIX_SOCKET` is retired (R-CFG1.2) and ignored by the TUI as it is by `ahma serve`.
+   `~/.ahma/settings.toml`. Lowest latency, local only, and the same `AF_UNIX` socket on
+   Windows (10 1803 or later). `$AHMA_UNIX_SOCKET` is retired (R-CFG1.2) and ignored by the TUI as it is by `ahma serve`.
 2. **HTTP/3 (QUIC)** — when the server advertises `Alt-Svc: h3=…` _and_ local TLS material exists at `~/.ahma/tls/`. See [TLS provisioning](#tls-provisioning-for-quic) below.
 3. **HTTP/1.1 / HTTP/2** — plain TCP, always available as a fallback.
 

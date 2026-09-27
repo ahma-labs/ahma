@@ -5706,7 +5706,6 @@ fn http_base_url(connection: &ResolvedConnection) -> String {
     match &connection.transport {
         crate::connection::ResolvedTransport::Http(url)
         | crate::connection::ResolvedTransport::Http3(url) => url.clone(),
-        #[cfg(unix)]
         crate::connection::ResolvedTransport::UnixSocket(path) => {
             // `AHMA_HTTP_URL` is retired (R-CFG1.2) and warn-and-ignored: it was
             // an undocumented second way to redirect the endpoint, invisible to

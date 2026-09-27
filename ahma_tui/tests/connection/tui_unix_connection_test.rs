@@ -9,10 +9,7 @@
 //! * The retired `AHMA_UNIX_SOCKET` variable (R-CFG1.2) is ignored.
 //! * `resolve_connection` falls back to HTTP when no Unix socket is present.
 //!
-//! All tests are gated on `cfg(unix)` — Unix domain sockets are not available
-//! on Windows.
-
-#![cfg(unix)]
+//! On every OS: the socket is `AF_UNIX` on Windows too (SPEC R-DAEMON.2).
 
 use crate::common;
 

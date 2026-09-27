@@ -368,14 +368,17 @@ async fn handshake_opens_sse_before_initialized_http3() {
 ///
 /// `ahma serve unix` is the default local transport, so the race must be proven
 /// gone here too. The mock MCP server is served over a Unix domain socket and
-/// the TUI connects via `ResolvedTransport::UnixSocket`.
-#[cfg(unix)]
+/// the TUI connects via `ResolvedTransport::UnixSocket` — on every OS, since
+/// the socket is `AF_UNIX` on Windows too (SPEC R-DAEMON.2).
 #[tokio::test]
 async fn handshake_opens_sse_before_initialized_unix() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let socket_path = tmp.path().join("ahma_tui_handshake_test.sock");
 
-    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind unix socket");
+    // Bound before the client starts, so no wait is needed.
+    let listener = common::LocalAxumListener(
+        ahma_common::local_socket::LocalListener::bind(&socket_path).expect("bind local socket"),
+    );
     let state = new_handshake_state();
     let router = handshake_router(state.clone());
     let _server = tokio::spawn(async move {
@@ -383,7 +386,6 @@ async fn handshake_opens_sse_before_initialized_unix() {
             .await
             .expect("handshake mock server error");
     });
-    tokio::time::sleep(TestTimeouts::short_delay()).await;
 
     let socket_str = socket_path.to_string_lossy().into_owned();
     let connection = ResolvedConnection {

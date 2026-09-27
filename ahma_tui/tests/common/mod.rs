@@ -35,10 +35,7 @@ pub async fn start_bridge_tcp(enable_quic: bool) -> BridgeHandle {
     let config = BridgeConfig {
         bind_addr,
         listener_kind: ListenerKind::Tcp(bind_addr),
-        #[cfg(unix)]
-        server_command: "false".to_string(),
-        #[cfg(not(unix))]
-        server_command: "cmd".to_string(),
+        server_command: noop_server_command(),
         enable_quic,
         ..BridgeConfig::default()
     };
@@ -52,14 +49,18 @@ pub async fn start_bridge_tcp(enable_quic: bool) -> BridgeHandle {
     BridgeHandle { base_url, task }
 }
 
+/// A command that exists on this OS; health-only tests never run it.
+fn noop_server_command() -> String {
+    if cfg!(windows) { "cmd" } else { "false" }.to_string()
+}
+
 /// In-process Unix-socket bridge handle that aborts and cleans up on drop.
-#[cfg(unix)]
+/// `AF_UNIX` on every OS, Windows included (SPEC R-DAEMON.2).
 pub struct UnixBridgeHandle {
     pub socket_path: std::path::PathBuf,
     task: tokio::task::JoinHandle<()>,
 }
 
-#[cfg(unix)]
 impl Drop for UnixBridgeHandle {
     fn drop(&mut self) {
         self.task.abort();
@@ -69,7 +70,6 @@ impl Drop for UnixBridgeHandle {
 
 /// Start an in-process HTTP bridge on a Unix domain socket.
 /// Waits until the socket file appears (up to 5 s) before returning.
-#[cfg(unix)]
 pub async fn start_bridge_unix(socket_path: std::path::PathBuf) -> UnixBridgeHandle {
     let path_str = socket_path.to_string_lossy().into_owned();
     let dummy_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -77,7 +77,7 @@ pub async fn start_bridge_unix(socket_path: std::path::PathBuf) -> UnixBridgeHan
     let config = BridgeConfig {
         bind_addr: dummy_addr,
         listener_kind: ListenerKind::Unix(path_str),
-        server_command: "false".to_string(),
+        server_command: noop_server_command(),
         enable_quic: false,
         ..BridgeConfig::default()
     };
@@ -124,4 +124,26 @@ pub async fn wait_for_health(base_url: &str) {
         }
     }
     panic!("Server at {base_url} did not become healthy within scaled 5 seconds");
+}
+
+/// Serve an axum router on a local socket, on every OS: tokio's
+/// `UnixListener` does not exist on Windows.
+pub struct LocalAxumListener(pub ahma_common::local_socket::LocalListener);
+
+impl axum::serve::Listener for LocalAxumListener {
+    type Io = ahma_common::local_socket::LocalStream;
+    type Addr = ();
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok(stream) => return (stream, ()),
+                Err(_) => tokio::time::sleep(TestTimeouts::poll_interval()).await,
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(())
+    }
 }

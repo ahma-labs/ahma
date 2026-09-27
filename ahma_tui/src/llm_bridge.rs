@@ -143,7 +143,7 @@ fn is_local_default_server(url: &str) -> bool {
 /// it so subsequent calls reuse it instead of retrying a dead session, and
 /// retries the tool call exactly once.
 async fn retry_tool_call_after_403(
-    client: &reqwest::Client,
+    client: &ahma_http_mcp_client::http_client::HttpClient,
     url: &str,
     mcp: &McpChatConfig,
     tool: &str,

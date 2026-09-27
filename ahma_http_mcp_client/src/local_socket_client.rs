@@ -397,35 +397,13 @@ impl StreamableHttpClient for LocalSocketHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::serve_on_local_socket as serve;
     use ahma_common::local_socket::LocalListener;
     use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
     use rmcp::transport::streamable_http_client::{
         StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
     };
     use std::collections::HashMap;
-
-    /// Serve every connection on `listener` with `app`, the way the bridge does.
-    fn serve(listener: LocalListener, app: axum::Router) {
-        tokio::spawn(async move {
-            while let Ok(stream) = listener.accept().await {
-                let app = app.clone();
-                tokio::spawn(async move {
-                    let svc = hyper::service::service_fn(
-                        move |req: hyper::Request<hyper::body::Incoming>| {
-                            let mut app = app.clone();
-                            async move {
-                                use tower_service::Service;
-                                app.call(req.map(axum::body::Body::new)).await
-                            }
-                        },
-                    );
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
-                        .await;
-                });
-            }
-        });
-    }
 
     fn ping() -> ClientJsonRpcMessage {
         serde_json::from_value(serde_json::json!({
