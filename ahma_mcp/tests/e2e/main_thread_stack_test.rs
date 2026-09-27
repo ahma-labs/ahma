@@ -8,11 +8,13 @@
 //! stack` before the MCP handshake. `main` now runs ahma on a thread whose stack
 //! size ahma chooses, so the platform's main-thread size no longer matters.
 //!
-//! Unix-only because the only way to reproduce a small main-thread stack from a
-//! test is `RLIMIT_STACK`, which sizes the main thread of the next `exec`. The
-//! Windows leg exercises the real constraint on every run through all its other
-//! subprocess tests.
-#![cfg(unix)]
+//! Linux-only because the only way to reproduce a small main-thread stack from a
+//! test is lowering `RLIMIT_STACK` before `exec`, which Linux honours for the
+//! next image's main thread. macOS refuses the same `setrlimit` in the forked
+//! child with `EINVAL` (below the stack the process already has), so the test
+//! could not even spawn `ahma` there. The Windows leg exercises the real 1 MiB
+//! constraint on every run through all its other subprocess tests.
+#![cfg(target_os = "linux")]
 
 use ahma_mcp::test_utils::cli::{build_binary_cached, test_command};
 use std::io::Write;
