@@ -93,11 +93,17 @@ honest gating.
   scope record when the notification omits its scope summary — and may fail fast when a scope
   is provably unresolvable (no roots and no fallback scope), but must never itself transition
   a session to `Active`.
-- **RB.3 — Deterministic POST-SSE interleave**: the SSE response stream for a POST request
-  contains exactly the broadcast events already queued when the response became available,
-  followed by the response event, then closes. No wall-clock windows: an event that arrives
-  later is delivered on the live `GET /mcp` stream and retained for `Last-Event-Id` replay,
-  never raced against a timer.
+- **RB.3 — Live, deterministic POST-SSE stream**: the SSE response to a POST request starts
+  at once — its headers are sent before the request is answered — and carries each broadcast
+  event published while the request runs as it arrives, then, once the response is available,
+  exactly the events already queued, the response event, and closes. Holding the headers until
+  the response was ready stalled the client: rmcp's HTTP client performs one POST at a time, so
+  one long `tools/call` (an `await` may run 30 minutes) held every other request, progress
+  notification and liveness ping on the session behind it, and RB.4 then killed the session as
+  unresponsive. Refusals that are known before the request is sent (unknown session, duplicate
+  id, dead subprocess pipe) keep their HTTP status; anything later is an in-band JSON-RPC
+  error. No wall-clock windows: an event that arrives after the response is delivered on the
+  live `GET /mcp` stream and retained for `Last-Event-Id` replay, never raced against a timer.
 - **RB.4 — Active client liveness probe**: the bridge periodically pings every session that has
   a live SSE subscriber, over the same routed-request channel used for sampling
   (`Session::routed_requests`), and terminates a session — cascading to its sandboxed worker
@@ -108,7 +114,9 @@ honest gating.
   hung process, or a dead network path can leave a session (and its subprocess) alive
   indefinitely otherwise. A session with **no** SSE subscriber at all is the
   idle-eviction sweep's responsibility (`SessionManager::evict_oldest_inactive_session`), not
-  this probe's — pinging it would have nothing to reach.
+  this probe's — pinging it would have nothing to reach. Nor is a session with a request
+  still in flight: its client is waiting on the bridge, and may be unable to answer until that
+  request returns.
 
 ## 3. Non-Functional Requirements
 

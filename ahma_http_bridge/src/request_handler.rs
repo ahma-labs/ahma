@@ -64,51 +64,32 @@ fn json_rpc_error_value(id: Value, code: i32, message: &str) -> Value {
     })
 }
 
-/// Build the recoverable "request timed out" response for a forwarded request
+/// Build the recoverable "request timed out" answer for a forwarded request
 /// (SPEC RB.1.2 — identical semantics on both transports).
 ///
-/// Returned with **HTTP 200** (not 500) and the original request `id` so the
-/// rmcp client correlates it to the pending request and surfaces it as that
-/// request's error — WITHOUT treating the transport as dead. A 500 here would
-/// make the rmcp streamable-HTTP client raise `UnexpectedServerResponse`, which
+/// Sent with **HTTP 200** (not 500) on the JSON transport, and as an ordinary
+/// event on the SSE one, with the original request `id` so the rmcp client
+/// correlates it to the pending request and surfaces it as that request's
+/// error — WITHOUT treating the transport as dead. A 500 here would make the
+/// rmcp streamable-HTTP client raise `UnexpectedServerResponse`, which
 /// `proxy_client` treats as fatal and tears the whole MCP session down. The
 /// operation itself keeps running in the subprocess; the caller can await again
 /// or wait for the completion notification.
-///
-/// In SSE mode the same JSON-RPC error body is delivered as a single SSE event,
-/// matching how the response itself would have been encoded.
-fn request_timeout_response(
-    session_manager: &SessionManager,
-    session_id: &str,
-    payload: &Value,
-    mode: ResponseMode,
-    window: Duration,
-) -> Response {
-    let id = payload_id(payload);
+fn request_timeout_body(payload: &Value, window: Duration) -> Value {
     // SPEC R2.6.5.4: state the wait that was applied. An `await` asked for more
     // than this window is cut here, and the caller must be able to see that
     // the number that elapsed is the bridge's, not the one it requested.
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": JSONRPC_REQUEST_TIMEOUT,
-            "message": format!(
-                "Operation still running: the bridge wait window ({}s) elapsed \
-                 before the tool returned. The operation continues in the \
-                 background — await again or wait for the completion \
-                 notification.",
-                window.as_secs()
-            )
-        }
-    });
-    match mode {
-        ResponseMode::Json => json_response_with_status(StatusCode::OK, body),
-        ResponseMode::Sse => {
-            let (event_id, json_str) = sse_event_for_session(session_manager, session_id, &body);
-            sse_single_event_response_with_id(event_id, json_str)
-        }
-    }
+    json_rpc_error_value(
+        payload_id(payload),
+        JSONRPC_REQUEST_TIMEOUT,
+        &format!(
+            "Operation still running: the bridge wait window ({}s) elapsed \
+             before the tool returned. The operation continues in the \
+             background — await again or wait for the completion \
+             notification.",
+            window.as_secs()
+        ),
+    )
 }
 
 /// Attach MCP session header when available.
@@ -650,8 +631,7 @@ async fn handle_initialize(
     }
 }
 
-/// Encode a successful `initialize` response for the caller's transport
-/// (mirrors [`encode_forwarded_response`] for the forwarding path).
+/// Encode a successful `initialize` response for the caller's transport.
 fn encode_initialize_response(
     session_manager: &Arc<SessionManager>,
     session_id: &str,
@@ -779,7 +759,7 @@ async fn handle_roots_changed_request(
 /// Handles requests for an existing session: the shared gate, then the shared
 /// mode-aware dispatch (SPEC RB.1).
 async fn handle_existing_session_request(
-    session_manager: &SessionManager,
+    session_manager: &Arc<SessionManager>,
     session_id: &str,
     method: Option<&str>,
     payload: &Value,
@@ -1279,14 +1259,14 @@ async fn mark_session_initialized(
 /// are identical; only the encoding of each outcome differs by `mode`:
 ///
 /// * JSON: every outcome is a JSON body (requests and notifications alike).
-/// * SSE, request (has `id`): an SSE stream interleaving already-queued
-///   broadcast events with the response event.
+/// * SSE, request (has `id`): an SSE stream that starts at once and carries
+///   the session's broadcast events live, then the response event (RB.3).
 /// * SSE, notification (no `id`): HTTP 202 Accepted, per MCP Streamable HTTP
 ///   spec §3.2.1 — returning an SSE stream here makes rmcp clients calling
 ///   `expect_accepted_or_json()` reject the response with
 ///   `UnexpectedServerResponse`, tearing down the proxy transport.
 async fn forward_request(
-    session_manager: &SessionManager,
+    session_manager: &Arc<SessionManager>,
     session_id: &str,
     method: Option<&str>,
     payload: &Value,
@@ -1318,44 +1298,15 @@ async fn forward_request(
 
     let request_timeout = forwarded_request_timeout(session_manager, method, payload);
 
-    match session_manager
-        .send_request(session_id, payload, Some(request_timeout))
-        .await
-    {
-        Ok(response) => {
-            handle_roots_list_response(session_manager, session_id, method, &response).await;
-            mark_session_initialized(session_manager, session_id, is_initialized_notification)
-                .await;
-            let encoded = encode_forwarded_response(sse_subscription, mode, response);
-            with_session_header(encoded, session_id)
-        }
-        // A per-request timeout is recoverable ON BOTH TRANSPORTS (SPEC
-        // RB.1.2): the subprocess is alive and the operation is still running,
-        // only our wait window elapsed. Return it as an HTTP 200 JSON-RPC error
-        // so the session survives (see `request_timeout_response`). A genuine
-        // transport/protocol failure still gets a fatal -32603 / HTTP 500 below.
-        Err(BridgeError::Timeout) => {
-            warn!(
-                session_id = %session_id,
-                "Forwarded request timed out; operation still running — returning \
-                 recoverable timeout (session preserved)"
-            );
-            with_session_header(
-                request_timeout_response(
-                    session_manager,
-                    session_id,
-                    payload,
-                    mode,
-                    request_timeout,
-                ),
-                session_id,
-            )
-        }
+    // Everything that can refuse the request fails here, while an HTTP status
+    // can still say so; only the wait for the answer is deferred.
+    let in_flight = match session_manager.start_request(session_id, payload).await {
+        Ok(in_flight) => in_flight,
         // The client's fault, not the bridge's: an invalid request (SPEC R8.3.7).
         // The earlier request with this id is untouched and still in flight.
         Err(e @ BridgeError::DuplicateRequestId { .. }) => {
             warn!(session_id = %session_id, "Rejected request: {}", e);
-            with_session_header(
+            return with_session_header(
                 error_response_with_status(
                     StatusCode::BAD_REQUEST,
                     payload_id(payload),
@@ -1363,14 +1314,125 @@ async fn forward_request(
                     &e.to_string(),
                 ),
                 session_id,
+            );
+        }
+        Err(e) => {
+            error!(session_id = %session_id, "Failed to send request: {}", e);
+            return error_response(
+                payload_id(payload),
+                -32603,
+                &format!("Failed to send request: {}", e),
+            );
+        }
+    };
+
+    let Some((session, rx)) = sse_subscription else {
+        let outcome = in_flight.response(Some(request_timeout)).await;
+        let (status, body) = settle_forwarded(
+            session_manager,
+            session_id,
+            method,
+            payload,
+            is_initialized_notification,
+            outcome,
+            request_timeout,
+        )
+        .await;
+        return if status == StatusCode::OK {
+            with_session_header(json_response_with_status(status, body), session_id)
+        } else {
+            json_response_with_status(status, body)
+        };
+    };
+
+    // SSE: start the stream now and deliver the answer on it when it comes
+    // (SPEC RB.3). Waiting for the answer before sending even the headers held
+    // the client's HTTP worker for the whole call — rmcp's performs one POST at
+    // a time — so one long `tools/call` stalled every other request, progress
+    // notification and liveness ping on the session behind it. The wait runs
+    // in its own task so an answer that arrives after the client dropped this
+    // stream still reaches the session's replay buffer.
+    let answer = {
+        let session_manager = Arc::clone(session_manager);
+        let session_id = session_id.to_owned();
+        let method = method.map(str::to_owned);
+        let payload = payload.clone();
+        tokio::spawn(async move {
+            let outcome = in_flight.response(Some(request_timeout)).await;
+            settle_forwarded(
+                &session_manager,
+                &session_id,
+                method.as_deref(),
+                &payload,
+                is_initialized_notification,
+                outcome,
+                request_timeout,
+            )
+            .await
+            .1
+        })
+    };
+    let request_id = payload_id(payload);
+    let answer = async move {
+        answer.await.unwrap_or_else(|e| {
+            json_rpc_error_value(request_id, -32603, &format!("Request task failed: {e}"))
+        })
+    };
+    with_session_header(
+        Sse::new(build_interleaved_sse_stream(session, rx, answer))
+            .keep_alive(KeepAlive::default())
+            .into_response(),
+        session_id,
+    )
+}
+
+/// Run a forwarded request's side effects and turn its outcome into the
+/// JSON-RPC message that answers it, with the HTTP status the JSON transport
+/// sends it under (the SSE transport carries it in-band, as an event).
+///
+/// Shared by both transports (SPEC RB.1): the post-forward side effects (roots
+/// lock, initialized flag) and the error/timeout semantics are identical.
+async fn settle_forwarded(
+    session_manager: &SessionManager,
+    session_id: &str,
+    method: Option<&str>,
+    payload: &Value,
+    is_initialized_notification: bool,
+    outcome: crate::error::Result<Value>,
+    request_timeout: Duration,
+) -> (StatusCode, Value) {
+    match outcome {
+        Ok(response) => {
+            handle_roots_list_response(session_manager, session_id, method, &response).await;
+            mark_session_initialized(session_manager, session_id, is_initialized_notification)
+                .await;
+            (StatusCode::OK, response)
+        }
+        // A per-request timeout is recoverable ON BOTH TRANSPORTS (SPEC
+        // RB.1.2): the subprocess is alive and the operation is still running,
+        // only our wait window elapsed. Return it as an HTTP 200 JSON-RPC error
+        // so the session survives (see `request_timeout_body`). A genuine
+        // transport/protocol failure still gets a fatal -32603 / HTTP 500 below.
+        Err(BridgeError::Timeout) => {
+            warn!(
+                session_id = %session_id,
+                "Forwarded request timed out; operation still running — returning \
+                 recoverable timeout (session preserved)"
+            );
+            (
+                StatusCode::OK,
+                request_timeout_body(payload, request_timeout),
             )
         }
         Err(e) => {
             error!(session_id = %session_id, "Failed to send request: {}", e);
-            error_response(
-                payload_id(payload),
-                -32603,
-                &format!("Failed to send request: {}", e),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json_rpc_error_value(
+                    payload_id(payload),
+                    -32603,
+                    &format!("Failed to send request: {}", e),
+                ),
             )
         }
     }
@@ -1413,26 +1475,6 @@ fn forwarded_request_timeout(
         calculate_tool_timeout(payload, session_manager.tool_call_timeout_secs())
     } else {
         Duration::from_secs(session_manager.request_timeout_secs())
-    }
-}
-
-/// Encode a successfully forwarded request's response for the wire.
-///
-/// `sse_subscription` is `Some` exactly when the caller is on the SSE
-/// transport and the subscription was captured before the request was sent
-/// (see [`capture_sse_subscription`]); this stays a pure encode step over
-/// that already-resolved state.
-fn encode_forwarded_response(
-    sse_subscription: Option<SseSubscription>,
-    mode: ResponseMode,
-    response: Value,
-) -> Response {
-    match sse_subscription {
-        Some((session, rx)) => Sse::new(build_interleaved_sse_stream(session, rx, response))
-            .keep_alive(KeepAlive::default())
-            .into_response(),
-        None if mode == ResponseMode::Sse => StatusCode::ACCEPTED.into_response(),
-        None => json_response(response),
     }
 }
 
@@ -1575,43 +1617,95 @@ pub(crate) fn broadcast_sse_event_stream(
 /// Build the SSE stream for a POST request's response (SPEC RB.3).
 ///
 /// Per MCP Streamable HTTP spec, POST with `Accept: text/event-stream` returns
-/// an SSE stream containing the JSON-RPC response event plus any interleaved
-/// server notifications. The interleave is **deterministic**: exactly the
-/// broadcast events already queued on `rx` (subscribed before the request was
-/// forwarded) are drained and emitted, followed by the response event, then the
-/// stream closes.
+/// an SSE stream carrying the server's messages for that request and then its
+/// JSON-RPC response. The stream starts immediately: each broadcast event
+/// published while the request runs (progress, the bridge's liveness ping) is
+/// emitted as it arrives, not held until the response. When `response`
+/// resolves, the events already queued on `rx` are drained first, so the
+/// response is the stream's last event, and the stream closes.
 ///
-/// This replaces an earlier 50 ms wall-clock `take_until` window, which added
-/// 50 ms latency to *every* POST-SSE response and made the event set
-/// timing-dependent: an event racing the window's edge was sometimes included,
-/// sometimes not. Events that arrive after the response is ready are not lost —
-/// they remain in the session's replay buffer and are delivered on the live
-/// `GET /mcp` stream (or via `Last-Event-Id` replay).
+/// `rx` must be subscribed before the request is forwarded, or events the
+/// subprocess publishes early are missed. Events that arrive after the response
+/// are not lost: they stay in the session's replay buffer and reach the client
+/// on the live `GET /mcp` stream (or via `Last-Event-Id` replay).
 fn build_interleaved_sse_stream(
     session: Arc<crate::session::Session>,
-    mut rx: tokio::sync::broadcast::Receiver<(u64, String)>,
-    response: Value,
+    rx: tokio::sync::broadcast::Receiver<(u64, String)>,
+    response: impl std::future::Future<Output = Value> + Send + 'static,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
-    use tokio::sync::broadcast::error::TryRecvError;
+    use std::collections::VecDeque;
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
-    let mut events: Vec<Event> = Vec::new();
-    loop {
-        match rx.try_recv() {
-            Ok((id, msg)) => {
-                debug!(session_id = %session.id, event_id = id, "POST SSE notification: {msg}");
-                events.push(sse_event(id, msg));
-            }
-            Err(TryRecvError::Lagged(n)) => {
-                events.push(Event::default().comment(record_and_describe_lag(&session, n)));
-            }
-            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-        }
+    enum Next {
+        Broadcast(Result<(u64, String), RecvError>),
+        Response(Value),
     }
 
-    let (response_id, response_json) = session_sse_event(&session, &response);
-    events.push(sse_event(response_id, response_json));
+    struct State<F> {
+        session: Arc<crate::session::Session>,
+        rx: tokio::sync::broadcast::Receiver<(u64, String)>,
+        rx_open: bool,
+        response: Option<std::pin::Pin<Box<F>>>,
+        ready: VecDeque<Event>,
+    }
 
-    stream::iter(events.into_iter().map(Ok::<_, Infallible>))
+    let broadcast_event = |session: &crate::session::Session, id: u64, msg: String| {
+        debug!(session_id = %session.id, event_id = id, "POST SSE notification: {msg}");
+        sse_event(id, msg)
+    };
+
+    let state = State {
+        session,
+        rx,
+        rx_open: true,
+        response: Some(Box::pin(response)),
+        ready: VecDeque::new(),
+    };
+    stream::unfold(state, move |mut state| async move {
+        loop {
+            if let Some(event) = state.ready.pop_front() {
+                return Some((Ok::<_, Infallible>(event), state));
+            }
+            let response = state.response.as_mut()?;
+            let next = tokio::select! {
+                biased;
+                received = state.rx.recv(), if state.rx_open => Next::Broadcast(received),
+                value = response => Next::Response(value),
+            };
+            match next {
+                Next::Broadcast(Ok((id, msg))) => {
+                    state
+                        .ready
+                        .push_back(broadcast_event(&state.session, id, msg));
+                }
+                Next::Broadcast(Err(RecvError::Lagged(n))) => {
+                    let lag = record_and_describe_lag(&state.session, n);
+                    state.ready.push_back(Event::default().comment(lag));
+                }
+                // Nothing more will be published; only the response remains.
+                Next::Broadcast(Err(RecvError::Closed)) => state.rx_open = false,
+                Next::Response(value) => {
+                    state.response = None;
+                    loop {
+                        match state.rx.try_recv() {
+                            Ok((id, msg)) => {
+                                state
+                                    .ready
+                                    .push_back(broadcast_event(&state.session, id, msg));
+                            }
+                            Err(TryRecvError::Lagged(n)) => {
+                                let lag = record_and_describe_lag(&state.session, n);
+                                state.ready.push_back(Event::default().comment(lag));
+                            }
+                            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                        }
+                    }
+                    let (id, json) = session_sse_event(&state.session, &value);
+                    state.ready.push_back(sse_event(id, json));
+                }
+            }
+        }
+    })
 }
 
 /// The single request gate shared by both transports (SPEC RB.1).
@@ -3555,7 +3649,7 @@ mod tests {
             .broadcast("{\"note\":\"interleaved\"}".to_string())
             .expect("broadcast ok");
 
-        let stream = build_interleaved_sse_stream(session, rx, json!({"resp": "final"}));
+        let stream = build_interleaved_sse_stream(session, rx, async { json!({"resp": "final"}) });
         let resp = Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response();
@@ -3760,5 +3854,60 @@ mod tests {
             "message should explain the op continues: {body}"
         );
         assert!(mgr.session_exists(&id), "the session must survive");
+    }
+
+    /// REGRESSION: the SSE transport used to wait for the whole tool call before
+    /// sending even the response headers. rmcp's client performs each POST
+    /// inline in its worker loop, so one long call (an `await` can run for 30
+    /// minutes) stalled everything else on that session behind it: concurrent
+    /// requests, progress, and the bridge's own liveness pings — which then went
+    /// unanswered until the bridge killed the session as unresponsive.
+    #[tokio::test]
+    async fn forward_sse_request_streams_before_the_tool_call_returns() {
+        use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        // The keep-alive peer never answers, and `await` gets the longest wait
+        // the bridge grants any request.
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {"name": "await", "arguments": {}}
+        });
+        let resp = tokio::time::timeout(
+            TestTimeouts::get(TimeoutCategory::Quick),
+            forward_request(
+                &mgr,
+                &id,
+                Some("tools/call"),
+                &payload,
+                false,
+                ResponseMode::Sse,
+            ),
+        )
+        .await
+        .expect("the SSE response must start at once, not when the tool call returns");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(content_type(&resp).contains("text/event-stream"));
+        assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+
+        // An event published while the call is still running is delivered now.
+        mgr.get_session(&id)
+            .unwrap()
+            .broadcast("{\"note\":\"live progress\"}".to_string())
+            .expect("broadcast ok");
+        let mut body = resp.into_body().into_data_stream();
+        let first = tokio::time::timeout(TestTimeouts::get(TimeoutCategory::Quick), body.next())
+            .await
+            .expect("a live event must not wait for the response")
+            .expect("stream open")
+            .expect("chunk");
+        assert!(
+            String::from_utf8_lossy(&first).contains("live progress"),
+            "first chunk was: {}",
+            String::from_utf8_lossy(&first)
+        );
     }
 }
