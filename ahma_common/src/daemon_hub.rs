@@ -7,13 +7,10 @@
 //!
 //! ## Transport
 //!
-//! | Platform        | Transport                                |
-//! |-----------------|------------------------------------------|
-//! | Unix / macOS    | Unix domain socket (`~/.ahma/daemon.sock`) |
-//! | Windows         | TCP loopback `127.0.0.1:7395`            |
-//!
-//! Override the path/address with the `--daemon-socket` CLI flag or the `AHMA_DAEMON_SOCK`
-//! internal environment variable (set only by `init_test_daemon_isolation()` in test builds).
+//! One `AF_UNIX` socket, `daemon.sock` in the per-user [`runtime_dir`], on
+//! every OS — Windows included, through [`crate::local_socket`]. Override the
+//! path with the `--daemon-socket` CLI flag; tests are isolated through the
+//! `AHMA_DAEMON_SOCK` variable (see [`default_socket_path`]).
 //!
 //! ## Protocol
 //!
@@ -21,25 +18,20 @@
 //! [`ClientMsg`] (instance → daemon or subscriber → daemon) or [`DaemonMsg`]
 //! (daemon → subscriber).
 //!
-//! ## Startup / race-condition handling
+//! ## Who owns the rendezvous
 //!
-//! The bind-is-the-mutex approach avoids lock files entirely:
+//! The lock beside the socket ([`lock_path_for`]: `daemon.sock` →
+//! `daemon.lock`) is the mutex (SPEC R-DAEMON.2). [`HubServer::bind_at`] takes
+//! it first; a loser gets [`HubBindError::AlreadyRunning`] and connects to the
+//! winner. Only the holder touches the socket file: it removes a stale one
+//! before binding and unlinks its own on the way out, before the lock goes. A
+//! kernel lock dies with its holder, so a crash leaves nothing that has to be
+//! cleaned up by probing — and no process can unlink a socket another one is
+//! serving.
 //!
-//! **Instance side** (`ensure_daemon_running`):
-//! 1. Try `connect()` → success → done, use existing daemon.
-//! 2. Spawn `ahma daemon` as a detached child.
-//! 3. Poll `connect()` every 50 ms × 20 attempts (~1 s).
-//!
-//! **Daemon startup** (`run_daemon`):
-//! 1. Try `bind()` → `Ok` → start serving (won the race).
-//! 2. `EADDRINUSE` → try `connect()` → `Ok` → `exit(0)` (another daemon won).
-//! 3. `EADDRINUSE` + `ECONNREFUSED` → unlink stale socket file (ENOENT benign)
-//!    → go back to step 1.
-//!
-//! **Idle exit**: the daemon resets a 60-second timer on every new connection.
-//! When the timer fires and the active connection count is zero it unlinks the
-//! socket file *first* (so late arrivals get ENOENT, not ECONNREFUSED) and then
-//! exits cleanly.
+//! Nothing in this module starts a daemon. That is one path, in `ahma_mcp`'s
+//! `daemon_client`; a hooked command or a session worker only ever connects
+//! (SPEC R-DAEMON.8).
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -57,36 +49,11 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-// ─── Windows constant ────────────────────────────────────────────────────────
-
-/// TCP port used on Windows (unix sockets not supported there).
-pub const WINDOWS_DAEMON_PORT: u16 = 7395;
-
-/// Get the daemon port.
-///
-/// In test builds, `AHMA_DAEMON_PORT` can be set by `init_test_daemon_isolation()` to
-/// isolate concurrent test processes. In production this always returns `WINDOWS_DAEMON_PORT`
-/// unless `set_socket_path_override` was used (the Windows equivalent of `--daemon-socket`).
-pub fn daemon_port() -> u16 {
-    if let Some(p) = std::env::var("AHMA_DAEMON_PORT")
-        .ok()
-        .and_then(|p_str| p_str.parse::<u16>().ok())
-    {
-        return p;
-    }
-    // Safety net (SPEC R-ISO.1): a test-spawned process that did not go through
-    // `init_test_daemon_isolation` must still not reach the live daemon port.
-    // Derive a stable per-run port so every process in the test run agrees.
-    if crate::test_isolation::spawned_under_test_harness() {
-        return 49152 + test_run_port_offset(16000);
-    }
-    WINDOWS_DAEMON_PORT
-}
+use crate::local_socket::{LocalListener, LocalStream};
 
 /// Fold the current test run's discriminator into a stable pseudo-random
-/// offset in `0..modulus`, shared by [`daemon_port`] and [`bridge_http_port`]
-/// so every process in a test run agrees on both derived ports without
-/// colliding (callers add different base offsets).
+/// offset in `0..modulus`, so every process in a test run agrees on
+/// [`bridge_http_port`] without plumbing.
 fn test_run_port_offset(modulus: u32) -> u16 {
     let disc = crate::test_isolation::test_run_discriminator();
     let hash: u32 = disc.bytes().fold(0u32, |acc, b| {
@@ -112,7 +79,6 @@ pub fn bridge_http_port(configured: u16) -> u16 {
     {
         return configured;
     }
-    // Same derivation as `daemon_port`, offset so the two never collide.
     32768 + test_run_port_offset(16000)
 }
 
@@ -647,43 +613,22 @@ static DAEMON_ISOLATION_INIT: std::sync::Once = std::sync::Once::new();
 #[cfg(test)]
 static DAEMON_SOCK_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Automatically configures environment variables to isolate the ahma daemon
-/// socket (Unix) and port (Windows) for the current test process.
+/// Point this test process's hub socket at a private path.
 ///
 /// Call this at the top of any test that exercises the daemon. It is idempotent
 /// (guarded by a `Once`). Only compiled into test builds.
 #[cfg(test)]
 pub fn init_test_daemon_isolation() {
     DAEMON_ISOLATION_INIT.call_once(|| {
-        isolate_test_unix_socket();
-        isolate_test_windows_port();
-    });
-}
-
-#[cfg(test)]
-fn isolate_test_unix_socket() {
-    if std::env::var_os("AHMA_DAEMON_SOCK").is_none() {
-        let pid = std::process::id();
-        let count = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let socket_name = format!("ah_t_{}_{}.sock", pid, count);
-        let temp_dir = std::env::temp_dir();
-        let socket_path = temp_dir.join(socket_name);
-        unsafe {
-            std::env::set_var("AHMA_DAEMON_SOCK", socket_path);
-        }
-    }
-}
-
-#[cfg(test)]
-fn isolate_test_windows_port() {
-    if std::env::var_os("AHMA_DAEMON_PORT").is_none() {
-        let bind_res = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr());
-        if let Ok(addr) = bind_res {
+        if std::env::var_os("AHMA_DAEMON_SOCK").is_none() {
+            let pid = std::process::id();
+            let count = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let socket_path = std::env::temp_dir().join(format!("ah_t_{pid}_{count}.sock"));
             unsafe {
-                std::env::set_var("AHMA_DAEMON_PORT", addr.port().to_string());
+                std::env::set_var("AHMA_DAEMON_SOCK", socket_path);
             }
         }
-    }
+    });
 }
 
 /// Return the platform-default socket path for the hub daemon.
@@ -692,8 +637,7 @@ fn isolate_test_windows_port() {
 /// 1. `--daemon-socket` CLI flag (`set_socket_path_override`).
 /// 2. `AHMA_DAEMON_SOCK` env var — accepted for backward compat and test isolation;
 ///    emits a deprecation warning in production if not set by `init_test_daemon_isolation`.
-/// 3. Platform default (`$XDG_RUNTIME_DIR/ahma/daemon.sock` on Linux,
-///    `~/.ahma/daemon.sock` on macOS, unused on Windows).
+/// 3. `daemon.sock` in [`runtime_dir`], on every OS.
 pub fn default_socket_path() -> PathBuf {
     if let Some(p) = SOCKET_PATH_OVERRIDE.get() {
         return p.clone();
@@ -726,7 +670,7 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 /// The per-user runtime directory holding every daemon rendezvous file
-/// (SPEC R-DAEMON.2): the hub socket, the MCP socket, and on Windows the
+/// (SPEC R-DAEMON.2): the lock, the hub socket, the MCP socket and the
 /// endpoint descriptor.
 ///
 /// Prefers `$XDG_RUNTIME_DIR/ahma` (per-user, tmpfs, cleaned at logout) and
@@ -833,18 +777,18 @@ pub fn verify_runtime_dir_secure(dir: &std::path::Path) -> Result<()> {
 /// Step 3 of [`default_socket_path`]'s resolution order: the platform default,
 /// ignoring every override. Creates the parent directory as a side effect so the
 /// returned path is immediately bindable.
-#[cfg(unix)]
 fn platform_default_socket_path() -> PathBuf {
     match runtime_dir() {
         Some(dir) => dir.join("daemon.sock"),
-        None => PathBuf::from("/tmp/ahma-daemon.sock"),
+        None => std::env::temp_dir().join("ahma-daemon.sock"),
     }
 }
 
-/// On Windows the path is unused; callers use the TCP address.
-#[cfg(not(unix))]
-fn platform_default_socket_path() -> PathBuf {
-    PathBuf::from("unused-on-windows")
+/// The lock that decides who owns the hub socket at `socket` (SPEC
+/// R-DAEMON.2): the same name with a `.lock` extension, so `daemon.sock` is
+/// guarded by `daemon.lock` and an explicitly placed socket brings its own.
+pub fn lock_path_for(socket: &Path) -> PathBuf {
+    socket.with_extension("lock")
 }
 
 /// The per-user MCP endpoint socket, ignoring test isolation and any explicit
@@ -909,33 +853,16 @@ pub fn mcp_socket_path(explicit: Option<&str>) -> String {
 // Client-side transport abstraction
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Platform stream type returned by [`connect_to_daemon`].
-///
-/// On Unix this is a `UnixStream`; on Windows a `TcpStream`.
-/// Both implement `AsyncRead + AsyncWrite + Unpin + Send`.
-#[cfg(unix)]
-pub type DaemonStream = tokio::net::UnixStream;
-
-#[cfg(not(unix))]
-pub type DaemonStream = tokio::net::TcpStream;
+/// The stream [`connect_to_daemon`] returns: one `AF_UNIX` connection on
+/// every OS.
+pub type DaemonStream = LocalStream;
 
 /// Try to connect to the hub daemon.
 ///
 /// Returns `Ok(stream)` on success, or an error if the daemon is not running.
+/// Never starts one.
 pub async fn connect_to_daemon() -> Result<DaemonStream> {
-    #[cfg(unix)]
-    {
-        let path = default_socket_path();
-        Ok(tokio::net::UnixStream::connect(&path).await?)
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(tokio::net::TcpStream::connect(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            daemon_port(),
-        )))
-        .await?)
-    }
+    Ok(LocalStream::connect(&default_socket_path()).await?)
 }
 
 /// One-shot query of a daemon at an explicit socket: connect, ask for the
@@ -943,9 +870,8 @@ pub async fn connect_to_daemon() -> Result<DaemonStream> {
 ///
 /// Takes the path rather than resolving it so a test can address the daemon it
 /// started, and so a diagnostic can address one that is not the default.
-#[cfg(unix)]
 pub async fn list_instances_at(socket_path: &std::path::Path) -> Result<Vec<InstanceInfo>> {
-    let stream = tokio::net::UnixStream::connect(socket_path).await?;
+    let stream = LocalStream::connect(socket_path).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     send_msg(&mut write_half, &ClientMsg::ListInstances).await?;
@@ -953,90 +879,6 @@ pub async fn list_instances_at(socket_path: &std::path::Path) -> Result<Vec<Inst
         DaemonMsg::InstanceList { instances } => Ok(instances),
         other => bail!("expected an instance list, got {other:?}"),
     }
-}
-
-/// Returns `true` if a daemon is currently accepting connections.
-async fn try_connect() -> bool {
-    connect_to_daemon().await.is_ok()
-}
-
-/// Spawn `ahma daemon` as a detached child and return as soon as the fork
-/// succeeded — readiness is the caller's concern.
-///
-/// Uses the current executable so this works regardless of `PATH`.
-///
-/// Intentionally detached (SPEC R-PROC.3): this daemon must outlive us, so it
-/// deliberately does NOT set `kill_on_drop`. `process_group(0)` is used here for
-/// the opposite reason to an owned child (R-PROC.2) — `setpgid(0,0)` puts the
-/// daemon in its own group so it is *not* killed when the spawning terminal/IDE
-/// exits, rather than so it can be reaped with us.
-/// The command that starts a detached hub daemon: no stdio, its own process
-/// group, and none of the spawning tree's supervision markers
-/// ([`crate::process_guard::NOT_INHERITED_BY_DAEMON`]).
-fn detached_daemon_command(exe: &Path) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    for key in crate::process_guard::NOT_INHERITED_BY_DAEMON {
-        cmd.env_remove(key);
-    }
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd
-}
-
-fn spawn_detached_daemon() -> Result<()> {
-    // Never from a test binary (SPEC R-ISO.1). `current_exe()` inside one is
-    // the *test harness*, not `ahma`, so this would re-run the test binary with
-    // `daemon` as its filter argument. If any test name matches that filter,
-    // each spawned copy re-runs the tests that spawn — a fork bomb that takes
-    // the whole machine's process table with it, which is exactly what happened
-    // the first time a test exercised this path with no daemon running.
-    if crate::test_isolation::spawned_under_test_harness() {
-        bail!(
-            "refusing to spawn a daemon from a test binary: start one explicitly \
-             (`run_daemon_at`/`HubServer::bind_at`) and point the client at its socket"
-        );
-    }
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ahma"));
-    let mut cmd = detached_daemon_command(&exe);
-    if let Err(e) = cmd.spawn() {
-        bail!("Failed to spawn ahma daemon: {e}");
-    }
-    debug!("daemon_hub: spawned ahma daemon from {:?}", exe);
-    Ok(())
-}
-
-/// Ensure a hub daemon is running, starting one if necessary.
-///
-/// * Fast path: daemon already up — returns immediately.
-/// * Slow path: spawns `ahma daemon` as a detached child, then polls until
-///   it accepts connections (up to ~1 second / 20 attempts at 50 ms).
-///
-/// Returns `Ok(())` when a daemon is reachable, or an error if it could not
-/// be started.
-pub async fn ensure_daemon_running() -> Result<()> {
-    if try_connect().await {
-        return Ok(());
-    }
-
-    spawn_detached_daemon()?;
-
-    // Poll until connected (max ~1 s).
-    for attempt in 1..=20u32 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if try_connect().await {
-            debug!("daemon_hub: connected after {}ms", attempt * 50);
-            return Ok(());
-        }
-    }
-
-    bail!(
-        "ahma daemon did not become ready within 1 s. \
-         Try starting it manually with `ahma daemon`."
-    )
 }
 
 /// Stop the running hub daemon immediately.
@@ -1115,7 +957,7 @@ fn is_unknown_message(e: &serde_json::Error) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Server-side: run_daemon
+// Server-side: hub state
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One operation's replayable state: the `OpStarted` event plus the terminal
@@ -1204,12 +1046,11 @@ struct PendingApproval {
 /// What the hub does when it is asked to stop.
 ///
 /// The hub used to call [`std::process::exit`] from inside a connection
-/// handler. That is correct for the standalone `ahma daemon` and wrong for
-/// anything that hosts the hub alongside something else: the per-user daemon
-/// also owns an MCP endpoint with live sessions and a history file to flush, so
-/// "stop" has to run one shutdown choreography, not `exit(0)` from whichever
-/// task noticed first. The composer installs a hook; with no hook installed the
-/// default is the historical exit.
+/// handler. That is wrong for anything that hosts the hub alongside something
+/// else: the per-user daemon also owns an MCP endpoint with live sessions and a
+/// history file to flush, so "stop" has to run one shutdown choreography, not
+/// `exit(0)` from whichever task noticed first. The daemon installs a hook; a
+/// hub without one (embedded in a test, say) refuses the request.
 type ExitHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 struct DaemonHub {
@@ -1225,7 +1066,6 @@ struct DaemonHub {
     op_history: Arc<Mutex<std::collections::HashMap<String, InstanceOpHistory>>>,
     op_seq: AtomicU64,
     connection_count: Arc<AtomicUsize>,
-    socket_path: Option<PathBuf>,
     pending_approvals: Arc<Mutex<std::collections::HashMap<String, PendingApproval>>>,
     /// `session_id` → the instance id first assigned to it, so a re-register
     /// keeps its identity (and its retained history) instead of arriving as a
@@ -1242,8 +1082,8 @@ struct DaemonHub {
     /// that lives for the length of one command, so by the time anyone looked
     /// at the TUI it had always already gone.
     ended_instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
-    /// What to run when a client sends [`ClientMsg::Shutdown`]. `None` means
-    /// the historical behaviour: unlink our socket and `exit(0)`.
+    /// What to run when a client sends [`ClientMsg::Shutdown`]. `None` refuses
+    /// the request (see [`HubServer::set_exit_hook`]).
     exit_hook: parking_lot::Mutex<Option<ExitHook>>,
     /// Appends operation history to disk so it outlives this process
     /// (SPEC R-DAEMON.7). `None` keeps history in memory only.
@@ -1251,7 +1091,7 @@ struct DaemonHub {
 }
 
 impl DaemonHub {
-    fn new(socket_path: Option<PathBuf>) -> (Self, broadcast::Receiver<DaemonMsg>) {
+    fn new() -> (Self, broadcast::Receiver<DaemonMsg>) {
         let (tx, rx) = broadcast::channel(512);
         (
             Self {
@@ -1261,7 +1101,6 @@ impl DaemonHub {
                 op_history: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 op_seq: AtomicU64::new(0),
                 connection_count: Arc::new(AtomicUsize::new(0)),
-                socket_path,
                 pending_approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 session_ids: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 pending_decisions: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -1668,35 +1507,6 @@ fn mark_unfinished_ops_interrupted(
     interrupted
 }
 
-/// Start the hub daemon.
-///
-/// Binds a unix socket (macOS / Linux) or TCP socket (Windows), accepts
-/// connections from instances and TUI subscribers, and fans out events.
-///
-/// Exits automatically when no connections have been active for 60 seconds.
-///
-/// This function is called by `ahma daemon` via the CLI dispatch.
-pub async fn run_daemon() -> Result<()> {
-    run_daemon_at(default_socket_path()).await
-}
-
-/// Like [`run_daemon`] but binds at `socket_path` instead of the default.
-///
-/// Exposed for testing — callers can pass a temp-directory path to avoid
-/// colliding with a real daemon running on the default socket.
-pub async fn run_daemon_at(socket_path: PathBuf) -> Result<()> {
-    let server = match HubServer::bind_at(socket_path).await {
-        Ok(server) => server,
-        Err(HubBindError::AlreadyRunning) => {
-            info!("ahma daemon: another instance is already running, exiting");
-            return Ok(());
-        }
-        Err(HubBindError::Failed(e)) => return Err(e),
-    };
-    server.spawn_standalone_idle_watcher();
-    server.serve().await
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Hub server — bind, serve and stop as three separate steps
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1708,8 +1518,7 @@ pub enum HubBindError {
     /// user by design (SPEC R-DAEMON.1), so this is an ordinary outcome for the
     /// loser of a startup race, not a failure: connect to the winner instead.
     AlreadyRunning,
-    /// The bind genuinely failed (permissions, a bad path, a port held by a
-    /// foreign process).
+    /// The bind genuinely failed (permissions, a bad path).
     Failed(anyhow::Error),
 }
 
@@ -1724,42 +1533,63 @@ impl std::fmt::Display for HubBindError {
 
 impl std::error::Error for HubBindError {}
 
-#[cfg(unix)]
-type HubListener = tokio::net::UnixListener;
-#[cfg(not(unix))]
-type HubListener = tokio::net::TcpListener;
-
-/// A bound, not-yet-serving hub.
+/// A bound, not-yet-serving hub, and the owner of its rendezvous.
 ///
 /// Binding, serving and stopping are separate so one process can host the hub
 /// *and* the MCP endpoint on one runtime with a single idle policy and a single
-/// exit path (SPEC R-DAEMON.3). Fused together — as they were, inside
-/// `run_daemon_at` — the hub's own idle timer and its `exit(0)` would race the
-/// MCP endpoint's live sessions.
+/// exit path (SPEC R-DAEMON.3).
+///
+/// Dropping it unlinks the socket and only then releases the lock, so the next
+/// owner can never have its fresh socket unlinked by the previous one.
 pub struct HubServer {
-    listener: HubListener,
+    listener: LocalListener,
     hub: Arc<DaemonHub>,
     socket_path: PathBuf,
+    /// Held for as long as this server exists; declared last so it is the
+    /// last thing released.
+    _lock: crate::fs_lock::FsLock,
 }
 
 impl HubServer {
-    /// Bind the hub rendezvous at `socket_path` (bind-is-the-mutex).
+    /// Take the rendezvous at `socket_path` and bind it.
     ///
-    /// A stale socket file — one nothing answers on — is removed and the bind
-    /// retried; a **live** one is never stolen (SPEC R-ISO.2), it yields
-    /// [`HubBindError::AlreadyRunning`].
+    /// The lock beside the socket ([`lock_path_for`]) decides who owns it
+    /// (SPEC R-DAEMON.2): whoever holds it may remove a stale socket file and
+    /// bind; anyone else gets [`HubBindError::AlreadyRunning`]. A socket that
+    /// still answers is never removed even by the lock holder (SPEC R-ISO.2) —
+    /// a hub from before the lock existed is live, not stale.
     pub async fn bind_at(socket_path: PathBuf) -> std::result::Result<Self, HubBindError> {
+        let lock_path = lock_path_for(&socket_path);
+        let lock = match crate::fs_lock::FsLock::try_acquire(&lock_path) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return Err(HubBindError::AlreadyRunning),
+            Err(e) => {
+                return Err(HubBindError::Failed(anyhow::anyhow!(
+                    "ahma hub: cannot open the rendezvous lock {}: {e}",
+                    lock_path.display()
+                )));
+            }
+        };
+        if LocalStream::connect(&socket_path).await.is_ok() {
+            return Err(HubBindError::AlreadyRunning);
+        }
+        crate::fs_lock::remove_stale_socket(&socket_path);
+        let listener = LocalListener::bind(&socket_path).map_err(|e| {
+            HubBindError::Failed(anyhow::anyhow!(
+                "ahma hub: failed to bind {}: {e}",
+                socket_path.display()
+            ))
+        })?;
         #[cfg(unix)]
-        let listener = bind_unix(&socket_path).await?;
-        #[cfg(not(unix))]
-        let listener = bind_tcp().await?;
+        restrict_unix_socket_permissions(&socket_path);
 
         info!("ahma hub: listening on {}", socket_path.display());
-        let (hub, _) = DaemonHub::new(Some(socket_path.clone()));
+        let (hub, _) = DaemonHub::new();
         Ok(Self {
             listener,
             hub: Arc::new(hub),
             socket_path,
+            _lock: lock,
         })
     }
 
@@ -1775,14 +1605,14 @@ impl HubServer {
         self.hub.connection_count.clone()
     }
 
-    /// The path this server bound, for an identity-checked unlink at shutdown.
+    /// The path this server bound.
     pub fn socket_path(&self) -> &std::path::Path {
         &self.socket_path
     }
 
-    /// Install what runs when a client sends `Shutdown`. Without one the hub
-    /// unlinks its socket and exits the process, which is right only when the
-    /// hub is the whole process.
+    /// Install what runs when a client sends `Shutdown`. Without one the
+    /// request is refused: an embedded hub cannot know what else its process
+    /// is doing.
     pub fn set_exit_hook(&self, hook: ExitHook) {
         *self.hub.exit_hook.lock() = Some(hook);
     }
@@ -1812,40 +1642,36 @@ impl HubServer {
         Some(writer)
     }
 
-    /// The standalone `ahma daemon`'s idle policy: exit once nothing has been
-    /// connected for 60 s. A composed daemon does **not** call this — it owns a
-    /// combined policy that also counts live MCP sessions (SPEC R-DAEMON.3).
-    fn spawn_standalone_idle_watcher(&self) {
-        let idle_count = self.hub.connection_count.clone();
-        let socket_path = self.socket_path.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                if idle_count.load(Ordering::Relaxed) != 0 {
-                    continue;
+    /// Accept and serve connections until dropped.
+    pub async fn serve(&self) -> Result<()> {
+        loop {
+            match self.listener.accept().await {
+                Ok(stream) => {
+                    self.hub.connection_count.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(handle_connection(stream, self.hub.clone()));
                 }
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                if idle_count.load(Ordering::Relaxed) == 0 {
-                    info!("ahma daemon: idle timeout, exiting");
-                    // Unlink FIRST so a late arrival gets ENOENT (clean start)
-                    // rather than ECONNREFUSED (ambiguous stale).
-                    #[cfg(unix)]
-                    crate::fs_lock::remove_stale_socket(&socket_path);
-                    #[cfg(not(unix))]
-                    let _ = &socket_path;
-                    std::process::exit(0);
+                Err(e) => {
+                    warn!("ahma hub: accept error: {e}");
+                    // Most accept errors are transient (a full descriptor
+                    // table); pausing keeps a persistent one from spinning.
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
             }
-        });
-    }
-
-    /// Accept and serve until the listener fails.
-    pub async fn serve(self) -> Result<()> {
-        accept_loop(self.listener, self.hub).await
+        }
     }
 }
 
-// ── Unix bind/accept ──────────────────────────────────────────────────────────
+impl Drop for HubServer {
+    /// Unlink the socket while the lock is still held (SPEC R-ISO.3): once it
+    /// is released a successor may bind the same path, and removing the file
+    /// after that would remove *its* socket.
+    fn drop(&mut self) {
+        crate::fs_lock::remove_stale_socket(&self.socket_path);
+    }
+}
+
+/// How long [`HubServer::serve`] pauses after a failed accept.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Restrict a filesystem-backed Unix socket to owner-only (mode `0600`) so that
 /// no other local user can `connect()` and drive the server (which executes
@@ -1866,85 +1692,6 @@ pub fn restrict_unix_socket_permissions(path: &std::path::Path) {
             "failed to chmod 0600 unix socket {}: {e} (other local users may be able to connect)",
             path.display()
         );
-    }
-}
-
-#[cfg(unix)]
-async fn bind_unix(
-    path: &std::path::Path,
-) -> std::result::Result<tokio::net::UnixListener, HubBindError> {
-    use tokio::net::UnixListener;
-    loop {
-        match UnixListener::bind(path) {
-            Ok(l) => {
-                restrict_unix_socket_permissions(path);
-                return Ok(l);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                // Probe before unlinking: a socket someone answers on is a live
-                // server and must never be stolen (SPEC R-ISO.2).
-                match tokio::net::UnixStream::connect(path).await {
-                    Ok(_) => return Err(HubBindError::AlreadyRunning),
-                    Err(_) => {
-                        // Nothing answers — a stale file from a crash or reboot.
-                        debug!("ahma hub: removing stale socket at {}", path.display());
-                        crate::fs_lock::remove_stale_socket(path);
-                        // Small delay before retry to avoid a tight loop on odd filesystems.
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            }
-            Err(e) => {
-                return Err(HubBindError::Failed(anyhow::anyhow!(
-                    "ahma hub: failed to bind unix socket {}: {e}",
-                    path.display()
-                )));
-            }
-        }
-    }
-}
-
-// ── Windows bind/accept ───────────────────────────────────────────────────────
-
-#[cfg(not(unix))]
-async fn bind_tcp() -> std::result::Result<tokio::net::TcpListener, HubBindError> {
-    use tokio::net::TcpListener;
-    let port = daemon_port();
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    match TcpListener::bind(addr).await {
-        Ok(l) => Ok(l),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // Try connecting to confirm a live hub rather than a foreign
-            // process squatting the port.
-            match tokio::net::TcpStream::connect(addr).await {
-                Ok(_) => Err(HubBindError::AlreadyRunning),
-                Err(_) => Err(HubBindError::Failed(anyhow::anyhow!(
-                    "ahma hub: port {port} is in use by another process"
-                ))),
-            }
-        }
-        Err(e) => Err(HubBindError::Failed(anyhow::anyhow!(
-            "ahma hub: failed to bind TCP socket: {e}"
-        ))),
-    }
-}
-
-/// Accept loop shared by both platforms: [`HubListener`] is a `UnixListener`
-/// on Unix and a `TcpListener` elsewhere, and both accept a stream type
-/// [`handle_connection`] is already generic over — only the bind/rendezvous
-/// mechanics above this differ per platform.
-async fn accept_loop(listener: HubListener, hub: Arc<DaemonHub>) -> Result<()> {
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                hub.connection_count.fetch_add(1, Ordering::Relaxed);
-                let hub2 = hub.clone();
-                tokio::spawn(async move {
-                    handle_connection(stream, hub2).await;
-                });
-            }
-            Err(e) => warn!("ahma daemon: accept error: {e}"),
-        }
     }
 }
 
@@ -2016,12 +1763,7 @@ where
                 // sessions to terminate, history to flush, two sockets to
                 // unlink) — it must not be short-circuited from here.
                 Some(hook) => hook("client requested shutdown"),
-                None => {
-                    if let Some(ref path) = hub.socket_path {
-                        crate::fs_lock::remove_stale_socket(path);
-                    }
-                    std::process::exit(0);
-                }
+                None => warn!("daemon: no exit hook installed; ignoring the shutdown request"),
             }
         }
 
@@ -2615,28 +2357,6 @@ fn local_instance_id() -> String {
 mod tests {
     use crate::timeouts::TestTimeouts;
 
-    /// SPEC R2.7.7: the detached daemon outlives whoever started it, so it
-    /// must not inherit that process tree's lease — or it and all its workers
-    /// would skip the workspace lock for good.
-    #[test]
-    fn the_detached_daemon_inherits_no_supervision_marker() {
-        let cmd = super::detached_daemon_command(std::path::Path::new("ahma"));
-        let removed: Vec<_> = cmd
-            .as_std()
-            .get_envs()
-            .filter(|(_, v)| v.is_none())
-            .map(|(k, _)| k.to_string_lossy().into_owned())
-            .collect();
-        for key in [
-            crate::process_guard::HELD_WORKSPACE_LEASE_ENV,
-            "AHMA_SERVER_CHILD",
-        ] {
-            assert!(
-                removed.iter().any(|r| r == key),
-                "{key} must be removed: {removed:?}"
-            );
-        }
-    }
     // ── Wire compatibility for the R24.7 identity fields ─────────────────────
 
     /// A *new* event must deserialize into an *old* reader.
@@ -2871,7 +2591,6 @@ mod tests {
     /// registered) MUST broadcast an `AgentError` back to subscribers. Silently
     /// dropping it left the TUI's elapsed counter incrementing forever with no
     /// answer and no error — exactly the "ahma tui says nothing" symptom.
-    #[cfg(unix)]
     #[tokio::test]
     async fn submit_prompt_without_instance_broadcasts_agent_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -2880,17 +2599,17 @@ mod tests {
         let server = HubServer::bind_at(socket_path.clone())
             .await
             .expect("hub should bind a fresh socket");
-        tokio::spawn(server.serve());
+        tokio::spawn(async move { server.serve().await });
 
         // Subscribe over the socket before sending, so the broadcast is observed.
-        let mut sub = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let mut sub = LocalStream::connect(&socket_path).await.unwrap();
         send_msg(&mut sub, &ClientMsg::Subscribe).await.unwrap();
         let mut sub_reader = BufReader::new(sub);
         // Drain the initial InstanceList so the next read is the AgentError.
         let _ = recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap();
 
         // Connect as a client and submit a prompt with no instances registered.
-        let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let mut client = LocalStream::connect(&socket_path).await.unwrap();
         send_msg(
             &mut client,
             &ClientMsg::SubmitPrompt {
@@ -3297,38 +3016,30 @@ mod tests {
         }
     }
 
-    // ── In-process daemon integration (Unix only) ─────────────────────────────
+    // ── In-process hub integration ────────────────────────────────────────────
     //
-    // We spin up `run_daemon_at()` in a background tokio task pointing to a
-    // temp socket, then exercise the register → subscribe → event → unregister
-    // flow end-to-end.  All spawned tasks are automatically cancelled when the
-    // test runtime drops.
+    // We bind a hub on a temp socket and serve it from a background task, then
+    // exercise the register → subscribe → event → unregister flow end-to-end.
+    // All spawned tasks are cancelled when the test runtime drops, and dropping
+    // the server unlinks its socket.
 
-    /// Wait until a Unix socket file exists and accepts a connection.
-    #[cfg(unix)]
-    async fn wait_for_daemon(sock: &std::path::Path) {
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            if tokio::net::UnixStream::connect(sock).await.is_ok() {
-                return;
-            }
-        }
-        panic!("daemon did not start within 1 s on {}", sock.display());
+    /// Bind a hub at `sock` and serve it for the rest of the test. It is bound
+    /// before this returns, so a connect straight after succeeds.
+    async fn start_hub(sock: &std::path::Path) {
+        let server = HubServer::bind_at(sock.to_path_buf())
+            .await
+            .expect("the hub binds a fresh socket");
+        tokio::spawn(async move { server.serve().await });
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_subscribe_register_event_unregister_flow() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("daemon.sock");
-        let sock2 = sock.clone();
-        tokio::spawn(async move {
-            let _ = run_daemon_at(sock2).await;
-        });
-        wait_for_daemon(&sock).await;
+        start_hub(&sock).await;
 
         // ── Subscriber connects ────────────────────────────────────────────
-        let sub = tokio::net::UnixStream::connect(&sock)
+        let sub = LocalStream::connect(&sock)
             .await
             .expect("connect subscriber");
         let (sr, sw) = tokio::io::split(sub);
@@ -3346,9 +3057,7 @@ mod tests {
         assert!(instances.is_empty(), "no instances registered yet");
 
         // ── Instance registers ─────────────────────────────────────────────
-        let inst = tokio::net::UnixStream::connect(&sock)
-            .await
-            .expect("connect instance");
+        let inst = LocalStream::connect(&sock).await.expect("connect instance");
         let (_, mut iw) = tokio::io::split(inst);
         send_msg(
             &mut iw,
@@ -3452,19 +3161,14 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_list_instances_query() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("list.sock");
-        let sock2 = sock.clone();
-        tokio::spawn(async move {
-            let _ = run_daemon_at(sock2).await;
-        });
-        wait_for_daemon(&sock).await;
+        start_hub(&sock).await;
 
         // Register one instance.
-        let inst = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let inst = LocalStream::connect(&sock).await.unwrap();
         let (_, mut iw) = tokio::io::split(inst);
         send_msg(
             &mut iw,
@@ -3486,7 +3190,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         // One-shot ListInstances query.
-        let q = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let q = LocalStream::connect(&sock).await.unwrap();
         let (qr, mut qw) = tokio::io::split(q);
         let mut qrdr = BufReader::new(qr);
         send_msg(&mut qw, &ClientMsg::ListInstances).await.unwrap();
@@ -3502,41 +3206,9 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn daemon_stale_socket_cleanup() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("stale.sock");
-
-        // Create a stale socket file: bind a listener then immediately drop it.
-        // The file remains but nothing is listening.
-        {
-            let _listener = tokio::net::UnixListener::bind(&sock).unwrap();
-        }
-        assert!(
-            sock.exists(),
-            "stale socket file should exist before daemon starts"
-        );
-
-        // The daemon should detect ECONNREFUSED on the stale socket,
-        // remove the file, and bind successfully.
-        let sock2 = sock.clone();
-        tokio::spawn(async move {
-            let _ = run_daemon_at(sock2).await;
-        });
-        wait_for_daemon(&sock).await;
-
-        // Verify a fresh connection works after cleanup.
-        let conn = tokio::net::UnixStream::connect(&sock).await;
-        assert!(
-            conn.is_ok(),
-            "daemon should be running after stale socket cleanup"
-        );
-    }
-
     #[tokio::test]
     async fn op_history_replays_started_and_finished_in_order() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
 
         // op-1 runs to completion; op-2 is still running.
         hub.record_op_event(
@@ -3623,7 +3295,7 @@ mod tests {
 
     #[tokio::test]
     async fn op_history_drops_unregistered_instance_and_ignores_output() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
 
         // Streaming output is a live tail — never retained for replay.
         hub.record_op_event(
@@ -3674,7 +3346,7 @@ mod tests {
     static ENV_MUTEX: std::sync::LazyLock<parking_lot::Mutex<()>> =
         std::sync::LazyLock::new(|| parking_lot::Mutex::new(()));
 
-    // ── daemon_port / default_socket_path (env-driven) ────────────────────────
+    // ── bridge port / default_socket_path (env-driven) ────────────────────────
 
     /// The HTTP fallback must be per-run under a harness, or a test finds the
     /// developer's live server and calls it a pass.
@@ -3697,56 +3369,6 @@ mod tests {
             8123,
             "a port someone named is the port they meant"
         );
-    }
-
-    #[test]
-    fn daemon_port_default_and_override() {
-        let _g = ENV_MUTEX.lock();
-        let prev = std::env::var_os("AHMA_DAEMON_PORT");
-        let prev_iso = std::env::var_os("AHMA_TEST_ISOLATION");
-        let prev_nextest = std::env::var_os("NEXTEST");
-
-        // Valid override is honored.
-        unsafe { std::env::set_var("AHMA_DAEMON_PORT", "54321") };
-        assert_eq!(daemon_port(), 54321);
-
-        // Unparseable value falls back: under a test harness (R-ISO.1) to a
-        // stable per-run private port in the ephemeral range, never the live
-        // daemon port.
-        unsafe { std::env::set_var("AHMA_DAEMON_PORT", "not-a-port") };
-        unsafe { std::env::set_var("NEXTEST", "1") };
-        let port = daemon_port();
-        assert_ne!(
-            port, WINDOWS_DAEMON_PORT,
-            "a test-harness process must not fall back to the live daemon port"
-        );
-        assert!(
-            (49152..65152).contains(&port),
-            "per-run port must be in the ephemeral range, got {port}"
-        );
-        assert_eq!(daemon_port(), port, "per-run port must be stable");
-
-        // Outside any test harness the platform default applies.
-        unsafe { std::env::remove_var("NEXTEST") };
-        unsafe { std::env::remove_var("AHMA_TEST_ISOLATION") };
-        assert_eq!(
-            daemon_port(),
-            WINDOWS_DAEMON_PORT,
-            "invalid AHMA_DAEMON_PORT must fall back to the default in production"
-        );
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("AHMA_DAEMON_PORT", v) },
-            None => unsafe { std::env::remove_var("AHMA_DAEMON_PORT") },
-        }
-        match prev_iso {
-            Some(v) => unsafe { std::env::set_var("AHMA_TEST_ISOLATION", v) },
-            None => unsafe { std::env::remove_var("AHMA_TEST_ISOLATION") },
-        }
-        match prev_nextest {
-            Some(v) => unsafe { std::env::set_var("NEXTEST", v) },
-            None => unsafe { std::env::remove_var("NEXTEST") },
-        }
     }
 
     /// R-ISO.1: a test-harness process without explicit daemon-socket isolation
@@ -3833,7 +3455,6 @@ mod tests {
 
     /// The two rendezvous files live side by side, so one `runtime_dir` check
     /// covers both (SPEC R-DAEMON.2).
-    #[cfg(unix)]
     #[test]
     fn mcp_socket_path_lives_beside_the_hub_socket() {
         let hub = platform_default_socket_path();
@@ -3925,7 +3546,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_op_event_evicts_oldest_finished_when_over_cap() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
 
         // Fill to the cap with fully-finished ops.
         for i in 0..MAX_OPS_PER_INSTANCE {
@@ -4004,7 +3625,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_op_event_keeps_all_when_none_finished_to_evict() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
 
         // Insert cap+1 *running* ops — none are eligible for eviction, so the
         // history is allowed to exceed the cap (running ops are never dropped).
@@ -4043,7 +3664,7 @@ mod tests {
     /// reconstruction is a *separate* row and never corrupts a live one.
     #[tokio::test]
     async fn a_finish_for_another_op_never_terminates_the_running_one() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         hub.record_op_event("i1", &started_ev("real")).await;
         hub.record_op_event("i1", &finished_ev("other", Some(now_epoch_ms())))
             .await;
@@ -4091,7 +3712,7 @@ mod tests {
     /// at an id another session had since been given.
     #[tokio::test]
     async fn resolve_target_explicit_must_name_a_live_instance() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         assert_eq!(
             resolve_target(&hub, Some("ghost")).await,
             None,
@@ -4113,7 +3734,7 @@ mod tests {
     /// to another window's question; the hub now refuses to guess.
     #[tokio::test]
     async fn resolve_target_refuses_to_guess_among_several_instances() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         {
             let mut instances = hub.instances.lock().await;
             instances.insert("a".into(), instance_with_mode("a", "stdio"));
@@ -4131,7 +3752,7 @@ mod tests {
     /// them excluded, one real session is still unambiguous.
     #[tokio::test]
     async fn resolve_target_ignores_hook_and_tui_instances() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         {
             let mut instances = hub.instances.lock().await;
             instances.insert("hook".into(), instance_with_mode("hook", "hook"));
@@ -4148,7 +3769,7 @@ mod tests {
     /// happens to be registered.
     #[tokio::test]
     async fn a_decision_routes_to_the_instance_that_raised_it() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         {
             let mut instances = hub.instances.lock().await;
             instances.insert("asker".into(), instance_with_mode("asker", "stdio"));
@@ -4208,7 +3829,7 @@ mod tests {
     /// needs to see, not a log (SPEC R-DAEMON.7).
     #[tokio::test]
     async fn op_output_tail_is_bounded_to_max_tail_lines() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         hub.record_op_event("i1", &started_ev("op-1")).await;
         for n in 0..(MAX_TAIL_LINES * 2) {
             hub.record_op_event(
@@ -4251,7 +3872,7 @@ mod tests {
     /// finished — so a subscriber needs no second code path for history.
     #[tokio::test]
     async fn replay_emits_started_then_tail_then_finished_in_order() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         hub.record_op_event("i1", &started_ev("op-1")).await;
         hub.record_op_event(
             "i1",
@@ -4287,7 +3908,7 @@ mod tests {
     /// by the time anyone looked, the instance had always already gone.
     #[tokio::test]
     async fn history_survives_unregister_and_the_instance_is_listed_as_ended() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         let info = InstanceInfo {
             id: "i1".into(),
             pid: 7,
@@ -4331,7 +3952,7 @@ mod tests {
     /// however long it takes.
     #[tokio::test]
     async fn replay_window_evicts_finished_ops_older_than_the_window() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         let now = now_epoch_ms();
         let long_ago = now - HISTORY_REPLAY_WINDOW.as_millis() as u64 - 60_000;
 
@@ -4371,7 +3992,7 @@ mod tests {
     /// bounds the daemon's memory.
     #[tokio::test]
     async fn global_retention_cap_evicts_oldest_finished_first() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         let now = now_epoch_ms();
         for i in 0..(MAX_RETAINED_OPS + 50) {
             let inst = format!("hook-{i}");
@@ -4411,7 +4032,7 @@ mod tests {
     /// exactly the work a user is most likely to ask about.
     #[tokio::test]
     async fn finished_without_started_is_retained_as_partial() {
-        let (hub, _rx) = DaemonHub::new(None);
+        let (hub, _rx) = DaemonHub::new();
         let now = now_epoch_ms();
         hub.record_op_event("i1", &finished_ev("orphan", Some(now)))
             .await;
@@ -4463,7 +4084,6 @@ mod tests {
     /// alive. A fresh daemon must restore the window from disk — including the
     /// output tail, and including operations that were still running when the
     /// previous daemon went away (SPEC R-DAEMON.7).
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_fresh_hub_replays_the_last_hour_from_disk() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4607,14 +4227,13 @@ mod tests {
     /// A subscriber that falls far enough behind drops messages — possibly an
     /// `OpFinished`, which leaves a spinner that never resolves. The hub
     /// repairs the gap by re-sending the authoritative state.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_lagging_subscriber_is_resynchronised_rather_than_left_with_a_hole() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("lag.sock");
         let server = HubServer::bind_at(sock.clone()).await.expect("bind");
         let hub = server.hub.clone();
-        tokio::spawn(server.serve());
+        tokio::spawn(async move { server.serve().await });
 
         // An operation that ran and finished before anyone subscribed.
         hub.instances.lock().await.insert(
@@ -4657,7 +4276,6 @@ mod tests {
     /// A live hub is never stolen: the loser of a startup race is told so and
     /// connects to the winner instead of unlinking a socket in use
     /// (SPEC R-DAEMON.1, R-ISO.2).
-    #[cfg(unix)]
     #[tokio::test]
     async fn bind_hub_reports_already_running_when_a_live_hub_owns_the_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4666,7 +4284,7 @@ mod tests {
             .await
             .expect("first bind should succeed on a fresh socket");
         let count = first.connection_count();
-        tokio::spawn(first.serve());
+        tokio::spawn(async move { first.serve().await });
 
         match HubServer::bind_at(sock.clone()).await {
             Err(HubBindError::AlreadyRunning) => {}
@@ -4684,28 +4302,95 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    /// The lock holder removes a socket file nothing answers on — what a crash
+    /// or a reboot leaves on a filesystem that is not tmpfs — and binds. On
+    /// Windows too, where an `AF_UNIX` socket leaves its file behind as well.
     #[tokio::test]
     async fn bind_hub_removes_a_stale_socket_and_binds() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("stale_embed.sock");
-
-        // Leave a socket file behind with nothing listening on it — what a
-        // crash or a reboot leaves on a filesystem that is not tmpfs.
-        {
-            let _l = tokio::net::UnixListener::bind(&sock).unwrap();
-        }
-        assert!(sock.exists());
+        drop(LocalListener::bind(&sock).unwrap());
+        assert!(sock.exists(), "a dropped listener leaves its file behind");
 
         let server = HubServer::bind_at(sock.clone())
             .await
             .expect("a stale socket is cleaned up and bound");
         assert_eq!(server.socket_path(), sock.as_path());
+        assert!(LocalStream::connect(&sock).await.is_ok());
+    }
+
+    /// The lock, not the socket, decides who owns the rendezvous (SPEC
+    /// R-DAEMON.2). A hub that holds it but has not bound yet must not be
+    /// raced, and a process without it must not touch the socket file — that
+    /// is what used to let two starters unlink each other's sockets.
+    #[tokio::test]
+    async fn without_the_lock_a_hub_neither_binds_nor_touches_the_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("locked.sock");
+        let _held = crate::fs_lock::FsLock::try_acquire(&lock_path_for(&sock))
+            .unwrap()
+            .expect("a fresh lock is free");
+        std::fs::write(&sock, b"").unwrap();
+
+        match HubServer::bind_at(sock.clone()).await {
+            Err(HubBindError::AlreadyRunning) => {}
+            Err(HubBindError::Failed(e)) => panic!("expected AlreadyRunning, got failure: {e}"),
+            Ok(_) => panic!("a hub must not bind without the lock"),
+        }
+        assert!(sock.exists(), "only the lock holder may remove the file");
+    }
+
+    /// A socket that answers is live, even if nobody holds the lock — a hub
+    /// from before the lock existed. It is never stolen (SPEC R-ISO.2).
+    #[tokio::test]
+    async fn the_lock_holder_still_never_steals_a_live_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("legacy.sock");
+        let _legacy = LocalListener::bind(&sock).unwrap();
+
+        assert!(matches!(
+            HubServer::bind_at(sock.clone()).await,
+            Err(HubBindError::AlreadyRunning)
+        ));
+        assert!(LocalStream::connect(&sock).await.is_ok());
+    }
+
+    /// Dropping the server unlinks its socket before releasing the lock, so
+    /// the rendezvous is immediately free and clean for a successor.
+    #[tokio::test]
+    async fn dropping_the_hub_frees_the_rendezvous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("handover.sock");
+        let first = HubServer::bind_at(sock.clone()).await.expect("first bind");
+        drop(first);
+        assert!(
+            !sock.exists(),
+            "the owner unlinks its socket on the way out"
+        );
+
+        HubServer::bind_at(sock.clone())
+            .await
+            .expect("a successor binds the freed rendezvous");
+    }
+
+    /// `daemon.sock` is guarded by `daemon.lock`, the file the daemon already
+    /// held before the lock became the mutex, so an old and a new daemon agree
+    /// on who owns the default rendezvous.
+    #[test]
+    fn the_lock_sits_beside_its_socket() {
+        let dir = std::path::Path::new("run");
+        assert_eq!(
+            lock_path_for(&dir.join("daemon.sock")),
+            dir.join("daemon.lock")
+        );
+        assert_eq!(
+            lock_path_for(&dir.join("mcp.hub.sock")),
+            dir.join("mcp.hub.lock")
+        );
     }
 
     /// `Shutdown` must not shortcut a composed daemon's shutdown: with a hook
     /// installed the hub delegates instead of calling `process::exit`.
-    #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_message_invokes_exit_hook_instead_of_exiting() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4716,9 +4401,9 @@ mod tests {
         server.set_exit_hook(Arc::new(move |reason: &str| {
             let _ = tx.send(reason.to_string());
         }));
-        tokio::spawn(server.serve());
+        tokio::spawn(async move { server.serve().await });
 
-        let mut client = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut client = LocalStream::connect(&sock).await.unwrap();
         send_msg(&mut client, &ClientMsg::Shutdown).await.unwrap();
 
         let reason = tokio::time::timeout(crate::timeouts::TestTimeouts::scale_secs(5), rx.recv())
@@ -4738,16 +4423,15 @@ mod tests {
     /// leave and a stranger arrive — losing the section's expansion state and
     /// reshuffling any view sorted by id. The session id keeps it the same
     /// instance (SPEC R-DAEMON.6).
-    #[cfg(unix)]
     #[tokio::test]
     async fn reregister_with_the_same_session_keeps_the_instance_id() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("stable.sock");
         let server = HubServer::bind_at(sock.clone()).await.expect("bind");
-        tokio::spawn(server.serve());
+        tokio::spawn(async move { server.serve().await });
 
         async fn register_once(sock: &std::path::Path, client: Option<&str>) -> String {
-            let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+            let stream = LocalStream::connect(sock).await.unwrap();
             let (r, mut w) = tokio::io::split(stream);
             let reader = BufReader::new(r);
             send_msg(
@@ -4765,24 +4449,30 @@ mod tests {
             )
             .await
             .unwrap();
-            // Observe the registration from a subscriber's point of view.
-            let sub = tokio::net::UnixStream::connect(sock).await.unwrap();
-            let (sr, mut sw) = tokio::io::split(sub);
-            let mut sub_reader = BufReader::new(sr);
-            send_msg(&mut sw, &ClientMsg::ListInstances).await.unwrap();
-            let id = match recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap() {
-                DaemonMsg::InstanceList { instances } => {
-                    let live: Vec<_> = instances
-                        .iter()
-                        .filter(|i| i.ended_epoch_ms.is_none())
-                        .collect();
-                    assert_eq!(live.len(), 1, "one session is one instance: {instances:?}");
-                    assert_eq!(live[0].session_id.as_deref(), Some("mcp-session-7"));
-                    assert_eq!(live[0].client_pid, Some(4242));
-                    live[0].id.clone()
+            // Observe the registration from a one-shot query's point of view.
+            // The query travels on a connection of its own, so nothing orders
+            // it after the `Register` above: wait until the hub has handled
+            // this registration (the label names it) rather than assume it.
+            let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(5);
+            let live = loop {
+                let instances = list_instances_at(sock).await.unwrap();
+                let live: Vec<_> = instances
+                    .into_iter()
+                    .filter(|i| i.ended_epoch_ms.is_none())
+                    .collect();
+                if live.iter().any(|i| i.client.as_deref() == client) {
+                    break live;
                 }
-                other => panic!("expected InstanceList, got {other:?}"),
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the registration never became visible: {live:?}"
+                );
+                tokio::time::sleep(TestTimeouts::poll_interval()).await;
             };
+            assert_eq!(live.len(), 1, "one session is one instance: {live:?}");
+            assert_eq!(live[0].session_id.as_deref(), Some("mcp-session-7"));
+            assert_eq!(live[0].client_pid, Some(4242));
+            let id = live[0].id.clone();
             // Drop the instance connection so the next registration is a
             // genuine reconnect-to-relabel.
             drop(w);
@@ -4792,18 +4482,17 @@ mod tests {
 
         let first = register_once(&sock, None).await;
         // Wait for the hub to finish tearing the first connection down.
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
-            let (r, mut w) = tokio::io::split(stream);
-            let mut reader = BufReader::new(r);
-            send_msg(&mut w, &ClientMsg::ListInstances).await.unwrap();
-            if let DaemonMsg::InstanceList { instances } =
-                recv_msg::<_, DaemonMsg>(&mut reader).await.unwrap()
-                && instances.iter().all(|i| i.ended_epoch_ms.is_some())
-            {
+        let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(5);
+        loop {
+            let instances = list_instances_at(&sock).await.unwrap();
+            if instances.iter().all(|i| i.ended_epoch_ms.is_some()) {
                 break;
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first connection was never torn down: {instances:?}"
+            );
+            tokio::time::sleep(TestTimeouts::poll_interval()).await;
         }
         let second = register_once(&sock, Some("claude-code")).await;
 
@@ -4815,21 +4504,16 @@ mod tests {
 
     // ── serve_instance event forwarding ───────────────────────────────────────
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_forwards_instance_events_to_subscriber() {
         use crate::scope_grant::{GrantReason, ScopeGrantRequest};
 
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("events.sock");
-        let s2 = sock.clone();
-        tokio::spawn(async move {
-            let _ = run_daemon_at(s2).await;
-        });
-        wait_for_daemon(&sock).await;
+        start_hub(&sock).await;
 
         // Subscriber connects first.
-        let sub = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let sub = LocalStream::connect(&sock).await.unwrap();
         let (sr, mut sw) = tokio::io::split(sub);
         let mut srdr = BufReader::new(sr);
         send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();
@@ -4839,7 +4523,7 @@ mod tests {
         ));
 
         // Instance registers.
-        let inst = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let inst = LocalStream::connect(&sock).await.unwrap();
         let (_ir, mut iw) = tokio::io::split(inst);
         send_msg(
             &mut iw,
@@ -5022,21 +4706,16 @@ mod tests {
 
     // ── handle_connection routing arms ────────────────────────────────────────
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_routes_tui_requests_to_instance() {
         use crate::scope_grant::GrantDecision;
 
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("route.sock");
-        let s2 = sock.clone();
-        tokio::spawn(async move {
-            let _ = run_daemon_at(s2).await;
-        });
-        wait_for_daemon(&sock).await;
+        start_hub(&sock).await;
 
         // Instance registers and keeps its connection to receive routed messages.
-        let inst = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let inst = LocalStream::connect(&sock).await.unwrap();
         let (ir, mut iw) = tokio::io::split(inst);
         let mut irdr = BufReader::new(ir);
         send_msg(
@@ -5058,7 +4737,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // SubmitPrompt with no explicit target → routed (delivered) to the only instance.
-        let mut tui = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut tui = LocalStream::connect(&sock).await.unwrap();
         send_msg(
             &mut tui,
             &ClientMsg::SubmitPrompt {
@@ -5090,7 +4769,7 @@ mod tests {
         }
 
         // CancelPrompt routed to the instance running the turn.
-        let mut tui_cancel = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut tui_cancel = LocalStream::connect(&sock).await.unwrap();
         send_msg(
             &mut tui_cancel,
             &ClientMsg::CancelPrompt {
@@ -5105,7 +4784,7 @@ mod tests {
         }
 
         // CancelOperation routed to the instance that owns the operation.
-        let mut tui_cancel_op = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut tui_cancel_op = LocalStream::connect(&sock).await.unwrap();
         send_msg(
             &mut tui_cancel_op,
             &ClientMsg::CancelOperation {
@@ -5121,7 +4800,7 @@ mod tests {
         }
 
         // SubmitApproval routed.
-        let mut tui2 = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut tui2 = LocalStream::connect(&sock).await.unwrap();
         send_msg(
             &mut tui2,
             &ClientMsg::SubmitApproval {
@@ -5138,7 +4817,7 @@ mod tests {
         }
 
         // SubmitScopeGrant routed.
-        let mut tui3 = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut tui3 = LocalStream::connect(&sock).await.unwrap();
         send_msg(
             &mut tui3,
             &ClientMsg::SubmitScopeGrant {
@@ -5161,19 +4840,14 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_unexpected_first_message_closes_connection() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("unexpected.sock");
-        let s2 = sock.clone();
-        tokio::spawn(async move {
-            let _ = run_daemon_at(s2).await;
-        });
-        wait_for_daemon(&sock).await;
+        start_hub(&sock).await;
 
         // Pong is not a valid first/role message → server hits the `_` arm and closes.
-        let client = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let client = LocalStream::connect(&sock).await.unwrap();
         let (cr, mut cw) = tokio::io::split(client);
         let mut crdr = BufReader::new(cr);
         send_msg(&mut cw, &ClientMsg::Pong { seq: 1 })
@@ -5193,19 +4867,14 @@ mod tests {
 
     // ── serve_subscriber replay path ──────────────────────────────────────────
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_replays_history_to_late_subscriber() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("replay.sock");
-        let s2 = sock.clone();
-        tokio::spawn(async move {
-            let _ = run_daemon_at(s2).await;
-        });
-        wait_for_daemon(&sock).await;
+        start_hub(&sock).await;
 
         // Instance registers and runs one op to completion BEFORE any subscriber.
-        let inst = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let inst = LocalStream::connect(&sock).await.unwrap();
         let (_ir, mut iw) = tokio::io::split(inst);
         send_msg(
             &mut iw,
@@ -5264,7 +4933,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
 
         // A late subscriber must receive the instance list AND the replayed history.
-        let sub = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let sub = LocalStream::connect(&sock).await.unwrap();
         let (sr, mut sw) = tokio::io::split(sub);
         let mut srdr = BufReader::new(sr);
         send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();

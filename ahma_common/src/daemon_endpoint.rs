@@ -1,30 +1,17 @@
-//! Windows rendezvous for the per-user daemon (SPEC R-DAEMON.2).
+//! Which daemon owns the rendezvous, for `ahma doctor` (SPEC R-DAEMON.2).
 //!
-//! Unix has two things Windows does not: a filesystem socket that can be
-//! chmodded `0600`, and a bind that is itself the mutex. Windows therefore used
-//! two fixed loopback ports — 7395 for the hub, 3000 for the MCP endpoint —
-//! which any local user could connect to, and which fail outright when some
-//! unrelated program already holds them.
-//!
-//! This module replaces both with what a socket gives for free elsewhere:
-//!
-//! * **`daemon.lock`** is the mutex. [`crate::fs_lock::FsLock`] is an advisory
-//!   lock the kernel releases when the holder dies, so "is a daemon running?"
-//!   never depends on a stale file being cleaned up — which is exactly what a
-//!   crash or a power cut leaves behind.
-//! * **`daemon.json`** publishes where the daemon actually listens. Both
-//!   listeners bind port 0, so a busy port is not a startup failure, and the
-//!   ports are discovered rather than assumed.
-//! * A **bearer token** in that file stands in for the `0600` mode bit: the
-//!   file lives under the user's own profile directory, and a client that
-//!   cannot read it cannot present the token.
+//! * **`daemon.lock`** is the mutex, held by the daemon's hub
+//!   ([`crate::daemon_hub::HubServer`]). [`crate::fs_lock::FsLock`] is an
+//!   advisory lock the kernel releases when the holder dies, so "is a daemon
+//!   running?" never depends on a stale file being cleaned up — which is
+//!   exactly what a crash or a power cut leaves behind.
+//! * **`daemon.json`** names the holder: pid, version and build id. Its port
+//!   and token fields are vestigial — they date from when Windows reached the
+//!   daemon over loopback TCP — and go when the MCP endpoint joins the hub on
+//!   its socket.
 //!
 //! The file is written atomically (write a temporary, then rename) so a reader
 //! never sees a half-written descriptor.
-//!
-//! Everything here is cross-platform code — only the daemon's *use* of it is
-//! Windows-only — because the alternative is logic that no test on a developer
-//! machine ever executes.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

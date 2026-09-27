@@ -17,8 +17,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use ahma_common::daemon_hub::{
-    ClientMsg, DaemonEvent, DaemonMsg, HubRelay, InstanceInfo, connect_to_daemon,
-    ensure_daemon_running, recv_msg, send_msg,
+    ClientMsg, DaemonEvent, DaemonMsg, HubRelay, InstanceInfo, connect_to_daemon, recv_msg,
+    send_msg,
 };
 use tokio::{io::BufReader, sync::mpsc};
 use tracing::{debug, warn};
@@ -357,7 +357,12 @@ async fn connect_or_retry_daemon(
     tx: &mpsc::Sender<SourceEvent>,
     backoff: &mut Duration,
 ) -> Option<ahma_common::daemon_hub::DaemonStream> {
-    if let Err(e) = ensure_daemon_running().await {
+    if let Ok(stream) = connect_to_daemon().await {
+        return Some(stream);
+    }
+    // The subscriber is what keeps a daemon around for the TUI (SPEC
+    // R-DAEMON.9), so it starts one — through the one path that does.
+    if let Err(e) = ahma_mcp::shell::modes::daemon_client::ensure_hub().await {
         debug!(
             "daemon_source: daemon unavailable ({e}); retry in {:?}",
             *backoff
@@ -1203,7 +1208,7 @@ mod tests {
         }
     }
 
-    /// Point `AHMA_DAEMON_SOCK` (Unix) / `AHMA_DAEMON_PORT` (Windows) at a
+    /// Point `AHMA_DAEMON_SOCK` at a
     /// throwaway location so this test's embedded hub cannot collide with a
     /// real daemon or with another test's hub. Mirrors the isolation done by
     /// `ahma_common::daemon_hub::init_test_daemon_isolation` (a `#[cfg(test)]`
@@ -1216,14 +1221,6 @@ mod tests {
         // SAFETY: debug-only test seam; nextest isolates each test in its own process.
         unsafe {
             std::env::set_var("AHMA_DAEMON_SOCK", &sock_path);
-        }
-        if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0")
-            && let Ok(addr) = listener.local_addr()
-        {
-            // SAFETY: debug-only test seam; nextest isolates each test in its own process.
-            unsafe {
-                std::env::set_var("AHMA_DAEMON_PORT", addr.port().to_string());
-            }
         }
         dir
     }
@@ -1897,7 +1894,7 @@ mod tests {
         )
         .await
         .expect("this test owns a freshly isolated socket, so bind must succeed");
-        let hub = tokio::spawn(hub.serve());
+        let hub = tokio::spawn(async move { hub.serve().await });
 
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(64);
         let task = tokio::spawn(daemon_source_task(tx));

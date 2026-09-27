@@ -50,13 +50,14 @@ hooked command ─────────────────────�
 
 ## Where it lives
 
-A per-user runtime directory — `$XDG_RUNTIME_DIR/ahma`, else `~/.ahma` —
-created `0700` and refused if it is owned by someone else or reachable by group
-or others. It holds:
+A per-user runtime directory — `$XDG_RUNTIME_DIR/ahma`, else `~/.ahma`;
+`%LOCALAPPDATA%\ahma\run` on Windows — created `0700` and refused if it is
+owned by someone else or reachable by group or others. It holds:
 
 | File | What it is |
 |---|---|
-| `daemon.sock` | The hub. Binding it is the mutex: whoever binds it is the daemon. `0600`. |
+| `daemon.lock` | The mutex: whoever holds it is the daemon. A kernel lock, so it is released the moment its holder dies, and nothing is left to clean up after a crash. |
+| `daemon.sock` | The hub. Only the lock holder binds or removes it. `0600`. |
 | `mcp.sock` | The MCP endpoint editors proxy to. `0600`. |
 | `history.jsonl` | The last hour of operations, so recent work survives a restart. `0600`. |
 
@@ -71,17 +72,11 @@ it, and since nothing owned the path, pre-create it. A `0600` socket inside a
 world-writable directory is still squattable, which is why the directory is
 checked and not only the socket.
 
-On **Windows** there are no filesystem sockets, so `daemon.lock` (a kernel
-advisory lock, released automatically when its holder dies) is the mutex, and
-`daemon.json` publishes the daemon's ports with a random bearer token that
-stands in for the mode bits.
-
-Windows still binds the historical fixed loopback ports rather than ephemeral
-ones, and discovery still reads those rather than the descriptor — so on a
-shared machine the token, not the port, is what keeps another local user out.
-This is not finished work: it could not be compiled, let alone tested, on the
-machine it was written on, and shipping an unverified rendezvous change is how
-a daemon becomes unreachable on a platform you cannot debug.
+On **Windows** (10 1803 or later) the hub is the same kind of `AF_UNIX` socket
+file, with the same lock; access control comes from the per-user profile ACL
+rather than mode bits. The MCP endpoint is not there yet: on Windows it still
+listens on a loopback TCP port that clients do not discover, until the stdio
+proxy and the TUI can speak HTTP over the socket too.
 
 ## Lifetime
 

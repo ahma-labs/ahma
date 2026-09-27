@@ -14,31 +14,15 @@ use ahma_tui::mcp_source::SourceEvent;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-/// The isolated hub rendezvous for this test process.
-///
-/// Both halves, because the hub is a Unix socket on Unix and a loopback port on
-/// Windows: setting only the socket left the Windows run pointed at the
-/// machine-global daemon port (SPEC R-ISO.1).
-fn isolated_socket() -> std::path::PathBuf {
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!(
-        "ahma_tui_sub_{}_{}.sock",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    ));
+/// The isolated hub rendezvous for this test process, in a directory of its
+/// own so the socket and its lock go with it. Keep the `TempDir` alive for the
+/// whole test.
+fn isolated_socket() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir for the hub socket");
+    let path = dir.path().join("hub.sock");
     // SAFETY: nextest runs each test in its own process.
     unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &path) };
-    if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0")
-        && let Ok(addr) = listener.local_addr()
-    {
-        // SAFETY: as above.
-        unsafe { std::env::set_var("AHMA_DAEMON_PORT", addr.port().to_string()) };
-    }
-    let _ = std::fs::remove_file(&path);
-    path
+    (dir, path)
 }
 
 async fn next_event(rx: &mut mpsc::Receiver<SourceEvent>) -> SourceEvent {
@@ -55,11 +39,11 @@ async fn next_event(rx: &mut mpsc::Receiver<SourceEvent>) -> SourceEvent {
 /// already gone (SPEC R-DAEMON.7, R-DAEMON.8).
 #[tokio::test]
 async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
-    let socket = isolated_socket();
+    let (_dir, socket) = isolated_socket();
     let hub = HubServer::bind_at(socket.clone())
         .await
         .expect("this test owns a freshly isolated socket");
-    let hub_task = tokio::spawn(hub.serve());
+    let hub_task = tokio::spawn(async move { hub.serve().await });
 
     // A hook registers, runs one command, and exits — all before the TUI looks.
     {
@@ -158,7 +142,6 @@ async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
     );
 
     hub_task.abort();
-    let _ = std::fs::remove_file(&socket);
 }
 
 /// Starting the TUI must not bind the hub: the daemon owns it, and a TUI that
@@ -168,19 +151,19 @@ async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
 /// no daemon running tries to start one, and from a test binary that means
 /// `current_exe daemon` — the test harness itself, re-run with `daemon` as a
 /// filter that matches these very tests. That is a fork bomb, and it emptied
-/// this machine's process table once already; `spawn_detached_daemon` now
+/// this machine's process table once already; `daemon_client::spawn_daemon` now
 /// refuses under a test harness, and this test does not go looking for the
 /// refusal.
 #[tokio::test]
 async fn the_tui_source_never_binds_the_hub() {
-    let socket = isolated_socket();
+    let (_dir, socket) = isolated_socket();
 
     // The daemon's hub, bound before the TUI exists.
     let hub = HubServer::bind_at(socket.clone())
         .await
         .expect("this test owns a freshly isolated socket");
     let count = hub.connection_count();
-    let task = tokio::spawn(hub.serve());
+    let task = tokio::spawn(async move { hub.serve().await });
 
     let (tx, _rx) = mpsc::channel::<SourceEvent>(8);
     spawn_daemon_source(tx);
@@ -208,35 +191,19 @@ async fn the_tui_source_never_binds_the_hub() {
     }
 
     task.abort();
-    let _ = std::fs::remove_file(&socket);
 }
 
 /// A one-shot query answers on the socket, which is what `ahma daemon`'s
 /// callers use to tell a live rendezvous from a stale file.
 #[tokio::test]
 async fn list_instances_answers_on_the_hub_socket() {
-    let socket = isolated_socket();
+    let (_dir, socket) = isolated_socket();
     let hub = HubServer::bind_at(socket.clone()).await.expect("bind");
-    let task = tokio::spawn(hub.serve());
+    let task = tokio::spawn(async move { hub.serve().await });
 
-    // `list_instances_at` takes a socket *path* and is Unix-only by
-    // construction (it dials a `UnixStream` directly); the portable
-    // equivalent — connecting through `connect_to_daemon()`, which honours
-    // both env vars `isolated_socket()` set — is what this test actually
-    // needs, since it only ever talks to the hub it just bound.
-    let one_shot = ahma_common::daemon_hub::connect_to_daemon()
+    let listed = ahma_common::daemon_hub::list_instances_at(&socket)
         .await
-        .expect("connect to the hub this test just bound");
-    let (r, mut w) = tokio::io::split(one_shot);
-    let mut one_shot_reader = BufReader::new(r);
-    send_msg(&mut w, &ClientMsg::ListInstances).await.unwrap();
-    let listed = match recv_msg::<_, DaemonMsg>(&mut one_shot_reader)
-        .await
-        .expect("the hub answers a one-shot query")
-    {
-        DaemonMsg::InstanceList { instances } => instances,
-        other => panic!("expected an instance list, got {other:?}"),
-    };
+        .expect("the hub answers a one-shot query");
     assert!(listed.is_empty(), "nothing has registered yet");
 
     // And an unknown message does not kill the connection (R24.5).
@@ -259,5 +226,4 @@ async fn list_instances_answers_on_the_hub_socket() {
     assert!(matches!(msg, DaemonMsg::InstanceList { .. }));
 
     task.abort();
-    let _ = std::fs::remove_file(&socket);
 }
