@@ -440,7 +440,7 @@ Production and test code must be separated so that test harness machinery can ne
   1. `#[cfg(test)]` compile-time gates (preferred — zero runtime cost in production builds).
   2. The `AppConfig.is_server_child` field (set only via the `--server-child` CLI flag or the `AHMA_SERVER_CHILD` internal plumbing variable, which is set by the parent ahma process before spawning a subprocess).
   3. Constructor/function parameters (dependency injection).
-- **R-CFG9.2**: Production code **must not** read `NEXTEST`, `CARGO_MANIFEST_DIR`, `CARGO_LLVM_COV`, `CARGO_TARGET_DIR`, or any other cargo-set environment variable. These variables are set by the build/test toolchain and must not influence runtime security decisions. The `--server-child` flag is the exclusive mechanism for subprocess detection in production. **Single carve-out (R-ISO.1):** `NEXTEST` / `NEXTEST_RUN_ID` may be read for exactly one purpose — forcing test isolation of endpoint rendezvous (private socket/port instead of the machine-global ones), via `ahma_common::test_isolation` only. This influence is fail-closed by construction: the variable can only *restrict* the process to private endpoints; it can never widen filesystem/network access, restart shared services, or weaken a sandbox decision. (Production already reads `AHMA_TEST_ISOLATION` to the same effect, so this adds no new attacker capability.)
+- **R-CFG9.2**: Production code **must not** read `NEXTEST`, `CARGO_MANIFEST_DIR`, `CARGO_LLVM_COV`, `CARGO_TARGET_DIR`, or any other cargo-set environment variable. These variables are set by the build/test toolchain and must not influence runtime security decisions. The `--server-child` flag is the exclusive mechanism for subprocess detection in production. **Single carve-out (R-ISO.1):** `NEXTEST` / `NEXTEST_RUN_ID` may be read for exactly one purpose — forcing test isolation of endpoint rendezvous (private sockets instead of the per-user ones), via `ahma_common::test_isolation` only. This influence is fail-closed by construction: the variable can only *restrict* the process to private endpoints; it can never widen filesystem/network access, restart shared services, or weaken a sandbox decision. (Production already reads `AHMA_TEST_ISOLATION` to the same effect, so this adds no new attacker capability.)
 - **R-CFG9.3**: Test helper code inside `#[cfg(test)]` blocks or `test_utils` modules **may** read `AHMA_TEST_BINARY`, `CARGO_TARGET_DIR`, `NEXTEST`, and `CARGO_LLVM_COV` to locate test fixtures and adjust timeouts. These reads are acceptable because they are gated behind compile-time test flags and do not run in production binaries.
 - **R-CFG9.4**: The `AHMA_DAEMON_SOCK` variable is a test-isolation helper set by `init_test_daemon_isolation()`. It **must** only be read inside `#[cfg(test)]`-gated code paths or in functions that are explicitly documented as test-only. They are INTERNAL plumbing (not user-facing) and **must** be listed in `docs/environment-variables.md` as `INTERNAL/TEST`.
 - **R-CFG9.5**: **Environment variable minimization.** Beyond the test/production split above, the system **must** minimize configuration via environment variables generally, to prevent security side-channel attacks and configuration clutter. Configuration parameters **must** be declared on the command line or in explicit configuration structures (`AppConfig`) and passed down through constructor arguments, rather than queried directly from the environment at the point of use.
@@ -761,7 +761,7 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
 - **R-DOCTOR.1 — One set of checks.** `ahma doctor` and the TUI's `/doctor` run
   the same checks (`ahma_common::doctor`): settings parse, granted folders that
   no longer exist, approvals for folders that no longer exist, the daemon's
-  build against this binary's, this folder's trust, and the most repeated
+  build (as its own `/health` reports it) against this binary's, this folder's trust, and the most repeated
   warnings in the latest log. Each finding says what it costs and what would
   fix it. The checks are read-only.
 - **R-DOCTOR.2 — A fix is shown, then confirmed, one at a time.** A fix
@@ -1568,9 +1568,11 @@ Operation ids are counters, and counters restart with the process that issues th
     socket derives its hub socket beside it; left on the shared hub it would
     lose the bind to whichever daemon already held it, stand down, and leave
     nobody serving the endpoint it was asked for.
-  - An atomically written `daemon.json` names the daemon holding the lock
-    (pid, version, build id) for `ahma doctor`. Liveness is the lock, never a
-    pid probe — a pid can be reused, a lock cannot.
+  - Nothing else is written to the runtime directory to say who the daemon
+    is. `ahma doctor` asks the daemon itself: `/health` on its MCP socket
+    reports its version and build id. A descriptor file outlives a crash, and
+    probing the lock instead could make a starting daemon lose it and stand
+    down.
 
 - **R-DAEMON.3 — Lifetime.** The first comer starts it, detached (R-PROC.3),
   and **never from a process that is itself confined** (R7.6) — a daemon that
@@ -1604,9 +1606,11 @@ Operation ids are counters, and counters restart with the process that issues th
   windows — the old rule ("restart the bridge") did exactly that, mid-command,
   to every attached editor so that one newly-started client could have a
   matching binary. A draining daemon answers `initialize` with `503` and
-  `Retry-After`, and says `draining` in `/health`. A skew that survives one
-  replacement is proxied and **disclosed**, never retried: retrying is how
-  several coexisting build ids become a respawn loop.
+  `Retry-After`, and says `draining` in `/health`. A daemon still serving
+  other sessions when the handoff times out is proxied and **disclosed**, not
+  replaced. An **older** client neither drains a newer daemon nor restarts
+  itself: it proxies, because the daemon runs every session's worker from its
+  own binary, so the stale client is served by the newer build.
 
 - **R-DAEMON.6 — Registration and routing.** An instance registers with its
   `session_id`, `client_pid`, MCP client identity, mode (`stdio` | `hook` |

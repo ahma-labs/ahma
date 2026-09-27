@@ -153,19 +153,6 @@ pub async fn run_daemon_mode(config: AppConfig) -> Result<()> {
         Err(HubBindError::Failed(e)) => return Err(e),
     };
 
-    // Publish which daemon owns this rendezvous, for `ahma doctor`. The hub
-    // already holds the lock the descriptor is judged against.
-    let runtime_dir = hub_socket
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    if let Err(e) = ahma_common::daemon_endpoint::write_endpoint(
-        &runtime_dir,
-        &ahma_common::daemon_endpoint::DaemonEndpoint::new(0, 0),
-    ) {
-        tracing::debug!("ahma daemon: could not publish the endpoint descriptor: {e}");
-    }
-
     let history_writer = hub
         .attach_history(ahma_common::daemon_history::history_path())
         .await;
@@ -232,7 +219,6 @@ pub async fn run_daemon_mode(config: AppConfig) -> Result<()> {
         writer.shutdown().await;
     }
     remove_own_socket(std::path::Path::new(&mcp_socket));
-    ahma_common::daemon_endpoint::remove_endpoint(&runtime_dir);
     // Last: dropping the hub unlinks its socket and then releases the lock, so
     // nothing above can touch a successor's files (SPEC R-ISO.3).
     drop(hub);

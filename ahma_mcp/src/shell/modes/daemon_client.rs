@@ -17,6 +17,11 @@
 //! client starts the new binary. Until then the newcomer proxies to the old
 //! daemon, which works, and says so loudly rather than pretending the skew is
 //! not there (SPEC R7's rule that ahma never hides its own state).
+//!
+//! An older client just proxies. The daemon runs every session's worker from
+//! its own binary, so a stale client — an editor configured with an old
+//! install — is served by the newer build all the same. It used to re-execute
+//! itself instead, which bought nothing but a flicker and a loop guard.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -35,10 +40,9 @@ const DRAIN_HANDOFF_SECS: u64 = 5;
 pub enum EnsureOutcome {
     /// A daemon of this build was already serving.
     Ready,
-    /// A daemon is serving, it is a different build, and it could not be
-    /// replaced right now — it is either busy or a replacement was already
-    /// attempted this lineage. Work continues against it; the caller must
-    /// disclose the skew.
+    /// A daemon of an older build is serving, and it could not be replaced
+    /// right now because it is busy. Work continues against it; the caller
+    /// must disclose the skew.
     ReadyButStale { daemon: String, ours: String },
     /// No daemon was serving, so this call started one.
     Spawned,
@@ -51,27 +55,16 @@ pub enum EnsureOutcome {
 /// to reproduce by hand.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SkewAction {
-    /// Same build: just use it.
+    /// The same build, or a newer one than ours: just use it.
     Proxy,
     /// We are newer: ask it to drain, then start the successor.
     Drain,
-    /// We are older: re-exec, so the right binary handles this session.
-    ReExec,
-    /// A skew we must not act on — a replacement was already tried in this
-    /// lineage, so trying again is how a respawn storm starts. Proxy and
-    /// disclose.
-    ProxyStale,
 }
 
 /// Decide what to do about the running daemon's version.
 ///
 /// `daemon_version` is the raw `semver+build_id` string from `/health`.
-pub fn skew_action(
-    client_semver: &str,
-    client_build: &str,
-    daemon_version: &str,
-    already_restarted: bool,
-) -> SkewAction {
+pub fn skew_action(client_semver: &str, client_build: &str, daemon_version: &str) -> SkewAction {
     let (daemon_semver, daemon_build) = split_version_and_build_id(daemon_version);
     let same_semver = daemon_semver == client_semver;
     let same_build = daemon_build.is_none_or(|b| b == client_build);
@@ -86,15 +79,10 @@ pub fn skew_action(
         _ => true,
     } || (same_semver && !same_build);
 
-    if already_restarted {
-        // The mismatch survived a replacement, so replacing again is futile and
-        // is exactly how several coexisting build-ids turn into a respawn loop.
-        return SkewAction::ProxyStale;
-    }
     if we_are_newer {
         SkewAction::Drain
     } else {
-        SkewAction::ReExec
+        SkewAction::Proxy
     }
 }
 
@@ -127,26 +115,8 @@ pub async fn ensure_daemon(
         return Ok(EnsureOutcome::Spawned);
     };
 
-    let already_restarted = std::env::var("AHMA_RESTARTED").is_ok();
-    match skew_action(
-        client_semver,
-        client_build,
-        &daemon_version,
-        already_restarted,
-    ) {
+    match skew_action(client_semver, client_build, &daemon_version) {
         SkewAction::Proxy => Ok(EnsureOutcome::Ready),
-        SkewAction::ProxyStale => Ok(EnsureOutcome::ReadyButStale {
-            daemon: daemon_version,
-            ours: format!("{client_semver}+{client_build}"),
-        }),
-        SkewAction::ReExec => {
-            tracing::info!(
-                daemon_version = %daemon_version,
-                "this build is older than the running daemon; re-executing"
-            );
-            super::server::re_exec_current_process()?;
-            unreachable!("re_exec_current_process replaces this process image")
-        }
         SkewAction::Drain => {
             tracing::info!(
                 daemon_version = %daemon_version,
@@ -363,49 +333,35 @@ mod tests {
     #[test]
     fn the_same_build_is_simply_used() {
         assert_eq!(
-            skew_action(OURS, OUR_BUILD, "0.20.2+abc1234", false),
+            skew_action(OURS, OUR_BUILD, "0.20.2+abc1234"),
             SkewAction::Proxy
         );
         // A daemon that publishes no build id cannot be proven stale by one.
-        assert_eq!(
-            skew_action(OURS, OUR_BUILD, "0.20.2", false),
-            SkewAction::Proxy
-        );
+        assert_eq!(skew_action(OURS, OUR_BUILD, "0.20.2"), SkewAction::Proxy);
     }
 
     #[test]
     fn a_newer_build_drains_rather_than_restarting() {
         assert_eq!(
-            skew_action(OURS, OUR_BUILD, "0.20.1+old1234", false),
+            skew_action(OURS, OUR_BUILD, "0.20.1+old1234"),
             SkewAction::Drain
         );
         // Same version, different build: a developer rebuild. Still a drain,
         // never a restart — other windows are attached to that daemon.
         assert_eq!(
-            skew_action(OURS, OUR_BUILD, "0.20.2+def5678", false),
+            skew_action(OURS, OUR_BUILD, "0.20.2+def5678"),
             SkewAction::Drain
         );
     }
 
+    /// An older client neither downgrades the daemon nor restarts itself: the
+    /// daemon runs every session's worker from its own, newer binary, so the
+    /// older client's thin proxy is served correctly as it is.
     #[test]
-    fn an_older_build_re_execs_instead_of_downgrading_the_daemon() {
+    fn an_older_build_proxies_to_the_newer_daemon() {
         assert_eq!(
-            skew_action("0.20.1", OUR_BUILD, "0.20.2+newer", false),
-            SkewAction::ReExec
-        );
-    }
-
-    /// A mismatch that survived one replacement will survive the next, and
-    /// retrying is how several coexisting build-ids become a respawn loop.
-    #[test]
-    fn a_skew_that_survived_a_replacement_is_not_retried() {
-        assert_eq!(
-            skew_action(OURS, OUR_BUILD, "0.20.1+old1234", true),
-            SkewAction::ProxyStale
-        );
-        assert_eq!(
-            skew_action("0.20.1", OUR_BUILD, "0.20.2+newer", true),
-            SkewAction::ProxyStale
+            skew_action("0.20.1", OUR_BUILD, "0.20.2+newer"),
+            SkewAction::Proxy
         );
     }
 
@@ -413,7 +369,7 @@ mod tests {
     #[test]
     fn an_unparsable_daemon_version_counts_as_older() {
         assert_eq!(
-            skew_action(OURS, OUR_BUILD, "not-a-version", false),
+            skew_action(OURS, OUR_BUILD, "not-a-version"),
             SkewAction::Drain
         );
     }

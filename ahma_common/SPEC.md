@@ -38,8 +38,8 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
   write → watch signal → event (R15.3 in AGENTS.md).
 - `op_identity`: one operation identity (title, cwd, command, origin, exit code), computed
   where the operation starts and carried on the wire (R24.7).
-- `daemon_hub`, `daemon_endpoint`, `daemon_history`: the per-user daemon's hub state, its
-  Windows rendezvous, and its bounded on-disk history (R-DAEMON).
+- `daemon_hub`, `daemon_history`: the per-user daemon's hub state and its bounded on-disk
+  history (R-DAEMON).
 - `session_event`, `keepalive`: session-health events and heartbeat payloads (R8.8).
   Added fields are `#[serde(default)]`, so old and new peers interoperate both ways.
 - `mcp_methods`, `mcp_protocol`, `sse`: MCP method names, protocol-version negotiation for

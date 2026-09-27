@@ -14,7 +14,7 @@
 //! | Permissions and scope | [`permissions`], [`workspace_scope`], [`scope_decision`], [`scope_grant`], [`sandbox_state`], [`elicitation`], [`hook_consent`] |
 //! | Network policy and outbound HTTP | [`web_policy`], [`web_approval`], [`net_approval`], [`http_retry`] |
 //! | Operations | [`event_dispatcher`], [`op_identity`] |
-//! | Per-user daemon | [`daemon_hub`], [`daemon_endpoint`], [`daemon_history`] |
+//! | Per-user daemon | [`daemon_hub`], [`daemon_history`] |
 //! | MCP wire | [`mcp_methods`], [`mcp_protocol`], [`session_event`], [`keepalive`], [`sse`], [`peer_factory`] |
 //! | Process and platform | [`test_isolation`], [`process_guard`], [`timeouts`], [`file_uri`], [`hostname`], [`fs_lock`], [`local_socket`], [`local_tls`], [`digest`] |
 //! | Shared definitions | [`prompts`], [`skills`], [`simplify_args`], [`state_machine`], [`doctor`], [`observability`] |
@@ -34,7 +34,6 @@
 pub const BUILD_ID: &str = env!("AHMA_BUILD_ID");
 
 pub mod config;
-pub mod daemon_endpoint;
 pub mod daemon_history;
 pub mod daemon_hub;
 /// SHA-256 hex digests, one encoder for every `SHA256SUMS`-style surface.

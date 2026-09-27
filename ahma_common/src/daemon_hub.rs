@@ -51,40 +51,6 @@ use tracing::{debug, info, warn};
 
 use crate::local_socket::{LocalListener, LocalStream};
 
-/// Fold the current test run's discriminator into a stable pseudo-random
-/// offset in `0..modulus`, so every process in a test run agrees on
-/// [`bridge_http_port`] without plumbing.
-fn test_run_port_offset(modulus: u32) -> u16 {
-    let disc = crate::test_isolation::test_run_discriminator();
-    let hash: u32 = disc.bytes().fold(0u32, |acc, b| {
-        acc.wrapping_mul(31).wrapping_add(u32::from(b))
-    });
-    (hash % modulus) as u16
-}
-
-/// The bridge's HTTP port, made private under a test harness (SPEC R-ISO.1).
-///
-/// The Unix socket and the hub port were isolated per run; this port was not,
-/// and it is the *fallback* every discovery probe tries when the socket has
-/// nothing on it. So a test whose daemon failed to start found the developer's
-/// live bridge on the machine-global 3000, read its `/health`, and reported
-/// success. A whole release's worth of E2E tests passed that way on one
-/// machine and failed on CI, where there is no live server to borrow.
-///
-/// Isolation applies only to the default: an operator or a test that names a
-/// port means that port.
-pub fn bridge_http_port(configured: u16) -> u16 {
-    if configured != DEFAULT_BRIDGE_HTTP_PORT
-        || !crate::test_isolation::spawned_under_test_harness()
-    {
-        return configured;
-    }
-    32768 + test_run_port_offset(16000)
-}
-
-/// The port `ahma serve http` listens on when nothing says otherwise.
-pub const DEFAULT_BRIDGE_HTTP_PORT: u16 = 3000;
-
 /// Interval at which the hub sends liveness pings to connected instances.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -2336,12 +2302,9 @@ where
 /// naming an instance is its entire job.
 ///
 /// It was called `uuid_v4`, which claimed randomness it has never had — the
-/// misreading a static analyser made before a human did, and a dangerous one
-/// to leave sitting one module away from
-/// [`crate::daemon_endpoint::DaemonEndpoint`], whose bearer token *is* a
-/// secret and *is* minted from a CSPRNG-backed `Uuid::new_v4`. When you need
-/// unguessability, that is the function to reach for; this one cannot give it
-/// to you.
+/// misreading a static analyser made before a human did. When you need
+/// unguessability, reach for the CSPRNG-backed `Uuid::new_v4`; this function
+/// cannot give it to you.
 fn local_instance_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -3351,30 +3314,7 @@ mod tests {
     static ENV_MUTEX: std::sync::LazyLock<parking_lot::Mutex<()>> =
         std::sync::LazyLock::new(|| parking_lot::Mutex::new(()));
 
-    // ── bridge port / default_socket_path (env-driven) ────────────────────────
-
-    /// The HTTP fallback must be per-run under a harness, or a test finds the
-    /// developer's live server and calls it a pass.
-    #[test]
-    fn the_default_bridge_port_is_private_under_a_test_harness() {
-        // The suite always runs under one, so this is the live expectation.
-        let isolated = bridge_http_port(DEFAULT_BRIDGE_HTTP_PORT);
-        assert_ne!(
-            isolated, DEFAULT_BRIDGE_HTTP_PORT,
-            "a test must never probe the machine-global bridge port"
-        );
-        assert!(isolated >= 32768, "ephemeral range: {isolated}");
-        assert_eq!(
-            isolated,
-            bridge_http_port(DEFAULT_BRIDGE_HTTP_PORT),
-            "every process in one run must agree on it"
-        );
-        assert_eq!(
-            bridge_http_port(8123),
-            8123,
-            "a port someone named is the port they meant"
-        );
-    }
+    // ── default_socket_path (env-driven) ──────────────────────────────────────
 
     /// R-ISO.1: a test-harness process without explicit daemon-socket isolation
     /// must still resolve a private per-run socket, never the live daemon's.
