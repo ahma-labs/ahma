@@ -60,7 +60,7 @@ impl AhmaMcpService {
 
         let summary = if let Some(ref id) = specific_id {
             if total_count == 0 {
-                common::unknown_operation_message(id)
+                common::unknown_operation_report(id).await
             } else {
                 format!("Operation '{}' found", id)
             }

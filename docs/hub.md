@@ -143,6 +143,12 @@ other. `/health` says which binary, and which file, the hub is running.
   hour by default), so an old build cannot run forever; the requests it
   interrupts get an error saying why.
 
+When your editor reconnects to the new build it is told the tool list may
+have changed, so it picks up new or changed tools without a restart. And if
+you `await` an operation id from before the handover, the answer says how that
+operation ended — from the hub's history — and when and why ahma restarted,
+rather than just "not found".
+
 Your other editors' sessions are not torn down mid-command to install a
 binary one of them asked for. Until the handover happens, the mismatch is
 disclosed rather than hidden. A TUI watching the old hub does not hold it

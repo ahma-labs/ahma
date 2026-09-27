@@ -68,6 +68,23 @@ struct CachedHandshake {
     /// invariant), so replaying this cached answer on reconnect is correct, not
     /// just convenient.
     roots_response: Option<serde_json::Value>,
+    /// The `serverInfo.version` the client last saw: from the first
+    /// `initialize` answer, then from each reconnect that announced a change.
+    server_version: Option<String>,
+    /// The `serverInfo.version` the most recent replay was answered with,
+    /// left for the reconnect site to compare. Shared rather than returned so
+    /// every reconnect path reports it the same way.
+    replayed_version: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+/// `result.serverInfo.version` of an `initialize` answer.
+fn server_version_of(response: &serde_json::Value) -> Option<String> {
+    response
+        .get("result")?
+        .get("serverInfo")?
+        .get("version")?
+        .as_str()
+        .map(String::from)
 }
 
 impl CachedHandshake {
@@ -92,6 +109,12 @@ impl CachedHandshake {
     /// Observe a message forwarded from the bridge to the client, and note when
     /// it is a `roots/list` request whose answer we need to watch for.
     fn observe_bridge_to_client(&mut self, val: &serde_json::Value) {
+        if self.server_version.is_none()
+            && val.get("id").is_some()
+            && self.init_request.as_ref().and_then(|r| r.get("id")) == val.get("id")
+        {
+            self.server_version = server_version_of(val);
+        }
         if val.get("method").and_then(|m| m.as_str()) == Some(ROOTS_LIST_METHOD) {
             self.pending_roots_list_id = val.get("id").cloned();
         }
@@ -119,10 +142,14 @@ where
         .send(init_msg)
         .await
         .map_err(|e| anyhow!("reconnect: failed to resend initialize: {e:?}"))?;
-    client
+    let answer = client
         .receive()
         .await
         .ok_or_else(|| anyhow!("reconnect: bridge closed before answering initialize"))?;
+    *handshake.replayed_version.lock() = serde_json::to_value(&answer)
+        .ok()
+        .as_ref()
+        .and_then(server_version_of);
 
     if let Some(notif) = &handshake.notif_initialized {
         let notif_msg: TxJsonRpcMessage<RoleClient> = serde_json::from_value(notif.clone())
@@ -201,6 +228,61 @@ async fn emit_session_event_downstream<S>(
         send_session_event_notification(stdio, kind, val).await;
     }
 }
+
+/// Did the reconnect just replayed land on a different ahma version?
+///
+/// Consumes the replayed version, and adopts it as the one the client has
+/// now been told about, so one change is announced once.
+fn version_changed_on_reconnect(handshake: &mut CachedHandshake) -> bool {
+    let replayed = handshake.replayed_version.lock().take();
+    match replayed {
+        Some(new) if handshake.server_version.as_deref() != Some(new.as_str()) => {
+            handshake.server_version = Some(new);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Disclose a transparent reconnect downstream, and — when it landed on a
+/// different ahma version — tell the client its tool list may have changed
+/// (SPEC R-HUB.5). The client cached `tools/list` from the old build; without
+/// this it would keep calling tools by the old build's schemas until it
+/// restarted.
+async fn announce_reconnect<S>(
+    stdio: &mut S,
+    seq: &mut u64,
+    handshake: &mut CachedHandshake,
+    detail: serde_json::Value,
+) where
+    S: Transport<RoleServer>,
+    S::Error: std::fmt::Debug,
+{
+    emit_session_event_downstream(
+        stdio,
+        seq,
+        ahma_common::session_event::SessionEventKind::Reconnected,
+        detail,
+    )
+    .await;
+    if version_changed_on_reconnect(handshake) {
+        let notice = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": TOOLS_LIST_CHANGED_METHOD,
+        });
+        match serde_json::from_value::<TxJsonRpcMessage<RoleServer>>(notice) {
+            Ok(msg) => {
+                if let Err(e) = stdio.send(msg).await {
+                    tracing::debug!(error = ?e, "tools/list_changed to stdio failed (non-fatal)");
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "tools/list_changed did not serialize"),
+        }
+    }
+}
+
+/// The notification that tells a client to fetch `tools/list` again.
+const TOOLS_LIST_CHANGED_METHOD: &str = "notifications/tools/list_changed";
 
 /// Deserialize one session-event notification and send it downstream,
 /// logging (never propagating) either failure: a malformed notification or a
@@ -999,10 +1081,10 @@ where
                                 transport,
                                 "Proxy reconnected to a live bridge; session resumed"
                             );
-                            emit_session_event_downstream(
+                            announce_reconnect(
                                 &mut stdio,
                                 &mut event_seq,
-                                ahma_common::session_event::SessionEventKind::Reconnected,
+                                &mut handshake,
                                 reconnected_detail(reconnects, "bridge_unreachable", true),
                             )
                             .await;
@@ -1107,10 +1189,10 @@ where
                                         relay_forward_failure_to_client(&mut stdio, id, None).await;
                                     }
                                 }
-                                emit_session_event_downstream(
+                                announce_reconnect(
                                     &mut stdio,
                                     &mut event_seq,
-                                    ahma_common::session_event::SessionEventKind::Reconnected,
+                                    &mut handshake,
                                     reconnected_detail(reconnects, "endpoint_gone", resent),
                                 )
                                 .await;
@@ -1182,10 +1264,10 @@ where
                                     // The request that tripped the failure was
                                     // answered with an error above; name it so
                                     // the client can re-issue.
-                                    emit_session_event_downstream(
+                                    announce_reconnect(
                                         &mut stdio,
                                         &mut event_seq,
-                                        ahma_common::session_event::SessionEventKind::Reconnected,
+                                        &mut handshake,
                                         reconnected_detail(
                                             reconnects,
                                             "transport_failure",
@@ -2521,6 +2603,7 @@ mod tests {
             ),
             pending_roots_list_id: None,
             roots_response: Some(serde_json::to_value(client_roots_list_response(1)).unwrap()),
+            ..Default::default()
         };
 
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -2531,8 +2614,8 @@ mod tests {
             send_error_text: TRANSIENT_SEND_ERROR,
             attempts: attempts.clone(),
             inbound: VecDeque::from(vec![
-                bridge_response(0),           // answers the replayed initialize
-                bridge_roots_list_request(7), // the fresh session's own roots/list
+                bridge_initialize_response(0), // answers the replayed initialize
+                bridge_roots_list_request(7),  // the fresh session's own roots/list
             ]),
             closed: Arc::new(AtomicUsize::new(0)),
             receive_none_after: None,
@@ -2544,6 +2627,11 @@ mod tests {
         replay_handshake(&mut client, &handshake)
             .await
             .expect("replay must succeed");
+        assert_eq!(
+            handshake.replayed_version.lock().as_deref(),
+            Some("0.1.0"),
+            "the replay records which version answered, for the reconnect site"
+        );
 
         // initialize + notifications/initialized + the roots/list answer.
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
@@ -2562,6 +2650,43 @@ mod tests {
             sent[2]["result"]["roots"][0]["uri"],
             serde_json::json!("file:///workspace")
         );
+    }
+
+    /// A reconnect that lands on a different ahma version tells the client
+    /// its tool list may have changed (SPEC R-HUB.5): it cached `tools/list`
+    /// from the old build and would otherwise keep using that build's
+    /// schemas until it restarted. Announced once per change, and never for
+    /// a reconnect to the same version.
+    #[tokio::test]
+    async fn a_reconnect_to_a_new_version_announces_changed_tools() {
+        let mut handshake = CachedHandshake {
+            init_request: Some(serde_json::to_value(client_initialize(0)).unwrap()),
+            ..Default::default()
+        };
+        handshake.observe_bridge_to_client(
+            &serde_json::to_value(bridge_initialize_response(0)).unwrap(),
+        );
+        assert_eq!(handshake.server_version.as_deref(), Some("0.1.0"));
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut stdio = MockStdio::new(VecDeque::new(), sent.clone());
+        let mut seq = 0;
+        let announcements = |sent: &Arc<Mutex<Vec<serde_json::Value>>>| {
+            sent.lock()
+                .iter()
+                .filter(|m| m["method"] == TOOLS_LIST_CHANGED_METHOD)
+                .count()
+        };
+
+        *handshake.replayed_version.lock() = Some("0.1.0".into());
+        announce_reconnect(&mut stdio, &mut seq, &mut handshake, serde_json::json!({})).await;
+        assert_eq!(announcements(&sent), 0, "same version, same tools");
+
+        *handshake.replayed_version.lock() = Some("0.2.0".into());
+        announce_reconnect(&mut stdio, &mut seq, &mut handshake, serde_json::json!({})).await;
+        announce_reconnect(&mut stdio, &mut seq, &mut handshake, serde_json::json!({})).await;
+        assert_eq!(announcements(&sent), 1, "one change, announced once");
+        assert_eq!(handshake.server_version.as_deref(), Some("0.2.0"));
     }
 
     #[tokio::test]

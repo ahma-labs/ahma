@@ -513,6 +513,128 @@ pub fn unknown_operation_message(id: &str) -> String {
     }
 }
 
+/// What the hub recorded that bears on an operation id this process does not
+/// know: why and when ahma last restarted, and how that operation ended.
+#[derive(Debug, Default)]
+pub struct RestartContext {
+    /// The hub's `last-exit.json`.
+    pub last_exit: Option<ahma_common::hub_history::LastExit>,
+    /// What the hub's history says about this id.
+    pub outcome: Option<ahma_common::hub_history::RecordedOutcome>,
+}
+
+/// Read the [`RestartContext`] for `id`: the last exit recorded beside the
+/// hub this process reports to, and the hub's history. Either may be
+/// missing, which only makes the answer less specific.
+pub async fn restart_context(id: &str) -> RestartContext {
+    let socket = ahma_common::hub::default_socket_path();
+    let last_exit = ahma_common::hub_history::read_last_exit(
+        &ahma_common::hub_history::last_exit_path_for(&socket),
+    )
+    .await;
+    let outcome = match ahma_common::hub_history::history_path() {
+        Some(path) => ahma_common::hub_history::recorded_outcome(&path, id).await,
+        None => None,
+    };
+    RestartContext { last_exit, outcome }
+}
+
+/// "45 s", "12 min", "3 h", "2 days": how long ago, to the unit a reader
+/// needs.
+fn ago(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        0..=89 => format!("{secs} s"),
+        90..=5399 => format!("{} min", secs / 60),
+        5400..=172_799 => format!("{} h", secs / 3600),
+        _ => format!("{} days", secs / 86_400),
+    }
+}
+
+/// [`unknown_operation_message`], told what the hub recorded (SPEC
+/// R-LIFECYCLE.4): *how* the operation ended when the history kept it, and
+/// when, why and from which version ahma last restarted.
+///
+/// Only an id from another process gains anything: one this process issued
+/// and evicted, or a string that is no operation id, reads as before.
+pub fn unknown_operation_message_with(id: &str, context: &RestartContext, now_ms: u64) -> String {
+    use crate::utils::operation::{generation, id_generation};
+    use ahma_common::hub_history::RecordedOutcome;
+    let from_another_process = match id_generation(id) {
+        Some(g) => g != generation(),
+        None => id
+            .strip_prefix("op_")
+            .and_then(|rest| rest.split('_').next())
+            .is_some_and(|first| !first.is_empty() && first.chars().all(|c| c.is_ascii_digit())),
+    };
+    if !from_another_process {
+        return unknown_operation_message(id);
+    }
+
+    let interrupted_by_exit = context
+        .last_exit
+        .as_ref()
+        .is_some_and(|exit| exit.interrupted_ops.iter().any(|op| op == id));
+    let mut message = match &context.outcome {
+        Some(RecordedOutcome::Finished {
+            status,
+            exit_code,
+            summary,
+            ended_epoch_ms,
+            interrupted,
+        }) => {
+            let mut how = format!("{status:?}");
+            if let Some(code) = exit_code {
+                how.push_str(&format!(", exit {code}"));
+            }
+            if *interrupted {
+                how.push_str(", interrupted");
+            }
+            if let Some(ended) = ended_epoch_ms {
+                how.push_str(&format!(", {} ago", ago(now_ms.saturating_sub(*ended))));
+            }
+            if let Some(summary) = summary.as_deref().filter(|s| !s.is_empty()) {
+                how.push_str(&format!(": {summary}"));
+            }
+            format!(
+                "Operation '{id}' not found: it was issued by an earlier ahma process, and its \
+                 result was not kept here. ahma's history recorded how it ended — {how}. Any \
+                 output file it wrote is still on disk."
+            )
+        }
+        Some(RecordedOutcome::NeverFinished) => format!(
+            "Operation '{id}' not found: it was issued by an earlier ahma process and was still \
+             running when that process went, so it did not finish. Check what it left behind, \
+             or run it again."
+        ),
+        None if interrupted_by_exit => format!(
+            "Operation '{id}' not found: it was issued by an earlier ahma process and was still \
+             running when ahma restarted, which interrupted it. Check what it left behind, or \
+             run it again."
+        ),
+        None => unknown_operation_message(id),
+    };
+    if let Some(exit) = &context.last_exit {
+        message.push_str(&format!(
+            " ahma last restarted {} ago ({}), from v{}+{} to v{}+{}.",
+            ago(now_ms.saturating_sub(exit.at_epoch_ms)),
+            exit.reason.phrase(),
+            exit.version,
+            exit.build_id,
+            env!("CARGO_PKG_VERSION"),
+            ahma_common::BUILD_ID,
+        ));
+    }
+    message
+}
+
+/// What `await`, `status` and `cancel` say about an id this process does not
+/// know, with everything the hub recorded about it (SPEC R-LIFECYCLE.4).
+pub async fn unknown_operation_report(id: &str) -> String {
+    let context = restart_context(id).await;
+    unknown_operation_message_with(id, &context, ahma_common::keepalive::current_timestamp_ms())
+}
+
 #[cfg(test)]
 #[path = "common_tests.rs"]
 mod tests;

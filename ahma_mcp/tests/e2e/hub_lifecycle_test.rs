@@ -200,6 +200,15 @@ async fn the_hub_exits_when_nothing_is_attached() {
         wait_for(&r.hub, false).await,
         "and unlink the socket it bound"
     );
+    // And say why, for whoever next asks about an operation it issued
+    // (SPEC R-LIFECYCLE.4).
+    let last_exit = ahma_common::hub_history::read_last_exit(
+        &ahma_common::hub_history::last_exit_path_for(&r.hub),
+    )
+    .await
+    .expect("the hub records why it exited");
+    assert_eq!(last_exit.reason, ahma_common::hub_history::ExitReason::Idle);
+    assert!(last_exit.interrupted_ops.is_empty());
 }
 
 /// A hub whose socket is removed gives way (SPEC R-HUB.3). No client can
@@ -310,6 +319,15 @@ async fn a_draining_hub_hands_over_to_its_successor() {
             ahma_common::hub::send_msg(&mut stream, &ahma_common::hub::ClientMsg::Shutdown).await;
     }
     assert!(serving, "the successor must take over the socket");
+    let last_exit = ahma_common::hub_history::read_last_exit(
+        &ahma_common::hub_history::last_exit_path_for(&r.hub),
+    )
+    .await
+    .expect("the old hub records why it exited");
+    assert_eq!(
+        last_exit.reason,
+        ahma_common::hub_history::ExitReason::Upgrade
+    );
     assert!(
         wait_for(&r.hub, false).await,
         "and the successor goes when asked"

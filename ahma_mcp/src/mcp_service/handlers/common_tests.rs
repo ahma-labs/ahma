@@ -529,3 +529,97 @@ fn unknown_id_that_is_not_an_operation_id_says_so() {
     assert!(msg.contains("not found"), "{msg}");
     assert!(msg.contains("not an ahma operation id"), "{msg}");
 }
+
+fn another_generation_id() -> String {
+    let current = crate::utils::operation::generation();
+    let other = if current == "zzzz" { "aaaa" } else { "zzzz" };
+    format!("op_{other}_3_cargo_build")
+}
+
+fn last_exit(interrupted: &[&str]) -> ahma_common::hub_history::LastExit {
+    ahma_common::hub_history::LastExit {
+        version: "0.21.7".into(),
+        build_id: "old1234".into(),
+        reason: ahma_common::hub_history::ExitReason::Upgrade,
+        at_epoch_ms: 1_000_000,
+        interrupted_ops: interrupted.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// SPEC R-LIFECYCLE.4: when the hub's history kept an operation, the answer
+/// says how it ended rather than guessing "most likely finished".
+#[test]
+fn an_unknown_id_the_history_kept_says_how_it_ended() {
+    let id = another_generation_id();
+    let context = RestartContext {
+        last_exit: Some(last_exit(&[])),
+        outcome: Some(ahma_common::hub_history::RecordedOutcome::Finished {
+            status: ahma_common::hub::OpStatus::Failed,
+            exit_code: Some(101),
+            summary: Some("test failed".into()),
+            ended_epoch_ms: Some(1_000_000 - 120_000),
+            interrupted: false,
+        }),
+    };
+    let msg = unknown_operation_message_with(&id, &context, 1_000_000 + 600_000);
+    assert!(msg.contains("Failed, exit 101"), "{msg}");
+    assert!(msg.contains("12 min ago"), "{msg}");
+    assert!(msg.contains("test failed"), "{msg}");
+    assert!(!msg.contains("most likely finished"), "{msg}");
+    assert!(
+        msg.contains("ahma last restarted 10 min ago (handed over to a newer build)"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(&format!(
+            "from v0.21.7+old1234 to v{}",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{msg}"
+    );
+}
+
+/// An operation the restart interrupted is never described as finished.
+#[test]
+fn an_unknown_id_a_restart_interrupted_says_so() {
+    let id = another_generation_id();
+    let never = RestartContext {
+        last_exit: None,
+        outcome: Some(ahma_common::hub_history::RecordedOutcome::NeverFinished),
+    };
+    let msg = unknown_operation_message_with(&id, &never, 2_000_000);
+    assert!(msg.contains("did not finish"), "{msg}");
+    assert!(!msg.contains("most likely finished"), "{msg}");
+
+    let named = RestartContext {
+        last_exit: Some(last_exit(&[id.as_str()])),
+        outcome: None,
+    };
+    let msg = unknown_operation_message_with(&id, &named, 2_000_000);
+    assert!(msg.contains("interrupted it"), "{msg}");
+    assert!(msg.contains("ahma last restarted"), "{msg}");
+}
+
+/// With nothing recorded the answer is what it always was; and an id this
+/// process issued, or no id at all, gains nothing from a restart record.
+#[test]
+fn an_unknown_id_with_nothing_recorded_reads_as_before() {
+    let id = another_generation_id();
+    assert_eq!(
+        unknown_operation_message_with(&id, &RestartContext::default(), 2_000_000),
+        unknown_operation_message(&id)
+    );
+    let context = RestartContext {
+        last_exit: Some(last_exit(&[])),
+        outcome: None,
+    };
+    let ours = crate::utils::operation::generate_id_with_details(3, "cargo", "cargo build");
+    assert_eq!(
+        unknown_operation_message_with(&ours, &context, 2_000_000),
+        unknown_operation_message(&ours)
+    );
+    assert_eq!(
+        unknown_operation_message_with("banana", &context, 2_000_000),
+        unknown_operation_message("banana")
+    );
+}

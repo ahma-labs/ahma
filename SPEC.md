@@ -1510,6 +1510,14 @@ Operation ids are counters, and counters restart with the process that issues th
    id belongs to another session), so the work most likely finished and the agent should check
    its effect; the current generation means it was evicted from the bounded history; an id
    that is not an operation id is called that.
+3. For an id from another process the answer says what ahma **recorded**, when it can. The hub
+   writes `<socket stem>.last-exit.json` beside its socket on every exit — its version and
+   build, why it went (`upgrade`, `idle`, `drain-timeout`, `socket-removed`, `stopped`,
+   `failed`), when, and the operations still running, which that exit interrupted. The answer
+   then names how the operation ended from `history.jsonl` (status, exit code, summary, how
+   long ago), or that it never finished, instead of "most likely finished"; and when, why and
+   from which version to which ahma last restarted. Keyed by the socket because hub and
+   worker already agree on it (R-HUB.2), and that keeps a test's record its own (R-HUB.10).
 
 ### R-HUB: The Single Per-User Hub
 
@@ -1662,6 +1670,9 @@ Operation ids are counters, and counters restart with the process that issues th
     interrupts are replayed `interrupted` (R-HUB.7). Work that never goes
     quiet is the one thing that can hold a drain open, and holding it open
     forever would run the old build forever.
+  - After a reconnect lands on a different ahma version, the frontend tells its client
+    `notifications/tools/list_changed`, once per change: the client cached `tools/list`
+    from the old build and would otherwise keep its schemas until it restarted.
   - A client that finds the hub already draining does not ask again or wait;
     it proxies and **discloses** the skew. An **older** client neither drains
     a newer hub nor restarts itself: it proxies, because the hub runs every

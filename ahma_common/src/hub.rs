@@ -1437,7 +1437,7 @@ impl Hub {
     /// What a draining hub waits for (SPEC R-HUB.5): work that would die with
     /// it. Hooks and a TUI's `!` commands run in their own processes and
     /// outlive the hub; a worker that has gone is not coming back to finish.
-    async fn operations_in_flight(&self) -> usize {
+    async fn operations_in_flight(&self) -> Vec<String> {
         let workers: Vec<String> = self
             .instances
             .lock()
@@ -1450,8 +1450,12 @@ impl Hub {
         workers
             .iter()
             .filter_map(|id| history.get(id))
-            .map(|ops| ops.values().filter(|s| s.finished.is_none()).count())
-            .sum()
+            .flat_map(|ops| {
+                ops.iter()
+                    .filter(|(_, s)| s.finished.is_none())
+                    .map(|(op_id, _)| op_id.clone())
+            })
+            .collect()
     }
 
     /// Every instance a subscriber should know about: those attached now, plus
@@ -1700,9 +1704,10 @@ pub struct HubEvents {
 }
 
 impl HubEvents {
-    /// Operations still running in a session worker attached now: what a
-    /// draining hub waits for before it goes (SPEC R-HUB.5).
-    pub async fn operations_in_flight(&self) -> usize {
+    /// Operations still running in a session worker attached now, by id:
+    /// what a draining hub waits for before it goes (SPEC R-HUB.5), and what
+    /// an exit interrupts.
+    pub async fn operations_in_flight(&self) -> Vec<String> {
         self.hub.operations_in_flight().await
     }
 
@@ -4153,13 +4158,16 @@ mod tests {
         // A worker that disconnected with an operation still marked running.
         hub.record_op_event("gone", &started_ev("gone-op")).await;
         let events = HubEvents { hub: Arc::new(hub) };
-        assert_eq!(events.operations_in_flight().await, 1);
+        assert_eq!(
+            events.operations_in_flight().await,
+            vec!["w1-op".to_string()]
+        );
 
         events
             .hub
             .record_op_event("w1", &finished_ev("w1-op", None))
             .await;
-        assert_eq!(events.operations_in_flight().await, 0);
+        assert!(events.operations_in_flight().await.is_empty());
     }
 
     /// The retained output window is bounded: it is what a late subscriber
