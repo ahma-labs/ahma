@@ -4,7 +4,8 @@
 //! Clients connect via a Unix domain socket (UDS) using standard
 //! MCP Streamable HTTP framing; no TCP port is opened.
 //!
-//! This mode is Unix-only (`#[cfg(unix)]`).
+//! On Windows (10 1803+) the socket is the same `AF_UNIX` kind, through
+//! `ahma_common::local_socket`.
 
 use crate::shell::cli::AppConfig;
 use ahma_http_bridge::{BridgeConfig, ListenerKind, start_bridge};

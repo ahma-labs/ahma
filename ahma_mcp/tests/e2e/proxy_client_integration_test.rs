@@ -1,3 +1,4 @@
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::test_utils::cli::build_binary_cached;
 use ahma_mcp::test_utils::fs::get_workspace_dir as workspace_dir;
 use std::time::{Duration, Instant};
@@ -48,10 +49,10 @@ async fn test_proxy_client_autostart_and_shutdown() {
     let mut child_stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
     let mut line = String::new();
 
-    // 2. Poll until the Unix socket file is created and healthy (up to 5s)
+    // 2. Poll until the daemon's socket is created and healthy.
     let start = Instant::now();
     let mut healthy = false;
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < TestTimeouts::get(TimeoutCategory::ProcessSpawn) {
         // Read any available stderr output from the child
         while let Ok(Ok(n)) =
             tokio::time::timeout(Duration::from_millis(5), child_stderr.read_line(&mut line)).await
@@ -63,17 +64,16 @@ async fn test_proxy_client_autostart_and_shutdown() {
             line.clear();
         }
 
-        #[cfg(unix)]
-        if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
-            healthy = true;
-            break;
-        }
-        #[cfg(not(unix))]
+        // The daemon's MCP endpoint is this socket on every OS (SPEC
+        // R-DAEMON.2); on Windows this used to be skipped, because there it was
+        // a TCP port the frontend could not find.
+        if ahma_common::local_socket::LocalStream::connect(&socket_path)
+            .await
+            .is_ok()
         {
             healthy = true;
             break;
         }
-        #[cfg(unix)]
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -135,7 +135,7 @@ async fn test_proxy_client_autostart_and_shutdown() {
     // Wait for the host process to terminate due to the 10-second idle shutdown
     let wait_start = Instant::now();
     let mut exited = false;
-    while wait_start.elapsed() < Duration::from_secs(15) {
+    while wait_start.elapsed() < TestTimeouts::scale_secs(15) {
         if let Ok(Some(_status)) = child.try_wait() {
             exited = true;
             break;
@@ -150,10 +150,9 @@ async fn test_proxy_client_autostart_and_shutdown() {
 
     let _ = std::fs::remove_file(&socket_path);
 
-    #[cfg(unix)]
     assert!(
         exited,
-        "Host server should exit cleanly within 15 seconds after stdin closes and 0 active sessions remain"
+        "Host server should exit cleanly after stdin closes and 0 active sessions remain"
     );
 }
 
@@ -162,7 +161,6 @@ async fn test_proxy_client_autostart_and_shutdown() {
 /// held OPEN (so the stdin-EOF exit path can NOT fire), must still terminate on
 /// its own via the handshake deadline. Without this, an editor that repeatedly
 /// spawns and abandons MCP servers piles up thousands of live processes.
-#[cfg(unix)]
 #[tokio::test]
 async fn test_frontend_exits_when_handshake_never_arrives() {
     let binary = build_binary();
@@ -204,7 +202,7 @@ async fn test_frontend_exits_when_handshake_never_arrives() {
     // The frontend must exit on its own: deadline (2s) + background-bridge
     // startup + margin. Generous upper bound, but well under any EOF/idle path
     // (stdin is still open, so EOF can't be why it exited).
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + TestTimeouts::scale_secs(20);
     let mut exit_status = None;
     while Instant::now() < deadline {
         if let Ok(Some(status)) = child.try_wait() {

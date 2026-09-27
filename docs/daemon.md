@@ -72,11 +72,9 @@ it, and since nothing owned the path, pre-create it. A `0600` socket inside a
 world-writable directory is still squattable, which is why the directory is
 checked and not only the socket.
 
-On **Windows** (10 1803 or later) the hub is the same kind of `AF_UNIX` socket
+On **Windows** (10 1803 or later) both are the same kind of `AF_UNIX` socket
 file, with the same lock; access control comes from the per-user profile ACL
-rather than mode bits. The MCP endpoint is not there yet: on Windows it still
-listens on a loopback TCP port that clients do not discover, until the stdio
-proxy and the TUI can speak HTTP over the socket too.
+rather than mode bits. The daemon opens no TCP port on any OS.
 
 ## Lifetime
 

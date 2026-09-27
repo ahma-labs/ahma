@@ -54,28 +54,10 @@ impl AhmaMcpService {
                 .filter(|path| !path.is_empty())
                 .unwrap_or_else(global_mcp_socket_path)
         };
-        let socket_path_opt = if cfg!(unix) {
-            Some(socket_path.as_str())
-        } else {
-            None
-        };
-
-        let http_url = {
-            let app_config_guard = self.app_config.read();
-            if let Some(ref config) = *app_config_guard {
-                format!("http://{}:{}", config.http_host, config.http_port)
-            } else {
-                "http://127.0.0.1:3000".to_string()
-            }
-        };
-        let http_url_opt = Some(http_url.as_str());
-
         tracing::info!("Tool 'restart' called. Triggering bridge server restart...");
 
         // Try to trigger restart on the bridge
-        let triggered =
-            crate::shell::modes::server::trigger_bridge_restart(socket_path_opt, http_url_opt)
-                .await;
+        let triggered = crate::shell::modes::server::trigger_bridge_restart(&socket_path).await;
 
         if triggered {
             Ok(text_result(
@@ -114,6 +96,28 @@ mod tests {
     use crate::test_utils::in_process::build_test_service;
     use serde_json::Map;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A stand-in daemon on `sock` that answers every request `200 OK` and
+    /// counts them, on every OS.
+    fn serve_restart_ok(sock: &std::path::Path) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = ahma_common::local_socket::LocalListener::bind(sock).expect("bind");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_bg = hits.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(mut conn) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf).await;
+                hits_bg.fetch_add(1, Ordering::SeqCst);
+                let _ = conn
+                    .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = conn.shutdown().await;
+            }
+        });
+        (server, hits)
+    }
 
     /// `restart_schema()` returns an object schema with no properties and no required fields,
     /// since the restart tool takes no arguments.
@@ -140,16 +144,12 @@ mod tests {
     }
 
     /// When `app_config` is `None` (the default for test services), `handle_restart` uses
-    /// the compiled-in defaults for both socket path and HTTP URL, then calls
-    /// `trigger_bridge_restart`.  The result is a valid restart message regardless of
-    /// whether a bridge is actually listening on port 3000 — the important thing is that
-    /// the `None` branches in both `RwLock` guards are executed and the function returns `Ok`.
+    /// the shared daemon socket, which a test-isolated process is refused (SPEC R-ISO.1),
+    /// so the handler reports rather than restarting anything.
     #[tokio::test]
     async fn handle_restart_no_app_config_executes_none_branches() {
         let (service, _temp_dir) = build_test_service().await.unwrap();
-        // app_config is None by default:
-        //   socket_path  → GLOBAL_SOCKET_PATH
-        //   http_url     → "http://127.0.0.1:3000"
+        // app_config is None by default, so the socket is the shared one.
         let result = service
             .handle_restart(Map::new())
             .await
@@ -160,43 +160,23 @@ mod tests {
             .and_then(|c| c.as_text())
             .map(|t| t.text.as_str())
             .unwrap_or("");
-        // Accept either outcome: if nothing is on port 3000 we get the exit message;
-        // if something happens to be listening we get the success message.
         assert!(
-            text.contains("No running bridge") || text.contains("Restart request sent"),
-            "expected a restart-related message, got: {text:?}"
+            text.contains("test-isolated"),
+            "a test must never restart the shared daemon, got: {text:?}"
         );
     }
 
-    /// When `app_config` contains an **empty** `unix_socket_path`, `handle_restart`
-    /// falls through to the `is_empty()` branch (defaulting to "/tmp/ahma.sock") and
-    /// uses the HTTP URL derived from `http_host`/`http_port`.  A wiremock server
-    /// responds 200 to the POST /restart call, so `triggered` is `true` and the handler
-    /// returns the success message.
-    ///
-    /// Covers: `Some(config)` app_config branch (both locks), `is_empty()` true branch,
-    /// `format!("http://…")` http_url branch, and `triggered == true` branch.
+    /// A configured socket with a daemon on it is asked to restart, on every OS —
+    /// the daemon's MCP endpoint is that socket everywhere (SPEC R-DAEMON.2).
     #[tokio::test]
-    async fn handle_restart_empty_socket_path_with_mock_bridge_returns_success() {
-        use wiremock::{
-            Mock, MockServer, ResponseTemplate,
-            matchers::{method, path},
-        };
-
-        let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/restart"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
-            .mount(&mock_server)
-            .await;
+    async fn handle_restart_reaches_the_configured_daemon_socket() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let sock = tmp.path().join("mcp.sock");
+        let (server, hits) = serve_restart_ok(&sock);
 
         let (service, _temp_dir) = build_test_service().await.unwrap();
-        let port = mock_server.address().port();
-        // Empty unix_socket_path → exercises the `is_empty()` → "/tmp/ahma.sock" branch
         service.set_app_config(Arc::new(AppConfig {
-            http_host: "127.0.0.1".to_string(),
-            http_port: port,
-            unix_socket_path: String::new(),
+            unix_socket_path: sock.to_string_lossy().into_owned(),
             ..AppConfig::default()
         }));
 
@@ -204,6 +184,7 @@ mod tests {
             .handle_restart(Map::new())
             .await
             .expect("handle_restart must not return McpError");
+        server.abort();
         let text = result
             .content
             .first()
@@ -214,60 +195,7 @@ mod tests {
             text.contains("Restart request sent successfully"),
             "expected the 'triggered=true' success message, got: {text:?}"
         );
-    }
-
-    /// When `app_config` contains a **non-empty** `unix_socket_path` and no bridge is
-    /// reachable, `handle_restart` takes the `config.unix_socket_path.clone()` branch,
-    /// finds no bridge, and returns the "No running bridge" fallback message.
-    ///
-    /// The 100 ms delayed `std::process::exit(0)` spawned in the false branch is
-    /// cancelled when the `#[tokio::test]` runtime is dropped after the test function
-    /// returns — no process exit occurs.
-    ///
-    /// Covers: `Some(config)` branch (both locks), `!is_empty()` socket_path branch,
-    /// and `triggered == false` branch.
-    #[tokio::test]
-    async fn handle_restart_nonempty_socket_path_no_bridge_returns_exit_message() {
-        // Bind on port 0 to let the OS pick a free port, then drop the listener so
-        // nothing is accepting connections.  reqwest will get ECONNREFUSED immediately.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind must succeed");
-        let free_port = listener
-            .local_addr()
-            .expect("local_addr must succeed")
-            .port();
-        drop(listener); // free the port; any connect attempt will get ECONNREFUSED
-
-        // Use the platform temp dir rather than a hardcoded "/tmp" path.
-        let nonexistent_sock = std::env::temp_dir()
-            .join("ahma_test_restart_handler_nonexistent.sock")
-            .to_string_lossy()
-            .to_string();
-
-        let (service, _temp_dir) = build_test_service().await.unwrap();
-        service.set_app_config(Arc::new(AppConfig {
-            http_host: "127.0.0.1".to_string(),
-            http_port: free_port,
-            // Non-empty: exercises the configured-path branch of the socket resolution
-            unix_socket_path: nonexistent_sock,
-            ..AppConfig::default()
-        }));
-
-        let result = service
-            .handle_restart(Map::new())
-            .await
-            .expect("handle_restart must not return McpError");
-        let text = result
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.as_str())
-            .unwrap_or("");
-        assert!(
-            text.contains("No running bridge"),
-            "expected 'No running bridge' fallback message, got: {text:?}"
-        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     /// R-CFG1.2: `AHMA_UNIX_SOCKET` is retired. It must **not** override the resolved
@@ -275,44 +203,19 @@ mod tests {
     ///
     /// The env var names a live mock bridge; the config names a socket that does not
     /// exist. If the retired variable were still honored the mock would be hit and the
-    /// handler would report success. It must instead take the configured (dead) socket,
-    /// fail over to the dead HTTP endpoint, and report no bridge.
+    /// handler would report success. It must instead take the configured (dead) socket
+    /// and report no bridge.
     ///
     /// Safety: nextest runs each test in its own process, so setting an env var here
     /// cannot race with other tests in the same binary.
-    ///
-    /// Unix-only: `handle_restart` itself only ever attempts a UDS connection when
-    /// `cfg!(unix)` (see the `socket_path_opt` branch above), so on non-Unix platforms
-    /// the property this test proves — the retired socket is never contacted — holds
-    /// trivially and unreachably, with no cross-platform equivalent to gate instead.
-    #[cfg(unix)]
+
     #[tokio::test]
     async fn handle_restart_ignores_retired_unix_socket_env_var() {
-        // A live UDS bridge that answers POST /restart with 200. Nothing must reach it.
+        // A live bridge that answers POST /restart with 200. Nothing must reach it.
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let live_sock = tmp.path().join("live.sock").to_string_lossy().into_owned();
-        let listener = tokio::net::UnixListener::bind(&live_sock).expect("bind uds");
-        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let hits_bg = hits.clone();
-        let server = tokio::spawn(async move {
-            while let Ok((mut conn, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let _ = conn.read(&mut buf).await;
-                hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = conn
-                    .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .await;
-                let _ = conn.shutdown().await;
-            }
-        });
-
-        // A TCP port with nothing listening, for the HTTP fallback.
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind must succeed");
-        let free_port = tcp.local_addr().expect("local_addr").port();
-        drop(tcp);
+        let live_sock = tmp.path().join("live.sock");
+        let (server, hits) = serve_restart_ok(&live_sock);
+        let live_sock = live_sock.to_string_lossy().into_owned();
 
         // SAFETY: nextest isolates each test in its own process.
         unsafe {
@@ -321,8 +224,6 @@ mod tests {
 
         let (service, _temp_dir) = build_test_service().await.unwrap();
         service.set_app_config(Arc::new(AppConfig {
-            http_host: "127.0.0.1".to_string(),
-            http_port: free_port,
             unix_socket_path: tmp
                 .path()
                 .join("configured-but-absent.sock")
@@ -347,7 +248,7 @@ mod tests {
             .map(|t| t.text.as_str())
             .unwrap_or("");
         assert_eq!(
-            hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits.load(Ordering::SeqCst),
             0,
             "the socket named by the retired AHMA_UNIX_SOCKET must never be contacted"
         );
@@ -368,16 +269,9 @@ mod tests {
     #[tokio::test]
     async fn handle_restart_sends_no_notification_and_does_not_exit_under_test_isolation() {
         let (service, _temp_dir) = build_test_service().await.unwrap();
-        // Point at endpoints nothing owns so `trigger_bridge_restart` reports false.
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind must succeed");
-        let free_port = tcp.local_addr().expect("local_addr").port();
-        drop(tcp);
+        // Point at a socket nothing owns so `trigger_bridge_restart` reports false.
         let tmp = tempfile::TempDir::new().expect("tempdir");
         service.set_app_config(Arc::new(AppConfig {
-            http_host: "127.0.0.1".to_string(),
-            http_port: free_port,
             unix_socket_path: tmp
                 .path()
                 .join("absent.sock")

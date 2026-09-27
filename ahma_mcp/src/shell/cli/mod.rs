@@ -896,26 +896,17 @@ async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
             tracing::info!("Running in HTTP bridge mode");
             modes::run_http_bridge_mode(cfg).await
         }
-        #[cfg(unix)]
         Some(ServeTransport::Unix(u)) => {
             let path = ahma_common::daemon_hub::mcp_socket_path(u.socket_path.as_deref());
             tracing::info!("Running in Unix socket bridge mode on {}", path);
             modes::run_unix_bridge_mode(cfg).await
         }
         None => {
-            #[cfg(unix)]
-            {
-                tracing::info!(
-                    "Running in Unix socket bridge mode on {}",
-                    ahma_common::daemon_hub::mcp_socket_path(None)
-                );
-                modes::run_unix_bridge_mode(cfg).await
-            }
-            #[cfg(not(unix))]
-            {
-                tracing::info!("Running in HTTP bridge mode");
-                modes::run_http_bridge_mode(cfg).await
-            }
+            tracing::info!(
+                "Running in Unix socket bridge mode on {}",
+                ahma_common::daemon_hub::mcp_socket_path(None)
+            );
+            modes::run_unix_bridge_mode(cfg).await
         }
     }
 }
@@ -2065,8 +2056,8 @@ pub enum ServeTransport {
     Http(HttpArgs),
     /// Serve over a Unix domain socket (UDS) for local IPC and sidecar proxies.
     /// Listens on a UDS path and routes MCP Streamable HTTP traffic. Filesystem socket
-    /// files are removed automatically on graceful shutdown. Not available on Windows.
-    #[cfg(unix)]
+    /// files are removed automatically on graceful shutdown. On Windows (10 1803+) this
+    /// is the same AF_UNIX socket, and the default.
     #[command(after_help = "EXAMPLES:
   # Filesystem socket (default path)
   ahma serve unix
@@ -2135,7 +2126,6 @@ pub struct StdioArgs {
 }
 
 /// Arguments for `ahma serve unix`.
-#[cfg(unix)]
 #[derive(Parser, Debug)]
 pub struct UnixArgs {
     /// Path to the Unix domain socket to create.
@@ -2454,7 +2444,6 @@ pub struct LlmRemoveArgs {
 // AppConfig construction from CLI + env vars
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 fn unix_socket_path_from_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> String {
     // R-CFG1.2: AHMA_UNIX_SOCKET is RETIRED — warn and ignore.
     warn_retired_env!("AHMA_UNIX_SOCKET");
@@ -2482,11 +2471,6 @@ fn unix_socket_path_from_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -
     }
 }
 
-#[cfg(not(unix))]
-fn unix_socket_path_from_cli(_cli: &Cli, _s: &ahma_common::config::AhmaSettings) -> String {
-    String::new()
-}
-
 struct ServeFields {
     http_host: String,
     http_port: u16,
@@ -2500,7 +2484,6 @@ fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
         let (host, port) = match &s.transport {
             Some(ServeTransport::Http(h)) => (h.host.clone(), h.port),
             Some(ServeTransport::Stdio(_)) => ("127.0.0.1".to_string(), 3000u16),
-            #[cfg(unix)]
             Some(ServeTransport::Unix(_)) => ("127.0.0.1".to_string(), 3000u16),
             None => ("127.0.0.1".to_string(), 3000u16),
         };
@@ -5023,7 +5006,6 @@ mod tests {
 
     // ─── unix_socket_path_from_cli ───────────────────────────────────────────
 
-    #[cfg(unix)]
     #[test]
     fn test_unix_socket_path_cli_flag_wins() {
         let _guard = ENV_MUTEX.lock();
@@ -5032,7 +5014,6 @@ mod tests {
         assert_eq!(unix_socket_path_from_cli(&cli, &s), "/x/y.sock");
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_unix_socket_path_serve_unix_socket_path() {
         let _guard = ENV_MUTEX.lock();
@@ -5041,7 +5022,6 @@ mod tests {
         assert_eq!(unix_socket_path_from_cli(&cli, &s), "/a/b.sock");
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_unix_socket_path_serve_unix_settings_fallback() {
         let _guard = ENV_MUTEX.lock();
@@ -5051,7 +5031,6 @@ mod tests {
         assert_eq!(unix_socket_path_from_cli(&cli, &s), "/from/settings.sock");
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_unix_socket_path_default_when_unset() {
         let _guard = ENV_MUTEX.lock();

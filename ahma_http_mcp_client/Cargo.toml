@@ -14,8 +14,14 @@ ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true
 async-stream = "0.3"
 async-trait.workspace = true
+# The local-socket MCP client (`local_socket_client`): rmcp's own is Unix-only.
+bytes = "1.12"
 dirs.workspace = true
 futures.workspace = true
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 # No default features: they enable `reqwest`+`rustls-tls`, which links a second
 # reqwest major (0.12) and the `ring` provider into every binary. Token requests
 # go through `oauth_http::OAuthHttpClient` over the workspace reqwest instead.
@@ -24,6 +30,7 @@ reqwest = { workspace = true, features = ["json", "stream", "http3"] }
 rmcp = { workspace = true, features = ["client"] }
 serde.workspace = true
 serde_json.workspace = true
+sse-stream = "0.2"
 thiserror.workspace = true
 tokio = { workspace = true, features = [
     "rt-multi-thread",
@@ -38,6 +45,8 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["tokio"] }
+hyper = { version = "1", features = ["server"] }
+tower-service = "0.3"
 clap = { version = "4.6", features = ["derive"] }
 tempfile.workspace = true
 tracing-subscriber = "0.3"

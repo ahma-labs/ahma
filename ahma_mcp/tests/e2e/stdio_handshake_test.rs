@@ -110,8 +110,10 @@ impl StdioClient {
         let mut cmd = tokio::process::Command::new(&binary);
         cmd.current_dir(&workspace)
             .env("RUST_LOG", "warn")
-            // Deliberately NOT setting AHMA_SERVER_CHILD on Unix so the production
-            // proxy + background bridge code path runs (this is an E2E test).
+            // Deliberately NOT setting AHMA_SERVER_CHILD, so the production
+            // proxy + background daemon path runs (this is an E2E test) — on
+            // every OS, since the daemon's endpoint is a local socket on
+            // Windows too (SPEC R-DAEMON.2).
             .args([
                 "--no-sandbox",
                 "--unix-socket-path",
@@ -124,9 +126,6 @@ impl StdioClient {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-
-        #[cfg(target_os = "windows")]
-        cmd.env("AHMA_SERVER_CHILD", "1");
 
         let mut child = cmd.spawn().expect("spawn ahma serve stdio");
         let stdin = child.stdin.take().unwrap();
@@ -309,10 +308,7 @@ async fn test_serve_stdio_tools_list_no_roots_client() {
 /// SPEC R-LIFECYCLE.3 (item 3): when the shared backend cannot be started at all —
 /// here its socket path lies under a regular file, the way a host sandbox that
 /// forbids the detached spawn looks from inside — the frontend serves the
-/// session in-process instead of failing. Unix-only because on Windows this
-/// harness runs the server directly (`AHMA_SERVER_CHILD`), so the frontend
-/// under test never runs there.
-#[cfg(unix)]
+/// session in-process instead of failing.
 #[tokio::test]
 async fn test_serve_stdio_falls_back_in_process_when_backend_cannot_start() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

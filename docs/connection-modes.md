@@ -255,7 +255,7 @@ ordinary editor use.
 
 ```bash
 # Start on the default socket: mcp.sock in your per-user runtime directory
-# ($XDG_RUNTIME_DIR/ahma, else ~/.ahma)
+# ($XDG_RUNTIME_DIR/ahma, else ~/.ahma; %LOCALAPPDATA%\ahma\run on Windows)
 ahma serve unix
 
 # Custom socket path
@@ -280,7 +280,11 @@ ahma serve unix --socket-path @ahma
 
 **Why `#/mcp` in the URL?** VS Code uses the URL fragment (`#/subpath`) as the documented way to specify the HTTP endpoint path when connecting over a Unix socket. This is VS Code-specific syntax — the part before `#` is the socket path (`ahma setup` writes the resolved per-user path for you) and `/mcp` is the HTTP path to request on it. See the [VS Code MCP configuration reference](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration) for details.
 
-> Note: Unix socket mode is not available on Windows. Use `ahma serve http` instead.
+> On Windows (10 1803 or later) this is the same `AF_UNIX` socket file, in
+> `%LOCALAPPDATA%\ahma\run`, and it is what `ahma serve` with no transport starts
+> there too. Abstract `@` sockets are Linux-only. Whether a given Windows MCP
+> client can dial a Unix socket is up to that client; `ahma serve http` works
+> with any of them.
 
 ## HTTP/3 (QUIC)
 

@@ -451,10 +451,10 @@ fn parse_health_body(body: &str) -> Option<BridgeHealth> {
     })
 }
 
-#[cfg(unix)]
+/// Read a bridge's `/health` over its local socket, on every OS.
 pub async fn query_uds_health(path: &str) -> Option<BridgeHealth> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let connect = tokio::net::UnixStream::connect(path);
+    let connect = ahma_common::local_socket::LocalStream::connect(std::path::Path::new(path));
     let mut stream = tokio::time::timeout(Duration::from_millis(200), connect)
         .await
         .ok()?
@@ -498,37 +498,13 @@ pub async fn query_tcp_health(url: &str) -> Option<BridgeHealth> {
     None
 }
 
-/// Query the bridge's `/health` endpoint, preferring the Unix socket over TCP.
-pub async fn query_bridge_health(
-    socket_path: Option<&str>,
-    http_url: Option<&str>,
-) -> Option<BridgeHealth> {
-    #[cfg(unix)]
-    if let Some(path) = socket_path
-        && let Some(health) = query_uds_health(path).await
-    {
-        return Some(health);
-    }
-    if let Some(url) = http_url
-        && let Some(health) = query_tcp_health(url).await
-    {
-        return Some(health);
-    }
-    #[cfg(not(unix))]
-    let _ = socket_path;
-    None
+/// The version the daemon at `socket_path` reports, or `None` if nothing
+/// answers there.
+pub async fn get_bridge_version(socket_path: &str) -> Option<String> {
+    query_uds_health(socket_path).await.map(|h| h.version)
 }
 
-pub async fn get_bridge_version(
-    socket_path: Option<&str>,
-    http_url: Option<&str>,
-) -> Option<String> {
-    query_bridge_health(socket_path, http_url)
-        .await
-        .map(|h| h.version)
-}
-
-#[cfg(unix)]
+/// POST `/restart` to the bridge at `path`.
 pub async fn trigger_uds_restart(path: &str) -> bool {
     trigger_uds_restart_with_mode(path, None).await
 }
@@ -538,18 +514,9 @@ pub async fn trigger_uds_restart(path: &str) -> bool {
 /// `Some("drain")` asks a daemon to stop accepting new sessions and go once the
 /// live ones end, which is how a version handoff avoids ending sessions that
 /// belong to other windows (SPEC R-DAEMON.5).
-///
-/// `#[cfg(unix)]` like every other filesystem-socket helper here
-/// ([`query_uds_health`], [`trigger_uds_restart`]): Windows has no
-/// `UnixStream`, and this function's only caller is already inside a
-/// `cfg(unix)` block. Omitting the gate broke the Windows build outright — a
-/// break no developer on macOS or Linux can see, because this workspace cannot
-/// compile for `x86_64-pc-windows-msvc` (`aws-lc-sys` needs an MSVC
-/// toolchain). CI's Windows leg is the only thing that catches it.
-#[cfg(unix)]
 pub async fn trigger_uds_restart_with_mode(path: &str, mode: Option<&str>) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let connect = tokio::net::UnixStream::connect(path);
+    let connect = ahma_common::local_socket::LocalStream::connect(std::path::Path::new(path));
     let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_millis(200), connect).await else {
         return false;
     };
@@ -588,87 +555,41 @@ pub async fn trigger_tcp_restart_with_mode(url: &str, mode: Option<&str>) -> boo
     false
 }
 
-/// Default TCP port of the shared bridge — the other machine-global endpoint.
+/// True when a test-isolated process has been pointed at the shared daemon's
+/// socket, which it must never ask to stop.
 ///
-/// One definition, in `ahma_common`, because this number is what test isolation
-/// keys off (`bridge_http_port`) and two copies would drift.
-pub const GLOBAL_HTTP_PORT: u16 = ahma_common::daemon_hub::DEFAULT_BRIDGE_HTTP_PORT;
-
-/// True when `url` addresses the shared bridge's default port on loopback.
-fn is_global_bridge_url(url: &str) -> bool {
-    url.rsplit(':')
-        .next()
-        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
-        .is_some_and(|port| port == GLOBAL_HTTP_PORT)
-}
-
-/// Drop the machine-global endpoints from a restart request made by a
-/// test-isolated process.
-///
-/// A test must never shut down a bridge it does not own. A test-spawned ahma is
+/// A test must never shut down a daemon it does not own. A test-spawned ahma is
 /// a freshly built binary, so it carries a different BUILD_ID; pointed at the
-/// machine-global endpoint it decides the running bridge is "stale" and restarts
-/// whatever owns it — the developer's live MCP server, or another application's.
-///
-/// Strips only the *global* endpoints, rather than refusing every restart: a test
-/// driving its own mock bridge on a private socket/port is legitimate. Outside
-/// test isolation both endpoints pass through untouched.
-fn strip_global_endpoints_under_test<'a>(
-    socket_path: Option<&'a str>,
-    http_url: Option<&'a str>,
-) -> (Option<&'a str>, Option<&'a str>) {
-    if !is_test_isolated() {
-        return (socket_path, http_url);
-    }
-    let global_socket = socket_path.is_some_and(|p| p == global_mcp_socket_path());
-    let global_http = http_url.is_some_and(is_global_bridge_url);
-    if global_socket || global_http {
+/// shared endpoint it decides the running daemon is "stale" and restarts
+/// whatever owns it — the developer's live MCP server. A test driving its own
+/// bridge on a private socket is legitimate, so only the shared one is refused.
+fn is_shared_socket_under_test(socket_path: &str) -> bool {
+    let shared = is_test_isolated() && socket_path == global_mcp_socket_path();
+    if shared {
         tracing::warn!(
-            "Test-isolated process may not restart the shared bridge; ignoring \
-             global endpoints (socket={socket_path:?}, http={http_url:?})"
+            "Test-isolated process may not restart the shared daemon; ignoring {socket_path}"
         );
     }
-    (
-        socket_path.filter(|_| !global_socket),
-        http_url.filter(|_| !global_http),
-    )
+    shared
 }
 
-pub async fn trigger_bridge_restart(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
-    trigger_bridge_restart_with_mode(socket_path, http_url, None).await
+pub async fn trigger_bridge_restart(socket_path: &str) -> bool {
+    trigger_bridge_restart_with_mode(socket_path, None).await
 }
 
 /// Ask the daemon to drain: finish the sessions it has, accept no new ones,
 /// then exit (SPEC R-DAEMON.5).
-pub async fn trigger_bridge_drain(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
-    trigger_bridge_restart_with_mode(socket_path, http_url, Some("drain")).await
+pub async fn trigger_bridge_drain(socket_path: &str) -> bool {
+    trigger_bridge_restart_with_mode(socket_path, Some("drain")).await
 }
 
-async fn trigger_bridge_restart_with_mode(
-    socket_path: Option<&str>,
-    http_url: Option<&str>,
-    mode: Option<&str>,
-) -> bool {
-    let (socket_path, http_url) = strip_global_endpoints_under_test(socket_path, http_url);
-
-    #[cfg(unix)]
-    if let Some(path) = socket_path
-        && trigger_uds_restart_with_mode(path, mode).await
-    {
-        return true;
-    }
-    if let Some(url) = http_url
-        && trigger_tcp_restart_with_mode(url, mode).await
-    {
-        return true;
-    }
-    #[cfg(not(unix))]
-    let _ = socket_path;
-    false
+async fn trigger_bridge_restart_with_mode(socket_path: &str, mode: Option<&str>) -> bool {
+    !is_shared_socket_under_test(socket_path)
+        && trigger_uds_restart_with_mode(socket_path, mode).await
 }
 
-pub async fn check_bridge_running(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
-    get_bridge_version(socket_path, http_url).await.is_some()
+pub async fn check_bridge_running(socket_path: &str) -> bool {
+    get_bridge_version(socket_path).await.is_some()
 }
 
 pub fn re_exec_current_process() -> Result<()> {
@@ -776,28 +697,22 @@ fn is_test_or_server_child(config: &AppConfig) -> bool {
     std::env::var("AHMA_SERVER_CHILD").is_ok() || config.is_server_child
 }
 
-/// Resolve the Unix socket path and HTTP URL used to communicate with the background bridge.
-/// Returns `(socket_path_string, http_url_string)`.
-fn resolve_bridge_endpoints(config: &AppConfig) -> (String, String) {
+/// The daemon socket this frontend proxies to: the configured one, or the
+/// per-user default (private under a test harness, SPEC R-ISO.1).
+///
+/// There is no HTTP fallback. The daemon serves its MCP endpoint on this socket
+/// on every OS (SPEC R-DAEMON.2); a fallback to the `serve http` port only ever
+/// found some *other* server — on a developer's machine, their live one, which
+/// is how a daemon that never started once produced a green local test run.
+fn resolve_bridge_socket(config: &AppConfig) -> String {
     // AHMA_UNIX_SOCKET is retired per R-CFG1.2. Use --unix-socket-path CLI flag or
     // settings.toml instead. The value comes from AppConfig.unix_socket_path which
     // was already resolved at startup.
-    let socket_path = if config.unix_socket_path.is_empty() {
+    if config.unix_socket_path.is_empty() {
         default_socket_path()
     } else {
         config.unix_socket_path.clone()
-    };
-    // Under a test harness the default port is redirected to a per-run one
-    // (SPEC R-ISO.1). Without that, a probe that should have found nothing
-    // found the developer's live bridge on 3000 and reported it healthy —
-    // which is how a daemon that never started produced a green local run and
-    // a red CI one.
-    let http_url = format!(
-        "http://{}:{}",
-        config.http_host,
-        ahma_common::daemon_hub::bridge_http_port(config.http_port)
-    );
-    (socket_path, http_url)
+    }
 }
 
 pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
@@ -811,14 +726,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
 
     let is_test = is_test_or_server_child(&config);
 
-    let (socket_path, http_url) = resolve_bridge_endpoints(&config);
-
-    let socket_path_opt = if cfg!(unix) {
-        Some(socket_path.as_str())
-    } else {
-        None
-    };
-    let http_url_opt = Some(http_url.as_str());
+    let socket_path = resolve_bridge_socket(&config);
 
     // ── The frontend path: a pipe, and nothing else ──────────────────────────
     //
@@ -830,8 +738,8 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // TUI showed a phantom instance that could not run anything.
     if !is_test {
         crate::utils::parent_watchdog::spawn_parent_death_watchdog();
-        match ensure_backend(&config, socket_path_opt, http_url_opt).await {
-            Ok(()) => return run_as_frontend(&config, socket_path_opt, http_url_opt).await,
+        match ensure_backend(&config, &socket_path).await {
+            Ok(()) => return run_as_frontend(&config, &socket_path).await,
             // SPEC R-LIFECYCLE.3 (item 3): no shared backend (a host sandbox that
             // forbids the detached spawn, an unwritable runtime dir) must not
             // mean no ahma. Serve this session in-process, and say so (R7).
@@ -1020,15 +928,9 @@ async fn serve_stdio_until_shutdown(
 /// prevents orphaned `ahma serve stdio` processes from accumulating across IDE
 /// sessions. The detached background process is deliberately NOT armed (it
 /// outlives its spawner by design and self-terminates on idle).
-async fn ensure_backend(
-    config: &AppConfig,
-    socket_path_opt: Option<&str>,
-    http_url_opt: Option<&str>,
-) -> Result<()> {
+async fn ensure_backend(config: &AppConfig, socket_path: &str) -> Result<()> {
     use crate::shell::modes::daemon_client;
-    let outcome =
-        daemon_client::ensure_daemon(socket_path_opt, http_url_opt, config.idle_timeout_secs)
-            .await?;
+    let outcome = daemon_client::ensure_daemon(socket_path, config.idle_timeout_secs).await?;
     if let Some(notice) = daemon_client::disclosure(&outcome) {
         // R7: never let ahma's own state be something the user has to infer.
         tracing::warn!("{notice}");
@@ -1039,25 +941,19 @@ async fn ensure_backend(
 /// Run this process as the IDE-facing frontend: it was spawned by an editor/agent
 /// over a stdin/stdout pipe and proxies to the shared background process, which
 /// [`ensure_backend`] has found or started.
-async fn run_as_frontend(
-    config: &AppConfig,
-    socket_path_opt: Option<&str>,
-    http_url_opt: Option<&str>,
-) -> Result<()> {
+async fn run_as_frontend(config: &AppConfig, socket_path: &str) -> Result<()> {
     use crate::shell::modes::daemon_client;
 
     // Respawn hook: if the daemon later dies or its socket vanishes (killed
     // out-of-band, or it exited on idle between our calls), the proxy's
     // reconnect loop brings one back instead of re-dialing a gone endpoint.
     let respawn_bridge: crate::shell::modes::proxy_client::BridgeRespawnFn = {
-        let socket_path = socket_path_opt.map(str::to_string);
-        let http_url = http_url_opt.map(str::to_string);
+        let socket_path = socket_path.to_string();
         let idle = config.idle_timeout_secs;
         Box::new(move || {
             let socket_path = socket_path.clone();
-            let http_url = http_url.clone();
             Box::pin(async move {
-                daemon_client::ensure_daemon(socket_path.as_deref(), http_url.as_deref(), idle)
+                daemon_client::ensure_daemon(&socket_path, idle)
                     .await
                     .map(|_| ())
             })
@@ -1069,8 +965,7 @@ async fn run_as_frontend(
     let session_query = crate::shell::modes::session_options::session_query_from_config(config);
 
     crate::shell::modes::proxy_client::run_proxy_client_with_options(
-        socket_path_opt,
-        http_url_opt,
+        socket_path,
         Some(respawn_bridge),
         &session_query,
     )
@@ -1359,7 +1254,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // resolve_bridge_endpoints
+    // resolve_bridge_socket
     // ------------------------------------------------------------------
 
     /// A test process must NEVER resolve the machine-global bridge socket.
@@ -1369,14 +1264,12 @@ mod tests {
     /// POSTed `/restart` — killing the developer's live MCP server (and, since the
     /// socket is shared by design, whatever other application was using it too).
     #[test]
-    fn resolve_bridge_endpoints_never_returns_the_global_socket_under_test() {
+    fn resolve_bridge_socket_never_returns_the_global_socket_under_test() {
         let cfg = AppConfig {
             unix_socket_path: String::new(),
-            http_host: "127.0.0.1".to_string(),
-            http_port: 3000,
             ..base_cfg()
         };
-        let (socket, url) = resolve_bridge_endpoints(&cfg);
+        let socket = resolve_bridge_socket(&cfg);
 
         assert!(
             is_test_isolated(),
@@ -1396,60 +1289,71 @@ mod tests {
             )),
             "expected the per-run private socket, got {socket}"
         );
-        // ...and so is the HTTP fallback, which is the half this test used to
-        // pin the wrong way round. The socket was private and the URL was not,
-        // so a probe that found nothing on the private socket fell through to
-        // the machine-global port and found the developer's live bridge. Every
-        // E2E test that spawns the real binary passed on that borrowed server
-        // and failed on CI, where there is none.
-        assert_ne!(
-            url, "http://127.0.0.1:3000",
-            "a test must not probe the machine-global bridge port either"
-        );
-        assert_eq!(
-            url,
-            format!(
-                "http://127.0.0.1:{}",
-                ahma_common::daemon_hub::bridge_http_port(GLOBAL_HTTP_PORT)
-            ),
-            "and every process in one run must agree on which port that is"
-        );
     }
 
-    /// Defence in depth: even if a test somehow resolves the shared endpoints, it
-    /// is refused the ability to shut that bridge down.
+    /// Defence in depth: even if a test somehow resolves the shared endpoint, it
+    /// is refused the ability to shut that daemon down.
     #[tokio::test]
-    async fn trigger_bridge_restart_refuses_the_global_endpoints_under_test_isolation() {
+    async fn trigger_bridge_restart_refuses_the_global_endpoint_under_test_isolation() {
         assert!(
-            !trigger_bridge_restart(
-                Some(&global_mcp_socket_path()),
-                Some(&format!("http://127.0.0.1:{GLOBAL_HTTP_PORT}"))
-            )
-            .await,
-            "a test must never restart the shared bridge"
+            !trigger_bridge_restart(&global_mcp_socket_path()).await,
+            "a test must never restart the shared daemon"
         );
     }
 
-    /// ...but a test driving its OWN mock bridge on a private port is legitimate,
-    /// so the guard must not be a blanket refusal.
-    #[test]
-    fn only_the_shared_bridge_port_counts_as_global() {
-        assert!(is_global_bridge_url("http://127.0.0.1:3000"));
-        assert!(is_global_bridge_url("http://127.0.0.1:3000/"));
-        assert!(
-            !is_global_bridge_url("http://127.0.0.1:54321"),
-            "a mock bridge on a random port is the test's own, not the shared one"
+    /// The frontend finds, versions and restarts its daemon through the socket
+    /// on every OS — there is no HTTP fallback left to find it by (SPEC
+    /// R-DAEMON.2). On Windows this used to be a TCP port nobody could discover.
+    #[tokio::test]
+    async fn the_daemon_is_probed_and_restarted_over_its_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = tempdir().unwrap();
+        let sock = tmp.path().join("mcp.sock");
+        let listener = ahma_common::local_socket::LocalListener::bind(&sock).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            while let Ok(mut stream) = listener.accept().await {
+                let mut buf = vec![0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let line = request.lines().next().unwrap_or_default().to_string();
+                seen.lock().push(line);
+                let body = r#"{"version":"9.9.9+test"}"#;
+                let reply = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        let path = sock.to_string_lossy();
+
+        assert_eq!(
+            get_bridge_version(&path).await.as_deref(),
+            Some("9.9.9+test")
+        );
+        assert!(check_bridge_running(&path).await);
+        assert!(trigger_bridge_drain(&path).await);
+        assert_eq!(
+            *requests.lock(),
+            [
+                "GET /health HTTP/1.0",
+                "GET /health HTTP/1.0",
+                "POST /restart?mode=drain HTTP/1.0"
+            ]
         );
     }
 
     /// An explicit path still wins — tests that drive their own bridge are unaffected.
     #[test]
-    fn resolve_bridge_endpoints_explicit_path_still_wins_under_isolation() {
+    fn resolve_bridge_socket_explicit_path_still_wins_under_isolation() {
         let cfg = AppConfig {
             unix_socket_path: "/run/custom/explicit.sock".to_string(),
             ..base_cfg()
         };
-        let (socket, _) = resolve_bridge_endpoints(&cfg);
+        let socket = resolve_bridge_socket(&cfg);
         assert_eq!(socket, "/run/custom/explicit.sock");
     }
 
@@ -1468,19 +1372,6 @@ mod tests {
             "isolation must not be mistaken for server-child: that would disarm \
              the parent-death watchdog and leak orphaned test servers"
         );
-    }
-
-    #[test]
-    fn test_resolve_bridge_endpoints_custom_socket_and_host() {
-        let cfg = AppConfig {
-            unix_socket_path: "/run/custom/ahma.sock".to_string(),
-            http_host: "0.0.0.0".to_string(),
-            http_port: 8080,
-            ..base_cfg()
-        };
-        let (socket, url) = resolve_bridge_endpoints(&cfg);
-        assert_eq!(socket, "/run/custom/ahma.sock");
-        assert_eq!(url, "http://0.0.0.0:8080");
     }
 
     // ------------------------------------------------------------------
@@ -1536,49 +1427,18 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_get_bridge_version_none_endpoints() {
-        assert_eq!(get_bridge_version(None, None).await, None);
-    }
-
-    #[tokio::test]
-    async fn test_check_bridge_running_none_endpoints() {
-        assert!(!check_bridge_running(None, None).await);
-    }
-
-    #[tokio::test]
-    async fn test_trigger_bridge_restart_none_endpoints() {
-        assert!(!trigger_bridge_restart(None, None).await);
+    async fn test_get_bridge_version_missing_socket() {
+        let tmp = tempdir().unwrap();
+        let socket = tmp.path().join("missing.sock");
+        assert_eq!(get_bridge_version(&socket.to_string_lossy()).await, None);
+        assert!(!check_bridge_running(&socket.to_string_lossy()).await);
+        assert!(!trigger_bridge_restart(&socket.to_string_lossy()).await);
     }
 
     #[tokio::test]
     async fn test_query_tcp_health_dead_url() {
         // Port 1 is reserved/unusable; connection fails fast (well under the 200ms cap).
         assert_eq!(query_tcp_health("http://127.0.0.1:1").await, None);
-    }
-
-    #[tokio::test]
-    async fn test_get_bridge_version_dead_url() {
-        assert_eq!(
-            get_bridge_version(None, Some("http://127.0.0.1:1")).await,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn test_trigger_bridge_restart_dead_url() {
-        assert!(!trigger_bridge_restart(None, Some("http://127.0.0.1:1")).await);
-    }
-
-    #[tokio::test]
-    async fn test_get_bridge_version_missing_socket_and_dead_url() {
-        // A unix socket path that does not exist fails to connect immediately;
-        // combined with a dead URL the result is None.
-        let tmp = tempdir().unwrap();
-        let socket = tmp.path().join("missing.sock");
-        let socket_str = socket.to_string_lossy();
-        let result =
-            get_bridge_version(Some(socket_str.as_ref()), Some("http://127.0.0.1:1")).await;
-        assert_eq!(result, None);
     }
 
     // ------------------------------------------------------------------

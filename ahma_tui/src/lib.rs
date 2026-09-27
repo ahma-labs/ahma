@@ -98,8 +98,7 @@ pub async fn run_tui(
         // arrived afterwards to whichever folder a terminal happened to be in
         // (SPEC R-DAEMON.9).
         let socket = ahma_common::daemon_hub::mcp_socket_path(None);
-        match ahma_mcp::shell::modes::daemon_client::ensure_daemon(Some(&socket), None, None).await
-        {
+        match ahma_mcp::shell::modes::daemon_client::ensure_daemon(&socket, None).await {
             Ok(outcome) => {
                 if let Some(notice) = ahma_mcp::shell::modes::daemon_client::disclosure(&outcome) {
                     startup_notices::push(startup_notices::Level::Warn, notice);

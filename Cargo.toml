@@ -115,7 +115,7 @@ rmcp = { version = "2.2.0", features = [
     "transport-child-process",
     "elicitation",
     "schemars",
-    "transport-streamable-http-client-unix-socket",
+    "transport-streamable-http-client",
 ] }
 rustc-hash = "2.1"
 schemars = "1.2"
