@@ -2,8 +2,8 @@
 
 Session isolation is how several clients share one ahma without sharing a
 sandbox. Each session runs in its own subprocess with its own kernel-enforced
-boundary and its own lifecycle — in the per-user daemon
-([docs/daemon.md](daemon.md)) as much as in an explicitly started
+boundary and its own lifecycle — in the per-user hub
+([docs/hub.md](hub.md)) as much as in an explicitly started
 `ahma serve http`.
 
 ## Why Session Isolation is Needed
@@ -47,7 +47,7 @@ Session isolation resolves these issues by spinning up a dedicated, isolated `ah
 ## Configuration and Usage
 
 Session isolation is not optional and has no flag: every HTTP-served MCP session — the
-per-user daemon's and an explicit `ahma serve http`'s alike — gets its own subprocess.
+per-user hub's and an explicit `ahma serve http`'s alike — gets its own subprocess.
 
 ## Security Invariants
 
@@ -57,9 +57,9 @@ per-user daemon's and an explicit `ahma serve http`'s alike — gets its own sub
 
 ## Bridge Lifecycle
 
-The per-user daemon's lifetime is described in [docs/daemon.md](daemon.md): it
+The per-user hub's lifetime is described in [docs/hub.md](hub.md): it
 exits when no MCP sessions **and** no hub subscribers have been attached for
-`[daemon] idle_timeout_secs`. What follows describes an explicitly started
+`[hub] idle_timeout_secs`. What follows describes an explicitly started
 bridge given `--idle-timeout`:
 
 - With `--idle-timeout N`, once `active_sessions` drops to zero and stays there for N seconds, the bridge calls `terminate_all` and exits cleanly. Without it (the default) there is no idle exit.

@@ -15,7 +15,7 @@ use crate::task_tree::{
     GroupCounts, LOCAL_GROUP, RowKind, TreeOptions, TreeRow, emit_group_ops, scope_matches_project,
     short_path,
 };
-use ahma_common::daemon_hub::InstanceInfo;
+use ahma_common::hub::InstanceInfo;
 use std::collections::{HashMap, HashSet};
 
 /// What a section represents. Ordering of the variants is display order.
@@ -63,7 +63,7 @@ pub struct SectionHeader {
 pub struct Section {
     /// Stable across re-registration: the session id where there is one, so a
     /// section keeps its place and its open/closed state when its instance
-    /// re-registers (SPEC R-DAEMON.6).
+    /// re-registers (SPEC R-HUB.6).
     pub key: String,
     pub header: SectionHeader,
     /// Content rows, built only for the open section (and, while it animates

@@ -260,7 +260,7 @@ sections, one per client session. A closed section says what it is running or
 last ran; clicking a header opens it (and closes the previous one) with a short
 animation, and a task inside expands into its live output.
 
-- **Already current when you open it.** The daemon replays recent history with
+- **Already current when you open it.** The hub replays recent history with
   true timestamps and the output each command was printing, including work from
   sessions that have since closed.
 - **Approval gates** — tool approvals, sandbox grants, egress — are answered
@@ -279,15 +279,15 @@ animation, and a task inside expands into its live output.
 
 See [docs/tui.md](docs/tui.md) and [docs/doctor.md](docs/doctor.md).
 
-### One daemon per user
+### One hub per user
 
 Whatever starts ahma — an editor, `ahma tui`, or a shell hook — there is one
-daemon per user hosting the MCP endpoint and the observability hub, so
+hub per user hosting the MCP endpoint and the observability hub, so
 everything shows up in one place. It runs no commands itself: every tool call
 runs in a kernel-sandboxed worker, one per session, each locked to its own
 project.
 
-See [docs/daemon.md](docs/daemon.md).
+See [docs/hub.md](docs/hub.md).
 
 ### Bundle Audit — supply-chain checks for MTDF bundles *(experimental)*
 

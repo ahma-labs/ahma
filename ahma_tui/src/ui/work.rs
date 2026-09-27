@@ -391,7 +391,7 @@ pub(crate) fn section_llm_suffix(state: &AppState, key: &str) -> String {
 mod tests {
     use super::*;
     use crate::state::{OpStatus, Operation};
-    use ahma_common::daemon_hub::InstanceInfo;
+    use ahma_common::hub::InstanceInfo;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 

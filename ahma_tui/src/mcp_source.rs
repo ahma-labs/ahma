@@ -27,14 +27,14 @@ pub enum SourceEvent {
     HealthChanged {
         healthy: bool,
     },
-    DaemonHealthChanged {
+    HubHealthChanged {
         healthy: bool,
     },
     OperationsUpdated {
         ops: Vec<Operation>,
     },
     /// A single live output line from a running operation, streamed as the
-    /// child process produces it (pushed via the daemon hub).
+    /// child process produces it (pushed via the hub).
     OperationOutput {
         instance_id: Option<String>,
         op_id: String,
@@ -71,7 +71,7 @@ pub enum SourceEvent {
         append: bool,
     },
     InstancesUpdated {
-        instances: Vec<ahma_common::daemon_hub::InstanceInfo>,
+        instances: Vec<ahma_common::hub::InstanceInfo>,
     },
     ChatToken {
         token: String,
@@ -110,7 +110,7 @@ pub enum SourceEvent {
         /// Whether sending the turn again may work (SPEC R-HTTP.2).
         transient: bool,
     },
-    /// Token usage for the latest model turn, forwarded over the daemon hub so
+    /// Token usage for the latest model turn, forwarded over the hub so
     /// the status-bar counter updates on the hub path (not just in-process).
     Usage {
         prompt_tokens: u32,
@@ -118,20 +118,20 @@ pub enum SourceEvent {
         total_tokens: u32,
     },
     /// A tool call the agent started — drives the live "which tool is running"
-    /// display when the agent runs through the daemon hub.
+    /// display when the agent runs through the hub.
     ToolCallStarted {
         id: String,
         name: String,
         args: String,
     },
-    /// A tool call result, forwarded over the daemon hub.
+    /// A tool call result, forwarded over the hub.
     ToolCallFinished {
         id: String,
         result: String,
         failed: bool,
     },
     /// The model's response was cut short (length limit, provider
-    /// truncation), forwarded over the daemon hub so the hub path can render
+    /// truncation), forwarded over the hub so the hub path can render
     /// it as a system note the same way the in-process path's
     /// `BridgeEvent::Truncated` already does.
     Truncated {
@@ -149,7 +149,7 @@ pub enum SourceEvent {
 pub enum McpSourceCommand {
     SetActiveFile(Option<String>),
     RefreshLogs,
-    SetDaemonHealthy(bool),
+    SetHubHealthy(bool),
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -179,7 +179,7 @@ async fn mcp_source_task(
     let base_url = extract_http_base_url(&connection);
     debug!("mcp_source: base_url={base_url}");
 
-    // `unix://` is the local socket on every OS (SPEC R-DAEMON.2); the SSE
+    // `unix://` is the local socket on every OS (SPEC R-HUB.2); the SSE
     // client has no timeout because its stream is long-lived by design.
     let (request_base_url, client) =
         HttpClient::for_base_url(&base_url, Some(Duration::from_secs(5)))
@@ -233,7 +233,7 @@ async fn mcp_source_task(
                             send(&tx, SourceEvent::LogFilesUpdated { files }).await;
                         }
                     }
-                    Some(McpSourceCommand::SetDaemonHealthy(healthy)) => {
+                    Some(McpSourceCommand::SetHubHealthy(healthy)) => {
                         let interval_secs = if healthy { 10 } else { 3 };
                         status_tick = tokio::time::interval(Duration::from_secs(interval_secs));
                         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

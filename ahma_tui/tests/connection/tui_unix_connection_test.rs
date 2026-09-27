@@ -9,7 +9,7 @@
 //! * The retired `AHMA_UNIX_SOCKET` variable (R-CFG1.2) is ignored.
 //! * `resolve_connection` falls back to HTTP when no Unix socket is present.
 //!
-//! On every OS: the socket is `AF_UNIX` on Windows too (SPEC R-DAEMON.2).
+//! On every OS: the socket is `AF_UNIX` on Windows too (SPEC R-HUB.2).
 
 use crate::common;
 
@@ -115,10 +115,10 @@ fn unix_socket_path_ignores_retired_env_var() {
 }
 
 /// With neither the settings key nor anything else set, the TUI falls back to the
-/// same per-user daemon socket `ahma_mcp` defaults to, so the two agree out of the
-/// box (SPEC R-DAEMON.2).
+/// same per-user hub socket `ahma_mcp` defaults to, so the two agree out of the
+/// box (SPEC R-HUB.2).
 #[test]
-fn unix_socket_path_falls_back_to_the_per_user_daemon_socket() {
+fn unix_socket_path_falls_back_to_the_per_user_hub_socket() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     // A temp home with no settings.toml at all.
     // SAFETY: nextest isolates each test in its own OS process.
@@ -128,7 +128,7 @@ fn unix_socket_path_falls_back_to_the_per_user_daemon_socket() {
     }
     assert_eq!(
         ahma_tui::connection::unix_socket_default_path(),
-        ahma_common::daemon_hub::mcp_socket_path(None),
+        ahma_common::hub::mcp_socket_path(None),
     );
 }
 

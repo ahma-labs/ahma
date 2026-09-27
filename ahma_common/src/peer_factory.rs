@@ -70,7 +70,7 @@ pub trait PeerFactory: Send + Sync + 'static {
     ///
     /// `options` carries what this session asked for and nobody else did: its
     /// id, and the arguments derived from its own client's configuration
-    /// (SPEC R-DAEMON.4). They used to be process-wide, so the first client to
+    /// (SPEC R-HUB.4). They used to be process-wide, so the first client to
     /// start the bridge configured every later one.
     ///
     /// Returns an error (as `anyhow::Error`) if the backend cannot be

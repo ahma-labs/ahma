@@ -1,4 +1,4 @@
-//! Per-session worker options (SPEC R-DAEMON.4).
+//! Per-session worker options (SPEC R-HUB.4).
 //!
 //! An editor's `mcp.json` can ask for things that change how *its* work runs:
 //! `--tools simplify`, `--sandbox-scope`, `--no-sandbox`, a task vault. Those
@@ -7,9 +7,9 @@
 //! the second window's `--tools` was ignored, and, worse, the first window's
 //! `--no-sandbox` unsandboxed everybody.
 //!
-//! With one daemon per user that is no longer tenable, so the options travel
+//! With one hub per user that is no longer tenable, so the options travel
 //! **with the session**: the frontend encodes them into the MCP URL's query,
-//! and the daemon turns them back into arguments for that session's worker
+//! and the hub turns them back into arguments for that session's worker
 //! alone. Forwarding per session is strictly narrower than the inheritance it
 //! replaces — anything that can reach the socket already runs as this user and
 //! could simply run `ahma --no-sandbox` itself.
@@ -32,7 +32,7 @@ struct Opt {
 /// Every option a session may carry.
 ///
 /// Deliberately *not* here: rate limits, bearer tokens, handshake and idle
-/// timeouts. Those govern the daemon as a whole, and letting one session's URL
+/// timeouts. Those govern the hub as a whole, and letting one session's URL
 /// change them would let one client reconfigure everyone else's.
 const OPTIONS: &[Opt] = &[
     Opt {
@@ -330,10 +330,10 @@ mod tests {
         );
     }
 
-    /// Daemon-wide settings are not session options: one client must not be
+    /// Hub-wide settings are not session options: one client must not be
     /// able to change the handshake timeout or the bearer token for everyone.
     #[test]
-    fn daemon_wide_settings_are_not_session_options() {
+    fn hub_wide_settings_are_not_session_options() {
         for name in [
             "require_token",
             "rate_limit_rps",

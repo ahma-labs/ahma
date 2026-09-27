@@ -14,8 +14,8 @@
 - **Terminal Dashboard**: Implements a full-screen ratatui terminal user interface with mouse support and Unicode detection.
 - **Operations Monitor**: Displays all active, pending, and completed background operations with detailed status views.
 - **Unified Work View (SPEC R24, R24.9)**: The home view. One borderless section per client session — a rule with the client, its scope, a liveness glyph, the running/queued/succeeded/failed tallies, and the command it is running or last ran — with hooked commands folded into one section and this TUI's own work into *this terminal (you)*. Exactly one section is open at a time; opening another closes it over a 300 ms eased layout tween. Inside the open section, operations with children indented under whatever spawned them (`parent_id`); Space/click expands one into its live or historic output tail, Enter opens the full-screen detail overlay, `f` toggles this-project/all-projects, and the wheel scrolls the view. Chat is a toggle (`i`, `/chat`), not the screen.
-- **Its own work is everyone's work (SPEC R-DAEMON.9)**: the TUI subscribes to the hub *and* registers a reporter connection of its own (`mode: "tui"`, a session id stable for the process), so every `!` command it runs is reported like any other client's work — into the history file, into a second TUI, and into the view after a restart. Those commands run outside the sandbox by design, so they carry `unsandboxed` on the wire and are marked wherever they are drawn: a `!` on the row, `UNSANDBOXED` in the detail pane and the identity footnote. The reporter never starts a daemon and never blocks the UI: the command runs, and shows its output, whether or not the report lands.
-- **Current at Startup**: Opening the TUI in a project directory immediately shows work already in flight, and recent work that has finished: the daemon's replay (with `started_epoch_ms`/`ended_epoch_ms` back-dating, the retained output window, and the last hour restored from disk) populates the view before and independent of any MCP handshake, and live project work auto-**opens that client's section** until the first user keystroke.
+- **Its own work is everyone's work (SPEC R-HUB.9)**: the TUI subscribes to the hub *and* registers a reporter connection of its own (`mode: "tui"`, a session id stable for the process), so every `!` command it runs is reported like any other client's work — into the history file, into a second TUI, and into the view after a restart. Those commands run outside the sandbox by design, so they carry `unsandboxed` on the wire and are marked wherever they are drawn: a `!` on the row, `UNSANDBOXED` in the detail pane and the identity footnote. The reporter never starts a hub and never blocks the UI: the command runs, and shows its output, whether or not the report lands.
+- **Current at Startup**: Opening the TUI in a project directory immediately shows work already in flight, and recent work that has finished: the hub's replay (with `started_epoch_ms`/`ended_epoch_ms` back-dating, the retained output window, and the last hour restored from disk) populates the view before and independent of any MCP handshake, and live project work auto-**opens that client's section** until the first user keystroke.
 - **Live Streaming**: Operation windows appear when an operation STARTS (hub `OpStarted`) and stream live output lines end-to-end (`OpOutput` from the unified event stream); polling is demoted to periodic reconciliation against the store of record.
 - **Interactive Controls**: Allows pin/unpin and cancellation of running background operations via interactive hotkeys or mouse clicks. Cancel is routed to the instance that owns the operation (SPEC R24.10.6).
 - **`/intro` and a complete `/settings` (SPEC R24.12.6, R24.12.7)**: a two-level tour shown once on first run; `/settings` adds Access & trust (confirm-to-change) and Model, and `/settings <words>` jumps to a row.
@@ -66,16 +66,16 @@ correct **at startup**, not only for events that happen afterwards.
   `session:<id>` for persistent-shell commands — that spawned it. The parent
   link is set where the operation is created (adapter), carried on
   `OperationEvent::Started`, and forwarded on the hub wire
-  (`DaemonEvent::OpStarted.parent_id`). Observers **must not** infer hierarchy
+  (`HubEvent::OpStarted.parent_id`). Observers **must not** infer hierarchy
   from descriptions or naming conventions.
 
 - **R24.2 — Current at startup ("it just works").** On launch the TUI
-  subscribes to the daemon, which replays each instance's retained operation
+  subscribes to the hub, which replays each instance's retained operation
   history (`OpStarted`, the bounded output window that followed it as ordinary
   `OpOutput` events, then terminal `OpFinished`) before live events — including
   the last hour restored from disk for instances that are no longer attached
-  (R-DAEMON.7), so recent work does not disappear because the client that did
-  it has closed. An operation still running when its daemon went away replays
+  (R-HUB.7), so recent work does not disappear because the client that did
+  it has closed. An operation still running when its hub went away replays
   `interrupted`. Replayed events carry wall-clock timestamps
   (`started_epoch_ms` / `ended_epoch_ms`) so elapsed/duration displays are
   **true times, not time-since-receipt**. When the replay reveals live work for
@@ -84,7 +84,7 @@ correct **at startup**, not only for events that happen afterwards.
   would then have to click into; any user keystroke disarms this auto-open.
 
 - **R24.3 — Project-scoped by default.** The view shows instances whose
-  **committed** sandbox scope (R-DAEMON.6) covers, or lives inside, the
+  **committed** sandbox scope (R-HUB.6) covers, or lives inside, the
   directory the TUI was started in; an instance whose scope is not established
   yet reads *no scope yet* rather than being filtered out — it is not somewhere
   else, it is not yet anywhere;
@@ -104,9 +104,9 @@ correct **at startup**, not only for events that happen afterwards.
 
 - **R24.5 — Field-only wire evolution.** The protocol additions
   (`parent_id`, `started_epoch_ms`, `ended_epoch_ms`, `partial`, `interrupted`,
-  `unsandboxed` on `DaemonEvent`; `client`, `session_id`, `client_pid`,
+  `unsandboxed` on `HubEvent`; `client`, `session_id`, `client_pid`,
   `ended_epoch_ms` on `Register`/`InstanceInfo`) are `#[serde(default)]` **field**
-  additions — never new message variants — so mixed-version daemon / instance
+  additions — never new message variants — so mixed-version hub / instance
   / TUI combinations keep interoperating. The MCP client identity
   (`clientInfo.name`, learned at `initialize` — after hub registration) is
   conveyed by the reporter **reconnecting and re-registering**
@@ -119,9 +119,9 @@ correct **at startup**, not only for events that happen afterwards.
     JSON is still an error — a desynchronised stream must not pretend to make
     progress.
   - **The constraint is on the bytes, not on the Rust types.** Restructuring
-    `ClientMsg`/`DaemonMsg` is permitted whenever the JSON is unchanged, and
+    `ClientMsg`/`HubMsg` is permitted whenever the JSON is unchanged, and
     forbidden whenever it is not — there is no version to negotiate on this
-    socket, so a daemon left running across an upgrade is the reader that
+    socket, so a hub left running across an upgrade is the reader that
     decides. `HubRelay` is the worked example: the ten messages the hub forwards
     verbatim are declared once and embedded in both enums as
     `#[serde(untagged)] Relay(HubRelay)`, which still serializes as
@@ -129,7 +129,7 @@ correct **at startup**, not only for events that happen afterwards.
   - A test that only round-trips a message through its own type **cannot**
     enforce this, because both ends move together; nor can one that compares
     `serde_json::Value`, because a duplicated tag silently collapses in a map.
-    `daemon_hub::relay_wire_compat` therefore asserts the serialized **string**
+    `hub::relay_wire_compat` therefore asserts the serialized **string**
     and reads it back with a separately-declared pre-collapse enum.
 
 - **R24.6 — One task, one row.** An operation visible both through the hub
@@ -142,14 +142,14 @@ correct **at startup**, not only for events that happen afterwards.
   id, its description prose, or any other naming convention: a row reading
   `op_41_echo_hello`, or a bare tool name, is a *data* defect, and no formatter
   can repair data that was never sent.
-  - `DaemonEvent::OpStarted` carries `title` (a human command summary computed
+  - `HubEvent::OpStarted` carries `title` (a human command summary computed
     **server-side**, which is the only place that knows the command), plus
     `cwd`, the full `command`, and `origin` — which attached session initiated
     the work (`cursor` | `claude-code` | `tui` | `cli` | `hook` | …). `origin`
     is the **client's** identity where there is one, not the instance label,
     which is `ahma` for every session and so tells a reader nothing about which
     window started the work.
-  - `DaemonEvent::OpFinished` carries a numeric `exit_code` in addition to its
+  - `HubEvent::OpFinished` carries a numeric `exit_code` in addition to its
     status string, because "failed" without an exit code is not actionable.
   - These are `#[serde(default)]` **field** additions, permitted by R24.5;
     mixed-version combinations keep interoperating, and a reader that receives
@@ -208,7 +208,7 @@ correct **at startup**, not only for events that happen afterwards.
   do (`i` or `/chat`).
   - **A section per client session**, keyed by `session_id` so it keeps its
     place and its open/closed state when its instance re-registers
-    (R-DAEMON.6). Hooked commands fold into one section — a hook is an instance
+    (R-HUB.6). Hooked commands fold into one section — a hook is an instance
     per command, so one section each would be a wall of one-line sections — and
     this TUI's own `!` commands and chat tool calls are one section, *this
     terminal (you)*. A section's header names its client, its scope, whether
@@ -239,7 +239,7 @@ correct **at startup**, not only for events that happen afterwards.
     hub routes it to the instance running the turn, and that instance aborts
     the agent loop, wakes any approval waiter, and ends the turn with one
     `AgentError`. The TUI ends the turn locally at once, so cancel works even
-    when the daemon is gone. A second Ctrl-C within 2 s quits. `CancelPrompt`
+    when the hub is gone. A second Ctrl-C within 2 s quits. `CancelPrompt`
     and `CancelOperation` are new message types; a reader that predates them
     skips them (R24.5), so against an older instance the turn still ends in the
     TUI while that instance finishes it unobserved.
@@ -297,10 +297,10 @@ correct **at startup**, not only for events that happen afterwards.
 
 - **R24.11 — What a glance is for is always on screen.**
   - **R24.11.1 — One status header in every layout.** It **must** show the
-    execution mode (R2.1), whether the ahma server and the daemon are reachable
+    execution mode (R2.1), whether the ahma server and the hub are reachable
     — a lost connection spelled out with how long it has been down, never a
     glyph flip alone — the transport, and the sandbox as locked (R5.4). Showing
-    these only in a zoomed pane hid a dead daemon from anyone in the default
+    these only in a zoomed pane hid a dead hub from anyone in the default
     layout.
   - **R24.11.2 — Each window shows its own LLM and spend.** A section's rule
     names the model its chat uses and, once used, its context fill and tokens

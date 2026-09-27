@@ -130,7 +130,7 @@ async fn test_external_mcp_tool_listing_and_routing() -> anyhow::Result<()> {
     // 2. Set up the in-process MCP pair
     let mcp = create_test_mcp().await?;
 
-    // 3. Inject our external server configuration into the daemon-side McpConnectionManager
+    // 3. Inject our external server configuration into the hub-side McpConnectionManager
     {
         let mut conn_mgr = mcp.service.mcp_connections.write().await;
         conn_mgr.servers.push(McpServerConfig {

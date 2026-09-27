@@ -355,7 +355,7 @@ description, subcommands.
 
 `/ahma tui` runs `ahma tui` in the user's terminal: a work view with one section per client
 session (attached editors, hooked shell commands, the user's own commands), history replayed
-from the per-user daemon, and `i` to toggle the chat pane where approval gates are answered.
+from the per-user hub, and `i` to toggle the chat pane where approval gates are answered.
 Inside that chat, `/skills` lists Agent Skills from the standard locations and `/<name>
 [args]` runs one. Full detail: [docs/tui.md](https://github.com/ahma-labs/ahma/blob/main/docs/tui.md).
 

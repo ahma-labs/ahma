@@ -111,9 +111,9 @@ impl StdioClient {
         cmd.current_dir(&workspace)
             .env("RUST_LOG", "warn")
             // Deliberately NOT setting AHMA_SERVER_CHILD, so the production
-            // proxy + background daemon path runs (this is an E2E test) — on
-            // every OS, since the daemon's endpoint is a local socket on
-            // Windows too (SPEC R-DAEMON.2).
+            // proxy + background hub path runs (this is an E2E test) — on
+            // every OS, since the hub's endpoint is a local socket on
+            // Windows too (SPEC R-HUB.2).
             .args([
                 "--no-sandbox",
                 "--unix-socket-path",

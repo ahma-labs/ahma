@@ -1,24 +1,23 @@
-//! Daemon source — background task that subscribes to the hub daemon and
+//! Hub source — background task that subscribes to the hub and
 //! feeds multi-instance operation events into the TUI event loop.
 //!
 //! Unlike [`crate::mcp_source`], which polls a single HTTP/Unix server, this
-//! source connects to the hub daemon socket and aggregates events from **all**
+//! source connects to the hub socket and aggregates events from **all**
 //! registered ahma instances (including stdio instances that have no HTTP
 //! endpoint).
 //!
 //! ## Protocol
 //!
-//! 1. Connect to the daemon socket (`~/.ahma/daemon.sock` on Unix).
+//! 1. Connect to the hub socket (`~/.ahma/hub.sock` on Unix).
 //! 2. Send `Subscribe` → receive `InstanceList` (current snapshot).
-//! 3. Stream `DaemonMsg` events until EOF.
+//! 3. Stream `HubMsg` events until EOF.
 //!
 //! On disconnect the task waits 5 s then reconnects.
 
 use std::{collections::HashMap, time::Duration};
 
-use ahma_common::daemon_hub::{
-    ClientMsg, DaemonEvent, DaemonMsg, HubRelay, InstanceInfo, connect_to_daemon, recv_msg,
-    send_msg,
+use ahma_common::hub::{
+    ClientMsg, HubEvent, HubMsg, HubRelay, InstanceInfo, connect_to_hub, recv_msg, send_msg,
 };
 use tokio::{io::BufReader, sync::mpsc};
 use tracing::{debug, warn};
@@ -56,36 +55,36 @@ pub use crate::mcp_source::SourceEvent;
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Spawn the daemon source background task.
+/// Spawn the hub source background task.
 ///
 /// All `OperationsUpdated` events contain the merged operation list from
 /// **all** connected instances.  Each [`Operation`] has `instance_id` and
 /// `instance_label` set so the UI can display an attribution badge.
-pub fn spawn_daemon_source(tx: mpsc::Sender<SourceEvent>) {
+pub fn spawn_hub_source(tx: mpsc::Sender<SourceEvent>) {
     tokio::spawn(async move {
-        daemon_source_task(tx).await;
+        hub_source_task(tx).await;
     });
 }
 
-/// Apply one daemon message to `state` and forward the resulting UI
+/// Apply one hub message to `state` and forward the resulting UI
 /// event(s) on `tx`.
 ///
-/// Used by [`daemon_source_task`] for every message the hub sends.
+/// Used by [`hub_source_task`] for every message the hub sends.
 ///
 /// Returns `None` when the TUI channel closed (caller should stop
 /// processing). Returns `Some(true)` when the merged operation list changed
 /// — callers that periodically prune terminal operations use this to drive
 /// their prune counter — and `Some(false)` otherwise.
-async fn handle_daemon_msg(
-    state: &mut DaemonState,
+async fn handle_incoming(
+    state: &mut HubState,
     tx: &mpsc::Sender<SourceEvent>,
-    msg: DaemonMsg,
+    msg: HubMsg,
 ) -> Option<bool> {
     let is_instance_change = matches!(
         msg,
-        DaemonMsg::InstanceList { .. }
-            | DaemonMsg::InstanceRegistered { .. }
-            | DaemonMsg::InstanceUnregistered { .. }
+        HubMsg::InstanceList { .. }
+            | HubMsg::InstanceRegistered { .. }
+            | HubMsg::InstanceUnregistered { .. }
     );
     let applied = apply_msg(state, msg);
     if is_instance_change {
@@ -124,14 +123,14 @@ async fn handle_daemon_msg(
 /// Per-instance operation map.
 type InstanceOps = HashMap<String, Operation>; // keyed by op_id
 
-struct DaemonState {
+struct HubState {
     /// Metadata for each registered instance.
     instances: HashMap<String, InstanceInfo>,
     /// Live operations per instance.
     ops: HashMap<String, InstanceOps>, // outer key = instance_id
 }
 
-impl DaemonState {
+impl HubState {
     fn new() -> Self {
         Self {
             instances: HashMap::new(),
@@ -215,12 +214,12 @@ impl DaemonState {
         &mut self,
         instance_id: &str,
         op_id: &str,
-        status: ahma_common::daemon_hub::OpStatus,
+        status: ahma_common::hub::OpStatus,
         result_summary: Option<String>,
         duration_ms: u64,
         ended_epoch_ms: Option<u64>,
         exit_code: Option<i64>,
-        denial: Option<ahma_common::daemon_hub::OpDenial>,
+        denial: Option<ahma_common::hub::OpDenial>,
         interrupted: bool,
     ) {
         if let Some(instance_ops) = self.ops.get_mut(instance_id)
@@ -315,19 +314,19 @@ fn backdate(
 // Task implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
+async fn hub_source_task(tx: mpsc::Sender<SourceEvent>) {
     let mut backoff = Duration::from_secs(5);
     let mut prune_counter: u8 = 0;
 
     loop {
-        let Some(stream) = connect_or_retry_daemon(&tx, &mut backoff).await else {
+        let Some(stream) = connect_or_retry_hub(&tx, &mut backoff).await else {
             continue;
         };
 
         backoff = Duration::from_secs(5);
-        debug!("daemon_source: connected");
+        debug!("hub_source: connected");
         let _ = tx
-            .send(SourceEvent::DaemonHealthChanged { healthy: true })
+            .send(SourceEvent::HubHealthChanged { healthy: true })
             .await;
 
         let (read_half, write_half) = tokio::io::split(stream);
@@ -336,15 +335,15 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
 
         // Subscribe to the event stream.
         if let Err(e) = send_msg(&mut writer, &ClientMsg::Subscribe).await {
-            warn!("daemon_source: subscribe failed: {e}");
+            warn!("hub_source: subscribe failed: {e}");
             let _ = tx
-                .send(SourceEvent::DaemonHealthChanged { healthy: false })
+                .send(SourceEvent::HubHealthChanged { healthy: false })
                 .await;
             continue;
         }
 
-        let mut state = DaemonState::new();
-        if !run_daemon_event_loop(&mut reader, &tx, &mut state, &mut prune_counter).await {
+        let mut state = HubState::new();
+        if !run_hub_event_loop(&mut reader, &tx, &mut state, &mut prune_counter).await {
             return;
         }
 
@@ -353,37 +352,31 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
     }
 }
 
-async fn connect_or_retry_daemon(
+async fn connect_or_retry_hub(
     tx: &mpsc::Sender<SourceEvent>,
     backoff: &mut Duration,
-) -> Option<ahma_common::daemon_hub::DaemonStream> {
-    if let Ok(stream) = connect_to_daemon().await {
+) -> Option<ahma_common::hub::HubStream> {
+    if let Ok(stream) = connect_to_hub().await {
         return Some(stream);
     }
-    // The subscriber is what keeps a daemon around for the TUI (SPEC
-    // R-DAEMON.9), so it starts one — through the one path that does.
-    if let Err(e) = ahma_mcp::shell::modes::daemon_client::ensure_hub().await {
-        debug!(
-            "daemon_source: daemon unavailable ({e}); retry in {:?}",
-            *backoff
-        );
+    // The subscriber is what keeps a hub around for the TUI (SPEC
+    // R-HUB.9), so it starts one — through the one path that does.
+    if let Err(e) = ahma_mcp::shell::modes::hub_client::ensure_hub_events().await {
+        debug!("hub_source: hub unavailable ({e}); retry in {:?}", *backoff);
         let _ = tx
-            .send(SourceEvent::DaemonHealthChanged { healthy: false })
+            .send(SourceEvent::HubHealthChanged { healthy: false })
             .await;
         tokio::time::sleep(*backoff).await;
         *backoff = (*backoff * 2).min(Duration::from_secs(30));
         return None;
     }
 
-    match connect_to_daemon().await {
+    match connect_to_hub().await {
         Ok(s) => Some(s),
         Err(e) => {
-            debug!(
-                "daemon_source: connect failed ({e}); retry in {:?}",
-                *backoff
-            );
+            debug!("hub_source: connect failed ({e}); retry in {:?}", *backoff);
             let _ = tx
-                .send(SourceEvent::DaemonHealthChanged { healthy: false })
+                .send(SourceEvent::HubHealthChanged { healthy: false })
                 .await;
             tokio::time::sleep(*backoff).await;
             *backoff = (*backoff * 2).min(Duration::from_secs(30));
@@ -392,18 +385,18 @@ async fn connect_or_retry_daemon(
     }
 }
 
-async fn run_daemon_event_loop<R>(
+async fn run_hub_event_loop<R>(
     reader: &mut BufReader<R>,
     tx: &mpsc::Sender<SourceEvent>,
-    state: &mut DaemonState,
+    state: &mut HubState,
     prune_counter: &mut u8,
 ) -> bool
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     loop {
-        match recv_msg::<_, DaemonMsg>(reader).await {
-            Ok(msg) => match handle_daemon_msg(state, tx, msg).await {
+        match recv_msg::<_, HubMsg>(reader).await {
+            Ok(msg) => match handle_incoming(state, tx, msg).await {
                 Some(true) => {
                     *prune_counter += 1;
                     if *prune_counter >= 10 {
@@ -415,9 +408,9 @@ where
                 None => return false, // Channel closed — TUI exited.
             },
             Err(e) => {
-                debug!("daemon_source: connection lost ({e})");
+                debug!("hub_source: connection lost ({e})");
                 let _ = tx
-                    .send(SourceEvent::DaemonHealthChanged { healthy: false })
+                    .send(SourceEvent::HubHealthChanged { healthy: false })
                     .await;
                 return true;
             }
@@ -425,7 +418,7 @@ where
     }
 }
 
-/// Result of applying one daemon message to the state.
+/// Result of applying one hub message to the state.
 ///
 /// Only three outcomes are possible, so only three variants exist. This used
 /// to be a fifteen-variant enum shadowing [`SourceEvent`] one variant at a
@@ -437,7 +430,7 @@ enum Applied {
     None,
     /// The operation list changed — re-emit the merged snapshot. Handled by
     /// the caller rather than carried as an event, because it needs
-    /// `DaemonState::all_ops()` (and, in [`daemon_source_task`], a prune
+    /// `HubState::all_ops()` (and, in [`hub_source_task`], a prune
     /// counter) rather than data on the value itself.
     ListChanged,
     /// Forward this event to the TUI as-is.
@@ -452,29 +445,29 @@ impl Applied {
     }
 }
 
-/// Apply one daemon message to the state.
-fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
+/// Apply one hub message to the state.
+fn apply_msg(state: &mut HubState, msg: HubMsg) -> Applied {
     match msg {
-        DaemonMsg::InstanceList { instances } => {
+        HubMsg::InstanceList { instances } => {
             for info in instances {
                 state.add_instance(info);
             }
-            // Initial snapshot — emit even if empty so TUI sees "daemon connected".
+            // Initial snapshot — emit even if empty so TUI sees "hub connected".
             Applied::ListChanged
         }
-        DaemonMsg::InstanceRegistered { instance } => {
+        HubMsg::InstanceRegistered { instance } => {
             state.add_instance(instance);
             Applied::ListChanged
         }
-        DaemonMsg::InstanceUnregistered { id } => {
+        HubMsg::InstanceUnregistered { id } => {
             state.remove_instance(&id);
             Applied::ListChanged
         }
-        DaemonMsg::Event {
+        HubMsg::Event {
             instance_id,
             payload,
         } => match payload {
-            DaemonEvent::OpStarted {
+            HubEvent::OpStarted {
                 id,
                 tool_name,
                 description,
@@ -507,7 +500,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 );
                 Applied::ListChanged
             }
-            DaemonEvent::OpFinished {
+            HubEvent::OpFinished {
                 id,
                 status,
                 result_summary,
@@ -531,10 +524,10 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 Applied::ListChanged
             }
             // Output lines are forwarded incrementally to the TUI and are NOT
-            // accumulated in DaemonState: the merged-list snapshot would be
+            // accumulated in HubState: the merged-list snapshot would be
             // re-appended by `upsert_operation` on every re-emit, duplicating
             // lines.  The TUI app state owns the per-operation tail buffer.
-            DaemonEvent::OpOutput {
+            HubEvent::OpOutput {
                 id,
                 line,
                 is_stderr,
@@ -544,27 +537,27 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 line,
                 is_stderr,
             }),
-            DaemonEvent::LogLine { .. } => Applied::None, // not yet surfaced in TUI
+            HubEvent::LogLine { .. } => Applied::None, // not yet surfaced in TUI
         },
-        DaemonMsg::Ping { .. } => Applied::None, // hub-to-instance ping; no state change for subscribers
+        HubMsg::Ping { .. } => Applied::None, // hub-to-instance ping; no state change for subscribers
         // Instance-directed: the hub routes a TUI's re-raise request to the
         // instance that owns the path. A subscriber seeing it has nothing to do
         // — the re-raised question arrives as a normal ScopeGrantRequested.
-        DaemonMsg::ReRaiseScopeGrant { .. } => Applied::None,
-        DaemonMsg::RunPrompt { .. }
-        | DaemonMsg::CancelPrompt
-        | DaemonMsg::CancelOperation { .. } => Applied::None,
-        DaemonMsg::SubmitApproval { .. } => Applied::None,
-        DaemonMsg::ScopeGrantDismiss { decision_id } => {
+        HubMsg::ReRaiseScopeGrant { .. } => Applied::None,
+        HubMsg::RunPrompt { .. } | HubMsg::CancelPrompt | HubMsg::CancelOperation { .. } => {
+            Applied::None
+        }
+        HubMsg::SubmitApproval { .. } => Applied::None,
+        HubMsg::ScopeGrantDismiss { decision_id } => {
             Applied::Event(SourceEvent::ScopeGrantDismiss { decision_id })
         }
-        DaemonMsg::WebApprovalDismiss { decision_id } => {
+        HubMsg::WebApprovalDismiss { decision_id } => {
             Applied::Event(SourceEvent::WebApprovalDismiss { decision_id })
         }
         // Everything the hub forwards untouched. Kept as one nested match so
         // the relayed set reads as a set: a message added to `HubRelay` shows
         // up here as a missing arm rather than falling through to a default.
-        DaemonMsg::Relay(relay) => Applied::Event(match relay {
+        HubMsg::Relay(relay) => Applied::Event(match relay {
             HubRelay::ChatToken { token } => SourceEvent::ChatToken { token },
             HubRelay::ChatThinking { token } => SourceEvent::ChatThinking { token },
             HubRelay::ApprovalRequested {
@@ -607,7 +600,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
             HubRelay::ChatStatus { phase, detail } => SourceEvent::ChatStatus { phase, detail },
         }),
         // Instance-bound; a subscriber never receives it.
-        DaemonMsg::SubmitScopeGrant { .. } | DaemonMsg::SubmitWebApproval { .. } => Applied::None,
+        HubMsg::SubmitScopeGrant { .. } | HubMsg::SubmitWebApproval { .. } => Applied::None,
     }
 }
 
@@ -620,8 +613,8 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
 /// deliberate display choice (the TUI has no timeout glyph) — it is now stated
 /// as its own arm rather than hidden in a catch-all, and `Pending`/`InProgress`
 /// are non-terminal and only reachable if a producer mislabels a finish.
-fn parse_op_status(s: ahma_common::daemon_hub::OpStatus) -> OpStatus {
-    use ahma_common::daemon_hub::OpStatus as Wire;
+fn parse_op_status(s: ahma_common::hub::OpStatus) -> OpStatus {
+    use ahma_common::hub::OpStatus as Wire;
     match s {
         Wire::Completed => OpStatus::Succeeded,
         Wire::Failed => OpStatus::Failed,
@@ -639,7 +632,7 @@ fn parse_op_status(s: ahma_common::daemon_hub::OpStatus) -> OpStatus {
 mod tests {
     use super::*;
     use crate::state::OpStatus;
-    use ahma_common::daemon_hub::{DaemonEvent, DaemonMsg, HubRelay, InstanceInfo};
+    use ahma_common::hub::{HubEvent, HubMsg, HubRelay, InstanceInfo};
     use ahma_common::timeouts::TestTimeouts;
 
     fn inst(id: &str, label: &str) -> InstanceInfo {
@@ -657,11 +650,11 @@ mod tests {
         }
     }
 
-    // ── DaemonState structural mutations ──────────────────────────────────────
+    // ── HubState structural mutations ──────────────────────────────────────
 
     #[test]
     fn add_and_remove_instance() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "VS Code"));
         assert_eq!(s.instances.len(), 1);
         assert!(s.ops.contains_key("i1"));
@@ -673,7 +666,7 @@ mod tests {
 
     #[test]
     fn remove_unknown_instance_is_noop() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         // Should not panic.
         s.remove_instance("nonexistent");
         assert!(s.instances.is_empty());
@@ -681,7 +674,7 @@ mod tests {
 
     #[test]
     fn op_started_sets_running_with_instance_metadata() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Cursor"));
         s.on_op_started(
             "i1",
@@ -705,7 +698,7 @@ mod tests {
 
     #[test]
     fn op_finished_updates_status() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
         s.on_op_started(
             "i1",
@@ -720,7 +713,7 @@ mod tests {
         s.on_op_finished(
             "i1",
             "op-1",
-            ahma_common::daemon_hub::OpStatus::Completed,
+            ahma_common::hub::OpStatus::Completed,
             Some("ok".to_string()),
             100,
             None,
@@ -738,13 +731,13 @@ mod tests {
 
     #[test]
     fn op_finished_on_unknown_op_is_noop() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
         // Should not panic.
         s.on_op_finished(
             "i1",
             "nonexistent-op",
-            ahma_common::daemon_hub::OpStatus::Completed,
+            ahma_common::hub::OpStatus::Completed,
             None,
             0,
             None,
@@ -760,8 +753,8 @@ mod tests {
     /// the grant question can be re-raised for that pair (SPEC R-PERM.7/.7.1).
     #[test]
     fn denial_field_promotes_failed_to_denied() {
-        use ahma_common::daemon_hub::OpDenial;
-        let mut s = DaemonState::new();
+        use ahma_common::hub::OpDenial;
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
         s.on_op_started(
             "i1",
@@ -776,7 +769,7 @@ mod tests {
         s.on_op_finished(
             "i1",
             "op-1",
-            ahma_common::daemon_hub::OpStatus::Failed,
+            ahma_common::hub::OpStatus::Failed,
             Some("Operation not permitted".into()),
             5,
             None,
@@ -807,7 +800,7 @@ mod tests {
     /// is driven by the field, never guessed from the status word.
     #[test]
     fn plain_failure_without_denial_stays_failed() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
         s.on_op_started(
             "i1",
@@ -822,7 +815,7 @@ mod tests {
         s.on_op_finished(
             "i1",
             "op-1",
-            ahma_common::daemon_hub::OpStatus::Failed,
+            ahma_common::hub::OpStatus::Failed,
             Some("boom".into()),
             5,
             None,
@@ -835,7 +828,7 @@ mod tests {
 
     #[test]
     fn all_ops_running_sorted_before_terminal() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
         s.on_op_started(
             "i1",
@@ -860,7 +853,7 @@ mod tests {
         s.on_op_finished(
             "i1",
             "op-a",
-            ahma_common::daemon_hub::OpStatus::Completed,
+            ahma_common::hub::OpStatus::Completed,
             None,
             0,
             None,
@@ -881,7 +874,7 @@ mod tests {
 
     #[test]
     fn all_ops_spans_multiple_instances() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "VS Code"));
         s.add_instance(inst("i2", "Cursor"));
         s.on_op_started(
@@ -909,7 +902,7 @@ mod tests {
 
     #[test]
     fn prune_terminal_removes_non_running() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
         s.on_op_started(
             "i1",
@@ -934,7 +927,7 @@ mod tests {
         s.on_op_finished(
             "i1",
             "op-2",
-            ahma_common::daemon_hub::OpStatus::Failed,
+            ahma_common::hub::OpStatus::Failed,
             None,
             0,
             None,
@@ -965,7 +958,7 @@ mod tests {
 
     #[test]
     fn prune_terminal_keeps_pending() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
         let mut op = Operation::new("op-p", "tool", OpStatus::Pending);
         op.instance_id = Some("i1".to_string());
@@ -982,10 +975,10 @@ mod tests {
 
     #[test]
     fn apply_msg_instance_list_initial_snapshot() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         let changed = apply_msg(
             &mut s,
-            DaemonMsg::InstanceList {
+            HubMsg::InstanceList {
                 instances: vec![inst("i1", "IDE")],
             },
         );
@@ -995,21 +988,21 @@ mod tests {
 
     #[test]
     fn apply_msg_empty_instance_list_signals_change() {
-        // Empty InstanceList = "daemon connected" signal → changed = true.
-        let mut s = DaemonState::new();
-        let changed = apply_msg(&mut s, DaemonMsg::InstanceList { instances: vec![] });
+        // Empty InstanceList = "hub connected" signal → changed = true.
+        let mut s = HubState::new();
+        let changed = apply_msg(&mut s, HubMsg::InstanceList { instances: vec![] });
         assert!(
             changed.is_list_changed(),
-            "empty InstanceList is still a change (daemon-connected signal)"
+            "empty InstanceList is still a change (hub-connected signal)"
         );
     }
 
     #[test]
     fn apply_msg_instance_registered() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         let changed = apply_msg(
             &mut s,
-            DaemonMsg::InstanceRegistered {
+            HubMsg::InstanceRegistered {
                 instance: inst("i2", "IDE"),
             },
         );
@@ -1019,11 +1012,11 @@ mod tests {
 
     #[test]
     fn apply_msg_instance_unregistered() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i3", "X"));
         let changed = apply_msg(
             &mut s,
-            DaemonMsg::InstanceUnregistered {
+            HubMsg::InstanceUnregistered {
                 id: "i3".to_string(),
             },
         );
@@ -1033,14 +1026,14 @@ mod tests {
 
     #[test]
     fn apply_msg_op_started_then_finished() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
 
         let c1 = apply_msg(
             &mut s,
-            DaemonMsg::Event {
+            HubMsg::Event {
                 instance_id: "i1".to_string(),
-                payload: DaemonEvent::OpStarted {
+                payload: HubEvent::OpStarted {
                     id: "op-1".to_string(),
                     tool_name: "tool".to_string(),
                     description: "".to_string(),
@@ -1062,11 +1055,11 @@ mod tests {
 
         let c2 = apply_msg(
             &mut s,
-            DaemonMsg::Event {
+            HubMsg::Event {
                 instance_id: "i1".to_string(),
-                payload: DaemonEvent::OpFinished {
+                payload: HubEvent::OpFinished {
                     id: "op-1".to_string(),
-                    status: ahma_common::daemon_hub::OpStatus::Completed,
+                    status: ahma_common::hub::OpStatus::Completed,
                     result_summary: Some("success".to_string()),
                     duration_ms: 1200,
                     ended_epoch_ms: None,
@@ -1085,12 +1078,12 @@ mod tests {
 
     #[test]
     fn apply_msg_log_line_returns_false() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         let changed = apply_msg(
             &mut s,
-            DaemonMsg::Event {
+            HubMsg::Event {
                 instance_id: "x".to_string(),
-                payload: DaemonEvent::LogLine {
+                payload: HubEvent::LogLine {
                     level: "info".to_string(),
                     message: "hello".to_string(),
                 },
@@ -1104,13 +1097,13 @@ mod tests {
 
     #[test]
     fn apply_msg_op_output_forwards_incrementally() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
         apply_msg(
             &mut s,
-            DaemonMsg::Event {
+            HubMsg::Event {
                 instance_id: "i1".to_string(),
-                payload: DaemonEvent::OpStarted {
+                payload: HubEvent::OpStarted {
                     id: "op-1".to_string(),
                     tool_name: "tool".to_string(),
                     description: "".to_string(),
@@ -1129,9 +1122,9 @@ mod tests {
 
         let applied = apply_msg(
             &mut s,
-            DaemonMsg::Event {
+            HubMsg::Event {
                 instance_id: "i1".to_string(),
-                payload: DaemonEvent::OpOutput {
+                payload: HubEvent::OpOutput {
                     id: "op-1".to_string(),
                     line: "compiling...".to_string(),
                     is_stderr: false,
@@ -1152,7 +1145,7 @@ mod tests {
             }
             _ => panic!("OpOutput must map to SourceEvent::OperationOutput"),
         }
-        // Output is NOT accumulated in DaemonState (the TUI app state owns
+        // Output is NOT accumulated in HubState (the TUI app state owns
         // the tail buffer) — the snapshot list stays line-free.
         assert!(s.all_ops()[0].stdout_tail.is_empty());
     }
@@ -1164,7 +1157,7 @@ mod tests {
     /// construction. What remains worth asserting is the deliberate collapses.
     #[test]
     fn parse_op_status_all_variants() {
-        use ahma_common::daemon_hub::OpStatus as Wire;
+        use ahma_common::hub::OpStatus as Wire;
         assert_eq!(parse_op_status(Wire::Completed), OpStatus::Succeeded);
         assert_eq!(parse_op_status(Wire::Failed), OpStatus::Failed);
         assert_eq!(parse_op_status(Wire::Cancelled), OpStatus::Cancelled);
@@ -1181,7 +1174,7 @@ mod tests {
         assert_eq!(parse_op_status(Wire::InProgress), OpStatus::Failed);
     }
 
-    // ── coverage batch: apply_msg arms, DaemonState branches, embedded hub ─────
+    // ── coverage batch: apply_msg arms, HubState branches, embedded hub ─────
     async fn next_ev(rx: &mut mpsc::Receiver<SourceEvent>) -> SourceEvent {
         tokio::time::timeout(TestTimeouts::scale_secs(2), rx.recv())
             .await
@@ -1208,26 +1201,26 @@ mod tests {
         }
     }
 
-    /// Point `AHMA_DAEMON_SOCK` at a
+    /// Point `AHMA_HUB_SOCK` at a
     /// throwaway location so this test's embedded hub cannot collide with a
-    /// real daemon or with another test's hub. Mirrors the isolation done by
-    /// `ahma_common::daemon_hub::init_test_daemon_isolation` (a `#[cfg(test)]`
+    /// real hub or with another test's hub. Mirrors the isolation done by
+    /// `ahma_common::hub::init_test_hub_isolation` (a `#[cfg(test)]`
     /// item private to that crate and thus unavailable here).
     ///
     /// The returned `TempDir` must be kept alive for the duration of the test.
-    fn isolate_daemon_socket_for_test() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir for isolated daemon socket");
-        let sock_path = dir.path().join("daemon_test.sock");
+    fn isolate_hub_socket_for_test() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir for isolated hub socket");
+        let sock_path = dir.path().join("hub_test.sock");
         // SAFETY: debug-only test seam; nextest isolates each test in its own process.
         unsafe {
-            std::env::set_var("AHMA_DAEMON_SOCK", &sock_path);
+            std::env::set_var("AHMA_HUB_SOCK", &sock_path);
         }
         dir
     }
 
     #[test]
     fn all_instances_returns_clones_of_registered() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "VS Code"));
         s.add_instance(inst("i2", "Cursor"));
         let mut got: Vec<String> = s.all_instances().into_iter().map(|i| i.id).collect();
@@ -1237,7 +1230,7 @@ mod tests {
 
     #[test]
     fn op_started_unknown_instance_uses_id_as_label_and_no_pid() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.on_op_started(
             "ghost-instance",
             "op-1".to_string(),
@@ -1259,7 +1252,7 @@ mod tests {
 
     #[test]
     fn prune_terminal_keeps_recently_completed() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
         s.on_op_started(
             "i1",
@@ -1274,7 +1267,7 @@ mod tests {
         s.on_op_finished(
             "i1",
             "op-1",
-            ahma_common::daemon_hub::OpStatus::Completed,
+            ahma_common::hub::OpStatus::Completed,
             None,
             5,
             None,
@@ -1290,7 +1283,7 @@ mod tests {
 
     #[test]
     fn prune_terminal_keeps_terminal_without_completed_at() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         s.add_instance(inst("i1", "Test"));
         let mut op = Operation::new("op-x", "tool", OpStatus::Failed);
         op.instance_id = Some("i1".to_string());
@@ -1309,18 +1302,18 @@ mod tests {
 
     #[test]
     fn apply_msg_ping_is_noop() {
-        let mut s = DaemonState::new();
-        let a = apply_msg(&mut s, DaemonMsg::Ping { seq: 7 });
+        let mut s = HubState::new();
+        let a = apply_msg(&mut s, HubMsg::Ping { seq: 7 });
         assert!(matches!(a, Applied::None));
         assert!(!a.is_list_changed());
     }
 
     #[test]
     fn apply_msg_chat_token_carries_token() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::Relay(HubRelay::ChatToken {
+            HubMsg::Relay(HubRelay::ChatToken {
                 token: "hi".to_string(),
             }),
         ) {
@@ -1331,10 +1324,10 @@ mod tests {
 
     #[test]
     fn apply_msg_usage_carries_token_counts() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::Relay(HubRelay::Usage {
+            HubMsg::Relay(HubRelay::Usage {
                 prompt_tokens: 10,
                 completion_tokens: 3,
                 total_tokens: 13,
@@ -1356,10 +1349,10 @@ mod tests {
 
     #[test]
     fn apply_msg_tool_call_lifecycle_carries_fields() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::Relay(HubRelay::ToolCallStarted {
+            HubMsg::Relay(HubRelay::ToolCallStarted {
                 id: "t1".to_string(),
                 name: "read_file".to_string(),
                 args: "{}".to_string(),
@@ -1373,7 +1366,7 @@ mod tests {
         }
         match apply_msg(
             &mut s,
-            DaemonMsg::Relay(HubRelay::ToolCallFinished {
+            HubMsg::Relay(HubRelay::ToolCallFinished {
                 id: "t1".to_string(),
                 result: "ok".to_string(),
                 failed: false,
@@ -1389,10 +1382,10 @@ mod tests {
 
     #[test]
     fn apply_msg_approval_requested_carries_fields() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::Relay(HubRelay::ApprovalRequested {
+            HubMsg::Relay(HubRelay::ApprovalRequested {
                 id: "a1".to_string(),
                 tool: "shell".to_string(),
                 args: "ls".to_string(),
@@ -1410,19 +1403,19 @@ mod tests {
 
     #[test]
     fn apply_msg_agent_done() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         assert!(matches!(
-            apply_msg(&mut s, DaemonMsg::Relay(HubRelay::AgentDone)),
+            apply_msg(&mut s, HubMsg::Relay(HubRelay::AgentDone)),
             Applied::Event(SourceEvent::AgentDone)
         ));
     }
 
     #[test]
     fn apply_msg_agent_error_carries_message() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::Relay(HubRelay::AgentError {
+            HubMsg::Relay(HubRelay::AgentError {
                 error: "boom".to_string(),
                 transient: false,
             }),
@@ -1434,10 +1427,10 @@ mod tests {
 
     #[test]
     fn apply_msg_run_prompt_is_noop() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         let a = apply_msg(
             &mut s,
-            DaemonMsg::RunPrompt {
+            HubMsg::RunPrompt {
                 messages: vec![],
                 system_prompt: None,
                 provider: None,
@@ -1449,10 +1442,10 @@ mod tests {
 
     #[test]
     fn apply_msg_submit_approval_is_noop() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         let a = apply_msg(
             &mut s,
-            DaemonMsg::SubmitApproval {
+            HubMsg::SubmitApproval {
                 id: None,
                 approved: true,
             },
@@ -1462,10 +1455,10 @@ mod tests {
 
     #[test]
     fn apply_msg_scope_grant_requested_carries_request() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::Relay(HubRelay::ScopeGrantRequested {
+            HubMsg::Relay(HubRelay::ScopeGrantRequested {
                 request: sample_scope_grant(),
             }),
         ) {
@@ -1479,10 +1472,10 @@ mod tests {
 
     #[test]
     fn apply_msg_scope_grant_dismiss_carries_decision_id() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::ScopeGrantDismiss {
+            HubMsg::ScopeGrantDismiss {
                 decision_id: "d9".to_string(),
             },
         ) {
@@ -1495,10 +1488,10 @@ mod tests {
 
     #[test]
     fn apply_msg_submit_scope_grant_is_noop() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         let a = apply_msg(
             &mut s,
-            DaemonMsg::SubmitScopeGrant {
+            HubMsg::SubmitScopeGrant {
                 decision_id: "d1".to_string(),
                 decision: ahma_common::scope_grant::GrantDecision::Deny,
             },
@@ -1508,22 +1501,22 @@ mod tests {
 
     /// Every hub message maps to the UI event the TUI expects.
     ///
-    /// Drives `handle_daemon_msg` — the fan-out both the socket task and the
+    /// Drives `handle_incoming` — the fan-out both the socket task and the
     /// (now removed) in-process source shared — so the mapping is pinned once,
     /// without a socket.
     #[tokio::test]
-    async fn handle_daemon_msg_maps_every_event() {
+    async fn handle_incoming_maps_every_event() {
         let (tx_s, mut rx_s) = mpsc::channel::<SourceEvent>(64);
-        let mut st = DaemonState::new();
-        let feed = async |st: &mut DaemonState, msg: DaemonMsg| {
-            handle_daemon_msg(st, &tx_s, msg)
+        let mut st = HubState::new();
+        let feed = async |st: &mut HubState, msg: HubMsg| {
+            handle_incoming(st, &tx_s, msg)
                 .await
                 .expect("TUI channel stays open");
         };
 
         feed(
             &mut st,
-            DaemonMsg::InstanceList {
+            HubMsg::InstanceList {
                 instances: vec![inst("i1", "IDE")],
             },
         )
@@ -1539,9 +1532,9 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::Event {
+            HubMsg::Event {
                 instance_id: "i1".to_string(),
-                payload: DaemonEvent::OpStarted {
+                payload: HubEvent::OpStarted {
                     id: "op1".to_string(),
                     tool_name: "t".to_string(),
                     description: "d".to_string(),
@@ -1569,9 +1562,9 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::Event {
+            HubMsg::Event {
                 instance_id: "i1".to_string(),
-                payload: DaemonEvent::OpOutput {
+                payload: HubEvent::OpOutput {
                     id: "op1".to_string(),
                     line: "hello".to_string(),
                     is_stderr: true,
@@ -1596,7 +1589,7 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::Relay(HubRelay::ChatToken {
+            HubMsg::Relay(HubRelay::ChatToken {
                 token: "tok".to_string(),
             }),
         )
@@ -1606,10 +1599,10 @@ mod tests {
             other => panic!("expected ChatToken, got {other:?}"),
         }
 
-        feed(&mut st, DaemonMsg::Ping { seq: 3 }).await;
+        feed(&mut st, HubMsg::Ping { seq: 3 }).await;
         feed(
             &mut st,
-            DaemonMsg::Relay(HubRelay::ApprovalRequested {
+            HubMsg::Relay(HubRelay::ApprovalRequested {
                 id: "a1".to_string(),
                 tool: "tool".to_string(),
                 args: "args".to_string(),
@@ -1628,7 +1621,7 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::Relay(HubRelay::ScopeGrantRequested {
+            HubMsg::Relay(HubRelay::ScopeGrantRequested {
                 request: sample_scope_grant(),
             }),
         )
@@ -1642,7 +1635,7 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::ScopeGrantDismiss {
+            HubMsg::ScopeGrantDismiss {
                 decision_id: "d1".to_string(),
             },
         )
@@ -1652,7 +1645,7 @@ mod tests {
             other => panic!("expected ScopeGrantDismiss, got {other:?}"),
         }
 
-        feed(&mut st, DaemonMsg::Relay(HubRelay::AgentDone)).await;
+        feed(&mut st, HubMsg::Relay(HubRelay::AgentDone)).await;
         match next_ev(&mut rx_s).await {
             SourceEvent::AgentDone => {}
             other => panic!("expected AgentDone, got {other:?}"),
@@ -1660,7 +1653,7 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::Relay(HubRelay::AgentError {
+            HubMsg::Relay(HubRelay::AgentError {
                 error: "boom".to_string(),
                 transient: false,
             }),
@@ -1673,7 +1666,7 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::InstanceUnregistered {
+            HubMsg::InstanceUnregistered {
                 id: "i1".to_string(),
             },
         )
@@ -1691,18 +1684,14 @@ mod tests {
     /// The fan-out reports a closed TUI channel so its caller can stop reading
     /// the socket, rather than looping on a receiver nobody drains.
     #[tokio::test]
-    async fn handle_daemon_msg_reports_a_closed_tui_channel() {
+    async fn handle_incoming_reports_a_closed_tui_channel() {
         let (tx_s, rx_s) = mpsc::channel::<SourceEvent>(8);
-        let mut st = DaemonState::new();
+        let mut st = HubState::new();
         drop(rx_s);
         assert!(
-            handle_daemon_msg(
-                &mut st,
-                &tx_s,
-                DaemonMsg::InstanceList { instances: vec![] }
-            )
-            .await
-            .is_none(),
+            handle_incoming(&mut st, &tx_s, HubMsg::InstanceList { instances: vec![] })
+                .await
+                .is_none(),
             "a closed TUI channel must be reported, not ignored"
         );
     }
@@ -1711,10 +1700,10 @@ mod tests {
 
     #[test]
     fn apply_msg_chat_thinking_carries_token() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::Relay(HubRelay::ChatThinking {
+            HubMsg::Relay(HubRelay::ChatThinking {
                 token: "pondering".to_string(),
             }),
         ) {
@@ -1725,10 +1714,10 @@ mod tests {
 
     #[test]
     fn apply_msg_web_approval_requested_carries_request() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::Relay(HubRelay::WebApprovalRequested {
+            HubMsg::Relay(HubRelay::WebApprovalRequested {
                 request: sample_web_approval(),
             }),
         ) {
@@ -1743,10 +1732,10 @@ mod tests {
 
     #[test]
     fn apply_msg_web_approval_dismiss_carries_decision_id() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         match apply_msg(
             &mut s,
-            DaemonMsg::WebApprovalDismiss {
+            HubMsg::WebApprovalDismiss {
                 decision_id: "w9".to_string(),
             },
         ) {
@@ -1759,10 +1748,10 @@ mod tests {
 
     #[test]
     fn apply_msg_submit_web_approval_is_noop() {
-        let mut s = DaemonState::new();
+        let mut s = HubState::new();
         let a = apply_msg(
             &mut s,
-            DaemonMsg::SubmitWebApproval {
+            HubMsg::SubmitWebApproval {
                 decision_id: "w1".to_string(),
                 decision: ahma_common::web_approval::WebApprovalDecision::Deny,
             },
@@ -1770,21 +1759,21 @@ mod tests {
         assert!(matches!(a, Applied::None));
     }
 
-    // ── fan-out: variants not covered by `handle_daemon_msg_maps_every_event` ──
+    // ── fan-out: variants not covered by `handle_incoming_maps_every_event` ──
 
     #[tokio::test]
-    async fn handle_daemon_msg_maps_remaining_events() {
+    async fn handle_incoming_maps_remaining_events() {
         let (tx_s, mut rx_s) = mpsc::channel::<SourceEvent>(64);
-        let mut st = DaemonState::new();
-        let feed = async |st: &mut DaemonState, msg: DaemonMsg| {
-            handle_daemon_msg(st, &tx_s, msg)
+        let mut st = HubState::new();
+        let feed = async |st: &mut HubState, msg: HubMsg| {
+            handle_incoming(st, &tx_s, msg)
                 .await
                 .expect("TUI channel stays open");
         };
 
         feed(
             &mut st,
-            DaemonMsg::Relay(HubRelay::ChatThinking {
+            HubMsg::Relay(HubRelay::ChatThinking {
                 token: "pondering".to_string(),
             }),
         )
@@ -1796,7 +1785,7 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::Relay(HubRelay::WebApprovalRequested {
+            HubMsg::Relay(HubRelay::WebApprovalRequested {
                 request: sample_web_approval(),
             }),
         )
@@ -1810,7 +1799,7 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::WebApprovalDismiss {
+            HubMsg::WebApprovalDismiss {
                 decision_id: "w1".to_string(),
             },
         )
@@ -1822,7 +1811,7 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::Relay(HubRelay::ToolCallStarted {
+            HubMsg::Relay(HubRelay::ToolCallStarted {
                 id: "t1".to_string(),
                 name: "read_file".to_string(),
                 args: "{}".to_string(),
@@ -1839,7 +1828,7 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::Relay(HubRelay::ToolCallFinished {
+            HubMsg::Relay(HubRelay::ToolCallFinished {
                 id: "t1".to_string(),
                 result: "ok".to_string(),
                 failed: true,
@@ -1856,7 +1845,7 @@ mod tests {
 
         feed(
             &mut st,
-            DaemonMsg::Relay(HubRelay::Usage {
+            HubMsg::Relay(HubRelay::Usage {
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 total_tokens: 3,
@@ -1875,34 +1864,32 @@ mod tests {
         }
     }
 
-    // ── daemon_source_task: full round trip over a real (isolated) socket ──────
+    // ── hub_source_task: full round trip over a real (isolated) socket ──────
     //
     // Exercises the actual connect → Subscribe → recv loop in
-    // `daemon_source_task`, not just `apply_msg`/`Applied` in isolation. This
+    // `hub_source_task`, not just `apply_msg`/`Applied` in isolation. This
     // covers the socket-framed match arms (lines that forward each `Applied`
-    // variant into a `SourceEvent` send) that the `handle_daemon_msg` tests
+    // variant into a `SourceEvent` send) that the `handle_incoming` tests
     // above cannot reach, because they never touch the socket read loop.
     //
     // A second raw connection plays the role of a registered ahma instance,
     // driving the hub exactly the way a real `ahma` process would.
     #[tokio::test]
-    async fn daemon_source_task_full_round_trip_over_socket() {
-        let _isolation_guard = isolate_daemon_socket_for_test();
+    async fn hub_source_task_full_round_trip_over_socket() {
+        let _isolation_guard = isolate_hub_socket_for_test();
 
-        let hub = ahma_common::daemon_hub::HubServer::bind_at(
-            ahma_common::daemon_hub::default_socket_path(),
-        )
-        .await
-        .expect("this test owns a freshly isolated socket, so bind must succeed");
+        let hub = ahma_common::hub::HubServer::bind_at(ahma_common::hub::default_socket_path())
+            .await
+            .expect("this test owns a freshly isolated socket, so bind must succeed");
         let hub = tokio::spawn(async move { hub.serve().await });
 
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(64);
-        let task = tokio::spawn(daemon_source_task(tx));
+        let task = tokio::spawn(hub_source_task(tx));
 
         // Connect succeeds → health true, then the initial (empty) snapshot.
         match next_ev(&mut rx).await {
-            SourceEvent::DaemonHealthChanged { healthy } => assert!(healthy),
-            other => panic!("expected DaemonHealthChanged, got {other:?}"),
+            SourceEvent::HubHealthChanged { healthy } => assert!(healthy),
+            other => panic!("expected HubHealthChanged, got {other:?}"),
         }
         match next_ev(&mut rx).await {
             SourceEvent::InstancesUpdated { instances } => assert!(instances.is_empty()),
@@ -1920,7 +1907,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // A second raw connection plays the role of a registered ahma instance.
-        let inst_stream = ahma_common::daemon_hub::connect_to_daemon()
+        let inst_stream = ahma_common::hub::connect_to_hub()
             .await
             .expect("instance connect");
         let (_inst_r, mut inst_w) = tokio::io::split(inst_stream);
@@ -1953,7 +1940,7 @@ mod tests {
         send_msg(
             &mut inst_w,
             &ClientMsg::Event {
-                payload: DaemonEvent::OpStarted {
+                payload: HubEvent::OpStarted {
                     id: "op-1".to_string(),
                     tool_name: "cargo_build".to_string(),
                     description: "Build".to_string(),
@@ -1984,7 +1971,7 @@ mod tests {
         send_msg(
             &mut inst_w,
             &ClientMsg::Event {
-                payload: DaemonEvent::OpOutput {
+                payload: HubEvent::OpOutput {
                     id: "op-1".to_string(),
                     line: "compiling".to_string(),
                     is_stderr: false,
@@ -2011,9 +1998,9 @@ mod tests {
         send_msg(
             &mut inst_w,
             &ClientMsg::Event {
-                payload: DaemonEvent::OpFinished {
+                payload: HubEvent::OpFinished {
                     id: "op-1".to_string(),
-                    status: ahma_common::daemon_hub::OpStatus::Completed,
+                    status: ahma_common::hub::OpStatus::Completed,
                     result_summary: Some("ok".to_string()),
                     duration_ms: 42,
                     ended_epoch_ms: None,
@@ -2039,7 +2026,7 @@ mod tests {
         send_msg(
             &mut inst_w,
             &ClientMsg::Event {
-                payload: DaemonEvent::LogLine {
+                payload: HubEvent::LogLine {
                     level: "info".to_string(),
                     message: "hello".to_string(),
                 },

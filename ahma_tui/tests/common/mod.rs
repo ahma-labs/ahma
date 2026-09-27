@@ -55,7 +55,7 @@ fn noop_server_command() -> String {
 }
 
 /// In-process Unix-socket bridge handle that aborts and cleans up on drop.
-/// `AF_UNIX` on every OS, Windows included (SPEC R-DAEMON.2).
+/// `AF_UNIX` on every OS, Windows included (SPEC R-HUB.2).
 pub struct UnixBridgeHandle {
     pub socket_path: std::path::PathBuf,
     task: tokio::task::JoinHandle<()>,

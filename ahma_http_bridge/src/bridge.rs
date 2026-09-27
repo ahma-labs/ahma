@@ -205,17 +205,17 @@ pub struct BridgeConfig {
     pub bound_port_tx: Option<tokio::sync::oneshot::Sender<u16>>,
 
     /// Translates a session's URL query into worker arguments. Set by the
-    /// daemon, which owns the allowlist (SPEC R-DAEMON.4); `None` on an
+    /// hub, which owns the allowlist (SPEC R-HUB.4); `None` on an
     /// explicitly started bridge, which does not accept session options.
     pub session_options: Option<crate::session::SessionOptionTranslator>,
 
-    /// Set when this bridge is hosted by the per-user daemon (SPEC R-DAEMON.3).
+    /// Set when this bridge is hosted by the per-user hub (SPEC R-HUB.3).
     ///
     /// With it, `/restart` and the idle timer ask the composer to stop instead
-    /// of calling `process::exit` — the daemon also owns the hub, live sessions
+    /// of calling `process::exit` — the hub also owns the hub, live sessions
     /// and a history file, and exiting from whichever task noticed first would
     /// skip all of it.
-    pub exit: Option<Arc<DaemonExit>>,
+    pub exit: Option<Arc<HubExit>>,
 }
 
 impl Default for BridgeConfig {
@@ -277,7 +277,7 @@ impl std::fmt::Debug for BridgeConfig {
                 "bound_port_tx",
                 &self.bound_port_tx.as_ref().map(|_| "<Sender>"),
             )
-            .field("exit", &self.exit.as_ref().map(|_| "<DaemonExit>"))
+            .field("exit", &self.exit.as_ref().map(|_| "<HubExit>"))
             .finish_non_exhaustive()
     }
 }
@@ -375,28 +375,28 @@ impl BridgeConfig {
 ///
 /// The entire struct is wrapped in `Arc` before being registered as an Axum
 /// extension, so handler clones are cheap reference-count increments.
-/// How a composed daemon is asked to stop, so the bridge never exits the
-/// process out from under it (SPEC R-DAEMON.3).
+/// How a composed hub is asked to stop, so the bridge never exits the
+/// process out from under it (SPEC R-HUB.3).
 ///
 /// A standalone `ahma serve http|unix` owns its process and exits directly. The
-/// per-user daemon does not: it also holds the observability hub, live MCP
+/// per-user hub does not: it also holds the observability hub, live MCP
 /// sessions and a history file to flush, so "stop" is one choreography owned by
 /// the composer. When an exit coordinator is installed the bridge asks; with
 /// none it behaves exactly as it always did.
-pub struct DaemonExit {
+pub struct HubExit {
     request: Box<dyn Fn(&str) + Send + Sync>,
     draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl std::fmt::Debug for DaemonExit {
+impl std::fmt::Debug for HubExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DaemonExit")
+        f.debug_struct("HubExit")
             .field("draining", &self.is_draining())
             .finish()
     }
 }
 
-impl DaemonExit {
+impl HubExit {
     /// Build a coordinator whose `request` runs the composer's shutdown.
     pub fn new(request: Box<dyn Fn(&str) + Send + Sync>) -> Self {
         Self {
@@ -413,7 +413,7 @@ impl DaemonExit {
     /// Stop accepting new sessions and exit once the live ones end.
     ///
     /// This is what makes an upgrade safe: a newer client can replace the
-    /// daemon without tearing down another window's session mid-command, which
+    /// hub without tearing down another window's session mid-command, which
     /// is what the old "restart the bridge" path did to everyone attached.
     pub fn request_drain(&self) {
         self.draining
@@ -442,9 +442,9 @@ pub struct BridgeState {
     require_token: ArcSwapOption<String>,
     /// The listener configuration, used for cleanup on restart.
     listener_kind: ListenerKind,
-    /// Set when this bridge is hosted by the per-user daemon, which owns the
+    /// Set when this bridge is hosted by the per-user hub, which owns the
     /// process's exit path.
-    exit: Option<Arc<DaemonExit>>,
+    exit: Option<Arc<HubExit>>,
 }
 
 /// Build a CORS layer appropriate for the bind address.
@@ -636,15 +636,15 @@ async fn await_shutdown_signal() {
 /// Tear the bridge down after `spawn_idle_timeout_checker` observes zero
 /// active sessions for the configured timeout.
 ///
-/// When hosted by the per-user daemon, `exit` owns the process's exit path,
-/// so this only *asks* it to stop (the daemon's own idle policy also counts
+/// When hosted by the per-user hub, `exit` owns the process's exit path,
+/// so this only *asks* it to stop (the hub's own idle policy also counts
 /// hub connections, so it must decide rather than have this checker exit
 /// unilaterally). Standalone, it tears down sessions itself, cleans up a
 /// Unix socket if any, and exits directly.
 async fn shutdown_idle_bridge(
     timeout: u64,
     session_manager: Arc<SessionManager>,
-    exit: Option<Arc<DaemonExit>>,
+    exit: Option<Arc<HubExit>>,
     listener_kind: ListenerKind,
 ) {
     tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
@@ -1267,7 +1267,7 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
 
     // Restrict to owner-only (0600) so other local users cannot connect and drive
     // the bridge. No-op for abstract sockets (leading NUL).
-    ahma_common::daemon_hub::restrict_unix_socket_permissions(std::path::Path::new(&socket_path));
+    ahma_common::hub::restrict_unix_socket_permissions(std::path::Path::new(&socket_path));
 
     info!("HTTP bridge listening on Unix socket: {}", raw_socket_path);
     info!(
@@ -1379,7 +1379,7 @@ pub struct HealthResponse {
     /// doesn't send this field still deserializes the response.
     #[serde(default)]
     pub default_sandbox_scope: Option<String>,
-    /// True once this daemon has been asked to drain: it is finishing the
+    /// True once this hub has been asked to drain: it is finishing the
     /// sessions it has and accepting no new ones, so a client should start (or
     /// wait for) its successor rather than opening a session here.
     /// `#[serde(default)]` so a pre-upgrade client still parses the response.
@@ -1415,7 +1415,7 @@ const RESTART_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_se
 /// `?mode=drain` is what an upgrading client asks for: stop accepting new
 /// sessions and go when the live ones end. The old unconditional restart
 /// tore down every attached editor's session mid-command to install a new
-/// binary for one of them (SPEC R-DAEMON.5).
+/// binary for one of them (SPEC R-HUB.5).
 fn drain_requested(request: &axum::extract::Request) -> bool {
     request
         .uri()
@@ -1506,7 +1506,7 @@ async fn handle_restart(
             exit.request_drain();
             return restart_status_response("draining");
         }
-        info!("Restart requested. Asking the daemon to stop...");
+        info!("Restart requested. Asking the hub to stop...");
         exit.request("restart requested");
         return restart_status_response("restarting");
     }
@@ -1900,7 +1900,7 @@ async fn handle_mcp_request(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response {
-    // The query carries this client's own session options (SPEC R-DAEMON.4).
+    // The query carries this client's own session options (SPEC R-HUB.4).
     let session_query = uri.query().unwrap_or("").to_string();
     // JSON-RPC batch arrays are not supported (batching was removed from the
     // MCP spec in 2025-06-18). Refusing loudly beats the old behavior, which
@@ -3118,8 +3118,8 @@ for line in sys.stdin:
         assert!(path.exists(), "the live socket file must not be removed");
     }
 
-    /// The daemon's MCP endpoint is this listener on every OS (SPEC
-    /// R-DAEMON.2): until it was, Windows bound a TCP port nobody could find.
+    /// The hub's MCP endpoint is this listener on every OS (SPEC
+    /// R-HUB.2): until it was, Windows bound a TCP port nobody could find.
     #[tokio::test]
     async fn the_bridge_serves_http_on_a_local_socket() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

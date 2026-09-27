@@ -21,7 +21,7 @@
 //! the shape is unit-testable.
 
 use crate::state::{OpStatus, Operation};
-use ahma_common::daemon_hub::InstanceInfo;
+use ahma_common::hub::InstanceInfo;
 use std::collections::{HashMap, HashSet};
 
 /// Number of output-tail lines shown inline under the expanded operation.

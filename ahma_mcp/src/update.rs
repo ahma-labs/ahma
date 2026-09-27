@@ -4,7 +4,7 @@
 //! extraction and `cargo install` paths live in the [`ahma_update`] crate
 //! (re-exported here wholesale, so `crate::update::…` and
 //! `ahma_mcp::update::…` paths are unchanged). What stays in this module is
-//! only the part that needs the engine: stopping the running bridge/daemon
+//! only the part that needs the engine: stopping the running bridge/hub
 //! before the binary is replaced ([`crate::shell::modes::server`]) and the
 //! post-install MCP-config drift check ([`crate::setup`]).
 
@@ -17,10 +17,10 @@ use std::path::Path;
 pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result<()> {
     if !args.dry_run {
         println!("Stopping running background processes...");
-        let _ = ahma_common::daemon_hub::stop_daemon().await;
+        let _ = ahma_common::hub::stop_hub().await;
 
         let socket_path = if cfg.unix_socket_path.is_empty() {
-            ahma_common::daemon_hub::mcp_socket_path(None)
+            ahma_common::hub::mcp_socket_path(None)
         } else {
             cfg.unix_socket_path.clone()
         };
@@ -265,7 +265,7 @@ mod tests {
         //   • GitRef match arm → run_git_update (dry_run path, no cargo needed)
         //   • outcome.binary_changed = false → skip print_post_install_details
         //   • maybe_run_setup_wizard (dry_run=true → early Ok)
-        // No daemon stop, no network calls.
+        // No hub stop, no network calls.
         let temp_dir = tempfile::tempdir().unwrap();
         let args = UpdateArgs {
             reference: Some("main".to_string()),

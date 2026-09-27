@@ -21,12 +21,12 @@ pub const CHAT_HISTORY_CAP: usize = 200;
 
 /// How long a turn may go without any server event before the TUI says it
 /// looks stalled. Long enough for a slow model's first token, short enough that
-/// a turn silently lost to a dead daemon is not left looking busy.
+/// a turn silently lost to a dead hub is not left looking busy.
 pub const TURN_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The same, for a model still reading its prompt: that is silent by nature
 /// and can legitimately take minutes on a local model (the status line says
-/// so meanwhile), but a turn lost to a dead daemon must still be flagged.
+/// so meanwhile), but a turn lost to a dead hub must still be flagged.
 pub const READING_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Token spend for one window's conversations, as reported by its provider.
@@ -41,7 +41,7 @@ pub struct WindowUsage {
 /// Window in which a second Ctrl-C quits. The first one cancels a running turn.
 pub const CTRL_C_QUIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// A chat turn submitted to the daemon and not yet ended by `AgentDone` or
+/// A chat turn submitted to the hub and not yet ended by `AgentDone` or
 /// `AgentError`. Unlike `liveness_state`, which stays `Idle` until the first
 /// server event, this exists from the moment the prompt is sent.
 #[derive(Debug, Clone)]
@@ -999,10 +999,10 @@ pub enum OpStatus {
     /// says which path was refused, and the user can re-raise the grant
     /// question from it (R-PERM.7.1).
     Denied,
-    /// Still running when the daemon watching it went away, and reconstructed
+    /// Still running when the hub watching it went away, and reconstructed
     /// from the history file at the next start. Distinct from `Failed`: the
     /// command may well have succeeded, and claiming it failed would be an
-    /// invention (SPEC R-DAEMON.7).
+    /// invention (SPEC R-HUB.7).
     Interrupted,
 }
 
@@ -1077,7 +1077,7 @@ pub struct Operation {
     pub alerts: Vec<String>,
     pub pid: Option<u32>,
     pub pinned: bool,
-    /// UUID of the ahma instance this operation belongs to (set for daemon-sourced ops).
+    /// UUID of the ahma instance this operation belongs to (set for hub-sourced ops).
     pub instance_id: Option<String>,
     /// Short human-readable label for the owning instance (e.g. `"VS Code"`).
     pub instance_label: Option<String>,
@@ -1100,7 +1100,7 @@ pub struct Operation {
     /// question can be re-raised for exactly that pair (SPEC R-PERM.7.1).
     pub denial: Option<(String, ahma_common::config::ScopeAccess)>,
     /// This row was reconstructed from its terminal event alone: the hub never
-    /// saw the operation start (it aged out, or the daemon restarted mid-run).
+    /// saw the operation start (it aged out, or the hub restarted mid-run).
     /// Its outcome is real; its command and working directory are unknown.
     pub partial: bool,
     /// When the most recent live output line arrived (set locally, not from
@@ -1108,7 +1108,7 @@ pub struct Operation {
     pub last_output_at: Option<Instant>,
     /// The command ran **outside** the kernel sandbox, at the user's full
     /// privilege — today only a `!` command someone typed into this TUI
-    /// (SPEC R-DAEMON.9). Drawn as such: a unified view in which the one
+    /// (SPEC R-HUB.9). Drawn as such: a unified view in which the one
     /// unconfined row looks like all the others is the wrong view.
     pub unsandboxed: bool,
 }
@@ -1424,7 +1424,7 @@ impl ApprovalGate {
 /// blocked by an out-of-scope path (SPEC R5.4.7). Three-valued: the default/Enter
 /// choice is the safe Deny — widening (`y`=read+write, `r`=read-only) requires an
 /// explicit non-default key (R5.3.1). Lives in its own `AppState.scope_grant`
-/// field, parallel to `approval`, because it is daemon-raised and may coexist with
+/// field, parallel to `approval`, because it is hub-raised and may coexist with
 /// an open user overlay (it is rendered as an overlay, not a `ModalState`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeGrantGate {
@@ -1562,7 +1562,7 @@ pub enum ClickTarget {
 /// "which overlay is open" and its contents.
 ///
 /// The bridge-driven approval gate is intentionally *not* a variant here: it is
-/// raised asynchronously by the daemon and may legitimately be pending while a
+/// raised asynchronously by the hub and may legitimately be pending while a
 /// user overlay is open, so it lives in its own guarded field
 /// ([`AppState::request_approval`]).
 #[derive(Debug, Default)]
@@ -1822,7 +1822,7 @@ pub struct AppState {
     pub mcp_http_base_url: String,
     pub transport_label: String,
     pub server_healthy: bool,
-    pub daemon_healthy: bool,
+    pub hub_healthy: bool,
     pub session_id: Option<String>,
     pub sandbox_status: SandboxAuthority,
     pub workspace: String,
@@ -1848,9 +1848,9 @@ pub struct AppState {
     /// Monitor activity feed: op started/finished transitions, newest first.
     pub events: VecDeque<OpEvent>,
     pub operations: Vec<Operation>,
-    /// Live output lines that arrived (via the daemon hub) before the operation
+    /// Live output lines that arrived (via the hub) before the operation
     /// they belong to was materialised in `operations`. Keyed by op id. The
-    /// daemon hub delivers `OpStarted` and `OpOutput` over one ordered socket,
+    /// hub delivers `OpStarted` and `OpOutput` over one ordered socket,
     /// but on a hub reconnect only `OpStarted`/`OpFinished` are replayed — so an
     /// output line can outrun its operation. Rather than drop it (which left fast
     /// commands like `!pwd` showing no result until the next status poll), we
@@ -1897,7 +1897,7 @@ pub struct AppState {
     /// breach of the honest-panes rule it exists to describe (SPEC R24.8).
     pub help_scroll: u16,
     /// Complete scope + provenance from `notifications/sandbox/configured`.
-    /// `None` until the server reports it (or when attached daemon-only).
+    /// `None` until the server reports it (or when attached hub-only).
     pub sandbox_scope: Option<SandboxScopeInfo>,
     /// Error text from `notifications/sandbox/failed`, kept until the next
     /// successful configuration so the reason outlives the log scrollback.
@@ -1923,8 +1923,8 @@ pub struct AppState {
     pub available_providers: Vec<ahma_llm_monitor::LocalProvider>,
     /// Discovered providers (from probing/local discovery)
     pub discovered_providers: Vec<ahma_llm_monitor::LocalProvider>,
-    /// Active instances registered with the daemon
-    pub active_instances: Vec<ahma_common::daemon_hub::InstanceInfo>,
+    /// Active instances registered with the hub
+    pub active_instances: Vec<ahma_common::hub::InstanceInfo>,
     /// Available models for the current provider.
     pub available_models: Vec<String>,
     /// Agent Skills currently active in the chat session (SPEC R-SK8.4).
@@ -2069,10 +2069,10 @@ pub struct AppState {
     /// no target window). Usage events carry no instance, but the TUI runs one
     /// turn at a time, so each belongs to the in-flight turn's window.
     pub window_usage: HashMap<String, WindowUsage>,
-    /// When the ahma server / the daemon was last seen going down, so the
+    /// When the ahma server / the hub was last seen going down, so the
     /// header can say for how long rather than just "offline".
     pub server_down_since: Option<std::time::Instant>,
-    pub daemon_down_since: Option<std::time::Instant>,
+    pub hub_down_since: Option<std::time::Instant>,
     /// `(base_url, num_ctx)` of the provider last looked up, so the header can
     /// show context fill each frame without re-reading the config file.
     pub ctx_window_cache: std::cell::RefCell<Option<(String, Option<u32>)>>,
@@ -2090,7 +2090,7 @@ pub struct AppState {
     pub mcp_source_tx: Option<tokio::sync::mpsc::Sender<crate::mcp_source::McpSourceCommand>>,
     pub approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
     /// This TUI's own connection to the hub, so the `!` commands it runs are
-    /// visible everywhere the rest of the work is (SPEC R-DAEMON.9). `None`
+    /// visible everywhere the rest of the work is (SPEC R-HUB.9). `None`
     /// only in tests, which build state without a runtime.
     pub tui_reporter: Option<crate::tui_reporter::TuiReporter>,
 }
@@ -2389,13 +2389,13 @@ impl AppState {
         self.server_healthy = healthy;
     }
 
-    pub fn set_daemon_healthy(&mut self, healthy: bool) {
-        match (self.daemon_healthy, healthy) {
-            (true, false) => self.daemon_down_since = Some(std::time::Instant::now()),
-            (_, true) => self.daemon_down_since = None,
+    pub fn set_hub_healthy(&mut self, healthy: bool) {
+        match (self.hub_healthy, healthy) {
+            (true, false) => self.hub_down_since = Some(std::time::Instant::now()),
+            (_, true) => self.hub_down_since = None,
             _ => {}
         }
-        self.daemon_healthy = healthy;
+        self.hub_healthy = healthy;
     }
 
     /// The model's context window in tokens: `--context-length`, else the
@@ -2601,7 +2601,7 @@ impl AppState {
             mcp_http_base_url: String::new(),
             transport_label: transport_label.into(),
             server_healthy: false,
-            daemon_healthy: false,
+            hub_healthy: false,
             session_id: None,
             sandbox_status: SandboxAuthority::Unknown,
             workspace,
@@ -2715,7 +2715,7 @@ impl AppState {
             history_draft: String::new(),
             window_usage: HashMap::new(),
             server_down_since: None,
-            daemon_down_since: None,
+            hub_down_since: None,
             ctx_window_cache: std::cell::RefCell::new(None),
             model_picker_requested: false,
             quit_armed_at: None,
@@ -3222,7 +3222,7 @@ impl AppState {
     }
 
     /// The key a window's LLM choice is saved under. A section is keyed by
-    /// the daemon's instance id, which is stable only while that daemon and
+    /// the hub's instance id, which is stable only while that hub and
     /// that IDE session live; a choice saved under it was lost on every
     /// restart and left a dead entry behind. What the user means by "this
     /// window" across restarts is the client in this workspace.
@@ -3541,8 +3541,8 @@ impl AppState {
 
     /// Merge an incoming operation update into the matching existing entry.
     ///
-    /// Status-poll updates (from the daemon HTTP source) may arrive interleaved
-    /// with push updates (from the daemon hub).  Each source may populate a
+    /// Status-poll updates (from the hub HTTP source) may arrive interleaved
+    /// with push updates (from the hub).  Each source may populate a
     /// different subset of fields, so we merge rather than replace to avoid
     /// clobbering output that was delivered by a different path.
     fn merge_operation(existing: &mut Operation, op: Operation) {
@@ -3890,8 +3890,8 @@ mod tests {
         assert_eq!(s.open_section, None);
     }
 
-    fn instance_info(id: &str, client: &str, scope: &str) -> ahma_common::daemon_hub::InstanceInfo {
-        ahma_common::daemon_hub::InstanceInfo {
+    fn instance_info(id: &str, client: &str, scope: &str) -> ahma_common::hub::InstanceInfo {
+        ahma_common::hub::InstanceInfo {
             id: id.into(),
             pid: 7,
             mode: "stdio".into(),
@@ -4272,7 +4272,7 @@ mod tests {
     #[test]
     fn pending_output_flushes_when_op_materialises() {
         // Regression: an OpOutput line that arrives before its operation (e.g.
-        // after a daemon-hub reconnect) must not be dropped. It is buffered and
+        // after a hub reconnect) must not be dropped. It is buffered and
         // flushed into the op's tail once the op appears, so fast commands like
         // `!pwd` still show their output.
         let mut s = AppState::new("http://localhost:3000", "HTTP", true);
@@ -4448,7 +4448,7 @@ mod tests {
         op_term.description = "/bin/sh {\"c_flag\": true, \"command\": \"sleep 10\"}".to_string();
         assert_eq!(op_term.display_name(), "sleep 10");
 
-        // Test run_terminal_command with "Execute <cmd> in <dir>" description (daemon reporter)
+        // Test run_terminal_command with "Execute <cmd> in <dir>" description (hub reporter)
         let mut op_term_exec = Operation::new("op3", "run_terminal_command", OpStatus::Running);
         op_term_exec.description =
             "Execute sleep 30 in /Users/paulhoughton/github/ahma".to_string();
@@ -4599,7 +4599,7 @@ mod tests {
     #[test]
     fn window_llm_survives_a_new_instance_id() {
         use crate::session_config::WindowLlmConfig;
-        let inst = |id: &str| ahma_common::daemon_hub::InstanceInfo {
+        let inst = |id: &str| ahma_common::hub::InstanceInfo {
             id: id.into(),
             scope: "/w".into(),
             label: "ahma".into(),

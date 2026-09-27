@@ -98,7 +98,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A stand-in daemon on `sock` that answers every request `200 OK` and
+    /// A stand-in hub on `sock` that answers every request `200 OK` and
     /// counts them, on every OS.
     fn serve_restart_ok(sock: &std::path::Path) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
         let listener = ahma_common::local_socket::LocalListener::bind(sock).expect("bind");
@@ -144,7 +144,7 @@ mod tests {
     }
 
     /// When `app_config` is `None` (the default for test services), `handle_restart` uses
-    /// the shared daemon socket, which a test-isolated process is refused (SPEC R-ISO.1),
+    /// the shared hub socket, which a test-isolated process is refused (SPEC R-ISO.1),
     /// so the handler reports rather than restarting anything.
     #[tokio::test]
     async fn handle_restart_no_app_config_executes_none_branches() {
@@ -162,14 +162,14 @@ mod tests {
             .unwrap_or("");
         assert!(
             text.contains("test-isolated"),
-            "a test must never restart the shared daemon, got: {text:?}"
+            "a test must never restart the shared hub, got: {text:?}"
         );
     }
 
-    /// A configured socket with a daemon on it is asked to restart, on every OS —
-    /// the daemon's MCP endpoint is that socket everywhere (SPEC R-DAEMON.2).
+    /// A configured socket with a hub on it is asked to restart, on every OS —
+    /// the hub's MCP endpoint is that socket everywhere (SPEC R-HUB.2).
     #[tokio::test]
-    async fn handle_restart_reaches_the_configured_daemon_socket() {
+    async fn handle_restart_reaches_the_configured_hub_socket() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let sock = tmp.path().join("mcp.sock");
         let (server, hits) = serve_restart_ok(&sock);

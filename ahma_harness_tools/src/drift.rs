@@ -8,7 +8,7 @@
 //! tree the model no longer has.
 //!
 //! This is optimistic concurrency control, not locking: it costs one
-//! `.gitignore`-aware walk (no watcher, no daemon, nothing to clean up) and it
+//! `.gitignore`-aware walk (no watcher, no hub, nothing to clean up) and it
 //! sees every writer, cooperating or not.
 
 use std::path::{Path, PathBuf};

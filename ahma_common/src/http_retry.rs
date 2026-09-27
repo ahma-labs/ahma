@@ -344,7 +344,7 @@ pub struct ServiceError {
 }
 
 impl ServiceError {
-    /// A failure of `service` (a plain name: "the ahma daemon", "GitHub",
+    /// A failure of `service` (a plain name: "the ahma hub", "GitHub",
     /// "your local model server at localhost:11434"), summarised from how it
     /// failed.
     pub fn new(service: &str, failure: Failure, source: impl Into<anyhow::Error>) -> Self {
@@ -391,7 +391,7 @@ impl ServiceError {
 
     /// The same failure attributed to `service` — for a caller that knows
     /// more about the far end than the layer that failed ("the MCP server at
-    /// 127.0.0.1:4242" is, to the agent, "the ahma daemon"). The summary is
+    /// 127.0.0.1:4242" is, to the agent, "the ahma hub"). The summary is
     /// regenerated; the hint, attempts and technical detail are kept.
     pub fn for_service(&self, service: &str) -> Self {
         Self {
@@ -616,8 +616,8 @@ mod tests {
             count: 4,
             elapsed: Duration::from_secs(3),
         });
-        let renamed = original.for_service("the ahma daemon");
-        assert_eq!(renamed.summary(), "Couldn't reach the ahma daemon.");
+        let renamed = original.for_service("the ahma hub");
+        assert_eq!(renamed.summary(), "Couldn't reach the ahma hub.");
         assert_eq!(renamed.details(), original.details());
     }
 
@@ -731,11 +731,11 @@ mod tests {
         assert_eq!(err.failure, Failure::NotDelivered);
         assert_eq!(err.attempts.count, FAST.max_retries + 1);
 
-        let service = ServiceError::from_transport("the ahma daemon", err);
+        let service = ServiceError::from_transport("the ahma hub", err);
         assert!(
             service
                 .to_string()
-                .starts_with("Couldn't reach the ahma daemon.")
+                .starts_with("Couldn't reach the ahma hub.")
         );
         assert!(service.details().contains("gave up after 4 attempts"));
     }
@@ -781,11 +781,11 @@ mod tests {
         assert_eq!(err.failure, Failure::NotDelivered);
         assert_eq!(tries.load(Ordering::SeqCst), 4);
 
-        let service = ServiceError::from_transport("the ahma daemon", err);
+        let service = ServiceError::from_transport("the ahma hub", err);
         assert!(
             service
                 .to_string()
-                .starts_with("Couldn't reach the ahma daemon.")
+                .starts_with("Couldn't reach the ahma hub.")
         );
     }
 

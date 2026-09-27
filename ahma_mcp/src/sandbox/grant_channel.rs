@@ -174,10 +174,10 @@ impl ScopeGrantNotifier for LoggingGrantNotifier {
     }
 }
 
-/// A notifier that forwards each de-duplicated grant request to the daemon hub
+/// A notifier that forwards each de-duplicated grant request to the hub
 /// (for a connected TUI to show as a modal) **and** logs it (so it stays
 /// observable even when no TUI is attached). The shared [`GrantCoordinator`] is
-/// the same instance the daemon reporter uses to resolve the answer, so dedup,
+/// the same instance the hub reporter uses to resolve the answer, so dedup,
 /// first-answer-wins, and dismiss all coordinate across the request and the reply.
 #[derive(Debug)]
 pub struct HubGrantNotifier {
@@ -187,7 +187,7 @@ pub struct HubGrantNotifier {
 
 impl HubGrantNotifier {
     /// Create a hub-delivering notifier sharing `coordinator`, sending fresh
-    /// requests on `req_tx` (drained by the daemon reporter and forwarded to the
+    /// requests on `req_tx` (drained by the hub reporter and forwarded to the
     /// hub as `ClientMsg::Relay(HubRelay::ScopeGrantRequested)`).
     pub fn new(
         coordinator: Arc<GrantCoordinator>,

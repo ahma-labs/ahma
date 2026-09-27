@@ -199,9 +199,9 @@ pub struct AhmaMcpService {
     /// denied for this session.
     pub net_approval: Arc<ahma_common::net_approval::NetApprovalCoordinator>,
     /// Optional sink for delivering a web-approval prompt to a connected TUI over
-    /// the daemon hub (R-WEB.6), set in daemon/server mode. When a `fetch_webpage`
+    /// the hub (R-WEB.6), set in hub/server mode. When a `fetch_webpage`
     /// hits an unknown domain and the MCP client cannot do interactive
-    /// `elicitation/create`, the request is sent here; the daemon reporter forwards
+    /// `elicitation/create`, the request is sent here; the hub reporter forwards
     /// it as `ClientMsg::Relay(HubRelay::WebApprovalRequested)` and routes
     /// the TUI's answer back into `web_approval`. `None` ⇒ no TUI surface wired.
     pub web_approval_tx: Arc<
@@ -974,7 +974,7 @@ impl AhmaMcpService {
         self
     }
 
-    /// Wire the daemon-hub sink that delivers web-approval prompts to a connected
+    /// Wire the hub sink that delivers web-approval prompts to a connected
     /// TUI (R-WEB.6). Takes `&self` so it can be called after construction on the
     /// already-shared service; the sink is stored behind the service's shared
     /// `Arc`, so every clone sees it.
@@ -1571,11 +1571,11 @@ impl ServerHandler for AhmaMcpService {
                 }
             );
 
-            // Publish the raw client identity so the daemon reporter can
+            // Publish the raw client identity so the hub reporter can
             // re-register this instance with the hub under the client's name
             // (the TUI task tree groups work by who is driving it).
             if let Some(info) = context.peer.peer_info() {
-                crate::daemon_reporter::set_client_identity(
+                crate::hub_reporter::set_client_identity(
                     info.client_info.name.clone(),
                     info.capabilities.sampling.is_some(),
                 );
@@ -4387,14 +4387,14 @@ mod tests {
 
     #[tokio::test]
     async fn handle_agent_delegates_to_the_registered_runner() {
-        use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
+        use ahma_common::hub::{ClientMsg, HubChatMessage};
 
         struct MockRunner;
         #[async_trait::async_trait]
         impl PromptRunner for MockRunner {
             async fn run_prompt(
                 &self,
-                _messages: Vec<DaemonChatMessage>,
+                _messages: Vec<HubChatMessage>,
                 _system_prompt: Option<String>,
                 _provider: Option<String>,
                 _model: Option<String>,
@@ -4405,7 +4405,7 @@ mod tests {
             }
             async fn run_prompt_to_completion(
                 &self,
-                messages: Vec<DaemonChatMessage>,
+                messages: Vec<HubChatMessage>,
                 _system_prompt: Option<String>,
                 _provider: Option<String>,
                 _model: Option<String>,

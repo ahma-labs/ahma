@@ -621,12 +621,12 @@ fn reconnect_backoff_base() -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Run the stdio proxy against the daemon's MCP endpoint on its local socket.
+/// Run the stdio proxy against the hub's MCP endpoint on its local socket.
 ///
 /// Returns `Ok(true)` when the bridge successfully responded to at least one
 /// message (normal session end).  Returns `Ok(false)` or `Err` when the bridge
 /// closed the connection before sending any response back to the client, which
-/// typically indicates a stale or incompatible bridge daemon.
+/// typically indicates a stale or incompatible bridge hub.
 pub async fn run_proxy_client(
     socket_path: &str,
     respawn_bridge: Option<BridgeRespawnFn>,
@@ -635,8 +635,8 @@ pub async fn run_proxy_client(
 }
 
 /// As [`run_proxy_client`], carrying this client's per-session options in the
-/// MCP URL's query so the daemon can apply them to this session's worker and no
-/// other (SPEC R-DAEMON.4).
+/// MCP URL's query so the hub can apply them to this session's worker and no
+/// other (SPEC R-HUB.4).
 pub async fn run_proxy_client_with_options(
     socket_path: &str,
     respawn_bridge: Option<BridgeRespawnFn>,
@@ -646,7 +646,7 @@ pub async fn run_proxy_client_with_options(
     let mcp_uri = append_session_query("http://localhost/mcp", session_query);
     tracing::info!(
         socket = socket_path,
-        "Proxying stdio to the daemon's local socket"
+        "Proxying stdio to the hub's local socket"
     );
     run_proxy_client_socket(socket_path, &mcp_uri, handshake_deadline, respawn_bridge).await
 }
@@ -765,8 +765,8 @@ fn synthesize_initialize_request(val: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Proxy stdio to the MCP endpoint on `socket_path` — an `AF_UNIX` socket on
-/// every OS (SPEC R-DAEMON.2), so the reconnect and respawn below that keep a
-/// session alive across a daemon restart (SPEC R-LIFECYCLE.3) work on Windows
+/// every OS (SPEC R-HUB.2), so the reconnect and respawn below that keep a
+/// session alive across a hub restart (SPEC R-LIFECYCLE.3) work on Windows
 /// too.
 async fn run_proxy_client_socket(
     socket_path: &str,

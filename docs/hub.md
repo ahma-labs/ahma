@@ -1,8 +1,11 @@
-# The ahma daemon
+# The ahma hub
 
-There is **one ahma daemon per user**, and it hosts both halves of ahma's
+> **Status:** stable. Called the *daemon* in 0.21 and earlier; `[daemon]` settings are
+> still read.
+
+There is **one ahma hub per user**, and it hosts both halves of ahma's
 background presence: the MCP endpoint your editors connect to, and the
-observability hub that `ahma tui` watches. Whoever needs it first starts it —
+event stream that `ahma tui` watches. Whoever needs it first starts it —
 an editor's `ahma serve stdio`, `ahma tui`, or a hooked command — and everyone
 else attaches to the same one.
 
@@ -22,12 +25,12 @@ bridge on the machine-global `/tmp/ahma.sock`, and a hub that `ahma tui` would
   everybody.
 - Hooked shell commands reported to neither and were invisible everywhere.
 
-One daemon fixes those by construction, and the trade is deliberate: several
+One hub fixes those by construction, and the trade is deliberate: several
 clients share one process. The **sandbox** is not shared — see below.
 
 ## What it does and does not do
 
-The daemon is a control plane. It runs no commands itself. Every tool call runs
+The hub is a control plane. It runs no commands itself. Every tool call runs
 in a kernel-sandboxed worker subprocess, **one per MCP session**, each locking
 its own scope from its own client's `roots/list` (SPEC R5.1). That is not a
 design preference: on Linux a Landlock ruleset restricts the process that
@@ -37,12 +40,12 @@ applies it, irreversibly, so one process cannot hold two workspace scopes.
 editor 1 ─┐
 editor 2 ─┼─ ahma serve stdio (a pipe) ─┐
 editor 3 ─┘                             │  mcp.sock
-ahma tui ───────────────────────────────┤  daemon.sock
+ahma tui ───────────────────────────────┤  hub.sock
 hooked command ─────────────────────────┘
                                         ▼
                             ┌───────────────────────┐
-                            │   ahma daemon         │
-                            │   hub + MCP endpoint  │
+                            │       ahma hub        │
+                            │ events + MCP endpoint │
                             └───┬────┬────┬────┬────┘
                                 ▼    ▼    ▼    ▼      one per session,
                                W1   W2   W3   W4      one locked scope each
@@ -56,8 +59,8 @@ owned by someone else or reachable by group or others. It holds:
 
 | File | What it is |
 |---|---|
-| `daemon.lock` | The mutex: whoever holds it is the daemon. A kernel lock, so it is released the moment its holder dies, and nothing is left to clean up after a crash. |
-| `daemon.sock` | The hub. Only the lock holder binds or removes it. `0600`. |
+| `hub.lock` | The mutex: whoever holds it is the hub. A kernel lock, so it is released the moment its holder dies, and nothing is left to clean up after a crash. |
+| `hub.sock` | The event stream: instances, operations and approvals. Only the lock holder binds or removes it. `0600`. |
 | `mcp.sock` | The MCP endpoint editors proxy to. `0600`. |
 | `history.jsonl` | The last hour of operations, so recent work survives a restart. `0600`. |
 
@@ -74,7 +77,7 @@ checked and not only the socket.
 
 On **Windows** (10 1803 or later) both are the same kind of `AF_UNIX` socket
 file, with the same lock; access control comes from the per-user profile ACL
-rather than mode bits. The daemon opens no TCP port on any OS.
+rather than mode bits. The hub opens no TCP port on any OS.
 
 ## Lifetime
 
@@ -82,20 +85,25 @@ It exits when nothing has been attached for a while — no MCP sessions **and** 
 TUI or other hub subscribers:
 
 ```toml
-[daemon]
-# Seconds with nothing attached before the daemon exits. 0 keeps it running.
-idle_timeout_secs = 60
+[hub]
+# Seconds with nothing attached before the hub exits. 0 keeps it running.
+idle_timeout_secs = 3600
 ```
+
+| Setting | Default | What it does |
+|---|---|---|
+| `[hub] idle_timeout_secs` | `3600` | Seconds with no MCP sessions and no TUI before the hub exits; `0` never. |
+| `--unix-socket-path` / `[http] unix_socket_path` | per-user runtime dir | Where the MCP socket (and, beside it, the hub socket) lives. |
 
 Counting only sessions would exit while a TUI sat watching an idle project;
 counting only subscribers would exit mid-build. Restarting is cheap and the
-daemon holds nothing you depend on — history is on disk.
+hub holds nothing you depend on — history is on disk.
 
 Your editor never has to notice. The `ahma serve stdio` process it talks to
-stays attached however the daemon goes away (idle exit, crash, kill, upgrade):
+stays attached however the hub goes away (idle exit, crash, kill, upgrade):
 the next request restarts it and resumes the session, and requests made while
 it is unreachable are answered with "ahma is restarting, retry" rather than the
-server going dead. If the daemon cannot be started at all — a host sandbox that
+server going dead. If the hub cannot be started at all — a host sandbox that
 forbids the detached spawn, say — the session runs in-process instead, and the
 log says so. Operation ids name the process that issued them, so `await` on an
 id from before a restart says what happened instead of just "not found"
@@ -104,12 +112,12 @@ id from before a restart says what happened instead of just "not found"
 ## Upgrades
 
 When you install a new ahma while one is running, the new binary asks the old
-daemon to **drain**: stop accepting new sessions, finish the ones it has, then
+hub to **drain**: stop accepting new sessions, finish the ones it has, then
 exit, at which point the next client starts the new one. Your other editors'
 sessions are not torn down mid-command to install a binary one of them asked
 for. Until the handover happens, the mismatch is disclosed rather than hidden.
 
-`ahma daemon` in a terminal runs one in the foreground, which is the way to see
+`ahma hub` in a terminal runs one in the foreground, which is the way to see
 what it is doing.
 
 ## The TUI's own commands
@@ -119,20 +127,20 @@ typed into its input runs right there, outside the sandbox, at your full
 privilege. So the TUI registers a connection of its own (`mode: "tui"`) and
 reports those commands like any other client — which is what puts them in the
 history file and in front of a second TUI. They are flagged `unsandboxed` on
-the wire and every surface says so. If the daemon is down the command still
+the wire and every surface says so. If the hub is down the command still
 runs and still shows its output; only the report is lost.
 
 ## Hooked commands
 
 A command wrapped by ahma's shell hook registers as an instance of its own for
 the length of that command, so hooked work appears in the TUI beside everything
-else. It never starts a daemon (that would put a process launch in front of your
+else. It never starts a hub (that would put a process launch in front of your
 command) and waits at most 300 ms for its report to land before exiting. With no
-daemon running, the command runs exactly as it otherwise would.
+hub running, the command runs exactly as it otherwise would.
 
 ## See also
 
 - [docs/tui.md](tui.md) — the work view that watches all of this
 - [docs/connection-modes.md](connection-modes.md) — how editors connect
 - [docs/session-isolation.md](session-isolation.md) — per-session workers and scopes
-- SPEC.md `R-DAEMON` — the requirements this implements
+- SPEC.md `R-HUB` — the requirements this implements

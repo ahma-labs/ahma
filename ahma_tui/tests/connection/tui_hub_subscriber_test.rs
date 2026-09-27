@@ -1,4 +1,4 @@
-//! The TUI is a subscriber, never the hub, and never a server (SPEC R-DAEMON.9).
+//! The TUI is a subscriber, never the hub, and never a server (SPEC R-HUB.9).
 //!
 //! Two behaviours used to make one terminal window quietly decide things for
 //! every other client: the TUI bound the hub socket when it started first, so
@@ -7,9 +7,9 @@
 //! arrived afterwards locked to whichever folder that terminal happened to be
 //! in.
 
-use ahma_common::daemon_hub::{ClientMsg, DaemonMsg, HubServer, recv_msg, send_msg};
+use ahma_common::hub::{ClientMsg, HubMsg, HubServer, recv_msg, send_msg};
 use ahma_common::timeouts::TestTimeouts;
-use ahma_tui::daemon_source::spawn_daemon_source;
+use ahma_tui::hub_source::spawn_hub_source;
 use ahma_tui::mcp_source::SourceEvent;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -21,7 +21,7 @@ fn isolated_socket() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir for the hub socket");
     let path = dir.path().join("hub.sock");
     // SAFETY: nextest runs each test in its own process.
-    unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &path) };
+    unsafe { std::env::set_var("AHMA_HUB_SOCK", &path) };
     (dir, path)
 }
 
@@ -36,7 +36,7 @@ async fn next_event(rx: &mut mpsc::Receiver<SourceEvent>) -> SourceEvent {
 ///
 /// This is what makes a hooked command visible: it is an instance for the
 /// length of one command, so by the time anyone looks at the TUI it has always
-/// already gone (SPEC R-DAEMON.7, R-DAEMON.8).
+/// already gone (SPEC R-HUB.7, R-HUB.8).
 #[tokio::test]
 async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
     let (_dir, socket) = isolated_socket();
@@ -47,7 +47,7 @@ async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
 
     // A hook registers, runs one command, and exits — all before the TUI looks.
     {
-        let stream = ahma_common::daemon_hub::connect_to_daemon()
+        let stream = ahma_common::hub::connect_to_hub()
             .await
             .expect("the hook connects to the hub this test just bound");
         let (r, mut w) = tokio::io::split(stream);
@@ -70,7 +70,7 @@ async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
         send_msg(
             &mut w,
             &ClientMsg::Event {
-                payload: ahma_common::daemon_hub::DaemonEvent::OpStarted {
+                payload: ahma_common::hub::HubEvent::OpStarted {
                     id: "op-1".to_string(),
                     tool_name: "run_terminal_command".to_string(),
                     description: "lint".to_string(),
@@ -91,9 +91,9 @@ async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
         send_msg(
             &mut w,
             &ClientMsg::Event {
-                payload: ahma_common::daemon_hub::DaemonEvent::OpFinished {
+                payload: ahma_common::hub::HubEvent::OpFinished {
                     id: "op-1".to_string(),
-                    status: ahma_common::daemon_hub::OpStatus::Completed,
+                    status: ahma_common::hub::OpStatus::Completed,
                     result_summary: Some("ok".to_string()),
                     duration_ms: 5,
                     ended_epoch_ms: None,
@@ -112,7 +112,7 @@ async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
     tokio::time::sleep(TestTimeouts::short_delay()).await;
 
     let (tx, mut rx) = mpsc::channel::<SourceEvent>(64);
-    spawn_daemon_source(tx);
+    spawn_hub_source(tx);
 
     let mut instances_seen = Vec::new();
     let mut ops_seen = Vec::new();
@@ -144,21 +144,21 @@ async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
     hub_task.abort();
 }
 
-/// Starting the TUI must not bind the hub: the daemon owns it, and a TUI that
+/// Starting the TUI must not bind the hub: the hub owns it, and a TUI that
 /// took it would take the event stream away from every editor when it quit.
 ///
 /// The hub is bound **first** here, and deliberately so. A source started with
-/// no daemon running tries to start one, and from a test binary that means
-/// `current_exe daemon` — the test harness itself, re-run with `daemon` as a
+/// no hub running tries to start one, and from a test binary that means
+/// `current_exe hub` — the test harness itself, re-run with `hub` as a
 /// filter that matches these very tests. That is a fork bomb, and it emptied
-/// this machine's process table once already; `daemon_client::spawn_daemon` now
+/// this machine's process table once already; `hub_client::spawn_hub` now
 /// refuses under a test harness, and this test does not go looking for the
 /// refusal.
 #[tokio::test]
 async fn the_tui_source_never_binds_the_hub() {
     let (_dir, socket) = isolated_socket();
 
-    // The daemon's hub, bound before the TUI exists.
+    // The hub, bound before the TUI exists.
     let hub = HubServer::bind_at(socket.clone())
         .await
         .expect("this test owns a freshly isolated socket");
@@ -166,7 +166,7 @@ async fn the_tui_source_never_binds_the_hub() {
     let task = tokio::spawn(async move { hub.serve().await });
 
     let (tx, _rx) = mpsc::channel::<SourceEvent>(8);
-    spawn_daemon_source(tx);
+    spawn_hub_source(tx);
 
     // The TUI attaches as an ordinary subscriber...
     let subscribed = tokio::time::timeout(TestTimeouts::scale_secs(10), async {
@@ -179,21 +179,21 @@ async fn the_tui_source_never_binds_the_hub() {
     })
     .await
     .unwrap_or(false);
-    assert!(subscribed, "the TUI must subscribe to the daemon's hub");
+    assert!(subscribed, "the TUI must subscribe to the hub");
 
     // ...and the socket still belongs to the hub that bound it: a second bind
     // is refused as AlreadyRunning, which it would not be had the TUI taken it
     // over.
     match HubServer::bind_at(socket.clone()).await {
-        Err(ahma_common::daemon_hub::HubBindError::AlreadyRunning) => {}
+        Err(ahma_common::hub::HubBindError::AlreadyRunning) => {}
         Err(e) => panic!("expected AlreadyRunning, got {e}"),
-        Ok(_) => panic!("the hub socket must still be owned by the daemon's hub"),
+        Ok(_) => panic!("the hub socket must still be owned by the hub"),
     }
 
     task.abort();
 }
 
-/// A one-shot query answers on the socket, which is what `ahma daemon`'s
+/// A one-shot query answers on the socket, which is what `ahma hub`'s
 /// callers use to tell a live rendezvous from a stale file.
 #[tokio::test]
 async fn list_instances_answers_on_the_hub_socket() {
@@ -201,13 +201,13 @@ async fn list_instances_answers_on_the_hub_socket() {
     let hub = HubServer::bind_at(socket.clone()).await.expect("bind");
     let task = tokio::spawn(async move { hub.serve().await });
 
-    let listed = ahma_common::daemon_hub::list_instances_at(&socket)
+    let listed = ahma_common::hub::list_instances_at(&socket)
         .await
         .expect("the hub answers a one-shot query");
     assert!(listed.is_empty(), "nothing has registered yet");
 
     // And an unknown message does not kill the connection (R24.5).
-    let stream = ahma_common::daemon_hub::connect_to_daemon()
+    let stream = ahma_common::hub::connect_to_hub()
         .await
         .expect("connect to the hub this test just bound");
     let (r, mut w) = tokio::io::split(stream);
@@ -218,12 +218,12 @@ async fn list_instances_answers_on_the_hub_socket() {
     send_msg(&mut w, &ClientMsg::ListInstances).await.unwrap();
     let msg = tokio::time::timeout(
         TestTimeouts::scale_secs(5),
-        recv_msg::<_, DaemonMsg>(&mut reader),
+        recv_msg::<_, HubMsg>(&mut reader),
     )
     .await
     .expect("the hub must answer after skipping what it did not understand")
     .expect("connection stays open");
-    assert!(matches!(msg, DaemonMsg::InstanceList { .. }));
+    assert!(matches!(msg, HubMsg::InstanceList { .. }));
 
     task.abort();
 }

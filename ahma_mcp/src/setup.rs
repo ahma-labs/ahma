@@ -363,7 +363,7 @@ fn select_platforms(actions: &[SetupAction], interactive: bool) -> Vec<Platform>
 
 /// The URL a shared-transport client entry is written with.
 ///
-/// The Unix arm resolves the **per-user** daemon socket (SPEC R-DAEMON.2) at
+/// The Unix arm resolves the **per-user** hub socket (SPEC R-HUB.2) at
 /// setup time rather than hardcoding the retired machine-global
 /// `/tmp/ahma.sock`: this string is baked into the user's client config, so a
 /// stale literal here outlives every later fix.
@@ -372,7 +372,7 @@ fn mcp_shared_transport_url(transport: &str) -> Option<String> {
         "http" => Some("http://localhost:3000/mcp".to_string()),
         "unix" => Some(format!(
             "unix://{}#/mcp",
-            ahma_common::daemon_hub::mcp_socket_path(None)
+            ahma_common::hub::mcp_socket_path(None)
         )),
         _ => None,
     }
@@ -472,7 +472,7 @@ fn print_mcp_restart_hints(interactive: bool, configured: &[&str], transport: &s
         ),
         "unix" => println!(
             "  Start the Unix socket server before opening tools: ahma serve unix --socket-path {} --tools simplify",
-            ahma_common::daemon_hub::mcp_socket_path(None)
+            ahma_common::hub::mcp_socket_path(None)
         ),
         _ => {}
     }
@@ -828,7 +828,7 @@ fn build_codex_toml_value(transport: &str) -> toml::Value {
                 "url".to_string(),
                 toml::Value::String(format!(
                     "unix://{}#/mcp",
-                    ahma_common::daemon_hub::mcp_socket_path(None)
+                    ahma_common::hub::mcp_socket_path(None)
                 )),
             );
         }
@@ -1313,14 +1313,8 @@ mod tests {
         );
         assert_eq!(
             mcp_shared_transport_url("unix").as_deref(),
-            Some(
-                format!(
-                    "unix://{}#/mcp",
-                    ahma_common::daemon_hub::mcp_socket_path(None)
-                )
-                .as_str()
-            ),
-            "the Unix entry names the per-user daemon socket, not /tmp/ahma.sock"
+            Some(format!("unix://{}#/mcp", ahma_common::hub::mcp_socket_path(None)).as_str()),
+            "the Unix entry names the per-user hub socket, not /tmp/ahma.sock"
         );
         assert_eq!(mcp_shared_transport_url("stdio"), None);
         assert_eq!(mcp_shared_transport_url("bogus"), None);
@@ -1340,10 +1334,7 @@ mod tests {
     fn test_build_mcp_servers_entry_unix() {
         let entry = build_mcp_servers_entry("unix");
         assert_eq!(entry["type"], "http");
-        let expected = format!(
-            "unix://{}#/mcp",
-            ahma_common::daemon_hub::mcp_socket_path(None)
-        );
+        let expected = format!("unix://{}#/mcp", ahma_common::hub::mcp_socket_path(None));
         assert_eq!(entry["url"], expected);
     }
 
@@ -1374,10 +1365,7 @@ mod tests {
     fn test_build_scoped_servers_entry_unix_returns_url_only() {
         let tmp = tempdir().unwrap();
         let entry = build_scoped_servers_entry("unix", tmp.path());
-        let expected = format!(
-            "unix://{}#/mcp",
-            ahma_common::daemon_hub::mcp_socket_path(None)
-        );
+        let expected = format!("unix://{}#/mcp", ahma_common::hub::mcp_socket_path(None));
         assert_eq!(entry["url"], expected);
         assert!(entry.get("command").is_none());
     }
@@ -1397,10 +1385,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let entry = build_claude_desktop_mcp_entry("unix", tmp.path());
         assert_eq!(entry["type"], "http");
-        let expected = format!(
-            "unix://{}#/mcp",
-            ahma_common::daemon_hub::mcp_socket_path(None)
-        );
+        let expected = format!("unix://{}#/mcp", ahma_common::hub::mcp_socket_path(None));
         assert_eq!(entry["url"], expected);
     }
 
@@ -1430,10 +1415,7 @@ mod tests {
     fn test_build_codex_toml_value_unix() {
         let v = build_codex_toml_value("unix");
         let t = v.as_table().unwrap();
-        let expected = format!(
-            "unix://{}#/mcp",
-            ahma_common::daemon_hub::mcp_socket_path(None)
-        );
+        let expected = format!("unix://{}#/mcp", ahma_common::hub::mcp_socket_path(None));
         assert_eq!(t.get("url").unwrap().as_str(), Some(expected.as_str()));
     }
 

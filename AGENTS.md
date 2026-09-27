@@ -241,7 +241,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Session isolation | [docs/session-isolation.md](docs/session-isolation.md) | R10 (`ahma_http_bridge/SPEC.md`) |
 | Task vaults | [docs/task-vault.md](docs/task-vault.md) | `ahma_vault/SPEC.md` |
 | TUI | [docs/tui.md](docs/tui.md) | R24, R25 (`ahma_tui/SPEC.md`) |
-| Per-user daemon | [docs/daemon.md](docs/daemon.md) | R-DAEMON |
+| Per-user hub | [docs/hub.md](docs/hub.md) | R-HUB |
 | Network egress (`--restrict-network`) | [docs/network-egress.md](docs/network-egress.md) | R-WEB.16, R-PERM.5.3 |
 | Execution audit log | [docs/execution-audit-log.md](docs/execution-audit-log.md) | R-HANDOFF.10 |
 | Bundle audit | [docs/bundle-audit.md](docs/bundle-audit.md) | `ahma_bundle/SPEC.md` |
@@ -610,7 +610,7 @@ Capture full logs (`<cmd> 2>&1 | tee …`) and reduce concurrency to a single te
   R-SK3 500-line cap, so a skill can grow with every feature PR without anyone noticing it
   drifted out of compliance.
 - **R-GUARD.7**: Guardrail scripts and PR CI **must** run `scripts/check-spec-ids.sh`, which
-  fails when a requirement id cited in code (`R5.4`, `R-DAEMON.2`, …) is written in no
+  fails when a requirement id cited in code (`R5.4`, `R-HUB.2`, …) is written in no
   `SPEC.md` and not in this file. Moving a requirement between SPECs keeps its id; the check
   is what makes a move that drops one visible.
 

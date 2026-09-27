@@ -3,9 +3,9 @@
 //! Default behaviour when `--connect` is not supplied:
 //!
 //! try the local Unix domain socket (`[http] unix_socket_path` in
-//! `~/.ahma/settings.toml`, default the per-user daemon's `mcp.sock`) first, then
+//! `~/.ahma/settings.toml`, default the per-user hub's `mcp.sock`) first, then
 //! fall back to `http://localhost:3000`. The socket is `AF_UNIX` on every OS,
-//! Windows included (SPEC R-DAEMON.2).
+//! Windows included (SPEC R-HUB.2).
 //!
 //! After a successful TCP/HTTP probe the server's `Alt-Svc` response header is
 //! checked for an `h3` token.  When QUIC is advertised **and** a persistent local
@@ -36,7 +36,7 @@ pub enum ResolvedTransport {
     /// from the TUI use regular HTTPS (TCP) since QUIC connectivity was already
     /// verified at connection time.  The inner string is the base HTTP URL.
     Http3(String),
-    /// HTTP over an `AF_UNIX` socket, on every OS (SPEC R-DAEMON.2).  The
+    /// HTTP over an `AF_UNIX` socket, on every OS (SPEC R-HUB.2).  The
     /// inner string is the socket path, e.g. `"/run/user/1000/ahma/mcp.sock"`.
     UnixSocket(String),
 }
@@ -234,7 +234,7 @@ pub fn unix_socket_default_path() -> String {
         .http
         .unix_socket_path
         .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| ahma_common::daemon_hub::mcp_socket_path(None))
+        .unwrap_or_else(|| ahma_common::hub::mcp_socket_path(None))
 }
 
 /// Parse a user-supplied `--connect` value into a `ResolvedConnection`.
@@ -375,7 +375,7 @@ pub fn parse_h3_from_alt_svc(alt_svc: &str) -> Option<&str> {
 /// and checking the response status line for a 2xx code.
 ///
 /// We use raw I/O here to avoid pulling in a full HTTP client just for a
-/// health check. `AF_UNIX` on every OS, Windows included (SPEC R-DAEMON.2).
+/// health check. `AF_UNIX` on every OS, Windows included (SPEC R-HUB.2).
 async fn probe_unix_socket(socket_path: &str) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

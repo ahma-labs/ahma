@@ -49,7 +49,7 @@ async fn test_proxy_client_autostart_and_shutdown() {
     let mut child_stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
     let mut line = String::new();
 
-    // 2. Poll until the daemon's socket is created and healthy.
+    // 2. Poll until the hub's socket is created and healthy.
     let start = Instant::now();
     let mut healthy = false;
     while start.elapsed() < TestTimeouts::get(TimeoutCategory::ProcessSpawn) {
@@ -64,8 +64,8 @@ async fn test_proxy_client_autostart_and_shutdown() {
             line.clear();
         }
 
-        // The daemon's MCP endpoint is this socket on every OS (SPEC
-        // R-DAEMON.2); on Windows this used to be skipped, because there it was
+        // The hub's MCP endpoint is this socket on every OS (SPEC
+        // R-HUB.2); on Windows this used to be skipped, because there it was
         // a TCP port the frontend could not find.
         if ahma_common::local_socket::LocalStream::connect(&socket_path)
             .await

@@ -3,13 +3,13 @@
 * **Status**: Approved
 * **License**: MIT OR Apache-2.0
 * **Depends on**: `ahma_common` (dev: `ahma_mcp`, `ahma_test_support`)
-* **Used by**: `ahma_mcp` (`ahma serve http|unix` and the per-user daemon embed it); the
+* **Used by**: `ahma_mcp` (`ahma serve http|unix` and the per-user hub embed it); the
   standalone `ahma_http_bridge` binary exists for end-to-end tests
 
 ## 1. User Story / Problem Statement
 
 *As an MCP client that speaks Streamable HTTP — or as several clients sharing one per-user
-daemon — I want each session to get its own sandboxed ahma worker, so that one client's
+hub — I want each session to get its own sandboxed ahma worker, so that one client's
 scope, operations and failures can never reach another's.*
 
 The bridge terminates HTTP/SSE and multiplexes sessions. For each `Mcp-Session-Id` it runs
@@ -70,7 +70,7 @@ honest gating.
 - **Per-IP rate limiting** (`--rate-limit-rps`, `--rate-limit-burst`) answers excess
   requests with HTTP 429 and `Retry-After`; `/health` is exempt.
 - **Listeners**: TCP (`ahma serve http`), a Unix socket (`ahma serve unix`, `AF_UNIX` on every OS), and
-  the per-user daemon's endpoint (R-DAEMON). An explicitly started `serve http|unix` is
+  the per-user hub's endpoint (R-HUB). An explicitly started `serve http|unix` is
   operator-owned and has no idle exit unless `--idle-timeout` is given.
 
 ### RB: Pipeline and state invariants

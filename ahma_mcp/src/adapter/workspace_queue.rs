@@ -57,7 +57,7 @@ use tokio_util::sync::CancellationToken;
 /// Environment variable naming the workspace lease(s) the current process tree
 /// already runs under. Internal supervision marker, like `AHMA_SERVER_CHILD` —
 /// not configuration (SPEC R-CFG): it only ever *skips a wait* for a lease an
-/// ancestor provably holds. Never inherited by the detached daemon.
+/// ancestor provably holds. Never inherited by the detached hub.
 pub const HELD_LEASE_ENV: &str = ahma_common::process_guard::HELD_WORKSPACE_LEASE_ENV;
 
 /// How an operation participates in the workspace queue.
@@ -207,7 +207,7 @@ pub fn key_id(key: &Path) -> String {
 /// dir>/locks`. Outside every sandbox scope by construction (R5.4.8 keeps
 /// `~/.ahma` out; `$XDG_RUNTIME_DIR` is never a workspace).
 pub fn default_lock_dir() -> Option<PathBuf> {
-    ahma_common::daemon_hub::runtime_dir().map(|d| d.join("locks"))
+    ahma_common::hub::runtime_dir().map(|d| d.join("locks"))
 }
 
 /// Whether this process already runs inside an ancestor's lease on `key`.

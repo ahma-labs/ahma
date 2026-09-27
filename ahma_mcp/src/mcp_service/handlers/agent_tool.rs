@@ -6,7 +6,7 @@
 use super::common::{mcp_internal, mcp_invalid_params, text_result};
 use crate::AhmaMcpService;
 use crate::mcp_service::schema;
-use ahma_common::daemon_hub::DaemonChatMessage;
+use ahma_common::hub::HubChatMessage;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData as McpError};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -41,7 +41,7 @@ impl AhmaMcpService {
             mcp_internal("no agent runtime is registered in this process; the `agent` tool is unavailable here")
         })?;
 
-        let messages = vec![DaemonChatMessage {
+        let messages = vec![HubChatMessage {
             role: "user".to_string(),
             content: prompt.to_string(),
         }];

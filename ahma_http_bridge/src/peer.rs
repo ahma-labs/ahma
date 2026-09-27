@@ -80,7 +80,7 @@ impl PeerFactory for SubprocessPeerFactory {
             // roots/list_changed, and suppress the interactive CLI output path.
             let mut args = base_args;
             // A per-session scope wins over the manager-wide fallback: it came
-            // from this client, not from whoever started the daemon.
+            // from this client, not from whoever started the hub.
             let has_session_scope = options.extra_args.iter().any(|a| a == "--sandbox-scope");
             args.extend(options.extra_args.iter().cloned());
             if let Some(ref scope) = default_sandbox_scope
@@ -159,7 +159,7 @@ impl PeerFactory for SubprocessPeerFactory {
             // Stripping NEXTEST above must not strip endpoint isolation
             // (SPEC R-ISO.1): if this bridge is itself test-owned, the peer
             // must inherit that fact explicitly or it would resolve the
-            // machine-global daemon endpoints from inside a test run.
+            // machine-global hub endpoints from inside a test run.
             if ahma_common::test_isolation::spawned_under_test_harness() {
                 cmd.env("AHMA_TEST_ISOLATION", "1");
             }

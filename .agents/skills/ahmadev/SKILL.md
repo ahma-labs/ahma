@@ -507,7 +507,7 @@ publishes three artifacts to GitHub Pages, rooted at `https://ahma-labs.github.i
    worth 10× the attention of a 0%-covered 14-line glue file. Prioritize:
    - Sandbox scope derivation, path security, approvals/gating
    - The MCP handshake and session isolation paths
-   - Daemon/bridge request routing, shell-pool command construction
+   - Hub/bridge request routing, shell-pool command construction
    - Any logic-heavy module where a silent break causes a reversion
    Integration tests are the gold standard here — they catch cross-module contracts that unit
    tests mock away. See the **Hard Invariants** section in `AGENTS.md`.

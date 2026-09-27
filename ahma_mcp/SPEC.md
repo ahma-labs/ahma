@@ -19,7 +19,7 @@ This crate is the engine behind every ahma surface. It owns:
 - sandboxed execution (`sandbox`, `adapter`) and operation tracking (`operation_monitor`);
 - the MCP service and its built-in tools (`mcp_service`, `builtin_tool`);
 - the `ahma` command line itself (`shell::cli`, every subcommand and server mode), plus
-  `setup`, `uninstall`, terminal `hooks`, `update` orchestration and the daemon reporter.
+  `setup`, `uninstall`, terminal `hooks`, `update` orchestration and the hub reporter.
 
 `ahma_bin` is a thin `main` over `shell::cli`. The root [SPEC.md](../SPEC.md) states the
 product rules this crate implements; the list below is what this crate must guarantee.
@@ -47,7 +47,7 @@ product rules this crate implements; the list below is what this crate must guar
   operation id after a short window for collection with `await` (R2.1, R2.6).
 - `OperationMonitor` is the single lifecycle emitter onto the one `OperationEvent` stream
   (`ahma_common::event_dispatcher`) and emits exactly one terminal event per operation.
-  Subscribers — MCP progress push (`mcp_service::progress_push`), daemon hub, audit, TUI —
+  Subscribers — MCP progress push (`mcp_service::progress_push`), hub, audit, TUI —
   only consume it (root SPEC §2.4).
 - The complete redacted output of every operation is written to
   `<project log dir>/operations/<id>.log` and advertised as `output_file`; the inline result

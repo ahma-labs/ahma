@@ -384,7 +384,7 @@ impl PermissionSettings {
 ///
 /// Trust is stored as a wildcard tool in the existing `tool_approvals` list
 /// rather than a new `[permissions]` key on purpose: that table is
-/// `deny_unknown_fields`, and a daemon left running from an older release would
+/// `deny_unknown_fields`, and a hub left running from an older release would
 /// refuse to parse a settings file carrying a key it has never heard of —
 /// taking every other grant down with it. An older binary reads `"*"` as a tool
 /// literally named `*`, which never matches a real call, so it simply keeps

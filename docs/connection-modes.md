@@ -4,20 +4,20 @@
 1. **STDIO Mode** (default): your editor spawns `ahma` as a subprocess and communicates via standard I/O. Recommended for development.
 2. **HTTP Mode**: Start `ahma serve http` for HTTP/3 (QUIC) support.
 
-> **All of them go through one daemon.** Whatever an editor spawns, the process
-> that actually serves MCP is the single per-user daemon, and the tools run in a
-> kernel-sandboxed worker per session. See [docs/daemon.md](daemon.md).
+> **All of them go through one hub.** Whatever an editor spawns, the process
+> that actually serves MCP is the single per-user hub, and the tools run in a
+> kernel-sandboxed worker per session. See [docs/hub.md](hub.md).
 
 ## 1. STDIO Mode (Default)
 
 Your editor spawns `ahma` as a subprocess and communicates via standard I/O.
-That subprocess is a **pipe**: it ensures the per-user daemon is running and
-forwards to it (SPEC R-DAEMON.1). This is the recommended mode for development
+That subprocess is a **pipe**: it ensures the per-user hub is running and
+forwards to it (SPEC R-HUB.1). This is the recommended mode for development
 because:
 
 - The sandbox scope comes from the workspace roots your editor reports via `roots/list` (VS Code and Cursor do this automatically). The subprocess's working directory is **never** trusted as a scope on its own (SPEC R5.2.1) — it is client-config-controlled and spoofable.
 - Each session gets its own kernel-sandboxed worker, locking its own scope. Three windows on three projects are three workers with three scopes.
-- Flags in *your* `mcp.json` — `--tools`, `--sandbox-scope`, a task vault — apply to *your* session and no one else's (SPEC R-DAEMON.4).
+- Flags in *your* `mcp.json` — `--tools`, `--sandbox-scope`, a task vault — apply to *your* session and no one else's (SPEC R-HUB.4).
 - No network exposure.
 
 ```bash
@@ -248,8 +248,8 @@ Ahma treats an empty `roots/list` response as "client has no workspace roots yet
 
 Serves MCP Streamable HTTP over a Unix domain socket instead of TCP. Lower latency than HTTP mode, no port conflicts, and access-controlled by filesystem permissions.
 
-This is the transport the per-user daemon uses; running `ahma serve unix`
-yourself starts a **separate**, operator-owned server (SPEC R-DAEMON.1), which
+This is the transport the per-user hub uses; running `ahma serve unix`
+yourself starts a **separate**, operator-owned server (SPEC R-HUB.1), which
 is what you want for a fixed scope or a custom path and not what you need for
 ordinary editor use.
 

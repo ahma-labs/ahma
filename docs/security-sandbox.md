@@ -55,7 +55,7 @@ Consequences worth knowing:
 
 ### Linux (Landlock)
 
-On Linux, Ahma uses [Landlock](https://docs.kernel.org/userspace-api/landlock.html) — a kernel LSM that applies fine-grained filesystem access rules in-process with no daemon or capability escalation required.
+On Linux, Ahma uses [Landlock](https://docs.kernel.org/userspace-api/landlock.html) — a kernel LSM that applies fine-grained filesystem access rules in-process with no hub or capability escalation required.
 
 **Requirements**: Linux kernel 5.13 or newer (released June 2021). The server refuses to start on older kernels unless sandbox is explicitly disabled.
 
@@ -90,7 +90,7 @@ What keeps secrets unreadable on macOS is therefore an explicit **denylist**, no
 
 The login **keychain** (`~/Library/Keychains`) is **allowed by default** (read + write, plus the `com.apple.security*` preference plists). This is what lets `gh`, `git-credential-osxkeychain`, and other Keychain-backed credential helpers work under the sandbox.
 
-Why it's on by default (unlike the plaintext credential dirs above): the keychain is **encrypted at rest**, so blocking file access to it only guards against offline theft of the encrypted database — not against secret extraction, which goes through the `securityd` daemon and is gated by each item's ACL (and a GUI prompt) regardless of the sandbox. Blocking it mostly just breaks tools: `gh auth login` appears to succeed but writes the OAuth token where `gh` can't read it back, so every later `gh` call falls back to unauthenticated (HTTP 401 / the anonymous IP rate limit).
+Why it's on by default (unlike the plaintext credential dirs above): the keychain is **encrypted at rest**, so blocking file access to it only guards against offline theft of the encrypted database — not against secret extraction, which goes through the `securityd` hub and is gated by each item's ACL (and a GUI prompt) regardless of the sandbox. Blocking it mostly just breaks tools: `gh auth login` appears to succeed but writes the OAuth token where `gh` can't read it back, so every later `gh` call falls back to unauthenticated (HTTP 401 / the anonymous IP rate limit).
 
 For maximum defense-in-depth on high-security machines, turn it off:
 

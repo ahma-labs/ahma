@@ -1,21 +1,21 @@
-//! Daemon reporter — background task that registers this ahma instance with
-//! the hub daemon and forwards operation events to it.
+//! Hub reporter — background task that registers this ahma instance with
+//! the hub and forwards operation events to it.
 //!
 //! ## Design goals
 //!
 //! * **Non-blocking**: spawned as a detached Tokio task; never affects MCP
-//!   operation if the daemon is unavailable or crashes.
+//!   operation if the hub is unavailable or crashes.
 //! * **Self-healing**: reconnects automatically with exponential back-off
-//!   (initial 5 s, cap 30 s) when the daemon connection is lost.
+//!   (initial 5 s, cap 30 s) when the hub connection is lost.
 //! * **Low overhead**: polls [`OperationMonitor`](crate::operation_monitor::OperationMonitor) every 2 seconds and diffs
 //!   the snapshot — no changes means no wire traffic.
 
 use crate::mcp_service::{ActiveAgentSession, get_global_prompt_runner};
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use ahma_common::config::settings_path;
-use ahma_common::daemon_hub::{
-    ClientMsg, DaemonChatMessage, DaemonEvent, DaemonMsg, DaemonStream, HubRelay,
-    OpStatus as WireStatus, connect_to_daemon, recv_msg, send_msg,
+use ahma_common::hub::{
+    ClientMsg, HubChatMessage, HubEvent, HubMsg, HubRelay, HubStream, OpStatus as WireStatus,
+    connect_to_hub, recv_msg, send_msg,
 };
 use ahma_common::scope_grant::{
     GrantCoordinator, GrantDecision, GrantResolveOutcome, ScopeGrantRequest, persist_grant,
@@ -62,7 +62,7 @@ pub struct WebApprovalReporting {
 /// happens before any client attaches, so the reporter watches this channel
 /// and — when the identity is learned or changes — reconnects and re-registers
 /// with `client` set. Reconnect-to-relabel keeps the wire protocol field-only
-/// (no `UpdateInstance` message), which keeps mixed-version daemons working;
+/// (no `UpdateInstance` message), which keeps mixed-version hubs working;
 /// the hub replays this instance's operations to subscribers after the
 /// re-register, so the TUI view stays complete.
 /// What this instance knows about itself, as far as the hub is concerned.
@@ -168,7 +168,7 @@ pub fn current_identity() -> InstanceIdentity {
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Spawn a background task that registers this instance with the hub daemon and
+/// Spawn a background task that registers this instance with the hub and
 /// forwards operation events.
 ///
 /// This function returns immediately; all errors are logged at `warn` / `debug`
@@ -204,7 +204,7 @@ pub fn spawn_reporter(
 /// A long-lived server never needs this: it outlives its operations. A hooked
 /// command does — it *is* one operation, and it exits the moment that command
 /// ends, so without waiting the terminal event races process teardown and the
-/// work never appears anywhere (SPEC R-DAEMON.8).
+/// work never appears anywhere (SPEC R-HUB.8).
 pub struct ReporterHandle {
     finished_rx: tokio::sync::watch::Receiver<Option<String>>,
 }
@@ -236,7 +236,7 @@ impl ReporterHandle {
     /// hub, or `budget` elapses.
     ///
     /// Bounded on purpose, and short: reporting is an observability nicety, and
-    /// a user's hooked command must never be held up by a daemon that is slow,
+    /// a user's hooked command must never be held up by a hub that is slow,
     /// absent, or wedged. Returns whether the event made it.
     pub async fn wait_for_finished(&mut self, op_id: &str, budget: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + budget;
@@ -287,9 +287,9 @@ fn persist_resolved_web_allow(domain: &str) {
         Some(file) => match persist_web_allow(&file, domain) {
             Ok(true) => info!(domain, "web approval persisted to [web].always_allow"),
             Ok(false) => info!(domain, "web approval already in [web].always_allow"),
-            Err(e) => warn!("daemon_reporter: failed to persist web allow for {domain}: {e:#}"),
+            Err(e) => warn!("hub_reporter: failed to persist web allow for {domain}: {e:#}"),
         },
-        None => warn!("daemon_reporter: cannot persist web allow (home directory unknown)"),
+        None => warn!("hub_reporter: cannot persist web allow (home directory unknown)"),
     }
 }
 
@@ -313,12 +313,12 @@ fn persist_resolved_grant(
                      tool) to apply it now, otherwise it takes effect on the next server start"
                 ),
                 Err(e) => warn!(
-                    "daemon_reporter: failed to persist scope grant for {}: {e:#}",
+                    "hub_reporter: failed to persist scope grant for {}: {e:#}",
                     path.display()
                 ),
             }
         }
-        None => warn!("daemon_reporter: cannot persist scope grant (home directory unknown)"),
+        None => warn!("hub_reporter: cannot persist scope grant (home directory unknown)"),
     }
 }
 
@@ -367,22 +367,22 @@ async fn run_reporter_loop(
 
     loop {
         // ── Connect ──────────────────────────────────────────────────────────
-        // Connect only; never start a daemon (SPEC R-DAEMON.8). This runs in
+        // Connect only; never start a hub (SPEC R-HUB.8). This runs in
         // hooked commands, where a spawn would sit in front of the user's
-        // command, and in session workers, whose daemon already exists. With
+        // command, and in session workers, whose hub already exists. With
         // no hub the loop backs off and tries again, and finds one that
         // arrives later.
-        let stream = match connect_to_daemon().await {
+        let stream = match connect_to_hub().await {
             Ok(s) => s,
             Err(e) => {
-                debug!("daemon_reporter: connect failed ({e}); retry in {backoff_secs}s");
+                debug!("hub_reporter: connect failed ({e}); retry in {backoff_secs}s");
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                 backoff_secs = next_backoff_secs(backoff_secs);
                 continue;
             }
         };
 
-        debug!("daemon_reporter: connected to hub daemon");
+        debug!("hub_reporter: connected to hub");
         backoff_secs = 1; // reset back-off on successful connect
 
         let (read_half, write_half) = tokio::io::split(stream);
@@ -412,7 +412,7 @@ async fn run_reporter_loop(
             sampling: identity.sampling,
         };
         if let Err(e) = send_msg(&mut writer, &reg).await {
-            debug!("daemon_reporter: register failed ({e})");
+            debug!("hub_reporter: register failed ({e})");
             continue;
         }
 
@@ -446,27 +446,27 @@ async fn run_reporter_loop(
                 event_res = event_rx.recv() => {
                     match event_res {
                         Ok(event) => {
-                            let Some(payload) = daemon_event_for(&event, &scope, &origin) else {
+                            let Some(payload) = hub_event_for(&event, &scope, &origin) else {
                                 continue;
                             };
                             // Note the terminal event *after* it is on the wire,
                             // so a caller waiting for its own operation waits for
                             // the send, not for the intent to send.
                             let finished_id = match &payload {
-                                DaemonEvent::OpFinished { id, .. } => Some(id.clone()),
+                                HubEvent::OpFinished { id, .. } => Some(id.clone()),
                                 _ => None,
                             };
                             let client_msg = ClientMsg::Event { payload };
 
                             if let Err(e) = send_msg(&mut writer, &client_msg).await {
-                                debug!("daemon_reporter: send failed ({e}), reconnecting");
+                                debug!("hub_reporter: send failed ({e}), reconnecting");
                                 closed = true;
                             } else if let Some(id) = finished_id {
                                 let _ = finished_tx.send(Some(id));
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("daemon_reporter event queue lagged by {n} messages; continuing");
+                            warn!("hub_reporter event queue lagged by {n} messages; continuing");
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             closed = true;
@@ -478,7 +478,7 @@ async fn run_reporter_loop(
                 hub_msg = hub_rx.recv() => {
                     if let Some(msg) = hub_msg {
                         if let Err(e) = send_msg(&mut writer, &msg).await {
-                            debug!("daemon_reporter: send hub_msg failed ({e}), reconnecting");
+                            debug!("hub_reporter: send hub_msg failed ({e}), reconnecting");
                             closed = true;
                         }
                     } else {
@@ -491,7 +491,7 @@ async fn run_reporter_loop(
                     match maybe_req {
                         Some(req) => {
                             if send_msg(&mut writer, &ClientMsg::Relay(HubRelay::ScopeGrantRequested { request: req })).await.is_err() {
-                                debug!("daemon_reporter: send ScopeGrantRequested failed, reconnecting");
+                                debug!("hub_reporter: send ScopeGrantRequested failed, reconnecting");
                                 closed = true;
                             }
                         }
@@ -505,7 +505,7 @@ async fn run_reporter_loop(
                     match maybe_web {
                         Some(request) => {
                             if send_msg(&mut writer, &ClientMsg::Relay(HubRelay::WebApprovalRequested { request })).await.is_err() {
-                                debug!("daemon_reporter: send WebApprovalRequested failed, reconnecting");
+                                debug!("hub_reporter: send WebApprovalRequested failed, reconnecting");
                                 closed = true;
                             }
                         }
@@ -520,15 +520,15 @@ async fn run_reporter_loop(
                 // survives because the session id does.
                 changed = identity_rx.changed() => {
                     if changed.is_ok() {
-                        info!("daemon_reporter: instance identity changed; re-registering with hub");
+                        info!("hub_reporter: instance identity changed; re-registering with hub");
                         closed = true;
                     }
                 }
 
-                // 3. Incoming messages from daemon hub
-                daemon_msg = recv_msg::<_, DaemonMsg>(&mut reader) => {
-                    closed = handle_daemon_msg(
-                        daemon_msg,
+                // 3. Incoming messages from hub
+                incoming = recv_msg::<_, HubMsg>(&mut reader) => {
+                    closed = handle_incoming(
+                        incoming,
                         &mut writer,
                         &hub_tx,
                         &session,
@@ -551,7 +551,7 @@ async fn run_reporter_loop(
 /// Stops at the first send failure — the caller reconnects in that case.
 /// Returns `true` when every operation replayed successfully.
 async fn replay_completed_operations(
-    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    writer: &mut tokio::io::WriteHalf<HubStream>,
     completed_ops: &[Operation],
     scope: &str,
     label: &str,
@@ -570,7 +570,7 @@ async fn replay_completed_operations(
             .unwrap_or(0);
         let (result_summary, denial) = summary_and_denial(op);
         let finished_ev = ClientMsg::Event {
-            payload: DaemonEvent::OpFinished {
+            payload: HubEvent::OpFinished {
                 id: op.id.clone(),
                 status: wire_status(op.state),
                 result_summary,
@@ -596,7 +596,7 @@ async fn replay_completed_operations(
 /// they haven't finished yet). Same stop-on-failure contract as
 /// [`replay_completed_operations`].
 async fn replay_active_operations(
-    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    writer: &mut tokio::io::WriteHalf<HubStream>,
     active_ops: &[Operation],
     scope: &str,
     label: &str,
@@ -612,61 +612,61 @@ async fn replay_active_operations(
     true
 }
 
-/// Handle one message received from the daemon hub (the reporter loop's
-/// "incoming messages from daemon hub" select arm). Returns `true` when the
+/// Handle one message received from the hub (the reporter loop's
+/// "incoming messages from hub" select arm). Returns `true` when the
 /// connection should be treated as closed — the caller sets `closed = true`
 /// and the outer loop reconnects.
-async fn handle_daemon_msg(
-    daemon_msg: anyhow::Result<DaemonMsg>,
-    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+async fn handle_incoming(
+    incoming: anyhow::Result<HubMsg>,
+    writer: &mut tokio::io::WriteHalf<HubStream>,
     hub_tx: &tokio::sync::mpsc::Sender<ClientMsg>,
     session: &Arc<tokio::sync::Mutex<ActiveAgentSession>>,
     monitor: &OperationMonitor,
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
     web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
 ) -> bool {
-    let msg = match daemon_msg {
+    let msg = match incoming {
         Ok(msg) => msg,
         Err(e) => {
-            debug!("daemon_reporter: read error or EOF ({e}), reconnecting");
+            debug!("hub_reporter: read error or EOF ({e}), reconnecting");
             return true;
         }
     };
 
     match msg {
-        DaemonMsg::Ping { seq } => {
-            debug!("daemon_reporter: received ping seq={seq}");
+        HubMsg::Ping { seq } => {
+            debug!("hub_reporter: received ping seq={seq}");
             if let Err(e) = send_msg(writer, &ClientMsg::Pong { seq }).await {
-                debug!("daemon_reporter: pong send failed ({e}), reconnecting");
+                debug!("hub_reporter: pong send failed ({e}), reconnecting");
                 return true;
             }
         }
-        DaemonMsg::RunPrompt {
+        HubMsg::RunPrompt {
             messages,
             system_prompt,
             provider,
             model,
         } => spawn_prompt_run(messages, system_prompt, provider, model, hub_tx, session).await,
-        DaemonMsg::CancelPrompt => cancel_prompt_run(hub_tx, session).await,
-        DaemonMsg::CancelOperation { op_id } => {
+        HubMsg::CancelPrompt => cancel_prompt_run(hub_tx, session).await,
+        HubMsg::CancelOperation { op_id } => {
             let cancelled = monitor
                 .cancel_operation_with_reason(&op_id, Some("Cancelled from ahma tui".into()))
                 .await;
-            info!("daemon_reporter: CancelOperation op={op_id} cancelled={cancelled}");
+            info!("hub_reporter: CancelOperation op={op_id} cancelled={cancelled}");
         }
-        DaemonMsg::SubmitApproval { id, approved } => deliver_approval(id, approved, session).await,
-        DaemonMsg::SubmitScopeGrant {
+        HubMsg::SubmitApproval { id, approved } => deliver_approval(id, approved, session).await,
+        HubMsg::SubmitScopeGrant {
             decision_id,
             decision,
         } => resolve_scope_grant(decision_id, decision, writer, grant_coordinator).await,
-        DaemonMsg::ReRaiseScopeGrant { path, access } => {
+        HubMsg::ReRaiseScopeGrant { path, access } => {
             re_raise_scope_grant(&path, access, writer, grant_coordinator).await
         }
-        DaemonMsg::SubmitWebApproval {
+        HubMsg::SubmitWebApproval {
             decision_id,
             decision,
         } => resolve_web_approval(decision_id, decision, writer, web_coordinator).await,
-        other => debug!("daemon_reporter: ignored unexpected DaemonMsg: {:?}", other),
+        other => debug!("hub_reporter: ignored unexpected HubMsg: {:?}", other),
     }
     false
 }
@@ -675,7 +675,7 @@ async fn handle_daemon_msg(
 /// task, reporting its outcome back to the hub. An instance with no runner
 /// registered answers with an `AgentError` rather than going silent.
 async fn spawn_prompt_run(
-    messages: Vec<DaemonChatMessage>,
+    messages: Vec<HubChatMessage>,
     system_prompt: Option<String>,
     provider: Option<String>,
     model: Option<String>,
@@ -686,10 +686,10 @@ async fn spawn_prompt_run(
         provider = ?provider,
         model = ?model,
         messages = messages.len(),
-        "daemon_reporter: RunPrompt received"
+        "hub_reporter: RunPrompt received"
     );
     let Some(runner) = get_global_prompt_runner() else {
-        warn!("daemon_reporter: RunPrompt received but no prompt runner is registered");
+        warn!("hub_reporter: RunPrompt received but no prompt runner is registered");
         let _ = hub_tx
             .send(ClientMsg::Relay(HubRelay::AgentError {
                 error: "No prompt runner registered on this instance".to_string(),
@@ -740,11 +740,11 @@ async fn cancel_prompt_run(
         guard.turn.take()
     };
     let Some(turn) = turn.filter(|t| !t.is_finished()) else {
-        debug!("daemon_reporter: CancelPrompt with no running turn");
+        debug!("hub_reporter: CancelPrompt with no running turn");
         return;
     };
     turn.abort();
-    info!("daemon_reporter: agent turn cancelled by user");
+    info!("hub_reporter: agent turn cancelled by user");
     let _ = hub_tx
         .send(ClientMsg::Relay(HubRelay::AgentError {
             error: "Cancelled by user".to_string(),
@@ -754,13 +754,13 @@ async fn cancel_prompt_run(
 }
 
 /// `SubmitApproval`: wake the waiter registered for this call id, or — when the
-/// daemon sent no id — the single pending session-level waiter.
+/// hub sent no id — the single pending session-level waiter.
 async fn deliver_approval(
     id: Option<String>,
     approved: bool,
     session: &Arc<tokio::sync::Mutex<ActiveAgentSession>>,
 ) {
-    debug!("daemon_reporter: received SubmitApproval id={id:?} approved={approved}");
+    debug!("hub_reporter: received SubmitApproval id={id:?} approved={approved}");
     let mut session_guard = session.lock().await;
     let Some(call_id) = id else {
         match session_guard.approval_tx.take() {
@@ -768,7 +768,7 @@ async fn deliver_approval(
                 let _ = tx.send(approved);
             }
             None => {
-                debug!("daemon_reporter: received SubmitApproval but no approval sender pending")
+                debug!("hub_reporter: received SubmitApproval but no approval sender pending")
             }
         }
         return;
@@ -777,7 +777,7 @@ async fn deliver_approval(
         Some(tx) => {
             let _ = tx.send(approved);
         }
-        None => debug!("daemon_reporter: received SubmitApproval for unknown call_id={call_id}"),
+        None => debug!("hub_reporter: received SubmitApproval for unknown call_id={call_id}"),
     }
 }
 
@@ -787,10 +787,10 @@ async fn deliver_approval(
 async fn resolve_scope_grant(
     decision_id: String,
     decision: GrantDecision,
-    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    writer: &mut tokio::io::WriteHalf<HubStream>,
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
 ) {
-    debug!("daemon_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?}");
+    debug!("hub_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?}");
     let Some(coord) = grant_coordinator else {
         return;
     };
@@ -812,11 +812,11 @@ async fn resolve_scope_grant(
 async fn re_raise_scope_grant(
     path: &str,
     access: ahma_common::config::ScopeAccess,
-    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    writer: &mut tokio::io::WriteHalf<HubStream>,
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
 ) {
     debug!(
-        "daemon_reporter: received ReRaiseScopeGrant path={path} access={}",
+        "hub_reporter: received ReRaiseScopeGrant path={path} access={}",
         access.label()
     );
     let Some(coord) = grant_coordinator else {
@@ -836,7 +836,7 @@ async fn re_raise_scope_grant(
             .await;
         }
         // Already in flight — the modal the user wants is on screen already.
-        None => debug!("daemon_reporter: re-raise skipped, question already in flight"),
+        None => debug!("hub_reporter: re-raise skipped, question already in flight"),
     }
 }
 
@@ -847,10 +847,10 @@ async fn re_raise_scope_grant(
 async fn resolve_web_approval(
     decision_id: String,
     decision: WebApprovalDecision,
-    writer: &mut tokio::io::WriteHalf<DaemonStream>,
+    writer: &mut tokio::io::WriteHalf<HubStream>,
     web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
 ) {
-    debug!("daemon_reporter: received SubmitWebApproval id={decision_id} decision={decision:?}");
+    debug!("hub_reporter: received SubmitWebApproval id={decision_id} decision={decision:?}");
     let Some(coord) = web_coordinator else {
         return;
     };
@@ -876,8 +876,8 @@ fn epoch_ms(t: std::time::SystemTime) -> Option<u64> {
 /// Build the replay `OpStarted` wire event for an operation, preserving its
 /// true start time and parent link so a late-joining TUI shows accurate
 /// elapsed times and hierarchy.
-fn op_started_event(op: &Operation, scope: &str, origin: &str) -> DaemonEvent {
-    DaemonEvent::OpStarted {
+fn op_started_event(op: &Operation, scope: &str, origin: &str) -> HubEvent {
+    HubEvent::OpStarted {
         id: op.id.clone(),
         tool_name: op.tool_name.clone(),
         description: op.description.clone(),
@@ -895,7 +895,7 @@ fn op_started_event(op: &Operation, scope: &str, origin: &str) -> DaemonEvent {
         partial: false,
         // Everything a worker runs goes through the kernel sandbox; the
         // unsandboxed hook fallback is deliberately not reported at all
-        // (SPEC R-DAEMON.8).
+        // (SPEC R-HUB.8).
         unsandboxed: false,
     }
 }
@@ -909,11 +909,11 @@ fn op_started_event(op: &Operation, scope: &str, origin: &str) -> DaemonEvent {
 /// knows it: the adapter that *runs* the command has no idea who asked. It is what
 /// lets one timeline interleave IDE work and the user's own TUI commands and stay
 /// readable (SPEC R24.7).
-fn daemon_event_for(
+fn hub_event_for(
     event: &ahma_common::event_dispatcher::OperationEvent,
     scope: &str,
     origin: &str,
-) -> Option<DaemonEvent> {
+) -> Option<HubEvent> {
     use ahma_common::event_dispatcher::OperationEvent as Ev;
     let now_ms = epoch_ms(std::time::SystemTime::now());
     Some(match event {
@@ -925,7 +925,7 @@ fn daemon_event_for(
             title,
             cwd,
             command,
-        } => DaemonEvent::OpStarted {
+        } => HubEvent::OpStarted {
             id: operation_id.clone(),
             tool_name: tool_name.clone(),
             description: description.clone(),
@@ -942,14 +942,14 @@ fn daemon_event_for(
             partial: false,
             // Everything a worker runs goes through the kernel sandbox; the
             // unsandboxed hook fallback is deliberately not reported at all
-            // (SPEC R-DAEMON.8).
+            // (SPEC R-HUB.8).
             unsandboxed: false,
         },
         Ev::OutputLine {
             operation_id,
             line,
             is_stderr,
-        } => DaemonEvent::OpOutput {
+        } => HubEvent::OpOutput {
             id: operation_id.clone(),
             line: line.clone(),
             is_stderr: *is_stderr,
@@ -957,7 +957,7 @@ fn daemon_event_for(
         Ev::Alert {
             operation_id,
             message,
-        } => DaemonEvent::LogLine {
+        } => HubEvent::LogLine {
             level: "alert".to_string(),
             message: format!("{operation_id}: {message}"),
         },
@@ -965,7 +965,7 @@ fn daemon_event_for(
             operation_id,
             result,
             duration_ms,
-        } => DaemonEvent::OpFinished {
+        } => HubEvent::OpFinished {
             id: operation_id.clone(),
             status: WireStatus::Completed,
             result_summary: summary_from_value(result),
@@ -980,7 +980,7 @@ fn daemon_event_for(
             operation_id,
             error,
             duration_ms,
-        } => DaemonEvent::OpFinished {
+        } => HubEvent::OpFinished {
             id: operation_id.clone(),
             status: WireStatus::Failed,
             result_summary: Some(clip_summary(error.clone())),
@@ -999,7 +999,7 @@ fn daemon_event_for(
             operation_id,
             reason,
             duration_ms,
-        } => DaemonEvent::OpFinished {
+        } => HubEvent::OpFinished {
             id: operation_id.clone(),
             status: WireStatus::Cancelled,
             result_summary: Some(clip_summary(reason.clone())),
@@ -1012,7 +1012,7 @@ fn daemon_event_for(
         Ev::TimedOut {
             operation_id,
             duration_ms,
-        } => DaemonEvent::OpFinished {
+        } => HubEvent::OpFinished {
             id: operation_id.clone(),
             status: WireStatus::TimedOut,
             result_summary: Some("operation timed out".to_string()),
@@ -1101,9 +1101,9 @@ fn wire_status(s: OperationStatus) -> WireStatus {
 /// Reuses the same scanner the live grant flow uses, so what the TUI labels
 /// `denied:` is exactly what would have raised a grant prompt — the two can
 /// never disagree about whether something was a denial.
-fn denial_from_text(text: &str) -> Option<ahma_common::daemon_hub::OpDenial> {
+fn denial_from_text(text: &str) -> Option<ahma_common::hub::OpDenial> {
     let hit = crate::sandbox::denial_scan::scan_denial(text)?;
-    Some(ahma_common::daemon_hub::OpDenial {
+    Some(ahma_common::hub::OpDenial {
         path: hit.path.display().to_string(),
         access: hit.access,
     })
@@ -1129,9 +1129,7 @@ fn result_summary_from(op: &Operation) -> Option<String> {
 /// two used to compute it independently. The denial is scanned from the *full*
 /// text and the summary clipped afterwards, so the wire-length cap on one
 /// cannot silently discard the other.
-fn summary_and_denial(
-    op: &Operation,
-) -> (Option<String>, Option<ahma_common::daemon_hub::OpDenial>) {
+fn summary_and_denial(op: &Operation) -> (Option<String>, Option<ahma_common::hub::OpDenial>) {
     let Some(result) = op.result.as_ref() else {
         return (None, None);
     };
@@ -1144,8 +1142,8 @@ fn summary_and_denial(
 mod tests {
     use super::*;
     use crate::operation_monitor::{Operation, OperationStatus};
-    use ahma_common::daemon_hub::DaemonEvent;
     use ahma_common::event_dispatcher::OperationEvent;
+    use ahma_common::hub::HubEvent;
     use ahma_common::timeouts::TestTimeouts;
     use serde_json::json;
     use tokio::sync::mpsc;
@@ -1196,10 +1194,10 @@ mod tests {
         assert!(hub_rx.try_recv().is_err());
     }
 
-    // ── daemon_event_for ──────────────────────────────────────────────────────
+    // ── hub_event_for ──────────────────────────────────────────────────────
 
     #[test]
-    fn daemon_event_for_started() {
+    fn hub_event_for_started() {
         let ev = OperationEvent::Started {
             operation_id: "op-1".into(),
             tool_name: "cargo_build".into(),
@@ -1209,8 +1207,8 @@ mod tests {
             cwd: None,
             command: None,
         };
-        let result = daemon_event_for(&ev, "workspace/root", "test");
-        let Some(DaemonEvent::OpStarted {
+        let result = hub_event_for(&ev, "workspace/root", "test");
+        let Some(HubEvent::OpStarted {
             id,
             tool_name,
             description,
@@ -1243,14 +1241,14 @@ mod tests {
     }
 
     #[test]
-    fn daemon_event_for_output_line() {
+    fn hub_event_for_output_line() {
         let ev = OperationEvent::OutputLine {
             operation_id: "op-2".into(),
             line: "hello stdout".into(),
             is_stderr: false,
         };
-        let result = daemon_event_for(&ev, "ws", "test");
-        let Some(DaemonEvent::OpOutput {
+        let result = hub_event_for(&ev, "ws", "test");
+        let Some(HubEvent::OpOutput {
             id,
             line,
             is_stderr,
@@ -1264,27 +1262,25 @@ mod tests {
     }
 
     #[test]
-    fn daemon_event_for_output_line_stderr() {
+    fn hub_event_for_output_line_stderr() {
         let ev = OperationEvent::OutputLine {
             operation_id: "op-3".into(),
             line: "err msg".into(),
             is_stderr: true,
         };
-        let Some(DaemonEvent::OpOutput { is_stderr, .. }) = daemon_event_for(&ev, "ws", "test")
-        else {
+        let Some(HubEvent::OpOutput { is_stderr, .. }) = hub_event_for(&ev, "ws", "test") else {
             panic!("expected OpOutput");
         };
         assert!(is_stderr);
     }
 
     #[test]
-    fn daemon_event_for_alert() {
+    fn hub_event_for_alert() {
         let ev = OperationEvent::Alert {
             operation_id: "op-4".into(),
             message: "disk full".into(),
         };
-        let Some(DaemonEvent::LogLine { level, message }) = daemon_event_for(&ev, "ws", "test")
-        else {
+        let Some(HubEvent::LogLine { level, message }) = hub_event_for(&ev, "ws", "test") else {
             panic!("expected LogLine");
         };
         assert_eq!(level, "alert");
@@ -1293,13 +1289,13 @@ mod tests {
     }
 
     #[test]
-    fn daemon_event_for_completed() {
+    fn hub_event_for_completed() {
         let ev = OperationEvent::Completed {
             operation_id: "op-5".into(),
             result: json!({ "message": "ok" }),
             duration_ms: 42,
         };
-        let Some(DaemonEvent::OpFinished {
+        let Some(HubEvent::OpFinished {
             denial: _,
             id,
             status,
@@ -1308,7 +1304,7 @@ mod tests {
             ended_epoch_ms,
             exit_code: None,
             interrupted: false,
-        }) = daemon_event_for(&ev, "ws", "test")
+        }) = hub_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -1323,17 +1319,17 @@ mod tests {
     }
 
     #[test]
-    fn daemon_event_for_failed() {
+    fn hub_event_for_failed() {
         let ev = OperationEvent::Failed {
             operation_id: "op-6".into(),
             error: "permission denied".into(),
             duration_ms: 10,
         };
-        let Some(DaemonEvent::OpFinished {
+        let Some(HubEvent::OpFinished {
             status,
             result_summary,
             ..
-        }) = daemon_event_for(&ev, "ws", "test")
+        }) = hub_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -1342,17 +1338,17 @@ mod tests {
     }
 
     #[test]
-    fn daemon_event_for_cancelled() {
+    fn hub_event_for_cancelled() {
         let ev = OperationEvent::Cancelled {
             operation_id: "op-7".into(),
             reason: "user cancelled".into(),
             duration_ms: 5,
         };
-        let Some(DaemonEvent::OpFinished {
+        let Some(HubEvent::OpFinished {
             status,
             result_summary,
             ..
-        }) = daemon_event_for(&ev, "ws", "test")
+        }) = hub_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -1361,17 +1357,17 @@ mod tests {
     }
 
     #[test]
-    fn daemon_event_for_timed_out() {
+    fn hub_event_for_timed_out() {
         let ev = OperationEvent::TimedOut {
             operation_id: "op-8".into(),
             duration_ms: 30_000,
         };
-        let Some(DaemonEvent::OpFinished {
+        let Some(HubEvent::OpFinished {
             status,
             result_summary,
             duration_ms,
             ..
-        }) = daemon_event_for(&ev, "ws", "test")
+        }) = hub_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -1381,27 +1377,27 @@ mod tests {
     }
 
     #[test]
-    fn daemon_event_for_progress_is_none() {
+    fn hub_event_for_progress_is_none() {
         let ev = OperationEvent::Progress {
             operation_id: "op-9".into(),
             message: "50%".into(),
             percent: Some(0.5),
         };
         assert!(
-            daemon_event_for(&ev, "ws", "test").is_none(),
+            hub_event_for(&ev, "ws", "test").is_none(),
             "Progress should map to None"
         );
     }
 
     #[test]
-    fn daemon_event_for_mcp_notification_is_none() {
+    fn hub_event_for_mcp_notification_is_none() {
         let ev = OperationEvent::McpNotification {
             operation_id: "op-10".into(),
             method: "notifications/message".into(),
             params: None,
         };
         assert!(
-            daemon_event_for(&ev, "ws", "test").is_none(),
+            hub_event_for(&ev, "ws", "test").is_none(),
             "McpNotification should map to None"
         );
     }
@@ -1538,7 +1534,7 @@ mod tests {
 
     /// The status field was a `String` carrying these exact words. Typing it
     /// must not have changed a byte on the socket, or a new client would fail to
-    /// talk to an already-running daemon. This pins the encoding.
+    /// talk to an already-running hub. This pins the encoding.
     #[test]
     fn wire_status_serialises_to_the_historical_strings() {
         for (status, expected) in [
@@ -1658,17 +1654,16 @@ mod tests {
         assert!(result.is_none(), "closed channel yields None");
     }
 
-    // ── daemon_event_for: clip paths in Failed / Cancelled arms ───────────────
+    // ── hub_event_for: clip paths in Failed / Cancelled arms ───────────────
 
     #[test]
-    fn daemon_event_for_failed_long_error_is_clipped() {
+    fn hub_event_for_failed_long_error_is_clipped() {
         let ev = OperationEvent::Failed {
             operation_id: "op-f".into(),
             error: "e".repeat(300),
             duration_ms: 1,
         };
-        let Some(DaemonEvent::OpFinished { result_summary, .. }) =
-            daemon_event_for(&ev, "ws", "test")
+        let Some(HubEvent::OpFinished { result_summary, .. }) = hub_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -1678,14 +1673,13 @@ mod tests {
     }
 
     #[test]
-    fn daemon_event_for_cancelled_long_reason_is_clipped() {
+    fn hub_event_for_cancelled_long_reason_is_clipped() {
         let ev = OperationEvent::Cancelled {
             operation_id: "op-c".into(),
             reason: "r".repeat(300),
             duration_ms: 2,
         };
-        let Some(DaemonEvent::OpFinished { result_summary, .. }) =
-            daemon_event_for(&ev, "ws", "test")
+        let Some(HubEvent::OpFinished { result_summary, .. }) = hub_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -1873,27 +1867,27 @@ mod tests {
 
     // ── run_reporter_loop: end-to-end over an in-process local socket ─────────
     //
-    // These tests exercise the long-running reporter loop without a real daemon
-    // by binding our OWN listener in a temp path and pointing `AHMA_DAEMON_SOCK`
+    // These tests exercise the long-running reporter loop without a real hub
+    // by binding our OWN listener in a temp path and pointing `AHMA_HUB_SOCK`
     // at it, then reading the framed `ClientMsg`s the reporter emits to assert
     // on register/replay/dispatch. The socket path is process-global state, so
     // we serialize with a mutex and restore the env var on drop.
 
     use ahma_common::local_socket::{LocalListener, LocalStream};
 
-    static DAEMON_SOCK_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-    static DAEMON_SOCK_COUNTER: std::sync::atomic::AtomicUsize =
+    static HUB_SOCK_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static HUB_SOCK_COUNTER: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
-    /// Restores `AHMA_DAEMON_SOCK` to its prior value when dropped.
+    /// Restores `AHMA_HUB_SOCK` to its prior value when dropped.
     struct EnvGuard {
         prev: Option<std::ffi::OsString>,
     }
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => unsafe { std::env::set_var("AHMA_DAEMON_SOCK", v) },
-                None => unsafe { std::env::remove_var("AHMA_DAEMON_SOCK") },
+                Some(v) => unsafe { std::env::set_var("AHMA_HUB_SOCK", v) },
+                None => unsafe { std::env::remove_var("AHMA_HUB_SOCK") },
             }
         }
     }
@@ -1914,8 +1908,8 @@ mod tests {
     ///
     /// Strict on purpose: the reporter connects and registers, and does
     /// nothing else first. It used to open a probe connection on the way — the
-    /// "is a daemon running, or must I start one?" check that let a hooked
-    /// command spawn a daemon (SPEC R-DAEMON.8).
+    /// "is a hub running, or must I start one?" check that let a hooked
+    /// command spawn a hub (SPEC R-HUB.8).
     async fn accept_register(
         listener: &LocalListener,
     ) -> (
@@ -1934,18 +1928,18 @@ mod tests {
     }
 
     /// With no hub the reporter waits for one instead of starting one (SPEC
-    /// R-DAEMON.8), and finds it when it arrives.
+    /// R-HUB.8), and finds it when it arrives.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn the_reporter_waits_for_a_hub_rather_than_starting_one() {
         use crate::operation_monitor::MonitorConfig;
 
-        let _lock = DAEMON_SOCK_MUTEX.lock();
-        let unique = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _lock = HUB_SOCK_MUTEX.lock();
+        let unique = HUB_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join(format!("late_{unique}.sock"));
-        let prev = std::env::var_os("AHMA_DAEMON_SOCK");
-        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &sock) };
+        let prev = std::env::var_os("AHMA_HUB_SOCK");
+        unsafe { std::env::set_var("AHMA_HUB_SOCK", &sock) };
         let _env_guard = EnvGuard { prev };
 
         let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
@@ -1977,7 +1971,7 @@ mod tests {
     /// A hooked command must not be held up by observability.
     ///
     /// The whole point of the flush budget is that it is bounded: with no
-    /// daemon listening, waiting costs the budget and no more, and the command's
+    /// hub listening, waiting costs the budget and no more, and the command's
     /// own result is unaffected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn waiting_for_a_report_gives_up_within_its_budget() {
@@ -1999,7 +1993,7 @@ mod tests {
         );
         assert!(
             waited < budget * 8,
-            "and no longer: a user's command must not wait on a missing daemon ({waited:?})"
+            "and no longer: a user's command must not wait on a missing hub ({waited:?})"
         );
     }
 
@@ -2027,21 +2021,21 @@ mod tests {
     /// Registration happens at process start, before `roots/list` has been
     /// answered — so an instance used to advertise a placeholder (`"."` in the
     /// default roots-driven configuration) for its whole life, and a TUI
-    /// filtering by project matched none of them (SPEC R24.3, R-DAEMON.6).
+    /// filtering by project matched none of them (SPEC R24.3, R-HUB.6).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn reporter_re_registers_with_the_committed_scope_and_session_id() {
         use crate::operation_monitor::MonitorConfig;
 
-        let _lock = DAEMON_SOCK_MUTEX.lock();
-        let unique = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _lock = HUB_SOCK_MUTEX.lock();
+        let unique = HUB_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sock =
             std::env::temp_dir().join(format!("ahma_scope_{}_{}.sock", std::process::id(), unique));
         let _ = std::fs::remove_file(&sock);
-        let prev = std::env::var_os("AHMA_DAEMON_SOCK");
-        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &sock) };
+        let prev = std::env::var_os("AHMA_HUB_SOCK");
+        unsafe { std::env::set_var("AHMA_HUB_SOCK", &sock) };
         let _env_guard = EnvGuard { prev };
-        let listener = LocalListener::bind(&sock).expect("bind temp daemon socket");
+        let listener = LocalListener::bind(&sock).expect("bind temp hub socket");
 
         // The session identity is known at startup; the scope is not.
         set_initial_identity(Some("mcp-session-42".to_string()), Some(4242));
@@ -2104,7 +2098,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    // The std Mutex deliberately serializes this whole async test (the daemon
+    // The std Mutex deliberately serializes this whole async test (the hub
     // socket path is process-global state); holding it across awaits is the point.
     #[allow(clippy::await_holding_lock)]
     async fn reporter_loop_register_replay_dispatch_and_reconnect_over_unix_socket() {
@@ -2113,21 +2107,21 @@ mod tests {
         use ahma_common::scope_grant::{GrantCoordinator, GrantDecision, GrantReason};
 
         // Serialize: the socket path is global state shared by the whole process.
-        let _lock = DAEMON_SOCK_MUTEX.lock();
+        let _lock = HUB_SOCK_MUTEX.lock();
 
         // Unique short socket path under the system temp dir (kept short to stay
         // under the platform's sockaddr_un path limit).
-        let unique = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let unique = HUB_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sock =
             std::env::temp_dir().join(format!("ahma_rep_{}_{}.sock", std::process::id(), unique));
         let _ = std::fs::remove_file(&sock);
 
         // Point the reporter's socket resolution at our listener and bind it
         // BEFORE spawning the reporter so its first connect finds it.
-        let prev = std::env::var_os("AHMA_DAEMON_SOCK");
-        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &sock) };
+        let prev = std::env::var_os("AHMA_HUB_SOCK");
+        unsafe { std::env::set_var("AHMA_HUB_SOCK", &sock) };
         let _env_guard = EnvGuard { prev };
-        let listener = LocalListener::bind(&sock).expect("bind temp daemon socket");
+        let listener = LocalListener::bind(&sock).expect("bind temp hub socket");
 
         // ── Seed the monitor: one completed op (replayed as Started+Finished) and
         //    one active op (replayed as Started). ─────────────────────────────────
@@ -2193,7 +2187,7 @@ mod tests {
         // Completed op: OpStarted then OpFinished.
         match read_client_msg(&mut server_reader).await {
             ClientMsg::Event {
-                payload: DaemonEvent::OpStarted { id, scope, .. },
+                payload: HubEvent::OpStarted { id, scope, .. },
             } => {
                 assert_eq!(id, "comp-1");
                 assert_eq!(scope, "ws-scope");
@@ -2203,7 +2197,7 @@ mod tests {
         match read_client_msg(&mut server_reader).await {
             ClientMsg::Event {
                 payload:
-                    DaemonEvent::OpFinished {
+                    HubEvent::OpFinished {
                         id,
                         status,
                         result_summary,
@@ -2219,7 +2213,7 @@ mod tests {
         // Active op: OpStarted.
         match read_client_msg(&mut server_reader).await {
             ClientMsg::Event {
-                payload: DaemonEvent::OpStarted { id, .. },
+                payload: HubEvent::OpStarted { id, .. },
             } => assert_eq!(id, "act-1"),
             other => panic!("expected replayed active OpStarted, got {other:?}"),
         }
@@ -2231,9 +2225,7 @@ mod tests {
             r: &mut tokio::io::BufReader<tokio::io::ReadHalf<LocalStream>>,
             seq: u32,
         ) {
-            send_msg(w, &DaemonMsg::Ping { seq })
-                .await
-                .expect("send ping");
+            send_msg(w, &HubMsg::Ping { seq }).await.expect("send ping");
             match read_client_msg(r).await {
                 ClientMsg::Pong { seq: got } => assert_eq!(got, seq, "pong seq mismatch"),
                 other => panic!("expected Pong({seq}), got {other:?}"),
@@ -2262,8 +2254,8 @@ mod tests {
         // ── 2. Ping/Pong. ────────────────────────────────────────────────────────
         ping_pong(&mut server_writer, &mut server_reader, 11).await;
 
-        // ── 3. Catch-all DaemonMsg (ignored), then confirm loop continues. ───────
-        send_msg(&mut server_writer, &DaemonMsg::Relay(HubRelay::AgentDone))
+        // ── 3. Catch-all HubMsg (ignored), then confirm loop continues. ───────
+        send_msg(&mut server_writer, &HubMsg::Relay(HubRelay::AgentDone))
             .await
             .expect("send AgentDone");
         ping_pong(&mut server_writer, &mut server_reader, 12).await;
@@ -2271,7 +2263,7 @@ mod tests {
         // ── 4. SubmitApproval with no pending sender (debug arm). ─────────────────
         send_msg(
             &mut server_writer,
-            &DaemonMsg::SubmitApproval {
+            &HubMsg::SubmitApproval {
                 id: None,
                 approved: true,
             },
@@ -2283,7 +2275,7 @@ mod tests {
         // ── 5. SubmitScopeGrant for an unknown decision (Unknown arm, no reply). ──
         send_msg(
             &mut server_writer,
-            &DaemonMsg::SubmitScopeGrant {
+            &HubMsg::SubmitScopeGrant {
                 decision_id: "ghost".into(),
                 decision: GrantDecision::Deny,
             },
@@ -2305,7 +2297,7 @@ mod tests {
         let did = req.decision_id.clone();
         send_msg(
             &mut server_writer,
-            &DaemonMsg::SubmitScopeGrant {
+            &HubMsg::SubmitScopeGrant {
                 decision_id: did.clone(),
                 decision: GrantDecision::Deny,
             },
@@ -2317,7 +2309,7 @@ mod tests {
             other => panic!("expected ScopeGrantResolved after Deny, got {other:?}"),
         }
 
-        // ── 7. Emit a Progress event → daemon_event_for None → continue. ─────────
+        // ── 7. Emit a Progress event → hub_event_for None → continue. ─────────
         monitor.note_progress("act-1", "tick".into());
         ping_pong(&mut server_writer, &mut server_reader, 15).await;
 
@@ -2336,7 +2328,7 @@ mod tests {
             .await;
         match read_client_msg(&mut server_reader).await {
             ClientMsg::Event {
-                payload: DaemonEvent::OpStarted { id, .. },
+                payload: HubEvent::OpStarted { id, .. },
             } => assert_eq!(id, "live-1"),
             other => panic!("expected live OpStarted, got {other:?}"),
         }
@@ -2355,7 +2347,7 @@ mod tests {
         // ── Teardown. ────────────────────────────────────────────────────────────
         reporter.abort();
         let _ = std::fs::remove_file(&sock);
-        // _env_guard restores AHMA_DAEMON_SOCK; _lock releases the serialization.
+        // _env_guard restores AHMA_HUB_SOCK; _lock releases the serialization.
     }
 
     #[test]

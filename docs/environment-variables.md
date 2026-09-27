@@ -174,12 +174,12 @@ AHMA_DISABLE_HOOKS=1
 ## INTERNAL/TEST — Test Isolation
 
 > [!CAUTION]
-> These are set only by `init_test_daemon_isolation()` inside `#[cfg(test)]` code.
+> These are set only by `init_test_hub_isolation()` inside `#[cfg(test)]` code.
 > They are never present in production builds. Do not set these manually.
 
 | Variable | Purpose |
 |---|---|
-| `AHMA_DAEMON_SOCK` | Isolates each test process's daemon to a unique socket path |
+| `AHMA_HUB_SOCK` | Isolates each test process's hub to a unique socket path |
 | `AHMA_TEST_BINARY` | Locates the compiled test binary for in-process test helpers |
 | `AHMA_TEST_HTTP_CLIENT_TOKEN_PATH` | Redirects the external-MCP OAuth token file in `ahma_http_mcp_client` tests. Compiled in **debug builds only** — a release binary ignores it |
 | `AHMA_TEST_LOG_DIR` | Redirects the project log directory in `ahma_mcp` unit tests. Read only under `cfg!(test)` — no shipped binary contains the read |
@@ -187,7 +187,7 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_RECONNECT_BACKOFF_MS` | Shortens the stdio proxy's reconnect backoff in tests. Debug builds only |
 | `AHMA_CONFIG_DIR` | Relocates the platform config directory holding `log_exceptions.json` and the legacy `approvals.json` read by the one-time migration. Used by tests; see SPEC §11 (known gaps) |
 | `AHMA_TEST_HOME` | Redirects `~` resolution (`ahma_common::config::ahma_home_dir`) at a temp directory so a test can supply its own `~/.ahma/settings.toml`. Compiled in **debug builds only** (`#[cfg(debug_assertions)]`) — a release binary ignores it |
-| `AHMA_TEST_ISOLATION` | Set by test harnesses on spawned ahma binaries: forces private (non-global) bridge/daemon endpoints (SPEC R-ISO.1) |
+| `AHMA_TEST_ISOLATION` | Set by test harnesses on spawned ahma binaries: forces private (non-global) bridge/hub endpoints (SPEC R-ISO.1) |
 | `NEXTEST` / `NEXTEST_RUN_ID` | Set by `cargo nextest`, inherited by spawned binaries; read solely to force the same private-endpoint isolation as `AHMA_TEST_ISOLATION` — the single R-CFG9.2 carve-out (SPEC R-ISO.1) |
 
 ---
@@ -200,7 +200,7 @@ These are standard ecosystem variables that Ahma reads but does not define:
 |---|---|
 | `RUST_LOG` | Log verbosity: `debug`, `info`, `warn`, `error`, or crate-specific filters |
 | `HOME` / `USERPROFILE` | Home directory for `~` expansion and `~/.ahma/` paths |
-| `XDG_RUNTIME_DIR` | Linux: per-user runtime directory for daemon socket |
+| `XDG_RUNTIME_DIR` | Linux: per-user runtime directory for hub socket |
 | `CARGO_HOME` | Cargo home override; affects package cache scope |
 | `PATH` | Executable search path |
 | `NO_COLOR` | Any non-empty value suppresses colour in the TUI (https://no-color.org). Styles keep bold/dim emphasis; only hues are dropped. Glyph choice is separate — it follows `TERM` |

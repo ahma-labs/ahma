@@ -31,10 +31,10 @@ subtly wrong on its own.*
 - Every timeout is supplied by the caller; nothing is hardcoded here.
 - `delete_session` ends a session with `DELETE /mcp` (R8.3.6).
 - Every POST retries per root SPEC R-HTTP: a request that never arrived, or that the server
-  answered 429/503 (a draining daemon), is re-sent; a timeout or 5xx is re-sent only for the
+  answered 429/503 (a draining hub), is re-sent; a timeout or 5xx is re-sent only for the
   read-only `*/list` methods, never for `tools/call` or `initialize`. A retried request keeps
   its JSON-RPC id. A final failure is a `ServiceError` naming "the MCP server at host:port";
-  callers that know better (the agent: "the ahma daemon") re-attribute it with
+  callers that know better (the agent: "the ahma hub") re-attribute it with
   `ServiceError::for_service`. `with_retry_policy` overrides the default policy.
 - JSON-RPC request ids are unique across **every** client in the process, not per client:
   callers `attach` a fresh client per call against one shared session and run calls
@@ -49,7 +49,7 @@ subtly wrong on its own.*
   warning (R-CFG1.2).
 - `local_socket_client`: the same Streamable HTTP transport over an `AF_UNIX` socket, on
   every OS including Windows (through `ahma_common::local_socket`), for the per-user
-  daemon's MCP endpoint (root SPEC R-DAEMON.2) and `ahma serve unix`. rmcp's own
+  hub's MCP endpoint (root SPEC R-HUB.2) and `ahma serve unix`. rmcp's own
   `UnixSocketHttpClient` is built on `tokio::net::UnixStream` and does not exist on
   Windows; this is that client with only the connect replaced.
 - `http_client::HttpClient`: how `streamable` sends. It builds every request with
@@ -57,7 +57,7 @@ subtly wrong on its own.*
   socket for a `unix://` base URL, returning an ordinary `reqwest::Response` with its
   body streaming either way. `reqwest` reaches an `AF_UNIX` socket only on Unix and its
   connector cannot be replaced, so this is what lets the TUI and the agent attach to the
-  daemon on Windows. Both transports are retried by the same rules (R-HTTP.2): a failed
+  hub on Windows. Both transports are retried by the same rules (R-HTTP.2): a failed
   connect never delivered the request; anything later may have.
 
 ## 3. Non-Functional Requirements
