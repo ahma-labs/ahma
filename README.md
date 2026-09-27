@@ -5,7 +5,7 @@ _Use your existing command line workflows through MCP with a repo-scoped sandbox
 ## Why Ahma helps
 
 - **When the agent only needs the repo, broad terminal access is too much**: ahma starts inside a kernel-enforced workspace boundary, so normal project work does not require wider filesystem access.
-- **When builds, tests, and checks take time, you still want to see and stop them**: every command is a tracked operation — visible in `ahma tui`, cancellable, with its full output kept in a file. By default a call waits for its result like a terminal; switch to `async` ([docs/settings.md](docs/settings.md#sync-or-async-toolsexecution_mode)) to let the agent start several long jobs in parallel and collect them with `await`.
+- **When builds, tests, and checks take time, you still want to see and stop them**: every command is a tracked operation — visible in `ahma tui`, cancellable, with its full output kept in a file. A long command hands back an operation id so the agent keeps working, and collects the result with `await` ([docs/settings.md](docs/settings.md#sync-or-async-toolsexecution_mode)).
 - **When independent tasks are forced through one terminal, work gets serialized**: ahma can start separate operations concurrently and track them cleanly.
 - **When safety is noisy, people disable it**: ahma aims to make the safe path the practical path, reducing pressure to use broad or insecure override modes just to get work done.
 
@@ -14,6 +14,8 @@ _Use your existing command line workflows through MCP with a repo-scoped sandbox
 | [![CI](https://github.com/ahma-labs/ahma/actions/workflows/build.yml/badge.svg)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml) [![Coverage Report](https://img.shields.io/badge/Coverage-Report-blue)](https://ahma-labs.github.io/ahma/html/) [![Rust Docs](https://img.shields.io/badge/Rust-Docs-blue)](https://ahma-labs.github.io/ahma/doc/) [![Code Simplicity](https://img.shields.io/badge/Code-Simplicity-green)](https://ahma-labs.github.io/ahma/CODE_SIMPLICITY.html) [![Prebuilt Binaries](https://img.shields.io/badge/Prebuilt-Binaries-blueviolet)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) [![License: Per Crate](https://img.shields.io/badge/License-Per--Crate-6f42c1)](#license) [![Rust](https://img.shields.io/badge/Rust-1.95%2B-B7410E.svg)](https://www.rust-lang.org/) | ![Ahma Logo](./assets/ahma.png) |
 
 Ahma is an MCP server for running real project work through existing CLI tools with tighter filesystem boundaries and less blocking. It is aimed at the common case: builds, tests, formatters, git operations, log inspection, and other deterministic command-line tasks that agents already try to run.
+
+**Concurrent, but never racing.** An agent is fastest when a ten-minute test run overlaps its own reasoning, and least trustworthy when that overlap lets two writers change the same tree at once — a build racing a `git checkout`, or an edit landing mid-test so the verdict describes neither the old code nor the new. Ahma keeps the overlap and removes the race. Long commands return an operation id and the model keeps working; anything that may write a workspace runs one at a time, in the order it was sent, across every agent and session on the machine, behind a kernel lock that cannot go stale; reads skip the line under a sandbox that cannot write. The harness's own file edits — Claude Code, Codex, Copilot CLI, Cursor, Antigravity, and VS Code's agents — are held back by opt-in pre-edit hooks while a writer runs, and any change that slips past is named in the result it could have skewed. Details: [docs/workspace-queue.md](docs/workspace-queue.md).
 
 ## Quickstart
 
@@ -213,6 +215,7 @@ The ahma MCP server only sandboxes the tools an agent calls explicitly. **Termin
 
 ```bash
 ahma hooks install      # user-scoped hooks for all supported clients
+ahma hooks install --edit-guard  # also hold the client's own file edits while an ahma writer runs
 ahma hooks status       # shows the EFFECTIVE state (active vs installed-but-inactive)
 ahma hooks uninstall    # remove them
 ```
@@ -238,7 +241,6 @@ See [docs/live-log-monitoring.md](docs/live-log-monitoring.md) for setup, the An
 - **Custom tools**: If you want to expose your own command-line tools through ahma, start with [docs/custom-tools.md](docs/custom-tools.md).
 - **Agent skills**: Optional agent-specific setup is documented in [docs/agent-skills.md](docs/agent-skills.md).
 - **Code complexity analysis**: `ahma simplify` analyzes source files and returns structured AI fix instructions. See [docs/simplify.md](docs/simplify.md).
-- **Safe async (workspace write queue)**: long commands overlap the agent's thinking while writers to one workspace run one at a time, in arrival order, across every ahma session; reads skip the queue under a sandbox that cannot write; uncollected results arrive with the next tool result; files changed by other writers mid-run are reported. See [docs/workspace-queue.md](docs/workspace-queue.md).
 - **Built-in file tools**: read, edit (unique-match, read-before-edit, atomic), `multi_edit`, `apply_patch`, and `.gitignore`-aware search, for clients without their own. See [docs/file-tools.md](docs/file-tools.md).
 
 ---

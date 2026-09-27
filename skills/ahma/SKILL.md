@@ -200,7 +200,7 @@ ahma hooks status                                    # effective ACTIVE/INACTIVE
 ahma hooks install --scope user                      # all supported clients
 ahma hooks install --platform copilot --scope project
 ahma hooks uninstall --platform copilot --scope user
-ahma hooks edit-guard   # opt-in Claude Code PreToolUse hook for Edit/Write (docs/workspace-queue.md)
+ahma hooks install --edit-guard   # + hold native file edits while an ahma writer runs
 ```
 
 Key points: **installed ≠ active** (only active when an ahma MCP server is detected for that

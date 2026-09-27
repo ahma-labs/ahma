@@ -41,8 +41,8 @@ status()                                     → ── Finished since your last
   changed in its workspace while it ran (`changed_during_run`), so a test verdict that
   raced an edit says so.
 - **Edits wait for writers.** ahma's own file tools refuse an edit while a writer runs in
-  that workspace, naming it; the opt-in `ahma hooks edit-guard` does the same for Claude
-  Code's native `Edit`/`Write`.
+  that workspace, naming it; the opt-in edit guard does the same for the client's own file
+  tools in Claude Code, Codex, Copilot CLI, Cursor, Antigravity and VS Code.
 
 ## Quickstart
 
@@ -53,25 +53,32 @@ short writer in the same repository:
 ahma tui          # watch the second command sit in the queue behind the first
 ```
 
-To make harness-native edits wait too, add the edit guard to Claude Code's settings
-(`~/.claude/settings.json` or `.claude/settings.json`):
+To make the client's own file edits wait too, install the **edit guard** alongside the
+terminal hooks:
 
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [{ "type": "command", "command": "ahma hooks edit-guard" }]
-      }
-    ]
-  }
-}
+```bash
+ahma hooks install --edit-guard                      # user scope, every supported client
+ahma hooks install --edit-guard --platform codex --scope project
+ahma hooks status                                    # "installed+guard" per client
+ahma hooks uninstall                                 # removes shell hook and guard
 ```
 
-The hook never waits and never approves anything: while the workspace is free it prints
-nothing and Claude Code decides as usual; while an ahma writer runs it denies the edit with
-a reason naming that command.
+It adds one pre-edit hook per client, under its own managed id:
+
+| Client | Hook file (user / project) | Edit tools it guards |
+|---|---|---|
+| Claude Code | `~/.claude/settings.json` / `.claude/settings.json` | `Edit`, `Write`, `MultiEdit`, `NotebookEdit` |
+| Codex | `~/.codex/hooks.json` / `.codex/hooks.json` | `apply_patch` (paths read from the patch) |
+| GitHub Copilot CLI | `~/.copilot/hooks/ahma.json` / `.github/hooks/ahma.json` | `create`, `edit`, `str_replace_editor`, `apply_patch` |
+| Cursor | `~/.cursor/hooks.json` / `.cursor/hooks.json` | `Write`, `Delete` |
+| Antigravity | `~/.gemini/config/hooks.json` / `.agents/hooks.json` | `write_to_file`, `replace_file_content`, `multi_replace_file_content` |
+| VS Code | — (no file of its own) | Its Claude, Codex and Copilot agents run those clients' hooks above; its *Local* agent reads the Copilot files and is recognised by its payload |
+
+While the workspace is free the hook takes no position and the client decides as usual
+(Cursor and Antigravity get the same plain `allow` ahma's shell hook already sends them).
+While an ahma writer runs, it denies the edit with a reason naming that command. It never
+waits, never approves an edit the client would otherwise question, and always exits 0 — a
+missing or broken ahma cannot block editing.
 
 ## How it works
 
@@ -108,14 +115,17 @@ A custom tool declares its lane in MTDF (subcommand overrides tool):
 |---|---|---|
 | `execution_mode` | `"async"` | `"sync"` makes every call wait for its result |
 | `workspace_queue` | `true` | `false` lets writers overlap again (the pre-R2.7 behaviour); only sensible with `execution_mode = "sync"` |
-| `edit_guard` | `true` | ahma's own file tools refuse edits while a writer runs; also gates `ahma hooks edit-guard` |
+| `edit_guard` | `true` | ahma's own file tools refuse edits while a writer runs; also gates the edit guard installed by `ahma hooks install --edit-guard` |
 | `mutex_groups` | `cargo` | Extra per-workspace serialisation for tools that contend on a shared directory, matched on the command line you wrote |
 
 ## Limits
 
-- **Harness-native edits are ordered only through a hook.** Without `ahma hooks
-  edit-guard` (and in harnesses with no pre-edit hook, such as Cursor), such an edit during a
-  run is *reported* (`changed_during_run`), not prevented.
+- **Harness-native edits are held back only through the edit guard.** Without
+  `--edit-guard`, such an edit during a run is *reported* (`changed_during_run`), not
+  prevented. Some Codex releases fire `PreToolUse` for `apply_patch` without enforcing its
+  deny ([openai/codex#27833](https://github.com/openai/codex/issues/27833)); there the drift
+  report is the remaining signal. Edits made through a shell command are ordered by the
+  terminal hook and the queue, not by the guard.
 - **Cross-process order is mutual exclusion, not FIFO.** Two sessions queued on the same
   workspace never overlap, but the kernel lock does not promise which goes first.
 - **The drift report is by modification time**, skips `.gitignore`d paths and `.git/`,

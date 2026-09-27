@@ -858,7 +858,7 @@ pub struct ToolSettings {
     /// Refuse ahma's own file edits (`write_file`, `replace_in_file`,
     /// `multi_edit`, `apply_patch`) while a command that may write the same
     /// workspace is running, naming it (SPEC R2.7.8). The same check backs the
-    /// opt-in `ahma hooks edit-guard` for harness-native edit tools.
+    /// opt-in pre-edit hooks installed by `ahma hooks install --edit-guard`.
     /// Default: `true`
     #[serde(default = "default_true")]
     pub edit_guard: bool,

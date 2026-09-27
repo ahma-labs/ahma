@@ -326,10 +326,16 @@ drops work — and it is built so that no crash, kill or power loss can leave it
 - **R2.7.8**: **Edits wait for writers.** ahma's own file tools (`write_file`,
   `replace_in_file`, `multi_edit`, `apply_patch`) **must** refuse an edit while an exclusive
   operation holds the edited file's workspace, naming it and saying to `await` or `cancel`
-  it (`tools.edit_guard`, default on). `ahma hooks edit-guard` is the same check for a
-  harness's native edit tools, as an opt-in Claude Code `PreToolUse` hook: it never waits,
-  and emits only a deny — otherwise no decision at all (R5.5.5). A harness with no pre-edit
-  hook is covered by R2.7.6 alone.
+  it (`tools.edit_guard`, default on). `ahma hooks install --edit-guard` **must** install the
+  same check as a pre-edit hook in every supported client that has one — Claude Code, Codex
+  (`apply_patch`, paths read from the patch), Copilot CLI, Cursor and Antigravity; VS Code's
+  agents run those files — each in that client's own matcher and decision format, under its
+  own managed id so `uninstall` and `status` see it apart from the shell hook. The hook never
+  waits, always exits 0, and emits only a deny; otherwise no decision where the client's
+  contract defines "no decision", and the plain `allow` ahma's shell hook already sends where
+  that is unverified (Cursor, Antigravity; R5.5.5). Tool names are checked in the hook too,
+  because some hosts (VS Code's Local agent) ignore matchers. A client with no pre-edit hook,
+  or one that does not enforce the deny, is covered by R2.7.6 alone.
 
 ### R3: Performance
 

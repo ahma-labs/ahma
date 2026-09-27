@@ -139,9 +139,9 @@ pub enum HooksCommand {
     /// Diagnose why ahma cannot sandbox (binary path/version, kernel backend) and
     /// print repair guidance, plus the current consent state.
     Doctor,
-    /// Opt-in Claude Code PreToolUse hook for the native Edit, Write, MultiEdit and NotebookEdit tools. Those edits never pass through ahma, so its workspace write queue cannot order them; this hook refuses one (with a reason naming the command) while an ahma command that may read or write the same workspace is still running, so a test run never silently mixes old and new code. It never waits and never approves: when the workspace is free it prints nothing and the editor decides as usual. Install it by hand; see docs/workspace-queue.md.
-    #[command(name = "edit-guard")]
-    EditGuard,
+    /// Internal pre-edit hook written by `hooks install --edit-guard`. A harness's own file-edit tools never pass through ahma, so its workspace write queue cannot order them; this hook refuses such an edit (naming the command) while an ahma command that may read or write the same workspace is still running, so a test run never silently mixes old and new code. It never waits and never approves anything.
+    #[command(name = "edit-guard", hide = true)]
+    EditGuard(edit_guard::HooksEditGuardArgs),
 }
 
 #[derive(Args, Debug)]
@@ -157,6 +157,10 @@ pub struct HooksInstallArgs {
     /// Show planned changes without writing files.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Also install the edit guard: a pre-edit hook that refuses the client's own file-edit tools (Claude Code Edit/Write, Codex apply_patch, Copilot edit/create, Cursor Write, Antigravity write_to_file, and VS Code's agents through the same files) while an ahma command that may read or write the same workspace is running, naming that command. Without it such edits are only reported after the fact. See docs/workspace-queue.md.
+    #[arg(long)]
+    pub edit_guard: bool,
 }
 
 #[derive(Args, Debug)]
@@ -528,7 +532,7 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
         HooksCommand::ApproveUnsandboxed => run_approve_unsandboxed(),
         HooksCommand::Revoke => run_revoke_consent(),
         HooksCommand::Doctor => run_doctor(),
-        HooksCommand::EditGuard => edit_guard::run(cfg.edit_guard),
+        HooksCommand::EditGuard(args) => edit_guard::run(&args, cfg.edit_guard),
     }
 }
 
@@ -677,12 +681,16 @@ pub fn run_install(args: HooksInstallArgs) -> Result<()> {
         let before = document.clone();
 
         install_platform_hook(&mut document, platform, args.scope, &env)?;
+        if args.edit_guard {
+            edit_guard::install(&mut document, platform, args.scope, &env)?;
+        }
         let action = write_hook_document(&path, &before, &document, args.dry_run, existed)?;
 
         println!(
-            "{} {} hook {} at {}",
+            "{} {} hook{} {} at {}",
             platform.label(),
             args.scope.label(),
+            if args.edit_guard { " + edit guard" } else { "" },
             action_message(action, args.dry_run),
             path.display()
         );
@@ -725,6 +733,7 @@ fn uninstall_single_platform_hook(
     let mut document = load_hook_document(&path)?;
     let before = document.clone();
     let changed = uninstall_platform_hook(&mut document, platform)?;
+    let changed = edit_guard::uninstall(&mut document, platform)? || changed;
 
     if !changed {
         println!(
@@ -752,11 +761,15 @@ fn hook_status_string(path: &Path, platform: HookPlatform) -> Result<String> {
         return Ok("missing".to_string());
     }
     let document = load_hook_document(path)?;
-    if platform_hook_installed(&document, platform) {
-        Ok("installed".to_string())
-    } else {
-        Ok("not installed".to_string())
-    }
+    let guard = edit_guard::installed(&document, platform);
+    Ok(
+        match (platform_hook_installed(&document, platform), guard) {
+            (true, true) => "installed+guard".to_string(),
+            (true, false) => "installed".to_string(),
+            (false, true) => "guard only".to_string(),
+            (false, false) => "not installed".to_string(),
+        },
+    )
 }
 
 /// Returns `true` when ahma's terminal hooks should route commands through the sandbox.
@@ -974,7 +987,7 @@ fn print_hook_status_rows(
         for platform in selected_platforms(requested_platforms) {
             let path = env.config_path(platform, scope);
             let status = hook_status_string(&path, platform)?;
-            if status == "installed" {
+            if status.starts_with("installed") {
                 installed_hooks.push((platform, scope, path.clone()));
             }
             println!(
