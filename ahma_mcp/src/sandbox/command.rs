@@ -526,6 +526,98 @@ impl Sandbox {
         Ok(fd)
     }
 
+    /// Whether this sandbox can spawn a command the **kernel** forbids from
+    /// writing the workspace (SPEC R2.7.4): Linux with Landlock, macOS when
+    /// ahma is not itself nested inside another Seatbelt profile. Never in
+    /// Test mode (no kernel enforcement at all) and never on Windows (no
+    /// filesystem boundary, R6.3.3). Where this is `false` the read-only lane
+    /// does not exist and every command takes the exclusive lane — the queue
+    /// never trusts a classifier without a kernel behind it.
+    pub fn can_enforce_read_only(&self) -> bool {
+        if self.mode == SandboxMode::Test {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            static LANDLOCK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *LANDLOCK.get_or_init(|| {
+                matches!(
+                    super::landlock::landlock_read_only_ruleset_fd(&[], &[], true, None),
+                    Ok(Some(_))
+                )
+            })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.outer_sandbox.is_none()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            false
+        }
+    }
+
+    /// Create a command that may read the workspace but not write it: the
+    /// read-only lane's spawn (SPEC R2.7.4). Errors where
+    /// [`Self::can_enforce_read_only`] is `false`, so a caller can never get
+    /// an unenforced "read-only" command by accident.
+    ///
+    /// Also sets `GIT_OPTIONAL_LOCKS=0`, so `git status` reads the index
+    /// without trying to refresh it — the one write a reading git command
+    /// otherwise attempts.
+    pub fn create_read_only_command(
+        &self,
+        program: &str,
+        args: &[String],
+        working_dir: &Path,
+    ) -> Result<tokio::process::Command> {
+        if !self.can_enforce_read_only() {
+            anyhow::bail!("read-only execution is not enforceable on this platform/sandbox");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let scopes = self.scopes().to_vec();
+            let connect_tcp_port = self.egress_proxy_addr.read().map(|addr| addr.port());
+            // No temp-dir writes: Landlock rules are additive, so a writable
+            // `/tmp` would make any workspace *under* `/tmp` writable again.
+            let Some(fd) = super::landlock::landlock_read_only_ruleset_fd(
+                &scopes,
+                &self.read_scopes(),
+                true,
+                connect_tcp_port,
+            )?
+            else {
+                anyhow::bail!("Landlock unavailable: read-only execution is not enforceable");
+            };
+            let mut cmd = self.base_command(program, args, working_dir);
+            cmd.env("GIT_OPTIONAL_LOCKS", "0");
+            use std::os::fd::AsRawFd;
+            // SAFETY: as in `create_platform_sandboxed_command` — only
+            // async-signal-safe syscalls between fork and exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    super::landlock::apply_landlock_ruleset_in_child(fd.as_raw_fd())
+                });
+            }
+            Ok(cmd)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut full_command = vec![program.to_string()];
+            full_command.extend(args.iter().cloned());
+            let (sandbox_program, sandbox_args) =
+                self.build_macos_sandbox_command_with(&full_command, working_dir, false)?;
+            let mut cmd = self.base_command(&sandbox_program, &sandbox_args, working_dir);
+            cmd.env("GIT_OPTIONAL_LOCKS", "0");
+            Ok(cmd)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (program, args, working_dir);
+            anyhow::bail!("read-only execution is not enforceable on this platform")
+        }
+    }
+
     /// Create a sandboxed shell command (e.g. `bash -c "..."` on Unix,
     /// `powershell -NoProfile -NonInteractive -Command "..."` on Windows).
     pub fn create_shell_command(

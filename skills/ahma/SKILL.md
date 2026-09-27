@@ -144,11 +144,14 @@ Every call is a tracked operation (`status`, `ahma tui`, cancellable, full outpu
 `output_file`). `tools.execution_mode` decides how long a call waits (the server
 `instructions` say which); humans switch it with `--sync`/`--async` or `/sync`/`/async`:
 
-- **`sync` (default)** — a call returns the command's result when it finishes. If it outlasts
-  what your client can hold one request open for, you get an `operation_id` and a line saying
-  it is still running: `await` that id to collect it.
-- **`async`** (`--async`) — a call returns inline only if it finishes within a few seconds,
-  otherwise an `operation_id`; start several, then `await` them:
+- **`async` (default)** — a call returns inline if it finishes within a few seconds, otherwise
+  an `operation_id`: keep working, then `await` it. Writers run one at a time in the order sent
+  (the workspace queue): a result saying `NOT started — queued behind op X` will run by itself —
+  never resend it. Read-only commands (`git status`, `rg`, `ls`) answer at once. A result you
+  never awaited arrives atop your next tool result; `changed_during_run` lists files another
+  writer touched meanwhile. ([docs/workspace-queue.md](https://github.com/ahma-labs/ahma/blob/main/docs/workspace-queue.md))
+- **`sync`** (`--sync`) — a call returns the result when it finishes; past what your client can
+  hold one request open for, you get an `operation_id` to `await`:
 
 ```
 result = cargo_build(subcommand="build")        # → "AHMA ID: op_abc123 … running in the background"
@@ -197,6 +200,7 @@ ahma hooks status                                    # effective ACTIVE/INACTIVE
 ahma hooks install --scope user                      # all supported clients
 ahma hooks install --platform copilot --scope project
 ahma hooks uninstall --platform copilot --scope user
+ahma hooks install --edit-guard   # + hold native file edits while an ahma writer runs
 ```
 
 Key points: **installed ≠ active** (only active when an ahma MCP server is detected for that
@@ -254,7 +258,8 @@ Validate configs: `ahma tool validate .ahma/`
 |----------|---------|---------|
 | `--tools-dir` / `tools.tools_dir` | `.ahma/` | Custom tools directory path |
 | `--timeout` / `tools.timeout_secs` | `600` | Default tool timeout (seconds) |
-| `--sync` / `--async` / `tools.execution_mode` | `sync` | `sync`: calls return results; `async`: calls return ids to `await` |
+| `--sync` / `--async` / `tools.execution_mode` | `async` | `async`: long calls return ids to `await`; `sync`: calls return results |
+| `tools.workspace_queue` / `tools.edit_guard` | on / on | Writers one at a time per workspace; refuse edits while one runs |
 | `--no-sandbox` / `sandbox.disable` | off | Disable kernel sandbox (UNSAFE) |
 | `--sandbox-scope` / `sandbox.scopes` | cwd | Sandbox scope paths |
 | `sandbox.container_root` | unset | Directory holding your projects; scope fallback when the client reports no roots |

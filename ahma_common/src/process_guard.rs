@@ -23,6 +23,19 @@
 /// IDE/agent/CLI rather than by another `ahma`.
 pub const SPAWN_DEPTH_ENV: &str = "AHMA_SPAWN_DEPTH";
 
+/// Environment variable naming the workspace lease(s) a process tree already
+/// runs under (SPEC R2.7.7): an ahma started by a command holding a lease must
+/// not wait for that same lease. An internal supervision marker, not
+/// configuration — it only ever *skips a wait* for a lease an ancestor holds.
+pub const HELD_WORKSPACE_LEASE_ENV: &str = "AHMA_HELD_WORKSPACE_LEASE";
+
+/// Markers that describe the *spawning* process tree and must never reach the
+/// detached per-user daemon, which outlives that tree: `AHMA_SERVER_CHILD`
+/// would make it believe it is a session worker, and an inherited lease would
+/// make it — and every session worker it spawns — skip the workspace lock for
+/// that workspace for the rest of its life (SPEC R2.7.7).
+pub const NOT_INHERITED_BY_DAEMON: &[&str] = &["AHMA_SERVER_CHILD", HELD_WORKSPACE_LEASE_ENV];
+
 /// Maximum tolerated spawn depth before a process refuses to start.
 ///
 /// The deepest legitimate chain is frontend(0) → bridge(1) → peer(2). The

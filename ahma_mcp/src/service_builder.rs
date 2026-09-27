@@ -205,7 +205,10 @@ impl<'a> ServiceBuilder<'a> {
                 sandbox.clone(),
                 mutex_registry,
             )?
-            .with_scope_grant_notifier(grant_notifier),
+            .with_scope_grant_notifier(grant_notifier)
+            .with_workspace_queue(
+                crate::adapter::workspace_queue::WorkspaceQueue::new(config.workspace_queue),
+            ),
         );
 
         let raw_configs = load_tool_configs(config, config.tools_dir.as_deref())

@@ -158,6 +158,12 @@ pub struct Operation {
     /// write lock. Serializes as the same RFC 3339 string as before.
     #[serde(default = "ActivityStamp::now")]
     pub last_activity: ActivityStamp,
+    /// How long this operation waited in the workspace write queue before it
+    /// ran (SPEC R2.7). `None` when it never queued. The operation's clocks
+    /// (`start_time`, `last_activity`) restart when it leaves the queue, so its
+    /// duration and timeout measure the command, not the wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<u64>,
 }
 
 /// Default factory for `completion_watch` used during serde deserialisation.
@@ -301,6 +307,7 @@ impl Operation {
             alerts: Vec::new(),
             output_file: None,
             last_activity: ActivityStamp::now(),
+            queue_wait_ms: None,
         }
     }
 
@@ -535,6 +542,29 @@ impl OperationMonitor {
     pub async fn note_liveness(&self, id: &str) {
         let ops = self.operations.read().await;
         if let Some(op) = ops.get(id) {
+            op.last_activity.touch();
+        }
+    }
+
+    /// [`Self::note_liveness`] for synchronous callers (the workspace-queue
+    /// wait observer): best-effort, skipped if the map is momentarily locked —
+    /// the next observation, seconds later, will land.
+    pub fn try_note_liveness(&self, id: &str) {
+        if let Ok(ops) = self.operations.try_read()
+            && let Some(op) = ops.get(id)
+        {
+            op.last_activity.touch();
+        }
+    }
+
+    /// The operation left the workspace write queue after `waited` (SPEC
+    /// R2.7.1): record the wait and restart its clocks, so neither its
+    /// reported duration nor its timeout is eaten by time spent queued.
+    pub async fn left_queue(&self, id: &str, waited: Duration) {
+        let mut ops = self.operations.write().await;
+        if let Some(op) = ops.get_mut(id) {
+            op.queue_wait_ms = Some(waited.as_millis() as u64);
+            op.start_time = SystemTime::now();
             op.last_activity.touch();
         }
     }

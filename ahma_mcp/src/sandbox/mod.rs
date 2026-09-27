@@ -98,7 +98,8 @@ pub use grant_channel::{HubGrantNotifier, LoggingGrantNotifier, ScopeGrantNotifi
 pub use host_detect::{HostSandbox, OUTER_SANDBOX_PID_ENV, detect_host_sandbox};
 #[cfg(target_os = "linux")]
 pub use landlock::{
-    apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_ruleset_fd,
+    apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_read_only_ruleset_fd,
+    landlock_ruleset_fd,
 };
 pub use permission_broker::{
     AskedAt, ElicitOutcome, ElicitationSurface, PeerElicitationSurface, PermissionBroker,

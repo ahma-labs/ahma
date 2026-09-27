@@ -35,7 +35,7 @@
       "minimum": 0
     },
     "synchronous": {
-      "description": "Override the default execution mode for this tool.\n- `true`: Always run on the legacy direct path (blocking, untracked)\n- `false`: Return after the adaptive window, even in sync mode\n- `null`/omitted: Use the server's `tools.execution_mode` (sync by default)\n\nInheritance: Subcommand-level settings override tool-level settings.",
+      "description": "Override the default execution mode for this tool.\n- `true`: Always run on the legacy direct path (blocking, untracked)\n- `false`: Return after the adaptive window, even in sync mode\n- `null`/omitted: Use the server's `tools.execution_mode` (async by default)\n\nInheritance: Subcommand-level settings override tool-level settings.",
       "type": [
         "boolean",
         "null"
@@ -135,6 +135,17 @@
       "type": [
         "boolean",
         "null"
+      ]
+    },
+    "concurrency": {
+      "description": "How this tool's calls take part in the workspace write queue (SPEC\nR2.7): `\"exclusive\"` (the default — may write the workspace, runs in\narrival order), `\"read_only\"` (spawned with a sandbox profile that\ncannot write the workspace, so it never queues), or `\"service\"` (a\nlong-lived process such as a dev server, which must not hold the\nworkspace for its whole life). Unlike `mutates`, `read_only` is enforced\nby the kernel: a `read_only` tool that tries to write fails. Subcommand\nsettings override this tool-level default.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Lane"
+        },
+        {
+          "type": "null"
+        }
       ]
     }
   },
@@ -260,6 +271,17 @@
           "type": [
             "boolean",
             "null"
+          ]
+        },
+        "concurrency": {
+          "description": "Override the tool-level `concurrency` for this subcommand — e.g.\n`git status` (`\"read_only\"`) under a `git` tool whose other subcommands\nwrite. See [`ToolConfig::concurrency`].",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Lane"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
@@ -445,6 +467,26 @@
         }
       },
       "additionalProperties": false
+    },
+    "Lane": {
+      "description": "How an operation participates in the workspace queue.",
+      "oneOf": [
+        {
+          "description": "May write the workspace: takes the lease, runs in arrival order.",
+          "type": "string",
+          "const": "exclusive"
+        },
+        {
+          "description": "Cannot write the workspace — the kernel sandbox is told so at spawn\n(SPEC R2.7.4). Needs no lease and never waits.",
+          "type": "string",
+          "const": "read_only"
+        },
+        {
+          "description": "Long-lived by design (a dev server, a log follower): holding the lease\nwould block every later command for its whole life, so it takes none.",
+          "type": "string",
+          "const": "service"
+        }
+      ]
     },
     "ToolHints": {
       "description": "Provides hints to an AI agent on how to use a tool.",

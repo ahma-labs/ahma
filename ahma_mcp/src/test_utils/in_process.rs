@@ -167,20 +167,71 @@ async fn wire_in_process_mcp(
     wire_in_process_mcp_with_client((), configs, sandbox).await
 }
 
+/// An in-process pair with the workspace write queue on (SPEC R2.7): its
+/// rendezvous files go under `lock_dir` (so a test never touches the user's
+/// runtime directory), the scope is `scope` (Test-mode sandbox — no kernel
+/// enforcement, so there is no read-only lane and every command is exclusive),
+/// and `app_config` is installed as the service's configuration — which is how a
+/// test picks the execution mode and shrinks the inline window
+/// (`request_budget_override_secs`).
+pub async fn create_in_process_mcp_with_workspace_queue(
+    scope: &Path,
+    lock_dir: PathBuf,
+    app_config: AppConfig,
+) -> Result<InProcessMcp> {
+    let sandbox = Sandbox::new(
+        vec![scope.to_path_buf()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )?;
+    sandbox.set_roots_received(true);
+    let _ = sandbox.commit_existing_scopes();
+    let mcp = wire_in_process_mcp_with_queue(
+        (),
+        HashMap::new(),
+        sandbox,
+        crate::adapter::workspace_queue::WorkspaceQueue::with_lock_dir(true, Some(lock_dir)),
+    )
+    .await?;
+    mcp.service.set_app_config(Arc::new(app_config));
+    Ok(mcp)
+}
+
 /// Internal: as [`wire_in_process_mcp`], with a caller-supplied client handler.
 async fn wire_in_process_mcp_with_client<C: ClientHandler>(
     client_handler: C,
     configs: HashMap<String, ToolConfig>,
     sandbox: Sandbox,
 ) -> Result<InProcessMcp<C>> {
+    wire_in_process_mcp_with_queue(
+        client_handler,
+        configs,
+        sandbox,
+        crate::adapter::workspace_queue::WorkspaceQueue::disabled(),
+    )
+    .await
+}
+
+/// Internal: the one constructor every helper funnels into.
+async fn wire_in_process_mcp_with_queue<C: ClientHandler>(
+    client_handler: C,
+    configs: HashMap<String, ToolConfig>,
+    sandbox: Sandbox,
+    queue: crate::adapter::workspace_queue::WorkspaceQueue,
+) -> Result<InProcessMcp<C>> {
     let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
-    let adapter = Arc::new(Adapter::new(
-        Arc::clone(&operation_monitor),
-        shell_pool,
-        Arc::new(sandbox),
-    )?);
+    let adapter = Arc::new(
+        Adapter::new(
+            Arc::clone(&operation_monitor),
+            shell_pool,
+            Arc::new(sandbox),
+        )?
+        .with_workspace_queue(queue),
+    );
 
     // NOTE: `set_roots_received` is the *caller's* decision, made on the sandbox
     // before it is handed here. It used to be forced to `true` at this point,

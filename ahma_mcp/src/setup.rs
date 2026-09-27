@@ -908,6 +908,8 @@ async fn setup_terminal_hooks(platforms: &[Platform], interactive: bool) -> Resu
         platforms: hook_platforms,
         scope: HookScope::User,
         dry_run: false,
+        // The edit guard stays opt-in (`ahma hooks install --edit-guard`).
+        edit_guard: false,
     };
 
     println!("Installing terminal hooks...");

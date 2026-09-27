@@ -370,6 +370,9 @@ impl AhmaMcpService {
             // least contained builtin there is, matching
             // BuiltinTool::RunTerminalCommand.is_mutating() == true.
             mutates: Some(true),
+            // Undeclared on purpose: the adapter classifies each command line
+            // (SPEC R2.7.4) — `git status` reads, `cargo build` writes.
+            concurrency: None,
         }
     }
 

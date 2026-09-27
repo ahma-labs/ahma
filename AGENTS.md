@@ -250,6 +250,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Built-in file tools | [docs/file-tools.md](docs/file-tools.md) | R26 |
 | Doctor (`ahma doctor`, `/doctor`) | [docs/doctor.md](docs/doctor.md) | R-DOCTOR |
 | Settings file, sync/async execution mode | [docs/settings.md](docs/settings.md) | R-CFG, R2.1, R2.4 |
+| Workspace write queue (safe async) | [docs/workspace-queue.md](docs/workspace-queue.md) | R2.7 |
 | Permissions and grants | [docs/permissions.md](docs/permissions.md) | R-PERM |
 | LLM providers | [docs/llm-providers.md](docs/llm-providers.md) | §5.5 |
 | Session-health notifications | [docs/session-health-notifications.md](docs/session-health-notifications.md) | R8.8 (`ahma_http_bridge/SPEC.md`) |
@@ -670,9 +671,12 @@ version bump is what triggers a release**: a push to `main` publishes GitHub Rel
 `v<X.Y.Z>` only when it bumps to a version whose tag does not yet exist; an ordinary land that
 doesn't change the version runs the test matrix but publishes nothing.
 
-Install local git guardrail hook:
+Install local git hooks — the guardrails before push, and a `commit-msg` hook that strips AI
+attribution trailers (`Co-Authored-By: Claude`, `🤖 Generated with [Claude Code]`,
+`Claude-Session:`), which would otherwise land on `main` through the squash body:
 ```bash
 cp scripts/check-guardrails.sh .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+cp scripts/commit-msg.sh .git/hooks/commit-msg && chmod +x .git/hooks/commit-msg
 ```
 
 ### Repo-Local Skills

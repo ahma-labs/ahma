@@ -69,6 +69,7 @@ fn test_tool_config_creation() {
         subcommand: Some(vec![SubcommandConfig {
             extra: Default::default(),
             mutates: None,
+            concurrency: None,
             name: "build".to_string(),
             description: "Build project".to_string(),
             enabled: true,
@@ -123,6 +124,7 @@ fn test_subcommand_config_creation() {
     let subcommand = SubcommandConfig {
         extra: Default::default(),
         mutates: None,
+        concurrency: None,
         name: "build".to_string(),
         description: "Build project".to_string(),
         enabled: true,
@@ -226,6 +228,7 @@ async fn test_service_with_configs() {
         subcommand: Some(vec![SubcommandConfig {
             extra: Default::default(),
             mutates: None,
+            concurrency: None,
             name: "test_sub".to_string(),
             description: "Test subcommand".to_string(),
             enabled: true,
@@ -325,6 +328,7 @@ fn test_tool_config_with_nested_subcommands() {
         subcommand: Some(vec![SubcommandConfig {
             extra: Default::default(),
             mutates: None,
+            concurrency: None,
             name: "build".to_string(),
             description: "Build command".to_string(),
             enabled: true,
@@ -337,6 +341,7 @@ fn test_tool_config_with_nested_subcommands() {
             subcommand: Some(vec![SubcommandConfig {
                 extra: Default::default(),
                 mutates: None,
+                concurrency: None,
                 name: "release".to_string(),
                 description: "Release build".to_string(),
                 enabled: true,
@@ -396,6 +401,7 @@ async fn test_service_with_tool_configs() {
         subcommand: Some(vec![SubcommandConfig {
             extra: Default::default(),
             mutates: None,
+            concurrency: None,
             name: "build".to_string(),
             description: "Build project".to_string(),
             enabled: true,

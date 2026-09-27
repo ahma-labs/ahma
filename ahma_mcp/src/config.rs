@@ -64,7 +64,7 @@ pub struct ToolConfig {
     /// Override the default execution mode for this tool.
     /// - `true`: Always run on the legacy direct path (blocking, untracked)
     /// - `false`: Return after the adaptive window, even in sync mode
-    /// - `null`/omitted: Use the server's `tools.execution_mode` (sync by default)
+    /// - `null`/omitted: Use the server's `tools.execution_mode` (async by default)
     ///
     /// Inheritance: Subcommand-level settings override tool-level settings.
     #[serde(
@@ -129,6 +129,40 @@ pub struct ToolConfig {
     /// override this tool-level default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutates: Option<bool>,
+    /// How this tool's calls take part in the workspace write queue (SPEC
+    /// R2.7): `"exclusive"` (the default — may write the workspace, runs in
+    /// arrival order), `"read_only"` (spawned with a sandbox profile that
+    /// cannot write the workspace, so it never queues), or `"service"` (a
+    /// long-lived process such as a dev server, which must not hold the
+    /// workspace for its whole life). Unlike `mutates`, `read_only` is enforced
+    /// by the kernel: a `read_only` tool that tries to write fails. Subcommand
+    /// settings override this tool-level default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<crate::adapter::workspace_queue::Lane>,
+}
+
+impl ToolConfig {
+    /// Push the tool-level `concurrency` down to every subcommand that does not
+    /// declare its own, nearest declaration winning (SPEC R2.7.4). Done once,
+    /// when a definition is parsed, so every execution path — which only ever
+    /// sees the resolved leaf `SubcommandConfig` — gets the same lane.
+    pub fn with_inherited_concurrency(mut self) -> Self {
+        fn inherit(
+            subs: &mut [SubcommandConfig],
+            parent: Option<crate::adapter::workspace_queue::Lane>,
+        ) {
+            for sub in subs {
+                sub.concurrency = sub.concurrency.or(parent);
+                if let Some(children) = sub.subcommand.as_mut() {
+                    inherit(children, sub.concurrency);
+                }
+            }
+        }
+        if let Some(subs) = self.subcommand.as_mut() {
+            inherit(subs, self.concurrency);
+        }
+        self
+    }
 }
 
 /// Classifier that determines how the MCP service routes a tool invocation.
@@ -474,6 +508,11 @@ pub struct SubcommandConfig {
     /// [`ToolConfig::mutates`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutates: Option<bool>,
+    /// Override the tool-level `concurrency` for this subcommand — e.g.
+    /// `git status` (`"read_only"`) under a `git` tool whose other subcommands
+    /// write. See [`ToolConfig::concurrency`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<crate::adapter::workspace_queue::Lane>,
 }
 
 /// Configuration for a single command-line option.
@@ -667,7 +706,7 @@ fn builtin_tool_definition(bundle_name: &str) -> Option<&'static str> {
 }
 
 fn parse_builtin_tool_config(json_str: &str) -> anyhow::Result<ToolConfig> {
-    Ok(serde_json::from_str::<ToolConfig>(json_str)?)
+    Ok(serde_json::from_str::<ToolConfig>(json_str)?.with_inherited_concurrency())
 }
 
 enum ToolConfigLoadError {
@@ -679,7 +718,9 @@ async fn read_tool_config_once(path: &Path) -> Result<ToolConfig, ToolConfigLoad
     let contents = tokio::fs::read_to_string(path)
         .await
         .map_err(ToolConfigLoadError::Read)?;
-    serde_json::from_str::<ToolConfig>(&contents).map_err(ToolConfigLoadError::Parse)
+    serde_json::from_str::<ToolConfig>(&contents)
+        .map(ToolConfig::with_inherited_concurrency)
+        .map_err(ToolConfigLoadError::Parse)
 }
 
 fn log_tool_config_load_failure(path: &Path, error: &ToolConfigLoadError) {
@@ -1011,4 +1052,115 @@ pub fn load_tool_configs_sync(
     tools_dir: Option<&Path>,
 ) -> anyhow::Result<HashMap<String, ToolConfig>> {
     tokio::runtime::Runtime::new()?.block_on(load_tool_configs(config, tools_dir))
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use crate::adapter::workspace_queue::Lane;
+
+    fn leaf<'a>(config: &'a ToolConfig, path: &[&str]) -> &'a SubcommandConfig {
+        let mut subs = config.subcommand.as_deref().expect("subcommands");
+        let mut found = None;
+        for name in path {
+            let sub = subs
+                .iter()
+                .find(|s| s.name == *name)
+                .unwrap_or_else(|| panic!("{} has no subcommand {name}", config.name));
+            found = Some(sub);
+            subs = sub.subcommand.as_deref().unwrap_or(&[]);
+        }
+        found.expect("non-empty path")
+    }
+
+    /// SPEC R2.7.4: a lane declared on the tool applies to every subcommand
+    /// that does not declare its own; the nearest declaration wins.
+    #[test]
+    fn a_tool_level_lane_is_inherited_and_the_nearest_declaration_wins() {
+        let config = parse_builtin_tool_config(
+            r#"{
+                "name": "srv", "description": "d", "command": "srv",
+                "concurrency": "service",
+                "subcommand": [
+                    { "name": "run", "description": "d" },
+                    { "name": "check", "description": "d", "concurrency": "read_only" },
+                    { "name": "db", "description": "d", "concurrency": "exclusive",
+                      "subcommand": [ { "name": "migrate", "description": "d" } ] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(leaf(&config, &["run"]).concurrency, Some(Lane::Service));
+        assert_eq!(leaf(&config, &["check"]).concurrency, Some(Lane::ReadOnly));
+        assert_eq!(
+            leaf(&config, &["db", "migrate"]).concurrency,
+            Some(Lane::Exclusive)
+        );
+    }
+
+    fn bundled(bundle: &str) -> ToolConfig {
+        parse_builtin_tool_config(builtin_tool_definition(bundle).expect("bundle")).unwrap()
+    }
+
+    /// SPEC R2.7.4: the bundled tools declare their lanes, so a plain read
+    /// never queues behind a build, and a follower never holds the workspace.
+    #[test]
+    fn bundled_tools_declare_their_lanes() {
+        let files = bundled("fileutils");
+        for name in [
+            "ls", "grep", "pwd", "cd", "cat", "find", "head", "tail", "diff",
+        ] {
+            assert_eq!(
+                leaf(&files, &[name]).concurrency,
+                Some(Lane::ReadOnly),
+                "file-tools {name}"
+            );
+        }
+        for name in ["mv", "cp", "rm", "sed", "touch"] {
+            assert_ne!(
+                leaf(&files, &[name]).concurrency,
+                Some(Lane::ReadOnly),
+                "file-tools {name} writes"
+            );
+        }
+
+        let git = bundled("git");
+        for name in ["status", "log"] {
+            assert_eq!(
+                leaf(&git, &[name]).concurrency,
+                Some(Lane::ReadOnly),
+                "git {name}"
+            );
+        }
+        for name in ["add", "commit", "push"] {
+            assert_ne!(
+                leaf(&git, &[name]).concurrency,
+                Some(Lane::ReadOnly),
+                "git {name}"
+            );
+        }
+
+        let gh = bundled("github");
+        assert_eq!(leaf(&gh, &["run_watch"]).concurrency, Some(Lane::Service));
+        for name in [
+            "pr_list",
+            "pr_view",
+            "run_list",
+            "run_view",
+            "workflow_list",
+            "workflow_view",
+            "cache_list",
+        ] {
+            assert_eq!(
+                leaf(&gh, &[name]).concurrency,
+                Some(Lane::ReadOnly),
+                "gh {name}"
+            );
+        }
+        assert_ne!(
+            leaf(&gh, &["run_download"]).concurrency,
+            Some(Lane::ReadOnly),
+            "run_download writes into the workspace"
+        );
+    }
 }

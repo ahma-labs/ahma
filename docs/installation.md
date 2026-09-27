@@ -152,11 +152,14 @@ Terminal hooks route the shell commands an agent runs through its *native* termi
 | **GitHub Copilot CLI** | `~/.copilot/hooks/ahma.json` | `<repo>/.github/hooks/ahma.json` |
 | **Antigravity** | `~/.gemini/config/hooks.json` | `<repo>/.agents/hooks.json` |
 
-VS Code and Claude Desktop have no execution-hook mechanism and are not supported.
+Claude Desktop has no hook mechanism. VS Code has no hook file of its own that ahma writes; its Claude, Codex and Copilot agents read those clients' files above.
+
+**Edit guard (opt-in).** `ahma hooks install --edit-guard` adds a second, pre-edit hook to the same files: while an ahma command that may write the workspace is running, the client's own file-edit tools are refused with the command's id, so an edit never lands halfway through a build or test run. See [workspace-queue.md](workspace-queue.md).
 
 ```bash
 ahma hooks install                                   # user-scoped, all supported clients
 ahma hooks install --platform claude,codex --scope project
+ahma hooks install --edit-guard                      # + the pre-edit guard, every client
 ahma hooks status                                    # effective state + where installed
 ahma hooks uninstall --platform cursor --scope project
 ```

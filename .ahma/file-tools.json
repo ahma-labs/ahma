@@ -9,6 +9,7 @@
         {
             "name": "ls",
             "description": "List directory contents with various formatting options",
+            "concurrency": "read_only",
             "positional_args": [
                 {
                     "name": "path",
@@ -229,6 +230,7 @@
         {
             "name": "grep",
             "description": "Search text patterns in files",
+            "concurrency": "read_only",
             "positional_args": [
                 {
                     "name": "pattern",
@@ -397,6 +399,7 @@
         {
             "name": "pwd",
             "description": "Print current working directory",
+            "concurrency": "read_only",
             "options": [
                 {
                     "name": "working_directory",
@@ -410,6 +413,7 @@
         {
             "name": "cd",
             "description": "Change working directory and list contents",
+            "concurrency": "read_only",
             "positional_args": [
                 {
                     "name": "path",
@@ -437,6 +441,7 @@
         {
             "name": "cat",
             "description": "Display file contents",
+            "concurrency": "read_only",
             "positional_args": [
                 {
                     "name": "files",
@@ -481,6 +486,7 @@
         {
             "name": "find",
             "description": "Search for files and directories",
+            "concurrency": "read_only",
             "positional_args_first": true,
             "positional_args": [
                 {
@@ -534,6 +540,7 @@
         {
             "name": "head",
             "description": "Display first lines of files",
+            "concurrency": "read_only",
             "positional_args": [
                 {
                     "name": "files",
@@ -578,6 +585,7 @@
         {
             "name": "tail",
             "description": "Display last lines of files",
+            "concurrency": "read_only",
             "positional_args": [
                 {
                     "name": "files",
@@ -628,6 +636,7 @@
         {
             "name": "diff",
             "description": "Compare files line by line",
+            "concurrency": "read_only",
             "positional_args": [
                 {
                     "name": "file1",

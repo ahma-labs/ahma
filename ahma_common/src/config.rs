@@ -744,11 +744,13 @@ pub enum ExecutionPolicy {
     /// client can hold the request open (the same bound `await` uses). A
     /// command still running at that bound returns its id with a note to call
     /// `await`, rather than a result lost to a closed connection.
-    #[default]
     Sync,
     /// Wait only a short adaptive inline window (SPEC R2.6.1), then return an
-    /// operation id; the caller collects the result with `await`. Lets a model
-    /// start several long commands in parallel.
+    /// operation id; the caller collects the result with `await`, and thinks
+    /// meanwhile. Safe as the default because commands that may write the
+    /// workspace still run one at a time, in arrival order (the workspace
+    /// write queue, SPEC R2.7).
+    #[default]
     Async,
 }
 
@@ -801,12 +803,12 @@ pub struct ToolSettings {
     /// want progress notifications back.
     /// Default: `false`
     pub force_progress_notifications: bool,
-    /// `"sync"` waits for each command to finish and returns its result;
     /// `"async"` returns an operation id after a short inline window and the
-    /// caller collects the result with `await` (see [`ExecutionPolicy`]).
-    /// Replaces the retired `force_sync` key, which is still parsed and ignored
-    /// (sync is now the default it used to opt into).
-    /// Default: `"sync"`
+    /// caller collects the result with `await`, while writers stay ordered by
+    /// the workspace write queue; `"sync"` waits for each command to finish
+    /// and returns its result (see [`ExecutionPolicy`]). The retired
+    /// `force_sync` key is still parsed and ignored.
+    /// Default: `"async"`
     pub execution_mode: ExecutionPolicy,
     /// Skip tool availability probes at startup.  Probes detect whether required
     /// executables (e.g. `cargo`, `git`) are installed and hide tools whose
@@ -838,13 +840,28 @@ pub struct ToolSettings {
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
     /// Command serialisation groups.  Commands matching a group's prefix are
-    /// serialised per working directory (at most one runs at a time within
-    /// that directory).  Defaults to a single `cargo` group so that
+    /// serialised per workspace — the repository root, SPEC R2.7.2 — (at most
+    /// one runs at a time within it).  Defaults to a single `cargo` group so that
     /// `cargo build`, `cargo test`, `cargo clippy`, etc. do not contend on
     /// the shared `target/` directory.
     /// Default: `[{ name = "cargo", prefixes = ["cargo"], max_wait_secs = 600 }]`
     #[serde(default = "default_mutex_groups")]
     pub mutex_groups: Vec<MutexGroupConfig>,
+    /// The workspace write queue (SPEC R2.7): commands that may write a
+    /// workspace run one at a time, in arrival order, across every ahma
+    /// process on the machine; read-only commands skip it under a sandbox that
+    /// forbids writes. Turning it off lets writers overlap again — the pre-R2.7
+    /// behaviour — and is only sensible together with `execution_mode = "sync"`.
+    /// Default: `true`
+    #[serde(default = "default_true")]
+    pub workspace_queue: bool,
+    /// Refuse ahma's own file edits (`write_file`, `replace_in_file`,
+    /// `multi_edit`, `apply_patch`) while a command that may write the same
+    /// workspace is running, naming it (SPEC R2.7.8). The same check backs the
+    /// opt-in pre-edit hooks installed by `ahma hooks install --edit-guard`.
+    /// Default: `true`
+    #[serde(default = "default_true")]
+    pub edit_guard: bool,
 }
 
 impl Default for ToolSettings {
@@ -864,6 +881,8 @@ impl Default for ToolSettings {
             context_length: None,
             max_turns: default_max_turns(),
             mutex_groups: default_mutex_groups(),
+            workspace_queue: true,
+            edit_guard: true,
         }
     }
 }
@@ -2083,10 +2102,22 @@ impl AhmaSettings {
             d.tools.max_turns.to_string(),
         );
         w.setting(
-            "Command serialisation groups (per-dir mutex; set [] to disable).",
+            "Command serialisation groups (per-workspace mutex; set [] to disable).",
             "mutex_groups",
             toml_mutex_groups(&self.tools.mutex_groups),
             toml_mutex_groups(&d.tools.mutex_groups),
+        );
+        w.setting(
+            "Workspace write queue: writers run one at a time, in arrival order (SPEC R2.7).",
+            "workspace_queue",
+            self.tools.workspace_queue.to_string(),
+            d.tools.workspace_queue.to_string(),
+        );
+        w.setting(
+            "Refuse ahma's own file edits while a workspace writer runs (SPEC R2.7.8).",
+            "edit_guard",
+            self.tools.edit_guard.to_string(),
+            d.tools.edit_guard.to_string(),
         );
 
         // ── Sandbox & filesystem security ────────────────────────────────────
@@ -2881,7 +2912,7 @@ mod tests {
                 idle_timeout_secs: 789,
                 request_budget_override_secs: Some(120),
                 force_progress_notifications: true,
-                execution_mode: ExecutionPolicy::Async,
+                execution_mode: ExecutionPolicy::Sync,
                 skip_probes: true,
                 tools_dir: Some(PathBuf::from("/opt/tools")),
                 tool_bundles: vec!["rust".into(), "git".into()],
@@ -2894,6 +2925,8 @@ mod tests {
                     prefixes: vec!["gradle".into(), "./gradlew".into()],
                     max_wait_secs: 42,
                 }],
+                workspace_queue: false,
+                edit_guard: false,
             },
             sandbox: SandboxSettings {
                 disable: true,
@@ -3087,7 +3120,7 @@ mod tests {
         // A file that asserts a default (timeout_secs = 1800) and an override.
         std::fs::write(
             &path,
-            "[tools]\ntimeout_secs = 1800\nexecution_mode = \"async\"\n",
+            "[tools]\ntimeout_secs = 1800\nexecution_mode = \"sync\"\n",
         )
         .unwrap();
 
@@ -3099,7 +3132,7 @@ mod tests {
             "default value de-asserted into a comment; got:\n{text}"
         );
         assert!(
-            text.contains("\nexecution_mode = \"async\"\n"),
+            text.contains("\nexecution_mode = \"sync\"\n"),
             "override preserved as active; got:\n{text}"
         );
         // Now idempotent.
@@ -3505,7 +3538,15 @@ default_model = "llama3.2"
         assert_eq!(s.tools.timeout_secs, 1800);
         assert_eq!(s.tools.await_timeout_secs, 1800);
         assert_eq!(s.tools.idle_timeout_secs, 1800);
-        assert_eq!(s.tools.execution_mode, crate::config::ExecutionPolicy::Sync);
+        assert_eq!(
+            s.tools.execution_mode,
+            crate::config::ExecutionPolicy::Async
+        );
+        assert!(
+            s.tools.workspace_queue,
+            "async is only the default with the queue on"
+        );
+        assert!(s.tools.edit_guard);
         assert!(!s.tools.skip_probes);
     }
 
@@ -3563,7 +3604,10 @@ timeout_secs = 600
         assert_eq!(s.tools.timeout_secs, 600);
         // Non-overridden values stay at defaults
         assert_eq!(s.lmstudio.base_url, "http://localhost:1234/v1");
-        assert_eq!(s.tools.execution_mode, crate::config::ExecutionPolicy::Sync);
+        assert_eq!(
+            s.tools.execution_mode,
+            crate::config::ExecutionPolicy::Async
+        );
         assert_eq!(s.logging.target, "file");
     }
 
@@ -3866,21 +3910,24 @@ mod removed_key_compat_tests {
         assert!(s.tools.skip_probes, "sibling keys must still apply");
     }
 
-    /// `force_sync` was replaced by `execution_mode`. Old files still carry it
-    /// — `force_sync = true` from users who opted in, and nothing else, since
-    /// defaults were written as comments — so it must parse, and the only
-    /// value it could hold, `true`, is what the new default already does.
+    /// `force_sync` was replaced by `execution_mode`. Old files still carry it,
+    /// so it must parse — and it is ignored: the mode is `execution_mode` alone
+    /// (async by default since the workspace write queue, SPEC R2.7), set to
+    /// `"sync"` by whoever still wants every call to block.
     #[test]
-    fn retired_force_sync_key_is_ignored_and_sync_is_the_default() {
-        let s = AhmaSettings::parse("[tools]\nforce_sync = true\n")
-            .expect("the retired force_sync key must not make the file unparseable");
+    fn retired_force_sync_key_is_ignored() {
+        for value in ["true", "false"] {
+            let s = AhmaSettings::parse(&format!("[tools]\nforce_sync = {value}\n"))
+                .expect("the retired force_sync key must not make the file unparseable");
+            assert_eq!(
+                s.tools.execution_mode,
+                crate::config::ExecutionPolicy::Async,
+                "force_sync = {value} must not change the mode"
+            );
+        }
+        let s =
+            AhmaSettings::parse("[tools]\nforce_sync = true\nexecution_mode = \"sync\"\n").unwrap();
         assert_eq!(s.tools.execution_mode, crate::config::ExecutionPolicy::Sync);
-        let s = AhmaSettings::parse("[tools]\nforce_sync = false\n").unwrap();
-        assert_eq!(
-            s.tools.execution_mode,
-            crate::config::ExecutionPolicy::Sync,
-            "an explicit false never meant async; async is opt-in via execution_mode"
-        );
     }
 
     #[test]

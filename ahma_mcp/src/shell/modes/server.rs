@@ -1130,6 +1130,8 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             mutex_groups: ahma_common::config::default_mutex_groups(),
+            workspace_queue: true,
+            edit_guard: true,
             settings_origin: crate::shell::cli::SettingsOriginCtx::default(),
             daemon_idle_timeout_secs: 60,
             daemon_socket_explicit: false,

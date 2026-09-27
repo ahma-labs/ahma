@@ -115,7 +115,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
 >   container_root = "~/github"
 >   ```
 >   ahma narrows the writable scope from there to the one project you are actually working in, keeping the rest of the container readable but not writable.
-> - **You do not need a "sync" flag.** By default (`tools.execution_mode = "sync"`) a command returns its output in the same response, waiting as long as your client tolerates on one open request (SPEC R2.6). Set `async` ([settings.md](settings.md#sync-or-async-toolsexecution_mode)) to get an operation id back after a short window and collect results with `await`. Sending `"sync": true` to `run_terminal_command` does nothing; the result will say so.
+> - **You do not need a "sync" flag.** By default (`tools.execution_mode = "async"`) a command that finishes within a short window returns its output in the same response; a longer one returns an operation id to collect with `await`, while writers stay ordered by the workspace write queue ([workspace-queue.md](workspace-queue.md)). Set `sync` ([settings.md](settings.md#sync-or-async-toolsexecution_mode)) to make every call wait for its result, as long as your client tolerates on one open request (SPEC R2.6). Sending `"sync": true` to `run_terminal_command` does nothing; the result will say so.
 
 ## 2. HTTP Mode (EXPERIMENTAL)
 

@@ -71,9 +71,11 @@ Run `ahma settings init` to generate this file automatically.
 # idle_timeout_secs = 1800  # tool execution idle timeout (seconds without output); 0 disables
 # request_budget_override_secs = 0 # override the fallback single-request budget (SPEC R2.6.5); 0 = unset, use the built-in default
 # force_progress_notifications = false # send progress to Cursor despite its client-side logging quirk
-# execution_mode = "sync"  # "sync": wait for each command's result (within what the
-#                          # client can wait for); "async": return an operation id
-#                          # after a short window, collect with `await`. See below.
+# execution_mode = "async" # "async": return an operation id after a short window,
+#                          # collect with `await`; "sync": wait for each command's
+#                          # result (within what the client can wait for). See below.
+# workspace_queue = true   # writers run one at a time per workspace, in arrival order
+# edit_guard = true        # refuse ahma's own file edits while a writer runs
 # skip_probes  = false    # skip availability probes at startup
 # minimize_tokens     = false # `ahma tui` chat: ask the model for terse answers
 # small_model_harness = false # `ahma tui` chat: tighter result/conversation budgets
@@ -125,20 +127,32 @@ only decides how long the call waits before answering:
 
 | Mode | What a call returns | Use it when |
 |---|---|---|
-| `sync` (default) | The command's result, once it finishes. If it outlasts what the client can hold one request open for, the call returns the operation id and says to `await` it — the result is never lost to a closed connection. | Almost always: run a command, read its output, like a terminal. |
-| `async` | The result if the command finishes within a short adaptive window (≈10 s idle, ≈1 s when other work is running), otherwise an operation id to collect with `await`. | A model that deliberately starts several long builds or test runs in parallel. |
+| `async` (default) | The result if the command finishes within a short adaptive window (≈10 s idle, ≈1 s when other work is running), otherwise an operation id to collect with `await` — the model keeps thinking while a long build or test run goes on. | Almost always. |
+| `sync` | The command's result, once it finishes. If it outlasts what the client can hold one request open for, the call returns the operation id and says to `await` it — the result is never lost to a closed connection. | A client or model that handles operation ids badly. |
+
+Async is safe as the default because of the **workspace write queue**: commands
+that may write a workspace run one at a time, in the order they were sent,
+across every ahma session on the machine; read-only commands skip the queue under
+a sandbox that forbids them to write; a result nobody collected is delivered with
+the next tool result. See [workspace-queue.md](workspace-queue.md).
 
 Set it any of these ways (highest priority first):
 
 - `--sync` / `--async` on the command line (the last one given wins);
-- `execution_mode = "async"` under `[tools]` in a project's `.ahma/settings.toml`;
+- `execution_mode = "sync"` under `[tools]` in a project's `.ahma/settings.toml`;
 - the same in `~/.ahma/settings.toml`;
 - in `ahma tui`: `/sync` or `/async`, or **Settings → Tools → Execution** (Space
   cycles, `s` saves). Both write `~/.ahma/settings.toml`.
 
 A running ahma session read its mode when it started: a change reaches new
 sessions, and a running one after it restarts (the agent's `restart` tool).
-Details: SPEC R2.1, R2.4.
+
+| Key (`[tools]`) | Default | Effect |
+|---|---|---|
+| `workspace_queue` | `true` | Writers run one at a time per workspace, in arrival order (SPEC R2.7). Off restores unordered async — only sensible with `execution_mode = "sync"`. |
+| `edit_guard` | `true` | ahma's own `write_file`/`replace_in_file`/`multi_edit`/`apply_patch` refuse an edit while a writer runs in that workspace (SPEC R2.7.8). |
+
+Details: SPEC R2.1, R2.4, R2.7.
 
 ---
 

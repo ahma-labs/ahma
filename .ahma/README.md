@@ -113,11 +113,18 @@ All tool configurations follow the MCP Tool Definition Format (MTDF) schema. Onl
 }
 ```
 
-By default a tool call waits for its result (`tools.execution_mode = "sync"`); with
-`--async` (or `execution_mode = "async"`) a command that is still running after a
-few seconds returns an operation ID to collect with `await`. Choose the mode for
+By default (`tools.execution_mode = "async"`) a command that is still running after
+a few seconds returns an operation ID to collect with `await`; with `--sync` (or
+`execution_mode = "sync"`) a tool call waits for its result. Choose the mode for
 the server rather than with the per-subcommand `synchronous` field, which is
 deprecated. See [docs/settings.md](../docs/settings.md#sync-or-async-toolsexecution_mode).
+
+A tool (or subcommand) that only reads can declare `"concurrency": "read_only"`: it
+then runs at once, even while a build holds the workspace, under a sandbox that
+cannot write the workspace. `"service"` marks a long-lived process (a dev server)
+that must not hold the workspace write queue for its whole life. The default,
+`"exclusive"`, runs one at a time per workspace, in arrival order. See
+[docs/workspace-queue.md](../docs/workspace-queue.md).
 
 ## Validation Tools
 

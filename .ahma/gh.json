@@ -51,6 +51,7 @@
         {
             "name": "pr_list",
             "description": "List pull requests with flexible filtering options.",
+            "concurrency": "read_only",
             "options": [
                 {
                     "name": "repo",
@@ -77,6 +78,7 @@
         {
             "name": "pr_view",
             "description": "View detailed information about a pull request.",
+            "concurrency": "read_only",
             "positional_args": [
                 {
                     "name": "pr_selector",
@@ -132,6 +134,7 @@
         {
             "name": "cache_list",
             "description": "List GitHub Actions caches for a repository.",
+            "concurrency": "read_only",
             "options": [
                 {
                     "name": "repo",
@@ -235,6 +238,7 @@
         {
             "name": "run_list",
             "description": "List recent workflow runs for a repository.",
+            "concurrency": "read_only",
             "options": [
                 {
                     "name": "repo",
@@ -266,6 +270,7 @@
         {
             "name": "run_view",
             "description": "View details for a specific workflow run.",
+            "concurrency": "read_only",
             "positional_args": [
                 {
                     "name": "run_id",
@@ -290,6 +295,7 @@
         {
             "name": "run_watch",
             "description": "Stream updates for a workflow run until completion.",
+            "concurrency": "service",
             "positional_args": [
                 {
                     "name": "run_id",
@@ -309,6 +315,7 @@
         {
             "name": "workflow_view",
             "description": "View metadata for a workflow definition.",
+            "concurrency": "read_only",
             "positional_args": [
                 {
                     "name": "workflow_selector",
@@ -333,6 +340,7 @@
         {
             "name": "workflow_list",
             "description": "List workflows configured for a repository.",
+            "concurrency": "read_only",
             "options": [
                 {
                     "name": "repo",

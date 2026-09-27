@@ -3,13 +3,37 @@ use std::path::{Path, PathBuf};
 
 use super::core::Sandbox;
 
+/// Read access to `path`, plus write access when `writable` (the read-only
+/// lane passes `false`, SPEC R2.7.4).
+fn macos_path_rules(path: &Path, writable: bool) -> String {
+    let mut rules = format!("(allow file-read* (subpath \"{}\"))\n", path.display());
+    if writable {
+        rules.push_str(&format!(
+            "(allow file-write* (subpath \"{}\"))\n",
+            path.display()
+        ));
+    }
+    rules
+}
+
 impl Sandbox {
     pub(super) fn build_macos_sandbox_command(
         &self,
         command: &[String],
         working_dir: &Path,
     ) -> Result<(String, Vec<String>)> {
-        let profile = self.generate_seatbelt_profile(working_dir);
+        self.build_macos_sandbox_command_with(command, working_dir, true)
+    }
+
+    /// [`Self::build_macos_sandbox_command`] with the workspace's write access
+    /// chosen: `writable = false` is the read-only lane (SPEC R2.7.4).
+    pub(super) fn build_macos_sandbox_command_with(
+        &self,
+        command: &[String],
+        working_dir: &Path,
+        writable: bool,
+    ) -> Result<(String, Vec<String>)> {
+        let profile = self.generate_seatbelt_profile_with(working_dir, writable);
 
         let mut args = vec!["-p".to_string(), profile];
         args.extend(command.iter().cloned());
@@ -24,17 +48,38 @@ impl Sandbox {
         self.generate_seatbelt_profile(working_dir)
     }
 
+    /// Expose the read-only-lane profile for test inspection (SPEC R2.7.4).
+    #[doc(hidden)]
+    pub fn generate_read_only_seatbelt_profile_test(&self, working_dir: &Path) -> String {
+        self.generate_seatbelt_profile_with(working_dir, false)
+    }
+
     fn generate_seatbelt_profile(&self, working_dir: &Path) -> String {
+        self.generate_seatbelt_profile_with(working_dir, true)
+    }
+
+    fn generate_seatbelt_profile_with(&self, working_dir: &Path, writable: bool) -> String {
         let wd_str = working_dir.to_string_lossy();
-        let scope_rules = self.get_macos_scope_rules();
+        let scope_rules = self.get_macos_scope_rules(writable);
         let read_scopes_rules = self.get_macos_read_scopes_rules();
         let git_resolution_roots = self.git_resolution_roots(working_dir);
-        let git_dir_rules = self.get_macos_git_dir_rules(&git_resolution_roots);
+        let git_dir_rules = self.get_macos_git_dir_rules(&git_resolution_roots, writable);
+        let working_dir_write = if writable {
+            format!("(allow file-write* (subpath \"{wd_str}\"))\n")
+        } else {
+            String::new()
+        };
         let system_rules = self.get_macos_system_rules();
         let credential_deny_rules = self.get_macos_credential_deny_rules();
         let keychain_rules = self.get_macos_keychain_rules();
         let profile_rules = self.get_macos_profile_rules();
-        let temp_rules = self.get_macos_temp_rules();
+        // The read-only lane grants no temp writes either: a workspace under
+        // the temp directory would otherwise be writable through that rule.
+        let temp_rules = if writable {
+            self.get_macos_temp_rules()
+        } else {
+            String::new()
+        };
         let network_rules = self.get_macos_network_rules();
         let exec_config_deny_rules = self.get_macos_exec_config_deny_rules(&git_resolution_roots);
 
@@ -45,8 +90,7 @@ impl Sandbox {
 (allow signal)
 (allow sysctl-read)
 {system_rules}{git_dir_rules}{credential_deny_rules}{keychain_rules}{profile_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
-(allow file-write* (subpath "{working_dir}"))
-{temp_rules}(allow file-read* (literal "/dev/null"))
+{working_dir_write}{temp_rules}(allow file-read* (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))
 (allow file-read* (literal "/dev/tty"))
 (allow file-write* (literal "/dev/tty"))
@@ -56,6 +100,7 @@ impl Sandbox {
 (allow ipc-posix-shm*)
 "#,
             working_dir = wd_str,
+            working_dir_write = working_dir_write,
             system_rules = system_rules,
             credential_deny_rules = credential_deny_rules,
             keychain_rules = keychain_rules,
@@ -104,7 +149,7 @@ impl Sandbox {
     /// private-key regex, container sockets, `<git_dir>/hooks` — has to outrank
     /// them. `git_dir_allow_rules_come_before_credential_denies` asserts the byte
     /// offsets.
-    fn get_macos_git_dir_rules(&self, roots: &[PathBuf]) -> String {
+    fn get_macos_git_dir_rules(&self, roots: &[PathBuf], writable: bool) -> String {
         let scopes = self.scopes.read().to_vec();
         let grants = super::exec_config::grantable_git_dirs(roots, &scopes);
 
@@ -119,23 +164,15 @@ impl Sandbox {
                 grant.path.display(),
                 grant.basis
             );
-            rules.push_str(&format!(
-                "(allow file-read* (subpath \"{}\"))\n(allow file-write* (subpath \"{}\"))\n",
-                grant.path.display(),
-                grant.path.display()
-            ));
+            rules.push_str(&macos_path_rules(&grant.path, writable));
         }
         rules
     }
 
-    fn get_macos_scope_rules(&self) -> String {
+    fn get_macos_scope_rules(&self, writable: bool) -> String {
         let mut rules = String::new();
         for scope in self.scopes.read().iter() {
-            rules.push_str(&format!(
-                "(allow file-read* (subpath \"{}\"))\n(allow file-write* (subpath \"{}\"))\n",
-                scope.display(),
-                scope.display()
-            ));
+            rules.push_str(&macos_path_rules(scope, writable));
         }
         rules
     }

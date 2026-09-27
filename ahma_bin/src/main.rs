@@ -14,8 +14,41 @@ use ahma_mcp::shell::cli::{
 use ahma_mcp::utils::logging::{
     detect_log_role_from_startup, init_logging_with_observability, set_log_role,
 };
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Stack for the thread ahma actually runs on.
+///
+/// The process's own main thread is not used for work, because its stack size is
+/// the platform's choice, not ours: Windows fixes it at 1 MiB in the PE header,
+/// and a debug build of ahma had grown to need ~990 KiB of it just to parse the
+/// command line (clap's derived parser builds the whole command tree on the
+/// stack). A few more flags tipped it over, and every Windows subprocess test
+/// died with `thread 'main' has overflowed its stack` before the MCP handshake.
+/// Running on a thread whose stack we size removes the dependency instead of
+/// shaving bytes until the next flag. The memory is reserved, not committed, so
+/// the generous figure costs nothing until it is used.
+const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    let worker = std::thread::Builder::new()
+        // Keep the name: log lines and panic messages say `main`.
+        .name("main".to_string())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("Failed to start the async runtime")?
+                .block_on(async_main())
+        })
+        .context("Failed to start ahma's main thread")?;
+    match worker.join() {
+        Ok(result) => result,
+        // Re-raise the panic on the real main thread so the exit status and the
+        // message are exactly what they were under `#[tokio::main]`.
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+async fn async_main() -> Result<()> {
     let result = run().await;
     // A failed outside service (GitHub, a model server, the daemon) is shown
     // summary-first (SPEC R-HTTP.3), not in anyhow's `Error: … Caused by:`

@@ -13,6 +13,7 @@
         {
             "name": "status",
             "description": "Show the working tree status and staged changes. Automatically runs synchronously when worktree is small.",
+            "concurrency": "read_only",
             "options": [
                 {
                     "name": "short",
@@ -125,6 +126,7 @@
         {
             "name": "log",
             "description": "Show commit logs with common formatting options. Runs asynchronously, returns an id immediately, and will notify you on completion so continue working while it processes.",
+            "concurrency": "read_only",
             "options": [
                 {
                     "name": "oneline",

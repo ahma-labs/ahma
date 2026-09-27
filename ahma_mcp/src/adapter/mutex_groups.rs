@@ -14,9 +14,11 @@
 //! * "Blocking waiting for file lock on build directory" log spam.
 //! * Cascading timeouts when an AI agent queues several cargo commands at once.
 //!
-//! [`CommandMutexRegistry`] gates these commands behind a per-directory semaphore
-//! so at most one runs at a time **within each working directory**.  Commands in
-//! different directories are entirely independent and never block each other.
+//! [`CommandMutexRegistry`] gates these commands behind a per-workspace semaphore
+//! so at most one runs at a time **within each workspace** — the repository root
+//! (SPEC R2.7.2), not the working directory: `cargo test` in `crate_a/` and
+//! `cargo build` at the root share one `target/`, so they share one gate.
+//! Commands in different workspaces never block each other.
 //!
 //! ## Two layers of serialisation
 //!
@@ -27,7 +29,10 @@
 //!    across ahma sessions, hook invocations, and any other OS processes.
 //!    The lock is automatically released by the OS when the owning process
 //!    exits for any reason (including panic, `SIGKILL`, or crash).  No stale
-//!    locks, no manual cleanup.
+//!    locks, no manual cleanup.  The rendezvous file lives in the per-user
+//!    runtime lock directory, **never in the workspace**: a file the agent can
+//!    delete (or `git clean -fdx` can sweep) while it is held lets a second
+//!    holder in, and an untracked lock file is `git status` noise.
 //!
 //! ## Configuration
 //!
@@ -94,6 +99,8 @@ pub struct CommandMutexRegistry {
     groups: Vec<MutexGroupConfig>,
     /// Lazily-created semaphores, one per `(group_name, canonical_dir)` pair.
     semaphores: Arc<SemaphoreMap>,
+    /// Where the cross-process rendezvous files live. `None` = in-process only.
+    lock_dir: Option<PathBuf>,
 }
 
 impl CommandMutexRegistry {
@@ -101,9 +108,18 @@ impl CommandMutexRegistry {
     ///
     /// Pass an empty slice to disable all mutex gating.
     pub fn from_config(groups: &[MutexGroupConfig]) -> Self {
+        Self::from_config_with_lock_dir(groups, super::workspace_queue::default_lock_dir())
+    }
+
+    /// [`Self::from_config`] with an explicit rendezvous directory (tests).
+    pub fn from_config_with_lock_dir(
+        groups: &[MutexGroupConfig],
+        lock_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             groups: groups.to_vec(),
             semaphores: Arc::new(RwLock::new(HashMap::new())),
+            lock_dir,
         }
     }
 
@@ -119,14 +135,15 @@ impl CommandMutexRegistry {
             .find(|g| g.prefixes.iter().any(|p| p.to_ascii_lowercase() == low))
     }
 
-    /// Acquire the mutex group gate for `(group.name, canonical(working_dir))`.
+    /// Acquire the mutex group gate for `(group.name, canonical(workspace))`.
     ///
+    /// `workspace` is the workspace key (SPEC R2.7.2), not the working directory.
     /// This acquires **two layers** of serialisation:
     ///
     /// 1. An in-memory semaphore permit (prevents intra-process thundering herd).
     /// 2. A cross-process filesystem advisory lock on
-    ///    `<working_dir>/.ahma-<group>.lock` (serialises across ahma sessions,
-    ///    hooks, and external processes).
+    ///    `<lock dir>/grp-<group>-<workspace id>.lock` (serialises across ahma
+    ///    sessions, hooks, and external processes).
     ///
     /// Blocks until:
     /// * Both locks become available, or
@@ -184,13 +201,22 @@ impl CommandMutexRegistry {
         };
 
         // ── Layer 2: cross-process filesystem advisory lock ─────────────
-        // The lockfile lives inside the working directory so it's workspace-
-        // scoped and cleaned by `cargo clean` (if in target/).  The filename
-        // includes the group name to avoid collisions if we ever add non-cargo
-        // groups.
-        let group_name = group.name.clone();
+        // The rendezvous file lives in the runtime lock directory, keyed by the
+        // workspace — never inside the workspace, where the agent could delete
+        // it while held (see the module docs).
+        let Some(lock_path) = self.lock_dir.as_ref().map(|dir| {
+            dir.join(format!(
+                "grp-{}-{}.lock",
+                sanitize_group_name(&group.name),
+                super::workspace_queue::key_id(&canonical)
+            ))
+        }) else {
+            return Ok(MutexGroupGuard {
+                _permit: permit,
+                _fs_lock: None,
+            });
+        };
         let fs_lock = tokio::task::spawn_blocking(move || {
-            let lock_path = canonical.join(format!(".ahma-{group_name}.lock"));
             match FsLock::acquire(&lock_path) {
                 Ok(lock) => Some(lock),
                 Err(e) => {
@@ -217,6 +243,12 @@ impl CommandMutexRegistry {
         })
     }
 
+    /// Where the cross-process rendezvous files live (tests).
+    #[cfg(test)]
+    pub fn lock_dir(&self) -> Option<&Path> {
+        self.lock_dir.as_deref()
+    }
+
     /// Returns the number of `(group, dir)` semaphores currently tracked.
     ///
     /// Primarily for tests and diagnostics.
@@ -224,6 +256,19 @@ impl CommandMutexRegistry {
     pub async fn semaphore_count(&self) -> usize {
         self.semaphores.read().await.len()
     }
+}
+
+/// A group name made safe for a file name.
+fn sanitize_group_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +280,7 @@ mod tests {
     use super::*;
     use ahma_common::config::MutexGroupConfig;
     use std::sync::Arc;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
     use tokio::time::{Duration, sleep};
 
     fn cargo_group() -> MutexGroupConfig {
@@ -246,15 +291,22 @@ mod tests {
         }
     }
 
-    fn registry() -> CommandMutexRegistry {
-        CommandMutexRegistry::from_config(&[cargo_group()])
+    /// A registry whose rendezvous files go to a private temp dir, so tests
+    /// never touch the user's runtime directory.
+    fn registry() -> (TempDir, CommandMutexRegistry) {
+        let locks = tempdir().unwrap();
+        let reg = CommandMutexRegistry::from_config_with_lock_dir(
+            &[cargo_group()],
+            Some(locks.path().join("locks")),
+        );
+        (locks, reg)
     }
 
     // ── find_group ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_find_group_matches_cargo_prefix() {
-        let reg = registry();
+        let (_locks, reg) = registry();
         assert!(reg.find_group("cargo build").is_some());
         assert!(reg.find_group("cargo nextest run --all").is_some());
         assert!(reg.find_group("CARGO check").is_some()); // case-insensitive
@@ -262,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_find_group_no_match_for_unrelated_command() {
-        let reg = registry();
+        let (_locks, reg) = registry();
         assert!(reg.find_group("git status").is_none());
         assert!(reg.find_group("echo hello").is_none());
         assert!(reg.find_group("").is_none());
@@ -279,7 +331,8 @@ mod tests {
     #[tokio::test]
     async fn test_same_dir_serialises_commands() {
         let td = tempdir().unwrap();
-        let reg = Arc::new(registry());
+        let (_locks, reg) = registry();
+        let reg = Arc::new(reg);
         let group = cargo_group();
 
         // Acquire the permit in task A.
@@ -306,7 +359,8 @@ mod tests {
     async fn test_different_dirs_run_in_parallel() {
         let td1 = tempdir().unwrap();
         let td2 = tempdir().unwrap();
-        let reg = Arc::new(registry());
+        let (_locks, reg) = registry();
+        let reg = Arc::new(reg);
         let group = cargo_group();
 
         // Acquire permit for dir1.
@@ -330,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_times_out_when_held() {
         let td = tempdir().unwrap();
-        let reg = registry();
+        let (_locks, reg) = registry();
         let short_group = MutexGroupConfig {
             name: "cargo".to_string(),
             prefixes: vec!["cargo".to_string()],
@@ -348,13 +402,57 @@ mod tests {
         );
     }
 
+    // ── rendezvous file location ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn the_lock_file_is_never_created_inside_the_workspace() {
+        let workspace = tempdir().unwrap();
+        let (_locks, reg) = registry();
+        let _guard = reg.acquire(&cargo_group(), workspace.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read_dir(workspace.path()).unwrap().count(),
+            0,
+            "the workspace must stay untouched"
+        );
+        let lock_dir = reg.lock_dir().unwrap();
+        let files: Vec<_> = std::fs::read_dir(lock_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].starts_with("grp-cargo-"), "{files:?}");
+    }
+
+    #[tokio::test]
+    async fn two_registries_serialise_through_the_shared_lock_dir() {
+        // Two registries stand in for two ahma processes: they share nothing
+        // in memory, only the rendezvous directory.
+        let workspace = tempdir().unwrap();
+        let locks = tempdir().unwrap();
+        let dir = locks.path().join("locks");
+        let a =
+            CommandMutexRegistry::from_config_with_lock_dir(&[cargo_group()], Some(dir.clone()));
+        let b = Arc::new(CommandMutexRegistry::from_config_with_lock_dir(
+            &[cargo_group()],
+            Some(dir),
+        ));
+        let held = a.acquire(&cargo_group(), workspace.path()).await.unwrap();
+        let ws = workspace.path().to_path_buf();
+        let b2 = b.clone();
+        let handle = tokio::spawn(async move { b2.acquire(&cargo_group(), &ws).await.map(|_| ()) });
+        sleep(Duration::from_millis(100)).await;
+        assert!(!handle.is_finished(), "b must wait for a");
+        drop(held);
+        handle.await.unwrap().unwrap();
+    }
+
     // ── lazy semaphore creation ───────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_semaphore_created_lazily_per_dir() {
         let td1 = tempdir().unwrap();
         let td2 = tempdir().unwrap();
-        let reg = registry();
+        let (_locks, reg) = registry();
         let group = cargo_group();
 
         assert_eq!(reg.semaphore_count().await, 0);

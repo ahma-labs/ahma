@@ -9,6 +9,7 @@ pub fn make_subcommand(name: &str, enabled: bool) -> SubcommandConfig {
     SubcommandConfig {
         extra: Default::default(),
         mutates: None,
+        concurrency: None,
         name: name.to_string(),
         description: format!("{} subcommand", name),
         enabled,
@@ -24,6 +25,7 @@ pub fn make_subcommand_with_nested(
     SubcommandConfig {
         extra: Default::default(),
         mutates: None,
+        concurrency: None,
         name: name.to_string(),
         description: format!("{} subcommand", name),
         subcommand: Some(nested),

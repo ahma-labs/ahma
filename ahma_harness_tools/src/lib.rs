@@ -28,6 +28,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+pub mod drift;
 pub mod edit;
 pub mod egress_guard;
 

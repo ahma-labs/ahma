@@ -124,8 +124,14 @@ pub struct AppConfig {
     pub small_model_harness: bool,
     /// Command serialisation mutex groups (from settings.toml `[tools].mutex_groups`).
     /// Each group gates commands whose first token matches one of `prefixes`,
-    /// serialising them per working directory.
+    /// serialising them per workspace.
     pub mutex_groups: Vec<MutexGroupConfig>,
+    /// The workspace write queue (settings.toml `[tools].workspace_queue`,
+    /// SPEC R2.7).
+    pub workspace_queue: bool,
+    /// Refuse ahma's own file edits while a workspace writer runs
+    /// (settings.toml `[tools].edit_guard`, SPEC R2.7.8).
+    pub edit_guard: bool,
 
     // ── Sandbox ─────────────────────────────────────────────────────────────
     /// Disable the kernel sandbox entirely (AHMA_DISABLE_SANDBOX=1).
@@ -277,6 +283,8 @@ impl Default for AppConfig {
             minimize_tokens: false,
             small_model_harness: false,
             mutex_groups: ahma_common::config::default_mutex_groups(),
+            workspace_queue: true,
+            edit_guard: true,
 
             no_sandbox: false,
             restrict_network: false,
@@ -3143,6 +3151,8 @@ pub fn build_app_config_with_settings(
         minimize_tokens,
         small_model_harness,
         mutex_groups,
+        workspace_queue: s.tools.workspace_queue,
+        edit_guard: s.tools.edit_guard,
 
         no_sandbox: sandbox.no_sandbox,
         restrict_network: cli.restrict_network || s.network.restrict,
@@ -4627,16 +4637,17 @@ mod tests {
             ExecutionPolicy::Sync
         );
 
-        // No flag: the settings value stands; with no settings, sync.
+        // No flag: the settings value stands; with no settings, async.
+        s.tools.execution_mode = ExecutionPolicy::Sync;
         let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
         assert_eq!(
             parse_execution_settings(&cli, &s).execution_mode,
-            ExecutionPolicy::Async
+            ExecutionPolicy::Sync
         );
         let d = ahma_common::config::AhmaSettings::default();
         assert_eq!(
             parse_execution_settings(&cli, &d).execution_mode,
-            ExecutionPolicy::Sync
+            ExecutionPolicy::Async
         );
     }
 
@@ -5055,9 +5066,14 @@ mod tests {
         assert_eq!(cfg.tool_idle_timeout_secs, 1800);
         assert_eq!(
             cfg.execution_mode,
-            ahma_common::config::ExecutionPolicy::Sync,
-            "sync is the default"
+            ahma_common::config::ExecutionPolicy::Async,
+            "async is the default (safe because of the workspace write queue, SPEC R2.7)"
         );
+        assert!(
+            cfg.workspace_queue,
+            "the workspace write queue is on by default"
+        );
+        assert!(cfg.edit_guard, "the edit guard is on by default");
         assert_eq!(cfg.http_host, "127.0.0.1");
         assert_eq!(cfg.http_port, 3000);
         assert!(!cfg.is_server_child);

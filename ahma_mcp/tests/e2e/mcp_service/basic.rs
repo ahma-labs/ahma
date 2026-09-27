@@ -80,6 +80,7 @@ mod mcp_service_tests {
             subcommand: Some(vec![SubcommandConfig {
                 extra: Default::default(),
                 mutates: None,
+                concurrency: None,
                 name: "build".to_string(),
                 description: "Build the project".to_string(),
                 enabled: true,
