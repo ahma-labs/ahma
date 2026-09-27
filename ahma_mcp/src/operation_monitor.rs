@@ -35,7 +35,7 @@ const EVENT_STREAM_CAPACITY: usize = 1024;
 /// bound already applied to `Operation::stdout_tail` (see
 /// [`MAX_TAIL_LINES`]) — without one, a long-lived server session
 /// accumulates one entry per operation for the life of the process.
-const MAX_COMPLETION_HISTORY: usize = 1000;
+pub(crate) const MAX_COMPLETION_HISTORY: usize = 1000;
 
 /// Default bound for [`OperationMonitor::wait_for_operation`].
 ///

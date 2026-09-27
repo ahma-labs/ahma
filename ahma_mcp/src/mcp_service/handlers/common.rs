@@ -470,6 +470,49 @@ fn extract_output_from_result(result: &Option<Value>) -> String {
     format_result_fallback(val)
 }
 
+/// What `await`, `status` and `cancel` say about an operation id this process
+/// does not know (SPEC R-LIFECYCLE.4).
+///
+/// A bare "not found" leaves an agent guessing whether its build failed, is
+/// still running somewhere, or never started. The id's generation tag
+/// ([`crate::utils::operation::generation`]) tells us which of those is true:
+/// an id from another generation predates a restart or an update (or belongs
+/// to another session's process), and the work it named most likely finished
+/// before that — which the agent should verify rather than assume.
+pub fn unknown_operation_message(id: &str) -> String {
+    use crate::utils::operation::{generation, id_generation};
+    let current = generation();
+    let looks_like_op_id = id
+        .strip_prefix("op_")
+        .and_then(|rest| rest.split('_').next())
+        .is_some_and(|first| !first.is_empty() && first.chars().all(|c| c.is_ascii_digit()));
+    match id_generation(id) {
+        Some(g) if g == current => format!(
+            "Operation '{id}' not found: this ahma process issued it, but it is no longer \
+             kept (only the most recent {} completed operations are). It finished; check its \
+             effect before relying on it.",
+            crate::operation_monitor::MAX_COMPLETION_HISTORY
+        ),
+        Some(_) => format!(
+            "Operation '{id}' not found: it was issued by an earlier ahma process, and ahma \
+             has restarted or was updated since (or it belongs to another session). The \
+             operation most likely finished before that, but its result was not kept here — \
+             check its effect before relying on it, or run it again. Any output file it wrote \
+             is still on disk."
+        ),
+        None if looks_like_op_id => format!(
+            "Operation '{id}' not found: it was issued by an older ahma, which has since \
+             restarted or was updated. The operation most likely finished before that, but \
+             its result was not kept here — check its effect before relying on it, or run it \
+             again."
+        ),
+        None => format!(
+            "Operation '{id}' not found: this is not an ahma operation id. Ids look like \
+             `op_{current}_12_cargo_build`; `status` lists the ones this session knows."
+        ),
+    }
+}
+
 #[cfg(test)]
 #[path = "common_tests.rs"]
 mod tests;

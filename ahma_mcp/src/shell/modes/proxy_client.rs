@@ -36,11 +36,23 @@ use tokio::sync::mpsc;
 /// the first occurrence — see the gone-endpoint branch in `run_transport_proxy`.
 const MAX_CONSECUTIVE_FORWARD_FAILURES: u32 = 3;
 
-/// How many reconnect attempts the proxy makes against a genuinely-dead bridge
-/// transport before giving up and exiting for good. Each attempt rebuilds the
-/// bridge connection and replays the cached handshake; a transient bridge
-/// restart typically recovers within one or two attempts.
+/// How many reconnect attempts make up one recovery burst. Each attempt
+/// rebuilds the bridge connection and replays the cached handshake; a transient
+/// bridge restart typically recovers within one or two attempts.
+///
+/// A failed burst does **not** end the session (SPEC R-LIFECYCLE.3): while the editor
+/// is attached the proxy stays attached, answers requests with
+/// [`BRIDGE_UNREACHABLE_MESSAGE`] and runs another burst on the next request.
+/// Exiting instead left the editor showing ahma as dead until the user
+/// reconnected by hand, although the next hub was one respawn away.
 const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+
+/// What a request is answered with while the bridge cannot be reached.
+#[cfg(unix)]
+const BRIDGE_UNREACHABLE_MESSAGE: &str = "ahma is restarting or unreachable. This connection \
+     stays open and reconnects automatically on your next request, so retry shortly. \
+     Operations started before the restart may have finished; check their effect (or \
+     `status`) before re-running them.";
 
 /// The handshake messages captured the first time they flow through the proxy,
 /// so a dead bridge transport can be reconnected *invisibly to the downstream
@@ -507,6 +519,27 @@ fn reconnected_detail(reconnects: u32, cause: &str, in_flight_resent: bool) -> s
     })
 }
 
+/// The `detail` of a `reconnect_failed` event: the bridge is unreachable, but
+/// the session is not over — the proxy retries on the next request.
+#[cfg(unix)]
+fn reconnect_failed_detail(err: &anyhow::Error) -> serde_json::Value {
+    serde_json::json!({
+        "cause": err.to_string(),
+        "attempts": MAX_RECONNECT_ATTEMPTS,
+        "message": "ahma bridge is unreachable; this connection stays open and \
+                    reconnects automatically on the next request",
+    })
+}
+
+/// The JSON-RPC error a request gets while the bridge is unreachable.
+#[cfg(unix)]
+fn bridge_unreachable_error() -> serde_json::Value {
+    serde_json::json!({
+        "code": ahma_common::mcp_methods::JSONRPC_REQUEST_TIMEOUT,
+        "message": BRIDGE_UNREACHABLE_MESSAGE,
+    })
+}
+
 /// Rebuild the bridge connection (via `reconnect`) and replay the cached
 /// handshake, retrying up to [`MAX_RECONNECT_ATTEMPTS`] times with a short
 /// backoff. Returns the freshly reconnected client on success.
@@ -545,8 +578,7 @@ where
                     error = %e,
                     "Reconnect attempt failed"
                 );
-                respawn_after_reconnect_failure(attempt, &e, respawn.as_deref_mut(), transport)
-                    .await;
+                respawn_after_reconnect_failure(&e, respawn.as_deref_mut(), transport).await;
                 last_err = Some(e);
             }
         }
@@ -557,21 +589,17 @@ where
     Err(last_err.unwrap_or_else(|| anyhow!("reconnect failed for an unknown reason")))
 }
 
-/// After a failed reconnect `attempt`, respawn the background bridge when
-/// there is another attempt left to retry *and* the failure proves the
-/// endpoint itself is gone (not merely glitching) *and* a respawn hook is
-/// available. Best-effort: a failed respawn only logs, so the caller still
-/// moves on to the next reconnect attempt.
+/// After a failed reconnect attempt, respawn the background bridge when the
+/// failure proves the endpoint itself is gone (not merely glitching) and a
+/// respawn hook is available. This includes the last attempt of a burst: the
+/// session outlives the burst, so the next request finds a live bridge.
+/// Best-effort: a failed respawn only logs.
 #[cfg(unix)]
 async fn respawn_after_reconnect_failure(
-    attempt: u32,
     err: &anyhow::Error,
     respawn: Option<&mut BridgeRespawnFn>,
     transport: &str,
 ) {
-    if attempt >= MAX_RECONNECT_ATTEMPTS {
-        return;
-    }
     let Some(respawn) = respawn else {
         return;
     };
@@ -845,6 +873,11 @@ where
     // the monotonic seq for the events that disclose them.
     let mut reconnects: u32 = 0;
     let mut event_seq: u64 = 0;
+    // The bridge could not be reached (or closed a handshaken session). The
+    // proxy stays attached and reconnects when the next request arrives.
+    let mut disconnected = false;
+    // Whether this outage has been disclosed; one `reconnect_failed` per outage.
+    let mut outage_disclosed = false;
 
     // Handshake deadline: if the client never sends its first message (the
     // `initialize` handshake) within this window, the connection was spawned
@@ -983,6 +1016,64 @@ where
                     continue;
                 }
                 handshake.observe_client_to_bridge(&val);
+                if disconnected {
+                    match reconnect_with_retries(
+                        reconnect,
+                        &handshake,
+                        transport,
+                        respawn_bridge.as_mut(),
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            let _ =
+                                tokio::time::timeout(Duration::from_secs(2), client.close()).await;
+                            client = fresh;
+                            disconnected = false;
+                            outage_disclosed = false;
+                            consecutive_forward_failures = 0;
+                            bridge_responded = true;
+                            reconnects += 1;
+                            tracing::warn!(
+                                transport,
+                                "Proxy reconnected to a live bridge; session resumed"
+                            );
+                            emit_session_event_downstream(
+                                &mut stdio,
+                                &mut event_seq,
+                                ahma_common::session_event::SessionEventKind::Reconnected,
+                                reconnected_detail(reconnects, "bridge_unreachable", true),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                transport,
+                                error = %e,
+                                "Bridge still unreachable; answering the request with an error"
+                            );
+                            if !outage_disclosed {
+                                outage_disclosed = true;
+                                emit_session_event_downstream(
+                                    &mut stdio,
+                                    &mut event_seq,
+                                    ahma_common::session_event::SessionEventKind::ReconnectFailed,
+                                    reconnect_failed_detail(&e),
+                                )
+                                .await;
+                            }
+                            if let Some(id) = request_id {
+                                relay_forward_failure_to_client(
+                                    &mut stdio,
+                                    id,
+                                    Some(bridge_unreachable_error()),
+                                )
+                                .await;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 // `val` is kept alive past the send: the gone-endpoint recovery
                 // path below resends this exact message on a fresh transport.
                 // The typed message itself is forwarded — the client-to-server
@@ -1148,25 +1239,19 @@ where
                                         transport,
                                         failures = consecutive_forward_failures,
                                         error = %e,
-                                        "Proxy exiting: bridge transport failed repeatedly and \
-                                         reconnect also failed"
+                                        "Bridge transport failed repeatedly and reconnect also \
+                                         failed; staying attached and retrying on the next request"
                                     );
-                                    // Terminal disclosure (#485): the pipe dies
-                                    // next; at least say why.
+                                    disconnected = true;
+                                    outage_disclosed = true;
                                     emit_session_event_downstream(
                                         &mut stdio,
                                         &mut event_seq,
                                         ahma_common::session_event::SessionEventKind::ReconnectFailed,
-                                        serde_json::json!({
-                                            "cause": e.to_string(),
-                                            "attempts": MAX_RECONNECT_ATTEMPTS,
-                                            "message": "ahma bridge is unreachable and reconnect \
-                                                        attempts are exhausted; the server \
-                                                        connection is closing",
-                                        }),
+                                        reconnect_failed_detail(&e),
                                     )
                                     .await;
-                                    break;
+                                    continue;
                                 }
                             }
                         }
@@ -1182,8 +1267,19 @@ where
                 consecutive_forward_failures = 0;
                 forwarded_any = true;
             }
-            client_msg = client.receive() => {
+            client_msg = client.receive(), if !disconnected => {
                 let Some(msg) = client_msg else {
+                    if handshake.init_request.is_some() {
+                        // The bridge exited on idle, crashed, or handed over to
+                        // a newer version. The editor is still attached, so stay
+                        // attached and reconnect when the next request arrives.
+                        tracing::warn!(
+                            transport,
+                            "Bridge connection closed; will reconnect on the next request"
+                        );
+                        disconnected = true;
+                        continue;
+                    }
                     tracing::info!(
                         transport,
                         "Proxy exiting: bridge connection closed"
@@ -1959,6 +2055,10 @@ mod tests {
         /// When true, `send()` always fails (simulates a broken pipe writing back
         /// to the client), instead of recording the message.
         fail_send: bool,
+        /// Optional delay before yielding every inbound message after the first,
+        /// so bridge-side events can be ordered between client requests.
+        inbound_delay: Option<Duration>,
+        yielded: usize,
     }
     impl MockStdio {
         fn new(
@@ -1970,6 +2070,8 @@ mod tests {
                 sent,
                 eof_delay: None,
                 fail_send: false,
+                inbound_delay: None,
+                yielded: 0,
             }
         }
     }
@@ -1992,7 +2094,14 @@ mod tests {
             }
         }
         async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+            if let Some(delay) = self.inbound_delay
+                && self.yielded > 0
+                && !self.inbound.is_empty()
+            {
+                tokio::time::sleep(delay).await;
+            }
             if let Some(msg) = self.inbound.pop_front() {
+                self.yielded += 1;
                 return Some(msg);
             }
             if let Some(delay) = self.eof_delay {
@@ -2305,32 +2414,69 @@ mod tests {
         .await;
     }
 
+    /// A client whose every `send` fails with a transient error: a transport
+    /// that is genuinely dead but not provably gone.
+    fn dead_client() -> MockClient {
+        MockClient {
+            fail_first_n: usize::MAX,
+            fail_sends_from: usize::MAX,
+            send_error_text: TRANSIENT_SEND_ERROR,
+            attempts: Arc::new(AtomicUsize::new(0)),
+            inbound: VecDeque::new(),
+            closed: Arc::new(AtomicUsize::new(0)),
+            receive_none_after: None,
+            receive_call_count: Arc::new(AtomicUsize::new(0)),
+            close_behavior: CloseBehavior::Ok,
+            sent: None,
+        }
+    }
+
+    /// A freshly reconnected client that answers the replayed `initialize` and
+    /// accepts every later send, counting them in `attempts`.
+    fn healthy_client(attempts: Arc<AtomicUsize>) -> MockClient {
+        MockClient {
+            fail_first_n: 0,
+            fail_sends_from: usize::MAX,
+            send_error_text: TRANSIENT_SEND_ERROR,
+            attempts,
+            inbound: VecDeque::from(vec![bridge_response(0)]),
+            closed: Arc::new(AtomicUsize::new(0)),
+            receive_none_after: None,
+            receive_call_count: Arc::new(AtomicUsize::new(0)),
+            close_behavior: CloseBehavior::Ok,
+            sent: None,
+        }
+    }
+
+    fn session_event_kinds(sent: &[serde_json::Value]) -> Vec<String> {
+        sent.iter()
+            .filter(|m| {
+                m.get("method").and_then(|m| m.as_str())
+                    == Some(ahma_common::session_event::SESSION_EVENT_METHOD)
+            })
+            .map(|m| m["params"]["kind"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn reconnect_exhausted_all_attempts_still_exits() {
-        // If the bridge is truly gone (every reconnect attempt fails to even
-        // build a fresh connection), the proxy must still give up and exit —
-        // it must not retry forever.
+    async fn unreachable_bridge_never_ends_the_session() {
+        // REGRESSION: the proxy used to exit for good once one burst of
+        // reconnect attempts failed, and the editor then showed ahma as dead
+        // until the user reconnected by hand. While the editor is attached the
+        // proxy must stay attached: every request is answered (with an error
+        // while the bridge is down) and each new request tries to reconnect.
         with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
             let stdio = MockStdio::new(
                 VecDeque::from(vec![
                     client_initialize(0),
                     client_request(1),
                     client_request(2),
+                    client_request(3),
+                    client_request(4),
                 ]),
-                Arc::new(Mutex::new(Vec::new())),
+                sent.clone(),
             );
-            let dead_client = MockClient {
-                fail_first_n: usize::MAX,
-                fail_sends_from: usize::MAX,
-                send_error_text: TRANSIENT_SEND_ERROR,
-                attempts: Arc::new(AtomicUsize::new(0)),
-                inbound: VecDeque::new(),
-                closed: Arc::new(AtomicUsize::new(0)),
-                receive_none_after: None,
-                receive_call_count: Arc::new(AtomicUsize::new(0)),
-                close_behavior: CloseBehavior::Ok,
-                sent: None,
-            };
             let reconnect_calls = Arc::new(AtomicUsize::new(0));
             let reconnect_calls_inner = reconnect_calls.clone();
             let mut reconnect = move || -> Result<MockClient> {
@@ -2339,22 +2485,31 @@ mod tests {
             };
 
             let result =
-                run_transport_proxy(stdio, dead_client, "test", None, &mut reconnect, None).await;
-            assert!(result.is_ok(), "proxy must exit cleanly, not error out");
+                run_transport_proxy(stdio, dead_client(), "test", None, &mut reconnect, None).await;
+            assert!(result.is_ok(), "proxy must end cleanly at stdio EOF");
+            // One burst when the transport died (after request 2), then one
+            // burst per request that arrived while disconnected (3 and 4).
             assert_eq!(
                 reconnect_calls.load(Ordering::SeqCst),
-                MAX_RECONNECT_ATTEMPTS as usize,
-                "must try reconnecting exactly MAX_RECONNECT_ATTEMPTS times, then give up"
+                3 * MAX_RECONNECT_ATTEMPTS as usize,
+                "each request while disconnected must retry the reconnect"
             );
+            let sent = sent.lock();
+            for id in 0..=4 {
+                assert!(
+                    sent.iter()
+                        .any(|m| m["id"] == serde_json::json!(id) && m.get("error").is_some()),
+                    "request {id} must be answered with an error, got {sent:?}"
+                );
+            }
         })
         .await;
     }
 
     #[tokio::test]
-    async fn reconnect_exhaustion_discloses_reconnect_failed_before_exit() {
-        // Session-health disclosure (#485): when the proxy gives up and the
-        // pipe is about to die, the client receives a terminal
-        // `reconnect_failed` event (error-level mirror) explaining why.
+    async fn unreachable_bridge_is_disclosed_once_without_claiming_the_session_closed() {
+        // Session-health disclosure (#485): losing the bridge is announced once
+        // per outage, not once per request, and says the proxy is still here.
         with_zero_backoff(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
             let stdio = MockStdio::new(
@@ -2362,46 +2517,123 @@ mod tests {
                     client_initialize(0),
                     client_request(1),
                     client_request(2),
+                    client_request(3),
                 ]),
                 sent.clone(),
             );
-            let dead_client = MockClient {
-                fail_first_n: usize::MAX,
-                fail_sends_from: usize::MAX,
-                send_error_text: TRANSIENT_SEND_ERROR,
-                attempts: Arc::new(AtomicUsize::new(0)),
-                inbound: VecDeque::new(),
-                closed: Arc::new(AtomicUsize::new(0)),
-                receive_none_after: None,
-                receive_call_count: Arc::new(AtomicUsize::new(0)),
-                close_behavior: CloseBehavior::Ok,
-                sent: None,
-            };
             let mut reconnect =
                 move || -> Result<MockClient> { Err(anyhow!("simulated: bridge gone")) };
 
             let result =
-                run_transport_proxy(stdio, dead_client, "test", None, &mut reconnect, None).await;
+                run_transport_proxy(stdio, dead_client(), "test", None, &mut reconnect, None).await;
             assert!(result.is_ok());
             let sent = sent.lock();
-            let events: Vec<_> = sent
+            assert_eq!(
+                session_event_kinds(&sent),
+                vec!["reconnect_failed".to_string()],
+                "got {sent:?}"
+            );
+            let event = sent
                 .iter()
-                .filter(|m| {
+                .find(|m| {
                     m.get("method").and_then(|m| m.as_str())
                         == Some(ahma_common::session_event::SESSION_EVENT_METHOD)
                 })
-                .collect();
-            assert_eq!(
-                events.len(),
-                1,
-                "expected 1 reconnect_failed event, got {sent:?}"
+                .unwrap();
+            let message = event["params"]["detail"]["message"].as_str().unwrap();
+            assert!(
+                !message.contains("closing"),
+                "the connection is not closing: {message}"
             );
-            assert_eq!(events[0]["params"]["kind"], "reconnect_failed");
             let mirror = sent
                 .iter()
                 .find(|m| m.get("method").and_then(|m| m.as_str()) == Some("notifications/message"))
                 .expect("logging mirror present");
             assert_eq!(mirror["params"]["level"], "error");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unreachable_bridge_recovers_on_a_later_request() {
+        // The bridge comes back (restarted, or a newer version took over): the
+        // next request reconnects, replays the handshake, is forwarded, and the
+        // recovery is disclosed.
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let stdio = MockStdio::new(
+                VecDeque::from(vec![
+                    client_initialize(0),
+                    client_request(1),
+                    client_request(2),
+                    client_request(3),
+                ]),
+                sent.clone(),
+            );
+            let reconnect_calls = Arc::new(AtomicUsize::new(0));
+            let reconnect_calls_inner = reconnect_calls.clone();
+            let fresh_attempts = Arc::new(AtomicUsize::new(0));
+            let fresh_attempts_inner = fresh_attempts.clone();
+            let mut reconnect = move || -> Result<MockClient> {
+                let n = reconnect_calls_inner.fetch_add(1, Ordering::SeqCst) + 1;
+                if n <= MAX_RECONNECT_ATTEMPTS as usize {
+                    Err(anyhow!("simulated: bridge restarting"))
+                } else {
+                    Ok(healthy_client(fresh_attempts_inner.clone()))
+                }
+            };
+
+            let result =
+                run_transport_proxy(stdio, dead_client(), "test", None, &mut reconnect, None).await;
+            assert!(result.is_ok_and(|responded| responded));
+            // The fresh client saw the replayed initialize and request 3.
+            assert_eq!(fresh_attempts.load(Ordering::SeqCst), 2);
+            let sent = sent.lock();
+            assert!(
+                !sent.iter().any(|m| m["id"] == serde_json::json!(3)),
+                "request 3 was forwarded, not answered with an error: {sent:?}"
+            );
+            assert_eq!(
+                session_event_kinds(&sent),
+                vec!["reconnect_failed".to_string(), "reconnected".to_string()],
+                "got {sent:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bridge_closing_a_handshaken_session_does_not_end_the_proxy() {
+        // The bridge closes its side (it exited on idle, crashed, or handed over
+        // to a newer version). With a handshake to replay, the proxy keeps the
+        // editor attached and reconnects when the next request arrives.
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let mut stdio = MockStdio::new(
+                VecDeque::from(vec![client_initialize(0), client_request(1)]),
+                sent.clone(),
+            );
+            stdio.inbound_delay = Some(Duration::from_millis(50));
+            let first = MockClient {
+                inbound: VecDeque::from(vec![bridge_response(0)]),
+                receive_none_after: Some(1),
+                ..healthy_client(Arc::new(AtomicUsize::new(0)))
+            };
+            let fresh_attempts = Arc::new(AtomicUsize::new(0));
+            let fresh_attempts_inner = fresh_attempts.clone();
+            let mut reconnect =
+                move || -> Result<MockClient> { Ok(healthy_client(fresh_attempts_inner.clone())) };
+
+            let result =
+                run_transport_proxy(stdio, first, "test", None, &mut reconnect, None).await;
+            assert!(result.is_ok());
+            // Replayed initialize + request 1 on the fresh connection.
+            assert_eq!(fresh_attempts.load(Ordering::SeqCst), 2);
+            assert!(
+                session_event_kinds(&sent.lock()).contains(&"reconnected".to_string()),
+                "got {:?}",
+                sent.lock()
+            );
         })
         .await;
     }

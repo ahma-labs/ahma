@@ -494,3 +494,38 @@ async fn an_override_budget_clamps_the_window_regardless_of_client() {
         "window {window:?} must leave the overridden client margin to receive the response"
     );
 }
+
+/// SPEC R-LIFECYCLE.4: an id this process never issued is answered with what
+/// happened to it, not a bare "not found".
+#[test]
+fn unknown_id_from_another_generation_says_ahma_restarted() {
+    let current = crate::utils::operation::generation();
+    let other = if current == "zzzz" { "aaaa" } else { "zzzz" };
+    let msg = unknown_operation_message(&format!("op_{other}_3_cargo_build"));
+    assert!(msg.contains("not found"), "{msg}");
+    assert!(msg.contains("restarted or was updated"), "{msg}");
+    assert!(msg.contains("most likely finished"), "{msg}");
+    assert!(msg.contains("check its effect"), "{msg}");
+}
+
+#[test]
+fn unknown_id_from_before_generations_existed_says_ahma_restarted() {
+    let msg = unknown_operation_message("op_3_cargo_build");
+    assert!(msg.contains("restarted or was updated"), "{msg}");
+}
+
+#[test]
+fn unknown_id_from_this_generation_says_it_was_evicted() {
+    let id = crate::utils::operation::generate_id_with_details(3, "cargo", "cargo build");
+    let msg = unknown_operation_message(&id);
+    assert!(msg.contains("not found"), "{msg}");
+    assert!(msg.contains("no longer kept"), "{msg}");
+    assert!(!msg.contains("restarted"), "{msg}");
+}
+
+#[test]
+fn unknown_id_that_is_not_an_operation_id_says_so() {
+    let msg = unknown_operation_message("banana");
+    assert!(msg.contains("not found"), "{msg}");
+    assert!(msg.contains("not an ahma operation id"), "{msg}");
+}

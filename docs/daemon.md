@@ -98,6 +98,16 @@ Counting only sessions would exit while a TUI sat watching an idle project;
 counting only subscribers would exit mid-build. Restarting is cheap and the
 daemon holds nothing you depend on — history is on disk.
 
+Your editor never has to notice. The `ahma serve stdio` process it talks to
+stays attached however the daemon goes away (idle exit, crash, kill, upgrade):
+the next request restarts it and resumes the session, and requests made while
+it is unreachable are answered with "ahma is restarting, retry" rather than the
+server going dead. If the daemon cannot be started at all — a host sandbox that
+forbids the detached spawn, say — the session runs in-process instead, and the
+log says so. Operation ids name the process that issued them, so `await` on an
+id from before a restart says what happened instead of just "not found"
+(SPEC R-LIFECYCLE.3, R-LIFECYCLE.4).
+
 ## Upgrades
 
 When you install a new ahma while one is running, the new binary asks the old

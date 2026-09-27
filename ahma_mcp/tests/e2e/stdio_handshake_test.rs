@@ -32,12 +32,6 @@ fn build_binary() -> PathBuf {
 /// `roots/list` request.  When `false` the server must fall back to the
 /// `--sandbox-scope` it was given and still lock the sandbox in time.
 async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
-    let binary = build_binary();
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-
     // Create the UDS path in the OS temp dir, not the workspace tree: this test
     // passes `--no-sandbox` to the spawned process, so there is no sandbox-scope
     // reason to keep the socket inside the workspace, and a workspace-rooted path
@@ -48,6 +42,17 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
     let rand_id = rand::random::<u32>();
     let socket_path = std::env::temp_dir().join(format!("ahma_test_handshake_{}.sock", rand_id));
     let _ = std::fs::remove_file(&socket_path);
+    run_stdio_tools_list_against(respond_to_roots, &socket_path).await;
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+/// The scenario body, against a chosen shared-endpoint socket path.
+async fn run_stdio_tools_list_against(respond_to_roots: bool, socket_path: &std::path::Path) {
+    let binary = build_binary();
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let socket_str = socket_path.to_string_lossy().into_owned();
 
     // Use a tmp dir as the sandbox scope so the bridge can lock without real roots.
@@ -226,7 +231,6 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
 
     let _ = child.kill().await;
     let _ = child.wait().await;
-    let _ = std::fs::remove_file(&socket_path);
 
     let resp = tools_resp.unwrap_or_else(|| {
         panic!(
@@ -262,4 +266,19 @@ async fn test_serve_stdio_tools_list_with_roots_client() {
 #[tokio::test]
 async fn test_serve_stdio_tools_list_no_roots_client() {
     run_stdio_tools_list_scenario(false).await;
+}
+
+/// SPEC R-LIFECYCLE.3 (item 3): when the shared backend cannot be started at all —
+/// here its socket path lies under a regular file, the way a host sandbox that
+/// forbids the detached spawn looks from inside — the frontend serves the
+/// session in-process instead of failing. Unix-only because on Windows this
+/// harness runs the server directly (`AHMA_SERVER_CHILD`), so the frontend
+/// under test never runs there.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_serve_stdio_falls_back_in_process_when_backend_cannot_start() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let not_a_dir = tmp.path().join("f");
+    std::fs::write(&not_a_dir, b"").unwrap();
+    run_stdio_tools_list_against(true, &not_a_dir.join("mcp.sock")).await;
 }

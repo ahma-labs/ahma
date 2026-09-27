@@ -22,8 +22,8 @@ Method: `notifications/ahma/session_event`. Params envelope:
 
 | `kind` | Mirror level | `detail` fields | Emitted by |
 |---|---|---|---|
-| `reconnected` | `warning` | `cause` (`"transport_failure"`), `reconnects` (count so far), `message` | stdio proxy, after it transparently rebuilt the bridge session |
-| `reconnect_failed` | `error` | `cause`, `attempts`, `message` | stdio proxy, right before it exits; the pipe dies next |
+| `reconnected` | `warning` | `cause` (`"transport_failure"`, `"endpoint_gone"` or `"bridge_unreachable"`), `reconnects` (count so far), `in_flight_request`, `message` | stdio proxy, after it transparently rebuilt the bridge session |
+| `reconnect_failed` | `error` | `cause`, `attempts`, `message` | stdio proxy, once per outage, when a reconnect burst failed; the connection stays open and retries on the next request |
 | `grant_pending` | `warning` | `grant_id`, `path`, `access` (`ro`/`rw`), `reason` | server broker, before the question ladder asks |
 | `grant_decided` | `warning` | `grant_id`, `outcome` (`granted`/`declined`), `access` (granted only) | server broker, on resolution |
 | `health` | `info` | reserved | reserved for future telemetry |
@@ -68,8 +68,9 @@ reactions, all optional:
 - `reconnected` → toast/log line; requests that were in flight got a JSON-RPC
   error and can simply be re-issued (`status`/`await` tell you whether an
   `op_id` survived).
-- `reconnect_failed` → show the message; the connection is about to die, so
-  offer a restart.
+- `reconnect_failed` → show the message. The connection stays open: requests
+  are answered with an error until ahma is back, and the next request after
+  that reconnects on its own — no restart needed.
 - `grant_pending` → display "a sandbox grant for `<path>` is awaiting approval".
   To pull the decision into your own UI instead, call the `sandbox_grant` tool
   with the same path — the coordinator's dedup makes the surfaces converge on

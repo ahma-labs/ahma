@@ -665,6 +665,21 @@ Conventional commits (`feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `chore`
 
 Before committing: `cargo fmt --all && cargo clippy --all-targets && cargo nextest run`.
 
+### Working Model — One Writer, Feature Branches, Integration Through CI
+
+* **The main agent is the only one that changes files.** Subagents research, review and
+  propose; they return findings or proposed code in their report and the main agent applies
+  it. Two writers on one checkout race each other and the build lock; two writers in two
+  checkouts diverge silently until a merge surfaces it.
+* **Work on a normal feature branch in the main checkout**, branched from a fresh
+  `origin/main` (`/ahmadev land` step 1). **Avoid git worktrees.** They are not forbidden,
+  but each one is a cold `target/` (see [Target Directory & Cache
+  Management](#target-directory--cache-management)), a second sandbox scope, and a place
+  for work to be stranded; they have caused more trouble here than they saved.
+* **Integrate separate lines of work through CI, as separate PRs**, landed one after the
+  other — not by merging branches locally. A large change is a sequence of small PRs, each
+  branched after the previous one merges.
+
 Bump versions with `cargo xtask bump-version X.Y.Z` — updates every version-bearing file in one
 step (see `xtask/SPEC.md` for the full list and its idempotence/atomicity guarantees). **The
 version bump is what triggers a release**: a push to `main` publishes GitHub Release
