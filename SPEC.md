@@ -1622,12 +1622,24 @@ Operation ids are counters, and counters restart with the process that issues th
   Settings that govern the hub as a whole — bearer tokens, rate limits,
   handshake and idle timeouts — are deliberately not settable per session.
 
-- **R-HUB.5 — Upgrade by draining.** Version and build id are compared at
-  every connect. A newer client asks the hub to **drain**: hand over to the
-  new build without ending anyone's work. It never tears down sessions that
+- **R-HUB.5 — Upgrade by draining.** A **strictly newer** build asks the hub
+  to **drain**: hand over to the new build without ending anyone's work. It never tears down sessions that
   belong to other windows — the old rule ("restart the bridge") did exactly
   that, mid-command, to every attached editor so that one newly-started
   client could have a matching binary.
+  - **Strictly newer** means a newer version, or the same version whose file
+    is newer. Each side knows its **identity** — version, build id, and the
+    size and mtime of the executable it started from — and `/health` says the
+    hub's. A git hash alone missed dirty rebuilds, and "a different build"
+    alone made two installed copies of one version (`target/release/ahma`
+    and `~/.cargo/bin/ahma`) take turns replacing each other's hub. A hub too
+    old to say is compared by version string, as before.
+  - The hub **notices an install itself**: every 30 s, and whenever a
+    session arrives, it compares the file at its own executable path with
+    the identity it started with, and drains when they differ. `cargo
+    install`, brew, `ahma update` and the install scripts only write the
+    file; nothing else would tell the hub. A path briefly missing mid-install
+    is not yet a replacement.
   - A draining hub **keeps serving**, new sessions included, and says
     `draining` in `/health`. It used to refuse new sessions with `503`, which
     made a drain an outage for every window opened while a long build

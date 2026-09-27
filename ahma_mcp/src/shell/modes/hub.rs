@@ -229,6 +229,47 @@ fn squattable_directory_notice(_dir: &std::path::Path) -> Option<String> {
     None
 }
 
+/// How often the hub looks at its own executable (SPEC R-HUB.5): every 30 s,
+/// or every second under a test harness, so a test can watch it happen.
+fn self_check_interval() -> std::time::Duration {
+    if ahma_common::test_isolation::spawned_under_test_harness() {
+        std::time::Duration::from_secs(1)
+    } else {
+        std::time::Duration::from_secs(30)
+    }
+}
+
+/// When the hub next looks at whether its executable has been replaced.
+///
+/// Every [`self_check_interval`], and whenever a session has arrived since
+/// the last look: a new session is the moment a new build matters most, and
+/// the one most likely to follow an install.
+#[derive(Debug, Default)]
+pub(crate) struct SelfCheck {
+    last: Option<std::time::SystemTime>,
+    sessions: usize,
+}
+
+impl SelfCheck {
+    /// Is a look due now, with `sessions` open?
+    pub(crate) fn due(
+        &mut self,
+        now: std::time::SystemTime,
+        sessions: usize,
+        interval: std::time::Duration,
+    ) -> bool {
+        let new_session = sessions > self.sessions;
+        self.sessions = sessions;
+        let interval_passed = self
+            .last
+            .is_none_or(|last| now.duration_since(last).map_or(true, |d| d >= interval));
+        if new_session || interval_passed {
+            self.last = Some(now);
+        }
+        new_session || interval_passed
+    }
+}
+
 /// How often a successor looks for the rendezvous coming free.
 const SUCCESSOR_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -309,6 +350,9 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
     // process's image as "(deleted)", and the successor must come from the
     // path.
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
+    // Pinned before anything else, for the same reason: this is the build
+    // the hub runs, and the file it compares against to notice an install.
+    let identity = ahma_common::exe_identity::ExeIdentity::this_process();
 
     // ── The rendezvous, and the mutex ────────────────────────────────────────
     //
@@ -389,6 +433,7 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
     let mut socket_watch = SocketWatch::default();
     let mut socket_check = tokio::time::interval(IDLE_CHECK_INTERVAL);
     let mut successor_started = false;
+    let mut self_check = SelfCheck::default();
     let mut serving = std::pin::pin!(start_bridge(bridge));
     let mut signal = std::pin::pin!(shutdown_signal());
     let reason = loop {
@@ -421,6 +466,23 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
                     // than a cold start on some client's next request.
                     successor_started = true;
                     spawn_successor(&exe, &socket, config.idle_timeout_secs);
+                } else if !exit.is_draining()
+                    && self_check.due(
+                        std::time::SystemTime::now(),
+                        active_sessions.load(Ordering::SeqCst),
+                        self_check_interval(),
+                    )
+                    && identity.is_some_and(|me| me.replaced_on_disk())
+                {
+                    // An install (cargo, brew, `ahma update`, a script)
+                    // wrote a new build over ours: hand over to it, without
+                    // interrupting anyone (SPEC R-HUB.5).
+                    tracing::info!(
+                        exe = %exe.display(),
+                        "ahma hub: its executable was replaced by a new install; \
+                         handing over to it"
+                    );
+                    exit.request_drain();
                 }
             }
         }
@@ -847,6 +909,31 @@ mod tests {
         std::fs::remove_file(&sock).expect("remove the socket file");
         assert!(!watch.still_ours(socket_file_id(&sock)));
         drop(listener);
+    }
+
+    /// The hub looks at its own executable on a timer and whenever a session
+    /// arrives (SPEC R-HUB.5): a new session is when a new build matters
+    /// most, and the one most likely to follow an install.
+    #[test]
+    fn the_hub_looks_at_its_binary_on_a_timer_and_on_each_new_session() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let every = Duration::from_secs(30);
+        let mut check = SelfCheck::default();
+        assert!(check.due(t0, 0, every), "the first look is immediate");
+        assert!(!check.due(t0 + Duration::from_secs(10), 0, every));
+        assert!(
+            check.due(t0 + Duration::from_secs(11), 1, every),
+            "a new session brings the next look forward"
+        );
+        assert!(
+            !check.due(t0 + Duration::from_secs(12), 1, every),
+            "the same session does not"
+        );
+        assert!(
+            !check.due(t0 + Duration::from_secs(13), 0, every),
+            "nor does one leaving"
+        );
+        assert!(check.due(t0 + Duration::from_secs(41), 0, every));
     }
 
     /// `0` is an operator saying "stay": a hub started deliberately in a

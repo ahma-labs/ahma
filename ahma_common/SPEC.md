@@ -40,6 +40,10 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
   where the operation starts and carried on the wire (R24.7).
 - `hub`, `hub_history`: the per-user hub state and its bounded on-disk
   history (R-HUB).
+- `exe_identity`: which ahma binary a process runs and the file it started from
+  (version, build id, path, size, mtime). A version string cannot tell a dirty rebuild
+  from the build it replaced, nor say that the file under a running process has been
+  overwritten; this can, and "strictly newer" is decided here once (R-HUB.5).
 - `session_event`, `keepalive`: session-health events and heartbeat payloads (R8.8).
   Added fields are `#[serde(default)]`, so old and new peers interoperate both ways.
 - `mcp_methods`, `mcp_protocol`, `sse`: MCP method names, protocol-version negotiation for

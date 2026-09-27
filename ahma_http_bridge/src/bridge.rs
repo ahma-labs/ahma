@@ -1426,6 +1426,12 @@ pub struct HealthResponse {
     /// `#[serde(default)]` so a pre-upgrade client still parses the response.
     #[serde(default)]
     pub draining: bool,
+    /// Which binary this process runs, and the file it started from (SPEC
+    /// R-HUB.5): what lets a client tell a strictly newer build from merely a
+    /// different one, and lets anyone see which install is serving.
+    /// `#[serde(default)]` so a pre-upgrade client still parses the response.
+    #[serde(default)]
+    pub exe: Option<ahma_common::exe_identity::ExeIdentity>,
 }
 
 /// Health check endpoint
@@ -1445,6 +1451,7 @@ async fn health_check(State(state): State<Arc<BridgeState>>) -> impl IntoRespons
             version,
             default_sandbox_scope,
             draining: state.exit.as_ref().is_some_and(|e| e.is_draining()),
+            exe: ahma_common::exe_identity::ExeIdentity::this_process().cloned(),
         }),
     )
 }
