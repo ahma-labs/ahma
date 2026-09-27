@@ -279,7 +279,10 @@ fn build_bridge_config(
         // QUIC is UDP-based and has no meaning over a Unix socket.
         enable_quic: false,
         disable_http1_1: false,
-        listener_kind: listener_for(mcp_socket),
+        // The same `AF_UNIX` socket on every OS, Windows included (SPEC
+        // R-DAEMON.2): until this was so, Windows bound a TCP port that no
+        // client could discover.
+        listener_kind: ListenerKind::Unix(mcp_socket.to_string()),
         require_token: None,
         require_token_path: None,
         rate_limit_rps: 0,
@@ -299,19 +302,6 @@ fn build_bridge_config(
         })),
         exit: Some(exit.clone()),
     })
-}
-
-#[cfg(unix)]
-fn listener_for(mcp_socket: &str) -> ListenerKind {
-    ListenerKind::Unix(mcp_socket.to_string())
-}
-
-/// Windows has no Unix sockets: the MCP endpoint binds an ephemeral loopback
-/// port, published in the runtime directory's endpoint descriptor
-/// (SPEC R-DAEMON.2).
-#[cfg(not(unix))]
-fn listener_for(_mcp_socket: &str) -> ListenerKind {
-    ListenerKind::Tcp("127.0.0.1:0".parse().expect("a literal loopback address"))
 }
 
 /// Watch both halves and ask the daemon to stop once neither has anything

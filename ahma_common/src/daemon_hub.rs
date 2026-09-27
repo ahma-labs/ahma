@@ -1695,6 +1695,11 @@ pub fn restrict_unix_socket_permissions(path: &std::path::Path) {
     }
 }
 
+/// Windows has no mode bits: a socket file inherits the ACL of the per-user
+/// runtime directory it is created in, which is what keeps other users out.
+#[cfg(not(unix))]
+pub fn restrict_unix_socket_permissions(_path: &std::path::Path) {}
+
 // ── Per-connection handler (generic over stream type) ─────────────────────────
 
 async fn handle_connection<S>(stream: S, hub: Arc<DaemonHub>)

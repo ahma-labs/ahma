@@ -62,13 +62,11 @@ use tracing::{debug, error, info, warn};
 pub enum ListenerKind {
     /// Bind a TCP socket on the given address.
     Tcp(SocketAddr),
-    /// Bind a Unix domain socket (UDS) at the given path.
+    /// Bind an `AF_UNIX` socket at the given path — on every OS, Windows 10
+    /// 1803+ included (`ahma_common::local_socket`).
     ///
     /// Use the `@` prefix for Linux abstract sockets: `@name` → `\0name`.
     /// Filesystem socket files are removed on graceful shutdown.
-    ///
-    /// Not available on Windows; a compile-time `#[cfg(unix)]` gate is applied.
-    #[cfg(unix)]
     Unix(String),
 }
 
@@ -647,7 +645,7 @@ async fn shutdown_idle_bridge(
     timeout: u64,
     session_manager: Arc<SessionManager>,
     exit: Option<Arc<DaemonExit>>,
-    #[cfg_attr(not(unix), allow(unused_variables))] listener_kind: ListenerKind,
+    listener_kind: ListenerKind,
 ) {
     tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
     if let Some(exit) = exit.as_ref() {
@@ -657,7 +655,6 @@ async fn shutdown_idle_bridge(
     session_manager
         .terminate_all(crate::session::SessionTerminationReason::Timeout)
         .await;
-    #[cfg(unix)]
     if let ListenerKind::Unix(ref path) = listener_kind
         && !path.starts_with('\0')
     {
@@ -727,7 +724,6 @@ pub async fn start_bridge(mut config: BridgeConfig) -> Result<()> {
         config.active_sessions = Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
     }
 
-    #[cfg(unix)]
     if let ListenerKind::Unix(ref socket_path) = config.listener_kind {
         return start_bridge_unix(config.clone(), socket_path.clone()).await;
     }
@@ -1094,8 +1090,7 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
 /// successful connection means a live server owns the path and this process
 /// must refuse to bind; a refused connection means the file is stale and safe
 /// to unlink.
-#[cfg(unix)]
-fn prepare_unix_socket_path(socket_path: &str) -> Result<()> {
+async fn prepare_unix_socket_path(socket_path: &str) -> Result<()> {
     use std::io::ErrorKind;
 
     // Abstract sockets (leading NUL) have no filesystem entry to clean up.
@@ -1103,7 +1098,7 @@ fn prepare_unix_socket_path(socket_path: &str) -> Result<()> {
         return Ok(());
     }
 
-    match std::os::unix::net::UnixStream::connect(socket_path) {
+    match ahma_common::local_socket::LocalStream::connect(std::path::Path::new(socket_path)).await {
         Ok(_) => Err(BridgeError::HttpServer(format!(
             "refusing to bind Unix socket {socket_path}: another server is live on it. \
              Stop that server first, or pass --socket-path to use a private socket."
@@ -1123,22 +1118,20 @@ fn prepare_unix_socket_path(socket_path: &str) -> Result<()> {
 
 /// Conservative cross-platform ceiling for `sockaddr_un.sun_path`, used only as
 /// a friendly pre-check before `bind()` — not a precise per-OS contract. The
-/// real usable limit is ~103 bytes on macOS and ~107 on Linux; 100 bytes leaves
-/// headroom under both without needing to special-case the running platform.
-#[cfg(unix)]
+/// real usable limit is ~103 bytes on macOS and ~107 on Linux and Windows; 100
+/// bytes leaves headroom under all three without special-casing the platform.
 const MAX_UNIX_SOCKET_PATH_LEN: usize = 100;
 
 /// Pre-check `socket_path`'s byte length before it reaches `bind()`, so a
 /// too-long path (e.g. a user-supplied `--unix-socket-path` or
 /// `settings.toml` value) fails with an ahma-authored, actionable message
 /// instead of libstd's bare `"path must be shorter than SUN_LEN"`.
-#[cfg(unix)]
 fn check_unix_socket_path_length(socket_path: &str) -> Result<()> {
     let byte_len = socket_path.len();
     if byte_len > MAX_UNIX_SOCKET_PATH_LEN {
         return Err(BridgeError::HttpServer(format!(
             "Unix socket path '{socket_path}' is {byte_len} bytes, which exceeds the OS limit \
-             (~103 bytes on macOS, ~107 on Linux); use a shorter --unix-socket-path or the default"
+             (~103 bytes on macOS, ~107 on Linux and Windows); use a shorter --unix-socket-path or the default"
         )));
     }
     Ok(())
@@ -1155,13 +1148,22 @@ fn unix_socket_identity(socket_path: &str) -> Option<(u64, u64)> {
         .map(|m| (m.dev(), m.ino()))
 }
 
-/// Serve a single accepted Unix-domain-socket stream over auto HTTP/1.1+HTTP/2.
+/// Windows exposes no stable file identity without a handle, and a creation
+/// time is no substitute (NTFS "tunnelling" gives a file recreated under the
+/// same name its predecessor's). With no identity, shutdown leaves the file
+/// and the next server's probe removes it as stale (SPEC R-ISO.2) — never a
+/// live one.
+#[cfg(not(unix))]
+fn unix_socket_identity(_socket_path: &str) -> Option<(u64, u64)> {
+    None
+}
+
+/// Serve a single accepted local-socket stream over auto HTTP/1.1+HTTP/2.
 ///
 /// Unlike [`serve_tcp_connection`] there is no `ConnectInfo` to inject: a UDS
 /// peer has no IP address, so per-IP middleware (the rate limiter) simply
 /// never fires on this transport.
-#[cfg(unix)]
-async fn serve_unix_connection(stream: tokio::net::UnixStream, app: Router) {
+async fn serve_unix_connection(stream: ahma_common::local_socket::LocalStream, app: Router) {
     let io = hyper_util::rt::TokioIo::new(stream);
     let hyper_svc =
         hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
@@ -1185,8 +1187,8 @@ async fn serve_unix_connection(stream: tokio::net::UnixStream, app: Router) {
 /// this process still owns it (SPEC R-ISO.3) — if another server has replaced
 /// the path in the meantime, deleting it would orphan *their* live socket.
 ///
-/// `owned_socket_identity` is `None` for abstract sockets, which have no file.
-#[cfg(unix)]
+/// `owned_socket_identity` is `None` for abstract sockets, which have no file,
+/// and on Windows, which offers no identity to check.
 fn spawn_unix_shutdown_handler(
     state: Arc<BridgeState>,
     socket_path: String,
@@ -1215,7 +1217,6 @@ fn spawn_unix_shutdown_handler(
 /// A stale (dead) socket file is removed before binding; a *live* socket is
 /// never stolen — binding fails loudly instead. On graceful shutdown the
 /// socket file is removed only if this process still owns it.
-#[cfg(unix)]
 async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Result<()> {
     // Translate `@name` → `\0name` (Linux abstract namespace).
     let socket_path = if let Some(name) = raw_socket_path.strip_prefix('@') {
@@ -1250,10 +1251,11 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
 
     // Remove a stale socket file from a previous run — but never a live one
     // (SPEC R-ISO.2). Abstract sockets start with '\0' and have no file.
-    prepare_unix_socket_path(&socket_path)?;
+    prepare_unix_socket_path(&socket_path).await?;
 
-    let listener = tokio::net::UnixListener::bind(&socket_path)
-        .map_err(|e| BridgeError::HttpServer(format!("Failed to bind Unix socket: {}", e)))?;
+    let listener =
+        ahma_common::local_socket::LocalListener::bind(std::path::Path::new(&socket_path))
+            .map_err(|e| BridgeError::HttpServer(format!("Failed to bind Unix socket: {}", e)))?;
 
     // Record which inode we bound so shutdown removes only our own socket
     // (SPEC R-ISO.3).
@@ -1285,7 +1287,7 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     );
 
     loop {
-        let (stream, _) = listener
+        let stream = listener
             .accept()
             .await
             .map_err(|e| BridgeError::HttpServer(format!("Unix accept error: {}", e)))?;
@@ -1448,7 +1450,7 @@ fn restart_status_response(status: &str) -> Response {
 /// this outer bound is the backstop that makes exit unconditional.
 async fn shut_down_after_restart(
     session_manager: Arc<SessionManager>,
-    #[cfg_attr(not(unix), allow(unused_variables))] listener_kind: ListenerKind,
+    listener_kind: ListenerKind,
 ) {
     if tokio::time::timeout(
         RESTART_SHUTDOWN_GRACE,
@@ -1464,7 +1466,6 @@ async fn shut_down_after_restart(
         );
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    #[cfg(unix)]
     if let ListenerKind::Unix(ref path) = listener_kind
         && !path.starts_with('\0')
     {
@@ -3061,30 +3062,36 @@ for line in sys.stdin:
     }
 
     /// R-ISO.2: binding must not disturb a path with no socket file.
-    #[cfg(unix)]
-    #[test]
-    fn prepare_unix_socket_path_ok_when_absent() {
+    #[tokio::test]
+    async fn prepare_unix_socket_path_ok_when_absent() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("absent.sock");
-        assert!(prepare_unix_socket_path(path.to_str().unwrap()).is_ok());
+        assert!(
+            prepare_unix_socket_path(path.to_str().unwrap())
+                .await
+                .is_ok()
+        );
     }
 
     /// R-ISO.2: a stale socket file (its listener is gone) is removed so the
     /// new server can bind.
-    #[cfg(unix)]
-    #[test]
-    fn prepare_unix_socket_path_removes_stale_socket() {
+    #[tokio::test]
+    async fn prepare_unix_socket_path_removes_stale_socket() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("stale.sock");
         {
             // Bind and immediately drop the listener; the file stays behind.
-            let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let _listener = ahma_common::local_socket::LocalListener::bind(&path).unwrap();
         }
         assert!(
             path.exists(),
             "socket file should linger after listener drop"
         );
-        assert!(prepare_unix_socket_path(path.to_str().unwrap()).is_ok());
+        assert!(
+            prepare_unix_socket_path(path.to_str().unwrap())
+                .await
+                .is_ok()
+        );
         assert!(!path.exists(), "stale socket file must be removed");
     }
 
@@ -3092,14 +3099,17 @@ for line in sys.stdin:
     /// and the live listener's socket file is left untouched. This is the
     /// regression test for a test-spawned bridge deleting the developer's
     /// live /tmp/ahma.sock.
-    #[cfg(unix)]
-    #[test]
-    fn prepare_unix_socket_path_refuses_live_socket() {
+    #[tokio::test]
+    async fn prepare_unix_socket_path_refuses_live_socket() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("live.sock");
-        let _live_listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let live_listener = ahma_common::local_socket::LocalListener::bind(&path).unwrap();
+        // Accept in the background: on Windows the connect completes only
+        // once something takes it off the backlog.
+        let _accepting = tokio::spawn(async move { live_listener.accept().await.map(drop) });
 
         let err = prepare_unix_socket_path(path.to_str().unwrap())
+            .await
             .expect_err("must refuse to bind over a live socket");
         assert!(
             err.to_string().contains("another server is live"),
@@ -3108,10 +3118,53 @@ for line in sys.stdin:
         assert!(path.exists(), "the live socket file must not be removed");
     }
 
+    /// The daemon's MCP endpoint is this listener on every OS (SPEC
+    /// R-DAEMON.2): until it was, Windows bound a TCP port nobody could find.
+    #[tokio::test]
+    async fn the_bridge_serves_http_on_a_local_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("mcp.sock");
+        let config = BridgeConfig {
+            listener_kind: ListenerKind::Unix(path.to_string_lossy().into_owned()),
+            enable_quic: false,
+            ..BridgeConfig::default()
+        };
+        let bridge = tokio::spawn(start_bridge(config));
+
+        let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(5);
+        let mut stream = loop {
+            if let Ok(stream) = ahma_common::local_socket::LocalStream::connect(&path).await {
+                break stream;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the bridge never listened on {}",
+                path.display()
+            );
+            tokio::time::sleep(TestTimeouts::poll_interval()).await;
+        };
+        stream
+            .write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            TestTimeouts::scale_secs(5),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("the bridge answers")
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.0 200"), "{response}");
+        assert!(response.contains("\"version\""), "{response}");
+        bridge.abort();
+    }
+
     /// A too-long socket path must fail with ahma's actionable message, not
     /// libstd's bare "path must be shorter than SUN_LEN". The length check
     /// runs before any filesystem access, so the path need not exist on disk.
-    #[cfg(unix)]
     #[test]
     fn check_unix_socket_path_length_rejects_too_long_path() {
         use ahma_mcp::test_utils::path_helpers::test_abs;
@@ -3140,7 +3193,6 @@ for line in sys.stdin:
     }
 
     /// A short path within the limit must pass the pre-check.
-    #[cfg(unix)]
     #[test]
     fn check_unix_socket_path_length_accepts_short_path() {
         use ahma_mcp::test_utils::path_helpers::test_temp_path;

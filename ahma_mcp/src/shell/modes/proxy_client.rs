@@ -5,8 +5,6 @@
 //! JSON-RPC traffic to the running server.
 
 use crate::transport_patch::PatchedStdioTransport;
-use ahma_common::http_retry::{Idempotency, RetryPolicy, ServiceError, send_with_retry};
-#[cfg(unix)]
 use ahma_common::mcp_methods::ROOTS_LIST_METHOD;
 use ahma_common::mcp_methods::{
     INITIALIZE_METHOD, INITIALIZED_METHOD, SERVER_DISCOVER_METHOD, SERVER_INSTRUCTIONS,
@@ -14,14 +12,11 @@ use ahma_common::mcp_methods::{
 };
 use ahma_common::mcp_protocol::{MCP_PROTOCOL_VERSION_2025_11_25, MCP_PROTOCOL_VERSION_2026_07_28};
 use anyhow::{Context, Result, anyhow};
-use futures::StreamExt;
 use rmcp::model::{CustomResult, RequestId, ServerResult};
-#[cfg(unix)]
 use rmcp::service::RoleClient;
 use rmcp::service::{RoleServer, TxJsonRpcMessage};
 use rmcp::transport::Transport;
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 /// How many *consecutive* forward failures the proxy tolerates before treating
 /// the bridge transport as genuinely dead and attempting to reconnect. A single
@@ -48,7 +43,6 @@ const MAX_CONSECUTIVE_FORWARD_FAILURES: u32 = 3;
 const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 
 /// What a request is answered with while the bridge cannot be reached.
-#[cfg(unix)]
 const BRIDGE_UNREACHABLE_MESSAGE: &str = "ahma is restarting or unreachable. This connection \
      stays open and reconnects automatically on your next request, so retry shortly. \
      Operations started before the restart may have finished; check their effect (or \
@@ -60,7 +54,6 @@ const BRIDGE_UNREACHABLE_MESSAGE: &str = "ahma is restarting or unreachable. Thi
 /// answered `roots/list` once and does not expect — and in practice will not
 /// resend — either on a mid-session reconnect. The proxy replays its own cached
 /// copies against a freshly built bridge connection instead.
-#[cfg(unix)]
 #[derive(Default, Clone)]
 struct CachedHandshake {
     /// The raw `initialize` request the client sent, if seen yet.
@@ -77,7 +70,6 @@ struct CachedHandshake {
     roots_response: Option<serde_json::Value>,
 }
 
-#[cfg(unix)]
 impl CachedHandshake {
     /// Observe a message forwarded from the client (stdio) to the bridge, and
     /// cache it if the reconnect replay will need it.
@@ -111,7 +103,6 @@ impl CachedHandshake {
 /// bridge's `roots/list` request from the cached response. None of this reaches
 /// `stdio` — the downstream client already completed this handshake once and
 /// must not see it repeated.
-#[cfg(unix)]
 async fn replay_handshake<C>(client: &mut C, handshake: &CachedHandshake) -> Result<()>
 where
     C: Transport<RoleClient>,
@@ -153,7 +144,6 @@ where
     Ok(())
 }
 
-#[cfg(unix)]
 async fn wait_and_answer_roots_list<C>(
     client: &mut C,
     roots_response: &serde_json::Value,
@@ -192,7 +182,6 @@ where
 /// `notifications/ahma/session_event` plus its `notifications/message` mirror
 /// for foreign clients. Best-effort — a failed send must never affect the
 /// session that was just saved.
-#[cfg(unix)]
 async fn emit_session_event_downstream<S>(
     stdio: &mut S,
     seq: &mut u64,
@@ -216,7 +205,6 @@ async fn emit_session_event_downstream<S>(
 /// Deserialize one session-event notification and send it downstream,
 /// logging (never propagating) either failure: a malformed notification or a
 /// failed send must not affect the session that was just saved.
-#[cfg(unix)]
 async fn send_session_event_notification<S>(
     stdio: &mut S,
     kind: ahma_common::session_event::SessionEventKind,
@@ -248,7 +236,6 @@ async fn send_session_event_notification<S>(
 /// know how many times its transport was rebuilt, so the proxy owns this field.
 /// Returns whether the value was mutated, so the caller only rebuilds the typed
 /// message from JSON when the overlay actually applied.
-#[cfg(unix)]
 fn overlay_heartbeat_reconnects(val: &mut serde_json::Value, reconnects: u32) -> bool {
     if reconnects > 0
         && val.get("method").and_then(|m| m.as_str()) == Some("notifications/ahma/heartbeat")
@@ -279,12 +266,14 @@ pub type BridgeRespawnFn = Box<
 ///
 /// Re-dialing a gone endpoint can never succeed on its own; only respawning the
 /// bridge restores service.
-#[cfg(unix)]
 fn error_text_indicates_gone_endpoint(text: &str) -> bool {
     text.contains("No such file or directory")
         || text.contains("Connection refused")
         || text.contains("(os error 2)")
         || text.contains("(os error 61)")
+        // Windows: WSAECONNREFUSED, what an `AF_UNIX` connect to a socket file
+        // with no listener fails with there.
+        || text.contains("(os error 10061)")
         // Debug renderings of a nested io error keep the kind, not the message.
         || text.contains("kind: NotFound")
         || text.contains("kind: ConnectionRefused")
@@ -293,7 +282,6 @@ fn error_text_indicates_gone_endpoint(text: &str) -> bool {
 /// True when a reconnect failure indicates the bridge endpoint itself is gone
 /// (socket file unlinked, nothing listening) rather than a transient error on
 /// a live endpoint.
-#[cfg(unix)]
 fn reconnect_failure_wants_respawn(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
         if let Some(io) = cause.downcast_ref::<std::io::Error>()
@@ -310,10 +298,9 @@ fn reconnect_failure_wants_respawn(err: &anyhow::Error) -> bool {
     error_text_indicates_gone_endpoint(&format!("{err:#}"))
 }
 
-/// The marker rmcp writes ahead of a folded HTTP response body:
+/// The marker written ahead of a folded HTTP response body:
 /// `StreamableHttpError::UnexpectedServerResponse(format!("HTTP {status}: {body}"))`
-/// in `UnixSocketHttpClient::post_message`.
-#[cfg(unix)]
+/// in `LocalSocketHttpClient::post_message`.
 const HTTP_BODY_MARKER: &str = "HTTP ";
 
 /// Recover the JSON-RPC `error` object the bridge actually sent, from the
@@ -331,7 +318,6 @@ const HTTP_BODY_MARKER: &str = "HTTP ";
 /// Returns `None` when the rendered error carries no HTTP body at all (a
 /// genuinely dead socket: ENOENT / ECONNREFUSED), when the body is not JSON, or
 /// when the body has no `error` object the downstream client could decode.
-#[cfg(unix)]
 fn recover_bridge_jsonrpc_error(rendered: &str) -> Option<serde_json::Value> {
     // Find where the body's JSON *starts* rather than splitting on ':' — the
     // status line, the JSON structure and the bridge's own message all contain
@@ -356,7 +342,6 @@ fn recover_bridge_jsonrpc_error(rendered: &str) -> Option<serde_json::Value> {
 /// What a failed forward to the bridge actually means. Distinguishing these is
 /// the difference between telling the model something true and something
 /// invented, and between recovering now and burning three requests first.
-#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum ForwardFailure {
     /// The bridge answered — with a non-2xx HTTP status whose body carried a
@@ -378,7 +363,6 @@ enum ForwardFailure {
 /// Order matters: a recoverable bridge body proves the endpoint answered, so it
 /// is never mistaken for a gone endpoint even if the bridge's own message
 /// happens to mention a missing file.
-#[cfg(unix)]
 fn classify_forward_failure(display: &str, debug: &str) -> ForwardFailure {
     if let Some(error) = recover_bridge_jsonrpc_error(display) {
         return ForwardFailure::BridgeError(error);
@@ -392,7 +376,6 @@ fn classify_forward_failure(display: &str, debug: &str) -> ForwardFailure {
 /// The message the proxy invents when a forward failed and *nothing* better
 /// could be recovered from it. Deliberately vague, because in that case the
 /// proxy genuinely does not know whether the bridge saw the request.
-#[cfg(unix)]
 const GENERIC_FORWARD_FAILURE_MESSAGE: &str = "Bridge could not service this request; it may \
                                                still be running. Retry, or await the completion \
                                                notification.";
@@ -400,7 +383,6 @@ const GENERIC_FORWARD_FAILURE_MESSAGE: &str = "Bridge could not service this req
 /// Answer a single request id downstream after its forward failed: the bridge's
 /// own JSON-RPC error when one could be recovered, otherwise the generic
 /// fallback. Best-effort — a failed relay must not end the session.
-#[cfg(unix)]
 async fn relay_forward_failure_to_client<S>(
     stdio: &mut S,
     request_id: serde_json::Value,
@@ -429,7 +411,6 @@ async fn relay_forward_failure_to_client<S>(
 /// Such a message must never *also* be resent by the gone-endpoint recovery
 /// path: the replay already delivered it, and a second `initialize` on the
 /// fresh session is a protocol error.
-#[cfg(unix)]
 fn message_is_replayed_by_handshake(val: &serde_json::Value) -> bool {
     matches!(
         val.get("method").and_then(|m| m.as_str()),
@@ -447,7 +428,6 @@ fn message_is_replayed_by_handshake(val: &serde_json::Value) -> bool {
 /// Returns `Ok(true)` when the request was resent, `Ok(false)` when the
 /// reconnect succeeded but the resend did not (the caller must then answer the
 /// request with an error), and `Err` when the reconnect itself failed.
-#[cfg(unix)]
 async fn reconnect_and_resend<C>(
     client: &mut C,
     pending: &serde_json::Value,
@@ -496,7 +476,6 @@ where
 /// the fresh transport the client has nothing to do, and telling it the request
 /// "was answered with an error and can be retried" would be a lie that invites
 /// a duplicate call.
-#[cfg(unix)]
 fn reconnected_detail(reconnects: u32, cause: &str, in_flight_resent: bool) -> serde_json::Value {
     let (in_flight_request, message) = if in_flight_resent {
         (
@@ -521,7 +500,6 @@ fn reconnected_detail(reconnects: u32, cause: &str, in_flight_resent: bool) -> s
 
 /// The `detail` of a `reconnect_failed` event: the bridge is unreachable, but
 /// the session is not over — the proxy retries on the next request.
-#[cfg(unix)]
 fn reconnect_failed_detail(err: &anyhow::Error) -> serde_json::Value {
     serde_json::json!({
         "cause": err.to_string(),
@@ -532,7 +510,6 @@ fn reconnect_failed_detail(err: &anyhow::Error) -> serde_json::Value {
 }
 
 /// The JSON-RPC error a request gets while the bridge is unreachable.
-#[cfg(unix)]
 fn bridge_unreachable_error() -> serde_json::Value {
     serde_json::json!({
         "code": ahma_common::mcp_methods::JSONRPC_REQUEST_TIMEOUT,
@@ -549,7 +526,6 @@ fn bridge_unreachable_error() -> serde_json::Value {
 /// the next attempt so the retry has a live bridge to dial — without this the
 /// proxy could only re-dial a socket that no longer exists until the attempts
 /// were exhausted, and the client saw the server as dead.
-#[cfg(unix)]
 async fn reconnect_with_retries<C>(
     reconnect: &mut dyn FnMut() -> Result<C>,
     handshake: &CachedHandshake,
@@ -594,7 +570,6 @@ where
 /// respawn hook is available. This includes the last attempt of a burst: the
 /// session outlives the burst, so the next request finds a live bridge.
 /// Best-effort: a failed respawn only logs.
-#[cfg(unix)]
 async fn respawn_after_reconnect_failure(
     err: &anyhow::Error,
     respawn: Option<&mut BridgeRespawnFn>,
@@ -637,7 +612,6 @@ fn frontend_handshake_deadline() -> Option<Duration> {
 /// Base backoff between reconnect attempts (multiplied by the attempt number).
 /// Debug builds let tests override it with `AHMA_RECONNECT_BACKOFF_MS`, so the
 /// retry path stays fast and deterministic; release builds never read it (R-CFG9).
-#[cfg(unix)]
 fn reconnect_backoff_base() -> Duration {
     let ms = cfg!(debug_assertions)
         .then(|| std::env::var("AHMA_RECONNECT_BACKOFF_MS").ok())
@@ -647,48 +621,34 @@ fn reconnect_backoff_base() -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Run the stdio proxy connecting to the running UDS or HTTP server.
+/// Run the stdio proxy against the daemon's MCP endpoint on its local socket.
 ///
 /// Returns `Ok(true)` when the bridge successfully responded to at least one
 /// message (normal session end).  Returns `Ok(false)` or `Err` when the bridge
 /// closed the connection before sending any response back to the client, which
 /// typically indicates a stale or incompatible bridge daemon.
 pub async fn run_proxy_client(
-    uds_path: Option<&str>,
-    http_url: Option<&str>,
+    socket_path: &str,
     respawn_bridge: Option<BridgeRespawnFn>,
 ) -> Result<bool> {
-    run_proxy_client_with_options(uds_path, http_url, respawn_bridge, "").await
+    run_proxy_client_with_options(socket_path, respawn_bridge, "").await
 }
 
 /// As [`run_proxy_client`], carrying this client's per-session options in the
 /// MCP URL's query so the daemon can apply them to this session's worker and no
 /// other (SPEC R-DAEMON.4).
 pub async fn run_proxy_client_with_options(
-    uds_path: Option<&str>,
-    http_url: Option<&str>,
+    socket_path: &str,
     respawn_bridge: Option<BridgeRespawnFn>,
     session_query: &str,
 ) -> Result<bool> {
     let handshake_deadline = frontend_handshake_deadline();
     let mcp_uri = append_session_query("http://localhost/mcp", session_query);
-
-    #[cfg(unix)]
-    if let Some(path) = uds_path {
-        tracing::info!(socket = path, "Proxying stdio to Unix Domain Socket");
-        return run_proxy_client_unix(path, &mcp_uri, handshake_deadline, respawn_bridge).await;
-    }
-
-    if let Some(url) = http_url {
-        tracing::info!(url = url, "Proxying stdio to HTTP server");
-        let url = append_session_query(url, session_query);
-        return run_proxy_client_http(&url, handshake_deadline).await;
-    }
-
-    #[cfg(not(unix))]
-    let _ = (uds_path, respawn_bridge);
-
-    Err(anyhow!("No socket or HTTP URL provided for proxy client"))
+    tracing::info!(
+        socket = socket_path,
+        "Proxying stdio to the daemon's local socket"
+    );
+    run_proxy_client_socket(socket_path, &mcp_uri, handshake_deadline, respawn_bridge).await
 }
 
 /// Append `?session_query` to `base` (trimming any trailing `/` first so the
@@ -804,26 +764,28 @@ fn synthesize_initialize_request(val: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-#[cfg(unix)]
-async fn run_proxy_client_unix(
+/// Proxy stdio to the MCP endpoint on `socket_path` — an `AF_UNIX` socket on
+/// every OS (SPEC R-DAEMON.2), so the reconnect and respawn below that keep a
+/// session alive across a daemon restart (SPEC R-LIFECYCLE.3) work on Windows
+/// too.
+async fn run_proxy_client_socket(
     socket_path: &str,
     mcp_uri: &str,
     handshake_deadline: Option<Duration>,
     respawn_bridge: Option<BridgeRespawnFn>,
 ) -> Result<bool> {
-    use ahma_http_mcp_client::unix_client::unix_socket_transport;
+    use ahma_http_mcp_client::local_socket_client::local_socket_transport;
 
-    let client_transport = unix_socket_transport(socket_path, mcp_uri);
+    let client_transport = local_socket_transport(socket_path, mcp_uri);
     let stdio_transport = PatchedStdioTransport::new_stdio();
 
-    tracing::info!(socket = socket_path, "Proxy connected to bridge via UDS");
     let socket_path_owned = socket_path.to_string();
     let mcp_uri_owned = mcp_uri.to_string();
-    let mut reconnect = move || Ok(unix_socket_transport(&socket_path_owned, &mcp_uri_owned));
+    let mut reconnect = move || Ok(local_socket_transport(&socket_path_owned, &mcp_uri_owned));
     let result = run_transport_proxy(
         stdio_transport,
         client_transport,
-        "unix",
+        "socket",
         handshake_deadline,
         &mut reconnect,
         respawn_bridge,
@@ -835,7 +797,6 @@ async fn run_proxy_client_unix(
     result
 }
 
-#[cfg(unix)]
 async fn run_transport_proxy<S, C>(
     mut stdio: S,
     mut client: C,
@@ -1334,544 +1295,7 @@ where
     Ok(bridge_responded)
 }
 
-/// Perform the HTTP `initialize` handshake: receive the client's `initialize`
-/// request from stdio (bounded by `handshake_deadline`), POST it to the
-/// bridge, forward the response back to stdio, and return the negotiated
-/// session id and protocol version — every subsequent request on this
-/// connection must echo both.
-/// POST to the bridge, retrying per SPEC R-HTTP.2 (`idempotency` decides
-/// whether a timeout or 5xx may be re-sent), and reporting a final failure
-/// that names the bridge first (SPEC R-HTTP.3).
-async fn proxy_post<F>(
-    mcp_url: &str,
-    method: &str,
-    idempotency: Idempotency,
-    build: F,
-) -> Result<reqwest::Response>
-where
-    F: Fn() -> reqwest::RequestBuilder,
-{
-    let service = format!("the ahma bridge at {mcp_url}");
-    send_with_retry(&service, &RetryPolicy::DEFAULT, idempotency, build)
-        .await
-        .map(|(response, _)| response)
-        .map_err(|failure| {
-            ServiceError::new(
-                &service,
-                failure.failure,
-                anyhow::Error::new(failure.error).context(format!("{method} request")),
-            )
-            .with_attempts(failure.attempts)
-            .into()
-        })
-}
-
-async fn perform_http_initialize(
-    client: &reqwest::Client,
-    mcp_url: &str,
-    stdio: &mut PatchedStdioTransport,
-    handshake_deadline: Option<Duration>,
-) -> Result<(String, String)> {
-    // Bounded by the handshake deadline so a connection that is spawned and
-    // abandoned (no handshake message ever sent) exits rather than parking on
-    // stdin forever and piling up.
-    let first_recv = stdio.receive();
-    let msg = match handshake_deadline {
-            Some(deadline) => match tokio::time::timeout(deadline, first_recv).await {
-                Ok(msg) => msg,
-                Err(_) => {
-                    tracing::warn!(
-                        ?deadline,
-                        "Proxy exiting: no MCP handshake within deadline (connection spawned but abandoned)"
-                    );
-                    // Exit directly: the stdin reader thread is still blocked on the
-                    // held-open pipe, so returning would hang on runtime shutdown.
-                    std::process::exit(0);
-                }
-            },
-            None => first_recv.await,
-        }
-        .ok_or_else(|| {
-            tracing::error!("Proxy HTTP handshake failed: no initialize message on stdin");
-            anyhow!("No initialize message on stdin")
-        })?;
-
-    let val = serde_json::to_value(&msg)?;
-    if val.get("method").and_then(|m| m.as_str()) == Some(SERVER_DISCOVER_METHOD) {
-        tracing::info!(
-            "Received server/discover probe from modern MCP client (2026-07-28); establishing first-class modern stateless session via HTTP"
-        );
-        let discover_id = val
-            .get("id")
-            .filter(|id| !id.is_null())
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!(1));
-
-        let synth_init = synthesize_initialize_request(&val);
-
-        let response = proxy_post(mcp_url, "initialize", Idempotency::NotIdempotent, || {
-            client
-                .post(mcp_url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .header(reqwest::header::ACCEPT, "application/json")
-                .json(&synth_init)
-        })
-        .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            tracing::error!(
-                url = %mcp_url,
-                status = %status,
-                "Proxy HTTP initialize returned non-success status"
-            );
-            return Err(anyhow!("Initialize failed with HTTP {status}"));
-        }
-
-        let session_id = crate::mcp_client::session_id_header(&response).ok_or_else(|| {
-            tracing::error!(
-                url = %mcp_url,
-                "Proxy HTTP initialize missing mcp-session-id header"
-            );
-            anyhow!("Missing mcp-session-id header in initialize response")
-        })?;
-
-        let resp_bytes = response
-            .bytes()
-            .await
-            .context("Failed to read initialize response body")?;
-
-        let protocol_version = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
-            .map(|v| ahma_common::mcp_protocol::negotiated_protocol_version(&v))
-            .unwrap_or_else(|_| {
-                ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION.to_string()
-            });
-
-        let init_resp_val =
-            serde_json::from_slice::<serde_json::Value>(&resp_bytes).unwrap_or_default();
-        let init_result = init_resp_val.get("result").cloned().unwrap_or_default();
-
-        let bridge_capabilities = init_result.get("capabilities").cloned().unwrap_or_else(|| {
-            serde_json::json!({
-                "tools": { "listChanged": true }
-            })
-        });
-        let bridge_server_info = init_result.get("serverInfo").cloned().unwrap_or_else(|| {
-            serde_json::json!({
-                "name": env!("CARGO_PKG_NAME"),
-                "version": env!("CARGO_PKG_VERSION")
-            })
-        });
-        let bridge_instructions = init_result
-            .get("instructions")
-            .and_then(|i| i.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| SERVER_INSTRUCTIONS.to_string());
-
-        let discover_result = serde_json::json!({
-            "supportedVersions": [
-                MCP_PROTOCOL_VERSION_2026_07_28,
-                MCP_PROTOCOL_VERSION_2025_11_25
-            ],
-            "capabilities": bridge_capabilities,
-            "instructions": bridge_instructions,
-            "serverInfo": bridge_server_info.clone(),
-            "_meta": {
-                "io.modelcontextprotocol/serverInfo": bridge_server_info
-            }
-        });
-
-        let req_id: RequestId = serde_json::from_value(discover_id).unwrap_or(RequestId::Number(1));
-        let resp_msg = TxJsonRpcMessage::<RoleServer>::response(
-            ServerResult::CustomResult(CustomResult(discover_result)),
-            req_id,
-        );
-        stdio
-            .send(resp_msg)
-            .await
-            .context("Failed to forward discover response to stdio")?;
-
-        let notif_init = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": INITIALIZED_METHOD,
-            "params": {}
-        });
-        let _ = client
-            .post(mcp_url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header("mcp-session-id", &session_id)
-            .header(
-                ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER,
-                &protocol_version,
-            )
-            .json(&notif_init)
-            .send()
-            .await;
-
-        return Ok((session_id, protocol_version));
-    }
-    let init_val = val;
-
-    let response = proxy_post(mcp_url, "initialize", Idempotency::NotIdempotent, || {
-        client
-            .post(mcp_url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "application/json")
-            .json(&init_val)
-    })
-    .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        tracing::error!(
-            url = %mcp_url,
-            status = %status,
-            "Proxy HTTP initialize returned non-success status"
-        );
-        return Err(anyhow!("Initialize failed with HTTP {status}"));
-    }
-
-    let session_id = crate::mcp_client::session_id_header(&response).ok_or_else(|| {
-        tracing::error!(
-            url = %mcp_url,
-            "Proxy HTTP initialize missing mcp-session-id header"
-        );
-        anyhow!("Missing mcp-session-id header in initialize response")
-    })?;
-
-    let resp_bytes = response
-        .bytes()
-        .await
-        .context("Failed to read initialize response body")?;
-    // The version the server answered with is what every subsequent HTTP
-    // request must echo in `MCP-Protocol-Version` (2025-06-18 Streamable HTTP).
-    let protocol_version = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
-        .map(|v| ahma_common::mcp_protocol::negotiated_protocol_version(&v))
-        .unwrap_or_else(|_| {
-            ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION.to_string()
-        });
-    let resp_msg: TxJsonRpcMessage<RoleServer> =
-        serde_json::from_slice(&resp_bytes).context("Failed to parse initialize response JSON")?;
-    stdio
-        .send(resp_msg)
-        .await
-        .context("Failed to forward initialize response to stdio")?;
-
-    Ok((session_id, protocol_version))
-}
-
-/// Background task body: open the bridge's SSE stream for `session_id` and
-/// forward every `data:` line that parses as a JSON-RPC message onto
-/// `sse_tx`. Runs until the stream ends, the connection fails, or the
-/// receiving end of `sse_tx` is dropped.
-async fn run_http_sse_listener(
-    client: reqwest::Client,
-    url: String,
-    session_id: String,
-    protocol_version: String,
-    sse_tx: mpsc::Sender<TxJsonRpcMessage<RoleServer>>,
-) {
-    let Some(headers) = sse_listener_headers(&session_id, &protocol_version) else {
-        return;
-    };
-
-    let res = match client.get(&url).headers(headers).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(url = %url, error = %e, "Proxy SSE connection failed");
-            return;
-        }
-    };
-
-    if !res.status().is_success() {
-        tracing::error!(
-            url = %url,
-            status = %res.status(),
-            "Proxy SSE stream returned non-success status"
-        );
-        return;
-    }
-
-    pump_sse_stream(res.bytes_stream(), &sse_tx, &url).await;
-    tracing::info!(url = %url, "Proxy SSE stream ended");
-}
-
-/// Reassemble SSE lines across chunk boundaries and forward each JSON-RPC
-/// `data:` payload onto `sse_tx`, until the stream ends, it errors, or the
-/// receiving end of `sse_tx` is dropped.
-///
-/// Stopping on a dropped receiver matters: without it the loop keeps reading
-/// and appending to a buffer that can no longer be drained, so it does useless
-/// work and grows without bound for the remaining life of the stream.
-///
-/// Generic over the chunk and error types so it can be driven from a plain
-/// in-memory stream in tests; `run_http_sse_listener` passes
-/// `reqwest::Response::bytes_stream()`.
-async fn pump_sse_stream<S, B, E>(
-    mut stream: S,
-    sse_tx: &mpsc::Sender<TxJsonRpcMessage<RoleServer>>,
-    url: &str,
-) where
-    S: futures::Stream<Item = std::result::Result<B, E>> + Unpin,
-    B: AsRef<[u8]>,
-    E: std::fmt::Display,
-{
-    let mut buffer = String::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(url = %url, error = %e, "Proxy SSE stream error");
-                break;
-            }
-        };
-
-        buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()));
-        if forward_buffered_sse_lines(&mut buffer, sse_tx, url).await
-            == ForwardOutcome::ChannelClosed
-        {
-            break;
-        }
-    }
-}
-
-/// Build the SSE request headers for `session_id`, or `None` — after logging —
-/// when the bridge handed back a session id that is not a valid HTTP header
-/// value.
-///
-/// Fallible, not `.unwrap()`: `session_id` is whatever the *bridge* returned in
-/// `Mcp-Session-Id`, so a byte outside visible ASCII would panic the detached
-/// listener task rather than surface anywhere a caller could see it. The
-/// protocol-version header already handled the identical construction with
-/// `if let Ok`; the session one did not, which is the tell rather than a
-/// decision.
-fn sse_listener_headers(
-    session_id: &str,
-    protocol_version: &str,
-) -> Option<reqwest::header::HeaderMap> {
-    let Ok(session_header) = reqwest::header::HeaderValue::from_str(session_id) else {
-        tracing::error!(
-            session_id = %session_id,
-            "bridge returned a session id that is not a valid HTTP header value; \
-             cannot open the SSE stream for it"
-        );
-        return None;
-    };
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("mcp-session-id", session_header);
-    headers.insert(
-        reqwest::header::ACCEPT,
-        reqwest::header::HeaderValue::from_static("text/event-stream"),
-    );
-    if let Ok(v) = reqwest::header::HeaderValue::from_str(protocol_version) {
-        headers.insert(ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER, v);
-    }
-    Some(headers)
-}
-
-/// Whether the SSE forward channel is still usable once a drain pass returns.
-#[derive(Debug, PartialEq, Eq)]
-enum ForwardOutcome {
-    /// Everything currently buffered was forwarded or skipped — keep reading.
-    Continue,
-    /// The receiving end of `sse_tx` is gone. Nothing further can be delivered,
-    /// so the caller must stop reading the stream rather than accumulating a
-    /// buffer it can no longer drain.
-    ChannelClosed,
-}
-
-/// Drain every complete line buffered so far, forwarding each `data:` payload
-/// that parses as a JSON-RPC message onto `sse_tx`. An incomplete trailing line
-/// stays in `buffer` for the next chunk; a line that is not `data:`, is empty,
-/// or does not parse is skipped.
-///
-/// Stops at the first failed send and reports [`ForwardOutcome::ChannelClosed`]
-/// so the caller can shut the listener down. The undrained remainder of
-/// `buffer` is deliberately left alone: there is nowhere to deliver it.
-async fn forward_buffered_sse_lines(
-    buffer: &mut String,
-    sse_tx: &mpsc::Sender<TxJsonRpcMessage<RoleServer>>,
-    url: &str,
-) -> ForwardOutcome {
-    while let Some(pos) = buffer.find('\n') {
-        let line = buffer.drain(..=pos).collect::<String>();
-        let Some(msg) = parse_sse_data_line(&line) else {
-            continue;
-        };
-        if sse_tx.send(msg).await.is_err() {
-            tracing::info!(url = %url, "Proxy SSE forward channel closed");
-            return ForwardOutcome::ChannelClosed;
-        }
-    }
-    ForwardOutcome::Continue
-}
-
-/// Parse one buffered SSE line into a JSON-RPC message, or `None` when the
-/// line is not a `data:` line, carries an empty payload, or does not parse —
-/// each of those is silently skipped by the caller.
-fn parse_sse_data_line(line: &str) -> Option<TxJsonRpcMessage<RoleServer>> {
-    let data = line.trim().strip_prefix("data:")?.trim();
-    if data.is_empty() {
-        return None;
-    }
-    serde_json::from_str::<TxJsonRpcMessage<RoleServer>>(data).ok()
-}
-
-/// Pump messages between stdio and the bridge until stdio hits EOF or the SSE
-/// channel closes: client→bridge messages are POSTed to the bridge and (for
-/// requests) their response forwarded back to stdio; bridge→client SSE
-/// messages are forwarded to stdio directly.
-async fn run_http_proxy_loop(
-    stdio: &mut PatchedStdioTransport,
-    client: &reqwest::Client,
-    mcp_url: &str,
-    session_id: &str,
-    protocol_version: &str,
-    sse_rx: &mut mpsc::Receiver<TxJsonRpcMessage<RoleServer>>,
-) -> Result<()> {
-    loop {
-        tokio::select! {
-            stdio_msg = stdio.receive() => {
-                let Some(msg) = stdio_msg else {
-                    tracing::info!(
-                        url = %mcp_url,
-                        session_id = %session_id,
-                        "Proxy exiting: stdio EOF (Cursor client disconnected)"
-                    );
-                    return Ok(());
-                };
-
-                let val = serde_json::to_value(&msg)?;
-                let has_id = val.get("id").is_some();
-                let is_request = val.get("method").is_some();
-
-                if val.get("method").and_then(|m| m.as_str()) == Some(SUBSCRIPTIONS_LISTEN_METHOD) {
-                    tracing::debug!("Handling modern subscriptions/listen request via HTTP");
-                    if let Some(id) = val.get("id").filter(|id| !id.is_null()) {
-                        let req_id: RequestId =
-                            serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(1));
-                        let ok_msg =
-                            TxJsonRpcMessage::<RoleServer>::response(ServerResult::empty(()), req_id);
-                        let _ = stdio.send(ok_msg).await;
-                    }
-                    continue;
-                }
-
-                let method = val.get("method").and_then(|m| m.as_str()).unwrap_or("response");
-                let idempotency = match method {
-                    "tools/list" | "resources/list" | "prompts/list" | "ping" => {
-                        Idempotency::Idempotent
-                    }
-                    _ => Idempotency::NotIdempotent,
-                };
-                let resp = proxy_post(mcp_url, method, idempotency, || {
-                    let req = client.post(mcp_url)
-                        .header(reqwest::header::CONTENT_TYPE, "application/json")
-                        .header("mcp-session-id", session_id)
-                        .header(
-                            ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER,
-                            protocol_version,
-                        )
-                        .json(&val);
-                    if has_id && is_request {
-                        req.header(reqwest::header::ACCEPT, "application/json")
-                    } else {
-                        req
-                    }
-                })
-                .await
-                .with_context(|| format!("proxy session {session_id}"))?;
-                if has_id && is_request {
-                    if !resp.status().is_success() {
-                        tracing::warn!(
-                            url = %mcp_url,
-                            status = %resp.status(),
-                            "Proxy HTTP tool/request returned non-success status"
-                        );
-                    }
-                    let bytes = resp.bytes().await?;
-                    if !bytes.is_empty() {
-                        let resp_msg: TxJsonRpcMessage<RoleServer> = serde_json::from_slice(&bytes)?;
-                        stdio.send(resp_msg).await?;
-                    }
-                }
-            }
-
-            sse_msg = sse_rx.recv() => {
-                let Some(msg) = sse_msg else {
-                    tracing::info!(
-                        url = %mcp_url,
-                        session_id = %session_id,
-                        "Proxy exiting: SSE channel closed"
-                    );
-                    return Ok(());
-                };
-                stdio.send(msg).await?;
-            }
-        }
-    }
-}
-
-async fn run_proxy_client_http(
-    base_url: &str,
-    handshake_deadline: Option<Duration>,
-) -> Result<bool> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .context("Failed to build HTTP client for stdio proxy")?;
-
-    let mcp_url = format!("{}/mcp", base_url.trim_end_matches('/'));
-
-    let mut stdio = PatchedStdioTransport::new_stdio();
-
-    let (session_id, protocol_version) =
-        perform_http_initialize(&client, &mcp_url, &mut stdio, handshake_deadline).await?;
-
-    tracing::info!(
-        url = %mcp_url,
-        session_id = %session_id,
-        "Proxy connected to bridge via HTTP"
-    );
-
-    // Start the SSE listener in the background.
-    let (sse_tx, mut sse_rx) = mpsc::channel::<TxJsonRpcMessage<RoleServer>>(100);
-    tokio::spawn(run_http_sse_listener(
-        client.clone(),
-        mcp_url.clone(),
-        session_id.clone(),
-        protocol_version.clone(),
-        sse_tx,
-    ));
-
-    run_http_proxy_loop(
-        &mut stdio,
-        &client,
-        &mcp_url,
-        &session_id,
-        &protocol_version,
-        &mut sse_rx,
-    )
-    .await?;
-
-    let _ = client
-        .delete(&mcp_url)
-        .header("mcp-session-id", &session_id)
-        .header(
-            ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_HEADER,
-            &protocol_version,
-        )
-        .send()
-        .await;
-
-    // The bridge successfully responded to initialize, so it was reachable
-    // and communicating — nothing past that point can make this `false`.
-    Ok(true)
-}
-
-// `run_transport_proxy` and the `RoleClient` import are Unix-only, so these
-// tests (which drive it directly with mock transports) are gated to match.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use parking_lot::Mutex;
@@ -3208,16 +2632,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_proxy_client_without_target_errors() {
-        let result = run_proxy_client(None, None, None).await;
-        let err = result.expect_err("no socket or URL must be an error");
-        assert!(
-            err.to_string().contains("No socket or HTTP URL provided"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[tokio::test]
     async fn bridge_response_forwarded_then_stdio_eof_returns_true() {
         // Bridge delivers one message which the proxy must forward to stdio; the
         // stdio side then EOFs. Because nothing was ever forwarded *to* the bridge
@@ -3493,84 +2907,6 @@ mod tests {
             state.sent.lock().len(),
             0,
             "notifications have no id, so no error can be relayed to stdio"
-        );
-    }
-}
-
-// `pump_sse_stream` is cross-platform, so — unlike the `run_transport_proxy`
-// tests above — these are deliberately not gated to Unix.
-#[cfg(test)]
-mod sse_pump_tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A server→client notification that round-trips through
-    /// `TxJsonRpcMessage<RoleServer>`. If this ever stops parsing, the
-    /// `forwards_data_lines` test below fails loudly rather than the
-    /// close-detection test silently passing for the wrong reason.
-    const PROGRESS: &str = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"progress":1}}"#;
-
-    /// A stream over `chunks` that records how many it actually yielded, so a
-    /// test can assert the pump *stopped reading* rather than merely stopped
-    /// forwarding.
-    fn counting_stream(
-        chunks: Vec<String>,
-        yielded: Arc<AtomicUsize>,
-    ) -> impl futures::Stream<Item = std::result::Result<Vec<u8>, std::convert::Infallible>> + Unpin
-    {
-        Box::pin(futures::stream::iter(chunks).map(move |c| {
-            yielded.fetch_add(1, Ordering::SeqCst);
-            Ok(c.into_bytes())
-        }))
-    }
-
-    #[tokio::test]
-    async fn pump_reassembles_a_frame_split_across_chunks() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let yielded = Arc::new(AtomicUsize::new(0));
-
-        // Split one `data:` frame mid-JSON so the first chunk contains no
-        // newline at all — the pump must hold it and complete it on the next.
-        let (head, tail) = PROGRESS.split_at(20);
-        let stream = counting_stream(
-            vec![format!("data: {head}"), format!("{tail}\n\n")],
-            yielded.clone(),
-        );
-
-        pump_sse_stream(stream, &tx, "test://sse").await;
-
-        assert!(
-            rx.try_recv().is_ok(),
-            "the frame split across two chunks should have been reassembled and forwarded"
-        );
-        assert_eq!(
-            yielded.load(Ordering::SeqCst),
-            2,
-            "both chunks are consumed"
-        );
-    }
-
-    #[tokio::test]
-    async fn pump_stops_reading_once_the_forward_channel_closes() {
-        let (tx, rx) = mpsc::channel(1);
-        // The stdio side is gone: every send from here on fails.
-        drop(rx);
-
-        let yielded = Arc::new(AtomicUsize::new(0));
-        let chunks: Vec<String> = (0..50).map(|_| format!("data: {PROGRESS}\n\n")).collect();
-        let stream = counting_stream(chunks, yielded.clone());
-
-        pump_sse_stream(stream, &tx, "test://sse").await;
-
-        // Reading past the first failed send is pointless work, and — because
-        // the buffer can no longer be drained — it grows without bound for the
-        // rest of the stream's life.
-        let consumed = yielded.load(Ordering::SeqCst);
-        assert_eq!(
-            consumed, 1,
-            "the listener must stop reading as soon as the forward channel \
-             closes, but it consumed {consumed} of 50 chunks"
         );
     }
 }

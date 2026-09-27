@@ -47,8 +47,11 @@ subtly wrong on its own.*
 - Tokens persist in `~/.ahma/mcp_http_token.json` (file `0600`, directory `0700` on Unix),
   outside every sandbox scope. The retired `AHMA_HTTP_CLIENT_TOKEN_PATH` is ignored with a
   warning (R-CFG1.2).
-- `unix_client` (Unix only): the same Streamable HTTP transport over a Unix domain socket,
-  for `ahma serve unix` and the per-user daemon.
+- `local_socket_client`: the same Streamable HTTP transport over an `AF_UNIX` socket, on
+  every OS including Windows (through `ahma_common::local_socket`), for the per-user
+  daemon's MCP endpoint (root SPEC R-DAEMON.2) and `ahma serve unix`. rmcp's own
+  `UnixSocketHttpClient` is built on `tokio::net::UnixStream` and does not exist on
+  Windows; this is that client with only the connect replaced.
 
 ## 3. Non-Functional Requirements
 

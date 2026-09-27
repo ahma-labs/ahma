@@ -98,11 +98,10 @@ pub fn skew_action(
     }
 }
 
-/// Ensure a daemon is serving at `socket_path` / `http_url`, starting one if
-/// there is none, and reconcile a version skew.
+/// Ensure a daemon is serving at `socket_path`, starting one if there is none,
+/// and reconcile a version skew.
 pub async fn ensure_daemon(
-    socket_path: Option<&str>,
-    http_url: Option<&str>,
+    socket_path: &str,
     idle_timeout_secs: Option<u64>,
 ) -> Result<EnsureOutcome> {
     let client_semver = env!("CARGO_PKG_VERSION");
@@ -113,16 +112,16 @@ pub async fn ensure_daemon(
     let running_version = if is_test_isolated() {
         None
     } else {
-        get_bridge_version(socket_path, http_url).await
+        get_bridge_version(socket_path).await
     };
 
     let Some(daemon_version) = running_version else {
-        if check_bridge_running(socket_path, http_url).await {
+        if check_bridge_running(socket_path).await {
             // Serving but not answering /health: an older or foreign server.
             return Ok(EnsureOutcome::Ready);
         }
-        spawn_daemon(socket_path, idle_timeout_secs, || {
-            check_bridge_running(socket_path, http_url)
+        spawn_daemon(Some(socket_path), idle_timeout_secs, || {
+            check_bridge_running(socket_path)
         })
         .await?;
         return Ok(EnsureOutcome::Spawned);
@@ -154,7 +153,7 @@ pub async fn ensure_daemon(
                 client_version = client_semver,
                 "asking the running daemon to drain so this build can take over"
             );
-            let drained = drain_and_wait(socket_path, http_url).await;
+            let drained = drain_and_wait(socket_path).await;
             if !drained {
                 // It is still serving somebody. Use it and disclose the skew
                 // rather than killing sessions that are not ours to end.
@@ -163,8 +162,8 @@ pub async fn ensure_daemon(
                     ours: format!("{client_semver}+{client_build}"),
                 });
             }
-            spawn_daemon(socket_path, idle_timeout_secs, || {
-                check_bridge_running(socket_path, http_url)
+            spawn_daemon(Some(socket_path), idle_timeout_secs, || {
+                check_bridge_running(socket_path)
             })
             .await?;
             Ok(EnsureOutcome::Spawned)
@@ -176,11 +175,11 @@ pub async fn ensure_daemon(
 ///
 /// Returns `false` when it is still there at the deadline — it has live
 /// sessions, and taking them away is precisely what draining exists to avoid.
-async fn drain_and_wait(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
-    super::server::trigger_bridge_drain(socket_path, http_url).await;
+async fn drain_and_wait(socket_path: &str) -> bool {
+    super::server::trigger_bridge_drain(socket_path).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(DRAIN_HANDOFF_SECS);
     while std::time::Instant::now() < deadline {
-        if !check_bridge_running(socket_path, http_url).await {
+        if !check_bridge_running(socket_path).await {
             return true;
         }
         tokio::time::sleep(ahma_common::timeouts::TestTimeouts::poll_interval()).await;
@@ -315,19 +314,6 @@ pub fn disclosure(outcome: &EnsureOutcome) -> Option<String> {
     }
 }
 
-/// True when `path` names a socket nothing is listening on.
-pub fn socket_is_stale(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        path.exists() && std::os::unix::net::UnixStream::connect(path).is_err()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -371,13 +357,6 @@ mod tests {
         )));
         assert!(!may_spawn_daemon_from(Path::new(
             "/target/debug/deps/ahma_tui-0123456789abcdef"
-        )));
-    }
-
-    #[test]
-    fn test_socket_is_stale_nonexistent() {
-        assert!(!socket_is_stale(Path::new(
-            "/nonexistent/socket/path/12345"
         )));
     }
 

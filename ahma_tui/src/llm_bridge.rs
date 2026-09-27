@@ -195,9 +195,7 @@ pub fn spawn_tool_call_task(
             // per-user daemon, scoped by this TUI's own `roots/list` answer —
             // not by a server started for this directory (SPEC R-DAEMON.9).
             let socket = ahma_common::daemon_hub::mcp_socket_path(None);
-            let res =
-                ahma_mcp::shell::modes::daemon_client::ensure_daemon(Some(&socket), None, None)
-                    .await;
+            let res = ahma_mcp::shell::modes::daemon_client::ensure_daemon(&socket, None).await;
             if let Err(e) = res {
                 let _ = tx
                     .send(BridgeEvent::ToolCallFinished {

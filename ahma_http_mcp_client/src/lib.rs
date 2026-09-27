@@ -9,7 +9,7 @@
 //! - [`client::HttpMcpTransport`]: an `rmcp` `Transport` for external MCP servers,
 //!   with optional OAuth 2.0 + PKCE. The OAuth endpoints are currently Atlassian's.
 //!   Tokens persist in `~/.ahma/mcp_http_token.json`.
-//! - `unix_client` (Unix only): the same transport over a Unix domain socket.
+//! - `local_socket_client`: the same transport over the per-user `AF_UNIX` socket, on every OS.
 //!
 //! ## Usage
 //!
@@ -38,10 +38,9 @@
 pub mod client;
 /// Error types for HTTP MCP client operations.
 pub mod error;
+/// MCP Streamable HTTP over the per-user local socket, on every OS.
+pub mod local_socket_client;
 /// `oauth2` HTTP adapter over the workspace `reqwest` client.
 pub mod oauth_http;
 /// Shared MCP Streamable-HTTP client (handshake, SSE, roots, 409 gate).
 pub mod streamable;
-/// Unix domain socket MCP transport (Unix only).
-#[cfg(unix)]
-pub mod unix_client;

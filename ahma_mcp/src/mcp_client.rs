@@ -478,15 +478,6 @@ async fn call_mcp_tool_stdio(
     Ok((content_str, is_error))
 }
 
-/// Extract the `mcp-session-id` header an MCP server stamps on its HTTP
-/// `initialize` response. Shared by every in-crate HTTP MCP client.
-pub(crate) fn session_id_header(resp: &reqwest::Response) -> Option<String> {
-    resp.headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-}
-
 /// Minimal handshake against an *external* Streamable-HTTP MCP server via the
 /// shared client (initialize + notifications/initialized). Intentionally no
 /// SSE stream and no roots answering: external servers are not assumed to

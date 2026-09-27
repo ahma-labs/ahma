@@ -91,7 +91,9 @@ fn kill(child: &mut std::process::Child) {
 
 /// One process binds *both* rendezvous points, and both are owner-only. Two
 /// singletons with two lifetimes is what this replaces.
-#[cfg(unix)]
+///
+/// On every OS: both are `AF_UNIX` sockets on Windows too (SPEC R-DAEMON.2).
+/// The mode check alone is Unix-only, because Windows has no mode bits.
 #[tokio::test]
 async fn the_daemon_serves_both_rendezvous_points() {
     let binary = build_binary_cached("ahma_bin", "ahma");
@@ -134,7 +136,6 @@ async fn the_daemon_serves_both_rendezvous_points() {
 
 /// A second daemon recognises the first and stands down. Exactly one per user
 /// is the whole point, and a losing race is an ordinary outcome, not a crash.
-#[cfg(unix)]
 #[tokio::test]
 async fn a_second_daemon_stands_down() {
     let binary = build_binary_cached("ahma_bin", "ahma");
@@ -165,7 +166,6 @@ async fn a_second_daemon_stands_down() {
 
 /// With nothing attached the daemon goes, and takes its sockets with it — so a
 /// later client sees a clean absence rather than a stale file.
-#[cfg(unix)]
 #[tokio::test]
 async fn the_daemon_exits_when_nothing_is_attached() {
     let binary = build_binary_cached("ahma_bin", "ahma");

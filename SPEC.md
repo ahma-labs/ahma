@@ -162,7 +162,7 @@ what is missing named; `dormant` means present but not active.
 | Unified permissions and doctor (R-PERM, R-DOCTOR) | tests-pass | One ledger under `~/.ahma`; question ladder; `ahma doctor [--fix]` |
 | Configuration standard (R-CFG) | in-progress | Done: retirement of `AHMA_*`, tiers, provenance, project file. Pending: R-CFG5.2, R-CFG6.2, R-CFG6.3 |
 | STDIO, HTTP bridge, Streamable HTTP, session isolation | tests-pass | `ahma_http_bridge/SPEC.md` (R8, R10) |
-| Per-user daemon (R-DAEMON) | tests-pass | Windows MCP endpoint still on an undiscovered TCP port (R-DAEMON.2) |
+| Per-user daemon (R-DAEMON) | tests-pass | Hub and MCP endpoint on one `AF_UNIX` rendezvous on every OS (R-DAEMON.2) |
 | HTTP MCP client, OAuth 2.0 + PKCE | tests-pass | OAuth endpoints are Atlassian's; no token refresh |
 | Web egress policy for `fetch_webpage` (R-WEB) | tests-pass | Three-tier approval, private-range block, redirect guard |
 | Outbound HTTP retry and failure wording (R-HTTP) | tests-pass | `ahma_common::http_retry`; SSE stream reconnect and `xtask` not covered (R-HTTP.4) |
@@ -1546,8 +1546,15 @@ Operation ids are counters, and counters restart with the process that issues th
     allowed, since the bind can only be retried after someone has unlinked
     the path. A socket that still answers is never removed, even by the holder
     (R-ISO.2): that is a daemon from before the lock.
-  - **The hub is an `AF_UNIX` socket on every OS**, Windows 10 1803+
-    included, through `ahma_common::local_socket`. There is no hub TCP port.
+  - **Both sockets are `AF_UNIX` on every OS**, Windows 10 1803+ included,
+    through `ahma_common::local_socket`: the hub, and the MCP endpoint the
+    stdio proxy speaks Streamable HTTP to
+    (`ahma_http_mcp_client::local_socket_client`). The daemon binds no TCP
+    port, and the frontend has no HTTP fallback: a probe of the `serve http`
+    port only ever found some *other* server (R-ISO.1). Until this held on
+    Windows the MCP endpoint there was a loopback TCP port no client could
+    discover, so every Windows session silently ran in-process and the
+    proxy's reconnect (R-LIFECYCLE.3) never ran at all.
   - **The check binds the directory ahma chose, not one it was handed.** That
     guarantee is about the runtime directory ahma creates `0700` itself. Applied
     to an operator-named `--unix-socket-path` (or `[http] unix_socket_path`) it
@@ -1564,11 +1571,6 @@ Operation ids are counters, and counters restart with the process that issues th
   - An atomically written `daemon.json` names the daemon holding the lock
     (pid, version, build id) for `ahma doctor`. Liveness is the lock, never a
     pid probe — a pid can be reused, a lock cannot.
-  - **Not yet done on Windows: the MCP endpoint.** It still binds a loopback
-    TCP port that clients do not discover, because the stdio proxy and the TUI
-    speak HTTP through a client that only has a Unix-socket transport. Moving
-    it onto the same `AF_UNIX` socket as the hub is the next step, and until
-    then this gap is stated rather than papered over.
 
 - **R-DAEMON.3 — Lifetime.** The first comer starts it, detached (R-PROC.3),
   and **never from a process that is itself confined** (R7.6) — a daemon that
@@ -1689,8 +1691,8 @@ Operation ids are counters, and counters restart with the process that issues th
 
 > **Problem (confirmed live failure, 2026-07-14).** The proxy, bridge, and daemon rendezvous on machine-global singleton endpoints (`/tmp/ahma.sock`, `~/.ahma/daemon.sock`, the Windows daemon TCP port). Test isolation existed but was opt-in per spawn site (`AHMA_TEST_ISOLATION`, set only by `test_utils::cli::test_command`); harnesses in other crates spawned the real binary without it. A full `cargo nextest run` therefore unlinked the live `/tmp/ahma.sock` while binding test bridges and dispatched a `RunPrompt` to the live daemon hub — tearing down the developer's active MCP session mid-conversation (surfaced to the client as `-32002` then a full server disconnect).
 
-- **R-ISO.1 (fail-closed test detection).** Any ahma process spawned directly or transitively under a test harness MUST resolve private, test-scoped endpoints **and state** instead of the shared ones: the hub socket, the MCP socket, **the bridge's default HTTP port** and the history file (R-DAEMON.10). A test that wrote the developer's history would also read it back into its own assertions. It MUST also refuse to *spawn* a daemon at all: `current_exe` inside a test binary is the test harness, so spawning it re-runs the tests, each copy spawning again — a fork bomb that empties the machine's process table. Detection is `ahma_common::test_isolation::spawned_under_test_harness()`: the explicit `AHMA_TEST_ISOLATION` plumbing variable OR the `NEXTEST` variable that `cargo nextest` exports to every test process (inherited by all children), so a spawn site that forgets the explicit variable can no longer reach live endpoints. Per-run endpoint names that parent and child processes must agree on use `NEXTEST_RUN_ID` (not the PID). Test harnesses that spawn the binary SHOULD still set `AHMA_TEST_ISOLATION=1` explicitly (plain `cargo test` sets no distinctive variable).
-  - **Isolating some endpoints and not others is worse than isolating none**, because it hides itself. The socket was per-run and the HTTP port was not, and the HTTP port is the *fallback* every discovery probe tries once the socket answers nothing. So an E2E test whose daemon failed to start reached the developer's live bridge on the machine-global 3000, read its `/health`, and reported success. Every E2E test that drives the real binary passed on that borrowed server for as long as one was running, and failed the moment CI — which has none — ran the same code. R-ISO exists to stop a test corrupting live state; this is the same coupling in the other direction, and it costs more, because it converts a broken build into a green run. A discovery path's *last* resort must be isolated as carefully as its first.
+- **R-ISO.1 (fail-closed test detection).** Any ahma process spawned directly or transitively under a test harness MUST resolve private, test-scoped endpoints **and state** instead of the shared ones: the hub socket, the MCP socket and the history file (R-DAEMON.10). A test that wrote the developer's history would also read it back into its own assertions. It MUST also refuse to *spawn* a daemon at all: `current_exe` inside a test binary is the test harness, so spawning it re-runs the tests, each copy spawning again — a fork bomb that empties the machine's process table. Detection is `ahma_common::test_isolation::spawned_under_test_harness()`: the explicit `AHMA_TEST_ISOLATION` plumbing variable OR the `NEXTEST` variable that `cargo nextest` exports to every test process (inherited by all children), so a spawn site that forgets the explicit variable can no longer reach live endpoints. Per-run endpoint names that parent and child processes must agree on use `NEXTEST_RUN_ID` (not the PID). Test harnesses that spawn the binary SHOULD still set `AHMA_TEST_ISOLATION=1` explicitly (plain `cargo test` sets no distinctive variable).
+  - **Isolating some endpoints and not others is worse than isolating none**, because it hides itself. The socket was per-run and the HTTP port was not, and the HTTP port is the *fallback* every discovery probe tries once the socket answers nothing. So an E2E test whose daemon failed to start reached the developer's live bridge on the machine-global 3000, read its `/health`, and reported success. Every E2E test that drives the real binary passed on that borrowed server for as long as one was running, and failed the moment CI — which has none — ran the same code. R-ISO exists to stop a test corrupting live state; this is the same coupling in the other direction, and it costs more, because it converts a broken build into a green run. A discovery path's *last* resort must be isolated as carefully as its first — and the better fix, taken once the daemon's endpoint was a socket on every OS, is to have no fallback at all (R-DAEMON.2).
 - **R-ISO.2 (never steal a live socket).** A Unix-socket listener MUST NOT unlink an existing socket file without first probe-connecting it: a successful connection means a live server owns the path and binding MUST fail loudly (naming the conflict and the `--socket-path` remedy); only a refused/absent connection marks the file stale and safe to remove. (The daemon hub probes before removing even when it holds the rendezvous lock; the HTTP bridge's Unix listener must probe too.)
 - **R-ISO.3 (remove only what you own).** On shutdown a server MUST remove its socket file only if the path still refers to the socket it bound (device+inode match). The daemon hub meets this with its rendezvous lock instead (R-DAEMON.2): every would-be owner must take the lock before touching the path, and the hub unlinks before releasing it. If another process has since replaced the path, deleting it would orphan *that* server's live socket.
 - **R-ISO.4 (regression tests).** Unit tests MUST pin: harness detection via both variables; refusal to bind over a live socket; stale-socket cleanup; and identity-checked shutdown removal.
@@ -2002,7 +2004,6 @@ Stated here so that no other document implies otherwise.
 
 - **Windows filesystem boundary** (R6.3.3): none until AppContainer grants are proven both ways in CI.
 - **Linux deny tier** (R6.1.7): application-layer only; a shell command can write the paths it protects.
-- **Windows daemon MCP endpoint** (R-DAEMON.2): a loopback TCP port clients do not discover; the hub is already on the shared `AF_UNIX` socket.
 - **Release signing** (R-SIGN.1, R-SIGN.3): no Developer-ID signing or notarization; no Windows verification.
 - **Configuration** (R-CFG5.2, R-CFG6.2, R-CFG6.3): per-setting startup log lines, unknown-key abort for security tables in the user file, and the permissions warning are pending.
 - **Bundle trust**: no signature and no load-time gate; the checksum detects corruption only.
