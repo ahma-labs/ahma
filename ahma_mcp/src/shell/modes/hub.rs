@@ -420,6 +420,7 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
     );
 
     let hub_connections = hub.connection_count();
+    let interrupted = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let idle_task = spawn_idle_watcher(
         hub_connections,
         active_sessions.clone(),
@@ -427,6 +428,7 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
         config.hub_drain_timeout_secs,
         hub.events(),
         exit.clone(),
+        interrupted.clone(),
     );
 
     // ── Serve until something asks us to stop ────────────────────────────────
@@ -490,6 +492,28 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
     idle_task.abort();
 
     tracing::info!("ahma hub: stopping ({reason})");
+    // Say why, for whoever next asks about an operation this process
+    // issued (SPEC R-LIFECYCLE.4): what is still running now is what this
+    // exit interrupts.
+    let mut interrupted_ops = interrupted.lock().clone();
+    for id in hub.events().operations_in_flight().await {
+        if !interrupted_ops.contains(&id) {
+            interrupted_ops.push(id);
+        }
+    }
+    {
+        let path = ahma_common::hub_history::last_exit_path_for(&socket);
+        let record = ahma_common::hub_history::LastExit {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build_id: ahma_common::BUILD_ID.to_string(),
+            reason: exit_reason(&reason, hub.relinquished()),
+            at_epoch_ms: ahma_common::keepalive::current_timestamp_ms(),
+            interrupted_ops,
+        };
+        if let Err(e) = ahma_common::hub_history::write_last_exit(&path, &record).await {
+            tracing::warn!("ahma hub: could not record why it exited: {e}");
+        }
+    }
     if let Some(writer) = history_writer {
         // Flush before the sockets go: a record written but not yet on disk is
         // exactly the last thing that happened, which is what someone opening a
@@ -505,6 +529,22 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
     // nothing above can touch a successor's files (SPEC R-ISO.3).
     drop(hub);
     Ok(())
+}
+
+/// Classify the reason the serve loop ended, for `last-exit.json`.
+///
+/// `socket_lost` tells a drain the hub started because nobody could reach it
+/// from one a newer build asked for.
+fn exit_reason(reason: &str, socket_lost: bool) -> ahma_common::hub_history::ExitReason {
+    use ahma_common::hub_history::ExitReason;
+    match reason {
+        "idle" => ExitReason::Idle,
+        "drained" if socket_lost => ExitReason::SocketRemoved,
+        "drained" => ExitReason::Upgrade,
+        "drain cap reached" => ExitReason::DrainTimeout,
+        r if r.starts_with("listener failed") => ExitReason::Failed,
+        _ => ExitReason::Stopped,
+    }
 }
 
 /// Build the MCP endpoint's configuration.
@@ -581,6 +621,7 @@ fn spawn_idle_watcher(
     drain_cap_secs: u64,
     events: ahma_common::hub::HubEvents,
     exit: Arc<HubExit>,
+    interrupted: Arc<parking_lot::Mutex<Vec<String>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut clock = IdleClock::default();
@@ -591,7 +632,8 @@ fn spawn_idle_watcher(
             let now = std::time::SystemTime::now();
             if exit.is_draining() {
                 let started = *drain_started.get_or_insert(now);
-                let work = events.operations_in_flight().await + exit.requests_in_flight();
+                let running = events.operations_in_flight().await;
+                let work = running.len() + exit.requests_in_flight();
                 quiet_checks = if work == 0 {
                     quiet_checks.saturating_add(1)
                 } else {
@@ -615,6 +657,9 @@ fn spawn_idle_watcher(
                             "ahma hub: drain cap reached with work still in flight; \
                              ending it so the successor can take over"
                         );
+                        // Recorded before the sessions end: once their
+                        // workers are gone the hub no longer lists them.
+                        interrupted.lock().extend(running);
                         // Answers each request still waiting with an error
                         // rather than leaving it on a process about to exit.
                         exit.end_sessions().await;
@@ -934,6 +979,26 @@ mod tests {
             "nor does one leaving"
         );
         assert!(check.due(t0 + Duration::from_secs(41), 0, every));
+    }
+
+    /// `last-exit.json` names why the hub went in words a reader can act on
+    /// (SPEC R-LIFECYCLE.4).
+    #[test]
+    fn the_exit_reason_is_classified() {
+        use ahma_common::hub_history::ExitReason;
+        assert_eq!(exit_reason("idle", false), ExitReason::Idle);
+        assert_eq!(exit_reason("drained", false), ExitReason::Upgrade);
+        assert_eq!(exit_reason("drained", true), ExitReason::SocketRemoved);
+        assert_eq!(
+            exit_reason("drain cap reached", false),
+            ExitReason::DrainTimeout
+        );
+        assert_eq!(
+            exit_reason("listener failed: boom", false),
+            ExitReason::Failed
+        );
+        assert_eq!(exit_reason("signal", false), ExitReason::Stopped);
+        assert_eq!(exit_reason("hub Shutdown", false), ExitReason::Stopped);
     }
 
     /// `0` is an operator saying "stay": a hub started deliberately in a

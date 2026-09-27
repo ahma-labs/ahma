@@ -90,7 +90,7 @@ impl AhmaMcpService {
                     }
                 )
             } else {
-                format!("FAIL {}", common::unknown_operation_message(&id))
+                format!("FAIL {}", common::unknown_operation_report(&id).await)
             }
         };
 

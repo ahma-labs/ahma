@@ -248,6 +248,154 @@ pub async fn load_recent(path: &Path, cutoff_ms: u64) -> Vec<HistoryRecord> {
     out
 }
 
+/// Why the hub last exited (SPEC R-LIFECYCLE.4, R-HUB.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExitReason {
+    /// Drained and handed over to a newer build.
+    Upgrade,
+    /// Nothing attached for the idle timeout.
+    Idle,
+    /// Drained, but work never went quiet, so the drain cap ended it.
+    DrainTimeout,
+    /// Its socket was removed, so no client could reach it.
+    SocketRemoved,
+    /// Asked to stop: a signal, or a client's `Shutdown`.
+    Stopped,
+    /// Its listener failed.
+    Failed,
+}
+
+impl ExitReason {
+    /// A phrase for a sentence: "ahma last restarted … (`phrase`)".
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Self::Upgrade => "handed over to a newer build",
+            Self::Idle => "idle",
+            Self::DrainTimeout => {
+                "handed over to a newer build; work still running was interrupted"
+            }
+            Self::SocketRemoved => "its socket was removed",
+            Self::Stopped => "stopped",
+            Self::Failed => "its listener failed",
+        }
+    }
+}
+
+/// What the hub wrote on its way out: `last-exit.json`, beside the history.
+///
+/// What lets a later answer about an operation id nobody knows say *when* and
+/// *why* ahma restarted, from which version to which, and whether that
+/// operation was one the exit interrupted (SPEC R-LIFECYCLE.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastExit {
+    /// The version of the hub that exited.
+    pub version: String,
+    /// Its build id.
+    pub build_id: String,
+    pub reason: ExitReason,
+    /// When it exited (Unix epoch, milliseconds).
+    pub at_epoch_ms: u64,
+    /// Operations still running when it went, which it therefore interrupted.
+    #[serde(default)]
+    pub interrupted_ops: Vec<String>,
+}
+
+/// Where the hub at `socket` records why it last exited:
+/// `<socket stem>.last-exit.json` beside the socket — `hub.last-exit.json` in
+/// the runtime directory.
+///
+/// Keyed by the socket rather than resolved separately because both sides
+/// already agree on it: the hub owns it, and every worker is told it (SPEC
+/// R-HUB.2). It is also what keeps a test's record its own (SPEC R-HUB.10).
+pub fn last_exit_path_for(socket: &Path) -> PathBuf {
+    let stem = socket
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "hub".to_string());
+    socket.with_file_name(format!("{stem}.last-exit.json"))
+}
+
+/// Write `last-exit.json`, owner-only, replacing any previous one whole.
+pub async fn write_last_exit(path: &Path, exit: &LastExit) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(exit).map_err(std::io::Error::other)?;
+    let mut staged = path.as_os_str().to_os_string();
+    staged.push(".tmp");
+    let staged = PathBuf::from(staged);
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&staged).await?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, &json).await?;
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    drop(file);
+    tokio::fs::rename(&staged, path).await
+}
+
+/// Read `last-exit.json`, if there is a readable one.
+pub async fn read_last_exit(path: &Path) -> Option<LastExit> {
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// What the history recorded about one operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedOutcome {
+    /// It finished, and this is how.
+    Finished {
+        status: crate::hub::OpStatus,
+        exit_code: Option<i64>,
+        summary: Option<String>,
+        ended_epoch_ms: Option<u64>,
+        interrupted: bool,
+    },
+    /// It started and no end was ever recorded: it was still running when
+    /// its hub went.
+    NeverFinished,
+}
+
+/// Look `op_id` up in the history at `path` (and its rotated predecessor).
+///
+/// `None` when the history never saw it — an operation older than the
+/// history keeps, or one that ran where no hub was recording.
+pub async fn recorded_outcome(path: &Path, op_id: &str) -> Option<RecordedOutcome> {
+    let mut outcome = None;
+    for record in load_recent(path, 0).await {
+        match record {
+            HistoryRecord::Started {
+                event: HubEvent::OpStarted { id, .. },
+                ..
+            } if id == op_id && outcome.is_none() => {
+                outcome = Some(RecordedOutcome::NeverFinished);
+            }
+            HistoryRecord::Finished {
+                event:
+                    HubEvent::OpFinished {
+                        id,
+                        status,
+                        exit_code,
+                        result_summary,
+                        ended_epoch_ms,
+                        interrupted,
+                        ..
+                    },
+                ..
+            } if id == op_id => {
+                outcome = Some(RecordedOutcome::Finished {
+                    status,
+                    exit_code,
+                    summary: result_summary,
+                    ended_epoch_ms,
+                    interrupted,
+                });
+            }
+            _ => {}
+        }
+    }
+    outcome
+}
+
 /// The cutoff for [`load_recent`]: one replay window ago.
 pub fn replay_cutoff_ms(now_ms: u64) -> u64 {
     now_ms.saturating_sub(HISTORY_REPLAY_WINDOW.as_millis() as u64)
@@ -301,6 +449,100 @@ mod tests {
             denial: None,
             interrupted: false,
         }
+    }
+
+    /// `last-exit.json` is replaced whole and owner-only: it names the
+    /// operations an exit interrupted, and a torn one would say nothing.
+    #[tokio::test]
+    async fn the_last_exit_round_trips_and_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("last-exit.json");
+        let exit = LastExit {
+            version: "0.21.8".into(),
+            build_id: "abc".into(),
+            reason: ExitReason::DrainTimeout,
+            at_epoch_ms: 1_700_000_000_000,
+            interrupted_ops: vec!["op_abcd_3_cargo_build".into()],
+        };
+        write_last_exit(&path, &exit).await.expect("written");
+        assert_eq!(read_last_exit(&path).await, Some(exit.clone()));
+
+        let replaced = LastExit {
+            reason: ExitReason::Idle,
+            interrupted_ops: vec![],
+            ..exit
+        };
+        write_last_exit(&path, &replaced).await.expect("rewritten");
+        assert_eq!(read_last_exit(&path).await, Some(replaced));
+        let text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            text.contains("\"idle\""),
+            "reasons are kebab-case words: {text}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_unreadable_last_exit_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("last-exit.json");
+        assert_eq!(read_last_exit(&path).await, None);
+        tokio::fs::write(&path, "{torn").await.unwrap();
+        assert_eq!(read_last_exit(&path).await, None);
+    }
+
+    /// The history answers what happened to an operation whose process is
+    /// gone: how it finished, or that it never did (SPEC R-LIFECYCLE.4).
+    #[tokio::test]
+    async fn the_history_says_how_an_operation_ended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let writer = HistoryWriter::start(Some(path.clone())).unwrap();
+        for (ts, id) in [(1_000, "done"), (1_100, "cut-off")] {
+            writer.record(HistoryRecord::Started {
+                ts,
+                instance: instance("i1"),
+                event: started(id),
+            });
+        }
+        writer.record(HistoryRecord::Finished {
+            ts: 2_000,
+            instance_id: "i1".into(),
+            event: finished("done"),
+            tail: vec![],
+        });
+        writer.flush().await;
+
+        assert_eq!(
+            recorded_outcome(&path, "done").await,
+            Some(RecordedOutcome::Finished {
+                status: OpStatus::Completed,
+                exit_code: Some(0),
+                summary: Some("ok".into()),
+                ended_epoch_ms: Some(2_000),
+                interrupted: false,
+            })
+        );
+        assert_eq!(
+            recorded_outcome(&path, "cut-off").await,
+            Some(RecordedOutcome::NeverFinished)
+        );
+        assert_eq!(recorded_outcome(&path, "never-seen").await, None);
+    }
+
+    #[test]
+    fn the_last_exit_lives_beside_the_socket() {
+        let socket = Path::new("/run/user/1000/ahma/hub.sock");
+        assert_eq!(
+            last_exit_path_for(socket),
+            Path::new("/run/user/1000/ahma/hub.last-exit.json")
+        );
     }
 
     #[tokio::test]
