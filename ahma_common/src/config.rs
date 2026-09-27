@@ -1383,8 +1383,9 @@ pub struct HttpSettings {
     /// Require HTTP/2 or better; reject HTTP/1.1 connections.
     /// Default: `false`
     pub disable_http1_1: bool,
-    /// Path to the Unix domain socket.
-    /// Default: `None`
+    /// The per-user hub's one socket, and `ahma serve unix`'s when it is given
+    /// no `--socket-path` (SPEC R-HUB.2).
+    /// Default: `None` — `hub.sock` in the per-user runtime directory.
     pub unix_socket_path: Option<String>,
 }
 

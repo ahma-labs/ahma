@@ -1917,10 +1917,13 @@ mod tests {
         tokio::io::WriteHalf<LocalStream>,
         ClientMsg,
     ) {
-        let stream = tokio::time::timeout(TestTimeouts::scale_secs(5), listener.accept())
+        let mut stream = tokio::time::timeout(TestTimeouts::scale_secs(5), listener.accept())
             .await
             .expect("timed out waiting for the reporter to connect")
             .expect("accept failed");
+        ahma_common::hub::accept_events_upgrade(&mut stream)
+            .await
+            .expect("the reporter asks for the event stream (SPEC R-HUB.2)");
         let (read_half, write_half) = tokio::io::split(stream);
         let mut reader = tokio::io::BufReader::new(read_half);
         let msg = read_client_msg(&mut reader).await;

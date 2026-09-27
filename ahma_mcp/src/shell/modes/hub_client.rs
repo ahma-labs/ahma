@@ -1,9 +1,11 @@
 //! Finding — or starting — the one hub (SPEC R-HUB.1, R-HUB.5).
 //!
 //! Every entry point that needs ahma's background presence comes through here:
-//! the stdio frontend an editor spawns, `ahma tui`, and anything else that
-//! wants the MCP endpoint. They all want the same thing: *a hub is running
-//! and it is the right version*.
+//! the stdio frontend an editor spawns, `ahma tui` — for its event stream as
+//! much as for the MCP endpoint, which share one socket (SPEC R-HUB.2) — and
+//! anything else that wants either. They all want the same thing: *a hub is
+//! running and it is the right version*. Nothing else in ahma starts one, and
+//! a hooked command or a session worker never does (SPEC R-HUB.8).
 //!
 //! ## Why the version policy is what it is
 //!
@@ -108,10 +110,7 @@ pub async fn ensure_hub(
             // Serving but not answering /health: an older or foreign server.
             return Ok(EnsureOutcome::Ready);
         }
-        spawn_hub(Some(socket_path), idle_timeout_secs, || {
-            check_bridge_running(socket_path)
-        })
-        .await?;
+        spawn_hub(socket_path, idle_timeout_secs).await?;
         return Ok(EnsureOutcome::Spawned);
     };
 
@@ -132,10 +131,7 @@ pub async fn ensure_hub(
                     ours: format!("{client_semver}+{client_build}"),
                 });
             }
-            spawn_hub(Some(socket_path), idle_timeout_secs, || {
-                check_bridge_running(socket_path)
-            })
-            .await?;
+            spawn_hub(socket_path, idle_timeout_secs).await?;
             Ok(EnsureOutcome::Spawned)
         }
     }
@@ -162,21 +158,14 @@ async fn drain_and_wait(socket_path: &str) -> bool {
 /// ([`ahma_common::process_guard::NOT_INHERITED_BY_HUB`]).
 fn hub_command(
     exe: &std::path::Path,
-    socket_path: Option<&str>,
+    socket_path: &str,
     idle_timeout_secs: Option<u64>,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("hub");
-    if let Some(path) = socket_path {
-        cmd.args(["--unix-socket-path", path]);
-        // Hand it the matching hub socket, so a caller that asked for a private
-        // MCP endpoint gets a hub of its own rather than standing down
-        // against whoever holds the shared hub.
-        cmd.args([
-            "--hub-socket",
-            &ahma_common::hub::hub_socket_beside(path).to_string_lossy(),
-        ]);
-    }
+    // The one socket (SPEC R-HUB.2): the MCP endpoint, the event stream and
+    // the lock beside it all follow from this path.
+    cmd.args(["--unix-socket-path", socket_path]);
     if let Some(secs) = idle_timeout_secs {
         cmd.args(["--idle-timeout", &secs.to_string()]);
     }
@@ -206,22 +195,6 @@ fn hub_command(
     cmd
 }
 
-/// Ensure the hub answers, starting the hub if it does not.
-///
-/// For a client that needs the hub rather than the MCP endpoint — the TUI's
-/// event stream. It starts the hub through the same one path as
-/// [`ensure_hub`] (SPEC R-HUB.3); nothing else in ahma starts one.
-pub async fn ensure_hub_events() -> Result<()> {
-    if hub_answers().await {
-        return Ok(());
-    }
-    spawn_hub(None, None, hub_answers).await
-}
-
-async fn hub_answers() -> bool {
-    ahma_common::hub::connect_to_hub().await.is_ok()
-}
-
 /// May this process start a hub from `exe`?
 ///
 /// Under a test harness only the real `ahma` binary may (SPEC R-ISO.1). The
@@ -234,16 +207,8 @@ fn may_spawn_hub_from(exe: &Path) -> bool {
         || exe.file_stem().is_some_and(|stem| stem == "ahma")
 }
 
-/// Start the hub, detached, and wait until `ready` says it answers.
-async fn spawn_hub<F, Fut>(
-    socket_path: Option<&str>,
-    idle_timeout_secs: Option<u64>,
-    ready: F,
-) -> Result<()>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
+/// Start the hub, detached, and wait until it answers on its socket.
+async fn spawn_hub(socket_path: &str, idle_timeout_secs: Option<u64>) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
     if !may_spawn_hub_from(&exe) {
         anyhow::bail!(
@@ -260,7 +225,7 @@ where
         ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick);
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if ready().await {
+        if check_bridge_running(socket_path).await {
             tracing::info!("ahma hub started");
             return Ok(());
         }
@@ -291,7 +256,7 @@ mod tests {
     /// neither that tree's worker marker nor its workspace lease.
     #[test]
     fn the_hub_inherits_no_supervision_marker() {
-        let cmd = super::hub_command(std::path::Path::new("ahma"), None, None);
+        let cmd = super::hub_command(std::path::Path::new("ahma"), "/tmp/hub.sock", None);
         let removed: Vec<_> = cmd
             .as_std()
             .get_envs()

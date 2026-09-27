@@ -201,8 +201,9 @@ pub struct AppConfig {
     pub disable_http1_1: bool,
     /// Handshake timeout for HTTP mode in seconds (AHMA_HANDSHAKE_TIMEOUT, default 45).
     pub handshake_timeout_secs: u64,
-    /// Unix domain socket path for `serve unix` mode (AHMA_UNIX_SOCKET).
-    /// Empty string means unix socket mode is not active.
+    /// The local socket: the hub's for every mode but `serve unix`, which
+    /// binds it instead (`--unix-socket-path`, `[http] unix_socket_path`).
+    /// Empty means the default for the mode.
     pub unix_socket_path: String,
 
     // ── Observability ────────────────────────────────────────────────────────
@@ -249,9 +250,6 @@ pub struct AppConfig {
     pub hub_idle_timeout_secs: u64,
     /// Maximum concurrent HTTP server sessions.
     pub max_sessions: usize,
-    /// True when `--hub-socket` named the hub rendezvous explicitly, so the
-    /// hub must not derive one beside its MCP socket.
-    pub hub_socket_explicit: bool,
     /// The MCP session this worker serves (from `--session-id`).
     pub session_id: Option<String>,
     /// Pid of the client-facing frontend process (from `--client-pid`).
@@ -326,7 +324,6 @@ impl Default for AppConfig {
             idle_timeout_secs: None,
             max_sessions: 50,
             hub_idle_timeout_secs: 60,
-            hub_socket_explicit: false,
             session_id: None,
             client_pid: None,
             is_server_child: false,
@@ -896,15 +893,12 @@ async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
             tracing::info!("Running in HTTP bridge mode");
             modes::run_http_bridge_mode(cfg).await
         }
-        Some(ServeTransport::Unix(u)) => {
-            let path = ahma_common::hub::mcp_socket_path(u.socket_path.as_deref());
-            tracing::info!("Running in Unix socket bridge mode on {}", path);
-            modes::run_unix_bridge_mode(cfg).await
-        }
-        None => {
+        // `ahma serve` with no transport is `serve unix`; the socket was
+        // resolved into `cfg` with the rest of the configuration.
+        Some(ServeTransport::Unix(_)) | None => {
             tracing::info!(
                 "Running in Unix socket bridge mode on {}",
-                ahma_common::hub::mcp_socket_path(None)
+                cfg.unix_socket_path
             );
             modes::run_unix_bridge_mode(cfg).await
         }
@@ -1344,11 +1338,6 @@ pub struct Cli {
     #[arg(long = "tls-dir", value_name = "PATH", global = true)]
     pub tls_dir: Option<PathBuf>,
 
-    /// Hub socket path (an `AF_UNIX` socket on every OS).
-    /// Replaces the retired AHMA_HUB_SOCK environment variable.
-    #[arg(long = "hub-socket", value_name = "PATH", global = true)]
-    pub hub_socket: Option<PathBuf>,
-
     /// Indicate that this process is spawned as a child server subprocess.
     #[arg(long = "server-child", global = true)]
     pub server_child: bool,
@@ -1369,7 +1358,7 @@ pub struct Cli {
     #[arg(long = "max-sessions", value_name = "LIMIT", global = true)]
     pub max_sessions: Option<usize>,
 
-    /// Path to the Unix domain socket.
+    /// The per-user hub's socket, where editors' stdio frontends, the TUI and hooked commands all find the one hub (an `AF_UNIX` socket on every OS). It carries the MCP endpoint and the TUI's event stream both, so one path is all there is to move. The default is `hub.sock` in your private runtime directory; set it (or `[http] unix_socket_path`) only to run a separate hub, as tests do. `ahma serve unix` binds this path too when given no `--socket-path`.
     #[arg(long = "unix-socket-path", value_name = "PATH", global = true)]
     pub unix_socket_path: Option<String>,
 
@@ -2133,8 +2122,10 @@ pub struct UnixArgs {
     /// Supports filesystem paths (`/tmp/ahma.sock`) and Linux abstract sockets
     /// using the `@` prefix (`@ahma`).
     ///
-    /// Defaults to `[http] unix_socket_path` in `~/.ahma/settings.toml`, or
-    /// `/tmp/ahma.sock`. (`AHMA_UNIX_SOCKET` is retired and ignored, R-CFG1.2.)
+    /// Defaults to `--unix-socket-path`, then `[http] unix_socket_path` in
+    /// `~/.ahma/settings.toml`, then `mcp.sock` in the per-user runtime
+    /// directory — beside the hub's `hub.sock`, never on it.
+    /// (`AHMA_UNIX_SOCKET` is retired and ignored, R-CFG1.2.)
     #[arg(long = "socket-path")]
     pub socket_path: Option<String>,
 }
@@ -2450,24 +2441,26 @@ fn unix_socket_path_from_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -
     if let Some(path) = &cli.unix_socket_path {
         return path.clone();
     }
+    let configured = s.http.unix_socket_path.clone().filter(|p| !p.is_empty());
     match &cli.command {
-        Subcommands::Serve(serve_args) => match &serve_args.transport {
-            Some(ServeTransport::Unix(u)) => u
-                .socket_path
-                .clone()
-                .or_else(|| s.http.unix_socket_path.clone())
-                .unwrap_or_else(|| ahma_common::hub::mcp_socket_path(None)),
-            _ => s
-                .http
-                .unix_socket_path
-                .clone()
-                .unwrap_or_else(|| ahma_common::hub::mcp_socket_path(None)),
-        },
-        _ => s
-            .http
-            .unix_socket_path
+        // An operator's own server has a default of its own, so it never
+        // lands on the hub's rendezvous uninvited.
+        Subcommands::Serve(ServeArgs {
+            transport: Some(ServeTransport::Unix(u)),
+        }) => u
+            .socket_path
             .clone()
-            .unwrap_or_else(|| ahma_common::hub::mcp_socket_path(None)),
+            .or(configured)
+            .unwrap_or_else(|| ahma_common::hub::serve_unix_socket_path(None)),
+        // `ahma serve` with no transport is `serve unix`.
+        Subcommands::Serve(ServeArgs { transport: None }) => {
+            configured.unwrap_or_else(|| ahma_common::hub::serve_unix_socket_path(None))
+        }
+        _ => configured.unwrap_or_else(|| {
+            ahma_common::hub::default_socket_path()
+                .to_string_lossy()
+                .into_owned()
+        }),
     }
 }
 
@@ -2932,9 +2925,19 @@ fn apply_process_wide_cli_overrides(cli: &Cli) {
     if let Some(dir) = &cli.tls_dir {
         ahma_common::local_tls::LocalTlsConfig::set_dir_override(dir.clone());
     }
-    if let Some(path) = &cli.hub_socket {
-        ahma_common::hub::set_socket_path_override(path.clone());
-    }
+}
+
+/// The hub socket this process was told to use, if any (SPEC R-HUB.2).
+///
+/// One setting names it for every process, so the hub, the frontends that
+/// start it, the workers that report to it and the TUI that watches it cannot
+/// disagree: `--unix-socket-path`, else `[http] unix_socket_path`.
+fn hub_socket_override(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> Option<PathBuf> {
+    cli.unix_socket_path
+        .clone()
+        .or_else(|| s.http.unix_socket_path.clone())
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Resolve macOS keychain access (default on; `[sandbox] allow_keychain`) and
@@ -3072,6 +3075,9 @@ pub fn build_app_config_with_settings(
     s: ahma_common::config::AhmaSettings,
 ) -> AppConfig {
     apply_process_wide_cli_overrides(cli);
+    if let Some(path) = hub_socket_override(cli, &s) {
+        ahma_common::hub::set_socket_path_override(path);
+    }
 
     let serve = extract_serve_fields(&cli.command);
     let tool = extract_tool_fields(&cli.command);
@@ -3192,7 +3198,6 @@ pub fn build_app_config_with_settings(
         idle_timeout_secs,
         max_sessions: cli.max_sessions.unwrap_or(10),
         hub_idle_timeout_secs: s.hub.idle_timeout_secs,
-        hub_socket_explicit: cli.hub_socket.is_some(),
         session_id: cli.session_id.clone(),
         client_pid: cli.client_pid,
         is_server_child: cli.server_child || std::env::var("AHMA_SERVER_CHILD").is_ok(),
@@ -5034,13 +5039,61 @@ mod tests {
     #[test]
     fn test_unix_socket_path_default_when_unset() {
         let _guard = ENV_MUTEX.lock();
-        let cli = Cli::parse_from(["ahma", "serve", "http"]);
+        let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
         let s = ahma_common::config::AhmaSettings::default();
         assert_eq!(
             unix_socket_path_from_cli(&cli, &s),
-            ahma_common::hub::mcp_socket_path(None),
-            "with nothing configured the CLI resolves the per-user hub socket \
+            ahma_common::hub::default_socket_path().to_string_lossy(),
+            "with nothing configured a frontend resolves the per-user hub socket \
              (SPEC R-HUB.2), never the retired machine-global /tmp/ahma.sock"
+        );
+    }
+
+    /// An operator's `serve unix`, bare `serve` included, never defaults onto
+    /// the hub's socket: it would be serving there without the hub's lock.
+    #[test]
+    fn test_unix_socket_path_serve_unix_defaults_off_the_hub() {
+        let _guard = ENV_MUTEX.lock();
+        let s = ahma_common::config::AhmaSettings::default();
+        for args in [&["ahma", "serve", "unix"][..], &["ahma", "serve"][..]] {
+            let cli = Cli::parse_from(args);
+            assert_eq!(
+                unix_socket_path_from_cli(&cli, &s),
+                ahma_common::hub::serve_unix_socket_path(None),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// One flag names the hub's one socket (SPEC R-HUB.2): the MCP endpoint
+    /// and the event stream share it, so `--hub-socket` is gone.
+    #[test]
+    fn the_unix_socket_path_names_the_hub_for_every_process() {
+        let _guard = ENV_MUTEX.lock();
+        let mut s = ahma_common::config::AhmaSettings::default();
+        let bare = Cli::parse_from(["ahma", "hub"]);
+        assert_eq!(hub_socket_override(&bare, &s), None);
+
+        let flagged = Cli::parse_from(["ahma", "--unix-socket-path", "/x/hub.sock", "tui"]);
+        assert_eq!(
+            hub_socket_override(&flagged, &s),
+            Some(PathBuf::from("/x/hub.sock"))
+        );
+
+        s.http.unix_socket_path = Some("/from/settings.sock".to_string());
+        assert_eq!(
+            hub_socket_override(&bare, &s),
+            Some(PathBuf::from("/from/settings.sock"))
+        );
+        assert_eq!(
+            hub_socket_override(&flagged, &s),
+            Some(PathBuf::from("/x/hub.sock")),
+            "the flag outranks the setting (SPEC R-CFG1)"
+        );
+
+        assert!(
+            Cli::try_parse_from(["ahma", "--hub-socket", "/x/hub.sock", "hub"]).is_err(),
+            "the second socket flag is gone with the second socket"
         );
     }
 

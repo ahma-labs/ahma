@@ -564,7 +564,7 @@ pub async fn trigger_tcp_restart_with_mode(url: &str, mode: Option<&str>) -> boo
 /// whatever owns it — the developer's live MCP server. A test driving its own
 /// bridge on a private socket is legitimate, so only the shared one is refused.
 fn is_shared_socket_under_test(socket_path: &str) -> bool {
-    let shared = is_test_isolated() && socket_path == global_mcp_socket_path();
+    let shared = is_test_isolated() && socket_path == global_hub_socket_path();
     if shared {
         tracing::warn!(
             "Test-isolated process may not restart the shared hub; ignoring {socket_path}"
@@ -617,16 +617,16 @@ fn open_capture_file_sync(path: &std::path::Path, banner: &str) -> Option<std::f
     }
 }
 
-/// The per-user MCP endpoint the hub binds (SPEC R-HUB.2).
+/// The per-user hub's socket (SPEC R-HUB.2), ignoring every override.
 ///
 /// It is a per-user singleton *by design*: several MCP clients share one hub.
 /// That sharing is exactly why a test must never resolve it — see
 /// [`is_test_isolated`] and this module's socket resolution. It used to be the
 /// machine-global `/tmp/ahma.sock`, which every local user could see and, since
-/// nothing owned the path, pre-create; it now lives beside the hub socket in the
-/// 0700 per-user runtime directory.
-pub fn global_mcp_socket_path() -> String {
-    ahma_common::hub::platform_mcp_socket_path()
+/// nothing owned the path, pre-create; it now lives in the 0700 per-user
+/// runtime directory.
+pub fn global_hub_socket_path() -> String {
+    ahma_common::hub::platform_hub_socket_path()
         .to_string_lossy()
         .into_owned()
 }
@@ -654,10 +654,12 @@ pub fn is_test_isolated() -> bool {
 /// Under test isolation this is a per-process private path, so a test can never
 /// reach — much less restart — a bridge it does not own.
 fn default_socket_path() -> String {
-    // One resolver for both rendezvous files (SPEC R-HUB.2, R-ISO.1): the
+    // One resolver for the hub's one socket (SPEC R-HUB.2, R-ISO.1): the
     // harness fallback keys off the test-run discriminator, not this process's
     // pid, so a test and the binaries it spawns agree on the same private path.
-    ahma_common::hub::mcp_socket_path(None)
+    ahma_common::hub::default_socket_path()
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Returns true when the process is running as a server-child subprocess.
@@ -1020,7 +1022,6 @@ mod tests {
             edit_guard: true,
             settings_origin: crate::shell::cli::SettingsOriginCtx::default(),
             hub_idle_timeout_secs: 60,
-            hub_socket_explicit: false,
             session_id: None,
             client_pid: None,
         }
@@ -1249,14 +1250,14 @@ mod tests {
         );
         assert_ne!(
             socket,
-            global_mcp_socket_path(),
+            global_hub_socket_path(),
             "a test must not resolve the shared hub socket"
         );
         // Keyed by the test-run discriminator, not this pid: a test and the
         // binaries it spawns must agree on one private path (SPEC R-ISO.1).
         assert!(
             socket.contains(&format!(
-                "ahma-test-mcp-{}",
+                "ahma-test-hub-{}",
                 ahma_common::test_isolation::test_run_discriminator()
             )),
             "expected the per-run private socket, got {socket}"
@@ -1268,7 +1269,7 @@ mod tests {
     #[tokio::test]
     async fn trigger_bridge_restart_refuses_the_global_endpoint_under_test_isolation() {
         assert!(
-            !trigger_bridge_restart(&global_mcp_socket_path()).await,
+            !trigger_bridge_restart(&global_hub_socket_path()).await,
             "a test must never restart the shared hub"
         );
     }

@@ -39,7 +39,7 @@ applies it, irreversibly, so one process cannot hold two workspace scopes.
 ```
 editor 1 ─┐
 editor 2 ─┼─ ahma serve stdio (a pipe) ─┐
-editor 3 ─┘                             │  mcp.sock
+editor 3 ─┘                             │
 ahma tui ───────────────────────────────┤  hub.sock
 hooked command ─────────────────────────┘
                                         ▼
@@ -60,12 +60,18 @@ owned by someone else or reachable by group or others. It holds:
 | File | What it is |
 |---|---|
 | `hub.lock` | The mutex: whoever holds it is the hub. A kernel lock, so it is released the moment its holder dies, and nothing is left to clean up after a crash. |
-| `hub.sock` | The event stream: instances, operations and approvals. Only the lock holder binds or removes it. `0600`. |
-| `mcp.sock` | The MCP endpoint editors proxy to. `0600`. |
+| `hub.sock` | The one socket: the MCP endpoint editors proxy to, and the event stream (instances, operations and approvals). Only the lock holder binds or removes it. `0600`. |
 | `history.jsonl` | The last hour of operations, so recent work survives a restart. `0600`. |
 
-You can put the sockets somewhere else with `--unix-socket-path` (or `[http]
-unix_socket_path`), and ahma will honour it. It checks ownership and mode only
+Both halves share the socket. `/mcp` and `/health` are ordinary HTTP; the
+event stream is an HTTP upgrade (`GET /events` with `Upgrade: ahma-hub`), after
+which the connection carries newline-delimited JSON. So there is one path to
+configure and one file to secure. An `ahma serve unix` you start yourself
+defaults to `mcp.sock` beside it, never onto it.
+
+You can put the socket somewhere else with `--unix-socket-path` (or `[http]
+unix_socket_path`), and ahma will honour it — every process that looks for
+the hub reads the same setting, and the lock goes beside it. It checks ownership and mode only
 on the directory it picked itself — the `0700` one above. A directory you named
 is your decision; if it is writable by other users and has no sticky bit to stop
 them unlinking your socket, ahma says so at startup and carries on.
@@ -75,7 +81,7 @@ it, and since nothing owned the path, pre-create it. A `0600` socket inside a
 world-writable directory is still squattable, which is why the directory is
 checked and not only the socket.
 
-On **Windows** (10 1803 or later) both are the same kind of `AF_UNIX` socket
+On **Windows** (10 1803 or later) it is the same kind of `AF_UNIX` socket
 file, with the same lock; access control comes from the per-user profile ACL
 rather than mode bits. The hub opens no TCP port on any OS.
 
@@ -93,7 +99,7 @@ idle_timeout_secs = 3600
 | Setting | Default | What it does |
 |---|---|---|
 | `[hub] idle_timeout_secs` | `3600` | Seconds with no MCP sessions and no TUI before the hub exits; `0` never. |
-| `--unix-socket-path` / `[http] unix_socket_path` | per-user runtime dir | Where the MCP socket (and, beside it, the hub socket) lives. |
+| `--unix-socket-path` / `[http] unix_socket_path` | `hub.sock` in the per-user runtime dir | Where the hub's one socket lives. |
 
 Counting only sessions would exit while a TUI sat watching an idle project;
 counting only subscribers would exit mid-build. Restarting is cheap and the

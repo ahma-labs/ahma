@@ -194,7 +194,9 @@ pub fn spawn_tool_call_task(
             // The chat's tool calls run in an ordinary MCP session on the
             // per-user hub, scoped by this TUI's own `roots/list` answer —
             // not by a server started for this directory (SPEC R-HUB.9).
-            let socket = ahma_common::hub::mcp_socket_path(None);
+            let socket = ahma_common::hub::default_socket_path()
+                .to_string_lossy()
+                .into_owned();
             let res = ahma_mcp::shell::modes::hub_client::ensure_hub(&socket, None).await;
             if let Err(e) = res {
                 let _ = tx

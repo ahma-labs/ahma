@@ -128,7 +128,7 @@ fn unix_socket_path_falls_back_to_the_per_user_hub_socket() {
     }
     assert_eq!(
         ahma_tui::connection::unix_socket_default_path(),
-        ahma_common::hub::mcp_socket_path(None),
+        ahma_common::hub::default_socket_path().to_string_lossy(),
     );
 }
 

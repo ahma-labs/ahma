@@ -21,12 +21,14 @@
 //!
 //! ## Lifetime
 //!
-//! The hub's rendezvous lock is the mutex (SPEC R-HUB.2); whoever takes it
-//! binds the MCP socket too. Idle is judged across *both* halves — no MCP sessions **and**
-//! no hub connections — so a TUI watching an idle project keeps the hub
-//! alive while an editor with no TUI attached does too. Exit runs one
-//! choreography: stop the sessions, flush history, unlink only the sockets this
-//! process bound (SPEC R-ISO.3), and go.
+//! Both halves are served on **one socket** (SPEC R-HUB.2): the MCP bridge
+//! listens on it, answering `/mcp` and `/health`, and hands `GET /events`
+//! upgrades to the event stream. The rendezvous lock beside it is the mutex;
+//! whoever takes it binds the socket. Idle is judged across *both* halves — no
+//! MCP sessions **and** no hub connections — so a TUI watching an idle project
+//! keeps the hub alive while an editor with no TUI attached does too. Exit
+//! runs one choreography: stop the sessions, flush history, unlink the socket
+//! while the lock is still held (SPEC R-ISO.3), and go.
 
 use crate::shell::cli::AppConfig;
 use ahma_common::hub::{HubBindError, HubServer};
@@ -118,23 +120,15 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
 
     // ── The rendezvous, and the mutex ────────────────────────────────────────
     //
-    // The two sockets are a pair. When an explicit MCP socket is given without
-    // an explicit hub socket, the hub goes beside it: left on the shared path,
-    // this hub would lose the bind to whichever one already held it and
-    // stand down, leaving nobody serving the endpoint it was asked for.
-    let mcp_socket = ahma_common::hub::mcp_socket_path(
-        Some(config.unix_socket_path.as_str()).filter(|p| !p.is_empty()),
-    );
-    let hub_socket = if config.hub_socket_explicit {
-        ahma_common::hub::default_socket_path()
-    } else {
-        ahma_common::hub::hub_socket_beside(&mcp_socket)
-    };
-    if let Some(dir) = hub_socket.parent() {
-        if rendezvous_is_ahma_owned(&hub_socket) {
+    // One socket (SPEC R-HUB.2): the bridge below serves `/mcp`, `/health`
+    // and the event stream on it. The hub takes its lock and leaves the bind
+    // to the bridge.
+    let socket = ahma_common::hub::default_socket_path();
+    if let Some(dir) = socket.parent() {
+        if rendezvous_is_ahma_owned(&socket) {
             if let Err(e) = ahma_common::hub::verify_runtime_dir_secure(dir) {
                 // Refusing is the point: a directory another user can write is
-                // a directory in which our sockets can be replaced with theirs.
+                // a directory in which our socket can be replaced with theirs.
                 return Err(e.context("refusing to start the ahma hub"));
             }
         } else if let Some(notice) = squattable_directory_notice(dir) {
@@ -142,7 +136,7 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
         }
     }
 
-    let hub = match HubServer::bind_at(hub_socket.clone()).await {
+    let hub = match HubServer::lock_at(socket.clone()).await {
         Ok(server) => server,
         Err(HubBindError::AlreadyRunning) => {
             // The ordinary outcome of losing a startup race: the winner is
@@ -167,9 +161,10 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
         Arc::new(move |reason: &str| exit.request(reason))
     });
 
-    // ── The MCP endpoint ─────────────────────────────────────────────────────
+    // ── The one listener ─────────────────────────────────────────────────────
     let active_sessions = Arc::new(AtomicUsize::new(0));
-    let bridge = build_bridge_config(&config, &mcp_socket, &hub_socket, &active_sessions, &exit)?;
+    let mut bridge = build_bridge_config(&config, &socket, &active_sessions, &exit)?;
+    bridge.hub_events = Some(hub.events());
 
     // An explicit --idle-timeout is a deliberate instruction and outranks the
     // settings value, as every other flag does (SPEC R-CFG1).
@@ -178,10 +173,9 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
         .unwrap_or(config.hub_idle_timeout_secs);
 
     tracing::info!(
-        hub = %hub_socket.display(),
-        mcp = %mcp_socket,
+        socket = %socket.display(),
         idle_timeout_secs,
-        "ahma hub: serving the hub and the MCP endpoint"
+        "ahma hub: serving the MCP endpoint and the event stream"
     );
 
     let hub_connections = hub.connection_count();
@@ -194,16 +188,10 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
 
     // ── Serve until something asks us to stop ────────────────────────────────
     let reason = tokio::select! {
-        result = hub.serve() => {
-            match result {
-                Ok(()) => "hub accept loop ended".to_string(),
-                Err(e) => format!("hub accept loop failed: {e}"),
-            }
-        }
         result = start_bridge(bridge) => {
             match result {
-                Ok(()) => "MCP endpoint ended".to_string(),
-                Err(e) => format!("MCP endpoint failed: {e}"),
+                Ok(()) => "listener ended".to_string(),
+                Err(e) => format!("listener failed: {e}"),
             }
         }
         stop = stop_rx.recv() => stop.unwrap_or_else(|| "stop requested".to_string()),
@@ -218,8 +206,7 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
         // TUI afterwards is most likely to be looking for.
         writer.shutdown().await;
     }
-    remove_own_socket(std::path::Path::new(&mcp_socket));
-    // Last: dropping the hub unlinks its socket and then releases the lock, so
+    // Last: dropping the hub unlinks the socket and then releases the lock, so
     // nothing above can touch a successor's files (SPEC R-ISO.3).
     drop(hub);
     Ok(())
@@ -232,8 +219,7 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
 /// own, from its own client's `roots/list`.
 fn build_bridge_config(
     config: &AppConfig,
-    mcp_socket: &str,
-    hub_socket: &std::path::Path,
+    socket: &std::path::Path,
     active_sessions: &Arc<AtomicUsize>,
     exit: &Arc<HubExit>,
 ) -> Result<BridgeConfig> {
@@ -242,16 +228,14 @@ fn build_bridge_config(
         .to_string_lossy()
         .to_string();
 
-    // Workers must report to *this* hub, not to whatever the default
-    // path resolves to. It is the same path in production, so this only shows
-    // up when a hub is given an explicit socket — where a worker reporting
-    // somewhere else is exactly the confusion the one-hub rule exists to
-    // remove.
+    // Workers must report to *this* hub, not to whatever the default path
+    // resolves to in their environment — a worker reporting somewhere else is
+    // exactly the confusion the one-hub rule exists to remove. Said
+    // explicitly even when it is the default, so a worker never has to
+    // re-derive it.
     let mut server_args = super::build_stdio_server_args(config, "--tools", false);
-    if config.hub_socket_explicit {
-        server_args.push("--hub-socket".to_string());
-        server_args.push(hub_socket.to_string_lossy().into_owned());
-    }
+    server_args.push("--unix-socket-path".to_string());
+    server_args.push(socket.to_string_lossy().into_owned());
 
     Ok(BridgeConfig {
         bind_addr: "127.0.0.1:0".parse().expect("a literal loopback address"),
@@ -268,7 +252,7 @@ fn build_bridge_config(
         // The same `AF_UNIX` socket on every OS, Windows included (SPEC
         // R-HUB.2): until this was so, Windows bound a TCP port that no
         // client could discover.
-        listener_kind: ListenerKind::Unix(mcp_socket.to_string()),
+        listener_kind: ListenerKind::Unix(socket.to_string_lossy().into_owned()),
         require_token: None,
         require_token_path: None,
         rate_limit_rps: 0,
@@ -287,6 +271,8 @@ fn build_bridge_config(
             super::session_options::session_query_to_worker_args(&pairs)
         })),
         exit: Some(exit.clone()),
+        // Filled in by the caller, which owns the hub.
+        hub_events: None,
     })
 }
 
@@ -321,13 +307,6 @@ fn spawn_idle_watcher(
             }
         }
     })
-}
-
-/// Remove a socket file this process bound. Safe only while the hub still holds
-/// the rendezvous lock (SPEC R-ISO.3): after that another hub may have bound
-/// the same path, and this would orphan *its* live socket.
-fn remove_own_socket(path: &std::path::Path) {
-    ahma_common::fs_lock::remove_stale_socket(path);
 }
 
 /// Resolve when the process is asked to stop by the operating system.
@@ -424,38 +403,27 @@ mod tests {
         set(0o700);
     }
 
-    /// A worker must report to *its own* hub.
-    ///
-    /// The paths are identical in production, so this only bites when a hub
-    /// is given an explicit socket — and then a worker reporting to whatever
-    /// the default resolves to is exactly the confusion one hub exists to
-    /// remove. Found by running the thing rather than by a test, which is why
-    /// there is now a test.
+    /// A worker must report to *its own* hub, on the one socket (SPEC
+    /// R-HUB.2) — told so explicitly, so it never re-derives the path.
     #[test]
     fn workers_are_told_which_hub_to_report_to() {
-        let hub = std::path::Path::new("/run/user/1000/ahma-test/hub.sock");
+        let socket = std::path::Path::new("/run/user/1000/ahma-test/hub.sock");
         let sessions = Arc::new(AtomicUsize::new(0));
         let exit = Arc::new(HubExit::new(Box::new(|_| {})));
 
-        let explicit = AppConfig {
-            hub_socket_explicit: true,
-            ..AppConfig::default()
-        };
-        let cfg = build_bridge_config(&explicit, "/tmp/mcp.sock", hub, &sessions, &exit)
+        let cfg = build_bridge_config(&AppConfig::default(), socket, &sessions, &exit)
             .expect("config builds");
         let idx = cfg
             .server_args
             .iter()
-            .position(|a| a == "--hub-socket")
+            .position(|a| a == "--unix-socket-path")
             .expect("the worker is told which hub to use");
-        assert_eq!(cfg.server_args[idx + 1], hub.to_string_lossy());
-
-        // With no explicit socket both sides resolve the same default, and
-        // passing it would only be noise.
-        let default_cfg = AppConfig::default();
-        let cfg = build_bridge_config(&default_cfg, "/tmp/mcp.sock", hub, &sessions, &exit)
-            .expect("config builds");
-        assert!(!cfg.server_args.iter().any(|a| a == "--hub-socket"));
+        assert_eq!(cfg.server_args[idx + 1], socket.to_string_lossy());
+        assert!(
+            matches!(&cfg.listener_kind, ListenerKind::Unix(p) if p == &socket.to_string_lossy()),
+            "and the bridge serves that same socket: {:?}",
+            cfg.listener_kind
+        );
     }
 
     /// The hub's MCP endpoint carries no scope of its own: one there would
@@ -466,7 +434,6 @@ mod tests {
         let exit = Arc::new(HubExit::new(Box::new(|_| {})));
         let cfg = build_bridge_config(
             &AppConfig::default(),
-            "/tmp/mcp.sock",
             std::path::Path::new("/tmp/hub.sock"),
             &sessions,
             &exit,

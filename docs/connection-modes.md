@@ -255,7 +255,8 @@ ordinary editor use.
 
 ```bash
 # Start on the default socket: mcp.sock in your per-user runtime directory
-# ($XDG_RUNTIME_DIR/ahma, else ~/.ahma; %LOCALAPPDATA%\ahma\run on Windows)
+# ($XDG_RUNTIME_DIR/ahma, else ~/.ahma; %LOCALAPPDATA%\ahma\run on Windows),
+# beside the per-user hub's own hub.sock
 ahma serve unix
 
 # Custom socket path

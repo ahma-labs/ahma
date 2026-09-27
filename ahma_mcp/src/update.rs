@@ -20,7 +20,9 @@ pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result
         let _ = ahma_common::hub::stop_hub().await;
 
         let socket_path = if cfg.unix_socket_path.is_empty() {
-            ahma_common::hub::mcp_socket_path(None)
+            ahma_common::hub::default_socket_path()
+                .to_string_lossy()
+                .into_owned()
         } else {
             cfg.unix_socket_path.clone()
         };
