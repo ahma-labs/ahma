@@ -2,10 +2,10 @@
 //!
 //! Default behaviour when `--connect` is not supplied:
 //!
-//! * **Unix** — try the local Unix domain socket (`[http] unix_socket_path` in
-//!   `~/.ahma/settings.toml`, default `/tmp/ahma.sock`) first, then fall back to
-//!   `http://localhost:3000`.
-//! * **Windows / non-Unix** — go straight to `http://localhost:3000`.
+//! try the local Unix domain socket (`[http] unix_socket_path` in
+//! `~/.ahma/settings.toml`, default the per-user daemon's `mcp.sock`) first, then
+//! fall back to `http://localhost:3000`. The socket is `AF_UNIX` on every OS,
+//! Windows included (SPEC R-DAEMON.2).
 //!
 //! After a successful TCP/HTTP probe the server's `Alt-Svc` response header is
 //! checked for an `h3` token.  When QUIC is advertised **and** a persistent local
@@ -15,7 +15,7 @@
 //! When `--connect <URL>` is explicitly supplied the value is used as the sole
 //! candidate; no fallback is attempted.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -36,9 +36,8 @@ pub enum ResolvedTransport {
     /// from the TUI use regular HTTPS (TCP) since QUIC connectivity was already
     /// verified at connection time.  The inner string is the base HTTP URL.
     Http3(String),
-    /// HTTP over a Unix domain socket.  The inner string is the socket path,
-    /// e.g. `"/tmp/ahma.sock"`.
-    #[cfg(unix)]
+    /// HTTP over an `AF_UNIX` socket, on every OS (SPEC R-DAEMON.2).  The
+    /// inner string is the socket path, e.g. `"/run/user/1000/ahma/mcp.sock"`.
     UnixSocket(String),
 }
 
@@ -58,7 +57,6 @@ impl ResolvedConnection {
         match &self.transport {
             ResolvedTransport::Http(_) => "HTTP",
             ResolvedTransport::Http3(_) => "HTTP/3 (QUIC)",
-            #[cfg(unix)]
             ResolvedTransport::UnixSocket(_) => "Unix socket",
         }
     }
@@ -74,8 +72,7 @@ impl ResolvedConnection {
 ///   treated as the sole candidate and the function returns an error if it is
 ///   unreachable.
 /// * When `None`, the function tries candidates in order and returns the first
-///   healthy one.  On Unix this is: Unix socket, then `http://localhost:3000`.
-///   On non-Unix platforms it is: `http://localhost:3000` only.
+///   healthy one: the Unix socket (on every OS), then `http://localhost:3000`.
 pub async fn resolve_connection(explicit: Option<&str>) -> Result<ResolvedConnection> {
     if let Some(url) = explicit {
         return resolve_explicit(url).await;
@@ -153,20 +150,11 @@ async fn resolve_default_candidates() -> Result<ResolvedConnection> {
     )
 }
 
-#[cfg(unix)]
 fn default_server_candidate() -> ResolvedConnection {
     let socket_path = unix_socket_default_path();
     ResolvedConnection {
         display_url: format!("unix://{socket_path}"),
         transport: ResolvedTransport::UnixSocket(socket_path),
-    }
-}
-
-#[cfg(not(unix))]
-fn default_server_candidate() -> ResolvedConnection {
-    ResolvedConnection {
-        display_url: "http://localhost:3000".to_string(),
-        transport: ResolvedTransport::Http("http://localhost:3000".to_string()),
     }
 }
 
@@ -215,15 +203,11 @@ async fn start_background_server() -> Result<ResolvedConnection> {
 fn default_candidates() -> Vec<ResolvedConnection> {
     let mut candidates: Vec<ResolvedConnection> = Vec::new();
 
-    #[cfg(unix)]
-    {
-        let socket_path = unix_socket_default_path();
-        let display = format!("unix://{socket_path}");
-        candidates.push(ResolvedConnection {
-            display_url: display,
-            transport: ResolvedTransport::UnixSocket(socket_path),
-        });
-    }
+    let socket_path = unix_socket_default_path();
+    candidates.push(ResolvedConnection {
+        display_url: format!("unix://{socket_path}"),
+        transport: ResolvedTransport::UnixSocket(socket_path),
+    });
 
     candidates.push(ResolvedConnection {
         display_url: "http://localhost:3000".to_string(),
@@ -244,7 +228,6 @@ fn default_candidates() -> Vec<ResolvedConnection> {
 /// with two meanings in two binaries of the same product, and "which socket does the
 /// control-plane UI attach to" is not something ambient environment should decide.
 /// Use `--connect unix://<path>` for a one-off, or the settings key to make it stick.
-#[cfg(unix)]
 pub fn unix_socket_default_path() -> String {
     ahma_mcp::warn_retired_env("AHMA_UNIX_SOCKET");
     ahma_common::config::AhmaSettings::load()
@@ -256,21 +239,12 @@ pub fn unix_socket_default_path() -> String {
 
 /// Parse a user-supplied `--connect` value into a `ResolvedConnection`.
 fn parse_candidate(url: &str) -> ResolvedConnection {
-    // unix:///path  or  unix://path  (both mean filesystem socket)
+    // unix:///path  or  unix://path  (both mean filesystem socket, on every OS)
     if let Some(rest) = url.strip_prefix("unix://") {
-        let socket_path = rest.to_string();
-        #[cfg(unix)]
         return ResolvedConnection {
             display_url: url.to_string(),
-            transport: ResolvedTransport::UnixSocket(socket_path),
+            transport: ResolvedTransport::UnixSocket(rest.to_string()),
         };
-        #[cfg(not(unix))]
-        {
-            let _ = socket_path; // suppress unused warning
-            tracing::warn!(
-                "Unix domain sockets are not supported on this platform; falling back to HTTP."
-            );
-        }
     }
 
     // Strip fragment (unix:///tmp/ahma.sock#/mcp) for display; we only probe /health
@@ -300,7 +274,6 @@ fn candidate_to_resolved(c: ResolvedConnection) -> ResolvedConnection {
 pub async fn probe_candidate(candidate: &ResolvedConnection) -> bool {
     match &candidate.transport {
         ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => probe_http(url).await,
-        #[cfg(unix)]
         ResolvedTransport::UnixSocket(path) => probe_unix_socket(path).await,
     }
 }
@@ -401,13 +374,12 @@ pub fn parse_h3_from_alt_svc(alt_svc: &str) -> Option<&str> {
 /// Probe a Unix domain socket by sending a raw HTTP/1.0 GET /health request
 /// and checking the response status line for a 2xx code.
 ///
-/// We use raw I/O here to avoid pulling in a full HTTP-over-UDS library just
-/// for a health check.
-#[cfg(unix)]
+/// We use raw I/O here to avoid pulling in a full HTTP client just for a
+/// health check. `AF_UNIX` on every OS, Windows included (SPEC R-DAEMON.2).
 async fn probe_unix_socket(socket_path: &str) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let connect = tokio::net::UnixStream::connect(socket_path);
+    let connect = ahma_common::local_socket::LocalStream::connect(Path::new(socket_path));
     let Some(mut stream) = tokio::time::timeout(Duration::from_secs(2), connect)
         .await
         .ok()
@@ -429,7 +401,6 @@ async fn probe_unix_socket(socket_path: &str) -> bool {
 }
 
 /// Parse the first line of an HTTP response and return `true` for 2xx codes.
-#[cfg(any(unix, test))]
 fn parse_status_2xx(response: &[u8]) -> bool {
     let text = std::str::from_utf8(response).unwrap_or("");
     let first_line = text.lines().next().unwrap_or("");
@@ -446,9 +417,9 @@ fn parse_status_2xx(response: &[u8]) -> bool {
 
 #[cfg(test)]
 use ahma_mcp::shell::modes::server::parse_version;
-use ahma_mcp::shell::modes::server::{BridgeHealth, query_tcp_health, trigger_tcp_restart};
-#[cfg(unix)]
-use ahma_mcp::shell::modes::server::{query_uds_health, trigger_uds_restart};
+use ahma_mcp::shell::modes::server::{
+    BridgeHealth, query_tcp_health, query_uds_health, trigger_tcp_restart, trigger_uds_restart,
+};
 
 pub async fn get_candidate_version(candidate: &ResolvedConnection) -> Option<String> {
     get_candidate_health(candidate).await.map(|h| h.version)
@@ -457,7 +428,6 @@ pub async fn get_candidate_version(candidate: &ResolvedConnection) -> Option<Str
 async fn get_candidate_health(candidate: &ResolvedConnection) -> Option<BridgeHealth> {
     match &candidate.transport {
         ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => query_tcp_health(url).await,
-        #[cfg(unix)]
         ResolvedTransport::UnixSocket(path) => query_uds_health(path).await,
     }
 }
@@ -467,7 +437,6 @@ pub async fn trigger_candidate_restart(candidate: &ResolvedConnection) -> bool {
         ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => {
             trigger_tcp_restart(url).await
         }
-        #[cfg(unix)]
         ResolvedTransport::UnixSocket(path) => trigger_uds_restart(path).await,
     }
 }
@@ -503,13 +472,10 @@ mod tests {
         let candidates = default_candidates();
         assert!(!candidates.is_empty(), "must have at least one candidate");
 
-        #[cfg(unix)]
-        {
-            assert!(
-                matches!(candidates[0].transport, ResolvedTransport::UnixSocket(_)),
-                "first candidate on Unix must be a Unix socket"
-            );
-        }
+        assert!(
+            matches!(candidates[0].transport, ResolvedTransport::UnixSocket(_)),
+            "the first candidate is the local socket, on every OS"
+        );
 
         // Last candidate is always HTTP localhost
         let last = candidates.last().unwrap();
@@ -520,9 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn default_candidates_non_unix_http_only() {
-        // On Unix this test is weaker (both transports present), but on
-        // non-Unix platforms there must be exactly one HTTP candidate.
+    fn default_candidates_include_http() {
         let candidates = default_candidates();
         let http_count = candidates
             .iter()
@@ -546,7 +510,6 @@ mod tests {
         assert!(!c.display_url.contains('#'));
     }
 
-    #[cfg(unix)]
     #[test]
     fn parse_candidate_unix_url() {
         let c = parse_candidate("unix:///tmp/ahma.sock");
@@ -567,40 +530,22 @@ mod tests {
         assert!(!parse_status_2xx(b"garbage"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn probe_unix_socket_returns_false_for_missing_socket() {
-        // A socket path that cannot exist
-        let result = probe_unix_socket("/tmp/ahma_tui_test_nonexistent.sock").await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("nonexistent.sock");
+        let result = probe_unix_socket(&missing.to_string_lossy()).await;
         assert!(!result, "non-existent socket must return false");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn probe_unix_socket_live_health() {
-        use tokio::io::AsyncReadExt;
-
-        // Spin up a minimal Unix socket server that returns "HTTP/1.0 200 OK"
         let tmp = tempfile::TempDir::new().unwrap();
         let socket_path = tmp.path().join("test.sock").to_string_lossy().into_owned();
-
-        let socket_path_clone = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let listener = tokio::net::UnixListener::bind(&socket_path_clone).unwrap();
-            if let Ok((mut conn, _)) = listener.accept().await {
-                // drain request
-                let mut buf = [0u8; 512];
-                let _ = tokio::time::timeout(Duration::from_millis(200), conn.read(&mut buf)).await;
-                // send response
-                use tokio::io::AsyncWriteExt;
-                let _ = conn
-                    .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                    .await;
-            }
-        });
-
-        // Give the server a moment to bind
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let server = spawn_uds_once(
+            socket_path.clone(),
+            b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        );
 
         let result = probe_unix_socket(&socket_path).await;
         server.abort();
@@ -710,12 +655,14 @@ mod tests {
         format!("http://{addr}")
     }
 
-    #[cfg(unix)]
+    /// Answer one connection on `socket_path` with `response`. The socket is
+    /// bound before this returns, so a caller can connect at once.
     fn spawn_uds_once(socket_path: String, response: &'static [u8]) -> tokio::task::JoinHandle<()> {
+        let listener =
+            ahma_common::local_socket::LocalListener::bind(Path::new(&socket_path)).unwrap();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-            if let Ok((mut conn, _)) = listener.accept().await {
+            if let Ok(mut conn) = listener.accept().await {
                 let mut buf = [0u8; 1024];
                 let _ = tokio::time::timeout(Duration::from_millis(200), conn.read(&mut buf)).await;
                 let _ = conn.write_all(response).await;
@@ -745,7 +692,6 @@ mod tests {
         assert!(matches!(r.transport, ResolvedTransport::Http(_)));
     }
 
-    #[cfg(unix)]
     #[test]
     fn transport_label_unix_socket() {
         let c = ResolvedConnection {
@@ -755,7 +701,6 @@ mod tests {
         assert_eq!(c.transport_label(), "Unix socket");
     }
 
-    #[cfg(unix)]
     #[test]
     fn default_server_candidate_unix_is_socket() {
         let c = default_server_candidate();
@@ -906,7 +851,6 @@ mod tests {
         assert!(try_upgrade_to_http3(&c).await.is_none());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn try_upgrade_http3_none_for_unix_transport() {
         let c = ResolvedConnection {
@@ -978,7 +922,6 @@ mod tests {
         h3.abort();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn query_uds_health_live_and_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -989,7 +932,6 @@ mod tests {
             .into_owned();
         let resp = b"HTTP/1.0 200 OK\r\nContent-Length: 19\r\n\r\n{\"version\":\"2.0.0\"}";
         let server = spawn_uds_once(sock.clone(), resp);
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let v = query_uds_health(&sock).await;
         server.abort();
@@ -999,7 +941,6 @@ mod tests {
         assert!(query_uds_health(&missing).await.is_none());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn trigger_uds_restart_live_and_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1010,7 +951,6 @@ mod tests {
             .into_owned();
         let resp = b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
         let server = spawn_uds_once(sock.clone(), resp);
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let ok = trigger_uds_restart(&sock).await;
         server.abort();
@@ -1023,14 +963,12 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn get_candidate_version_and_restart_unix() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock = tmp.path().join("uds.sock").to_string_lossy().into_owned();
         let resp = b"HTTP/1.0 200 OK\r\nContent-Length: 19\r\n\r\n{\"version\":\"3.1.4\"}";
         let server = spawn_uds_once(sock.clone(), resp);
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let c = ResolvedConnection {
             display_url: format!("unix://{sock}"),

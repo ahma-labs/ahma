@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use ahma_common::mcp_methods::{SANDBOX_CONFIGURED_METHOD, SANDBOX_FAILED_METHOD};
+use ahma_http_mcp_client::http_client::HttpClient;
 use ahma_http_mcp_client::streamable::{
     ConflictRetryPolicy, ConnectOptions, Connector, StreamableHttpMcpClient, ToolCallOutcome,
 };
@@ -178,32 +179,13 @@ async fn mcp_source_task(
     let base_url = extract_http_base_url(&connection);
     debug!("mcp_source: base_url={base_url}");
 
-    let socket_path = base_url.strip_prefix("unix://");
-    let builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
-    #[cfg(unix)]
-    let builder = if let Some(path) = socket_path {
-        builder.unix_socket(path)
-    } else {
-        builder
-    };
-    let client = builder.build().expect("reqwest client build failed");
-
-    let sse_builder = reqwest::Client::builder();
-    #[cfg(unix)]
-    let sse_builder = if let Some(path) = socket_path {
-        sse_builder.unix_socket(path)
-    } else {
-        sse_builder
-    };
-    let sse_client = sse_builder
-        .build()
-        .expect("reqwest sse client build failed");
-
-    let request_base_url = if socket_path.is_some() {
-        "http://localhost".to_string()
-    } else {
-        base_url.clone()
-    };
+    // `unix://` is the local socket on every OS (SPEC R-DAEMON.2); the SSE
+    // client has no timeout because its stream is long-lived by design.
+    let (request_base_url, client) =
+        HttpClient::for_base_url(&base_url, Some(Duration::from_secs(5)))
+            .expect("HTTP client build failed");
+    let (_, sse_client) =
+        HttpClient::for_base_url(&base_url, None).expect("HTTP SSE client build failed");
 
     let mut health_tick = tokio::time::interval(Duration::from_secs(2));
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -452,8 +434,8 @@ async fn mcp_source_task(
 /// the real reply and can lock the sandbox with zero scopes (every subsequent
 /// tool call then 409s).
 async fn init_mcp_session(
-    client: &reqwest::Client,
-    sse_client: &reqwest::Client,
+    client: &HttpClient,
+    sse_client: &HttpClient,
     base_url: &str,
     workspace_path: Option<std::path::PathBuf>,
     tx: mpsc::Sender<SourceEvent>,
@@ -839,9 +821,9 @@ fn parse_operations(val: &Value) -> Vec<Operation> {
 
 // ─── Utility helpers ──────────────────────────────────────────────────────────
 
-async fn check_health(client: &reqwest::Client, base_url: &str) -> bool {
+async fn check_health(client: &HttpClient, base_url: &str) -> bool {
     let url = format!("{base_url}/health");
-    match client.get(&url).send().await {
+    match client.send(client.get(&url)).await {
         Ok(resp) => resp.status().is_success(),
         Err(e) => {
             debug!("health check failed: {e}");
@@ -853,7 +835,6 @@ async fn check_health(client: &reqwest::Client, base_url: &str) -> bool {
 fn extract_http_base_url(connection: &ResolvedConnection) -> String {
     match &connection.transport {
         ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => url.clone(),
-        #[cfg(unix)]
         ResolvedTransport::UnixSocket(path) => {
             // Retired (R-CFG1.2); use `ahma tui --connect <URL>` instead.
             ahma_common::config::warn_retired_env("AHMA_HTTP_URL");
@@ -936,11 +917,12 @@ mod tests {
         (base, handle)
     }
 
-    fn test_client() -> reqwest::Client {
+    fn test_client() -> HttpClient {
         reqwest::Client::builder()
             .timeout(TestTimeouts::scale_secs(5))
             .build()
             .expect("client build")
+            .into()
     }
 
     /// A shared-client session attached to `base` with a fixed test id —
@@ -996,7 +978,6 @@ mod tests {
     /// A Unix-socket connection reports a `unix://` base URL. `AHMA_HTTP_URL`
     /// no longer redirects it (retired, R-CFG1.2) — so unlike before, this does
     /// not need to bail out when the variable happens to be set.
-    #[cfg(unix)]
     #[test]
     fn mcp_extract_http_base_url_unix_socket_default() {
         let conn = ResolvedConnection {
@@ -1583,9 +1564,15 @@ mod tests {
         let (base, handle) = spawn_test_server(router).await;
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(16);
 
-        let session = init_mcp_session(&test_client(), &reqwest::Client::new(), &base, None, tx)
-            .await
-            .expect("handshake succeeds");
+        let session = init_mcp_session(
+            &test_client(),
+            &reqwest::Client::new().into(),
+            &base,
+            None,
+            tx,
+        )
+        .await
+        .expect("handshake succeeds");
         assert_eq!(session.session_id(), "session-ok");
         match rx.try_recv().expect("status event") {
             SourceEvent::SandboxStatus { status } => {
@@ -1605,8 +1592,14 @@ mod tests {
         let (base, handle) = spawn_test_server(router).await;
         let (tx, _rx) = mpsc::channel::<SourceEvent>(16);
 
-        let err = match init_mcp_session(&test_client(), &reqwest::Client::new(), &base, None, tx)
-            .await
+        let err = match init_mcp_session(
+            &test_client(),
+            &reqwest::Client::new().into(),
+            &base,
+            None,
+            tx,
+        )
+        .await
         {
             Ok(_) => panic!("missing session id must error"),
             Err(e) => e,
@@ -1634,8 +1627,14 @@ mod tests {
         let (base, handle) = spawn_test_server(router).await;
         let (tx, _rx) = mpsc::channel::<SourceEvent>(16);
 
-        let err = match init_mcp_session(&test_client(), &reqwest::Client::new(), &base, None, tx)
-            .await
+        let err = match init_mcp_session(
+            &test_client(),
+            &reqwest::Client::new().into(),
+            &base,
+            None,
+            tx,
+        )
+        .await
         {
             Ok(_) => panic!("SSE failure must abort handshake"),
             Err(e) => e,

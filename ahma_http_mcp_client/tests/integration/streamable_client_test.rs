@@ -173,8 +173,8 @@ fn connector(mcp_url: &str) -> Connector {
     let sse_client = reqwest::Client::new();
     Connector {
         mcp_url: mcp_url.to_string(),
-        post_client,
-        sse_client,
+        post_client: post_client.into(),
+        sse_client: sse_client.into(),
     }
 }
 

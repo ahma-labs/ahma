@@ -202,11 +202,29 @@ impl fmt::Display for Attempts {
     }
 }
 
+/// A transport's own error, as far as retrying needs to know it.
+///
+/// `reqwest` is the usual transport, but not the only one: the local-socket
+/// MCP client sends over an `AF_UNIX` socket that `reqwest` cannot reach on
+/// Windows, and its errors are not `reqwest::Error`s. Both are retried by the
+/// same rules ([`send_with_retry_using`]).
+pub trait TransportError: std::error::Error + Send + Sync + 'static {
+    /// Whether the request timed out, which [`RetryPolicy::retry_timeouts`]
+    /// may make final.
+    fn is_timeout(&self) -> bool;
+}
+
+impl TransportError for reqwest::Error {
+    fn is_timeout(&self) -> bool {
+        reqwest::Error::is_timeout(self)
+    }
+}
+
 /// A transport error that survived every retry.
 #[derive(Debug)]
-pub struct TransportFailure {
+pub struct TransportFailure<E = reqwest::Error> {
     /// The last attempt's error.
-    pub error: reqwest::Error,
+    pub error: E,
     /// Its classification.
     pub failure: Failure,
     /// Every attempt made.
@@ -249,6 +267,25 @@ where
     F: Fn() -> reqwest::RequestBuilder,
     C: Fn(&reqwest::Error) -> Failure,
 {
+    send_with_retry_using(service, policy, idempotency, || build().send(), classify).await
+}
+
+/// The retry loop itself, over any transport: `send` makes one attempt and
+/// `classify` says what its error means. [`send_with_retry`] is this over
+/// `reqwest`.
+pub async fn send_with_retry_using<S, Fut, E, C>(
+    service: &str,
+    policy: &RetryPolicy,
+    idempotency: Idempotency,
+    send: S,
+    classify: C,
+) -> Result<(reqwest::Response, Attempts), TransportFailure<E>>
+where
+    S: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response, E>>,
+    E: TransportError,
+    C: Fn(&E) -> Failure,
+{
     let started = Instant::now();
     let mut attempt = 0u32;
     loop {
@@ -256,7 +293,7 @@ where
             count: attempt + 1,
             elapsed: started.elapsed(),
         };
-        match build().send().await {
+        match send().await {
             Ok(response) => {
                 let status = response.status();
                 let retry = classify_status(status).is_some_and(|f| f.is_retryable(idempotency))
@@ -348,7 +385,7 @@ impl ServiceError {
     }
 
     /// Build one from a [`TransportFailure`] that [`send_with_retry`] gave up on.
-    pub fn from_transport(service: &str, failure: TransportFailure) -> Self {
+    pub fn from_transport<E: TransportError>(service: &str, failure: TransportFailure<E>) -> Self {
         Self::new(service, failure.failure, failure.error).with_attempts(failure.attempts)
     }
 
@@ -701,5 +738,79 @@ mod tests {
                 .starts_with("Couldn't reach the ahma daemon.")
         );
         assert!(service.details().contains("gave up after 4 attempts"));
+    }
+
+    /// A transport error of the caller's own, such as the local-socket MCP
+    /// client's, which `reqwest` cannot represent.
+    #[derive(Debug)]
+    struct StubError {
+        timeout: bool,
+    }
+
+    impl fmt::Display for StubError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("stub transport error")
+        }
+    }
+
+    impl std::error::Error for StubError {}
+
+    impl TransportError for StubError {
+        fn is_timeout(&self) -> bool {
+            self.timeout
+        }
+    }
+
+    /// Another transport is retried by the same rules as `reqwest`'s, and
+    /// reported the same way when it gives up (R-HTTP.2, R-HTTP.3).
+    #[tokio::test]
+    async fn a_custom_transport_is_retried_by_the_same_rules() {
+        let tries = AtomicUsize::new(0);
+        let err = send_with_retry_using(
+            "stub",
+            &FAST,
+            Idempotency::NotIdempotent,
+            || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                async { Err::<reqwest::Response, _>(StubError { timeout: false }) }
+            },
+            |_: &StubError| Failure::NotDelivered,
+        )
+        .await
+        .expect_err("the transport always fails");
+        assert_eq!(err.failure, Failure::NotDelivered);
+        assert_eq!(tries.load(Ordering::SeqCst), 4);
+
+        let service = ServiceError::from_transport("the ahma daemon", err);
+        assert!(
+            service
+                .to_string()
+                .starts_with("Couldn't reach the ahma daemon.")
+        );
+    }
+
+    /// A timeout is not retried when the policy says so, whatever transport
+    /// reported it.
+    #[tokio::test]
+    async fn a_custom_transport_timeout_follows_the_policy() {
+        let tries = AtomicUsize::new(0);
+        let policy = RetryPolicy {
+            retry_timeouts: false,
+            ..FAST
+        };
+        let err = send_with_retry_using(
+            "stub",
+            &policy,
+            Idempotency::Idempotent,
+            || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                async { Err::<reqwest::Response, _>(StubError { timeout: true }) }
+            },
+            |_: &StubError| Failure::Interrupted,
+        )
+        .await
+        .expect_err("the transport always times out");
+        assert_eq!(err.failure, Failure::Permanent);
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
     }
 }

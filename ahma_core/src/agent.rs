@@ -1,7 +1,9 @@
 use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage, HubRelay};
 use ahma_common::http_retry::{
-    Idempotency, RetryPolicy, ServiceError, classify_status, find_service_error, send_with_retry,
+    Idempotency, RetryPolicy, ServiceError, classify_status, find_service_error,
+    send_with_retry_using,
 };
+use ahma_http_mcp_client::http_client::{HttpClient, classify_send_error};
 use ahma_http_mcp_client::streamable::{
     ConflictRetryPolicy, ConnectOptions, Connector, StreamableHttpMcpClient, ToolCallOutcome,
 };
@@ -476,14 +478,14 @@ fn extract_sampling_completion_text(content_arr: &[serde_json::Value]) -> String
     completion_text
 }
 
-/// Build the reqwest client and the `/mcp` URL to reach it, handling the
-/// `unix://` base-url convention (a local Unix domain socket) separately
+/// Build the HTTP client and the `/mcp` URL to reach it, handling the
+/// `unix://` base-url convention (the local socket, on every OS) separately
 /// from a normal HTTP(S) base URL.
 ///
 /// Delegates to [`cached_http_client`], which already implements this exact
 /// `unix://`-prefix decision (and additionally reuses one client per base URL
 /// instead of paying TLS/connection-pool setup on every sampling call).
-fn build_sampling_client(mcp: &McpChatConfig) -> Result<(reqwest::Client, String), String> {
+fn build_sampling_client(mcp: &McpChatConfig) -> Result<(HttpClient, String), String> {
     let (request_base_url, client) = cached_http_client(&mcp.base_url)?;
     let url = format!("{}/mcp", request_base_url);
     Ok((client, url))
@@ -518,16 +520,19 @@ async fn call_mcp_sampling_routed(
 
     // Not idempotent: a sampling request that arrived may already be running
     // on the client's model (SPEC R-HTTP.2).
-    let (resp, _) = send_with_retry(
+    let (resp, _) = send_with_retry_using(
         DAEMON_SERVICE,
         &RetryPolicy::DEFAULT,
         Idempotency::NotIdempotent,
         || {
-            client
-                .post(&url)
-                .header("mcp-session-id", &session_id)
-                .json(&payload)
+            client.send(
+                client
+                    .post(&url)
+                    .header("mcp-session-id", &session_id)
+                    .json(&payload),
+            )
         },
+        classify_send_error,
     )
     .await
     .map_err(|failure| daemon_error(ServiceError::from_transport(DAEMON_SERVICE, failure)))?;
@@ -1547,45 +1552,28 @@ async fn finish_with_limit_summary(
     }
 }
 
-/// Process-wide cache of `reqwest::Client`s keyed by bridge base URL.
-/// Building a fresh client per tool call re-does TLS and connection-pool
-/// setup every time and forfeits HTTP keep-alive reuse entirely; sharing one
-/// client per base URL keeps connections warm across the agent loop's many
-/// sequential tool calls. `reqwest::Client` clones are cheap `Arc` handles.
+/// Process-wide cache of HTTP clients keyed by bridge base URL, with the
+/// request base each addresses. Building a fresh client per tool call re-does
+/// TLS and connection-pool setup every time and forfeits HTTP keep-alive reuse
+/// entirely; sharing one client per base URL keeps connections warm across
+/// the agent loop's many sequential tool calls. Clones are cheap `Arc`
+/// handles.
 static HTTP_CLIENT_CACHE: std::sync::LazyLock<
-    parking_lot::Mutex<HashMap<String, reqwest::Client>>,
+    parking_lot::Mutex<HashMap<String, (String, HttpClient)>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-/// Return the effective request base URL and a cached `reqwest::Client` for an
-/// MCP bridge `base_url`. `unix://<path>` URLs (Unix only) yield a client
-/// bound to that socket with `http://localhost` as the request base; all other
-/// URLs get a plain client and are used as-is.
-pub fn cached_http_client(base_url: &str) -> Result<(String, reqwest::Client), String> {
-    let unix_path = if cfg!(unix) {
-        base_url.strip_prefix("unix://")
-    } else {
-        None
-    };
-    let request_base = if unix_path.is_some() {
-        "http://localhost".to_string()
-    } else {
-        base_url.to_string()
-    };
-
+/// Return the effective request base URL and a cached [`HttpClient`] for an
+/// MCP bridge `base_url`. A `unix://<path>` URL is the local socket at
+/// `<path>`, on every OS (SPEC R-DAEMON.2), addressed as `http://localhost`;
+/// any other URL gets a plain TCP client and is used as-is.
+pub fn cached_http_client(base_url: &str) -> Result<(String, HttpClient), String> {
     let mut cache = HTTP_CLIENT_CACHE.lock();
-    if let Some(client) = cache.get(base_url) {
-        return Ok((request_base, client.clone()));
+    if let Some(cached) = cache.get(base_url) {
+        return Ok(cached.clone());
     }
-
-    let builder = reqwest::Client::builder();
-    #[cfg(unix)]
-    let builder = match unix_path {
-        Some(path) => builder.unix_socket(path),
-        None => builder,
-    };
-    let client = builder.build().map_err(|e| e.to_string())?;
-    cache.insert(base_url.to_string(), client.clone());
-    Ok((request_base, client))
+    let built = HttpClient::for_base_url(base_url, None).map_err(|e| e.to_string())?;
+    cache.insert(base_url.to_string(), built.clone());
+    Ok(built)
 }
 
 async fn spawn_local_tool_call(
@@ -1616,10 +1604,7 @@ async fn spawn_external_tool_call_http(
 /// answering: external servers are not assumed to implement ahma's
 /// roots/sandbox gate, and this path never performed that handshake —
 /// preserved as-is from the pre-unification implementation.
-async fn get_or_create_external_session(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<String, String> {
+async fn get_or_create_external_session(client: &HttpClient, url: &str) -> Result<String, String> {
     let connector = Connector {
         mcp_url: url.to_string(),
         post_client: client.clone(),
@@ -1676,7 +1661,7 @@ pub fn invalidate_cached_session(url: &str, workspace_root: &std::path::Path) {
 /// stuck in `AwaitingRoots`, which is why `ahma tui` chat tool calls returned
 /// "the sandbox is still initializing" indefinitely on startup or after a reset.
 pub async fn get_or_create_session(
-    client: &reqwest::Client,
+    client: &HttpClient,
     url: &str,
     mcp: &McpChatConfig,
 ) -> Result<String, String> {
@@ -1771,7 +1756,7 @@ fn extract_content_text(res: &serde_json::Value) -> String {
 /// POST a `tools/call` to the local MCP bridge and parse the response.
 /// Shared by the core agent loop and the TUI's manual tool-call path.
 pub async fn call_mcp_tool_http(
-    client: &reqwest::Client,
+    client: &HttpClient,
     url: &str,
     session_id: &str,
     tool: &str,
@@ -3117,12 +3102,62 @@ mod tests {
     /// `roots/list` response.
     #[tokio::test]
     async fn test_get_or_create_session_completes_handshake_before_tools_call() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        let roots_answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = handshake_router(roots_answered.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        assert_handshake_then_tool_call(&format!("http://{addr}"), &roots_answered).await;
+    }
 
-        let roots_answered = Arc::new(AtomicBool::new(false));
-        let ra_post = roots_answered.clone();
+    /// The agent reaches the daemon at a `unix://` base URL on every OS: the
+    /// daemon's MCP endpoint is an `AF_UNIX` socket on Windows too, which
+    /// `reqwest` cannot connect to there (SPEC R-DAEMON.2).
+    #[tokio::test]
+    async fn a_tool_call_reaches_the_daemon_over_the_local_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp.sock");
+        let roots_answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener =
+            LocalAxumListener(ahma_common::local_socket::LocalListener::bind(&sock).unwrap());
+        let router = handshake_router(roots_answered.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        assert_handshake_then_tool_call(&format!("unix://{}", sock.display()), &roots_answered)
+            .await;
+    }
 
-        let router = axum::Router::new().route(
+    /// Serve an axum router on a local socket; tokio's `UnixListener` does not
+    /// exist on Windows.
+    struct LocalAxumListener(ahma_common::local_socket::LocalListener);
+
+    impl axum::serve::Listener for LocalAxumListener {
+        type Io = ahma_common::local_socket::LocalStream;
+        type Addr = ();
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            loop {
+                if let Ok(stream) = self.0.accept().await {
+                    return (stream, ());
+                }
+            }
+        }
+
+        fn local_addr(&self) -> std::io::Result<Self::Addr> {
+            Ok(())
+        }
+    }
+
+    /// A bridge that gates `tools/call` on the client having answered
+    /// `roots/list`, which it asks for over the SSE stream.
+    fn handshake_router(roots_answered: Arc<std::sync::atomic::AtomicBool>) -> axum::Router {
+        use std::sync::atomic::Ordering;
+        let ra_post = roots_answered;
+
+        axum::Router::new().route(
             "/mcp",
             axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
                 let ra = ra_post.clone();
@@ -3195,17 +3230,18 @@ mod tests {
                 )
                     .into_response()
             }),
-        );
+        )
+    }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-
-        let base_url = format!("http://{}", addr);
+    /// Handshake with the bridge at `base_url`, the way the agent does, then
+    /// call a tool on the session.
+    async fn assert_handshake_then_tool_call(
+        base_url: &str,
+        roots_answered: &std::sync::atomic::AtomicBool,
+    ) {
+        use std::sync::atomic::Ordering;
         let mcp = McpChatConfig {
-            base_url: base_url.clone(),
+            base_url: base_url.to_string(),
             workspace_root: PathBuf::from("/tmp"),
             session_id: None,
             external_http_servers: BTreeMap::new(),
@@ -3219,8 +3255,8 @@ mod tests {
             tool_menu: None,
         };
 
-        let client = reqwest::Client::new();
-        let url = format!("{}/mcp", base_url);
+        let (request_base_url, client) = cached_http_client(base_url).unwrap();
+        let url = format!("{request_base_url}/mcp");
 
         let sid = get_or_create_session(&client, &url, &mcp)
             .await
@@ -4118,7 +4154,7 @@ mod tests {
         let base = mock_post_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
         let url = format!("{}/mcp", base);
         let err = call_mcp_tool_http(
-            &reqwest::Client::new(),
+            &reqwest::Client::new().into(),
             &url,
             "sid",
             "t",
@@ -4137,7 +4173,7 @@ mod tests {
         let base = serve_router(router).await;
         let url = format!("{}/mcp", base);
         let err = call_mcp_tool_http(
-            &reqwest::Client::new(),
+            &reqwest::Client::new().into(),
             &url,
             "sid",
             "t",
@@ -4182,7 +4218,7 @@ mod tests {
         let base = serve_router(router).await;
         let url = format!("{}/mcp", base);
         let (text, is_err) = call_mcp_tool_http(
-            &reqwest::Client::new(),
+            &reqwest::Client::new().into(),
             &url,
             "sid",
             "t",
@@ -4302,9 +4338,13 @@ mod tests {
         let mut cfg = empty_mcp_config("http://127.0.0.1:9");
         cfg.session_id = Some("already-have".to_string());
         // No server is contacted because the id is preset and non-empty.
-        let sid = get_or_create_session(&reqwest::Client::new(), "http://127.0.0.1:9/mcp", &cfg)
-            .await
-            .expect("preset session id is returned verbatim");
+        let sid = get_or_create_session(
+            &reqwest::Client::new().into(),
+            "http://127.0.0.1:9/mcp",
+            &cfg,
+        )
+        .await
+        .expect("preset session id is returned verbatim");
         assert_eq!(sid, "already-have");
     }
 

@@ -486,8 +486,8 @@ async fn call_mcp_tool_stdio(
 async fn connect_minimal_session(base_url: &str) -> Result<StreamableHttpMcpClient> {
     let connector = Connector {
         mcp_url: format!("{}/mcp", base_url.trim_end_matches('/')),
-        post_client: reqwest::Client::new(),
-        sse_client: reqwest::Client::new(),
+        post_client: reqwest::Client::new().into(),
+        sse_client: reqwest::Client::new().into(),
     };
     // clientInfo.name is load-bearing: servers may key behaviour off it.
     StreamableHttpMcpClient::connect_minimal(

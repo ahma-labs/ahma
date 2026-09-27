@@ -10,6 +10,7 @@
 //!   with optional OAuth 2.0 + PKCE. The OAuth endpoints are currently Atlassian's.
 //!   Tokens persist in `~/.ahma/mcp_http_token.json`.
 //! - `local_socket_client`: the same transport over the per-user `AF_UNIX` socket, on every OS.
+//! - [`http_client::HttpClient`]: sends [`streamable`]'s requests over TCP or that socket.
 //!
 //! ## Usage
 //!
@@ -38,9 +39,13 @@
 pub mod client;
 /// Error types for HTTP MCP client operations.
 pub mod error;
+/// One HTTP client for ahma's MCP endpoints, over TCP or the local socket.
+pub mod http_client;
 /// MCP Streamable HTTP over the per-user local socket, on every OS.
 pub mod local_socket_client;
 /// `oauth2` HTTP adapter over the workspace `reqwest` client.
 pub mod oauth_http;
 /// Shared MCP Streamable-HTTP client (handshake, SSE, roots, 409 gate).
 pub mod streamable;
+#[cfg(test)]
+mod test_support;

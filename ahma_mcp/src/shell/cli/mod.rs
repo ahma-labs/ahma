@@ -1344,7 +1344,7 @@ pub struct Cli {
     #[arg(long = "tls-dir", value_name = "PATH", global = true)]
     pub tls_dir: Option<PathBuf>,
 
-    /// Hub daemon socket path (Unix socket path; `host:port` on Windows).
+    /// Hub daemon socket path (an `AF_UNIX` socket on every OS).
     /// Replaces the retired AHMA_DAEMON_SOCK environment variable.
     #[arg(long = "daemon-socket", value_name = "PATH", global = true)]
     pub daemon_socket: Option<PathBuf>,
@@ -2271,13 +2271,13 @@ pub struct TuiArgs {
     /// URL of the ahma server to monitor.
     ///
     /// When omitted, `ahma tui` probes local transports in order:
-    /// Unix socket (default `/tmp/ahma.sock`, or `[http] unix_socket_path`
-    /// in `~/.ahma/settings.toml`) on Unix, then `http://localhost:3000`.
+    /// the per-user daemon's Unix socket (or `[http] unix_socket_path`
+    /// in `~/.ahma/settings.toml`), then `http://localhost:3000`.
     ///
     /// Supported URL formats:
     ///   http://host:port        — plain HTTP / HTTP2 / HTTP3
     ///   https://host:port       — HTTPS
-    ///   unix:///path/to.sock    — Unix domain socket (Unix only)
+    ///   unix:///path/to.sock    — Unix domain socket (AF_UNIX, every OS)
     #[arg(long = "connect")]
     pub connect: Option<String>,
 

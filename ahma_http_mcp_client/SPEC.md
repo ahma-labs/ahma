@@ -52,6 +52,13 @@ subtly wrong on its own.*
   daemon's MCP endpoint (root SPEC R-DAEMON.2) and `ahma serve unix`. rmcp's own
   `UnixSocketHttpClient` is built on `tokio::net::UnixStream` and does not exist on
   Windows; this is that client with only the connect replaced.
+- `http_client::HttpClient`: how `streamable` sends. It builds every request with
+  `reqwest` and sends it through `reqwest` over TCP, or through hyper over the local
+  socket for a `unix://` base URL, returning an ordinary `reqwest::Response` with its
+  body streaming either way. `reqwest` reaches an `AF_UNIX` socket only on Unix and its
+  connector cannot be replaced, so this is what lets the TUI and the agent attach to the
+  daemon on Windows. Both transports are retried by the same rules (R-HTTP.2): a failed
+  connect never delivered the request; anything later may have.
 
 ## 3. Non-Functional Requirements
 

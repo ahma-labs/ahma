@@ -69,7 +69,7 @@ honest gating.
   is no authentication, and binding a non-loopback address warns loudly.
 - **Per-IP rate limiting** (`--rate-limit-rps`, `--rate-limit-burst`) answers excess
   requests with HTTP 429 and `Retry-After`; `/health` is exempt.
-- **Listeners**: TCP (`ahma serve http`), a Unix socket (`ahma serve unix`, Unix only), and
+- **Listeners**: TCP (`ahma serve http`), a Unix socket (`ahma serve unix`, `AF_UNIX` on every OS), and
   the per-user daemon's endpoint (R-DAEMON). An explicitly started `serve http|unix` is
   operator-owned and has no idle exit unless `--idle-timeout` is given.
 
