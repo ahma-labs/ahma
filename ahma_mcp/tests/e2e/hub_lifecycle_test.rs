@@ -246,3 +246,72 @@ async fn a_hub_whose_socket_is_removed_gives_way() {
         r.log()
     );
 }
+
+/// A draining hub starts its successor and hands over to it (SPEC R-HUB.5):
+/// with nothing in flight the old hub goes at once, and the successor it
+/// pre-spawned — waiting on the lock — is serving on the same socket.
+#[tokio::test]
+async fn a_draining_hub_hands_over_to_its_successor() {
+    let binary = build_binary_cached("ahma_bin", "ahma");
+    let r = Rendezvous::new();
+    let child = spawn_hub(&binary, &r, 30);
+    let started = wait_for(&r.hub, true).await;
+    let socket = r.hub.to_string_lossy().into_owned();
+    let drain_accepted =
+        started && ahma_mcp::shell::modes::server::trigger_bridge_drain(&socket).await;
+
+    let exited = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        let deadline = std::time::Instant::now() + TestTimeouts::get(TimeoutCategory::ProcessSpawn);
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) => std::thread::sleep(TestTimeouts::poll_interval()),
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        false
+    })
+    .await
+    .expect("join");
+
+    assert!(started, "hub must start; it said:\n{}", r.log());
+    assert!(drain_accepted, "the hub must accept a drain request");
+    assert!(
+        exited,
+        "with nothing in flight a draining hub goes; it said:\n{}",
+        r.log()
+    );
+    assert!(
+        r.log().contains("successor started"),
+        "and it started its successor first: {}",
+        r.log()
+    );
+
+    // The successor, not a client, now serves the socket.
+    let deadline = std::time::Instant::now() + TestTimeouts::get(TimeoutCategory::ProcessSpawn);
+    let mut serving = false;
+    while std::time::Instant::now() < deadline {
+        if matches!(
+            ahma_common::doctor::probe_hub(&r.hub).await,
+            ahma_common::doctor::HubStatus::Running { .. }
+        ) {
+            serving = true;
+            break;
+        }
+        tokio::time::sleep(TestTimeouts::poll_interval()).await;
+    }
+
+    // The successor is detached from this test, so stop it by asking.
+    if let Ok(mut stream) = ahma_common::hub::connect_to_hub_at(&r.hub).await {
+        let _ =
+            ahma_common::hub::send_msg(&mut stream, &ahma_common::hub::ClientMsg::Shutdown).await;
+    }
+    assert!(serving, "the successor must take over the socket");
+    assert!(
+        wait_for(&r.hub, false).await,
+        "and the successor goes when asked"
+    );
+}

@@ -248,6 +248,9 @@ pub struct AppConfig {
     /// Seconds the per-user hub stays alive with nothing attached — no MCP
     /// sessions and no hub subscribers (`[hub] idle_timeout_secs`).
     pub hub_idle_timeout_secs: u64,
+    /// Longest a draining hub waits for work in flight before ending it and
+    /// handing over (`[hub] drain_timeout_secs`, SPEC R-HUB.5).
+    pub hub_drain_timeout_secs: u64,
     /// Maximum concurrent HTTP server sessions.
     pub max_sessions: usize,
     /// The MCP session this worker serves (from `--session-id`).
@@ -324,6 +327,7 @@ impl Default for AppConfig {
             idle_timeout_secs: None,
             max_sessions: 50,
             hub_idle_timeout_secs: 60,
+            hub_drain_timeout_secs: 3600,
             session_id: None,
             client_pid: None,
             is_server_child: false,
@@ -1584,8 +1588,12 @@ pub struct UninstallArgs {
 ///
 /// The hub is configured via `~/.ahma/settings.toml` or the `AHMA_HUB_SOCK`
 /// environment variable (socket path override only).
-#[derive(clap::Args, Debug, Clone)]
-pub struct HubArgs {}
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct HubArgs {
+    /// Start as the successor of a draining hub: wait for it to hand the rendezvous over instead of standing down because one is already running. Set by the draining hub when it pre-spawns its replacement (SPEC R-HUB.5), so a new build is ready the moment the old one leaves; not meant to be typed.
+    #[arg(long, hide = true)]
+    pub successor: bool,
+}
 
 // ── settings ─────────────────────────────────────────────────────────────────
 
@@ -3198,6 +3206,7 @@ pub fn build_app_config_with_settings(
         idle_timeout_secs,
         max_sessions: cli.max_sessions.unwrap_or(10),
         hub_idle_timeout_secs: s.hub.idle_timeout_secs,
+        hub_drain_timeout_secs: s.hub.drain_timeout_secs,
         session_id: cli.session_id.clone(),
         client_pid: cli.client_pid,
         is_server_child: cli.server_child || std::env::var("AHMA_SERVER_CHILD").is_ok(),
@@ -5219,7 +5228,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_subcommand_hub_bails() {
-        let err = dispatch_subcommand(Subcommands::Hub(HubArgs {}), make_cfg())
+        let err = dispatch_subcommand(Subcommands::Hub(HubArgs::default()), make_cfg())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("hub is provided"));

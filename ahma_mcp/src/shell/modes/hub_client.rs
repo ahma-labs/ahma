@@ -14,11 +14,11 @@
 //! means a newly-started editor window tears down every other window's session,
 //! mid-command, to install a binary only it asked for.
 //!
-//! So a newer client **drains** instead: the hub stops accepting new
-//! sessions, finishes the ones it has, and exits — at which point the next
-//! client starts the new binary. Until then the newcomer proxies to the old
-//! hub, which works, and says so loudly rather than pretending the skew is
-//! not there (SPEC R7's rule that ahma never hides its own state).
+//! So a newer client **drains** instead: the hub keeps serving, starts the
+//! new build as its successor, and hands over the moment no work is in
+//! flight. Until then the newcomer proxies to the old hub, which works, and
+//! says so loudly rather than pretending the skew is not there (SPEC R7's
+//! rule that ahma never hides its own state).
 //!
 //! An older client just proxies. The hub runs every session's worker from
 //! its own binary, so a stale client — an editor configured with an old
@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 use super::server::{
-    check_bridge_running, get_bridge_version, is_test_isolated, parse_version,
+    check_bridge_running, is_test_isolated, parse_version, query_uds_health,
     split_version_and_build_id,
 };
 
@@ -99,13 +99,13 @@ pub async fn ensure_hub(
 
     // A test-isolated process never judges — much less replaces — a hub it
     // does not own (SPEC R-ISO.1).
-    let running_version = if is_test_isolated() {
+    let running = if is_test_isolated() {
         None
     } else {
-        get_bridge_version(socket_path).await
+        query_uds_health(socket_path).await
     };
 
-    let Some(hub_version) = running_version else {
+    let Some(health) = running else {
         if check_bridge_running(socket_path).await {
             // Serving but not answering /health: an older or foreign server.
             return Ok(EnsureOutcome::Ready);
@@ -113,9 +113,18 @@ pub async fn ensure_hub(
         spawn_hub(socket_path, idle_timeout_secs).await?;
         return Ok(EnsureOutcome::Spawned);
     };
+    let hub_version = health.version;
 
     match skew_action(client_semver, client_build, &hub_version) {
         SkewAction::Proxy => Ok(EnsureOutcome::Ready),
+        SkewAction::Drain if health.draining => {
+            // Already handing over, with its successor waiting on the lock:
+            // asking again, and waiting, would only delay this client.
+            Ok(EnsureOutcome::ReadyButStale {
+                hub: hub_version,
+                ours: format!("{client_semver}+{client_build}"),
+            })
+        }
         SkewAction::Drain => {
             tracing::info!(
                 hub_version = %hub_version,
@@ -139,8 +148,8 @@ pub async fn ensure_hub(
 
 /// Ask the hub to drain, then wait for it to release the rendezvous.
 ///
-/// Returns `false` when it is still there at the deadline — it has live
-/// sessions, and taking them away is precisely what draining exists to avoid.
+/// Returns `false` when it is still there at the deadline — it has work in
+/// flight, and taking that away is precisely what draining exists to avoid.
 async fn drain_and_wait(socket_path: &str) -> bool {
     super::server::trigger_bridge_drain(socket_path).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(DRAIN_HANDOFF_SECS);
@@ -156,7 +165,7 @@ async fn drain_and_wait(socket_path: &str) -> bool {
 /// The command that starts the detached per-user hub (SPEC R-PROC.3).
 /// None of the spawning tree's supervision markers survive into it
 /// ([`ahma_common::process_guard::NOT_INHERITED_BY_HUB`]).
-fn hub_command(
+pub(crate) fn hub_command(
     exe: &std::path::Path,
     socket_path: &str,
     idle_timeout_secs: Option<u64>,
@@ -202,7 +211,7 @@ fn hub_command(
 /// library call inside a test binary would spawn `current_exe` — the *test
 /// harness* — with `hub` as its filter, and if any test name matches, each
 /// copy re-runs the tests that spawn: a fork bomb.
-fn may_spawn_hub_from(exe: &Path) -> bool {
+pub(crate) fn may_spawn_hub_from(exe: &Path) -> bool {
     !ahma_common::test_isolation::spawned_under_test_harness()
         || exe.file_stem().is_some_and(|stem| stem == "ahma")
 }
@@ -243,8 +252,8 @@ pub fn disclosure(outcome: &EnsureOutcome) -> Option<String> {
         EnsureOutcome::Ready | EnsureOutcome::Spawned => None,
         EnsureOutcome::ReadyButStale { hub, ours } => Some(format!(
             "The running ahma hub is v{hub} and this build is v{ours}. \
-             It is still serving other sessions, so it was not replaced; it will \
-             restart itself once they end."
+             It is finishing work for other sessions, so it was not replaced; it \
+             hands over to the newer build as soon as that work ends."
         )),
     }
 }

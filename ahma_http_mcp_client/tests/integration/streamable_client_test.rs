@@ -663,7 +663,7 @@ async fn call_tool_is_not_resent_after_a_500() {
     server.abort();
 }
 
-/// A draining hub answers 503: nothing ran, so even `tools/call` retries.
+/// A 503 means nothing ran, so even `tools/call` retries.
 #[tokio::test]
 async fn call_tool_retries_through_a_503() {
     let (mcp_url, posts, server) = spawn_scripted(vec![StatusCode::SERVICE_UNAVAILABLE]).await;

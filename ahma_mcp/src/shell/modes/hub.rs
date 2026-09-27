@@ -29,6 +29,11 @@
 //! keeps the hub alive while an editor with no TUI attached does too. Exit
 //! runs one choreography: stop the sessions, flush history, unlink the socket
 //! while the lock is still held (SPEC R-ISO.3), and go.
+//!
+//! A drain (SPEC R-HUB.5) is the other way out: the hub keeps serving, starts
+//! the build now at its own path as a successor that waits on the lock, and
+//! goes the moment no work is in flight — or ends what is left at the drain
+//! cap.
 
 use crate::shell::cli::AppConfig;
 use ahma_common::hub::{HubBindError, HubServer};
@@ -41,32 +46,68 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// socket is still where clients will look for it.
 const IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Should the hub exit now?
+/// Should an idle hub exit now?
 ///
 /// Split out as a pure function because the interesting part is the policy, not
-/// the timer: idleness spans both halves of the hub, and a drain shortens
-/// the wait to nothing so a replacement can take over the moment the last
-/// session ends.
+/// the timer: idleness spans both halves of the hub.
 pub(crate) fn idle_exit_due(
     hub_connections: usize,
     mcp_sessions: usize,
     idle_for: std::time::Duration,
     timeout_secs: u64,
-    draining: bool,
 ) -> bool {
-    if draining {
-        // A drained hub has nothing left to finish once its sessions end;
-        // waiting out the idle timer would only delay its successor. A
-        // subscriber has no work here and reconnects to the successor on
-        // its own, so it does not hold a draining hub open.
-        return mcp_sessions == 0;
-    }
     if hub_connections > 0 || mcp_sessions > 0 {
         return false;
     }
     // A zero timeout means "stay forever", which is what an operator who runs
     // the hub deliberately wants.
     timeout_secs > 0 && idle_for.as_secs() >= timeout_secs
+}
+
+/// Consecutive quiet looks a drain needs before it hands over.
+///
+/// One is not enough: a tool call answered a moment ago may not have reported
+/// its operation to the hub yet, and in that instant nothing looks in flight.
+const DRAIN_QUIET_CHECKS: u32 = 2;
+
+/// What a draining hub does next (SPEC R-HUB.5).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DrainStep {
+    /// Work is in flight and the cap is not reached: keep serving.
+    Wait,
+    /// Nothing is in flight: end the sessions, whose clients reconnect to the
+    /// successor, and go.
+    HandOver,
+    /// The cap is reached with work still running: end it, disclosed and
+    /// recorded as interrupted, and go.
+    Interrupt,
+}
+
+/// Decide a draining hub's next step.
+///
+/// `work_in_flight` is operations still running in session workers plus
+/// requests not yet answered. Open sessions and subscribers are deliberately
+/// not work: an idle session loses nothing when its client reconnects to the
+/// successor, and waiting for every session to end kept an outdated hub
+/// alive for as long as any editor window stayed open.
+pub(crate) fn drain_step(
+    work_in_flight: usize,
+    quiet_checks: u32,
+    draining_for: std::time::Duration,
+    cap_secs: u64,
+) -> DrainStep {
+    if work_in_flight == 0 {
+        return if quiet_checks >= DRAIN_QUIET_CHECKS {
+            DrainStep::HandOver
+        } else {
+            DrainStep::Wait
+        };
+    }
+    if cap_secs > 0 && draining_for.as_secs() >= cap_secs {
+        DrainStep::Interrupt
+    } else {
+        DrainStep::Wait
+    }
 }
 
 /// How long the hub has had nothing attached, in wall-clock time (SPEC
@@ -188,12 +229,86 @@ fn squattable_directory_notice(_dir: &std::path::Path) -> Option<String> {
     None
 }
 
+/// How often a successor looks for the rendezvous coming free.
+const SUCCESSOR_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Take the rendezvous once the draining hub that started this one lets it go
+/// (SPEC R-HUB.5).
+///
+/// Stands down — as [`HubBindError::AlreadyRunning`], the same quiet exit as
+/// losing a startup race — once a hub that is *not* draining answers on the
+/// socket, because a client's own spawn got there first, or once the drain
+/// cap and a minute's grace have passed, by which time the draining hub has
+/// gone whatever happened.
+async fn take_rendezvous_as_successor(
+    socket: &std::path::Path,
+    drain_cap_secs: u64,
+) -> std::result::Result<HubServer, HubBindError> {
+    let patience =
+        (drain_cap_secs > 0).then(|| std::time::Duration::from_secs(drain_cap_secs + 60));
+    let started = std::time::SystemTime::now();
+    let socket_str = socket.to_string_lossy();
+    loop {
+        match HubServer::lock_at(socket.to_path_buf()).await {
+            Err(HubBindError::AlreadyRunning) => {}
+            taken => return taken,
+        }
+        if super::server::query_uds_health(&socket_str)
+            .await
+            .is_some_and(|h| !h.draining)
+        {
+            return Err(HubBindError::AlreadyRunning);
+        }
+        if patience.is_some_and(|p| started.elapsed().unwrap_or_default() >= p) {
+            return Err(HubBindError::AlreadyRunning);
+        }
+        tokio::time::sleep(SUCCESSOR_POLL).await;
+    }
+}
+
+/// Start the binary now at this hub's own path as its successor (SPEC
+/// R-HUB.5).
+///
+/// From the path, not this process's image: after an install the path holds
+/// the new build, which is the point. At this hub's own spawn depth, as a
+/// sibling rather than a child: every upgrade would otherwise nest one level
+/// deeper, and the one after [`ahma_common::process_guard::MAX_SPAWN_DEPTH`]
+/// would refuse to start. A failure is only logged: the next client to find
+/// no hub starts one anyway.
+fn spawn_successor(
+    exe: &std::path::Path,
+    socket: &std::path::Path,
+    idle_timeout_secs: Option<u64>,
+) {
+    if !super::hub_client::may_spawn_hub_from(exe) {
+        return;
+    }
+    let mut cmd = super::hub_client::hub_command(exe, &socket.to_string_lossy(), idle_timeout_secs);
+    cmd.arg("--successor");
+    cmd.env(
+        ahma_common::process_guard::SPAWN_DEPTH_ENV,
+        ahma_common::process_guard::current_spawn_depth().to_string(),
+    );
+    match cmd.spawn() {
+        Ok(_) => tracing::info!(exe = %exe.display(), "ahma hub: successor started"),
+        Err(e) => tracing::warn!("ahma hub: could not start a successor: {e}"),
+    }
+}
+
 /// Run the per-user hub: hub plus MCP endpoint, one runtime, one exit.
-pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
+///
+/// `successor` is set when a draining hub started this one to replace it
+/// (SPEC R-HUB.5): it waits for the rendezvous to come free instead of
+/// standing down because a hub is already running.
+pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
     if let Err(msg) = ahma_common::process_guard::check_spawn_depth() {
         tracing::error!("{msg}");
         return Err(anyhow::anyhow!(msg));
     }
+    // Captured now: once an install replaces the file, Linux reports this
+    // process's image as "(deleted)", and the successor must come from the
+    // path.
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
 
     // ── The rendezvous, and the mutex ────────────────────────────────────────
     //
@@ -213,7 +328,12 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
         }
     }
 
-    let mut hub = match HubServer::lock_at(socket.clone()).await {
+    let taken = if successor {
+        take_rendezvous_as_successor(&socket, config.hub_drain_timeout_secs).await
+    } else {
+        HubServer::lock_at(socket.clone()).await
+    };
+    let mut hub = match taken {
         Ok(server) => server,
         Err(HubBindError::AlreadyRunning) => {
             // The ordinary outcome of losing a startup race: the winner is
@@ -260,12 +380,15 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
         hub_connections,
         active_sessions.clone(),
         idle_timeout_secs,
+        config.hub_drain_timeout_secs,
+        hub.events(),
         exit.clone(),
     );
 
     // ── Serve until something asks us to stop ────────────────────────────────
     let mut socket_watch = SocketWatch::default();
     let mut socket_check = tokio::time::interval(IDLE_CHECK_INTERVAL);
+    let mut successor_started = false;
     let mut serving = std::pin::pin!(start_bridge(bridge));
     let mut signal = std::pin::pin!(shutdown_signal());
     let reason = loop {
@@ -292,6 +415,12 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
                     );
                     hub.relinquish();
                     exit.request_drain();
+                } else if exit.is_draining() && !successor_started {
+                    // Ready and waiting on the lock the moment this hub
+                    // goes, so the handover is a gap of milliseconds rather
+                    // than a cold start on some client's next request.
+                    successor_started = true;
+                    spawn_successor(&exe, &socket, config.idle_timeout_secs);
                 }
             }
         }
@@ -381,26 +510,62 @@ fn build_bridge_config(
 }
 
 /// Watch both halves and ask the hub to stop once neither has anything
-/// attached for the configured window.
+/// attached for the configured window — or, once it is draining, once no work
+/// is in flight (SPEC R-HUB.5).
 fn spawn_idle_watcher(
     hub_connections: Arc<AtomicUsize>,
     active_sessions: Arc<AtomicUsize>,
     timeout_secs: u64,
+    drain_cap_secs: u64,
+    events: ahma_common::hub::HubEvents,
     exit: Arc<HubExit>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut clock = IdleClock::default();
+        let mut drain_started: Option<std::time::SystemTime> = None;
+        let mut quiet_checks = 0u32;
         loop {
             tokio::time::sleep(IDLE_CHECK_INTERVAL).await;
+            let now = std::time::SystemTime::now();
+            if exit.is_draining() {
+                let started = *drain_started.get_or_insert(now);
+                let work = events.operations_in_flight().await + exit.requests_in_flight();
+                quiet_checks = if work == 0 {
+                    quiet_checks.saturating_add(1)
+                } else {
+                    0
+                };
+                let draining_for = now.duration_since(started).unwrap_or_default();
+                match drain_step(work, quiet_checks, draining_for, drain_cap_secs) {
+                    DrainStep::Wait => continue,
+                    DrainStep::HandOver => {
+                        // Sessions are left open on purpose: when the socket
+                        // goes, each client sees its endpoint gone and
+                        // reconnects to the successor at once, where a
+                        // terminated session would first look like a failing
+                        // request.
+                        exit.request("drained");
+                    }
+                    DrainStep::Interrupt => {
+                        tracing::warn!(
+                            work,
+                            drain_cap_secs,
+                            "ahma hub: drain cap reached with work still in flight; \
+                             ending it so the successor can take over"
+                        );
+                        // Answers each request still waiting with an error
+                        // rather than leaving it on a process about to exit.
+                        exit.end_sessions().await;
+                        exit.request("drain cap reached");
+                    }
+                }
+                return;
+            }
             let hub_now = hub_connections.load(Ordering::Relaxed);
             let sessions_now = active_sessions.load(Ordering::SeqCst);
-            let idle_for = clock.observe(
-                hub_now > 0 || sessions_now > 0,
-                std::time::SystemTime::now(),
-            );
-            let draining = exit.is_draining();
-            if idle_exit_due(hub_now, sessions_now, idle_for, timeout_secs, draining) {
-                exit.request(if draining { "drained" } else { "idle" });
+            let idle_for = clock.observe(hub_now > 0 || sessions_now > 0, now);
+            if idle_exit_due(hub_now, sessions_now, idle_for, timeout_secs) {
+                exit.request("idle");
                 return;
             }
         }
@@ -549,33 +714,61 @@ mod tests {
     /// exit while an editor was mid-build with no TUI attached.
     #[test]
     fn idle_exit_needs_both_halves_empty_for_the_full_window() {
-        assert!(!idle_exit_due(1, 0, Duration::from_secs(600), 60, false));
-        assert!(!idle_exit_due(0, 1, Duration::from_secs(600), 60, false));
-        assert!(!idle_exit_due(0, 0, Duration::from_secs(59), 60, false));
-        assert!(idle_exit_due(0, 0, Duration::from_secs(60), 60, false));
+        assert!(!idle_exit_due(1, 0, Duration::from_secs(600), 60));
+        assert!(!idle_exit_due(0, 1, Duration::from_secs(600), 60));
+        assert!(!idle_exit_due(0, 0, Duration::from_secs(59), 60));
+        assert!(idle_exit_due(0, 0, Duration::from_secs(60), 60));
     }
 
-    /// A drained hub has nothing left to finish, so it goes as soon as the
-    /// last session ends rather than making its successor wait out the timer.
+    /// A draining hub hands over the moment no work is in flight — with
+    /// sessions still open, because an idle session loses nothing: its
+    /// client reconnects to the successor (SPEC R-HUB.5). Waiting for every
+    /// session to end instead kept an outdated hub alive for as long as any
+    /// editor window stayed open.
     #[test]
-    fn draining_shortens_the_wait_to_nothing() {
-        assert!(idle_exit_due(0, 0, Duration::ZERO, 60, true));
-        assert!(
-            !idle_exit_due(0, 1, Duration::ZERO, 60, true),
-            "but a live session still holds a draining hub open"
+    fn a_drain_hands_over_once_nothing_is_in_flight() {
+        let minute = Duration::from_secs(60);
+        assert_eq!(drain_step(2, 0, minute, 3600), DrainStep::Wait);
+        assert_eq!(
+            drain_step(0, 1, minute, 3600),
+            DrainStep::Wait,
+            "one quiet look is not enough: a tool call answered a moment ago \
+             may not have reported its operation yet"
+        );
+        assert_eq!(drain_step(0, 2, minute, 3600), DrainStep::HandOver);
+    }
+
+    /// Work that never goes quiet is ended at the cap, which is disclosed
+    /// and recorded rather than waited on forever (SPEC R-HUB.5).
+    #[test]
+    fn a_drain_ends_what_is_left_at_its_cap() {
+        let hour = Duration::from_secs(3600);
+        assert_eq!(
+            drain_step(1, 0, hour - Duration::from_secs(1), 3600),
+            DrainStep::Wait
+        );
+        assert_eq!(drain_step(1, 0, hour, 3600), DrainStep::Interrupt);
+        assert_eq!(
+            drain_step(1, 0, hour * 24, 0),
+            DrainStep::Wait,
+            "0 waits for as long as the work takes"
         );
     }
 
-    /// A subscriber does not hold a draining hub open. It has no work in the
-    /// hub to finish, and it reconnects to the successor on its own; a TUI
-    /// left attached would otherwise keep an outdated hub, or one whose
-    /// socket is gone, alive for as long as the window stayed open.
+    /// A subscriber has no work in the hub, so it counts toward idleness but
+    /// never toward a drain: a TUI left attached would otherwise keep an
+    /// outdated hub, or one whose socket is gone, alive for as long as the
+    /// window stayed open.
     #[test]
     fn a_subscriber_does_not_hold_a_draining_hub_open() {
-        assert!(idle_exit_due(3, 0, Duration::ZERO, 60, true));
+        assert_eq!(
+            drain_step(0, 2, Duration::ZERO, 3600),
+            DrainStep::HandOver,
+            "subscribers are not in-flight work"
+        );
         assert!(
-            !idle_exit_due(3, 0, Duration::ZERO, 60, false),
-            "outside a drain it still counts as attached"
+            !idle_exit_due(3, 0, Duration::from_secs(600), 60),
+            "outside a drain a subscriber still counts as attached"
         );
     }
 
@@ -660,6 +853,70 @@ mod tests {
     /// terminal should not disappear because nobody happened to be attached.
     #[test]
     fn a_zero_timeout_never_expires() {
-        assert!(!idle_exit_due(0, 0, Duration::from_secs(86_400), 0, false));
+        assert!(!idle_exit_due(0, 0, Duration::from_secs(86_400), 0));
+    }
+
+    /// A successor waits for the draining hub to let the rendezvous go, then
+    /// takes it (SPEC R-HUB.5): pre-spawned, so the handover is the moment the
+    /// old hub leaves rather than a cold start on some client's next request.
+    #[tokio::test]
+    async fn a_successor_takes_the_rendezvous_once_it_comes_free() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("hub.sock");
+        let draining = HubServer::lock_at(sock.clone()).await.expect("free");
+
+        let waiting = tokio::spawn({
+            let sock = sock.clone();
+            async move { take_rendezvous_as_successor(&sock, 3600).await }
+        });
+        // Still held: the successor must not have given up.
+        tokio::time::sleep(SUCCESSOR_POLL * 2).await;
+        assert!(!waiting.is_finished(), "a held rendezvous is waited for");
+
+        drop(draining);
+        let taken = tokio::time::timeout(
+            ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+            waiting,
+        )
+        .await
+        .expect("the successor notices the rendezvous come free")
+        .expect("join");
+        assert!(taken.is_ok(), "and takes it: {:?}", taken.err());
+    }
+
+    /// A successor stands down when a hub that is not draining already
+    /// serves: a client's own spawn won, and a second hub is exactly what the
+    /// rendezvous exists to prevent.
+    #[tokio::test]
+    async fn a_successor_stands_down_for_a_hub_that_is_not_draining() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("hub.sock");
+        let _held = HubServer::lock_at(sock.clone()).await.expect("free");
+        let listener = ahma_common::local_socket::LocalListener::bind(&sock).expect("bind");
+        let serving = tokio::spawn(async move {
+            loop {
+                let Ok(mut stream) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"status":"OK","version":"0.0.0+x","draining":false}"#;
+                let reply = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+
+        let outcome = tokio::time::timeout(
+            ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+            take_rendezvous_as_successor(&sock, 3600),
+        )
+        .await
+        .expect("a successor with nothing to succeed does not wait");
+        assert!(matches!(outcome, Err(HubBindError::AlreadyRunning)));
+        serving.abort();
     }
 }

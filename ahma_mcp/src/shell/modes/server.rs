@@ -436,6 +436,9 @@ pub fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
 pub struct BridgeHealth {
     pub version: String,
     pub default_sandbox_scope: Option<String>,
+    /// The hub is handing over to a newer build (SPEC R-HUB.5): it still
+    /// serves, and its successor is already waiting.
+    pub draining: bool,
 }
 
 fn parse_health_body(body: &str) -> Option<BridgeHealth> {
@@ -448,6 +451,10 @@ fn parse_health_body(body: &str) -> Option<BridgeHealth> {
     Some(BridgeHealth {
         version,
         default_sandbox_scope,
+        draining: parsed
+            .get("draining")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -950,6 +957,18 @@ async fn run_as_frontend(config: &AppConfig, socket_path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client reads whether the hub is already handing over (SPEC R-HUB.5),
+    /// and a hub from before the field existed is simply not draining.
+    #[test]
+    fn health_says_whether_the_hub_is_draining() {
+        let draining =
+            parse_health_body(r#"{"status":"OK","version":"0.21.8+abc","draining":true}"#)
+                .expect("parses");
+        assert!(draining.draining);
+        let older = parse_health_body(r#"{"status":"OK","version":"0.21.7+abc"}"#).expect("parses");
+        assert!(!older.draining);
+    }
     use parking_lot::Mutex;
     use std::sync::LazyLock;
     use tempfile::tempdir;
@@ -1022,6 +1041,7 @@ mod tests {
             edit_guard: true,
             settings_origin: crate::shell::cli::SettingsOriginCtx::default(),
             hub_idle_timeout_secs: 60,
+            hub_drain_timeout_secs: 3600,
             session_id: None,
             client_pid: None,
         }

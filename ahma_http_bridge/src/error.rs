@@ -27,14 +27,6 @@ pub enum BridgeError {
         max: usize,
     },
 
-    /// The hub is draining: it is finishing the sessions it has and taking
-    /// no new ones, because a newer build has asked to replace it
-    /// (SPEC R-HUB.5). Distinct from the session cap because the remedy is
-    /// different — wait a moment and connect to the successor, rather than
-    /// close something — and answered `503` with `Retry-After`.
-    #[error("Server process error: the ahma hub is draining for an upgrade; retry shortly")]
-    Draining,
-
     /// Operator configuration the bridge cannot start with.
     ///
     /// Distinct from the runtime variants above because the remedy is different:

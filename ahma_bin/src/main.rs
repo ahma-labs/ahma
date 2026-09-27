@@ -177,11 +177,11 @@ async fn run() -> Result<()> {
             tracing::info!("Dispatching llm subcommand");
             dispatch_llm(llm_args).await
         }
-        Subcommands::Hub(_) => {
+        Subcommands::Hub(hub_args) => {
             tracing::info!("Starting the per-user ahma hub");
             // Hosts both the observability hub and the MCP endpoint in one
             // process, with one idle policy and one exit path (SPEC R-HUB.1).
-            ahma_mcp::shell::modes::hub::run_hub_mode(cfg).await
+            ahma_mcp::shell::modes::hub::run_hub_mode(cfg, hub_args.successor).await
         }
         Subcommands::Simplify(simplify_args) => {
             tracing::info!("Running in simplify mode");

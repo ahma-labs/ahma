@@ -116,6 +116,9 @@ Run `ahma settings init` to generate this file automatically.
 #                          # no TUI — before the per-user hub exits. 0 keeps
 #                          # it running. `[daemon]` (its old name) is still
 #                          # read. See docs/hub.md.
+# drain_timeout_secs = 3600 # longest a hub replaced by a newer install waits
+#                           # for running work before ending it and handing
+#                           # over. 0 waits as long as the work takes.
 ```
 
 ---

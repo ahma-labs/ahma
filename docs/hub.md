@@ -99,6 +99,7 @@ idle_timeout_secs = 3600
 | Setting | Default | What it does |
 |---|---|---|
 | `[hub] idle_timeout_secs` | `3600` | Seconds with no MCP sessions and no TUI before the hub exits; `0` never. |
+| `[hub] drain_timeout_secs` | `3600` | Longest a hub replaced by a newer install waits for running work before ending it and handing over; `0` waits as long as the work takes. |
 | `--unix-socket-path` / `[http] unix_socket_path` | `hub.sock` in the per-user runtime dir | Where the hub's one socket lives. |
 
 Counting only sessions would exit while a TUI sat watching an idle project;
@@ -124,12 +125,23 @@ id from before a restart says what happened instead of just "not found"
 ## Upgrades
 
 When you install a new ahma while one is running, the new binary asks the old
-hub to **drain**: stop accepting new sessions, finish the ones it has, then
-exit, at which point the next client starts the new one. Your other editors'
-sessions are not torn down mid-command to install a binary one of them asked
-for. Until the handover happens, the mismatch is disclosed rather than hidden.
-A TUI watching the old hub does not hold it open: it reconnects to the new one
-on its own.
+hub to **drain**: hand over to the new build without ending anyone's work.
+
+- The old hub **keeps serving** meanwhile, new sessions included — opening
+  another editor window during a drain works as usual.
+- It starts the new build straight away, waiting in the wings for the
+  rendezvous.
+- It hands over the moment nothing is running: no command in any session and
+  no request waiting for an answer. Your editors reconnect to the new hub on
+  their next request, without you doing anything.
+- Work that never goes quiet is ended after `[hub] drain_timeout_secs` (an
+  hour by default), so an old build cannot run forever; the requests it
+  interrupts get an error saying why.
+
+Your other editors' sessions are not torn down mid-command to install a
+binary one of them asked for. Until the handover happens, the mismatch is
+disclosed rather than hidden. A TUI watching the old hub does not hold it
+open: it reconnects to the new one on its own.
 
 `ahma hub` in a terminal runs one in the foreground, which is the way to see
 what it is doing.
