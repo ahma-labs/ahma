@@ -4449,24 +4449,30 @@ mod tests {
             )
             .await
             .unwrap();
-            // Observe the registration from a subscriber's point of view.
-            let sub = LocalStream::connect(sock).await.unwrap();
-            let (sr, mut sw) = tokio::io::split(sub);
-            let mut sub_reader = BufReader::new(sr);
-            send_msg(&mut sw, &ClientMsg::ListInstances).await.unwrap();
-            let id = match recv_msg::<_, DaemonMsg>(&mut sub_reader).await.unwrap() {
-                DaemonMsg::InstanceList { instances } => {
-                    let live: Vec<_> = instances
-                        .iter()
-                        .filter(|i| i.ended_epoch_ms.is_none())
-                        .collect();
-                    assert_eq!(live.len(), 1, "one session is one instance: {instances:?}");
-                    assert_eq!(live[0].session_id.as_deref(), Some("mcp-session-7"));
-                    assert_eq!(live[0].client_pid, Some(4242));
-                    live[0].id.clone()
+            // Observe the registration from a one-shot query's point of view.
+            // The query travels on a connection of its own, so nothing orders
+            // it after the `Register` above: wait until the hub has handled
+            // this registration (the label names it) rather than assume it.
+            let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(5);
+            let live = loop {
+                let instances = list_instances_at(sock).await.unwrap();
+                let live: Vec<_> = instances
+                    .into_iter()
+                    .filter(|i| i.ended_epoch_ms.is_none())
+                    .collect();
+                if live.iter().any(|i| i.client.as_deref() == client) {
+                    break live;
                 }
-                other => panic!("expected InstanceList, got {other:?}"),
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the registration never became visible: {live:?}"
+                );
+                tokio::time::sleep(TestTimeouts::poll_interval()).await;
             };
+            assert_eq!(live.len(), 1, "one session is one instance: {live:?}");
+            assert_eq!(live[0].session_id.as_deref(), Some("mcp-session-7"));
+            assert_eq!(live[0].client_pid, Some(4242));
+            let id = live[0].id.clone();
             // Drop the instance connection so the next registration is a
             // genuine reconnect-to-relabel.
             drop(w);
@@ -4476,18 +4482,17 @@ mod tests {
 
         let first = register_once(&sock, None).await;
         // Wait for the hub to finish tearing the first connection down.
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            let stream = LocalStream::connect(&sock).await.unwrap();
-            let (r, mut w) = tokio::io::split(stream);
-            let mut reader = BufReader::new(r);
-            send_msg(&mut w, &ClientMsg::ListInstances).await.unwrap();
-            if let DaemonMsg::InstanceList { instances } =
-                recv_msg::<_, DaemonMsg>(&mut reader).await.unwrap()
-                && instances.iter().all(|i| i.ended_epoch_ms.is_some())
-            {
+        let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(5);
+        loop {
+            let instances = list_instances_at(&sock).await.unwrap();
+            if instances.iter().all(|i| i.ended_epoch_ms.is_some()) {
                 break;
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first connection was never torn down: {instances:?}"
+            );
+            tokio::time::sleep(TestTimeouts::poll_interval()).await;
         }
         let second = register_once(&sock, Some("claude-code")).await;
 
