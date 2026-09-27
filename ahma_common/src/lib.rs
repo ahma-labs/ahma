@@ -16,7 +16,7 @@
 //! | Operations | [`event_dispatcher`], [`op_identity`] |
 //! | Per-user daemon | [`daemon_hub`], [`daemon_endpoint`], [`daemon_history`] |
 //! | MCP wire | [`mcp_methods`], [`mcp_protocol`], [`session_event`], [`keepalive`], [`sse`], [`peer_factory`] |
-//! | Process and platform | [`test_isolation`], [`process_guard`], [`timeouts`], [`file_uri`], [`hostname`], [`fs_lock`], [`local_tls`], [`digest`] |
+//! | Process and platform | [`test_isolation`], [`process_guard`], [`timeouts`], [`file_uri`], [`hostname`], [`fs_lock`], [`local_socket`], [`local_tls`], [`digest`] |
 //! | Shared definitions | [`prompts`], [`skills`], [`simplify_args`], [`state_machine`], [`doctor`], [`observability`] |
 //!
 //! ## Design Goal: Workspace Consistency
@@ -48,6 +48,7 @@ pub mod hook_consent;
 pub mod hostname;
 pub mod http_retry;
 pub mod keepalive;
+pub mod local_socket;
 pub mod local_tls;
 pub mod mcp_methods;
 pub mod mcp_protocol;
