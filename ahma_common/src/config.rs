@@ -1461,6 +1461,13 @@ pub struct HubSettings {
     /// test harness the default drops to ten seconds, so a test-spawned hub
     /// cannot outlive the run that started it by a minute.
     pub idle_timeout_secs: u64,
+    /// Longest a draining hub waits for work in flight to finish before it
+    /// ends what is left and hands over to its successor (SPEC R-HUB.5).
+    /// `0` waits for as long as the work takes.
+    ///
+    /// A drain keeps serving, so waiting costs nothing but running the older
+    /// build a while longer; the cap exists for work that never goes quiet.
+    pub drain_timeout_secs: u64,
 }
 
 impl Default for HubSettings {
@@ -1469,6 +1476,7 @@ impl Default for HubSettings {
             idle_timeout_secs: hub_idle_timeout_default(
                 crate::test_isolation::spawned_under_test_harness(),
             ),
+            drain_timeout_secs: 3600,
         }
     }
 }
@@ -2343,6 +2351,12 @@ impl AhmaSettings {
             self.hub.idle_timeout_secs.to_string(),
             d.hub.idle_timeout_secs.to_string(),
         );
+        w.setting(
+            "Longest a draining hub (one replaced by a newer install) waits for running work before ending it and handing over. 0 waits as long as the work takes.",
+            "drain_timeout_secs",
+            self.hub.drain_timeout_secs.to_string(),
+            d.hub.drain_timeout_secs.to_string(),
+        );
 
         w.section("Agent (last-selected LLM, written by ahma tui)", "agent");
         w.setting(
@@ -2985,6 +2999,7 @@ mod tests {
             },
             hub: HubSettings {
                 idle_timeout_secs: 321,
+                drain_timeout_secs: 654,
             },
             agent: AgentSettings {
                 provider: Some("Ollama".into()),
@@ -4184,6 +4199,7 @@ mod tier_tests {
             ("logging", "target"),
             ("instance", "label"),
             ("hub", "idle_timeout_secs"),
+            ("hub", "drain_timeout_secs"),
             ("http", "handshake_timeout_secs"),
         ] {
             assert_eq!(

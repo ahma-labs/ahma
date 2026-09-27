@@ -1432,6 +1432,28 @@ impl Hub {
         }
     }
 
+    /// Operations still running in a session worker attached now.
+    ///
+    /// What a draining hub waits for (SPEC R-HUB.5): work that would die with
+    /// it. Hooks and a TUI's `!` commands run in their own processes and
+    /// outlive the hub; a worker that has gone is not coming back to finish.
+    async fn operations_in_flight(&self) -> usize {
+        let workers: Vec<String> = self
+            .instances
+            .lock()
+            .await
+            .values()
+            .filter(|i| i.mode != "hook" && i.mode != "tui")
+            .map(|i| i.id.clone())
+            .collect();
+        let history = self.op_history.lock().await;
+        workers
+            .iter()
+            .filter_map(|id| history.get(id))
+            .map(|ops| ops.values().filter(|s| s.finished.is_none()).count())
+            .sum()
+    }
+
     /// Every instance a subscriber should know about: those attached now, plus
     /// those retained inside the replay window so their operations have a
     /// section to belong to. An ended instance carries `ended_epoch_ms`, which
@@ -1678,6 +1700,12 @@ pub struct HubEvents {
 }
 
 impl HubEvents {
+    /// Operations still running in a session worker attached now: what a
+    /// draining hub waits for before it goes (SPEC R-HUB.5).
+    pub async fn operations_in_flight(&self) -> usize {
+        self.hub.operations_in_flight().await
+    }
+
     /// Serve one connection whose upgrade has already been accepted, until the
     /// peer hangs up.
     pub async fn serve<S>(&self, stream: S)
@@ -4100,6 +4128,38 @@ mod tests {
             denial: None,
             interrupted: false,
         }
+    }
+
+    /// What holds a draining hub open is work that would die with it: an
+    /// operation still running in a session worker attached now (SPEC
+    /// R-HUB.5). A hook and a TUI's `!` command run in their own processes and
+    /// outlive the hub, and a worker that has gone is not coming back to
+    /// finish anything.
+    #[tokio::test]
+    async fn only_running_worker_operations_are_in_flight() {
+        let (hub, _rx) = Hub::new();
+        for (id, mode) in [("w1", "stdio"), ("h1", "hook"), ("t1", "tui")] {
+            hub.instances.lock().await.insert(
+                id.into(),
+                InstanceInfo {
+                    id: id.into(),
+                    mode: mode.into(),
+                    ..Default::default()
+                },
+            );
+            hub.record_op_event(id, &started_ev(&format!("{id}-op")))
+                .await;
+        }
+        // A worker that disconnected with an operation still marked running.
+        hub.record_op_event("gone", &started_ev("gone-op")).await;
+        let events = HubEvents { hub: Arc::new(hub) };
+        assert_eq!(events.operations_in_flight().await, 1);
+
+        events
+            .hub
+            .record_op_event("w1", &finished_ev("w1-op", None))
+            .await;
+        assert_eq!(events.operations_in_flight().await, 0);
     }
 
     /// The retained output window is bounded: it is what a late subscriber

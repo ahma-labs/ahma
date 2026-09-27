@@ -166,6 +166,9 @@ pub enum SessionTerminationReason {
     /// The real client missed enough consecutive bridge-initiated liveness
     /// pings in a row to be treated as gone (SPEC RB.4).
     Unresponsive,
+    /// The per-user hub reached its drain cap and ended what was left so its
+    /// successor could take over (SPEC R-HUB.5).
+    HubRestart,
 }
 
 /// Diagnostic summary of a terminated session retained in memory.
@@ -736,10 +739,6 @@ pub struct SessionManager {
     config: SessionManagerConfig,
     /// Shared atomic counter tracking active connections.
     pub active_sessions: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    /// Set once the hosting hub has been asked to drain: existing sessions
-    /// run to completion, new ones are refused so they are not started inside a
-    /// process that is about to go (SPEC R-HUB.5).
-    pub draining: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Retained history of recently terminated sessions with their termination reason.
     terminated_sessions: DashMap<String, TerminatedSessionInfo>,
 }
@@ -1312,7 +1311,6 @@ impl SessionManager {
             sessions: DashMap::new(),
             config,
             active_sessions: None,
-            draining: None,
             terminated_sessions: DashMap::new(),
         }
     }
@@ -1567,15 +1565,6 @@ impl SessionManager {
     /// already dead, then evict the oldest unobserved session, and fail only
     /// when neither frees a slot.
     async fn ensure_session_capacity(&self) -> Result<()> {
-        if self
-            .draining
-            .as_ref()
-            .is_some_and(|d| d.load(std::sync::atomic::Ordering::SeqCst))
-        {
-            // Accepting here would start a session inside a process that is
-            // leaving, so the client would lose it moments later.
-            return Err(BridgeError::Draining);
-        }
         if self.sessions.len() < self.config.max_sessions {
             return Ok(());
         }
@@ -2083,6 +2072,15 @@ impl SessionManager {
     /// Look up diagnostic info about a terminated session, if recently recorded.
     pub fn terminated_session_info(&self, session_id: &str) -> Option<TerminatedSessionInfo> {
         self.terminated_sessions.get(session_id).map(|r| r.clone())
+    }
+
+    /// Requests sent to a worker and not yet answered, across every session:
+    /// work a draining hub would lose by leaving now (SPEC R-HUB.5).
+    pub fn requests_in_flight(&self) -> usize {
+        self.sessions
+            .iter()
+            .map(|entry| entry.value().pending_requests.len())
+            .sum()
     }
 
     /// Get session count (for metrics/debugging)

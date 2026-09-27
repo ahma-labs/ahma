@@ -6,29 +6,58 @@
 //! binary. With one hub per user that is every attached editor, mid-command.
 
 use ahma_http_bridge::bridge::HubExit;
-use ahma_http_bridge::error::BridgeError;
 use ahma_http_bridge::session::{SessionManager, SessionManagerConfig};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A drained hub refuses a *new* session rather than starting one inside a
-/// process that is about to leave.
-#[tokio::test]
-async fn a_draining_hub_refuses_new_sessions() {
-    let exit = Arc::new(HubExit::new(Box::new(|_| {})));
-    let mut manager = SessionManager::new(SessionManagerConfig {
-        server_command: "echo".to_string(),
+/// A worker that never answers, in memory on every OS: what these tests need
+/// is sessions and requests that stay open, not a process.
+struct ParkedPeer;
+
+impl ahma_common::peer_factory::PeerFactory for ParkedPeer {
+    fn create(
+        &self,
+        _options: ahma_common::peer_factory::PeerSpawnOptions,
+    ) -> ahma_common::peer_factory::BoxFuture<anyhow::Result<ahma_common::peer_factory::PeerStreams>>
+    {
+        Box::pin(async move {
+            let (bridge_end, peer_end) = tokio::io::duplex(64 * 1024);
+            let (bridge_read, bridge_write) = tokio::io::split(bridge_end);
+            std::mem::forget(peer_end);
+            Ok(ahma_common::peer_factory::PeerStreams {
+                stdin: Box::new(bridge_write),
+                stdout: Box::new(bridge_read),
+                stderr: None,
+                shutdown_fn: Some(Box::new(|| Box::pin(async {}))),
+                exit_cause: None,
+            })
+        })
+    }
+}
+
+fn parked_manager() -> Arc<SessionManager> {
+    Arc::new(SessionManager::new(SessionManagerConfig {
+        server_command: "unused".to_string(),
+        peer_factory: Some(Arc::new(ParkedPeer)),
         ..Default::default()
-    });
-    manager.draining = Some(exit.draining_flag());
+    }))
+}
+
+/// A draining hub keeps serving, new sessions included. Refusing them made a
+/// drain an outage: every window opened while an hour-long build finished
+/// elsewhere got `503` until it did.
+#[tokio::test]
+async fn a_draining_hub_keeps_accepting_sessions() {
+    let exit = Arc::new(HubExit::new(Box::new(|_| {})));
+    let manager = parked_manager();
+    exit.attach_sessions(&manager);
 
     exit.request_drain();
 
-    match manager.create_session().await {
-        Err(BridgeError::Draining) => {}
-        Err(other) => panic!("expected Draining, got {other}"),
-        Ok(id) => panic!("a draining hub must not accept session {id}"),
-    }
+    manager
+        .create_session()
+        .await
+        .expect("a draining hub still accepts a session");
 }
 
 /// Draining is not stopping: the request only sets the flag, so live sessions
@@ -57,18 +86,52 @@ async fn draining_does_not_stop_anything_by_itself() {
     );
 }
 
-/// Without a coordinator — an operator's own `ahma serve http|unix` — nothing
-/// changes: that process owns itself.
+/// The hub sees the requests its bridge is still answering, because a
+/// request in flight is work that would be lost if it went now.
 #[tokio::test]
-async fn a_standalone_bridge_has_no_drain_state() {
-    let manager = SessionManager::new(SessionManagerConfig {
-        server_command: "echo".to_string(),
-        ..Default::default()
-    });
-    assert!(
-        manager.draining.is_none(),
-        "an explicitly started bridge is not part of a hub's drain"
-    );
+async fn the_hub_sees_requests_in_flight() {
+    let exit = HubExit::new(Box::new(|_| {}));
+    assert_eq!(exit.requests_in_flight(), 0, "no bridge attached yet");
+
+    let manager = parked_manager();
+    exit.attach_sessions(&manager);
+    let id = manager.create_session().await.expect("session");
+    assert_eq!(exit.requests_in_flight(), 0);
+
+    // The parked worker never answers, so the request stays pending.
+    let request = manager
+        .start_request(
+            &id,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}),
+        )
+        .await
+        .expect("request sent");
+    assert_eq!(exit.requests_in_flight(), 1);
+    drop(request);
+    manager
+        .terminate_session(
+            &id,
+            ahma_http_bridge::session::SessionTerminationReason::ClientRequested,
+        )
+        .await
+        .expect("terminate");
+    assert_eq!(exit.requests_in_flight(), 0, "an ended session has none");
+}
+
+/// At the drain cap the hub ends what is left (SPEC R-HUB.5): every session
+/// is terminated, which answers each request still in flight with an error
+/// rather than leaving it hanging on a process about to exit.
+#[tokio::test]
+async fn ending_the_sessions_leaves_none() {
+    let exit = HubExit::new(Box::new(|_| {}));
+    let manager = parked_manager();
+    exit.attach_sessions(&manager);
+    manager.create_session().await.expect("session");
+    manager.create_session().await.expect("session");
+    assert_eq!(manager.session_count(), 2);
+
+    exit.end_sessions().await;
+    assert_eq!(manager.session_count(), 0);
 }
 
 /// A session's options reach *its* worker and no other (SPEC R-HUB.4).

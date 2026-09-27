@@ -31,7 +31,7 @@ subtly wrong on its own.*
 - Every timeout is supplied by the caller; nothing is hardcoded here.
 - `delete_session` ends a session with `DELETE /mcp` (R8.3.6).
 - Every POST retries per root SPEC R-HTTP: a request that never arrived, or that the server
-  answered 429/503 (a draining hub), is re-sent; a timeout or 5xx is re-sent only for the
+  answered 429/503 (overloaded, or not ready yet), is re-sent; a timeout or 5xx is re-sent only for the
   read-only `*/list` methods, never for `tools/call` or `initialize`. A retried request keeps
   its JSON-RPC id. A final failure is a `ServiceError` naming "the MCP server at host:port";
   callers that know better (the agent: "the ahma hub") re-attribute it with

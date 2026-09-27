@@ -396,6 +396,10 @@ impl BridgeConfig {
 pub struct HubExit {
     request: Box<dyn Fn(&str) + Send + Sync>,
     draining: Arc<std::sync::atomic::AtomicBool>,
+    /// The bridge's sessions, once it has built them: what the hub asks how
+    /// much work is still in flight, and ends at the drain cap. Weak, so the
+    /// coordinator never keeps a finished bridge's sessions alive.
+    sessions: std::sync::OnceLock<std::sync::Weak<SessionManager>>,
 }
 
 impl std::fmt::Debug for HubExit {
@@ -412,6 +416,7 @@ impl HubExit {
         Self {
             request,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sessions: std::sync::OnceLock::new(),
         }
     }
 
@@ -420,11 +425,13 @@ impl HubExit {
         (self.request)(reason);
     }
 
-    /// Stop accepting new sessions and exit once the live ones end.
+    /// Hand the hub over to its successor once no work is in flight.
     ///
-    /// This is what makes an upgrade safe: a newer client can replace the
-    /// hub without tearing down another window's session mid-command, which
-    /// is what the old "restart the bridge" path did to everyone attached.
+    /// This is what makes an upgrade safe: a newer build replaces the hub
+    /// without tearing down another window's session mid-command, which is
+    /// what the old "restart the bridge" path did to everyone attached. The
+    /// hub keeps serving meanwhile, new sessions included (SPEC R-HUB.5);
+    /// when it goes is the composer's decision.
     pub fn request_drain(&self) {
         self.draining
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -435,9 +442,28 @@ impl HubExit {
         self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// The flag itself, for the session manager's admission check.
-    pub fn draining_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        self.draining.clone()
+    /// Called by the bridge once its sessions exist.
+    pub fn attach_sessions(&self, sessions: &Arc<SessionManager>) {
+        let _ = self.sessions.set(Arc::downgrade(sessions));
+    }
+
+    /// Requests the bridge has sent to a worker and not yet answered.
+    pub fn requests_in_flight(&self) -> usize {
+        self.sessions
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .map_or(0, |sessions| sessions.requests_in_flight())
+    }
+
+    /// End every session, answering each request still in flight with an
+    /// error: what a drain does at its cap, rather than leave callers
+    /// waiting on a process about to exit (SPEC R-HUB.5).
+    pub async fn end_sessions(&self) {
+        if let Some(sessions) = self.sessions.get().and_then(std::sync::Weak::upgrade) {
+            sessions
+                .terminate_all(crate::session::SessionTerminationReason::HubRestart)
+                .await;
+        }
     }
 }
 
@@ -746,13 +772,13 @@ pub async fn start_bridge(mut config: BridgeConfig) -> Result<()> {
 fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
     let session_config = create_session_config(config);
     let mut session_manager = SessionManager::new(session_config);
-    if let Some(ref exit) = config.exit {
-        session_manager.draining = Some(exit.draining_flag());
-    }
     if let Some(ref counter) = config.active_sessions {
         session_manager.active_sessions = Some(counter.clone());
     }
     let session_manager = Arc::new(session_manager);
+    if let Some(ref exit) = config.exit {
+        exit.attach_sessions(&session_manager);
+    }
     session_manager.start_sweeper();
     session_manager.start_liveness_prober();
     Arc::new(BridgeState {

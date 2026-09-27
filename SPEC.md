@@ -1608,7 +1608,8 @@ Operation ids are counters, and counters restart with the process that issues th
     stray `rm` — nobody can reach it. It then **relinquishes** the rendezvous
     (releases the lock and forgets the path, so the next client can start a
     successor at once and this hub's exit never unlinks that successor's
-    socket) and drains. Staying on left a zombie beside the new hub.
+    socket) and drains, without a successor of its own: whoever connects
+    next starts one. Staying on left a zombie beside the new hub.
 
 - **R-HUB.4 — Sessions and per-session options.** One kernel-sandboxed worker
   per MCP session, owned by the hub. Ending a session never affects another.
@@ -1622,20 +1623,38 @@ Operation ids are counters, and counters restart with the process that issues th
   handshake and idle timeouts — are deliberately not settable per session.
 
 - **R-HUB.5 — Upgrade by draining.** Version and build id are compared at
-  every connect. A newer client asks the hub to **drain**: stop accepting new
-  sessions, finish the live ones, then exit, at which point the next client
-  starts the successor. It never tears down sessions that belong to other
-  windows — the old rule ("restart the bridge") did exactly that, mid-command,
-  to every attached editor so that one newly-started client could have a
-  matching binary. A draining hub answers `initialize` with `503` and
-  `Retry-After`, and says `draining` in `/health`. A hub still serving
-  other sessions when the handoff times out is proxied and **disclosed**, not
-  replaced. A draining hub exits once its MCP sessions end; a subscriber
-  (a TUI) does not hold it open, because it has no work there and reconnects
-  to the successor on its own. An **older** client neither drains a newer
-  hub nor restarts itself: it proxies, because the hub runs every session's
-  worker from its own binary, so the stale client is served by the newer
-  build.
+  every connect. A newer client asks the hub to **drain**: hand over to the
+  new build without ending anyone's work. It never tears down sessions that
+  belong to other windows — the old rule ("restart the bridge") did exactly
+  that, mid-command, to every attached editor so that one newly-started
+  client could have a matching binary.
+  - A draining hub **keeps serving**, new sessions included, and says
+    `draining` in `/health`. It used to refuse new sessions with `503`, which
+    made a drain an outage for every window opened while a long build
+    finished elsewhere.
+  - It pre-spawns its **successor** from its own executable path (which an
+    install has just filled with the new build), at its own spawn depth so
+    upgrades never nest. The successor waits on the rendezvous lock and binds
+    the moment the old hub lets go; it stands down if a hub that is not
+    draining answers first.
+  - It goes at the first moment **no work is in flight** — no operation
+    running in a session worker and no request unanswered — on two
+    consecutive looks, since a tool call answered a moment ago may not have
+    reported its operation yet. Open sessions and subscribers are not work:
+    their clients reconnect to the successor when the socket goes, and
+    waiting for every session to end kept an outdated hub alive for as long
+    as any editor window stayed open.
+  - At `[hub] drain_timeout_secs` (3600; `0` waits for as long as the work
+    takes) it ends what is left: every session is terminated, which answers
+    each request still in flight with an error, and the operations it
+    interrupts are replayed `interrupted` (R-HUB.7). Work that never goes
+    quiet is the one thing that can hold a drain open, and holding it open
+    forever would run the old build forever.
+  - A client that finds the hub already draining does not ask again or wait;
+    it proxies and **discloses** the skew. An **older** client neither drains
+    a newer hub nor restarts itself: it proxies, because the hub runs every
+    session's worker from its own binary, so the stale client is served by
+    the newer build.
 
 - **R-HUB.6 — Registration and routing.** An instance registers with its
   `session_id`, `client_pid`, MCP client identity, mode (`stdio` | `hook` |
