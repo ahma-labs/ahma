@@ -36,6 +36,7 @@ mod generate_schema_test;
 mod linux_legacy_kernel_sandbox_test;
 mod linux_sandbox_integration_test;
 mod macos_sandbox_integration_test;
+mod main_thread_stack_test;
 mod mcp_cancellation_bug_test;
 mod mcp_integration_tests;
 mod mcp_service;
