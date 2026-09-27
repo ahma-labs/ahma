@@ -835,8 +835,48 @@ fn fail_pending_requests(
 }
 
 /// Wait for a JSON-RPC response via a oneshot channel, or return immediately for notifications.
-async fn await_response(
+/// A request written to a session's subprocess whose response has not been
+/// collected yet (see [`SessionManager::start_request`]).
+///
+/// Dropping it unanswered releases its id: a client that disconnects mid-call
+/// must not leave the session looking busy forever, which would both exempt it
+/// from the liveness probe (SPEC RB.4) and refuse the id's reuse (R8.3.7).
+pub struct InFlightRequest {
     response_rx: Option<oneshot::Receiver<Value>>,
+    id: Option<String>,
+    pending: Arc<DashMap<String, oneshot::Sender<Value>>>,
+    default_timeout: Duration,
+}
+
+impl InFlightRequest {
+    /// Wait for the subprocess's response, for `timeout` or the session
+    /// manager's request timeout.
+    pub async fn response(mut self, timeout: Option<Duration>) -> Result<Value> {
+        await_response(
+            self.response_rx.as_mut(),
+            timeout,
+            self.default_timeout,
+            &self.id,
+            &self.pending,
+        )
+        .await
+    }
+}
+
+impl Drop for InFlightRequest {
+    fn drop(&mut self) {
+        // Close our receiver first: the sender still registered under this id
+        // is then recognisably ours (closed), not a later request's that
+        // reused the id after ours was answered.
+        drop(self.response_rx.take());
+        if let Some(id) = &self.id {
+            self.pending.remove_if(id, |_, sender| sender.is_closed());
+        }
+    }
+}
+
+async fn await_response(
+    response_rx: Option<&mut oneshot::Receiver<Value>>,
     timeout: Option<Duration>,
     default_timeout: Duration,
     id_opt: &Option<String>,
@@ -1356,7 +1396,10 @@ impl SessionManager {
     /// alive, and many legitimate clients never implement the server→client
     /// `ping` side of the protocol, so probing a busy session risks killing
     /// it over a ping it was never going to answer regardless of whether it
-    /// is alive. `timeout` and `min_idle` are parameters (rather than always
+    /// is alive. A session with a request still in flight is skipped for the
+    /// same reason: its client is waiting on us, and may be unable to answer
+    /// a ping until that request returns (rmcp's HTTP client handles one POST
+    /// at a time). `timeout` and `min_idle` are parameters (rather than always
     /// the `LIVENESS_PING_*`/`LIVENESS_PING_INTERVAL` constants) so tests can
     /// drive this deterministically with short bounds.
     async fn ping_connected_sessions(&self, timeout: Duration, min_idle: Duration) {
@@ -1365,7 +1408,9 @@ impl SessionManager {
             .iter()
             .filter(|entry| {
                 let session = entry.value();
-                session.sse_receivers() > 0 && session.idle_since_last_activity() >= min_idle
+                session.sse_receivers() > 0
+                    && !session.has_pending_requests()
+                    && session.idle_since_last_activity() >= min_idle
             })
             .map(|entry| Arc::clone(entry.value()))
             .collect();
@@ -1794,30 +1839,44 @@ impl SessionManager {
         request: &Value,
         timeout: Option<Duration>,
     ) -> Result<Value> {
+        self.start_request(session_id, request)
+            .await?
+            .response(timeout)
+            .await
+    }
+
+    /// Send a request without waiting for its response.
+    ///
+    /// Everything that can refuse the request — an unknown or terminated
+    /// session, a duplicate id (SPEC R8.3.7), a dead subprocess pipe — fails
+    /// here, so a caller can still answer with the matching HTTP status before
+    /// it commits to streaming the response.
+    pub async fn start_request(
+        &self,
+        session_id: &str,
+        request: &Value,
+    ) -> Result<InFlightRequest> {
         let session = self.live_session(session_id)?;
 
-        let id_opt = extract_request_id(request);
+        let id = extract_request_id(request);
 
-        let response_rx = register_pending_request(&session.pending_requests, id_opt.as_ref())?;
+        let response_rx = register_pending_request(&session.pending_requests, id.as_ref())?;
 
-        // Send the request
         let json_str = serde_json::to_string(request)?;
         if let Err(err) = session
             .send_serialized_to_subprocess(json_str, "Failed to send to subprocess")
             .await
         {
-            clear_pending_request(&session.pending_requests, id_opt.as_deref());
+            clear_pending_request(&session.pending_requests, id.as_deref());
             return Err(err);
         }
 
-        await_response(
+        Ok(InFlightRequest {
             response_rx,
-            timeout,
-            Duration::from_secs(self.request_timeout_secs()),
-            &id_opt,
-            &session.pending_requests,
-        )
-        .await
+            id,
+            pending: Arc::clone(&session.pending_requests),
+            default_timeout: Duration::from_secs(self.request_timeout_secs()),
+        })
     }
 
     /// Lock sandbox scope for a session (called when observing first roots/list response).
@@ -3107,11 +3166,11 @@ mod session_logic_tests {
     #[tokio::test]
     async fn await_response_returns_delivered_value() {
         let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         tx.send(json!({"jsonrpc": "2.0", "id": "1", "result": "done"}))
             .unwrap();
         let res = await_response(
-            Some(rx),
+            Some(&mut rx),
             Some(Duration::from_secs(1)),
             Duration::from_secs(60),
             &Some("1".to_string()),
@@ -3125,10 +3184,10 @@ mod session_logic_tests {
     #[tokio::test]
     async fn await_response_channel_closed_errors() {
         let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
-        let (tx, rx) = oneshot::channel::<Value>();
+        let (tx, mut rx) = oneshot::channel::<Value>();
         drop(tx); // sender dropped → recv yields Err
         let err = await_response(
-            Some(rx),
+            Some(&mut rx),
             Some(Duration::from_secs(1)),
             Duration::from_secs(60),
             &None,
@@ -3142,12 +3201,12 @@ mod session_logic_tests {
     #[tokio::test]
     async fn await_response_timeout_clears_pending() {
         let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
-        let (tx, rx) = oneshot::channel::<Value>();
+        let (tx, mut rx) = oneshot::channel::<Value>();
         // Keep tx alive so the channel never delivers and never closes.
         let id = "timeout-id".to_string();
         pending.insert(id.clone(), oneshot::channel().0);
         let err = await_response(
-            Some(rx),
+            Some(&mut rx),
             Some(Duration::from_millis(20)),
             Duration::from_secs(60),
             &Some(id.clone()),
@@ -3333,6 +3392,77 @@ mod session_logic_tests {
         .await;
 
         assert!(mgr.session_exists(&id));
+        assert_eq!(session.missed_liveness_pings.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unanswered_request_releases_its_id() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let id = mgr.create_session().await.unwrap();
+        let session = mgr.get_session(&id).unwrap();
+        let request = json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list"});
+
+        let in_flight = mgr.start_request(&id, &request).await.unwrap();
+        assert!(session.has_pending_requests());
+        drop(in_flight);
+        assert!(
+            !session.has_pending_requests(),
+            "an abandoned request must not keep the session looking busy"
+        );
+
+        // A request abandoned mid-wait releases its id too, and the id is
+        // free for the client to reuse.
+        let waiting = mgr.start_request(&id, &request).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(20), waiting.response(None)).await;
+        assert!(!session.has_pending_requests());
+        mgr.start_request(&id, &request)
+            .await
+            .expect("the id is reusable once its request was abandoned");
+    }
+
+    #[tokio::test]
+    async fn dropping_an_answered_request_leaves_a_reused_id_alone() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let id = mgr.create_session().await.unwrap();
+        let session = mgr.get_session(&id).unwrap();
+        let request = json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list"});
+
+        let answered = mgr.start_request(&id, &request).await.unwrap();
+        take_pending_request(&session.pending_requests, "5")
+            .expect("registered")
+            .send(json!({"jsonrpc": "2.0", "id": 5, "result": {}}))
+            .unwrap();
+        let _reuse = mgr.start_request(&id, &request).await.unwrap();
+        drop(answered);
+        assert!(
+            session.has_pending_requests(),
+            "the later request reusing id 5 must stay registered"
+        );
+    }
+
+    /// REGRESSION: a client waiting on a long `tools/call` (an `await` can hold
+    /// one open for 30 minutes) is plainly alive, but it may not be able to
+    /// answer a ping until that call returns — its transport can be busy with
+    /// the very request it is waiting on. Pinging it anyway terminated a live
+    /// session after three rounds and left the IDE's server dead.
+    #[tokio::test]
+    async fn ping_connected_sessions_skips_session_with_request_in_flight() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let id = mgr.create_session().await.unwrap();
+        let session = mgr.get_session(&id).unwrap();
+        let _sub = session.subscribe(); // never answers anything
+        let _in_flight = register_pending_request(&session.pending_requests, Some(&"7".into()))
+            .expect("register in-flight request");
+
+        for _ in 1..=SessionManager::MAX_MISSED_LIVENESS_PINGS {
+            mgr.ping_connected_sessions(Duration::from_millis(20), Duration::ZERO)
+                .await;
+        }
+
+        assert!(
+            mgr.session_exists(&id),
+            "a session waiting on its own request must not be probed to death"
+        );
         assert_eq!(session.missed_liveness_pings.load(Ordering::Relaxed), 0);
     }
 
