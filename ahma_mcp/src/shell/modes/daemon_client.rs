@@ -121,7 +121,10 @@ pub async fn ensure_daemon(
             // Serving but not answering /health: an older or foreign server.
             return Ok(EnsureOutcome::Ready);
         }
-        spawn_daemon(socket_path, http_url, idle_timeout_secs).await?;
+        spawn_daemon(socket_path, idle_timeout_secs, || {
+            check_bridge_running(socket_path, http_url)
+        })
+        .await?;
         return Ok(EnsureOutcome::Spawned);
     };
 
@@ -160,7 +163,10 @@ pub async fn ensure_daemon(
                     ours: format!("{client_semver}+{client_build}"),
                 });
             }
-            spawn_daemon(socket_path, http_url, idle_timeout_secs).await?;
+            spawn_daemon(socket_path, idle_timeout_secs, || {
+                check_bridge_running(socket_path, http_url)
+            })
+            .await?;
             Ok(EnsureOutcome::Spawned)
         }
     }
@@ -231,13 +237,52 @@ fn daemon_command(
     cmd
 }
 
-/// Start the daemon, detached, and wait for it to answer.
-async fn spawn_daemon(
+/// Ensure the daemon's hub answers, starting the daemon if it does not.
+///
+/// For a client that needs the hub rather than the MCP endpoint — the TUI's
+/// event stream. It starts the daemon through the same one path as
+/// [`ensure_daemon`] (SPEC R-DAEMON.3); nothing else in ahma starts one.
+pub async fn ensure_hub() -> Result<()> {
+    if hub_answers().await {
+        return Ok(());
+    }
+    spawn_daemon(None, None, hub_answers).await
+}
+
+async fn hub_answers() -> bool {
+    ahma_common::daemon_hub::connect_to_daemon().await.is_ok()
+}
+
+/// May this process start a daemon from `exe`?
+///
+/// Under a test harness only the real `ahma` binary may (SPEC R-ISO.1). The
+/// E2E tests drive it, and it must start its daemon as in production; but a
+/// library call inside a test binary would spawn `current_exe` — the *test
+/// harness* — with `daemon` as its filter, and if any test name matches, each
+/// copy re-runs the tests that spawn: a fork bomb.
+fn may_spawn_daemon_from(exe: &Path) -> bool {
+    !ahma_common::test_isolation::spawned_under_test_harness()
+        || exe.file_stem().is_some_and(|stem| stem == "ahma")
+}
+
+/// Start the daemon, detached, and wait until `ready` says it answers.
+async fn spawn_daemon<F, Fut>(
     socket_path: Option<&str>,
-    http_url: Option<&str>,
     idle_timeout_secs: Option<u64>,
-) -> Result<()> {
+    ready: F,
+) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
+    if !may_spawn_daemon_from(&exe) {
+        anyhow::bail!(
+            "refusing to start a daemon from a test binary ({}): bind a HubServer \
+             in the test and point the client at its socket",
+            exe.display()
+        );
+    }
     daemon_command(&exe, socket_path, idle_timeout_secs)
         .spawn()
         .context("Failed to spawn the ahma daemon")?;
@@ -246,7 +291,7 @@ async fn spawn_daemon(
         ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick);
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if check_bridge_running(socket_path, http_url).await {
+        if ready().await {
             tracing::info!("ahma daemon started");
             return Ok(());
         }
@@ -312,6 +357,22 @@ mod tests {
 
     const OURS: &str = "0.20.2";
     const OUR_BUILD: &str = "abc1234";
+
+    /// Under a test harness only the real binary may start a daemon: from a
+    /// test binary, `current_exe` is the harness, and spawning it is a fork
+    /// bomb (SPEC R-ISO.1). The suite always runs under one, so this is the
+    /// live expectation.
+    #[test]
+    fn only_the_ahma_binary_may_start_a_daemon_under_a_test_harness() {
+        assert!(may_spawn_daemon_from(Path::new("/target/debug/ahma")));
+        assert!(may_spawn_daemon_from(Path::new("C:/target/debug/ahma.exe")));
+        assert!(!may_spawn_daemon_from(Path::new(
+            "/target/debug/deps/unit-0123456789abcdef"
+        )));
+        assert!(!may_spawn_daemon_from(Path::new(
+            "/target/debug/deps/ahma_tui-0123456789abcdef"
+        )));
+    }
 
     #[test]
     fn test_socket_is_stale_nonexistent() {

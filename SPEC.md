@@ -162,7 +162,7 @@ what is missing named; `dormant` means present but not active.
 | Unified permissions and doctor (R-PERM, R-DOCTOR) | tests-pass | One ledger under `~/.ahma`; question ladder; `ahma doctor [--fix]` |
 | Configuration standard (R-CFG) | in-progress | Done: retirement of `AHMA_*`, tiers, provenance, project file. Pending: R-CFG5.2, R-CFG6.2, R-CFG6.3 |
 | STDIO, HTTP bridge, Streamable HTTP, session isolation | tests-pass | `ahma_http_bridge/SPEC.md` (R8, R10) |
-| Per-user daemon (R-DAEMON) | tests-pass | Windows still uses fixed loopback ports (R-DAEMON.2) |
+| Per-user daemon (R-DAEMON) | tests-pass | Windows MCP endpoint still on an undiscovered TCP port (R-DAEMON.2) |
 | HTTP MCP client, OAuth 2.0 + PKCE | tests-pass | OAuth endpoints are Atlassian's; no token refresh |
 | Web egress policy for `fetch_webpage` (R-WEB) | tests-pass | Three-tier approval, private-range block, redirect guard |
 | Outbound HTTP retry and failure wording (R-HTTP) | tests-pass | `ahma_common::http_retry`; SSE stream reconnect and `xtask` not covered (R-HTTP.4) |
@@ -442,7 +442,7 @@ Production and test code must be separated so that test harness machinery can ne
   3. Constructor/function parameters (dependency injection).
 - **R-CFG9.2**: Production code **must not** read `NEXTEST`, `CARGO_MANIFEST_DIR`, `CARGO_LLVM_COV`, `CARGO_TARGET_DIR`, or any other cargo-set environment variable. These variables are set by the build/test toolchain and must not influence runtime security decisions. The `--server-child` flag is the exclusive mechanism for subprocess detection in production. **Single carve-out (R-ISO.1):** `NEXTEST` / `NEXTEST_RUN_ID` may be read for exactly one purpose — forcing test isolation of endpoint rendezvous (private socket/port instead of the machine-global ones), via `ahma_common::test_isolation` only. This influence is fail-closed by construction: the variable can only *restrict* the process to private endpoints; it can never widen filesystem/network access, restart shared services, or weaken a sandbox decision. (Production already reads `AHMA_TEST_ISOLATION` to the same effect, so this adds no new attacker capability.)
 - **R-CFG9.3**: Test helper code inside `#[cfg(test)]` blocks or `test_utils` modules **may** read `AHMA_TEST_BINARY`, `CARGO_TARGET_DIR`, `NEXTEST`, and `CARGO_LLVM_COV` to locate test fixtures and adjust timeouts. These reads are acceptable because they are gated behind compile-time test flags and do not run in production binaries.
-- **R-CFG9.4**: The `AHMA_DAEMON_PORT` and `AHMA_DAEMON_SOCK` variables are test-isolation helpers set by `init_test_daemon_isolation()`. They **must** only be read inside `#[cfg(test)]`-gated code paths or in functions that are explicitly documented as test-only. They are INTERNAL plumbing (not user-facing) and **must** be listed in `docs/environment-variables.md` as `INTERNAL/TEST`.
+- **R-CFG9.4**: The `AHMA_DAEMON_SOCK` variable is a test-isolation helper set by `init_test_daemon_isolation()`. It **must** only be read inside `#[cfg(test)]`-gated code paths or in functions that are explicitly documented as test-only. They are INTERNAL plumbing (not user-facing) and **must** be listed in `docs/environment-variables.md` as `INTERNAL/TEST`.
 - **R-CFG9.5**: **Environment variable minimization.** Beyond the test/production split above, the system **must** minimize configuration via environment variables generally, to prevent security side-channel attacks and configuration clutter. Configuration parameters **must** be declared on the command line or in explicit configuration structures (`AppConfig`) and passed down through constructor arguments, rather than queried directly from the environment at the point of use.
 
 ---
@@ -1531,11 +1531,23 @@ Operation ids are counters, and counters restart with the process that issues th
 - **R-DAEMON.2 — Rendezvous.** A per-user runtime directory
   (`$XDG_RUNTIME_DIR/ahma`, else `~/.ahma`; `%LOCALAPPDATA%\ahma\run` on
   Windows), created `0700` and verified to be owned by the caller with no group
-  or other bits before use. It holds `daemon.sock` (the hub, and the mutex) and
-  `mcp.sock`, both `0600`. The machine-global `/tmp/ahma.sock` is retired: every
-  local user could see it and, since nothing owned the path, pre-create it.
-  A `0600` socket inside a lax directory is still squattable, which is why the
-  directory is checked and not merely the socket.
+  or other bits before use. It holds `daemon.lock`, `daemon.sock` (the hub) and
+  `mcp.sock`, the sockets `0600`. The machine-global `/tmp/ahma.sock` is
+  retired: every local user could see it and, since nothing owned the path,
+  pre-create it. A `0600` socket inside a lax directory is still squattable,
+  which is why the directory is checked and not merely the socket.
+  - **The lock is the mutex, on every OS.** `daemon.lock` beside the socket
+    (generally `<socket>.lock`) is a kernel advisory lock, released when its
+    holder dies. The daemon takes it before anything else; a loser connects to
+    the winner. Only the holder touches the socket file: it removes a stale one
+    before binding and unlinks its own before letting go of the lock. So a
+    crash leaves nothing that must be cleaned up by probing, and two starters
+    can no longer unlink each other's sockets — which "bind is the mutex"
+    allowed, since the bind can only be retried after someone has unlinked
+    the path. A socket that still answers is never removed, even by the holder
+    (R-ISO.2): that is a daemon from before the lock.
+  - **The hub is an `AF_UNIX` socket on every OS**, Windows 10 1803+
+    included, through `ahma_common::local_socket`. There is no hub TCP port.
   - **The check binds the directory ahma chose, not one it was handed.** That
     guarantee is about the runtime directory ahma creates `0700` itself. Applied
     to an operator-named `--unix-socket-path` (or `[http] unix_socket_path`) it
@@ -1549,22 +1561,14 @@ Operation ids are counters, and counters restart with the process that issues th
     socket derives its hub socket beside it; left on the shared hub it would
     lose the bind to whichever daemon already held it, stand down, and leave
     nobody serving the endpoint it was asked for.
-  - **Windows** has no filesystem sockets: `daemon.lock` (a kernel advisory
-    lock, released when its holder dies) is the mutex, and an atomically
-    written `daemon.json` publishes the daemon's ports with a random bearer
-    token that stands in for the mode bits. Liveness is the lock, never a pid
-    probe — a pid can be reused, a lock cannot.
-  - **Not yet done on Windows: ephemeral ports.** The lock, the descriptor and
-    the token are written and tested on every platform, but both listeners
-    still bind the historical fixed loopback ports and discovery still reads
-    those rather than the descriptor — so any local user can still reach them,
-    and the token is the only thing between them and the endpoint. Wiring port
-    `0` blind was refused deliberately: this workspace cannot compile for
-    `x86_64-pc-windows-msvc` (`aws-lc-sys` needs an MSVC toolchain), so the
-    code could not be shown to build, let alone to work, and an untested
-    rendezvous change is how a daemon becomes unreachable on a platform nobody
-    here can debug. Until CI's Windows leg proves it, Windows keeps the fixed
-    ports and this gap is stated rather than papered over.
+  - An atomically written `daemon.json` names the daemon holding the lock
+    (pid, version, build id) for `ahma doctor`. Liveness is the lock, never a
+    pid probe — a pid can be reused, a lock cannot.
+  - **Not yet done on Windows: the MCP endpoint.** It still binds a loopback
+    TCP port that clients do not discover, because the stdio proxy and the TUI
+    speak HTTP through a client that only has a Unix-socket transport. Moving
+    it onto the same `AF_UNIX` socket as the hub is the next step, and until
+    then this gap is stated rather than papered over.
 
 - **R-DAEMON.3 — Lifetime.** The first comer starts it, detached (R-PROC.3),
   and **never from a process that is itself confined** (R7.6) — a daemon that
@@ -1576,8 +1580,8 @@ Operation ids are counters, and counters restart with the process that issues th
     Counting only sessions would exit while a TUI sat watching an idle project;
     counting only hub connections would exit mid-build.
   - Idle exit closes its listeners **first**, re-checks emptiness (a connection
-    accepted in between re-arms it), unlinks only the sockets whose inode it
-    still owns (R-ISO.3), and exits. There is one exit path: sessions
+    accepted in between re-arms it), unlinks its sockets while it still holds
+    the lock (R-ISO.3), and exits. There is one exit path: sessions
     terminated, history flushed, sockets removed.
 
 - **R-DAEMON.4 — Sessions and per-session options.** One kernel-sandboxed worker
@@ -1687,8 +1691,8 @@ Operation ids are counters, and counters restart with the process that issues th
 
 - **R-ISO.1 (fail-closed test detection).** Any ahma process spawned directly or transitively under a test harness MUST resolve private, test-scoped endpoints **and state** instead of the shared ones: the hub socket, the MCP socket, **the bridge's default HTTP port** and the history file (R-DAEMON.10). A test that wrote the developer's history would also read it back into its own assertions. It MUST also refuse to *spawn* a daemon at all: `current_exe` inside a test binary is the test harness, so spawning it re-runs the tests, each copy spawning again — a fork bomb that empties the machine's process table. Detection is `ahma_common::test_isolation::spawned_under_test_harness()`: the explicit `AHMA_TEST_ISOLATION` plumbing variable OR the `NEXTEST` variable that `cargo nextest` exports to every test process (inherited by all children), so a spawn site that forgets the explicit variable can no longer reach live endpoints. Per-run endpoint names that parent and child processes must agree on use `NEXTEST_RUN_ID` (not the PID). Test harnesses that spawn the binary SHOULD still set `AHMA_TEST_ISOLATION=1` explicitly (plain `cargo test` sets no distinctive variable).
   - **Isolating some endpoints and not others is worse than isolating none**, because it hides itself. The socket was per-run and the HTTP port was not, and the HTTP port is the *fallback* every discovery probe tries once the socket answers nothing. So an E2E test whose daemon failed to start reached the developer's live bridge on the machine-global 3000, read its `/health`, and reported success. Every E2E test that drives the real binary passed on that borrowed server for as long as one was running, and failed the moment CI — which has none — ran the same code. R-ISO exists to stop a test corrupting live state; this is the same coupling in the other direction, and it costs more, because it converts a broken build into a green run. A discovery path's *last* resort must be isolated as carefully as its first.
-- **R-ISO.2 (never steal a live socket).** A Unix-socket listener MUST NOT unlink an existing socket file without first probe-connecting it: a successful connection means a live server owns the path and binding MUST fail loudly (naming the conflict and the `--socket-path` remedy); only a refused/absent connection marks the file stale and safe to remove. (The daemon hub's bind-is-the-mutex protocol already satisfies this; the HTTP bridge's Unix listener must too.)
-- **R-ISO.3 (remove only what you own).** On shutdown a server MUST remove its socket file only if the path still refers to the socket it bound (device+inode match). If another process has since replaced the path, deleting it would orphan *that* server's live socket.
+- **R-ISO.2 (never steal a live socket).** A Unix-socket listener MUST NOT unlink an existing socket file without first probe-connecting it: a successful connection means a live server owns the path and binding MUST fail loudly (naming the conflict and the `--socket-path` remedy); only a refused/absent connection marks the file stale and safe to remove. (The daemon hub probes before removing even when it holds the rendezvous lock; the HTTP bridge's Unix listener must probe too.)
+- **R-ISO.3 (remove only what you own).** On shutdown a server MUST remove its socket file only if the path still refers to the socket it bound (device+inode match). The daemon hub meets this with its rendezvous lock instead (R-DAEMON.2): every would-be owner must take the lock before touching the path, and the hub unlinks before releasing it. If another process has since replaced the path, deleting it would orphan *that* server's live socket.
 - **R-ISO.4 (regression tests).** Unit tests MUST pin: harness detection via both variables; refusal to bind over a live socket; stale-socket cleanup; and identity-checked shutdown removal.
 - **R-ISO.5 (test-launched servers die with their launcher).** An operator-started `ahma serve http|unix` outlives whoever launched it, by design — except when a test harness launched it (R-ISO.1 detection). Then it arms the parent-death watchdog, so a test run that is killed (a nextest timeout, Ctrl-C) cannot leave its servers running for good. A test's `Drop` guard never runs on SIGKILL; this is the backstop. Observed: an `ahma --sync … serve http` from an `ahma_http_bridge` test still running two days after its run.
 
@@ -1998,7 +2002,7 @@ Stated here so that no other document implies otherwise.
 
 - **Windows filesystem boundary** (R6.3.3): none until AppContainer grants are proven both ways in CI.
 - **Linux deny tier** (R6.1.7): application-layer only; a shell command can write the paths it protects.
-- **Windows daemon ports** (R-DAEMON.2): fixed loopback ports guarded by a bearer token, not ephemeral ports.
+- **Windows daemon MCP endpoint** (R-DAEMON.2): a loopback TCP port clients do not discover; the hub is already on the shared `AF_UNIX` socket.
 - **Release signing** (R-SIGN.1, R-SIGN.3): no Developer-ID signing or notarization; no Windows verification.
 - **Configuration** (R-CFG5.2, R-CFG6.2, R-CFG6.3): per-setting startup log lines, unknown-key abort for security tables in the user file, and the permissions warning are pending.
 - **Bundle trust**: no signature and no load-time gate; the checksum detects corruption only.

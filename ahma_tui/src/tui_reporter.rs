@@ -190,12 +190,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::set_var("AHMA_DAEMON_SOCK", dir.path().join("d.sock")) };
-        if let Ok(l) = std::net::TcpListener::bind("127.0.0.1:0")
-            && let Ok(addr) = l.local_addr()
-        {
-            // SAFETY: as above.
-            unsafe { std::env::set_var("AHMA_DAEMON_PORT", addr.port().to_string()) };
-        }
         dir
     }
 
@@ -207,7 +201,7 @@ mod tests {
         let hub = HubServer::bind_at(ahma_common::daemon_hub::default_socket_path())
             .await
             .expect("this test owns a freshly isolated socket");
-        let hub_task = tokio::spawn(hub.serve());
+        let hub_task = tokio::spawn(async move { hub.serve().await });
 
         // A subscriber standing in for a second TUI watching this one.
         let sub = connect_to_daemon().await.expect("subscriber connect");

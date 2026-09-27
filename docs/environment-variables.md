@@ -180,8 +180,7 @@ AHMA_DISABLE_HOOKS=1
 
 | Variable | Purpose |
 |---|---|
-| `AHMA_DAEMON_SOCK` | Isolates each test process's daemon to a unique Unix socket path |
-| `AHMA_DAEMON_PORT` | Isolates each test process's daemon to a unique TCP port (Windows) |
+| `AHMA_DAEMON_SOCK` | Isolates each test process's daemon to a unique socket path |
 | `AHMA_TEST_BINARY` | Locates the compiled test binary for in-process test helpers |
 | `AHMA_TEST_HTTP_CLIENT_TOKEN_PATH` | Redirects the external-MCP OAuth token file in `ahma_http_mcp_client` tests. Compiled in **debug builds only** — a release binary ignores it |
 | `AHMA_TEST_LOG_DIR` | Redirects the project log directory in `ahma_mcp` unit tests. Read only under `cfg!(test)` — no shipped binary contains the read |

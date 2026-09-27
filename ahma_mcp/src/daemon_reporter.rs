@@ -15,7 +15,7 @@ use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use ahma_common::config::settings_path;
 use ahma_common::daemon_hub::{
     ClientMsg, DaemonChatMessage, DaemonEvent, DaemonMsg, DaemonStream, HubRelay,
-    OpStatus as WireStatus, connect_to_daemon, ensure_daemon_running, recv_msg, send_msg,
+    OpStatus as WireStatus, connect_to_daemon, recv_msg, send_msg,
 };
 use ahma_common::scope_grant::{
     GrantCoordinator, GrantDecision, GrantResolveOutcome, ScopeGrantRequest, persist_grant,
@@ -366,15 +366,12 @@ async fn run_reporter_loop(
     let mut identity_rx = INSTANCE_IDENTITY.subscribe();
 
     loop {
-        // ── Ensure daemon is running ─────────────────────────────────────────
-        if let Err(e) = ensure_daemon_running().await {
-            warn!("daemon_reporter: daemon unavailable ({e}); retry in {backoff_secs}s");
-            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-            backoff_secs = next_backoff_secs(backoff_secs);
-            continue;
-        }
-
         // ── Connect ──────────────────────────────────────────────────────────
+        // Connect only; never start a daemon (SPEC R-DAEMON.8). This runs in
+        // hooked commands, where a spawn would sit in front of the user's
+        // command, and in session workers, whose daemon already exists. With
+        // no hub the loop backs off and tries again, and finds one that
+        // arrives later.
         let stream = match connect_to_daemon().await {
             Ok(s) => s,
             Err(e) => {
@@ -1874,30 +1871,24 @@ mod tests {
         );
     }
 
-    // ── run_reporter_loop: end-to-end over an in-process Unix socket ───────────
+    // ── run_reporter_loop: end-to-end over an in-process local socket ─────────
     //
     // These tests exercise the long-running reporter loop without a real daemon
-    // by binding our OWN UnixListener in a temp path and pointing
-    // `AHMA_DAEMON_SOCK` at it. `ensure_daemon_running` then connects to our
-    // listener (so it never spawns the `ahma daemon` subprocess), and we read the
-    // framed `ClientMsg`s the reporter emits to assert on register/replay/dispatch.
-    //
-    // Unix-only: the listener is a UnixListener (Windows uses TCP). The socket
-    // path is process-global state, so we serialize with a mutex and restore the
-    // env var on drop.
+    // by binding our OWN listener in a temp path and pointing `AHMA_DAEMON_SOCK`
+    // at it, then reading the framed `ClientMsg`s the reporter emits to assert
+    // on register/replay/dispatch. The socket path is process-global state, so
+    // we serialize with a mutex and restore the env var on drop.
 
-    #[cfg(unix)]
+    use ahma_common::local_socket::{LocalListener, LocalStream};
+
     static DAEMON_SOCK_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-    #[cfg(unix)]
     static DAEMON_SOCK_COUNTER: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
     /// Restores `AHMA_DAEMON_SOCK` to its prior value when dropped.
-    #[cfg(unix)]
     struct EnvGuard {
         prev: Option<std::ffi::OsString>,
     }
-    #[cfg(unix)]
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.prev {
@@ -1908,7 +1899,6 @@ mod tests {
     }
 
     /// Read and parse one newline-framed `ClientMsg` the reporter sent us.
-    #[cfg(unix)]
     async fn read_client_msg<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> ClientMsg {
         use tokio::io::AsyncBufReadExt;
         let mut line = String::new();
@@ -1920,38 +1910,68 @@ mod tests {
         serde_json::from_str(line.trim()).expect("failed to parse ClientMsg JSON")
     }
 
-    /// Accept connections until one sends a first message (the real reporter
-    /// connection), skipping the probe connection from `ensure_daemon_running`
-    /// (which connects then immediately drops → EOF).
-    #[cfg(unix)]
+    /// Accept the reporter's next connection and read its first message.
+    ///
+    /// Strict on purpose: the reporter connects and registers, and does
+    /// nothing else first. It used to open a probe connection on the way — the
+    /// "is a daemon running, or must I start one?" check that let a hooked
+    /// command spawn a daemon (SPEC R-DAEMON.8).
     async fn accept_register(
-        listener: &tokio::net::UnixListener,
+        listener: &LocalListener,
     ) -> (
-        tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
-        tokio::net::unix::OwnedWriteHalf,
+        tokio::io::BufReader<tokio::io::ReadHalf<LocalStream>>,
+        tokio::io::WriteHalf<LocalStream>,
         ClientMsg,
     ) {
-        use tokio::io::AsyncBufReadExt;
-        loop {
-            let (stream, _) = tokio::time::timeout(TestTimeouts::scale_secs(5), listener.accept())
-                .await
-                .expect("timed out waiting for the reporter to connect")
-                .expect("accept failed");
-            let (read_half, write_half) = stream.into_split();
-            let mut reader = tokio::io::BufReader::new(read_half);
-            let mut line = String::new();
-            match tokio::time::timeout(TestTimeouts::scale_secs(5), reader.read_line(&mut line))
-                .await
-            {
-                Ok(Ok(n)) if n > 0 => {
-                    let msg: ClientMsg =
-                        serde_json::from_str(line.trim()).expect("parse first ClientMsg");
-                    return (reader, write_half, msg);
-                }
-                // Probe connection (EOF) or timeout — wait for the next connection.
-                _ => continue,
-            }
-        }
+        let stream = tokio::time::timeout(TestTimeouts::scale_secs(5), listener.accept())
+            .await
+            .expect("timed out waiting for the reporter to connect")
+            .expect("accept failed");
+        let (read_half, write_half) = tokio::io::split(stream);
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let msg = read_client_msg(&mut reader).await;
+        (reader, write_half, msg)
+    }
+
+    /// With no hub the reporter waits for one instead of starting one (SPEC
+    /// R-DAEMON.8), and finds it when it arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_reporter_waits_for_a_hub_rather_than_starting_one() {
+        use crate::operation_monitor::MonitorConfig;
+
+        let _lock = DAEMON_SOCK_MUTEX.lock();
+        let unique = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join(format!("late_{unique}.sock"));
+        let prev = std::env::var_os("AHMA_DAEMON_SOCK");
+        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &sock) };
+        let _env_guard = EnvGuard { prev };
+
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            TestTimeouts::scale_secs(60),
+        )));
+        let reporter = tokio::spawn(run_reporter_loop(
+            monitor,
+            "hook".to_string(),
+            String::new(),
+            "ahma".to_string(),
+            None,
+            None,
+            tokio::sync::watch::channel(None).0,
+        ));
+
+        // Let it find nothing at least once.
+        tokio::time::sleep(TestTimeouts::short_delay()).await;
+        assert!(!sock.exists(), "nothing may appear at the rendezvous");
+
+        let listener = LocalListener::bind(&sock).expect("bind the late hub");
+        let (_r, _w, first) = accept_register(&listener).await;
+        assert!(
+            matches!(first, ClientMsg::Register { ref mode, .. } if mode == "hook"),
+            "expected the hook to register, got {first:?}"
+        );
+        reporter.abort();
     }
 
     /// A hooked command must not be held up by observability.
@@ -2008,7 +2028,6 @@ mod tests {
     /// answered — so an instance used to advertise a placeholder (`"."` in the
     /// default roots-driven configuration) for its whole life, and a TUI
     /// filtering by project matched none of them (SPEC R24.3, R-DAEMON.6).
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn reporter_re_registers_with_the_committed_scope_and_session_id() {
@@ -2022,7 +2041,7 @@ mod tests {
         let prev = std::env::var_os("AHMA_DAEMON_SOCK");
         unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &sock) };
         let _env_guard = EnvGuard { prev };
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind temp daemon socket");
+        let listener = LocalListener::bind(&sock).expect("bind temp daemon socket");
 
         // The session identity is known at startup; the scope is not.
         set_initial_identity(Some("mcp-session-42".to_string()), Some(4242));
@@ -2084,7 +2103,6 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     // The std Mutex deliberately serializes this whole async test (the daemon
     // socket path is process-global state); holding it across awaits is the point.
@@ -2105,12 +2123,11 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
 
         // Point the reporter's socket resolution at our listener and bind it
-        // BEFORE spawning the reporter so `ensure_daemon_running` connects
-        // immediately instead of spawning a subprocess.
+        // BEFORE spawning the reporter so its first connect finds it.
         let prev = std::env::var_os("AHMA_DAEMON_SOCK");
         unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &sock) };
         let _env_guard = EnvGuard { prev };
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind temp daemon socket");
+        let listener = LocalListener::bind(&sock).expect("bind temp daemon socket");
 
         // ── Seed the monitor: one completed op (replayed as Started+Finished) and
         //    one active op (replayed as Started). ─────────────────────────────────
@@ -2210,8 +2227,8 @@ mod tests {
         // Small helper to assert a Ping is answered with a matching Pong, proving
         // the select loop kept running past whatever we sent before it.
         async fn ping_pong(
-            w: &mut tokio::net::unix::OwnedWriteHalf,
-            r: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+            w: &mut tokio::io::WriteHalf<LocalStream>,
+            r: &mut tokio::io::BufReader<tokio::io::ReadHalf<LocalStream>>,
             seq: u32,
         ) {
             send_msg(w, &DaemonMsg::Ping { seq })
@@ -2333,7 +2350,7 @@ mod tests {
             other => panic!("expected re-Register after reconnect, got {other:?}"),
         }
         // Keep _r2/_w2 alive so the reporter parks in select rather than
-        // reconnecting (which would otherwise spawn a daemon subprocess).
+        // reconnecting.
 
         // ── Teardown. ────────────────────────────────────────────────────────────
         reporter.abort();
