@@ -105,6 +105,12 @@ Counting only sessions would exit while a TUI sat watching an idle project;
 counting only subscribers would exit mid-build. Restarting is cheap and the
 hub holds nothing you depend on — history is on disk.
 
+The hour is wall-clock time, so a laptop that sleeps overnight does not wake
+up to a hub that thinks it has only just gone idle. And if the hub's socket is
+removed — `$XDG_RUNTIME_DIR` cleared at logout, say — the hub can no longer be
+reached, so it hands the rendezvous over to whatever starts next, finishes
+what it has, and exits rather than lingering beside its replacement.
+
 Your editor never has to notice. The `ahma serve stdio` process it talks to
 stays attached however the hub goes away (idle exit, crash, kill, upgrade):
 the next request restarts it and resumes the session, and requests made while
@@ -122,6 +128,8 @@ hub to **drain**: stop accepting new sessions, finish the ones it has, then
 exit, at which point the next client starts the new one. Your other editors'
 sessions are not torn down mid-command to install a binary one of them asked
 for. Until the handover happens, the mismatch is disclosed rather than hidden.
+A TUI watching the old hub does not hold it open: it reconnects to the new one
+on its own.
 
 `ahma hub` in a terminal runs one in the foreground, which is the way to see
 what it is doing.

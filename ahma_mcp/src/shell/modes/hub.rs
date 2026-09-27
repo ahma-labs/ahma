@@ -37,7 +37,8 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// How often the idle watcher checks whether anything is attached.
+/// How often the hub checks whether anything is attached, and whether its
+/// socket is still where clients will look for it.
 const IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Should the hub exit now?
@@ -53,17 +54,93 @@ pub(crate) fn idle_exit_due(
     timeout_secs: u64,
     draining: bool,
 ) -> bool {
+    if draining {
+        // A drained hub has nothing left to finish once its sessions end;
+        // waiting out the idle timer would only delay its successor. A
+        // subscriber has no work here and reconnects to the successor on
+        // its own, so it does not hold a draining hub open.
+        return mcp_sessions == 0;
+    }
     if hub_connections > 0 || mcp_sessions > 0 {
         return false;
-    }
-    if draining {
-        // A drained hub has nothing left to finish; waiting out the idle
-        // timer would only delay its successor.
-        return true;
     }
     // A zero timeout means "stay forever", which is what an operator who runs
     // the hub deliberately wants.
     timeout_secs > 0 && idle_for.as_secs() >= timeout_secs
+}
+
+/// How long the hub has had nothing attached, in wall-clock time (SPEC
+/// R-HUB.3).
+///
+/// Not a tick count and not [`std::time::Instant`]: the monotonic clock stops
+/// while a Mac sleeps, so a hub that was idle when the lid closed woke up
+/// with its timer where it had left it, and an hour's timeout could stretch
+/// over days.
+#[derive(Debug, Default)]
+pub(crate) struct IdleClock {
+    since: Option<std::time::SystemTime>,
+}
+
+impl IdleClock {
+    /// Record one observation and return how long the hub has been idle.
+    pub(crate) fn observe(
+        &mut self,
+        busy: bool,
+        now: std::time::SystemTime,
+    ) -> std::time::Duration {
+        if busy {
+            self.since = None;
+            return std::time::Duration::ZERO;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.duration_since(since).unwrap_or_else(|_| {
+            // Stepped backwards: restart the window rather than guess.
+            self.since = Some(now);
+            std::time::Duration::ZERO
+        })
+    }
+}
+
+/// Which file sits at a socket path: `(device, inode)` on Unix.
+///
+/// Windows exposes no file identity without opening a handle, so there it is
+/// presence alone — which still catches the case that matters, a cleared
+/// runtime directory.
+#[cfg(unix)]
+fn socket_file_id(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn socket_file_id(path: &std::path::Path) -> Option<(u64, u64)> {
+    std::fs::metadata(path).ok().map(|_| (0, 0))
+}
+
+/// Is the socket at the hub's path still the one it serves on?
+///
+/// Clients find the hub by that path and nothing else. Once the file has
+/// gone — `$XDG_RUNTIME_DIR` cleared at logout, a stray `rm` — or another has
+/// taken its place, no client can reach this hub again, and staying on would
+/// leave a zombie beside the hub the next client starts (SPEC R-HUB.3).
+#[derive(Debug, Default)]
+pub(crate) struct SocketWatch {
+    bound: Option<(u64, u64)>,
+}
+
+impl SocketWatch {
+    /// `current` is [`socket_file_id`] now. Before the host has bound the
+    /// path there is nothing to lose, so the first identity seen is the one
+    /// the hub owns.
+    pub(crate) fn still_ours(&mut self, current: Option<(u64, u64)>) -> bool {
+        match self.bound {
+            None => {
+                self.bound = current;
+                true
+            }
+            Some(bound) => current == Some(bound),
+        }
+    }
 }
 
 /// Is this rendezvous in the directory **ahma chose**, rather than one it was
@@ -136,7 +213,7 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
         }
     }
 
-    let hub = match HubServer::lock_at(socket.clone()).await {
+    let mut hub = match HubServer::lock_at(socket.clone()).await {
         Ok(server) => server,
         Err(HubBindError::AlreadyRunning) => {
             // The ordinary outcome of losing a startup race: the winner is
@@ -187,15 +264,37 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
     );
 
     // ── Serve until something asks us to stop ────────────────────────────────
-    let reason = tokio::select! {
-        result = start_bridge(bridge) => {
-            match result {
-                Ok(()) => "listener ended".to_string(),
-                Err(e) => format!("listener failed: {e}"),
+    let mut socket_watch = SocketWatch::default();
+    let mut socket_check = tokio::time::interval(IDLE_CHECK_INTERVAL);
+    let mut serving = std::pin::pin!(start_bridge(bridge));
+    let mut signal = std::pin::pin!(shutdown_signal());
+    let reason = loop {
+        tokio::select! {
+            result = &mut serving => {
+                break match result {
+                    Ok(()) => "listener ended".to_string(),
+                    Err(e) => format!("listener failed: {e}"),
+                };
+            }
+            stop = stop_rx.recv() => {
+                break stop.unwrap_or_else(|| "stop requested".to_string());
+            }
+            _ = &mut signal => break "signal".to_string(),
+            _ = socket_check.tick(), if !hub.relinquished() => {
+                if !socket_watch.still_ours(socket_file_id(&socket)) {
+                    // Nobody can reach us by that path any more. Give the
+                    // rendezvous to whoever the next client starts, and
+                    // finish what we have (SPEC R-HUB.3).
+                    tracing::warn!(
+                        socket = %socket.display(),
+                        "ahma hub: its socket was removed or replaced; handing over \
+                         and draining"
+                    );
+                    hub.relinquish();
+                    exit.request_drain();
+                }
             }
         }
-        stop = stop_rx.recv() => stop.unwrap_or_else(|| "stop requested".to_string()),
-        _ = shutdown_signal() => "signal".to_string(),
     };
     idle_task.abort();
 
@@ -205,6 +304,11 @@ pub async fn run_hub_mode(config: AppConfig) -> Result<()> {
         // exactly the last thing that happened, which is what someone opening a
         // TUI afterwards is most likely to be looking for.
         writer.shutdown().await;
+    }
+    // One last look before unlinking anything: a path lost since the last
+    // tick may already be a successor's (SPEC R-ISO.3).
+    if !hub.relinquished() && !socket_watch.still_ours(socket_file_id(&socket)) {
+        hub.relinquish();
     }
     // Last: dropping the hub unlinks the socket and then releases the lock, so
     // nothing above can touch a successor's files (SPEC R-ISO.3).
@@ -285,24 +389,18 @@ fn spawn_idle_watcher(
     exit: Arc<HubExit>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut idle_for = std::time::Duration::ZERO;
+        let mut clock = IdleClock::default();
         loop {
             tokio::time::sleep(IDLE_CHECK_INTERVAL).await;
             let hub_now = hub_connections.load(Ordering::Relaxed);
             let sessions_now = active_sessions.load(Ordering::SeqCst);
-            if hub_now > 0 || sessions_now > 0 {
-                idle_for = std::time::Duration::ZERO;
-                continue;
-            }
-            idle_for += IDLE_CHECK_INTERVAL;
-            if idle_exit_due(
-                hub_now,
-                sessions_now,
-                idle_for,
-                timeout_secs,
-                exit.is_draining(),
-            ) {
-                exit.request("idle");
+            let idle_for = clock.observe(
+                hub_now > 0 || sessions_now > 0,
+                std::time::SystemTime::now(),
+            );
+            let draining = exit.is_draining();
+            if idle_exit_due(hub_now, sessions_now, idle_for, timeout_secs, draining) {
+                exit.request(if draining { "drained" } else { "idle" });
                 return;
             }
         }
@@ -466,6 +564,96 @@ mod tests {
             !idle_exit_due(0, 1, Duration::ZERO, 60, true),
             "but a live session still holds a draining hub open"
         );
+    }
+
+    /// A subscriber does not hold a draining hub open. It has no work in the
+    /// hub to finish, and it reconnects to the successor on its own; a TUI
+    /// left attached would otherwise keep an outdated hub, or one whose
+    /// socket is gone, alive for as long as the window stayed open.
+    #[test]
+    fn a_subscriber_does_not_hold_a_draining_hub_open() {
+        assert!(idle_exit_due(3, 0, Duration::ZERO, 60, true));
+        assert!(
+            !idle_exit_due(3, 0, Duration::ZERO, 60, false),
+            "outside a drain it still counts as attached"
+        );
+    }
+
+    /// Idle time is wall-clock time (SPEC R-HUB.3). The monotonic clock stops
+    /// while a Mac sleeps, so a hub idle when the lid closed at night used to
+    /// wake up with its timer exactly where it had left it.
+    #[test]
+    fn idle_time_is_wall_clock_time() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut clock = IdleClock::default();
+        assert_eq!(clock.observe(false, t0), Duration::ZERO);
+        // Eight hours asleep between two one-second ticks.
+        let woke = t0 + Duration::from_secs(8 * 3600);
+        assert_eq!(clock.observe(false, woke), Duration::from_secs(8 * 3600));
+
+        assert_eq!(
+            clock.observe(true, woke),
+            Duration::ZERO,
+            "anything attached restarts the window"
+        );
+        assert_eq!(
+            clock.observe(false, woke + Duration::from_secs(5)),
+            Duration::ZERO,
+            "and idleness is counted from when it resumed"
+        );
+        assert_eq!(
+            clock.observe(false, woke + Duration::from_secs(7)),
+            Duration::from_secs(2)
+        );
+    }
+
+    /// A clock stepped backwards (NTP, a manual change) restarts the window
+    /// rather than underflowing or exiting early.
+    #[test]
+    fn a_clock_stepped_backwards_restarts_the_window() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut clock = IdleClock::default();
+        clock.observe(false, t0);
+        let earlier = t0 - Duration::from_secs(600);
+        assert_eq!(clock.observe(false, earlier), Duration::ZERO);
+        assert_eq!(
+            clock.observe(false, earlier + Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+    }
+
+    /// The hub watches the one path every client finds it by (SPEC R-HUB.3).
+    /// Before the host has bound it there is nothing to lose; after, the
+    /// file going away — or another file taking its place — means no client
+    /// can reach this hub any more.
+    #[test]
+    fn the_socket_watch_notices_the_path_being_lost() {
+        let mut watch = SocketWatch::default();
+        assert!(watch.still_ours(None), "not bound yet");
+        assert!(watch.still_ours(Some((1, 7))), "bound");
+        assert!(watch.still_ours(Some((1, 7))));
+        assert!(!watch.still_ours(None), "removed");
+
+        let mut watch = SocketWatch::default();
+        watch.still_ours(Some((1, 7)));
+        assert!(!watch.still_ours(Some((1, 8))), "replaced by another file");
+    }
+
+    /// The identity the watch compares is read from a real socket file, on
+    /// every OS: Windows `AF_UNIX` sockets leave a file too.
+    #[tokio::test]
+    async fn a_socket_file_has_an_identity_until_it_is_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("hub.sock");
+        assert_eq!(socket_file_id(&sock), None);
+        let listener = ahma_common::local_socket::LocalListener::bind(&sock).expect("bind");
+        let bound = socket_file_id(&sock);
+        assert!(bound.is_some(), "a bound socket has an identity");
+        let mut watch = SocketWatch::default();
+        assert!(watch.still_ours(bound));
+        std::fs::remove_file(&sock).expect("remove the socket file");
+        assert!(!watch.still_ours(socket_file_id(&sock)));
+        drop(listener);
     }
 
     /// `0` is an operator saying "stay": a hub started deliberately in a

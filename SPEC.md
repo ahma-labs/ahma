@@ -1599,6 +1599,16 @@ Operation ids are counters, and counters restart with the process that issues th
     accepted in between re-arms it), unlinks its sockets while it still holds
     the lock (R-ISO.3), and exits. There is one exit path: sessions
     terminated, history flushed, sockets removed.
+  - Idle time is **wall-clock** time. The monotonic clock stops while a Mac
+    sleeps, so a hub idle when the lid closed woke with its timer where it had
+    left it and an hour's timeout stretched over days. A clock stepped
+    backwards restarts the window rather than ending it early.
+  - It watches its socket. Clients find the hub by that path alone, so once
+    the file is removed or replaced — `$XDG_RUNTIME_DIR` cleared at logout, a
+    stray `rm` — nobody can reach it. It then **relinquishes** the rendezvous
+    (releases the lock and forgets the path, so the next client can start a
+    successor at once and this hub's exit never unlinks that successor's
+    socket) and drains. Staying on left a zombie beside the new hub.
 
 - **R-HUB.4 — Sessions and per-session options.** One kernel-sandboxed worker
   per MCP session, owned by the hub. Ending a session never affects another.
@@ -1620,9 +1630,12 @@ Operation ids are counters, and counters restart with the process that issues th
   matching binary. A draining hub answers `initialize` with `503` and
   `Retry-After`, and says `draining` in `/health`. A hub still serving
   other sessions when the handoff times out is proxied and **disclosed**, not
-  replaced. An **older** client neither drains a newer hub nor restarts
-  itself: it proxies, because the hub runs every session's worker from its
-  own binary, so the stale client is served by the newer build.
+  replaced. A draining hub exits once its MCP sessions end; a subscriber
+  (a TUI) does not hold it open, because it has no work there and reconnects
+  to the successor on its own. An **older** client neither drains a newer
+  hub nor restarts itself: it proxies, because the hub runs every session's
+  worker from its own binary, so the stale client is served by the newer
+  build.
 
 - **R-HUB.6 — Registration and routing.** An instance registers with its
   `session_id`, `client_pid`, MCP client identity, mode (`stdio` | `hook` |

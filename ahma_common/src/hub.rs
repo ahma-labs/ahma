@@ -1662,9 +1662,10 @@ pub struct HubServer {
     listener: Option<LocalListener>,
     hub: Arc<Hub>,
     socket_path: PathBuf,
-    /// Held for as long as this server exists; declared last so it is the
-    /// last thing released.
-    _lock: crate::fs_lock::FsLock,
+    /// Held for as long as this server exists, unless it is relinquished;
+    /// declared last so it is the last thing released. `None` once
+    /// [`HubServer::relinquish`] has given the rendezvous up.
+    lock: Option<crate::fs_lock::FsLock>,
 }
 
 /// A handle that serves event-stream connections into one hub.
@@ -1744,7 +1745,7 @@ impl HubServer {
             listener: None,
             hub: Arc::new(hub),
             socket_path,
-            _lock: lock,
+            lock: Some(lock),
         })
     }
 
@@ -1765,6 +1766,23 @@ impl HubServer {
     /// The path this server owns.
     pub fn socket_path(&self) -> &std::path::Path {
         &self.socket_path
+    }
+
+    /// Give the rendezvous up while this hub finishes what it has.
+    ///
+    /// For a hub whose socket was removed out from under it — a cleared
+    /// runtime directory, a stray `rm` — so that nobody can reach it any more
+    /// (SPEC R-HUB.3). Releasing the lock lets a successor start at once
+    /// instead of waiting on a hub no client can find; forgetting the path
+    /// means this one's exit never unlinks the successor's socket (SPEC
+    /// R-ISO.3).
+    pub fn relinquish(&mut self) {
+        self.lock = None;
+    }
+
+    /// True once [`HubServer::relinquish`] has given the rendezvous up.
+    pub fn relinquished(&self) -> bool {
+        self.lock.is_none()
     }
 
     /// Install what runs when a client sends `Shutdown`. Without one the
@@ -1834,8 +1852,12 @@ impl Drop for HubServer {
     /// Unlink the socket while the lock is still held (SPEC R-ISO.3): once it
     /// is released a successor may bind the same path, and removing the file
     /// after that would remove *its* socket.
+    ///
+    /// A relinquished server owns neither, so it touches nothing.
     fn drop(&mut self) {
-        crate::fs_lock::remove_stale_socket(&self.socket_path);
+        if self.lock.is_some() {
+            crate::fs_lock::remove_stale_socket(&self.socket_path);
+        }
     }
 }
 
@@ -3680,6 +3702,33 @@ mod tests {
 
         drop(hub);
         assert!(!sock.exists(), "dropping the hub unlinks the hosted socket");
+    }
+
+    /// A hub whose socket was removed out from under it can be reached by
+    /// nobody, so it hands the rendezvous over (SPEC R-HUB.3): a successor
+    /// may take the lock while the old hub finishes what it has, and the old
+    /// one's exit must not unlink the successor's socket (SPEC R-ISO.3).
+    #[tokio::test]
+    async fn a_relinquished_rendezvous_is_free_for_a_successor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("relinquished.sock");
+
+        let mut first = HubServer::lock_at(sock.clone())
+            .await
+            .expect("free rendezvous");
+        first.relinquish();
+        assert!(first.relinquished());
+
+        let second = HubServer::bind_at(sock.clone())
+            .await
+            .expect("a relinquished rendezvous is free for a successor");
+        drop(first);
+        assert!(
+            sock.exists(),
+            "a hub that gave up the rendezvous must not unlink its successor's socket"
+        );
+        drop(second);
+        assert!(!sock.exists(), "the successor still cleans up its own");
     }
 
     #[test]
