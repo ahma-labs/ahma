@@ -270,6 +270,45 @@ impl SelfCheck {
     }
 }
 
+/// Remove the builds a Windows install moved aside next to `exe` (SPEC
+/// R-HUB.5): `<stem>.old`, or `<stem>.<secs>.old` when an earlier one was
+/// still running. Windows will not replace a running executable, only rename
+/// it, so every install leaves one. One still running — a hub that has not
+/// finished draining — cannot be removed yet; the next start tries again.
+/// Returns how many were removed.
+///
+/// Called only on Windows: elsewhere `ahma update` keeps `<stem>.old` on
+/// purpose, as the build to roll back to.
+// Tested on every OS; run only on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+async fn remove_builds_moved_aside(exe: &std::path::Path) -> usize {
+    let (Some(dir), Some(stem)) = (exe.parent(), exe.file_stem()) else {
+        return 0;
+    };
+    let prefix = format!("{}.", stem.to_string_lossy());
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return 0;
+    };
+    let mut removed = 0;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(middle) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix("old"))
+        else {
+            continue;
+        };
+        let moved_aside = middle.is_empty()
+            || middle
+                .strip_suffix('.')
+                .is_some_and(|secs| !secs.is_empty() && secs.chars().all(|c| c.is_ascii_digit()));
+        if moved_aside && tokio::fs::remove_file(entry.path()).await.is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// How often a successor looks for the rendezvous coming free.
 const SUCCESSOR_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -353,6 +392,13 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
     // Pinned before anything else, for the same reason: this is the build
     // the hub runs, and the file it compares against to notice an install.
     let identity = ahma_common::exe_identity::ExeIdentity::this_process();
+    #[cfg(windows)]
+    {
+        let removed = remove_builds_moved_aside(&exe).await;
+        if removed > 0 {
+            tracing::info!(removed, "ahma hub: removed builds an install moved aside");
+        }
+    }
 
     // ── The rendezvous, and the mutex ────────────────────────────────────────
     //
@@ -979,6 +1025,30 @@ mod tests {
             "nor does one leaving"
         );
         assert!(check.due(t0 + Duration::from_secs(41), 0, every));
+    }
+
+    /// What a Windows install moved aside is removed on the next start, and
+    /// nothing else is: not another program's `.old`, not the running build.
+    #[tokio::test]
+    async fn builds_moved_aside_by_an_install_are_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("ahma.exe");
+        for name in [
+            "ahma.exe",
+            "ahma.old",
+            "ahma.1759000000.old",
+            "ahma.notes.old",
+            "other.old",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        assert_eq!(remove_builds_moved_aside(&exe).await, 2);
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["ahma.exe", "ahma.notes.old", "other.old"]);
     }
 
     /// `last-exit.json` names why the hub went in words a reader can act on

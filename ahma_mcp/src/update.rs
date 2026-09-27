@@ -4,8 +4,8 @@
 //! extraction and `cargo install` paths live in the [`ahma_update`] crate
 //! (re-exported here wholesale, so `crate::update::…` and
 //! `ahma_mcp::update::…` paths are unchanged). What stays in this module is
-//! only the part that needs the engine: stopping the running bridge/hub
-//! before the binary is replaced ([`crate::shell::modes::server`]) and the
+//! only the part that needs the engine: asking the running hub to hand over
+//! once the new binary is in place ([`crate::shell::modes::server`]) and the
 //! post-install MCP-config drift check ([`crate::setup`]).
 
 pub use ahma_update::*;
@@ -15,20 +15,6 @@ use std::path::Path;
 
 /// Entry point for `ahma update`.
 pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result<()> {
-    if !args.dry_run {
-        println!("Stopping running background processes...");
-        let _ = ahma_common::hub::stop_hub().await;
-
-        let socket_path = if cfg.unix_socket_path.is_empty() {
-            ahma_common::hub::default_socket_path()
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            cfg.unix_socket_path.clone()
-        };
-        let _ = crate::shell::modes::server::trigger_bridge_restart(&socket_path).await;
-    }
-
     let install_dir = resolve_install_dir(args.install_dir.as_deref())?;
 
     if args.prefer_musl {
@@ -51,6 +37,9 @@ pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result
         UpdateMode::GitRef { branch } => run_git_update(&branch, &install_dir, args.dry_run).await,
     }?;
 
+    if outcome.binary_changed && !args.dry_run {
+        hand_over_to_the_new_build(cfg).await;
+    }
     if outcome.binary_changed {
         print_post_install_details(
             &outcome.binary_path,
@@ -61,6 +50,31 @@ pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result
         .await;
     }
     maybe_run_setup_wizard(&args, &outcome.binary_path).await
+}
+
+/// Ask the running hub to hand over to the build just installed (SPEC
+/// R-HUB.5).
+///
+/// After the install, not before: the running hub keeps serving every
+/// editor's session while the new file is written, and drains — finishing
+/// what is in flight, starting the new build as its successor — once it is
+/// there. It would notice the new file on its own within half a minute; this
+/// only makes it prompt. Stopping it first, as `ahma update` used to, ended
+/// every attached session mid-command.
+async fn hand_over_to_the_new_build(cfg: &crate::shell::cli::AppConfig) {
+    let socket_path = if cfg.unix_socket_path.is_empty() {
+        ahma_common::hub::default_socket_path()
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        cfg.unix_socket_path.clone()
+    };
+    if crate::shell::modes::server::trigger_bridge_drain(&socket_path).await {
+        println!(
+            "The running ahma hub will hand over to the new build as soon as the work \
+             in flight is done; open sessions reconnect on their own."
+        );
+    }
 }
 
 async fn maybe_run_setup_wizard(args: &UpdateArgs, binary_path: &Path) -> Result<()> {

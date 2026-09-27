@@ -234,18 +234,29 @@ async fn install_binary(source: &Path, target: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         if target.exists() {
-            // Avoid overwriting a running executable when possible.
+            // Windows will not replace a running executable, but it will
+            // rename one: move it aside, then put the new build at the path.
+            // Nothing running is stopped — the hub notices the new file and
+            // hands over once its work is done (SPEC R-HUB.5), and its next
+            // start removes what was moved aside.
             let staged = target.with_extension("new.exe");
-            fs::copy(source, &staged).await?;
-            match fs::rename(&staged, target).await {
-                Ok(()) => {}
-                Err(_) => {
-                    bail!(
-                        "Could not replace {}. Close running ahma/MCP clients and retry, \
-                         or manually replace the binary after exit.",
-                        target.display()
-                    );
-                }
+            let _ = fs::remove_file(&staged).await;
+            fs::copy(source, &staged)
+                .await
+                .with_context(|| format!("Failed to stage binary at {}", staged.display()))?;
+            let aside = aside_path(target).await;
+            if let Err(e) = fs::rename(target, &aside).await {
+                let _ = fs::remove_file(&staged).await;
+                bail!(
+                    "Could not move the running {} aside to {}: {e}",
+                    target.display(),
+                    aside.display()
+                );
+            }
+            if let Err(e) = fs::rename(&staged, target).await {
+                // Put the old build back rather than leave no binary at all.
+                let _ = fs::rename(&aside, target).await;
+                bail!("Could not install {}: {e}", target.display());
             }
         } else {
             fs::copy(source, target).await?;
@@ -254,6 +265,23 @@ async fn install_binary(source: &Path, target: &Path) -> Result<()> {
 
     println!("Installed {}", target.display());
     Ok(())
+}
+
+/// Where a running Windows binary is moved aside to: `<name>.old`, or — when
+/// an earlier `.old` is itself still running and cannot be removed — a
+/// timestamped `<name>.<secs>.old` beside it.
+#[cfg(windows)]
+async fn aside_path(target: &Path) -> PathBuf {
+    let aside = target.with_extension("old");
+    let _ = fs::remove_file(&aside).await;
+    if !fs::try_exists(&aside).await.unwrap_or(true) {
+        return aside;
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    target.with_extension(format!("{secs}.old"))
 }
 
 async fn cleanup_legacy_binaries(install_dir: &Path) -> Result<()> {
@@ -597,11 +625,10 @@ mod tests {
         );
     }
 
-    /// Existing target: rename to .old, then copy new binary.
-    #[cfg(unix)]
+    /// Existing target: rename to .old, then put the new binary at the path.
+    /// On every OS — on Windows this is how a running binary is replaced.
     #[tokio::test]
     async fn test_install_binary_backs_up_existing_target() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source_bin");
         let target = dir.path().join("installed_bin");
@@ -617,12 +644,17 @@ mod tests {
 
         let backup = target.with_extension("old");
         assert!(backup.exists(), "backup (.old) should exist");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old binary");
 
-        let perms = std::fs::metadata(&target).unwrap().permissions();
-        assert!(
-            perms.mode() & 0o111 != 0,
-            "installed binary should be executable"
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&target).unwrap().permissions();
+            assert!(
+                perms.mode() & 0o111 != 0,
+                "installed binary should be executable"
+            );
+        }
     }
 
     /// R-SIGN.2: installing over an existing binary must never write through

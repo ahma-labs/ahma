@@ -276,46 +276,36 @@ fi
 # Extract
 tar -xzf "$TEMP_DIR/$ASSET_NAME" -C "$TEMP_DIR"
 
-# Clean up running instances to avoid locking and stale processes
-echo "Stopping running ahma processes..."
-if command -v pgrep >/dev/null 2>&1; then
-    for proc in ahma ahma-http-bridge; do
-        pids=$(pgrep -x "$proc" || true)
-        if [ -n "$pids" ]; then
-            for pid in $pids; do
-                if [ "$pid" != "$$" ]; then
-                    echo "Killing running process $proc (PID $pid)..."
-                    kill -9 "$pid" 2>/dev/null || true
-                fi
-            done
-        fi
-    done
-fi
-
-# Install binaries
+# Nothing running is stopped. The new binary is staged beside the old one,
+# verified and signed there, then renamed over it: the path never holds a
+# partial file, and a running ahma's binary is never written through (macOS
+# kills a process whose mapped code changes under it). The running hub
+# notices the new file and hands over to it once the work in flight is done;
+# open editor sessions reconnect on their own (docs/hub.md, "Upgrades").
 echo "Installing binaries to ${INSTALL_DIR}..."
-if [ -f "$TEMP_DIR/ahma" ]; then
-    mv "$TEMP_DIR/ahma" "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/ahma"
-else
+if [ ! -f "$TEMP_DIR/ahma" ]; then
     echo "Error: ahma binary not found in archive"
     exit 1
 fi
+STAGED_BIN="$INSTALL_DIR/ahma.new"
+rm -f "$STAGED_BIN"
+cp "$TEMP_DIR/ahma" "$STAGED_BIN"
+chmod +x "$STAGED_BIN"
 
-# Cryptographic verification: confirm the installed binary has a valid GitHub Build Provenance
+# Cryptographic verification: confirm the new binary has a valid GitHub Build Provenance
 # Attestation (Sigstore SLSA Level 3) from the official ahma-labs/ahma CI pipeline.
 # This is the canonical trust check — even if an attacker substituted the release asset,
-# they cannot mint a Fulcio certificate for our workflow's OIDC identity.
-INSTALLED_BIN="$INSTALL_DIR/ahma"
+# they cannot mint a Fulcio certificate for our workflow's OIDC identity. It runs before
+# the binary takes the install path, so a failure leaves the previous install untouched.
 if [ "${AHMA_INSECURE_SKIP_VERIFY:-}" != "1" ] && [ "${AHMA_INSECURE_SKIP_SIGNATURE:-}" != "1" ]; then
     echo "Verifying Sigstore Build Provenance Attestation..."
-    if ! "$INSTALLED_BIN" verify --self; then
+    if ! "$STAGED_BIN" verify --self; then
         echo "########################################################################" >&2
         echo "CRITICAL SECURITY ERROR: Sigstore attestation verification FAILED!" >&2
-        echo "The installed binary failed GitHub Build Provenance Attestation." >&2
-        echo "Removing $INSTALLED_BIN." >&2
+        echo "The downloaded binary failed GitHub Build Provenance Attestation." >&2
+        echo "Removing $STAGED_BIN; the existing install is unchanged." >&2
         echo "########################################################################" >&2
-        rm -f "$INSTALLED_BIN"
+        rm -f "$STAGED_BIN"
         exit 1
     fi
 else
@@ -330,8 +320,11 @@ fi
 # This step runs after Sigstore attestation is verified so the security guarantee is preserved.
 if [ "$OS" = "darwin" ]; then
     echo "Re-signing with hardened runtime (prevents macOS CODESIGNING SIGKILL under memory pressure)..."
-    codesign --force --sign - --options runtime "$INSTALLED_BIN"
+    codesign --force --sign - --options runtime "$STAGED_BIN"
 fi
+
+INSTALLED_BIN="$INSTALL_DIR/ahma"
+mv -f "$STAGED_BIN" "$INSTALLED_BIN"
 
 "$INSTALLED_BIN" --version
 echo "Success! Installed and verified ahma to ${INSTALL_DIR}"
