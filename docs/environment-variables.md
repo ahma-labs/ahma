@@ -55,7 +55,7 @@ All previously accepted. Now ignored with a `WARN`. Use `~/.ahma/settings.toml` 
 |---|---|---|
 | `AHMA_TOOLS_DIR` | `--tools-dir` CLI flag or `tools.tools_dir` in settings.toml | auto-detect `.ahma/` |
 | `AHMA_TIMEOUT` | `--timeout` flag or `tools.timeout_secs` in settings.toml | `360` |
-| `AHMA_SYNC` | `--sync` / `--async`, or `tools.execution_mode` in settings.toml | `"sync"` |
+| `AHMA_SYNC` | `--sync` / `--async`, or `tools.execution_mode` in settings.toml | `"async"` |
 | `AHMA_HOT_RELOAD` | none — tool hot-reload was removed entirely (agent-writable tools dir); use the `restart` tool | n/a |
 | `AHMA_SKIP_PROBES` | `--skip-probes` flag or `tools.skip_probes = true` in settings.toml | `false` |
 | `AHMA_MINIMIZE_TOKENS` | `--minimize-tokens` flag or `tools.minimize_tokens = true` in settings.toml | `false` |
@@ -167,6 +167,7 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_SERVER_CHILD` | Parent bridge process | Tells a child subprocess it was spawned by a parent bridge. Equivalent to `--server-child` flag. |
 | `AHMA_MCP_ARGS` | HTTP bridge | Passes resolved tool configuration to the per-session subprocess. |
 | `AHMA_RESTARTED` | `re_exec_current_process()` | Prevents infinite re-exec loops during version-mismatch auto-restart. |
+| `AHMA_HELD_WORKSPACE_LEASE` | Every command ahma runs while it holds a workspace write-queue lease | Comma-separated ids of the workspace leases the command already runs under (SPEC R2.7.7). A nested ahma started by that command reads it only to *skip waiting* for the lease its own ancestor holds, which would otherwise deadlock (`cargo nextest` spawning `ahma`). A marker, not a setting: it can never grant a lease or widen anything. |
 | `AHMA_OUTER_SANDBOX_PID` | Every command ahma runs inside its kernel sandbox | The pid of the ahma that sandboxed the command. A nested ahma (ahma's test suite or `ahma serve` run through `run_terminal_command`) reads it only to *name* the outer sandbox it defers to on macOS, where Seatbelt cannot nest (SPEC R7.6). A marker, not a setting. |
 
 ---

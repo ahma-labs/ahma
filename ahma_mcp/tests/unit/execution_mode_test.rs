@@ -203,10 +203,7 @@ async fn the_server_instructions_describe_the_active_mode() -> Result<()> {
         sync.contains("Each call waits for the command to finish"),
         "{sync}"
     );
-    assert!(
-        !sync.contains("returns an operation_id immediately"),
-        "{sync}"
-    );
+    assert!(!sync.contains("NOT started"), "{sync}");
 
     service.set_app_config(Arc::new(AppConfig {
         execution_mode: ExecutionPolicy::Async,
@@ -214,7 +211,14 @@ async fn the_server_instructions_describe_the_active_mode() -> Result<()> {
     }));
     let asynchronous = service.get_info().instructions.unwrap_or_default();
     assert!(
-        asynchronous.contains("returns an operation_id immediately"),
+        asynchronous.contains("returns an operation_id"),
+        "{asynchronous}"
+    );
+    // Async is only safe because writers are ordered; the model must know how
+    // a queued command reads, and that it must not resend it (SPEC R2.7.3).
+    assert!(asynchronous.contains("NOT started"), "{asynchronous}");
+    assert!(
+        asynchronous.contains("do not send it again"),
         "{asynchronous}"
     );
     Ok(())

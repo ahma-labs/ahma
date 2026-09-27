@@ -19,6 +19,7 @@ If your main goal is to use ahma with existing tools such as cargo, git, Python,
   `agent`, `todo_write`, `log_monitor`). A config that takes one is refused at
   load with a message naming the conflict — see
   [.ahma/README.md](../.ahma/README.md) for the full table.
+- **Say whether a tool writes.** A tool (or subcommand) that only reads can declare `"concurrency": "read_only"` and then runs at once even while a build holds the workspace — under a sandbox that cannot write the workspace, so a wrong declaration fails rather than writes. `"service"` marks a long-lived process that must not hold the workspace write queue for its whole life; the default is `"exclusive"`. See [workspace-queue.md](workspace-queue.md).
 - **Changes are not picked up automatically.** ahma does not watch the tool-config directory — a watcher would turn writing a tool definition into *running* it with no user action in between. Reload with the explicit `restart` tool (or restart the server).
 
 ## Where to start

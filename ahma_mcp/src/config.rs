@@ -64,7 +64,7 @@ pub struct ToolConfig {
     /// Override the default execution mode for this tool.
     /// - `true`: Always run on the legacy direct path (blocking, untracked)
     /// - `false`: Return after the adaptive window, even in sync mode
-    /// - `null`/omitted: Use the server's `tools.execution_mode` (sync by default)
+    /// - `null`/omitted: Use the server's `tools.execution_mode` (async by default)
     ///
     /// Inheritance: Subcommand-level settings override tool-level settings.
     #[serde(
@@ -129,6 +129,16 @@ pub struct ToolConfig {
     /// override this tool-level default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutates: Option<bool>,
+    /// How this tool's calls take part in the workspace write queue (SPEC
+    /// R2.7): `"exclusive"` (the default — may write the workspace, runs in
+    /// arrival order), `"read_only"` (spawned with a sandbox profile that
+    /// cannot write the workspace, so it never queues), or `"service"` (a
+    /// long-lived process such as a dev server, which must not hold the
+    /// workspace for its whole life). Unlike `mutates`, `read_only` is enforced
+    /// by the kernel: a `read_only` tool that tries to write fails. Subcommand
+    /// settings override this tool-level default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<crate::adapter::workspace_queue::Lane>,
 }
 
 /// Classifier that determines how the MCP service routes a tool invocation.
@@ -474,6 +484,11 @@ pub struct SubcommandConfig {
     /// [`ToolConfig::mutates`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutates: Option<bool>,
+    /// Override the tool-level `concurrency` for this subcommand — e.g.
+    /// `git status` (`"read_only"`) under a `git` tool whose other subcommands
+    /// write. See [`ToolConfig::concurrency`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<crate::adapter::workspace_queue::Lane>,
 }
 
 /// Configuration for a single command-line option.

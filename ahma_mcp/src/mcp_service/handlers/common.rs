@@ -310,6 +310,13 @@ pub async fn wait_for_completion(
 /// which is best-effort and which the caller may not even receive. An operation
 /// that finished inline must say so in the result itself.
 fn format_completed_operation(op: &Operation) -> rmcp::model::CallToolResult {
+    text_result(render_completed_operation(op))
+}
+
+/// The text of [`format_completed_operation`]: identity line, output, then the
+/// workspace-queue notes (SPEC R2.7) — how long it waited for its turn, and
+/// which files changed while it ran.
+pub(crate) fn render_completed_operation(op: &Operation) -> String {
     use crate::operation_monitor::OperationStatus;
 
     let body = match op.state {
@@ -328,7 +335,55 @@ fn format_completed_operation(op: &Operation) -> rmcp::model::CallToolResult {
     } else {
         body.trim_end()
     };
-    text_result(format!("{}\n{}", identity_line(op), body))
+    let mut text = format!("{}\n{}", identity_line(op), body);
+    for note in concurrency_notes(op) {
+        text.push_str("\n\n");
+        text.push_str(&note);
+    }
+    text
+}
+
+/// What the workspace write queue has to say about a finished operation
+/// (SPEC R2.7.1, R2.7.6).
+pub(crate) fn concurrency_notes(op: &Operation) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(ms) = op.queue_wait_ms {
+        notes.push(format!(
+            "Waited {} for the workspace before starting (an earlier command was still writing it).",
+            crate::adapter::workspace_queue::format_duration_secs(ms.div_ceil(1000))
+        ));
+    }
+    if let Some(changed) = op.result.as_ref().and_then(|r| r.get("changed_during_run")) {
+        notes.push(changed_during_run_note(changed));
+    }
+    notes
+}
+
+/// Render the `changed_during_run` result field (SPEC R2.7.6).
+fn changed_during_run_note(changed: &Value) -> String {
+    let files: Vec<&str> = changed
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let more = changed.get("more").and_then(Value::as_u64).unwrap_or(0);
+    let read_only = changed.get("lane").and_then(Value::as_str) == Some("read_only");
+    let who = if read_only {
+        "by another writer — this command could not write"
+    } else {
+        "by this command or another writer, such as your editor"
+    };
+    let mut list = files.join(", ");
+    if more > 0 {
+        list.push_str(&format!(" (+{more} more)"));
+    }
+    if changed.get("incomplete").and_then(Value::as_bool) == Some(true) {
+        list.push_str(" (the scan stopped early; there may be others)");
+    }
+    format!(
+        "Files changed while this ran ({who}): {list}. If a change was not made by this \
+         command, its output may not reflect it — rerun it if that matters."
+    )
 }
 
 /// The one-line identity for a finished operation, rendered by the shared

@@ -74,18 +74,27 @@ that already have native equivalents."
 }
 
 /// Canonical server instructions for an **async-mode** server
-/// (`tools.execution_mode = "async"`), and for stateless discovery, which
-/// cannot know a session's mode. See [`server_instructions`].
+/// (`tools.execution_mode = "async"`, the default), and for stateless
+/// discovery, which cannot know a session's mode. See [`server_instructions`].
 pub const SERVER_INSTRUCTIONS: &str = concat!(
     instructions_head!(),
     "\
-(2) the command is long-running — `run_terminal_command` returns an operation_id immediately \
-and you can `status`, `await`, or `cancel` it without blocking; \
+(2) the command is long-running — a command still running after a few seconds returns an \
+operation_id, so you keep thinking, reading and planning while it runs; `await` the id when \
+you need the result, or `cancel` it. \
+Commands that may write the workspace run one at a time, in the order you sent them (the \
+workspace write queue, shared with every other ahma session on this machine): a later command \
+waits for earlier ones, and if it has not started yet its result says `NOT started — queued \
+behind` another operation. It will run automatically when its turn comes — do not send it \
+again. Read-only commands (`git status`/`diff`/`log`, `rg`, `grep`, `ls`, `cat`) skip the queue \
+and answer at once, even during a build, under a sandbox that forbids them to write. \
+An operation that finished since you last heard about it is reported at the top of your next \
+tool result. A result that lists files changed by another writer while the command ran may \
+not reflect those changes: rerun it if they matter. \
 (3) the command's output should be watched for errors — set `monitor_level` and ahma \
-streams alerts when matching lines appear; \
-(4) multiple commands should run concurrently — each call gets its own operation_id. \
-Workflow: start operations, do other useful work, then `await` the ids you need — \
-completion is also pushed via notifications, so avoid polling `status` in a loop. \
+streams alerts when matching lines appear. \
+Workflow: start a long command, do other useful work, then `await` the ids you need — \
+avoid polling `status` in a loop. \
 Push notifications only arrive over a live, actively-listening connection — if you \
 might stop generating before an operation finishes (ending your turn, handing off, \
 or exiting), call `await` and let it block rather than counting on a notification to \
@@ -94,8 +103,8 @@ resume you; a push sent while you are not listening is not queued or replayed. "
 );
 
 /// Server instructions for a **sync-mode** server (`tools.execution_mode =
-/// "sync"`, the default): calls return their result, and an operation id is
-/// the exception a model must know how to handle, not the workflow.
+/// "sync"`): calls return their result, and an operation id is the exception a
+/// model must know how to handle, not the workflow.
 pub const SERVER_INSTRUCTIONS_SYNC: &str = concat!(
     instructions_head!(),
     "\

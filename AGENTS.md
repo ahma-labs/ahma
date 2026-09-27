@@ -250,6 +250,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Built-in file tools | [docs/file-tools.md](docs/file-tools.md) | R26 |
 | Doctor (`ahma doctor`, `/doctor`) | [docs/doctor.md](docs/doctor.md) | R-DOCTOR |
 | Settings file, sync/async execution mode | [docs/settings.md](docs/settings.md) | R-CFG, R2.1, R2.4 |
+| Workspace write queue (safe async) | [docs/workspace-queue.md](docs/workspace-queue.md) | R2.7 |
 | Permissions and grants | [docs/permissions.md](docs/permissions.md) | R-PERM |
 | LLM providers | [docs/llm-providers.md](docs/llm-providers.md) | §5.5 |
 | Session-health notifications | [docs/session-health-notifications.md](docs/session-health-notifications.md) | R8.8 (`ahma_http_bridge/SPEC.md`) |

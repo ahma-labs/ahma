@@ -76,16 +76,28 @@ impl FsLock {
     }
 
     /// Open or create the lockfile.  Creates parent directories as needed.
+    ///
+    /// A process that may not write the lock directory (a server confined by
+    /// its own Landlock ruleset) can still take the lock on a file another
+    /// process already created: `flock`/`LockFileEx` need only an open handle,
+    /// not a writable one. So a permission error falls back to a read-only open.
     fn open_or_create(lock_path: &Path) -> io::Result<File> {
         if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
+            // Best-effort: a denied mkdir of an existing directory is not fatal.
+            let _ = fs::create_dir_all(parent);
         }
-        File::options()
+        match File::options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(lock_path)
+        {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                File::options().read(true).open(lock_path)
+            }
+            other => other,
+        }
     }
 }
 

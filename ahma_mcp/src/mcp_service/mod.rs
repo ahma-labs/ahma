@@ -37,6 +37,7 @@
 //! background tasks and executing arbitrary logic within the sandbox.
 
 pub mod bundle_registry;
+pub mod delivery;
 pub mod handlers;
 pub mod progress_push;
 /// Sandbox configuration from client roots + the one-shot tool-config loads that
@@ -177,6 +178,9 @@ pub struct AhmaMcpService {
     /// service instance — adequate for the single-user TUI; per-session
     /// isolation is a future refinement.
     pub todo_list: Arc<tokio::sync::Mutex<Vec<handlers::todo_tool::TodoItem>>>,
+    /// Operations this session started whose result it has not delivered yet
+    /// (SPEC R2.7.5).
+    pub undelivered: Arc<delivery::UndeliveredOps>,
     /// Routes unified operation events to the MCP client as progress
     /// notifications (per-operation peer + progress token registration).
     pub progress_push: Arc<progress_push::ProgressPushRouter>,
@@ -898,6 +902,7 @@ impl AhmaMcpService {
                 crate::harness_guard::HarnessGuard::new(true),
             )),
             todo_list: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            undelivered: Arc::new(delivery::UndeliveredOps::default()),
             progress_push,
             vault_audited_ops: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             mcp_connections: Arc::new(tokio::sync::RwLock::new(
@@ -1496,7 +1501,17 @@ impl AhmaMcpService {
                 if let Some(result) = finished {
                     return Ok(result);
                 }
+                // The result is still to come: remember to deliver it (R2.7.5).
+                self.undelivered.started_without_result(&id);
                 let hint = crate::tool_hints::preview(&id, tool_name);
+                // Not started at all? Say so — a queued `sed -i` must never
+                // read as an applied one (R2.7.3).
+                if let Some(ahead) = self.adapter.workspace_queue().waiting_behind(&id) {
+                    return Ok(handlers::common::text_result(format!(
+                        "{}{hint}",
+                        delivery::queued_notice(&id, &ahead)
+                    )));
+                }
                 Ok(handlers::common::text_result(format!(
                     "AHMA ID: {id}{still_running}{hint}"
                 )))
@@ -1765,8 +1780,21 @@ impl ServerHandler for AhmaMcpService {
                 self.guard_sandbox_ready_for_tool_calls().await?;
             }
 
+            let awaited_id = (builtin == Some(BuiltinTool::Await))
+                .then(|| {
+                    run_params
+                        .arguments
+                        .as_ref()
+                        .and_then(|a| a.get("id"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .flatten();
             let result = self
                 .dispatch_tool_call(tool_name.as_ref(), run_params, context)
+                .await;
+            let result = self
+                .deliver_finished_operations(builtin, awaited_id.as_deref(), result)
                 .await;
 
             if is_guard_active {
@@ -1823,6 +1851,44 @@ fn append_external_mcp_tools(
 }
 
 impl AhmaMcpService {
+    /// Settle the undelivered-results ledger after a tool call (SPEC R2.7.5):
+    /// what an `await` just returned is delivered; anything else that has
+    /// finished since is prepended to this result.
+    async fn deliver_finished_operations(
+        &self,
+        builtin: Option<BuiltinTool>,
+        awaited_id: Option<&str>,
+        result: Result<CallToolResult, McpError>,
+    ) -> Result<CallToolResult, McpError> {
+        if builtin == Some(BuiltinTool::Await) {
+            // An `await` delivers what it saw finish: the id it named, or —
+            // without one — everything pending. A soft timeout delivered
+            // nothing, so only operations that have actually finished count.
+            let candidates = match awaited_id {
+                Some(id) => vec![id.to_string()],
+                None => self.undelivered.pending(),
+            };
+            for id in candidates {
+                if self
+                    .operation_monitor
+                    .check_completion_history_pub(&id)
+                    .await
+                    .is_some()
+                {
+                    self.undelivered.delivered(&id);
+                }
+            }
+        }
+        let Ok(result) = result else {
+            return result;
+        };
+        let finished = self
+            .undelivered
+            .take_finished(&self.operation_monitor)
+            .await;
+        Ok(delivery::prepend_finished(result, &finished))
+    }
+
     async fn dispatch_tool_call(
         &self,
         tool_name: &str,
@@ -3162,6 +3228,7 @@ mod tests {
             subcommand: Some(vec![SubcommandConfig {
                 extra: Default::default(),
                 mutates: None,
+                concurrency: None,
                 name: "default".to_string(),
                 description: "d".to_string(),
                 enabled: true,

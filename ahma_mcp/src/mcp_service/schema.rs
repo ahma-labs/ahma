@@ -592,6 +592,7 @@ mod tests {
         SubcommandConfig {
             extra: Default::default(),
             mutates: None,
+            concurrency: None,
             name: name.to_string(),
             description: description.to_string(),
             enabled,
@@ -608,6 +609,7 @@ mod tests {
         SubcommandConfig {
             extra: Default::default(),
             mutates: None,
+            concurrency: None,
             name: name.to_string(),
             description: description.to_string(),
             subcommand: Some(nested),

@@ -65,6 +65,31 @@ impl AhmaMcpService {
         }
     }
 
+    /// Refuse an edit while a command that may read or write the same
+    /// workspace is running (SPEC R2.7.8): the edit would land partway
+    /// through that command, and its result would describe neither version.
+    fn ensure_workspace_not_busy(&self, path: &Path) -> Result<(), McpError> {
+        let enabled = self
+            .app_config
+            .read()
+            .as_ref()
+            .map(|c| c.edit_guard)
+            .unwrap_or(true);
+        if !enabled {
+            return Ok(());
+        }
+        let scopes = self.adapter.sandbox().scopes().to_vec();
+        let key = crate::adapter::workspace_queue::workspace_key_for_path(path, &scopes);
+        match self.adapter.workspace_queue().probe(&key) {
+            crate::adapter::workspace_queue::LeaseProbe::Free => Ok(()),
+            crate::adapter::workspace_queue::LeaseProbe::Held { holder } => {
+                Err(mcp_invalid_params(
+                    crate::adapter::workspace_queue::edit_refusal(path, &key, holder.as_ref()),
+                ))
+            }
+        }
+    }
+
     /// Resolves the `base_dir` argument shared by `file_search`/`grep_search`:
     /// the explicit value if given, else the first sandbox scope, else `.`.
     fn resolve_base_dir(&self, args: &Map<String, Value>) -> PathBuf {
@@ -434,6 +459,7 @@ impl AhmaMcpService {
             .ok_or_else(|| mcp_invalid_params("'content' is required"))?;
 
         let path_ref = Path::new(path);
+        self.ensure_workspace_not_busy(path_ref)?;
         // Creating is free; overwriting needs to have seen what is there.
         self.ensure_read_and_unchanged(path_ref).await?;
         let narrowing = self.narrow_container_for(path_ref);
@@ -528,6 +554,7 @@ impl AhmaMcpService {
         edits: &[ahma_harness_tools::edit::Edit],
         tool: &str,
     ) -> Result<CallToolResult, McpError> {
+        self.ensure_workspace_not_busy(path)?;
         self.ensure_read_and_unchanged(path).await?;
         let narrowing = self.narrow_container_for(path);
         let scopes = self.adapter.sandbox().scopes().to_vec();
@@ -594,6 +621,7 @@ impl AhmaMcpService {
             }
             for p in op.paths() {
                 if let Ok(full) = ahma_harness_tools::resolve_patch_path(&scopes, &base_dir, p) {
+                    self.ensure_workspace_not_busy(&full)?;
                     touched.push(full);
                 }
             }

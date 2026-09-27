@@ -9,6 +9,19 @@ pub trait CommandExecutor: Send + Sync + std::fmt::Debug {
         args: &[String],
         working_dir: &Path,
     ) -> Result<tokio::process::Command>;
+
+    /// Build a command the kernel forbids from writing the workspace — the
+    /// read-only lane (SPEC R2.7.4). The default defers to the sandbox, which
+    /// refuses where it cannot enforce it.
+    fn build_read_only_command(
+        &self,
+        sandbox: &crate::sandbox::Sandbox,
+        program: &str,
+        args: &[String],
+        working_dir: &Path,
+    ) -> Result<tokio::process::Command> {
+        sandbox.create_read_only_command(program, args, working_dir)
+    }
 }
 
 #[derive(Debug, Clone, Default)]

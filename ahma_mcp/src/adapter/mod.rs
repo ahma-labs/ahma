@@ -45,11 +45,13 @@
 
 pub mod audit;
 pub mod executor;
+pub mod lane;
 pub mod mutex_groups;
 mod preparer;
 mod pty_exec;
 pub mod spill;
 mod types;
+pub mod workspace_queue;
 
 pub use mutex_groups::CommandMutexRegistry;
 pub use preparer::{
@@ -227,6 +229,11 @@ pub struct Adapter {
     pub shell_sessions: Arc<crate::shell_session::ShellSessionManager>,
     /// Configurable per-(group, directory) command serialisation registry.
     pub mutex_registry: Arc<CommandMutexRegistry>,
+    /// The workspace write queue (SPEC R2.7): exclusive operations in one
+    /// workspace run one at a time, in arrival order, across every ahma
+    /// process. Disabled unless the embedder opts in
+    /// ([`Self::with_workspace_queue`]); the `ahma` binary always does.
+    workspace_queue: workspace_queue::WorkspaceQueue,
     /// Optional sink for auto-detected sandbox scope violations. When set, an
     /// out-of-scope path (rejected up front, or surfaced by a stderr denial) raises
     /// a "grant access to X?" prompt through this notifier. `None` disables
@@ -284,8 +291,67 @@ impl Adapter {
             )),
             shell_sessions: crate::shell_session::ShellSessionManager::new(),
             mutex_registry,
+            workspace_queue: workspace_queue::WorkspaceQueue::disabled(),
             scope_grant_notifier: None,
         })
+    }
+
+    /// Enable (or replace) the workspace write queue (SPEC R2.7).
+    pub fn with_workspace_queue(mut self, queue: workspace_queue::WorkspaceQueue) -> Self {
+        self.workspace_queue = queue;
+        self
+    }
+
+    /// The workspace write queue, for callers that must ask whether a
+    /// workspace is busy (the edit guard, SPEC R2.7.8) or why an operation has
+    /// not started (SPEC R2.7.3).
+    pub fn workspace_queue(&self) -> &workspace_queue::WorkspaceQueue {
+        &self.workspace_queue
+    }
+
+    /// The workspace `working_dir` belongs to (SPEC R2.7.2).
+    pub fn workspace_key_for(&self, working_dir: &std::path::Path) -> std::path::PathBuf {
+        workspace_queue::workspace_key(working_dir, &self.sandbox.scopes())
+    }
+
+    /// Which lane a call runs in (SPEC R2.7.4): what the MTDF definition
+    /// declares, else — for a shell command line — what the classifier says,
+    /// else exclusive. A read-only verdict the kernel cannot enforce here is
+    /// demoted to exclusive: the queue never trusts a classifier alone.
+    pub fn resolve_lane(
+        &self,
+        args: Option<&Map<String, serde_json::Value>>,
+        subcommand_config: Option<&crate::config::SubcommandConfig>,
+    ) -> workspace_queue::Lane {
+        use workspace_queue::Lane;
+        let lane = subcommand_config
+            .and_then(|s| s.concurrency)
+            .unwrap_or_else(|| match shell_command_line(args) {
+                Some(line) => lane::classify_shell_command(line),
+                None => Lane::Exclusive,
+            });
+        if lane == Lane::ReadOnly && !self.sandbox.can_enforce_read_only() {
+            Lane::Exclusive
+        } else {
+            lane
+        }
+    }
+
+    /// Take a place in the workspace line for an exclusive operation, now —
+    /// at arrival — so arrival order is execution order (SPEC R2.7.1).
+    fn enqueue_exclusive(
+        &self,
+        lane: workspace_queue::Lane,
+        working_dir: &std::path::Path,
+        op_id: &str,
+        title: &str,
+    ) -> Option<workspace_queue::Ticket> {
+        if lane != workspace_queue::Lane::Exclusive {
+            return None;
+        }
+        let key = self.workspace_key_for(working_dir);
+        self.workspace_queue
+            .enqueue(&key, workspace_queue::HolderInfo::new(op_id, title))
     }
 
     /// Sets a custom command executor on the adapter.
@@ -476,6 +542,23 @@ impl Adapter {
         // `tool_call` and its `tool_complete` can be correlated in the log.
         let op_id = generate_id(command, command);
         let safe_wd_str = safe_wd.to_string_lossy().into_owned();
+
+        // Workspace write queue (SPEC R2.7): the synchronous path — terminal
+        // hooks, CLI one-shots, `synchronous: true` tools — queues exactly like
+        // an async operation, so a hooked `sed -i` never lands in the middle of
+        // an MCP `cargo nextest run`.
+        let lane = self.resolve_lane(args.as_ref(), subcommand_config);
+        let title = shell_command_line(args.as_ref())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{program} {}", args_vec.join(" ")));
+        let lease = match self.enqueue_exclusive(lane, &safe_wd, &op_id, &title) {
+            Some(ticket) => ticket
+                .acquire(&tokio_util::sync::CancellationToken::new(), &|_| {})
+                .await
+                .ok(),
+            None => None,
+        };
+
         audit::record_tool_call(
             &op_id,
             command,
@@ -495,8 +578,11 @@ impl Adapter {
                 &args_vec,
                 &safe_wd,
                 timeout_seconds,
+                lane,
+                lease.as_ref(),
             )
             .await;
+        drop(lease);
         audit::record_tool_complete(
             &op_id,
             run.outcome,
@@ -514,6 +600,7 @@ impl Adapter {
     /// single return value the caller can turn into exactly one `tool_complete`
     /// audit event.  Recording completion at each `return` instead would be one
     /// forgotten branch away from a `tool_call` that never closes.
+    #[allow(clippy::too_many_arguments)]
     async fn run_sync_prepared(
         &self,
         command: &str,
@@ -522,6 +609,8 @@ impl Adapter {
         args_vec: &[String],
         safe_wd: &std::path::Path,
         timeout_seconds: Option<u64>,
+        lane: workspace_queue::Lane,
+        lease: Option<&workspace_queue::Lease>,
     ) -> SyncRun {
         let timeout = timeout_seconds
             .map(Duration::from_secs)
@@ -532,16 +621,23 @@ impl Adapter {
         // the caller has NOT already added the -c flag via a subcommand config.
         // For bash/powershell the preparer already embeds -c/-Command; always
         // use create_command so the sandbox wrapper is applied without double-wrapping.
-        let mut cmd = match build_sandboxed_command(
-            self.command_executor.as_ref(),
-            &self.sandbox,
-            program,
-            args_vec,
-            safe_wd,
-        ) {
+        let built = if lane == workspace_queue::Lane::ReadOnly {
+            self.command_executor
+                .build_read_only_command(&self.sandbox, program, args_vec, safe_wd)
+        } else {
+            build_sandboxed_command(
+                self.command_executor.as_ref(),
+                &self.sandbox,
+                program,
+                args_vec,
+                safe_wd,
+            )
+        };
+        let mut cmd = match built {
             Ok(cmd) => cmd,
             Err(e) => return SyncRun::failed(e),
         };
+        stamp_lease(&mut cmd, lease);
 
         // Spawn manually (rather than `cmd.output()`) so a timeout can take down
         // the whole process group — `cmd.output()` drops the future on timeout,
@@ -872,6 +968,20 @@ impl Adapter {
         // callers know where the complete output lives (stdout_tail is a
         // bounded window).  The file is created lazily by the streaming task.
         operation.output_file = Some(spill::operation_spill_path(&op_id));
+
+        // Workspace write queue (SPEC R2.7): the place in line is taken here,
+        // synchronously, before anything is spawned.
+        let lane = self.resolve_lane(args.as_ref(), subcommand_config);
+        let workspace = self.workspace_key_for(&safe_wd);
+        let holder_title = operation
+            .command
+            .clone()
+            .or_else(|| operation.title.clone())
+            .unwrap_or_else(|| command.to_string());
+        let ticket = self.enqueue_exclusive(lane, &safe_wd, &op_id, &holder_title);
+        let display_command = shell_command_line(args.as_ref())
+            .map(str::to_string)
+            .unwrap_or_else(|| command.to_string());
         self.monitor.add_operation(operation).await;
 
         // Durable provenance, written *before* the task is spawned. Doing it here
@@ -912,6 +1022,10 @@ impl Adapter {
             output_optimizer: self.output_optimizer.clone(),
             mutex_registry: self.mutex_registry.clone(),
             scope_grant_notifier: self.scope_grant_notifier.clone(),
+            lane,
+            ticket,
+            workspace,
+            display_command,
         }));
 
         // Store the handle for graceful shutdown
@@ -984,9 +1098,31 @@ impl Adapter {
         let command_str = command_str.to_string();
         let task_handles = self.task_handles.clone();
         let op_id_task = op_id.clone();
+        // A PTY command is an arbitrary shell command: exclusive (SPEC R2.7).
+        let ticket = self.enqueue_exclusive(
+            workspace_queue::Lane::Exclusive,
+            &safe_wd,
+            &op_id,
+            &command_str,
+        );
 
         let handle = tokio::spawn(async move {
             let started = Instant::now();
+            // Held until the PTY process is gone.
+            let Ok(lease) =
+                wait_for_lease(ticket, &monitor, &op_id_task, &cancellation_token).await
+            else {
+                handle_cancellation(&monitor, &op_id_task).await;
+                audit::record_tool_complete(
+                    &op_id_task,
+                    audit::Outcome::Cancelled,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                )
+                .await;
+                task_handles.lock().await.remove(&op_id_task);
+                return;
+            };
             let (outcome, exit_code) = pty_exec::run_pty_operation(
                 &sandbox,
                 &command_str,
@@ -997,6 +1133,7 @@ impl Adapter {
                 &monitor,
             )
             .await;
+            drop(lease);
             audit::record_tool_complete(
                 &op_id_task,
                 outcome,
@@ -1071,9 +1208,31 @@ impl Adapter {
         let command_str = command_str.to_string();
         let task_handles = self.task_handles.clone();
         let op_id_task = op_id.clone();
+        // A session command is an arbitrary shell command: exclusive (SPEC R2.7).
+        let ticket = self.enqueue_exclusive(
+            workspace_queue::Lane::Exclusive,
+            &safe_wd,
+            &op_id,
+            &command_str,
+        );
 
         let handle = tokio::spawn(async move {
             let started = Instant::now();
+            // Held until the session command is done.
+            let Ok(lease) =
+                wait_for_lease(ticket, &monitor, &op_id_task, &cancellation_token).await
+            else {
+                handle_cancellation(&monitor, &op_id_task).await;
+                audit::record_tool_complete(
+                    &op_id_task,
+                    audit::Outcome::Cancelled,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                )
+                .await;
+                task_handles.lock().await.remove(&op_id_task);
+                return;
+            };
             let (outcome, exit_code) = run_session_operation(
                 &sessions,
                 &sandbox,
@@ -1086,6 +1245,7 @@ impl Adapter {
                 &monitor,
             )
             .await;
+            drop(lease);
             audit::record_tool_complete(
                 &op_id_task,
                 outcome,
@@ -1182,6 +1342,16 @@ struct AsyncOperationRun {
     output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     mutex_registry: Arc<CommandMutexRegistry>,
     scope_grant_notifier: Option<Arc<dyn sandbox::ScopeGrantNotifier>>,
+    /// Workspace-queue lane (SPEC R2.7.4).
+    lane: workspace_queue::Lane,
+    /// Place in the workspace line, for an exclusive operation.
+    ticket: Option<workspace_queue::Ticket>,
+    /// The workspace key (SPEC R2.7.2): the drift probe's root and the mutex
+    /// groups' key.
+    workspace: std::path::PathBuf,
+    /// The command line as the caller wrote it (for a shell tool, the shell
+    /// string — `command` is then just the shell program).
+    display_command: String,
 }
 
 async fn run_async_operation(ctx: AsyncOperationRun) {
@@ -1201,6 +1371,10 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         output_optimizer,
         mutex_registry,
         scope_grant_notifier,
+        lane,
+        ticket,
+        workspace,
+        display_command,
     } = ctx;
 
     // Timed from the moment the task starts, so queueing behind a command mutex
@@ -1228,6 +1402,20 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         }
     };
 
+    // ── Workspace write queue (SPEC R2.7) ──────────────────────────────────
+    // Wait for every exclusive operation that arrived earlier in this
+    // workspace — in this process or any other — before starting. The lease is
+    // held until this function returns, i.e. until the process tree is gone.
+    let mut lease = match wait_for_lease(ticket, &monitor, &op_id, &cancellation_token).await {
+        Ok(lease) => lease,
+        Err(()) => {
+            handle_cancellation(&monitor, &op_id).await;
+            audit_complete(audit::Outcome::Cancelled, None).await;
+            task_handles.lock().await.remove(&op_id);
+            return;
+        }
+    };
+
     monitor
         .update_status(&op_id, OperationStatus::InProgress, None)
         .await;
@@ -1248,29 +1436,43 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // Serialise commands in the same mutex group within the same working
     // directory.  The permit is held for the entire execution and released
     // automatically when it drops at the end of this function.
-    let _exclusive_permit =
-        match acquire_mutex_gate(&mutex_registry, &monitor, &op_id, &command, &working_dir).await {
-            Ok(permit) => permit,
-            Err(err) => {
-                fail_operation_with_error(&monitor, &op_id, err).await;
-                audit_complete(audit::Outcome::TimedOut, None).await;
-                task_handles.lock().await.remove(&op_id);
-                return;
-            }
-        };
+    let _exclusive_permit = match acquire_mutex_gate(
+        &mutex_registry,
+        &monitor,
+        &op_id,
+        &display_command,
+        &workspace,
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(err) => {
+            drop(lease.take());
+            fail_operation_with_error(&monitor, &op_id, err).await;
+            audit_complete(audit::Outcome::TimedOut, None).await;
+            task_handles.lock().await.remove(&op_id);
+            return;
+        }
+    };
 
     let start_time = Instant::now();
     let wd_path = std::path::PathBuf::from(&working_dir);
-    let mut proc_cmd = match build_sandboxed_command(
-        command_executor.as_ref(),
-        &sandbox,
-        &program,
-        &args_vec,
-        &wd_path,
-    ) {
+    let built = if lane == workspace_queue::Lane::ReadOnly {
+        command_executor.build_read_only_command(&sandbox, &program, &args_vec, &wd_path)
+    } else {
+        build_sandboxed_command(
+            command_executor.as_ref(),
+            &sandbox,
+            &program,
+            &args_vec,
+            &wd_path,
+        )
+    };
+    let mut proc_cmd = match built {
         Ok(cmd) => cmd,
         Err(e) => {
             let err_msg = format!("Failed to create sandboxed command: {}", e);
+            drop(lease.take());
             fail_operation_with_error(&monitor, &op_id, err_msg).await;
             audit_complete(audit::Outcome::Failed, None).await;
             task_handles.lock().await.remove(&op_id);
@@ -1278,9 +1480,16 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         }
     };
 
+    stamp_lease(&mut proc_cmd, lease.as_ref());
+
     let timeout_ms = timeout_secs
         .map(|t| t * 1000)
         .unwrap_or_else(|| shell_pool.config().command_timeout.as_millis() as u64);
+
+    let drift = (lane != workspace_queue::Lane::Service).then(|| DriftProbe {
+        root: workspace.clone(),
+        lane,
+    });
 
     // Single execution path: stream stdout/stderr line-by-line for every
     // operation (SPEC R15.2).  Lines flow through the OperationMonitor, which
@@ -1300,11 +1509,133 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         scope_grant_notifier.as_ref(),
         &command,
         &wd_path,
+        drift.as_ref(),
+        &mut lease,
     )
     .await;
+    // Normally already released inside, just before the terminal transition.
+    drop(lease);
     audit_complete(outcome, exit_code).await;
 
     task_handles.lock().await.remove(&op_id);
+}
+
+/// The shell command line of a `run_terminal_command`-style call (`command`
+/// plus `c_flag`), which is what the lane classifier and the mutex groups must
+/// look at — the adapter's own `command` is then only the shell program.
+fn shell_command_line(args: Option<&Map<String, serde_json::Value>>) -> Option<&str> {
+    let args = args?;
+    if args.get("c_flag").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    args.get("command").and_then(|v| v.as_str())
+}
+
+/// What ahma says while an operation waits for its workspace (SPEC R2.7.3).
+pub(crate) fn queued_message(ahead: &[workspace_queue::HolderInfo]) -> String {
+    match ahead {
+        [] => "Queued: waiting for the workspace, held by another ahma process".to_string(),
+        [only] => format!(
+            "Queued: waiting for the workspace behind {}",
+            only.describe()
+        ),
+        [first, rest @ ..] => format!(
+            "Queued: waiting for the workspace behind {} and {} more",
+            first.describe(),
+            rest.len()
+        ),
+    }
+}
+
+/// Wait for a ticket's turn (SPEC R2.7.1), keeping the operation visibly alive
+/// meanwhile: queued is not stalled, so the idle-output watchdog must not kill
+/// it, and observers see who it waits for. `Err` = cancelled while queued.
+async fn wait_for_lease(
+    ticket: Option<workspace_queue::Ticket>,
+    monitor: &Arc<OperationMonitor>,
+    op_id: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Option<workspace_queue::Lease>, ()> {
+    let Some(ticket) = ticket else {
+        return Ok(None);
+    };
+    let started = Instant::now();
+    let observe = |ahead: &[workspace_queue::HolderInfo]| {
+        monitor.try_note_liveness(op_id);
+        monitor.note_progress(op_id, queued_message(ahead));
+    };
+    let lease = ticket.acquire(cancel, &observe).await.map_err(|_| ())?;
+    let waited = started.elapsed();
+    if waited >= QUEUE_WAIT_WORTH_REPORTING {
+        monitor.left_queue(op_id, waited).await;
+    }
+    Ok(Some(lease))
+}
+
+/// A wait shorter than this is not worth a line in the result.
+const QUEUE_WAIT_WORTH_REPORTING: Duration = Duration::from_millis(500);
+
+/// Stamp a child spawned under a lease with it (SPEC R2.7.7), so an ahma the
+/// command itself starts does not wait for the lease its ancestor holds.
+fn stamp_lease(cmd: &mut tokio::process::Command, lease: Option<&workspace_queue::Lease>) {
+    if let Some(lease) = lease {
+        cmd.env(
+            workspace_queue::HELD_LEASE_ENV,
+            workspace_queue::child_lease_env(lease.key()),
+        );
+    }
+}
+
+/// Where and how to look for files that changed while an operation ran
+/// (SPEC R2.7.6).
+#[derive(Debug, Clone)]
+struct DriftProbe {
+    root: std::path::PathBuf,
+    lane: workspace_queue::Lane,
+}
+
+/// Only operations at least this long are probed: a sub-second command had no
+/// window worth racing, and the walk is not free.
+const DRIFT_MIN_RUN: Duration = Duration::from_secs(2);
+/// At most this many changed files are named in a result.
+const DRIFT_LIST_LIMIT: usize = 20;
+/// The walk visits at most this many entries.
+const DRIFT_MAX_ENTRIES: usize = 200_000;
+
+impl DriftProbe {
+    /// The `changed_during_run` result field, or `None` when nothing changed
+    /// or the run was too short to probe.
+    async fn report(&self, ran_for: Duration) -> Option<serde_json::Value> {
+        if ran_for < DRIFT_MIN_RUN {
+            return None;
+        }
+        let until = std::time::SystemTime::now();
+        let since = until.checked_sub(ran_for)?;
+        let root = self.root.clone();
+        let exclude = vec![crate::utils::logging::project_log_dir()];
+        let changed = tokio::task::spawn_blocking(move || {
+            ahma_harness_tools::drift::files_modified_between(
+                &root,
+                since,
+                until,
+                &exclude,
+                DRIFT_LIST_LIMIT,
+                DRIFT_MAX_ENTRIES,
+            )
+        })
+        .await
+        .ok()?;
+        if changed.is_empty() {
+            return None;
+        }
+        Some(json!({
+            "root": self.root.to_string_lossy(),
+            "files": changed.paths.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            "more": changed.more,
+            "incomplete": changed.incomplete,
+            "lane": self.lane.as_str(),
+        }))
+    }
 }
 
 /// Acquire the command's mutex-group gate, if the command belongs to one.
@@ -1322,7 +1653,7 @@ async fn acquire_mutex_gate(
     monitor: &Arc<OperationMonitor>,
     op_id: &str,
     command: &str,
-    working_dir: &str,
+    workspace: &std::path::Path,
 ) -> Result<Option<mutex_groups::MutexGroupGuard>, String> {
     let Some(group) = mutex_registry.find_group(command) else {
         return Ok(None);
@@ -1332,18 +1663,17 @@ async fn acquire_mutex_gate(
         op_id,
         format!(
             "Queued: waiting for '{group_name}' mutex \
-             (another {group_name} command is running in this directory)"
+             (another {group_name} command is running in this workspace)"
         ),
     );
-    let wd_path = std::path::Path::new(working_dir);
-    match mutex_registry.acquire(group, wd_path).await {
+    match mutex_registry.acquire(group, workspace).await {
         Ok(permit) => {
             tracing::debug!(op_id = %op_id, group = %group_name, "Acquired mutex group gate");
             Ok(Some(permit))
         }
         Err(mutex_groups::MutexGroupError::Timeout { secs, .. }) => Err(format!(
             "Timed out waiting for '{group_name}' exclusive lock after {secs}s. \
-             Another {group_name} command is still running in this directory. \
+             Another {group_name} command is still running in this workspace. \
              Try again after it completes."
         )),
         Err(mutex_groups::MutexGroupError::Closed { .. }) => {
@@ -1580,6 +1910,8 @@ async fn execute_with_streaming(
     scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
     tool: &str,
     working_dir: &Path,
+    drift: Option<&DriftProbe>,
+    lease: &mut Option<workspace_queue::Lease>,
 ) -> (audit::Outcome, Option<i32>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1591,6 +1923,7 @@ async fn execute_with_streaming(
     let child = match proc_cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
+            drop(lease.take());
             fail_operation_with_error(op_monitor, op_id, format!("Failed to spawn process: {}", e))
                 .await;
             return (audit::Outcome::Failed, None);
@@ -1660,6 +1993,7 @@ async fn execute_with_streaming(
                     tracing::warn!("Operation {} cancelled but its process did not reap cleanly", op_id);
                 }
                 spill.finish().await;
+                drop(lease.take());
                 handle_cancellation(op_monitor, op_id).await;
                 return (audit::Outcome::Cancelled, None);
             }
@@ -1672,6 +2006,7 @@ async fn execute_with_streaming(
                 }
                 spill.finish().await;
                 let duration_ms = start_time.elapsed().as_millis() as u64;
+                drop(lease.take());
                 cancel_operation_timed_out(op_monitor, op_id, duration_ms).await;
                 return (audit::Outcome::TimedOut, None);
             }
@@ -1797,6 +2132,8 @@ async fn execute_with_streaming(
         scope_grant_notifier,
         tool,
         working_dir,
+        drift,
+        lease,
     )
     .await
 }
@@ -1960,6 +2297,8 @@ async fn finalize_streaming_operation(
     scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
     tool: &str,
     working_dir: &Path,
+    drift: Option<&DriftProbe>,
+    lease: &mut Option<workspace_queue::Lease>,
 ) -> (audit::Outcome, Option<i32>) {
     let exit_status = child.wait().await;
     let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -1991,7 +2330,12 @@ async fn finalize_streaming_operation(
         .await;
     }
 
-    let final_output = json!({
+    let changed_during_run = match drift {
+        Some(probe) => probe.report(start_time.elapsed()).await,
+        None => None,
+    };
+
+    let mut final_output = json!({
         "stdout": stdout_str,
         "stderr": stderr_str,
         "exit_code": exit_code,
@@ -2003,6 +2347,14 @@ async fn finalize_streaming_operation(
         // inline stdout/stderr above was truncated.
         "output_file": spill::operation_spill_path(op_id).to_string_lossy(),
     });
+    if let Some(changed) = changed_during_run {
+        final_output["changed_during_run"] = changed;
+    }
+    // The process tree is gone and the drift probe has looked: hand the
+    // workspace on *before* anyone can observe this operation as finished, so
+    // a caller woken by the terminal transition never finds it still held
+    // (SPEC R2.7.1).
+    drop(lease.take());
 
     let status = if success {
         OperationStatus::Completed
@@ -2299,6 +2651,90 @@ mod tests {
         );
         let adapter = Adapter::new(monitor, shell_pool, sandbox).unwrap();
         assert!(adapter.retry_config().is_none());
+    }
+
+    fn adapter_with_mode(mode: crate::sandbox::SandboxMode) -> (Adapter, tempfile::TempDir) {
+        let monitor = Arc::new(OperationMonitor::new(
+            crate::operation_monitor::MonitorConfig::with_timeout(Duration::from_secs(30)),
+        ));
+        let shell_pool = Arc::new(ShellPoolManager::new(
+            crate::shell_pool::ShellPoolConfig::default(),
+        ));
+        let td = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(
+            crate::sandbox::Sandbox::new(vec![td.path().to_path_buf()], mode, false, false, false)
+                .unwrap(),
+        );
+        (Adapter::new(monitor, shell_pool, sandbox).unwrap(), td)
+    }
+
+    fn shell_args(command: &str) -> Map<String, serde_json::Value> {
+        let mut args = Map::new();
+        args.insert("command".into(), json!(command));
+        args.insert("c_flag".into(), json!(true));
+        args
+    }
+
+    /// SPEC R2.7.4: a reading command line is read-only only where the kernel
+    /// can enforce it; without enforcement everything is exclusive.
+    #[test]
+    fn a_reading_command_is_read_only_only_where_the_kernel_enforces_it() {
+        use workspace_queue::Lane;
+        let (test_mode, _t) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        assert_eq!(
+            test_mode.resolve_lane(Some(&shell_args("git status")), None),
+            Lane::Exclusive,
+            "no kernel enforcement, no read-only lane"
+        );
+
+        let (strict, _s) = adapter_with_mode(crate::sandbox::SandboxMode::Strict);
+        let expected = if strict.sandbox().can_enforce_read_only() {
+            Lane::ReadOnly
+        } else {
+            Lane::Exclusive
+        };
+        assert_eq!(
+            strict.resolve_lane(Some(&shell_args("git status")), None),
+            expected
+        );
+        assert_eq!(
+            strict.resolve_lane(Some(&shell_args("cargo build")), None),
+            Lane::Exclusive
+        );
+    }
+
+    /// SPEC R2.7.4: an MTDF declaration wins over the classifier, and a
+    /// non-shell tool is exclusive unless it declares otherwise.
+    #[test]
+    fn a_declared_lane_wins_and_undeclared_tools_are_exclusive() {
+        use workspace_queue::Lane;
+        let (adapter, _t) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let mut sc = crate::mcp_service::AhmaMcpService::build_shell_subcommand_config(
+            None,
+            &ExecutionMode::AsyncResultPush,
+        );
+        sc.concurrency = Some(Lane::Service);
+        assert_eq!(
+            adapter.resolve_lane(Some(&shell_args("npm run dev")), Some(&sc)),
+            Lane::Service
+        );
+        let mut not_shell = Map::new();
+        not_shell.insert("command".into(), json!("git status"));
+        assert_eq!(
+            adapter.resolve_lane(Some(&not_shell), None),
+            Lane::Exclusive,
+            "only a shell command line (c_flag) is classified"
+        );
+    }
+
+    #[test]
+    fn the_queued_message_names_who_is_ahead() {
+        let one = workspace_queue::HolderInfo::new("op_1", "cargo nextest run");
+        let two = workspace_queue::HolderInfo::new("op_2", "cargo build");
+        assert!(queued_message(&[]).contains("another ahma process"));
+        assert!(queued_message(std::slice::from_ref(&one)).contains("op_1"));
+        let both = queued_message(&[one, two]);
+        assert!(both.contains("op_1") && both.contains("1 more"), "{both}");
     }
 
     #[test]

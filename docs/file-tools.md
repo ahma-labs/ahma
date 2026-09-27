@@ -38,6 +38,11 @@ current harnesses converged on, applied to every write path.
 - **Output is bounded.** `read_file` returns up to 2000 numbered lines and says
   how to continue; `grep_search` caps at 200 matches; `fetch_webpage` at 50,000
   characters. Each says when it cut something and how to narrow.
+- **Edits wait for writers.** While a command that may write the workspace is
+  running (a build, a test run), an edit to that workspace is refused with the
+  command's id — `await` or `cancel` it first, so its result describes one
+  version of the code (`tools.edit_guard`, default on; see
+  [workspace-queue.md](workspace-queue.md)).
 - **The same guard as every write.** All of it goes through ahma's write guard
   (refusing git hooks, `.ahma/`, venv interpreters; disclosing editor/harness
   auto-run config) and the execution audit log — see
@@ -81,3 +86,4 @@ Models trained on other harnesses can use those names: `Read`, `Write`, `Edit`,
 - [SPEC.md](../SPEC.md) R26 (the file-tool contract), R1.5 (built-in tool names)
 - [security-sandbox.md](security-sandbox.md) — the scope and write guard these run under
 - [tui.md](tui.md) — ahma's own agent, the main user of these tools
+- [workspace-queue.md](workspace-queue.md) — the edit guard and the write queue it waits on

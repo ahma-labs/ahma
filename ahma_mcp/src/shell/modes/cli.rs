@@ -167,6 +167,7 @@ fn sequence_subcommand_config(config: &crate::config::ToolConfig) -> SubcommandC
         availability_check: None,
         install_instructions: None,
         mutates: config.mutates,
+        concurrency: config.concurrency,
     }
 }
 

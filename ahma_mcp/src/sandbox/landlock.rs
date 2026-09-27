@@ -13,6 +13,29 @@ fn build_landlock_ruleset(
     package_cache_write: bool,
     connect_tcp_port: Option<u16>,
 ) -> Result<landlock::RulesetCreated> {
+    build_landlock_ruleset_with(
+        scopes,
+        read_scopes,
+        no_temp_files,
+        package_cache_write,
+        connect_tcp_port,
+        true,
+    )
+}
+
+/// [`build_landlock_ruleset`] with the scope access chosen: `scopes_writable =
+/// false` grants the workspace scopes (and their git storage) **read and
+/// execute only** — the kernel half of the read-only lane (SPEC R2.7.4).
+/// Everything outside the workspace (system paths, toolchain profiles, temp)
+/// is granted exactly as for an ordinary command.
+fn build_landlock_ruleset_with(
+    scopes: &[PathBuf],
+    read_scopes: &[PathBuf],
+    no_temp_files: bool,
+    package_cache_write: bool,
+    connect_tcp_port: Option<u16>,
+    scopes_writable: bool,
+) -> Result<landlock::RulesetCreated> {
     use anyhow::Context;
     use landlock::{
         ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -70,11 +93,16 @@ fn build_landlock_ruleset(
             all_scopes.push(git_dir);
         }
     }
+    let scope_access = if scopes_writable {
+        access_all
+    } else {
+        access_read
+    };
     for scope in &all_scopes {
         ruleset = ruleset
             .add_rule(PathBeneath::new(
                 PathFd::new(scope).context("Failed to open sandbox scope for Landlock")?,
-                access_all,
+                scope_access,
             ))
             .context("Failed to add Landlock rule for sandbox scope")?;
     }
@@ -206,6 +234,27 @@ pub fn landlock_ruleset_fd(
     Ok(ruleset.into())
 }
 
+/// Like [`landlock_ruleset_fd`], but the workspace scopes are read-only: the
+/// ruleset for a read-lane command (SPEC R2.7.4). Package-cache writes are
+/// never granted here.
+#[cfg(target_os = "linux")]
+pub fn landlock_read_only_ruleset_fd(
+    scopes: &[PathBuf],
+    read_scopes: &[PathBuf],
+    no_temp_files: bool,
+    connect_tcp_port: Option<u16>,
+) -> Result<Option<std::os::fd::OwnedFd>> {
+    let ruleset = build_landlock_ruleset_with(
+        scopes,
+        read_scopes,
+        no_temp_files,
+        false,
+        connect_tcp_port,
+        false,
+    )?;
+    Ok(ruleset.into())
+}
+
 /// Apply a previously built Landlock ruleset fd to the current (child) process.
 ///
 /// Intended to be called from a `pre_exec` closure, after `fork` and before
@@ -240,6 +289,18 @@ fn add_landlock_system_rules(
             && let Ok(fd) = PathFd::new(path_obj)
         {
             let _ = ruleset.add_rule(PathBeneath::new(fd, access_read_execute));
+        }
+    }
+    // The data sinks every Unix program may write, as the Seatbelt profile
+    // already allows on macOS. `/dev` itself is read-only above, which made
+    // every `git` command die at startup (`could not open '/dev/null' for
+    // reading and writing`: git opens it O_RDWR to sanitize its std fds).
+    for sink in ["/dev/null", "/dev/zero"] {
+        if let Ok(fd) = PathFd::new(sink) {
+            let _ = ruleset.add_rule(PathBeneath::new(
+                fd,
+                AccessFs::ReadFile | AccessFs::WriteFile,
+            ));
         }
     }
     Ok(())

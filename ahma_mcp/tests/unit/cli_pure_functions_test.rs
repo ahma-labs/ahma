@@ -73,6 +73,7 @@ fn create_subcommand(name: &str) -> SubcommandConfig {
     SubcommandConfig {
         extra: Default::default(),
         mutates: None,
+        concurrency: None,
         name: name.to_string(),
         description: format!("{} subcommand", name),
         timeout_seconds: None,
@@ -94,6 +95,7 @@ fn create_subcommand_with_nested(name: &str, nested: Vec<SubcommandConfig>) -> S
     SubcommandConfig {
         extra: Default::default(),
         mutates: None,
+        concurrency: None,
         name: name.to_string(),
         description: format!("{} subcommand", name),
         timeout_seconds: None,

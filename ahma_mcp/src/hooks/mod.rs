@@ -12,6 +12,7 @@ use std::{
 use tempfile::NamedTempFile;
 
 mod consent;
+pub mod edit_guard;
 pub use consent::HookConsentStore;
 
 pub mod post_exec;
@@ -138,6 +139,9 @@ pub enum HooksCommand {
     /// Diagnose why ahma cannot sandbox (binary path/version, kernel backend) and
     /// print repair guidance, plus the current consent state.
     Doctor,
+    /// Opt-in Claude Code PreToolUse hook for the native Edit, Write, MultiEdit and NotebookEdit tools. Those edits never pass through ahma, so its workspace write queue cannot order them; this hook refuses one (with a reason naming the command) while an ahma command that may read or write the same workspace is still running, so a test run never silently mixes old and new code. It never waits and never approves: when the workspace is free it prints nothing and the editor decides as usual. Install it by hand; see docs/workspace-queue.md.
+    #[command(name = "edit-guard")]
+    EditGuard,
 }
 
 #[derive(Args, Debug)]
@@ -524,6 +528,7 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
         HooksCommand::ApproveUnsandboxed => run_approve_unsandboxed(),
         HooksCommand::Revoke => run_revoke_consent(),
         HooksCommand::Doctor => run_doctor(),
+        HooksCommand::EditGuard => edit_guard::run(cfg.edit_guard),
     }
 }
 
@@ -1487,12 +1492,21 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         None,
     );
 
-    let adapter = std::sync::Arc::new(crate::adapter::Adapter::new_with_registry(
-        operation_monitor,
-        shell_pool_manager,
-        sandbox,
-        mutex_registry,
-    )?);
+    // The hooked command joins the same workspace write queue as every MCP
+    // operation (SPEC R2.7): a harness's own Bash tool, rewritten through this
+    // hook, waits its turn behind an ahma `cargo nextest run` instead of
+    // racing it.
+    let adapter = std::sync::Arc::new(
+        crate::adapter::Adapter::new_with_registry(
+            operation_monitor,
+            shell_pool_manager,
+            sandbox,
+            mutex_registry,
+        )?
+        .with_workspace_queue(crate::adapter::workspace_queue::WorkspaceQueue::new(
+            cfg.workspace_queue,
+        )),
+    );
 
     let mut adapter_args = serde_json::Map::new();
     adapter_args.insert(

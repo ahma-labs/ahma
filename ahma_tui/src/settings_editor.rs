@@ -1040,17 +1040,17 @@ mod tests {
     #[test]
     fn reset_to_default() {
         let mut editor = SettingsEditor::default();
-        editor.settings.tools.execution_mode = ExecutionPolicy::Sync;
-        editor.item_down(); // Tools → execution_mode (default sync)
+        editor.item_down(); // Tools → execution_mode (default async)
         editor.toggle_current();
         assert_eq!(
             editor.settings().tools.execution_mode,
-            ExecutionPolicy::Async
+            ExecutionPolicy::Sync
         );
         editor.reset_current();
         assert_eq!(
             editor.settings().tools.execution_mode,
-            ExecutionPolicy::Sync
+            ExecutionPolicy::Async,
+            "reset returns to the default"
         );
     }
 
@@ -1097,20 +1097,20 @@ mod tests {
 
         let mut editor = SettingsEditor::default();
         editor.item_down(); // Tools → execution_mode
-        editor.toggle_current(); // sync → async
+        editor.toggle_current(); // async → sync
 
         editor.settings.save_to(&path).unwrap();
 
         // The user's choice is persisted as a documented, active line.
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            text.contains("\nexecution_mode = \"async\"\n"),
+            text.contains("\nexecution_mode = \"sync\"\n"),
             "saved file carries the choice:\n{text}"
         );
         let reloaded = AhmaSettings::load_from(&path);
         assert_eq!(
             reloaded.tools.execution_mode,
-            ExecutionPolicy::Async,
+            ExecutionPolicy::Sync,
             "the edit round-trips through disk"
         );
     }
@@ -1496,18 +1496,18 @@ mod tests {
         editor.item_down(); // index 1 = execution_mode (sync|async)
         assert_eq!(
             editor.settings().tools.execution_mode,
-            ExecutionPolicy::Sync
+            ExecutionPolicy::Async
         );
         editor.toggle_current();
         assert_eq!(
             editor.settings().tools.execution_mode,
-            ExecutionPolicy::Async
+            ExecutionPolicy::Sync
         );
         assert!(editor.dirty);
         editor.toggle_current();
         assert_eq!(
             editor.settings().tools.execution_mode,
-            ExecutionPolicy::Sync,
+            ExecutionPolicy::Async,
             "Space cycles back"
         );
     }
@@ -1776,7 +1776,7 @@ mod tests {
         editor.save();
 
         let reloaded = AhmaSettings::load();
-        assert_eq!(reloaded.tools.execution_mode, ExecutionPolicy::Async);
+        assert_eq!(reloaded.tools.execution_mode, ExecutionPolicy::Sync);
         assert!(
             reloaded
                 .permissions
@@ -1798,8 +1798,8 @@ mod tests {
         }
         let mut editor = SettingsEditor::default();
         // Mutate a value, then persist via the no-arg save() (uses settings_path()).
-        editor.item_down(); // Tools → execution_mode (default sync)
-        editor.toggle_current(); // → async
+        editor.item_down(); // Tools → execution_mode (default async)
+        editor.toggle_current(); // → sync
         editor.dirty = true;
         editor.save();
 
@@ -1814,8 +1814,8 @@ mod tests {
         let reloaded = AhmaSettings::load();
         assert_eq!(
             reloaded.tools.execution_mode,
-            ExecutionPolicy::Async,
-            "switching to async in the TUI persists to ~/.ahma/settings.toml"
+            ExecutionPolicy::Sync,
+            "switching to sync in the TUI persists to ~/.ahma/settings.toml"
         );
 
         unsafe {
