@@ -552,9 +552,10 @@ network I/O, a real platform binary, or a refactor (explain which, and why).
 
 ### Build economics: fan-out writes, the orchestrator verifies once
 
-The single most important rule for parallel fan-out: **subagents WRITE, they do not BUILD.**
-Each subagent reads source and returns test code; the orchestrator compiles and runs the suite
-**exactly once**, after consolidating every subagent's output.
+The single most important rule for parallel fan-out: **subagents PROPOSE, they do not edit
+or BUILD.** Each subagent reads source and returns test code in its report; the orchestrator —
+the only writer (AGENTS.md *Working Model*) — applies it, then compiles and runs the suite
+**exactly once**.
 
 Why this matters: N subagents each running `cargo` means **N cold builds of the entire
 dependency graph in parallel** — CPU/disk saturation, and on macOS N× the
@@ -565,11 +566,10 @@ does not verify better, and once.
 
 Corollaries:
 
-- **Do NOT give coverage subagents `isolation: worktree`.** Worktree isolation exists for
-  agents that mutate the *same* files concurrently. Coverage agents touch different files, so
-  they share one branch and the orchestrator merges their `#[cfg(test)]` blocks. A worktree per
-  agent only buys a redundant cold build and its own contaminated `target/`. Reserve worktrees
-  for genuinely conflicting parallel edits.
+- **Do NOT give coverage subagents `isolation: worktree`.** They do not edit files at all, so
+  there is nothing to isolate; the orchestrator applies their `#[cfg(test)]` blocks on its one
+  feature branch. A worktree per agent only buys a redundant cold build and its own
+  contaminated `target/`.
 - **If parallel builds are ever truly unavoidable, lean on sccache — never a shared
   `CARGO_TARGET_DIR`.** sccache (which ahma now supports inside the sandbox; set
   `sandbox.trust_build_caches = true`) shares *compiled artifacts* content-addressably and
@@ -577,9 +577,8 @@ Corollaries:
   shared target dir is the wrong tool: concurrent writers to one `target/` reintroduce the very
   provenance contamination above.
 
-This generalizes beyond coverage: **any** fan-out of file-writing subagents should separate the
-write phase (parallel, no builds) from a single consolidated verify phase. Isolation and
-per-agent builds are costs to justify, not defaults.
+This generalizes beyond coverage: **any** fan-out separates the propose phase (parallel,
+read-only, no builds) from a single apply-and-verify phase done by the orchestrator.
 
 ### Parallel subagent workflow (one Agent per file)
 
@@ -634,10 +633,11 @@ yourself. The agent fan-out IS the work.
    Total the "lines uncovered" column. That is the impact of this PR.
 
 3. **Fan out subagents.** One `Agent` call per file, all in the same response (parallel).
-   Each agent **writes** tests and returns the test code + summary — it does **not** build or
-   run them, and is **not** given `isolation: worktree` (see *Build economics* above).
+   Each agent **drafts** tests and returns the test code + summary in its report — it does
+   **not** edit files, build or run anything, and is **not** given `isolation: worktree` (see
+   *Build economics* above).
 
-4. **Consolidate.** Apply all subagent edits to your branch. Merge any overlapping `#[cfg(test)]`
+4. **Consolidate.** Apply every subagent's proposed tests to your branch yourself. Merge any overlapping `#[cfg(test)]`
    blocks. Resolve any naming conflicts between test functions.
 
 5. **Verify the full batch — the single build for the whole fan-out:**
@@ -676,9 +676,9 @@ yourself. The agent fan-out IS the work.
   pure `println!` is not the same as a file at 2% with 500 lines of branching logic. Read first.
 - **Skipping the HTML per-file page.** The compact summary gives % and line counts. The HTML gives
   you the exact red lines. You need both: the summary to pick targets, the HTML to close the holes.
-- **Letting subagents build/run cargo, or giving them `isolation: worktree`.** This is the most
-  expensive anti-pattern: N agents each cold-building the dependency graph saturates the machine
-  and multiplies macOS provenance contamination. Subagents write; the orchestrator builds once.
+- **Letting subagents edit files, build/run cargo, or giving them `isolation: worktree`.** N
+  agents each cold-building the dependency graph saturates the machine and multiplies macOS
+  provenance contamination. Subagents propose; the orchestrator applies and builds once.
   See *Build economics* above.
 
 ---

@@ -90,10 +90,7 @@ impl AhmaMcpService {
                     }
                 )
             } else {
-                format!(
-                    "FAIL Operation '{}' not found. It may have already completed or never existed.",
-                    id
-                )
+                format!("FAIL {}", common::unknown_operation_message(&id))
             }
         };
 

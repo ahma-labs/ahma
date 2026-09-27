@@ -875,8 +875,9 @@ mod tests {
         assert!(id2.starts_with("op_"));
         let parts1: Vec<&str> = id1.split('_').collect();
         let parts2: Vec<&str> = id2.split('_').collect();
-        let n1: u64 = parts1[1].parse().unwrap();
-        let n2: u64 = parts2[1].parse().unwrap();
+        // op_<generation>_<n>_<details>
+        let n1: u64 = parts1[2].parse().unwrap();
+        let n2: u64 = parts2[2].parse().unwrap();
         assert!(n2 > n1);
     }
 

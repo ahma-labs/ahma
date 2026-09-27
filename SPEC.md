@@ -1479,6 +1479,38 @@ The IDE-facing `ahma serve stdio` **frontend** process (which proxies stdin/stdo
 
 These three mechanisms together bound how long any abandoned `ahma serve stdio` can live; none of them affect a healthy, actively-used session.
 
+#### R-LIFECYCLE.3: The Frontend Outlives Its Backend
+
+Conversely, a frontend whose client is still attached MUST NOT exit because the per-user
+process behind it went away — it exited on idle, crashed, was killed, or handed over to a
+newer version. Those are the only three exits above; a lost backend is not one of them.
+Exiting used to leave the editor showing ahma as dead until the user reconnected by hand,
+although a fresh backend was one respawn away.
+
+1. Once a handshake has been observed, a closed or unreachable backend puts the frontend in a
+   *disconnected* state rather than ending it. Each request that arrives while disconnected
+   first runs a reconnect burst (respawning the backend when its endpoint is gone, and
+   replaying the cached handshake); if the burst succeeds the request is forwarded, otherwise
+   it is answered with a JSON-RPC error saying ahma is restarting and to retry.
+2. The outage is disclosed once, as `reconnect_failed` (R8.8.3), and its end as `reconnected`.
+3. If the backend cannot be reached or started at all when the frontend starts (for example a
+   host sandbox forbids the detached spawn), the frontend serves the session **in-process**
+   instead, and says so loudly (R7): ahma works, only unshared.
+
+#### R-LIFECYCLE.4: Operation Ids Survive Their Process Honestly
+
+Operation ids are counters, and counters restart with the process that issues them.
+
+1. Every id carries its process's **generation**: `op_<generation>_<n>[_<details>]`, where
+   `<generation>` is four random lowercase letters minted once per process. Without it,
+   `op_3_cargo_build` issued after a restart or update could name a *different* operation
+   than the one an agent is still awaiting, and `await` would return that one's result.
+2. `await`, `status` and `cancel` on an id the process does not know say what happened to it,
+   derived from the tag: another generation means ahma restarted or was updated since (or the
+   id belongs to another session), so the work most likely finished and the agent should check
+   its effect; the current generation means it was evicted from the bounded history; an id
+   that is not an operation id is called that.
+
 ### R-DAEMON: The Single Per-User Daemon
 
 > **Why one daemon.** With a separate bridge and hub, each with its own rendezvous and
@@ -1658,6 +1690,7 @@ These three mechanisms together bound how long any abandoned `ahma serve stdio` 
 - **R-ISO.2 (never steal a live socket).** A Unix-socket listener MUST NOT unlink an existing socket file without first probe-connecting it: a successful connection means a live server owns the path and binding MUST fail loudly (naming the conflict and the `--socket-path` remedy); only a refused/absent connection marks the file stale and safe to remove. (The daemon hub's bind-is-the-mutex protocol already satisfies this; the HTTP bridge's Unix listener must too.)
 - **R-ISO.3 (remove only what you own).** On shutdown a server MUST remove its socket file only if the path still refers to the socket it bound (device+inode match). If another process has since replaced the path, deleting it would orphan *that* server's live socket.
 - **R-ISO.4 (regression tests).** Unit tests MUST pin: harness detection via both variables; refusal to bind over a live socket; stale-socket cleanup; and identity-checked shutdown removal.
+- **R-ISO.5 (test-launched servers die with their launcher).** An operator-started `ahma serve http|unix` outlives whoever launched it, by design — except when a test harness launched it (R-ISO.1 detection). Then it arms the parent-death watchdog, so a test run that is killed (a nextest timeout, Ctrl-C) cannot leave its servers running for good. A test's `Drop` guard never runs on SIGKILL; this is the backstop. Observed: an `ahma --sync … serve http` from an `ahma_http_bridge` test still running two days after its run.
 
 ### R-SIGN: Binary Code Signing — in-progress (macOS runtime stability; Windows/Linux distribution-only)
 

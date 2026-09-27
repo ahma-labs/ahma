@@ -866,7 +866,19 @@ fn log_sandbox_mode(no_sandbox: bool, deferred_host: Option<sandbox::HostSandbox
     );
 }
 
+/// An operator-started bridge outlives whoever launched it, by design — unless
+/// a test launched it: then it must die with the test, or a killed test run
+/// leaves it running for good (SPEC R-ISO.5).
+fn arm_watchdog_if_test_launched() {
+    if ahma_common::test_isolation::spawned_under_test_harness() {
+        crate::utils::parent_watchdog::spawn_parent_death_watchdog();
+    }
+}
+
 async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
+    if !matches!(serve_args.transport, Some(ServeTransport::Stdio(_))) {
+        arm_watchdog_if_test_launched();
+    }
     match serve_args.transport {
         Some(ServeTransport::Stdio(stdio_args)) => {
             let mut cfg = cfg;

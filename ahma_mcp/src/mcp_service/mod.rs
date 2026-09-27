@@ -3063,7 +3063,7 @@ mod tests {
         let service = make_service().await;
         let params = call_tool_params("await", json!({"id": "op_missing"}));
         let result = service.handle_await(params).await.expect("await result");
-        assert!(first_text(&result).contains("Operation op_missing not found"));
+        assert!(first_text(&result).contains("Operation 'op_missing' not found"));
     }
 
     #[tokio::test]

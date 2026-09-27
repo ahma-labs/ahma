@@ -829,7 +829,18 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // build a complete service it never served, and register it, which is why a
     // TUI showed a phantom instance that could not run anything.
     if !is_test {
-        return run_as_frontend(&config, socket_path_opt, http_url_opt).await;
+        crate::utils::parent_watchdog::spawn_parent_death_watchdog();
+        match ensure_backend(&config, socket_path_opt, http_url_opt).await {
+            Ok(()) => return run_as_frontend(&config, socket_path_opt, http_url_opt).await,
+            // SPEC R-LIFECYCLE.3 (item 3): no shared backend (a host sandbox that
+            // forbids the detached spawn, an unwritable runtime dir) must not
+            // mean no ahma. Serve this session in-process, and say so (R7).
+            Err(e) => tracing::error!(
+                "ahma could not reach or start its shared background process ({e:#}); \
+                 serving this session in-process instead. It works, but is not shared \
+                 with other editor windows or the TUI."
+            ),
+        }
     }
 
     // Redirect stdout to stderr to prevent protocol stream corruption by standard prints
@@ -1001,24 +1012,20 @@ async fn serve_stdio_until_shutdown(
     Ok(())
 }
 
-/// Run this process as the IDE-facing frontend: it was spawned by an editor/agent
-/// over a stdin/stdout pipe and proxies to the detached background bridge.
+/// Find or start the shared background process this frontend proxies to.
 ///
-/// Arms the parent-death watchdog so we exit if that IDE dies without cleanly
-/// closing our stdin (uncaught kill, inherited pipe fds, or a hang before the
-/// proxy loop begins reading). This is the backstop that prevents orphaned
-/// `ahma serve stdio` processes from accumulating across IDE sessions. The
-/// detached bridge/daemon are deliberately NOT armed (they outlive their
-/// spawner by design and self-terminate via idle-timeout).
-async fn run_as_frontend(
+/// The caller has already armed the parent-death watchdog, so we exit if the
+/// IDE dies without cleanly closing our stdin (uncaught kill, inherited pipe
+/// fds, or a hang before the proxy loop begins reading) — the backstop that
+/// prevents orphaned `ahma serve stdio` processes from accumulating across IDE
+/// sessions. The detached background process is deliberately NOT armed (it
+/// outlives its spawner by design and self-terminates on idle).
+async fn ensure_backend(
     config: &AppConfig,
     socket_path_opt: Option<&str>,
     http_url_opt: Option<&str>,
 ) -> Result<()> {
     use crate::shell::modes::daemon_client;
-
-    crate::utils::parent_watchdog::spawn_parent_death_watchdog();
-
     let outcome =
         daemon_client::ensure_daemon(socket_path_opt, http_url_opt, config.idle_timeout_secs)
             .await?;
@@ -1026,6 +1033,18 @@ async fn run_as_frontend(
         // R7: never let ahma's own state be something the user has to infer.
         tracing::warn!("{notice}");
     }
+    Ok(())
+}
+
+/// Run this process as the IDE-facing frontend: it was spawned by an editor/agent
+/// over a stdin/stdout pipe and proxies to the shared background process, which
+/// [`ensure_backend`] has found or started.
+async fn run_as_frontend(
+    config: &AppConfig,
+    socket_path_opt: Option<&str>,
+    http_url_opt: Option<&str>,
+) -> Result<()> {
+    use crate::shell::modes::daemon_client;
 
     // Respawn hook: if the daemon later dies or its socket vanishes (killed
     // out-of-band, or it exited on idle between our calls), the proxy's

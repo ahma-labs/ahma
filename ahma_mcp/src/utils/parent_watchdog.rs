@@ -25,10 +25,11 @@
 //! (or another subreaper) the instant its parent dies, so a changed ppid is an
 //! unambiguous "my parent is gone" signal. When detected, the process exits.
 //!
-//! IMPORTANT: install this **only** on the IDE-facing frontend process. The
-//! intentionally-detached background bridge and hub daemon are reparented by
-//! design (they outlive their spawner and self-terminate via idle-timeout);
-//! installing the watchdog there would kill them immediately.
+//! IMPORTANT: install this **only** on the IDE-facing frontend process, and on
+//! bridges a test harness launched (SPEC R-ISO.5). The intentionally-detached
+//! background process is reparented by design (it outlives its spawner and
+//! self-terminates on idle); installing the watchdog there would kill it
+//! immediately.
 
 use std::time::Duration;
 

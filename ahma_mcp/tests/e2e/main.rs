@@ -52,6 +52,7 @@ mod sandbox_lifecycle_notification_test;
 mod sandbox_security_red_team_test;
 mod shell_list_tools_integration_test;
 mod stdio_handshake_test;
+mod test_launched_server_orphan_test;
 mod test_utils_coverage_test;
 mod tools_dir_auto_detection_test;
 mod transport_patch_extended_test;

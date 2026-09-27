@@ -31,8 +31,9 @@ pub enum SessionEventKind {
     /// The stdio proxy rebuilt the bridge connection and replayed the cached
     /// handshake; the session resumed transparently (#479).
     Reconnected,
-    /// Reconnection exhausted its attempts; the proxy is about to exit and the
-    /// pipe will go dead. Emitted so the death is at least explained.
+    /// A reconnect burst failed: the bridge is unreachable. The proxy stays
+    /// attached, answers requests with an error and retries on the next one;
+    /// emitted once per outage (SPEC R8.8.3).
     ReconnectFailed,
     /// A sandbox scope grant is awaiting a human decision at some surface.
     GrantPending,
@@ -55,7 +56,7 @@ impl SessionEventKind {
     }
 
     /// The MCP logging level used for the `notifications/message` mirror.
-    /// `reconnect_failed` is terminal (the pipe dies next) → `error`; pending
+    /// `reconnect_failed` means ahma is unusable until it recovers → `error`; pending
     /// grants and transparent reconnects deserve attention → `warning`; plain
     /// health telemetry is `info`.
     pub fn mirror_level(self) -> &'static str {

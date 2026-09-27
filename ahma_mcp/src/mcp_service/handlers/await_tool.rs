@@ -623,7 +623,7 @@ impl AhmaMcpService {
             .check_completion_history_pub(op_id)
             .await
         else {
-            return common::text_result(format!("Operation {} not found", op_id));
+            return common::text_result(common::unknown_operation_message(op_id));
         };
         self.delivered_by_await(std::slice::from_ref(&completed_op));
         let mut contents = vec![ContentBlock::text(format!(
