@@ -439,6 +439,9 @@ pub struct BridgeHealth {
     /// The hub is handing over to a newer build (SPEC R-HUB.5): it still
     /// serves, and its successor is already waiting.
     pub draining: bool,
+    /// The hub's binary and the file it started from, when it says (SPEC
+    /// R-HUB.5). `None` from a hub older than the field.
+    pub exe: Option<ahma_common::exe_identity::ExeIdentity>,
 }
 
 fn parse_health_body(body: &str) -> Option<BridgeHealth> {
@@ -455,6 +458,9 @@ fn parse_health_body(body: &str) -> Option<BridgeHealth> {
             .get("draining")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
+        exe: parsed
+            .get("exe")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
     })
 }
 
@@ -968,6 +974,23 @@ mod tests {
         assert!(draining.draining);
         let older = parse_health_body(r#"{"status":"OK","version":"0.21.7+abc"}"#).expect("parses");
         assert!(!older.draining);
+        assert!(
+            older.exe.is_none(),
+            "an older hub does not say which binary"
+        );
+    }
+
+    /// A hub says which binary it runs, so a client can tell a strictly
+    /// newer build from merely a different one (SPEC R-HUB.5).
+    #[test]
+    fn health_says_which_binary_the_hub_runs() {
+        let health = parse_health_body(
+            r#"{"status":"OK","version":"0.21.8+abc","exe":{"version":"0.21.8","build_id":"abc","path":"/usr/local/bin/ahma","size":7,"mtime_ms":42}}"#,
+        )
+        .expect("parses");
+        let exe = health.exe.expect("identity");
+        assert_eq!(exe.path, std::path::PathBuf::from("/usr/local/bin/ahma"));
+        assert_eq!(exe.mtime_ms, 42);
     }
     use parking_lot::Mutex;
     use std::sync::LazyLock;

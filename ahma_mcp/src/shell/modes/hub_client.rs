@@ -20,11 +20,14 @@
 //! says so loudly rather than pretending the skew is not there (SPEC R7's
 //! rule that ahma never hides its own state).
 //!
-//! An older client just proxies. The hub runs every session's worker from
+//! Only a *strictly* newer build drains ([`skew_action_by_identity`]), so two
+//! installed copies of one version never take turns replacing each other's
+//! hub. An older client just proxies. The hub runs every session's worker from
 //! its own binary, so a stale client — an editor configured with an old
 //! install — is served by the newer build all the same. It used to re-execute
 //! itself instead, which bought nothing but a flicker and a loop guard.
 
+use ahma_common::exe_identity::ExeIdentity;
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -88,6 +91,21 @@ pub fn skew_action(client_semver: &str, client_build: &str, hub_version: &str) -
     }
 }
 
+/// Decide what to do about the running hub when both sides know which binary
+/// they are (SPEC R-HUB.5).
+///
+/// Only a **strictly newer** build drains: a newer version, or the same
+/// version built later. "Different" was enough for [`skew_action`], which has
+/// only version strings to go on, and that made two installed copies of one
+/// version take turns replacing each other's hub.
+pub fn skew_action_by_identity(ours: &ExeIdentity, hub: &ExeIdentity) -> SkewAction {
+    if ours.is_strictly_newer_than(hub) {
+        SkewAction::Drain
+    } else {
+        SkewAction::Proxy
+    }
+}
+
 /// Ensure a hub is serving at `socket_path`, starting one if there is none,
 /// and reconcile a version skew.
 pub async fn ensure_hub(
@@ -114,8 +132,14 @@ pub async fn ensure_hub(
         return Ok(EnsureOutcome::Spawned);
     };
     let hub_version = health.version;
+    // Both identities when both are known; a hub older than the field has
+    // only its version string to compare.
+    let action = match (ExeIdentity::this_process(), health.exe.as_ref()) {
+        (Some(ours), Some(hub)) => skew_action_by_identity(ours, hub),
+        _ => skew_action(client_semver, client_build, &hub_version),
+    };
 
-    match skew_action(client_semver, client_build, &hub_version) {
+    match action {
         SkewAction::Proxy => Ok(EnsureOutcome::Ready),
         SkewAction::Drain if health.draining => {
             // Already handing over, with its successor waiting on the lock:
@@ -335,6 +359,47 @@ mod tests {
     fn an_older_build_proxies_to_the_newer_hub() {
         assert_eq!(
             skew_action("0.20.1", OUR_BUILD, "0.20.2+newer"),
+            SkewAction::Proxy
+        );
+    }
+
+    fn identity(version: &str, build_id: &str, mtime_ms: u64) -> ExeIdentity {
+        ExeIdentity {
+            version: version.into(),
+            build_id: build_id.into(),
+            path: std::path::PathBuf::from("ahma"),
+            size: 1,
+            mtime_ms,
+        }
+    }
+
+    /// Only a strictly newer build drains (SPEC R-HUB.5). Two installed
+    /// copies of one version — `target/release/ahma` and `~/.cargo/bin/ahma`
+    /// — used to take turns replacing each other's hub, because "a different
+    /// build" was enough.
+    #[test]
+    fn only_a_strictly_newer_build_drains_a_hub_that_says_which_it_runs() {
+        let hub = identity("0.21.8", "abc", 1_000);
+        assert_eq!(
+            skew_action_by_identity(&identity("0.21.8", "abc", 1_000), &hub),
+            SkewAction::Proxy
+        );
+        assert_eq!(
+            skew_action_by_identity(&identity("0.21.8", "def", 2_000), &hub),
+            SkewAction::Drain,
+            "a later rebuild of the same version replaces it"
+        );
+        assert_eq!(
+            skew_action_by_identity(&identity("0.21.8", "def", 500), &hub),
+            SkewAction::Proxy,
+            "an older copy elsewhere on the PATH does not"
+        );
+        assert_eq!(
+            skew_action_by_identity(&identity("0.21.9", "old", 1), &hub),
+            SkewAction::Drain
+        );
+        assert_eq!(
+            skew_action_by_identity(&identity("0.21.7", "new", 9_000), &hub),
             SkewAction::Proxy
         );
     }

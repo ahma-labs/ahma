@@ -315,3 +315,88 @@ async fn a_draining_hub_hands_over_to_its_successor() {
         "and the successor goes when asked"
     );
 }
+
+/// Put a copy of `binary` at `dest`, with a modification time `ahead` of now,
+/// the way an install writes a new file over the path.
+fn install_copy(binary: &Path, dest: &Path, ahead: std::time::Duration) {
+    std::fs::copy(binary, dest).expect("copy the ahma binary");
+    // A copy may keep the source's timestamps (macOS clones do): set one
+    // so the file is unmistakably newer, as a real install's would be.
+    std::fs::File::options()
+        .write(true)
+        .open(dest)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now() + ahead))
+        .expect("stamp the installed copy");
+}
+
+/// A hub notices a new install written over its own executable and hands
+/// over to it (SPEC R-HUB.5). Nothing tells it: `cargo install`, brew and
+/// the install scripts just write the file, which is why the hub looks.
+#[tokio::test]
+async fn a_hub_hands_over_when_its_executable_is_replaced() {
+    let binary = build_binary_cached("ahma_bin", "ahma");
+    let r = Rendezvous::new();
+    let installed = r
+        .dir
+        .path()
+        .join(format!("ahma{}", std::env::consts::EXE_SUFFIX));
+    install_copy(&binary, &installed, std::time::Duration::ZERO);
+    let child = spawn_hub(&installed, &r, 30);
+    let started = wait_for(&r.hub, true).await;
+
+    if started {
+        // How an installer replaces a running binary on every OS, Windows
+        // included: move the running file aside, write the new one.
+        let aside = installed.with_extension("old");
+        std::fs::rename(&installed, &aside).expect("move the running binary aside");
+        install_copy(&binary, &installed, std::time::Duration::from_secs(60));
+    }
+
+    let exited = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        let deadline = std::time::Instant::now() + TestTimeouts::get(TimeoutCategory::ProcessSpawn);
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) => std::thread::sleep(TestTimeouts::poll_interval()),
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        false
+    })
+    .await
+    .expect("join");
+
+    let deadline = std::time::Instant::now() + TestTimeouts::get(TimeoutCategory::ProcessSpawn);
+    let mut serving = false;
+    while exited && std::time::Instant::now() < deadline {
+        if matches!(
+            ahma_common::doctor::probe_hub(&r.hub).await,
+            ahma_common::doctor::HubStatus::Running { .. }
+        ) {
+            serving = true;
+            break;
+        }
+        tokio::time::sleep(TestTimeouts::poll_interval()).await;
+    }
+    if let Ok(mut stream) = ahma_common::hub::connect_to_hub_at(&r.hub).await {
+        let _ =
+            ahma_common::hub::send_msg(&mut stream, &ahma_common::hub::ClientMsg::Shutdown).await;
+    }
+
+    assert!(started, "hub must start; it said:\n{}", r.log());
+    assert!(
+        exited,
+        "a hub whose binary was replaced hands over; it said:\n{}",
+        r.log()
+    );
+    assert!(
+        r.log().contains("was replaced by a new install"),
+        "and says why: {}",
+        r.log()
+    );
+    assert!(serving, "the new install serves the socket");
+    assert!(wait_for(&r.hub, false).await, "and goes when asked");
+}

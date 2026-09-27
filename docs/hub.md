@@ -124,8 +124,13 @@ id from before a restart says what happened instead of just "not found"
 
 ## Upgrades
 
-When you install a new ahma while one is running, the new binary asks the old
-hub to **drain**: hand over to the new build without ending anyone's work.
+When you install a new ahma while one is running, the old hub **drains**: it
+hands over to the new build without ending anyone's work. It notices the
+install itself — it checks its own executable every 30 seconds and whenever a
+session starts — and a newer client that connects asks it to as well. Only a
+strictly newer build does that (a newer version, or the same version built
+later), so two installed copies of ahma never take turns replacing each
+other. `/health` says which binary, and which file, the hub is running.
 
 - The old hub **keeps serving** meanwhile, new sessions included — opening
   another editor window during a drain works as usual.

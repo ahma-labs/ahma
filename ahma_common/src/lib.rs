@@ -16,7 +16,7 @@
 //! | Operations | [`event_dispatcher`], [`op_identity`] |
 //! | Per-user hub | [`hub`], [`hub_history`] |
 //! | MCP wire | [`mcp_methods`], [`mcp_protocol`], [`session_event`], [`keepalive`], [`sse`], [`peer_factory`] |
-//! | Process and platform | [`test_isolation`], [`process_guard`], [`timeouts`], [`file_uri`], [`hostname`], [`fs_lock`], [`local_socket`], [`local_tls`], [`digest`] |
+//! | Process and platform | [`exe_identity`], [`test_isolation`], [`process_guard`], [`timeouts`], [`file_uri`], [`hostname`], [`fs_lock`], [`local_socket`], [`local_tls`], [`digest`] |
 //! | Shared definitions | [`prompts`], [`skills`], [`simplify_args`], [`state_machine`], [`doctor`], [`observability`] |
 //!
 //! ## Design Goal: Workspace Consistency
@@ -39,6 +39,7 @@ pub mod digest;
 pub mod doctor;
 pub mod elicitation;
 pub mod event_dispatcher;
+pub mod exe_identity;
 pub mod file_uri;
 pub mod fs_lock;
 pub mod hook_consent;
