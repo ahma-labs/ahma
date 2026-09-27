@@ -51,6 +51,7 @@ serde_json.workspace = true
 tokio = { workspace = true, features = [
     "sync",
     "net",
+    "rt",
     "time",
     "io-util",
     "process",
@@ -62,6 +63,9 @@ tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[target.'cfg(windows)'.dependencies]
+socket2.workspace = true
 
 [[bin]]
 name = "ahma_coverage"
