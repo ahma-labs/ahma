@@ -34,14 +34,28 @@ ahma asks you in the best place available, in this order:
    where the question appears — you're already looking at it, and it arrives with
    the context of whatever you were doing.
 2. **The ahma TUI**, if one is attached: a modal, over whichever view you're in.
-3. **Nowhere left to ask** → the command **fails**, and tells you exactly how to
-   fix it:
+3. **Nowhere left to ask** → the command **fails**, and tells you exactly what to do:
 
    ```
-   ahma's kernel sandbox blocked an out-of-scope write to
-   '/opt/ext/sccache/0/object.o'. To allow it, run
-   `ahma sandbox grant /opt/ext/sccache/0` and re-run the command.
+   Blocked until a human grants it: ahma's kernel sandbox refused an
+   out-of-scope write to '/opt/ext/sccache/0/object.o'.
+   ...the same who / what / minimum / allows / risk body as the prompt...
+   One thing to do (pick a tier), then re-run the command:
+     ahma sandbox grant /opt/ext/sccache/0 --session   # this terminal session only
+     ahma sandbox grant /opt/ext/sccache/0             # until revoked, this workspace
    ```
+
+Wherever the question lands, it carries the same body: **who** is asking (client,
+workspace, session), **what was blocked** (the command, the path the kernel named,
+the evidence line, how many times it has been asked), **what the agent says it
+needs** (its own words, shown as its claim), the **minimum** that would work
+(read-only unless a write was refused), **what a grant allows** every later command
+in that workspace to do, the **risk** (with observed facts, never file contents),
+and the exact settings line an "always" answer writes. In your IDE the choices are
+buttons with those labels, deny first; in the TUI they are keys; in a terminal they
+are the two commands above. A client that cannot show a prompt is told to relay the
+body to you unchanged. Ahma raises at most five such questions per ten minutes per
+session; past that the agent is told to ask you in conversation instead.
 
 That last rung is the important one: ahma never fails *open*. If nobody can be
 asked, the answer is no — and you get a command you can paste rather than a
@@ -61,7 +75,7 @@ A few deliberate details:
 
 | Tier | Lives | Use it when |
 |---|---|---|
-| **once** | This command only. Never written down. | You're not sure yet. |
+| **once** | The next command only. Never written down. | You're not sure yet. |
 | **session** | Until the session that approved it ends (your MCP server, or the terminal you ran `ahma sandbox grant --session` in), at most 12 hours. Never written to the file; terminal hooks and the edit guard honour it too. | A one-off task. |
 | **always** | `~/.ahma/settings.toml`, until you revoke it. | A cache your builds always need. |
 

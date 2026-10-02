@@ -80,10 +80,18 @@ pub fn sandbox_grant_schema() -> Arc<Map<String, Value>> {
         ),
     );
     props.insert(
+        "reason".to_string(),
+        schema::string_property(
+            "One sentence, for the human: what you need this path for and which command was \
+             denied. Shown at the prompt as YOUR claim, next to the kernel's evidence, so write \
+             it for a person deciding in ten seconds. Required.",
+        ),
+    );
+    props.insert(
         "note".to_string(),
         schema::string_property("Optional provenance note recorded alongside the grant."),
     );
-    schema::object_input_schema(props, &["path"])
+    schema::object_input_schema(props, &["path", "reason"])
 }
 
 impl AhmaMcpService {
@@ -105,6 +113,14 @@ impl AhmaMcpService {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let note = common::opt_str(&args, "note");
+        // SPEC R-PERM.3.4: the human sees the agent's own stated reason, labelled
+        // as its claim. A request without one is a request nobody can judge.
+        let reason = common::require_str(
+            &args,
+            "reason",
+            "sandbox_grant requires a `reason`: one sentence saying what you need the path for \
+             and which command was denied, for the human who decides",
+        )?;
 
         let home = ahma_home_dir();
         let scopes = self.adapter.sandbox().scopes().to_vec();
@@ -149,7 +165,12 @@ impl AhmaMcpService {
         // denylisted) and we apply it to the live session here (R5.4.6).
         let raised = self
             .adapter
-            .request_scope_grant(&path, access, Some("sandbox_grant".to_string()))
+            .request_scope_grant_with(
+                &path,
+                access,
+                Some("sandbox_grant".to_string()),
+                Some(&reason),
+            )
             .await;
         let approved = ahma_common::config::AhmaSettings::load_from_result(&settings_file)
             .ok()
@@ -171,7 +192,8 @@ impl AhmaMcpService {
                 &path,
                 access,
                 &settings_file,
-                raised,
+                raised.as_ref(),
+                self.adapter.grant_budget_exhausted(),
             ))),
         }
     }
@@ -304,39 +326,54 @@ fn preview_text(
     )
 }
 
-/// Message when `confirm: true` was routed to the human approval surface and
-/// no grant exists yet. It must make clear the agent did NOT widen the sandbox
-/// and that a human decision is required.
+/// Message when `confirm: true` was routed to the human approval surfaces and
+/// nothing came back yet. Carries the exact body the human sees (SPEC
+/// R-PERM.3.4) so a client that cannot show a prompt relays it unchanged.
 fn agent_requested_text(
     path: &Path,
     access: ScopeAccess,
     settings_file: &Path,
-    raised: bool,
+    raised: Option<&ahma_common::scope_grant::ScopeGrantRequest>,
+    budget_exhausted: bool,
 ) -> String {
     let ro_flag = if access == ScopeAccess::Ro {
         " --read-only"
     } else {
         ""
     };
-    let surface = if raised {
-        "The request was handed to the human approval surfaces (your client's prompt if it \
-         supports one, else an attached ahma TUI). It is NOT granted until a person approves it \
-         (Enter/Esc deny); if it was already asked and declined this session, it will not be \
-         asked again."
-    } else {
-        "No interactive approval surface is attached, so nothing was requested."
+    let (status, body) = match raised {
+        Some(req) => (
+            "Blocked until a human answers. The question was raised at the human surfaces (your \
+             client's prompt if it supports one, else an attached ahma TUI). It is NOT granted \
+             until a person approves it; Enter/Esc deny. If your client shows no prompt, show the \
+             human the text below UNCHANGED and stop asking.",
+            ahma_common::grant_prompt::render(req).to_text(),
+        ),
+        None if budget_exhausted => (
+            "Not raised: this session has used its prompt budget. Stop requesting grants; tell \
+             the human in conversation what you need and why, and continue with what you have.",
+            String::new(),
+        ),
+        None => (
+            "Not raised: this path was already asked about this session, is refused outright, or \
+             no surface can ask. Nothing is granted.",
+            String::new(),
+        ),
     };
     format!(
-        "Requested {access} access to\n  {path}\n\n\
-         You cannot widen your own sandbox: `confirm: true` does not self-grant, for any \
-         client. {surface}\n\n\
-         A human must approve — at the prompt, or by running:\n  \
-         ahma sandbox grant {path}{ro_flag}\n\n\
+        "Requested {access} access to\n  {path}\n\n{status}\n\n{body}\
+         A human can also run:\n  ahma sandbox grant {path}{ro_flag} --session   # this \
+         terminal session\n  ahma sandbox grant {path}{ro_flag}             # until revoked\n\n\
          Grants are written to {file} (outside every sandbox scope); a human-approved grant \
          applies to this session immediately.",
         access = access.label(),
         path = path.display(),
-        surface = surface,
+        status = status,
+        body = if body.is_empty() {
+            String::new()
+        } else {
+            format!("{body}\n")
+        },
         ro_flag = ro_flag,
         file = settings_file.display(),
     )

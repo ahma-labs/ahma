@@ -3782,7 +3782,9 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
     let Some(gate) = &state.scope_grant else {
         return;
     };
-    let popup = centered_rect(78, 16, area);
+    let body = ahma_common::grant_prompt::render(&gate.request);
+    let height = if gate.show_detail { 30 } else { 20 };
+    let popup = centered_rect(92, height.min(area.height.saturating_sub(2)), area);
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -3795,57 +3797,70 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let reason = match gate.reason {
-        ahma_common::scope_grant::GrantReason::PreExecViolation => {
-            "a command targeted a path outside the sandbox"
-        }
-        ahma_common::scope_grant::GrantReason::StderrHeuristic => {
-            "a command was blocked accessing a path outside the sandbox"
-        }
-    };
-    let tool = gate.tool.as_deref().unwrap_or("A sandboxed command");
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(tool.to_string(), theme.normal().bold()),
-            Span::styled(
-                format!(" needs {} access to:", gate.access.label()),
-                theme.normal(),
-            ),
-        ]),
-        Line::from(Span::styled(gate.path.clone(), theme.success().bold())),
-        Line::from(""),
-        Line::from(Span::styled(format!("Why: {reason}."), theme.dim())),
-        Line::from(Span::styled(
-            "A grant applies to this session now and only to this workspace. [y]/[r] also",
-            theme.dim(),
-        )),
-        Line::from(Span::styled(
-            "save it in ~/.ahma/settings.toml for next time; [s]/[o] last for this session",
-            theme.dim(),
-        )),
-        Line::from(Span::styled(
-            "only. Everything else outside the workspace stays blocked.",
-            theme.dim(),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  [n] ", theme.failed().bold()),
-            Span::styled("Deny (default)   ", theme.normal().bold()),
-            Span::styled("[y] ", theme.success().bold()),
-            Span::styled("read+write, saved   ", theme.normal()),
-            Span::styled("[r] ", theme.pending().bold()),
-            Span::styled("read-only, saved", theme.normal()),
-        ]),
-        Line::from(vec![
-            Span::styled("      ", theme.normal()),
-            Span::styled("[s] ", theme.success().bold()),
-            Span::styled("read+write, this session   ", theme.normal()),
-            Span::styled("[o] ", theme.pending().bold()),
-            Span::styled("read-only, this session", theme.normal()),
-        ]),
-        Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
+    // SPEC R-PERM.3.4: the same sections every surface shows. The compact view
+    // keeps who / what / minimum / allows / risk; `?` adds the agent's claim,
+    // the evidence line and the exact settings line.
+    let compact_headings = [
+        "Who is asking",
+        "What was blocked",
+        "Minimum that would work",
+        "What a grant allows",
+        "Risk",
     ];
+    let mut lines = vec![Line::from(Span::styled(
+        body.title.clone(),
+        theme.success().bold(),
+    ))];
+    for section in &body.sections {
+        if !gate.show_detail && !compact_headings.contains(&section.heading.as_str()) {
+            continue;
+        }
+        let style = if section.heading == "Risk"
+            && gate
+                .request
+                .context
+                .risk
+                .as_ref()
+                .is_some_and(|r| r.class != "normal")
+        {
+            theme.failed().bold()
+        } else {
+            theme.normal().bold()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{}:", section.heading),
+            style,
+        )));
+        let mut text = section.body.clone();
+        if !gate.show_detail && section.heading == "What was blocked" {
+            // Compact: the first line only (what tried to touch what).
+            text = text.lines().next().unwrap_or("").to_string();
+        }
+        for l in text.lines() {
+            lines.push(Line::from(Span::styled(format!("  {l}"), theme.normal())));
+        }
+    }
+    lines.push(Line::from(""));
+    let mut keys: Vec<Span<'static>> = vec![Span::styled("  ", theme.normal())];
+    for o in &body.options {
+        let key_style = match o.decision {
+            ahma_common::scope_grant::GrantDecision::Deny => theme.failed().bold(),
+            ahma_common::scope_grant::GrantDecision::GrantRo
+            | ahma_common::scope_grant::GrantDecision::GrantRw => theme.pending().bold(),
+            _ => theme.success().bold(),
+        };
+        keys.push(Span::styled(format!("[{}] ", o.key), key_style));
+        keys.push(Span::styled(format!("{}   ", o.label), theme.normal()));
+    }
+    lines.push(Line::from(keys));
+    lines.push(Line::from(Span::styled(
+        if gate.show_detail {
+            "  Enter / Esc = Deny · [?] less detail"
+        } else {
+            "  Enter / Esc = Deny · [?] the agent's claim, evidence and the exact settings line"
+        },
+        theme.dim(),
+    )));
     lines.extend(gate_typing_note(state, theme));
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });

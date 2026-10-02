@@ -428,6 +428,7 @@ where
 /// time, with a companion function that was a fourteen-arm identity map — a
 /// second copy of `SourceEvent`'s shape that had to be updated alongside it,
 /// paying for nothing. `apply_msg` builds the `SourceEvent` directly now.
+#[allow(clippy::large_enum_variant)] // a grant request carries its full context
 enum Applied {
     /// Nothing the TUI needs to react to.
     None,
@@ -649,6 +650,7 @@ mod tests {
             session_id: None,
             client_pid: None,
             sampling: false,
+            elicitation: false,
             ended_epoch_ms: None,
             scopes: vec![],
             read_scopes: vec![],
@@ -1196,6 +1198,7 @@ mod tests {
             access: ahma_common::config::ScopeAccess::Ro,
             reason: ahma_common::scope_grant::GrantReason::PreExecViolation,
             tool: Some("run_terminal_command".to_string()),
+            context: Default::default(),
         }
     }
 
@@ -1929,6 +1932,7 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                elicitation: false,
                 scopes: vec![],
                 read_scopes: vec![],
                 grants: vec![],

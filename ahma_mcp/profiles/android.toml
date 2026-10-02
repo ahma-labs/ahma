@@ -65,6 +65,19 @@ access = "rx"
 path = "~/.android/avd"
 access = "rw"
 
+# The debug signing keystore is *created* by the first debug assembly, so a
+# read-only ~/.android fails `assembleDebug` on a fresh machine. One file.
+[[rules]]
+path = "~/.android/debug.keystore"
+access = "rw"
+kind = "file"
+
+# The Kotlin compiler daemon's cache (macOS location); Gradle's Kotlin plugin
+# writes it on every build.
+[[rules]]
+path = "~/Library/Application Support/kotlin"
+access = "rw"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Hostnames this toolchain must reach when `--restrict-network` is on. Widen
 # nothing unless restriction is on (see the rust profile for the rationale).

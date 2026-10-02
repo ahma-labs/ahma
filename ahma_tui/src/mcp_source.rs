@@ -23,6 +23,7 @@ use crate::state::{AiActivityEntry, LogEntry, LogFileInfo, LogLevel, OpStatus, O
 
 /// Events produced by the MCP source task and consumed by the app event loop.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // a grant request carries its full context
 pub enum SourceEvent {
     HealthChanged {
         healthy: bool,

@@ -2587,26 +2587,33 @@ fn handle_scope_grant_key(
         return false;
     }
 
+    // The keys are the ones the shared prompt body advertises (SPEC R-PERM.3.4);
+    // lower-case is this session, upper-case is always, `o`/`w` once, `?` detail.
+    if let (KeyCode::Char('?'), _) = (key.code, key.modifiers) {
+        if let Some(gate) = state.scope_grant.as_mut() {
+            gate.show_detail = !gate.show_detail;
+        }
+        return true;
+    }
     match (key.code, key.modifiers) {
-        (KeyCode::Char('y'), KeyModifiers::NONE) => {
-            resolve_scope_grant(state, GrantDecision::GrantRw);
-            true
-        }
-        (KeyCode::Char('r'), KeyModifiers::NONE) => {
-            resolve_scope_grant(state, GrantDecision::GrantRo);
-            true
-        }
-        (KeyCode::Char('s'), KeyModifiers::NONE) => {
-            resolve_scope_grant(state, GrantDecision::GrantRwSession);
-            true
-        }
-        (KeyCode::Char('o'), KeyModifiers::NONE) => {
-            resolve_scope_grant(state, GrantDecision::GrantRoSession);
-            true
-        }
         (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
             resolve_scope_grant(state, GrantDecision::Deny);
             true
+        }
+        (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
+            // `s` stays an alias of `y` (read-write, this session) for the
+            // fingers that learned it.
+            let c = if c == 's' { 'y' } else { c };
+            match ahma_common::grant_prompt::options()
+                .into_iter()
+                .find(|o| o.key == c)
+            {
+                Some(o) => {
+                    resolve_scope_grant(state, o.decision);
+                    true
+                }
+                None => false,
+            }
         }
         _ => false,
     }
@@ -2664,6 +2671,20 @@ fn resolve_scope_grant(
             LogLevel::Info,
             format!(
                 "Granted read+write access to {} for this session only (not saved)",
+                gate.path
+            ),
+        ),
+        GrantDecision::GrantRoOnce => (
+            LogLevel::Info,
+            format!(
+                "Granted read-only access to {} for the next command only",
+                gate.path
+            ),
+        ),
+        GrantDecision::GrantRwOnce => (
+            LogLevel::Info,
+            format!(
+                "Granted read+write access to {} for the next command only",
                 gate.path
             ),
         ),
@@ -7362,6 +7383,7 @@ mod tests {
                 access: ahma_common::config::ScopeAccess::Rw,
                 reason: ahma_common::scope_grant::GrantReason::PreExecViolation,
                 tool: Some("write_file".into()),
+                context: Default::default(),
             },
         ));
         state.chat_input.insert_str("hello");
@@ -7457,6 +7479,7 @@ mod tests {
             access: ahma_common::config::ScopeAccess::Rw,
             reason: GrantReason::PreExecViolation,
             tool: Some("run_terminal_command".to_string()),
+            context: Default::default(),
         })
     }
 

@@ -304,6 +304,7 @@ async fn handler_refuses_catastrophic_path_even_with_confirm() {
     let result = service
         .handle_sandbox_grant(
             args(&[
+                ("reason", json!("test: the build needs it")),
                 ("path", json!("/")),
                 ("access", json!("rw")),
                 ("confirm", json!(true)),
@@ -327,7 +328,10 @@ async fn handler_previews_without_writing_when_unconfirmed() {
     let target = tempdir().unwrap();
     let result = service
         .handle_sandbox_grant(
-            args(&[("path", json!(target.path().to_string_lossy()))]),
+            args(&[
+                ("reason", json!("test: the build needs it")),
+                ("path", json!(target.path().to_string_lossy())),
+            ]),
             crate::client_type::McpClientType::Cursor,
         )
         .await
@@ -353,6 +357,7 @@ async fn handler_autonomous_agent_does_not_self_persist_on_confirm() {
     let result = service
         .handle_sandbox_grant(
             args(&[
+                ("reason", json!("test: the build needs it")),
                 ("path", json!(target.path().to_string_lossy())),
                 ("access", json!("rw")),
                 ("confirm", json!(true)),
@@ -367,7 +372,7 @@ async fn handler_autonomous_agent_does_not_self_persist_on_confirm() {
         .filter_map(|c| c.as_text().map(|t| t.text.clone()))
         .collect::<String>();
     assert!(
-        text.contains("cannot widen your own sandbox"),
+        text.contains("Blocked until a human answers") || text.contains("Not raised"),
         "autonomous agent must be told it cannot self-grant: {text}"
     );
     assert!(
@@ -375,7 +380,7 @@ async fn handler_autonomous_agent_does_not_self_persist_on_confirm() {
         "autonomous agent confirm must not persist a grant: {text}"
     );
     assert!(
-        text.contains("A human must approve"),
+        text.contains("A human can also run"),
         "message must direct to human approval: {text}"
     );
     // The external-client persist path is covered by the `persist_grant` unit
@@ -398,7 +403,13 @@ fn schema_declares_path_access_confirm_and_note() {
         .get("required")
         .and_then(Value::as_array)
         .expect("schema must declare required fields");
-    assert_eq!(required, &vec![Value::String("path".to_string())]);
+    assert_eq!(
+        required,
+        &vec![
+            Value::String("path".to_string()),
+            Value::String("reason".to_string())
+        ]
+    );
 
     // `access` defaults to "ro" and is constrained to the two valid values.
     let access_prop = properties.get("access").expect("access property");
@@ -447,43 +458,64 @@ fn resolve_grant_path_falls_back_to_lexical_clean_for_missing_path() {
     );
 }
 
-// ── agent_requested_text (pure, both `raised` branches) ─────────────────────
+// ── agent_requested_text (pure, every branch) ───────────────────────────────
+
+fn sample_request() -> ahma_common::scope_grant::ScopeGrantRequest {
+    ahma_common::scope_grant::ScopeGrantRequest {
+        decision_id: "d1".into(),
+        path: PathBuf::from("/cache/x"),
+        access: ScopeAccess::Ro,
+        reason: ahma_common::scope_grant::GrantReason::PreExecViolation,
+        tool: Some("sandbox_grant".into()),
+        context: ahma_common::scope_grant::GrantContext {
+            agent_claim: Some("the build reads the shared model cache".into()),
+            ..Default::default()
+        },
+    }
+}
 
 #[test]
-fn agent_requested_text_when_surface_raised() {
+fn agent_requested_text_when_surface_raised_relays_the_body() {
+    let req = sample_request();
     let text = agent_requested_text(
         Path::new("/cache/x"),
         ScopeAccess::Ro,
         Path::new("/home/u/.ahma/settings.toml"),
-        true,
+        Some(&req),
+        false,
     );
+    assert!(text.starts_with("Requested read-only access"), "{text}");
+    assert!(text.contains("Blocked until a human answers"), "{text}");
+    // The same body the human sees (SPEC R-PERM.3.4), claim labelled as a claim.
+    assert!(text.contains("What the agent says it needs"), "{text}");
+    assert!(text.contains("shared model cache"), "{text}");
+    assert!(text.contains("UNCHANGED"), "{text}");
     assert!(
-        text.contains("handed to the human approval surfaces"),
-        "{text}"
-    );
-    assert!(text.contains("cannot widen your own sandbox"), "{text}");
-    // Read-only access appends the `--read-only` CLI hint.
-    assert!(
-        text.contains("ahma sandbox grant /cache/x --read-only"),
+        text.contains("ahma sandbox grant /cache/x --read-only --session"),
         "{text}"
     );
 }
 
 #[test]
-fn agent_requested_text_when_no_surface_attached() {
+fn agent_requested_text_when_nothing_was_raised() {
     let text = agent_requested_text(
         Path::new("/cache/x"),
         ScopeAccess::Rw,
         Path::new("/home/u/.ahma/settings.toml"),
+        None,
         false,
     );
-    assert!(
-        text.contains("No interactive approval surface is attached"),
-        "{text}"
+    assert!(text.contains("Not raised"), "{text}");
+    assert!(text.contains("Nothing is granted"), "{text}");
+    let text = agent_requested_text(
+        Path::new("/cache/x"),
+        ScopeAccess::Rw,
+        Path::new("/home/u/.ahma/settings.toml"),
+        None,
+        true,
     );
-    // Read+write access must NOT append the `--read-only` flag.
-    assert!(!text.contains("--read-only"), "{text}");
-    assert!(text.contains("ahma sandbox grant /cache/x\n"), "{text}");
+    assert!(text.contains("prompt budget"), "{text}");
+    assert!(text.contains("tell the human in conversation"), "{text}");
 }
 
 // ── declined_text (pure; unreachable via the handler without a mocked Peer) ─
@@ -511,6 +543,7 @@ async fn handler_errors_on_invalid_access_argument() {
     let err = service
         .handle_sandbox_grant(
             args(&[
+                ("reason", json!("test: the build needs it")),
                 ("path", json!(target.path().to_string_lossy())),
                 ("access", json!("yolo")),
             ]),
@@ -532,7 +565,10 @@ async fn handler_preview_surfaces_high_risk_for_nonexistent_path() {
     let missing = base.path().join("does-not-exist-yet");
     let result = service
         .handle_sandbox_grant(
-            args(&[("path", json!(missing.to_string_lossy()))]),
+            args(&[
+                ("reason", json!("test: the build needs it")),
+                ("path", json!(missing.to_string_lossy())),
+            ]),
             crate::client_type::McpClientType::Cursor,
         )
         .await
@@ -571,6 +607,7 @@ async fn sandbox_grant_confirm_without_elicitation_does_not_write_settings() {
         let result = service
             .handle_sandbox_grant(
                 args(&[
+                    ("reason", json!("test: the build needs it")),
                     ("path", json!(target.path().to_string_lossy())),
                     ("access", json!("rw")),
                     ("confirm", json!(true)),
@@ -586,10 +623,10 @@ async fn sandbox_grant_confirm_without_elicitation_does_not_write_settings() {
             .filter_map(|c| c.as_text().map(|t| t.text.clone()))
             .collect::<String>();
         assert!(
-            text.contains("cannot widen your own sandbox"),
+            text.contains("Blocked until a human answers") || text.contains("Not raised"),
             "{client:?}: {text}"
         );
-        assert!(text.contains("A human must approve"), "{client:?}: {text}");
+        assert!(text.contains("A human can also run"), "{client:?}: {text}");
         assert!(
             !text.contains("✓"),
             "{client:?} must not report a grant: {text}"
@@ -672,6 +709,7 @@ async fn sandbox_grant_human_approval_applies_live_and_persists() {
     let result = service
         .handle_sandbox_grant(
             args(&[
+                ("reason", json!("test: the build needs it")),
                 ("path", json!(canon_external.to_string_lossy())),
                 ("access", json!("rw")),
                 ("confirm", json!(true)),

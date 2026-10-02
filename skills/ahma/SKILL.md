@@ -121,7 +121,7 @@ Terminates the process and frees resources.
 ### `sandbox_grant` — Request persistent filesystem scope
 
 ```
-sandbox_grant(path="/opt/ext/sccache", access="rw", confirm=false)
+sandbox_grant(path="/opt/ext/sccache", access="rw", reason="cargo build writes the sccache cache; the write was refused", confirm=false)
 ```
 
 Ask the human to add an out-of-scope path as a persistent sandbox root in `~/.ahma/settings.toml`. Call this when a command fails with a `sandbox_denial` error. Without `confirm: true` it only previews. With `confirm: true` it raises an approval prompt for the human (your client's, or the ahma TUI) and tells you whether they approved — it never grants by itself, for any client. Ask for the narrowest directory and `ro` unless a write was denied. A human-approved grant applies to the live session immediately.

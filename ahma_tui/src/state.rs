@@ -1437,17 +1437,25 @@ pub struct ScopeGrantGate {
     pub reason: ahma_common::scope_grant::GrantReason,
     /// The tool/command that tripped the scope, if known.
     pub tool: Option<String>,
+    /// The whole request, rendered through the one prompt body every surface
+    /// shows (SPEC R-PERM.3.4).
+    pub request: ahma_common::scope_grant::ScopeGrantRequest,
+    /// `?` toggles the evidence and risk detail; the compact view keeps the
+    /// modal readable on a small terminal.
+    pub show_detail: bool,
 }
 
 impl ScopeGrantGate {
     /// Build a gate from a hub [`ahma_common::scope_grant::ScopeGrantRequest`].
     pub fn from_request(request: ahma_common::scope_grant::ScopeGrantRequest) -> Self {
         Self {
-            decision_id: request.decision_id,
+            decision_id: request.decision_id.clone(),
             path: request.path.display().to_string(),
             access: request.access,
             reason: request.reason,
-            tool: request.tool,
+            tool: request.tool.clone(),
+            request,
+            show_detail: false,
         }
     }
 }
@@ -3901,6 +3909,7 @@ mod tests {
             session_id: Some(format!("sess-{id}")),
             client_pid: None,
             sampling: false,
+            elicitation: false,
             ended_epoch_ms: None,
             scopes: vec![],
             read_scopes: vec![],
