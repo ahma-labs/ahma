@@ -319,6 +319,14 @@ pub fn trim_conversation(msg_json: &mut Vec<serde_json::Value>, budget: usize) {
         total -= content_len(&msg_json[protected_head + dropped]);
         dropped += 1;
     }
+    // A tool result whose assistant call was just dropped would be sent
+    // orphaned, which both OpenAI and Anthropic reject with a 400: drop it too.
+    while dropped > 0
+        && msg_json.len() - dropped > protected_head + 1
+        && msg_json[protected_head + dropped].get("role") == Some(&serde_json::json!("tool"))
+    {
+        dropped += 1;
+    }
     if dropped > 0 {
         msg_json.drain(protected_head..protected_head + dropped);
         tracing::info!(
@@ -333,6 +341,24 @@ pub fn trim_conversation(msg_json: &mut Vec<serde_json::Value>, budget: usize) {
             }),
         );
     }
+}
+
+/// Where compaction stops: the last [`COMPACTION_KEEP_RECENT_MESSAGES`] stay
+/// verbatim, except that the kept tail never starts with a tool result whose
+/// assistant call is being summarised away — an orphaned `role: tool` message
+/// is a 400 at OpenAI and Anthropic — so such results are compacted with
+/// their call.
+fn compaction_end(msg_json: &[serde_json::Value], protected_head: usize) -> usize {
+    let keep_recent =
+        COMPACTION_KEEP_RECENT_MESSAGES.min(msg_json.len().saturating_sub(protected_head));
+    let mut end = msg_json.len().saturating_sub(keep_recent);
+    while end > protected_head
+        && end < msg_json.len()
+        && msg_json[end].get("role") == Some(&serde_json::json!("tool"))
+    {
+        end += 1;
+    }
+    end
 }
 
 /// Proactively compact the conversation when real reported usage crosses the
@@ -373,9 +399,7 @@ async fn maybe_compact_conversation(
     }
 
     let protected_head = protected_head(msg_json);
-    let keep_recent =
-        COMPACTION_KEEP_RECENT_MESSAGES.min(msg_json.len().saturating_sub(protected_head));
-    let compact_end = msg_json.len().saturating_sub(keep_recent);
+    let compact_end = compaction_end(msg_json, protected_head);
     // Nothing meaningful to compact yet (conversation too short) — let it
     // grow; trim_conversation's hard limit is still there as a backstop.
     if compact_end <= protected_head {
@@ -755,13 +779,50 @@ fn approval_lock_for(workspace: &std::path::Path, tool: &str) -> Arc<tokio::sync
         .clone()
 }
 
+/// The arguments to run a tool call with: what the model sent, repaired when
+/// the only fault is trailing commas, or `Err` with the message the model gets
+/// back when they are not JSON at all — never `{}` in their place.
+fn tool_call_arguments(
+    call: &ahma_llm_monitor::client::ChatToolCall,
+) -> Result<serde_json::Value, String> {
+    if !call.arguments.is_null() {
+        return Ok(call.arguments.clone());
+    }
+    let healed = ahma_mcp::harness_guard::clean_json_trailing_commas(&call.arguments_raw);
+    serde_json::from_str(&healed).map_err(|e| {
+        let shown: String = call.arguments_raw.chars().take(200).collect();
+        format!(
+            "Error: the arguments for `{}` were not valid JSON ({e}): {shown}. Send the call \
+             again with a JSON object of arguments.",
+            call.name
+        )
+    })
+}
+
 async fn execute_single_tool_call(
     call: ahma_llm_monitor::client::ChatToolCall,
     cfg: &McpChatConfig,
     tx: Sender<AgentEvent>,
     gate: Arc<dyn AgentApprovalGate>,
 ) -> (String, String, serde_json::Value, bool) {
-    let args_value = call.arguments;
+    let args_value = match tool_call_arguments(&call) {
+        Ok(v) => v,
+        Err(text) => {
+            let _ = tx
+                .send(AgentEvent::ToolCallFinished {
+                    id: call.id.clone(),
+                    result: text.clone(),
+                    failed: true,
+                })
+                .await;
+            return (
+                call.id,
+                call.name,
+                serde_json::json!({ "error": text }),
+                true,
+            );
+        }
+    };
     let args_str = serde_json::to_string(&args_value).unwrap_or_default();
 
     // The menu answers `more_tools` itself and refuses a tool the model was
@@ -2523,6 +2584,71 @@ mod tests {
         assert!(out.contains("characters elided"), "marker present");
         assert!(out.chars().count() < 1200, "got {}", out.chars().count());
         assert_eq!(truncate_middle("short", 1000), "short");
+    }
+
+    /// The kept tail of a compaction never starts with an orphaned tool result.
+    #[test]
+    fn compaction_never_keeps_a_tool_result_without_its_call() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "system", "content": "SYS"}),
+            serde_json::json!({"role": "user", "content": "goal"}),
+        ];
+        for i in 0..20 {
+            msgs.push(serde_json::json!({"role": "assistant", "content": "x", "tool_calls": [
+                {"id": format!("c{i}"), "type": "function", "function": {"name": "status", "arguments": "{}"}}
+            ]}));
+            msgs.push(serde_json::json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "ok"}));
+        }
+        for extra in 0..3 {
+            let mut m = msgs.clone();
+            for _ in 0..extra {
+                m.push(serde_json::json!({"role": "user", "content": "more"}));
+            }
+            let end = super::compaction_end(&m, 2);
+            assert!(end > 2);
+            assert_ne!(
+                m[end]["role"], "tool",
+                "extra {extra}: kept tail starts orphaned"
+            );
+        }
+    }
+
+    /// A tool result is never left without the assistant call it answers:
+    /// both OpenAI and Anthropic reject an orphaned `role: tool` message with
+    /// a 400, which ended the turn.
+    #[test]
+    fn trimming_never_orphans_a_tool_result() {
+        let big = "x".repeat(600);
+        let mut msgs = vec![
+            serde_json::json!({"role": "system", "content": "SYS"}),
+            serde_json::json!({"role": "user", "content": "goal"}),
+        ];
+        for i in 0..6 {
+            msgs.push(serde_json::json!({"role": "assistant", "content": "checking the status of the build first", "tool_calls": [
+                {"id": format!("c{i}"), "type": "function", "function": {"name": "status", "arguments": "{}"}}
+            ]}));
+            msgs.push(serde_json::json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": big}));
+        }
+        msgs.push(serde_json::json!({"role": "user", "content": "next"}));
+        for budget in (600..4_000).step_by(37) {
+            let mut m = msgs.clone();
+            trim_conversation(&mut m, budget);
+            let mut calls = std::collections::HashSet::new();
+            for msg in &m {
+                if let Some(tc) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                    for c in tc {
+                        calls.insert(c["id"].as_str().unwrap().to_string());
+                    }
+                }
+                if msg["role"] == "tool" {
+                    let id = msg["tool_call_id"].as_str().unwrap();
+                    assert!(
+                        calls.contains(id),
+                        "budget {budget}: tool result {id} has no call before it: {m:#?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4462,6 +4588,48 @@ mod tests {
     }
 
     // ── execute_single_tool_call (rejection & dispatch-error branches) ─────────
+
+    /// Arguments that are not JSON are not run as `{}`: trailing commas are
+    /// repaired, anything else goes back to the model as an error to resend.
+    #[test]
+    fn malformed_tool_arguments_are_repaired_or_refused_never_emptied() {
+        let call = |raw: &str| ahma_llm_monitor::client::ChatToolCall {
+            id: "c".into(),
+            name: "read_file".into(),
+            arguments: serde_json::Value::Null,
+            arguments_raw: raw.into(),
+        };
+        assert_eq!(
+            super::tool_call_arguments(&call(r#"{"path": "a",}"#)).unwrap(),
+            serde_json::json!({"path": "a"})
+        );
+        let err = super::tool_call_arguments(&call("path=a")).unwrap_err();
+        assert!(
+            err.contains("not valid JSON") && err.contains("read_file"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_arguments_never_reach_the_tool() {
+        let cfg = empty_mcp_config("http://127.0.0.1:9");
+        let call = ahma_llm_monitor::client::ChatToolCall {
+            id: "c1".into(),
+            name: "write_file".into(),
+            arguments: serde_json::Value::Null,
+            arguments_raw: "path=a content=b".into(),
+        };
+        let (tx, _rx) = mpsc::channel(8);
+        let (_, _, payload, failed) =
+            execute_single_tool_call(call, &cfg, tx, Arc::new(AutoApproveGate)).await;
+        assert!(failed);
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("not valid JSON")
+        );
+    }
 
     #[tokio::test]
     async fn execute_single_tool_call_rejection_path() {
