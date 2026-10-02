@@ -1,0 +1,30 @@
+# GitHub CLI sandbox profile.
+#
+# `gh` caches API responses and downloaded run logs under its own cache
+# directory and fails outright when it cannot write there: inside ahma's
+# sandbox, `gh run view --log-failed` died with "operation not permitted"
+# opening ~/.cache/gh, so an agent could not read the CI failure it was asked
+# to fix. Its credentials (~/.config/gh/hosts.yml) are not granted here; reads
+# of that directory stay governed by the credential rules (SPEC R6.2.3).
+name = "gh"
+description = "GitHub CLI: its own cache directory, read-write"
+deny_write = []
+
+# What enabling this costs, shown beside the profile by `ahma permissions list`
+# (SPEC R-PERM.5.2).
+cost = """gh's cache (API responses and run logs) is shared by every project on this machine; \
+a command in one project can read or replace what gh cached for another. gh does not execute \
+anything it caches. Disable with `[sandbox] profiles` to keep gh read-only."""
+
+[[rules]]
+path = "${XDG_CACHE_HOME:-~/.cache}/gh"
+access = "rw"
+
+# Hostnames gh reaches when `--restrict-network` is on.
+[[hosts]]
+host = "api.github.com"
+reason = "the REST and GraphQL API every gh command calls"
+
+[[hosts]]
+host = "github.com"
+reason = "authentication and git operations gh performs"

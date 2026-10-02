@@ -221,6 +221,7 @@ pub fn builtin_profiles() -> &'static [SandboxProfile] {
             include_str!("../../profiles/android.toml"),
             include_str!("../../profiles/apple.toml"),
             include_str!("../../profiles/common.toml"),
+            include_str!("../../profiles/gh.toml"),
         ];
         SOURCES
             .iter()
@@ -579,14 +580,38 @@ mod tests {
     }
 
     #[test]
+    fn the_gh_profile_lets_gh_write_its_own_cache_and_says_what_that_costs() {
+        let gh = builtin_profiles()
+            .iter()
+            .find(|p| p.name == "gh")
+            .expect("gh ships a profile");
+        assert!(
+            gh.rules
+                .iter()
+                .any(|r| r.path.ends_with("/gh") && r.access.is_write()),
+            "{:?}",
+            gh.rules
+        );
+        assert!(
+            !gh.rules.iter().any(|r| r.path.contains(".config/gh")),
+            "credentials are never part of a profile"
+        );
+        assert!(
+            gh.cost
+                .as_deref()
+                .is_some_and(|c| c.contains("every project"))
+        );
+    }
+
+    #[test]
     fn every_builtin_profile_parses() {
         // A malformed shipped profile is a build-time bug that would silently
         // shrink the sandbox's usable surface for everyone.
         let profiles = builtin_profiles();
         assert_eq!(
             profiles.len(),
-            6,
-            "all six shipped profiles parse: {:?}",
+            7,
+            "all seven shipped profiles parse: {:?}",
             profiles.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
         for p in profiles {
