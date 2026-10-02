@@ -362,8 +362,19 @@ impl Adapter {
             return None;
         }
         let key = self.workspace_key_for(working_dir);
-        self.workspace_queue
-            .enqueue(&key, workspace_queue::HolderInfo::new(op_id, title))
+        let mut holder = workspace_queue::HolderInfo::new(op_id, title)
+            .with_typical_secs(self.monitor.typical_duration_secs(title));
+        let declared = self.workspace_queue.source_readers();
+        if !declared.is_empty() {
+            holder = holder.with_effect(lane::classify_source_effect(title, declared));
+        }
+        // A command run in a subtree of its workspace can only race edits
+        // there (SPEC R2.7.8).
+        let cwd = dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+        if cwd != key && cwd.starts_with(&key) {
+            holder = holder.with_footprint(cwd);
+        }
+        self.workspace_queue.enqueue(&key, holder)
     }
 
     /// Sets a custom command executor on the adapter.

@@ -904,6 +904,40 @@ impl OperationMonitor {
             .collect()
     }
 
+    /// How long `title` usually runs: the median wall time of the completed
+    /// operations with that title (or command) still in history. `None` when
+    /// none has finished yet, or the history is being written right now — a
+    /// refusal that has to wait for this number would defeat its purpose.
+    pub fn typical_duration_secs(&self, title: &str) -> Option<u64> {
+        let history = self.completion_history.try_read().ok()?;
+        let mut secs: Vec<u64> = history
+            .values()
+            .filter(|op| op.title.as_deref() == Some(title) || op.command.as_deref() == Some(title))
+            .filter_map(|op| {
+                op.end_time?
+                    .duration_since(op.start_time)
+                    .ok()
+                    .map(|d| d.as_secs())
+            })
+            .collect();
+        if secs.is_empty() {
+            return None;
+        }
+        secs.sort_unstable();
+        Some(secs[secs.len() / 2])
+    }
+
+    /// Test-only: put a finished operation with `title` that took `secs` into
+    /// the completion history.
+    #[cfg(test)]
+    pub(crate) async fn record_finished_for_test(&self, id: &str, title: &str, secs: u64) {
+        let mut op = Operation::new(id.to_string(), "test".to_string(), title.to_string(), None);
+        op.title = Some(title.to_string());
+        op.state = OperationStatus::Completed;
+        op.end_time = Some(op.start_time + Duration::from_secs(secs));
+        self.move_to_history_and_notify(id, Some(op)).await;
+    }
+
     pub async fn get_completed_operations(&self) -> Vec<Operation> {
         let history = self.completion_history.read().await;
         history.values().cloned().collect()
@@ -1861,5 +1895,29 @@ mod tests {
             vec!["live"],
             "only the still-active op is cancelled"
         );
+    }
+}
+
+#[cfg(test)]
+mod typical_duration_tests {
+    use super::*;
+
+    /// The time a refusal says a command usually takes comes from the same
+    /// command's completed history: the median, so one outlier cannot skew it.
+    #[tokio::test]
+    async fn the_typical_duration_is_the_median_of_the_same_command() {
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(
+            std::time::Duration::from_secs(30),
+        ));
+        assert_eq!(monitor.typical_duration_secs("cargo nextest run"), None);
+        for (i, secs) in [10u64, 30, 500].into_iter().enumerate() {
+            monitor
+                .record_finished_for_test(&format!("op_{i}"), "cargo nextest run", secs)
+                .await;
+        }
+        monitor
+            .record_finished_for_test("op_x", "cargo build", 99)
+            .await;
+        assert_eq!(monitor.typical_duration_secs("cargo nextest run"), Some(30));
     }
 }

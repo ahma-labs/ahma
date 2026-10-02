@@ -862,6 +862,16 @@ pub struct ToolSettings {
     /// Default: `true`
     #[serde(default = "default_true")]
     pub edit_guard: bool,
+    /// Commands this project runs that only *read* source files — typically
+    /// its own test or build wrappers (`"scripts/heavy"`, `"make test"`). A
+    /// command line that starts with one, as whole words, does not block file
+    /// edits while it runs (SPEC R2.7.8); builds and tests ahma recognises
+    /// (`cargo test`, `npm test`, `./gradlew build`, …) never do. A wrong entry
+    /// costs a stale test verdict, which the drift report names; it cannot
+    /// widen the sandbox.
+    /// Default: `[]`
+    #[serde(default)]
+    pub source_readers: Vec<String>,
 }
 
 impl Default for ToolSettings {
@@ -883,6 +893,7 @@ impl Default for ToolSettings {
             mutex_groups: default_mutex_groups(),
             workspace_queue: true,
             edit_guard: true,
+            source_readers: Vec::new(),
         }
     }
 }
@@ -2195,6 +2206,12 @@ impl AhmaSettings {
             self.tools.edit_guard.to_string(),
             d.tools.edit_guard.to_string(),
         );
+        w.setting(
+            "This project's own commands that only read sources; edits proceed while they run.",
+            "source_readers",
+            toml_str_list(&self.tools.source_readers),
+            toml_str_list(&d.tools.source_readers),
+        );
 
         // ── Sandbox & filesystem security ────────────────────────────────────
         w.section("Sandbox & filesystem security", "sandbox");
@@ -3024,6 +3041,7 @@ mod tests {
                 }],
                 workspace_queue: false,
                 edit_guard: false,
+                source_readers: vec!["scripts/heavy".into(), "make test".into()],
             },
             sandbox: SandboxSettings {
                 disable: true,

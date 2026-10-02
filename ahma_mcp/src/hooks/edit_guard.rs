@@ -38,7 +38,7 @@ use super::{
     PATH_LOOKUP_BINARY, build_windows_absolute_command, ensure_child_array, ensure_child_object,
     ensure_root_object, remove_managed_hook_entries, shell_quote_posix,
 };
-use crate::adapter::workspace_queue::{WorkspaceQueue, edit_refusal};
+use crate::adapter::workspace_queue::WorkspaceQueue;
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 use std::io::Read;
@@ -254,12 +254,7 @@ pub fn refusal(
             }
         }
     }
-    for path in &paths {
-        if let Some((workspace, holder)) = queue.probe_path(path, &[]) {
-            return Some(edit_refusal(path, &workspace, holder.as_ref()));
-        }
-    }
-    None
+    paths.iter().find_map(|path| queue.edit_conflict(path, &[]))
 }
 
 /// Canonicalize a path that may not exist yet: resolve the deepest existing
@@ -633,7 +628,7 @@ mod tests {
         let repo = dunce::canonicalize(&repo).unwrap();
         let queue = WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")));
         let lease = queue
-            .enqueue(&repo, HolderInfo::new("op_3", "cargo nextest run"))
+            .enqueue(&repo, HolderInfo::new("op_3", "cargo fmt --all"))
             .unwrap()
             .acquire(&CancellationToken::new(), &|_| {})
             .await
@@ -655,7 +650,62 @@ mod tests {
         let reason = out["hookSpecificOutput"]["permissionDecisionReason"]
             .as_str()
             .unwrap();
-        assert!(reason.contains("cargo nextest run"), "{reason}");
+        assert!(reason.contains("cargo fmt --all"), "{reason}");
+    }
+
+    /// SPEC R2.7.8: a test run reads sources, so a native edit made while one
+    /// runs goes through; the run's drift report names the file it may have
+    /// seen change. This was the most common refusal, and it bought nothing.
+    #[tokio::test]
+    async fn an_edit_during_a_test_run_is_left_to_the_client() {
+        let td = tempdir().unwrap();
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let repo = dunce::canonicalize(&repo).unwrap();
+        let queue = WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")));
+        let _lease = queue
+            .enqueue(
+                &repo,
+                HolderInfo::new("op_9", "cargo nextest run --no-fail-fast"),
+            )
+            .unwrap()
+            .acquire(&CancellationToken::new(), &|_| {})
+            .await
+            .unwrap();
+        let payload =
+            json!({"tool_name": "Write", "cwd": "/", "tool_input": {"file_path": file(&repo)}});
+        assert!(
+            decide(Some(HookPlatform::Claude), &payload, &queue, None).is_none(),
+            "no opinion: the client decides as usual"
+        );
+    }
+
+    /// A writer bound to one subtree does not block an edit in another.
+    #[tokio::test]
+    async fn an_edit_outside_the_writers_subtree_is_left_to_the_client() {
+        let td = tempdir().unwrap();
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("rust")).unwrap();
+        std::fs::create_dir_all(repo.join("android")).unwrap();
+        let repo = dunce::canonicalize(&repo).unwrap();
+        let queue = WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")));
+        let _lease = queue
+            .enqueue(
+                &repo,
+                HolderInfo::new("op_4", "./gen.sh").with_footprint(repo.join("rust")),
+            )
+            .unwrap()
+            .acquire(&CancellationToken::new(), &|_| {})
+            .await
+            .unwrap();
+        let kotlin = repo.join("android/Main.kt").to_string_lossy().into_owned();
+        let payload = json!({"tool_name": "Write", "tool_input": {"file_path": kotlin}});
+        assert!(decide(Some(HookPlatform::Claude), &payload, &queue, None).is_none());
+        let rust = repo.join("rust/lib.rs").to_string_lossy().into_owned();
+        let payload = json!({"tool_name": "Write", "tool_input": {"file_path": rust}});
+        assert!(decide(Some(HookPlatform::Claude), &payload, &queue, None).is_some());
     }
 
     /// Outside a git repository the server keys a workspace by its sandbox

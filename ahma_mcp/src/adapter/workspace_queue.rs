@@ -87,6 +87,25 @@ impl Lane {
     }
 }
 
+/// What a command does to the workspace's source files, for the edit guard
+/// (SPEC R2.7.8). Published with the holder so a hook in another process can
+/// decide without re-parsing the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceEffect {
+    /// Not known: treated as a writer, exactly as every holder was before
+    /// this field existed. A record from an older ahma decodes as this.
+    #[default]
+    Unknown,
+    /// Builds, tests, linters: they read sources and write only their own
+    /// outputs. An edit made while one runs is allowed; the drift report
+    /// (R2.7.6) says the run may have seen it.
+    ReadsSources,
+    /// Formatters, codemods, checkouts, package managers: an edit racing one
+    /// is overwritten or lost, so it is refused.
+    RewritesSources,
+}
+
 /// Who holds (or is waiting for) a workspace lease — enough to name it in a
 /// message a model can act on ("cancel op X").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,15 +117,62 @@ pub struct HolderInfo {
     pub pid: u32,
     /// Seconds since the Unix epoch when the lease was taken (or the call queued).
     pub since_unix: u64,
+    /// What the command does to source files (add-only, R24.5).
+    #[serde(default)]
+    pub effect: SourceEffect,
+    /// The subtree the command runs in, when narrower than the workspace: an
+    /// edit outside it cannot race it. `None` means the whole workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint: Option<PathBuf>,
+    /// How long the same command usually runs, for "usually takes …".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typical_secs: Option<u64>,
 }
 
 impl HolderInfo {
     pub fn new(op_id: impl Into<String>, title: impl Into<String>) -> Self {
+        let title = title.into();
         Self {
             op_id: op_id.into(),
-            title: title.into(),
+            effect: super::lane::classify_source_effect(&title, &[]),
+            title,
             pid: std::process::id(),
             since_unix: unix_now(),
+            footprint: None,
+            typical_secs: None,
+        }
+    }
+
+    /// Bound the holder to the subtree it runs in.
+    #[must_use]
+    pub fn with_footprint(mut self, footprint: PathBuf) -> Self {
+        self.footprint = Some(footprint);
+        self
+    }
+
+    /// Say how long the same command usually runs.
+    #[must_use]
+    pub fn with_typical_secs(mut self, secs: Option<u64>) -> Self {
+        self.typical_secs = secs;
+        self
+    }
+
+    /// Override the classified effect (a project-declared source reader).
+    #[must_use]
+    pub fn with_effect(mut self, effect: SourceEffect) -> Self {
+        self.effect = effect;
+        self
+    }
+
+    /// Whether an edit of `path` must wait for this holder (SPEC R2.7.8): a
+    /// source reader never blocks; anything else blocks inside its footprint.
+    pub fn blocks_edit_of(&self, path: &Path) -> bool {
+        match self.effect {
+            SourceEffect::ReadsSources => false,
+            SourceEffect::Unknown | SourceEffect::RewritesSources => self
+                .footprint
+                .as_deref()
+                .is_none_or(|f| path.starts_with(f)),
         }
     }
 
@@ -241,13 +307,33 @@ pub fn edit_refusal(path: &Path, workspace: &Path, holder: Option<&HolderInfo>) 
     let who = holder
         .map(HolderInfo::describe)
         .unwrap_or_else(|| "a command in another ahma session".to_string());
+    let usually = holder
+        .and_then(|h| h.typical_secs)
+        .map(|s| format!(" It usually takes {}.", format_duration_secs(s)))
+        .unwrap_or_default();
     format!(
-        "Not edited: {} is in workspace {}, where {who} is running and may read or write it. \
-         An edit now could change what that command sees partway through, so its result would \
-         describe neither the old code nor the new. `await` it (or `cancel` it), then make the \
-         edit.",
+        "Not edited: {} is in workspace {}, where {who} is running and may rewrite source \
+         files. An edit now could be overwritten, or change what that command sees partway \
+         through.{usually} `await` it (or `cancel` it), then make the edit. Builds and tests do \
+         not block edits; if this command only reads sources (a test or build wrapper), a human \
+         can declare it in `[tools] source_readers` and edits will proceed while it runs.",
         path.display(),
         workspace.display()
+    )
+}
+
+/// The one-line form of [`edit_refusal`], for every refusal after the first
+/// while the same command runs: the agent already has the full reason.
+fn edit_refusal_again(path: &Path, holder: &HolderInfo) -> String {
+    let usually = holder
+        .typical_secs
+        .map(|s| format!(", usually {}", format_duration_secs(s)))
+        .unwrap_or_default();
+    format!(
+        "Not edited: {} — op `{}` is still running ({}{usually}); `await` or `cancel` it.",
+        path.display(),
+        holder.op_id,
+        holder.age()
     )
 }
 
@@ -364,6 +450,9 @@ pub enum QueueError {
 pub struct WorkspaceQueue {
     enabled: bool,
     lock_dir: Option<PathBuf>,
+    /// `[tools] source_readers`: commands a project declares read-only for
+    /// its sources (SPEC R2.7.8).
+    source_readers: Vec<String>,
 }
 
 impl WorkspaceQueue {
@@ -372,13 +461,32 @@ impl WorkspaceQueue {
         Self {
             enabled,
             lock_dir: default_lock_dir(),
+            source_readers: Vec::new(),
         }
     }
 
     /// A queue with an explicit rendezvous directory (tests; `None` =
     /// in-process ordering only).
     pub fn with_lock_dir(enabled: bool, lock_dir: Option<PathBuf>) -> Self {
-        Self { enabled, lock_dir }
+        Self {
+            enabled,
+            lock_dir,
+            source_readers: Vec::new(),
+        }
+    }
+
+    /// A project's own commands that only read sources (`[tools]
+    /// source_readers`, SPEC R2.7.8), published on every holder this queue
+    /// creates so the edit guard in another process can honour them.
+    #[must_use]
+    pub fn with_source_readers(mut self, readers: Vec<String>) -> Self {
+        self.source_readers = readers;
+        self
+    }
+
+    /// The declared source readers.
+    pub fn source_readers(&self) -> &[String] {
+        &self.source_readers
     }
 
     /// A queue that never orders anything — the pre-R2.7 behaviour, kept for
@@ -387,6 +495,7 @@ impl WorkspaceQueue {
         Self {
             enabled: false,
             lock_dir: None,
+            source_readers: Vec::new(),
         }
     }
 
@@ -500,6 +609,50 @@ impl WorkspaceQueue {
                 LeaseProbe::Held { holder } => Some((a.to_path_buf(), holder)),
                 LeaseProbe::Free => None,
             })
+    }
+
+    /// Whether an edit of `path` must wait, and the message saying so (SPEC
+    /// R2.7.8). The one decision behind ahma's own file tools and the
+    /// harness edit guard: a source reader (build, test, linter) never blocks;
+    /// anything else blocks inside its footprint; an unreadable holder record
+    /// blocks, as before. The full reason is given once per running command;
+    /// every later refusal for it is one line.
+    pub fn edit_conflict(&self, path: &Path, scopes: &[PathBuf]) -> Option<String> {
+        let (workspace, holder) = self.probe_path(path, scopes)?;
+        let canonical = {
+            let start = path.ancestors().find(|a| a.exists()).unwrap_or(path);
+            let rest = path.strip_prefix(start).unwrap_or(Path::new(""));
+            dunce::canonicalize(start)
+                .map(|c| c.join(rest))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        let Some(holder) = holder else {
+            return Some(edit_refusal(path, &workspace, None));
+        };
+        if !holder.blocks_edit_of(&canonical) {
+            return None;
+        }
+        if self.already_refused(&workspace, &holder.op_id) {
+            Some(edit_refusal_again(path, &holder))
+        } else {
+            Some(edit_refusal(path, &workspace, Some(&holder)))
+        }
+    }
+
+    /// Record that `op_id` was named in a full refusal for `workspace`, and
+    /// say whether it already had been. One small file beside the lock,
+    /// overwritten when the holder changes; no lock directory means every
+    /// refusal is a first one.
+    fn already_refused(&self, workspace: &Path, op_id: &str) -> bool {
+        let Some(lock) = self.lock_path(workspace) else {
+            return false;
+        };
+        let marker = lock.with_extension("refused");
+        if std::fs::read_to_string(&marker).is_ok_and(|s| s == op_id) {
+            return true;
+        }
+        let _ = std::fs::write(&marker, op_id);
+        false
     }
 
     /// Why `op_id` has not started: the operations ahead of it, if it is still
@@ -1071,12 +1224,14 @@ mod holder_listing_tests {
             title: "cargo nextest run".into(),
             pid: 1,
             since_unix: 1_000,
+            ..HolderInfo::new("", "")
         };
         let dead = HolderInfo {
             op_id: "op_dead".into(),
             title: "cargo build".into(),
             pid: 2,
             since_unix: 2_000,
+            ..HolderInfo::new("", "")
         };
         for (key, h) in [("/ws/a", &live), ("/ws/b", &dead)] {
             let path = lock_dir.join(format!("ws-{}.holder.json", key_id(Path::new(key))));
@@ -1132,4 +1287,85 @@ pub fn list_holders(lock_dir: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<QueueHo
         .collect();
     out.sort_by_key(|r| r.holder.since_unix);
     out
+}
+
+#[cfg(test)]
+mod edit_conflict_tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    /// A holder record written by an older ahma has no effect or footprint;
+    /// it must keep today's conservative meaning: it blocks every edit.
+    #[test]
+    fn an_old_holder_record_blocks_every_edit() {
+        let old = r#"{"op_id":"op_1","title":"cargo nextest run","pid":1,"since_unix":0}"#;
+        let h: HolderInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(h.effect, SourceEffect::Unknown);
+        assert!(h.blocks_edit_of(Path::new("/repo/src/lib.rs")));
+    }
+
+    #[test]
+    fn a_source_reader_never_blocks_and_a_footprint_bounds_the_rest() {
+        let reader = HolderInfo::new("op_1", "cargo nextest run");
+        assert_eq!(reader.effect, SourceEffect::ReadsSources);
+        assert!(!reader.blocks_edit_of(Path::new("/repo/src/lib.rs")));
+
+        let fmt = HolderInfo::new("op_2", "cargo fmt").with_footprint(PathBuf::from("/repo/rust"));
+        assert!(fmt.blocks_edit_of(Path::new("/repo/rust/src/lib.rs")));
+        assert!(
+            !fmt.blocks_edit_of(Path::new("/repo/android/Main.kt")),
+            "an edit outside the subtree the writer runs in cannot race it"
+        );
+    }
+
+    async fn held(queue: &WorkspaceQueue, key: &Path, holder: HolderInfo) -> Lease {
+        queue
+            .enqueue(key, holder)
+            .unwrap()
+            .acquire(&CancellationToken::new(), &|_| {})
+            .await
+            .unwrap()
+    }
+
+    /// SPEC R2.7.8: an edit during a build or test is allowed; the drift
+    /// report says the run may have seen it.
+    #[tokio::test]
+    async fn an_edit_during_a_test_run_is_not_refused() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = dunce::canonicalize(td.path()).unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let queue = WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")));
+        let _lease = held(&queue, &repo, HolderInfo::new("op_1", "cargo nextest run")).await;
+        assert!(queue.edit_conflict(&repo.join("src/lib.rs"), &[]).is_none());
+    }
+
+    /// A refusal is said in full once per running command; repeats are one
+    /// line that says what is still running and for how long.
+    #[tokio::test]
+    async fn a_repeated_refusal_is_one_line() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = dunce::canonicalize(td.path()).unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let queue = WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")));
+        let _lease = held(
+            &queue,
+            &repo,
+            HolderInfo::new("op_7", "cargo fmt --all").with_typical_secs(Some(40)),
+        )
+        .await;
+        let first = queue
+            .edit_conflict(&repo.join("src/lib.rs"), &[])
+            .expect("a formatter blocks the edit");
+        assert!(first.contains("Not edited"), "{first}");
+        assert!(first.contains("cargo fmt --all"), "{first}");
+        assert!(first.contains("usually takes 40s"), "{first}");
+        let second = queue
+            .edit_conflict(&repo.join("src/main.rs"), &[])
+            .expect("still blocked");
+        assert!(!second.contains('\n'), "a repeat is one line: {second}");
+        assert!(second.contains("op_7"), "{second}");
+        assert!(second.len() < first.len() / 2, "{second}");
+    }
 }
