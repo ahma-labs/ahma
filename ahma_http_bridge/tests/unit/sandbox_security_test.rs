@@ -307,6 +307,31 @@ async fn test_empty_roots_rejected() {
     );
 }
 
+/// SPEC R5.2.3 under the hub: an empty `roots/list` is a decision the bridge
+/// cannot make alone when only the worker knows the user's container root. The
+/// hub runs its bridge with no fallback scope of its own, so Antigravity and LM
+/// Studio — which answer `roots/list` with `[]` — had their sessions failed
+/// before the worker could commit the container root the user configured.
+#[test]
+fn empty_roots_wait_for_the_worker_when_it_has_a_fallback() {
+    use ahma_http_bridge::session::EmptyRoots;
+    let mgr = |default_scope: Option<std::path::PathBuf>, worker: bool| {
+        SessionManager::new(SessionManagerConfig {
+            server_command: "echo".to_string(),
+            default_scope,
+            worker_resolves_empty_roots: worker,
+            ..Default::default()
+        })
+    };
+    assert_eq!(mgr(None, false).on_empty_roots(), EmptyRoots::Fail);
+    assert_eq!(
+        mgr(Some(test_temp_path("fallback")), false).on_empty_roots(),
+        EmptyRoots::UseDefaultScope
+    );
+    assert_eq!(mgr(None, true).on_empty_roots(), EmptyRoots::AwaitWorker);
+    assert!(!mgr(None, true).requires_client_roots());
+}
+
 /// Test empty roots use explicit fallback scope when configured.
 #[tokio::test]
 async fn test_empty_roots_use_explicit_fallback_scope() {

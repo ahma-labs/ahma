@@ -73,6 +73,7 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
         server_args,
         enable_colored_output,
         default_sandbox_scope: explicit_fallback_scope,
+        worker_resolves_empty_roots: config.container_root.is_some(),
         handshake_timeout_secs: config.handshake_timeout_secs,
         request_timeout_secs: ahma_http_bridge::session::DEFAULT_REQUEST_TIMEOUT_SECS,
         tool_call_timeout_secs: ahma_http_bridge::session::DEFAULT_TOOL_CALL_TIMEOUT_SECS,

@@ -143,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         server_args,
         enable_colored_output,
         default_sandbox_scope: args.default_sandbox_scope,
+        worker_resolves_empty_roots: false,
         handshake_timeout_secs: args.handshake_timeout_secs,
         request_timeout_secs: args.request_timeout_secs,
         tool_call_timeout_secs: args.tool_call_timeout_secs,
