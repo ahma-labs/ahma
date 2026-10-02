@@ -276,7 +276,15 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
-        tokio::time::timeout(TestTimeouts::get(TimeoutCategory::Quick), fut)
+        within_budget(TimeoutCategory::Quick, what, fut).await
+    }
+
+    async fn within_budget<T>(
+        category: TimeoutCategory,
+        what: &str,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        tokio::time::timeout(TestTimeouts::get(category), fut)
             .await
             .unwrap_or_else(|_| panic!("timed out: {what}"))
     }
@@ -324,7 +332,13 @@ mod tests {
         let listener = LocalListener::bind(&path).expect("bind");
         const N: usize = 8;
 
-        within("concurrent connections", async {
+        // Eight connections is two OS threads each on the Windows AF_UNIX
+        // bridge plus eight blocking connects, on a 2-core runner: the `Quick`
+        // budget (20s there) timed out on roughly one main run in three while
+        // the same test passed on every PR run. The work is bounded and never
+        // waits on anything outside the test, so a slow-runner budget is the
+        // honest one; a genuine deadlock still fails, just later.
+        within_budget(TimeoutCategory::ToolCall, "concurrent connections", async {
             let server = async {
                 let mut conns = Vec::new();
                 for _ in 0..N {
