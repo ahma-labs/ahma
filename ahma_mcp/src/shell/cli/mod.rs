@@ -1535,10 +1535,12 @@ pub enum PermissionsCommand {
         /// The path, domain pattern, or tool name to revoke.
         #[arg(value_name = "SUBJECT")]
         subject: String,
-        /// For `tool`: which workspace the approval is scoped to.
-        /// Defaults to the current directory.
-        #[arg(long = "workspace", value_name = "PATH")]
+        /// For `tool` and `fs-scope`: which workspace the permission is bound to. Defaults to the current directory for `tool`, and to the git repository enclosing it for `fs-scope`.
+        #[arg(long = "workspace", value_name = "PATH", conflicts_with = "global")]
         workspace: Option<PathBuf>,
+        /// For `fs-scope`: revoke the legacy global grant, the one that applies to every workspace.
+        #[arg(long = "global")]
+        global: bool,
         /// Apply the previewed change (without this, nothing is written).
         #[arg(long = "yes", short = 'y')]
         yes: bool,
@@ -1880,11 +1882,17 @@ pub enum SandboxCommand {
     },
     /// List the persistent scopes currently granted, and the file they live in.
     List,
-    /// Revoke a previously granted persistent scope.
+    /// Revoke a previously granted persistent scope. A grant belongs to one workspace, so a revoke names the workspace too; another workspace's grant of the same path is never touched.
     Revoke {
         /// Directory to revoke (matched after `~` expansion).
         #[arg(value_name = "PATH")]
         path: PathBuf,
+        /// The workspace whose grant to revoke. Default: the git repository enclosing the current directory, else the current directory.
+        #[arg(long = "workspace", value_name = "DIR", conflicts_with = "global")]
+        workspace: Option<PathBuf>,
+        /// Revoke the legacy global grant, the one that applies to every workspace.
+        #[arg(long = "global")]
+        global: bool,
     },
 }
 

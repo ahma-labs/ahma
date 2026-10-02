@@ -140,9 +140,9 @@ impl AhmaMcpService {
         // Gate 1: the hard denylist refuses outright, regardless of `confirm`.
         if let GrantRisk::Refused(reason) = &risk {
             return Err(common::mcp_invalid_params(format!(
-                "sandbox_grant REFUSED for {}: {reason}.\n\nThis path is on the hard denylist and \
-                 cannot be granted by the AI even with confirmation. If you genuinely need it, the \
-                 human must edit {} by hand.",
+                "sandbox_grant REFUSED for {}: {reason}.\n\nThis path is on the hard denylist: no \
+                 prompt can grant it, and a grant for it written into {} is not applied either. \
+                 Do not ask again; continue without it.",
                 path.display(),
                 settings_file.display(),
             )));

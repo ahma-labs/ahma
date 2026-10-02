@@ -45,7 +45,7 @@ fn a_grant_is_in_effect_for_the_next_hooked_command_with_no_restart() {
     // blocks it and the user is asked.
     let before = AhmaSettings::load_from(&settings_file);
     assert!(
-        before.sandbox.find_scope(&cache).is_none(),
+        before.sandbox.find_scope(&cache, None).is_none(),
         "precondition: nothing granted yet"
     );
 
@@ -71,7 +71,7 @@ fn a_grant_is_in_effect_for_the_next_hooked_command_with_no_restart() {
     let after = AhmaSettings::load_from_result(&settings_file).expect("the ledger parses");
     let granted = after
         .sandbox
-        .find_scope(&cache)
+        .find_scope(&cache, None)
         .expect("the next command sees the grant");
     assert_eq!(granted.access, ScopeAccess::Rw);
     assert_eq!(

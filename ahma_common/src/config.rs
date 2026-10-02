@@ -1244,24 +1244,31 @@ fn default_sandbox_profiles() -> Vec<String> {
 }
 
 impl SandboxSettings {
-    /// Find a persistent scope whose path matches `path` (after `~` expansion).
-    pub fn find_scope(&self, path: &Path) -> Option<&PersistentScope> {
+    /// The grant for `path` made for `workspace` (both matched after `~`
+    /// expansion). `None` finds only a legacy global record.
+    ///
+    /// The ledger is keyed by `(path, workspace)` (SPEC R5.4.11): one path may
+    /// be granted to several workspaces, each its own record with its own
+    /// access, provenance and revocation.
+    pub fn find_scope(&self, path: &Path, workspace: Option<&Path>) -> Option<&PersistentScope> {
         self.persistent_scopes
             .iter()
-            .find(|s| scope_paths_equiv(&s.path, path))
+            .find(|s| same_grant_key(s, path, workspace))
     }
 
-    /// Add a persistent scope, or replace the existing entry for the same path.
+    /// Add a persistent scope, or replace the existing entry for the same
+    /// `(path, workspace)`.
     ///
     /// Matching is by `~`-expanded path, so re-granting `~/x` after `/home/u/x`
-    /// updates in place rather than duplicating. Returns whether this added a new
-    /// entry or replaced one (the previous value is returned for the confirm
-    /// message).
+    /// updates in place rather than duplicating. A grant of the same path for a
+    /// different workspace is a separate record, never an update of another
+    /// workspace's. Returns whether this added a new entry or replaced one (the
+    /// previous value is returned for the confirm message).
     pub fn grant_scope(&mut self, scope: PersistentScope) -> GrantOutcome {
         if let Some(existing) = self
             .persistent_scopes
             .iter_mut()
-            .find(|s| scope_paths_equiv(&s.path, &scope.path))
+            .find(|s| same_grant_key(s, &scope.path, scope.workspace.as_deref()))
         {
             let old = std::mem::replace(existing, scope);
             GrantOutcome::Updated(Box::new(old))
@@ -1271,15 +1278,40 @@ impl SandboxSettings {
         }
     }
 
-    /// Remove the persistent scope for `path` (matched after `~` expansion).
-    /// Returns the removed entry, or `None` if no match existed.
-    pub fn revoke_scope(&mut self, path: &Path) -> Option<PersistentScope> {
+    /// Remove the persistent scope for `(path, workspace)`. Returns the removed
+    /// entry, or `None` if no record for that workspace exists — another
+    /// workspace's grant of the same path is never touched.
+    pub fn revoke_scope(
+        &mut self,
+        path: &Path,
+        workspace: Option<&Path>,
+    ) -> Option<PersistentScope> {
         let idx = self
             .persistent_scopes
             .iter()
-            .position(|s| scope_paths_equiv(&s.path, path))?;
+            .position(|s| same_grant_key(s, path, workspace))?;
         Some(self.persistent_scopes.remove(idx))
     }
+
+    /// Every workspace holding a grant for `path` (`None` = legacy global), so
+    /// a revoke that names the wrong workspace can say which ones to name.
+    pub fn workspaces_holding(&self, path: &Path) -> Vec<Option<PathBuf>> {
+        self.persistent_scopes
+            .iter()
+            .filter(|s| scope_paths_equiv(&s.path, path))
+            .map(|s| s.workspace.clone())
+            .collect()
+    }
+}
+
+/// Whether `scope` is the ledger record for `(path, workspace)`.
+fn same_grant_key(scope: &PersistentScope, path: &Path, workspace: Option<&Path>) -> bool {
+    scope_paths_equiv(&scope.path, path)
+        && match (scope.workspace.as_deref(), workspace) {
+            (None, None) => true,
+            (Some(a), Some(b)) => scope_paths_equiv(a, b),
+            _ => false,
+        }
 }
 
 impl Default for SandboxSettings {
@@ -3970,8 +4002,8 @@ persistent_scopes = [
             granted_at: None,
             note: None,
         });
-        assert!(sb.revoke_scope(Path::new("/nope")).is_none());
-        let removed = sb.revoke_scope(Path::new("/cache")).expect("removed");
+        assert!(sb.revoke_scope(Path::new("/nope"), None).is_none());
+        let removed = sb.revoke_scope(Path::new("/cache"), None).expect("removed");
         assert_eq!(removed.path, PathBuf::from("/cache"));
         assert!(sb.persistent_scopes.is_empty());
     }
@@ -3991,10 +4023,68 @@ persistent_scopes = [
             note: None,
         });
         // Looking up by the expanded absolute path finds the ~-stored entry.
-        assert!(sb.find_scope(&home.join("foo")).is_some());
+        assert!(sb.find_scope(&home.join("foo"), None).is_some());
         // Revoking by the expanded path removes the ~-stored entry.
-        assert!(sb.revoke_scope(&home.join("foo")).is_some());
+        assert!(sb.revoke_scope(&home.join("foo"), None).is_some());
         assert!(sb.persistent_scopes.is_empty());
+    }
+
+    /// SPEC R5.4.11: a grant belongs to the workspace it was made for, so the
+    /// ledger is keyed by `(path, workspace)`. Keyed by path alone, a grant from
+    /// workspace B silently replaced A's record, and a revoke from B removed A's.
+    #[test]
+    fn the_ledger_is_keyed_by_path_and_workspace() {
+        let mut sb = SandboxSettings::default();
+        let mk = |ws: &str, access| PersistentScope {
+            path: PathBuf::from("/shared/cache"),
+            access,
+            workspace: Some(PathBuf::from(ws)),
+            granted_by: None,
+            granted_at: None,
+            note: None,
+        };
+        assert_eq!(
+            sb.grant_scope(mk("/ws/a", ScopeAccess::Rw)),
+            GrantOutcome::Added
+        );
+        assert_eq!(
+            sb.grant_scope(mk("/ws/b", ScopeAccess::Ro)),
+            GrantOutcome::Added,
+            "the same path for another workspace is another grant, not an update"
+        );
+        assert_eq!(sb.persistent_scopes.len(), 2);
+
+        let a = sb
+            .find_scope(Path::new("/shared/cache"), Some(Path::new("/ws/a")))
+            .expect("A's grant");
+        assert_eq!(a.access, ScopeAccess::Rw);
+        assert!(
+            sb.find_scope(Path::new("/shared/cache"), None).is_none(),
+            "no legacy global record exists for this path"
+        );
+        assert!(
+            sb.find_scope(Path::new("/shared/cache"), Some(Path::new("/ws/c")))
+                .is_none()
+        );
+
+        let removed = sb
+            .revoke_scope(Path::new("/shared/cache"), Some(Path::new("/ws/b")))
+            .expect("B's grant is revoked");
+        assert_eq!(removed.workspace.as_deref(), Some(Path::new("/ws/b")));
+        assert_eq!(
+            sb.persistent_scopes.len(),
+            1,
+            "A's grant survives B's revoke"
+        );
+        assert_eq!(
+            sb.persistent_scopes[0].workspace.as_deref(),
+            Some(Path::new("/ws/a"))
+        );
+        assert_eq!(
+            sb.workspaces_holding(Path::new("/shared/cache")),
+            vec![Some(PathBuf::from("/ws/a"))],
+            "a revoke that finds nothing can say where the path is granted"
+        );
     }
 }
 

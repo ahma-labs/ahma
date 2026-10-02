@@ -607,6 +607,28 @@ impl Sandbox {
         mut self,
         records: Vec<ahma_common::config::PersistentScope>,
     ) -> Self {
+        // The hard denylist binds what is already in the file too (SPEC
+        // R5.4.5): a record written by hand, or by a build whose denylist was
+        // narrower, is skipped and said so — recorded is not the same as allowed.
+        let records = records
+            .into_iter()
+            .filter(|rec| match ahma_common::scope_grant::refusal_reason(&rec.path) {
+                Some(why) => {
+                    tracing::warn!(
+                        "Persistent grant {} is not applied: {why} Remove it with `ahma sandbox \
+                         revoke {}{}`.",
+                        rec.path.display(),
+                        rec.path.display(),
+                        rec.workspace
+                            .as_deref()
+                            .map(|w| format!(" --workspace {}", w.display()))
+                            .unwrap_or_else(|| " --global".to_string()),
+                    );
+                    false
+                }
+                None => true,
+            })
+            .collect();
         self.persistent_records = records;
         let (write, read) = self.applicable_persistent(&self.scopes.read());
         if !write.is_empty() {
@@ -1534,6 +1556,51 @@ mod live_grant_gate_tests {
             .expect("an ordinary cache directory is applied");
         let canon = dunce::canonicalize(cache.path()).unwrap();
         assert!(sb.scopes().iter().any(|s| s == &canon));
+    }
+
+    /// SPEC R5.4.5: the hard denylist holds for grants *already* in the
+    /// settings file — one written by hand, or by a build of ahma whose
+    /// denylist was narrower. Recorded is not the same as allowed.
+    #[test]
+    fn a_persisted_grant_on_the_denylist_is_not_applied() {
+        use ahma_common::config::PersistentScope;
+        let workspace = tempdir().unwrap();
+        let home = ahma_common::config::ahma_home_dir().expect("home dir");
+        let cache = tempdir().unwrap();
+        let record = |path: PathBuf| PersistentScope {
+            path,
+            access: ScopeAccess::Rw,
+            workspace: None,
+            granted_by: Some("a hand edit".into()),
+            granted_at: None,
+            note: None,
+        };
+        let sb = Sandbox::new(
+            vec![workspace.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap()
+        .with_persistent_records(vec![
+            record(home.join(".ssh").join("id_ed25519")),
+            record(dunce::canonicalize(cache.path()).unwrap()),
+        ]);
+        let in_scope = |p: &std::path::Path| sb.scopes().iter().any(|s| p.starts_with(s));
+        assert!(
+            !in_scope(&home.join(".ssh").join("id_ed25519")),
+            "a denylisted record is skipped at load"
+        );
+        assert!(
+            in_scope(&dunce::canonicalize(cache.path()).unwrap()),
+            "an ordinary record still applies"
+        );
+        assert_eq!(
+            sb.persistent_grants_in_effect().len(),
+            1,
+            "a skipped record is not reported as in force"
+        );
     }
 }
 
