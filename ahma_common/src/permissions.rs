@@ -750,6 +750,32 @@ pub struct AuditEntry {
     /// The surface the answer came from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
+    /// The request (`decision_id`) this answered, when it answered one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// How long the question was open before the human answered. This is the
+    /// habituation signal: a median under a few seconds means the prompts are
+    /// being clicked through, not read (SPEC R-PERM.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_decision_ms: Option<u64>,
+    /// The risk class shown at the prompt (`normal`, `high`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+}
+
+impl AuditEntry {
+    /// Attach the request this entry answered and how long it took.
+    pub fn with_request(
+        mut self,
+        request_id: impl Into<String>,
+        time_to_decision_ms: Option<u64>,
+        risk: Option<&str>,
+    ) -> Self {
+        self.request_id = Some(request_id.into());
+        self.time_to_decision_ms = time_to_decision_ms;
+        self.risk = risk.map(str::to_string);
+        self
+    }
 }
 
 /// The audit log path, `~/.ahma/permissions-audit.jsonl`.
@@ -811,6 +837,9 @@ pub fn audit_entry(
         access,
         tier,
         surface,
+        request_id: None,
+        time_to_decision_ms: None,
+        risk: None,
     }
 }
 
@@ -1130,4 +1159,42 @@ mod tests {
         assert_eq!(tool_row.subject, "cargo_build");
         assert_eq!(tool_row.scope_note.as_deref(), Some("/ws"));
     }
+}
+
+#[cfg(test)]
+mod audit_context_tests {
+    use super::*;
+
+    /// The audit line is where rubber-stamping becomes measurable: it carries
+    /// the request it answered, how long the human took, and the risk class.
+    #[test]
+    fn audit_entry_carries_request_id_and_time_to_decision() {
+        let e = audit_entry(
+            "2026-10-02T12:00:00Z",
+            AuditAction::Grant,
+            GrantKind::FsScope,
+            "/x",
+            Some("rw".into()),
+            GrantTier::Session,
+            Some("tui".into()),
+        )
+        .with_request("d1", Some(1_700), Some("high"));
+        assert_eq!(e.request_id.as_deref(), Some("d1"));
+        assert_eq!(e.time_to_decision_ms, Some(1_700));
+        assert_eq!(e.risk.as_deref(), Some("high"));
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"request_id\":\"d1\""), "{json}");
+        let plain: AuditEntry = serde_json::from_str(
+            r#"{"at":"t","action":"grant","kind":"fs-scope","subject":"/x","tier":"session"}"#,
+        )
+        .unwrap();
+        assert!(plain.request_id.is_none());
+    }
+}
+
+/// Unix seconds as a local `HH:MM` for prompts; the date is dropped on purpose
+/// (a prompt is about now, and a day-old one says "asked N times" anyway).
+pub fn fmt_unix_secs(secs: u64) -> String {
+    let s = secs % 86_400;
+    format!("{:02}:{:02} UTC", s / 3_600, (s % 3_600) / 60)
 }

@@ -42,6 +42,7 @@ pub mod event_dispatcher;
 pub mod exe_identity;
 pub mod file_uri;
 pub mod fs_lock;
+pub mod grant_prompt;
 pub mod hook_consent;
 pub mod hostname;
 pub mod http_retry;

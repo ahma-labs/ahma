@@ -91,6 +91,9 @@ pub struct InstanceIdentity {
     pub client_pid: Option<u32>,
     /// The client declared MCP `sampling` at `initialize`.
     pub sampling: bool,
+    /// The client declared MCP `elicitation` at `initialize`: a grant question
+    /// can be asked inside it (rung 1 of SPEC R-PERM.3).
+    pub elicitation: bool,
     /// Every writable root of the committed scope (SPEC R5.4).
     pub scopes: Vec<String>,
     /// Read-only roots beyond the writable ones.
@@ -123,17 +126,21 @@ pub fn set_initial_identity(session_id: Option<String>, client_pid: Option<u32>)
 /// Record the MCP client identity for this instance. Called from
 /// `on_initialized` once `clientInfo.name` is known. Idempotent: setting the
 /// same name again does not trigger a hub re-register.
-pub fn set_client_identity(name: impl Into<String>, sampling: bool) {
+pub fn set_client_identity(name: impl Into<String>, sampling: bool, elicitation: bool) {
     let name = name.into();
     if name.is_empty() {
         return;
     }
     INSTANCE_IDENTITY.send_if_modified(|cur| {
-        if cur.client.as_deref() == Some(name.as_str()) && cur.sampling == sampling {
+        if cur.client.as_deref() == Some(name.as_str())
+            && cur.sampling == sampling
+            && cur.elicitation == elicitation
+        {
             false
         } else {
             cur.client = Some(name);
             cur.sampling = sampling;
+            cur.elicitation = elicitation;
             true
         }
     });
@@ -345,6 +352,8 @@ fn persist_resolved_grant(
     tool: Option<String>,
     tier: ahma_common::permissions::GrantTier,
     sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
+    decision_id: &str,
+    time_to_decision_ms: Option<u64>,
 ) {
     let live_scopes: Vec<std::path::PathBuf> =
         sandbox.map(|sb| sb.scopes().to_vec()).unwrap_or_default();
@@ -392,26 +401,35 @@ fn persist_resolved_grant(
             }
         }
     } else {
-        ahma_common::permissions::append_audit(&ahma_common::permissions::audit_entry(
-            chrono::Local::now().to_rfc3339(),
-            ahma_common::permissions::AuditAction::Grant,
-            ahma_common::permissions::GrantKind::FsScope,
-            path.display().to_string(),
-            Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
-            ahma_common::permissions::GrantTier::Session,
-            Some("tui".to_string()),
-        ));
+        ahma_common::permissions::append_audit(
+            &ahma_common::permissions::audit_entry(
+                chrono::Local::now().to_rfc3339(),
+                ahma_common::permissions::AuditAction::Grant,
+                ahma_common::permissions::GrantKind::FsScope,
+                path.display().to_string(),
+                Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
+                tier,
+                Some("tui".to_string()),
+            )
+            .with_request(decision_id, time_to_decision_ms, None),
+        );
         tracing::info!(
             path = %path.display(),
             access = access.label(),
-            "scope granted at the TUI for this session only (not written to settings)"
+            tier = tier.label(),
+            "scope granted at the TUI without writing settings"
         );
     }
     if let Some(sb) = sandbox {
-        match sb.add_live_grant(path, access) {
+        let applied = if tier == ahma_common::permissions::GrantTier::Once {
+            sb.add_once_grant(path, access)
+        } else {
+            sb.add_live_grant(path, access)
+        };
+        match applied {
             Ok(()) => {
                 publish_committed_scope(sb);
-                if !tier.is_persistent() {
+                if tier == ahma_common::permissions::GrantTier::Session {
                     // R-PERM.4.4: a `[s]`/`[o]` answer at the TUI reaches hooked commands too.
                     crate::sandbox::record_session_grant(
                         path,
@@ -519,6 +537,7 @@ async fn run_reporter_loop(
             session_id: identity.session_id.clone(),
             client_pid: identity.client_pid,
             sampling: identity.sampling,
+            elicitation: identity.elicitation,
             scopes: identity.scopes.clone(),
             read_scopes: identity.read_scopes.clone(),
             grants: identity.grants.clone(),
@@ -926,8 +945,33 @@ async fn resolve_scope_grant(
             access,
             tool,
             tier,
-        } => persist_resolved_grant(&path, access, tool, tier, sandbox),
-        GrantResolveOutcome::Denied { .. } => {}
+            time_to_decision_ms,
+        } => persist_resolved_grant(
+            &path,
+            access,
+            tool,
+            tier,
+            sandbox,
+            &decision_id,
+            time_to_decision_ms,
+        ),
+        GrantResolveOutcome::Denied {
+            path,
+            time_to_decision_ms,
+        } => {
+            ahma_common::permissions::append_audit(
+                &ahma_common::permissions::audit_entry(
+                    chrono::Local::now().to_rfc3339(),
+                    ahma_common::permissions::AuditAction::Deny,
+                    ahma_common::permissions::GrantKind::FsScope,
+                    path.display().to_string(),
+                    None,
+                    ahma_common::permissions::GrantTier::Session,
+                    Some("tui".to_string()),
+                )
+                .with_request(&decision_id, time_to_decision_ms, None),
+            );
+        }
         GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => return,
     }
     let _ = send_msg(writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
@@ -1754,6 +1798,7 @@ mod tests {
             access: ScopeAccess::Ro,
             reason: GrantReason::PreExecViolation,
             tool: Some("cargo_build".into()),
+            context: Default::default(),
         };
         tx.send(req.clone()).unwrap();
 
@@ -1936,6 +1981,8 @@ mod tests {
                 Some("sccache".to_string()),
                 ahma_common::permissions::GrantTier::Always,
                 None,
+                "test-decision",
+                None,
             );
         });
 
@@ -1965,6 +2012,8 @@ mod tests {
                 ScopeAccess::Ro,
                 None,
                 ahma_common::permissions::GrantTier::Always,
+                None,
+                "test-decision",
                 None,
             );
         });
@@ -1997,6 +2046,8 @@ mod tests {
                 ScopeAccess::Rw,
                 Some("t".to_string()),
                 ahma_common::permissions::GrantTier::Always,
+                None,
+                "test-decision",
                 None,
             );
         });
@@ -2388,6 +2439,7 @@ mod tests {
                 access: ScopeAccess::Rw,
                 reason: GrantReason::PreExecViolation,
                 tool: Some("rustc".into()),
+                context: Default::default(),
             })
             .unwrap();
         match read_client_msg(&mut server_reader).await {

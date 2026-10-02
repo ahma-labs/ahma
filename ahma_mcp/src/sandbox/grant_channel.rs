@@ -23,7 +23,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use ahma_common::config::ScopeAccess;
-use ahma_common::scope_grant::{GrantCoordinator, GrantReason};
+use ahma_common::scope_grant::{
+    GrantContext, GrantCoordinator, GrantEvidence, GrantReason, GrantRequester, GrantRiskSummary,
+    ScopeGrantRequest,
+};
 
 /// The directory to actually offer for a denied `path` (P1c).
 ///
@@ -149,6 +152,189 @@ pub trait ScopeGrantNotifier: Send + Sync + std::fmt::Debug {
         reason: GrantReason,
         tool: Option<String>,
     );
+
+    /// [`Self::notify_violation`] with the judgement aids the caller gathered
+    /// (SPEC R-PERM.3.4). Returns the request that was raised, if one was, so
+    /// the caller can show the same body the human sees. The default drops the
+    /// context, for implementors that predate it.
+    async fn notify_violation_with(
+        &self,
+        path: &Path,
+        access: ScopeAccess,
+        reason: GrantReason,
+        tool: Option<String>,
+        context: GrantContext,
+    ) -> Option<ScopeGrantRequest> {
+        let _ = context;
+        self.notify_violation(path, access, reason, tool).await;
+        None
+    }
+
+    /// Whether the session's automatic prompt budget is spent (SPEC R-PERM.4.5).
+    fn budget_exhausted(&self) -> bool {
+        false
+    }
+}
+
+/// Facts about a grant target a human can check at a glance (SPEC R-PERM.3.4):
+/// names and counts only — never file contents, which could carry an injection
+/// into the prompt or an advisor. Bounded to one directory listing.
+pub fn inspect_grant_target(path: &Path) -> Vec<String> {
+    let mut facts = Vec::new();
+    match std::fs::symlink_metadata(path) {
+        Err(_) => facts.push("does not exist yet (a grant would let the command create it)".into()),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            facts.push("is a symlink; the grant applies to what it points at".into())
+        }
+        Ok(meta) if meta.is_file() => facts.push("is a single file".into()),
+        Ok(_) => {
+            let mut entries = 0usize;
+            let mut dotfiles = 0usize;
+            if let Ok(rd) = std::fs::read_dir(path) {
+                for e in rd.flatten().take(5_000) {
+                    entries += 1;
+                    if e.file_name().to_string_lossy().starts_with('.') {
+                        dotfiles += 1;
+                    }
+                }
+            }
+            facts.push(format!(
+                "directory with {entries}{} entries{}",
+                if entries >= 5_000 { "+" } else { "" },
+                if dotfiles > 0 {
+                    format!(", {dotfiles} hidden")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    }
+    if let Some(file) = ahma_common::config::settings_path()
+        && let Ok(settings) = ahma_common::config::AhmaSettings::load_from_result(&file)
+    {
+        let canon = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let others: Vec<String> = settings
+            .sandbox
+            .persistent_scopes
+            .iter()
+            .filter(|g| {
+                let gp = ahma_common::config::expand_home(&g.path);
+                dunce::canonicalize(&gp).unwrap_or(gp) == canon
+            })
+            .map(|g| {
+                g.workspace
+                    .as_ref()
+                    .map(|w| w.display().to_string())
+                    .unwrap_or_else(|| "every workspace (global)".into())
+            })
+            .collect();
+        if !others.is_empty() {
+            facts.push(format!(
+                "already granted for {} other workspace{}: {}",
+                others.len(),
+                if others.len() == 1 { "" } else { "s" },
+                others.join(", ")
+            ));
+        }
+    }
+    facts
+}
+
+/// Assemble the request context from what this process knows: who it is,
+/// what was denied, and how risky the target is (SPEC R-PERM.3.4).
+pub fn build_context(
+    sandbox: &super::Sandbox,
+    target: &Path,
+    evidence: Option<GrantEvidence>,
+    command: Option<&str>,
+    op_id: Option<&str>,
+    agent_claim: Option<&str>,
+    write_denied: bool,
+) -> GrantContext {
+    let identity = crate::hub_reporter::current_identity();
+    let scopes = sandbox.scopes().to_vec();
+    let risk = match ahma_common::scope_grant::classify_grant_risk(
+        target,
+        ahma_common::config::ahma_home_dir().as_deref(),
+        &scopes,
+    ) {
+        ahma_common::scope_grant::GrantRisk::High(warnings) => GrantRiskSummary {
+            class: "high".into(),
+            warnings,
+            facts: inspect_grant_target(target),
+        },
+        ahma_common::scope_grant::GrantRisk::Refused(why) => GrantRiskSummary {
+            class: "refused".into(),
+            warnings: vec![why],
+            facts: Vec::new(),
+        },
+        ahma_common::scope_grant::GrantRisk::Normal => GrantRiskSummary {
+            class: "normal".into(),
+            warnings: Vec::new(),
+            facts: inspect_grant_target(target),
+        },
+    };
+    GrantContext {
+        requester: Some(GrantRequester {
+            client: identity.client.clone(),
+            session_id: identity.session_id.clone(),
+            workspace: scopes.first().cloned(),
+            pid: std::process::id(),
+        }),
+        op_id: op_id.map(str::to_string),
+        command: command.map(redact_command),
+        evidence,
+        agent_claim: agent_claim.map(str::to_string),
+        risk: Some(risk),
+        times_asked: 0,
+        first_asked_at: None,
+        write_denied,
+    }
+}
+
+/// A command line safe to show at a prompt: `KEY=secret` prefixes and
+/// `--token x`-style values are masked, and it is cut to one screen line.
+pub fn redact_command(cmd: &str) -> String {
+    let mut out = Vec::new();
+    let mut mask_next = false;
+    for tok in cmd.split_whitespace() {
+        if mask_next {
+            out.push("***".to_string());
+            mask_next = false;
+            continue;
+        }
+        let lower = tok.to_ascii_lowercase();
+        if let Some((k, _)) = tok.split_once('=')
+            && (lower.contains("token")
+                || lower.contains("secret")
+                || lower.contains("password")
+                || lower.contains("key="))
+        {
+            out.push(format!("{k}=***"));
+        } else if lower.starts_with("--token") || lower.starts_with("--password") {
+            out.push(tok.to_string());
+            mask_next = !tok.contains('=');
+        } else {
+            out.push(tok.to_string());
+        }
+    }
+    let joined = out.join(" ");
+    if joined.chars().count() > 200 {
+        let cut: String = joined.chars().take(197).collect();
+        format!("{cut}...")
+    } else {
+        joined
+    }
+}
+
+/// The line in `stderr`/`stdout` that names `needle`, trimmed, for evidence.
+fn evidence_line(stderr: &str, stdout: &str, needle: &Path) -> Option<String> {
+    let n = needle.to_string_lossy();
+    stderr
+        .lines()
+        .chain(stdout.lines())
+        .find(|l| l.contains(&*n))
+        .map(|l| l.trim().chars().take(300).collect::<String>())
 }
 
 /// The PR-boundary stub: instead of a UI, log an actionable line (once per
@@ -222,9 +408,22 @@ impl ScopeGrantNotifier for HubGrantNotifier {
         reason: GrantReason,
         tool: Option<String>,
     ) {
-        let Some(req) = self.coordinator.begin(path, access, reason, tool) else {
-            return;
-        };
+        let _ = self
+            .notify_violation_with(path, access, reason, tool, GrantContext::default())
+            .await;
+    }
+
+    async fn notify_violation_with(
+        &self,
+        path: &Path,
+        access: ScopeAccess,
+        reason: GrantReason,
+        tool: Option<String>,
+        context: GrantContext,
+    ) -> Option<ScopeGrantRequest> {
+        let req = self
+            .coordinator
+            .begin_with_context(path, access, reason, tool, context)?;
         // Log unconditionally so the violation is visible even with no TUI attached.
         tracing::warn!(
             path = %req.path.display(),
@@ -234,7 +433,12 @@ impl ScopeGrantNotifier for HubGrantNotifier {
         );
         // Deliver to the hub; if the channel is closed (no reporter yet) the log
         // above is the fallback.
-        let _ = self.req_tx.send(req);
+        let _ = self.req_tx.send(req.clone());
+        Some(req)
+    }
+
+    fn budget_exhausted(&self) -> bool {
+        self.coordinator.budget_exhausted()
     }
 }
 
@@ -254,14 +458,51 @@ pub async fn notify_pre_exec(
         // Offer the enclosing directory when the argument is a file (P1c), so one
         // grant covers it and its siblings.
         let target = grant_dir_for(path);
-        n.notify_violation(
-            &target,
-            ScopeAccess::Rw,
-            GrantReason::PreExecViolation,
-            Some(tool.to_string()),
-        )
-        .await;
+        let evidence = GrantEvidence {
+            raw_path: Some(path.clone()),
+            pattern: Some("path validation before the command ran".into()),
+            line: Some(err.to_string().lines().next().unwrap_or("").to_string()),
+        };
+        let _ = n
+            .notify_violation_with(
+                &target,
+                ScopeAccess::Rw,
+                GrantReason::PreExecViolation,
+                Some(tool.to_string()),
+                GrantContext {
+                    evidence: Some(evidence),
+                    command: Some(redact_command(tool)),
+                    write_denied: true,
+                    ..Default::default()
+                },
+            )
+            .await;
     }
+}
+
+/// What a terminal hook prints for a denial (SPEC R-PERM.9, R-PERM.3.4): the
+/// first line says the user must act, then the same body every other surface
+/// shows, then the exact commands for each tier.
+pub fn hook_denial_text(path: &Path, access: ScopeAccess, details: &str) -> String {
+    let target = grant_dir_for(path);
+    let body = ahma_common::grant_prompt::render_for_hook(&target, access, details);
+    let ro_flag = if access.is_write() {
+        ""
+    } else {
+        " --read-only"
+    };
+    format!(
+        "Blocked until a human grants it: ahma's kernel sandbox refused an out-of-scope {} to \
+         '{}'.\n\n{}\nOne thing to do (pick a tier), then re-run the command:\n  ahma sandbox \
+         grant {target}{ro_flag} --session   # this terminal session only, at most 12h\n  ahma \
+         sandbox grant {target}{ro_flag}             # until revoked, bound to this workspace\n\n\
+         Either applies on your next command; nothing to restart.",
+        if access.is_write() { "write" } else { "read" },
+        path.display(),
+        body.to_text(),
+        target = target.display(),
+        ro_flag = ro_flag,
+    )
 }
 
 /// Wiring helper: a sandboxed command failed; scan its stderr for a denial and, if
@@ -275,7 +516,7 @@ pub async fn notify_stderr_denial(
     stdout: &str,
     tool: &str,
 ) {
-    notify_stderr_denial_in_dir(sandbox, notifier, stderr, stdout, tool, None).await;
+    notify_stderr_denial_in_dir(sandbox, notifier, stderr, stdout, tool, None, None).await;
 }
 
 /// Variant of [`notify_stderr_denial`] that resolves relative candidate paths
@@ -287,12 +528,18 @@ pub async fn notify_stderr_denial_in_dir(
     stdout: &str,
     tool: &str,
     working_dir: Option<&Path>,
+    op_id: Option<&str>,
 ) {
     let Some(n) = notifier else { return };
     // stdout too: a merged pipeline (`… 2>&1 | tail`) leaves stderr empty, and a
     // denial that disappears when a caller adds `2>&1` is a trap, not a feature.
     let Some(hit) = super::denial_scan::scan_denial_streams(stderr, stdout) else {
         return;
+    };
+    let evidence = GrantEvidence {
+        raw_path: Some(hit.path.clone()),
+        pattern: Some(hit.pattern.to_string()),
+        line: evidence_line(stderr, stdout, &hit.path),
     };
     let (in_scope, target) = {
         let scopes_guard = sandbox.scopes();
@@ -316,13 +563,24 @@ pub async fn notify_stderr_denial_in_dir(
     // one grant covers the whole cache rather than re-prompting per file (P1c).
     // When the path was reached through a symlink to an out-of-scope tree (e.g. a
     // symlinked `target/` directory), offer the canonical external target root.
-    n.notify_violation(
+    let context = build_context(
+        sandbox,
         &target,
-        hit.access,
-        GrantReason::StderrHeuristic,
-        Some(tool.to_string()),
-    )
-    .await;
+        Some(evidence),
+        Some(tool),
+        op_id,
+        None,
+        hit.access.is_write(),
+    );
+    let _ = n
+        .notify_violation_with(
+            &target,
+            hit.access,
+            GrantReason::StderrHeuristic,
+            Some(tool.to_string()),
+            context,
+        )
+        .await;
 }
 
 /// Resolve the candidate path from a denial into the directory that should actually
@@ -633,5 +891,41 @@ mod grant_dir_gate_tests {
         assert_eq!(grant_dir_for(&file), file, "$HOME is never the suggestion");
         let key = home.join(".ssh").join("ahma-grant-gate-test.pub");
         assert_eq!(grant_dir_for(&key), key, "~/.ssh is never the suggestion");
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn hook_denial_text_leads_with_blocked_and_has_every_section() {
+        let t = hook_denial_text(
+            Path::new("/opt/cache/x.bin"),
+            ScopeAccess::Rw,
+            "write to /opt/cache/x.bin: Operation not permitted",
+        );
+        assert!(t.starts_with("Blocked until a human grants it"), "{t}");
+        for h in [
+            "Who is asking",
+            "What was blocked",
+            "What the agent says it needs",
+            "Minimum that would work",
+            "What a grant allows",
+            "Risk",
+            "If you choose always",
+        ] {
+            assert!(t.contains(h), "missing {h}: {t}");
+        }
+        assert!(t.contains("ahma sandbox grant /opt/cache --session"), "{t}");
+    }
+
+    #[test]
+    fn command_lines_are_redacted_for_the_prompt() {
+        assert_eq!(
+            redact_command("GITHUB_TOKEN=abc cargo publish --token xyz"),
+            "GITHUB_TOKEN=*** cargo publish --token ***"
+        );
+        assert_eq!(redact_command("cargo test -p stat3"), "cargo test -p stat3");
     }
 }

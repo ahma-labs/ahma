@@ -82,6 +82,89 @@ pub struct ScopeGrantRequest {
     /// The tool/command that tripped the scope (e.g. `"run_terminal_command"`),
     /// for the prompt text and the grant's `granted_by` provenance.
     pub tool: Option<String>,
+    /// Everything a human needs to judge the request (SPEC R-PERM.3.4). Absent
+    /// in records from older senders; every field is optional on purpose.
+    #[serde(default)]
+    pub context: GrantContext,
+}
+
+/// Who raised the request: the session and client it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GrantRequester {
+    /// `clientInfo.name` from the MCP handshake (`claude-code`, `cursor`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// The MCP session id, for telling three windows on one repo apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The workspace the grant would be bound to (SPEC R5.4.11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
+    /// The server process asking.
+    #[serde(default)]
+    pub pid: u32,
+}
+
+/// What the kernel actually refused, as evidence rather than a summary.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GrantEvidence {
+    /// The path the denial named, before any parent-directory widening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_path: Option<PathBuf>,
+    /// Which denial signature matched (`seatbelt file-write`, `permission denied`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// The output line the path was read from, trimmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+}
+
+/// The risk assessment, pre-computed where the live scopes are known.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GrantRiskSummary {
+    /// `normal` or `high` (a `refused` path never becomes a request).
+    #[serde(default)]
+    pub class: String,
+    /// The High-risk warnings, verbatim from [`classify_grant_risk`].
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Observed facts about the target: existence, size, other grants on it.
+    #[serde(default)]
+    pub facts: Vec<String>,
+}
+
+/// The judgement aids attached to a request (SPEC R-PERM.3.4). Every field is
+/// optional so a sender that knows nothing (a hook, an old binary) still
+/// produces a complete, honest prompt that says "unknown" where it must.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GrantContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<GrantRequester>,
+    /// The operation whose command was denied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
+    /// The command line that was denied, secrets redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<GrantEvidence>,
+    /// What the agent said it needs the path for. Displayed as its claim —
+    /// never as the prompt's own authority (the agent is the untrusted party).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_claim: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<GrantRiskSummary>,
+    /// How many times this `(path, access)` has been asked this session,
+    /// counting this one. A repeat reads as a pattern, not a surprise.
+    #[serde(default)]
+    pub times_asked: u32,
+    /// Unix seconds of the first ask this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_asked_at: Option<u64>,
+    /// Whether a *write* was actually refused. Decides the minimum offered:
+    /// read-only unless this is true.
+    #[serde(default)]
+    pub write_denied: bool,
 }
 
 /// The human's answer at any surface. Three-valued — never a bool — because
@@ -100,6 +183,10 @@ pub enum GrantDecision {
     GrantRoSession,
     /// Grant read+write access for this session only — applied live, never written.
     GrantRwSession,
+    /// Grant read-only access for the next command only (`once` tier).
+    GrantRoOnce,
+    /// Grant read+write access for the next command only (`once` tier).
+    GrantRwOnce,
 }
 
 impl GrantDecision {
@@ -107,8 +194,12 @@ impl GrantDecision {
     pub fn access(self) -> Option<ScopeAccess> {
         match self {
             GrantDecision::Deny => None,
-            GrantDecision::GrantRo | GrantDecision::GrantRoSession => Some(ScopeAccess::Ro),
-            GrantDecision::GrantRw | GrantDecision::GrantRwSession => Some(ScopeAccess::Rw),
+            GrantDecision::GrantRo | GrantDecision::GrantRoSession | GrantDecision::GrantRoOnce => {
+                Some(ScopeAccess::Ro)
+            }
+            GrantDecision::GrantRw | GrantDecision::GrantRwSession | GrantDecision::GrantRwOnce => {
+                Some(ScopeAccess::Rw)
+            }
         }
     }
 
@@ -118,6 +209,9 @@ impl GrantDecision {
         match self {
             GrantDecision::GrantRoSession | GrantDecision::GrantRwSession => {
                 crate::permissions::GrantTier::Session
+            }
+            GrantDecision::GrantRoOnce | GrantDecision::GrantRwOnce => {
+                crate::permissions::GrantTier::Once
             }
             _ => crate::permissions::GrantTier::Always,
         }
@@ -137,14 +231,18 @@ pub enum GrantResolveOutcome {
         access: ScopeAccess,
         /// Tool that requested it, for `granted_by` provenance.
         tool: Option<String>,
-        /// `always` (write it) or `session` (live only).
+        /// `always` (write it), `session` (live only) or `once` (next command).
         tier: crate::permissions::GrantTier,
+        /// How long the question was open, for the audit line.
+        time_to_decision_ms: Option<u64>,
     },
     /// The human denied; nothing is persisted. The `(path, access)` is now dismissed
     /// for the session.
     Denied {
         /// The directory that was denied.
         path: PathBuf,
+        /// How long the question was open, for the audit line.
+        time_to_decision_ms: Option<u64>,
     },
     /// This `decision_id` was already resolved (a twin surface answered first).
     AlreadyResolved,
@@ -171,6 +269,29 @@ struct Inner {
     /// `decision_id`s already resolved — makes [`GrantCoordinator::resolve`]
     /// idempotent and lets late twin answers no-op.
     resolved: HashSet<String>,
+    /// How often each `(path, access)` was asked this session, and when first:
+    /// a repeat is shown as a pattern at the prompt (SPEC R-PERM.3.4).
+    ask_counts: HashMap<(PathBuf, ScopeAccess), (u32, u64)>,
+    /// When each in-flight decision was raised, for time-to-decision.
+    raised_at: HashMap<String, std::time::Instant>,
+    /// Unix seconds of every prompt raised automatically, for the budget
+    /// (SPEC R-PERM.4.5). Explicit re-raises are not counted.
+    raised_window: Vec<u64>,
+}
+
+/// At most this many automatic prompts per [`PROMPT_WINDOW_SECS`] per session;
+/// past it the agent is told to ask the human in conversation instead
+/// (SPEC R-PERM.4.5). A sixth interrupt in ten minutes is not a question the
+/// human will read.
+pub const PROMPT_BUDGET: usize = 5;
+/// The budget window, in seconds.
+pub const PROMPT_WINDOW_SECS: u64 = 600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl GrantCoordinator {
@@ -192,7 +313,43 @@ impl GrantCoordinator {
         reason: GrantReason,
         tool: Option<String>,
     ) -> Option<ScopeGrantRequest> {
-        self.begin_canonical(canonicalize_best_effort(path), access, reason, tool)
+        self.begin_with_context(path, access, reason, tool, GrantContext::default())
+    }
+
+    /// [`Self::begin`] with the judgement aids the caller could gather
+    /// (SPEC R-PERM.3.4). The coordinator fills in `times_asked` and
+    /// `first_asked_at` itself; the caller supplies the rest.
+    pub fn begin_with_context(
+        &self,
+        path: &Path,
+        access: ScopeAccess,
+        reason: GrantReason,
+        tool: Option<String>,
+        context: GrantContext,
+    ) -> Option<ScopeGrantRequest> {
+        self.begin_canonical(
+            canonicalize_best_effort(path),
+            access,
+            reason,
+            tool,
+            context,
+            true,
+        )
+    }
+
+    /// Whether the automatic prompt budget for the current window is spent
+    /// (SPEC R-PERM.4.5). Surfaces use it to tell the agent to ask in
+    /// conversation instead of raising another interrupt.
+    pub fn budget_exhausted(&self) -> bool {
+        let inner = self.inner.lock();
+        Self::prompts_in_window(&inner.raised_window, now_secs()) >= PROMPT_BUDGET
+    }
+
+    fn prompts_in_window(window: &[u64], now: u64) -> usize {
+        window
+            .iter()
+            .filter(|t| now.saturating_sub(**t) < PROMPT_WINDOW_SECS)
+            .count()
     }
 
     /// [`Self::begin`], given an already-canonicalized path — lets
@@ -204,6 +361,8 @@ impl GrantCoordinator {
         access: ScopeAccess,
         reason: GrantReason,
         tool: Option<String>,
+        mut context: GrantContext,
+        budgeted: bool,
     ) -> Option<ScopeGrantRequest> {
         // SPEC R-PERM.4.3: a path the hard denylist refuses never becomes a
         // question. The prompt would be one whose right answer is always "no",
@@ -221,6 +380,27 @@ impl GrantCoordinator {
         if inner.dismissed.contains(&key) || inner.active_keys.contains(&key) {
             return None;
         }
+        let now = now_secs();
+        if budgeted {
+            // SPEC R-PERM.4.5: past the budget, nothing is raised. The agent
+            // learns it from `budget_exhausted()` and asks in conversation.
+            inner
+                .raised_window
+                .retain(|t| now.saturating_sub(*t) < PROMPT_WINDOW_SECS);
+            if inner.raised_window.len() >= PROMPT_BUDGET {
+                tracing::warn!(
+                    path = %canonical.display(),
+                    "scope grant not raised: {PROMPT_BUDGET} prompts already in the last \
+                     {PROMPT_WINDOW_SECS}s; the agent must ask the human in conversation"
+                );
+                return None;
+            }
+            inner.raised_window.push(now);
+        }
+        let entry = inner.ask_counts.entry(key.clone()).or_insert((0, now));
+        entry.0 += 1;
+        context.times_asked = entry.0;
+        context.first_asked_at = Some(entry.1);
         let decision_id = uuid::Uuid::new_v4().to_string();
         let req = ScopeGrantRequest {
             decision_id: decision_id.clone(),
@@ -228,8 +408,12 @@ impl GrantCoordinator {
             access,
             reason,
             tool,
+            context,
         };
         inner.active_keys.insert(key);
+        inner
+            .raised_at
+            .insert(decision_id.clone(), std::time::Instant::now());
         inner.in_flight.insert(decision_id, req.clone());
         Some(req)
     }
@@ -256,7 +440,16 @@ impl GrantCoordinator {
             let mut inner = self.inner.lock();
             inner.dismissed.remove(&(canonical.clone(), access));
         }
-        self.begin_canonical(canonical, access, reason, tool)
+        // An explicit human re-raise is not an interrupt ahma chose, so it is
+        // not counted against the prompt budget.
+        self.begin_canonical(
+            canonical,
+            access,
+            reason,
+            tool,
+            GrantContext::default(),
+            false,
+        )
     }
 
     /// Resolve a decision with the human's answer. First-answer-wins and idempotent:
@@ -276,12 +469,19 @@ impl GrantCoordinator {
         };
         inner.resolved.insert(decision_id.to_string());
         inner.active_keys.remove(&(req.path.clone(), req.access));
+        let time_to_decision_ms = inner
+            .raised_at
+            .remove(decision_id)
+            .map(|t| t.elapsed().as_millis() as u64);
 
         match decision.access() {
             None => {
                 // Deny: suppress re-asking exactly this (path, access).
                 inner.dismissed.insert((req.path.clone(), req.access));
-                GrantResolveOutcome::Denied { path: req.path }
+                GrantResolveOutcome::Denied {
+                    path: req.path,
+                    time_to_decision_ms,
+                }
             }
             Some(access) => {
                 // Grant: suppress both access variants for this path — the live
@@ -293,6 +493,7 @@ impl GrantCoordinator {
                     access,
                     tool: req.tool,
                     tier: decision.tier(),
+                    time_to_decision_ms,
                 }
             }
         }
@@ -308,6 +509,7 @@ impl GrantCoordinator {
         if let Some(r) = &req {
             inner.active_keys.remove(&(r.path.clone(), r.access));
         }
+        inner.raised_at.remove(decision_id);
         inner.resolved.insert(decision_id.to_string());
         req
     }
@@ -760,6 +962,7 @@ mod tests {
                 access,
                 tool,
                 tier,
+                ..
             } => {
                 assert_eq!(access, ScopeAccess::Rw);
                 assert_eq!(tool.as_deref(), Some("sccache"));
@@ -1217,5 +1420,222 @@ pub fn refusal_reason(path: &Path) -> Option<String> {
     match classify_grant_risk(&canonical, crate::config::ahma_home_dir().as_deref(), &[]) {
         GrantRisk::Refused(why) => Some(why),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod request_context_tests {
+    use super::*;
+    use crate::grant_prompt::{PromptBody, render};
+
+    fn full_request() -> ScopeGrantRequest {
+        ScopeGrantRequest {
+            decision_id: "d1".into(),
+            path: PathBuf::from("/Users/me/.cache/neubit"),
+            access: ScopeAccess::Rw,
+            reason: GrantReason::StderrHeuristic,
+            tool: Some("run_terminal_command".into()),
+            context: GrantContext {
+                requester: Some(GrantRequester {
+                    client: Some("claude-code".into()),
+                    session_id: Some("0123456789abcdef".into()),
+                    workspace: Some(PathBuf::from("/Users/me/github/neubit4")),
+                    pid: 4242,
+                }),
+                op_id: Some("op_x1".into()),
+                command: Some("cargo test -p stat3".into()),
+                evidence: Some(GrantEvidence {
+                    raw_path: Some(PathBuf::from("/Users/me/.cache/neubit/heavy.lock")),
+                    pattern: Some("permission denied".into()),
+                    line: Some(
+                        "error: failed to create lock /Users/me/.cache/neubit/heavy.lock: \
+                         Permission denied (os error 13)"
+                            .into(),
+                    ),
+                }),
+                agent_claim: Some("the build needs the shared model cache".into()),
+                risk: Some(GrantRiskSummary {
+                    class: "high".into(),
+                    warnings: vec!["the directory does not exist yet".into()],
+                    facts: vec!["3 other checkouts hold a grant on it".into()],
+                }),
+                times_asked: 2,
+                first_asked_at: Some(1_000),
+                write_denied: true,
+            },
+        }
+    }
+
+    /// SPEC R-PERM.3.4: one body, every section, in this order, at every surface.
+    #[test]
+    fn body_has_every_section_in_order_and_labels_the_claim() {
+        let PromptBody {
+            title,
+            sections,
+            options,
+        } = render(&full_request());
+        assert!(title.contains("/Users/me/.cache/neubit"), "{title}");
+        let headings: Vec<&str> = sections.iter().map(|s| s.heading.as_str()).collect();
+        assert_eq!(
+            headings,
+            vec![
+                "Who is asking",
+                "What was blocked",
+                "What the agent says it needs",
+                "Minimum that would work",
+                "What a grant allows",
+                "Risk",
+                "If you choose always",
+            ],
+            "{headings:?}"
+        );
+        let text = sections
+            .iter()
+            .map(|s| s.body.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("claude-code"), "{text}");
+        assert!(text.contains("neubit4"), "{text}");
+        assert!(text.contains("cargo test -p stat3"), "{text}");
+        assert!(text.contains("heavy.lock"), "{text}");
+        assert!(text.contains("Permission denied"), "{text}");
+        assert!(
+            text.contains("the agent's claim") || text.contains("agent's own words"),
+            "the rationale is labelled as a claim: {text}"
+        );
+        assert!(text.contains("asked 2 times"), "{text}");
+        assert!(
+            text.contains("read+write on"),
+            "a write was denied, so rw is the minimum: {text}"
+        );
+        assert!(
+            text.contains("every command in /Users/me/github/neubit4"),
+            "{text}"
+        );
+        assert!(text.contains("3 other checkouts"), "{text}");
+        assert!(text.contains("settings.toml"), "{text}");
+        assert_eq!(options[0].decision, GrantDecision::Deny, "deny is first");
+        assert!(
+            options
+                .iter()
+                .any(|o| o.decision == GrantDecision::GrantRwOnce)
+        );
+        assert!(options.iter().any(|o| o.label.contains("session")));
+    }
+
+    #[test]
+    fn minimum_is_read_only_unless_a_write_was_denied() {
+        let mut req = full_request();
+        req.context.write_denied = false;
+        req.access = ScopeAccess::Ro;
+        let body = render(&req);
+        let min = body
+            .sections
+            .iter()
+            .find(|s| s.heading == "Minimum that would work")
+            .unwrap();
+        assert!(min.body.contains("read-only"), "{}", min.body);
+    }
+
+    #[test]
+    fn a_bare_request_still_renders_every_section() {
+        // Hooks and legacy senders have no context at all; the body must not
+        // panic or drop sections, it says "unknown" where it cannot know.
+        let req = ScopeGrantRequest {
+            decision_id: "d2".into(),
+            path: PathBuf::from("/opt/cache"),
+            access: ScopeAccess::Ro,
+            reason: GrantReason::PreExecViolation,
+            tool: None,
+            context: GrantContext::default(),
+        };
+        let body = render(&req);
+        assert_eq!(body.sections.len(), 7);
+        assert!(body.to_text().contains("/opt/cache"));
+    }
+
+    #[test]
+    fn legacy_request_json_still_parses() {
+        let v1 = r#"{"decision_id":"a","path":"/x","access":"rw","reason":"pre_exec_violation","tool":null}"#;
+        let req: ScopeGrantRequest = serde_json::from_str(v1).unwrap();
+        assert_eq!(req.context, GrantContext::default());
+    }
+
+    #[test]
+    fn once_tier_is_never_persistent() {
+        assert_eq!(
+            GrantDecision::GrantRwOnce.tier(),
+            crate::permissions::GrantTier::Once
+        );
+        assert_eq!(GrantDecision::GrantRoOnce.access(), Some(ScopeAccess::Ro));
+        assert!(!GrantDecision::GrantRwOnce.tier().is_persistent());
+    }
+
+    #[test]
+    fn coordinator_counts_repeat_asks() {
+        let c = GrantCoordinator::new();
+        let dir = tempfile::tempdir().unwrap();
+        let first = c
+            .begin_with_context(
+                dir.path(),
+                ScopeAccess::Rw,
+                GrantReason::PreExecViolation,
+                None,
+                GrantContext::default(),
+            )
+            .unwrap();
+        assert_eq!(first.context.times_asked, 1);
+        assert!(first.context.first_asked_at.is_some());
+        c.resolve(&first.decision_id, GrantDecision::Deny);
+        let again = c
+            .reopen(
+                dir.path(),
+                ScopeAccess::Rw,
+                GrantReason::PreExecViolation,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            again.context.times_asked, 2,
+            "a re-raise reads as a pattern"
+        );
+        assert_eq!(again.context.first_asked_at, first.context.first_asked_at);
+    }
+
+    /// SPEC R-PERM.4.5: a session may raise at most `PROMPT_BUDGET` questions
+    /// per window; past it, nothing is asked and the agent is told to talk.
+    #[test]
+    fn coordinator_rate_limits_prompts_per_window() {
+        let c = GrantCoordinator::new();
+        let dirs: Vec<_> = (0..PROMPT_BUDGET + 1)
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect();
+        for d in dirs.iter().take(PROMPT_BUDGET) {
+            assert!(
+                c.begin(
+                    d.path(),
+                    ScopeAccess::Rw,
+                    GrantReason::PreExecViolation,
+                    None
+                )
+                .is_some()
+            );
+        }
+        assert!(
+            c.budget_exhausted(),
+            "after {PROMPT_BUDGET} prompts the next one will not be raised"
+        );
+        assert!(
+            c.begin(
+                dirs[PROMPT_BUDGET].path(),
+                ScopeAccess::Rw,
+                GrantReason::PreExecViolation,
+                None
+            )
+            .is_none(),
+            "the {}th prompt in one window is not raised",
+            PROMPT_BUDGET + 1
+        );
+        assert!(c.budget_exhausted());
     }
 }

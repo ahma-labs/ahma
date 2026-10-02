@@ -175,6 +175,10 @@ pub struct InstanceInfo {
     /// own model (`mcp://` providers in the TUI). Field-only (R24.5).
     #[serde(default)]
     pub sampling: bool,
+    /// Whether the MCP client declared the `elicitation` capability: a grant
+    /// question can be asked inside it (SPEC R-PERM.3 rung 1). Field-only (R24.5).
+    #[serde(default)]
+    pub elicitation: bool,
     /// When this instance disconnected (Unix epoch, milliseconds), for an
     /// instance retained only so its recent operations still have somewhere to
     /// belong. `None` for a live instance.
@@ -325,6 +329,7 @@ pub enum HubEvent {
 /// a requirement, not a nicety: the hub socket has no protocol version (R24.5
 /// evolves it by adding fields), so a hub left running across an upgrade must
 /// keep understanding a newer instance. `relay_wire_compat` pins the bytes.
+#[allow(clippy::large_enum_variant)] // a relayed grant request carries its full context
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HubRelay {
@@ -450,6 +455,9 @@ pub enum ClientMsg {
         /// The client declared MCP `sampling` (see [`InstanceInfo::sampling`]).
         #[serde(default)]
         sampling: bool,
+        /// The client declared MCP `elicitation` (see [`InstanceInfo::elicitation`]).
+        #[serde(default)]
+        elicitation: bool,
         /// See [`InstanceInfo::scopes`]. Field-only evolution (R24.5).
         #[serde(default)]
         scopes: Vec<String>,
@@ -1991,6 +1999,7 @@ where
             session_id,
             client_pid,
             sampling,
+            elicitation,
             scopes,
             read_scopes,
             grants,
@@ -2009,6 +2018,7 @@ where
                     session_id,
                     client_pid,
                     sampling,
+                    elicitation,
                     scopes,
                     read_scopes,
                     grants,
@@ -2280,6 +2290,7 @@ struct Registration {
     session_id: Option<String>,
     client_pid: Option<u32>,
     sampling: bool,
+    elicitation: bool,
     scopes: Vec<String>,
     read_scopes: Vec<String>,
     grants: Vec<GrantSummary>,
@@ -2324,6 +2335,7 @@ async fn serve_instance<R, W>(
         session_id: reg.session_id,
         client_pid: reg.client_pid,
         sampling: reg.sampling,
+        elicitation: reg.elicitation,
         ended_epoch_ms: None,
         scopes: reg.scopes,
         read_scopes: reg.read_scopes,
@@ -2679,6 +2691,7 @@ mod tests {
             session_id: Some("sess-1".into()),
             client_pid: Some(99),
             sampling: false,
+            elicitation: false,
             scopes: vec![],
             read_scopes: vec![],
             grants: vec![],
@@ -2924,6 +2937,7 @@ mod tests {
             session_id: None,
             client_pid: None,
             sampling: false,
+            elicitation: false,
             scopes: vec![],
             read_scopes: vec![],
             grants: vec![],
@@ -3045,6 +3059,7 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                elicitation: false,
                 ended_epoch_ms: None,
                 scopes: vec![],
                 read_scopes: vec![],
@@ -3208,6 +3223,7 @@ mod tests {
             access: crate::config::ScopeAccess::Rw,
             reason: GrantReason::StderrHeuristic,
             tool: Some("sccache".into()),
+            context: Default::default(),
         };
 
         // ClientMsg side (instance → hub, and TUI → hub).
@@ -3345,6 +3361,7 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                elicitation: false,
                 scopes: vec![],
                 read_scopes: vec![],
                 grants: vec![],
@@ -3460,6 +3477,7 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                elicitation: false,
                 scopes: vec![],
                 read_scopes: vec![],
                 grants: vec![],
@@ -4083,6 +4101,7 @@ mod tests {
             session_id: None,
             client_pid: None,
             sampling: false,
+            elicitation: false,
             ended_epoch_ms: None,
             scopes: vec![],
             read_scopes: vec![],
@@ -4338,6 +4357,7 @@ mod tests {
             session_id: None,
             client_pid: None,
             sampling: false,
+            elicitation: false,
             ended_epoch_ms: None,
             scopes: vec![],
             read_scopes: vec![],
@@ -4534,6 +4554,7 @@ mod tests {
                     session_id: Some("sess-1".into()),
                     client_pid: Some(11),
                     sampling: false,
+                    elicitation: false,
                     ended_epoch_ms: None,
                     scopes: vec![],
                     read_scopes: vec![],
@@ -4675,6 +4696,7 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                elicitation: false,
                 ended_epoch_ms: None,
                 scopes: vec![],
                 read_scopes: vec![],
@@ -4873,6 +4895,7 @@ mod tests {
                     session_id: Some("mcp-session-7".into()),
                     client_pid: Some(4242),
                     sampling: false,
+                    elicitation: false,
                     scopes: vec![],
                     read_scopes: vec![],
                     grants: vec![],
@@ -4968,6 +4991,7 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                elicitation: false,
                 scopes: vec![],
                 read_scopes: vec![],
                 grants: vec![],
@@ -5023,6 +5047,7 @@ mod tests {
             access: crate::config::ScopeAccess::Rw,
             reason: GrantReason::StderrHeuristic,
             tool: Some("sccache".into()),
+            context: Default::default(),
         };
         send_msg(
             &mut iw,
@@ -5165,6 +5190,7 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                elicitation: false,
                 scopes: vec![],
                 read_scopes: vec![],
                 grants: vec![],
@@ -5327,6 +5353,7 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                elicitation: false,
                 scopes: vec![],
                 read_scopes: vec![],
                 grants: vec![],
@@ -5582,6 +5609,7 @@ mod relay_wire_compat {
             access: crate::config::ScopeAccess::Rw,
             reason: crate::scope_grant::GrantReason::StderrHeuristic,
             tool: Some("sccache".into()),
+            context: Default::default(),
         };
         let expected_scope = serde_json::to_value(&scope).unwrap();
         assert_same_bytes_both_directions(

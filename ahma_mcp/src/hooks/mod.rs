@@ -1746,15 +1746,21 @@ fn report_shell_execution_error(e: anyhow::Error) -> Result<()> {
         return Err(e);
     };
     let remediation = match sandbox_err {
-        crate::sandbox::SandboxError::RuntimeDenial { path, access, .. } => {
-            Some(crate::sandbox::grant_channel::runtime_denial_remediation_cli(path, *access))
-        }
-        crate::sandbox::SandboxError::PathOutsideSandbox { path, .. } => Some(
-            crate::sandbox::grant_channel::runtime_denial_remediation_cli(
+        crate::sandbox::SandboxError::RuntimeDenial {
+            path,
+            access,
+            details,
+            ..
+        } => Some(crate::sandbox::grant_channel::hook_denial_text(
+            path, *access, details,
+        )),
+        crate::sandbox::SandboxError::PathOutsideSandbox { path, .. } => {
+            Some(crate::sandbox::grant_channel::hook_denial_text(
                 path,
                 ahma_common::config::ScopeAccess::Rw,
-            ),
-        ),
+                "the path was refused before the command ran",
+            ))
+        }
         _ => None,
     };
     let Some(remediation) = remediation else {

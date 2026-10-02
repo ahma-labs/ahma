@@ -587,7 +587,22 @@ impl AhmaMcpService {
                 ),
             ),
         };
-        self_titled_tool(tool.name(), description, input_schema)
+        let mut built = self_titled_tool(tool.name(), description, input_schema);
+        if matches!(tool, BuiltinTool::SandboxGrant | BuiltinTool::NetworkGrant) {
+            // Claude Code honours `_meta["anthropic/requiresUserInteraction"]`:
+            // the call prompts the human directly even under an allow rule,
+            // never reaches the auto-mode classifier, and is denied outright in
+            // a non-interactive session (SPEC R5.4.5). The grant tools exist
+            // only to ask a human, so an auto-approved call is the one thing
+            // they must never be.
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "anthropic/requiresUserInteraction".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            built.meta = Some(rmcp::model::Meta(meta));
+        }
+        built
     }
 
     fn task_vault_root(&self) -> Option<PathBuf> {
@@ -1578,6 +1593,7 @@ impl ServerHandler for AhmaMcpService {
                 crate::hub_reporter::set_client_identity(
                     info.client_info.name.clone(),
                     info.capabilities.sampling.is_some(),
+                    info.capabilities.elicitation.is_some(),
                 );
             }
 
@@ -4715,5 +4731,31 @@ mod tests {
 
         service.enrich_heartbeat(&mut payload);
         assert_eq!(payload.pending_grants, 1);
+    }
+}
+
+#[cfg(test)]
+mod requires_user_interaction_tests {
+    /// The grant tools carry the one annotation that keeps a harness from
+    /// auto-approving them (SPEC R5.4.5).
+    #[tokio::test]
+    async fn grant_tools_declare_requires_user_interaction() {
+        let td = tempfile::tempdir().unwrap();
+        let mcp = crate::test_utils::in_process::create_in_process_mcp_from_dir(td.path())
+            .await
+            .expect("in-process service");
+        let service = &mcp.service;
+        for name in ["sandbox_grant", "network_grant"] {
+            let tool = service
+                .build_builtin_tool(crate::builtin_tool::BuiltinTool::from_name(name).expect(name));
+            let meta = tool.meta.expect("meta present");
+            assert_eq!(
+                meta.0.get("anthropic/requiresUserInteraction"),
+                Some(&serde_json::Value::Bool(true)),
+                "{name}"
+            );
+        }
+        let plain = service.build_builtin_tool(crate::builtin_tool::BuiltinTool::Status);
+        assert!(plain.meta.is_none());
     }
 }

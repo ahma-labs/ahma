@@ -401,6 +401,10 @@ impl Adapter {
         working_dir: &str,
         tool: &str,
     ) -> Result<std::path::PathBuf> {
+        // Every execution path validates its working directory first, so this is
+        // where "a command starts" is observed: once-grants rotate here
+        // (SPEC R-PERM.2).
+        self.sandbox.begin_command();
         match self
             .sandbox
             .validate_path(std::path::Path::new(working_dir))
@@ -502,6 +506,46 @@ impl Adapter {
             }
             None => false,
         }
+    }
+
+    /// Whether this session's automatic prompt budget is spent (SPEC R-PERM.4.5).
+    pub fn grant_budget_exhausted(&self) -> bool {
+        self.scope_grant_notifier
+            .as_ref()
+            .is_some_and(|n| n.budget_exhausted())
+    }
+
+    /// [`Self::request_scope_grant`] with the judgement aids the caller has
+    /// (the agent's own stated reason above all). Returns the request that was
+    /// raised, so the caller can relay the exact body the human sees; `None`
+    /// when nothing was raised (no surface, already asked, refused, or over the
+    /// prompt budget — see [`Self::grant_budget_exhausted`]).
+    pub async fn request_scope_grant_with(
+        &self,
+        path: &std::path::Path,
+        access: ahma_common::config::ScopeAccess,
+        tool: Option<String>,
+        agent_claim: Option<&str>,
+    ) -> Option<ahma_common::scope_grant::ScopeGrantRequest> {
+        let notifier = self.scope_grant_notifier.as_ref()?;
+        let context = sandbox::grant_channel::build_context(
+            &self.sandbox,
+            path,
+            None,
+            tool.as_deref(),
+            None,
+            agent_claim,
+            access.is_write(),
+        );
+        notifier
+            .notify_violation_with(
+                path,
+                access,
+                ahma_common::scope_grant::GrantReason::PreExecViolation,
+                tool,
+                context,
+            )
+            .await
     }
 
     /// Synchronously executes a command and returns the result directly.
@@ -811,6 +855,7 @@ impl Adapter {
             stdout,
             command,
             Some(safe_wd),
+            Some(op_id),
         )
         .await;
         // When the failure was a kernel denial on an out-of-scope path, return
@@ -2293,6 +2338,7 @@ async fn record_failure_diagnostics(
         stdout_str,
         tool,
         working_dir,
+        Some(op_id),
     )
     .await;
 

@@ -264,6 +264,15 @@ fn append_missing_scopes(target: &mut Vec<PathBuf>, additions: &[PathBuf]) {
 }
 
 /// The security context for the Ahma session.
+/// One `once`-tier grant and whether the command it was approved for has
+/// started (see [`Sandbox::begin_command`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnceGrant {
+    pub path: PathBuf,
+    pub access: ahma_common::config::ScopeAccess,
+    pub armed: bool,
+}
+
 pub struct Sandbox {
     pub(super) scopes: parking_lot::RwLock<Vec<PathBuf>>,
     pub(super) read_scopes: parking_lot::RwLock<Vec<PathBuf>>,
@@ -329,6 +338,10 @@ pub struct Sandbox {
     /// so a later tool call naming a *different* project cannot re-point the
     /// writable scope (R5.1.1 — one commit, never re-derived).
     pub(super) narrowed_to: parking_lot::RwLock<Option<PathBuf>>,
+    /// `once`-tier grants (SPEC R-PERM.2): applied live for the *next* command
+    /// this session starts, retired when the one after it starts. Each entry
+    /// records whether that next command has begun yet.
+    pub(super) once_grants: parking_lot::RwLock<Vec<OnceGrant>>,
     /// `Some(host)` when this process is itself inside a macOS Seatbelt profile
     /// that refuses to nest ahma's own (SPEC R7.6). Commands then spawn bare —
     /// still inside the outer kernel boundary — and every scope surface reports
@@ -401,6 +414,7 @@ impl Clone for Sandbox {
             scope_lock: self.scope_lock.clone(),
             container_root: self.container_root.clone(),
             narrowed_to: parking_lot::RwLock::new(self.narrowed_to.read().clone()),
+            once_grants: parking_lot::RwLock::new(self.once_grants.read().clone()),
             outer_sandbox: self.outer_sandbox,
         }
     }
@@ -485,6 +499,7 @@ impl Sandbox {
             scope_lock: super::scope_lock::ScopeLock::new(),
             container_root: None,
             narrowed_to: parking_lot::RwLock::new(None),
+            once_grants: parking_lot::RwLock::new(Vec::new()),
             outer_sandbox,
         })
     }
@@ -684,6 +699,54 @@ impl Sandbox {
             append_missing_scopes(&mut self.read_scopes.write(), &[canon]);
         }
         Ok(())
+    }
+
+    /// Apply a `once`-tier grant (SPEC R-PERM.2): live now, for the next
+    /// command this session starts, gone when the one after it starts. Passes
+    /// the same gate as every live widening (R-PERM.4.3).
+    pub fn add_once_grant(
+        &self,
+        path: &Path,
+        access: ahma_common::config::ScopeAccess,
+    ) -> std::result::Result<(), String> {
+        self.add_live_grant(path, access)?;
+        let canon = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.once_grants.write().push(OnceGrant {
+            path: canon,
+            access,
+            armed: false,
+        });
+        Ok(())
+    }
+
+    /// Called when a command starts: the once-grants an earlier command already
+    /// used are retired, and the fresh ones are marked as in use by this one.
+    /// A path that is also granted persistently stays, since that grant is not
+    /// ours to withdraw.
+    pub fn begin_command(&self) {
+        let mut grants = self.once_grants.write();
+        if grants.is_empty() {
+            return;
+        }
+        let (spent, fresh): (Vec<OnceGrant>, Vec<OnceGrant>) =
+            grants.drain(..).partition(|g| g.armed);
+        for g in spent {
+            let keep = if g.access.is_write() {
+                self.persistent_write_scopes.contains(&g.path)
+            } else {
+                self.persistent_read_scopes.contains(&g.path)
+            };
+            if keep {
+                continue;
+            }
+            if g.access.is_write() {
+                self.scopes.write().retain(|p| p != &g.path);
+            } else {
+                self.read_scopes.write().retain(|p| p != &g.path);
+            }
+            tracing::info!(path = %g.path.display(), "once-grant retired");
+        }
+        grants.extend(fresh.into_iter().map(|g| OnceGrant { armed: true, ..g }));
     }
 
     /// Commit the sandbox scope by **replacing** the provisional scopes with
@@ -1471,5 +1534,46 @@ mod live_grant_gate_tests {
             .expect("an ordinary cache directory is applied");
         let canon = dunce::canonicalize(cache.path()).unwrap();
         assert!(sb.scopes().iter().any(|s| s == &canon));
+    }
+}
+
+#[cfg(test)]
+mod once_grant_tests {
+    use super::*;
+    use ahma_common::config::ScopeAccess;
+    use tempfile::tempdir;
+
+    /// SPEC R-PERM.2: a `once` answer covers the next command and nothing after.
+    #[test]
+    fn once_grant_covers_next_command_only() {
+        let workspace = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let canon = dunce::canonicalize(cache.path()).unwrap();
+        let sb = Sandbox::new(
+            vec![workspace.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        sb.add_once_grant(cache.path(), ScopeAccess::Rw).unwrap();
+        assert!(sb.scopes().iter().any(|s| s == &canon), "live at once");
+        sb.begin_command(); // the command it was approved for starts
+        assert!(
+            sb.scopes().iter().any(|s| s == &canon),
+            "still live for that command"
+        );
+        sb.begin_command(); // the following command starts
+        assert!(
+            !sb.scopes().iter().any(|s| s == &canon),
+            "retired before the next command"
+        );
+        // A denylisted path is refused here exactly as at the session tier.
+        let home = ahma_common::config::ahma_home_dir().unwrap();
+        assert!(
+            sb.add_once_grant(&home.join(".ssh"), ScopeAccess::Ro)
+                .is_err()
+        );
     }
 }

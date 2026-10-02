@@ -319,7 +319,9 @@ impl PermissionBroker {
                 access,
                 tool,
                 tier,
+                time_to_decision_ms,
             } => {
+                let risk_class = req.context.risk.as_ref().map(|r| r.class.clone());
                 let sandbox = self.sandbox.read().clone();
                 let live_scopes: Vec<std::path::PathBuf> = sandbox
                     .as_ref()
@@ -367,29 +369,42 @@ impl PermissionBroker {
                         }
                     }
                 } else {
-                    append_audit(&audit_entry(
-                        granted_at.to_rfc3339(),
-                        AuditAction::Grant,
-                        GrantKind::FsScope,
-                        path.display().to_string(),
-                        Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
-                        GrantTier::Session,
-                        Some("harness".to_string()),
-                    ));
+                    append_audit(
+                        &audit_entry(
+                            granted_at.to_rfc3339(),
+                            AuditAction::Grant,
+                            GrantKind::FsScope,
+                            path.display().to_string(),
+                            Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
+                            tier,
+                            Some("harness".to_string()),
+                        )
+                        .with_request(
+                            &req.decision_id,
+                            time_to_decision_ms,
+                            risk_class.as_deref(),
+                        ),
+                    );
                     tracing::info!(
                         path = %path.display(),
                         access = access.label(),
-                        "Scope granted for this session only (not written to settings)."
+                        tier = tier.label(),
+                        "Scope granted without writing settings."
                     );
                 }
                 // R5.4.6: a human-approved grant takes effect in the live session —
                 // after the live gate (R-PERM.4.3), which is the only denylist the
                 // `session` tier ever meets.
                 if let Some(sb) = sandbox {
-                    match sb.add_live_grant(&path, access) {
+                    let applied = if tier == GrantTier::Once {
+                        sb.add_once_grant(&path, access)
+                    } else {
+                        sb.add_live_grant(&path, access)
+                    };
+                    match applied {
                         Ok(()) => {
                             crate::hub_reporter::publish_committed_scope(&sb);
-                            if !tier.is_persistent() {
+                            if tier == GrantTier::Session {
                                 // R-PERM.4.4: a session answer reaches hooked commands too.
                                 crate::sandbox::record_session_grant(
                                     &path,
@@ -407,16 +422,26 @@ impl PermissionBroker {
                     }
                 }
             }
-            GrantResolveOutcome::Denied { path } => {
-                append_audit(&audit_entry(
-                    chrono::Local::now().to_rfc3339(),
-                    AuditAction::Deny,
-                    GrantKind::FsScope,
-                    path.display().to_string(),
-                    None,
-                    GrantTier::Session,
-                    Some("harness".to_string()),
-                ));
+            GrantResolveOutcome::Denied {
+                path,
+                time_to_decision_ms,
+            } => {
+                append_audit(
+                    &audit_entry(
+                        chrono::Local::now().to_rfc3339(),
+                        AuditAction::Deny,
+                        GrantKind::FsScope,
+                        path.display().to_string(),
+                        None,
+                        GrantTier::Session,
+                        Some("harness".to_string()),
+                    )
+                    .with_request(
+                        &req.decision_id,
+                        time_to_decision_ms,
+                        req.context.risk.as_ref().map(|r| r.class.as_str()),
+                    ),
+                );
                 tracing::info!(
                     path = %path.display(),
                     "Scope grant declined; it will not be asked again this session."
@@ -493,27 +518,57 @@ impl PeerElicitationSurface {
     }
 }
 
-/// The elicitation form the human fills in at the harness.
-///
-/// Three-valued rather than a bool, and the *safe* option is the one a distracted
-/// Enter lands on: `deny` sorts first and is described as the default, because
-/// R5.3.1 requires that Enter alone can never widen the sandbox.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-pub struct GrantForm {
-    /// `deny` (default), `read-only`, `read-write`, `read-only-session`, or
-    /// `read-write-session`.
-    pub decision: String,
+/// The elicitation form the human fills in at the harness: one titled
+/// single-select, `deny` first (SPEC R5.3.1: Enter alone never widens), every
+/// tier labelled in words (SPEC R-PERM.3.4). Built by hand rather than derived
+/// from a type so the client gets `oneOf` const/title pairs — buttons with
+/// readable labels — instead of a free-text box.
+fn grant_form_schema() -> rmcp::model::ElicitationSchema {
+    use rmcp::model::{
+        ConstTitle, ElicitationSchema, EnumSchema, PrimitiveSchemaDefinition,
+        SingleSelectEnumSchema, TitledSingleSelectEnumSchema,
+    };
+    let one_of: Vec<ConstTitle> = ahma_common::grant_prompt::options()
+        .into_iter()
+        .map(|o| ConstTitle::new(o.value, o.label))
+        .collect();
+    let mut select = TitledSingleSelectEnumSchema::new(one_of);
+    select.title = Some("Your decision".into());
+    select.description =
+        Some("Deny is the default. Session and once answers are never written to disk.".into());
+    select.default = Some("deny".to_string());
+    let mut props = std::collections::BTreeMap::new();
+    props.insert(
+        "decision".to_string(),
+        PrimitiveSchemaDefinition::Enum(EnumSchema::Single(SingleSelectEnumSchema::Titled(select))),
+    );
+    let mut schema = ElicitationSchema::new(props);
+    schema.required = Some(vec!["decision".to_string()]);
+    schema
 }
 
-rmcp::elicit_safe!(GrantForm);
+/// The answer the client returns for [`grant_form_schema`].
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GrantForm {
+    decision: String,
+}
 
 #[async_trait]
 impl ElicitationSurface for PeerElicitationSurface {
     async fn ask(&self, req: &ScopeGrantRequest) -> ElicitOutcome {
+        use rmcp::model::{ElicitRequest, ElicitRequestParams, ElicitationAction, ServerRequest};
         let peer = self.peer.read().clone();
         let Some(peer) = peer else {
             return ElicitOutcome::Unavailable;
         };
+        if !peer
+            .supported_elicitation_modes()
+            .contains(&rmcp::service::ElicitationMode::Form)
+        {
+            // The client cannot elicit at all. Nothing to demote — there was never
+            // a working surface here to lose.
+            return ElicitOutcome::Unavailable;
+        }
 
         // SPEC R5.3.1: bound the wait by *this* client's patience, so ahma is the
         // one that resolves the prompt. A flat 120s here is what let Antigravity
@@ -522,88 +577,60 @@ impl ElicitationSurface for PeerElicitationSurface {
         let timeout = crate::client_type::McpClientType::from_peer(&peer).elicitation_budget();
 
         let message = prompt_text(req);
-        match peer
-            .elicit_with_timeout::<GrantForm>(message, Some(timeout))
-            .await
-        {
-            Ok(Some(form)) => ElicitOutcome::Answered(parse_decision(&form.decision)),
-            // An explicit decline is the human saying no. An answer, not a fault:
-            // the surface stays trusted.
-            Err(rmcp::service::ElicitationError::UserDeclined) => {
-                ElicitOutcome::Answered(GrantDecision::Deny)
-            }
-            // The client cannot elicit at all. Nothing to demote — there was never
-            // a working surface here to lose.
-            Err(rmcp::service::ElicitationError::CapabilityNotSupported) => {
-                ElicitOutcome::Unavailable
-            }
-            // Dismissed rather than decided (R5.3.1). `cancel` is what a client
-            // sends when *it* gives up, with no human involved, so it is neither
-            // consent nor a denial; an accept with no content is an answer we
-            // cannot read, which is not consent either; and our own wait expiring
-            // means a human was slow, not that the surface is broken.
-            Ok(None)
-            | Err(rmcp::service::ElicitationError::UserCancelled)
-            | Err(rmcp::service::ElicitationError::NoContent) => {
-                ElicitOutcome::Dismissed("cancelled or dismissed without a choice".to_string())
-            }
-            Err(rmcp::service::ElicitationError::Service(
-                rmcp::service::ServiceError::Timeout { timeout },
-            )) => ElicitOutcome::Dismissed(format!("no answer within {timeout:?}")),
-            // The transport broke, or the answer would not parse: the surface is
-            // genuinely unusable, which is the one case that demotes it.
-            Err(e) => ElicitOutcome::Failed(e.to_string()),
+        let request = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
+            meta: None,
+            message,
+            requested_schema: grant_form_schema(),
+        });
+        let sent = tokio::time::timeout(
+            timeout,
+            peer.send_request(ServerRequest::ElicitRequest(request)),
+        )
+        .await;
+        match sent {
+            Ok(Ok(rmcp::model::ClientResult::ElicitResult(result))) => match result.action {
+                ElicitationAction::Accept => match result
+                    .content
+                    .and_then(|v| serde_json::from_value::<GrantForm>(v).ok())
+                {
+                    Some(form) => ElicitOutcome::Answered(parse_decision(&form.decision)),
+                    // An accept with no readable content is an answer we cannot
+                    // read, which is not consent (R5.3.1).
+                    None => ElicitOutcome::Dismissed("accepted without a choice".to_string()),
+                },
+                // An explicit decline is the human saying no. An answer, not a fault:
+                // the surface stays trusted.
+                ElicitationAction::Decline => ElicitOutcome::Answered(GrantDecision::Deny),
+                // `cancel` is what a client sends when *it* gives up, with no human
+                // involved: neither consent nor a denial (R5.3.1).
+                ElicitationAction::Cancel => {
+                    ElicitOutcome::Dismissed("cancelled without a choice".to_string())
+                }
+                // A future action this build does not know: not consent.
+                _ => ElicitOutcome::Dismissed("unrecognised action".to_string()),
+            },
+            Ok(Ok(other)) => ElicitOutcome::Failed(format!("unexpected reply: {other:?}")),
+            // The transport broke: the surface is genuinely unusable, which is
+            // the one case that demotes it.
+            Ok(Err(e)) => ElicitOutcome::Failed(e.to_string()),
+            // Our own budget expired (SPEC R-PERM.3.1): a surface that does not
+            // answer within the client's own deadline is treated as broken for
+            // the session, and the question moves on so it is not lost.
+            Err(_) => ElicitOutcome::Failed(format!("no answer within {timeout:?}")),
         }
     }
 }
 
-/// Map the form's free-text choice to a decision. Anything unrecognized is a
-/// **deny**: an answer we cannot read is not consent.
+/// Map the form's choice to a decision. Anything unrecognized is a **deny**: an
+/// answer we cannot read is not consent.
 fn parse_decision(s: &str) -> GrantDecision {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "read-write" | "read_write" | "rw" | "write" => GrantDecision::GrantRw,
-        "read-only" | "read_only" | "ro" | "read" => GrantDecision::GrantRo,
-        "read-write-session" | "rw-session" | "write-session" => GrantDecision::GrantRwSession,
-        "read-only-session" | "ro-session" | "read-session" => GrantDecision::GrantRoSession,
-        _ => GrantDecision::Deny,
-    }
+    ahma_common::grant_prompt::parse_decision(s)
 }
 
-/// The question the human actually reads.
-///
-/// It names the literal path, what tripped it, what the choice means, and what
-/// happens next — because "Allow workspace?" is not a question anyone can answer
-/// responsibly (R5.3.1).
+/// The question the human actually reads: the one body every surface renders
+/// (SPEC R-PERM.3.4), as text.
 fn prompt_text(req: &ScopeGrantRequest) -> String {
-    let tool = req.tool.as_deref().unwrap_or("a command");
-    let what = if req.access.is_write() {
-        "write to"
-    } else {
-        "read"
-    };
-    let reason = match req.reason {
-        GrantReason::PreExecViolation => {
-            "ahma's sandbox blocked it before the command ran, so the path is exact"
-        }
-        GrantReason::StderrHeuristic => {
-            "ahma read this path out of the command's error output, so double-check it"
-        }
-    };
-    format!(
-        "Allow ahma to {what} '{path}'?\n\n\
-         {tool} needs it and the sandbox blocked it ({reason}).\n\n\
-         Granting adds this one directory to ahma's sandbox scope for this workspace \
-         only. 'read-only'/'read-write' are saved in ~/.ahma/settings.toml and apply \
-         now; 'read-only-session'/'read-write-session' apply now and are forgotten \
-         when this session ends. Everything else outside your workspace stays \
-         blocked. Revoke a saved grant any time with `ahma sandbox revoke {path}`.\n\n\
-         Choose: 'deny' (default), 'read-only', 'read-write', 'read-only-session', \
-         or 'read-write-session'.",
-        what = what,
-        path = req.path.display(),
-        tool = tool,
-        reason = reason,
-    )
+    ahma_common::grant_prompt::render(req).to_text()
 }
 
 /// The message a *hook* prints to the terminal when nobody could be asked — the
@@ -925,6 +952,7 @@ mod tests {
             access: ScopeAccess::Rw,
             reason: GrantReason::StderrHeuristic,
             tool: Some("sccache".into()),
+            context: Default::default(),
         };
         let text = prompt_text(&req);
         assert!(

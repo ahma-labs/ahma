@@ -474,6 +474,7 @@ mod tests {
             session_id: None,
             client_pid: None,
             sampling: false,
+            elicitation: false,
             ended_epoch_ms: None,
             scopes: vec![],
             read_scopes: vec![],
