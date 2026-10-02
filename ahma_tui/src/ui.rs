@@ -3787,11 +3787,14 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
     let popup = centered_rect(92, height.min(area.height.saturating_sub(2)), area);
     frame.render_widget(Clear, popup);
 
+    let waiting = state.scope_grant_queue.len();
+    let title = if waiting == 0 {
+        " Sandbox · grant access? ".to_string()
+    } else {
+        format!(" Sandbox · grant access? ({waiting} more waiting) ")
+    };
     let block = Block::default()
-        .title(Span::styled(
-            " Sandbox · grant access? ",
-            theme.title().bold(),
-        ))
+        .title(Span::styled(title, theme.title().bold()))
         .borders(Borders::ALL)
         .border_style(theme.border_focused());
     let inner = block.inner(popup);
