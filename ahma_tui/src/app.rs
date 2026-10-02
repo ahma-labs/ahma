@@ -2596,6 +2596,14 @@ fn handle_scope_grant_key(
             resolve_scope_grant(state, GrantDecision::GrantRo);
             true
         }
+        (KeyCode::Char('s'), KeyModifiers::NONE) => {
+            resolve_scope_grant(state, GrantDecision::GrantRwSession);
+            true
+        }
+        (KeyCode::Char('o'), KeyModifiers::NONE) => {
+            resolve_scope_grant(state, GrantDecision::GrantRoSession);
+            true
+        }
         (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
             resolve_scope_grant(state, GrantDecision::Deny);
             true
@@ -2604,8 +2612,9 @@ fn handle_scope_grant_key(
     }
 }
 
-/// Resolve the pending scope-grant prompt: send the decision to the hub (which
-/// resolves + persists for the next start — never the live session) and log it.
+/// Resolve the pending scope-grant prompt: send the decision to the hub, where
+/// the owning instance applies it to its live session (and writes it at the
+/// `always` tier, bound to that session's workspace), and log it.
 fn resolve_scope_grant(
     state: &mut crate::state::AppState,
     decision: ahma_common::scope_grant::GrantDecision,
@@ -2631,16 +2640,30 @@ fn resolve_scope_grant(
         GrantDecision::GrantRo => (
             LogLevel::Info,
             format!(
-                "Granted read-only access to {} — restart the bridge to apply now, else \
-                 it takes effect on the next server start",
+                "Granted read-only access to {} for this workspace — applied now and saved \
+                 to ~/.ahma/settings.toml",
                 gate.path
             ),
         ),
         GrantDecision::GrantRw => (
             LogLevel::Info,
             format!(
-                "Granted read+write access to {} — restart the bridge to apply now, else \
-                 it takes effect on the next server start",
+                "Granted read+write access to {} for this workspace — applied now and saved \
+                 to ~/.ahma/settings.toml",
+                gate.path
+            ),
+        ),
+        GrantDecision::GrantRoSession => (
+            LogLevel::Info,
+            format!(
+                "Granted read-only access to {} for this session only (not saved)",
+                gate.path
+            ),
+        ),
+        GrantDecision::GrantRwSession => (
+            LogLevel::Info,
+            format!(
+                "Granted read+write access to {} for this session only (not saved)",
                 gate.path
             ),
         ),
@@ -7477,6 +7500,7 @@ mod tests {
                 .push(ahma_common::config::PersistentScope {
                     path: gone.clone(),
                     access: ahma_common::config::ScopeAccess::Rw,
+                    workspace: None,
                     granted_by: Some("cargo_build".into()),
                     granted_at: None,
                     note: None,

@@ -629,17 +629,51 @@ fn add_temp_scope_if_requested(
 /// Writable (`rw`) grants are auto-created if missing (a fresh build cache is
 /// expected not to exist yet); read-only (`ro`) grants are never created — a
 /// missing one is logged and skipped rather than silently materialised.
+/// The `(writable, read-only)` projection of [`resolve_persistent_records`],
+/// ignoring workspace bindings — what the unit tests of the resolver assert on.
+#[cfg(test)]
 fn resolve_persistent_scopes(cfg: &AppConfig) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    use ahma_common::config::ScopeAccess;
     let mut write = Vec::new();
     let mut read = Vec::new();
-    for scope in &cfg.persistent_scopes {
-        match scope.access {
-            ScopeAccess::Rw => grant_persistent_write_scope(scope, &mut write),
-            ScopeAccess::Ro => grant_persistent_read_scope(scope, &mut read),
+    for rec in resolve_persistent_records(cfg) {
+        let target = if rec.access.is_write() {
+            &mut write
+        } else {
+            &mut read
+        };
+        if !target.contains(&rec.path) {
+            target.push(rec.path);
         }
     }
     (write, read)
+}
+
+/// Every persistent grant, with its path canonicalized (and created, for `rw`)
+/// and its workspace binding kept, for the sandbox to filter per session
+/// (SPEC R5.4.11).
+fn resolve_persistent_records(cfg: &AppConfig) -> Vec<ahma_common::config::PersistentScope> {
+    use ahma_common::config::ScopeAccess;
+    let mut out: Vec<ahma_common::config::PersistentScope> = Vec::new();
+    for scope in &cfg.persistent_scopes {
+        let mut paths = Vec::new();
+        match scope.access {
+            ScopeAccess::Rw => grant_persistent_write_scope(scope, &mut paths),
+            ScopeAccess::Ro => grant_persistent_read_scope(scope, &mut paths),
+        }
+        let Some(canonical) = paths.pop() else {
+            continue;
+        };
+        if out.iter().any(|r| {
+            r.path == canonical && r.access == scope.access && r.workspace == scope.workspace
+        }) {
+            continue;
+        }
+        out.push(ahma_common::config::PersistentScope {
+            path: canonical,
+            ..scope.clone()
+        });
+    }
+    out
 }
 
 /// Add a `rw` persistent scope, auto-creating the directory if it is missing.
@@ -756,10 +790,10 @@ fn create_sandbox_instance(
         .filter(|root| scopes.contains(root));
 
     // User-granted persistent scopes (e.g. an sccache cache outside the workspace).
-    // Folded into the sandbox now (so initial enforcement covers them) and
-    // re-applied on every roots/list update so a client's workspace root cannot
-    // silently drop them.
-    let (persistent_write_scopes, persistent_read_scopes) = resolve_persistent_scopes(cfg);
+    // Handed to the sandbox with their workspace binding: it folds in the ones that
+    // apply now and re-decides at every roots/list commit, so a grant made for
+    // another project never reaches this session (SPEC R5.4.11).
+    let persistent_records = resolve_persistent_records(cfg);
 
     let s = sandbox::Sandbox::new(
         scopes.clone(),
@@ -772,7 +806,7 @@ fn create_sandbox_instance(
     .with_explicit_scopes(explicit_scopes)
     .with_container_root(container_root)
     .with_scratch_dir(scratch_dir)
-    .with_persistent_scopes(persistent_write_scopes, persistent_read_scopes)
+    .with_persistent_records(persistent_records)
     .with_package_cache_write(cfg.package_cache_write);
 
     // SPEC R5.2 step 1: an explicit scope is **locked immediately** — commit it
@@ -1790,18 +1824,23 @@ pub struct SandboxArgs {
 /// Subcommands for `ahma sandbox` — manage persistent sandbox scope grants.
 ///
 /// A *persistent scope* is an external directory (outside the workspace) added
-/// to the kernel sandbox that **survives `roots/list` replacement**, so it stays
-/// available no matter which workspace the client opens. Grants are stored in
-/// `[sandbox].persistent_scopes` in `~/.ahma/settings.toml` — a file that lives
-/// outside every sandbox scope and so cannot be edited by a sandboxed tool call.
-/// Changes take effect the next time an ahma server starts.
+/// to the kernel sandbox that **survives `roots/list` replacement**. A grant is
+/// bound to one workspace (SPEC R5.4.11): it applies to sessions working in that
+/// project and to no other. Grants are stored in `[sandbox].persistent_scopes`
+/// in `~/.ahma/settings.toml` — a file that lives outside every sandbox scope
+/// and so cannot be edited by a sandboxed tool call. A CLI grant takes effect
+/// the next time an ahma server starts for that workspace; a grant approved at a
+/// prompt applies to that session at once.
 #[derive(Subcommand, Debug, Clone)]
 pub enum SandboxCommand {
-    /// Grant a directory persistent access in the sandbox.
+    /// Grant a directory persistent access in the sandbox, for one workspace.
     ///
     /// Defaults to read+write (most external tool dirs are caches the tool both
     /// reads and writes); pass `--read-only` for read access alone. A writable
-    /// directory is created if it does not yet exist.
+    /// directory is created if it does not yet exist. The grant applies only to
+    /// sessions working in `--workspace` (default: the repository enclosing the
+    /// current directory); `--global` makes it apply to every workspace, which
+    /// is the one thing a grant should rarely do.
     ///
     /// Example (allow an sccache cache outside the workspace):
     ///   ahma sandbox grant ~/Library/Caches/Mozilla.sccache --by sccache \
@@ -1813,6 +1852,12 @@ pub enum SandboxCommand {
         /// Grant read-only access instead of the default read+write.
         #[arg(long = "read-only")]
         read_only: bool,
+        /// The workspace (project root) this grant is for. Default: the git repository enclosing the current directory, else the current directory.
+        #[arg(long = "workspace", value_name = "DIR", conflicts_with = "global")]
+        workspace: Option<PathBuf>,
+        /// Apply this grant to every workspace on this machine. Rarely right: a grant made for one project then reaches every other project's agent.
+        #[arg(long = "global")]
+        global: bool,
         /// Record what asked for this scope (e.g. a tool name), for auditing.
         #[arg(long = "by", value_name = "WHO")]
         by: Option<String>,
@@ -4362,6 +4407,7 @@ mod tests {
         ahma_common::config::PersistentScope {
             path,
             access,
+            workspace: None,
             granted_by: Some("test".to_string()),
             granted_at: None,
             note: None,

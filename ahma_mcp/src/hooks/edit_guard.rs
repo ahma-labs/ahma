@@ -979,6 +979,7 @@ mod scope_tests {
         let grant = ahma_common::config::PersistentScope {
             path: cache.clone(),
             access: ahma_common::config::ScopeAccess::Rw,
+            workspace: None,
             granted_by: Some("user".into()),
             granted_at: None,
             note: None,
@@ -1015,6 +1016,7 @@ mod scope_tests {
         let ro = ahma_common::config::PersistentScope {
             path: cache.clone(),
             access: ahma_common::config::ScopeAccess::Ro,
+            workspace: None,
             granted_by: None,
             granted_at: None,
             note: None,

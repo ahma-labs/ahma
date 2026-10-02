@@ -482,9 +482,11 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
         SandboxCommand::Grant {
             path: dir,
             read_only,
+            workspace,
+            global,
             by,
             note,
-        } => run_sandbox_grant(&file, dir, read_only, by, note),
+        } => run_sandbox_grant(&file, dir, read_only, workspace, global, by, note),
         SandboxCommand::List => run_sandbox_list(&file),
         SandboxCommand::Revoke { path: dir } => run_sandbox_revoke(&file, dir),
     }
@@ -496,10 +498,22 @@ fn load_sandbox_settings(file: &std::path::Path) -> Result<ahma_common::config::
     ahma_common::config::AhmaSettings::load_from_result(file).map_err(|e| anyhow::anyhow!(e))
 }
 
+/// The workspace a CLI grant is bound to when none is named: the git
+/// repository enclosing the current directory, else the directory itself
+/// (SPEC R5.4.11).
+fn default_grant_workspace() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    crate::hooks::resolve_hook_sandbox_scopes(&cwd)
+        .into_iter()
+        .next()
+}
+
 fn run_sandbox_grant(
     file: &std::path::Path,
     dir: PathBuf,
     read_only: bool,
+    workspace: Option<PathBuf>,
+    global: bool,
     by: Option<String>,
     note: Option<String>,
 ) -> Result<()> {
@@ -509,6 +523,15 @@ fn run_sandbox_grant(
         ScopeAccess::Ro
     } else {
         ScopeAccess::Rw
+    };
+    let workspace: Option<PathBuf> = if global {
+        None
+    } else {
+        let ws = workspace.or_else(default_grant_workspace).context(
+            "cannot determine the workspace for this grant; pass --workspace <DIR> or --global",
+        )?;
+        let expanded = ahma_common::config::expand_home(&ws);
+        Some(dunce::canonicalize(&expanded).unwrap_or(expanded))
     };
     let settings = load_sandbox_settings(file)?;
 
@@ -534,6 +557,7 @@ fn run_sandbox_grant(
             note,
             surface: "cli",
             live_scopes: &live_scopes,
+            workspace: workspace.as_deref(),
         },
     )?;
 
@@ -551,6 +575,10 @@ fn run_sandbox_grant(
         }
     }
     println!();
+    match &workspace {
+        Some(ws) => println!("Bound to workspace: {}", ws.display()),
+        None => println!("GLOBAL: applies to every workspace on this machine."),
+    }
     println!("Recorded in: {}", file.display());
     println!("  This file lives outside every sandbox scope, so a sandboxed *command*");
     println!("  cannot touch it. Only you can change it — here, in the ahma TUI, or at a");
@@ -560,8 +588,8 @@ fn run_sandbox_grant(
         dir.display()
     );
     println!();
-    println!("Takes effect the next time an ahma server starts (restart your IDE's MCP");
-    println!("connection, or `ahma serve …`, to apply it now).");
+    println!("Takes effect the next time an ahma server starts for that workspace (restart");
+    println!("your IDE's MCP connection, or `ahma serve …`, to apply it now).");
     Ok(())
 }
 
@@ -593,6 +621,13 @@ fn run_sandbox_list(file: &std::path::Path) -> Result<()> {
 /// fields the grant actually carries.
 fn print_persistent_scope(s: &ahma_common::config::PersistentScope) {
     println!("• {}  ({})", s.path.display(), s.access.label());
+    match &s.workspace {
+        Some(ws) => println!("    workspace:  {}", ws.display()),
+        None => println!(
+            "    workspace:  GLOBAL (legacy) — applies to every workspace; re-grant it from \
+             the project that needs it to narrow it"
+        ),
+    }
     if let Some(by) = &s.granted_by {
         println!("    granted by: {by}");
     }
@@ -2291,6 +2326,8 @@ mod tests {
         run_sandbox_command(SandboxArgs {
             command: SandboxCommand::Grant {
                 path: scope_dir.clone(),
+                workspace: None,
+                global: true,
                 read_only: false,
                 by: Some("tester".into()),
                 note: Some("a note".into()),
@@ -2305,6 +2342,8 @@ mod tests {
         run_sandbox_command(SandboxArgs {
             command: SandboxCommand::Grant {
                 path: scope_dir.clone(),
+                workspace: None,
+                global: true,
                 read_only: true,
                 by: None,
                 note: None,
@@ -2690,6 +2729,8 @@ mod tests {
         // credential; it must be refused outright, with no override flag.
         let err = run_sandbox_command(SandboxArgs {
             command: SandboxCommand::Grant {
+                workspace: None,
+                global: true,
                 path: home.path().to_path_buf(),
                 read_only: false,
                 by: None,
@@ -2718,6 +2759,8 @@ mod tests {
 
         run_sandbox_command(SandboxArgs {
             command: SandboxCommand::Grant {
+                workspace: None,
+                global: true,
                 path: cache.clone(),
                 read_only: true,
                 by: Some("sccache".into()),
@@ -2762,6 +2805,8 @@ mod tests {
 
         run_sandbox_command(SandboxArgs {
             command: SandboxCommand::Grant {
+                workspace: None,
+                global: true,
                 path: cache.clone(),
                 read_only: false,
                 by: None,

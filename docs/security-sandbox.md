@@ -291,10 +291,12 @@ default. There is no special flag for it — the supported remedy is the standar
    (preview first; `confirm: true` asks you, in your client or the ahma TUI, and never
    grants by itself), or on the CLI: `ahma sandbox grant ~/.cargo/bin` (and `~/.cargo`
    for the manifest). The grant is written to `~/.ahma/settings.toml`, which lives
-   outside every sandbox scope. Credential/config files are never auto-granted and the
-   path is risk-classified before it is offered. A grant you approve at the prompt takes
-   effect **immediately** for the running session and persists. (If granted via CLI or
-   offline editing, restart the server for it to take effect.)
+   outside every sandbox scope, bound to the workspace it was approved for — sessions in
+   other projects never see it (SPEC R5.4.11). Credential/config files are never
+   auto-granted and the path is risk-classified before it is offered. A grant you approve
+   at the prompt takes effect **immediately** for the running session and persists; answer
+   for this session only if that is all you want. (If granted via CLI or offline editing,
+   restart the server for it to take effect.)
 3. **Re-run** the original command.
 
 If a maintenance script bootstraps tools (e.g. `cargo install cargo-binstall`),

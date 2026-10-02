@@ -70,6 +70,14 @@ exact line.
 
 ## When a grant takes effect
 
+- **Scope**: a filesystem grant is bound to the workspace it was approved for
+  (the session's project root; `ahma sandbox grant` uses the repository enclosing
+  your current directory, or `--workspace <DIR>`). Agents in other projects never
+  see it. `--global` is the explicit opt-out, and `ahma doctor` flags grants that
+  have no workspace.
+- **Tier**: at a prompt you can answer for this session only (`read-write-session`
+  / `read-only-session`, or `[s]` / `[o]` in the TUI): applied now, audited, never
+  written to the file.
 - **Terminal hooks**: on your **next command**. Hooks re-derive the sandbox each
   time, so there's nothing to restart.
 - **The MCP server** (your IDE's connection): when a human approves a request the

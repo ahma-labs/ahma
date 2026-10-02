@@ -247,9 +247,12 @@ Three `[sandbox]` keys are worth knowing:
   project. No sandbox rule is broken at any step. `ahma permissions list` states
   this cost beside the `rust` profile that creates it (SPEC R-HANDOFF.8).
 - **`persistent_scopes`** — the directories you have granted, surviving every
-  `roots/list` update. Written by `ahma sandbox grant` or by an approved prompt,
-  never by a sandboxed command (this file is outside every sandbox scope, by
-  design — SPEC R5.4.8).
+  `roots/list` update. Each is bound to one `workspace` (the project it was
+  granted for) and applies only to sessions working in that project (SPEC
+  R5.4.11); an entry without a `workspace` is a legacy global grant that `ahma
+  doctor` flags. Written by `ahma sandbox grant` or by an approved prompt, never
+  by a sandboxed command (this file is outside every sandbox scope, by design —
+  SPEC R5.4.8).
 
 See [permissions.md](permissions.md) for the full model.
 

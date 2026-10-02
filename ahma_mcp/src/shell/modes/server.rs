@@ -773,6 +773,9 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         grant_coordinator.clone(),
         Some(grant_req_tx),
     ));
+    // An approved grant is applied to this session and bound to its workspace
+    // (SPEC R5.4.6, R5.4.11).
+    permission_broker.set_sandbox(sandbox.clone());
 
     // Build the MCP service: monitor → pool → adapter → configs → service.
     let BuiltService {
@@ -834,6 +837,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
             Some(crate::hub_reporter::GrantReporting {
                 coordinator: grant_coordinator,
                 req_rx: grant_req_rx,
+                sandbox: Some(sandbox.clone()),
             }),
             Some(crate::hub_reporter::WebApprovalReporting {
                 coordinator: web_coordinator,

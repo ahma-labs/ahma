@@ -10,11 +10,13 @@
 //!
 //! ## The invariant that shapes this module
 //!
-//! *The sandbox scope cannot be changed during a session* (SPEC R5). Approval here
-//! **never widens the live session** — [`persist_grant`] only writes the settings
-//! file, which takes effect on the next server start (exactly like the CLI). The
-//! grant path must never touch the live `Sandbox` or the scope state machine. That
-//! is why this is a *persist*, not a *re-lock*.
+//! *The committed workspace scope cannot be changed during a session* (SPEC
+//! R5.1): nothing here re-locks or replaces it. A **human-approved** grant may be
+//! *added* beside it — [`persist_grant`] writes the settings file, and the caller
+//! that holds the live `Sandbox` (the broker, the TUI reporter, the
+//! `sandbox_grant` handler) applies the same directory to the running session
+//! (R5.4.6) and announces it. A `session`-tier answer is applied live only and
+//! never written.
 //!
 //! ## Why a sibling, not an extension of [`crate::elicitation`]
 //!
@@ -90,19 +92,34 @@ pub struct ScopeGrantRequest {
 pub enum GrantDecision {
     /// Do not grant. Suppresses re-asking this `(path, access)` for the session.
     Deny,
-    /// Grant read-only access.
+    /// Grant read-only access, persisted (`always` tier).
     GrantRo,
-    /// Grant read+write access.
+    /// Grant read+write access, persisted (`always` tier).
     GrantRw,
+    /// Grant read-only access for this session only — applied live, never written.
+    GrantRoSession,
+    /// Grant read+write access for this session only — applied live, never written.
+    GrantRwSession,
 }
 
 impl GrantDecision {
-    /// The [`ScopeAccess`] to persist, or `None` for [`GrantDecision::Deny`].
+    /// The [`ScopeAccess`] to apply, or `None` for [`GrantDecision::Deny`].
     pub fn access(self) -> Option<ScopeAccess> {
         match self {
             GrantDecision::Deny => None,
-            GrantDecision::GrantRo => Some(ScopeAccess::Ro),
-            GrantDecision::GrantRw => Some(ScopeAccess::Rw),
+            GrantDecision::GrantRo | GrantDecision::GrantRoSession => Some(ScopeAccess::Ro),
+            GrantDecision::GrantRw | GrantDecision::GrantRwSession => Some(ScopeAccess::Rw),
+        }
+    }
+
+    /// How long the answer lasts (SPEC R-PERM.2): `always` is written to the
+    /// settings file, `session` lives only in the running instance.
+    pub fn tier(self) -> crate::permissions::GrantTier {
+        match self {
+            GrantDecision::GrantRoSession | GrantDecision::GrantRwSession => {
+                crate::permissions::GrantTier::Session
+            }
+            _ => crate::permissions::GrantTier::Always,
         }
     }
 }
@@ -110,8 +127,9 @@ impl GrantDecision {
 /// What the caller should do after [`GrantCoordinator::resolve`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantResolveOutcome {
-    /// Write this grant to settings via [`persist_grant`]. The access is the one the
-    /// human chose, which may be narrower than the requested access.
+    /// Apply this grant: at the `always` tier write it via [`persist_grant`] and
+    /// apply it live; at the `session` tier apply it live only. The access is the
+    /// one the human chose, which may be narrower than the requested access.
     Persist {
         /// Canonical directory to grant.
         path: PathBuf,
@@ -119,6 +137,8 @@ pub enum GrantResolveOutcome {
         access: ScopeAccess,
         /// Tool that requested it, for `granted_by` provenance.
         tool: Option<String>,
+        /// `always` (write it) or `session` (live only).
+        tier: crate::permissions::GrantTier,
     },
     /// The human denied; nothing is persisted. The `(path, access)` is now dismissed
     /// for the session.
@@ -261,6 +281,7 @@ impl GrantCoordinator {
                     path: req.path,
                     access,
                     tool: req.tool,
+                    tier: decision.tier(),
                 }
             }
         }
@@ -568,6 +589,26 @@ pub struct NewGrant<'a> {
     /// sandbox *above* the workspace is refused (`[]` when unknown — the
     /// remaining denylist rules still hold).
     pub live_scopes: &'a [PathBuf],
+    /// The workspace this grant is for (SPEC R5.4.11); `None` writes a global
+    /// grant, which only the CLI's explicit `--global` should ever ask for.
+    pub workspace: Option<&'a Path>,
+}
+
+/// Whether a persistent grant made for `workspace` applies to a session whose
+/// committed scopes are `scopes` (SPEC R5.4.11). A grant with no workspace is a
+/// legacy global grant and applies everywhere. Otherwise it applies when a
+/// committed scope lies inside the workspace, the workspace lies inside a
+/// committed scope, or the workspace is the enclosing git repository of one —
+/// the same project seen from a subdirectory or a worktree.
+pub fn grant_applies(workspace: Option<&Path>, scopes: &[PathBuf]) -> bool {
+    let Some(ws) = workspace else {
+        return true;
+    };
+    let ws = canonicalize_best_effort(ws);
+    scopes.iter().any(|s| {
+        let s = canonicalize_best_effort(s);
+        s.starts_with(&ws) || ws.starts_with(&s) || is_enclosing_git_repo(&s, &ws)
+    })
 }
 
 /// Persist a **human-approved** grant to the settings file — the single
@@ -604,6 +645,7 @@ pub fn persist_grant(settings_file: &Path, grant: NewGrant<'_>) -> Result<GrantO
     let outcome = settings.sandbox.grant_scope(PersistentScope {
         path: grant.path.to_path_buf(),
         access: grant.access,
+        workspace: grant.workspace.map(canonicalize_best_effort),
         granted_by: grant.granted_by,
         granted_at: grant.granted_at.clone(),
         note: grant.note,
@@ -694,10 +736,16 @@ mod tests {
             .unwrap();
         let out = c.resolve(&req.decision_id, GrantDecision::GrantRw);
         match out {
-            GrantResolveOutcome::Persist { path, access, tool } => {
+            GrantResolveOutcome::Persist {
+                path,
+                access,
+                tool,
+                tier,
+            } => {
                 assert_eq!(access, ScopeAccess::Rw);
                 assert_eq!(tool.as_deref(), Some("sccache"));
                 assert_eq!(path, canonicalize_best_effort(p));
+                assert_eq!(tier, crate::permissions::GrantTier::Always);
             }
             other => panic!("expected Persist, got {other:?}"),
         }
@@ -885,6 +933,7 @@ mod tests {
                 note: None,
                 surface: "test",
                 live_scopes: &[],
+                workspace: None,
             },
         )
         .unwrap();
@@ -910,6 +959,7 @@ mod tests {
                 note: None,
                 surface: "test",
                 live_scopes: &[],
+                workspace: None,
             },
         )
         .unwrap();
@@ -945,6 +995,7 @@ mod tests {
                 note: None,
                 surface: "test",
                 live_scopes: &[],
+                workspace: None,
             },
         );
         assert!(
@@ -968,7 +1019,65 @@ mod tests {
             note: None,
             surface: "test",
             live_scopes: scopes,
+            workspace: None,
         }
+    }
+
+    /// SPEC R5.4.11: a grant is bound to its workspace; a legacy record with
+    /// no workspace applies everywhere.
+    #[test]
+    fn persistent_scope_with_workspace_not_applied_to_other_workspace() {
+        let td = tempdir().unwrap();
+        let a = td.path().join("projects").join("a");
+        let b = td.path().join("projects").join("b");
+        std::fs::create_dir_all(a.join(".git")).unwrap();
+        std::fs::create_dir_all(a.join("rust")).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let a = dunce::canonicalize(&a).unwrap();
+        let b = dunce::canonicalize(&b).unwrap();
+
+        assert!(
+            grant_applies(Some(&a), std::slice::from_ref(&a)),
+            "same workspace"
+        );
+        assert!(
+            grant_applies(Some(&a), &[a.join("rust")]),
+            "a subdirectory session"
+        );
+        assert!(
+            grant_applies(Some(&a.join("rust")), std::slice::from_ref(&a)),
+            "granted from a subdirectory"
+        );
+        assert!(
+            !grant_applies(Some(&a), std::slice::from_ref(&b)),
+            "another project"
+        );
+        assert!(!grant_applies(Some(&a), &[]), "no scope yet");
+        assert!(
+            grant_applies(None, std::slice::from_ref(&b)),
+            "legacy global applies everywhere"
+        );
+    }
+
+    #[test]
+    fn persist_grant_records_the_workspace() {
+        let home = tempdir().unwrap();
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let file = home.path().join(".ahma").join("settings.toml");
+        let target = home.path().join("cache");
+        let ws = home.path().join("proj");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut g = grant(&target, &[]);
+        g.workspace = Some(&ws);
+        persist_grant(&file, g).unwrap();
+        let reloaded = AhmaSettings::load_from_result(&file).unwrap();
+        let rec = reloaded.sandbox.find_scope(&target).unwrap();
+        assert_eq!(
+            rec.workspace.as_deref(),
+            Some(dunce::canonicalize(&ws).unwrap().as_path())
+        );
+        unsafe { std::env::remove_var("AHMA_TEST_HOME") };
     }
 
     /// SPEC R-PERM.2: the hard denylist gates the one write path, so no surface

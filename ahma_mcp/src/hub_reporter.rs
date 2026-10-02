@@ -38,6 +38,9 @@ pub struct GrantReporting {
     pub coordinator: Arc<GrantCoordinator>,
     /// Stream of fresh requests to forward to the hub.
     pub req_rx: UnboundedReceiver<ScopeGrantRequest>,
+    /// The live sandbox an approved grant is applied to, and whose committed
+    /// scope stamps the grant's workspace (SPEC R5.4.6, R5.4.11).
+    pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
 }
 
 /// The shared web-approval plumbing handed to the reporter (SPEC R-WEB.6). Parallel
@@ -293,43 +296,81 @@ fn persist_resolved_web_allow(domain: &str) {
     }
 }
 
-/// Persist an approved grant to `~/.ahma/settings.toml` — never the live session
-/// (SPEC R5.4.7). Stamps today's date and records the requesting tool as
-/// `granted_by` provenance. Best-effort: a write failure is logged, not fatal.
+/// Apply a grant the human approved at the TUI modal: write it through the one
+/// audited chokepoint at the `always` tier (bound to the session's workspace,
+/// SPEC R5.4.11), and apply it to the live session at either tier (R5.4.6).
+/// Best-effort: a write failure is logged, not fatal.
 fn persist_resolved_grant(
     path: &std::path::Path,
     access: ahma_common::config::ScopeAccess,
     tool: Option<String>,
+    tier: ahma_common::permissions::GrantTier,
+    sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
 ) {
-    let granted_at = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let granted_by = tool.or_else(|| Some("scope-grant prompt".to_string()));
-    match settings_path() {
-        Some(file) => {
-            match persist_grant(
-                &file,
-                ahma_common::scope_grant::NewGrant {
-                    path,
-                    access,
-                    granted_by,
-                    granted_at: Some(granted_at),
-                    note: None,
-                    surface: "tui",
-                    live_scopes: &[],
-                },
-            ) {
-                Ok(_) => tracing::info!(
-                    path = %path.display(),
-                    access = access.label(),
-                    "scope grant approved and persisted; restart the bridge (the `restart` \
-                     tool) to apply it now, otherwise it takes effect on the next server start"
-                ),
-                Err(e) => warn!(
-                    "hub_reporter: failed to persist scope grant for {}: {e:#}",
-                    path.display()
-                ),
+    let live_scopes: Vec<std::path::PathBuf> =
+        sandbox.map(|sb| sb.scopes().to_vec()).unwrap_or_default();
+    let workspace = live_scopes.first().cloned();
+    if tier.is_persistent() {
+        let granted_at = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let granted_by = tool.or_else(|| Some("scope-grant prompt".to_string()));
+        match settings_path() {
+            Some(file) => {
+                match persist_grant(
+                    &file,
+                    ahma_common::scope_grant::NewGrant {
+                        path,
+                        access,
+                        granted_by,
+                        granted_at: Some(granted_at),
+                        note: None,
+                        surface: "tui",
+                        live_scopes: &live_scopes,
+                        workspace: workspace.as_deref(),
+                    },
+                ) {
+                    Ok(_) => tracing::info!(
+                        path = %path.display(),
+                        access = access.label(),
+                        "scope grant approved at the TUI, persisted for workspace {} and applied \
+                         to this session",
+                        workspace
+                            .as_deref()
+                            .map(|w| w.display().to_string())
+                            .unwrap_or_else(|| "(none)".into())
+                    ),
+                    Err(e) => {
+                        warn!(
+                            "hub_reporter: failed to persist scope grant for {}: {e:#}",
+                            path.display()
+                        );
+                        return;
+                    }
+                }
+            }
+            None => {
+                warn!("hub_reporter: cannot persist scope grant (home directory unknown)");
+                return;
             }
         }
-        None => warn!("hub_reporter: cannot persist scope grant (home directory unknown)"),
+    } else {
+        ahma_common::permissions::append_audit(&ahma_common::permissions::audit_entry(
+            chrono::Local::now().to_rfc3339(),
+            ahma_common::permissions::AuditAction::Grant,
+            ahma_common::permissions::GrantKind::FsScope,
+            path.display().to_string(),
+            Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
+            ahma_common::permissions::GrantTier::Session,
+            Some("tui".to_string()),
+        ));
+        tracing::info!(
+            path = %path.display(),
+            access = access.label(),
+            "scope granted at the TUI for this session only (not written to settings)"
+        );
+    }
+    if let Some(sb) = sandbox {
+        sb.add_live_grant(path, access);
+        publish_committed_scope(sb);
     }
 }
 
@@ -368,6 +409,7 @@ async fn run_reporter_loop(
     // resource in the select. Keeping them separate avoids a double-mutable-borrow
     // of one struct across two select branches.
     let grant_coordinator = grant.as_ref().map(|g| g.coordinator.clone());
+    let grant_sandbox = grant.as_ref().and_then(|g| g.sandbox.clone());
     let mut grant_req_rx = grant.map(|g| g.req_rx);
     // Same split for the web-approval plumbing.
     let web_coordinator = web.as_ref().map(|w| w.coordinator.clone());
@@ -545,6 +587,7 @@ async fn run_reporter_loop(
                         &session,
                         &monitor,
                         grant_coordinator.as_ref(),
+                        grant_sandbox.as_ref(),
                         web_coordinator.as_ref(),
                     ).await;
                 }
@@ -627,6 +670,7 @@ async fn replay_active_operations(
 /// "incoming messages from hub" select arm). Returns `true` when the
 /// connection should be treated as closed — the caller sets `closed = true`
 /// and the outer loop reconnects.
+#[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
     incoming: anyhow::Result<HubMsg>,
     writer: &mut tokio::io::WriteHalf<HubStream>,
@@ -634,6 +678,7 @@ async fn handle_incoming(
     session: &Arc<tokio::sync::Mutex<ActiveAgentSession>>,
     monitor: &OperationMonitor,
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
+    grant_sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
     web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
 ) -> bool {
     let msg = match incoming {
@@ -669,7 +714,16 @@ async fn handle_incoming(
         HubMsg::SubmitScopeGrant {
             decision_id,
             decision,
-        } => resolve_scope_grant(decision_id, decision, writer, grant_coordinator).await,
+        } => {
+            resolve_scope_grant(
+                decision_id,
+                decision,
+                writer,
+                grant_coordinator,
+                grant_sandbox,
+            )
+            .await
+        }
         HubMsg::ReRaiseScopeGrant { path, access } => {
             re_raise_scope_grant(&path, access, writer, grant_coordinator).await
         }
@@ -800,15 +854,19 @@ async fn resolve_scope_grant(
     decision: GrantDecision,
     writer: &mut tokio::io::WriteHalf<HubStream>,
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
+    sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
 ) {
     debug!("hub_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?}");
     let Some(coord) = grant_coordinator else {
         return;
     };
     match coord.resolve(&decision_id, decision) {
-        GrantResolveOutcome::Persist { path, access, tool } => {
-            persist_resolved_grant(&path, access, tool)
-        }
+        GrantResolveOutcome::Persist {
+            path,
+            access,
+            tool,
+            tier,
+        } => persist_resolved_grant(&path, access, tool, tier, sandbox),
         GrantResolveOutcome::Denied { .. } => {}
         GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => return,
     }
@@ -1816,6 +1874,8 @@ mod tests {
                 grant_dir.path(),
                 ScopeAccess::Rw,
                 Some("sccache".to_string()),
+                ahma_common::permissions::GrantTier::Always,
+                None,
             );
         });
 
@@ -1840,7 +1900,13 @@ mod tests {
         let settings = home.path().join(".ahma").join("settings.toml");
 
         with_home(home.path(), || {
-            persist_resolved_grant(grant_dir.path(), ScopeAccess::Ro, None);
+            persist_resolved_grant(
+                grant_dir.path(),
+                ScopeAccess::Ro,
+                None,
+                ahma_common::permissions::GrantTier::Always,
+                None,
+            );
         });
 
         let contents = std::fs::read_to_string(&settings).unwrap();
@@ -1866,7 +1932,13 @@ mod tests {
 
         with_home(home.path(), || {
             // Must not panic even though persistence fails.
-            persist_resolved_grant(grant_dir.path(), ScopeAccess::Rw, Some("t".to_string()));
+            persist_resolved_grant(
+                grant_dir.path(),
+                ScopeAccess::Rw,
+                Some("t".to_string()),
+                ahma_common::permissions::GrantTier::Always,
+                None,
+            );
         });
 
         let after = std::fs::read_to_string(&settings).unwrap();
@@ -2172,6 +2244,7 @@ mod tests {
         let grant = GrantReporting {
             coordinator: coord.clone(),
             req_rx: grant_rx,
+            sandbox: None,
         };
 
         // ── Run the loop in the background. ──────────────────────────────────────

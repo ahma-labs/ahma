@@ -643,6 +643,7 @@ async fn sandbox_grant_human_approval_applies_live_and_persists() {
                     note: None,
                     surface: "tui",
                     live_scopes: &[],
+                    workspace: None,
                 },
             )
             .unwrap();
