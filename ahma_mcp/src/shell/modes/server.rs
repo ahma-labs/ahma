@@ -769,10 +769,13 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // MCP client that requested the work first (it is where the user is looking),
     // fall back to an attached TUI, and if neither can be asked, fail closed with a
     // command the user can paste. The hub channel below is rung 2.
-    let permission_broker = Arc::new(crate::sandbox::PermissionBroker::new(
-        grant_coordinator.clone(),
-        Some(grant_req_tx),
-    ));
+    // Rung 2 is asked only while the hub says a TUI is watching (SPEC
+    // R-PERM.3.6); the reporter keeps this count, the broker reads it.
+    let tui_viewers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let permission_broker = Arc::new(
+        crate::sandbox::PermissionBroker::new(grant_coordinator.clone(), Some(grant_req_tx))
+            .with_tui_viewers(tui_viewers.clone()),
+    );
     // An approved grant is applied to this session and bound to its workspace
     // (SPEC R5.4.6, R5.4.11).
     permission_broker.set_sandbox(sandbox.clone());
@@ -838,6 +841,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
                 coordinator: grant_coordinator,
                 req_rx: grant_req_rx,
                 sandbox: Some(sandbox.clone()),
+                tui_viewers,
             }),
             Some(crate::hub_reporter::WebApprovalReporting {
                 coordinator: web_coordinator,

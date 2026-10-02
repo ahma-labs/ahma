@@ -543,7 +543,8 @@ fn apply_msg(state: &mut HubState, msg: HubMsg) -> Applied {
             }),
             HubEvent::LogLine { .. } => Applied::None, // not yet surfaced in TUI
         },
-        HubMsg::Ping { .. } => Applied::None, // hub-to-instance ping; no state change for subscribers
+        // Hub-to-instance messages; no state change for subscribers.
+        HubMsg::Ping { .. } | HubMsg::Viewers { .. } => Applied::None,
         // Instance-directed: the hub routes a TUI's re-raise request to the
         // instance that owns the path. A subscriber seeing it has nothing to do
         // — the re-raised question arrives as a normal ScopeGrantRequested.
