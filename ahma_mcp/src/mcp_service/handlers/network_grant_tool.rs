@@ -197,10 +197,18 @@ impl AhmaMcpService {
         // `confirm: true` is the model's word, never the human's (SPEC R5.4.5).
         // Ask a human through the client's elicitation prompt when it has one;
         // `None` means nobody could be asked, which is a request, not a grant.
-        let human_approved: Option<bool> = {
+        // What the human answered. `None` means nobody could be asked (or the
+        // prompt closed without an answer), which is a request, not a grant.
+        enum Answer {
+            Nobody,
+            Declined,
+            Session,
+            Always,
+        }
+        let answer = {
             let peer = self.peer.read().clone();
             match (client_type, peer) {
-                (crate::client_type::McpClientType::Ahma, _) | (_, None) => None,
+                (crate::client_type::McpClientType::Ahma, _) | (_, None) => Answer::Nobody,
                 (client_type, Some(peer)) => {
                     match peer
                         .elicit_with_timeout::<NetApprovalForm>(
@@ -209,52 +217,61 @@ impl AhmaMcpService {
                         )
                         .await
                     {
-                        Ok(Some(form)) => Some(matches!(
-                            parse_answer(&form.decision),
-                            NetApprovalDecision::AllowAlways
-                                | NetApprovalDecision::AllowSession
-                                | NetApprovalDecision::AllowOnce
-                        )),
+                        Ok(Some(form)) => match parse_answer(&form.decision) {
+                            NetApprovalDecision::AllowAlways => Answer::Always,
+                            // This prompt asks before any connection exists and
+                            // offers no "once"; a client that sends it anyway gets
+                            // the narrowest tier that has something to apply —
+                            // this session, never written.
+                            NetApprovalDecision::AllowSession | NetApprovalDecision::AllowOnce => {
+                                Answer::Session
+                            }
+                            NetApprovalDecision::Deny => Answer::Declined,
+                        },
                         Ok(None) | Err(rmcp::service::ElicitationError::UserDeclined) => {
-                            Some(false)
+                            Answer::Declined
                         }
-                        // The client cannot elicit: nobody was asked. Never persist
-                        // on the assumption that the client gated the call itself.
-                        Err(rmcp::service::ElicitationError::CapabilityNotSupported) => None,
+                        // The client cannot elicit, or the prompt timed out or
+                        // broke: nobody answered. Never persist on the assumption
+                        // that the client gated the call, and never report a
+                        // timeout as the human's "no".
                         Err(e) => {
-                            tracing::debug!("network_grant elicitation unavailable: {e}");
-                            Some(false)
+                            tracing::debug!("network_grant elicitation got no answer: {e}");
+                            Answer::Nobody
                         }
                     }
                 }
             }
         };
 
-        match human_approved {
-            None => {
+        let tier = match answer {
+            Answer::Nobody => {
                 return Ok(common::text_result(agent_requested_text(
                     &host,
                     &settings_file,
                 )));
             }
-            Some(false) => {
+            Answer::Declined => {
                 return Ok(common::text_result(declined_text(&host, &settings_file)));
             }
-            Some(true) => {}
-        }
+            Answer::Session => GrantTier::Session,
+            Answer::Always => GrantTier::Always,
+        };
 
-        // Persist to ~/.ahma/settings.toml
-        let newly_added = persist_net_allow(&settings_file, &host).map_err(|e| {
-            common::mcp_internal(format!(
-                "failed to persist network grant to {}: {e:#}",
-                settings_file.display()
-            ))
-        })?;
-
-        // Apply immediately to the live session
+        // Only an `always` answer is written (SPEC R-PERM.2); every allow
+        // applies to the live session now.
+        let newly_added = if tier == GrantTier::Always {
+            persist_net_allow(&settings_file, &host).map_err(|e| {
+                common::mcp_internal(format!(
+                    "failed to persist network grant to {}: {e:#}",
+                    settings_file.display()
+                ))
+            })?
+        } else {
+            false
+        };
         self.net_approval.add_session_grant(&host);
 
-        // Record audit entry
         let at = chrono::Local::now().to_rfc3339();
         let entry = audit_entry(
             at,
@@ -262,12 +279,19 @@ impl AhmaMcpService {
             GrantKind::NetHost,
             &host,
             None,
-            GrantTier::Always,
+            tier,
             Some("mcp:network_grant".to_string()),
         );
         let _ = note;
         append_audit(&entry);
 
+        if tier == GrantTier::Session {
+            return Ok(common::text_result(format!(
+                "✓ A human allowed network access to '{host}' for this session only. Nothing \
+                 was written to {}; it ends when this session does.",
+                settings_file.display()
+            )));
+        }
         Ok(common::text_result(success_text(
             &host,
             &settings_file,
@@ -322,9 +346,9 @@ fn grant_prompt_message(host: &str, settings_file: &Path, risk: &NetGrantRisk) -
     };
     format!(
         "Allow outbound network egress to '{host}'?\n{risk_note}\n\
-         This appends to {} (under [network].allow), takes effect immediately \
-         for this session, and persists for future sessions.\n\n\
-         Answer 'always' to persist, 'session' for this session only, or 'deny' to refuse.",
+         'session' allows it now, until this session ends, and writes nothing. 'always' \
+         also appends it to {} (under [network].allow) for future sessions. 'deny' \
+         refuses, and the agent is told not to ask again.",
         settings_file.display()
     )
 }
@@ -333,8 +357,8 @@ fn declined_text(host: &str, settings_file: &Path) -> String {
     format!(
         "Not granted — the human declined the prompt, so nothing was written.\n\n\
          Requested network access to: {host}\n\
-         Nothing was appended to {}. Re-run `network_grant` with `confirm: true` to \
-         prompt again, or run `ahma network allow {host}` directly.",
+         Nothing was appended to {}. That is their answer: do not ask again this session. \
+         If the task cannot go on without it, say so in conversation.",
         settings_file.display()
     )
 }
