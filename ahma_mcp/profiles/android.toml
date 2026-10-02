@@ -1,0 +1,95 @@
+# Android / JVM toolchain sandbox profile (Gradle, Maven, the Android SDK).
+#
+# Same shape as the rust profile: a pre-answered bundle of the grant questions a
+# Gradle build otherwise raises one denial at a time (SPEC R-PERM.5). The first
+# real-world request for these paths was an agent asking a human to grant
+# `~/.gradle` and `~/.m2` by hand, mid-build, with no context — exactly the
+# prompt a profile exists to remove.
+name = "android"
+description = "Android/JVM toolchain: Gradle and Maven caches, the Android SDK, Kotlin/Native"
+
+# What enabling this costs (SPEC R-PERM.5.2, R-HANDOFF.8): the Gradle and Maven
+# caches are shared by every JVM project on this machine, and Gradle *executes*
+# what it finds there — plugin jars, build-logic classes, the wrapper
+# distribution. An agent in one project can edit a cached jar or a Kotlin/Native
+# toolchain file, and that code then runs the next time you build an unrelated
+# project. Nothing in the sandbox is broken at any step; the write is legitimate
+# and the execution happens later, elsewhere.
+cost = """the Gradle (~/.gradle), Maven (~/.m2) and Kotlin/Native (~/.konan) caches are shared by \
+every JVM project on this machine, and this profile makes them writable. Gradle executes what it \
+finds in them — plugin jars, build logic, the wrapper distribution — so an agent working in one \
+project can plant code that runs the next time you build an unrelated one. Turn it off with \
+`--no-package-cache-write` (or `[sandbox] package_cache_write = false`), which downgrades these \
+caches to read-only and leaves the toolchain runnable (SPEC R-HANDOFF.8)."""
+
+# Paths this profile asserts must NEVER become writable: the adb host key pair is
+# a credential (it authenticates this machine to every paired device), and the
+# SDK's own binaries are run outside any sandbox by Android Studio.
+deny_write = [
+  "~/.android/adbkey",
+  "~/.android/adbkey.pub",
+  "${ANDROID_HOME:-~/Library/Android/sdk}/platform-tools",
+  "${ANDROID_HOME:-~/Library/Android/sdk}/cmdline-tools",
+]
+
+# Gradle: the dependency cache, wrapper distributions, daemon logs and the
+# per-user init scripts all live under one directory; Gradle needs to write it.
+[[rules]]
+path = "~/.gradle"
+access = "rw"
+
+# Maven local repository. Robolectric and most Android unit-test setups resolve
+# runtime jars into it on first use, so a read-only grant fails the first test run.
+[[rules]]
+path = "~/.m2"
+access = "rw"
+
+# Kotlin/Native downloads its toolchain and dependency cache here on first use.
+[[rules]]
+path = "~/.konan"
+access = "rw"
+
+# The Android SDK: read + execute, never write. `sdkmanager` installs components
+# into it, but that is an operator action (and a code-install), not a build step.
+[[rules]]
+path = "${ANDROID_HOME:-~/Library/Android/sdk}"
+access = "rx"
+
+# Emulator images and device state are writable; the rest of ~/.android (the adb
+# key pair above all) stays read-only.
+[[rules]]
+path = "~/.android"
+access = "rx"
+
+[[rules]]
+path = "~/.android/avd"
+access = "rw"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hostnames this toolchain must reach when `--restrict-network` is on. Widen
+# nothing unless restriction is on (see the rust profile for the rationale).
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[hosts]]
+host = "dl.google.com"
+reason = "Google's Maven repository (AndroidX, the Android Gradle plugin) and SDK component downloads"
+
+[[hosts]]
+host = "maven.google.com"
+reason = "the documented alias of Google's Maven repository; Gradle's `google()` resolves against it"
+
+[[hosts]]
+host = "repo.maven.apache.org"
+reason = "Maven Central — Gradle's `mavenCentral()` and Maven's default remote repository"
+
+[[hosts]]
+host = "repo1.maven.org"
+reason = "Maven Central's canonical host; older POMs and Maven settings name it directly"
+
+[[hosts]]
+host = "services.gradle.org"
+reason = "Gradle wrapper distributions (`gradlew` downloads the pinned Gradle version from here)"
+
+[[hosts]]
+host = "plugins.gradle.org"
+reason = "the Gradle plugin portal — `plugins {}` blocks resolve plugin ids and artifacts here"

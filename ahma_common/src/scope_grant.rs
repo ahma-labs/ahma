@@ -205,6 +205,17 @@ impl GrantCoordinator {
         reason: GrantReason,
         tool: Option<String>,
     ) -> Option<ScopeGrantRequest> {
+        // SPEC R-PERM.4.3: a path the hard denylist refuses never becomes a
+        // question. The prompt would be one whose right answer is always "no",
+        // and a `session` answer to it would apply live, past `persist_grant`.
+        if let Some(why) = refusal_reason(&canonical) {
+            tracing::warn!(
+                path = %canonical.display(),
+                access = access.label(),
+                "scope grant not raised: {why}"
+            );
+            return None;
+        }
         let key = (canonical.clone(), access);
         let mut inner = self.inner.lock();
         if inner.dismissed.contains(&key) || inner.active_keys.contains(&key) {
@@ -537,10 +548,18 @@ pub fn is_system_dir(path: &Path) -> bool {
         "C:\\Program Files (x86)",
         "C:\\ProgramData",
     ];
+    // macOS canonicalizes `/etc`, `/var` and `/tmp` to `/private/<dir>`, and
+    // every caller that canonicalizes first would otherwise slip past an
+    // exact-match list. Compare the path as given *and* with that prefix
+    // removed, so `/private/etc` is `/etc`.
+    let lexical = path
+        .strip_prefix("/private")
+        .ok()
+        .map(|rest| Path::new("/").join(rest));
     UNIX_SYSTEM_DIRS
         .iter()
         .chain(WINDOWS_SYSTEM_DIRS)
-        .any(|d| path == Path::new(d))
+        .any(|d| path == Path::new(d) || lexical.as_deref() == Some(Path::new(d)))
 }
 
 /// Whether `name` (a `~/<name>` hidden directory) is a well-known build cache,
@@ -1144,5 +1163,58 @@ mod tests {
         assert_eq!(entry.access.as_deref(), Some("rw"));
         assert!(entry.subject.ends_with("cache"), "{}", entry.subject);
         unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+    }
+}
+
+#[cfg(test)]
+mod refused_path_gate_tests {
+    use super::*;
+
+    /// SPEC R-PERM.4.3: a path the hard denylist refuses is never turned into a
+    /// question. Asking "grant ~/.ssh?" trains the reflex click the denylist
+    /// exists to make unnecessary, and a `session` answer would apply it.
+    #[test]
+    fn coordinator_never_raises_request_for_refused_path() {
+        let c = GrantCoordinator::new();
+        let home = crate::config::ahma_home_dir().expect("home dir");
+        for refused in [home.join(".ssh"), home.join(".aws"), home.clone()] {
+            assert!(
+                c.begin(
+                    &refused,
+                    ScopeAccess::Rw,
+                    GrantReason::StderrHeuristic,
+                    Some("git".into())
+                )
+                .is_none(),
+                "{} must never become a prompt",
+                refused.display()
+            );
+        }
+        assert!(
+            c.begin(
+                Path::new("/"),
+                ScopeAccess::Ro,
+                GrantReason::PreExecViolation,
+                None
+            )
+            .is_none()
+        );
+        // The refusal is reportable to the agent as text, not a silent `None`.
+        let why = refusal_reason(&home.join(".ssh")).expect("a reason is given");
+        assert!(why.contains("credentials"), "{why}");
+        assert!(refusal_reason(Path::new("/etc")).is_some());
+    }
+}
+
+/// Why `path` can never be granted, if the hard denylist refuses it
+/// (SPEC R-PERM.4.3): a filesystem root, `$HOME`, a credential directory,
+/// ahma's own settings directory, or an OS system directory. `None` for a path
+/// a human may be asked about. Evaluated without live scopes, so the
+/// "parent of the workspace" rule is left to the apply site, which has them.
+pub fn refusal_reason(path: &Path) -> Option<String> {
+    let canonical = canonicalize_best_effort(path);
+    match classify_grant_risk(&canonical, crate::config::ahma_home_dir().as_deref(), &[]) {
+        GrantRisk::Refused(why) => Some(why),
+        _ => None,
     }
 }

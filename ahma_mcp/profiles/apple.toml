@@ -1,0 +1,76 @@
+# Apple toolchain sandbox profile (Xcode, SwiftPM, CocoaPods).
+#
+# A pre-answered bundle of the grant questions an `xcodebuild` or
+# `swift build` raises otherwise (SPEC R-PERM.5). Xcode insists on writing its
+# build products and module caches under ~/Library rather than in the project,
+# and SwiftPM writes manifest and package caches under ~/Library/Caches even when
+# `--scratch-path` points elsewhere — so a per-project scope alone cannot build
+# an iOS app, and the agent ends up asking a human for these paths one at a time.
+name = "apple"
+description = "Apple toolchain: Xcode DerivedData, SwiftPM and CocoaPods caches, simulators (read-only)"
+
+# What enabling this costs (SPEC R-PERM.5.2, R-HANDOFF.8): DerivedData and the
+# SwiftPM cache are shared by every Apple project on this machine. SwiftPM
+# compiles the package sources it has cached, and Xcode links from DerivedData,
+# so an agent in one project can edit a cached package checkout and that code is
+# built into the next unrelated project that depends on it.
+cost = """Xcode's DerivedData (~/Library/Developer/Xcode/DerivedData) and the SwiftPM and CocoaPods \
+caches under ~/Library are shared by every Apple project on this machine, and this profile makes \
+them writable. SwiftPM compiles the package sources it has cached, so an agent working in one \
+project can edit a cached package checkout that is then built into an unrelated project. Turn it \
+off with `--no-package-cache-write` (or `[sandbox] package_cache_write = false`), which downgrades \
+these caches to read-only and leaves the toolchain runnable (SPEC R-HANDOFF.8)."""
+
+deny_write = []
+
+# Build products, indexes and module caches. Not optional: xcodebuild writes
+# here even when a project sets a custom build location.
+[[rules]]
+path = "~/Library/Developer/Xcode/DerivedData"
+access = "rw"
+
+# Xcode's own caches (precompiled headers, module maps). Written during builds.
+[[rules]]
+path = "~/Library/Caches/com.apple.dt.Xcode"
+access = "rw"
+
+# SwiftPM: the manifest/package cache, and the per-user security and
+# configuration store (collection fingerprints, mirrors). `swift package resolve`
+# writes both.
+[[rules]]
+path = "~/Library/Caches/org.swift.swiftpm"
+access = "rw"
+
+[[rules]]
+path = "~/Library/org.swift.swiftpm"
+access = "rw"
+
+# CocoaPods: the spec repos are read; the pod download cache is written.
+[[rules]]
+path = "~/.cocoapods"
+access = "rx"
+
+[[rules]]
+path = "~/Library/Caches/CocoaPods"
+access = "rw"
+
+# Simulators: runtimes and device images are read to build *for* the simulator.
+# Booting a device and running tests writes device state under
+# `CoreSimulator/Devices`; that is a per-session question the sandbox asks when
+# it happens, not a default grant to every Apple project.
+[[rules]]
+path = "~/Library/Developer/CoreSimulator"
+access = "rx"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hostnames this toolchain must reach when `--restrict-network` is on. Widen
+# nothing unless restriction is on (see the rust profile for the rationale).
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[hosts]]
+host = "github.com"
+reason = "SwiftPM dependencies are git repositories, overwhelmingly hosted on GitHub"
+
+[[hosts]]
+host = "cdn.cocoapods.org"
+reason = "the CocoaPods spec CDN (`trunk` source) that `pod install` resolves against"

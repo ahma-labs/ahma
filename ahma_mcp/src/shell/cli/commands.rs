@@ -484,9 +484,10 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
             read_only,
             workspace,
             global,
+            session,
             by,
             note,
-        } => run_sandbox_grant(&file, dir, read_only, workspace, global, by, note),
+        } => run_sandbox_grant(&file, dir, read_only, workspace, global, session, by, note),
         SandboxCommand::List => run_sandbox_list(&file),
         SandboxCommand::Revoke { path: dir } => run_sandbox_revoke(&file, dir),
     }
@@ -508,12 +509,14 @@ fn default_grant_workspace() -> Option<PathBuf> {
         .next()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sandbox_grant(
     file: &std::path::Path,
     dir: PathBuf,
     read_only: bool,
     workspace: Option<PathBuf>,
     global: bool,
+    session: bool,
     by: Option<String>,
     note: Option<String>,
 ) -> Result<()> {
@@ -546,6 +549,10 @@ fn run_sandbox_grant(
         .collect();
     warn_elevated_risk_grant(&dir, &live_scopes);
     drop(settings);
+
+    if session {
+        return run_sandbox_grant_session(dir, access, workspace, by);
+    }
 
     let outcome = ahma_common::scope_grant::persist_grant(
         file,
@@ -580,22 +587,115 @@ fn run_sandbox_grant(
         None => println!("GLOBAL: applies to every workspace on this machine."),
     }
     println!("Recorded in: {}", file.display());
-    println!("  This file lives outside every sandbox scope, so a sandboxed *command*");
-    println!("  cannot touch it. Only you can change it — here, in the ahma TUI, or at a");
-    println!("  prompt the AI's `sandbox_grant` tool raises for you. Edit it by hand, or run");
+    println!();
+    // SPEC R-PERM.9: the first line answers "do I need to do anything?" and,
+    // when the answer is yes, names the exact action. Hooks and the edit guard
+    // re-read the ledger per command; a *running* MCP server does not yet.
     println!(
-        "  `ahma sandbox revoke {}` to remove this grant.",
-        dir.display()
+        "Nothing more to do for terminal hooks and the edit guard: they apply it on your next \
+         command."
+    );
+    println!(
+        "One thing to do only if an ahma MCP session is already running for this workspace: \
+         restart its MCP connection in your client, or approve the same grant at the prompt it \
+         raises. New sessions start with it."
     );
     println!();
-    println!("Takes effect the next time an ahma server starts for that workspace (restart");
-    println!("your IDE's MCP connection, or `ahma serve …`, to apply it now).");
+    println!(
+        "Revoke with: ahma sandbox revoke {}   (the file is outside every sandbox scope; only you \
+         can change it)",
+        dir.display()
+    );
+    Ok(())
+}
+
+/// `ahma sandbox grant --session`: record a session-tier grant for the shell
+/// this was typed into (SPEC R-PERM.4.4). Nothing is written to settings.toml;
+/// terminal hooks and the edit guard honour it in `workspace` while the parent
+/// shell lives, at most `MAX_AGE_SECS`. The hard denylist applies exactly as
+/// for the persistent tier.
+fn run_sandbox_grant_session(
+    dir: PathBuf,
+    access: ahma_common::config::ScopeAccess,
+    workspace: Option<PathBuf>,
+    by: Option<String>,
+) -> Result<()> {
+    let Some(workspace) = workspace else {
+        anyhow::bail!(
+            "a session grant is bound to a workspace; pass --workspace <DIR> (there is no \
+             --global session grant)"
+        );
+    };
+    let expanded = ahma_common::config::expand_home(&dir);
+    let canonical = dunce::canonicalize(&expanded).unwrap_or(expanded);
+    if let Some(why) = ahma_common::scope_grant::refusal_reason(&canonical) {
+        anyhow::bail!("refusing to grant {}: {why}", canonical.display());
+    }
+    #[cfg(unix)]
+    let owner_pid = unsafe { libc::getppid() } as u32;
+    #[cfg(not(unix))]
+    let owner_pid = std::process::id();
+    let Some(store) = ahma_common::session_grants::default_dir() else {
+        anyhow::bail!("cannot locate ahma's runtime directory for session grants");
+    };
+    let grant = ahma_common::session_grants::SessionGrant {
+        path: canonical.clone(),
+        access,
+        workspace: workspace.clone(),
+        owner_pid,
+        granted_at: ahma_common::session_grants::now_secs(),
+        granted_by: Some(by.unwrap_or_else(|| "cli".to_string())),
+    };
+    ahma_common::session_grants::record(&store, &grant)?;
+    ahma_common::permissions::append_audit(&ahma_common::permissions::audit_entry(
+        chrono::Local::now().to_rfc3339(),
+        ahma_common::permissions::AuditAction::Grant,
+        ahma_common::permissions::GrantKind::FsScope,
+        canonical.display().to_string(),
+        Some(access.short().to_string()),
+        ahma_common::permissions::GrantTier::Session,
+        Some("cli".to_string()),
+    ));
+    println!(
+        "✓ Granted {} access to {} for this terminal session (workspace {}).",
+        access.label(),
+        canonical.display(),
+        workspace.display()
+    );
+    println!();
+    println!(
+        "Nothing more to do: terminal hooks and the edit guard apply it on your next command in \
+         that workspace. It ends when this shell exits (pid {owner_pid}), or after {} hours; \
+         nothing was written to settings.toml.",
+        ahma_common::session_grants::MAX_AGE_SECS / 3600
+    );
+    println!(
+        "An ahma MCP session that is already running does not read session grants; answer the \
+         prompt it raises instead."
+    );
     Ok(())
 }
 
 fn run_sandbox_list(file: &std::path::Path) -> Result<()> {
     let settings = load_sandbox_settings(file)?;
     let scopes = &settings.sandbox.persistent_scopes;
+    let session = crate::sandbox::session_tier::all_active();
+    if !session.is_empty() {
+        println!(
+            "# Session grants in force on this machine (not in the file; end with their owner)"
+        );
+        for g in &session {
+            println!(
+                "  {} ({}) for workspace {}  [owner pid {}, by {}]",
+                g.path.display(),
+                g.access.short(),
+                g.workspace.display(),
+                g.owner_pid,
+                g.granted_by.as_deref().unwrap_or("?")
+            );
+        }
+        println!();
+    }
     println!("# Persistent sandbox scopes");
     println!("# File: {}", file.display());
     println!();
@@ -2328,6 +2428,7 @@ mod tests {
                 path: scope_dir.clone(),
                 workspace: None,
                 global: true,
+                session: false,
                 read_only: false,
                 by: Some("tester".into()),
                 note: Some("a note".into()),
@@ -2344,6 +2445,7 @@ mod tests {
                 path: scope_dir.clone(),
                 workspace: None,
                 global: true,
+                session: false,
                 read_only: true,
                 by: None,
                 note: None,
@@ -2731,6 +2833,7 @@ mod tests {
             command: SandboxCommand::Grant {
                 workspace: None,
                 global: true,
+                session: false,
                 path: home.path().to_path_buf(),
                 read_only: false,
                 by: None,
@@ -2761,6 +2864,7 @@ mod tests {
             command: SandboxCommand::Grant {
                 workspace: None,
                 global: true,
+                session: false,
                 path: cache.clone(),
                 read_only: true,
                 by: Some("sccache".into()),
@@ -2807,6 +2911,7 @@ mod tests {
             command: SandboxCommand::Grant {
                 workspace: None,
                 global: true,
+                session: false,
                 path: cache.clone(),
                 read_only: false,
                 by: None,

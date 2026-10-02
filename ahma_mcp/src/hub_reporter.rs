@@ -408,8 +408,25 @@ fn persist_resolved_grant(
         );
     }
     if let Some(sb) = sandbox {
-        sb.add_live_grant(path, access);
-        publish_committed_scope(sb);
+        match sb.add_live_grant(path, access) {
+            Ok(()) => {
+                publish_committed_scope(sb);
+                if !tier.is_persistent() {
+                    // R-PERM.4.4: a `[s]`/`[o]` answer at the TUI reaches hooked commands too.
+                    crate::sandbox::record_session_grant(
+                        path,
+                        access,
+                        workspace.as_deref(),
+                        std::process::id(),
+                        "tui",
+                    );
+                }
+            }
+            Err(why) => warn!(
+                path = %path.display(),
+                "hub_reporter: approved grant not applied: {why}"
+            ),
+        }
     }
 }
 

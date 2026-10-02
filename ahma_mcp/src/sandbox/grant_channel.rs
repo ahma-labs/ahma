@@ -50,6 +50,10 @@ pub(crate) fn grant_dir_for(path: &Path) -> PathBuf {
         // `parent.parent().is_some()` is false only for a filesystem root, so
         // this refuses to ever suggest `/` (or a bare drive root) as a grant.
         && parent.parent().is_some()
+        // Nor `$HOME`, `~/.ssh` or a system directory (SPEC R-PERM.4.3): a file
+        // denied there is offered as itself, never widened to a directory no
+        // prompt may grant.
+        && ahma_common::scope_grant::refusal_reason(parent).is_none()
     {
         return parent.to_path_buf();
     }
@@ -94,12 +98,19 @@ pub fn runtime_denial_remediation_cli(path: &Path, access: ScopeAccess) -> Strin
         " --read-only"
     };
     let verb = if access.is_write() { "write" } else { "read" };
+    // One first line that answers "do I need to do anything?" (SPEC R-PERM.9),
+    // then the exact command for each tier, then why. Hooks re-derive the
+    // sandbox per command, so the grant applies on the next command: no
+    // restart, and no second sentence saying otherwise.
     format!(
-        "ahma's kernel sandbox blocked an out-of-scope {verb} to '{denied}'. This is expected: \
-         writing outside the workspace (for example installing a global binary under ~/.cargo) is \
-         denied by default. To allow it, run `ahma sandbox grant {target}{ro_flag}` — the grant \
-         is validated against a denylist, persisted to ~/.ahma/settings.toml, and takes effect \
-         on the next server start — then re-run the command.",
+        "Blocked until a human grants it: ahma's kernel sandbox refused an out-of-scope {verb} to \
+         '{denied}'.\n\nOne thing to do (pick a tier), then re-run the command:\n  ahma sandbox grant \
+         {target}{ro_flag} --session   # this terminal session only, at most 12h\n  ahma sandbox grant \
+         {target}{ro_flag}             # until revoked, bound to this workspace\n\nEither applies on your \
+         next command; nothing to restart. The grant is checked against ahma's denylist and \
+         audited. Writing outside the workspace (a global binary under ~/.cargo, a cache under \
+         ~/Library) is denied by default; the narrowest directory that fixes the denial is the \
+         one to grant, read-only unless a write was refused.",
         verb = verb,
         denied = path.display(),
         target = target.display(),
@@ -604,5 +615,23 @@ Caused by:
         assert_eq!(seen[0].0, ext_canon);
         assert_eq!(seen[0].1, ScopeAccess::Rw);
         assert_eq!(seen[0].2, GrantReason::StderrHeuristic);
+    }
+}
+
+#[cfg(test)]
+mod grant_dir_gate_tests {
+    use super::grant_dir_for;
+
+    /// A denial on a file directly under `$HOME` (or inside a credential
+    /// directory) must not collapse the suggestion to `$HOME`/`~/.ssh`: the
+    /// prompt would then be asking the human to open everything, and a session
+    /// answer would apply it. Offer the file itself instead.
+    #[test]
+    fn grant_dir_for_never_offers_home_or_a_denylisted_dir() {
+        let home = ahma_common::config::ahma_home_dir().expect("home dir");
+        let file = home.join("ahma-grant-gate-test.txt");
+        assert_eq!(grant_dir_for(&file), file, "$HOME is never the suggestion");
+        let key = home.join(".ssh").join("ahma-grant-gate-test.pub");
+        assert_eq!(grant_dir_for(&key), key, "~/.ssh is never the suggestion");
     }
 }

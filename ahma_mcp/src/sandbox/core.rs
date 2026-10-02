@@ -652,13 +652,38 @@ impl Sandbox {
     /// Called when a human or elicitation confirms a `sandbox_grant`.
     /// Updates the in-memory scopes so subsequent tool executions in this session
     /// take effect immediately without requiring a full server restart.
-    pub fn add_live_grant(&self, path: &Path, access: ahma_common::config::ScopeAccess) {
+    ///
+    /// Every live widening passes the hard denylist first (SPEC R-PERM.4.3):
+    /// the `session` tier never reaches `persist_grant`, so this is the only
+    /// place a `read-write-session` answer on `~/.ssh` can be stopped. `Err`
+    /// carries the reason, for the audit line and the agent.
+    pub fn add_live_grant(
+        &self,
+        path: &Path,
+        access: ahma_common::config::ScopeAccess,
+    ) -> std::result::Result<(), String> {
         let canon = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let live: Vec<PathBuf> = self.scopes.read().clone();
+        if let ahma_common::scope_grant::GrantRisk::Refused(why) =
+            ahma_common::scope_grant::classify_grant_risk(
+                &canon,
+                ahma_common::config::ahma_home_dir().as_deref(),
+                &live,
+            )
+        {
+            tracing::warn!(
+                path = %canon.display(),
+                access = access.label(),
+                "live grant refused: {why}"
+            );
+            return Err(why);
+        }
         if access.is_write() {
             append_missing_scopes(&mut self.scopes.write(), &[canon]);
         } else {
             append_missing_scopes(&mut self.read_scopes.write(), &[canon]);
         }
+        Ok(())
     }
 
     /// Commit the sandbox scope by **replacing** the provisional scopes with
@@ -1403,5 +1428,48 @@ mod scope_view_tests {
             !sb.is_path_in_scope(&non_existent_nested),
             "Nested non-existent path under external symlink must NOT be considered in scope"
         );
+    }
+}
+
+#[cfg(test)]
+mod live_grant_gate_tests {
+    use super::*;
+    use ahma_common::config::ScopeAccess;
+    use tempfile::tempdir;
+
+    /// SPEC R-PERM.4.3: a `session`-tier answer applies live without ever
+    /// touching `persist_grant`, so the hard denylist has to run *here* too, or
+    /// `[s]` on `~/.ssh` opens the keys for the rest of the session.
+    #[test]
+    fn session_grant_of_denylisted_dir_is_refused_live() {
+        let workspace = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![workspace.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let home = ahma_common::config::ahma_home_dir().expect("home dir");
+        let before = sb.scopes().to_vec();
+        let before_ro = sb.read_scopes().to_vec();
+
+        let err = sb
+            .add_live_grant(&home.join(".ssh"), ScopeAccess::Rw)
+            .expect_err("a credential directory must be refused at the live gate");
+        assert!(err.contains("credentials"), "{err}");
+        let err = sb
+            .add_live_grant(&home, ScopeAccess::Ro)
+            .expect_err("$HOME itself must be refused even read-only");
+        assert!(err.contains("home directory"), "{err}");
+        assert_eq!(sb.scopes().to_vec(), before, "refused grants widen nothing");
+        assert_eq!(sb.read_scopes().to_vec(), before_ro);
+
+        let cache = tempdir().unwrap();
+        sb.add_live_grant(cache.path(), ScopeAccess::Rw)
+            .expect("an ordinary cache directory is applied");
+        let canon = dunce::canonicalize(cache.path()).unwrap();
+        assert!(sb.scopes().iter().any(|s| s == &canon));
     }
 }

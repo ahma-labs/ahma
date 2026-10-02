@@ -156,7 +156,11 @@ impl AhmaMcpService {
             .and_then(|s| s.sandbox.find_scope(&path).map(|g| g.access));
         match approved {
             Some(granted) => {
-                self.adapter.sandbox().add_live_grant(&path, granted);
+                if let Err(why) = self.adapter.sandbox().add_live_grant(&path, granted) {
+                    return Ok(common::text_result(format!(
+                        "Refused: {why}. Nothing to grant here; tell the human."
+                    )));
+                }
                 Ok(common::text_result(approved_text(
                     &path,
                     granted,

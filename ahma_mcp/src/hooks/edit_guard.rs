@@ -331,6 +331,8 @@ pub fn allowed_edit_scopes(
     persistent: &[ahma_common::config::PersistentScope],
 ) -> Vec<PathBuf> {
     let mut allowed = super::resolve_hook_sandbox_scopes(cwd);
+    // SPEC R5.5.7: the harness's own working set needs no grant.
+    allowed.extend(harness_owned_dirs_for_this_user());
     for scope in persistent {
         if scope.access.is_write() {
             let raw = ahma_common::config::expand_home(&scope.path);
@@ -340,6 +342,40 @@ pub fn allowed_edit_scopes(
     let tmp = std::env::temp_dir();
     allowed.push(dunce::canonicalize(&tmp).unwrap_or(tmp));
     allowed
+}
+
+/// Directories a harness owns for its *own* bookkeeping, writable by its
+/// native edit tools without a grant (SPEC R5.5.7): Claude Code keeps plan-mode
+/// documents in `~/.claude/plans` and a per-session scratchpad under
+/// `<temp_root>/claude-<uid>/`. They hold no project data, and refusing them
+/// broke plan mode outright — the only thing the human could do was grant a
+/// directory that is not theirs to worry about. Only directories that exist
+/// are listed; nothing is created, and nothing absent is granted.
+pub fn harness_owned_dirs(home: Option<&Path>, temp_root: &Path, uid: u32) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut push_existing = |p: PathBuf| {
+        if p.is_dir()
+            && let Ok(canon) = dunce::canonicalize(&p)
+            && !out.contains(&canon)
+        {
+            out.push(canon);
+        }
+    };
+    if let Some(home) = home {
+        push_existing(home.join(".claude").join("plans"));
+    }
+    push_existing(temp_root.join(format!("claude-{uid}")));
+    out
+}
+
+/// [`harness_owned_dirs`] for the real home, temp root and user.
+pub fn harness_owned_dirs_for_this_user() -> Vec<PathBuf> {
+    let home = ahma_common::config::ahma_home_dir();
+    #[cfg(unix)]
+    let (temp_root, uid) = (PathBuf::from("/tmp"), unsafe { libc::getuid() } as u32);
+    #[cfg(not(unix))]
+    let (temp_root, uid) = (std::env::temp_dir(), 0u32);
+    harness_owned_dirs(home.as_deref(), &temp_root, uid)
 }
 
 /// The output format a decision must be written in.
@@ -419,7 +455,13 @@ pub fn run(args: &HooksEditGuardArgs, cfg: &crate::shell::cli::AppConfig) -> Res
             .map(PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        allowed_edit_scopes(&cwd, &cfg.persistent_scopes)
+        // Session-tier answers given at the TUI or a harness prompt apply to
+        // native edits too (SPEC R-PERM.4.4).
+        let mut persistent = cfg.persistent_scopes.clone();
+        persistent.extend(crate::sandbox::session_scopes_for(
+            &super::resolve_hook_sandbox_scopes(&cwd),
+        ));
+        allowed_edit_scopes(&cwd, &persistent)
     });
     if let Some(decision) = decide(args.platform, &payload, &queue, allowed.as_deref()) {
         use std::io::Write;
@@ -1077,5 +1119,58 @@ mod scope_tests {
             ..args
         };
         assert!(!declined.installs_edit_guard());
+    }
+}
+
+#[cfg(test)]
+mod harness_owned_dir_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// SPEC R5.5.7: a harness's own working set — Claude Code's plan files and
+    /// its per-session scratchpad — is writable by its native edit tools without
+    /// a grant. They hold no project data, and refusing them broke plan mode.
+    #[test]
+    fn edit_guard_allows_claude_plan_and_scratchpad_dirs() {
+        let home = tempdir().unwrap();
+        let plans = home.path().join(".claude").join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let temp_root = tempdir().unwrap();
+        let scratch_root = temp_root.path().join("claude-501");
+        std::fs::create_dir_all(&scratch_root).unwrap();
+
+        let dirs = harness_owned_dirs(Some(home.path()), temp_root.path(), 501);
+        assert!(
+            dirs.contains(&dunce::canonicalize(&plans).unwrap()),
+            "{dirs:?}"
+        );
+        assert!(
+            dirs.contains(&dunce::canonicalize(&scratch_root).unwrap()),
+            "{dirs:?}"
+        );
+
+        // Absent directories are not listed: nothing is granted that does not exist.
+        let bare_home = tempdir().unwrap();
+        let bare_temp = tempdir().unwrap();
+        assert!(harness_owned_dirs(Some(bare_home.path()), bare_temp.path(), 501).is_empty());
+
+        // And the guard itself lets the edit through.
+        let td = tempdir().unwrap();
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo = dunce::canonicalize(&repo).unwrap();
+        let mut allowed = vec![repo.clone()];
+        allowed.extend(dirs);
+        let plan = plans.join("my-plan.md");
+        let payload = serde_json::json!({
+            "tool_name": "Write",
+            "cwd": repo.to_string_lossy(),
+            "tool_input": {"file_path": plan.to_string_lossy()}
+        });
+        let queue = WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")));
+        assert!(
+            decide(Some(HookPlatform::Claude), &payload, &queue, Some(&allowed)).is_none(),
+            "a plan-file write is no opinion"
+        );
     }
 }

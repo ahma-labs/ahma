@@ -820,7 +820,11 @@ impl Adapter {
         let Some(hit) = sandbox::scan_denial_streams(stderr, stdout) else {
             // A refused `kill` is a boundary too (SPEC R6.2.6): say so, or the
             // agent reads "Operation not permitted" as a dead pid and escalates.
-            let result = match sandbox::signal_denial_note(stderr, stdout) {
+            // Likewise a GPU the sandbox would not open (SPEC R6.2.7): a capability,
+            // not a path, so the agent must not go looking for a directory to grant.
+            let result = match sandbox::signal_denial_note(stderr, stdout)
+                .or_else(|| sandbox::gpu_denial_note(stderr, stdout))
+            {
                 Some(note) => result.map_err(|e| anyhow::anyhow!("{e}\n\n{note}")),
                 None => result,
             };
@@ -2317,6 +2321,7 @@ async fn record_failure_diagnostics(
 
     if target_and_access.is_none()
         && let Some(note) = sandbox::signal_denial_note(stderr_str, stdout_str)
+            .or_else(|| sandbox::gpu_denial_note(stderr_str, stdout_str))
     {
         op_monitor.append_alert(op_id, note).await;
     }

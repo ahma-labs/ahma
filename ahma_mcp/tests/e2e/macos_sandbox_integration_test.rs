@@ -788,3 +788,129 @@ fn sandboxed_kill_of_own_child_succeeds() {
         String::from_utf8_lossy(&ok.stderr)
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPEC R6.2.7: the GPU is a withheld capability, opt-in via `[sandbox] allow_gpu`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compile a tiny Metal probe outside any sandbox. Returns `None` (skip) when
+/// there is no Swift toolchain or the host itself has no Metal device, since
+/// then neither profile can be told apart.
+#[cfg(target_os = "macos")]
+fn metal_probe(dir: &Path) -> Option<std::path::PathBuf> {
+    let src = dir.join("metal_probe.swift");
+    std::fs::write(
+        &src,
+        "import Metal\nif let d = MTLCreateSystemDefaultDevice() { print(\"DEVICE:\\(d.name)\") } else { print(\"NONE\") }\n",
+    )
+    .ok()?;
+    let bin = dir.join("metal_probe");
+    let built = Command::new("xcrun")
+        .args(["swiftc", "-O", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .ok()?;
+    if !built.status.success() {
+        eprintln!(
+            "skipping: swiftc unavailable: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        return None;
+    }
+    let host = Command::new(&bin).output().ok()?;
+    if !String::from_utf8_lossy(&host.stdout).contains("DEVICE:") {
+        eprintln!("skipping: this host has no Metal device");
+        return None;
+    }
+    Some(bin)
+}
+
+#[cfg(target_os = "macos")]
+fn run_probe_in(profile: &str, bin: &Path, cwd: &Path) -> String {
+    let out = Command::new("sandbox-exec")
+        .args(["-p", profile])
+        .arg(bin)
+        .current_dir(cwd)
+        .output()
+        .expect("run sandbox-exec (metal probe)");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// The default profile keeps the GPU out of reach: the same probe that sees a
+/// device on the host sees none under the profile.
+#[cfg(target_os = "macos")]
+#[test]
+fn default_profile_hides_metal_device() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_allow_gpu};
+    let scope = TempDir::new().expect("scope dir");
+    let Some(bin) = metal_probe(scope.path()) else {
+        return;
+    };
+    set_allow_gpu(false);
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    assert!(
+        !profile.contains("iokit-open"),
+        "default profile grants no IOKit user clients: {profile}"
+    );
+    let out = run_probe_in(&profile, &bin, scope.path());
+    assert!(
+        out.contains("NONE") && !out.contains("DEVICE:"),
+        "GPU must be withheld by default: {out}"
+    );
+    assert!(
+        ahma_mcp::sandbox::gpu_denial_note("MTLCreateSystemDefaultDevice() returned nil", "")
+            .is_some(),
+        "ahma explains the withheld capability"
+    );
+}
+
+/// `[sandbox] allow_gpu = true` adds the Metal user clients and the probe sees
+/// the device again — the capability, not a directory, is what was missing.
+#[cfg(target_os = "macos")]
+#[test]
+fn gpu_allowed_profile_exposes_metal_device() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_allow_gpu};
+    let scope = TempDir::new().expect("scope dir");
+    let Some(bin) = metal_probe(scope.path()) else {
+        return;
+    };
+    set_allow_gpu(true);
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    set_allow_gpu(false);
+    assert!(
+        profile.contains("(iokit-user-client-class \"AGXDeviceUserClient\")"),
+        "opt-in adds the Metal user clients: {profile}"
+    );
+    assert!(
+        !profile.contains("(allow iokit-open)"),
+        "never a blanket IOKit allow: {profile}"
+    );
+    let out = run_probe_in(&profile, &bin, scope.path());
+    assert!(
+        out.contains("DEVICE:"),
+        "with allow_gpu the probe must see the device: {out}"
+    );
+}

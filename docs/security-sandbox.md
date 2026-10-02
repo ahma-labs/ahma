@@ -142,6 +142,10 @@ The shape-matched rules are application-layer on *every* platform by constructio
 
 On macOS the Seatbelt profile grants `(allow signal (target same-sandbox))`, so a sandboxed command can `kill` the process tree it started under the same profile and nothing else. A `kill` aimed at another session's build, a server from an earlier command, or any other process of yours is refused by the kernel, and ahma explains the `kill: (N) - Operation not permitted` it sees as a boundary rather than a dead pid: the agent is told the pid belongs to something outside its sandbox and that a human must stop it (SPEC R6.2.6). `[sandbox] signal_other_processes = true` is the explicit opt-out, logged at startup. (Linux and Windows do not confine signals; the README's *What the sandbox does not cover* says so.)
 
+## GPU (Metal): denied unless you opt in
+
+The Seatbelt profile is `(deny default)` and grants no `iokit-open`, so Metal cannot open the GPU inside a sandboxed command: llama.cpp reports `failed to create command queue`, a Metal probe sees no device, and GPU-accelerated tests fall back to the CPU or fail. This is a **capability**, not a path, so no prompt can grant it and the `sandbox_grant` tool is the wrong tool; ahma recognises the failure and tells the agent so instead of letting it hunt for a directory to request. `[sandbox] allow_gpu = true` enables it by adding only the Metal user-client classes Apple's own profiles use (`AGX*` on Apple silicon, `IOAccel*` on Intel/AMD, `IOSurface`), never a blanket IOKit allow, which would also hand over cameras and HID devices (SPEC R6.2.7). While the GPU is withheld, every scope display says so.
+
 The hub and the workers it spawns start in ahma's runtime directory, never in the checkout the hub happened to be launched from: a worker's scope comes from its own client's `roots/list`, and its tools directory and operation logs follow that scope. Before this, every worker inherited the first checkout's directory, logged into it, and loaded that checkout's `.ahma/` as the trusted tool set of every other project (SPEC R-HUB.12).
 
 ## Network egress
@@ -158,7 +162,7 @@ ahma can *name* a host from environment markers (`CURSOR_SANDBOX`/`CURSOR_AGENT`
 
 > Sandbox: this shell command runs inside ahma's kernel sandbox (terminal hook). Writes are confined to: /Users/you/github/project, plus any persistent grants in ~/.ahma/settings.toml. Reads are NOT confined on macOS (except credential directories) — a platform limit. A write outside the scope fails; to allow one, ask the human — they approve it in the ahma TUI or run `ahma sandbox grant <dir>`. You cannot widen the scope yourself.
 
-The same install writes an **edit guard** for the harness's native file tools (Claude Code `Edit`/`Write`, Codex `apply_patch`, Copilot `edit`/`create`, Cursor `Write`, Antigravity `write_to_file`), which never pass through the shell sandbox: an edit whose target is outside that same scope is refused with the same remediation (SPEC R5.5.6). Decline it with `ahma hooks install --no-edit-guard`; `ahma hooks status` shows `installed+guard` when it is in place.
+The same install writes an **edit guard** for the harness's native file tools (Claude Code `Edit`/`Write`, Codex `apply_patch`, Copilot `edit`/`create`, Cursor `Write`, Antigravity `write_to_file`), which never pass through the shell sandbox: an edit whose target is outside that same scope is refused with the same remediation (SPEC R5.5.6). A harness's own working set — Claude Code's plan files under `~/.claude/plans` and its per-session scratchpad under `/tmp/claude-<uid>/` — is writable without a grant and listed in the scope disclosure (SPEC R5.5.7); a `session` answer at a prompt reaches hooked commands and native edits too (SPEC R-PERM.4.4). Decline it with `ahma hooks install --no-edit-guard`; `ahma hooks status` shows `installed+guard` when it is in place.
 
 `AHMA_PREFER_OWN_SANDBOX` is retired — own sandbox is the only behaviour.
 

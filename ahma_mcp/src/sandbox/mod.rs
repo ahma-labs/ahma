@@ -53,6 +53,7 @@ pub mod denial_scan;
 pub mod display;
 mod error;
 pub mod exec_config;
+pub mod gpu;
 pub mod grant_channel;
 pub mod host_detect;
 #[cfg(target_os = "linux")]
@@ -64,6 +65,7 @@ mod scope_lock;
 mod scopes;
 #[cfg(target_os = "macos")]
 mod seatbelt;
+pub mod session_tier;
 pub mod signals;
 mod types;
 /// Windows backend. Compiled on **every** platform, unlike `landlock`/`seatbelt`,
@@ -95,6 +97,7 @@ pub use exec_config::{
     ExecConfigClass, HandoffAllowances, classify as classify_exec_config, deny_write_globs,
     resolve_git_dirs, set_handoff_allowances,
 };
+pub use gpu::{allow_gpu_enabled, gpu_denial_note, set_allow_gpu};
 pub use grant_channel::{HubGrantNotifier, LoggingGrantNotifier, ScopeGrantNotifier};
 pub use host_detect::{HostSandbox, OUTER_SANDBOX_PID_ENV, detect_host_sandbox};
 #[cfg(target_os = "linux")]
@@ -112,6 +115,7 @@ pub use prerequisites::{
 };
 pub use scope_lock::ScopeLockState;
 pub use scopes::{normalize_path_lexically, preflight_scope_candidate};
+pub use session_tier::{record_session_grant, session_scopes_for};
 pub use signals::{set_signal_other_processes, signal_denial_note, signal_other_processes_allowed};
 pub use types::{SandboxMode, ScopesGuard};
 /// Re-entry hook for the Windows AppContainer launcher. Exported unconditionally
