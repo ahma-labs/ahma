@@ -661,6 +661,13 @@ pub struct SessionManagerConfig {
     /// [`PeerStreams`]: crate::peer::PeerStreams
     pub peer_factory: Option<Arc<dyn PeerFactory>>,
 
+    /// The worker resolves an empty `roots/list` itself, from the user's
+    /// `[sandbox] container_root` (SPEC R5.2.3), which only the worker knows.
+    /// With this set and no `default_scope`, an empty answer waits for the
+    /// worker's own `sandbox/configured` (or `failed`) instead of failing the
+    /// session at once.
+    pub worker_resolves_empty_roots: bool,
+
     /// Translates a session's query string into worker arguments.
     ///
     /// The allowlist that decides which options exist lives in `ahma_mcp`,
@@ -693,8 +700,21 @@ impl Default for SessionManagerConfig {
             max_sessions: DEFAULT_MAX_SESSIONS,
             peer_factory: None,
             session_options: None,
+            worker_resolves_empty_roots: false,
         }
     }
+}
+
+/// What the bridge does when a client answers `roots/list` with no roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyRoots {
+    /// Nothing can scope the session: fail it now, with the remediation.
+    Fail,
+    /// Lock to this bridge's own fallback scope.
+    UseDefaultScope,
+    /// The worker has a fallback of its own; its `sandbox/configured` (or
+    /// `failed`) decides.
+    AwaitWorker,
 }
 
 impl std::fmt::Debug for SessionManagerConfig {
@@ -1451,7 +1471,18 @@ impl SessionManager {
 
     /// Returns true when this server requires client roots to complete sandbox lock.
     pub fn requires_client_roots(&self) -> bool {
-        self.config.default_scope.is_none()
+        self.on_empty_roots() == EmptyRoots::Fail
+    }
+
+    /// What an empty `roots/list` answer means for a session on this bridge.
+    pub fn on_empty_roots(&self) -> EmptyRoots {
+        if self.config.default_scope.is_some() {
+            EmptyRoots::UseDefaultScope
+        } else if self.config.worker_resolves_empty_roots {
+            EmptyRoots::AwaitWorker
+        } else {
+            EmptyRoots::Fail
+        }
     }
 
     /// The configured request timeout in seconds for bridge → subprocess calls

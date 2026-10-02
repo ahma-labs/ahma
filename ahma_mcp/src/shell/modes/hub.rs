@@ -628,6 +628,10 @@ fn build_bridge_config(
         server_args,
         enable_colored_output: true,
         default_sandbox_scope: None,
+        // The hub carries no scope (R-HUB.9), but a worker with a container
+        // root resolves an empty `roots/list` itself (R5.2.3): the bridge must
+        // wait for it rather than fail the session first.
+        worker_resolves_empty_roots: config.container_root.is_some(),
         handshake_timeout_secs: config.handshake_timeout_secs,
         request_timeout_secs: ahma_http_bridge::session::DEFAULT_REQUEST_TIMEOUT_SECS,
         tool_call_timeout_secs: ahma_http_bridge::session::DEFAULT_TOOL_CALL_TIMEOUT_SECS,

@@ -1150,6 +1150,14 @@ async fn try_lock_sandbox_from_roots(
     // the reason, so `tools/call` returns a deterministic 403 instead of hanging
     // until the handshake times out.
     if !should_lock_sandbox(&mcp_roots) {
+        if session_manager.on_empty_roots() == crate::session::EmptyRoots::AwaitWorker {
+            debug!(
+                session_id = %session_id,
+                "Roots list is empty; the worker resolves it from the container root and \
+                 reports sandbox/configured itself"
+            );
+            return;
+        }
         if session_manager.requires_client_roots() {
             warn!(
                 session_id = %session_id,

@@ -109,6 +109,9 @@ pub struct BridgeConfig {
     ///
     /// If `None`, clients must provide roots/list to complete handshake and unlock tools.
     pub default_sandbox_scope: Option<PathBuf>,
+    /// Workers resolve an empty `roots/list` from the user's container root
+    /// (SPEC R5.2.3); see `SessionManagerConfig::worker_resolves_empty_roots`.
+    pub worker_resolves_empty_roots: bool,
 
     /// Timeout in seconds for the MCP handshake to complete.
     /// If the handshake (SSE connection + roots/list response) doesn't complete
@@ -234,6 +237,7 @@ impl Default for BridgeConfig {
             server_args: vec![],
             enable_colored_output: false,
             default_sandbox_scope: None,
+            worker_resolves_empty_roots: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
@@ -299,6 +303,7 @@ impl Clone for BridgeConfig {
             server_args: self.server_args.clone(),
             enable_colored_output: self.enable_colored_output,
             default_sandbox_scope: self.default_sandbox_scope.clone(),
+            worker_resolves_empty_roots: self.worker_resolves_empty_roots,
             handshake_timeout_secs: self.handshake_timeout_secs,
             request_timeout_secs: self.request_timeout_secs,
             tool_call_timeout_secs: self.tool_call_timeout_secs,
@@ -796,6 +801,7 @@ fn create_session_config(config: &BridgeConfig) -> SessionManagerConfig {
         server_command: config.server_command.clone(),
         server_args: config.server_args.clone(),
         default_scope: config.default_sandbox_scope.clone(),
+        worker_resolves_empty_roots: config.worker_resolves_empty_roots,
         enable_colored_output: config.enable_colored_output,
         handshake_timeout_secs: config.handshake_timeout_secs,
         request_timeout_secs: config.request_timeout_secs,
@@ -2074,6 +2080,7 @@ mod tests {
             server_args: vec!["--arg1".to_string(), "value1".to_string()],
             enable_colored_output: false,
             default_sandbox_scope: Some(std::env::temp_dir()),
+            worker_resolves_empty_roots: false,
             handshake_timeout_secs: 10,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
