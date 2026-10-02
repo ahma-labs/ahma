@@ -41,6 +41,10 @@ pub const HISTORY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LINES_LOADED: usize = 20_000;
 
 /// One line of the history file.
+// `Started` carries the whole `InstanceInfo` (now with scopes and grants); the
+// other variants are small. It is a wire record built a few times a minute,
+// so the size spread costs nothing worth a `Box` in every constructor.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum HistoryRecord {
@@ -424,6 +428,10 @@ mod tests {
             client_pid: Some(11),
             sampling: false,
             ended_epoch_ms: None,
+            scopes: vec![],
+            read_scopes: vec![],
+            grants: vec![],
+            enforcement: None,
         }
     }
 

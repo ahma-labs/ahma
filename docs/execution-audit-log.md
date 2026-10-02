@@ -45,12 +45,40 @@ losing power still leaves this record — a `tool_call` with no matching
   "tool_name": "run_terminal_command",
   "args_summary": "{\"command\":\"cargo nextest run\"}",
   "working_dir": "/Users/me/github/project",
-  "command": "/bin/zsh -c cargo nextest run"
+  "command": "/bin/zsh -c cargo nextest run",
+  "session_id": "03a8d1a1-14ac-4cc2-b9b0-37524b550659",
+  "client": "claude-code",
+  "scopes": ["/Users/me/github/project"]
 }
 ```
 
 `command` is the command **as it will actually run** — after subcommand aliasing,
 argument construction, and shell selection — not the request that produced it.
+`session_id`, `client` and `scopes` say which agent session asked and what its
+sandbox allowed at the time, so a human reading one checkout's log can tell three
+agents sharing it apart (SPEC R5.4). They are absent when the session has not
+committed a scope yet.
+
+### `hook_decision`
+
+Written by `ahma hooks exec` for **every** native shell command a harness hands it
+(Claude Code's Bash, Cursor's terminal, …), whatever it decided: `rewrite` (the
+command runs in ahma's sandbox), `unchanged` (hooks inactive, or the command was
+already wrapped), `deny_pending_consent`, or `allow_unsandboxed` (the user's
+session consent, SPEC R5.5.3). A pass-through used to leave no trace, which is how
+a session that ran unsandboxed for days could not be reconstructed afterwards.
+
+```json
+{
+  "timestamp": "2026-10-02T06:10:21.062+00:00",
+  "type": "hook_decision",
+  "decision": "rewrite",
+  "cwd": "/Users/me/github/project",
+  "command": "git clone … ../alt4/project",
+  "session_id": "8c82f690-dec1-4232-bfdb-7d10a2ce6903",
+  "platform": "claude"
+}
+```
 
 ### `tool_complete`
 

@@ -75,6 +75,18 @@ enum HooksDecision {
     },
 }
 
+impl HooksDecision {
+    /// The stable word the audit log records for this decision.
+    fn audit_label(&self) -> &'static str {
+        match self {
+            HooksDecision::AllowUnchanged => "unchanged",
+            HooksDecision::AllowRewrite { .. } => "rewrite",
+            HooksDecision::DenyPendingConsent { .. } => "deny_pending_consent",
+            HooksDecision::AllowWithWarning { .. } => "allow_unsandboxed",
+        }
+    }
+}
+
 /// Manage terminal hooks for external AI tools.
 #[derive(Args, Debug)]
 #[command(
@@ -531,7 +543,7 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
         HooksCommand::Install(args) => run_install(args),
         HooksCommand::Uninstall(args) => run_uninstall(args),
         HooksCommand::Status(args) => run_status(args),
-        HooksCommand::Exec(args) => run_exec(args),
+        HooksCommand::Exec(args) => run_exec(args).await,
         HooksCommand::Observe(args) => run_observe(args),
         HooksCommand::RunShell(args) => run_shell(args, cfg).await,
         HooksCommand::ApproveUnsandboxed => run_approve_unsandboxed(),
@@ -1079,7 +1091,7 @@ fn print_hooks_mcp_coexistence_note(
     println!();
 }
 
-fn run_exec(args: HooksExecArgs) -> Result<()> {
+async fn run_exec(args: HooksExecArgs) -> Result<()> {
     // Parse stdin first. On any failure allow through — the editor may have sent an
     // empty or malformed payload (e.g. during IDE shutdown) and we must not block.
     let stdin = match read_stdin_json() {
@@ -1111,6 +1123,23 @@ fn run_exec(args: HooksExecArgs) -> Result<()> {
     }
 
     let decision = compute_exec_decision(&stdin, args.scope, &env);
+    // SPEC R5.4.10 / R-HANDOFF.10: every decision leaves a trace. A pass-through
+    // that no one can find afterwards is how a session ran unsandboxed for days.
+    let command = extract_tool_args(&stdin)
+        .ok()
+        .flatten()
+        .map(|a| a.command)
+        .unwrap_or_default();
+    let cwd = extract_command_cwd(&stdin, &Map::new()).ok();
+    let session_id = stdin.get("session_id").and_then(Value::as_str);
+    crate::adapter::audit::record_hook_decision(
+        decision.audit_label(),
+        cwd.as_deref(),
+        &command,
+        session_id,
+        args.platform.cli_name(),
+    )
+    .await;
     emit_decision(decision, args.platform)
 }
 

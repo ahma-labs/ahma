@@ -97,7 +97,7 @@ LLM log alerts.
 status(id="op_abc123")
 ```
 
-Returns `running`/`complete`/`failed`/`cancelled`/`timeout`. Non-blocking, safe to poll.
+Returns `running`/`complete`/`failed`/`cancelled`/`timeout`. Non-blocking, safe to poll. Every call also returns a `SANDBOX` section: which sandbox protects this session, the directories you may write and read, and every grant in force with who asked for it — read it before assuming a path is reachable.
 
 ### `await` — Wait for an async operation to finish
 
