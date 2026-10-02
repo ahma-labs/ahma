@@ -1406,6 +1406,7 @@ mod unreadable_lock_dir_tests {
         assert!(result.is_err(), "{result:?}");
     }
 
+    #[cfg(unix)]
     fn nix_is_root() -> bool {
         // SAFETY: getuid has no preconditions.
         unsafe { libc::getuid() == 0 }
