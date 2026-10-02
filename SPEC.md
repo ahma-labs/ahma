@@ -2206,5 +2206,5 @@ Stated here so that no other document implies otherwise.
 - **Bundle trust**: no signature and no load-time gate; the checksum detects corruption only.
 - **Server-side output minimization**: dormant (`ahma_output_optimizer/SPEC.md`).
 - **OAuth**: endpoints fixed to Atlassian; no token refresh.
-- **Multi-session scope decisions** (R5.3.3, R5.3.4, R5.3.6): specified but not wired; the building blocks are unit-tested only.
+- **Scope-downgrade prompts** (R5.3.1–R5.3.6): specified but not wired. No running ahma asks before a scope downgrade (broader client roots, `--tmp`, disabling enforcement) and none commits an `elicited` scope; the building blocks (`ahma_common::elicitation`, `workspace_scope`, `scope_decision`) have no caller outside their own tests. Live elicitation exists only for grants (R-PERM.3). Wiring it replaces the single commit point (R5.1.1) and must be done whole.
 - **Log-exception grants** (`logs_approve`): stored in `<platform config dir>/ahma/log_exceptions.json` (relocatable with `AHMA_CONFIG_DIR`), not in the unified ledger that R-PERM.1 requires.
