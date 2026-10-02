@@ -983,10 +983,13 @@ mod tests {
         let ahma_dir = home.path().join(".ahma");
         std::fs::create_dir_all(&ahma_dir).unwrap();
 
+        // A filesystem root rather than `/bin`: on Ubuntu `/bin` canonicalizes
+        // to `/usr/bin` (not an exact system dir), and on Windows it is nothing.
+        let root = std::path::Path::new(if cfg!(windows) { "C:\\" } else { "/" }).to_path_buf();
         for (what, path) in [
             ("~/.ahma", ahma_dir.clone()),
             ("$HOME", home.path().to_path_buf()),
-            ("/bin", PathBuf::from("/bin")),
+            ("a filesystem root", root),
         ] {
             let err = persist_grant(&file, grant(&path, &[]))
                 .expect_err(&format!("{what} must be refused"));
