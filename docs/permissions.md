@@ -154,10 +154,21 @@ the AI, or a confirmed prompt:
 - your home directory itself, or a filesystem root
 - any parent of your workspace (that would widen the sandbox above your project;
   the enclosing git repository root of a worktree or subdirectory workspace is allowed)
-- credential directories: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`,
-  `~/.config/gh`, `~/.config/gcloud`
-- `~/.ahma` itself — the ledger cannot authorize access to the ledger
+- credential directories and everything inside them: `~/.ssh`, `~/.aws`, `~/.gnupg`,
+  `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/gcloud` (a key file is refused
+  like the directory that holds it; git and ssh still work through your SSH agent)
+- `~/.ahma` itself and everything in it — the ledger cannot authorize access to the ledger
 - OS system directories
+- a grant for any of these that is already in `settings.toml` (written by hand, or by an
+  older ahma) is skipped at startup with a warning naming the revoke command; recorded
+  is not the same as allowed
+
+Some paths are allowed but flagged **high risk**, with a sentence saying what will run
+what a grant lets the agent write there: shell startup files (`~/.zshrc`, `~/.bashrc`,
+`~/.profile`, …) run in every new shell, `~/Library/LaunchAgents` and
+`~/.config/autostart` start programs at login, and a `.git/hooks` directory is run by
+git on commit, checkout and push. None of them asks first.
+
 - for network egress: blanket `*` wildcard (refused via AI grant tool; only human editing or explicit CLI can author), `localhost`, private RFC 1918 IP addresses, and link-local or cloud-metadata IPs (`169.254.169.254`)
 
 If a tool genuinely needs something under one of these, grant the *specific
@@ -233,14 +244,14 @@ and SPEC R-HANDOFF.
 ahma permissions list                          # every grant, of every kind
 ahma permissions list --kind fs-scope          # just filesystem scopes
 ahma permissions list --kind net-host          # just network hosts
-ahma permissions revoke fs-scope ~/cache --yes # revoke (previews without --yes)
+ahma permissions revoke fs-scope ~/cache --yes # revoke this workspace's grant (previews without --yes)
 ahma permissions revoke net-host crates.io --yes # revoke network host
 ahma permissions revoke tool cargo_build       # per-workspace tool approval
 
 ahma sandbox grant ~/cache [--read-only]       # kind-scoped shortcut, bound to this workspace
 ahma sandbox grant ~/cache --session           # this terminal session only; never written to the file
 ahma sandbox list
-ahma sandbox revoke ~/cache
+ahma sandbox revoke ~/cache                    # this workspace's grant; --workspace <DIR> or --global for another
 
 ahma network allow crates.io                   # subprocess egress hosts
 ahma network list
