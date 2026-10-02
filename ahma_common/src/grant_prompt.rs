@@ -186,8 +186,8 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
     // 5. What a grant allows
     let allows = format!(
         "every command in {} may {} {} — for the next command (once), until this session \
-         ends (session), or until you revoke it (always). Nothing else outside the workspace \
-         changes.",
+         ends (session), for 24 hours (lease), or until you revoke it (always). Nothing else \
+         outside the workspace changes.",
         workspace
             .clone()
             .unwrap_or_else(|| "this workspace".to_string()),
@@ -297,6 +297,18 @@ pub fn options() -> Vec<PromptOption> {
             label: "read-write, this session".into(),
         },
         PromptOption {
+            decision: GrantDecision::GrantRoLease,
+            key: 'l',
+            value: "read-only-24h",
+            label: "read-only for 24 hours (saved; ends on its own)".into(),
+        },
+        PromptOption {
+            decision: GrantDecision::GrantRwLease,
+            key: 'L',
+            value: "read-write-24h",
+            label: "read-write for 24 hours (saved; ends on its own)".into(),
+        },
+        PromptOption {
             decision: GrantDecision::GrantRo,
             key: 'R',
             value: "read-only",
@@ -323,6 +335,8 @@ pub fn parse_decision(s: &str) -> GrantDecision {
         "read-only-session" | "ro-session" | "read-session" => GrantDecision::GrantRoSession,
         "read-write-once" | "rw-once" | "write-once" => GrantDecision::GrantRwOnce,
         "read-only-once" | "ro-once" | "read-once" => GrantDecision::GrantRoOnce,
+        "read-write-24h" | "rw-24h" | "read-write-lease" => GrantDecision::GrantRwLease,
+        "read-only-24h" | "ro-24h" | "read-only-lease" => GrantDecision::GrantRoLease,
         _ => GrantDecision::Deny,
     }
 }

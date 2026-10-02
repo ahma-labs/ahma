@@ -3854,8 +3854,12 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
     for o in &body.options {
         let key_style = match o.decision {
             ahma_common::scope_grant::GrantDecision::Deny => theme.failed().bold(),
+            // Saved grants, permanent or leased, stand out from the
+            // session-only ones.
             ahma_common::scope_grant::GrantDecision::GrantRo
-            | ahma_common::scope_grant::GrantDecision::GrantRw => theme.pending().bold(),
+            | ahma_common::scope_grant::GrantDecision::GrantRw
+            | ahma_common::scope_grant::GrantDecision::GrantRoLease
+            | ahma_common::scope_grant::GrantDecision::GrantRwLease => theme.pending().bold(),
             _ => theme.success().bold(),
         };
         keys.push(Span::styled(format!("[{}] ", o.key), key_style));

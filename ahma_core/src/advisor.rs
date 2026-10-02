@@ -31,6 +31,8 @@ pub enum AdviceTier {
     Deny,
     Once,
     Session,
+    /// 24 hours, saved, ending on its own (SPEC R-PERM.2.3).
+    Lease,
     Always,
 }
 
@@ -55,6 +57,7 @@ impl GrantAdvice {
             AdviceTier::Deny => "deny",
             AdviceTier::Once => "once",
             AdviceTier::Session => "session",
+            AdviceTier::Lease => "lease 24h",
             AdviceTier::Always => "always",
         };
         let access = match self.recommendation {
@@ -83,6 +86,7 @@ impl GrantAdvice {
             GrantDecision::Deny => AdviceTier::Deny,
             GrantDecision::GrantRoOnce | GrantDecision::GrantRwOnce => AdviceTier::Once,
             GrantDecision::GrantRoSession | GrantDecision::GrantRwSession => AdviceTier::Session,
+            GrantDecision::GrantRoLease | GrantDecision::GrantRwLease => AdviceTier::Lease,
             GrantDecision::GrantRo | GrantDecision::GrantRw => AdviceTier::Always,
         };
         if tier != self.recommendation {
@@ -118,11 +122,13 @@ pub fn build_advisor_messages(req: &ScopeGrantRequest) -> Vec<serde_json::Value>
           configuration, or the risk class is high without a reason in the evidence;\n\
         - once when a single command outside the project needs it;\n\
         - session for build caches, package caches and build outputs (the common case);\n\
+        - lease (24 hours, saved) when a task needs it outside the project for longer than this \
+          session — an overnight run, a multi-day migration;\n\
         - always only when the same path has been asked for in two or more sessions of this \
           workspace, and then read-only unless a write was refused;\n\
         - read-only unless a write was actually refused.\n\
         Answer with ONE JSON object and nothing else: {\"recommendation\": \"deny|once|session|\
-        always\", \"access\": \"ro|rw\", \"confidence\": 0.0-1.0, \"reasons\": [\"one sentence\", \
+        lease|always\", \"access\": \"ro|rw\", \"confidence\": 0.0-1.0, \"reasons\": [\"one sentence\", \
         \"at most three\"]}.";
     vec![
         serde_json::json!({"role": "system", "content": system}),

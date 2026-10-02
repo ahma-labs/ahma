@@ -151,6 +151,52 @@ async fn a_session_answer_is_applied_and_the_agent_is_told_so() {
     );
 }
 
+/// SPEC R-PERM.2.3 at the prompt: "for 24 hours" is saved as a lease bound to
+/// the workspace, applied now, and the agent is told when it ends.
+#[tokio::test]
+async fn a_lease_answer_is_saved_with_its_end_and_applied() {
+    let home = private_home();
+    let workspace = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let target = canonical_dir(outside.path(), "task-cache");
+
+    let client = RecordingClient::new("claude-code").with_elicitation(Some("read-write-24h"));
+    let (mcp, _broker) = create_in_process_mcp_with_broker(client, workspace.path(), None)
+        .await
+        .unwrap();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let text = request_grant(
+        &mcp.client,
+        &target,
+        "rw",
+        "the task writes its cache there",
+    )
+    .await;
+
+    assert!(mcp.service.adapter.sandbox().is_path_in_scope(&target));
+    assert!(text.contains("A human approved"), "{text}");
+    assert!(
+        text.contains("24 hours"),
+        "the agent is told it ends: {text}"
+    );
+    let saved = ahma_common::config::AhmaSettings::load_from_result(
+        &home.path().join(".ahma").join("settings.toml"),
+    )
+    .unwrap();
+    let rec = saved
+        .sandbox
+        .persistent_scopes
+        .iter()
+        .find(|r| r.path == target)
+        .expect("a lease is saved");
+    let at = rec.expires_at.expect("with its end");
+    assert!((before + 86_400..=before + 86_460).contains(&at), "{at}");
+}
+
 #[tokio::test]
 async fn a_decline_is_reported_as_the_humans_answer() {
     let _home = private_home();

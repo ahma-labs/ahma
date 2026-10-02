@@ -105,6 +105,8 @@ pub enum GrantTier {
     Session,
     /// Persisted to the settings file until revoked.
     Always,
+    /// Persisted with an end: stops applying after its lease (SPEC R-PERM.2.3).
+    Lease,
 }
 
 impl GrantTier {
@@ -114,12 +116,13 @@ impl GrantTier {
             GrantTier::Once => "once",
             GrantTier::Session => "session",
             GrantTier::Always => "always",
+            GrantTier::Lease => "lease",
         }
     }
 
     /// Whether a grant at this tier is written to the settings file.
     pub fn is_persistent(self) -> bool {
-        matches!(self, GrantTier::Always)
+        matches!(self, GrantTier::Always | GrantTier::Lease)
     }
 }
 

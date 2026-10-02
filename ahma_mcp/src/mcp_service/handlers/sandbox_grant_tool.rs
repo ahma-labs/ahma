@@ -449,6 +449,11 @@ fn approved_text(
             "Saved to {} for this workspace and applied to this session now.",
             settings_file.display()
         ),
+        GrantTier::Lease => format!(
+            "Saved to {} for this workspace for 24 hours — it ends on its own; `ahma sandbox \
+             renew` extends it — and applied to this session now.",
+            settings_file.display()
+        ),
         GrantTier::Session => {
             "Granted for this session only (never written to disk) and applied now.".to_string()
         }

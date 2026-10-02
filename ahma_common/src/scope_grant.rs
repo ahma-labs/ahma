@@ -187,19 +187,29 @@ pub enum GrantDecision {
     GrantRoOnce,
     /// Grant read+write access for the next command only (`once` tier).
     GrantRwOnce,
+    /// Grant read-only access for [`PROMPT_LEASE_SECS`], saved with its end.
+    GrantRoLease,
+    /// Grant read+write access for [`PROMPT_LEASE_SECS`], saved with its end.
+    GrantRwLease,
 }
+
+/// How long a lease answered at a prompt lasts: a working day and a night, so
+/// an overnight run started after the answer keeps it (SPEC R-PERM.2.3).
+pub const PROMPT_LEASE_SECS: u64 = 24 * 3_600;
 
 impl GrantDecision {
     /// The [`ScopeAccess`] to apply, or `None` for [`GrantDecision::Deny`].
     pub fn access(self) -> Option<ScopeAccess> {
         match self {
             GrantDecision::Deny => None,
-            GrantDecision::GrantRo | GrantDecision::GrantRoSession | GrantDecision::GrantRoOnce => {
-                Some(ScopeAccess::Ro)
-            }
-            GrantDecision::GrantRw | GrantDecision::GrantRwSession | GrantDecision::GrantRwOnce => {
-                Some(ScopeAccess::Rw)
-            }
+            GrantDecision::GrantRo
+            | GrantDecision::GrantRoSession
+            | GrantDecision::GrantRoOnce
+            | GrantDecision::GrantRoLease => Some(ScopeAccess::Ro),
+            GrantDecision::GrantRw
+            | GrantDecision::GrantRwSession
+            | GrantDecision::GrantRwOnce
+            | GrantDecision::GrantRwLease => Some(ScopeAccess::Rw),
         }
     }
 
@@ -212,6 +222,9 @@ impl GrantDecision {
             }
             GrantDecision::GrantRoOnce | GrantDecision::GrantRwOnce => {
                 crate::permissions::GrantTier::Once
+            }
+            GrantDecision::GrantRoLease | GrantDecision::GrantRwLease => {
+                crate::permissions::GrantTier::Lease
             }
             _ => crate::permissions::GrantTier::Always,
         }
@@ -1002,7 +1015,11 @@ pub fn persist_grant(settings_file: &Path, grant: NewGrant<'_>) -> Result<GrantO
         crate::permissions::GrantKind::FsScope,
         canonical.display().to_string(),
         Some(if grant.access.is_write() { "rw" } else { "ro" }.to_string()),
-        crate::permissions::GrantTier::Always,
+        if grant.expires_at.is_some() {
+            crate::permissions::GrantTier::Lease
+        } else {
+            crate::permissions::GrantTier::Always
+        },
         Some(grant.surface.to_string()),
     ));
     Ok(outcome)

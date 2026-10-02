@@ -18,7 +18,7 @@ Minimum that would work
   read+write on /Users/u/Library/Caches/sccache (a write was refused, so read-only would not fix it)
 
 What a grant allows
-  every command in /Users/u/github/proj may read and write /Users/u/Library/Caches/sccache — for the next command (once), until this session ends (session), or until you revoke it (always). Nothing else outside the workspace changes.
+  every command in /Users/u/github/proj may read and write /Users/u/Library/Caches/sccache — for the next command (once), until this session ends (session), for 24 hours (lease), or until you revoke it (always). Nothing else outside the workspace changes.
 
 Risk
   HIGH
