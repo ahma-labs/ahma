@@ -295,6 +295,12 @@ pub struct Sandbox {
     /// shared-process clients like Cursor — whose subprocess CWD is unrelated to
     /// the open workspace — get sandboxed to the correct workspace root.
     pub(super) explicit_scopes: bool,
+    /// Every persistent grant on this machine, canonicalized, with the workspace
+    /// it was made for (SPEC R5.4.11). Which of them apply is decided against
+    /// the scopes in force — at construction and again at every commit — by
+    /// [`Self::applicable_persistent`]; `persistent_write_scopes` /
+    /// `persistent_read_scopes` hold that answer for the current scopes.
+    pub(super) persistent_records: Vec<ahma_common::config::PersistentScope>,
     pub(super) livelog: bool,
     /// Allow package-manager caches (cargo registry/git) to be written.
     /// Default `true`; disable with `--no-package-cache-write`.
@@ -388,6 +394,7 @@ impl Clone for Sandbox {
             persistent_write_scopes: self.persistent_write_scopes.clone(),
             persistent_read_scopes: self.persistent_read_scopes.clone(),
             explicit_scopes: self.explicit_scopes,
+            persistent_records: self.persistent_records.clone(),
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
             egress_proxy_addr: parking_lot::RwLock::new(*self.egress_proxy_addr.read()),
@@ -468,6 +475,7 @@ impl Sandbox {
             persistent_write_scopes: Vec::new(),
             persistent_read_scopes: Vec::new(),
             explicit_scopes: false,
+            persistent_records: Vec::new(),
             livelog,
             package_cache_write: true,
             egress_proxy_addr: parking_lot::RwLock::new(None),
@@ -557,7 +565,35 @@ impl Sandbox {
     /// re-appends them after every `roots/list` replacement. Paths must already be
     /// canonicalized by the caller.
     #[must_use]
-    pub fn with_persistent_scopes(mut self, write: Vec<PathBuf>, read: Vec<PathBuf>) -> Self {
+    pub fn with_persistent_scopes(self, write: Vec<PathBuf>, read: Vec<PathBuf>) -> Self {
+        use ahma_common::config::{PersistentScope, ScopeAccess};
+        let global = |path: PathBuf, access| PersistentScope {
+            path,
+            access,
+            workspace: None,
+            granted_by: None,
+            granted_at: None,
+            note: None,
+        };
+        let records = write
+            .into_iter()
+            .map(|p| global(p, ScopeAccess::Rw))
+            .chain(read.into_iter().map(|p| global(p, ScopeAccess::Ro)))
+            .collect();
+        self.with_persistent_records(records)
+    }
+
+    /// Install the machine's persistent grants (paths already canonicalized by
+    /// the caller) and fold in the ones that apply to the scopes in force now.
+    /// The same filter runs again at every scope commit, so a grant bound to
+    /// another workspace never leaks into this session (SPEC R5.4.11).
+    #[must_use]
+    pub fn with_persistent_records(
+        mut self,
+        records: Vec<ahma_common::config::PersistentScope>,
+    ) -> Self {
+        self.persistent_records = records;
+        let (write, read) = self.applicable_persistent(&self.scopes.read());
         if !write.is_empty() {
             append_missing_scopes(&mut self.scopes.write(), &write);
         }
@@ -567,6 +603,48 @@ impl Sandbox {
         self.persistent_write_scopes = write;
         self.persistent_read_scopes = read;
         self
+    }
+
+    /// The persistent grants that apply to a session scoped to `scopes`
+    /// (SPEC R5.4.11), as `(writable, read-only)` path lists.
+    pub fn applicable_persistent(&self, scopes: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut write = Vec::new();
+        let mut read = Vec::new();
+        for rec in &self.persistent_records {
+            if !ahma_common::scope_grant::grant_applies(rec.workspace.as_deref(), scopes) {
+                tracing::info!(
+                    "Persistent grant {} is bound to workspace {} and does not apply to this \
+                     session (scopes {:?})",
+                    rec.path.display(),
+                    rec.workspace
+                        .as_deref()
+                        .map(|w| w.display().to_string())
+                        .unwrap_or_default(),
+                    scopes
+                );
+                continue;
+            }
+            let target = if rec.access.is_write() {
+                &mut write
+            } else {
+                &mut read
+            };
+            if !target.contains(&rec.path) {
+                target.push(rec.path.clone());
+            }
+        }
+        (write, read)
+    }
+
+    /// The persistent grants in force for this session, with provenance, for
+    /// the surfaces that show the scope (SPEC R5.4).
+    pub fn persistent_grants_in_effect(&self) -> Vec<ahma_common::config::PersistentScope> {
+        let scopes = self.scopes.read().clone();
+        self.persistent_records
+            .iter()
+            .filter(|r| ahma_common::scope_grant::grant_applies(r.workspace.as_deref(), &scopes))
+            .cloned()
+            .collect()
     }
 
     /// Add a live scope grant immediately to the active session.
@@ -648,10 +726,12 @@ impl Sandbox {
             canonicalized.push(dir.clone());
         }
 
-        // Re-append user-granted writable persistent scopes so a client's
-        // roots/list (e.g. Cursor sending its workspace root) does not silently
-        // drop them. This is the durable half of the `ahma sandbox grant` flow.
-        for dir in &self.persistent_write_scopes {
+        // Re-append the user-granted writable persistent scopes that apply to
+        // the scopes now being committed (SPEC R5.4.11) so a client's roots/list
+        // (e.g. Cursor sending its workspace root) does not silently drop them.
+        // This is the durable half of the `ahma sandbox grant` flow.
+        let (persistent_write, persistent_read) = self.applicable_persistent(&canonicalized);
+        for dir in &persistent_write {
             if !canonicalized.contains(dir) {
                 tracing::info!(
                     "Preserving granted persistent scope after roots/list: {:?}",
@@ -677,7 +757,7 @@ impl Sandbox {
             if self.livelog && self.mode != SandboxMode::Test {
                 *current_read_scopes = resolve_livelog_scopes(&canonicalized);
             }
-            append_missing_scopes(&mut current_read_scopes, &self.persistent_read_scopes);
+            append_missing_scopes(&mut current_read_scopes, &persistent_read);
         }
 
         let mut current_scopes = self.scopes.write();

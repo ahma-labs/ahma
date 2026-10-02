@@ -60,6 +60,7 @@ fn a_grant_is_in_effect_for_the_next_hooked_command_with_no_restart() {
             note: None,
             surface: "tui",
             live_scopes: &[],
+            workspace: None,
         },
     )
     .expect("an approved grant persists");

@@ -953,12 +953,20 @@ impl ScopeAccess {
 ///
 /// This is the persistence record behind the "add an external tool directory to
 /// the sandbox" flow (e.g. an sccache / ccache / shared toolchain cache that
-/// lives outside the workspace). Entries are written only by the trusted
-/// `ahma sandbox grant` command — never by a sandboxed tool call, since the
+/// lives outside the workspace). Entries are written only through
+/// `scope_grant::persist_grant`, after a human answered at the CLI, the TUI
+/// modal or an elicitation prompt — never by a sandboxed tool call, since the
 /// settings file lives in `$HOME`, outside every workspace scope, and is
 /// therefore kernel-unwritable from inside the sandbox. That property is the
-/// whole point: the AI can *request* a scope, but only the human, editing the
-/// out-of-band file, can *grant* one.
+/// whole point: the AI can *request* a scope, but only the human can *grant*
+/// one.
+///
+/// A grant is **bound to the workspace it was made for** (SPEC R5.4.11): it
+/// applies to a session only when that session's committed scope lies inside
+/// `workspace` (or `workspace` is the enclosing repository of it). A record
+/// without a `workspace` is a legacy global grant that applies everywhere;
+/// `ahma sandbox list` and `ahma doctor` flag those so they can be re-granted
+/// narrowly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PersistentScope {
@@ -967,6 +975,9 @@ pub struct PersistentScope {
     /// Read-only or read+write. Default: `rw`.
     #[serde(default)]
     pub access: ScopeAccess,
+    /// The workspace (project root) this grant is for. `None` = legacy global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
     /// What asked for this scope (e.g. `"sccache"`), for auditability. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_by: Option<String>,
@@ -2567,6 +2578,9 @@ fn toml_persistent_scopes(v: &[PersistentScope]) -> String {
                 format!("path = {}", toml_path(&ps.path)),
                 format!("access = {}", toml_str(ps.access.short())),
             ];
+            if let Some(ws) = &ps.workspace {
+                parts.push(format!("workspace = {}", toml_path(ws)));
+            }
             push_opt_str_field(&mut parts, "granted_by", &ps.granted_by);
             push_opt_str_field(&mut parts, "granted_at", &ps.granted_at);
             push_opt_str_field(&mut parts, "note", &ps.note);
@@ -2964,6 +2978,7 @@ mod tests {
                 persistent_scopes: vec![PersistentScope {
                     path: PathBuf::from("~/Library/Caches/x.sccache"),
                     access: ScopeAccess::Ro,
+                    workspace: None,
                     granted_by: Some("sccache".into()),
                     granted_at: Some("2026-06-29".into()),
                     note: Some("compiler cache".into()),
@@ -3823,6 +3838,7 @@ timeout_secs = 600
             toml::to_string(&PersistentScope {
                 path: PathBuf::from("/x"),
                 access: ScopeAccess::Ro,
+                workspace: None,
                 granted_by: None,
                 granted_at: None,
                 note: None,
@@ -3891,6 +3907,7 @@ persistent_scopes = [
         let mk = |access| PersistentScope {
             path: PathBuf::from("/cache"),
             access,
+            workspace: None,
             granted_by: None,
             granted_at: None,
             note: None,
@@ -3914,6 +3931,7 @@ persistent_scopes = [
         sb.grant_scope(PersistentScope {
             path: PathBuf::from("/cache"),
             access: ScopeAccess::Rw,
+            workspace: None,
             granted_by: None,
             granted_at: None,
             note: None,
@@ -3933,6 +3951,7 @@ persistent_scopes = [
         sb.grant_scope(PersistentScope {
             path: PathBuf::from("~/foo"),
             access: ScopeAccess::Rw,
+            workspace: None,
             granted_by: None,
             granted_at: None,
             note: None,

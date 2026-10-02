@@ -235,6 +235,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
     let settings = check_settings(input, &mut findings);
     if let Some(settings) = &settings {
         check_missing_scopes(settings, &mut findings);
+        check_global_scopes(settings, &mut findings);
         check_missing_workspaces(settings, &mut findings);
         check_trust(settings, &input.workspace, &mut findings);
     }
@@ -474,6 +475,32 @@ fn check_missing_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
             join_paths(&missing)
         ),
         fix: Some(Fix::RemoveMissingScopes(missing)),
+    });
+}
+
+/// A grant with no workspace reaches every project's agent on this machine
+/// (SPEC R5.4.11). Say so, and how to narrow it.
+fn check_global_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
+    let global: Vec<String> = settings
+        .sandbox
+        .persistent_scopes
+        .iter()
+        .filter(|s| s.workspace.is_none())
+        .map(|s| format!("{} ({})", s.path.display(), s.access.label()))
+        .collect();
+    if global.is_empty() {
+        return;
+    }
+    out.push(Finding {
+        level: Level::Warn,
+        title: "Some granted folders apply to every workspace".into(),
+        detail: format!(
+            "These grants have no workspace, so an agent in any project can use them: {}. \
+             Narrow each one: `ahma sandbox revoke <path>`, then `ahma sandbox grant <path>` \
+             from inside the project that needs it.",
+            global.join(", ")
+        ),
+        fix: None,
     });
 }
 
@@ -1084,6 +1111,7 @@ mod tests {
         settings.sandbox.persistent_scopes.push(PersistentScope {
             path: PathBuf::from("/opt/two-does-not-exist"),
             access: ScopeAccess::Rw,
+            workspace: None,
             granted_by: Some("cargo_build".into()),
             granted_at: None,
             note: None,

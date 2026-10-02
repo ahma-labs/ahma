@@ -183,7 +183,12 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
             granted_at: s.granted_at.clone(),
             surface: None,
             note: s.note.clone(),
-            scope_note: None,
+            scope_note: Some(match &s.workspace {
+                Some(ws) => format!("workspace {}", ws.display()),
+                None => "GLOBAL (legacy): applies to every workspace; re-grant with \
+                         `ahma sandbox grant <path>` from the project that needs it"
+                    .to_string(),
+            }),
         });
     }
 
@@ -1101,6 +1106,7 @@ mod tests {
         s.sandbox.persistent_scopes.push(PersistentScope {
             path: PathBuf::from("/cache"),
             access: ScopeAccess::Rw,
+            workspace: None,
             granted_by: Some("sccache".into()),
             granted_at: Some("2026-07-12".into()),
             note: None,

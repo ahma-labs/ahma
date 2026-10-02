@@ -38,11 +38,14 @@
 //!
 //! ## What the broker will not do
 //!
-//! It never widens the live sandbox. An approval is *persisted* (R5.1 lock-once:
-//! the MCP server path applies it at next start; the hooks path re-derives its
-//! sandbox per command and so picks it up on the very next one). And it asks at
-//! most once per `(path, access)` per session — the [`GrantCoordinator`] gate —
-//! because a question the user already answered is not a question, it is nagging.
+//! It never re-locks or replaces the committed workspace scope (R5.1). A human's
+//! `always` answer is written through the one audited chokepoint
+//! (`persist_grant`, bound to this session's workspace) *and* applied to the
+//! live sandbox (R5.4.6); a `session` answer is applied live only. The hooks path
+//! re-derives its sandbox per command and so picks a written grant up on the
+//! very next one. And it asks at most once per `(path, access)` per session —
+//! the [`GrantCoordinator`] gate — because a question the user already answered
+//! is not a question, it is nagging.
 
 use parking_lot::{Mutex, RwLock};
 use std::path::Path;
@@ -139,6 +142,10 @@ pub struct PermissionBroker {
     /// events emitted *beside* the asking surfaces, never instead of them.
     /// Installed with the elicitation surface; `None` in bare-CLI runs.
     session_events: RwLock<Option<Arc<dyn crate::session_events::SessionEventSink>>>,
+    /// The live sandbox an approved grant is applied to and whose committed
+    /// scope stamps the grant's workspace (SPEC R5.4.6, R5.4.11). `None` in
+    /// tests that only exercise the asking ladder.
+    sandbox: RwLock<Option<Arc<super::Sandbox>>>,
 }
 
 impl PermissionBroker {
@@ -156,7 +163,14 @@ impl PermissionBroker {
             hub_tx,
             harness: Mutex::new(HarnessState::Untried),
             session_events: RwLock::new(None),
+            sandbox: RwLock::new(None),
         }
+    }
+
+    /// Install the live sandbox so an approval is applied to it and stamped
+    /// with its workspace (SPEC R5.4.6, R5.4.11).
+    pub fn set_sandbox(&self, sandbox: Arc<super::Sandbox>) {
+        *self.sandbox.write() = Some(sandbox);
     }
 
     /// Install rung 1 once the MCP peer is known.
@@ -300,42 +314,78 @@ impl PermissionBroker {
             GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
         }
         match outcome {
-            GrantResolveOutcome::Persist { path, access, tool } => {
+            GrantResolveOutcome::Persist {
+                path,
+                access,
+                tool,
+                tier,
+            } => {
+                let sandbox = self.sandbox.read().clone();
+                let live_scopes: Vec<std::path::PathBuf> = sandbox
+                    .as_ref()
+                    .map(|sb| sb.scopes().to_vec())
+                    .unwrap_or_default();
+                let workspace = live_scopes.first().cloned();
                 let granted_at = chrono::Local::now();
-                let Some(file) = settings_path() else {
-                    tracing::warn!("cannot persist scope grant: home directory unknown");
-                    return;
-                };
-                // The chokepoint applies the denylist and writes the audit
-                // record (R-PERM.2, R-PERM.2.1); the live scopes are not known
-                // here, so the parent-of-scope rule is the one it cannot apply —
-                // the tool and CLI surfaces supply them.
-                match persist_grant(
-                    &file,
-                    NewGrant {
-                        path: &path,
-                        access,
-                        granted_by: tool.or_else(|| Some("permission prompt".to_string())),
-                        granted_at: Some(granted_at.format("%Y-%m-%d").to_string()),
-                        note: None,
-                        surface: "harness",
-                        live_scopes: &[],
-                    },
-                ) {
-                    Ok(_) => {
-                        tracing::info!(
+                if tier.is_persistent() {
+                    let Some(file) = settings_path() else {
+                        tracing::warn!("cannot persist scope grant: home directory unknown");
+                        return;
+                    };
+                    // The chokepoint applies the denylist and writes the audit
+                    // record (R-PERM.2, R-PERM.2.1).
+                    match persist_grant(
+                        &file,
+                        NewGrant {
+                            path: &path,
+                            access,
+                            granted_by: tool.or_else(|| Some("permission prompt".to_string())),
+                            granted_at: Some(granted_at.format("%Y-%m-%d").to_string()),
+                            note: None,
+                            surface: "harness",
+                            live_scopes: &live_scopes,
+                            workspace: workspace.as_deref(),
+                        },
+                    ) {
+                        Ok(_) => tracing::info!(
                             path = %path.display(),
                             access = access.label(),
-                            "Scope granted and saved to {}. It applies on the next server start \
-                             (the `restart` tool applies it now); a terminal hook picks it up on \
-                             the very next command.",
+                            "Scope granted for workspace {} and saved to {}; applied to this \
+                             session now, and a terminal hook picks it up on its next command.",
+                            workspace
+                                .as_deref()
+                                .map(|w| w.display().to_string())
+                                .unwrap_or_else(|| "(none)".into()),
                             file.display(),
-                        );
+                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to persist scope grant for {}: {e:#}",
+                                path.display()
+                            );
+                            return;
+                        }
                     }
-                    Err(e) => tracing::warn!(
-                        "failed to persist scope grant for {}: {e:#}",
-                        path.display()
-                    ),
+                } else {
+                    append_audit(&audit_entry(
+                        granted_at.to_rfc3339(),
+                        AuditAction::Grant,
+                        GrantKind::FsScope,
+                        path.display().to_string(),
+                        Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
+                        GrantTier::Session,
+                        Some("harness".to_string()),
+                    ));
+                    tracing::info!(
+                        path = %path.display(),
+                        access = access.label(),
+                        "Scope granted for this session only (not written to settings)."
+                    );
+                }
+                // R5.4.6: a human-approved grant takes effect in the live session.
+                if let Some(sb) = sandbox {
+                    sb.add_live_grant(&path, access);
+                    crate::hub_reporter::publish_committed_scope(&sb);
                 }
             }
             GrantResolveOutcome::Denied { path } => {
@@ -431,7 +481,8 @@ impl PeerElicitationSurface {
 /// R5.3.1 requires that Enter alone can never widen the sandbox.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct GrantForm {
-    /// `deny` (default), `read-only`, or `read-write`.
+    /// `deny` (default), `read-only`, `read-write`, `read-only-session`, or
+    /// `read-write-session`.
     pub decision: String,
 }
 
@@ -493,6 +544,8 @@ fn parse_decision(s: &str) -> GrantDecision {
     match s.trim().to_ascii_lowercase().as_str() {
         "read-write" | "read_write" | "rw" | "write" => GrantDecision::GrantRw,
         "read-only" | "read_only" | "ro" | "read" => GrantDecision::GrantRo,
+        "read-write-session" | "rw-session" | "write-session" => GrantDecision::GrantRwSession,
+        "read-only-session" | "ro-session" | "read-session" => GrantDecision::GrantRoSession,
         _ => GrantDecision::Deny,
     }
 }
@@ -520,11 +573,13 @@ fn prompt_text(req: &ScopeGrantRequest) -> String {
     format!(
         "Allow ahma to {what} '{path}'?\n\n\
          {tool} needs it and the sandbox blocked it ({reason}).\n\n\
-         Granting adds this one directory to ahma's sandbox scope, saved in \
-         ~/.ahma/settings.toml. Everything outside your workspace stays blocked. \
-         The grant applies from the next server start (or immediately for terminal \
-         hooks); revoke it any time with `ahma permissions revoke fs-scope {path}`.\n\n\
-         Choose: 'deny' (default), 'read-only', or 'read-write'.",
+         Granting adds this one directory to ahma's sandbox scope for this workspace \
+         only. 'read-only'/'read-write' are saved in ~/.ahma/settings.toml and apply \
+         now; 'read-only-session'/'read-write-session' apply now and are forgotten \
+         when this session ends. Everything else outside your workspace stays \
+         blocked. Revoke a saved grant any time with `ahma sandbox revoke {path}`.\n\n\
+         Choose: 'deny' (default), 'read-only', 'read-write', 'read-only-session', \
+         or 'read-write-session'.",
         what = what,
         path = req.path.display(),
         tool = tool,
@@ -829,6 +884,14 @@ mod tests {
         // Anything we cannot confidently read as consent is not consent.
         assert_eq!(parse_decision("read-write"), GrantDecision::GrantRw);
         assert_eq!(parse_decision("Read-Only"), GrantDecision::GrantRo);
+        assert_eq!(
+            parse_decision("read-write-session"),
+            GrantDecision::GrantRwSession
+        );
+        assert_eq!(
+            parse_decision("read-only-session"),
+            GrantDecision::GrantRoSession
+        );
         assert_eq!(parse_decision("deny"), GrantDecision::Deny);
         assert_eq!(parse_decision(""), GrantDecision::Deny);
         assert_eq!(parse_decision("sure why not"), GrantDecision::Deny);

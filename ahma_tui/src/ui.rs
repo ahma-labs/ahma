@@ -3716,7 +3716,7 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
     let Some(gate) = &state.scope_grant else {
         return;
     };
-    let popup = centered_rect(76, 14, area);
+    let popup = centered_rect(78, 16, area);
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -3751,25 +3751,32 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
         Line::from(""),
         Line::from(Span::styled(format!("Why: {reason}."), theme.dim())),
         Line::from(Span::styled(
-            "Approving records a persistent grant in ~/.ahma/settings.toml. This running",
+            "A grant applies to this session now and only to this workspace. [y]/[r] also",
             theme.dim(),
         )),
         Line::from(Span::styled(
-            "session's scope stays locked: ask the agent to run the `restart` tool (or",
+            "save it in ~/.ahma/settings.toml for next time; [s]/[o] last for this session",
             theme.dim(),
         )),
         Line::from(Span::styled(
-            "restart ahma) to apply the grant now — otherwise it applies on next start.",
+            "only. Everything else outside the workspace stays blocked.",
             theme.dim(),
         )),
         Line::from(""),
         Line::from(vec![
             Span::styled("  [n] ", theme.failed().bold()),
-            Span::styled("Deny (default)    ", theme.normal().bold()),
-            Span::styled("[r] ", theme.pending().bold()),
-            Span::styled("Grant read-only    ", theme.normal()),
+            Span::styled("Deny (default)   ", theme.normal().bold()),
             Span::styled("[y] ", theme.success().bold()),
-            Span::styled("Grant read+write", theme.normal()),
+            Span::styled("read+write, saved   ", theme.normal()),
+            Span::styled("[r] ", theme.pending().bold()),
+            Span::styled("read-only, saved", theme.normal()),
+        ]),
+        Line::from(vec![
+            Span::styled("      ", theme.normal()),
+            Span::styled("[s] ", theme.success().bold()),
+            Span::styled("read+write, this session   ", theme.normal()),
+            Span::styled("[o] ", theme.pending().bold()),
+            Span::styled("read-only, this session", theme.normal()),
         ]),
         Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
     ];
