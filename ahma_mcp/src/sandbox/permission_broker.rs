@@ -53,7 +53,7 @@ use async_trait::async_trait;
 use ahma_common::config::{ScopeAccess, settings_path};
 use ahma_common::permissions::{AuditAction, GrantKind, GrantTier, append_audit, audit_entry};
 use ahma_common::scope_grant::{
-    GrantCoordinator, GrantDecision, GrantReason, GrantResolveOutcome, ScopeGrantRequest,
+    GrantCoordinator, GrantDecision, GrantReason, GrantResolveOutcome, NewGrant, ScopeGrantRequest,
     persist_grant,
 };
 
@@ -306,24 +306,23 @@ impl PermissionBroker {
                     tracing::warn!("cannot persist scope grant: home directory unknown");
                     return;
                 };
+                // The chokepoint applies the denylist and writes the audit
+                // record (R-PERM.2, R-PERM.2.1); the live scopes are not known
+                // here, so the parent-of-scope rule is the one it cannot apply —
+                // the tool and CLI surfaces supply them.
                 match persist_grant(
                     &file,
-                    &path,
-                    access,
-                    tool.or_else(|| Some("permission prompt".to_string())),
-                    Some(granted_at.format("%Y-%m-%d").to_string()),
-                    None,
+                    NewGrant {
+                        path: &path,
+                        access,
+                        granted_by: tool.or_else(|| Some("permission prompt".to_string())),
+                        granted_at: Some(granted_at.format("%Y-%m-%d").to_string()),
+                        note: None,
+                        surface: "harness",
+                        live_scopes: &[],
+                    },
                 ) {
                     Ok(_) => {
-                        append_audit(&audit_entry(
-                            granted_at.to_rfc3339(),
-                            AuditAction::Grant,
-                            GrantKind::FsScope,
-                            path.display().to_string(),
-                            Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
-                            GrantTier::Always,
-                            Some("harness".to_string()),
-                        ));
                         tracing::info!(
                             path = %path.display(),
                             access = access.label(),

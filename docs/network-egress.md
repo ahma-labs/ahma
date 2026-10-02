@@ -267,8 +267,8 @@ ahma permissions revoke net-host crates.io --yes  # revoke via unified ledger
 When an AI agent encounters a network block, it can invoke the `network_grant` tool:
 - **Two-phase confirmation**: Calling `network_grant` without `confirm: true` returns a preview with risk analysis and the exact line that would be added to `~/.ahma/settings.toml`.
 - **Hard denylist**: Blanket `*`, `localhost`, and private/loopback/cloud-metadata IP addresses (`169.254.169.254`) are refused outright even with confirmation.
-- **Human approval gate**: Autonomous in-process agents cannot self-persist network grants; external clients raise interactive elicitation prompts for human confirmation.
-- **Immediate effect**: Confirmed grants take effect immediately for the active session and persist to `~/.ahma/settings.toml` across restarts.
+- **Human approval gate**: `confirm: true` never grants by itself, for any client. A client that declared MCP elicitation gets a real prompt; every other caller (the in-process agent, a headless harness, a client with no prompt) is told the `ahma network allow <host>` command the human must run — it is never assumed to have asked you first.
+- **Immediate effect**: Human-approved grants take effect immediately for the active session and persist to `~/.ahma/settings.toml` across restarts.
 
 ## Limits you still have
 

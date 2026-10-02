@@ -52,11 +52,15 @@ fn a_grant_is_in_effect_for_the_next_hooked_command_with_no_restart() {
     // The user approves the grant (at whichever rung of the ladder answered).
     ahma_common::scope_grant::persist_grant(
         &settings_file,
-        &cache,
-        ScopeAccess::Rw,
-        Some("hook".into()),
-        Some("2026-07-12".into()),
-        None,
+        ahma_common::scope_grant::NewGrant {
+            path: &cache,
+            access: ScopeAccess::Rw,
+            granted_by: Some("hook".into()),
+            granted_at: Some("2026-07-12".into()),
+            note: None,
+            surface: "tui",
+            live_scopes: &[],
+        },
     )
     .expect("an approved grant persists");
 

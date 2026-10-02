@@ -72,11 +72,14 @@ exact line.
 
 - **Terminal hooks**: on your **next command**. Hooks re-derive the sandbox each
   time, so there's nothing to restart.
-- **The MCP server** (your IDE's connection): when granted interactively via the
-  `sandbox_grant` or `network_grant` MCP tools with human confirmation, it takes effect **immediately**
-  for the active session in addition to persisting. For offline configuration edits
-  (`ahma sandbox grant` or `ahma network allow` CLI, or direct `~/.ahma/settings.toml` edits), it takes effect
-  on the next server start (or after using the `restart` tool).
+- **The MCP server** (your IDE's connection): when a human approves a request the
+  `sandbox_grant` or `network_grant` MCP tool raised (at your client's prompt, or in the
+  ahma TUI), it takes effect **immediately** for the active session in addition to
+  persisting. The tools never grant on their own: `confirm: true` only raises the
+  question, for every client — a client that cannot show a prompt cannot approve, and
+  ahma never assumes it asked you before the call. For offline configuration edits
+  (`ahma sandbox grant` or `ahma network allow` CLI, or direct `~/.ahma/settings.toml`
+  edits), it takes effect on the next server start (or after using the `restart` tool).
 
 ## What ahma will never grant
 
@@ -175,7 +178,11 @@ ahma web allow api.github.com                  # outbound domains (HTTP fetch to
 ahma web list
 ```
 
-Every grant and revoke is appended to `~/.ahma/permissions-audit.jsonl`.
+Every grant and revoke is appended to `~/.ahma/permissions-audit.jsonl`, with the
+surface that answered (`cli`, `tui`, `harness`). Filesystem grants are written through
+one function — the CLI, the TUI modal and an elicitation answer all share it — and that
+function applies the denylist above and writes the audit record, so no surface can skip
+either.
 
 ## See also
 

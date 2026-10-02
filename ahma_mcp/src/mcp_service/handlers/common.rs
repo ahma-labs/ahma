@@ -138,8 +138,9 @@ fn denial_aware_error(context: &str, e: &anyhow::Error) -> McpError {
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
             "remediation": format!(
-                "'{path}' is outside the sandbox scope. To allow it, grant the path \
-                 (`ahma sandbox grant {path}`) and restart to apply.",
+                "'{path}' is outside the sandbox scope. Only a human can allow it: ask them to \
+                 approve it in the ahma TUI or run `ahma sandbox grant {path}`; the `sandbox_grant` \
+                 tool with `confirm: true` raises that prompt and cannot grant by itself.",
                 path = path.display()
             ),
         });

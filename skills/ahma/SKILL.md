@@ -124,7 +124,7 @@ Terminates the process and frees resources.
 sandbox_grant(path="/opt/ext/sccache", access="rw", confirm=false)
 ```
 
-Propose adding an out-of-scope path as a persistent sandbox root in `~/.ahma/settings.toml`. Call this when a command fails with a `sandbox_denial` error. Without `confirm: true` it only previews. On `confirm: true` with human approval, it writes the grant and applies immediately to the live session.
+Ask the human to add an out-of-scope path as a persistent sandbox root in `~/.ahma/settings.toml`. Call this when a command fails with a `sandbox_denial` error. Without `confirm: true` it only previews. With `confirm: true` it raises an approval prompt for the human (your client's, or the ahma TUI) and tells you whether they approved — it never grants by itself, for any client. Ask for the narrowest directory and `ro` unless a write was denied. A human-approved grant applies to the live session immediately.
 
 ### `network_grant` — Request persistent network egress grant
 
@@ -132,7 +132,7 @@ Propose adding an out-of-scope path as a persistent sandbox root in `~/.ahma/set
 network_grant(host="crates.io", confirm=false)
 ```
 
-Propose adding a hostname or pattern to `[network].allow` in `~/.ahma/settings.toml` for subprocess egress. Without `confirm: true` it only previews. Hard denylist blocks `*`, `localhost`, and private/metadata IPs (`169.254.169.254`). On `confirm: true` with human approval, it writes the grant and applies immediately to the live session.
+Ask the human to add a hostname or pattern to `[network].allow` in `~/.ahma/settings.toml` for subprocess egress. Without `confirm: true` it only previews. Hard denylist blocks `*`, `localhost`, and private/metadata IPs (`169.254.169.254`). With `confirm: true` it raises an approval prompt in a client that supports one, else tells you the `ahma network allow` command the human must run; it never grants by itself. A human-approved grant applies to the live session immediately.
 
 ---
 
@@ -317,7 +317,7 @@ ahma tls init && ahma tls status        # ahma tls rotate replaces certificate
 * **Timeout**: `--timeout 600` in mcp.json args, or `tools.timeout_secs = 600` in `~/.ahma/settings.toml`.
 * **Permission denied / sandbox error**: the path is outside the sandbox scope — check `--sandbox-scope`, set `[sandbox] container_root`, or add `--tmp` for temp-file access.
 * **"sandbox scope is your container root"**: the session scope spans every project; pass `working_directory` naming the project subdirectory so ahma knows which subtree to narrow to.
-* **Cargo/tool-install permission errors** (`cargo add`, `cargo install`, `npm i -g`, …): do **not** add `--sandbox-scope ~/.cargo` — that grants write to the whole cargo home including credentials. The built-in `package_cache_write` feature (on by default) already handles `cargo add`/`update`. For installs into `~/.cargo/bin`, use the `sandbox_grant` tool (preview, then `confirm: true`) — it takes effect immediately and persists — or install into the workspace instead (`cargo install --root <workspace>/.tools`). Full rationale: [docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs](https://github.com/ahma-labs/ahma/blob/main/docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs).
+* **Cargo/tool-install permission errors** (`cargo add`, `cargo install`, `npm i -g`, …): do **not** add `--sandbox-scope ~/.cargo` — that grants write to the whole cargo home including credentials. The built-in `package_cache_write` feature (on by default) already handles `cargo add`/`update`. For installs into `~/.cargo/bin`, ask the human for a grant with the `sandbox_grant` tool (preview, then `confirm: true` raises their approval prompt; it never grants by itself) — an approved grant takes effect immediately and persists — or install into the workspace instead (`cargo install --root <workspace>/.tools`). Full rationale: [docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs](https://github.com/ahma-labs/ahma/blob/main/docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs).
 * **"ahma is DEFERRING to … sandbox"**: ahma is inside an outer sandbox it can't nest inside (macOS Seatbelt refuses nesting). Commands still run, confined by the outer sandbox — expected when running ahma's own test suite or a nested `ahma serve`. For ahma's own enforcement, start it from a plain terminal.
 * **Tool still running**: `status(operation_id)` to check, or `cancel(operation_id)`.
 * **Linux old kernel**: Landlock needs kernel 5.13+; use `--no-sandbox` on older systems.

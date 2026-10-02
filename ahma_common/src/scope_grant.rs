@@ -320,23 +320,279 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     }
 }
 
-/// Persist an approved grant to the settings file — the single chokepoint that
-/// satisfies the session-immutability invariant: it writes `~/.ahma/settings.toml`
-/// and **never** mutates the live sandbox. Mirrors the CLI `ahma sandbox grant`
-/// path so both converge on one persistence code path.
+/// The risk tier of a proposed grant, decided purely from the path, the user's
+/// home directory, and the live sandbox scopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantRisk {
+    /// Catastrophic and never legitimate — refused even with `confirm: true`.
+    Refused(String),
+    /// Allowed with confirmation, but each reason is surfaced loudly first.
+    High(Vec<String>),
+    /// An ordinary grant (a build cache, a dependency source dir, a sibling
+    /// project, …).
+    Normal,
+}
+
+/// Check if `candidate_parent` is the enclosing git repository root (or main repo of a worktree)
+/// of `scope`. When true, granting `candidate_parent` is not widening above the workspace;
+/// it is granting the workspace root itself.
+pub fn is_enclosing_git_repo(scope: &Path, candidate_parent: &Path) -> bool {
+    let canon_scope = dunce::canonicalize(scope).unwrap_or_else(|_| scope.to_path_buf());
+    let canon_parent =
+        dunce::canonicalize(candidate_parent).unwrap_or_else(|_| candidate_parent.to_path_buf());
+
+    let mut dir = canon_scope.clone();
+    while dir.starts_with(&canon_parent) {
+        let git = dir.join(".git");
+        if git.exists() {
+            if dir == canon_parent {
+                return true;
+            }
+            if git.is_file()
+                && let Ok(content) = std::fs::read_to_string(&git)
+                && let Some(line) = content
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("gitdir:"))
+            {
+                let raw_gitdir = line.trim_start()["gitdir:".len()..].trim();
+                let gitdir_path = Path::new(raw_gitdir);
+                let resolved = if gitdir_path.is_relative() {
+                    dir.join(gitdir_path)
+                } else {
+                    gitdir_path.to_path_buf()
+                };
+                let canon_gitdir = dunce::canonicalize(&resolved).unwrap_or(resolved);
+                if let Some(main) = canon_gitdir
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|gp| gp.parent())
+                {
+                    let canon_main =
+                        dunce::canonicalize(main).unwrap_or_else(|_| main.to_path_buf());
+                    if canon_main == canon_parent {
+                        return true;
+                    }
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    false
+}
+
+/// Classify the risk of granting `path` — the hard denylist every write path
+/// into the ledger is gated by (SPEC R5.4.5, R-PERM.2).
+///
+/// `path` is expected to arrive canonicalized (symlinks and `..` resolved as far as it exists).
+/// `home` is canonicalized **here**, on purpose: the caller passes
+/// `ahma_home_dir()`, which is whatever the OS reports and may contain a symlink
+/// component — `/home` → `/mnt/home` on many Linux setups, an automounted
+/// corporate home, or a macOS home relocated to another volume. Comparing a
+/// resolved path against an unresolved `$HOME` makes every equality rule below
+/// silently miss, and these rules are the *hard* denylist: `$HOME` itself,
+/// `~/.ssh`, `~/.aws`, `~/.ahma`. A denylist that quietly stops matching is worse
+/// than no denylist, because everything downstream assumes it held.
+pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> GrantRisk {
+    let home = home.map(|h| dunce::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
+    let home = home.as_deref();
+
+    // 1. A filesystem root has no parent — granting it exposes the whole drive.
+    if path.parent().is_none() {
+        return GrantRisk::Refused(
+            "it is a filesystem root — granting it would expose the entire drive".to_string(),
+        );
+    }
+
+    // 2. The exact home directory exposes every dotfile, key, and credential.
+    if let Some(home) = home
+        && path == home
+    {
+        return GrantRisk::Refused(
+            "it is your home directory — granting it would expose every dotfile, key, and \
+             credential under $HOME"
+                .to_string(),
+        );
+    }
+
+    // 3. A strict ancestor of a live scope would widen the sandbox above the
+    //    workspace. (Equality is merely redundant — handled as a High warning.)
+    for scope in scopes {
+        if scope != path && scope.starts_with(path) {
+            if is_enclosing_git_repo(scope, path) {
+                // Not widening above the workspace; it is the enclosing workspace/repo root itself!
+                continue;
+            }
+            return GrantRisk::Refused(format!(
+                "it is a parent of the active sandbox scope {} — granting it would widen the \
+                 sandbox above your workspace",
+                scope.display()
+            ));
+        }
+    }
+
+    // 4. Credential directories and ahma's own settings directory.
+    if let Some(home) = home {
+        const SENSITIVE: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube", ".docker", ".ahma"];
+        if SENSITIVE.iter().any(|name| path == home.join(name))
+            || path == home.join(".config").join("gh")
+            || path == home.join(".config").join("gcloud")
+        {
+            return GrantRisk::Refused(format!(
+                "'{}' holds credentials/secrets (or ahma's own settings) and must never be \
+                 exposed to a sandboxed tool",
+                path.display()
+            ));
+        }
+    }
+
+    // 5. OS system directories.
+    if is_system_dir(path) {
+        return GrantRisk::Refused(format!(
+            "'{}' is a system directory — granting it is never required for a build and risks \
+             the OS",
+            path.display()
+        ));
+    }
+
+    // ── Not refused: collect elevated-risk warnings. ──
+    let mut warnings = Vec::new();
+
+    if scopes.iter().any(|s| s == path) {
+        warnings.push(
+            "this path is already inside the active sandbox scope; the grant is redundant"
+                .to_string(),
+        );
+    }
+
+    // A direct child of the filesystem root (e.g. `/data`, `/opt`).
+    if path.parent().is_some_and(|p| p.parent().is_none()) {
+        warnings.push(format!(
+            "'{}' sits directly under the filesystem root; double-check it is the specific \
+             directory you mean",
+            path.display()
+        ));
+    }
+
+    if !path.exists() {
+        warnings.push(format!(
+            "'{}' does not exist on disk — confirm the path is correct and not a typo",
+            path.display()
+        ));
+    }
+
+    // A hidden directory directly under home that is not a known build cache.
+    if let Some(home) = home
+        && path.parent() == Some(home)
+        && let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && name.starts_with('.')
+        && !is_known_cache_dir(name)
+    {
+        warnings.push(format!(
+            "'{}' is a hidden directory in your home folder; make sure it does not hold private \
+             data",
+            path.display()
+        ));
+    }
+
+    if warnings.is_empty() {
+        GrantRisk::Normal
+    } else {
+        GrantRisk::High(warnings)
+    }
+}
+
+/// Whether `path` is exactly an OS system directory that must never be granted.
+pub fn is_system_dir(path: &Path) -> bool {
+    // Exact matches only: `/usr/local/foo` is a legitimate grant, `/usr` is not.
+    const UNIX_SYSTEM_DIRS: &[&str] = &[
+        "/etc", "/usr", "/bin", "/sbin", "/var", "/boot", "/dev", "/proc", "/sys", "/root",
+        "/System", "/Library", "/opt", "/private",
+    ];
+    const WINDOWS_SYSTEM_DIRS: &[&str] = &[
+        "C:\\Windows",
+        "C:\\Program Files",
+        "C:\\Program Files (x86)",
+        "C:\\ProgramData",
+    ];
+    UNIX_SYSTEM_DIRS
+        .iter()
+        .chain(WINDOWS_SYSTEM_DIRS)
+        .any(|d| path == Path::new(d))
+}
+
+/// Whether `name` (a `~/<name>` hidden directory) is a well-known build cache,
+/// in which case a hidden-home-dir grant is unremarkable rather than elevated.
+pub fn is_known_cache_dir(name: &str) -> bool {
+    const CACHES: &[&str] = &[
+        ".cargo",
+        ".rustup",
+        ".cache",
+        ".npm",
+        ".gradle",
+        ".m2",
+        ".pub-cache",
+        ".cocoapods",
+        ".sccache",
+        ".ccache",
+        ".gem",
+        ".yarn",
+        ".pnpm-store",
+        ".nuget",
+        ".gradle-cache",
+        ".deno",
+        ".bun",
+    ];
+    CACHES.contains(&name)
+}
+
+/// Everything a write into the persistent-scope ledger needs to say about
+/// itself: what is granted, and who decided it where.
+#[derive(Debug, Clone)]
+pub struct NewGrant<'a> {
+    /// The directory to grant. `~` is expanded; the path is canonicalized as far
+    /// as it exists before the denylist sees it.
+    pub path: &'a Path,
+    pub access: ScopeAccess,
+    /// What asked for it (a tool or command name), for `granted_by` provenance.
+    pub granted_by: Option<String>,
+    /// `YYYY-MM-DD`, stamped by the caller (this crate carries no date dependency).
+    pub granted_at: Option<String>,
+    pub note: Option<String>,
+    /// Which human surface answered: `cli`, `tui`, `harness` (an MCP
+    /// elicitation). Recorded in the audit log; a grant with no human surface
+    /// has no business here.
+    pub surface: &'a str,
+    /// The session's live sandbox scopes, so a grant that would widen the
+    /// sandbox *above* the workspace is refused (`[]` when unknown — the
+    /// remaining denylist rules still hold).
+    pub live_scopes: &'a [PathBuf],
+}
+
+/// Persist a **human-approved** grant to the settings file — the single
+/// chokepoint every surface writes through: the CLI, an elicitation answer
+/// relayed by the permission broker, the TUI modal. It applies the hard
+/// denylist (R5.4.5 / R-PERM.2) and appends the audit record (R-PERM.2.1)
+/// here, so no surface can skip either; it writes `~/.ahma/settings.toml`
+/// and never touches the live sandbox (the caller that holds one decides
+/// whether to apply the grant live, R5.4.6).
 ///
 /// Uses the strict loader so a corrupt settings file is *not* silently clobbered.
-/// `granted_at` is supplied by the caller (stamp with `chrono::Local::now()`),
-/// keeping this crate free of a date dependency. Returns the
-/// [`GrantOutcome`] so the caller can report "added" vs "updated".
-pub fn persist_grant(
-    settings_file: &Path,
-    path: &Path,
-    access: ScopeAccess,
-    granted_by: Option<String>,
-    granted_at: Option<String>,
-    note: Option<String>,
-) -> Result<GrantOutcome> {
+/// Returns the [`GrantOutcome`] so the caller can report "added" vs "updated".
+pub fn persist_grant(settings_file: &Path, grant: NewGrant<'_>) -> Result<GrantOutcome> {
+    let canonical = canonicalize_best_effort(grant.path);
+    let home = crate::config::ahma_home_dir();
+    if let GrantRisk::Refused(reason) =
+        classify_grant_risk(&canonical, home.as_deref(), grant.live_scopes)
+    {
+        anyhow::bail!(
+            "refusing to grant {}: {reason}. This is a hard limit with no override; if a tool \
+             genuinely needs something under that path, grant the specific subdirectory it \
+             needs instead.",
+            canonical.display()
+        );
+    }
     let mut settings = AhmaSettings::load_from_result(settings_file)
         .map_err(|e| anyhow::anyhow!(e))
         .with_context(|| {
@@ -346,15 +602,24 @@ pub fn persist_grant(
             )
         })?;
     let outcome = settings.sandbox.grant_scope(PersistentScope {
-        path: path.to_path_buf(),
-        access,
-        granted_by,
-        granted_at,
-        note,
+        path: grant.path.to_path_buf(),
+        access: grant.access,
+        granted_by: grant.granted_by,
+        granted_at: grant.granted_at.clone(),
+        note: grant.note,
     });
     settings
         .save_to(settings_file)
         .with_context(|| format!("failed to write {}", settings_file.display()))?;
+    crate::permissions::append_audit(&crate::permissions::audit_entry(
+        grant.granted_at.unwrap_or_else(|| "unknown".to_string()),
+        crate::permissions::AuditAction::Grant,
+        crate::permissions::GrantKind::FsScope,
+        canonical.display().to_string(),
+        Some(if grant.access.is_write() { "rw" } else { "ro" }.to_string()),
+        crate::permissions::GrantTier::Always,
+        Some(grant.surface.to_string()),
+    ));
     Ok(outcome)
 }
 
@@ -612,11 +877,15 @@ mod tests {
         // First grant: rw, recorded as Added.
         let added = persist_grant(
             &file,
-            &target,
-            ScopeAccess::Rw,
-            Some("sccache".into()),
-            Some("2026-06-22".into()),
-            None,
+            NewGrant {
+                path: &target,
+                access: ScopeAccess::Rw,
+                granted_by: Some("sccache".into()),
+                granted_at: Some("2026-06-22".into()),
+                note: None,
+                surface: "test",
+                live_scopes: &[],
+            },
         )
         .unwrap();
         assert_eq!(added, GrantOutcome::Added);
@@ -633,11 +902,15 @@ mod tests {
         // proving a double-approve from two surfaces is safe and idempotent.
         let updated = persist_grant(
             &file,
-            &target,
-            ScopeAccess::Ro,
-            None,
-            Some("2026-06-22".into()),
-            None,
+            NewGrant {
+                path: &target,
+                access: ScopeAccess::Ro,
+                granted_by: None,
+                granted_at: Some("2026-06-22".into()),
+                note: None,
+                surface: "test",
+                live_scopes: &[],
+            },
         )
         .unwrap();
         assert!(matches!(updated, GrantOutcome::Updated(old) if old.access == ScopeAccess::Rw));
@@ -661,7 +934,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("settings.toml");
         std::fs::write(&file, "this is : not valid toml [[[").unwrap();
-        let err = persist_grant(&file, home.path(), ScopeAccess::Rw, None, None, None);
+        let target = home.path().join("cache");
+        let err = persist_grant(
+            &file,
+            NewGrant {
+                path: &target,
+                access: ScopeAccess::Rw,
+                granted_by: None,
+                granted_at: None,
+                note: None,
+                surface: "test",
+                live_scopes: &[],
+            },
+        );
         assert!(
             err.is_err(),
             "a corrupt settings file must not be silently overwritten"
@@ -672,5 +957,80 @@ mod tests {
                 .unwrap()
                 .contains("not valid toml")
         );
+    }
+
+    fn grant<'a>(path: &'a Path, scopes: &'a [PathBuf]) -> NewGrant<'a> {
+        NewGrant {
+            path,
+            access: ScopeAccess::Rw,
+            granted_by: Some("test".into()),
+            granted_at: Some("2026-10-02".into()),
+            note: None,
+            surface: "test",
+            live_scopes: scopes,
+        }
+    }
+
+    /// SPEC R-PERM.2: the hard denylist gates the one write path, so no surface
+    /// — CLI, TUI modal, elicitation answer, MCP tool — can write `~/.ahma`,
+    /// `$HOME`, a system directory or a parent of the live scope.
+    #[test]
+    fn persist_grant_refuses_denylisted_path_from_any_surface() {
+        let home = tempdir().unwrap();
+        // nextest runs each test in its own process: the override is local.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let file = home.path().join(".ahma").join("settings.toml");
+        let ahma_dir = home.path().join(".ahma");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+
+        for (what, path) in [
+            ("~/.ahma", ahma_dir.clone()),
+            ("$HOME", home.path().to_path_buf()),
+            ("/bin", PathBuf::from("/bin")),
+        ] {
+            let err = persist_grant(&file, grant(&path, &[]))
+                .expect_err(&format!("{what} must be refused"));
+            assert!(
+                err.to_string().contains("refusing to grant"),
+                "{what}: {err}"
+            );
+        }
+        // A parent of the live scope widens the sandbox above the workspace.
+        let ws = home.path().join("projects").join("app");
+        std::fs::create_dir_all(&ws).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let parent = ws.parent().unwrap().to_path_buf();
+        let scopes = vec![ws.clone()];
+        assert!(persist_grant(&file, grant(&parent, &scopes)).is_err());
+        assert!(
+            !file.exists(),
+            "a refused grant writes nothing: {}",
+            file.display()
+        );
+        unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+    }
+
+    /// SPEC R-PERM.2.1: every persist appends one audit record naming the
+    /// surface, from inside the chokepoint — the TUI and tool paths used to
+    /// skip it.
+    #[test]
+    fn persist_grant_appends_an_audit_record_with_the_surface() {
+        let home = tempdir().unwrap();
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let file = home.path().join(".ahma").join("settings.toml");
+        let target = home.path().join("cache");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut g = grant(&target, &[]);
+        g.surface = "tui";
+        persist_grant(&file, g).unwrap();
+        let audit =
+            std::fs::read_to_string(home.path().join(".ahma").join("permissions-audit.jsonl"))
+                .expect("audit log written");
+        let entry: crate::permissions::AuditEntry =
+            serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!(entry.surface.as_deref(), Some("tui"));
+        assert_eq!(entry.access.as_deref(), Some("rw"));
+        assert!(entry.subject.ends_with("cache"), "{}", entry.subject);
+        unsafe { std::env::remove_var("AHMA_TEST_HOME") };
     }
 }

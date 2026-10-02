@@ -512,39 +512,30 @@ fn run_sandbox_grant(
     };
     let settings = load_sandbox_settings(file)?;
 
-    // The catastrophic-path denylist gates *every* write into the ledger,
-    // not just the `sandbox_grant` MCP tool (SPEC R-PERM.2). The CLI used
-    // to skip it, which meant the safest surface (a human at a terminal)
-    // had the weakest guardrail — precisely backwards.
-    refuse_denylisted_grant(&dir, &settings)?;
+    // Surface the elevated-risk warnings before writing; the hard denylist
+    // itself is applied inside `persist_grant`, the one write path every
+    // surface shares (SPEC R-PERM.2), which also appends the audit record.
+    let live_scopes: Vec<PathBuf> = settings
+        .sandbox
+        .scopes
+        .iter()
+        .map(|p| ahma_common::config::expand_home(p))
+        .collect();
+    warn_elevated_risk_grant(&dir, &live_scopes);
     drop(settings);
 
-    // Write through the shared chokepoint rather than repeating its
-    // load/grant/save here. `persist_grant`'s own documentation claims the CLI
-    // converges on it and `sandbox_grant_tool` says the two share a code path;
-    // until now neither was true, and this is the ledger that decides what the
-    // kernel will let a command touch. A second copy of the write is the last
-    // place that should exist.
-    //
-    // It re-reads the file it was just handed, which is the price of the
-    // chokepoint owning the whole load-modify-save. The denylist gate above
-    // needs the settings first, and `load_sandbox_settings` is the same strict
-    // loader `persist_grant` uses, so the two reads agree.
     let outcome = ahma_common::scope_grant::persist_grant(
         file,
-        &dir,
-        access,
-        by,
-        Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
-        note,
+        ahma_common::scope_grant::NewGrant {
+            path: &dir,
+            access,
+            granted_by: by,
+            granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            note,
+            surface: "cli",
+            live_scopes: &live_scopes,
+        },
     )?;
-
-    audit(
-        AuditAction::Grant,
-        GrantKind::FsScope,
-        dir.display().to_string(),
-        Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
-    );
 
     match outcome {
         GrantOutcome::Added => {
@@ -562,8 +553,8 @@ fn run_sandbox_grant(
     println!();
     println!("Recorded in: {}", file.display());
     println!("  This file lives outside every sandbox scope, so a sandboxed *command*");
-    println!("  cannot touch it. Only you — or the AI's `sandbox_grant` tool, and only");
-    println!("  after you confirm a previewed line — can change it. Edit it by hand, or run");
+    println!("  cannot touch it. Only you can change it — here, in the ahma TUI, or at a");
+    println!("  prompt the AI's `sandbox_grant` tool raises for you. Edit it by hand, or run");
     println!(
         "  `ahma sandbox revoke {}` to remove this grant.",
         dir.display()
@@ -671,47 +662,26 @@ fn audit(action: AuditAction, kind: GrantKind, subject: String, access: Option<S
     ));
 }
 
-/// Refuse a filesystem grant that the hard denylist forbids (SPEC R5.4.5,
-/// generalized to every write path by R-PERM.2).
+/// Print the elevated-risk warnings for a grant the CLI is about to write
+/// (SPEC R5.4.5). The hard denylist is applied by `persist_grant` itself.
 ///
-/// The denylist is not advice, and no surface may skip it: not the MCP tool, not
-/// an elicitation answer, and not the CLI. A grant of `$HOME`, a filesystem root,
+/// A grant of `$HOME`, a filesystem root,
 /// a parent of the live scope, a credential directory, or an OS system directory
 /// is refused outright — there is no `--force`, because every legitimate use of
 /// such a grant is better served by naming the specific subdirectory.
-fn refuse_denylisted_grant(
-    path: &std::path::Path,
-    settings: &ahma_common::config::AhmaSettings,
-) -> Result<()> {
+fn warn_elevated_risk_grant(path: &std::path::Path, live_scopes: &[PathBuf]) {
     use crate::mcp_service::handlers::sandbox_grant_tool::{GrantRisk, classify_grant_risk};
 
     let expanded = ahma_common::config::expand_home(path);
     let canonical = dunce::canonicalize(&expanded).unwrap_or(expanded);
     let home = ahma_common::config::ahma_home_dir();
-    let live_scopes: Vec<PathBuf> = settings
-        .sandbox
-        .scopes
-        .iter()
-        .map(|p| ahma_common::config::expand_home(p))
-        .collect();
-
-    match classify_grant_risk(&canonical, home.as_deref(), &live_scopes) {
-        GrantRisk::Refused(reason) => anyhow::bail!(
-            "Refusing to grant {}:\n  {reason}\n\n\
-             This is a hard limit, not a warning — there is no override flag. If a tool \
-             genuinely needs something under that path, grant the specific subdirectory it \
-             needs instead.",
-            canonical.display()
-        ),
-        GrantRisk::High(warnings) => {
-            eprintln!("⚠ Elevated-risk grant for {}:", canonical.display());
-            for w in &warnings {
-                eprintln!("    • {w}");
-            }
-            eprintln!();
-            Ok(())
+    if let GrantRisk::High(warnings) = classify_grant_risk(&canonical, home.as_deref(), live_scopes)
+    {
+        eprintln!("⚠ Elevated-risk grant for {}:", canonical.display());
+        for w in &warnings {
+            eprintln!("    • {w}");
         }
-        GrantRisk::Normal => Ok(()),
+        eprintln!();
     }
 }
 

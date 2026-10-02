@@ -305,7 +305,18 @@ fn persist_resolved_grant(
     let granted_by = tool.or_else(|| Some("scope-grant prompt".to_string()));
     match settings_path() {
         Some(file) => {
-            match persist_grant(&file, path, access, granted_by, Some(granted_at), None) {
+            match persist_grant(
+                &file,
+                ahma_common::scope_grant::NewGrant {
+                    path,
+                    access,
+                    granted_by,
+                    granted_at: Some(granted_at),
+                    note: None,
+                    surface: "tui",
+                    live_scopes: &[],
+                },
+            ) {
                 Ok(_) => tracing::info!(
                     path = %path.display(),
                     access = access.label(),
