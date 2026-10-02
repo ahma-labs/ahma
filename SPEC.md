@@ -157,6 +157,7 @@ what is missing named; `dormant` means present but not active.
 | macOS sandbox (Seatbelt) | tests-pass | Writes confined; reads unconfined with a credential denylist (R6.2.2, R6.2.3); signals and the GPU confined, each with an explicit opt-out/opt-in (R6.2.6, R6.2.7) |
 | Grant prompts: one body, every surface (R-PERM.3.4) | tests-pass | `grant_prompt::render`; titled enum elicitation; once/session/always with a per-session budget (R-PERM.4.5) |
 | Usable lane and visible queue (R2.7.4, R2.7.9) | tests-pass | pipelines of readers are readers; `ahma queue`; `ps` under the profile (R6.2.8) |
+| Grant advisor and decision habits (R-PERM.8, R-DOCTOR.8) | tests-pass | TUI advisor line from the selected model, evidence only; audit `advice`/`advice_followed`; doctor time-to-decision report |
 | Windows sandbox | in-progress | Job Objects only; AppContainer written but disproved in CI, so off — no OS path boundary (R6.3.3) |
 | Nested sandbox detection and deferral (R7) | tests-pass | Hooks defer to the host; the MCP server stays authoritative |
 | Trust-handoff hardening (R-HANDOFF) | in-progress | Kernel-enforced on macOS; application-layer on Linux; none on Windows |
@@ -840,6 +841,14 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
   at startup, and the build diagnostic names the shape. Motivation: one such
   server cost two agent sessions an afternoon and was worked around with a
   shim on `PATH`.
+- **R-DOCTOR.8 — The doctor reports whether prompts are being read.** From the
+  permissions audit log it **must** report, over the last 200 answered
+  grant prompts, the median time-to-decision, how many were answered in
+  under three seconds, and how often the advisor was followed; a median
+  under three seconds is a warning that names the habit, because a prompt
+  answered faster than it can be read is theater and the sandbox is then
+  only as strong as the reflex (the warning-fatigue literature measures
+  reflex approvals at about two seconds).
 
 #### The question ladder (where a permission question is asked)
 
@@ -899,6 +908,10 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
 #### What the human is told
 
 - **R-PERM.9**: **Every user-facing permission message leads with whether the user must do anything.** The first line after a grant, a denial or a disclosure **must** be one of `Nothing more to do…`, `One thing to do: <the exact command or key>…`, or `Blocked until <who> <does what>…`, computed from the surface it is printed on (terminal hooks and the edit guard re-read grants per command; a running MCP session, until it watches the ledger, needs its connection restarted or the prompt it raised answered) — never hedged with "may" or "the next time a server starts", and never two answers in one message. When the user must act, the message names the exact action: the full command to paste, or the key to press and where, never "restart your IDE" or "grant it in the TUI". Motivation: a grant confirmation told the owner the grant "takes effect the next time an ahma server starts" while the hook had already applied it, and a denial told the agent both "next server start" and "on your next command" in one message.
+
+#### The advisor (a model recommends; it never answers)
+
+- **R-PERM.8**: **A model may recommend an answer to a grant question, and never give one.** Where a model is available to ahma (the TUI's selected model; a client's own model over MCP sampling is a later provider, off by default because the asking agent's model judging its own request is the documented circularity), the prompt **may** carry one labelled line: `advisor: <deny|once|session|always> · <access> — <reasons> (confidence N%)`. The rules are the SPEC, not a style guide: (1) the advisor sees the request **minus the agent's claim** — who asked, what the kernel refused, the command line, the observed facts about the target (names and counts, never file contents), the risk class — and never the agent's transcript, because a judge shown the actor's own summary approves most of what it is shown; (2) it **never** changes the pre-selected default (deny), never answers, and runs only after the hard denylist (R-PERM.4.3); (3) it is time-boxed (`[permissions] advisor_timeout_secs`, default 6) and fail-quiet — the prompt is complete without it; (4) path names and command lines are declared untrusted in its instructions; (5) every answer records the advice and whether it was followed in the audit line (`advice`, `advice_followed`), which is what makes rubber-stamping measurable (R-DOCTOR.8); (6) its tier guidance is the policy's: `once` for a single command outside the project, `session` for caches and build outputs, `always` only for a path asked in two or more sessions and read-only unless a write was refused. `[permissions] advisor = false` turns it off. The provider is pluggable (`ahma_core::advisor::advise` takes any client); a dedicated small security-tuned model is the intended successor (`// TODO(security-model)`).
 
 ---
 

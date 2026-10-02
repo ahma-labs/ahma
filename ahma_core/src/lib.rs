@@ -64,6 +64,7 @@ pub use ahma_mcp::{Adapter, AhmaMcpService};
 // Re-export LLM client for direct use
 pub use ahma_llm_monitor::LlmClient;
 
+pub mod advisor;
 pub mod agent;
 pub mod approvals;
 pub mod tool_menu;

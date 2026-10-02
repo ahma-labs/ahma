@@ -346,6 +346,7 @@ fn persist_resolved_web_allow(domain: &str) {
 /// audited chokepoint at the `always` tier (bound to the session's workspace,
 /// SPEC R5.4.11), and apply it to the live session at either tier (R5.4.6).
 /// Best-effort: a write failure is logged, not fatal.
+#[allow(clippy::too_many_arguments)]
 fn persist_resolved_grant(
     path: &std::path::Path,
     access: ahma_common::config::ScopeAccess,
@@ -354,6 +355,7 @@ fn persist_resolved_grant(
     sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
     decision_id: &str,
     time_to_decision_ms: Option<u64>,
+    advice: (Option<String>, Option<bool>),
 ) {
     let live_scopes: Vec<std::path::PathBuf> =
         sandbox.map(|sb| sb.scopes().to_vec()).unwrap_or_default();
@@ -411,7 +413,8 @@ fn persist_resolved_grant(
                 tier,
                 Some("tui".to_string()),
             )
-            .with_request(decision_id, time_to_decision_ms, None),
+            .with_request(decision_id, time_to_decision_ms, None)
+            .with_advice(advice.0.clone(), advice.1),
         );
         tracing::info!(
             path = %path.display(),
@@ -793,6 +796,8 @@ async fn handle_incoming(
         HubMsg::SubmitScopeGrant {
             decision_id,
             decision,
+            advice,
+            advice_followed,
         } => {
             resolve_scope_grant(
                 decision_id,
@@ -800,6 +805,7 @@ async fn handle_incoming(
                 writer,
                 grant_coordinator,
                 grant_sandbox,
+                (advice, advice_followed),
             )
             .await
         }
@@ -934,6 +940,7 @@ async fn resolve_scope_grant(
     writer: &mut tokio::io::WriteHalf<HubStream>,
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
     sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
+    advice: (Option<String>, Option<bool>),
 ) {
     debug!("hub_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?}");
     let Some(coord) = grant_coordinator else {
@@ -954,6 +961,7 @@ async fn resolve_scope_grant(
             sandbox,
             &decision_id,
             time_to_decision_ms,
+            advice.clone(),
         ),
         GrantResolveOutcome::Denied {
             path,
@@ -969,7 +977,8 @@ async fn resolve_scope_grant(
                     ahma_common::permissions::GrantTier::Session,
                     Some("tui".to_string()),
                 )
-                .with_request(&decision_id, time_to_decision_ms, None),
+                .with_request(&decision_id, time_to_decision_ms, None)
+                .with_advice(advice.0.clone(), advice.1),
             );
         }
         GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => return,
@@ -1983,6 +1992,7 @@ mod tests {
                 None,
                 "test-decision",
                 None,
+                (None, None),
             );
         });
 
@@ -2015,6 +2025,7 @@ mod tests {
                 None,
                 "test-decision",
                 None,
+                (None, None),
             );
         });
 
@@ -2049,6 +2060,7 @@ mod tests {
                 None,
                 "test-decision",
                 None,
+                (None, None),
             );
         });
 
@@ -2477,6 +2489,8 @@ mod tests {
             &HubMsg::SubmitScopeGrant {
                 decision_id: "ghost".into(),
                 decision: GrantDecision::Deny,
+                advice: None,
+                advice_followed: None,
             },
         )
         .await
@@ -2499,6 +2513,8 @@ mod tests {
             &HubMsg::SubmitScopeGrant {
                 decision_id: did.clone(),
                 decision: GrantDecision::Deny,
+                advice: None,
+                advice_followed: None,
             },
         )
         .await

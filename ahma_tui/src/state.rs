@@ -1426,7 +1426,7 @@ impl ApprovalGate {
 /// explicit non-default key (R5.3.1). Lives in its own `AppState.scope_grant`
 /// field, parallel to `approval`, because it is hub-raised and may coexist with
 /// an open user overlay (it is rendered as an overlay, not a `ModalState`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScopeGrantGate {
     pub decision_id: String,
     /// The literal canonical path the prompt is about (never abbreviated).
@@ -1443,6 +1443,9 @@ pub struct ScopeGrantGate {
     /// `?` toggles the evidence and risk detail; the compact view keeps the
     /// modal readable on a small terminal.
     pub show_detail: bool,
+    /// The advisor's recommendation, when one arrived in time (SPEC R-PERM.8).
+    /// Shown as advice; it never changes the default or answers.
+    pub advice: Option<ahma_core::advisor::GrantAdvice>,
 }
 
 impl ScopeGrantGate {
@@ -1456,6 +1459,7 @@ impl ScopeGrantGate {
             tool: request.tool.clone(),
             request,
             show_detail: false,
+            advice: None,
         }
     }
 }

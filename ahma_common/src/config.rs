@@ -3074,6 +3074,8 @@ mod tests {
                     granted_by: Some("user".into()),
                     surface: Some("tui".into()),
                 }],
+                advisor: true,
+                advisor_timeout_secs: 6,
             },
         }
     }

@@ -125,6 +125,25 @@ Username` or `Authentication failed`, no helper answered: `gh auth login` then `
 auth setup-git` on the host fixes it. `ahma doctor` checks both transports and
 names the exact command or settings key when one cannot work.
 
+## The advisor
+
+In the TUI, the model you have selected can add one line to a grant prompt:
+
+```
+advisor: session · read+write — a project cache; a write was refused (confidence 80%)
+```
+
+It is advice, labelled as such, and nothing more: it never changes the default
+(deny), never answers, and the prompt is complete without it if the model is slow.
+The model sees the evidence — who asked, what the kernel refused, the command, what
+the directory contains — and deliberately **not** the agent's own justification: a
+judge shown the actor's summary approves most of what it is shown. Every answer records
+the advice and whether you followed it in the audit log, and `ahma doctor` reports how
+long you take to answer prompts; a median under three seconds is a warning, because a
+prompt answered faster than it can be read is theater. `[permissions] advisor = false`
+turns the advisor off; `advisor_timeout_secs` (default 6) bounds the wait. (SPEC
+R-PERM.8, R-DOCTOR.8.)
+
 ## What ahma will never grant
 
 Some paths and network destinations are refused outright, with no override flag, no matter who asks — you,

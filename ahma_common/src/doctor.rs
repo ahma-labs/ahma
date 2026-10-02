@@ -235,6 +235,9 @@ pub struct DoctorInput {
     /// Collected by the caller, which has the platform probe; empty when none
     /// were found or the platform cannot tell.
     pub confined_daemons: Vec<ConfinedDaemon>,
+    /// The permissions audit log, oldest first, for the decision-habit report
+    /// (SPEC R-DOCTOR.8). Empty when there is no log.
+    pub audit_entries: Vec<crate::permissions::AuditEntry>,
 }
 
 /// A long-lived build helper (sccache above all) that was started from inside
@@ -267,6 +270,9 @@ impl DoctorInput {
                 crate::config::ahma_home_dir().as_deref(),
             )),
             confined_daemons: Vec::new(),
+            audit_entries: crate::permissions::audit_path()
+                .map(|p| crate::permissions::read_audit_entries(&p))
+                .unwrap_or_default(),
         }
     }
 }
@@ -301,6 +307,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
         check_git_auth(probe, settings, &mut findings);
     }
     check_confined_daemons(&input.confined_daemons, &mut findings);
+    check_decision_habits(&input.audit_entries, &mut findings);
     check_logs(&input.workspace, &mut findings);
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
     findings
@@ -1156,6 +1163,7 @@ mod tests {
             build_id: "b".into(),
             git_auth: None,
             confined_daemons: Vec::new(),
+            audit_entries: Vec::new(),
         }
     }
 
@@ -1497,6 +1505,7 @@ mod hook_and_grant_tool_tests {
             build_id: "b".into(),
             git_auth: None,
             confined_daemons: Vec::new(),
+            audit_entries: Vec::new(),
         }
     }
 
@@ -2107,4 +2116,117 @@ fn apply_restart_daemon(name: &str) -> anyhow::Result<String> {
         "Restarted the {name} server outside any sandbox. Nothing more to do: every checkout's \
          builds use it from their next command."
     ))
+}
+
+/// Below this median time-to-decision the prompts are being clicked, not
+/// read (the warning-fatigue literature measures reflex approvals at about
+/// two seconds).
+const REFLEX_SECS: u64 = 3;
+
+/// How the human has been answering grant prompts (SPEC R-DOCTOR.8): median
+/// time-to-decision, the share answered faster than they can be read, and how
+/// often the advisor was followed. A grant system whose prompts are answered
+/// by reflex is theater, and this is the number that says so.
+fn check_decision_habits(entries: &[crate::permissions::AuditEntry], out: &mut Vec<Finding>) {
+    let recent: Vec<&crate::permissions::AuditEntry> = entries
+        .iter()
+        .filter(|e| e.time_to_decision_ms.is_some())
+        .rev()
+        .take(200)
+        .collect();
+    if recent.len() < 5 {
+        return;
+    }
+    let mut times: Vec<u64> = recent
+        .iter()
+        .filter_map(|e| e.time_to_decision_ms)
+        .collect();
+    times.sort_unstable();
+    let median_ms = times[times.len() / 2];
+    let reflex = times.iter().filter(|t| **t < REFLEX_SECS * 1_000).count();
+    let advised: Vec<bool> = recent.iter().filter_map(|e| e.advice_followed).collect();
+    let followed = advised.iter().filter(|f| **f).count();
+    let habits = format!(
+        "{} prompts: median {:.1}s to answer, {} answered in under {REFLEX_SECS}s{}.",
+        times.len(),
+        median_ms as f64 / 1000.0,
+        reflex,
+        if advised.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; the advisor was followed {followed} of {} times",
+                advised.len()
+            )
+        }
+    );
+    if median_ms < REFLEX_SECS * 1_000 {
+        out.push(Finding {
+            level: Level::Warn,
+            title: "Grant prompts are being answered faster than they can be read".into(),
+            detail: format!(
+                "Nothing to run; something to notice. {habits} A prompt answered in under \
+                 {REFLEX_SECS}s was not read, so the sandbox is only as strong as the reflex. \
+                 Prefer `session` answers, let profiles cover the toolchain paths, and read the \
+                 advisor line (SPEC R-PERM.9)."
+            ),
+            fix: None,
+        });
+    } else {
+        out.push(Finding {
+            level: Level::Info,
+            title: "Grant prompts are being read".into(),
+            detail: format!("Nothing more to do. {habits}"),
+            fix: None,
+        });
+    }
+}
+
+#[cfg(test)]
+mod decision_habit_tests {
+    use super::*;
+    use crate::permissions::{AuditAction, AuditEntry, GrantKind, GrantTier, audit_entry};
+
+    fn entry(ms: u64, followed: Option<bool>) -> AuditEntry {
+        audit_entry(
+            "t",
+            AuditAction::Grant,
+            GrantKind::FsScope,
+            "/x",
+            Some("rw".into()),
+            GrantTier::Session,
+            Some("tui".into()),
+        )
+        .with_request("d", Some(ms), None)
+        .with_advice(followed.map(|_| "advisor: session".into()), followed)
+    }
+
+    /// SPEC R-DOCTOR.8: reflex answers are reported as the theater they are.
+    #[test]
+    fn reflex_answers_are_a_warning_and_read_ones_are_not() {
+        let fast: Vec<AuditEntry> = (0..6).map(|_| entry(900, Some(true))).collect();
+        let mut out = Vec::new();
+        check_decision_habits(&fast, &mut out);
+        assert_eq!(out[0].level, Level::Warn, "{out:?}");
+        assert!(out[0].detail.contains("median 0.9s"), "{}", out[0].detail);
+        assert!(
+            out[0].detail.contains("followed 6 of 6"),
+            "{}",
+            out[0].detail
+        );
+
+        let slow: Vec<AuditEntry> = (0..6).map(|i| entry(8_000 + i, None)).collect();
+        let mut out = Vec::new();
+        check_decision_habits(&slow, &mut out);
+        assert_eq!(out[0].level, Level::Info, "{out:?}");
+        assert!(
+            out[0].detail.starts_with("Nothing more to do."),
+            "{}",
+            out[0].detail
+        );
+
+        let mut none = Vec::new();
+        check_decision_habits(&[], &mut none);
+        assert!(none.is_empty(), "fewer than five prompts say nothing");
+    }
 }

@@ -1504,6 +1504,8 @@ mod tests {
             HubMsg::SubmitScopeGrant {
                 decision_id: "d1".to_string(),
                 decision: ahma_common::scope_grant::GrantDecision::Deny,
+                advice: None,
+                advice_followed: None,
             },
         );
         assert!(matches!(a, Applied::None));
