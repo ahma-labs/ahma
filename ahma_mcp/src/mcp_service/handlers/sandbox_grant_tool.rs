@@ -41,6 +41,7 @@ use super::common;
 use crate::AhmaMcpService;
 use crate::mcp_service::schema;
 use ahma_common::config::{ScopeAccess, ahma_home_dir, settings_path};
+use ahma_common::scope_grant::GrantStatus;
 use rmcp::model::{CallToolResult, ErrorData as McpError};
 use serde_json::{Map, Value};
 use std::path::{Component, Path, PathBuf};
@@ -160,9 +161,9 @@ impl AhmaMcpService {
 
         // Confirmed and not denylisted. `confirm: true` is the model's word,
         // never the human's (SPEC R5.4.5): raise the question at a human surface
-        // through the permission ladder and return without writing. If the
-        // ladder's human says yes, the broker persists the grant (audited,
-        // denylisted) and we apply it to the live session here (R5.4.6).
+        // through the permission ladder. Whatever the human answers, the broker
+        // applies (live, and at the `always` tier persisted through the audited,
+        // denylisted chokepoint); this handler only reports the answer.
         let raised = self
             .adapter
             .request_scope_grant_with(
@@ -172,30 +173,36 @@ impl AhmaMcpService {
                 Some(&reason),
             )
             .await;
-        let approved = ahma_common::config::AhmaSettings::load_from_result(&settings_file)
-            .ok()
-            .and_then(|s| s.sandbox.find_scope(&path).map(|g| g.access));
-        match approved {
-            Some(granted) => {
-                if let Err(why) = self.adapter.sandbox().add_live_grant(&path, granted) {
-                    return Ok(common::text_result(format!(
-                        "Refused: {why}. Nothing to grant here; tell the human."
-                    )));
-                }
-                Ok(common::text_result(approved_text(
-                    &path,
-                    granted,
-                    &settings_file,
-                )))
+        let text = match &raised {
+            None if self.adapter.grant_budget_exhausted() => {
+                not_raised_text(&path, access, &settings_file, NotRaised::BudgetSpent)
             }
-            None => Ok(common::text_result(agent_requested_text(
-                &path,
-                access,
-                &settings_file,
-                raised.as_ref(),
-                self.adapter.grant_budget_exhausted(),
-            ))),
-        }
+            None => not_raised_text(&path, access, &settings_file, NotRaised::Suppressed),
+            Some(req) => match self.adapter.grant_status(&req.decision_id) {
+                GrantStatus::Decided(decision) => match decision.access() {
+                    // A `once` grant arms the *next* command and is not in
+                    // scope yet; every other tier must already be live, and
+                    // when it is not (the save failed, or the live gate
+                    // refused it) saying "approved" would be a lie.
+                    Some(_)
+                        if decision.tier() != ahma_common::permissions::GrantTier::Once
+                            && !self.adapter.sandbox().is_path_in_scope(&path) =>
+                    {
+                        format!(
+                            "A human approved access to\n  {}\n\nbut ahma could not apply it (the \
+                             server log says why). Nothing changed. Tell the human, and do not \
+                             ask again.",
+                            path.display()
+                        )
+                    }
+                    Some(granted) => approved_text(&path, granted, decision, &settings_file),
+                    None => declined_text(&path, access),
+                },
+                GrantStatus::Pending => pending_text(&path, access, &settings_file, req),
+                GrantStatus::Closed => nobody_asked_text(&path, access, &settings_file, req),
+            },
+        };
+        Ok(common::text_result(text))
     }
 }
 
@@ -326,69 +333,134 @@ fn preview_text(
     )
 }
 
-/// Message when `confirm: true` was routed to the human approval surfaces and
-/// nothing came back yet. Carries the exact body the human sees (SPEC
-/// R-PERM.3.4) so a client that cannot show a prompt relays it unchanged.
-fn agent_requested_text(
-    path: &Path,
-    access: ScopeAccess,
-    settings_file: &Path,
-    raised: Option<&ahma_common::scope_grant::ScopeGrantRequest>,
-    budget_exhausted: bool,
-) -> String {
+/// The paste-able commands a human can run instead, for every message that
+/// leaves the agent without a grant.
+fn cli_alternatives(path: &Path, access: ScopeAccess, settings_file: &Path) -> String {
     let ro_flag = if access == ScopeAccess::Ro {
         " --read-only"
     } else {
         ""
     };
-    let (status, body) = match raised {
-        Some(req) => (
-            "Blocked until a human answers. The question was raised at the human surfaces (your \
-             client's prompt if it supports one, else an attached ahma TUI). It is NOT granted \
-             until a person approves it; Enter/Esc deny. If your client shows no prompt, show the \
-             human the text below UNCHANGED and stop asking.",
-            ahma_common::grant_prompt::render(req).to_text(),
-        ),
-        None if budget_exhausted => (
-            "Not raised: this session has used its prompt budget. Stop requesting grants; tell \
-             the human in conversation what you need and why, and continue with what you have.",
-            String::new(),
-        ),
-        None => (
-            "Not raised: this path was already asked about this session, is refused outright, or \
-             no surface can ask. Nothing is granted.",
-            String::new(),
-        ),
-    };
     format!(
-        "Requested {access} access to\n  {path}\n\n{status}\n\n{body}\
-         A human can also run:\n  ahma sandbox grant {path}{ro_flag} --session   # this \
+        "A human can also run:\n  ahma sandbox grant {path}{ro_flag} --session   # this \
          terminal session\n  ahma sandbox grant {path}{ro_flag}             # until revoked\n\n\
          Grants are written to {file} (outside every sandbox scope); a human-approved grant \
          applies to this session immediately.",
-        access = access.label(),
         path = path.display(),
-        status = status,
-        body = if body.is_empty() {
-            String::new()
-        } else {
-            format!("{body}\n")
-        },
-        ro_flag = ro_flag,
         file = settings_file.display(),
     )
 }
 
-/// Message when the human approved the request at a surface and the grant is
-/// now in the settings file and applied to the live session.
-fn approved_text(path: &Path, granted: ScopeAccess, settings_file: &Path) -> String {
+/// Why nothing was put to a human.
+enum NotRaised {
+    /// The session's prompt budget is spent (SPEC R-PERM.4.5).
+    BudgetSpent,
+    /// Already asked this session, refused outright, or no surface is wired.
+    Suppressed,
+}
+
+/// Message when the request never became a question.
+fn not_raised_text(
+    path: &Path,
+    access: ScopeAccess,
+    settings_file: &Path,
+    why: NotRaised,
+) -> String {
+    let status = match why {
+        NotRaised::BudgetSpent => {
+            "Not raised: this session has used its prompt budget. Stop requesting grants; tell \
+             the human in conversation what you need and why, and continue with what you have."
+        }
+        NotRaised::Suppressed => {
+            "Not raised: this path was already asked about this session, is refused outright, or \
+             no surface can ask. Nothing is granted."
+        }
+    };
     format!(
-        "✓ A human approved {access} access to\n  {path}\n\n\
-         Recorded in {file} and applied to this session immediately. You can now re-run the \
+        "Requested {access} access to\n  {path}\n\n{status}\n\n{cli}",
+        access = access.label(),
+        path = path.display(),
+        cli = cli_alternatives(path, access, settings_file),
+    )
+}
+
+/// Message when the question is parked at a surface that has not answered yet
+/// (an attached ahma TUI). Carries the exact body the human sees (SPEC
+/// R-PERM.3.4) so the agent can relay it.
+fn pending_text(
+    path: &Path,
+    access: ScopeAccess,
+    settings_file: &Path,
+    req: &ahma_common::scope_grant::ScopeGrantRequest,
+) -> String {
+    format!(
+        "Requested {access} access to\n  {path}\n\nBlocked until a human answers. The question \
+         is waiting in the ahma TUI. It is NOT granted until a person approves it; Enter/Esc deny. \
+         Do not ask again; tell the human it is waiting there.\n\n{body}\n{cli}",
+        access = access.label(),
+        path = path.display(),
+        body = ahma_common::grant_prompt::render(req).to_message(),
+        cli = cli_alternatives(path, access, settings_file),
+    )
+}
+
+/// Message when the question reached no human surface at all (rung 3, SPEC
+/// R-PERM.3): the agent is the only way it reaches a person.
+fn nobody_asked_text(
+    path: &Path,
+    access: ScopeAccess,
+    settings_file: &Path,
+    req: &ahma_common::scope_grant::ScopeGrantRequest,
+) -> String {
+    format!(
+        "Requested {access} access to\n  {path}\n\nBlocked until a human grants it: no surface \
+         could ask them (this client shows no prompts and no ahma TUI is attached). Nothing is \
+         granted. Show the human the text below UNCHANGED, then stop asking.\n\n{body}\n{cli}",
+        access = access.label(),
+        path = path.display(),
+        body = ahma_common::grant_prompt::render(req).to_message(),
+        cli = cli_alternatives(path, access, settings_file),
+    )
+}
+
+/// Message when a human declined. It is an answer: the path is not asked about
+/// again this session (SPEC R-PERM.4).
+fn declined_text(path: &Path, access: ScopeAccess) -> String {
+    format!(
+        "A human declined {access} access to\n  {path}\n\nNothing is granted, and this path will \
+         not be asked about again this session. Continue without it, or explain in conversation \
+         why you need it.",
+        access = access.label(),
+        path = path.display(),
+    )
+}
+
+/// Message when the human approved: the tier they chose decides how long the
+/// grant lasts and whether anything was written (SPEC R-PERM.2).
+fn approved_text(
+    path: &Path,
+    granted: ScopeAccess,
+    decision: ahma_common::scope_grant::GrantDecision,
+    settings_file: &Path,
+) -> String {
+    use ahma_common::permissions::GrantTier;
+    let how_long = match decision.tier() {
+        GrantTier::Always => format!(
+            "Saved to {} for this workspace and applied to this session now.",
+            settings_file.display()
+        ),
+        GrantTier::Session => {
+            "Granted for this session only (never written to disk) and applied now.".to_string()
+        }
+        GrantTier::Once => {
+            "Granted for the next command only: run the blocked command next.".to_string()
+        }
+    };
+    format!(
+        "✓ A human approved {access} access to\n  {path}\n\n{how_long} You can now re-run the \
          command that was blocked.",
         access = granted.label(),
         path = path.display(),
-        file = settings_file.display(),
     )
 }
 

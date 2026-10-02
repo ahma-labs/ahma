@@ -250,6 +250,19 @@ pub enum GrantResolveOutcome {
     Unknown,
 }
 
+/// Where one raised question stands, for the surface that has to tell the
+/// agent what happened (SPEC R-PERM.9: lead with whether anyone must act).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantStatus {
+    /// Still awaiting a human answer at some surface.
+    Pending,
+    /// A human answered; this is the answer.
+    Decided(GrantDecision),
+    /// Closed without an answer: nobody could be asked, or the asking session
+    /// ended. Nothing was granted and nothing was decided.
+    Closed,
+}
+
 /// Coordinates in-flight scope-grant decisions across surfaces. Cheap to share
 /// behind an `Arc`; all state is behind one mutex.
 #[derive(Debug, Default)]
@@ -269,6 +282,9 @@ struct Inner {
     /// `decision_id`s already resolved — makes [`GrantCoordinator::resolve`]
     /// idempotent and lets late twin answers no-op.
     resolved: HashSet<String>,
+    /// The answer each resolved decision got, so the surface that raised it can
+    /// report it (SPEC R-PERM.9). Cancelled decisions have no entry.
+    decided: HashMap<String, GrantDecision>,
     /// How often each `(path, access)` was asked this session, and when first:
     /// a repeat is shown as a pattern at the prompt (SPEC R-PERM.3.4).
     ask_counts: HashMap<(PathBuf, ScopeAccess), (u32, u64)>,
@@ -468,6 +484,7 @@ impl GrantCoordinator {
             return GrantResolveOutcome::Unknown;
         };
         inner.resolved.insert(decision_id.to_string());
+        inner.decided.insert(decision_id.to_string(), decision);
         inner.active_keys.remove(&(req.path.clone(), req.access));
         let time_to_decision_ms = inner
             .raised_at
@@ -529,6 +546,19 @@ impl GrantCoordinator {
     /// Whether `decision_id` is still awaiting an answer.
     pub fn is_in_flight(&self, decision_id: &str) -> bool {
         self.inner.lock().in_flight.contains_key(decision_id)
+    }
+
+    /// Where `decision_id` stands: awaiting an answer, answered (and how), or
+    /// closed with no answer. An id this coordinator never issued is `Closed`.
+    pub fn status(&self, decision_id: &str) -> GrantStatus {
+        let inner = self.inner.lock();
+        if inner.in_flight.contains_key(decision_id) {
+            GrantStatus::Pending
+        } else if let Some(d) = inner.decided.get(decision_id) {
+            GrantStatus::Decided(*d)
+        } else {
+            GrantStatus::Closed
+        }
     }
 }
 

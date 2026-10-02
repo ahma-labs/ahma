@@ -1,0 +1,34 @@
+Allow read+write access to /Users/u/Library/Caches/sccache?
+
+Who is asking
+  claude-code · workspace /Users/u/github/proj · session 8d387500 · pid 4242
+
+What was blocked
+  cargo_build tried to write /Users/u/Library/Caches/sccache/0/1/obj
+  command: cargo build --release
+  read from the command's error output: double-check the path
+  evidence: error: failed to write /Users/u/Library/Caches/sccache/0/1/obj: Operation not permitted
+  asked 2 times this session (first at 09:05 UTC)
+
+What the agent says it needs
+  "sccache keeps its compiler cache there"
+  (the agent's claim, in the agent's own words — it is the party asking, not a witness)
+
+Minimum that would work
+  read+write on /Users/u/Library/Caches/sccache (a write was refused, so read-only would not fix it)
+
+What a grant allows
+  every command in /Users/u/github/proj may read and write /Users/u/Library/Caches/sccache — for the next command (once), until this session ends (session), or until you revoke it (always). Nothing else outside the workspace changes.
+
+Risk
+  HIGH
+  ! is a hidden-data directory in your home folder
+  - directory with 12 entries
+
+If you choose always
+  ~/.ahma/settings.toml gets:
+  [[sandbox.persistent_scopes]]
+  path = "/Users/u/Library/Caches/sccache"
+  access = "rw"
+  workspace = "/Users/u/github/proj"
+  Revoke any time with: ahma sandbox revoke /Users/u/Library/Caches/sccache

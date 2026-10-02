@@ -47,8 +47,14 @@ pub struct PromptBody {
 }
 
 impl PromptBody {
-    /// Plain text for a terminal or an elicitation message.
-    pub fn to_text(&self) -> String {
+    /// The question without its choices: the title and every section.
+    ///
+    /// What an elicitation message, a terminal hook and a relayed tool result
+    /// show. Each of those carries the choices its own way — the form as a
+    /// titled select, the hook and the tool result as the exact commands — so
+    /// listing them again here, with TUI key letters nobody can press there,
+    /// only adds noise to the one screen a hurried human reads.
+    pub fn to_message(&self) -> String {
         let mut out = format!("{}\n", self.title);
         for s in &self.sections {
             out.push_str(&format!(
@@ -57,9 +63,15 @@ impl PromptBody {
                 s.body.replace('\n', "\n  ")
             ));
         }
+        out
+    }
+
+    /// [`Self::to_message`] followed by the choices, by name, deny first.
+    pub fn to_text(&self) -> String {
+        let mut out = self.to_message();
         out.push_str("\nChoices (deny is the default):\n");
         for o in &self.options {
-            out.push_str(&format!("  [{}] {:<20} {}\n", o.key, o.value, o.label));
+            out.push_str(&format!("  {:<20} {}\n", o.value, o.label));
         }
         out
     }
@@ -316,23 +328,30 @@ pub fn parse_decision(s: &str) -> GrantDecision {
 }
 
 /// The body for a denial a terminal hook reports, where no coordinator request
-/// exists: the same sections, built from what the hook knows.
-pub fn render_for_hook(path: &Path, access: ScopeAccess, details: &str) -> PromptBody {
+/// exists: the same sections, built from what the hook knows. `context` carries
+/// who asked and the risk; the first line of `details` becomes the evidence when
+/// the context has none.
+pub fn render_for_hook(
+    path: &Path,
+    access: ScopeAccess,
+    details: &str,
+    mut context: crate::scope_grant::GrantContext,
+) -> PromptBody {
+    if context.evidence.is_none() {
+        context.evidence = Some(crate::scope_grant::GrantEvidence {
+            raw_path: None,
+            pattern: None,
+            line: Some(details.lines().next().unwrap_or("").to_string()),
+        });
+    }
+    context.write_denied = context.write_denied || access.is_write();
     let req = ScopeGrantRequest {
         decision_id: String::new(),
         path: path.to_path_buf(),
         access,
         reason: GrantReason::StderrHeuristic,
         tool: Some("a hooked shell command".into()),
-        context: crate::scope_grant::GrantContext {
-            evidence: Some(crate::scope_grant::GrantEvidence {
-                raw_path: None,
-                pattern: None,
-                line: Some(details.lines().next().unwrap_or("").to_string()),
-            }),
-            write_denied: access.is_write(),
-            ..Default::default()
-        },
+        context,
     };
     render(&req)
 }
@@ -353,5 +372,78 @@ mod tests {
         dedup.sort_unstable();
         dedup.dedup();
         assert_eq!(keys.len(), dedup.len(), "keys are unique: {keys:?}");
+    }
+
+    /// A request with every judgement aid filled in, the shape the MCP worker
+    /// raises for a runtime denial.
+    fn full_request() -> ScopeGrantRequest {
+        use crate::scope_grant::{GrantContext, GrantEvidence, GrantRequester, GrantRiskSummary};
+        ScopeGrantRequest {
+            decision_id: "d-golden".into(),
+            path: "/Users/u/Library/Caches/sccache".into(),
+            access: ScopeAccess::Rw,
+            reason: GrantReason::StderrHeuristic,
+            tool: Some("cargo_build".into()),
+            context: GrantContext {
+                requester: Some(GrantRequester {
+                    client: Some("claude-code".into()),
+                    session_id: Some("8d387500-2ff3-4b2e-9a51".into()),
+                    workspace: Some("/Users/u/github/proj".into()),
+                    pid: 4242,
+                }),
+                op_id: Some("op_7".into()),
+                command: Some("cargo build --release".into()),
+                evidence: Some(GrantEvidence {
+                    raw_path: Some("/Users/u/Library/Caches/sccache/0/1/obj".into()),
+                    pattern: Some("Operation not permitted".into()),
+                    line: Some(
+                        "  error: failed to write /Users/u/Library/Caches/sccache/0/1/obj: \
+                         Operation not permitted  "
+                            .into(),
+                    ),
+                }),
+                agent_claim: Some("sccache keeps its compiler cache there".into()),
+                risk: Some(GrantRiskSummary {
+                    class: "high".into(),
+                    warnings: vec!["is a hidden-data directory in your home folder".into()],
+                    facts: vec!["directory with 12 entries".into()],
+                }),
+                times_asked: 2,
+                first_asked_at: Some(3_600 * 9 + 60 * 5),
+                write_denied: true,
+            },
+        }
+    }
+
+    /// GOLDEN: the exact text a human reads at an elicitation prompt, a
+    /// terminal hook and a relayed tool result (SPEC R-PERM.3.4). Substring
+    /// assertions let a section quietly lose its content while the heading
+    /// survives; a byte-for-byte comparison makes every change to what the
+    /// human reads a reviewed diff. To accept an intended change, update
+    /// `testdata/grant_prompt_full.txt`.
+    #[test]
+    fn the_full_prompt_reads_exactly_as_reviewed() {
+        let got = render(&full_request()).to_message();
+        let want = include_str!("testdata/grant_prompt_full.txt");
+        assert_eq!(
+            got, want,
+            "the grant prompt changed; review it and update testdata/grant_prompt_full.txt:\n{got}"
+        );
+    }
+
+    /// The choices are listed by name, deny first, with no TUI key letters:
+    /// nobody can press a key in a terminal hook or a relayed tool result.
+    #[test]
+    fn the_text_form_names_choices_without_keys() {
+        let text = render(&full_request()).to_text();
+        assert!(text.contains("Choices (deny is the default):"), "{text}");
+        let choices = text.split("Choices").nth(1).unwrap();
+        assert!(
+            choices
+                .trim_start_matches(|c| c != '\n')
+                .trim_start()
+                .starts_with("deny")
+        );
+        assert!(!text.contains("[n]") && !text.contains("[Y]"), "{text}");
     }
 }

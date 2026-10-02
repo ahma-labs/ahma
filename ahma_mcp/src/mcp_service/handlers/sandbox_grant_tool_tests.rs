@@ -458,7 +458,7 @@ fn resolve_grant_path_falls_back_to_lexical_clean_for_missing_path() {
     );
 }
 
-// ── agent_requested_text (pure, every branch) ───────────────────────────────
+// ── message builders (pure, every outcome) ─────────────────────────────────
 
 fn sample_request() -> ahma_common::scope_grant::ScopeGrantRequest {
     ahma_common::scope_grant::ScopeGrantRequest {
@@ -474,22 +474,23 @@ fn sample_request() -> ahma_common::scope_grant::ScopeGrantRequest {
     }
 }
 
+const SETTINGS: &str = "/home/u/.ahma/settings.toml";
+
 #[test]
-fn agent_requested_text_when_surface_raised_relays_the_body() {
+fn pending_text_relays_the_body_and_says_where_it_waits() {
     let req = sample_request();
-    let text = agent_requested_text(
+    let text = pending_text(
         Path::new("/cache/x"),
         ScopeAccess::Ro,
-        Path::new("/home/u/.ahma/settings.toml"),
-        Some(&req),
-        false,
+        Path::new(SETTINGS),
+        &req,
     );
     assert!(text.starts_with("Requested read-only access"), "{text}");
     assert!(text.contains("Blocked until a human answers"), "{text}");
+    assert!(text.contains("ahma TUI"), "{text}");
     // The same body the human sees (SPEC R-PERM.3.4), claim labelled as a claim.
     assert!(text.contains("What the agent says it needs"), "{text}");
     assert!(text.contains("shared model cache"), "{text}");
-    assert!(text.contains("UNCHANGED"), "{text}");
     assert!(
         text.contains("ahma sandbox grant /cache/x --read-only --session"),
         "{text}"
@@ -497,28 +498,59 @@ fn agent_requested_text_when_surface_raised_relays_the_body() {
 }
 
 #[test]
-fn agent_requested_text_when_nothing_was_raised() {
-    let text = agent_requested_text(
+fn nobody_asked_text_tells_the_agent_to_relay_the_body() {
+    let req = sample_request();
+    let text = nobody_asked_text(
+        Path::new("/cache/x"),
+        ScopeAccess::Ro,
+        Path::new(SETTINGS),
+        &req,
+    );
+    assert!(text.contains("no surface could ask"), "{text}");
+    assert!(text.contains("UNCHANGED"), "{text}");
+    assert!(text.contains("What the agent says it needs"), "{text}");
+}
+
+#[test]
+fn not_raised_text_names_the_reason() {
+    let text = not_raised_text(
         Path::new("/cache/x"),
         ScopeAccess::Rw,
-        Path::new("/home/u/.ahma/settings.toml"),
-        None,
-        false,
+        Path::new(SETTINGS),
+        NotRaised::Suppressed,
     );
     assert!(text.contains("Not raised"), "{text}");
     assert!(text.contains("Nothing is granted"), "{text}");
-    let text = agent_requested_text(
+    let text = not_raised_text(
         Path::new("/cache/x"),
         ScopeAccess::Rw,
-        Path::new("/home/u/.ahma/settings.toml"),
-        None,
-        true,
+        Path::new(SETTINGS),
+        NotRaised::BudgetSpent,
     );
     assert!(text.contains("prompt budget"), "{text}");
     assert!(text.contains("tell the human in conversation"), "{text}");
 }
 
-// ── declined_text (pure; unreachable via the handler without a mocked Peer) ─
+#[test]
+fn approved_text_states_the_tier_the_human_chose() {
+    use ahma_common::scope_grant::GrantDecision;
+    let p = Path::new("/cache/x");
+    let f = Path::new(SETTINGS);
+    let always = approved_text(p, ScopeAccess::Rw, GrantDecision::GrantRw, f);
+    assert!(always.contains(SETTINGS), "{always}");
+    let session = approved_text(p, ScopeAccess::Rw, GrantDecision::GrantRwSession, f);
+    assert!(session.contains("this session only"), "{session}");
+    assert!(!session.contains(SETTINGS), "{session}");
+    let once = approved_text(p, ScopeAccess::Ro, GrantDecision::GrantRoOnce, f);
+    assert!(once.contains("next command only"), "{once}");
+}
+
+#[test]
+fn declined_text_is_an_answer() {
+    let text = declined_text(Path::new("/cache/x"), ScopeAccess::Ro);
+    assert!(text.contains("A human declined"), "{text}");
+    assert!(text.contains("not be asked about again"), "{text}");
+}
 
 // ── handler: argument validation errors ──────────────────────────────────────
 
@@ -647,59 +679,27 @@ async fn sandbox_grant_confirm_without_elicitation_does_not_write_settings() {
     unsafe { std::env::remove_var("AHMA_TEST_HOME") };
 }
 
-/// With a human surface attached (here: a notifier standing in for the TUI
-/// modal, which persists through the same chokepoint the real one uses), a
-/// `confirm: true` request that the human approves ends up in the settings
-/// file, audited, and applied to the live session.
+/// With a human surface attached — the real broker asking a client that shows
+/// elicitation prompts — a `confirm: true` request the human approves at the
+/// `always` tier ends up in the settings file bound to this workspace, audited,
+/// and applied to the live session.
 #[tokio::test]
 async fn sandbox_grant_human_approval_applies_live_and_persists() {
-    use crate::sandbox::ScopeGrantNotifier;
-    use ahma_common::config::ScopeAccess;
-    use ahma_common::scope_grant::{GrantReason, NewGrant, persist_grant};
-
-    #[derive(Debug)]
-    struct ApprovingHuman {
-        file: PathBuf,
-    }
-    #[async_trait::async_trait]
-    impl ScopeGrantNotifier for ApprovingHuman {
-        async fn notify_violation(
-            &self,
-            path: &std::path::Path,
-            access: ScopeAccess,
-            _reason: GrantReason,
-            tool: Option<String>,
-        ) {
-            persist_grant(
-                &self.file,
-                NewGrant {
-                    path,
-                    access,
-                    granted_by: tool,
-                    granted_at: Some("2026-10-02".into()),
-                    note: None,
-                    surface: "tui",
-                    live_scopes: &[],
-                    workspace: None,
-                },
-            )
-            .unwrap();
-        }
-    }
-
     let tmp = tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     unsafe { std::env::set_var("AHMA_TEST_HOME", &home) };
     let settings_file = home.join(".ahma").join("settings.toml");
 
-    let (service, _scope) = crate::test_utils::in_process::build_test_service_with_notifier(
-        std::sync::Arc::new(ApprovingHuman {
-            file: settings_file.clone(),
-        }),
-    )
-    .await
-    .unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let client = crate::test_utils::recording_client::RecordingClient::new("cursor")
+        .with_elicitation(Some("read-write"));
+    let (mcp, _broker) =
+        crate::test_utils::in_process::create_in_process_mcp_with_broker(client, &workspace, None)
+            .await
+            .unwrap();
+    let service = &mcp.service;
 
     let external_dir = tmp.path().join("external_cache");
     std::fs::create_dir_all(&external_dir).unwrap();
@@ -726,15 +726,21 @@ async fn sandbox_grant_human_approval_applies_live_and_persists() {
         .filter_map(|c| c.as_text().map(|t| t.text.clone()))
         .collect::<String>();
     assert!(text.contains("A human approved"), "{text}");
+    assert!(text.contains("for this workspace"), "{text}");
     assert!(
         service.adapter.sandbox().is_path_in_scope(&canon_external),
         "a human-approved grant widens the live session immediately (R5.4.6)"
     );
     let written = std::fs::read_to_string(&settings_file).unwrap();
     assert!(written.contains("external_cache"), "{written}");
+    let canon_workspace = dunce::canonicalize(&workspace).unwrap();
+    assert!(
+        written.contains(&*canon_workspace.to_string_lossy()),
+        "an always grant is bound to the workspace that asked (R5.4.11): {written}"
+    );
     let audit = std::fs::read_to_string(home.join(".ahma").join("permissions-audit.jsonl"))
         .expect("the chokepoint audits every grant");
-    assert!(audit.contains("\"surface\":\"tui\""), "{audit}");
+    assert!(audit.contains("\"surface\":\"harness\""), "{audit}");
 }
 
 /// The hard denylist must hold when `$HOME` reaches ahma through a symlink.

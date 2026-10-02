@@ -29,7 +29,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, info, warn};
 
 /// The shared scope-grant plumbing handed to the reporter. The `coordinator` is
-/// the same instance the [`crate::sandbox::HubGrantNotifier`] uses, so a request it
+/// the same instance the [`crate::sandbox::PermissionBroker`] uses, so a request it
 /// emits and the answer routed back here resolve against one coordinator (dedup,
 /// first-answer-wins, dismiss). `req_rx` receives fresh requests to forward to the
 /// hub as `ClientMsg::Relay(HubRelay::ScopeGrantRequested)`.
