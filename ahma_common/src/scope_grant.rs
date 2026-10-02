@@ -1202,7 +1202,8 @@ mod refused_path_gate_tests {
         // The refusal is reportable to the agent as text, not a silent `None`.
         let why = refusal_reason(&home.join(".ssh")).expect("a reason is given");
         assert!(why.contains("credentials"), "{why}");
-        assert!(refusal_reason(Path::new("/etc")).is_some());
+        let system_dir = if cfg!(windows) { "C:\\Windows" } else { "/etc" };
+        assert!(refusal_reason(Path::new(system_dir)).is_some());
     }
 }
 

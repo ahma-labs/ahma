@@ -32,16 +32,25 @@ pub fn allow_gpu_enabled() -> bool {
 
 /// The IOKit user-client classes Metal needs. Taken from Apple's shipped
 /// `/System/Library/Sandbox/Profiles/*.sb`, which allow exactly these for
-/// GPU-using daemons; `AGX*` is Apple silicon, `IOAccel*` is Intel/AMD.
+/// GPU-using daemons: `AGX*` is Apple silicon hardware, `IOAccel*` and
+/// `IGAccel*` are AMD and Intel, and `IOGPUDeviceUserClient` is the IOGPUFamily
+/// client that paravirtualised GPUs present inside a VM (Apple's own
+/// `ParavirtualizedGraphicsGPUTask.sb` allows exactly that one plus IOSurface),
+/// which is what a macOS CI runner has.
 const GPU_USER_CLIENTS: &[&str] = &[
     "AGXDeviceUserClient",
     "AGXSharedUserClient",
     "AGXCommandQueue",
+    "IOGPUDeviceUserClient",
     "IOAccelDevice2",
     "IOAccelSharedUserClient2",
     "IOAccelContext2",
     "IOAccelCommandQueue",
+    "IGAccelDevice",
+    "IGAccelSharedUserClient",
+    "IGAccelCommandQueue",
     "IOSurfaceRootUserClient",
+    "IOSurfaceAcceleratorClient",
 ];
 
 /// The Seatbelt rules for GPU access under the current setting: empty when the
