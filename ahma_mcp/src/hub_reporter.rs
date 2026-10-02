@@ -376,6 +376,7 @@ fn persist_resolved_grant(
                         surface: "tui",
                         live_scopes: &live_scopes,
                         workspace: workspace.as_deref(),
+                        expires_at: None,
                     },
                 ) {
                     Ok(_) => tracing::info!(

@@ -139,6 +139,10 @@ impl AhmaMcpService {
                 ));
             }
         }
+        out.push_str(&lease_forecast(
+            &sandbox.persistent_grants_in_effect(),
+            ahma_common::config::unix_now(),
+        ));
         out.push_str(
             "  Only a human can widen this: they approve a prompt in the ahma TUI or run \
              `ahma sandbox grant <dir>`; `sandbox_grant` only asks.\n",
@@ -194,6 +198,40 @@ impl AhmaMcpService {
     }
 }
 
+/// How far ahead `status` warns about leases (SPEC R-PERM.2.3): long enough
+/// to cover an overnight run.
+const LEASE_FORECAST_SECS: u64 = 12 * 3_600;
+
+/// The leases in force that end within [`LEASE_FORECAST_SECS`], so an agent
+/// about to start a long unattended run can ask the human to renew them once,
+/// before it starts, instead of losing access partway through.
+fn lease_forecast(grants: &[ahma_common::config::PersistentScope], now: u64) -> String {
+    let mut due: Vec<_> = grants
+        .iter()
+        .filter_map(|g| {
+            let at = g.expires_at?;
+            (at > now && at - now <= LEASE_FORECAST_SECS).then_some((at - now, g))
+        })
+        .collect();
+    if due.is_empty() {
+        return String::new();
+    }
+    due.sort_by_key(|(left, _)| *left);
+    let mut out = String::from(
+        "  expiring within 12h (before a long run, ask the human to renew what it needs):\n",
+    );
+    for (left, g) in due {
+        out.push_str(&format!(
+            "    {} ({}) ends in {} — ahma sandbox renew {} --for 24h\n",
+            g.path.display(),
+            g.access.label(),
+            ahma_common::config::fmt_lease_duration(left),
+            g.path.display()
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod sandbox_report_tests {
     use crate::test_utils::in_process::build_test_service;
@@ -225,5 +263,38 @@ mod sandbox_report_tests {
             .filter_map(|c| c.as_text().map(|t| t.text.clone()))
             .collect::<String>();
         assert!(text.contains("=== SANDBOX ==="), "{text}");
+    }
+
+    #[test]
+    fn status_forecasts_leases_that_end_within_twelve_hours() {
+        use ahma_common::config::{PersistentScope, ScopeAccess};
+        let g = |path: &str, expires_at: Option<u64>| PersistentScope {
+            path: path.into(),
+            access: ScopeAccess::Rw,
+            workspace: None,
+            granted_by: None,
+            granted_at: None,
+            note: None,
+            expires_at,
+        };
+        let now = 1_000_000;
+        let text = super::lease_forecast(
+            &[
+                g("/soon", Some(now + 3 * 3_600)),
+                g("/later", Some(now + 30 * 3_600)),
+                g("/forever", None),
+            ],
+            now,
+        );
+        assert!(text.contains("/soon (read+write) ends in 3h"), "{text}");
+        assert!(
+            text.contains("ahma sandbox renew /soon --for 24h"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("/later") && !text.contains("/forever"),
+            "{text}"
+        );
+        assert!(super::lease_forecast(&[g("/forever", None)], now).is_empty());
     }
 }

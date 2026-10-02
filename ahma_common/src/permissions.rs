@@ -158,6 +158,9 @@ pub struct GrantRecord {
     /// is scoped to. Rendered as a qualifier, never as part of the subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_note: Option<String>,
+    /// When a leased grant stops applying, in Unix seconds (SPEC R-PERM.2.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 /// Project every persisted permission in `settings` into one list (R-PERM.2.1).
@@ -189,6 +192,7 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
                          `ahma sandbox grant <path>` from the project that needs it"
                     .to_string(),
             }),
+            expires_at: s.expires_at,
         });
     }
 
@@ -207,6 +211,7 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
                 surface: None,
                 note: None,
                 scope_note: None,
+                expires_at: None,
             });
         }
     }
@@ -222,6 +227,7 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
             surface: None,
             note: None,
             scope_note: None,
+            expires_at: None,
         });
     }
 
@@ -237,6 +243,7 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
                 surface: approval.surface.clone(),
                 note: None,
                 scope_note: Some(approval.workspace.display().to_string()),
+                expires_at: None,
             });
         }
     }
@@ -521,6 +528,7 @@ impl SessionGrants {
                 surface: None,
                 note: None,
                 scope_note: None,
+                expires_at: None,
             })
             .collect();
         rows.sort_by(|a, b| (a.kind, &a.subject).cmp(&(b.kind, &b.subject)));
@@ -1183,6 +1191,7 @@ mod tests {
             granted_by: Some("sccache".into()),
             granted_at: Some("2026-07-12".into()),
             note: None,
+            expires_at: None,
         });
         s.web.always_allow.push("api.github.com".into());
         s.network.allow.push("crates.io".into());

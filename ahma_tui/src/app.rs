@@ -7575,6 +7575,7 @@ mod tests {
                     granted_by: Some("cargo_build".into()),
                     granted_at: None,
                     note: None,
+                    expires_at: None,
                 });
         })
         .unwrap();

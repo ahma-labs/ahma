@@ -931,6 +931,9 @@ pub struct NewGrant<'a> {
     /// The workspace this grant is for (SPEC R5.4.11); `None` writes a global
     /// grant, which only the CLI's explicit `--global` should ever ask for.
     pub workspace: Option<&'a Path>,
+    /// When the grant stops applying, in Unix seconds — a lease (SPEC
+    /// R-PERM.2.3). `None` lasts until revoked.
+    pub expires_at: Option<u64>,
 }
 
 /// Whether a persistent grant made for `workspace` applies to a session whose
@@ -988,6 +991,7 @@ pub fn persist_grant(settings_file: &Path, grant: NewGrant<'_>) -> Result<GrantO
         granted_by: grant.granted_by,
         granted_at: grant.granted_at.clone(),
         note: grant.note,
+        expires_at: grant.expires_at,
     });
     settings
         .save_to(settings_file)
@@ -1274,6 +1278,7 @@ mod tests {
                 surface: "test",
                 live_scopes: &[],
                 workspace: None,
+                expires_at: None,
             },
         )
         .unwrap();
@@ -1300,6 +1305,7 @@ mod tests {
                 surface: "test",
                 live_scopes: &[],
                 workspace: None,
+                expires_at: None,
             },
         )
         .unwrap();
@@ -1336,6 +1342,7 @@ mod tests {
                 surface: "test",
                 live_scopes: &[],
                 workspace: None,
+                expires_at: None,
             },
         );
         assert!(
@@ -1360,6 +1367,7 @@ mod tests {
             surface: "test",
             live_scopes: scopes,
             workspace: None,
+            expires_at: None,
         }
     }
 

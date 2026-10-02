@@ -352,6 +352,7 @@ impl PermissionBroker {
                             surface: "harness",
                             live_scopes: &live_scopes,
                             workspace: workspace.as_deref(),
+                            expires_at: None,
                         },
                     ) {
                         Ok(_) => tracing::info!(

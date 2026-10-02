@@ -1075,6 +1075,7 @@ mod scope_tests {
             granted_by: Some("user".into()),
             granted_at: None,
             note: None,
+            expires_at: None,
         };
         let target = cache.join("heavy.lock");
         let denied = vec![repo.clone()];
@@ -1112,6 +1113,7 @@ mod scope_tests {
             granted_by: None,
             granted_at: None,
             note: None,
+            expires_at: None,
         };
         let ro_allowed = allowed_edit_scopes(&repo, &[ro]);
         assert!(
