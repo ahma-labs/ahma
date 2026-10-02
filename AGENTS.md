@@ -621,8 +621,8 @@ Capture full logs (`<cmd> 2>&1 | tee …`) and reduce concurrency to a single te
 ### Security Invariants
 
 - **Sandbox scope cannot change during a session.** Validate every user-supplied path through `path_security`; the kernel enforces the scope.
-- **ahma never silently disables enforcement.** Inside a host sandbox (Cursor, VS Code, Docker) it picks one authoritative sandbox per execution path and discloses which, loudly (SPEC R7): terminal hooks **defer to the host** (override with `AHMA_PREFER_OWN_SANDBOX=1`); the **MCP server stays authoritative** because the host does not wrap ahma's own executions, and fails loudly if it cannot sandbox. Detecting a host doesn't prove its sandbox is on — the disclosure says so.
-- **`AHMA_*` configuration env vars are retired and ignored.** Use CLI flags or `~/.ahma/settings.toml`. Still live: `AHMA_HOOKS`, `AHMA_DISABLE_HOOKS`, `AHMA_PREFER_OWN_SANDBOX`.
+- **ahma never silently disables enforcement, and never stands down on an environment marker.** `CLAUDECODE=1`, `CURSOR_SANDBOX`, `VSCODE_*` only prove who launched the process, not that that harness's sandbox is on — a Claude Code session ran every Bash command unsandboxed for days because a hook inferred otherwise. Terminal hooks and the MCP server both apply ahma's own sandbox; the one deferral is the kernel's (macOS refuses to nest a Seatbelt profile, SPEC R7.6), and it is disclosed on every affected command. Markers may *name* the outer sandbox in a disclosure, never decide one (SPEC R7.2).
+- **`AHMA_*` configuration env vars are retired and ignored.** Use CLI flags or `~/.ahma/settings.toml`. Still live: `AHMA_HOOKS`, `AHMA_DISABLE_HOOKS`.
 - Tool configs are validated against the MTDF schema at startup; `format: "path"` triggers path security validation.
 
 ### Windows

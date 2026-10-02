@@ -908,8 +908,10 @@ async fn setup_terminal_hooks(platforms: &[Platform], interactive: bool) -> Resu
         platforms: hook_platforms,
         scope: HookScope::User,
         dry_run: false,
-        // The edit guard stays opt-in (`ahma hooks install --edit-guard`).
+        // The edit guard is on by default (SPEC R5.5.6): the client's native
+        // file edits are confined to the same scope as its shell commands.
         edit_guard: false,
+        no_edit_guard: false,
     };
 
     println!("Installing terminal hooks...");

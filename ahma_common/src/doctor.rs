@@ -244,9 +244,178 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
         input.current_exe.as_deref(),
         &mut findings,
     );
+    check_grant_tools_auto_allowed(input.home_dir.as_deref(), &input.workspace, &mut findings);
+    check_hook_coverage(input.home_dir.as_deref(), &mut findings);
     check_logs(&input.workspace, &mut findings);
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
     findings
+}
+
+/// The MCP tools whose only job is to *request* a wider sandbox or network
+/// scope. A harness that auto-allows them removes the one human step ahma
+/// cannot supply itself when the harness also cannot show an elicitation
+/// prompt (SPEC R5.4.5). This is how an Antigravity agent granted itself a
+/// persistent read-write scope.
+const GRANT_TOOLS: [&str; 2] = ["sandbox_grant", "network_grant"];
+
+/// Every `permissions.allow`-style list in a harness settings file that names
+/// one of the grant tools, as `(file, entry)` pairs.
+fn grant_tool_allow_entries(path: &Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    fn walk(v: &serde_json::Value, under_allow: bool, hits: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    walk(child, under_allow || k == "allow", hits);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, under_allow, hits);
+                }
+            }
+            serde_json::Value::String(s)
+                if under_allow
+                    && GRANT_TOOLS.iter().any(|t| s.contains(t))
+                    && !hits.contains(s) =>
+            {
+                hits.push(s.clone());
+            }
+            _ => {}
+        }
+    }
+    walk(&doc, false, &mut hits);
+    hits
+}
+
+/// Warn when a harness is configured to approve `sandbox_grant`/`network_grant`
+/// without asking a human.
+fn check_grant_tools_auto_allowed(home: Option<&Path>, workspace: &Path, out: &mut Vec<Finding>) {
+    let Some(home) = home else { return };
+    let candidates = [
+        home.join(".gemini")
+            .join("antigravity-cli")
+            .join("settings.json"),
+        home.join(".gemini").join("config").join("config.json"),
+        home.join(".claude").join("settings.json"),
+        workspace.join(".claude").join("settings.json"),
+        workspace.join(".claude").join("settings.local.json"),
+        home.join(".cursor").join("mcp.json"),
+        home.join(".codex").join("config.toml"),
+    ];
+    let mut detail = Vec::new();
+    for path in candidates.iter().filter(|p| p.exists()) {
+        let entries = if path.extension().is_some_and(|e| e == "toml") {
+            // Codex keeps its allow list in TOML; a plain line scan is enough.
+            std::fs::read_to_string(path)
+                .map(|raw| {
+                    raw.lines()
+                        .filter(|l| GRANT_TOOLS.iter().any(|t| l.contains(t)))
+                        .map(|l| l.trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            grant_tool_allow_entries(path)
+        };
+        for e in entries {
+            detail.push(format!("{}: {e}", path.display()));
+        }
+    }
+    if detail.is_empty() {
+        return;
+    }
+    out.push(Finding {
+        level: Level::Warn,
+        title: "A harness auto-approves ahma's grant tools".into(),
+        detail: format!(
+            "`sandbox_grant` / `network_grant` only *request* a wider scope; the human decides. \
+             These allow-list entries let the model call them without a prompt, and a harness \
+             that cannot show ahma's own approval prompt then has no human in the loop at all \
+             (an agent granted itself a read-write directory this way). Remove them: {}",
+            detail.join("; ")
+        ),
+        fix: None,
+    });
+}
+
+/// Whether a harness's hook file carries ahma's shell hook and its edit guard.
+fn hook_file_coverage(path: &Path) -> Option<(bool, bool)> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let shell = raw.contains("hooks exec") || raw.contains("'hooks' 'exec'");
+    let guard = raw.contains("ahma-edit-guard-v1");
+    (shell || guard).then_some((shell, guard))
+}
+
+/// Report, per harness with an ahma shell hook, whether the client's native
+/// file edits are confined too (SPEC R5.5.6), and what Claude Code's own
+/// sandbox setting is — informational, since ahma enforces regardless (R7.2).
+fn check_hook_coverage(home: Option<&Path>, out: &mut Vec<Finding>) {
+    let Some(home) = home else { return };
+    let files = [
+        ("Claude Code", home.join(".claude").join("settings.json")),
+        ("Cursor", home.join(".cursor").join("hooks.json")),
+        ("Codex", home.join(".codex").join("hooks.json")),
+        (
+            "GitHub Copilot CLI",
+            home.join(".copilot").join("hooks").join("ahma.json"),
+        ),
+        (
+            "Antigravity",
+            home.join(".gemini").join("config").join("hooks.json"),
+        ),
+    ];
+    let mut unguarded = Vec::new();
+    let mut covered = Vec::new();
+    for (name, path) in &files {
+        match hook_file_coverage(path) {
+            Some((true, false)) => unguarded.push(*name),
+            Some((true, true)) => covered.push(*name),
+            _ => {}
+        }
+    }
+    let claude_sandbox = std::fs::read_to_string(home.join(".claude").join("settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("sandbox")?.get("enabled")?.as_bool())
+        .unwrap_or(false);
+    if !unguarded.is_empty() {
+        out.push(Finding {
+            level: Level::Warn,
+            title: "Native file edits are not confined in some clients".into(),
+            detail: format!(
+                "{} route shell commands through ahma's sandbox but have no edit guard, so the \
+                 client's own Edit/Write tools can reach any path on this machine. Run \
+                 `ahma hooks install` to add it (SPEC R5.5.6).",
+                unguarded.join(", ")
+            ),
+            fix: None,
+        });
+    }
+    if !covered.is_empty() || !unguarded.is_empty() {
+        out.push(Finding {
+            level: Level::Info,
+            title: "Terminal hooks apply ahma's own sandbox".into(),
+            detail: format!(
+                "Shell hook + edit guard: {}. ahma never defers to a client on an environment \
+                 marker; it defers only when the kernel refuses to nest its sandbox (SPEC R7.2). \
+                 Claude Code's own Bash sandbox is {} — ahma's hook is the sandbox either way.",
+                if covered.is_empty() {
+                    "none".to_string()
+                } else {
+                    covered.join(", ")
+                },
+                if claude_sandbox { "on" } else { "off" }
+            ),
+            fix: None,
+        });
+    }
 }
 
 fn check_settings(input: &DoctorInput, out: &mut Vec<Finding>) -> Option<AhmaSettings> {
@@ -1225,6 +1394,97 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
         assert_eq!(
             probe_hub_blocking(&dir.path().join("absent.sock")),
             HubStatus::NotRunning
+        );
+    }
+}
+
+#[cfg(test)]
+mod hook_and_grant_tool_tests {
+    use super::*;
+
+    fn input(home: &Path, workspace: &Path) -> DoctorInput {
+        DoctorInput {
+            settings_file: Some(home.join("settings.toml")),
+            home_dir: Some(home.to_path_buf()),
+            current_exe: Some(PathBuf::from("/usr/local/bin/ahma")),
+            workspace: workspace.to_path_buf(),
+            hub: HubStatus::NotRunning,
+            version: "1".into(),
+            build_id: "b".into(),
+        }
+    }
+
+    #[test]
+    fn doctor_warns_when_grant_tools_are_auto_allowed_in_antigravity_settings() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let cli_dir = home.path().join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::write(
+            cli_dir.join("settings.json"),
+            r#"{"permissions":{"allow":["mcp(Ahma/run_terminal_command)","mcp(Ahma/sandbox_grant)"]},"toolPermission":"always-proceed"}"#,
+        )
+        .unwrap();
+        let findings = run(&input(home.path(), ws.path()));
+        let f = findings
+            .iter()
+            .find(|f| f.title.contains("auto-approves ahma's grant tools"))
+            .expect("the auto-allowed grant tool must be reported");
+        assert_eq!(f.level, Level::Warn);
+        assert!(f.detail.contains("mcp(Ahma/sandbox_grant)"), "{}", f.detail);
+
+        // A clean allow list says nothing.
+        std::fs::write(
+            cli_dir.join("settings.json"),
+            r#"{"permissions":{"allow":["mcp(Ahma/run_terminal_command)"]}}"#,
+        )
+        .unwrap();
+        let findings = run(&input(home.path(), ws.path()));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("auto-approves ahma's grant tools"))
+        );
+    }
+
+    #[test]
+    fn doctor_warns_when_a_shell_hook_has_no_edit_guard() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'/usr/local/bin/ahma' 'hooks' 'exec' '--platform' 'claude'"}]}]}}"#,
+        )
+        .unwrap();
+        let findings = run(&input(home.path(), ws.path()));
+        let f = findings
+            .iter()
+            .find(|f| f.title.contains("Native file edits are not confined"))
+            .expect("a guard-less shell hook must be reported");
+        assert!(f.detail.contains("Claude Code"), "{}", f.detail);
+        let info = findings
+            .iter()
+            .find(|f| f.title.contains("Terminal hooks apply ahma's own sandbox"))
+            .expect("the enforcement model is stated");
+        assert!(
+            info.detail.contains("Bash sandbox is off"),
+            "{}",
+            info.detail
+        );
+
+        // With the guard present the warning goes away.
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"ahma hooks exec --platform claude"}]},{"matcher":"Edit|Write","hooks":[{"type":"command","command":"ahma hooks edit-guard --managed-id ahma-edit-guard-v1"}]}]}}"#,
+        )
+        .unwrap();
+        let findings = run(&input(home.path(), ws.path()));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("Native file edits are not confined"))
         );
     }
 }

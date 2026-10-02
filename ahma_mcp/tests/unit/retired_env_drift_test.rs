@@ -176,11 +176,7 @@ fn live_variables_are_not_treated_as_retired() {
     let doc = std::fs::read_to_string(repo_root().join("docs/environment-variables.md"))
         .expect("docs/environment-variables.md must exist");
     let retired = documented_retired_vars(&doc);
-    for live in [
-        "AHMA_HOOKS",
-        "AHMA_DISABLE_HOOKS",
-        "AHMA_PREFER_OWN_SANDBOX",
-    ] {
+    for live in ["AHMA_HOOKS", "AHMA_DISABLE_HOOKS"] {
         assert!(
             !retired.iter().any(|v| v == live),
             "{live} is a LIVE variable (terminal hooks) and must not be parsed as retired"

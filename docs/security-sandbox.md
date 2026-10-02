@@ -142,50 +142,47 @@ The shape-matched rules are application-layer on *every* platform by constructio
 
 The filesystem sandbox says nothing about the network, and **egress is unrestricted by default**. Pass `--restrict-network` (or set `[network] restrict = true`) to route sandboxed subprocesses through a guarded local proxy that forwards only the domains in `[network] allow` — deny-all when that list is empty — and refuses private, loopback and cloud-metadata addresses. The README's *What the sandbox does not cover* section states what that restriction is and is not on each platform. How the allowlist is built, and the hosts each sandbox profile contributes: [network-egress.md](network-egress.md).
 
-## Nested Sandbox Environments (Cursor, VS Code, Docker)
+## Nested Sandbox Environments (Cursor, Claude Code, VS Code, Docker)
 
-When ahma runs inside a host that already provides its own kernel sandbox (Cursor's agent sandbox, VS Code, Docker), ahma does **not** try to mimic or coexist with the host's internals (such as the build-cache environment variables Cursor injects). Instead it picks exactly **one authoritative sandbox per execution path** and **always tells you which one is active**.
+When ahma runs inside a host that may provide its own kernel sandbox (Cursor's agent sandbox, Claude Code's Bash sandbox, VS Code, Docker), ahma does **not** try to mimic or coexist with the host's internals (such as the build-cache environment variables Cursor injects), and it does **not** stand down because the host *might* be sandboxing. It applies **its own sandbox on every execution path**, defers only when the kernel proves an outer sandbox is enforcing, and **always tells you which one is active**.
 
-ahma detects a host from environment markers (`CURSOR_SANDBOX`/`CURSOR_AGENT`, `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT`, `VSCODE_*`, `/.dockerenv`/`container`).
+ahma can *name* a host from environment markers (`CURSOR_SANDBOX`/`CURSOR_AGENT`, `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT`, `VSCODE_*`, `/.dockerenv`/`container`). A marker only proves which harness launched the process. Claude Code, for example, sets `CLAUDECODE=1` for every process it starts whether or not its Bash sandbox is enabled — and it is off by default. An earlier release let terminal hooks pass commands through unchanged on that marker, so a Claude Code session ran every Bash command unsandboxed for days while `ahma hooks status` said ACTIVE and the disclosure was written to a hook field Claude Code does not render. That is why markers now name, and never decide (SPEC R7.2).
 
-**Terminal hooks → defer to the host.** When an ahma terminal hook fires inside a detected host sandbox, the command already runs under the host's kernel sandbox, so ahma defers: it lets the command run unchanged in the host sandbox and does **not** re-wrap it in a second sandbox. This removes the "double sandbox" friction (e.g. builds failing because the host redirected `CARGO_TARGET_DIR` outside the workspace) without ahma chasing each host's private cache variables. The hook discloses this loudly:
+**Terminal hooks → ahma's sandbox, always.** Every hooked shell command is rewritten into `ahma hooks run-shell` and runs under ahma's kernel sandbox, scoped to the enclosing repository (plus persistent grants). The first command of a session carries a scope disclosure the model and the user both see (SPEC R5.4.10), in the fields the harness renders (Claude Code: `additionalContext` and `systemMessage`):
 
-> Sandbox: ahma is DEFERRING to Cursor's sandbox and is NOT applying its own. Protection now depends on Cursor. If you have disabled Cursor's sandbox, this command runs UNSANDBOXED.
+> Sandbox: this shell command runs inside ahma's kernel sandbox (terminal hook). Writes are confined to: /Users/you/github/project, plus any persistent grants in ~/.ahma/settings.toml. Reads are NOT confined on macOS (except credential directories) — a platform limit. A write outside the scope fails; to allow one, ask the human — they approve it in the ahma TUI or run `ahma sandbox grant <dir>`. You cannot widen the scope yourself.
 
-To force ahma's own (tighter) sandbox instead — accepting the redundant double-sandbox and the host's build-cache friction — set `AHMA_PREFER_OWN_SANDBOX=1`.
+The same install writes an **edit guard** for the harness's native file tools (Claude Code `Edit`/`Write`, Codex `apply_patch`, Copilot `edit`/`create`, Cursor `Write`, Antigravity `write_to_file`), which never pass through the shell sandbox: an edit whose target is outside that same scope is refused with the same remediation (SPEC R5.5.6). Decline it with `ahma hooks install --no-edit-guard`; `ahma hooks status` shows `installed+guard` when it is in place.
+
+`AHMA_PREFER_OWN_SANDBOX` is retired — own sandbox is the only behaviour.
 
 **MCP server (`run_terminal_command`) → ahma stays authoritative.** Commands the agent runs through ahma's MCP tools execute in ahma's own process, which the host's terminal sandbox does **not** wrap, so ahma applies its own sandbox and remains the authority.
 
-Two nested cases are handled loudly at server startup (SPEC R5.4 "nothing silent"):
+Two nested cases are handled loudly, at server startup and on every hooked command (SPEC R5.4 "nothing silent"):
 
-- **ahma cannot nest its own sandbox** (macOS `sandbox-exec` is *denied* — positive proof ahma is inside a restrictive outer sandbox): instead of hard-failing, ahma **defers to that host** and discloses it loudly, with host-specific remediation. This is fail-closed — a blocked nesting attempt proves an outer sandbox is enforcing.
+- **ahma cannot nest its own sandbox** (macOS `sandbox-exec` is *denied* — positive proof ahma is inside a restrictive outer sandbox): instead of hard-failing, ahma **defers to that host** and discloses it loudly, with host-specific remediation. This is fail-closed — a blocked nesting attempt proves an outer sandbox is enforcing. A hooked command in this state prints the disclosure on stderr every time.
 
-  This is a platform rule, not a configuration: macOS refuses to apply a Seatbelt profile inside a process that is already confined by one whenever the outer profile denies *anything* (measured on macOS 26 — `(allow default)` plus a single `deny` of a nonexistent path is enough). Every real sandbox forbids nesting, ahma's own included, and no profile ahma could generate changes that; `AHMA_PREFER_OWN_SANDBOX` has no effect here because the kernel, not ahma, refuses. Every child of a confined process inherits the confinement, so a command ahma runs *without* its own wrapper is still kernel-sandboxed — by the outer boundary. That is why the deferral is decided when a `Sandbox` is **constructed**, on every execution path — `ahma serve` startup *and* the in-process library used by ahma's own tests and by embedders — from the kernel's own answer (`sandbox_check` on ahma's pid) confirmed by a refused nesting probe, never from environment markers alone. Before this, an ahma built in-process inside an outer sandbox found out at its first spawn, as the child's opaque `sandbox-exec: sandbox_apply: Operation not permitted`.
+  This is a platform rule, not a configuration: macOS refuses to apply a Seatbelt profile inside a process that is already confined by one whenever the outer profile denies *anything* (measured on macOS 26 — `(allow default)` plus a single `deny` of a nonexistent path is enough). Every real sandbox forbids nesting, ahma's own included, and no profile ahma could generate changes that. Every child of a confined process inherits the confinement, so a command ahma runs *without* its own wrapper is still kernel-sandboxed — by the outer boundary. That is why the deferral is decided when a `Sandbox` is **constructed**, on every execution path — `ahma serve` startup, `ahma hooks run-shell`, *and* the in-process library used by ahma's own tests and by embedders — from the kernel's own answer (`sandbox_check` on ahma's pid) confirmed by a refused nesting probe, never from environment markers alone.
 
   The common way to hit it is ahma running ahma: `cargo nextest run` executed through `run_terminal_command`, or a nested `ahma serve`. Every command ahma sandboxes carries the marker `AHMA_OUTER_SANDBOX_PID=<pid>` (set by ahma, never read as a setting), so the nested ahma names the outer one:
 
   > Sandbox: ahma is DEFERRING to an outer ahma's sandbox and is NOT applying its own. Protection now depends on an outer ahma. … This process was started by an outer ahma `run_terminal_command`, whose kernel sandbox already confines every write it makes …
 
   The nested ahma's own scope is still validated in-process (path checks on file tools) but is not kernel-enforced — the outer sandbox's boundary is. For ahma's own enforcement, start the process from a plain terminal instead (SPEC R7.6).
-- **ahma is enforcing *on top of* a host sandbox** (the report's classic case: ahma launched from inside an IDE's Bash sandbox): ahma keeps enforcing, but an **active confinement probe** — a write attempt outside every scope — confirms it is genuinely nested, and ahma discloses that the effective policy is the **intersection** of both sandboxes (so access ahma grants, e.g. the keychain, may still be blocked by the outer one). The probe is why this never false-positives on a normal IDE-launched-but-unconfined MCP server: an IDE sets `CURSOR_SANDBOX`/`CLAUDECODE` in the server's environment without wrapping its executions, so env presence alone is not trusted — only a *blocked* out-of-scope write triggers the disclosure.
+- **ahma is enforcing *on top of* a host sandbox** (ahma launched from inside an IDE's Bash sandbox): ahma keeps enforcing, but an **active confinement probe** — a write attempt outside every scope — confirms it is genuinely nested, and ahma discloses that the effective policy is the **intersection** of both sandboxes (so access ahma grants, e.g. the keychain, may still be blocked by the outer one). The probe is why this never false-positives on a normal IDE-launched-but-unconfined MCP server: an IDE sets `CURSOR_SANDBOX`/`CLAUDECODE` in the server's environment without wrapping its executions, so env presence alone is not trusted — only a *blocked* out-of-scope write triggers the disclosure.
 
 Every one of these disclosures includes **actionable remediation** — how to make ahma the single authoritative sandbox for that specific host:
 
 | Host | How to make ahma authoritative |
 |------|--------------------------------|
-| **Claude Code** | Run ahma as a configured **MCP server** (Claude Code does not sandbox MCP servers — only its Bash tool), rather than from inside its Bash tool; or disable Claude Code's Bash sandbox; or start ahma from a plain terminal outside Claude Code. |
-| **Cursor** | Set Cursor's sandbox to `"insecure_none"` in `sandbox.json` (or enable the Legacy Terminal Tool). For terminal hooks specifically, `AHMA_PREFER_OWN_SANDBOX=1`. |
+| **Claude Code** | Run ahma as a configured **MCP server** (Claude Code does not sandbox MCP servers — only its Bash tool), rather than from inside its Bash tool; or disable Claude Code's Bash sandbox; or start ahma from a plain terminal outside Claude Code. With Claude Code's sandbox off (the default) ahma's hook is the only sandbox a Bash command gets. |
+| **Cursor** | Set Cursor's sandbox to `"insecure_none"` in `sandbox.json` (or enable the Legacy Terminal Tool) so only ahma sandboxes. |
 | **VS Code** | Run ahma as its MCP server (VS Code has no execution sandbox of its own to disable). |
 | **Docker** | The container is a deliberate outer boundary; run ahma directly on the host if you did not intend the double layer. |
 
 If ahma cannot apply its own sandbox and this is not a recognized nesting case, it still fails loudly (use `--no-sandbox` to defer explicitly) — it never silently runs unsandboxed.
 
-**Choosing your model:**
-- Default (hooks): let the host sandbox protect; ahma defers and tells you.
-- Want ahma to be the single sandbox? Disable the host's sandbox (e.g. Cursor `sandbox.json` `"type": "insecure_none"`, or the Legacy Terminal Tool) so only ahma sandboxes.
-- Want belt-and-suspenders (both)? `AHMA_PREFER_OWN_SANDBOX=1` for hooks (re-introduces the host cache friction).
-
-**Honesty limit:** detecting a host does not prove its sandbox is *enabled*. If you have turned the host sandbox off, deferral means the command is unsandboxed — which is why the disclosure says so explicitly.
+**Honesty limit:** detecting a host does not prove its sandbox is *enabled*. That is exactly why detection never decides enforcement; and whenever ahma does defer — on kernel proof, or because you passed `--no-sandbox` — the disclosure says that protection now depends on the host.
 
 ## HTTP Transport Authentication
 

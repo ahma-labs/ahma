@@ -171,9 +171,9 @@ dependency's build script copied a file (e.g. `aws-lc-sys` copying its include h
 this is a `com.apple.provenance` denial: a sandbox refuses the metadata-preserving copy of a \
 provenance-stamped source file. It is most common when a host sandbox (Cursor/VS Code) redirects \
 `CARGO_TARGET_DIR` to its own cache outside the workspace and denies the build script's write. \
-Fix: re-run the build with the host's full-permission/unsandboxed approval, set \
-`AHMA_PREFER_OWN_SANDBOX=1` so ahma applies its own sandbox (which keeps the build inside the \
-workspace), or clear the redirected build cache and rebuild.";
+Fix: re-run the build with the host's full-permission/unsandboxed approval, run the build \
+through ahma's own sandbox (its terminal hook or `run_terminal_command`, which keeps the build \
+inside the workspace), or clear the redirected build cache and rebuild.";
 
 const SSH_PUBLICKEY_REMEDIATION: &str = "SSH authentication failed (`Permission denied (publickey)`). \
 Ahma's sandbox secures private keys in `~/.ssh/` from direct file reads, but forwards `$SSH_AUTH_SOCK`. \
@@ -274,7 +274,7 @@ mod tests {
   Failed to copy include file during build setup: Os { code: 1, kind: PermissionDenied, message: \"Operation not permitted\" }";
         let hit = diagnose(stderr).expect("aws-lc-sys copy failure should be diagnosed");
         assert_eq!(hit.kind, ContaminationKind::BuildScriptCopy);
-        assert!(hit.remediation.contains("AHMA_PREFER_OWN_SANDBOX"));
+        assert!(hit.remediation.contains("ahma's own sandbox"));
         assert!(hit.remediation.contains("aws-lc-sys"));
     }
 

@@ -53,12 +53,13 @@ short writer in the same repository:
 ahma tui          # watch the second command sit in the queue behind the first
 ```
 
-To make the client's own file edits wait too, install the **edit guard** alongside the
-terminal hooks:
+The client's own file edits wait too, through the **edit guard** that `ahma hooks install`
+writes alongside every terminal hook (decline it with `--no-edit-guard`). The same hook also
+keeps those edits inside the sandbox scope — see [security-sandbox.md](security-sandbox.md):
 
 ```bash
-ahma hooks install --edit-guard                      # user scope, every supported client
-ahma hooks install --edit-guard --platform codex --scope project
+ahma hooks install                                   # user scope, every supported client, shell hook + edit guard
+ahma hooks install --platform codex --scope project
 ahma hooks status                                    # "installed+guard" per client
 ahma hooks uninstall                                 # removes shell hook and guard
 ```
@@ -126,8 +127,8 @@ subcommand; the nearest one wins:
 
 ## Limits
 
-- **Harness-native edits are held back only through the edit guard.** Without
-  `--edit-guard`, such an edit during a run is *reported* (`changed_during_run`), not
+- **Harness-native edits are held back only through the edit guard.** With
+  `--no-edit-guard`, such an edit during a run is *reported* (`changed_during_run`), not
   prevented. Some Codex releases fire `PreToolUse` for `apply_patch` without enforcing its
   deny ([openai/codex#27833](https://github.com/openai/codex/issues/27833)); there the drift
   report is the remaining signal. Edits made through a shell command are ordered by the

@@ -10,11 +10,20 @@
 //! denies the edit with a reason naming that command — the same refusal ahma's
 //! own file tools give.
 //!
-//! Opt-in: `ahma hooks install --edit-guard` writes it next to the shell hook,
-//! under its own managed id, so `uninstall` and `status` treat it separately.
-//! It never waits and never takes the lease: an edit is refused, not queued,
-//! because a hook that blocks is killed by its timeout and the model learns
-//! nothing.
+//! It also enforces the sandbox *scope* on those same edits (SPEC R5.5.6): a
+//! native `Write`/`Edit` never passes through the shell sandbox, so without this
+//! check an agent whose shell is confined to one repository can still create
+//! files anywhere on the machine — which is exactly how one session cloned a
+//! second checkout next to its own. An edit whose target lies outside the hook's
+//! sandbox scope (the enclosing repository, plus the persistent `rw` grants in
+//! `~/.ahma/settings.toml` and the temp directory) is refused with the same
+//! "ask the human to grant it" remediation the shell hook gives.
+//!
+//! Installed by default with every shell hook (`ahma hooks install`; decline
+//! with `--no-edit-guard`), under its own managed id, so `uninstall` and
+//! `status` treat it separately. It never waits and never takes the lease: an
+//! edit is refused, not queued, because a hook that blocks is killed by its
+//! timeout and the model learns nothing.
 //!
 //! **Refuse, or say nothing** (R5.5.5): when the workspace is free, or the
 //! payload is not an edit this hook understands, it takes no position — empty
@@ -216,8 +225,17 @@ fn absolute(path: &str, cwd: Option<&str>) -> Option<PathBuf> {
 // Decision
 // ---------------------------------------------------------------------------
 
-/// Why the edit is refused, if it is: the first touched workspace that is busy.
-pub fn refusal(payload: &Value, queue: &WorkspaceQueue) -> Option<String> {
+/// Why the edit is refused, if it is: the first touched path outside the
+/// sandbox scope (when `allowed` is given), else the first touched workspace
+/// that is busy.
+///
+/// `allowed = None` disables the scope check (the caller has no scope to
+/// enforce — only tests do that); `Some(&[])` refuses every edit.
+pub fn refusal(
+    payload: &Value,
+    queue: &WorkspaceQueue,
+    allowed: Option<&[PathBuf]>,
+) -> Option<String> {
     if let Some(name) = tool_name(payload)
         && !is_edit_tool(name)
     {
@@ -225,15 +243,103 @@ pub fn refusal(payload: &Value, queue: &WorkspaceQueue) -> Option<String> {
     }
     let input = tool_input(payload)?;
     let cwd = payload.get("cwd").and_then(Value::as_str);
-    for raw in edited_paths(&input) {
-        let Some(path) = absolute(&raw, cwd) else {
-            continue;
-        };
-        if let Some((workspace, holder)) = queue.probe_path(&path, &[]) {
-            return Some(edit_refusal(&path, &workspace, holder.as_ref()));
+    let paths: Vec<PathBuf> = edited_paths(&input)
+        .iter()
+        .filter_map(|raw| absolute(raw, cwd))
+        .collect();
+    if let Some(allowed) = allowed {
+        for path in &paths {
+            if !within_scope(path, allowed) {
+                return Some(scope_refusal(path, allowed));
+            }
+        }
+    }
+    for path in &paths {
+        if let Some((workspace, holder)) = queue.probe_path(path, &[]) {
+            return Some(edit_refusal(path, &workspace, holder.as_ref()));
         }
     }
     None
+}
+
+/// Canonicalize a path that may not exist yet: resolve the deepest existing
+/// ancestor through the filesystem (so a symlink out of the scope is seen for
+/// what it is), then append the remaining components lexically.
+pub fn canonical_for_scope(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canon) = dunce::canonicalize(&existing) {
+            let mut out = canon;
+            for c in tail.iter().rev() {
+                if c == ".." {
+                    out.pop();
+                } else if c != "." {
+                    out.push(c);
+                }
+            }
+            return out;
+        }
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                existing = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Whether `path` (canonicalized as far as it exists) lies inside one of the
+/// `allowed` scopes.
+fn within_scope(path: &Path, allowed: &[PathBuf]) -> bool {
+    let canon = canonical_for_scope(path);
+    allowed
+        .iter()
+        .any(|scope| canon.starts_with(canonical_for_scope(scope)))
+}
+
+/// The refusal for an edit outside the sandbox scope (SPEC R5.5.6): names the
+/// path, the scope, and the only way to widen it — a human.
+fn scope_refusal(path: &Path, allowed: &[PathBuf]) -> String {
+    let dir = path.parent().unwrap_or(path);
+    let scopes = allowed
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Edit refused: {} is outside the sandbox scope ({}). Native file edits are confined to \
+         the same directories as sandboxed shell commands. To allow it, ask the human — they \
+         approve it in the ahma TUI or run `ahma sandbox grant {}`. You cannot widen the \
+         scope yourself.",
+        path.display(),
+        if scopes.is_empty() {
+            "none".to_string()
+        } else {
+            scopes
+        },
+        dir.display()
+    )
+}
+
+/// The directories a native edit may touch: the hook sandbox scope for `cwd`
+/// (the enclosing repository, SPEC R5.2.1), every persistent `rw` grant, and
+/// the temp directory — the same set a hooked shell command may write.
+pub fn allowed_edit_scopes(
+    cwd: &Path,
+    persistent: &[ahma_common::config::PersistentScope],
+) -> Vec<PathBuf> {
+    let mut allowed = super::resolve_hook_sandbox_scopes(cwd);
+    for scope in persistent {
+        if scope.access.is_write() {
+            let raw = ahma_common::config::expand_home(&scope.path);
+            allowed.push(dunce::canonicalize(&raw).unwrap_or(raw));
+        }
+    }
+    let tmp = std::env::temp_dir();
+    allowed.push(dunce::canonicalize(&tmp).unwrap_or(tmp));
+    allowed
 }
 
 /// The output format a decision must be written in.
@@ -265,8 +371,9 @@ pub fn decide(
     platform: Option<HookPlatform>,
     payload: &Value,
     queue: &WorkspaceQueue,
+    allowed: Option<&[PathBuf]>,
 ) -> Option<Value> {
-    let reason = refusal(payload, queue);
+    let reason = refusal(payload, queue, allowed);
     match (dialect(platform, payload), reason) {
         (Dialect::ClaudeLike, Some(r)) => Some(json!({
             "hookSpecificOutput": {
@@ -293,16 +400,28 @@ pub fn decide(
 
 /// Entry point: read the payload from stdin, print a decision if there is one.
 /// Fails open — any error is "no opinion" — and always exits 0.
-pub fn run(args: &HooksEditGuardArgs, enabled: bool) -> Result<()> {
+pub fn run(args: &HooksEditGuardArgs, cfg: &crate::shell::cli::AppConfig) -> Result<()> {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let payload = serde_json::from_str::<Value>(&input).unwrap_or(Value::Null);
-    let queue = if enabled {
+    let queue = if cfg.edit_guard {
         WorkspaceQueue::new(true)
     } else {
         WorkspaceQueue::disabled()
     };
-    if let Some(decision) = decide(args.platform, &payload, &queue) {
+    // The scope check runs whenever the hook is active at all (same switch as
+    // the shell hook, SPEC R5.5.6); a payload without a usable cwd falls back to
+    // this process's, which the harness sets to the session's directory.
+    let allowed = super::is_ahma_hooks_active().then(|| {
+        let cwd = payload
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        allowed_edit_scopes(&cwd, &cfg.persistent_scopes)
+    });
+    if let Some(decision) = decide(args.platform, &payload, &queue, allowed.as_deref()) {
         use std::io::Write;
         let _ = writeln!(std::io::stdout().lock(), "{decision}");
     }
@@ -489,7 +608,7 @@ mod tests {
         let (_td, repo, queue, _lease) = busy_repo().await;
         let payload =
             json!({"tool_name": "Edit", "cwd": "/", "tool_input": {"file_path": file(&repo)}});
-        let out = decide(Some(HookPlatform::Claude), &payload, &queue).expect("deny");
+        let out = decide(Some(HookPlatform::Claude), &payload, &queue, None).expect("deny");
         assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
         let reason = out["hookSpecificOutput"]["permissionDecisionReason"]
             .as_str()
@@ -515,7 +634,7 @@ mod tests {
             .unwrap();
         let path = project.join("src/lib.rs").to_string_lossy().into_owned();
         let payload = json!({"tool_name": "Edit", "tool_input": {"file_path": path}});
-        let out = decide(Some(HookPlatform::Claude), &payload, &queue).expect("deny");
+        let out = decide(Some(HookPlatform::Claude), &payload, &queue, None).expect("deny");
         assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
@@ -547,7 +666,7 @@ mod tests {
             "cwd": repo.to_string_lossy(),
             "tool_input": {"command": patch}
         });
-        let out = decide(Some(HookPlatform::Codex), &payload, &queue).expect("deny");
+        let out = decide(Some(HookPlatform::Codex), &payload, &queue, None).expect("deny");
         assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
@@ -557,7 +676,7 @@ mod tests {
         // Copilot sends toolArgs as a JSON string.
         let args = json!({"path": file(&repo), "old_str": "a", "new_str": "b"}).to_string();
         let payload = json!({"toolName": "edit", "cwd": "/", "toolArgs": args});
-        let out = decide(Some(HookPlatform::Copilot), &payload, &queue).expect("deny");
+        let out = decide(Some(HookPlatform::Copilot), &payload, &queue, None).expect("deny");
         assert_eq!(out["permissionDecision"], "deny");
         assert!(
             out["permissionDecisionReason"]
@@ -576,7 +695,7 @@ mod tests {
             "cwd": "/",
             "tool_input": {"filePath": file(&repo)}
         });
-        let out = decide(Some(HookPlatform::Copilot), &payload, &queue).expect("deny");
+        let out = decide(Some(HookPlatform::Copilot), &payload, &queue, None).expect("deny");
         assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
@@ -584,10 +703,10 @@ mod tests {
     async fn cursor_and_antigravity_edits_are_denied_in_their_formats() {
         let (_td, repo, queue, _lease) = busy_repo().await;
         let cursor = json!({"tool_name": "Write", "tool_input": {"file_path": file(&repo)}});
-        let out = decide(Some(HookPlatform::Cursor), &cursor, &queue).expect("deny");
+        let out = decide(Some(HookPlatform::Cursor), &cursor, &queue, None).expect("deny");
         assert_eq!(out["permission"], "deny");
         let agy = json!({"tool_name": "write_to_file", "tool_input": {"TargetFile": file(&repo)}});
-        let out = decide(Some(HookPlatform::Antigravity), &agy, &queue).expect("deny");
+        let out = decide(Some(HookPlatform::Antigravity), &agy, &queue, None).expect("deny");
         assert_eq!(out["decision"], "deny");
     }
 
@@ -603,7 +722,7 @@ mod tests {
         ] {
             let payload = json!({"tool_name": name, "tool_input": {"filePath": file(&repo)}});
             assert!(
-                decide(Some(HookPlatform::Claude), &payload, &queue).is_none(),
+                decide(Some(HookPlatform::Claude), &payload, &queue, None).is_none(),
                 "{name} must not be refused"
             );
         }
@@ -615,15 +734,15 @@ mod tests {
         let queue = WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")));
         let path = td.path().join("x.rs").to_string_lossy().into_owned();
         let payload = json!({"tool_name": "Edit", "tool_input": {"file_path": path}});
-        assert!(decide(Some(HookPlatform::Claude), &payload, &queue).is_none());
-        assert!(decide(Some(HookPlatform::Codex), &payload, &queue).is_none());
-        assert!(decide(Some(HookPlatform::Copilot), &payload, &queue).is_none());
+        assert!(decide(Some(HookPlatform::Claude), &payload, &queue, None).is_none());
+        assert!(decide(Some(HookPlatform::Codex), &payload, &queue, None).is_none());
+        assert!(decide(Some(HookPlatform::Copilot), &payload, &queue, None).is_none());
         assert_eq!(
-            decide(Some(HookPlatform::Cursor), &payload, &queue).unwrap()["permission"],
+            decide(Some(HookPlatform::Cursor), &payload, &queue, None).unwrap()["permission"],
             "allow"
         );
         assert_eq!(
-            decide(Some(HookPlatform::Antigravity), &payload, &queue).unwrap()["decision"],
+            decide(Some(HookPlatform::Antigravity), &payload, &queue, None).unwrap()["decision"],
             "allow"
         );
     }
@@ -631,12 +750,13 @@ mod tests {
     #[test]
     fn garbage_payloads_have_no_opinion() {
         let queue = WorkspaceQueue::disabled();
-        assert!(decide(None, &json!("garbage"), &queue).is_none());
+        assert!(decide(None, &json!("garbage"), &queue, None).is_none());
         assert!(
             decide(
                 None,
                 &json!({"tool_name": "Edit", "tool_input": {}}),
-                &queue
+                &queue,
+                None
             )
             .is_none()
         );
@@ -765,5 +885,195 @@ mod tests {
             "{bash}"
         );
         assert_eq!(doc["version"], 1);
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn idle_queue(td: &Path) -> WorkspaceQueue {
+        WorkspaceQueue::with_lock_dir(true, Some(td.join("locks")))
+    }
+
+    fn repo(td: &Path) -> PathBuf {
+        let repo = td.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        dunce::canonicalize(&repo).unwrap()
+    }
+
+    fn write_payload(cwd: &Path, file: &Path) -> Value {
+        json!({
+            "tool_name": "Write",
+            "cwd": cwd.to_string_lossy(),
+            "tool_input": {"file_path": file.to_string_lossy(), "content": "x"}
+        })
+    }
+
+    /// SPEC R5.5.6: a native edit outside the hook's scope is refused, naming
+    /// the path, the scope and the human-only remediation.
+    #[test]
+    fn edit_guard_denies_file_outside_hook_scope() {
+        let td = tempdir().unwrap();
+        let repo = repo(td.path());
+        let elsewhere = td
+            .path()
+            .join("alt4")
+            .join("neubit4")
+            .join("src")
+            .join("new.rs");
+        // `allowed_edit_scopes` admits the temp dir (as the shell sandbox does),
+        // which is where this test lives — so the scope is built by hand here.
+        let allowed = vec![repo.clone()];
+        let out = decide(
+            Some(HookPlatform::Claude),
+            &write_payload(&repo, &elsewhere),
+            &idle_queue(td.path()),
+            Some(&allowed),
+        )
+        .expect("deny");
+        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+        let reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.contains("outside the sandbox scope"), "{reason}");
+        assert!(reason.contains("ahma sandbox grant"), "{reason}");
+        assert!(reason.contains("cannot widen"), "{reason}");
+    }
+
+    #[test]
+    fn edit_guard_allows_file_inside_repo_root() {
+        let td = tempdir().unwrap();
+        let repo = repo(td.path());
+        // cwd is a subdirectory; the scope is the enclosing repository, so a
+        // file elsewhere in the same repo is fine, even one that does not exist.
+        let cwd = repo.join("src");
+        let target = repo.join("docs").join("new.md");
+        let allowed = super::super::resolve_hook_sandbox_scopes(&cwd);
+        assert_eq!(
+            allowed,
+            vec![repo.clone()],
+            "the enclosing repo is the scope"
+        );
+        assert!(
+            decide(
+                Some(HookPlatform::Claude),
+                &write_payload(&cwd, &target),
+                &idle_queue(td.path()),
+                Some(&allowed),
+            )
+            .is_none(),
+            "an in-repo edit is no opinion"
+        );
+    }
+
+    #[test]
+    fn edit_guard_allows_persistent_rw_grant() {
+        let td = tempdir().unwrap();
+        let repo = repo(td.path());
+        let cache = td.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cache = dunce::canonicalize(&cache).unwrap();
+        let grant = ahma_common::config::PersistentScope {
+            path: cache.clone(),
+            access: ahma_common::config::ScopeAccess::Rw,
+            granted_by: Some("user".into()),
+            granted_at: None,
+            note: None,
+        };
+        let target = cache.join("heavy.lock");
+        let denied = vec![repo.clone()];
+        assert!(
+            decide(
+                Some(HookPlatform::Claude),
+                &write_payload(&repo, &target),
+                &idle_queue(td.path()),
+                Some(&denied),
+            )
+            .is_some(),
+            "without the grant the cache is out of scope"
+        );
+        let allowed: Vec<PathBuf> = vec![repo.clone(), cache.clone()];
+        let computed = allowed_edit_scopes(&repo, &[grant]);
+        assert!(
+            computed.contains(&cache),
+            "an rw grant is in the allowed set: {computed:?}"
+        );
+        assert!(
+            decide(
+                Some(HookPlatform::Claude),
+                &write_payload(&repo, &target),
+                &idle_queue(td.path()),
+                Some(&allowed),
+            )
+            .is_none(),
+            "a persistent rw grant admits the edit"
+        );
+        // A read-only grant does not admit a write.
+        let ro = ahma_common::config::PersistentScope {
+            path: cache.clone(),
+            access: ahma_common::config::ScopeAccess::Ro,
+            granted_by: None,
+            granted_at: None,
+            note: None,
+        };
+        let ro_allowed = allowed_edit_scopes(&repo, &[ro]);
+        assert!(
+            !ro_allowed.contains(&cache),
+            "an ro grant is not writable: {ro_allowed:?}"
+        );
+        let ro_allowed = vec![repo.clone()];
+        assert!(
+            decide(
+                Some(HookPlatform::Claude),
+                &write_payload(&repo, &target),
+                &idle_queue(td.path()),
+                Some(&ro_allowed),
+            )
+            .is_some()
+        );
+    }
+
+    /// A symlink inside the repo that points outside it is resolved before the
+    /// check, so it cannot be used to write through the scope.
+    #[cfg(unix)]
+    #[test]
+    fn edit_guard_follows_symlinks_out_of_scope() {
+        let td = tempdir().unwrap();
+        let repo = repo(td.path());
+        let outside = td.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
+        let target = repo.join("link").join("escaped.txt");
+        let allowed = vec![repo.clone()];
+        assert!(
+            decide(
+                Some(HookPlatform::Claude),
+                &write_payload(&repo, &target),
+                &idle_queue(td.path()),
+                Some(&allowed),
+            )
+            .is_some(),
+            "a symlinked path is judged by where it really points"
+        );
+    }
+
+    #[test]
+    fn hooks_install_claude_installs_edit_guard_by_default() {
+        let args = super::super::HooksInstallArgs {
+            platforms: vec![],
+            scope: HookScope::User,
+            dry_run: true,
+            edit_guard: false,
+            no_edit_guard: false,
+        };
+        assert!(args.installs_edit_guard());
+        let declined = super::super::HooksInstallArgs {
+            no_edit_guard: true,
+            ..args
+        };
+        assert!(!declined.installs_edit_guard());
     }
 }

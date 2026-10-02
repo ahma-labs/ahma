@@ -82,6 +82,7 @@ meant setting one changed the chat client's behaviour but not the server's.
 | `AHMA_DISABLE_TEMP` | `--disable-temp-files` CLI flag or `sandbox.disable_temp = true` in settings.toml |
 | `AHMA_NO_PACKAGE_CACHE_WRITE` | `--no-package-cache-write` flag or `sandbox.package_cache_write = false` in settings.toml |
 | `AHMA_TASK_VAULT` | `--task-vault` CLI flag |
+| `AHMA_PREFER_OWN_SANDBOX` | Nothing — it is now the only behaviour. A terminal hook always applies ahma's own sandbox and never defers on an environment marker (`CLAUDECODE`, `CURSOR_SANDBOX`, …); it defers only when the kernel refuses to nest its profile (SPEC R7.2, R7.6). |
 
 ---
 
@@ -145,7 +146,6 @@ cannot be replaced by CLI flags since hooks are invoked directly by the editor, 
 |---|---|---|
 | `AHMA_HOOKS` | `auto` | `on` = always sandbox, `off` = pass through, `auto` = sandbox when MCP server detected |
 | `AHMA_DISABLE_HOOKS` | off | Alias for `AHMA_HOOKS=off`. Set to `1` to disable hook routing. |
-| `AHMA_PREFER_OWN_SANDBOX` | off | Set to `1` so a hook applies **ahma's own** sandbox instead of deferring to a detected host sandbox (Cursor, VS Code, Docker). Accepts the double-sandbox and the host's build-cache friction in exchange for ahma being the authority. See SPEC R7 and [security-sandbox.md](security-sandbox.md#nested-sandbox-environments-cursor-vs-code-docker). |
 
 ```bash
 # Temporarily disable hook routing without uninstalling
