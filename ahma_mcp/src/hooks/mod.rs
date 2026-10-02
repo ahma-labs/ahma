@@ -1317,11 +1317,20 @@ pub fn hook_scope_disclosure(scopes: &[PathBuf]) -> String {
     } else {
         "Reads are NOT confined on this platform."
     };
+    let tmp = std::env::temp_dir();
+    let tmp = dunce::canonicalize(&tmp).unwrap_or(tmp);
+    let no_project = if scopes.first() == Some(&tmp) {
+        " The session started in the home directory or at a filesystem root, which is never a \
+         writable scope, so only the temp directory is: open a project folder to work in it."
+    } else {
+        ""
+    };
     format!(
         "Sandbox: this shell command runs inside ahma's kernel sandbox (terminal hook). \
-         Writes are confined to: {listed}, plus any persistent grants in ~/.ahma/settings.toml. \
-         {reads} A write outside the scope fails; to allow one, ask the human — they approve \
-         it in the ahma TUI or run `ahma sandbox grant <dir>`. You cannot widen the scope yourself."
+         Writes are confined to: {listed}, plus any persistent grants in ~/.ahma/settings.toml.\
+         {no_project} {reads} A write outside the scope fails; to allow one, ask the human — they \
+         approve it in the ahma TUI or run `ahma sandbox grant <dir>`. You cannot widen the scope \
+         yourself."
     )
 }
 
@@ -1432,8 +1441,10 @@ fn resolve_worktree_main_repo(git_root: &Path) -> Option<PathBuf> {
 /// this discovers the repository root (and any connected worktree / main repo
 /// root) so intra-repo builds, target directories, and submodule writes do
 /// not fail with unexpected sandbox denials (SPEC R5.2.1).
+/// A filesystem root, the home directory, or an ancestor of it: never a
+/// writable scope, whatever its source (SPEC R5.2.4).
 fn is_scope_too_broad(path: &Path, canon_home: Option<&Path>) -> bool {
-    path.parent().is_none() || canon_home.is_some_and(|h| h == path)
+    path.parent().is_none() || canon_home.is_some_and(|h| h.starts_with(path))
 }
 
 fn collect_git_scopes(canon_cwd: &Path, canon_home: Option<&Path>, scopes: &mut Vec<PathBuf>) {
@@ -1474,7 +1485,12 @@ pub fn resolve_hook_sandbox_scopes(cwd: &Path) -> Vec<PathBuf> {
 
     let mut raw_scopes = Vec::new();
     collect_git_scopes(&canon_cwd, canon_home.as_deref(), &mut raw_scopes);
-    raw_scopes.push(canon_cwd);
+    // A harness started in the home directory or at a root does not make it
+    // writable (SPEC R5.2.4): writes fall back to the temp directory, and the
+    // scope disclosure says so.
+    if !is_scope_too_broad(&canon_cwd, canon_home.as_deref()) {
+        raw_scopes.push(canon_cwd);
+    }
 
     let mut deduped: Vec<PathBuf> = Vec::new();
     for scope in raw_scopes {
@@ -1485,7 +1501,8 @@ pub fn resolve_hook_sandbox_scopes(cwd: &Path) -> Vec<PathBuf> {
 
     let final_scopes = filter_enclosing_scopes(&deduped);
     if final_scopes.is_empty() {
-        vec![cwd.to_path_buf()]
+        let tmp = std::env::temp_dir();
+        vec![dunce::canonicalize(&tmp).unwrap_or(tmp)]
     } else {
         final_scopes
     }
@@ -5124,8 +5141,8 @@ mod tests {
     /// `CLAUDECODE=1` is set by Claude Code for every process it launches whether
     /// or not its own sandbox is on — a session ran unsandboxed for days on
     /// exactly that false inference. The full (impure) decision path is
-    /// exercised: real env, real consent/disclosure stores (pointed at a temp
-    /// dir via TMPDIR), hooks forced active.
+    /// exercised: real env, real consent/disclosure stores (pointed at this
+    /// test's own runtime directory via XDG_RUNTIME_DIR), hooks forced active.
     fn assert_rewrites_under_marker(marker: &str) {
         let temp = tempdir().unwrap();
         // nextest runs each test in its own process, so env mutation is local.
@@ -5135,6 +5152,7 @@ mod tests {
             std::env::set_var("TMPDIR", temp.path());
             std::env::set_var("TMP", temp.path());
             std::env::set_var("TEMP", temp.path());
+            std::env::set_var("XDG_RUNTIME_DIR", temp.path().join("run"));
         }
         let env = test_env();
         let cwd = temp.path().join("proj");
@@ -5202,6 +5220,35 @@ mod tests {
         let input = json!({"tool_input": {"command": "cargo build"}});
         let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
         assert!(matches!(decision, HooksDecision::AllowRewrite { .. }));
+    }
+
+    /// SPEC R5.2.4 binds every scope source, hooks included: a harness
+    /// launched in the home directory or a filesystem root must not make it a
+    /// writable scope. Writes fall back to the temp directory.
+    #[test]
+    fn a_hook_never_takes_home_or_a_root_as_its_scope() {
+        let Some(home) = ahma_common::config::ahma_home_dir() else {
+            return;
+        };
+        std::fs::create_dir_all(&home).unwrap();
+        let home = dunce::canonicalize(&home).unwrap();
+        let tmp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+        for cwd in [home.clone(), PathBuf::from(std::path::MAIN_SEPARATOR_STR)] {
+            let scopes = resolve_hook_sandbox_scopes(&cwd);
+            assert!(
+                !scopes.iter().any(|s| s == &cwd || home.starts_with(s)),
+                "{} must not become a hook scope: {scopes:?}",
+                cwd.display()
+            );
+            assert_eq!(
+                scopes,
+                vec![tmp.clone()],
+                "writes fall back to the temp directory"
+            );
+        }
+        let project = tempfile::tempdir().unwrap();
+        let project = dunce::canonicalize(project.path()).unwrap();
+        assert_eq!(resolve_hook_sandbox_scopes(&project), vec![project]);
     }
 
     #[test]
