@@ -132,6 +132,9 @@ pub struct AppConfig {
     /// Refuse ahma's own file edits while a workspace writer runs
     /// (settings.toml `[tools].edit_guard`, SPEC R2.7.8).
     pub edit_guard: bool,
+    /// This project's own commands that only read sources (settings.toml
+    /// `[tools].source_readers`, SPEC R2.7.8).
+    pub source_readers: Vec<String>,
 
     // ── Sandbox ─────────────────────────────────────────────────────────────
     /// Disable the kernel sandbox entirely (AHMA_DISABLE_SANDBOX=1).
@@ -286,6 +289,7 @@ impl Default for AppConfig {
             mutex_groups: ahma_common::config::default_mutex_groups(),
             workspace_queue: true,
             edit_guard: true,
+            source_readers: Vec::new(),
 
             no_sandbox: false,
             restrict_network: false,
@@ -3250,6 +3254,7 @@ pub fn build_app_config_with_settings(
         mutex_groups,
         workspace_queue: s.tools.workspace_queue,
         edit_guard: s.tools.edit_guard,
+        source_readers: s.tools.source_readers.clone(),
 
         no_sandbox: sandbox.no_sandbox,
         restrict_network: cli.restrict_network || s.network.restrict,

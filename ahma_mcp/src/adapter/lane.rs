@@ -13,7 +13,7 @@
 //! Anything the classifier cannot parse with certainty — shell operators,
 //! substitutions, redirections, escapes, an unknown program — is exclusive.
 
-use super::workspace_queue::Lane;
+use super::workspace_queue::{Lane, SourceEffect};
 
 /// Programs that only read, whatever their (plain) arguments.
 const READ_ONLY_PROGRAMS: &[&str] = &[
@@ -84,6 +84,9 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "xxd",
     "cal",
     "seq",
+    // Waiting reads nothing and writes nothing; classified as a writer, a
+    // poll loop held the workspace's write lease for its whole life.
+    "sleep",
 ];
 
 /// `git` subcommands that only read. `git status` would opportunistically
@@ -315,15 +318,43 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
 }
 
 /// The lane for a `run_terminal_command` command line.
+/// Shell keywords that open or close a loop or a conditional around the
+/// commands of a list: `until gh pr checks 87; do sleep 60; done` is a reader
+/// exactly when every command in it is.
+const LIST_KEYWORDS: &[&str] = &["until", "while", "if", "elif", "then", "else", "do"];
+
+/// Whether `word` is a `NAME=value` environment assignment.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
 pub fn classify_shell_command(command: &str) -> Lane {
     let Some(segs) = segments(command) else {
         return Lane::Exclusive;
     };
     for seg in &segs {
-        let Some((program, args)) = seg.split_first() else {
+        // Loop and conditional keywords, and `NAME=value` assignments, only
+        // frame the command that follows; the command decides. The read lane
+        // is still the kernel's word: an assignment such as `LD_PRELOAD` that
+        // makes a reader try to write fails, it cannot write.
+        let words: Vec<&String> = seg
+            .iter()
+            .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
+            .collect();
+        if matches!(words.as_slice(), [w] if matches!(w.as_str(), "done" | "fi")) {
+            continue;
+        }
+        let Some((program, args)) = words.split_first() else {
             return Lane::Exclusive;
         };
-        // A leading `VAR=value` assignment or a path to a program: not worth guessing.
+        let program = program.as_str();
+        let args: Vec<String> = args.iter().map(|a| (*a).clone()).collect();
+        let args = args.as_slice();
+        // A path to a program: not worth guessing.
         if program.contains('=') || program.contains('/') {
             return Lane::Exclusive;
         }
@@ -336,6 +367,175 @@ pub fn classify_shell_command(command: &str) -> Lane {
         }
     }
     Lane::ReadOnly
+}
+
+/// What a command line does to the workspace's source files (SPEC R2.7.8), for
+/// the edit guard: a build or test only reads them, a formatter or checkout
+/// rewrites them, and anything this module cannot read with certainty is
+/// unknown — which the guard treats as a writer, as it treated every command
+/// before. `declared` are a project's own wrappers (`[tools] source_readers`):
+/// a command line starting with one, as whole words, reads sources.
+pub fn classify_source_effect(command: &str, declared: &[String]) -> SourceEffect {
+    let trimmed = command.trim();
+    if declared.iter().map(|d| d.trim()).any(|d| {
+        !d.is_empty()
+            && (trimmed == d
+                || trimmed
+                    .strip_prefix(d)
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace)))
+    }) {
+        return SourceEffect::ReadsSources;
+    }
+    let Some(segs) = segments(trimmed) else {
+        return SourceEffect::Unknown;
+    };
+    segs.iter()
+        .map(|seg| segment_effect(seg, declared))
+        .fold(SourceEffect::ReadsSources, worse)
+}
+
+/// The more conservative of two effects: a rewrite anywhere in a pipeline or
+/// list makes the whole line a rewrite, and an unknown part makes it unknown.
+fn worse(a: SourceEffect, b: SourceEffect) -> SourceEffect {
+    use SourceEffect::*;
+    match (a, b) {
+        (RewritesSources, _) | (_, RewritesSources) => RewritesSources,
+        (Unknown, _) | (_, Unknown) => Unknown,
+        _ => ReadsSources,
+    }
+}
+
+/// The first argument that is not an option (`+toolchain` and `-q` skipped).
+fn subcommand(args: &[String]) -> Option<&str> {
+    args.iter()
+        .map(String::as_str)
+        .find(|a| !a.starts_with('-') && !a.starts_with('+'))
+}
+
+fn segment_effect(seg: &[String], declared: &[String]) -> SourceEffect {
+    use SourceEffect::*;
+    // `VAR=value cmd`: the assignment only sets the command's environment.
+    let words: Vec<String> = seg
+        .iter()
+        .skip_while(|w| w.contains('=') && !w.starts_with('-'))
+        .cloned()
+        .collect();
+    let Some((program, args)) = words.split_first() else {
+        return Unknown;
+    };
+    if program == "cd" && args.len() <= 1 {
+        return ReadsSources;
+    }
+    // `bash -c '<line>'`: what the line does.
+    if matches!(program.as_str(), "bash" | "sh" | "zsh") && args.len() == 2 && args[0] == "-c" {
+        return classify_source_effect(&args[1], declared);
+    }
+    // A path to a program is a project script — except the build wrappers
+    // every Gradle and Maven project ships.
+    let program = match program.rsplit('/').next() {
+        Some(base @ ("gradlew" | "mvnw")) => base,
+        _ if program.contains('/') => return Unknown,
+        _ => program.as_str(),
+    };
+    if program_is_read_only(program, args) {
+        return ReadsSources;
+    }
+    let has = |flag: &str| {
+        args.iter()
+            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+    };
+    let sub = subcommand(args);
+    match program {
+        "cargo" => match sub {
+            Some("fmt") if has("--check") => ReadsSources,
+            Some("clippy") if has("--fix") => RewritesSources,
+            Some(
+                "build" | "b" | "test" | "t" | "nextest" | "check" | "c" | "clippy" | "doc"
+                | "bench" | "tree" | "metadata" | "audit" | "deny" | "llvm-cov",
+            ) => ReadsSources,
+            Some("fmt" | "fix" | "update" | "add" | "remove" | "rm" | "upgrade") => RewritesSources,
+            _ => Unknown,
+        },
+        "npm" | "pnpm" | "yarn" | "bun" => match sub {
+            Some("test" | "t") => ReadsSources,
+            Some("run") if args.iter().any(|a| a == "test") => ReadsSources,
+            Some("install" | "i" | "ci" | "add" | "remove" | "update" | "upgrade") => {
+                RewritesSources
+            }
+            _ => Unknown,
+        },
+        "go" => match sub {
+            Some("build" | "test" | "vet" | "list") => ReadsSources,
+            Some("fmt" | "generate" | "get" | "mod") => RewritesSources,
+            _ => Unknown,
+        },
+        "python" | "python3" => {
+            if args.first().map(String::as_str) == Some("-m")
+                && matches!(
+                    args.get(1).map(String::as_str),
+                    Some("pytest" | "mypy" | "unittest")
+                )
+            {
+                ReadsSources
+            } else {
+                Unknown
+            }
+        }
+        "pytest" | "mypy" | "tsc" | "jest" | "vitest" | "tox" | "xcodebuild" => ReadsSources,
+        "swift" => match sub {
+            Some("build" | "test") => ReadsSources,
+            _ => Unknown,
+        },
+        "gradle" | "gradlew" | "mvn" | "mvnw" => {
+            if args.iter().any(|a| {
+                let a = a.to_ascii_lowercase();
+                a.contains("spotlessapply") || a.contains("format") || a.contains("ktlintformat")
+            }) {
+                RewritesSources
+            } else {
+                ReadsSources
+            }
+        }
+        "eslint" => {
+            if has("--fix") {
+                RewritesSources
+            } else {
+                ReadsSources
+            }
+        }
+        "ruff" => match sub {
+            Some("check") if !has("--fix") => ReadsSources,
+            Some("check" | "format") => RewritesSources,
+            _ => Unknown,
+        },
+        "black" | "isort" | "gofmt" | "rustfmt" => {
+            if has("--check") {
+                ReadsSources
+            } else {
+                RewritesSources
+            }
+        }
+        "prettier" => {
+            if has("--write") || has("-w") {
+                RewritesSources
+            } else if has("--check") || has("-c") {
+                ReadsSources
+            } else {
+                Unknown
+            }
+        }
+        "git" => match sub {
+            Some("commit" | "add" | "push" | "fetch" | "tag") => ReadsSources,
+            Some(
+                "checkout" | "switch" | "stash" | "reset" | "rebase" | "merge" | "pull" | "restore"
+                | "apply" | "am" | "cherry-pick" | "revert" | "clean" | "mv" | "rm",
+            ) => RewritesSources,
+            _ => Unknown,
+        },
+        "sed" | "gsed" | "perl" | "rm" | "mv" | "cp" | "touch" | "mkdir" | "ln" | "truncate"
+        | "patch" => RewritesSources,
+        _ => Unknown,
+    }
 }
 
 fn git_is_read_only(args: &[String]) -> bool {
@@ -401,7 +601,7 @@ mod tests {
             "sed -i s/a/b/ f",
             "npm test",
             "./script.sh",
-            "FOO=1 ls",
+            "FOO=1 cargo build",
             "",
         ] {
             assert_eq!(lane(cmd), Lane::Exclusive, "{cmd}");
@@ -525,6 +725,155 @@ mod pipeline_tests {
             "ls > out | cat",
         ] {
             assert_eq!(lane(cmd), Lane::Exclusive, "{cmd}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_effect_tests {
+    use super::*;
+    use crate::adapter::workspace_queue::SourceEffect;
+
+    fn effect(cmd: &str) -> SourceEffect {
+        classify_source_effect(cmd, &[])
+    }
+
+    /// SPEC R2.7.8: builds, tests and linters read sources; an edit made while
+    /// one runs is reported by the drift report (R2.7.6), not refused.
+    #[test]
+    fn builds_tests_and_linters_read_sources() {
+        for cmd in [
+            "cargo nextest run",
+            "cargo nextest run --no-fail-fast -E 'test(foo)'",
+            "cargo test -p stat3",
+            "cargo build --release",
+            "cargo check --all-targets",
+            "cargo clippy --all-targets",
+            "cargo fmt --check",
+            "RUST_LOG=debug cargo test",
+            "cd rust && cargo nextest run 2>&1 | tail -60",
+            "bash -c 'cd rust && cargo nextest run'",
+            "npm test",
+            "pnpm test",
+            "yarn test",
+            "go test ./...",
+            "go vet ./...",
+            "pytest -q",
+            "python -m pytest tests",
+            "./gradlew test",
+            "./gradlew :app:assembleDebug",
+            "mvn -q test",
+            "swift test",
+            "xcodebuild test -scheme App",
+            "tsc --noEmit",
+            "eslint src",
+            "git status",
+            "git commit -m wip",
+            "git push",
+        ] {
+            assert_eq!(effect(cmd), SourceEffect::ReadsSources, "{cmd}");
+        }
+    }
+
+    /// Commands that rewrite source files: an edit racing one is lost or
+    /// clobbered, so it is still refused.
+    #[test]
+    fn formatters_codemods_and_checkouts_rewrite_sources() {
+        for cmd in [
+            "cargo fmt",
+            "cargo fmt --all",
+            "cargo clippy --fix --allow-dirty",
+            "cargo fix",
+            "cargo update",
+            "cargo add serde",
+            "git checkout main",
+            "git switch feature",
+            "git stash",
+            "git rebase origin/main",
+            "git pull",
+            "git restore src/lib.rs",
+            "sed -i s/a/b/ src/lib.rs",
+            "prettier --write .",
+            "black .",
+            "ruff format .",
+            "go fmt ./...",
+            "npm install",
+            "rm -rf src/gen",
+            "mv a.rs b.rs",
+            "cargo build && cargo fmt",
+        ] {
+            assert_eq!(effect(cmd), SourceEffect::RewritesSources, "{cmd}");
+        }
+    }
+
+    /// Anything the classifier cannot read with certainty stays unknown, which
+    /// the guard treats exactly as it treated every writer before.
+    #[test]
+    fn scripts_and_unparsed_lines_are_unknown() {
+        for cmd in [
+            "./build.sh",
+            "scripts/heavy bash -c 'cargo test'",
+            "make",
+            "npm run gen",
+            "cargo run --bin codegen",
+            "cargo test > out.log",
+            "",
+        ] {
+            assert_eq!(effect(cmd), SourceEffect::Unknown, "{cmd}");
+        }
+    }
+
+    /// A project declares its own wrappers (`[tools] source_readers`): a
+    /// command line that starts with a declared prefix reads sources.
+    #[test]
+    fn a_declared_wrapper_reads_sources() {
+        let declared = vec!["scripts/heavy".to_string()];
+        assert_eq!(
+            classify_source_effect(
+                "scripts/heavy bash -c 'rust/gen.sh && cd rust && cargo nextest run'",
+                &declared
+            ),
+            SourceEffect::ReadsSources
+        );
+        assert_eq!(
+            classify_source_effect("scripts/heavyweight", &declared),
+            SourceEffect::Unknown,
+            "a prefix matches whole words, not a longer name"
+        );
+    }
+}
+
+#[cfg(test)]
+mod poll_loop_tests {
+    use super::*;
+
+    /// A poll — `sleep`, an environment assignment for a reader, a loop whose
+    /// every command reads — is a reader. Classified as a writer, a CI poll
+    /// held the workspace's write lease for forty minutes and every later
+    /// command queued behind it. The kernel's read-only lane still enforces
+    /// it: a misclassified poll fails, it cannot write.
+    #[test]
+    fn polls_and_waits_are_read_only() {
+        for cmd in [
+            "sleep 60",
+            "XDG_CACHE_HOME=/tmp/x gh pr checks 87",
+            "until gh pr checks 87 | grep -q pass; do sleep 60; done",
+            "while pgrep -f cargo; do sleep 5; done",
+            "sleep 30; gh run list --limit 5",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::ReadOnly, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_loop_or_assignment_around_a_writer_stays_exclusive() {
+        for cmd in [
+            "until cargo build; do sleep 5; done",
+            "while true; do rm -f x; done",
+            "FOO=1 cargo build",
+            "LD_PRELOAD=/x.so ls; touch y",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::Exclusive, "{cmd}");
         }
     }
 }

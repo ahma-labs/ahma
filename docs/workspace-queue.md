@@ -31,7 +31,7 @@ status()                                     → ── Finished since your last
 - **Writers run one at a time, in arrival order.** A command that may write the workspace
   waits for every earlier one. If its call returns before it starts, the result says
   `NOT started — queued behind …` and names who it waits for; it runs by itself.
-- **Readers never wait.** `git status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, `pgrep`, `ahma ps`, `sed -n`, `gh pr view`, `curl` and similar — and **pipelines and lists of them** (`grep … | head`, `cd src && ls`, `2>&1`, `>/dev/null`) —
+- **Readers never wait.** `git status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, `pgrep`, `ahma ps`, `sed -n`, `gh pr view`, `curl`, `sleep` and similar — and **pipelines, lists and loops of them** (`grep … | head`, `cd src && ls`, `2>&1`, `>/dev/null`, `FOO=1 gh pr checks 87`, `until gh pr checks 87; do sleep 60; done`) —
   plain reads skip the queue — under a sandbox that grants the workspace **no write access**,
   so a misclassified command fails instead of writing.
 - **Nothing is lost to a forgotten `await`.** A result the model never collected is put at
@@ -40,9 +40,16 @@ status()                                     → ── Finished since your last
   they cannot be queued. A command that ran for two seconds or more lists the files that
   changed in its workspace while it ran (`changed_during_run`), so a test verdict that
   raced an edit says so.
-- **Edits wait for writers.** ahma's own file tools refuse an edit while a writer runs in
-  that workspace, naming it; the opt-in edit guard does the same for the client's own file
-  tools in Claude Code, Codex, Copilot CLI, Cursor, Antigravity and VS Code.
+- **Edits wait only for commands that rewrite sources.** A build, test or linter (`cargo
+  test`, `npm test`, `./gradlew build`, `pytest`, …) reads sources, so an edit made while it
+  runs goes through, and the run's `changed_during_run` says the verdict may have seen it.
+  A formatter, codemod, checkout or package manager (`cargo fmt`, `git checkout`,
+  `prettier --write`, `npm install`) rewrites them, so an edit is refused until it finishes,
+  naming it and how long it usually takes. An unrecognised command (a project script) is
+  treated as a rewriter, but only inside the subtree it runs in. The first refusal for a
+  command gives the reason; later ones are one line. ahma's own file tools and the edit
+  guard for Claude Code, Codex, Copilot CLI, Cursor, Antigravity and VS Code decide the
+  same way.
 
 ## Quickstart
 
@@ -135,7 +142,8 @@ the session that started it.
 |---|---|---|
 | `execution_mode` | `"async"` | `"sync"` makes every call wait for its result |
 | `workspace_queue` | `true` | `false` lets writers overlap again (the pre-R2.7 behaviour); only sensible with `execution_mode = "sync"` |
-| `edit_guard` | `true` | ahma's own file tools refuse edits while a writer runs; also gates the edit guard installed by `ahma hooks install --edit-guard` |
+| `edit_guard` | `true` | ahma's own file tools refuse edits while a command that may rewrite sources runs; also gates the edit guard installed by `ahma hooks install --edit-guard` |
+| `source_readers` | `[]` | This project's own wrappers that only read sources (`["scripts/heavy"]`): edits proceed while one runs |
 | `mutex_groups` | `cargo` | Extra per-workspace serialisation for tools that contend on a shared directory, matched on the command line you wrote |
 
 ## Limits

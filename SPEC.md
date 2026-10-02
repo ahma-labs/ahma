@@ -309,7 +309,10 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   a reader that never ends must not hold the workspace for its whole life —, `ps`, `sed`
   without `-i`, `gh` viewing commands, `curl` without an output file, ahma's own listing
   commands, …), reads **pipelines and lists** of such readers (`grep … | head`, `cd src &&
-  ls`, `2>&1`, `>/dev/null`, a plain `$VAR`) as readers, and treats a substitution, a
+  ls`, `2>&1`, `>/dev/null`, a plain `$VAR`) as readers, and so too `sleep`, a `NAME=value`
+  assignment before a reader, and an `until`/`while`/`if` list whose every command reads (a CI
+  poll such as `until gh pr checks 87; do sleep 60; done`, which as a writer held the
+  workspace's lease for forty minutes), and treats a substitution, a
   writing redirection, grouping, an escape or an unknown program as exclusive. The
   classifier is permissive only where the kernel lane makes a mistake harmless; before it
   read pipelines, `git status`, `ps` and `grep … | head` all queued behind another session's
@@ -347,10 +350,23 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   degrades to in-process only, with a `warn` — it never wedges. Within one process the order
   is strict FIFO; across processes the kernel lock guarantees mutual exclusion but not
   arrival order.
-- **R2.7.8**: **Edits wait for writers.** ahma's own file tools (`write_file`,
-  `replace_in_file`, `multi_edit`, `apply_patch`) **must** refuse an edit while an exclusive
-  operation holds the edited file's workspace, naming it and saying to `await` or `cancel`
-  it (`tools.edit_guard`, default on). `ahma hooks install` **must** install the
+- **R2.7.8**: **Edits wait for commands that rewrite sources.** ahma's own file tools
+  (`write_file`, `replace_in_file`, `multi_edit`, `apply_patch`) **must** refuse an edit
+  while an exclusive operation that may rewrite source files holds the edited file's
+  workspace, naming it, how long the same command usually takes, and saying to `await` or
+  `cancel` it (`tools.edit_guard`, default on). What a holder does to sources is classified
+  where the command is known and published with the holder (`SourceEffect`): a build, test
+  or linter *reads* sources and **must not** block an edit — the drift report (R2.7.6)
+  already says the run may have seen it, and refusing bought nothing but a forced `await`
+  that undoes the overlap R2.7 exists for; a formatter, codemod, checkout or package
+  manager *rewrites* them and blocks; anything unrecognised is treated as a rewriter, but
+  blocks only inside the subtree it runs in (its footprint) when that is narrower than the
+  workspace. A holder record without these fields (an older ahma) blocks every edit, as
+  before. A project may declare its own source-reading wrappers (`tools.source_readers`, a
+  preference-tier list of command prefixes matched in whole words); a wrong entry costs a
+  stale verdict the drift report names, never confinement. The full refusal is given once
+  per running command; every later refusal for the same command is one line. ahma's file
+  tools and the hook below share one decision (`WorkspaceQueue::edit_conflict`). `ahma hooks install` **must** install the
   same check as a pre-edit hook in every supported client that has one — Claude Code, Codex
   (`apply_patch`, paths read from the patch), Copilot CLI, Cursor and Antigravity; VS Code's
   agents run those files — each in that client's own matcher and decision format, under its

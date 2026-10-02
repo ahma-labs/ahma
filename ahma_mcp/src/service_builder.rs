@@ -207,7 +207,8 @@ impl<'a> ServiceBuilder<'a> {
             )?
             .with_scope_grant_notifier(grant_notifier)
             .with_workspace_queue(
-                crate::adapter::workspace_queue::WorkspaceQueue::new(config.workspace_queue),
+                crate::adapter::workspace_queue::WorkspaceQueue::new(config.workspace_queue)
+                    .with_source_readers(config.source_readers.clone()),
             ),
         );
 

@@ -1066,6 +1066,7 @@ mod tests {
             mutex_groups: ahma_common::config::default_mutex_groups(),
             workspace_queue: true,
             edit_guard: true,
+            source_readers: Vec::new(),
             settings_origin: crate::shell::cli::SettingsOriginCtx::default(),
             hub_idle_timeout_secs: 60,
             hub_drain_timeout_secs: 3600,
