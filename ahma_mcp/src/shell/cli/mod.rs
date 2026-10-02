@@ -1059,6 +1059,7 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         }
         Subcommands::Doctor(args) => commands::run_doctor_command(args),
         Subcommands::Queue => commands::run_queue_command(),
+        Subcommands::Ps { filter } => commands::run_ps_command(filter.as_deref()),
     }
 }
 
@@ -1484,6 +1485,12 @@ pub enum Subcommands {
     Doctor(DoctorArgs),
     /// Show who holds each workspace's write lease right now (SPEC R2.7.9). Read-only and never queued itself, so it works while every other command of yours is waiting. Lists the holder's command, pid, age and whether that process is still alive; a dead holder has already released the OS lock and only its record remains. To stop a live holder, cancel its operation in the ahma TUI or with the `cancel` tool of the session that owns it.
     Queue,
+    /// List processes from inside the sandbox (SPEC R6.2.8). `/bin/ps` is setuid root and no sandbox can execute a setuid binary, so a sandboxed agent cannot run it at all; this prints pid, parent, start time, whether the process is itself sandboxed, and the command line, with the same information `ps` would give. Read-only and never queued.
+    Ps {
+        /// Only processes whose command line contains this text.
+        #[arg(value_name = "FILTER")]
+        filter: Option<String>,
+    },
 }
 
 /// Arguments for `ahma doctor`.

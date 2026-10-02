@@ -140,7 +140,7 @@ The shape-matched rules are application-layer on *every* platform by constructio
 
 ## Signals: a command may stop only what it started
 
-The profile also grants `process-info*`, so `ps`, `pgrep` and `lsof` work under it (SPEC R6.2.8); denying them protected nothing and left agents unable to see what they were waiting for.
+The profile also grants `process-info*`, so `pgrep` and `lsof` work under it (SPEC R6.2.8). `/bin/ps` and `top` are setuid root, and no sandbox can execute a setuid binary (a kernel rule, not a missing allow), so `ahma ps [FILTER]` lists processes instead — pid, parent, start, whether the process is itself sandboxed, command line — and is read-only and never queued. Denying process information protected nothing and left agents unable to see what they were waiting for.
 
 On macOS the Seatbelt profile grants `(allow signal (target same-sandbox))`, so a sandboxed command can `kill` the process tree it started under the same profile and nothing else. A `kill` aimed at another session's build, a server from an earlier command, or any other process of yours is refused by the kernel, and ahma explains the `kill: (N) - Operation not permitted` it sees as a boundary rather than a dead pid: the agent is told the pid belongs to something outside its sandbox and that a human must stop it (SPEC R6.2.6). `[sandbox] signal_other_processes = true` is the explicit opt-out, logged at startup. (Linux and Windows do not confine signals; the README's *What the sandbox does not cover* says so.)
 

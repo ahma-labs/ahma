@@ -303,7 +303,7 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
         "ahma" => {
             let mut it = args.iter().map(String::as_str);
             match (it.next(), it.next()) {
-                (Some("queue"), None) | (Some("--version"), _) => true,
+                (Some("queue"), None) | (Some("ps"), _) | (Some("--version"), _) => true,
                 (Some("sandbox" | "permissions" | "network"), Some("list")) => true,
                 (Some("hooks"), Some("status")) => true,
                 (Some("doctor"), _) => !has("--fix"),
@@ -482,6 +482,7 @@ mod pipeline_tests {
             "printenv PATH",
             "ahma sandbox list",
             "ahma queue",
+            "ahma ps sccache",
             "ahma doctor",
             "ahma --version",
             "cargo --version",

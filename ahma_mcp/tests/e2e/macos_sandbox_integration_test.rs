@@ -915,12 +915,12 @@ fn gpu_allowed_profile_exposes_metal_device() {
     );
 }
 
-/// SPEC R6.2.8: a sandboxed command can list processes. `ps` needs
-/// `process-info*`; without it an agent cannot even see what it is waiting
-/// for, and every diagnosis turns into a guess.
+/// SPEC R6.2.8: a sandboxed command can see processes. `/bin/ps` is setuid
+/// root and no sandbox can exec a setuid binary (a kernel rule), so the
+/// profile grants `process-info*` for `pgrep`/`lsof` and ahma ships `ahma ps`.
 #[cfg(target_os = "macos")]
 #[test]
-fn sandboxed_ps_can_list_processes() {
+fn sandboxed_pgrep_and_ahma_ps_can_list_processes() {
     skip_if_nested_sandbox!();
     use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     let scope = TempDir::new().expect("scope dir");
@@ -933,17 +933,47 @@ fn sandboxed_ps_can_list_processes() {
     )
     .expect("build sandbox");
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    assert!(profile.contains("(allow process-info*)"), "{profile}");
+
+    // pgrep is a plain binary: with process-info it can see other processes.
     let out = Command::new("sandbox-exec")
-        .args(["-p", &profile, "/bin/ps", "-o", "pid=,comm=", "-p"])
+        .args(["-p", &profile, "/usr/bin/pgrep", "-l", "-P", "1"])
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandbox-exec (pgrep)");
+    assert!(
+        out.status.success() && !out.stdout.is_empty(),
+        "pgrep must work under the profile. exit={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `ahma ps` lists this very test process.
+    let ahma = ahma_mcp::test_utils::cli::build_binary_cached("ahma_mcp", "ahma");
+    let out = Command::new("sandbox-exec")
+        .args(["-p", &profile])
+        .arg(&ahma)
+        .args(["ps", "macos_sandbox_integration_test"])
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandbox-exec (ahma ps)");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains(&std::process::id().to_string()),
+        "ahma ps must work under the profile and list this process. exit={:?} stdout={stdout} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And the setuid `ps` is refused by the kernel, which is why `ahma ps` exists.
+    let out = Command::new("sandbox-exec")
+        .args(["-p", &profile, "/bin/ps", "-p"])
         .arg(std::process::id().to_string())
         .current_dir(scope.path())
         .output()
         .expect("run sandbox-exec (ps)");
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success() && stdout.contains(&std::process::id().to_string()),
-        "ps must work under the profile. exit={:?} stdout={stdout} stderr={}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr)
+        !out.status.success(),
+        "a setuid binary cannot run under any sandbox; if this starts passing, drop `ahma ps`"
     );
 }
