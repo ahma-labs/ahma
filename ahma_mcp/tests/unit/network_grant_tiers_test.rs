@@ -10,6 +10,15 @@ use serde_json::json;
 use tempfile::TempDir;
 
 async fn grant_with_answer(answer: Option<&str>) -> (String, String) {
+    let (text, saved, _) = grant_with_answer_audited(answer).await;
+    (text, saved)
+}
+
+/// The reply, the settings file, and the grant tiers the audit log recorded
+/// for `crates.io`.
+async fn grant_with_answer_audited(
+    answer: Option<&str>,
+) -> (String, String, Vec<ahma_common::permissions::GrantTier>) {
     let home = TempDir::new().unwrap();
     // SAFETY: nextest runs each test in its own process.
     unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
@@ -34,7 +43,14 @@ async fn grant_with_answer(answer: Option<&str>) -> (String, String) {
         .collect::<String>();
     let saved = std::fs::read_to_string(home.path().join(".ahma").join("settings.toml"))
         .unwrap_or_default();
-    (text, saved)
+    let audited = ahma_common::permissions::read_audit_entries(
+        &home.path().join(".ahma").join("permissions-audit.jsonl"),
+    )
+    .into_iter()
+    .filter(|e| e.subject == "crates.io")
+    .map(|e| e.tier)
+    .collect();
+    (text, saved, audited)
 }
 
 #[tokio::test]
@@ -63,4 +79,18 @@ async fn a_decline_does_not_invite_asking_again() {
         !text.contains("to prompt again"),
         "a no is an answer, not an invitation to ask again: {text}"
     );
+}
+
+/// Every allow is audited exactly once, with the tier the human chose: an
+/// `always` answer where it is written, a session answer by the tool, since
+/// nothing is written for it (SPEC R-PERM.2).
+#[tokio::test]
+async fn each_answer_is_audited_once_with_its_tier() {
+    use ahma_common::permissions::GrantTier;
+    let (_, _, audited) = grant_with_answer_audited(Some("always")).await;
+    assert_eq!(audited, vec![GrantTier::Always]);
+    let (_, _, audited) = grant_with_answer_audited(Some("session")).await;
+    assert_eq!(audited, vec![GrantTier::Session]);
+    let (_, _, audited) = grant_with_answer_audited(None).await;
+    assert!(audited.is_empty(), "a decline grants nothing: {audited:?}");
 }

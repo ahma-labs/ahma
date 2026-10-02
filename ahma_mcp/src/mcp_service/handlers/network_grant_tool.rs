@@ -261,7 +261,7 @@ impl AhmaMcpService {
         // Only an `always` answer is written (SPEC R-PERM.2); every allow
         // applies to the live session now.
         let newly_added = if tier == GrantTier::Always {
-            persist_net_allow(&settings_file, &host).map_err(|e| {
+            persist_net_allow(&settings_file, &host, "mcp:network_grant").map_err(|e| {
                 common::mcp_internal(format!(
                     "failed to persist network grant to {}: {e:#}",
                     settings_file.display()
@@ -270,20 +270,24 @@ impl AhmaMcpService {
         } else {
             false
         };
+
         self.net_approval.add_session_grant(&host);
 
-        let at = chrono::Local::now().to_rfc3339();
-        let entry = audit_entry(
-            at,
-            AuditAction::Grant,
-            GrantKind::NetHost,
-            &host,
-            None,
-            tier,
-            Some("mcp:network_grant".to_string()),
-        );
+        // An `always` answer is audited where it is written
+        // (`persist_net_allow`). A session answer is never written, so it is
+        // audited here.
+        if tier == GrantTier::Session {
+            append_audit(&audit_entry(
+                chrono::Local::now().to_rfc3339(),
+                AuditAction::Grant,
+                GrantKind::NetHost,
+                &host,
+                None,
+                tier,
+                Some("mcp:network_grant".to_string()),
+            ));
+        }
         let _ = note;
-        append_audit(&entry);
 
         if tier == GrantTier::Session {
             return Ok(common::text_result(format!(

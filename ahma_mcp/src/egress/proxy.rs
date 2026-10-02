@@ -370,7 +370,11 @@ async fn resolve_egress_approval(
         }
         NetResolveOutcome::Persist { domain } => {
             match ahma_common::config::settings_path() {
-                Some(file) => match ahma_common::net_approval::persist_net_allow(&file, &domain) {
+                Some(file) => match ahma_common::net_approval::persist_net_allow(
+                    &file,
+                    &domain,
+                    "egress-proxy",
+                ) {
                     Ok(true) => info!(
                         domain = %domain,
                         "network egress approved and saved to [network].allow"
