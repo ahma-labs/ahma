@@ -44,6 +44,7 @@ mod livelog_pipeline_test;
 mod log_monitor_integration_test;
 mod logging_unit_test;
 mod mcp_service_coverage_improvement_test;
+mod network_grant_tiers_test;
 mod operation_monitor;
 mod package_cache_write_test;
 mod path_security_edge_cases_test;
