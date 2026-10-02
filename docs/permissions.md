@@ -101,8 +101,10 @@ exact line.
   time, so there's nothing to restart.
 - **The MCP server** (your IDE's connection): when a human approves a request the
   `sandbox_grant` or `network_grant` MCP tool raised (at your client's prompt, or in the
-  ahma TUI), it takes effect **immediately** for the active session in addition to
-  persisting. The tools never grant on their own: `confirm: true` only raises the
+  ahma TUI), it takes effect **immediately** for the active session, and an `always`
+  answer is also saved. The agent is told the answer you gave: approved and for how
+  long, declined, still waiting in the TUI, or that no surface could ask you. The
+  tools never grant on their own: `confirm: true` only raises the
   question, for every client — a client that cannot show a prompt cannot approve, and
   ahma never assumes it asked you before the call. For offline configuration edits
   (`ahma sandbox grant` or `ahma network allow` CLI, or direct `~/.ahma/settings.toml`
