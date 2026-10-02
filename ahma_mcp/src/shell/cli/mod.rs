@@ -3005,6 +3005,16 @@ fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::
 
     install_credential_read_denies(s, allow_keychain);
 
+    // SPEC R6.2.6: signals stay inside the command's own sandbox unless the
+    // user opted out in settings.
+    sandbox::set_signal_other_processes(s.sandbox.signal_other_processes);
+    if cfg!(target_os = "macos") && s.sandbox.signal_other_processes {
+        tracing::warn!(
+            "[sandbox] signal_other_processes=true: sandboxed commands may kill processes \
+             outside their own sandbox, including other sessions' builds"
+        );
+    }
+
     if cfg!(target_os = "macos") && !allow_keychain {
         tracing::info!(
             "macOS keychain access disabled ([sandbox] allow_keychain=false / \

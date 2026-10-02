@@ -260,6 +260,11 @@ See [permissions.md](permissions.md) for the full model.
 
 ## Trust-handoff escape hatches
 
+On macOS a sandboxed command may signal (`kill`) only the process tree it started
+itself; `signal_other_processes = true` lets it signal any of your processes, which is
+how one agent stopped another session's build — turn it on only for a workflow that
+genuinely has to stop a pre-existing server (SPEC R6.2.6).
+
 Some paths inside your workspace are writable by you but *executed by something
 outside ahma's sandbox*. ahma denies writes to those by default (SPEC R-HANDOFF),
 kernel-enforced on macOS. Two of them have real, legitimate uses, so each has a

@@ -83,12 +83,14 @@ impl Sandbox {
         let network_rules = self.get_macos_network_rules();
         let exec_config_deny_rules = self.get_macos_exec_config_deny_rules(&git_resolution_roots);
 
+        // SPEC R6.2.6: signals stay inside this command's own sandbox unless
+        // the user opted out — see `super::signals`.
+        let signal_rules = super::signals::seatbelt_signal_rule();
         let profile = format!(
             r#"(version 1)
 (deny default)
 (allow process*)
-(allow signal)
-(allow sysctl-read)
+{signal_rules}(allow sysctl-read)
 {system_rules}{git_dir_rules}{credential_deny_rules}{keychain_rules}{profile_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
 {working_dir_write}{temp_rules}(allow file-read* (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))
@@ -101,6 +103,7 @@ impl Sandbox {
 "#,
             working_dir = wd_str,
             working_dir_write = working_dir_write,
+            signal_rules = signal_rules,
             system_rules = system_rules,
             credential_deny_rules = credential_deny_rules,
             keychain_rules = keychain_rules,

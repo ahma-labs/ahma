@@ -180,4 +180,4 @@ hub running, the command runs exactly as it otherwise would.
 - [docs/tui.md](tui.md) — the work view that watches all of this
 - [docs/connection-modes.md](connection-modes.md) — how editors connect
 - [docs/session-isolation.md](session-isolation.md) — per-session workers and scopes
-- SPEC.md `R-HUB` — the requirements this implements
+- SPEC.md `R-HUB` — the requirements this implements. R-HUB.12: the hub and its workers start in the runtime directory, so a worker's tools dir, logs and audit follow its own committed scope rather than whichever checkout the hub was first launched from.

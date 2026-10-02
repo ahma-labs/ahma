@@ -360,9 +360,67 @@ fn is_windows_abs(token: &str) -> bool {
     drive_rooted || token.starts_with("\\\\")
 }
 
+/// The pid a shell's `kill` builtin reported it could not signal, when the
+/// output carries that signature (`kill: (N) - Operation not permitted`,
+/// `kill: kill N failed: operation not permitted`). A refused signal is a
+/// sandbox boundary (SPEC R6.2.4), not a dead process, and the agent needs to
+/// be told which. Plain line scanning, first hit only, like the path scanner.
+pub fn scan_signal_denial(output: &str) -> Option<u32> {
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("kill") || !lower.contains("operation not permitted") {
+            continue;
+        }
+        let digits: String = line
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        // bash prefixes the line with `line 0:`; take the first number after
+        // the `kill` word instead when that happened.
+        let after_kill = lower.find("kill").map(|i| &line[i..]).unwrap_or(line);
+        let pid_text: String = after_kill
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let candidate = if pid_text.is_empty() {
+            digits
+        } else {
+            pid_text
+        };
+        if let Ok(pid) = candidate.parse::<u32>()
+            && pid > 0
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_eperm_names_the_pid() {
+        assert_eq!(
+            scan_signal_denial("bash: line 0: kill: (78690) - Operation not permitted"),
+            Some(78690)
+        );
+        assert_eq!(
+            scan_signal_denial("kill: kill 5804 failed: operation not permitted"),
+            Some(5804)
+        );
+        assert_eq!(
+            scan_signal_denial("bash: line 0: kill: (78690) - No such process"),
+            None
+        );
+        assert_eq!(
+            scan_signal_denial("Operation not permitted (os error 1)"),
+            None
+        );
+    }
 
     #[test]
     fn seatbelt_write_denial_is_rw() {

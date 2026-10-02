@@ -1141,6 +1141,12 @@ pub struct SandboxSettings {
     /// Default: `true`
     #[serde(default = "default_true")]
     pub allow_keychain: bool,
+    /// macOS: let sandboxed commands signal (`kill`) processes outside their own
+    /// sandbox. Off by default (SPEC R6.2.6): a command may signal only the
+    /// process tree it started, so one agent cannot stop another session's
+    /// build. Turn on only for a workflow that genuinely has to stop a
+    /// pre-existing server. Default: `false`
+    pub signal_other_processes: bool,
     /// macOS only. Additional credential directories whose **reads** are denied
     /// to sandboxed tools, on top of the built-in default set (`~/.ahma`,
     /// `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.kube`, `~/.docker`,
@@ -1283,6 +1289,7 @@ impl Default for SandboxSettings {
             persistent_scopes: Vec::new(),
             env_allow: Vec::new(),
             allow_keychain: true,
+            signal_other_processes: false,
             deny_credential_reads: Vec::new(),
             allow_credential_reads: Vec::new(),
             profiles: default_sandbox_profiles(),
@@ -2234,6 +2241,12 @@ impl AhmaSettings {
             d.sandbox.allow_keychain.to_string(),
         );
         w.setting(
+            "macOS: let sandboxed commands signal (kill) processes outside their own sandbox. Off = a command may only stop the process tree it started (SPEC R6.2.6).",
+            "signal_other_processes",
+            self.sandbox.signal_other_processes.to_string(),
+            d.sandbox.signal_other_processes.to_string(),
+        );
+        w.setting(
             "macOS: extra credential dirs to deny reads (on top of the built-in default set; e.g. ~/.ssh to harden further).",
             "deny_credential_reads",
             toml_path_list(&self.sandbox.deny_credential_reads),
@@ -2985,6 +2998,7 @@ mod tests {
                 }],
                 env_allow: vec!["GITHUB_TOKEN".into()],
                 allow_keychain: false,
+                signal_other_processes: true,
                 deny_credential_reads: vec![PathBuf::from("~/.ssh")],
                 allow_credential_reads: vec![PathBuf::from("~/.aws")],
                 profiles: vec!["rust".into()],

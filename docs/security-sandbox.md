@@ -138,6 +138,12 @@ The shape-matched rules are application-layer on *every* platform by constructio
 
 **The child's environment is part of the same surface.** Variables that cause an unrelated process to load code of the agent's choosing (`BASH_ENV`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES` and family) or that re-point a trusted client at an attacker-chosen endpoint (`DOCKER_HOST`) are stripped from every sandboxed child. `SSH_AUTH_SOCK` is deliberately **kept**: it is a capability to *use* keys, not to read them, and it is what lets git-over-ssh keep working while the key files stay denied (SPEC R-HANDOFF.5).
 
+## Signals: a command may stop only what it started
+
+On macOS the Seatbelt profile grants `(allow signal (target same-sandbox))`, so a sandboxed command can `kill` the process tree it started under the same profile and nothing else. A `kill` aimed at another session's build, a server from an earlier command, or any other process of yours is refused by the kernel, and ahma explains the `kill: (N) - Operation not permitted` it sees as a boundary rather than a dead pid: the agent is told the pid belongs to something outside its sandbox and that a human must stop it (SPEC R6.2.6). `[sandbox] signal_other_processes = true` is the explicit opt-out, logged at startup. (Linux and Windows do not confine signals; the README's *What the sandbox does not cover* says so.)
+
+The hub and the workers it spawns start in ahma's runtime directory, never in the checkout the hub happened to be launched from: a worker's scope comes from its own client's `roots/list`, and its tools directory and operation logs follow that scope. Before this, every worker inherited the first checkout's directory, logged into it, and loaded that checkout's `.ahma/` as the trusted tool set of every other project (SPEC R-HUB.12).
+
 ## Network egress
 
 The filesystem sandbox says nothing about the network, and **egress is unrestricted by default**. Pass `--restrict-network` (or set `[network] restrict = true`) to route sandboxed subprocesses through a guarded local proxy that forwards only the domains in `[network] allow` — deny-all when that list is empty — and refuses private, loopback and cloud-metadata addresses. The README's *What the sandbox does not cover* section states what that restriction is and is not on each platform. How the allowlist is built, and the hosts each sandbox profile contributes: [network-egress.md](network-egress.md).

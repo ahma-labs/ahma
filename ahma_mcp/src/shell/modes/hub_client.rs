@@ -196,6 +196,15 @@ pub(crate) fn hub_command(
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("hub");
+    // The hub serves every workspace on this machine and must not belong to
+    // the one it happened to be started from: a worker inherits the hub's
+    // working directory, and that directory then chose the worker's tools dir
+    // and log dir — every session's logs landed in one checkout, and that
+    // checkout's `.ahma/` became the trusted tool set of every other project
+    // (SPEC R-HUB.12). Start it somewhere neutral.
+    if let Some(dir) = ahma_common::hub::runtime_dir() {
+        cmd.current_dir(dir);
+    }
     // The one socket (SPEC R-HUB.2): the MCP endpoint, the event stream and
     // the lock beside it all follow from this path.
     cmd.args(["--unix-socket-path", socket_path]);
