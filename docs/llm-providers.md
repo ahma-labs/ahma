@@ -163,7 +163,9 @@ curl http://localhost:11434/v1/chat/completions \
 Requests to a provider retry transient failures — a refused connection, a dropped connection,
 HTTP 429 or 5xx — up to three times with backoff, honouring `Retry-After`. A model on this
 machine is not re-sent its prompt after a timeout: it is slow, not gone, and a re-send makes it
-start reading again. If every attempt fails, the message leads with which endpoint is down and
+start reading again. A completion that is not streamed is never re-sent after a timeout
+either, local or remote: the provider has probably done the work and billed it already,
+and a second attempt would pay for it again. If every attempt fails, the message leads with which endpoint is down and
 what to check, then the technical detail:
 
 ```text

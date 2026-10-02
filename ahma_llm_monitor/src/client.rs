@@ -336,15 +336,31 @@ pub struct LlmClient {
     num_ctx: Option<u32>,
 }
 
+/// Timeout and retry rule for one non-streaming completion
+/// ([`LlmClient::completion_policy`]).
+#[derive(Debug, Clone, Copy)]
+struct CompletionPolicy {
+    timeout: Duration,
+    retry_timeouts: bool,
+}
+
 impl LlmClient {
-    /// Whole-request cap for a non-streaming completion: two minutes for a
-    /// remote API, the local read window for a model on this machine (which is
-    /// silent until it has read the entire prompt).
-    fn request_timeout(&self) -> Duration {
-        if self.local {
-            LLM_LOCAL_READ_TIMEOUT
-        } else {
-            Duration::from_secs(120)
+    /// How a non-streaming completion is sent. The whole-request cap is the
+    /// local read window for a model on this machine (silent until it has
+    /// read the entire prompt) and ten minutes for a remote API, the window
+    /// provider SDKs give a long tool turn; two minutes cut off Anthropic
+    /// tool turns with thinking. A timeout is never retried: the request was
+    /// most likely received, worked on and billed, and the same work usually
+    /// times out again, so a retry paid twice for nothing. Connection errors,
+    /// 429 and 5xx are still retried, since nothing was done for them.
+    fn completion_policy(&self) -> CompletionPolicy {
+        CompletionPolicy {
+            timeout: if self.local {
+                LLM_LOCAL_READ_TIMEOUT
+            } else {
+                Duration::from_secs(600)
+            },
+            retry_timeouts: false,
         }
     }
 
@@ -792,12 +808,13 @@ impl LlmClient {
         let (url, body) = self.build_chat_completion_request_payload(messages, tools);
 
         let started = std::time::Instant::now();
+        let policy = self.completion_policy();
         info!(
             model = %self.model,
             messages = messages.len(),
             tools = tools.len(),
             stream = false,
-            timeout_secs = self.request_timeout().as_secs(),
+            timeout_secs = policy.timeout.as_secs(),
             "llm: requesting chat completion with tools (non-streaming)"
         );
 
@@ -806,14 +823,14 @@ impl LlmClient {
                 self.http
                     .post(&url)
                     .json(&body)
-                    .timeout(self.request_timeout()),
+                    .timeout(policy.timeout),
             )
-        }, !self.local)
+        }, policy.retry_timeouts)
         .await
         .inspect_err(|e| {
             let elapsed_ms = started.elapsed().as_millis();
             if e.is_timeout() {
-                warn!(model = %self.model, elapsed_ms, "llm: chat completion timed out after retries — model too slow, or prompt exceeds its context window");
+                warn!(model = %self.model, elapsed_ms, "llm: chat completion timed out (not retried: the provider may already have done, and billed, the work) — model too slow, or prompt exceeds its context window");
             } else {
                 warn!(model = %self.model, elapsed_ms, error = %e, "llm: chat completion request failed after retries");
             }
@@ -1848,6 +1865,21 @@ mod tests {
         assert_eq!(b["max_tokens"], json!(8192));
         assert!(b.get("max_completion_tokens").is_none(), "{b}");
         assert_eq!(b["temperature"], json!(0.2));
+    }
+
+    /// A non-streaming completion that timed out was most likely received,
+    /// worked on and billed; sending it again pays twice for work that
+    /// usually times out again. So it is never retried on a timeout, local or
+    /// remote, and a remote one gets the ten minutes provider SDKs allow for
+    /// a long tool turn rather than two.
+    #[test]
+    fn a_timed_out_completion_is_never_sent_again() {
+        for url in ["https://api.anthropic.com/v1", "http://localhost:11434/v1"] {
+            let c = LlmClient::new(url, "m", Some("k".into()));
+            let policy = c.completion_policy();
+            assert!(!policy.retry_timeouts, "{url}");
+            assert!(policy.timeout >= Duration::from_secs(600), "{url}");
+        }
     }
 
     #[test]
