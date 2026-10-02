@@ -140,7 +140,17 @@ The shape-matched rules are application-layer on *every* platform by constructio
 
 ## Signals: a command may stop only what it started
 
+The profile also grants `process-info*`, so `ps`, `pgrep` and `lsof` work under it (SPEC R6.2.8); denying them protected nothing and left agents unable to see what they were waiting for.
+
 On macOS the Seatbelt profile grants `(allow signal (target same-sandbox))`, so a sandboxed command can `kill` the process tree it started under the same profile and nothing else. A `kill` aimed at another session's build, a server from an earlier command, or any other process of yours is refused by the kernel, and ahma explains the `kill: (N) - Operation not permitted` it sees as a boundary rather than a dead pid: the agent is told the pid belongs to something outside its sandbox and that a human must stop it (SPEC R6.2.6). `[sandbox] signal_other_processes = true` is the explicit opt-out, logged at startup. (Linux and Windows do not confine signals; the README's *What the sandbox does not cover* says so.)
+
+## Tools that bring their own sandbox (SwiftPM, xcodebuild)
+
+SwiftPM's manifest loader and `xcodebuild` package resolution call `sandbox-exec` themselves, and macOS allows one profile per process tree, so inside ahma's sandbox they fail with `sandbox_apply: Operation not permitted`. This is the nesting limit, not a path: no grant helps, and ahma says so instead of offering one (SPEC R7.7). Use the tool's own switch: `swift build --disable-sandbox` / `swift package resolve --disable-sandbox`, or for `xcodebuild` run `defaults write com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES` once (SwiftPM's manifest sandbox is turned off; ahma's sandbox still confines the build). A workspace whose packages were resolved once outside ahma no longer loads manifests under `sandbox-exec`.
+
+## Helpers left running inside a sandbox (sccache, Gradle and Kotlin daemons)
+
+A long-lived helper started by a sandboxed command inherits the sandbox and outlives the command. A sccache server started that way serves every session on the machine but can write only the checkout it was born in, so every other checkout's Rust build fails under its own `target/` with a bare `Operation not permitted`. `ahma doctor` finds any such process by its shape — confined, reparented to launchd, your own executable — and names the restart (`sccache --stop-server && sccache --start-server` from a plain terminal); `ahma doctor --fix` runs it, and an unconfined ahma server restarts a confined sccache on its own at startup (SPEC R-DOCTOR.7).
 
 ## GPU (Metal): denied unless you opt in
 

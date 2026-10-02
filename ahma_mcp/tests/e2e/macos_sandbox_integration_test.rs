@@ -914,3 +914,36 @@ fn gpu_allowed_profile_exposes_metal_device() {
         "with allow_gpu the probe must see the device: {out}"
     );
 }
+
+/// SPEC R6.2.8: a sandboxed command can list processes. `ps` needs
+/// `process-info*`; without it an agent cannot even see what it is waiting
+/// for, and every diagnosis turns into a guess.
+#[cfg(target_os = "macos")]
+#[test]
+fn sandboxed_ps_can_list_processes() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+    let scope = TempDir::new().expect("scope dir");
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    let out = Command::new("sandbox-exec")
+        .args(["-p", &profile, "/bin/ps", "-o", "pid=,comm=", "-p"])
+        .arg(std::process::id().to_string())
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandbox-exec (ps)");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains(&std::process::id().to_string()),
+        "ps must work under the profile. exit={:?} stdout={stdout} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

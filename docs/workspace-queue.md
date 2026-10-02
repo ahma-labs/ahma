@@ -31,7 +31,7 @@ status()                                     → ── Finished since your last
 - **Writers run one at a time, in arrival order.** A command that may write the workspace
   waits for every earlier one. If its call returns before it starts, the result says
   `NOT started — queued behind …` and names who it waits for; it runs by itself.
-- **Readers never wait.** `git status/diff/log/show`, `rg`, `grep`, `ls`, `cat` and similar
+- **Readers never wait.** `git status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, `ps`, `sed -n`, `gh pr view`, `curl` and similar — and **pipelines and lists of them** (`grep … | head`, `cd src && ls`, `2>&1`, `>/dev/null`) —
   plain reads skip the queue — under a sandbox that grants the workspace **no write access**,
   so a misclassified command fails instead of writing.
 - **Nothing is lost to a forgotten `await`.** A result the model never collected is put at
@@ -115,6 +115,19 @@ subcommand; the nearest one wins:
 ```json
 { "name": "status", "description": "git status", "concurrency": "read_only" }
 ```
+
+## Seeing who holds a workspace
+
+```
+ahma queue
+```
+
+lists every workspace lease right now: the holder's command, pid, age and whether that
+process is still alive, with a first line that says whether anything is blocked at all. It
+takes no lock and is never queued, so it works while every other command of yours is
+waiting (SPEC R2.7.9). A dead holder is shown as dead: its OS lock went with it, and only
+its record remains. To stop a live one, cancel it in the TUI or with the `cancel` tool of
+the session that started it.
 
 ## Configuration
 

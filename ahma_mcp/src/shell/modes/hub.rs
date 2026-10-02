@@ -363,6 +363,10 @@ fn spawn_successor(
     if !super::hub_client::may_spawn_hub_from(exe) {
         return;
     }
+    if let Err(why) = super::hub_client::may_spawn_hub_here() {
+        tracing::warn!("ahma hub: no successor: {why}");
+        return;
+    }
     let mut cmd = super::hub_client::hub_command(exe, &socket.to_string_lossy(), idle_timeout_secs);
     cmd.arg("--successor");
     cmd.env(

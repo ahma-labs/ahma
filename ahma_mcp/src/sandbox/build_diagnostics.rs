@@ -64,6 +64,11 @@ pub enum ContaminationKind {
     /// sandbox setting). The more common transport, so it gets the same
     /// first-class, exact remediation as SSH.
     HttpsAuth,
+    /// A child tool applied its *own* `sandbox-exec` (SwiftPM's manifest
+    /// loader, `xcodebuild` package resolution) and macOS refused to nest it
+    /// inside ahma's profile: `sandbox_apply: Operation not permitted`. A
+    /// capability refusal, not a path; no grant can fix it (SPEC R7.7).
+    NestedSandbox,
 }
 
 /// True for a token that looks like a Rust build artifact path (the things a
@@ -90,6 +95,12 @@ fn looks_like_build_script_copy(line: &str) -> bool {
     line.contains("failed to copy")
         || line.contains("copy include file")
         || line.contains("during build setup")
+}
+
+fn looks_like_nested_sandbox_refusal(line: &str) -> bool {
+    line.contains("sandbox_apply: Operation not permitted")
+        || line.contains("sandbox-exec: sandbox_apply")
+        || line.contains("sandbox_apply failed")
 }
 
 fn looks_like_https_auth_failure(line: &str) -> bool {
@@ -120,6 +131,12 @@ pub fn diagnose(stderr: &str) -> Option<ContaminationHint> {
 pub fn diagnose_streams(stderr: &str, stdout: &str) -> Option<ContaminationHint> {
     // Check both streams for SSH publickey failure first
     for line in stderr.lines().chain(stdout.lines()) {
+        if looks_like_nested_sandbox_refusal(line) {
+            return Some(ContaminationHint {
+                kind: ContaminationKind::NestedSandbox,
+                remediation: NESTED_SANDBOX_REMEDIATION.to_string(),
+            });
+        }
         if looks_like_ssh_publickey_failure(line) {
             return Some(ContaminationHint {
                 kind: ContaminationKind::SshPublicKeyAuth,
@@ -180,11 +197,24 @@ IDE background `cargo check`, or a build whose compiler wrapper changed). Fix: r
 contaminated build directory and rebuild — `rm -rf target`. Avoid running a second sandboxed build \
 against the same target dir concurrently.";
 
-const SCCACHE_REMEDIATION: &str = "Build failed and `sccache` (via RUSTC_WRAPPER) was active inside \
-the sandbox — its cache lives outside the workspace, so its reads/writes are denied and can \
-contaminate the target dir. Fix: grant the sccache cache directory to the sandbox scope (e.g. \
-`ahma sandbox grant <cache-dir>`) so the build can read/write it, or clear the wrapper for this \
-build (`RUSTC_WRAPPER=\"\" cargo …`).";
+const SCCACHE_REMEDIATION: &str = "Build failed and `sccache` (via RUSTC_WRAPPER) was active. The \
+usual cause is the shared sccache *server*: if it was started by a command inside some session's \
+ahma sandbox it inherited that sandbox, serves every session on this machine, and can write only \
+that one checkout — every other checkout then fails under its own `target/` with a bare \
+`Operation not permitted`. One thing for the human to do: `sccache --stop-server && sccache \
+--start-server` in a terminal that is not inside any sandbox; `ahma doctor` reports a confined \
+server by pid. If the server is fine, the cache directory itself may be outside the sandbox: ask \
+the human to grant it, or clear the wrapper for this build (`RUSTC_WRAPPER=\"\" cargo …`).";
+
+const NESTED_SANDBOX_REMEDIATION: &str = "A tool in this command applied its own sandbox \
+(`sandbox-exec`) and macOS refused to nest it inside ahma's: `sandbox_apply: Operation not \
+permitted`. SwiftPM's manifest loader and `xcodebuild` package resolution do this. It is a \
+capability, not a path: no directory grant can help, so do not request one. Options: `swift \
+build --disable-sandbox` / `swift package resolve --disable-sandbox` for SwiftPM; for \
+`xcodebuild`, the human runs `defaults write com.apple.dt.Xcode \
+IDEPackageSupportDisableManifestSandbox -bool YES` once (it turns off SwiftPM's own manifest \
+sandbox for Xcode; ahma's sandbox still confines the build). Resolving packages once outside \
+ahma also works, since a resolved workspace no longer loads manifests under sandbox-exec.";
 
 const BUILD_SCRIPT_COPY_REMEDIATION: &str = "Build failed with `Operation not permitted` while a \
 dependency's build script copied a file (e.g. `aws-lc-sys` copying its include headers). On macOS \
@@ -381,5 +411,59 @@ mod https_auth_tests {
             );
         }
         assert!(diagnose("fatal: repository 'https://x/y' not found").is_none());
+    }
+}
+
+#[cfg(test)]
+mod nested_and_sccache_tests {
+    use super::*;
+
+    /// SwiftPM and `xcodebuild` apply their own `sandbox-exec` to the manifest
+    /// loader; macOS refuses to nest it inside ahma's profile. No grant fixes
+    /// that, so the diagnosis must name the real options.
+    #[test]
+    fn nested_sandbox_refusal_is_diagnosed_with_the_real_options() {
+        let stderr = "error: 'neubit': sandbox_apply: Operation not permitted\n\
+            xcodebuild: error: Could not resolve package dependencies";
+        let hit = diagnose(stderr).expect("nested sandbox refusal should match");
+        assert_eq!(hit.kind, ContaminationKind::NestedSandbox);
+        assert!(
+            hit.remediation.contains("--disable-sandbox"),
+            "{}",
+            hit.remediation
+        );
+        assert!(
+            hit.remediation
+                .contains("IDEPackageSupportDisableManifestSandbox"),
+            "{}",
+            hit.remediation
+        );
+        assert!(
+            !hit.remediation.contains("sandbox_grant"),
+            "a capability refusal must not send the agent hunting for a path: {}",
+            hit.remediation
+        );
+    }
+
+    /// A sccache *server* started inside one session's sandbox can only write
+    /// that checkout; every other checkout's build then fails with a bare EPERM
+    /// under its own `target/`. The hint names the server and the exact restart.
+    #[test]
+    fn sccache_remediation_names_the_confined_server() {
+        let stderr = "sccache: error: failed to execute compile\n\
+            error writing `/p/target/debug/deps/x.rlib`: Operation not permitted (os error 1)";
+        let hit = diagnose(stderr).unwrap();
+        assert_eq!(hit.kind, ContaminationKind::SccacheWrapper);
+        assert!(
+            hit.remediation
+                .contains("sccache --stop-server && sccache --start-server"),
+            "{}",
+            hit.remediation
+        );
+        assert!(
+            hit.remediation.contains("ahma doctor"),
+            "{}",
+            hit.remediation
+        );
     }
 }

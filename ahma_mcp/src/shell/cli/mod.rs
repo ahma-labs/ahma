@@ -1058,6 +1058,7 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             commands::run_permissions_command(args)
         }
         Subcommands::Doctor(args) => commands::run_doctor_command(args),
+        Subcommands::Queue => commands::run_queue_command(),
     }
 }
 
@@ -1481,6 +1482,8 @@ pub enum Subcommands {
     Permissions(PermissionsArgs),
     /// Check ahma's own health and say what would fix what it finds: settings that do not parse, granted folders that no longer exist, a hub running a different build, the warnings repeating in the logs, and whether this folder is trusted. Read-only unless you pass --fix, and even then every fix is shown and asked about first. The same checks run as /doctor in `ahma tui`.
     Doctor(DoctorArgs),
+    /// Show who holds each workspace's write lease right now (SPEC R2.7.9). Read-only and never queued itself, so it works while every other command of yours is waiting. Lists the holder's command, pid, age and whether that process is still alive; a dead holder has already released the OS lock and only its record remains. To stop a live holder, cancel its operation in the ahma TUI or with the `cancel` tool of the session that owns it.
+    Queue,
 }
 
 /// Arguments for `ahma doctor`.
@@ -3014,6 +3017,10 @@ fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::
     // SPEC R6.2.7: the GPU is denied unless the user opted in; say so at startup
     // because the failure mode downstream is a silent CPU fallback.
     sandbox::set_allow_gpu(s.sandbox.allow_gpu);
+    // SPEC R-DOCTOR.7: a sccache server confined to one session's sandbox
+    // breaks every other checkout's build; an unconfined ahma fixes it on the
+    // way up, so the human never has to learn why.
+    sandbox::confinement::restart_confined_sccache_if_any();
     if cfg!(target_os = "macos") && s.sandbox.allow_gpu {
         tracing::info!(
             "[sandbox] allow_gpu=true: sandboxed commands may open the GPU (Metal user clients)"

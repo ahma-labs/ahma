@@ -156,6 +156,7 @@ what is missing named; `dormant` means present but not active.
 | Linux sandbox (Landlock) | tests-pass | Reads and writes confined; deny tier application-layer only (R6.1.7) |
 | macOS sandbox (Seatbelt) | tests-pass | Writes confined; reads unconfined with a credential denylist (R6.2.2, R6.2.3); signals and the GPU confined, each with an explicit opt-out/opt-in (R6.2.6, R6.2.7) |
 | Grant prompts: one body, every surface (R-PERM.3.4) | tests-pass | `grant_prompt::render`; titled enum elicitation; once/session/always with a per-session budget (R-PERM.4.5) |
+| Usable lane and visible queue (R2.7.4, R2.7.9) | tests-pass | pipelines of readers are readers; `ahma queue`; `ps` under the profile (R6.2.8) |
 | Windows sandbox | in-progress | Job Objects only; AppContainer written but disproved in CI, so off — no OS path boundary (R6.3.3) |
 | Nested sandbox detection and deferral (R7) | tests-pass | Hooks defer to the host; the MCP server stays authoritative |
 | Trust-handoff hardening (R-HANDOFF) | in-progress | Kernel-enforced on macOS; application-layer on Linux; none on Windows |
@@ -304,9 +305,14 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   (subcommand over parent subcommand over tool), resolved once when the definition is
   parsed; for a shell command line, from a conservative classifier that knows plain readers
   (`git status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, `tail` — followers included, since
-  a reader that never ends must not hold the workspace for its whole life, …) and treats
-  anything with a shell operator, redirection, substitution or unknown program as
-  exclusive. The bundled tools **must** declare their lanes, because the default is
+  a reader that never ends must not hold the workspace for its whole life —, `ps`, `sed`
+  without `-i`, `gh` viewing commands, `curl` without an output file, ahma's own listing
+  commands, …), reads **pipelines and lists** of such readers (`grep … | head`, `cd src &&
+  ls`, `2>&1`, `>/dev/null`, a plain `$VAR`) as readers, and treats a substitution, a
+  writing redirection, grouping, an escape or an unknown program as exclusive. The
+  classifier is permissive only where the kernel lane makes a mistake harmless; before it
+  read pipelines, `git status`, `ps` and `grep … | head` all queued behind another session's
+  build, which is most of why an agent "looked stuck". The bundled tools **must** declare their lanes, because the default is
   exclusive: their plain reads (`file-tools` `ls`/`cat`/`grep`/…, `git` `status`/`log`,
   `gh` list/view commands) are `read_only`, and `gh run_watch`, which follows a CI run for
   minutes, is `service`.
@@ -357,6 +363,14 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   A patch is read for paths only when a string *is* a patch (`*** Begin Patch`), never when
   file content merely quotes one. A client with no pre-edit hook,
   or one that does not enforce the deny, is covered by R2.7.6 alone.
+- **R2.7.9**: **The queue is visible, and seeing it never queues.** `ahma queue` lists every
+  workspace lease published beside its lock — the holder's command, pid, age, session and
+  whether that process is still alive — with a first line that says whether anything is
+  blocked at all (R-PERM.9), and the same facts appear in the TUI and the `status` tool.
+  It reads the records without taking a lock, so it is exactly what an agent whose every
+  command is waiting can still run; before it existed the agent could neither see nor name
+  what it was waiting for. A dead holder is listed as dead (its OS lock is already gone,
+  R2.7.7), never hidden.
 
 ### R3: Performance
 
@@ -588,6 +602,7 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 
 - **R6.2.6**: **Signals stay inside the command's own sandbox**: the Seatbelt profile **must** grant `(allow signal (target same-sandbox))`, not a blanket `(allow signal)`, so a sandboxed command can signal only the process tree it started under the same profile. A `kill` aimed at a process started elsewhere — another session's build, a server from an earlier command, any unrelated process of the same user — is refused by the kernel, and ahma **must** recognise the shell's `kill: (N) - Operation not permitted` and explain it as a boundary (the pid, that it belongs to another session, that a human must stop it), never leave it reading as a dead process. `[sandbox] signal_other_processes = true` is the explicit opt-out for a workflow that genuinely has to stop a pre-existing server, and ahma **must** log a warning at startup when it is on. Motivation: an agent in one checkout, told to "clear the lock", killed a sibling checkout's cargo build; with three agents sharing a machine, the ability to stop each other's work is the ability to make each other's results wrong.
 - **R6.2.7**: **The GPU is a withheld capability, not a grantable path**: the Seatbelt profile **must not** grant `iokit-open` by default, so Metal cannot open a device inside a sandboxed command. `[sandbox] allow_gpu = true` is the explicit opt-in and **must** add only the Metal user-client classes Apple's own profiles allow (`AGX*`, `IOAccel*`/`IGAccel*`, the IOGPUFamily device client a paravirtualised GPU presents in a VM, and `IOSurface`), never a blanket `(allow iokit-open)`. Because it is a capability, it **must not** be offered at any grant prompt or by the `sandbox_grant` tool; ahma **must** recognise the failure signatures (`failed to create command queue`, a nil Metal device, a Seatbelt `iokit-open` denial) and tell the agent it is a setting a human changes, with the exact key, and **must** disclose the withheld GPU on every R5.4 scope surface while it is off (R-PERM.5.1). Motivation: an agent asked a human to grant five cache directories to fix a GPU failure that no directory grant could have fixed.
+- **R6.2.8**: **A sandboxed command can see processes**: the Seatbelt profile **must** grant `process-info*`, so `ps`, `pgrep` and `lsof` work under it. Denying them protects nothing (the process list is visible to every process of the user anyway) and leaves an agent unable to see what it is waiting for or whether a server it started is alive. Motivation: `bash: /bin/ps: Operation not permitted` turned every diagnosis in an agent session into a guess.
 
 #### R6.3: Windows (AppContainer / Job Objects) — _in-progress_
 
@@ -685,6 +700,7 @@ A "host sandbox" is an outer kernel sandbox ahma is running inside (Cursor, Clau
 - **R7.5 (honesty limit)**: Detecting a host does **not** prove the host's sandbox is *enabled* (it may be configured off), which is why detection alone never decides enforcement (R7.2). Whenever ahma does defer (R7.4 `--no-sandbox`, R7.6 kernel refusal), the disclosure copy **must** state that protection now depends on the host, so a user who disabled the host sandbox is informed rather than surprised.
 - **R7.6 (macOS Seatbelt cannot nest — defer at every execution path, never fail opaquely)**: macOS refuses to apply a Seatbelt profile inside a process that is already confined by one whenever the outer profile denies *anything* — measured on macOS 26: `(allow default)` plus a single `deny` of a nonexistent path is enough for the inner `sandbox-exec` to fail with `sandbox_apply: Operation not permitted`; only a no-op `(allow default)` outer profile permits nesting. Every real sandbox, ahma's own included, therefore forbids it, and no profile ahma could generate changes that. Because every child of a confined process inherits the confinement, running a command *without* ahma's wrapper inside such a process is still kernel-sandboxed — by the outer boundary — and is the correct behaviour. So: ahma **must** decide, when a `Sandbox` is **constructed** (not at the first spawn), whether this process can apply its own profile, using the kernel's own answer (`sandbox_check` on its own pid) confirmed by a refused nesting probe — never environment markers alone (R7.5). When nesting is refused, ahma **must** defer to the outer sandbox on that instance: commands spawn bare, `is_enforced()` is false, every scope surface (R5.4 — startup banner, `sandbox/configured`, `ahma status`, TUI) reports `deferred_to_host`, and the deferral is logged at `warn` with the R7.5 disclosure and remediation. This binds the in-process library path (tests, embedders) exactly as it binds `ahma serve` startup — the failure that motivated it was ahma's own test suite run *through* `run_terminal_command`, whose in-process sandboxes never passed the startup probe and failed with the child's opaque OS error. The outer sandbox **must** be named when it is ahma itself (R7.1): every command ahma sandboxes carries `AHMA_OUTER_SANDBOX_PID=<pid>` (a marker ahma sets, not a setting ahma reads — R-CFG2.3 is unaffected), and a nested ahma that finds it reports "an outer ahma" with remediation that names `run_terminal_command`. `AHMA_PREFER_OWN_SANDBOX` cannot override this — the kernel, not ahma, refuses — and the disclosure says so implicitly by naming the platform rule. A `sandbox-exec` that cannot *execute* at all (missing, or the outer profile SIGKILLs it) remains the R7.3 hard stop: that is not proof of an outer sandbox. Linux Landlock and Windows Job Objects nest fine and are unaffected.
   - A **confined process must not spawn the per-user hub** (R-HUB.3): a hub that inherited an outer sandbox would defer every client's enforcement to it, not just its own. Hooks in that state skip registration; a frontend fails loudly with the R7.5 remediation.
+- **R7.7**: **A child tool that applies its own sandbox is a capability refusal, not a path.** SwiftPM's manifest loader and `xcodebuild` package resolution call `sandbox-exec` themselves, and macOS allows one profile per process tree, so inside ahma's sandbox they fail with `sandbox_apply: Operation not permitted`. ahma **must** recognise that signature, explain it as the nesting limit it is, **must not** offer a directory grant for it, and names the tool's own switch (`swift build --disable-sandbox`, the Xcode manifest-sandbox default) as the way through. Motivation: an agent spent an hour requesting cache grants for a failure no grant could fix, then dictated an unsandboxed command for the human to paste.
 
 ### R-HANDOFF: Trust Handoff — Legitimate Writes That Something Trusted Later Executes
 
@@ -810,6 +826,20 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
   authentication failure (`could not read Username for 'https://…'`,
   `Authentication failed for 'https://…'`) with the same exact remediation
   the SSH `Permission denied (publickey)` already gets.
+- **R-DOCTOR.7 — A helper left running inside a sandbox is found by its shape,
+  not its name.** A long-lived process started by a sandboxed command inherits
+  the sandbox and outlives the command: a sccache server, a Gradle or Kotlin
+  daemon. It serves every session on the machine but can write only the
+  checkout it was born in, so every other checkout fails with a bare
+  `Operation not permitted`. `ahma doctor` **must** report any process that is
+  Seatbelt-confined, has been reparented to launchd, and runs the user's own
+  executable (under `$HOME`, so an App-Sandboxed application never matches),
+  with the one restart line; `--fix` restarts the protocol it knows
+  (`sccache --stop-server` / `--start-server`) and refuses when the doctor is
+  itself confined. An unconfined ahma server also restarts a confined sccache
+  at startup, and the build diagnostic names the shape. Motivation: one such
+  server cost two agent sessions an afternoon and was worked around with a
+  shim on `PATH`.
 
 #### The question ladder (where a permission question is asked)
 
@@ -1805,6 +1835,11 @@ Operation ids are counters, and counters restart with the process that issues th
   Motivation: a hub started from one of three sibling checkouts put every
   session's logs in that checkout and would have trusted its `.ahma/` tool
   definitions — writable by that checkout's agent — in every other session.
+  A hub is also never started from a process that is itself inside a sandbox: it would
+  inherit that sandbox for life and serve every session on the machine confined to one
+  checkout (the shape R-DOCTOR.7 hunts). A confined ahma serves its own session in-process
+  and says so; the next unsandboxed ahma starts the hub. When the runtime directory cannot
+  be entered, the hub starts in the temp directory instead of failing with a bare ENOENT.
 
 > **Problem (confirmed live failure, 2026-07-14).** The proxy, bridge, and hub rendezvous on machine-global singleton endpoints (`/tmp/ahma.sock`, `~/.ahma/hub.sock`, the Windows hub TCP port). Test isolation existed but was opt-in per spawn site (`AHMA_TEST_ISOLATION`, set only by `test_utils::cli::test_command`); harnesses in other crates spawned the real binary without it. A full `cargo nextest run` therefore unlinked the live `/tmp/ahma.sock` while binding test bridges and dispatched a `RunPrompt` to the live hub — tearing down the developer's active MCP session mid-conversation (surfaced to the client as `-32002` then a full server disconnect).
 
