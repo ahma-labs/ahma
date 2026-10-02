@@ -259,7 +259,7 @@ Validate configs: `ahma tool validate .ahma/`
 | `--tools-dir` / `tools.tools_dir` | `.ahma/` | Custom tools directory path |
 | `--timeout` / `tools.timeout_secs` | `600` | Default tool timeout (seconds) |
 | `--sync` / `--async` / `tools.execution_mode` | `async` | `async`: long calls return ids to `await`; `sync`: calls return results |
-| `tools.workspace_queue` / `tools.edit_guard` | on / on | Writers one at a time per workspace; refuse edits while one runs |
+| `tools.workspace_queue` / `tools.edit_guard` | on / on | Writers one at a time per workspace; edits wait only for commands that rewrite sources (builds and tests never block them) |
 | `--no-sandbox` / `sandbox.disable` | off | Disable kernel sandbox (UNSAFE) |
 | `--sandbox-scope` / `sandbox.scopes` | cwd | Sandbox scope paths |
 | `sandbox.container_root` | unset | Directory holding your projects; scope fallback when the client reports no roots |
