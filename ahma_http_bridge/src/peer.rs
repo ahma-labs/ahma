@@ -103,6 +103,13 @@ impl PeerFactory for SubprocessPeerFactory {
             };
 
             let mut cmd = Command::new(&command);
+            // A worker's scope comes from its own client's roots/list, never
+            // from a directory; so neither may its tools dir or its logs
+            // (SPEC R-HUB.12). Spawn it in a neutral directory so nothing it
+            // resolves from `cwd` belongs to another session's checkout.
+            if let Some(dir) = ahma_common::hub::runtime_dir() {
+                cmd.current_dir(dir);
+            }
             cmd.args(&args)
                 // A subprocess peer is ALWAYS a server-child: it serves exactly one
                 // bridge session and must never run the IDE-facing frontend path

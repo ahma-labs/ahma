@@ -818,6 +818,12 @@ impl Adapter {
         // `sandbox_denial` payload (path + grant->restart->retry remediation)
         // instead of leaving the agent with a raw `os error 1`.
         let Some(hit) = sandbox::scan_denial_streams(stderr, stdout) else {
+            // A refused `kill` is a boundary too (SPEC R6.2.6): say so, or the
+            // agent reads "Operation not permitted" as a dead pid and escalates.
+            let result = match sandbox::signal_denial_note(stderr, stdout) {
+                Some(note) => result.map_err(|e| anyhow::anyhow!("{e}\n\n{note}")),
+                None => result,
+            };
             return SyncRun {
                 outcome: audit::Outcome::Failed,
                 exit_code,
@@ -2308,6 +2314,12 @@ async fn record_failure_diagnostics(
     } else {
         None
     };
+
+    if target_and_access.is_none()
+        && let Some(note) = sandbox::signal_denial_note(stderr_str, stdout_str)
+    {
+        op_monitor.append_alert(op_id, note).await;
+    }
 
     if let Some((target, access)) = target_and_access {
         // The alert below is transient; this line is the durable copy of the

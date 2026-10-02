@@ -188,6 +188,7 @@ pub fn project_log_dir() -> PathBuf {
 
     if let Ok(cwd) = std::env::current_dir()
         && cwd.parent().is_some()
+        && !is_ahma_runtime_dir(&cwd)
     {
         let anchor = log_anchor_dir(&cwd);
         #[cfg(debug_assertions)]
@@ -217,6 +218,22 @@ pub fn project_log_dir() -> PathBuf {
     }
 
     PathBuf::from(".").join(".ahma").join("logs")
+}
+
+/// Whether `cwd` is ahma's own runtime directory (`~/.ahma`, or
+/// `$XDG_RUNTIME_DIR/ahma`), where the hub and its workers are started so they
+/// belong to no checkout (SPEC R-HUB.12). Anchoring a log dir there would
+/// create `~/.ahma/.ahma/logs`; the per-process namespace under `~/.ahma/logs`
+/// is the right fallback instead.
+fn is_ahma_runtime_dir(cwd: &Path) -> bool {
+    let canonical = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    ahma_common::hub::runtime_dir()
+        .map(|d| dunce::canonicalize(&d).unwrap_or(d))
+        .is_some_and(|d| d == canonical)
+        || ahma_common::config::ahma_home_dir()
+            .map(|h| h.join(".ahma"))
+            .map(|d| dunce::canonicalize(&d).unwrap_or(d))
+            .is_some_and(|d| d == canonical)
 }
 
 /// The checkout this binary was built from, when it is a debug build of this

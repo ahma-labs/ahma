@@ -692,3 +692,99 @@ fn test_poisoned_gitdir_pointer_cannot_widen_sandbox_in_kernel() {
         "the out-of-scope file must not have been created"
     );
 }
+
+/// SPEC R6.2.6: a sandboxed command may signal only its own process tree. A
+/// `kill` aimed at a process started outside the profile — another session's
+/// build, say — is refused by the kernel.
+#[cfg(target_os = "macos")]
+#[test]
+fn sandboxed_kill_of_foreign_pid_is_denied() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_signal_other_processes};
+
+    let scope = TempDir::new().expect("scope dir");
+    // The "other session": a process this sandbox did not start.
+    let mut foreign = Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn foreign sleep");
+    let foreign_pid = foreign.id();
+
+    set_signal_other_processes(false);
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    assert!(
+        profile.contains("(allow signal (target same-sandbox))"),
+        "profile confines signals by default: {profile}"
+    );
+
+    let denied = Command::new("sandbox-exec")
+        .args(["-p", &profile, "/bin/kill", "-0", &foreign_pid.to_string()])
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandbox-exec (kill foreign)");
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    let _ = foreign.kill();
+    let _ = foreign.wait();
+    assert!(
+        !denied.status.success(),
+        "signalling a process outside the sandbox must fail. exit={:?} stderr={stderr}",
+        denied.status.code()
+    );
+    assert!(
+        stderr
+            .to_ascii_lowercase()
+            .contains("operation not permitted"),
+        "the kernel names the refusal: {stderr}"
+    );
+    assert!(
+        ahma_mcp::sandbox::signal_denial_note(&stderr, "").is_some(),
+        "ahma recognises the refusal and explains it: {stderr}"
+    );
+}
+
+/// The control for the test above: a process the command itself started is
+/// in the same sandbox and may be signalled.
+#[cfg(target_os = "macos")]
+#[test]
+fn sandboxed_kill_of_own_child_succeeds() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_signal_other_processes};
+
+    let scope = TempDir::new().expect("scope dir");
+    set_signal_other_processes(false);
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+
+    let ok = Command::new("sandbox-exec")
+        .args([
+            "-p",
+            &profile,
+            "/bin/sh",
+            "-c",
+            "/bin/sleep 30 & pid=$!; /bin/kill -TERM $pid && echo killed-own-child",
+        ])
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandbox-exec (kill own child)");
+    assert!(
+        ok.status.success() && String::from_utf8_lossy(&ok.stdout).contains("killed-own-child"),
+        "a command may stop its own child. exit={:?} stderr={}",
+        ok.status.code(),
+        String::from_utf8_lossy(&ok.stderr)
+    );
+}

@@ -584,6 +584,8 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 - **R6.2.4**: **CRITICAL**: `/var` is symlink to `/private/var` on macOS; profiles **must** use real paths.
 - **R6.2.5**: **Package Cache Write** (default on): `~/.cargo/registry/` and `~/.cargo/git/` (and cargo's root lock files) are writable by default so that `cargo add` / `cargo update` work inside the sandbox without manual `--sandbox-scope ~/.cargo` which would grant write to the entire cargo home including binaries and credentials. The writable set is computed from `$CARGO_HOME` (or `~/.cargo`) and excludes `bin/`, `config.toml`, and `credentials.toml`.  Disable with `--no-package-cache-write` / `[sandbox] package_cache_write = false`, which downgrades those `rw` rules to `rx` rather than dropping them. That flag is **not** merely generic hardening: it is the mitigation for the cross-project persistence channel this write access opens (**R-HANDOFF.8**), and **must** be documented as such. The rule now lives in the shipped `rust` profile rather than in the backends (R-PERM.5); this requirement records the decision and its cost, not the path list.
 
+- **R6.2.6**: **Signals stay inside the command's own sandbox**: the Seatbelt profile **must** grant `(allow signal (target same-sandbox))`, not a blanket `(allow signal)`, so a sandboxed command can signal only the process tree it started under the same profile. A `kill` aimed at a process started elsewhere — another session's build, a server from an earlier command, any unrelated process of the same user — is refused by the kernel, and ahma **must** recognise the shell's `kill: (N) - Operation not permitted` and explain it as a boundary (the pid, that it belongs to another session, that a human must stop it), never leave it reading as a dead process. `[sandbox] signal_other_processes = true` is the explicit opt-out for a workflow that genuinely has to stop a pre-existing server, and ahma **must** log a warning at startup when it is on. Motivation: an agent in one checkout, told to "clear the lock", killed a sibling checkout's cargo build; with three agents sharing a machine, the ability to stop each other's work is the ability to make each other's results wrong.
+
 #### R6.3: Windows (AppContainer / Job Objects) — _in-progress_
 
 > **Security gate**: Windows GA release requires this section to reach `tests-pass` status.
@@ -1764,6 +1766,21 @@ Operation ids are counters, and counters restart with the process that issues th
   no door.
 
 ### R-ISO: Test/Live Endpoint Isolation
+
+- **R-HUB.12 — The hub and its workers belong to no checkout.** The hub is
+  started, and every worker it spawns is started, in the R-HUB.2 runtime
+  directory — never in the directory the first frontend happened to be
+  launched from. A worker's sandbox scope comes from its own client's
+  `roots/list` (R5.1), and everything else it would otherwise resolve from its
+  working directory **must** follow that scope or a neutral per-process
+  location: the tools directory (the client root's `.ahma/` is layered as the
+  *untrusted* overlay after commit; no inherited checkout may become the trusted
+  operator tool set of another project), the execution audit log and operation
+  output (under the committed scope's `.ahma/logs`), and the process log
+  (under `~/.ahma/logs/<namespace>` until then; never `<runtime dir>/.ahma`).
+  Motivation: a hub started from one of three sibling checkouts put every
+  session's logs in that checkout and would have trusted its `.ahma/` tool
+  definitions — writable by that checkout's agent — in every other session.
 
 > **Problem (confirmed live failure, 2026-07-14).** The proxy, bridge, and hub rendezvous on machine-global singleton endpoints (`/tmp/ahma.sock`, `~/.ahma/hub.sock`, the Windows hub TCP port). Test isolation existed but was opt-in per spawn site (`AHMA_TEST_ISOLATION`, set only by `test_utils::cli::test_command`); harnesses in other crates spawned the real binary without it. A full `cargo nextest run` therefore unlinked the live `/tmp/ahma.sock` while binding test bridges and dispatched a `RunPrompt` to the live hub — tearing down the developer's active MCP session mid-conversation (surfaced to the client as `-32002` then a full server disconnect).
 
