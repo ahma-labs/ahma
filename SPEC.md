@@ -597,6 +597,7 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
   - **Broken pipe**: logged at `debug` level, treated as non-fatal (the bridge is already shutting down).
   - **Other I/O errors**: logged at `warn` level and returned to the caller, which may choose to abort or continue.
   - Code **must not** use `println!` or `print!` for protocol data on stdout; these macros panic unconditionally on write errors.
+- **R5.6.2**: **Every request is answered**: a stdio request that parses as JSON but not as an MCP message (wrong `params` shape, for example) **must** be answered with a JSON-RPC error carrying its `id` (code `-32600`), and the transport **must** go on reading. It was dropped with a debug log, which left the client waiting on that `id` forever. Notifications and responses are owed nothing and are still skipped.
 - **R5.7**: **Path Canonicalization**: All paths **must** be canonicalized using `dunce::canonicalize` before validation to prevent symlink escape attacks. This resolves symlinks to their real targets and normalizes paths, ensuring that a symlink pointing outside the sandbox cannot be used to bypass security. The `dunce` crate is used instead of `std::fs::canonicalize` to avoid the Windows `\\?\` extended-length path prefix that can cause compatibility issues with some APIs.
 
 ### R6: Platform-Specific Enforcement
