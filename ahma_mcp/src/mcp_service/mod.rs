@@ -471,7 +471,7 @@ impl AhmaMcpService {
                 self.generate_input_schema_for_wait(),
             ),
             BuiltinTool::Status => (
-                "Return a snapshot of active and completed operations without blocking. Completion is pushed via notifications, so this is for ad-hoc inspection rather than polling.",
+                "Return a snapshot of active and completed operations without blocking, plus a SANDBOX section: which sandbox is protecting this session, the directories it may write and read, and every persistent grant in force with who asked for it and for which workspace. Completion is pushed via notifications, so this is for ad-hoc inspection rather than polling.",
                 self.generate_input_schema_for_status(),
             ),
             BuiltinTool::RunTerminalCommand => (

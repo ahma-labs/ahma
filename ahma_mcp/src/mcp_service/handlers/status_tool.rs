@@ -81,6 +81,12 @@ impl AhmaMcpService {
 
         contents.push(ContentBlock::text(summary));
 
+        // SPEC R5.4: the scope is always visible with provenance — here too,
+        // the one surface an agent (or a human reading its transcript) reaches
+        // without a TUI. Which sandbox is enforcing, what it confines, and
+        // every grant in force with who asked for it and for which workspace.
+        contents.push(ContentBlock::text(self.sandbox_report()));
+
         // Add concurrency efficiency analysis
         if !completed_ops.is_empty()
             && let Some(efficiency_analysis) = Self::run_concurrency_analysis(&completed_ops)
@@ -106,6 +112,38 @@ impl AhmaMcpService {
         }
 
         Ok(CallToolResult::success(contents))
+    }
+
+    /// The sandbox section of `status` (SPEC R5.4): enforcement, scope, grants.
+    pub fn sandbox_report(&self) -> String {
+        let sandbox = self.adapter.sandbox();
+        let mut out = String::from("\n=== SANDBOX ===\n");
+        out.push_str(&sandbox.active_sandbox().disclosure_line());
+        out.push('\n');
+        out.push_str(&sandbox.scope_text(sandbox.scope_source()));
+        let grants = sandbox.persistent_grants_in_effect();
+        if grants.is_empty() {
+            out.push_str("  grants: (none in force for this session)\n");
+        } else {
+            out.push_str("  grants (persistent, in force for this session):\n");
+            for g in grants {
+                out.push_str(&format!(
+                    "    {} ({}) workspace={} by={}\n",
+                    g.path.display(),
+                    g.access.label(),
+                    g.workspace
+                        .as_deref()
+                        .map(|w| w.display().to_string())
+                        .unwrap_or_else(|| "GLOBAL (legacy)".to_string()),
+                    g.granted_by.as_deref().unwrap_or("user"),
+                ));
+            }
+        }
+        out.push_str(
+            "  Only a human can widen this: they approve a prompt in the ahma TUI or run \
+             `ahma sandbox grant <dir>`; `sandbox_grant` only asks.\n",
+        );
+        out
     }
 
     fn run_concurrency_analysis(completed_ops: &[Operation]) -> Option<String> {
@@ -153,5 +191,39 @@ impl AhmaMcpService {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_report_tests {
+    use crate::test_utils::in_process::build_test_service;
+
+    /// SPEC R5.4: `status` tells the agent which sandbox protects it, what it
+    /// confines, and the grants in force — the one scope surface that needs no
+    /// TUI.
+    #[tokio::test]
+    async fn status_tool_reports_sandbox_scopes_and_grants() {
+        let (service, scope) = build_test_service().await.unwrap();
+        let report = service.sandbox_report();
+        assert!(report.contains("=== SANDBOX ==="), "{report}");
+        assert!(report.contains("Sandbox:"), "{report}");
+        let canon = dunce::canonicalize(scope.path()).unwrap();
+        assert!(
+            report.contains(&canon.display().to_string()),
+            "names the writable scope: {report}"
+        );
+        assert!(report.contains("grants"), "{report}");
+        assert!(report.contains("Only a human can widen this"), "{report}");
+
+        let result = service
+            .handle_status(serde_json::Map::new())
+            .await
+            .expect("status succeeds");
+        let text = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<String>();
+        assert!(text.contains("=== SANDBOX ==="), "{text}");
     }
 }

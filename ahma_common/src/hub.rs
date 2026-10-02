@@ -124,6 +124,21 @@ pub enum OpStatus {
     TimedOut,
 }
 
+/// One persistent grant in force for an instance, as the hub and the TUI show
+/// it (SPEC R5.4): the path, its access, the workspace it was granted for and
+/// who asked for it. A view of `PersistentScope` for the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantSummary {
+    pub path: String,
+    /// `ro` or `rw`.
+    pub access: String,
+    /// The workspace the grant is bound to; `None` for a legacy global grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_by: Option<String>,
+}
+
 /// Metadata about a registered ahma instance.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceInfo {
@@ -165,6 +180,21 @@ pub struct InstanceInfo {
     /// belong. `None` for a live instance.
     #[serde(default)]
     pub ended_epoch_ms: Option<u64>,
+    /// Every writable root of the committed sandbox scope (`scope` is the
+    /// first). Empty until the scope commits (SPEC R5.4).
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Read-only roots granted beyond the writable ones.
+    #[serde(default)]
+    pub read_scopes: Vec<String>,
+    /// The persistent grants in force for this instance, with provenance.
+    #[serde(default)]
+    pub grants: Vec<GrantSummary>,
+    /// Which sandbox protects this instance's commands: `ahma`,
+    /// `ahma_nested_in_host`, `deferred_to_host` or `disabled` (the
+    /// `ActiveSandbox` token). `None` until the instance reported it.
+    #[serde(default)]
+    pub enforcement: Option<String>,
 }
 
 /// An operation event forwarded from an instance to the hub.
@@ -420,6 +450,18 @@ pub enum ClientMsg {
         /// The client declared MCP `sampling` (see [`InstanceInfo::sampling`]).
         #[serde(default)]
         sampling: bool,
+        /// See [`InstanceInfo::scopes`]. Field-only evolution (R24.5).
+        #[serde(default)]
+        scopes: Vec<String>,
+        /// See [`InstanceInfo::read_scopes`].
+        #[serde(default)]
+        read_scopes: Vec<String>,
+        /// See [`InstanceInfo::grants`].
+        #[serde(default)]
+        grants: Vec<GrantSummary>,
+        /// See [`InstanceInfo::enforcement`].
+        #[serde(default)]
+        enforcement: Option<String>,
     },
     /// An operation event from a registered instance.
     Event { payload: HubEvent },
@@ -1949,6 +1991,10 @@ where
             session_id,
             client_pid,
             sampling,
+            scopes,
+            read_scopes,
+            grants,
+            enforcement,
         } => {
             serve_instance(
                 &mut reader,
@@ -1963,6 +2009,10 @@ where
                     session_id,
                     client_pid,
                     sampling,
+                    scopes,
+                    read_scopes,
+                    grants,
+                    enforcement,
                 },
             )
             .await
@@ -2230,6 +2280,10 @@ struct Registration {
     session_id: Option<String>,
     client_pid: Option<u32>,
     sampling: bool,
+    scopes: Vec<String>,
+    read_scopes: Vec<String>,
+    grants: Vec<GrantSummary>,
+    enforcement: Option<String>,
 }
 
 /// Serve a registered ahma instance: register it, then exchange events and
@@ -2271,6 +2325,10 @@ async fn serve_instance<R, W>(
         client_pid: reg.client_pid,
         sampling: reg.sampling,
         ended_epoch_ms: None,
+        scopes: reg.scopes,
+        read_scopes: reg.read_scopes,
+        grants: reg.grants,
+        enforcement: reg.enforcement,
     };
     let pid = reg.pid;
     hub.instances.lock().await.insert(id.clone(), info.clone());
@@ -2621,6 +2679,10 @@ mod tests {
             session_id: Some("sess-1".into()),
             client_pid: Some(99),
             sampling: false,
+            scopes: vec![],
+            read_scopes: vec![],
+            grants: vec![],
+            enforcement: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -2862,6 +2924,10 @@ mod tests {
             session_id: None,
             client_pid: None,
             sampling: false,
+            scopes: vec![],
+            read_scopes: vec![],
+            grants: vec![],
+            enforcement: None,
         };
         let mut buf = Vec::<u8>::new();
         send_msg(&mut buf, &msg).await.unwrap();
@@ -2980,6 +3046,10 @@ mod tests {
                 client_pid: None,
                 sampling: false,
                 ended_epoch_ms: None,
+                scopes: vec![],
+                read_scopes: vec![],
+                grants: vec![],
+                enforcement: None,
             }],
         };
         let mut buf = Vec::<u8>::new();
@@ -3275,6 +3345,10 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                scopes: vec![],
+                read_scopes: vec![],
+                grants: vec![],
+                enforcement: None,
             },
         )
         .await
@@ -3386,6 +3460,10 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                scopes: vec![],
+                read_scopes: vec![],
+                grants: vec![],
+                enforcement: None,
             },
         )
         .await
@@ -4006,6 +4084,10 @@ mod tests {
             client_pid: None,
             sampling: false,
             ended_epoch_ms: None,
+            scopes: vec![],
+            read_scopes: vec![],
+            grants: vec![],
+            enforcement: None,
         }
     }
 
@@ -4257,6 +4339,10 @@ mod tests {
             client_pid: None,
             sampling: false,
             ended_epoch_ms: None,
+            scopes: vec![],
+            read_scopes: vec![],
+            grants: vec![],
+            enforcement: None,
         };
         hub.instances.lock().await.insert("i1".into(), info.clone());
         hub.record_op_event("i1", &started_ev("op-1")).await;
@@ -4449,6 +4535,10 @@ mod tests {
                     client_pid: Some(11),
                     sampling: false,
                     ended_epoch_ms: None,
+                    scopes: vec![],
+                    read_scopes: vec![],
+                    grants: vec![],
+                    enforcement: None,
                 },
             );
             hub.record_op_event("i1", &started_ev("done")).await;
@@ -4586,6 +4676,10 @@ mod tests {
                 client_pid: None,
                 sampling: false,
                 ended_epoch_ms: None,
+                scopes: vec![],
+                read_scopes: vec![],
+                grants: vec![],
+                enforcement: None,
             },
         );
         hub.record_op_event("i1", &started_ev("op-1")).await;
@@ -4779,6 +4873,10 @@ mod tests {
                     session_id: Some("mcp-session-7".into()),
                     client_pid: Some(4242),
                     sampling: false,
+                    scopes: vec![],
+                    read_scopes: vec![],
+                    grants: vec![],
+                    enforcement: None,
                 },
             )
             .await
@@ -4870,6 +4968,10 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                scopes: vec![],
+                read_scopes: vec![],
+                grants: vec![],
+                enforcement: None,
             },
         )
         .await
@@ -5063,6 +5165,10 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                scopes: vec![],
+                read_scopes: vec![],
+                grants: vec![],
+                enforcement: None,
             },
         )
         .await
@@ -5221,6 +5327,10 @@ mod tests {
                 session_id: None,
                 client_pid: None,
                 sampling: false,
+                scopes: vec![],
+                read_scopes: vec![],
+                grants: vec![],
+                enforcement: None,
             },
         )
         .await

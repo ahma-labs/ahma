@@ -401,6 +401,9 @@ pub fn identity_footnote(info: Option<&InstanceInfo>) -> String {
     if let Some(session) = &info.session_id {
         parts.push(format!("session {session}"));
     }
+    if let Some(enforcement) = &info.enforcement {
+        parts.push(format!("sandbox {enforcement}"));
+    }
     if info.ended_epoch_ms.is_some() {
         parts.push("ended".to_string());
     }
@@ -590,6 +593,10 @@ mod tests {
             client_pid: Some(99),
             sampling: false,
             ended_epoch_ms: None,
+            scopes: vec![],
+            read_scopes: vec![],
+            grants: vec![],
+            enforcement: None,
         }
     }
 

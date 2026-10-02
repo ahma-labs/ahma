@@ -475,6 +475,10 @@ mod tests {
             client_pid: None,
             sampling: false,
             ended_epoch_ms: None,
+            scopes: vec![],
+            read_scopes: vec![],
+            grants: vec![],
+            enforcement: None,
         }
     }
 

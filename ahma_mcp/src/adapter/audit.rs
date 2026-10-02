@@ -156,6 +156,34 @@ pub enum AuditEventKind {
         /// The command as it will actually run (program + argv), redacted.
         #[serde(skip_serializing_if = "Option::is_none")]
         command: Option<String>,
+        /// The MCP session that asked, so a human can tell which agent did
+        /// what when several share a checkout (SPEC R5.4).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// The client's `clientInfo.name` (`claude-code`, `agy`, …).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client: Option<String>,
+        /// The writable sandbox roots the command ran under.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+    },
+
+    /// A terminal hook decided what to do with a harness's native shell
+    /// command (SPEC R7.2, R5.4.10). Recorded for every decision — a
+    /// pass-through used to leave no trace at all, which is how a session that
+    /// ran unsandboxed for days was invisible after the fact.
+    HookDecision {
+        /// `rewrite` (runs in ahma's sandbox), `unchanged` (hooks inactive or
+        /// already wrapped), `deny_pending_consent`, `allow_unsandboxed`.
+        decision: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// Redacted, length-bounded command.
+        command: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// The harness that fired the hook (`claude`, `cursor`, …).
+        platform: String,
     },
 
     /// A command finished.  Written on every terminal path — exit, failure,
@@ -494,12 +522,34 @@ pub async fn record_tool_call(
     program: &str,
     argv: &[String],
 ) {
+    let identity = crate::hub_reporter::current_identity();
     record(AuditEventKind::ToolCall {
         operation_id: operation_id.to_string(),
         tool_name: tool_name.to_string(),
         args_summary: args_summary(args),
         working_dir: Some(redact_and_bound(working_dir, MAX_WORKING_DIR_CHARS)),
         command: Some(command_line(program, argv)),
+        session_id: identity.session_id,
+        client: identity.client,
+        scopes: identity.scopes,
+    })
+    .await;
+}
+
+/// Record a terminal hook's decision about a native shell command.
+pub async fn record_hook_decision(
+    decision: &str,
+    cwd: Option<&str>,
+    command: &str,
+    session_id: Option<&str>,
+    platform: &str,
+) {
+    record(AuditEventKind::HookDecision {
+        decision: decision.to_string(),
+        cwd: cwd.map(|c| redact_and_bound(c, MAX_WORKING_DIR_CHARS)),
+        command: redact_and_bound(command, MAX_ARGS_SUMMARY_CHARS),
+        session_id: session_id.map(str::to_string),
+        platform: platform.to_string(),
     })
     .await;
 }
@@ -549,6 +599,9 @@ mod tests {
             args_summary: "{\"command\":\"echo hi\"}".into(),
             working_dir: Some("/w".into()),
             command: Some("sh -c echo hi".into()),
+            session_id: Some("sess-1".into()),
+            client: Some("claude-code".into()),
+            scopes: vec!["/w".into()],
         })
         .await
         .unwrap();
@@ -591,6 +644,9 @@ mod tests {
             args_summary: "--release".into(),
             working_dir: Some("/w".into()),
             command: Some("cargo build --release".into()),
+            session_id: None,
+            client: None,
+            scopes: vec![],
         })
         .await
         .unwrap();
@@ -714,6 +770,9 @@ mod tests {
                 args_summary: String::new(),
                 working_dir: Some(redact_and_bound(&deep, MAX_WORKING_DIR_CHARS)),
                 command: Some("true".into()),
+                session_id: None,
+                client: None,
+                scopes: vec![],
             })
             .await;
 
@@ -869,6 +928,9 @@ mod tests {
                     args_summary: "x".repeat(200),
                     working_dir: Some("/w".into()),
                     command: Some("y".repeat(200)),
+                    session_id: None,
+                    client: None,
+                    scopes: vec![],
                 })
                 .await;
                 log.record(AuditEventKind::ToolComplete {

@@ -91,6 +91,14 @@ pub struct InstanceIdentity {
     pub client_pid: Option<u32>,
     /// The client declared MCP `sampling` at `initialize`.
     pub sampling: bool,
+    /// Every writable root of the committed scope (SPEC R5.4).
+    pub scopes: Vec<String>,
+    /// Read-only roots beyond the writable ones.
+    pub read_scopes: Vec<String>,
+    /// The persistent grants in force, with provenance.
+    pub grants: Vec<ahma_common::hub::GrantSummary>,
+    /// The `ActiveSandbox` token: which sandbox protects this instance.
+    pub enforcement: Option<String>,
 }
 
 static INSTANCE_IDENTITY: std::sync::LazyLock<tokio::sync::watch::Sender<InstanceIdentity>> =
@@ -158,7 +166,38 @@ pub fn set_committed_scope(scopes: &[std::path::PathBuf]) {
 /// placeholder it started with, and a TUI filtering by project matches nothing
 /// (SPEC R24.3).
 pub fn publish_committed_scope(sandbox: &crate::sandbox::Sandbox) {
-    set_committed_scope(&sandbox.scopes());
+    let scopes: Vec<String> = sandbox
+        .scopes()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let read_scopes: Vec<String> = sandbox
+        .read_scopes()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let grants: Vec<ahma_common::hub::GrantSummary> = sandbox
+        .persistent_grants_in_effect()
+        .into_iter()
+        .map(|g| ahma_common::hub::GrantSummary {
+            path: g.path.display().to_string(),
+            access: g.access.short().to_string(),
+            workspace: g.workspace.as_deref().map(|w| w.display().to_string()),
+            granted_by: g.granted_by,
+        })
+        .collect();
+    let enforcement = Some(sandbox.active_sandbox().token().to_string());
+    INSTANCE_IDENTITY.send_if_modified(|cur| {
+        let mut next = cur.clone();
+        next.scope = scopes.first().cloned().or_else(|| cur.scope.clone());
+        next.scopes = scopes.clone();
+        next.read_scopes = read_scopes.clone();
+        next.grants = grants.clone();
+        next.enforcement = enforcement.clone();
+        let changed = next != *cur;
+        *cur = next;
+        changed
+    });
 }
 
 /// The identity as currently known, for callers that register outside the
@@ -463,6 +502,10 @@ async fn run_reporter_loop(
             session_id: identity.session_id.clone(),
             client_pid: identity.client_pid,
             sampling: identity.sampling,
+            scopes: identity.scopes.clone(),
+            read_scopes: identity.read_scopes.clone(),
+            grants: identity.grants.clone(),
+            enforcement: identity.enforcement.clone(),
         };
         if let Err(e) = send_msg(&mut writer, &reg).await {
             debug!("hub_reporter: register failed ({e})");

@@ -81,6 +81,10 @@ pub fn register_msg(session_id: &str, workspace: &str) -> ClientMsg {
         // terminal (you)" rather than as some other window's work.
         client_pid: Some(std::process::id()),
         sampling: false,
+        scopes: vec![],
+        read_scopes: vec![],
+        grants: vec![],
+        enforcement: None,
     }
 }
 

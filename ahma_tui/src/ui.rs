@@ -2390,6 +2390,71 @@ fn scope_granted_lines(granted_scopes: &[(String, String)], theme: &Theme) -> Ve
     lines
 }
 
+/// Every attached session's own sandbox, as it reported it to the hub (SPEC
+/// R5.4): which sandbox protects it, its writable roots, and the grants in
+/// force. This is what lets a human supervising several agents see that one
+/// of them is scoped somewhere it should not be, without opening that agent.
+fn session_scope_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let live: Vec<_> = state
+        .active_instances
+        .iter()
+        .filter(|i| i.ended_epoch_ms.is_none() && i.mode != "tui")
+        .collect();
+    if live.is_empty() {
+        return lines;
+    }
+    lines.push(Line::from(Span::styled(
+        format!("sessions ({}):", live.len()),
+        theme.dim(),
+    )));
+    for inst in live.iter().take(8) {
+        let who = inst.client.as_deref().unwrap_or(&inst.label);
+        let enforcement = match inst.enforcement.as_deref() {
+            Some("ahma") => "ahma".to_string(),
+            Some("ahma_nested_in_host") => "ahma+host".to_string(),
+            Some("deferred_to_host") => "DEFERRED".to_string(),
+            Some("disabled") => "NO SANDBOX".to_string(),
+            Some(other) => other.to_string(),
+            None => "unreported".to_string(),
+        };
+        let roots = if inst.scopes.is_empty() {
+            if inst.scope.is_empty() {
+                "no scope yet".to_string()
+            } else {
+                shorten_path(&inst.scope, 40)
+            }
+        } else {
+            let first = shorten_path(&inst.scopes[0], 40);
+            if inst.scopes.len() > 1 {
+                format!("{first} +{} more", inst.scopes.len() - 1)
+            } else {
+                first
+            }
+        };
+        let grants = if inst.grants.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} grant(s)", inst.grants.len())
+        };
+        let style = match inst.enforcement.as_deref() {
+            Some("deferred_to_host") | Some("disabled") => theme.pending(),
+            _ => theme.normal(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {who}: "), theme.dim()),
+            Span::styled(format!("{enforcement} · {roots}{grants}"), style),
+        ]));
+    }
+    if live.len() > 8 {
+        lines.push(Line::from(Span::styled(
+            format!("  … and {} more", live.len() - 8),
+            theme.dim(),
+        )));
+    }
+    lines
+}
+
 fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -2439,6 +2504,7 @@ fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     ]));
 
     lines.extend(scope_granted_lines(&state.granted_scopes, theme));
+    lines.extend(session_scope_lines(state, theme));
 
     if let Some(note) = &scope.platform_note {
         lines.push(Line::from(Span::styled(
