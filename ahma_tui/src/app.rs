@@ -2588,7 +2588,8 @@ fn handle_scope_grant_key(
     }
 
     // The keys are the ones the shared prompt body advertises (SPEC R-PERM.3.4);
-    // lower-case is this session, upper-case is always, `o`/`w` once, `?` detail.
+    // lower-case is this session, upper-case is always, `o`/`w` once, `l`/`L`
+    // 24 hours, `?` detail.
     if let (KeyCode::Char('?'), _) = (key.code, key.modifiers) {
         if let Some(gate) = state.scope_grant.as_mut() {
             gate.show_detail = !gate.show_detail;
@@ -2675,6 +2676,22 @@ fn resolve_scope_grant(
             LogLevel::Info,
             format!(
                 "Granted read+write access to {} for this session only (not saved)",
+                gate.path
+            ),
+        ),
+        GrantDecision::GrantRoLease => (
+            LogLevel::Info,
+            format!(
+                "Granted read-only access to {} for 24 hours — applied now, saved, and ends on \
+                 its own (`ahma sandbox renew` extends it)",
+                gate.path
+            ),
+        ),
+        GrantDecision::GrantRwLease => (
+            LogLevel::Info,
+            format!(
+                "Granted read+write access to {} for 24 hours — applied now, saved, and ends on \
+                 its own (`ahma sandbox renew` extends it)",
                 gate.path
             ),
         ),
@@ -7575,6 +7592,7 @@ mod tests {
                     granted_by: Some("cargo_build".into()),
                     granted_at: None,
                     note: None,
+                    expires_at: None,
                 });
         })
         .unwrap();

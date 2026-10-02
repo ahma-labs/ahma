@@ -1052,6 +1052,100 @@ pub struct PersistentScope {
     /// Free-form human note explaining why this scope exists. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// When this grant stops applying, in Unix seconds (a **lease**, SPEC
+    /// R-PERM.2.3). `None` is a grant that lasts until revoked. An expired
+    /// lease stays in the file, shown as expired, until it is renewed or
+    /// revoked; it is never applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
+/// Where a lease stands at a given moment (SPEC R-PERM.2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseState {
+    /// No expiry: lasts until revoked.
+    Permanent,
+    /// Applies for this many more seconds.
+    Active { remaining_secs: u64 },
+    /// Expired this many seconds ago; not applied.
+    Expired { ago_secs: u64 },
+}
+
+impl PersistentScope {
+    /// Where this grant's lease stands at `now` (Unix seconds).
+    pub fn lease_state(&self, now: u64) -> LeaseState {
+        match self.expires_at {
+            None => LeaseState::Permanent,
+            Some(at) if at > now => LeaseState::Active {
+                remaining_secs: at - now,
+            },
+            Some(at) => LeaseState::Expired {
+                ago_secs: now.saturating_sub(at),
+            },
+        }
+    }
+
+    /// Whether the grant applies at `now`.
+    pub fn applies_at(&self, now: u64) -> bool {
+        !matches!(self.lease_state(now), LeaseState::Expired { .. })
+    }
+}
+
+/// Unix seconds now.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `2026-10-03 19:40 UTC` for Unix seconds: how a lease's end is shown.
+/// Civil-from-days (Howard Hinnant's algorithm), so this crate needs no date
+/// dependency.
+pub fn fmt_utc_datetime(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rem / 3_600,
+        (rem % 3_600) / 60
+    )
+}
+
+/// `3h12m`, `45m`, `2d4h`: a lease's remaining time for a human.
+pub fn fmt_lease_duration(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3_600, (secs % 3_600) / 60);
+    match (d, h, m) {
+        (0, 0, m) => format!("{}m", m.max(1)),
+        (0, h, 0) => format!("{h}h"),
+        (0, h, m) => format!("{h}h{m:02}m"),
+        (d, 0, _) => format!("{d}d"),
+        (d, h, _) => format!("{d}d{h}h"),
+    }
+}
+
+/// Parse a lease length: `30m`, `8h`, `7d`, `2w` (a bare number is hours).
+pub fn parse_lease_duration(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u64 = num.parse().ok().filter(|n| *n > 0)?;
+    let unit_secs = match unit {
+        "m" | "min" => 60,
+        "" | "h" => 3_600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => return None,
+    };
+    n.checked_mul(unit_secs)
 }
 
 /// Outcome of [`SandboxSettings::grant_scope`].
@@ -2717,6 +2811,9 @@ fn toml_persistent_scopes(v: &[PersistentScope]) -> String {
             push_opt_str_field(&mut parts, "granted_by", &ps.granted_by);
             push_opt_str_field(&mut parts, "granted_at", &ps.granted_at);
             push_opt_str_field(&mut parts, "note", &ps.note);
+            if let Some(at) = ps.expires_at {
+                parts.push(format!("expires_at = {at}"));
+            }
             format!("{{ {} }}", parts.join(", "))
         })
         .collect();
@@ -3116,6 +3213,7 @@ mod tests {
                     granted_by: Some("sccache".into()),
                     granted_at: Some("2026-06-29".into()),
                     note: Some("compiler cache".into()),
+                    expires_at: None,
                 }],
                 env_allow: vec!["GITHUB_TOKEN".into()],
                 allow_keychain: false,
@@ -3980,6 +4078,7 @@ timeout_secs = 600
                 granted_by: None,
                 granted_at: None,
                 note: None,
+                expires_at: None,
             })
             .unwrap()
             .trim(),
@@ -4049,6 +4148,7 @@ persistent_scopes = [
             granted_by: None,
             granted_at: None,
             note: None,
+            expires_at: None,
         };
         assert_eq!(sb.grant_scope(mk(ScopeAccess::Rw)), GrantOutcome::Added);
         assert_eq!(sb.persistent_scopes.len(), 1);
@@ -4073,6 +4173,7 @@ persistent_scopes = [
             granted_by: None,
             granted_at: None,
             note: None,
+            expires_at: None,
         });
         assert!(sb.revoke_scope(Path::new("/nope"), None).is_none());
         let removed = sb.revoke_scope(Path::new("/cache"), None).expect("removed");
@@ -4093,12 +4194,62 @@ persistent_scopes = [
             granted_by: None,
             granted_at: None,
             note: None,
+            expires_at: None,
         });
         // Looking up by the expanded absolute path finds the ~-stored entry.
         assert!(sb.find_scope(&home.join("foo"), None).is_some());
         // Revoking by the expanded path removes the ~-stored entry.
         assert!(sb.revoke_scope(&home.join("foo"), None).is_some());
         assert!(sb.persistent_scopes.is_empty());
+    }
+
+    #[test]
+    fn lease_lengths_and_dates_read_as_written() {
+        assert_eq!(parse_lease_duration("30m"), Some(1_800));
+        assert_eq!(parse_lease_duration("8h"), Some(28_800));
+        assert_eq!(parse_lease_duration("8"), Some(28_800));
+        assert_eq!(parse_lease_duration("7d"), Some(604_800));
+        assert_eq!(parse_lease_duration("2w"), Some(1_209_600));
+        for bad in ["", "0h", "h", "3y", "-1h", "1.5h"] {
+            assert_eq!(parse_lease_duration(bad), None, "{bad}");
+        }
+        assert_eq!(fmt_utc_datetime(0), "1970-01-01 00:00 UTC");
+        assert_eq!(fmt_utc_datetime(951_782_400), "2000-02-29 00:00 UTC");
+        assert_eq!(fmt_utc_datetime(1_790_967_600), "2026-10-02 19:00 UTC");
+        assert_eq!(fmt_lease_duration(45 * 60), "45m");
+        assert_eq!(fmt_lease_duration(3 * 3_600 + 12 * 60), "3h12m");
+        assert_eq!(fmt_lease_duration(2 * 86_400 + 4 * 3_600), "2d4h");
+    }
+
+    /// A lease survives the settings file being rewritten: ahma regenerates
+    /// the file on startup through its own writer, which must carry it.
+    #[test]
+    fn a_lease_survives_the_settings_file_being_rewritten() {
+        let td = tempfile::tempdir().unwrap();
+        let file = td.path().join("settings.toml");
+        let mut s = AhmaSettings::default();
+        s.sandbox.persistent_scopes.push(PersistentScope {
+            path: PathBuf::from("/cache"),
+            access: ScopeAccess::Rw,
+            workspace: Some(PathBuf::from("/ws")),
+            granted_by: None,
+            granted_at: None,
+            note: None,
+            expires_at: Some(1_790_967_600),
+        });
+        s.save_to(&file).unwrap();
+        let back = AhmaSettings::load_from_result(&file).unwrap();
+        assert_eq!(
+            back.sandbox.persistent_scopes[0].expires_at,
+            Some(1_790_967_600)
+        );
+        assert_eq!(
+            back.sandbox.persistent_scopes[0].lease_state(1_790_967_000),
+            LeaseState::Active {
+                remaining_secs: 600
+            }
+        );
+        assert!(!back.sandbox.persistent_scopes[0].applies_at(1_790_967_601));
     }
 
     /// SPEC R5.4.11: a grant belongs to the workspace it was made for, so the
@@ -4114,6 +4265,7 @@ persistent_scopes = [
             granted_by: None,
             granted_at: None,
             note: None,
+            expires_at: None,
         };
         assert_eq!(
             sb.grant_scope(mk("/ws/a", ScopeAccess::Rw)),

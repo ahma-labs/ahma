@@ -1525,6 +1525,9 @@ pub enum PermissionsCommand {
         /// Show only one kind: `fs-scope`, `web-domain`, or `tool`.
         #[arg(long = "kind", value_name = "KIND")]
         kind: Option<String>,
+        /// Show only leases that end within this long (`12h`, `2d`): what to renew before a long unattended run.
+        #[arg(long = "expiring", value_name = "DURATION")]
+        expiring: Option<String>,
     },
     /// Revoke a permission by kind and subject.
     ///
@@ -1883,9 +1886,27 @@ pub enum SandboxCommand {
         /// Free-form note explaining why this scope exists.
         #[arg(long = "note", value_name = "TEXT")]
         note: Option<String>,
+        /// Grant it as a lease that stops applying after this long (`30m`, `8h`, `7d`, `2w`): the right tier for anything outside the project you need for a task, not forever. `ahma sandbox list` shows when it ends and `ahma sandbox renew` extends it.
+        #[arg(long = "for", value_name = "DURATION", conflicts_with = "session")]
+        lease: Option<String>,
     },
     /// List the persistent scopes currently granted, and the file they live in.
     List,
+    /// Extend a lease granted with `--for`, so a long unattended run does not lose it. Applies the denylist and is audited like a grant.
+    Renew {
+        /// Directory whose lease to extend.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        /// How long from now the lease should last (`30m`, `8h`, `7d`, `2w`). Default: 24h.
+        #[arg(long = "for", value_name = "DURATION", default_value = "24h")]
+        lease: String,
+        /// The workspace whose grant to renew. Default: the git repository enclosing the current directory, else the current directory.
+        #[arg(long = "workspace", value_name = "DIR", conflicts_with = "global")]
+        workspace: Option<PathBuf>,
+        /// Renew the legacy global grant.
+        #[arg(long = "global")]
+        global: bool,
+    },
     /// Revoke a previously granted persistent scope. A grant belongs to one workspace, so a revoke names the workspace too; another workspace's grant of the same path is never touched.
     Revoke {
         /// Directory to revoke (matched after `~` expansion).
@@ -3275,7 +3296,19 @@ pub fn build_app_config_with_settings(
         package_cache_write: sandbox.package_cache_write,
         // Loaded from settings.toml (honors --no-settings via `s`); survives
         // roots/list because the subprocess reads it directly, not via the bridge.
-        persistent_scopes: s.sandbox.persistent_scopes.clone(),
+        // An expired lease is not applied by any surface: the server, terminal
+        // hooks and the edit guard all build their scopes from this list
+        // (SPEC R-PERM.2.3). Leases still active keep their expiry, so a
+        // long-running server retires them when they lapse.
+        persistent_scopes: {
+            let now = ahma_common::config::unix_now();
+            s.sandbox
+                .persistent_scopes
+                .iter()
+                .filter(|p| p.applies_at(now))
+                .cloned()
+                .collect()
+        },
         http_host: serve.http_host,
         http_port: serve.http_port,
         no_quic: http.no_quic,
@@ -4459,6 +4492,7 @@ mod tests {
             granted_by: Some("test".to_string()),
             granted_at: None,
             note: None,
+            expires_at: None,
         }
     }
 

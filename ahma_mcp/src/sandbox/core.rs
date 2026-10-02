@@ -310,6 +310,9 @@ pub struct Sandbox {
     /// [`Self::applicable_persistent`]; `persistent_write_scopes` /
     /// `persistent_read_scopes` hold that answer for the current scopes.
     pub(super) persistent_records: Vec<ahma_common::config::PersistentScope>,
+    /// Leases from `persistent_records` already withdrawn from the live scopes
+    /// because they expired (SPEC R-PERM.2.3), so each is retired once.
+    pub(super) retired_leases: parking_lot::RwLock<Vec<PathBuf>>,
     pub(super) livelog: bool,
     /// Allow package-manager caches (cargo registry/git) to be written.
     /// Default `true`; disable with `--no-package-cache-write`.
@@ -408,6 +411,7 @@ impl Clone for Sandbox {
             persistent_read_scopes: self.persistent_read_scopes.clone(),
             explicit_scopes: self.explicit_scopes,
             persistent_records: self.persistent_records.clone(),
+            retired_leases: parking_lot::RwLock::new(self.retired_leases.read().clone()),
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
             egress_proxy_addr: parking_lot::RwLock::new(*self.egress_proxy_addr.read()),
@@ -490,6 +494,7 @@ impl Sandbox {
             persistent_read_scopes: Vec::new(),
             explicit_scopes: false,
             persistent_records: Vec::new(),
+            retired_leases: parking_lot::RwLock::new(Vec::new()),
             livelog,
             package_cache_write: true,
             egress_proxy_addr: parking_lot::RwLock::new(None),
@@ -589,6 +594,7 @@ impl Sandbox {
             granted_by: None,
             granted_at: None,
             note: None,
+            expires_at: None,
         };
         let records = write
             .into_iter()
@@ -628,6 +634,25 @@ impl Sandbox {
                 }
                 None => true,
             })
+            // A lease that has already expired is not applied, and is said so
+            // (SPEC R-PERM.2.3); the settings file keeps it until it is renewed
+            // or revoked.
+            .filter(|rec| {
+                let now = ahma_common::config::unix_now();
+                if rec.applies_at(now) {
+                    return true;
+                }
+                tracing::info!(
+                    "Persistent grant {} is a lease that expired on {}; not applied. Renew it \
+                     with `ahma sandbox renew {}`.",
+                    rec.path.display(),
+                    rec.expires_at
+                        .map(ahma_common::config::fmt_utc_datetime)
+                        .unwrap_or_default(),
+                    rec.path.display()
+                );
+                false
+            })
             .collect();
         self.persistent_records = records;
         let (write, read) = self.applicable_persistent(&self.scopes.read());
@@ -647,7 +672,11 @@ impl Sandbox {
     pub fn applicable_persistent(&self, scopes: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let mut write = Vec::new();
         let mut read = Vec::new();
+        let now = ahma_common::config::unix_now();
         for rec in &self.persistent_records {
+            if !rec.applies_at(now) {
+                continue;
+            }
             if !ahma_common::scope_grant::grant_applies(rec.workspace.as_deref(), scopes) {
                 tracing::info!(
                     "Persistent grant {} is bound to workspace {} and does not apply to this \
@@ -676,12 +705,55 @@ impl Sandbox {
     /// The persistent grants in force for this session, with provenance, for
     /// the surfaces that show the scope (SPEC R5.4).
     pub fn persistent_grants_in_effect(&self) -> Vec<ahma_common::config::PersistentScope> {
+        self.persistent_grants_in_effect_at(ahma_common::config::unix_now())
+    }
+
+    /// [`Self::persistent_grants_in_effect`] at `now` (Unix seconds): an
+    /// expired lease is not in effect.
+    pub fn persistent_grants_in_effect_at(
+        &self,
+        now: u64,
+    ) -> Vec<ahma_common::config::PersistentScope> {
         let scopes = self.scopes.read().clone();
         self.persistent_records
             .iter()
+            .filter(|r| r.applies_at(now))
             .filter(|r| ahma_common::scope_grant::grant_applies(r.workspace.as_deref(), &scopes))
             .cloned()
             .collect()
+    }
+
+    /// Withdraw from the live scopes every lease that has expired at `now`
+    /// and was not withdrawn before; returns the paths withdrawn. A path still
+    /// held by another grant in effect stays. Narrowing only: nothing here can
+    /// widen a scope (SPEC R5.1).
+    pub fn retire_expired_leases(&self, now: u64) -> Vec<PathBuf> {
+        let mut retired = Vec::new();
+        for rec in &self.persistent_records {
+            if rec.applies_at(now) || self.retired_leases.read().contains(&rec.path) {
+                continue;
+            }
+            let held_elsewhere = self
+                .persistent_records
+                .iter()
+                .any(|other| other.path == rec.path && other.applies_at(now));
+            if !held_elsewhere {
+                if rec.access.is_write() {
+                    self.scopes.write().retain(|p| p != &rec.path);
+                } else {
+                    self.read_scopes.write().retain(|p| p != &rec.path);
+                }
+                tracing::info!(
+                    "The lease on {} expired; it no longer applies from this command on. Renew \
+                     it with `ahma sandbox renew {}`.",
+                    rec.path.display(),
+                    rec.path.display()
+                );
+                retired.push(rec.path.clone());
+            }
+            self.retired_leases.write().push(rec.path.clone());
+        }
+        retired
     }
 
     /// Add a live scope grant immediately to the active session.
@@ -746,6 +818,10 @@ impl Sandbox {
     /// A path that is also granted persistently stays, since that grant is not
     /// ours to withdraw.
     pub fn begin_command(&self) {
+        // A lease that expired since the last command is withdrawn now, before
+        // this one spawns; a command already running keeps the policy it was
+        // spawned with (SPEC R-PERM.2.3).
+        self.retire_expired_leases(ahma_common::config::unix_now());
         let mut grants = self.once_grants.write();
         if grants.is_empty() {
             return;
@@ -1558,6 +1634,57 @@ mod live_grant_gate_tests {
         assert!(sb.scopes().iter().any(|s| s == &canon));
     }
 
+    /// SPEC R-PERM.2.3: a lease applies until it expires, and expiry takes
+    /// effect at the next command, never under one already running (its
+    /// kernel policy is fixed at spawn).
+    #[test]
+    fn a_lease_applies_until_it_expires_and_retires_at_the_next_command() {
+        use ahma_common::config::PersistentScope;
+        let workspace = tempdir().unwrap();
+        let active = tempdir().unwrap();
+        let stale = tempdir().unwrap();
+        let canon = |p: &std::path::Path| dunce::canonicalize(p).unwrap();
+        let now = ahma_common::config::unix_now();
+        let lease = |path: PathBuf, expires_at: u64| PersistentScope {
+            path,
+            access: ScopeAccess::Rw,
+            workspace: None,
+            granted_by: None,
+            granted_at: None,
+            note: None,
+            expires_at: Some(expires_at),
+        };
+        let sb = Sandbox::new(
+            vec![workspace.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap()
+        .with_persistent_records(vec![
+            lease(canon(active.path()), now + 3_600),
+            lease(canon(stale.path()), now - 60),
+        ]);
+        let in_scope = |p: &std::path::Path| sb.scopes().iter().any(|s| p.starts_with(s));
+        assert!(in_scope(&canon(active.path())), "an active lease applies");
+        assert!(
+            !in_scope(&canon(stale.path())),
+            "a lease expired at startup never applies"
+        );
+        assert_eq!(sb.persistent_grants_in_effect().len(), 1);
+
+        // An hour later, the next command starts without it.
+        let retired = sb.retire_expired_leases(now + 3_601);
+        assert_eq!(retired, vec![canon(active.path())]);
+        assert!(!in_scope(&canon(active.path())));
+        assert!(sb.persistent_grants_in_effect_at(now + 3_601).is_empty());
+        assert!(
+            sb.retire_expired_leases(now + 7_200).is_empty(),
+            "a lease is retired once"
+        );
+    }
+
     /// SPEC R5.4.5: the hard denylist holds for grants *already* in the
     /// settings file — one written by hand, or by a build of ahma whose
     /// denylist was narrower. Recorded is not the same as allowed.
@@ -1574,6 +1701,7 @@ mod live_grant_gate_tests {
             granted_by: Some("a hand edit".into()),
             granted_at: None,
             note: None,
+            expires_at: None,
         };
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],

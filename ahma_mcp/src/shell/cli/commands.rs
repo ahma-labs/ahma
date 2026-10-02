@@ -487,7 +487,24 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
             session,
             by,
             note,
-        } => run_sandbox_grant(&file, dir, read_only, workspace, global, session, by, note),
+            lease,
+        } => {
+            let lease_secs = lease.as_deref().map(parse_lease_arg).transpose()?;
+            run_sandbox_grant(
+                &file, dir, read_only, workspace, global, session, by, note, lease_secs,
+            )
+        }
+        SandboxCommand::Renew {
+            path,
+            lease,
+            workspace,
+            global,
+        } => run_sandbox_renew(
+            &file,
+            path,
+            parse_lease_arg(&lease)?,
+            resolve_cli_workspace(workspace, global)?,
+        ),
         SandboxCommand::List => run_sandbox_list(&file),
         SandboxCommand::Revoke {
             path: dir,
@@ -564,6 +581,90 @@ fn print_revoke_not_found(
     }
 }
 
+/// Parse `--for`: `30m`, `8h`, `7d`, `2w`.
+fn parse_lease_arg(s: &str) -> Result<u64> {
+    ahma_common::config::parse_lease_duration(s).with_context(|| {
+        format!("cannot read {s:?} as a lease length; use a number with m, h, d or w (`8h`, `7d`)")
+    })
+}
+
+/// How a grant's lease reads in a listing: nothing for a permanent grant.
+fn lease_line(expires_at: Option<u64>) -> Option<String> {
+    use ahma_common::config::{LeaseState, fmt_lease_duration, fmt_utc_datetime};
+    let at = expires_at?;
+    let probe = ahma_common::config::PersistentScope {
+        path: PathBuf::new(),
+        access: ahma_common::config::ScopeAccess::Ro,
+        workspace: None,
+        granted_by: None,
+        granted_at: None,
+        note: None,
+        expires_at: Some(at),
+    };
+    Some(match probe.lease_state(ahma_common::config::unix_now()) {
+        LeaseState::Active { remaining_secs } => format!(
+            "lease ends {} (in {})",
+            fmt_utc_datetime(at),
+            fmt_lease_duration(remaining_secs)
+        ),
+        LeaseState::Expired { .. } => format!(
+            "EXPIRED {} — not applied; renew with `ahma sandbox renew <path>`",
+            fmt_utc_datetime(at)
+        ),
+        LeaseState::Permanent => return None,
+    })
+}
+
+/// `ahma sandbox renew`: extend a lease through the same audited, denylisted
+/// write path as a grant (SPEC R-PERM.2.3).
+fn run_sandbox_renew(
+    file: &std::path::Path,
+    dir: PathBuf,
+    lease_secs: u64,
+    workspace: Option<PathBuf>,
+) -> Result<()> {
+    let settings = load_sandbox_settings(file)?;
+    let Some(existing) = settings
+        .sandbox
+        .find_scope(&dir, workspace.as_deref())
+        .cloned()
+    else {
+        print_revoke_not_found(&settings, &dir, workspace.as_deref(), "ahma sandbox renew");
+        return Ok(());
+    };
+    if existing.expires_at.is_none() {
+        println!(
+            "Nothing to renew: {} is granted until revoked, not as a lease.",
+            dir.display()
+        );
+        return Ok(());
+    }
+    let expires_at = ahma_common::config::unix_now() + lease_secs;
+    ahma_common::scope_grant::persist_grant(
+        file,
+        ahma_common::scope_grant::NewGrant {
+            path: &existing.path,
+            access: existing.access,
+            granted_by: existing.granted_by.clone(),
+            granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            note: existing.note.clone(),
+            surface: "cli",
+            live_scopes: &[],
+            workspace: workspace.as_deref(),
+            expires_at: Some(expires_at),
+        },
+    )?;
+    println!(
+        "✓ Renewed {} access to {} until {} (for {}).",
+        existing.access.label(),
+        dir.display(),
+        ahma_common::config::fmt_utc_datetime(expires_at),
+        ahma_common::config::fmt_lease_duration(lease_secs)
+    );
+    println!("Recorded in: {}", file.display());
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_sandbox_grant(
     file: &std::path::Path,
@@ -574,6 +675,7 @@ fn run_sandbox_grant(
     session: bool,
     by: Option<String>,
     note: Option<String>,
+    lease_secs: Option<u64>,
 ) -> Result<()> {
     use ahma_common::config::{GrantOutcome, ScopeAccess};
 
@@ -612,6 +714,7 @@ fn run_sandbox_grant(
             surface: "cli",
             live_scopes: &live_scopes,
             workspace: workspace.as_deref(),
+            expires_at: lease_secs.map(|secs| ahma_common::config::unix_now() + secs),
         },
     )?;
 
@@ -632,6 +735,9 @@ fn run_sandbox_grant(
     match &workspace {
         Some(ws) => println!("Bound to workspace: {}", ws.display()),
         None => println!("GLOBAL: applies to every workspace on this machine."),
+    }
+    if let Some(line) = lease_line(lease_secs.map(|s| ahma_common::config::unix_now() + s)) {
+        println!("{line}");
     }
     println!("Recorded in: {}", file.display());
     println!();
@@ -784,6 +890,9 @@ fn print_persistent_scope(s: &ahma_common::config::PersistentScope) {
     if let Some(note) = &s.note {
         println!("    note:       {note}");
     }
+    if let Some(line) = lease_line(s.expires_at) {
+        println!("    {line}");
+    }
 }
 
 fn run_sandbox_revoke(
@@ -885,9 +994,12 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
     };
 
     match args.command {
-        PermissionsCommand::List { kind } => {
+        PermissionsCommand::List { kind, expiring } => {
             let settings = load()?;
-            print_permissions(&settings, kind.as_deref(), &file)
+            match expiring {
+                Some(window) => print_expiring(&settings, parse_lease_arg(&window)?, &file),
+                None => print_permissions(&settings, kind.as_deref(), &file),
+            }
         }
         PermissionsCommand::Revoke {
             kind,
@@ -911,6 +1023,53 @@ fn parse_kind(s: &str) -> Result<GrantKind> {
             "unknown permission kind '{other}' (expected: fs-scope, web-domain, net-host, or tool)"
         ),
     }
+}
+
+/// `ahma permissions list --expiring <window>`: the leases that end within
+/// `window`, and those already expired — what to renew before leaving a long
+/// run unattended (SPEC R-PERM.2.3).
+fn print_expiring(
+    settings: &ahma_common::config::AhmaSettings,
+    window_secs: u64,
+    file: &std::path::Path,
+) -> Result<()> {
+    let now = ahma_common::config::unix_now();
+    let due: Vec<_> = settings
+        .sandbox
+        .persistent_scopes
+        .iter()
+        .filter(|s| s.expires_at.is_some_and(|at| at <= now + window_secs))
+        .collect();
+    if due.is_empty() {
+        println!(
+            "Nothing more to do: no lease ends in the next {}.",
+            ahma_common::config::fmt_lease_duration(window_secs)
+        );
+        return Ok(());
+    }
+    println!(
+        "One thing to do before a long run: renew what it needs. {} lease{} end{} within {}:",
+        due.len(),
+        if due.len() == 1 { "" } else { "s" },
+        if due.len() == 1 { "s" } else { "" },
+        ahma_common::config::fmt_lease_duration(window_secs)
+    );
+    println!();
+    for s in due {
+        print_persistent_scope(s);
+        let flag = s
+            .workspace
+            .as_deref()
+            .map(|w| format!(" --workspace {}", w.display()))
+            .unwrap_or_else(|| " --global".to_string());
+        println!(
+            "    renew:      ahma sandbox renew {}{flag} --for 24h",
+            s.path.display()
+        );
+    }
+    println!();
+    println!("File: {}", file.display());
+    Ok(())
 }
 
 fn print_permissions(
@@ -988,6 +1147,9 @@ fn print_permission_record(r: &ahma_common::permissions::GrantRecord) {
     }
     if let Some(note) = &r.note {
         println!("      note:       {note}");
+    }
+    if let Some(line) = lease_line(r.expires_at) {
+        println!("      {line}");
     }
 }
 
@@ -2627,6 +2789,7 @@ mod tests {
                 read_only: false,
                 by: Some("tester".into()),
                 note: Some("a note".into()),
+                lease: None,
             },
         })
         .unwrap();
@@ -2644,6 +2807,7 @@ mod tests {
                 read_only: true,
                 by: None,
                 note: None,
+                lease: None,
             },
         })
         .unwrap();
@@ -3037,6 +3201,7 @@ mod tests {
                 read_only: false,
                 by: None,
                 note: None,
+                lease: None,
             },
         })
         .expect_err("granting $HOME must be refused");
@@ -3068,6 +3233,7 @@ mod tests {
                 read_only: true,
                 by: Some("sccache".into()),
                 note: None,
+                lease: None,
             },
         })
         .expect("an ordinary external cache dir is a legitimate grant");
@@ -3115,6 +3281,7 @@ mod tests {
                 read_only: false,
                 by: None,
                 note: None,
+                lease: None,
             },
         })
         .unwrap();
@@ -3156,6 +3323,95 @@ mod tests {
         );
     }
 
+    /// SPEC R-PERM.2.3: `--for` writes a lease; `renew` extends it through the
+    /// audited write path; a permanent grant has nothing to renew.
+    #[test]
+    fn a_lease_is_granted_for_a_while_and_renewed() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let cache = home.path().join("caches").join("task");
+        std::fs::create_dir_all(&cache).unwrap();
+        let before = ahma_common::config::unix_now();
+        run_sandbox_command(SandboxArgs {
+            command: SandboxCommand::Grant {
+                workspace: None,
+                global: true,
+                session: false,
+                path: cache.clone(),
+                read_only: true,
+                by: None,
+                note: None,
+                lease: Some("2h".into()),
+            },
+        })
+        .unwrap();
+        let load =
+            || ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
+        let at = load()
+            .sandbox
+            .find_scope(&cache, None)
+            .unwrap()
+            .expires_at
+            .expect("a lease");
+        assert!((before + 7_200..=before + 7_260).contains(&at), "{at}");
+
+        run_sandbox_command(SandboxArgs {
+            command: SandboxCommand::Renew {
+                path: cache.clone(),
+                lease: "3d".into(),
+                workspace: None,
+                global: true,
+            },
+        })
+        .unwrap();
+        let renewed = load()
+            .sandbox
+            .find_scope(&cache, None)
+            .unwrap()
+            .expires_at
+            .unwrap();
+        assert!(renewed >= before + 3 * 86_400, "{renewed}");
+        let audit =
+            std::fs::read_to_string(home.path().join(".ahma").join("permissions-audit.jsonl"))
+                .unwrap();
+        assert_eq!(
+            audit.lines().count(),
+            2,
+            "the grant and the renewal are both audited"
+        );
+
+        // A grant made without --for lasts until revoked: nothing to renew.
+        let other = home.path().join("caches").join("forever");
+        std::fs::create_dir_all(&other).unwrap();
+        run_sandbox_command(SandboxArgs {
+            command: SandboxCommand::Grant {
+                workspace: None,
+                global: true,
+                session: false,
+                path: other.clone(),
+                read_only: true,
+                by: None,
+                note: None,
+                lease: None,
+            },
+        })
+        .unwrap();
+        run_sandbox_command(SandboxArgs {
+            command: SandboxCommand::Renew {
+                path: other.clone(),
+                lease: "1h".into(),
+                workspace: None,
+                global: true,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            load().sandbox.find_scope(&other, None).unwrap().expires_at,
+            None
+        );
+        assert!(parse_lease_arg("soon").is_err());
+    }
+
     /// SPEC R5.4.11: a revoke names a workspace, and another workspace's grant
     /// of the same path survives it.
     #[test]
@@ -3178,6 +3434,7 @@ mod tests {
                     read_only: false,
                     by: None,
                     note: None,
+                    lease: None,
                 },
             })
             .unwrap();
@@ -3293,7 +3550,10 @@ mod tests {
         // "Nothing granted" is a normal, healthy state — not an error, and not a
         // reason to create a file.
         run_permissions_command(PermissionsArgs {
-            command: PermissionsCommand::List { kind: None },
+            command: PermissionsCommand::List {
+                kind: None,
+                expiring: None,
+            },
         })
         .expect("listing an empty ledger succeeds");
     }

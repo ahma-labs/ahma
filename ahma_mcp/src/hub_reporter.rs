@@ -376,6 +376,7 @@ fn persist_resolved_grant(
                         surface: "tui",
                         live_scopes: &live_scopes,
                         workspace: workspace.as_deref(),
+                        expires_at: crate::sandbox::permission_broker::lease_end(tier),
                     },
                 ) {
                     Ok(_) => tracing::info!(

@@ -152,6 +152,7 @@ pub fn as_persistent_scopes(grants: &[SessionGrant]) -> Vec<PersistentScope> {
             ),
             granted_at: None,
             note: Some(format!("for this session only (owner pid {})", g.owner_pid)),
+            expires_at: None,
         })
         .collect()
 }

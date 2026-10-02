@@ -352,6 +352,7 @@ impl PermissionBroker {
                             surface: "harness",
                             live_scopes: &live_scopes,
                             workspace: workspace.as_deref(),
+                            expires_at: lease_end(tier),
                         },
                     ) {
                         Ok(_) => tracing::info!(
@@ -457,6 +458,18 @@ impl PermissionBroker {
             GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
         }
     }
+}
+
+/// When a grant answered at `tier` ends: a lease ends
+/// [`ahma_common::scope_grant::PROMPT_LEASE_SECS`] from now; nothing else does.
+pub(crate) fn lease_end(tier: GrantTier) -> Option<u64> {
+    (tier == GrantTier::Lease).then(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            + ahma_common::scope_grant::PROMPT_LEASE_SECS
+    })
 }
 
 /// The paste-able remediation shown at rung 2 and rung 3 — the same string in
