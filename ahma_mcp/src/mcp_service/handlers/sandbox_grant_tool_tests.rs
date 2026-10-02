@@ -731,12 +731,19 @@ async fn sandbox_grant_human_approval_applies_live_and_persists() {
         service.adapter.sandbox().is_path_in_scope(&canon_external),
         "a human-approved grant widens the live session immediately (R5.4.6)"
     );
-    let written = std::fs::read_to_string(&settings_file).unwrap();
-    assert!(written.contains("external_cache"), "{written}");
-    let canon_workspace = dunce::canonicalize(&workspace).unwrap();
-    assert!(
-        written.contains(&*canon_workspace.to_string_lossy()),
-        "an always grant is bound to the workspace that asked (R5.4.11): {written}"
+    // Compare the parsed record, not the file text: TOML escapes Windows
+    // path separators, so a substring of the raw path never matches there.
+    let saved = ahma_common::config::AhmaSettings::load_from_result(&settings_file).unwrap();
+    let record = saved
+        .sandbox
+        .persistent_scopes
+        .iter()
+        .find(|r| r.path == canon_external)
+        .expect("the always grant is saved");
+    assert_eq!(
+        record.workspace.as_deref(),
+        Some(dunce::canonicalize(&workspace).unwrap().as_path()),
+        "an always grant is bound to the workspace that asked (R5.4.11)"
     );
     let audit = std::fs::read_to_string(home.join(".ahma").join("permissions-audit.jsonl"))
         .expect("the chokepoint audits every grant");

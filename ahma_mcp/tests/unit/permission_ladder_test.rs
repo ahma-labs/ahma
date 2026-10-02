@@ -22,7 +22,7 @@ use ahma_common::config::{AhmaSettings, ScopeAccess};
 use ahma_common::scope_grant::{GrantCoordinator, GrantDecision, ScopeGrantRequest};
 use ahma_mcp::sandbox::{
     ElicitOutcome, ElicitationSurface, PermissionBroker, Sandbox, SandboxMode, ScopeGrantNotifier,
-    grant_channel::{notify_pre_exec, notify_stderr_denial},
+    grant_channel::notify_pre_exec,
 };
 use async_trait::async_trait;
 use tempfile::TempDir;
@@ -90,9 +90,20 @@ async fn an_approval_at_the_harness_is_persisted_and_applied_beside_the_locked_s
     broker.set_sandbox(sandbox.clone());
     let notifier: Arc<dyn ScopeGrantNotifier> = broker.clone();
 
-    // A real kernel denial, as it appears in a sandboxed command's stderr.
-    let denied = "error: failed to create directory `/opt/ext/sccache/0`: Read-only file system";
-    notify_stderr_denial(&sandbox, Some(&notifier), denied, "", "sccache").await;
+    // A real directory outside the workspace, refused up front by path
+    // validation — the exact path, the same helper the adapter calls. A real
+    // temporary directory rather than a literal like `/opt/…`, which is not an
+    // absolute path on Windows and so names a different place there.
+    let outside = TempDir::new().unwrap();
+    let cache = outside.path().join("sccache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let cache = dunce::canonicalize(&cache).unwrap();
+    let err: anyhow::Error = ahma_mcp::sandbox::SandboxError::PathOutsideSandbox {
+        path: cache.clone(),
+        scopes: vec![workspace.path().to_path_buf()],
+    }
+    .into();
+    notify_pre_exec(&sandbox, Some(&notifier), &err, "sccache").await;
 
     assert_eq!(
         harness.asks.load(Ordering::SeqCst),
@@ -105,7 +116,7 @@ async fn an_approval_at_the_harness_is_persisted_and_applied_beside_the_locked_s
         .expect("the ledger was written and parses");
     let granted = settings
         .sandbox
-        .find_scope(Path::new("/opt/ext/sccache/0"))
+        .find_scope(&cache)
         .expect("the approved scope is persisted");
     assert_eq!(granted.access, ScopeAccess::Rw);
     assert_eq!(
@@ -116,7 +127,7 @@ async fn an_approval_at_the_harness_is_persisted_and_applied_beside_the_locked_s
 
     // Applied live beside the workspace scope, which itself never moves.
     assert!(
-        sandbox.is_path_in_scope(Path::new("/opt/ext/sccache/0")),
+        sandbox.is_path_in_scope(&cache),
         "a human-approved grant applies to this session now (R5.4.6)"
     );
     assert_eq!(
@@ -128,10 +139,7 @@ async fn an_approval_at_the_harness_is_persisted_and_applied_beside_the_locked_s
     // And it is auditable.
     let audit = home.path().join(".ahma").join("permissions-audit.jsonl");
     let text = std::fs::read_to_string(&audit).expect("the grant is audited");
-    assert!(
-        text.contains("/opt/ext/sccache/0"),
-        "audit names the subject: {text}"
-    );
+    assert!(text.contains("sccache"), "audit names the subject: {text}");
     assert!(text.contains("grant"), "audit names the action: {text}");
 }
 
