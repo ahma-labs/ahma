@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use ahma_common::config::ScopeAccess;
 use ahma_common::scope_grant::{
     GrantContext, GrantCoordinator, GrantEvidence, GrantReason, GrantRequester, GrantRiskSummary,
-    ScopeGrantRequest,
+    GrantStatus, ScopeGrantRequest,
 };
 
 /// The directory to actually offer for a denied `path` (P1c).
@@ -140,23 +140,22 @@ fn grant_hint(path: &Path, access: ScopeAccess) -> String {
 
 /// Delivers a scope-grant request to a human approval surface. Implementors own
 /// (a clone of) the shared [`GrantCoordinator`] and call
-/// [`GrantCoordinator::begin`] to dedup before delivering.
+/// [`GrantCoordinator::begin_with_context`] to dedup before delivering.
+///
+/// The context-carrying method is the one implementors **must** write. It used
+/// to be an optional extra with a default that dropped the context, and the
+/// production broker never overrode it: every prompt it raised read "unknown
+/// session" and "Risk: not assessed" while the tests, whose fakes were handed
+/// their context directly, stayed green (SPEC R-PERM.3.4). There is no default
+/// now, so a notifier cannot quietly be shorter than the body it renders.
 #[async_trait]
 pub trait ScopeGrantNotifier: Send + Sync + std::fmt::Debug {
-    /// Consider raising a grant prompt for `path` at `access`. A no-op if the
-    /// `(canonical_path, access)` was already asked or dismissed this session.
-    async fn notify_violation(
-        &self,
-        path: &Path,
-        access: ScopeAccess,
-        reason: GrantReason,
-        tool: Option<String>,
-    );
-
-    /// [`Self::notify_violation`] with the judgement aids the caller gathered
-    /// (SPEC R-PERM.3.4). Returns the request that was raised, if one was, so
-    /// the caller can show the same body the human sees. The default drops the
-    /// context, for implementors that predate it.
+    /// Consider raising a grant prompt for `path` at `access`, carrying the
+    /// judgement aids the caller gathered (SPEC R-PERM.3.4). A no-op if the
+    /// `(canonical_path, access)` was already asked or dismissed this session,
+    /// is refused outright, or the prompt budget is spent. Returns the request
+    /// that was raised, if one was, so the caller can show the same body the
+    /// human sees and later ask where it stands ([`Self::status`]).
     async fn notify_violation_with(
         &self,
         path: &Path,
@@ -164,16 +163,29 @@ pub trait ScopeGrantNotifier: Send + Sync + std::fmt::Debug {
         reason: GrantReason,
         tool: Option<String>,
         context: GrantContext,
-    ) -> Option<ScopeGrantRequest> {
-        let _ = context;
-        self.notify_violation(path, access, reason, tool).await;
-        None
+    ) -> Option<ScopeGrantRequest>;
+
+    /// [`Self::notify_violation_with`] for a caller that knows nothing beyond
+    /// the path. The body still renders every section; the unknown ones say so.
+    async fn notify_violation(
+        &self,
+        path: &Path,
+        access: ScopeAccess,
+        reason: GrantReason,
+        tool: Option<String>,
+    ) {
+        let _ = self
+            .notify_violation_with(path, access, reason, tool, GrantContext::default())
+            .await;
     }
 
     /// Whether the session's automatic prompt budget is spent (SPEC R-PERM.4.5).
-    fn budget_exhausted(&self) -> bool {
-        false
-    }
+    fn budget_exhausted(&self) -> bool;
+
+    /// Where a question this notifier raised stands, so the surface that asked
+    /// on the agent's behalf can tell it the answer rather than a guess
+    /// (SPEC R-PERM.9).
+    fn status(&self, decision_id: &str) -> GrantStatus;
 }
 
 /// Facts about a grant target a human can check at a glance (SPEC R-PERM.3.4):
@@ -253,10 +265,34 @@ pub fn build_context(
 ) -> GrantContext {
     let identity = crate::hub_reporter::current_identity();
     let scopes = sandbox.scopes().to_vec();
-    let risk = match ahma_common::scope_grant::classify_grant_risk(
+    let risk = risk_summary(target, &scopes);
+    GrantContext {
+        requester: Some(GrantRequester {
+            client: identity.client.clone(),
+            session_id: identity.session_id.clone(),
+            workspace: scopes.first().cloned(),
+            pid: std::process::id(),
+        }),
+        op_id: op_id.map(str::to_string),
+        command: command.map(redact_command),
+        evidence,
+        agent_claim: agent_claim.map(str::to_string),
+        risk: Some(risk),
+        times_asked: 0,
+        first_asked_at: None,
+        write_denied,
+    }
+}
+
+/// The risk section of a grant prompt for `target`, judged against `scopes`:
+/// the denylist's class and warnings, plus what a human can check at a glance.
+/// One implementation for the MCP path and the terminal-hook path, so the same
+/// path never reads as assessed on one surface and "not assessed" on the other.
+pub fn risk_summary(target: &Path, scopes: &[PathBuf]) -> GrantRiskSummary {
+    match ahma_common::scope_grant::classify_grant_risk(
         target,
         ahma_common::config::ahma_home_dir().as_deref(),
-        &scopes,
+        scopes,
     ) {
         ahma_common::scope_grant::GrantRisk::High(warnings) => GrantRiskSummary {
             class: "high".into(),
@@ -273,22 +309,6 @@ pub fn build_context(
             warnings: Vec::new(),
             facts: inspect_grant_target(target),
         },
-    };
-    GrantContext {
-        requester: Some(GrantRequester {
-            client: identity.client.clone(),
-            session_id: identity.session_id.clone(),
-            workspace: scopes.first().cloned(),
-            pid: std::process::id(),
-        }),
-        op_id: op_id.map(str::to_string),
-        command: command.map(redact_command),
-        evidence,
-        agent_claim: agent_claim.map(str::to_string),
-        risk: Some(risk),
-        times_asked: 0,
-        first_asked_at: None,
-        write_denied,
     }
 }
 
@@ -355,64 +375,6 @@ impl LoggingGrantNotifier {
 
 #[async_trait]
 impl ScopeGrantNotifier for LoggingGrantNotifier {
-    async fn notify_violation(
-        &self,
-        path: &Path,
-        access: ScopeAccess,
-        reason: GrantReason,
-        tool: Option<String>,
-    ) {
-        if let Some(req) = self.coordinator.begin(path, access, reason, tool) {
-            tracing::warn!(
-                path = %req.path.display(),
-                access = req.access.label(),
-                "Sandbox blocked an out-of-scope path. To allow it, {}",
-                grant_hint(&req.path, req.access),
-            );
-        }
-    }
-}
-
-/// A notifier that forwards each de-duplicated grant request to the hub
-/// (for a connected TUI to show as a modal) **and** logs it (so it stays
-/// observable even when no TUI is attached). The shared [`GrantCoordinator`] is
-/// the same instance the hub reporter uses to resolve the answer, so dedup,
-/// first-answer-wins, and dismiss all coordinate across the request and the reply.
-#[derive(Debug)]
-pub struct HubGrantNotifier {
-    coordinator: Arc<GrantCoordinator>,
-    req_tx: tokio::sync::mpsc::UnboundedSender<ahma_common::scope_grant::ScopeGrantRequest>,
-}
-
-impl HubGrantNotifier {
-    /// Create a hub-delivering notifier sharing `coordinator`, sending fresh
-    /// requests on `req_tx` (drained by the hub reporter and forwarded to the
-    /// hub as `ClientMsg::Relay(HubRelay::ScopeGrantRequested)`).
-    pub fn new(
-        coordinator: Arc<GrantCoordinator>,
-        req_tx: tokio::sync::mpsc::UnboundedSender<ahma_common::scope_grant::ScopeGrantRequest>,
-    ) -> Self {
-        Self {
-            coordinator,
-            req_tx,
-        }
-    }
-}
-
-#[async_trait]
-impl ScopeGrantNotifier for HubGrantNotifier {
-    async fn notify_violation(
-        &self,
-        path: &Path,
-        access: ScopeAccess,
-        reason: GrantReason,
-        tool: Option<String>,
-    ) {
-        let _ = self
-            .notify_violation_with(path, access, reason, tool, GrantContext::default())
-            .await;
-    }
-
     async fn notify_violation_with(
         &self,
         path: &Path,
@@ -424,29 +386,37 @@ impl ScopeGrantNotifier for HubGrantNotifier {
         let req = self
             .coordinator
             .begin_with_context(path, access, reason, tool, context)?;
-        // Log unconditionally so the violation is visible even with no TUI attached.
         tracing::warn!(
             path = %req.path.display(),
             access = req.access.label(),
-            "Sandbox blocked an out-of-scope path. Approve the prompt, or {}",
+            "Sandbox blocked an out-of-scope path. To allow it, {}",
             grant_hint(&req.path, req.access),
         );
-        // Deliver to the hub; if the channel is closed (no reporter yet) the log
-        // above is the fallback.
-        let _ = self.req_tx.send(req.clone());
         Some(req)
     }
 
     fn budget_exhausted(&self) -> bool {
         self.coordinator.budget_exhausted()
     }
+
+    /// A log line is not a surface anyone answers: a question this notifier
+    /// raised stays in flight only so the same path is logged once, and is
+    /// reported as closed — nobody was asked.
+    fn status(&self, decision_id: &str) -> GrantStatus {
+        match self.coordinator.status(decision_id) {
+            GrantStatus::Pending => GrantStatus::Closed,
+            other => other,
+        }
+    }
 }
 
 /// Wiring helper: a `PathOutsideSandbox` was returned by path validation up front,
 /// so the offending path is known exactly. Offers it as a read+write grant (a
-/// working directory / path argument is used for both). A no-op when there is no
-/// notifier or the error is a different `SandboxError`.
+/// working directory / path argument is used for both), with the same context a
+/// runtime denial carries: who is asking, the risk, the evidence. A no-op when
+/// there is no notifier or the error is a different `SandboxError`.
 pub async fn notify_pre_exec(
+    sandbox: &super::Sandbox,
     notifier: Option<&Arc<dyn ScopeGrantNotifier>>,
     err: &anyhow::Error,
     tool: &str,
@@ -463,29 +433,81 @@ pub async fn notify_pre_exec(
             pattern: Some("path validation before the command ran".into()),
             line: Some(err.to_string().lines().next().unwrap_or("").to_string()),
         };
+        let context = build_context(
+            sandbox,
+            &target,
+            Some(evidence),
+            Some(tool),
+            None,
+            None,
+            true,
+        );
         let _ = n
             .notify_violation_with(
                 &target,
                 ScopeAccess::Rw,
                 GrantReason::PreExecViolation,
                 Some(tool.to_string()),
-                GrantContext {
-                    evidence: Some(evidence),
-                    command: Some(redact_command(tool)),
-                    write_denied: true,
-                    ..Default::default()
-                },
+                context,
             )
             .await;
+    }
+}
+
+/// What a terminal hook knows about the party asking for a grant: the harness
+/// that ran the command (named from its environment markers, which may name a
+/// requester but never decide enforcement, SPEC R7), the harness session, the
+/// scopes the hook sandboxed it in, and the command itself.
+#[derive(Debug, Clone, Default)]
+pub struct HookRequester {
+    /// The harness, e.g. "Claude Code"; `None` when no marker names one.
+    pub harness: Option<String>,
+    /// The harness's own session id, when its hook payload carried one.
+    pub session_id: Option<String>,
+    /// The scopes the hook sandboxed the command in; the first is the workspace.
+    pub scopes: Vec<PathBuf>,
+    /// The command line that was denied.
+    pub command: Option<String>,
+}
+
+impl HookRequester {
+    /// The prompt context for a denial of `target`: who asked, which command,
+    /// and the risk, judged against the hook's own scopes.
+    fn context(&self, target: &Path, write_denied: bool) -> GrantContext {
+        GrantContext {
+            requester: Some(GrantRequester {
+                client: Some(format!(
+                    "{} (terminal hook)",
+                    self.harness.as_deref().unwrap_or("an unidentified harness")
+                )),
+                session_id: self.session_id.clone(),
+                workspace: self.scopes.first().cloned(),
+                pid: std::process::id(),
+            }),
+            command: self.command.as_deref().map(redact_command),
+            risk: Some(risk_summary(target, &self.scopes)),
+            write_denied,
+            ..Default::default()
+        }
     }
 }
 
 /// What a terminal hook prints for a denial (SPEC R-PERM.9, R-PERM.3.4): the
 /// first line says the user must act, then the same body every other surface
 /// shows, then the exact commands for each tier.
-pub fn hook_denial_text(path: &Path, access: ScopeAccess, details: &str) -> String {
+pub fn hook_denial_text(
+    path: &Path,
+    access: ScopeAccess,
+    details: &str,
+    who: &HookRequester,
+) -> String {
     let target = grant_dir_for(path);
-    let body = ahma_common::grant_prompt::render_for_hook(&target, access, details);
+    let body = ahma_common::grant_prompt::render_for_hook(
+        &target,
+        access,
+        details,
+        who.context(&target, access.is_write()),
+    );
     let ro_flag = if access.is_write() {
         ""
     } else {
@@ -499,7 +521,7 @@ pub fn hook_denial_text(path: &Path, access: ScopeAccess, details: &str) -> Stri
          Either applies on your next command; nothing to restart.",
         if access.is_write() { "write" } else { "read" },
         path.display(),
-        body.to_text(),
+        body.to_message(),
         target = target.display(),
         ro_flag = ro_flag,
     )
@@ -644,17 +666,30 @@ mod tests {
 
     #[async_trait]
     impl ScopeGrantNotifier for RecordingNotifier {
-        async fn notify_violation(
+        async fn notify_violation_with(
             &self,
             path: &Path,
             access: ScopeAccess,
             reason: GrantReason,
             tool: Option<String>,
-        ) {
+            context: GrantContext,
+        ) -> Option<ScopeGrantRequest> {
             // Exercise the same dedup the real notifiers use.
-            if let Some(req) = self.coordinator.begin(path, access, reason, tool) {
-                self.seen.lock().push((req.path, req.access, req.reason));
-            }
+            let req = self
+                .coordinator
+                .begin_with_context(path, access, reason, tool, context)?;
+            self.seen
+                .lock()
+                .push((req.path.clone(), req.access, req.reason));
+            Some(req)
+        }
+
+        fn budget_exhausted(&self) -> bool {
+            self.coordinator.budget_exhausted()
+        }
+
+        fn status(&self, decision_id: &str) -> GrantStatus {
+            self.coordinator.status(decision_id)
         }
     }
 
@@ -671,6 +706,8 @@ mod tests {
 
     #[tokio::test]
     async fn pre_exec_notifies_with_offending_path_as_rw() {
+        let scope = tempfile::tempdir().unwrap();
+        let sandbox = test_sandbox(scope.path());
         let rec = Arc::new(RecordingNotifier::default());
         let notifier: Arc<dyn ScopeGrantNotifier> = rec.clone();
         let err: anyhow::Error = super::super::SandboxError::PathOutsideSandbox {
@@ -678,7 +715,7 @@ mod tests {
             scopes: vec![PathBuf::from("/ws")],
         }
         .into();
-        notify_pre_exec(Some(&notifier), &err, "run_terminal_command").await;
+        notify_pre_exec(&sandbox, Some(&notifier), &err, "run_terminal_command").await;
         let seen = rec.seen.lock();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, PathBuf::from("/out/of/scope/dir"));
@@ -688,10 +725,12 @@ mod tests {
 
     #[tokio::test]
     async fn pre_exec_ignores_unrelated_errors() {
+        let scope = tempfile::tempdir().unwrap();
+        let sandbox = test_sandbox(scope.path());
         let rec = Arc::new(RecordingNotifier::default());
         let notifier: Arc<dyn ScopeGrantNotifier> = rec.clone();
         let err = anyhow::anyhow!("some unrelated failure");
-        notify_pre_exec(Some(&notifier), &err, "tool").await;
+        notify_pre_exec(&sandbox, Some(&notifier), &err, "tool").await;
         assert!(rec.seen.lock().is_empty());
     }
 
@@ -739,51 +778,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hub_notifier_emits_once_per_key_and_carries_fields() {
-        let coordinator = Arc::new(GrantCoordinator::new());
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let notifier = HubGrantNotifier::new(coordinator, tx);
-        let p = Path::new("/opt/ext/cache");
-
-        notifier
-            .notify_violation(
-                p,
-                ScopeAccess::Rw,
-                GrantReason::StderrHeuristic,
-                Some("sccache".into()),
-            )
-            .await;
-        // Same (path, access) again — dedup must suppress a second emission.
-        notifier
-            .notify_violation(
-                p,
-                ScopeAccess::Rw,
-                GrantReason::StderrHeuristic,
-                Some("sccache".into()),
-            )
-            .await;
-
-        let req = rx
-            .try_recv()
-            .expect("first violation is delivered to the hub channel");
-        assert_eq!(req.access, ScopeAccess::Rw);
-        assert_eq!(req.reason, GrantReason::StderrHeuristic);
-        assert_eq!(req.tool.as_deref(), Some("sccache"));
-        assert!(!req.decision_id.is_empty());
-        assert!(
-            rx.try_recv().is_err(),
-            "the duplicate violation is deduped, not re-emitted"
-        );
-    }
-
-    #[tokio::test]
     async fn no_notifier_is_a_noop() {
         let scope = tempfile::tempdir().unwrap();
         let sandbox = test_sandbox(scope.path());
         // Simply must not panic with notifier = None.
         notify_stderr_denial(&sandbox, None, "/x: Permission denied", "", "t").await;
         let err = anyhow::anyhow!("x");
-        notify_pre_exec(None, &err, "t").await;
+        notify_pre_exec(&sandbox, None, &err, "t").await;
     }
 
     // ── P1c: parent-directory suggestion ──────────────────────────────────────
@@ -900,10 +901,18 @@ mod context_tests {
 
     #[test]
     fn hook_denial_text_leads_with_blocked_and_has_every_section() {
+        let ws = tempfile::tempdir().unwrap();
+        let who = HookRequester {
+            harness: Some("Claude Code".into()),
+            session_id: Some("8d387500-2ff3-4b2e".into()),
+            scopes: vec![ws.path().to_path_buf()],
+            command: Some("cargo build --release".into()),
+        };
         let t = hook_denial_text(
             Path::new("/opt/cache/x.bin"),
             ScopeAccess::Rw,
             "write to /opt/cache/x.bin: Operation not permitted",
+            &who,
         );
         assert!(t.starts_with("Blocked until a human grants it"), "{t}");
         for h in [
@@ -917,6 +926,21 @@ mod context_tests {
         ] {
             assert!(t.contains(h), "missing {h}: {t}");
         }
+        // SPEC R-PERM.3.4: who asked, and for which command, in the terminal too.
+        for needle in [
+            "Claude Code (terminal hook)",
+            "session 8d387500",
+            &ws.path().display().to_string(),
+            "command: cargo build --release",
+        ] {
+            assert!(t.contains(needle), "missing {needle:?}: {t}");
+        }
+        assert!(!t.contains("unknown session"), "{t}");
+        assert!(!t.contains("not assessed"), "the risk is assessed: {t}");
+        assert!(
+            !t.contains("[n]"),
+            "no TUI keys in a terminal; the commands are the choices: {t}"
+        );
         assert!(t.contains("ahma sandbox grant /opt/cache --session"), "{t}");
     }
 

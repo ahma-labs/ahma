@@ -56,8 +56,8 @@ use async_trait::async_trait;
 use ahma_common::config::{ScopeAccess, settings_path};
 use ahma_common::permissions::{AuditAction, GrantKind, GrantTier, append_audit, audit_entry};
 use ahma_common::scope_grant::{
-    GrantCoordinator, GrantDecision, GrantReason, GrantResolveOutcome, NewGrant, ScopeGrantRequest,
-    persist_grant,
+    GrantContext, GrantCoordinator, GrantDecision, GrantReason, GrantResolveOutcome, GrantStatus,
+    NewGrant, ScopeGrantRequest, persist_grant,
 };
 
 use super::grant_channel::{ScopeGrantNotifier, runtime_denial_remediation_cli};
@@ -281,6 +281,11 @@ impl PermissionBroker {
              To allow it, {}",
             cli_hint(&req),
         );
+        // Nobody holds this question, so it must not stay in flight: an
+        // in-flight question blocks the same path from ever being asked again
+        // this session, and reads to the agent as "waiting for a human" when no
+        // human was reached. Closing it records no decision (R5.3.1).
+        self.coordinator.cancel(&req.decision_id);
         AskedAt::FailedClosed
     }
 
@@ -471,19 +476,22 @@ fn cli_hint(req: &ScopeGrantRequest) -> String {
 
 #[async_trait]
 impl ScopeGrantNotifier for PermissionBroker {
-    async fn notify_violation(
+    async fn notify_violation_with(
         &self,
         path: &Path,
         access: ScopeAccess,
         reason: GrantReason,
         tool: Option<String>,
-    ) {
+        context: GrantContext,
+    ) -> Option<ScopeGrantRequest> {
         // Ask at most once per (path, access) per session (R-PERM.4). The kernel
         // trips on the same path many times over; the human should hear about it
-        // once.
-        let Some(req) = self.coordinator.begin(path, access, reason, tool) else {
-            return;
-        };
+        // once. The context rides with the request to every rung, so the harness
+        // prompt and the TUI modal both say who asked, why, and how risky it is
+        // (R-PERM.3.4).
+        let req = self
+            .coordinator
+            .begin_with_context(path, access, reason, tool, context)?;
         // Disclose the pending question before the (possibly long-blocking)
         // ask, so a client that is not itself the asking surface learns a
         // decision is parked somewhere (#485). The path was already disclosed
@@ -497,7 +505,16 @@ impl ScopeGrantNotifier for PermissionBroker {
                 "reason": req.reason,
             }),
         );
-        self.ask(req).await;
+        self.ask(req.clone()).await;
+        Some(req)
+    }
+
+    fn budget_exhausted(&self) -> bool {
+        self.coordinator.budget_exhausted()
+    }
+
+    fn status(&self, decision_id: &str) -> GrantStatus {
+        self.coordinator.status(decision_id)
     }
 }
 
@@ -630,7 +647,7 @@ fn parse_decision(s: &str) -> GrantDecision {
 /// The question the human actually reads: the one body every surface renders
 /// (SPEC R-PERM.3.4), as text.
 fn prompt_text(req: &ScopeGrantRequest) -> String {
-    ahma_common::grant_prompt::render(req).to_text()
+    ahma_common::grant_prompt::render(req).to_message()
 }
 
 /// The message a *hook* prints to the terminal when nobody could be asked — the
@@ -965,8 +982,8 @@ mod tests {
             "a heuristic path is flagged as one"
         );
         assert!(
-            text.contains("deny"),
-            "deny is offered, and named as the default"
+            !text.contains("[n]"),
+            "the form carries the choices; the message names no TUI keys"
         );
         assert!(
             text.contains("revoke"),

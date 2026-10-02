@@ -1504,6 +1504,16 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     hook_scopes.extend(edit_guard::harness_owned_dirs_for_this_user());
     std::env::set_current_dir(&payload.cwd)
         .with_context(|| format!("Failed to change directory to {}", payload.cwd))?;
+    // Who a denial's grant question names (SPEC R-PERM.3.4). The harness is
+    // named from its environment markers, which may name but never decide (R7).
+    let requester = crate::sandbox::grant_channel::HookRequester {
+        harness: crate::sandbox::detect_host_sandbox()
+            .filter(|h| !matches!(h, crate::sandbox::HostSandbox::Unidentified))
+            .map(|h| h.label().to_string()),
+        session_id: payload.session_id.clone(),
+        scopes: hook_scopes.clone(),
+        command: Some(payload.command.clone()),
+    };
 
     let cfg = AppConfig {
         run_tool: Some("run_terminal_command".to_string()),
@@ -1701,7 +1711,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // grant ...` recovery line so the agent gets a next step instead of a raw
         // `os error 1`. The native-terminal hook uses the CLI grant path (not the
         // MCP grant/restart tools).
-        Err(e) => report_shell_execution_error(e),
+        Err(e) => report_shell_execution_error(e, &requester),
     }
 }
 
@@ -1741,7 +1751,10 @@ fn die_by_signal(signo: i32) -> Result<String> {
 /// write mid-command) and a *pre-exec* denial (the path was rejected before the
 /// command ran). The second used to fall through as a raw error — a denial the
 /// user could see but not act on.
-fn report_shell_execution_error(e: anyhow::Error) -> Result<()> {
+fn report_shell_execution_error(
+    e: anyhow::Error,
+    who: &crate::sandbox::grant_channel::HookRequester,
+) -> Result<()> {
     let Some(sandbox_err) = e.downcast_ref::<crate::sandbox::SandboxError>() else {
         return Err(e);
     };
@@ -1752,13 +1765,14 @@ fn report_shell_execution_error(e: anyhow::Error) -> Result<()> {
             details,
             ..
         } => Some(crate::sandbox::grant_channel::hook_denial_text(
-            path, *access, details,
+            path, *access, details, who,
         )),
         crate::sandbox::SandboxError::PathOutsideSandbox { path, .. } => {
             Some(crate::sandbox::grant_channel::hook_denial_text(
                 path,
                 ahma_common::config::ScopeAccess::Rw,
                 "the path was refused before the command ran",
+                who,
             ))
         }
         _ => None,

@@ -21,8 +21,9 @@ use std::time::Duration;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, Implementation, ListRootsResult, ProgressNotificationParam,
-    ProgressToken, ProtocolVersion, Root,
+    ClientCapabilities, ClientInfo, ElicitRequestParams, ElicitResult, ElicitationAction,
+    ElicitationCapability, FormElicitationCapability, Implementation, ListRootsResult,
+    ProgressNotificationParam, ProgressToken, ProtocolVersion, Root,
 };
 use rmcp::service::{MaybeSendFuture, NotificationContext, RequestContext, RoleClient};
 
@@ -117,6 +118,24 @@ pub struct RecordingClient {
     progress: ProgressLog,
     client_name: String,
     roots: Vec<Root>,
+    elicitation: Option<ElicitationLog>,
+}
+
+/// What a [`RecordingClient`] was asked through `elicitation/create`, and how it
+/// answers. Cloneable: keep one handle in the test to assert on.
+#[derive(Clone, Debug)]
+pub struct ElicitationLog {
+    messages: Arc<Mutex<Vec<String>>>,
+    /// The form value the client sends back (`"deny"`, `"read-write-session"`,
+    /// …), or `None` to decline outright.
+    answer: Option<String>,
+}
+
+impl ElicitationLog {
+    /// Every message the server put to the human, in order.
+    pub fn messages(&self) -> Vec<String> {
+        self.messages.lock().clone()
+    }
 }
 
 impl RecordingClient {
@@ -130,7 +149,26 @@ impl RecordingClient {
             progress: ProgressLog::new(),
             client_name: client_name.into(),
             roots: Vec::new(),
+            elicitation: None,
         }
+    }
+
+    /// Advertise form elicitation at `initialize` and answer every
+    /// `elicitation/create` with `answer` (a grant form value such as `"deny"`
+    /// or `"read-write-session"`; `None` declines). Every message is recorded,
+    /// so a test can assert on exactly what the human was shown.
+    pub fn with_elicitation(mut self, answer: Option<&str>) -> Self {
+        self.elicitation = Some(ElicitationLog {
+            messages: Arc::new(Mutex::new(Vec::new())),
+            answer: answer.map(str::to_string),
+        });
+        self
+    }
+
+    /// A handle to the elicitation prompts this client was shown, if
+    /// [`Self::with_elicitation`] enabled them.
+    pub fn elicitation(&self) -> Option<ElicitationLog> {
+        self.elicitation.clone()
     }
 
     /// Answer `roots/list` with these roots instead of an empty list.
@@ -156,6 +194,11 @@ impl ClientHandler for RecordingClient {
 
         let mut capabilities = ClientCapabilities::default();
         capabilities.roots = Some(Default::default());
+        if self.elicitation.is_some() {
+            let mut elicitation = ElicitationCapability::default();
+            elicitation.form = Some(FormElicitationCapability::default());
+            capabilities.elicitation = Some(elicitation);
+        }
 
         let mut info = ClientInfo::default();
         info.protocol_version = ProtocolVersion::default();
@@ -178,6 +221,27 @@ impl ClientHandler for RecordingClient {
         _context: RequestContext<RoleClient>,
     ) -> impl Future<Output = Result<ListRootsResult, McpError>> + MaybeSendFuture + '_ {
         std::future::ready(Ok(ListRootsResult::new(self.roots.clone())))
+    }
+
+    fn create_elicitation(
+        &self,
+        request: ElicitRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<ElicitResult, McpError>> + MaybeSendFuture + '_ {
+        let result = match &self.elicitation {
+            None => ElicitResult::new(ElicitationAction::Decline),
+            Some(log) => {
+                if let ElicitRequestParams::FormElicitationParams { message, .. } = &request {
+                    log.messages.lock().push(message.clone());
+                }
+                match &log.answer {
+                    Some(value) => ElicitResult::new(ElicitationAction::Accept)
+                        .with_content(serde_json::json!({ "decision": value })),
+                    None => ElicitResult::new(ElicitationAction::Decline),
+                }
+            }
+        };
+        std::future::ready(Ok(result))
     }
 }
 

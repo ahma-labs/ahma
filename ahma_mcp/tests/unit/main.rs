@@ -49,6 +49,7 @@ mod package_cache_write_test;
 mod path_security_edge_cases_test;
 mod path_security_test;
 mod permission_ladder_test;
+mod permission_prompt_context_test;
 mod progress_notification_e2e_test;
 mod pty_session_exec_test;
 mod read_only_lane_test;

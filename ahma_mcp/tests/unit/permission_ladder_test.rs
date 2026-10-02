@@ -8,10 +8,10 @@
 //! drive `notify_stderr_denial` / `notify_pre_exec`, the same helpers the adapter
 //! calls, and assert on the two outcomes that matter:
 //!
-//!   * an approval is **persisted** (so the next start, or the next hooked
-//!     command, actually works), and
-//!   * the **live sandbox is never widened** (R5.1 lock-once) — the grant is a
-//!     promise about the future, not a hole in the present.
+//!   * an `always` approval is **persisted**, bound to the asking workspace (so
+//!     the next start, or the next hooked command, actually works), and
+//!   * it is **applied to the live session** beside the committed workspace
+//!     scope, which itself never changes (R5.1 lock-once, R5.4.6).
 
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use ahma_common::config::{AhmaSettings, ScopeAccess};
 use ahma_common::scope_grant::{GrantCoordinator, GrantDecision, ScopeGrantRequest};
 use ahma_mcp::sandbox::{
     ElicitOutcome, ElicitationSurface, PermissionBroker, Sandbox, SandboxMode, ScopeGrantNotifier,
-    grant_channel::{notify_pre_exec, notify_stderr_denial},
+    grant_channel::notify_pre_exec,
 };
 use async_trait::async_trait;
 use tempfile::TempDir;
@@ -72,14 +72,14 @@ fn ledger(home: &Path) -> PathBuf {
 }
 
 #[tokio::test]
-async fn an_approval_at_the_harness_is_persisted_without_widening_the_live_sandbox() {
+async fn an_approval_at_the_harness_is_persisted_and_applied_beside_the_locked_scope() {
     let home = TempDir::new().unwrap();
     // SAFETY: single-test binary; set before any settings access.
     unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
 
     let workspace = TempDir::new().unwrap();
-    let sandbox = test_sandbox(workspace.path());
-    let scopes_before: Vec<PathBuf> = sandbox.scopes().to_vec();
+    let sandbox = Arc::new(test_sandbox(workspace.path()));
+    let primary_before = sandbox.scopes().first().cloned();
 
     let harness = ScriptedHarness::new(vec![ElicitOutcome::Answered(GrantDecision::GrantRw)]);
     let broker = Arc::new(PermissionBroker::new(
@@ -87,11 +87,23 @@ async fn an_approval_at_the_harness_is_persisted_without_widening_the_live_sandb
         None, // no TUI attached: the harness is the only surface above fail-closed
     ));
     broker.set_elicitation_surface(harness.clone());
+    broker.set_sandbox(sandbox.clone());
     let notifier: Arc<dyn ScopeGrantNotifier> = broker.clone();
 
-    // A real kernel denial, as it appears in a sandboxed command's stderr.
-    let denied = "error: failed to create directory `/opt/ext/sccache/0`: Read-only file system";
-    notify_stderr_denial(&sandbox, Some(&notifier), denied, "", "sccache").await;
+    // A real directory outside the workspace, refused up front by path
+    // validation — the exact path, the same helper the adapter calls. A real
+    // temporary directory rather than a literal like `/opt/…`, which is not an
+    // absolute path on Windows and so names a different place there.
+    let outside = TempDir::new().unwrap();
+    let cache = outside.path().join("sccache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let cache = dunce::canonicalize(&cache).unwrap();
+    let err: anyhow::Error = ahma_mcp::sandbox::SandboxError::PathOutsideSandbox {
+        path: cache.clone(),
+        scopes: vec![workspace.path().to_path_buf()],
+    }
+    .into();
+    notify_pre_exec(&sandbox, Some(&notifier), &err, "sccache").await;
 
     assert_eq!(
         harness.asks.load(Ordering::SeqCst),
@@ -99,31 +111,35 @@ async fn an_approval_at_the_harness_is_persisted_without_widening_the_live_sandb
         "the denial reached the ladder and the harness was asked"
     );
 
-    // The approval is in the ledger, ready for the next start / the next hooked command.
+    // The approval is in the ledger, bound to the workspace that asked.
     let settings = AhmaSettings::load_from_result(&ledger(home.path()))
         .expect("the ledger was written and parses");
     let granted = settings
         .sandbox
-        .find_scope(Path::new("/opt/ext/sccache/0"))
+        .find_scope(&cache)
         .expect("the approved scope is persisted");
     assert_eq!(granted.access, ScopeAccess::Rw);
-
-    // …and the live sandbox is untouched. This is the invariant that makes the
-    // whole flow safe to automate: approving a grant can never punch a hole in the
-    // session that is running right now (R5.1 lock-once).
     assert_eq!(
-        sandbox.scopes().to_vec(),
-        scopes_before,
-        "an approved grant must NEVER widen the live sandbox scope"
+        granted.workspace.as_deref(),
+        primary_before.as_deref(),
+        "an always grant is bound to the asking workspace (R5.4.11)"
+    );
+
+    // Applied live beside the workspace scope, which itself never moves.
+    assert!(
+        sandbox.is_path_in_scope(&cache),
+        "a human-approved grant applies to this session now (R5.4.6)"
+    );
+    assert_eq!(
+        sandbox.scopes().first().cloned(),
+        primary_before,
+        "the committed workspace scope is never replaced (R5.1)"
     );
 
     // And it is auditable.
     let audit = home.path().join(".ahma").join("permissions-audit.jsonl");
     let text = std::fs::read_to_string(&audit).expect("the grant is audited");
-    assert!(
-        text.contains("/opt/ext/sccache/0"),
-        "audit names the subject: {text}"
-    );
+    assert!(text.contains("sccache"), "audit names the subject: {text}");
     assert!(text.contains("grant"), "audit names the action: {text}");
 }
 
@@ -150,9 +166,10 @@ async fn a_declined_question_persists_nothing_and_is_not_asked_again() {
     .into();
 
     // The kernel will trip on this path again and again; the human is asked once.
-    notify_pre_exec(Some(&notifier), &err, "cargo_build").await;
-    notify_pre_exec(Some(&notifier), &err, "cargo_build").await;
-    notify_pre_exec(Some(&notifier), &err, "cargo_build").await;
+    let sandbox = test_sandbox(workspace.path());
+    notify_pre_exec(&sandbox, Some(&notifier), &err, "cargo_build").await;
+    notify_pre_exec(&sandbox, Some(&notifier), &err, "cargo_build").await;
+    notify_pre_exec(&sandbox, Some(&notifier), &err, "cargo_build").await;
 
     assert_eq!(
         harness.asks.load(Ordering::SeqCst),

@@ -98,7 +98,7 @@ pub use exec_config::{
     resolve_git_dirs, set_handoff_allowances,
 };
 pub use gpu::{allow_gpu_enabled, gpu_denial_note, set_allow_gpu};
-pub use grant_channel::{HubGrantNotifier, LoggingGrantNotifier, ScopeGrantNotifier};
+pub use grant_channel::{LoggingGrantNotifier, ScopeGrantNotifier};
 pub use host_detect::{HostSandbox, OUTER_SANDBOX_PID_ENV, detect_host_sandbox};
 #[cfg(target_os = "linux")]
 pub use landlock::{

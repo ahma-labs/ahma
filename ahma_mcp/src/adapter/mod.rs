@@ -423,6 +423,7 @@ impl Adapter {
                 )
                 .await;
                 sandbox::grant_channel::notify_pre_exec(
+                    &self.sandbox,
                     self.scope_grant_notifier.as_ref(),
                     &e,
                     tool,
@@ -513,6 +514,17 @@ impl Adapter {
         self.scope_grant_notifier
             .as_ref()
             .is_some_and(|n| n.budget_exhausted())
+    }
+
+    /// Where a grant question this adapter raised stands: still awaiting a
+    /// human, answered (and how), or closed with nobody asked (SPEC R-PERM.9).
+    /// `Closed` when no notifier is wired.
+    pub fn grant_status(&self, decision_id: &str) -> ahma_common::scope_grant::GrantStatus {
+        self.scope_grant_notifier
+            .as_ref()
+            .map_or(ahma_common::scope_grant::GrantStatus::Closed, |n| {
+                n.status(decision_id)
+            })
     }
 
     /// [`Self::request_scope_grant`] with the judgement aids the caller has

@@ -159,6 +159,83 @@ pub async fn create_in_process_mcp_with_client<C: ClientHandler>(
     wire_in_process_mcp_with_client(client, configs, sandbox).await
 }
 
+/// An in-process pair whose scope-grant notifier is the real
+/// [`PermissionBroker`](crate::sandbox::PermissionBroker), wired exactly as
+/// `ahma serve` wires it: rung 1 is a
+/// [`PeerElicitationSurface`](crate::sandbox::PeerElicitationSurface) over the
+/// service's own peer slot, the live sandbox is installed so an approval is
+/// applied and stamped with its workspace, and there is no hub (rung 2) unless
+/// a test supplies one.
+///
+/// Use it when the assertion is about what the human is *shown* or what the
+/// agent is *told* after a grant question — the seam fakes cannot see, because
+/// a fake notifier is handed whatever context its test chose to give it.
+pub async fn create_in_process_mcp_with_broker<C: ClientHandler>(
+    client: C,
+    scope: &Path,
+    hub_tx: Option<tokio::sync::mpsc::UnboundedSender<ahma_common::scope_grant::ScopeGrantRequest>>,
+) -> Result<(InProcessMcp<C>, Arc<crate::sandbox::PermissionBroker>)> {
+    let sandbox = Sandbox::new(
+        vec![scope.to_path_buf()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )?;
+    sandbox.set_roots_received(true);
+    let _ = sandbox.commit_existing_scopes();
+    let sandbox = Arc::new(sandbox);
+
+    let broker = Arc::new(crate::sandbox::PermissionBroker::new(
+        Arc::new(ahma_common::scope_grant::GrantCoordinator::new()),
+        hub_tx,
+    ));
+    broker.set_sandbox(sandbox.clone());
+
+    let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
+    let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
+    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
+    let adapter = Arc::new(
+        Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox)?
+            .with_scope_grant_notifier(broker.clone()),
+    );
+    let service = AhmaMcpService::new(
+        adapter,
+        operation_monitor,
+        Arc::new(HashMap::new()),
+        Arc::new(None::<GuidanceConfig>),
+        false, // force_synchronous
+        false, // defer_sandbox
+    )
+    .await?;
+    broker.set_elicitation_surface(Arc::new(crate::sandbox::PeerElicitationSurface::new(
+        service.peer.clone(),
+    )));
+    *service.grant_coordinator.write() = Some(broker.coordinator().clone());
+
+    let mcp = serve_in_process(client, service).await?;
+    // The peer slot (rung 1's only way to the client) and the client identity
+    // (the prompt's "who is asking") are both recorded when the server handles
+    // `notifications/initialized`, which can still be in flight when the
+    // handshake returns. Wait for it, so a test that calls a handler directly
+    // sees what production sees after its first request.
+    let peer = mcp.service.peer.clone();
+    let ready = super::concurrency::wait_for_condition(
+        ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Handshake),
+        ahma_common::timeouts::TestTimeouts::poll_interval(),
+        || {
+            let peer = peer.clone();
+            async move { peer.read().is_some() }
+        },
+    )
+    .await;
+    anyhow::ensure!(
+        ready,
+        "the server never recorded its MCP peer after initialize"
+    );
+    Ok((mcp, broker))
+}
+
 /// Internal: wire a pre-built `Sandbox` and tool configs into an in-process pair.
 async fn wire_in_process_mcp(
     configs: HashMap<String, ToolConfig>,
@@ -248,6 +325,15 @@ async fn wire_in_process_mcp_with_queue<C: ClientHandler>(
     )
     .await?;
 
+    serve_in_process(client_handler, service).await
+}
+
+/// Internal: run the initialize handshake for `service` against
+/// `client_handler` over an in-memory duplex channel.
+async fn serve_in_process<C: ClientHandler>(
+    client_handler: C,
+    service: AhmaMcpService,
+) -> Result<InProcessMcp<C>> {
     // Wire client and server through an in-memory duplex channel.
     let (client_stream, server_stream) = tokio::io::duplex(65536);
     let (client_read, client_write) = tokio::io::split(client_stream);
@@ -308,22 +394,11 @@ pub async fn build_test_service() -> Result<(AhmaMcpService, tempfile::TempDir)>
 pub async fn build_test_service_with_configs(
     configs: HashMap<String, ToolConfig>,
 ) -> Result<(AhmaMcpService, tempfile::TempDir)> {
-    build_test_service_inner(configs, None).await
-}
-
-/// Like [`build_test_service`] but with a scope-grant notifier installed on the
-/// adapter, standing in for the human surfaces (TUI modal, elicitation) a real
-/// server wires up — so a test can play the human who answers a
-/// `sandbox_grant` request.
-pub async fn build_test_service_with_notifier(
-    notifier: Arc<dyn crate::sandbox::ScopeGrantNotifier>,
-) -> Result<(AhmaMcpService, tempfile::TempDir)> {
-    build_test_service_inner(HashMap::new(), Some(notifier)).await
+    build_test_service_inner(configs).await
 }
 
 async fn build_test_service_inner(
     configs: HashMap<String, ToolConfig>,
-    notifier: Option<Arc<dyn crate::sandbox::ScopeGrantNotifier>>,
 ) -> Result<(AhmaMcpService, tempfile::TempDir)> {
     let temp_dir = tempfile::tempdir()?;
 
@@ -340,11 +415,11 @@ async fn build_test_service_inner(
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();
     let sandbox = Arc::new(sandbox);
-    let mut adapter = Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox)?;
-    if let Some(notifier) = notifier {
-        adapter = adapter.with_scope_grant_notifier(notifier);
-    }
-    let adapter = Arc::new(adapter);
+    let adapter = Arc::new(Adapter::new(
+        Arc::clone(&operation_monitor),
+        shell_pool,
+        sandbox,
+    )?);
 
     let service = AhmaMcpService::new(
         adapter,
