@@ -235,7 +235,9 @@ impl NetApprovalCoordinator {
 /// save. The settings file lives outside every sandbox scope, so a sandboxed
 /// subprocess cannot reach it. Returns `true` if the domain was newly added,
 /// `false` if it was already present.
-pub fn persist_net_allow(settings_file: &Path, domain: &str) -> Result<bool> {
+/// Every entry this adds is audited here, with the `surface` that asked
+/// (SPEC R-PERM.2.1), so no caller can write the allow list unrecorded.
+pub fn persist_net_allow(settings_file: &Path, domain: &str, surface: &str) -> Result<bool> {
     let domain = norm(domain);
     let mut settings = AhmaSettings::load_from_result(settings_file)
         .map_err(|e| anyhow::anyhow!(e))
@@ -253,10 +255,19 @@ pub fn persist_net_allow(settings_file: &Path, domain: &str) -> Result<bool> {
     {
         return Ok(false);
     }
-    settings.network.allow.push(domain);
+    settings.network.allow.push(domain.clone());
     settings
         .save_to(settings_file)
         .with_context(|| format!("failed to write {}", settings_file.display()))?;
+    crate::permissions::append_audit(&crate::permissions::audit_entry(
+        crate::config::fmt_utc_datetime(crate::config::unix_now()),
+        crate::permissions::AuditAction::Grant,
+        crate::permissions::GrantKind::NetHost,
+        domain,
+        None,
+        crate::permissions::GrantTier::Always,
+        Some(surface.to_string()),
+    ));
     Ok(true)
 }
 
@@ -373,16 +384,40 @@ mod tests {
         );
     }
 
+    /// Every entry added to the allow list is in the audit log, with the
+    /// surface that asked (SPEC R-PERM.2.1).
+    #[test]
+    fn every_added_entry_is_audited_with_its_surface() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let file = home.path().join(".ahma").join("settings.toml");
+        assert!(persist_net_allow(&file, "example.org", "egress-proxy").unwrap());
+        assert!(!persist_net_allow(&file, "example.org", "cli").unwrap());
+        let audit =
+            std::fs::read_to_string(home.path().join(".ahma").join("permissions-audit.jsonl"))
+                .expect("the grant is audited");
+        assert_eq!(
+            audit.lines().count(),
+            1,
+            "an entry already present is not re-audited"
+        );
+        assert!(
+            audit.contains("example.org") && audit.contains("egress-proxy"),
+            "{audit}"
+        );
+    }
+
     #[test]
     fn persist_net_allow_adds_then_dedups_case_insensitively() {
         let home = tempfile::tempdir().unwrap();
         let file = home.path().join(".ahma").join("settings.toml");
 
-        assert!(persist_net_allow(&file, "Crates.IO").unwrap());
+        assert!(persist_net_allow(&file, "Crates.IO", "test").unwrap());
         let reloaded = AhmaSettings::load_from_result(&file).unwrap();
         assert_eq!(reloaded.network.allow, vec!["crates.io".to_string()]);
 
-        assert!(!persist_net_allow(&file, "crates.io").unwrap());
+        assert!(!persist_net_allow(&file, "crates.io", "test").unwrap());
         let reloaded = AhmaSettings::load_from_result(&file).unwrap();
         assert_eq!(
             reloaded.network.allow.len(),
@@ -399,7 +434,7 @@ mod tests {
         let file = dir.join("settings.toml");
         std::fs::write(&file, "this is : not valid toml [[[").unwrap();
         assert!(
-            persist_net_allow(&file, "crates.io").is_err(),
+            persist_net_allow(&file, "crates.io", "test").is_err(),
             "a corrupt settings file must not be silently overwritten"
         );
         assert!(

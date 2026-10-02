@@ -333,7 +333,7 @@ async fn recv_optional_web(
 /// makes it survive restarts. Best-effort: a write failure is logged, not fatal.
 fn persist_resolved_web_allow(domain: &str) {
     match settings_path() {
-        Some(file) => match persist_web_allow(&file, domain) {
+        Some(file) => match persist_web_allow(&file, domain, "tui") {
             Ok(true) => info!(domain, "web approval persisted to [web].always_allow"),
             Ok(false) => info!(domain, "web approval already in [web].always_allow"),
             Err(e) => warn!("hub_reporter: failed to persist web allow for {domain}: {e:#}"),

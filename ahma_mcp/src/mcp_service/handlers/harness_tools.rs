@@ -302,7 +302,11 @@ impl AhmaMcpService {
                 WebResolveOutcome::Persist { domain } => {
                     match ahma_common::config::settings_path() {
                         Some(file) => {
-                            match ahma_common::web_approval::persist_web_allow(&file, &domain) {
+                            match ahma_common::web_approval::persist_web_allow(
+                                &file,
+                                &domain,
+                                "fetch_webpage",
+                            ) {
                                 Ok(true) => tracing::info!(
                                     domain = %domain,
                                     "web egress approved and saved to [web].always_allow"

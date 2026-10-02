@@ -1522,6 +1522,12 @@ fn web_command_at(file: &std::path::Path, command: WebCommand) -> Result<()> {
             settings
                 .save_to(file)
                 .with_context(|| format!("Failed to write {}", file.display()))?;
+            audit(
+                AuditAction::Revoke,
+                GrantKind::WebDomain,
+                pattern.clone(),
+                None,
+            );
             println!("✓ Removed `{pattern}` from the web policy");
             println!();
             println!("Updated: {}", file.display());
@@ -1611,6 +1617,15 @@ fn web_add(
     settings
         .save_to(file)
         .with_context(|| format!("Failed to write {}", file.display()))?;
+    audit(
+        match list {
+            WebList::Allow => AuditAction::Grant,
+            WebList::Deny => AuditAction::Deny,
+        },
+        GrantKind::WebDomain,
+        pattern.clone(),
+        None,
+    );
 
     println!("✓ Added `{pattern}` to [web].{label}");
     if conflicts {
@@ -1673,7 +1688,7 @@ fn network_command_at(file: &std::path::Path, command: NetworkCommand) -> Result
             let _ = HostPattern::parse(&host)
                 .map_err(|e| anyhow::anyhow!("invalid host pattern '{host}': {e}"))?;
 
-            let newly_added = ahma_common::net_approval::persist_net_allow(file, &host)?;
+            let newly_added = ahma_common::net_approval::persist_net_allow(file, &host, "cli")?;
             if newly_added {
                 println!("✓ Added `{host}` to [network].allow");
             } else {
@@ -1722,6 +1737,7 @@ fn network_command_at(file: &std::path::Path, command: NetworkCommand) -> Result
             settings
                 .save_to(file)
                 .with_context(|| format!("Failed to write {}", file.display()))?;
+            audit(AuditAction::Revoke, GrantKind::NetHost, pattern, None);
             println!("✓ Removed `{host}` from [network].allow");
             println!();
             println!("Updated: {}", file.display());
@@ -2837,6 +2853,50 @@ mod tests {
             },
         })
         .unwrap();
+    }
+
+    /// Every web and network allow-list change made from the CLI is in the
+    /// audit log (SPEC R-PERM.2.1), as filesystem grants always were.
+    #[test]
+    fn web_and_network_cli_changes_are_audited() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let file = ledger(home.path());
+        network_command_at(
+            &file,
+            NetworkCommand::Allow {
+                host: "crates.io".into(),
+            },
+        )
+        .unwrap();
+        network_command_at(
+            &file,
+            NetworkCommand::Revoke {
+                host: "crates.io".into(),
+            },
+        )
+        .unwrap();
+        web_command_at(
+            &file,
+            WebCommand::Allow {
+                pattern: "api.github.com".into(),
+            },
+        )
+        .unwrap();
+        web_command_at(
+            &file,
+            WebCommand::Revoke {
+                pattern: "api.github.com".into(),
+            },
+        )
+        .unwrap();
+        let audit =
+            std::fs::read_to_string(home.path().join(".ahma").join("permissions-audit.jsonl"))
+                .expect("audited");
+        assert_eq!(audit.lines().count(), 4, "{audit}");
+        for needle in ["crates.io", "api.github.com", "revoke"] {
+            assert!(audit.contains(needle), "{needle}: {audit}");
+        }
     }
 
     #[test]
