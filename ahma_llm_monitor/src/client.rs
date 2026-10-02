@@ -1491,8 +1491,15 @@ fn parse_chat_completion_response(json: Value) -> Result<ChatCompletionResponse,
                         .and_then(Value::as_str)
                         .unwrap_or("{}")
                         .to_string();
-                    let arguments =
-                        serde_json::from_str(&arguments_raw).unwrap_or_else(|_| json!({}));
+                    // Unparseable arguments are kept as `null` beside the raw
+                    // text, never replaced with `{}`: a tool run with no
+                    // arguments instead of the ones the model meant is worse
+                    // than a call the model is told to resend.
+                    let arguments = if arguments_raw.trim().is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_str(&arguments_raw).unwrap_or(Value::Null)
+                    };
                     Some(ChatToolCall {
                         id,
                         name,
