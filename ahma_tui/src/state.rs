@@ -1872,6 +1872,11 @@ pub struct AppState {
     pub approval: Option<ApprovalGate>,
     /// Pending scope-grant prompt, if any (parallel to `approval`).
     pub scope_grant: Option<ScopeGrantGate>,
+    /// Questions that arrived while `scope_grant` was open, oldest first. Each
+    /// is shown in turn; a new one never replaces the open one, which would
+    /// let a key meant for one question answer another and leave the replaced
+    /// one unanswered at its worker.
+    pub scope_grant_queue: VecDeque<ScopeGrantGate>,
     /// Pending web-egress approval prompt, if any (parallel to `scope_grant`).
     pub web_approval: Option<WebApprovalGate>,
     /// Measured prompt-reading speed (tokens/second) per model label, from
@@ -2629,6 +2634,7 @@ impl AppState {
             log: VecDeque::with_capacity(LOG_RING_CAP),
             approval: None,
             scope_grant: None,
+            scope_grant_queue: VecDeque::new(),
             web_approval: None,
             read_rates: std::collections::HashMap::new(),
             turn_retries: 0,

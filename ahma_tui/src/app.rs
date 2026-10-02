@@ -2633,6 +2633,8 @@ fn resolve_scope_grant(
     let Some(gate) = state.scope_grant.take() else {
         return;
     };
+    // The next waiting question, if any, takes the screen.
+    state.scope_grant = state.scope_grant_queue.pop_front();
 
     let advice_line = gate.advice.as_ref().map(|a| a.line());
     let advice_followed = gate.advice.as_ref().map(|a| a.matches(decision));
@@ -4957,8 +4959,11 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             decision_id,
             advice,
         } => {
-            if let Some(gate) = state.scope_grant.as_mut()
-                && gate.decision_id == decision_id
+            if let Some(gate) = state
+                .scope_grant
+                .iter_mut()
+                .chain(state.scope_grant_queue.iter_mut())
+                .find(|g| g.decision_id == decision_id)
             {
                 gate.advice = advice;
             }
@@ -5482,16 +5487,33 @@ fn handle_source_gate_event(
             request_tool_approval(state, id, tool, args, workspace, None);
         }
         SourceEvent::ScopeGrantRequested { request } => {
-            state.scope_grant = Some(crate::state::ScopeGrantGate::from_request(request.clone()));
-            spawn_grant_advisor(state, request);
+            let known = state
+                .scope_grant
+                .iter()
+                .chain(state.scope_grant_queue.iter())
+                .any(|g| g.decision_id == request.decision_id);
+            if !known {
+                let gate = crate::state::ScopeGrantGate::from_request(request.clone());
+                if state.scope_grant.is_none() {
+                    state.scope_grant = Some(gate);
+                } else {
+                    state.scope_grant_queue.push_back(gate);
+                }
+                spawn_grant_advisor(state, request);
+            }
         }
-        SourceEvent::ScopeGrantDismiss { decision_id }
+        SourceEvent::ScopeGrantDismiss { decision_id } => {
             if state
                 .scope_grant
                 .as_ref()
-                .is_some_and(|g| g.decision_id == decision_id) =>
-        {
-            state.scope_grant = None;
+                .is_some_and(|g| g.decision_id == decision_id)
+            {
+                state.scope_grant = state.scope_grant_queue.pop_front();
+            } else {
+                state
+                    .scope_grant_queue
+                    .retain(|g| g.decision_id != decision_id);
+            }
         }
         SourceEvent::WebApprovalRequested { request } => {
             state.web_approval = Some(crate::state::WebApprovalGate::from_request(request));
@@ -7546,6 +7568,71 @@ mod tests {
             tool: Some("run_terminal_command".to_string()),
             context: Default::default(),
         })
+    }
+
+    fn gate_with_id(id: &str) -> crate::state::ScopeGrantGate {
+        let mut request = test_scope_grant_gate().request;
+        request.decision_id = id.to_string();
+        crate::state::ScopeGrantGate::from_request(request)
+    }
+
+    /// A second question waits behind the open one instead of replacing it;
+    /// answering the first brings up the second; a dismissed waiting question
+    /// leaves the queue.
+    #[test]
+    fn grant_questions_queue_instead_of_replacing_each_other() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(gate_with_id("first"));
+        state.scope_grant_queue.push_back(gate_with_id("second"));
+        state.scope_grant_queue.push_back(gate_with_id("third"));
+
+        super::handle_scope_grant_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(
+            state.scope_grant.as_ref().map(|g| g.decision_id.as_str()),
+            Some("second"),
+            "answering the open question shows the next one"
+        );
+        assert_eq!(state.scope_grant_queue.len(), 1);
+    }
+
+    /// Requests arriving through the source queue behind the open one, a
+    /// repeated request is not queued twice, and a dismissal of a waiting
+    /// question removes it.
+    #[test]
+    fn source_events_queue_and_dismiss_grant_questions() {
+        use crate::mcp_source::SourceEvent;
+        use crate::state::AppState;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        let req = |id: &str| gate_with_id(id).request;
+        for id in ["a", "b", "b", "c"] {
+            super::handle_source_gate_event(
+                SourceEvent::ScopeGrantRequested { request: req(id) },
+                &mut state,
+            );
+        }
+        assert_eq!(state.scope_grant.as_ref().unwrap().decision_id, "a");
+        assert_eq!(state.scope_grant_queue.len(), 2, "b once, then c");
+        super::handle_source_gate_event(
+            SourceEvent::ScopeGrantDismiss {
+                decision_id: "b".into(),
+            },
+            &mut state,
+        );
+        assert_eq!(state.scope_grant_queue.len(), 1);
+        super::handle_source_gate_event(
+            SourceEvent::ScopeGrantDismiss {
+                decision_id: "a".into(),
+            },
+            &mut state,
+        );
+        assert_eq!(state.scope_grant.as_ref().unwrap().decision_id, "c");
+        assert!(state.scope_grant_queue.is_empty());
     }
 
     /// `y` widens to read+write, clears the gate, and is consumed even with chat
