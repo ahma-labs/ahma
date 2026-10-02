@@ -387,7 +387,10 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   It reads the records without taking a lock, so it is exactly what an agent whose every
   command is waiting can still run; before it existed the agent could neither see nor name
   what it was waiting for. A dead holder is listed as dead (its OS lock is already gone,
-  R2.7.7), never hidden.
+  R2.7.7), never hidden. A lock directory that exists but cannot be read — inside ahma's own sandbox it is out of
+  scope by design — **must** be reported as "cannot tell", with where to look instead, and
+  never as "no workspace is held": that answer once told a waiting agent nobody was in its way
+  while someone was.
 
 ### R3: Performance
 

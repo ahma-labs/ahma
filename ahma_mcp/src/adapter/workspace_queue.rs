@@ -1237,13 +1237,17 @@ mod holder_listing_tests {
             let path = lock_dir.join(format!("ws-{}.holder.json", key_id(Path::new(key))));
             std::fs::write(&path, serde_json::to_string(h).unwrap()).unwrap();
         }
-        let listed = list_holders(&lock_dir, &|pid| pid == 1);
+        let listed = list_holders(&lock_dir, &|pid| pid == 1).unwrap();
         assert_eq!(listed.len(), 2);
         let a = listed.iter().find(|r| r.holder.op_id == "op_live").unwrap();
         assert!(a.alive);
         let b = listed.iter().find(|r| r.holder.op_id == "op_dead").unwrap();
         assert!(!b.alive, "a dead holder is shown as such, not hidden");
-        assert!(list_holders(td.path().join("nope").as_path(), &|_| true).is_empty());
+        assert!(
+            list_holders(td.path().join("nope").as_path(), &|_| true)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -1263,9 +1267,19 @@ pub struct QueueHolderRecord {
 /// holder is listed as dead rather than hidden, because the OS lock it left
 /// behind has already been released (R2.7.7) and the stale record is the only
 /// thing still pointing at it.
-pub fn list_holders(lock_dir: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<QueueHolderRecord> {
-    let Ok(entries) = std::fs::read_dir(lock_dir) else {
-        return Vec::new();
+/// Every workspace lease published in `lock_dir`. A directory that does not
+/// exist means nothing is held; one that exists but cannot be read is an
+/// error, never "nothing is held" (SPEC R2.7.9): inside ahma's sandbox the
+/// runtime directory is out of scope by design, and an empty answer there
+/// told a waiting agent no one was in its way while someone was.
+pub fn list_holders(
+    lock_dir: &Path,
+    alive: &dyn Fn(u32) -> bool,
+) -> std::io::Result<Vec<QueueHolderRecord>> {
+    let entries = match std::fs::read_dir(lock_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
     let mut out: Vec<QueueHolderRecord> = entries
         .flatten()
@@ -1286,7 +1300,7 @@ pub fn list_holders(lock_dir: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<QueueHo
         })
         .collect();
     out.sort_by_key(|r| r.holder.since_unix);
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1367,5 +1381,33 @@ mod edit_conflict_tests {
         assert!(!second.contains('\n'), "a repeat is one line: {second}");
         assert!(second.contains("op_7"), "{second}");
         assert!(second.len() < first.len() / 2, "{second}");
+    }
+}
+
+#[cfg(test)]
+mod unreadable_lock_dir_tests {
+    use super::*;
+
+    /// A lock directory that exists but cannot be read is an error, not an
+    /// empty queue (SPEC R2.7.9).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_lock_dir_is_an_error_not_an_empty_queue() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("locks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = list_holders(&dir, &|_| true);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if nix_is_root() {
+            return; // root reads anything; nothing to assert
+        }
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    fn nix_is_root() -> bool {
+        // SAFETY: getuid has no preconditions.
+        unsafe { libc::getuid() == 0 }
     }
 }

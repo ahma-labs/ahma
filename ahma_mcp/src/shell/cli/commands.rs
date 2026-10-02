@@ -2193,12 +2193,26 @@ pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
 /// first line answers whether anything is blocked at all.
 pub(crate) fn run_queue_command() -> Result<()> {
     let Some(lock_dir) = crate::adapter::workspace_queue::default_lock_dir() else {
-        anyhow::bail!("cannot locate ahma's runtime directory");
+        anyhow::bail!(
+            "Cannot tell who holds a workspace: ahma's runtime directory is not reachable from \
+             here. Inside ahma's own sandbox it is out of scope by design; a queued command's \
+             own result names what it waits behind, and `ahma queue` in your own terminal \
+             reports every session's."
+        );
     };
-    let holders = crate::adapter::workspace_queue::list_holders(
+    let holders = match crate::adapter::workspace_queue::list_holders(
         &lock_dir,
         &crate::sandbox::session_tier::pid_alive,
-    );
+    ) {
+        Ok(holders) => holders,
+        Err(e) => anyhow::bail!(
+            "Cannot tell who holds a workspace: ahma cannot read its lock directory {} ({e}). \
+             Inside ahma's own sandbox that directory is out of scope by design; a queued \
+             command's own result names what it waits behind, and `ahma queue` in your own \
+             terminal reports every session's.",
+            lock_dir.display()
+        ),
+    };
     let live: Vec<_> = holders.iter().filter(|h| h.alive).collect();
     if live.is_empty() {
         println!("Nothing more to do: no workspace is held; writers run as soon as they are sent.");
