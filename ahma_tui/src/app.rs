@@ -2635,7 +2635,7 @@ fn handle_scope_grant_key(
     }
 }
 
-/// The next waiting question, if any, takes the screen. It is unread from
+/// The next waiting question, if any, takes the screen (SPEC R-PERM.3.5). It is unread from
 /// this moment however long it waited, so its arming delay starts now: a key
 /// typed for the question that just left must not answer this one.
 fn show_next_scope_grant(state: &mut crate::state::AppState) {
