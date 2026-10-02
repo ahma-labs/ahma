@@ -250,6 +250,9 @@ ahma permissions revoke tool cargo_build       # per-workspace tool approval
 
 ahma sandbox grant ~/cache [--read-only]       # kind-scoped shortcut, bound to this workspace
 ahma sandbox grant ~/cache --session           # this terminal session only; never written to the file
+ahma sandbox grant ~/cache --for 8h            # a lease: saved, and stops applying after 8h
+ahma sandbox renew ~/cache --for 24h           # extend a lease (denylisted and audited like a grant)
+ahma permissions list --expiring 12h           # the leases to renew before a long unattended run
 ahma sandbox list
 ahma sandbox revoke ~/cache                    # this workspace's grant; --workspace <DIR> or --global for another
 

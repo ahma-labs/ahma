@@ -281,7 +281,7 @@ Validate configs: `ahma tool validate .ahma/`
 Every permission lives in `~/.ahma/settings.toml`, outside every sandbox scope.
 
 ```bash
-ahma permissions list                          # every grant across all kinds
+ahma permissions list [--expiring 12h]         # every grant, or the leases to renew before a long run
 ahma permissions list --kind net-host          # just network hosts
 ahma permissions revoke net-host <host> --yes  # revoke network grant
 
