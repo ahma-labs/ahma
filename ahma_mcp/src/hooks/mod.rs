@@ -5152,7 +5152,11 @@ mod tests {
             std::env::set_var("TMPDIR", temp.path());
             std::env::set_var("TMP", temp.path());
             std::env::set_var("TEMP", temp.path());
+            // Each test process gets its own runtime directory on every OS:
+            // XDG_RUNTIME_DIR on Unix, LOCALAPPDATA on Windows. Sharing one
+            // let parallel tests race on the same disclosure marker.
             std::env::set_var("XDG_RUNTIME_DIR", temp.path().join("run"));
+            std::env::set_var("LOCALAPPDATA", temp.path().join("local"));
         }
         let env = test_env();
         let cwd = temp.path().join("proj");
