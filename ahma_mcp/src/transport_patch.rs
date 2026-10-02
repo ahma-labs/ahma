@@ -109,6 +109,7 @@ where
         &mut self,
     ) -> impl std::future::Future<Output = Option<RxJsonRpcMessage<RoleServer>>> + Send {
         let reader = self.reader.clone();
+        let writer = self.writer.clone();
 
         async move {
             let mut r = reader.lock().await;
@@ -218,10 +219,36 @@ where
                 }
                 // -----------------------
 
+                // A request carries a method and an id; only a request is
+                // owed an answer (a notification or a response is not).
+                let request_id = value
+                    .get("method")
+                    .and(value.get("id"))
+                    .filter(|id| !id.is_null())
+                    .cloned();
                 match serde_json::from_value(value) {
                     Ok(msg) => return Some(msg),
                     Err(e) => {
                         tracing::debug!("[AhmaTransport] Deserialization failed: {}", e);
+                        // JSON-RPC owes every request a response (SPEC
+                        // R5.6.2). Dropping
+                        // one left the client waiting on it forever.
+                        if let Some(id) = request_id {
+                            let reply = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32600,
+                                    "message": format!("Invalid request: {e}"),
+                                },
+                            });
+                            let mut w = writer.lock().await;
+                            let line = format!("{reply}\n");
+                            if let Err(err) = w.write_all(line.as_bytes()).await {
+                                tracing::debug!("[AhmaTransport] Could not answer: {err}");
+                            }
+                            let _ = w.flush().await;
+                        }
                         continue;
                     }
                 }
@@ -252,6 +279,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::summarize_jsonrpc_payload;
+
+    /// A request ahma cannot read is answered, never dropped: JSON-RPC
+    /// requires a response to every request, and a client whose request is
+    /// dropped waits on it forever. The next message still arrives.
+    #[tokio::test]
+    async fn an_unreadable_request_is_answered_with_its_id() {
+        use rmcp::transport::Transport;
+        use tokio::io::AsyncBufReadExt;
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":"oops"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "\n",
+        );
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(input.as_bytes().to_vec()));
+        let (writer, peer) = tokio::io::duplex(4096);
+        let mut transport = super::PatchedTransport::new(reader, writer);
+
+        let next = transport.receive().await;
+        assert!(next.is_some(), "the following message is still delivered");
+
+        let mut line = String::new();
+        let mut peer = tokio::io::BufReader::new(peer);
+        tokio::time::timeout(
+            ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+            peer.read_line(&mut line),
+        )
+        .await
+        .expect("the request is answered")
+        .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], serde_json::json!(7), "{line}");
+        assert_eq!(reply["error"]["code"], serde_json::json!(-32600), "{line}");
+    }
 
     #[test]
     fn summarize_jsonrpc_includes_method_and_id() {
