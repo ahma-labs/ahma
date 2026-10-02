@@ -80,8 +80,7 @@ impl HostSandbox {
             Self::Cursor => {
                 "To make ahma the sole sandbox: set Cursor's sandbox to \"insecure_none\" in \
                  its sandbox.json (or enable the Legacy Terminal Tool), so only ahma sandboxes. \
-                 For ahma terminal hooks specifically, set AHMA_PREFER_OWN_SANDBOX=1 to apply \
-                 ahma's sandbox instead of deferring. Alternatively start ahma outside Cursor."
+                 Alternatively start ahma outside Cursor."
             }
             Self::VsCode => {
                 "VS Code has no execution sandbox of its own to disable; run ahma as its MCP \
@@ -95,8 +94,7 @@ impl HostSandbox {
             }
             Self::Unidentified => {
                 "To make ahma the sole sandbox, start it from a plain terminal outside the outer \
-                 sandbox, or disable that outer sandbox. For ahma terminal hooks, \
-                 AHMA_PREFER_OWN_SANDBOX=1 forces ahma's own sandbox instead of deferring."
+                 sandbox, or disable that outer sandbox."
             }
         }
     }

@@ -1,9 +1,9 @@
-//! Post-execution observation for the deferred-host hook path.
+//! Post-execution observation for a command the kernel made ahma defer on.
 //!
-//! When ahma's terminal hook detects a host sandbox (Cursor/VS Code/Docker) it
-//! defers to the host (`super::defer_to_host_decision`, SPEC R7): the command
-//! runs unchanged inside the host's kernel sandbox and ahma does **not** re-wrap
-//! it. The cost of that honesty is a blind spot — if the *host* sandbox then
+//! When the kernel refuses to nest ahma's sandbox inside a host's (Cursor, Claude
+//! Code, …; SPEC R7.6), the hooked command runs bare inside the host's kernel
+//! sandbox and ahma's own profile is not applied. The cost of that honesty is a
+//! blind spot — if the *host* sandbox then
 //! denies a write (the classic `aws-lc-sys` build-script copy into the host's
 //! injected `CARGO_TARGET_DIR` cache), ahma's pre-execution hook never sees it
 //! and the user is left with a bare `Operation not permitted` deep in a build
@@ -25,8 +25,8 @@ use crate::sandbox::{
 
 /// Prefix that frames every surfaced message with the honest disclosure that the
 /// command ran under the host sandbox, not ahma's.
-const DEFER_NOTE: &str = "ahma deferred this command to the host sandbox (e.g. Cursor/VS Code), so \
-it ran under the host's sandbox rather than ahma's.";
+const DEFER_NOTE: &str = "ahma deferred this command to the host sandbox (the kernel refused to \
+nest ahma's own inside it, SPEC R7.6), so it ran under the host's sandbox rather than ahma's.";
 
 /// Inspect a finished shell command's combined output and return an actionable
 /// remediation message when a sandbox-denial signature is present.
@@ -53,9 +53,9 @@ pub fn surface_sandbox_denial(output: &str, failed: bool) -> Option<String> {
         let path = hit.path.display();
         return Some(format!(
             "{DEFER_NOTE} The host sandbox denied access to `{path}`. To recover: re-run the \
-             command with the host's full-permission/unsandboxed approval, or set \
-             `AHMA_PREFER_OWN_SANDBOX=1` to apply ahma's own sandbox and then grant the path \
-             (`ahma sandbox grant {path}`), or adjust the host sandbox configuration."
+             command with the host's full-permission/unsandboxed approval, or run it where ahma \
+             is the sandbox (a plain terminal or `run_terminal_command`) after a human grants \
+             the path (`ahma sandbox grant {path}`), or adjust the host sandbox configuration."
         ));
     }
 
@@ -94,8 +94,8 @@ mod tests {
             "message must disclose host deferral: {msg}"
         );
         assert!(
-            msg.contains("AHMA_PREFER_OWN_SANDBOX"),
-            "message must offer the prefer-own-sandbox recovery: {msg}"
+            msg.contains("ahma's own sandbox"),
+            "message must offer the own-sandbox recovery: {msg}"
         );
     }
 

@@ -161,12 +161,12 @@ Terminal hooks route the shell commands an agent runs through its *native* termi
 
 Claude Desktop has no hook mechanism. VS Code has no hook file of its own that ahma writes; its Claude, Codex and Copilot agents read those clients' files above.
 
-**Edit guard (opt-in).** `ahma hooks install --edit-guard` adds a second, pre-edit hook to the same files: while an ahma command that may write the workspace is running, the client's own file-edit tools are refused with the command's id, so an edit never lands halfway through a build or test run. See [workspace-queue.md](workspace-queue.md).
+**Edit guard (on by default; `--no-edit-guard` to decline).** `ahma hooks install` adds a second, pre-edit hook to the same files. It refuses a native edit (Claude Code `Edit`/`Write`, Codex `apply_patch`, …) whose target lies outside the shell hook's sandbox scope — those tools never pass through the shell sandbox, so without it an agent confined to one repository could still write anywhere (SPEC R5.5.6). And while an ahma command that may write the workspace is running, the client's own file-edit tools are refused with the command's id, so an edit never lands halfway through a build or test run. See [workspace-queue.md](workspace-queue.md).
 
 ```bash
 ahma hooks install                                   # user-scoped, all supported clients
 ahma hooks install --platform claude,codex --scope project
-ahma hooks install --edit-guard                      # + the pre-edit guard, every client
+ahma hooks install --no-edit-guard                   # shell hook only, no pre-edit guard
 ahma hooks status                                    # effective state + where installed
 ahma hooks uninstall --platform cursor --scope project
 ```

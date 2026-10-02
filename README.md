@@ -215,7 +215,7 @@ The ahma MCP server only sandboxes the tools an agent calls explicitly. **Termin
 
 ```bash
 ahma hooks install      # user-scoped hooks for all supported clients
-ahma hooks install --edit-guard  # also hold the client's own file edits while an ahma writer runs
+ahma hooks install --no-edit-guard  # shell hook only (the default also confines the client's Edit/Write tools to the scope)
 ahma hooks status       # shows the EFFECTIVE state (active vs installed-but-inactive)
 ahma hooks uninstall    # remove them
 ```

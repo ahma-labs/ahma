@@ -183,7 +183,7 @@ narrowing, trust-handoff writes, network egress, platform internals):
 | Scope (HTTP) | Workspace roots from MCP `roots/list` |
 | Override | `--sandbox-scope /path/a` (repeat for multiple paths) |
 | Temp dir | `--tmp` adds `/tmp` (`%TEMP%` on Windows); needed for compilers/build tools |
-| Nested sandbox | Ahma detects an outer sandbox (Cursor/VS Code/Docker/another ahma) and discloses which one is actually protecting you; on macOS, Seatbelt can't nest so ahma running inside another Seatbelt defers (`deferred_to_host`). `--no-sandbox` is the explicit opt-out. |
+| Nested sandbox | Ahma applies its own sandbox everywhere, hooks included — an environment marker such as `CLAUDECODE` never makes it stand down. It defers (`deferred_to_host`) only when the kernel refuses to nest its profile inside an outer one (macOS Seatbelt), and says so on every such command. `--no-sandbox` is the explicit opt-out. |
 | Platform | Linux: Landlock (kernel 5.13+) · macOS: Seatbelt · Windows: Job Objects (+ AppContainer, in progress) |
 
 ---
@@ -200,7 +200,7 @@ ahma hooks status                                    # effective ACTIVE/INACTIVE
 ahma hooks install --scope user                      # all supported clients
 ahma hooks install --platform copilot --scope project
 ahma hooks uninstall --platform copilot --scope user
-ahma hooks install --edit-guard   # + hold native file edits while an ahma writer runs
+ahma hooks install --no-edit-guard   # shell hook only; the default also confines native file edits (Edit/Write) to the scope
 ```
 
 Key points: **installed ≠ active** (only active when an ahma MCP server is detected for that
@@ -250,8 +250,8 @@ Validate configs: `ahma tool validate .ahma/`
 ## Key CLI Flags and Settings
 
 > `AHMA_*` **configuration** env vars are retired and ignored — use CLI flags or
-> `~/.ahma/settings.toml`. Terminal-hook vars (`AHMA_HOOKS`, `AHMA_DISABLE_HOOKS`,
-> `AHMA_PREFER_OWN_SANDBOX`) remain live. Full reference:
+> `~/.ahma/settings.toml`. Terminal-hook vars (`AHMA_HOOKS`, `AHMA_DISABLE_HOOKS`)
+> remain live. Full reference:
 > [docs/environment-variables.md](https://github.com/ahma-labs/ahma/blob/main/docs/environment-variables.md).
 
 | CLI flag / Settings key | Default | Purpose |

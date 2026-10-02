@@ -201,3 +201,100 @@ mod tests {
         assert!(!store.is_consented());
     }
 }
+
+/// Remembers which hook sessions have already been told their sandbox scope
+/// (SPEC R5.4.10), so the disclosure is said once per session and again only
+/// when the scope set changes — not on every command.
+///
+/// Same shape as [`HookConsentStore`]: a marker file under the temp directory,
+/// bound to the boot-session nonce, because each hooked command is its own
+/// short-lived process and the "already said it" state has to outlive one.
+pub struct HookDisclosureStore {
+    dir: PathBuf,
+    session: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DisclosureMarker {
+    session: String,
+    fingerprint: String,
+}
+
+impl HookDisclosureStore {
+    /// The store for the current boot session, using the system temp directory.
+    pub fn current() -> Self {
+        Self::with(std::env::temp_dir(), session_nonce())
+    }
+
+    /// Construct a store with an explicit marker directory and session nonce
+    /// (used by tests for hermetic isolation).
+    pub fn with(dir: PathBuf, session: String) -> Self {
+        Self { dir, session }
+    }
+
+    fn marker_path(&self, session_key: &str) -> PathBuf {
+        // The harness session id is opaque text; hash it into a file name so a
+        // hostile or merely odd id can never become a path component.
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        session_key.hash(&mut h);
+        self.dir
+            .join(format!("ahma-hook-disclosure-{:016x}.json", h.finish()))
+    }
+
+    /// `true` when the scope identified by `fingerprint` has not yet been
+    /// disclosed to `session_key` in this boot session — and records that it
+    /// now has been. A changed fingerprint (a different scope set) discloses
+    /// again. Any I/O failure answers `true`: over-disclosing is the safe side.
+    pub fn should_disclose(&self, session_key: &str, fingerprint: &str) -> bool {
+        let path = self.marker_path(session_key);
+        let already = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<DisclosureMarker>(&raw).ok())
+            .is_some_and(|m| m.session == self.session && m.fingerprint == fingerprint);
+        if already {
+            return false;
+        }
+        let marker = DisclosureMarker {
+            session: self.session.clone(),
+            fingerprint: fingerprint.to_string(),
+        };
+        let _ = std::fs::create_dir_all(&self.dir);
+        let _ = std::fs::write(
+            &path,
+            serde_json::to_string(&marker).expect("marker serializes"),
+        );
+        true
+    }
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::HookDisclosureStore;
+
+    #[test]
+    fn scope_disclosure_emitted_once_per_session_then_on_change() {
+        let td = tempfile::tempdir().unwrap();
+        let store = HookDisclosureStore::with(td.path().to_path_buf(), "boot-1".into());
+        assert!(
+            store.should_disclose("sess-a", "fp1"),
+            "first command discloses"
+        );
+        assert!(
+            !store.should_disclose("sess-a", "fp1"),
+            "same scope: silent"
+        );
+        assert!(
+            store.should_disclose("sess-a", "fp2"),
+            "scope changed: disclose again"
+        );
+        assert!(!store.should_disclose("sess-a", "fp2"));
+        assert!(
+            store.should_disclose("sess-b", "fp2"),
+            "another session is told too"
+        );
+        // A new boot session forgets everything.
+        let rebooted = HookDisclosureStore::with(td.path().to_path_buf(), "boot-2".into());
+        assert!(rebooted.should_disclose("sess-a", "fp2"));
+    }
+}
