@@ -1490,6 +1490,12 @@ pub struct WebApprovalGate {
     pub url: String,
     /// The tool that requested egress, if known.
     pub tool: Option<String>,
+    /// When the question took the screen; granting keys in the
+    /// [`GRANT_ARMING_DELAY`] after it are swallowed (SPEC R-PERM.3.5).
+    pub shown_at: std::time::Instant,
+    /// `a` was pressed once: the exact settings line is on screen and a
+    /// second `a` saves it (SPEC R-PERM.3.5).
+    pub confirm_always: bool,
 }
 
 impl WebApprovalGate {
@@ -1500,7 +1506,14 @@ impl WebApprovalGate {
             domain: request.domain,
             url: request.url,
             tool: request.tool,
+            shown_at: std::time::Instant::now(),
+            confirm_always: false,
         }
+    }
+
+    /// Whether a granting key may answer yet ([`GRANT_ARMING_DELAY`]).
+    pub fn armed(&self) -> bool {
+        self.shown_at.elapsed() >= GRANT_ARMING_DELAY
     }
 }
 
@@ -1893,6 +1906,9 @@ pub struct AppState {
     pub scope_grant_queue: VecDeque<ScopeGrantGate>,
     /// Pending web-egress approval prompt, if any (parallel to `scope_grant`).
     pub web_approval: Option<WebApprovalGate>,
+    /// Web-egress questions that arrived while one was open, oldest first
+    /// (parallel to `scope_grant_queue`): a new one never replaces the open one.
+    pub web_approval_queue: VecDeque<WebApprovalGate>,
     /// Measured prompt-reading speed (tokens/second) per model label, from
     /// this session's own turns. Feeds the "~2m left" estimate.
     pub read_rates: std::collections::HashMap<String, f64>,
@@ -2650,6 +2666,7 @@ impl AppState {
             scope_grant: None,
             scope_grant_queue: VecDeque::new(),
             web_approval: None,
+            web_approval_queue: VecDeque::new(),
             read_rates: std::collections::HashMap::new(),
             turn_retries: 0,
             recent_llms: session
