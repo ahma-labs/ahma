@@ -1016,6 +1016,35 @@ impl StreamingToolAccumulator {
         &mut self.tools[index]
     }
 
+    /// The slot for a fragment that carries no `index`, which the OpenAI
+    /// format makes optional and several servers omit (Gemini's compatible
+    /// endpoint, older llama.cpp and Ollama builds). Defaulting it to 0 merged
+    /// parallel calls into one call whose arguments were two JSON objects
+    /// glued together. A fragment starts a new call when it names a
+    /// different `id` than the open call, or, with no `id`, when it names a
+    /// tool and the open call already has a name and complete arguments.
+    /// Anything else continues the open call.
+    fn unindexed_slot(&self, call: &Value) -> usize {
+        let Some(open) = self.tools.last() else {
+            return 0;
+        };
+        let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+        let name = call
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let starts_new = if !id.is_empty() {
+            !open.0.is_empty() && open.0 != id
+        } else {
+            !name.is_empty() && !open.1.is_empty() && serde_json::from_str::<Value>(&open.2).is_ok()
+        };
+        if starts_new {
+            self.tools.len()
+        } else {
+            self.tools.len() - 1
+        }
+    }
+
     /// Replace `*target` with `value` when `value` is present and non-empty.
     /// Used for the `id`/`name` fields, which arrive once (not accumulated)
     /// on whichever chunk first carries them.
@@ -1034,7 +1063,10 @@ impl StreamingToolAccumulator {
             return;
         };
         for call in calls {
-            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let index = match call.get("index").and_then(Value::as_u64) {
+                Some(i) => i as usize,
+                None => self.unindexed_slot(call),
+            };
             let slot = self.tool_slot(index);
             Self::set_if_present(&mut slot.0, call.get("id").and_then(Value::as_str));
             Self::set_if_present(
@@ -1672,6 +1704,57 @@ mod tests {
         assert_eq!(resp.tool_calls[0].id, "call_a");
         assert_eq!(resp.tool_calls[0].name, "read_file");
         assert_eq!(resp.tool_calls[0].arguments, json!({"path": "a.rs"}));
+    }
+
+    /// Servers that stream parallel tool calls without `index` (Gemini's
+    /// OpenAI-compatible endpoint, older llama.cpp and Ollama builds) must
+    /// still yield one call per tool, never one call with both argument
+    /// objects glued together. Both shapes: one call per chunk, and several
+    /// calls in one chunk's array. A fragment that continues the open call
+    /// (same id, or arguments only) still joins it.
+    #[test]
+    fn streaming_accumulator_keeps_unindexed_parallel_calls_apart() {
+        let separate = [
+            json!({"choices":[{"delta":{"tool_calls":[{"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"id":"call_b","function":{"name":"read_file","arguments":"{\"path\":\"b.rs\"}"}}]}}]}),
+        ];
+        let together = [json!({"choices":[{"delta":{"tool_calls":[
+            {"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}},
+            {"id":"call_b","function":{"name":"read_file","arguments":"{\"path\":\"b.rs\"}"}}
+        ]}}]})];
+        let no_ids = [
+            json!({"choices":[{"delta":{"tool_calls":[{"function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"a.rs\"}"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"function":{"name":"read_file","arguments":"{\"path\":\"b.rs\"}"}}]}}]}),
+        ];
+        let repeated_id = [
+            json!({"choices":[{"delta":{"tool_calls":[{"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"id":"call_a","function":{"arguments":"\"a.rs\"}"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"id":"call_b","function":{"name":"read_file","arguments":"{\"path\":\"b.rs\"}"}}]}}]}),
+        ];
+        for (shape, chunks) in [
+            ("one per chunk", &separate[..]),
+            ("one chunk", &together[..]),
+            ("no ids", &no_ids[..]),
+            ("id repeated on each fragment", &repeated_id[..]),
+        ] {
+            let mut acc = StreamingToolAccumulator::default();
+            for c in chunks {
+                acc.push_chunk(c);
+            }
+            let resp = parse_chat_completion_response(acc.into_response_json(None, None)).unwrap();
+            let args: Vec<_> = resp
+                .tool_calls
+                .iter()
+                .map(|c| c.arguments.clone())
+                .collect();
+            assert_eq!(
+                args,
+                vec![json!({"path": "a.rs"}), json!({"path": "b.rs"})],
+                "{shape}"
+            );
+            assert_ne!(resp.tool_calls[0].id, resp.tool_calls[1].id, "{shape}");
+        }
     }
 
     #[test]
