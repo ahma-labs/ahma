@@ -134,7 +134,8 @@ process is still alive, with a first line that says whether anything is blocked 
 takes no lock and is never queued, so it works while every other command of yours is
 waiting (SPEC R2.7.9). A dead holder is shown as dead: its OS lock went with it, and only
 its record remains. To stop a live one, cancel it in the TUI or with the `cancel` tool of
-the session that started it.
+the session that started it. An agent sees the same report in the `status` tool, under
+`=== WORKSPACE QUEUE ===`.
 
 ## Configuration
 

@@ -1249,6 +1249,112 @@ mod holder_listing_tests {
                 .is_empty()
         );
     }
+
+    /// One report for `ahma queue` and the `status` tool (SPEC R2.7.9): the
+    /// first line says whether anything is blocked, each holder is listed
+    /// live or dead, and an unreachable lock directory says it cannot tell.
+    #[test]
+    fn queue_report_says_what_blocks_and_what_cannot_be_seen() {
+        let td = tempdir().unwrap();
+        let lock_dir = td.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let empty = queue_report(Some(&lock_dir), &|_| true, 0).unwrap();
+        assert!(empty.starts_with("Nothing more to do"), "{empty}");
+
+        for (key, op, pid) in [("/ws/a", "op_live", 1), ("/ws/b", "op_dead", 2)] {
+            let h = HolderInfo {
+                op_id: op.into(),
+                title: format!("cargo nextest run {op}"),
+                pid,
+                since_unix: 1_000,
+                ..HolderInfo::new("", "")
+            };
+            let path = lock_dir.join(format!("ws-{}.holder.json", key_id(Path::new(key))));
+            std::fs::write(&path, serde_json::to_string(&h).unwrap()).unwrap();
+        }
+        let report = queue_report(Some(&lock_dir), &|pid| pid == 1, 1_042).unwrap();
+        assert!(report.starts_with("Blocked until 1 finishes"), "{report}");
+        assert!(report.contains("LIVE"), "{report}");
+        assert!(report.contains("42s"), "the age is shown: {report}");
+        assert!(
+            report.contains("op_dead") && report.contains("dead "),
+            "{report}"
+        );
+        assert!(report.contains("blocks nothing"), "{report}");
+
+        let unknown = queue_report(None, &|_| true, 0).unwrap_err();
+        assert!(unknown.starts_with("Cannot tell"), "{unknown}");
+    }
+}
+
+/// The queue as a person or an agent reads it (SPEC R2.7.9): a first line
+/// that says whether anything is blocked (R-PERM.9), then every holder, live
+/// or dead, with its age, pid, command and operation. `ahma queue` prints it
+/// and the `status` tool includes it, so the two never disagree. `Err` is the
+/// text for a lock directory that cannot be read, which is never reported as
+/// an empty queue.
+pub fn queue_report(
+    lock_dir: Option<&Path>,
+    alive: &dyn Fn(u32) -> bool,
+    now_unix: u64,
+) -> Result<String, String> {
+    use std::fmt::Write;
+    const ELSEWHERE: &str = "Inside ahma's own sandbox it is out of scope by design; a queued \
+        command's own result names what it waits behind, and `ahma queue` in your own terminal \
+        reports every session's.";
+    let Some(lock_dir) = lock_dir else {
+        return Err(format!(
+            "Cannot tell who holds a workspace: ahma's runtime directory is not reachable from \
+             here. {ELSEWHERE}"
+        ));
+    };
+    let holders = list_holders(lock_dir, alive).map_err(|e| {
+        format!(
+            "Cannot tell who holds a workspace: ahma cannot read its lock directory {} ({e}). \
+             {ELSEWHERE}",
+            lock_dir.display()
+        )
+    })?;
+    let live = holders.iter().filter(|h| h.alive).count();
+    let mut out = String::new();
+    if live == 0 {
+        out.push_str(
+            "Nothing more to do: no workspace is held; writers run as soon as they are sent.\n",
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "Blocked until {live} finish{}: every writer in {live} workspace{} waits behind \
+             them. Readers (git status, grep, ps, …) run at once.",
+            if live == 1 { "es" } else { "" },
+            if live == 1 { "" } else { "s" }
+        );
+    }
+    for h in &holders {
+        let _ = writeln!(
+            out,
+            "  {} {:>5}s  pid {:<7} {}  ({})",
+            if h.alive { "LIVE " } else { "dead " },
+            now_unix.saturating_sub(h.holder.since_unix),
+            h.holder.pid,
+            h.holder.title,
+            h.holder.op_id
+        );
+    }
+    if live > 0 {
+        out.push_str(
+            "\nTo stop one: open `ahma tui`, select it and cancel, or call the `cancel` tool from \
+             the session that started it. A holder is the ahma process running the command; \
+             killing it ends that whole session.\n",
+        );
+    }
+    if holders.iter().any(|h| !h.alive) {
+        out.push_str(
+            "A dead holder released its OS lock when it died; its record is listed so you can \
+             see what was running, and it blocks nothing.\n",
+        );
+    }
+    Ok(out)
 }
 
 /// One workspace lease as published beside its lock, with whether the holder

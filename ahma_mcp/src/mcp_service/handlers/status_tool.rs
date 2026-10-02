@@ -87,6 +87,25 @@ impl AhmaMcpService {
         // every grant in force with who asked for it and for which workspace.
         contents.push(ContentBlock::text(self.sandbox_report()));
 
+        // SPEC R2.7.9: who holds a workspace, and whether anything waits,
+        // in the same words `ahma queue` prints.
+        // `queue_report` reads the lock directory with blocking calls (it is
+        // shared with the CLI), so it runs off the async workers.
+        let queue = tokio::task::spawn_blocking(|| {
+            let lock_dir = crate::adapter::workspace_queue::default_lock_dir();
+            crate::adapter::workspace_queue::queue_report(
+                lock_dir.as_deref(),
+                &crate::sandbox::session_tier::pid_alive,
+                ahma_common::session_grants::now_secs(),
+            )
+            .unwrap_or_else(|cannot_tell| cannot_tell)
+        })
+        .await
+        .unwrap_or_else(|e| format!("Cannot tell who holds a workspace: {e}"));
+        contents.push(ContentBlock::text(format!(
+            "\n=== WORKSPACE QUEUE ===\n{queue}"
+        )));
+
         // Add concurrency efficiency analysis
         if !completed_ops.is_empty()
             && let Some(efficiency_analysis) = Self::run_concurrency_analysis(&completed_ops)
@@ -263,6 +282,8 @@ mod sandbox_report_tests {
             .filter_map(|c| c.as_text().map(|t| t.text.clone()))
             .collect::<String>();
         assert!(text.contains("=== SANDBOX ==="), "{text}");
+        // SPEC R2.7.9: the queue's facts reach the agent here too.
+        assert!(text.contains("=== WORKSPACE QUEUE ==="), "{text}");
     }
 
     #[test]

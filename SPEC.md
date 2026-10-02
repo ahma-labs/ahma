@@ -383,7 +383,9 @@ drops work — and it is built so that no crash, kill or power loss can leave it
 - **R2.7.9**: **The queue is visible, and seeing it never queues.** `ahma queue` lists every
   workspace lease published beside its lock — the holder's command, pid, age, session and
   whether that process is still alive — with a first line that says whether anything is
-  blocked at all (R-PERM.9), and the same facts appear in the TUI and the `status` tool.
+  blocked at all (R-PERM.9), and the same facts appear in the TUI and the `status` tool;
+  `ahma queue` and `status` render them with one function (`queue_report`), so they never
+  disagree.
   It reads the records without taking a lock, so it is exactly what an agent whose every
   command is waiting can still run; before it existed the agent could neither see nor name
   what it was waiting for. A dead holder is listed as dead (its OS lock is already gone,

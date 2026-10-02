@@ -2208,67 +2208,18 @@ pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
 /// `ahma queue`: who holds each workspace's write lease (SPEC R2.7.9). The
 /// first line answers whether anything is blocked at all.
 pub(crate) fn run_queue_command() -> Result<()> {
-    let Some(lock_dir) = crate::adapter::workspace_queue::default_lock_dir() else {
-        anyhow::bail!(
-            "Cannot tell who holds a workspace: ahma's runtime directory is not reachable from \
-             here. Inside ahma's own sandbox it is out of scope by design; a queued command's \
-             own result names what it waits behind, and `ahma queue` in your own terminal \
-             reports every session's."
-        );
-    };
-    let holders = match crate::adapter::workspace_queue::list_holders(
-        &lock_dir,
+    let lock_dir = crate::adapter::workspace_queue::default_lock_dir();
+    match crate::adapter::workspace_queue::queue_report(
+        lock_dir.as_deref(),
         &crate::sandbox::session_tier::pid_alive,
+        ahma_common::session_grants::now_secs(),
     ) {
-        Ok(holders) => holders,
-        Err(e) => anyhow::bail!(
-            "Cannot tell who holds a workspace: ahma cannot read its lock directory {} ({e}). \
-             Inside ahma's own sandbox that directory is out of scope by design; a queued \
-             command's own result names what it waits behind, and `ahma queue` in your own \
-             terminal reports every session's.",
-            lock_dir.display()
-        ),
-    };
-    let live: Vec<_> = holders.iter().filter(|h| h.alive).collect();
-    if live.is_empty() {
-        println!("Nothing more to do: no workspace is held; writers run as soon as they are sent.");
-    } else {
-        println!(
-            "Blocked until {} finish{}: every writer in {} workspace{} waits behind them. Readers \
-             (git status, grep, ps, …) run at once.",
-            live.len(),
-            if live.len() == 1 { "es" } else { "" },
-            live.len(),
-            if live.len() == 1 { "" } else { "s" }
-        );
+        Ok(report) => {
+            print!("{report}");
+            Ok(())
+        }
+        Err(cannot_tell) => anyhow::bail!(cannot_tell),
     }
-    let now = ahma_common::session_grants::now_secs();
-    for h in &holders {
-        let age = now.saturating_sub(h.holder.since_unix);
-        println!(
-            "  {} {:>5}s  pid {:<7} {}  ({})",
-            if h.alive { "LIVE " } else { "dead " },
-            age,
-            h.holder.pid,
-            h.holder.title,
-            h.holder.op_id
-        );
-    }
-    if !live.is_empty() {
-        println!();
-        println!(
-            "To stop one: open `ahma tui`, select it and cancel, or call the `cancel` tool from \
-             the session that started it. A holder is the ahma process running the command; \
-             killing it ends that whole session."
-        );
-    }
-    if holders.iter().any(|h| !h.alive) {
-        println!(
-            "A dead holder released its OS lock when it died; its record is listed so you can \
-             see what was running, and it blocks nothing."
-        );
-    }
-    Ok(())
 }
 
 /// `ahma ps`: the process list a sandboxed agent cannot get from `/bin/ps`,
