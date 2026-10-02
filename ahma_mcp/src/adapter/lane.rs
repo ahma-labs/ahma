@@ -84,6 +84,9 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "xxd",
     "cal",
     "seq",
+    // Waiting reads nothing and writes nothing; classified as a writer, a
+    // poll loop held the workspace's write lease for its whole life.
+    "sleep",
 ];
 
 /// `git` subcommands that only read. `git status` would opportunistically
@@ -315,15 +318,43 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
 }
 
 /// The lane for a `run_terminal_command` command line.
+/// Shell keywords that open or close a loop or a conditional around the
+/// commands of a list: `until gh pr checks 87; do sleep 60; done` is a reader
+/// exactly when every command in it is.
+const LIST_KEYWORDS: &[&str] = &["until", "while", "if", "elif", "then", "else", "do"];
+
+/// Whether `word` is a `NAME=value` environment assignment.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
 pub fn classify_shell_command(command: &str) -> Lane {
     let Some(segs) = segments(command) else {
         return Lane::Exclusive;
     };
     for seg in &segs {
-        let Some((program, args)) = seg.split_first() else {
+        // Loop and conditional keywords, and `NAME=value` assignments, only
+        // frame the command that follows; the command decides. The read lane
+        // is still the kernel's word: an assignment such as `LD_PRELOAD` that
+        // makes a reader try to write fails, it cannot write.
+        let words: Vec<&String> = seg
+            .iter()
+            .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
+            .collect();
+        if matches!(words.as_slice(), [w] if matches!(w.as_str(), "done" | "fi")) {
+            continue;
+        }
+        let Some((program, args)) = words.split_first() else {
             return Lane::Exclusive;
         };
-        // A leading `VAR=value` assignment or a path to a program: not worth guessing.
+        let program = program.as_str();
+        let args: Vec<String> = args.iter().map(|a| (*a).clone()).collect();
+        let args = args.as_slice();
+        // A path to a program: not worth guessing.
         if program.contains('=') || program.contains('/') {
             return Lane::Exclusive;
         }
@@ -570,7 +601,7 @@ mod tests {
             "sed -i s/a/b/ f",
             "npm test",
             "./script.sh",
-            "FOO=1 ls",
+            "FOO=1 cargo build",
             "",
         ] {
             assert_eq!(lane(cmd), Lane::Exclusive, "{cmd}");
@@ -786,7 +817,6 @@ mod source_effect_tests {
             "npm run gen",
             "cargo run --bin codegen",
             "cargo test > out.log",
-            "sleep 3",
             "",
         ] {
             assert_eq!(effect(cmd), SourceEffect::Unknown, "{cmd}");
@@ -810,5 +840,40 @@ mod source_effect_tests {
             SourceEffect::Unknown,
             "a prefix matches whole words, not a longer name"
         );
+    }
+}
+
+#[cfg(test)]
+mod poll_loop_tests {
+    use super::*;
+
+    /// A poll — `sleep`, an environment assignment for a reader, a loop whose
+    /// every command reads — is a reader. Classified as a writer, a CI poll
+    /// held the workspace's write lease for forty minutes and every later
+    /// command queued behind it. The kernel's read-only lane still enforces
+    /// it: a misclassified poll fails, it cannot write.
+    #[test]
+    fn polls_and_waits_are_read_only() {
+        for cmd in [
+            "sleep 60",
+            "XDG_CACHE_HOME=/tmp/x gh pr checks 87",
+            "until gh pr checks 87 | grep -q pass; do sleep 60; done",
+            "while pgrep -f cargo; do sleep 5; done",
+            "sleep 30; gh run list --limit 5",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::ReadOnly, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_loop_or_assignment_around_a_writer_stays_exclusive() {
+        for cmd in [
+            "until cargo build; do sleep 5; done",
+            "while true; do rm -f x; done",
+            "FOO=1 cargo build",
+            "LD_PRELOAD=/x.so ls; touch y",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::Exclusive, "{cmd}");
+        }
     }
 }

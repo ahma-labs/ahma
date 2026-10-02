@@ -309,7 +309,10 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   a reader that never ends must not hold the workspace for its whole life —, `ps`, `sed`
   without `-i`, `gh` viewing commands, `curl` without an output file, ahma's own listing
   commands, …), reads **pipelines and lists** of such readers (`grep … | head`, `cd src &&
-  ls`, `2>&1`, `>/dev/null`, a plain `$VAR`) as readers, and treats a substitution, a
+  ls`, `2>&1`, `>/dev/null`, a plain `$VAR`) as readers, and so too `sleep`, a `NAME=value`
+  assignment before a reader, and an `until`/`while`/`if` list whose every command reads (a CI
+  poll such as `until gh pr checks 87; do sleep 60; done`, which as a writer held the
+  workspace's lease for forty minutes), and treats a substitution, a
   writing redirection, grouping, an escape or an unknown program as exclusive. The
   classifier is permissive only where the kernel lane makes a mistake harmless; before it
   read pipelines, `git status`, `ps` and `grep … | head` all queued behind another session's

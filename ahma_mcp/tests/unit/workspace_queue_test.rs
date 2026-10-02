@@ -43,6 +43,17 @@ fn sleep_cmd(secs: u64) -> String {
     }
 }
 
+/// A command that holds the workspace for `secs` and then writes a file in
+/// it: a writer the edit guard must wait for (SPEC R2.7.8). A bare `sleep`
+/// reads nothing, so an edit need not wait for it.
+fn writer_cmd(secs: u64) -> String {
+    if cfg!(windows) {
+        format!("Start-Sleep -Seconds {secs}; New-Item -ItemType File -Force writer-done.txt")
+    } else {
+        format!("sleep {secs}; touch writer-done.txt")
+    }
+}
+
 fn echo_cmd(word: &str) -> String {
     if cfg!(windows) {
         format!("Write-Output {word}")
@@ -223,7 +234,7 @@ async fn an_edit_is_refused_while_a_writer_runs() -> Result<()> {
     let wd = temp.path().join("ws");
     let file = wd.join("new_file.txt");
 
-    let id = op_id(&run(&mcp, &sleep_cmd(3), &wd).await?);
+    let id = op_id(&run(&mcp, &writer_cmd(3), &wd).await?);
 
     let refused = call(
         &mcp,
