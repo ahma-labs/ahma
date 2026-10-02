@@ -899,9 +899,19 @@ mod tests {
         std::env::set_current_dir(&root).unwrap();
         let dir = project_log_dir();
         let _ = std::env::set_current_dir(prev);
+        // The test home lives in the build's target directory, which may be
+        // inside the checkout (SPEC R-DOCTOR.4); what must never happen is a
+        // test run writing the checkout's *own* log directory.
         assert!(
-            !dir.starts_with(&root),
-            "under nextest, logs for the checkout go to the test home: {}",
+            !dir.starts_with(root.join(".ahma")),
+            "a test run never writes the checkout's own logs: {}",
+            dir.display()
+        );
+        let home = ahma_common::config::ahma_home_dir().expect("a test home");
+        assert!(
+            dir.starts_with(&home),
+            "under nextest, logs for the checkout go to the test home {}: {}",
+            home.display(),
             dir.display()
         );
     }

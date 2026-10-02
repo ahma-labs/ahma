@@ -106,10 +106,11 @@ impl PeerFactory for SubprocessPeerFactory {
             // A worker's scope comes from its own client's roots/list, never
             // from a directory; so neither may its tools dir or its logs
             // (SPEC R-HUB.12). Spawn it in a neutral directory so nothing it
-            // resolves from `cwd` belongs to another session's checkout.
-            if let Some(dir) = ahma_common::hub::runtime_dir() {
-                cmd.current_dir(dir);
-            }
+            // resolves from `cwd` belongs to another session's checkout: the
+            // runtime directory, else the temp directory — never the bridge's
+            // own working directory.
+            let working_dir = ahma_common::hub::runtime_dir().unwrap_or_else(std::env::temp_dir);
+            cmd.current_dir(&working_dir);
             cmd.args(&args)
                 // A subprocess peer is ALWAYS a server-child: it serves exactly one
                 // bridge session and must never run the IDE-facing frontend path
@@ -171,9 +172,12 @@ impl PeerFactory for SubprocessPeerFactory {
                 cmd.env("AHMA_TEST_ISOLATION", "1");
             }
 
-            let mut child = cmd
-                .spawn()
-                .map_err(|e| anyhow::anyhow!("Failed to spawn subprocess: {}", e))?;
+            let mut child = cmd.spawn().map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to spawn subprocess `{command}` in working directory {}: {e}",
+                    working_dir.display()
+                )
+            })?;
 
             let stdin_handle = child
                 .stdin
@@ -350,6 +354,24 @@ mod tests {
         let status = child.wait().await.expect("reap child");
         assert!(status.success());
         assert!(describe_abnormal_exit(status).is_none());
+    }
+
+    /// A spawn that fails says what it tried to run and where, instead of a
+    /// bare `No such file or directory` that names neither (SPEC R7: nothing
+    /// silent). That bare error is what 82 tests reported when they were run
+    /// inside ahma's own sandbox, and nothing in it pointed at the cause.
+    #[tokio::test]
+    async fn a_failed_spawn_names_the_command_and_its_directory() {
+        let factory =
+            SubprocessPeerFactory::new("definitely-not-an-ahma-binary-7f3a", Vec::new(), false);
+        let err = factory
+            .create(PeerSpawnOptions::default())
+            .await
+            .err()
+            .expect("an absent program cannot spawn")
+            .to_string();
+        assert!(err.contains("definitely-not-an-ahma-binary-7f3a"), "{err}");
+        assert!(err.contains("working directory"), "{err}");
     }
 
     #[test]

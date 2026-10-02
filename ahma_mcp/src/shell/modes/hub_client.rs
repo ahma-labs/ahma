@@ -252,7 +252,21 @@ pub(crate) fn may_spawn_hub_from(exe: &Path) -> bool {
 /// `ahma doctor` hunts for (SPEC R-DOCTOR.7, R-HUB.12). A confined process
 /// therefore never starts one; it serves its own session in-process instead.
 pub(crate) fn may_spawn_hub_here() -> Result<()> {
-    if crate::sandbox::process_is_seatbelt_confined() {
+    may_spawn_hub(
+        crate::sandbox::process_is_seatbelt_confined(),
+        ahma_common::test_isolation::spawned_under_test_harness(),
+    )
+}
+
+/// The rule behind [`may_spawn_hub_here`] (SPEC R7.6, R-HUB.3): a confined
+/// process may not start the shared hub, because every session on the machine
+/// would then run confined to this one. Under test isolation there is no
+/// shared hub to start: the process resolves only its run's private endpoint
+/// (R-ISO.1), so the hub it starts serves that test alone and no real client
+/// can reach it. Refusing there only stopped ahma's own suite from running
+/// inside ahma's sandbox.
+fn may_spawn_hub(confined: bool, test_isolated: bool) -> Result<()> {
+    if confined && !test_isolated {
         anyhow::bail!(
             "refusing to start the shared ahma hub from inside a sandbox: it would serve every \
              session on this machine confined to this one. Serving this session in-process; a hub \
@@ -322,6 +336,27 @@ pub fn disclosure(outcome: &EnsureOutcome) -> Option<String> {
              It is finishing work for other sessions, so it was not replaced; it \
              hands over to the newer build as soon as that work ends."
         )),
+    }
+}
+
+#[cfg(test)]
+mod hub_spawn_rule_tests {
+    use super::may_spawn_hub;
+
+    #[test]
+    fn a_confined_process_starts_no_shared_hub_but_a_test_may_start_its_own() {
+        assert!(
+            may_spawn_hub(false, false).is_ok(),
+            "an unconfined process starts the hub"
+        );
+        assert!(
+            may_spawn_hub(true, false).is_err(),
+            "a confined process never starts the shared hub (R7.6)"
+        );
+        assert!(
+            may_spawn_hub(true, true).is_ok(),
+            "under test isolation the hub is the run's private one (R-ISO.1)"
+        );
     }
 }
 

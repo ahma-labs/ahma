@@ -718,13 +718,49 @@ pub fn runtime_dir() -> Option<PathBuf> {
         .filter(|x| !x.is_empty())
         .map(|xdg| PathBuf::from(xdg).join("ahma"))
         .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))?;
-    let _ = std::fs::create_dir_all(&dir);
+    ensure_runtime_dir(dir)
+}
+
+/// Create `dir` (owner-only on Unix) and return it, or say why it cannot be
+/// and return `None`. A directory that was never created is not a runtime
+/// directory: handing it back made every caller that `chdir`s into it fail
+/// with a bare "No such file or directory" naming neither it nor the cause —
+/// inside a sandbox whose scope excludes it, that was every subprocess spawn
+/// (SPEC R7: nothing silent).
+fn ensure_runtime_dir(dir: PathBuf) -> Option<PathBuf> {
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            "ahma's runtime directory {} cannot be created ({e}); features that need it \
+             (the hub socket, workspace locks, session grants) are unavailable in this process. \
+             Inside a sandbox, this is a directory outside its scope.",
+            dir.display()
+        );
+        return None;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
     Some(dir)
+}
+
+#[cfg(test)]
+mod runtime_dir_creation_tests {
+    /// A runtime directory that cannot be created is reported as unavailable,
+    /// never handed back as if it existed: a caller that `chdir`s into it gets
+    /// a bare `No such file or directory` that names neither the directory nor
+    /// the reason (SPEC R7).
+    #[test]
+    fn an_uncreatable_runtime_dir_is_unavailable() {
+        let td = tempfile::tempdir().unwrap();
+        let file = td.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        assert!(super::ensure_runtime_dir(file.join("ahma")).is_none());
+        let ok = td.path().join("run").join("ahma");
+        assert_eq!(super::ensure_runtime_dir(ok.clone()), Some(ok.clone()));
+        assert!(ok.is_dir());
+    }
 }
 
 /// Windows counterpart of [`runtime_dir`]: `%LOCALAPPDATA%\ahma\run`, falling
@@ -737,8 +773,7 @@ pub fn runtime_dir() -> Option<PathBuf> {
         .filter(|x| !x.is_empty())
         .map(|local| PathBuf::from(local).join("ahma").join("run"))
         .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))?;
-    let _ = std::fs::create_dir_all(&dir);
-    Some(dir)
+    ensure_runtime_dir(dir)
 }
 
 /// Refuse a runtime directory another local user can reach (SPEC R-HUB.2).
