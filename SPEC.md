@@ -803,7 +803,15 @@ This is demonstrated, not hypothetical: Pillar Security published the pattern in
 - **R-DOCTOR.4 — Tests never touch the real home.** In debug builds under a
   test harness, a test that did not choose a home (`AHMA_TEST_HOME`) gets a
   private per-run one: a test once wrote a `/opt/two` grant into the
-  developer's real settings on every run.
+  developer's real settings on every run. It lives in the build's own target
+  directory (`<target>/tmp/ahma-test-homes`), which a test binary and every
+  `ahma` it spawns resolve alike and which is inside the workspace — so the
+  suite also runs inside ahma's own sandbox. Under the user cache directory
+  it could not be created there, the runtime directory beneath it was handed
+  back anyway, and 82 bridge tests failed with a bare "No such file or
+  directory". A runtime directory that cannot be created is now reported and
+  treated as unavailable, and a failed spawn names its command and working
+  directory.
 - **R-DOCTOR.5 — Antigravity permission health and repair.** `ahma doctor`
   and `ahma doctor --fix` **must** inspect Antigravity CLI and Gemini
   configuration files (`~/.gemini/antigravity-cli/settings.json` and

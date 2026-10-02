@@ -574,9 +574,21 @@ pub fn ahma_home_dir() -> Option<PathBuf> {
 /// are reasoning about.
 #[cfg(debug_assertions)]
 fn test_run_home() -> PathBuf {
-    let parent = dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("ahma-test-homes");
+    // In the build's own target directory, which is inside the workspace: a
+    // test run *through* ahma (its own suite via `run_terminal_command`, or a
+    // hooked `cargo nextest`) can only write its scope, and a home under the
+    // user cache directory silently failed to be created there — every
+    // runtime-directory user then failed with a bare "No such file or
+    // directory". The user cache directory remains the fallback for a binary
+    // that does not live in a cargo target directory.
+    let parent = std::env::current_exe()
+        .ok()
+        .and_then(|exe| test_homes_dir_for_exe(&exe))
+        .unwrap_or_else(|| {
+            dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("ahma-test-homes")
+        });
     static PRUNED: std::sync::Once = std::sync::Once::new();
     PRUNED.call_once(|| {
         prune_stale_test_homes(&parent, std::time::Duration::from_secs(24 * 60 * 60));
@@ -590,6 +602,48 @@ fn test_run_home() -> PathBuf {
 /// in the developer's cache directory. Best effort: a run still going (or one
 /// we cannot inspect) is left alone.
 #[cfg(debug_assertions)]
+/// `<target>/tmp/ahma-test-homes` for an executable built by cargo: a test
+/// binary in `<target>/<profile>/deps/` or a binary in `<target>/<profile>/`.
+/// `<target>/tmp` is cargo's own `CARGO_TARGET_TMPDIR`, so a test binary and
+/// every `ahma` it spawns resolve the same directory.
+#[cfg(debug_assertions)]
+fn test_homes_dir_for_exe(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    let profile = if dir.file_name()? == "deps" {
+        dir.parent()?
+    } else {
+        dir
+    };
+    let target = profile.parent()?;
+    Some(target.join("tmp").join("ahma-test-homes"))
+}
+
+#[cfg(test)]
+mod test_home_location_tests {
+    use super::*;
+
+    /// The per-run test home lives in the build's own target directory —
+    /// inside the workspace, so a test run inside ahma's sandbox can create
+    /// it — and a test binary and the `ahma` binary it spawns agree on it.
+    #[test]
+    fn test_homes_live_in_the_target_directory() {
+        let target = Path::new("/w/target");
+        assert_eq!(
+            test_homes_dir_for_exe(&target.join("debug/deps/unit-0123abcd")),
+            Some(target.join("tmp").join("ahma-test-homes"))
+        );
+        assert_eq!(
+            test_homes_dir_for_exe(&target.join("debug/ahma")),
+            Some(target.join("tmp").join("ahma-test-homes"))
+        );
+        assert_eq!(
+            test_homes_dir_for_exe(&target.join("release/deps/e2e-99")),
+            Some(target.join("tmp").join("ahma-test-homes"))
+        );
+        assert_eq!(test_homes_dir_for_exe(Path::new("ahma")), None);
+    }
+}
+
 fn prune_stale_test_homes(parent: &Path, max_age: std::time::Duration) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
