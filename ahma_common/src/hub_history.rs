@@ -190,6 +190,12 @@ async fn append_record(path: &Path, record: &HistoryRecord) -> std::io::Result<(
         .open(path)
         .await?;
     file.write_all(line.as_bytes()).await?;
+    // A tokio `File` hands the write to the blocking pool and `write_all` can
+    // return before the bytes reach the OS; without this flush a `Flush` ack
+    // sent right after could overtake the last record, and a reader (the
+    // round-trip test on a busy CI runner) saw two lines where three were
+    // written.
+    file.flush().await?;
     // 0600: this file names every command run on the user's behalf.
     #[cfg(unix)]
     {

@@ -5082,6 +5082,10 @@ mod tests {
         let env = test_env();
         let cwd = temp.path().join("proj");
         fs::create_dir_all(&cwd).unwrap();
+        // The disclosure names the scope as the kernel will see it (canonical):
+        // on Windows the temp dir arrives as an 8.3 short name, on macOS under
+        // /var rather than /private/var.
+        let canon_cwd = dunce::canonicalize(&cwd).unwrap();
         let input = json!({
             "session_id": "sess-1",
             "cwd": cwd.to_string_lossy(),
@@ -5100,7 +5104,7 @@ mod tests {
                     .expect("the first command of a session carries the scope disclosure");
                 assert!(line.contains("ahma's kernel sandbox"), "{line}");
                 assert!(
-                    line.contains(&cwd.display().to_string()),
+                    line.contains(&canon_cwd.display().to_string()),
                     "names the scope: {line}"
                 );
                 assert!(line.contains("ask the human"), "{line}");
