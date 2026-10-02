@@ -71,9 +71,11 @@ pub fn runtime_denial_remediation(path: &Path, access: ScopeAccess) -> String {
     format!(
         "ahma's kernel sandbox blocked an out-of-scope {verb} to '{denied}'. This is expected: \
          writing outside the workspace (for example installing a global binary under ~/.cargo) is \
-         denied by default. To allow it, call the `sandbox_grant` tool with path \"{target}\" and \
-         access \"{access_str}\" (it previews and asks the human to approve), then run the \
-         `restart` tool to apply the grant, then re-run the command. No flags are required.",
+         denied by default. Only a human can allow it: tell them you need \"{access_str}\" access \
+         to \"{target}\" and why (ask for the narrowest directory, and `ro` unless a write was \
+         denied). They approve it in the ahma TUI or run `ahma sandbox grant {target}`. The \
+         `sandbox_grant` tool with `confirm: true` only raises that prompt — it cannot grant. \
+         A human-approved grant applies to this session immediately; then re-run the command.",
         verb = verb,
         denied = path.display(),
         target = target.display(),

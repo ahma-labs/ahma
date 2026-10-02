@@ -99,8 +99,8 @@ fn execution_error_attaches_runtime_denial_payload() {
     assert_eq!(data["current_scopes"][0], "/work/space");
     let remediation = data["remediation"].as_str().unwrap();
     assert!(
-        remediation.contains("sandbox_grant") && remediation.contains("restart"),
-        "remediation should describe the grant -> restart -> retry loop: {remediation}"
+        remediation.contains("human") && remediation.contains("ahma sandbox grant"),
+        "remediation must send the model to a human, never to a self-grant: {remediation}"
     );
     // The original command output is preserved in the human-readable message.
     assert!(mcp.message.contains("os error 1"));

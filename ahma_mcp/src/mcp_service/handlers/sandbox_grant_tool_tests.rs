@@ -296,23 +296,6 @@ fn preview_text_surfaces_high_risk_warnings() {
     assert!(text.contains("filesystem root"));
 }
 
-#[test]
-fn success_text_added_reports_immediate_effect() {
-    let text = success_text(
-        Path::new("/cache/sccache"),
-        ScopeAccess::Rw,
-        Path::new("/home/u/.ahma/settings.toml"),
-        "line",
-        &GrantOutcome::Added,
-        &GrantRisk::Normal,
-    );
-    assert!(text.contains("✓ Granted"));
-    assert!(text.contains("takes effect immediately for this session"));
-    assert!(text.contains("persists"));
-}
-
-// ── handler integration (real service, real scopes) ─────────────────────────
-
 #[tokio::test]
 async fn handler_refuses_catastrophic_path_even_with_confirm() {
     let (service, _scope) = crate::test_utils::in_process::build_test_service()
@@ -384,7 +367,7 @@ async fn handler_autonomous_agent_does_not_self_persist_on_confirm() {
         .filter_map(|c| c.as_text().map(|t| t.text.clone()))
         .collect::<String>();
     assert!(
-        text.contains("cannot widen its own sandbox"),
+        text.contains("cannot widen your own sandbox"),
         "autonomous agent must be told it cannot self-grant: {text}"
     );
     assert!(
@@ -399,21 +382,6 @@ async fn handler_autonomous_agent_does_not_self_persist_on_confirm() {
     // tests in `ahma_common::scope_grant`; it is not exercised here because the
     // in-process test service does not isolate HOME and would write real settings.
 }
-
-#[test]
-fn grant_approved_accepts_only_explicit_approvals() {
-    use super::grant_approved;
-    for yes in ["approve", "Approve", "  ALLOW ", "yes", "grant", "ok"] {
-        assert!(grant_approved(yes), "'{yes}' should approve");
-    }
-    // Fail-safe: anything else — including empty, garbage, or a deny — is not an
-    // approval, so a misbehaving client can never widen the sandbox.
-    for no in ["", "deny", "no", "later", "approved?", "rm -rf", "🤷"] {
-        assert!(!grant_approved(no), "'{no}' must NOT approve");
-    }
-}
-
-// ── sandbox_grant_schema ─────────────────────────────────────────────────────
 
 #[test]
 fn schema_declares_path_access_confirm_and_note() {
@@ -490,10 +458,10 @@ fn agent_requested_text_when_surface_raised() {
         true,
     );
     assert!(
-        text.contains("A human approval prompt has been raised"),
+        text.contains("handed to the human approval surfaces"),
         "{text}"
     );
-    assert!(text.contains("cannot widen its own sandbox"), "{text}");
+    assert!(text.contains("cannot widen your own sandbox"), "{text}");
     // Read-only access appends the `--read-only` CLI hint.
     assert!(
         text.contains("ahma sandbox grant /cache/x --read-only"),
@@ -519,52 +487,6 @@ fn agent_requested_text_when_no_surface_attached() {
 }
 
 // ── declined_text (pure; unreachable via the handler without a mocked Peer) ─
-
-#[test]
-fn declined_text_reports_nothing_written() {
-    let text = declined_text(
-        Path::new("/cache/x"),
-        ScopeAccess::Ro,
-        Path::new("/home/u/.ahma/settings.toml"),
-    );
-    assert!(text.contains("Not granted"), "{text}");
-    assert!(text.contains("the human declined the prompt"), "{text}");
-    assert!(text.contains("/home/u/.ahma/settings.toml"), "{text}");
-    assert!(text.contains("confirm: true"), "{text}");
-}
-
-// ── grant_prompt_message (pure; unreachable via the handler without a mocked Peer) ─
-
-#[test]
-fn grant_prompt_message_states_path_access_and_answers() {
-    let msg = grant_prompt_message(
-        Path::new("/cache/x"),
-        ScopeAccess::Rw,
-        Path::new("/home/u/.ahma/settings.toml"),
-        "{ path = \"/cache/x\" }",
-        &GrantRisk::Normal,
-    );
-    assert!(
-        msg.contains("Grant read+write sandbox access to '/cache/x'?"),
-        "{msg}"
-    );
-    assert!(msg.contains("'approve'"), "{msg}");
-    assert!(msg.contains("'deny'"), "{msg}");
-    assert!(msg.contains("/home/u/.ahma/settings.toml"), "{msg}");
-}
-
-#[test]
-fn grant_prompt_message_surfaces_high_risk_banner() {
-    let msg = grant_prompt_message(
-        Path::new("/data"),
-        ScopeAccess::Ro,
-        Path::new("/home/u/.ahma/settings.toml"),
-        "line",
-        &GrantRisk::High(vec!["sits directly under the filesystem root".to_string()]),
-    );
-    assert!(msg.contains("Risk: HIGH"), "{msg}");
-    assert!(msg.contains("filesystem root"), "{msg}");
-}
 
 // ── handler: argument validation errors ──────────────────────────────────────
 
@@ -625,117 +547,155 @@ async fn handler_preview_surfaces_high_risk_for_nonexistent_path() {
     assert!(text.contains("does not exist"), "{text}");
 }
 
-// ── handler: external client, no peer attached — the "pre-existing trust     ─
-// ── model" direct-persist path (Gate: `None => true` at the elicit site).    ─
+// ── handler: `confirm: true` is a request, never a grant (SPEC R5.4.5) ───────
 
+/// A client with no elicitation capability and no attached TUI — the shape of a
+/// headless harness — must get nothing written, no matter what it passes.
 #[tokio::test]
-async fn handler_persists_grant_for_external_client_with_no_peer_and_reports_update() {
-    // SAFETY: nextest runs each test in its own process, so mutating this
-    // process-global env var is isolated from other tests (see the identical
-    // pattern in `harness_tools_tests.rs`).
+async fn sandbox_grant_confirm_without_elicitation_does_not_write_settings() {
+    // nextest runs each test in its own process, so this env override is
+    // isolated from other tests.
     let home_dir = tempdir().unwrap();
     let target = tempdir().unwrap();
+    unsafe { std::env::set_var("AHMA_TEST_HOME", home_dir.path()) };
 
     let (service, _scope) = crate::test_utils::in_process::build_test_service()
         .await
         .unwrap();
 
-    unsafe { std::env::set_var("AHMA_TEST_HOME", home_dir.path()) };
+    for client in [
+        crate::client_type::McpClientType::Cursor,
+        crate::client_type::McpClientType::Antigravity,
+        crate::client_type::McpClientType::Ahma,
+    ] {
+        let result = service
+            .handle_sandbox_grant(
+                args(&[
+                    ("path", json!(target.path().to_string_lossy())),
+                    ("access", json!("rw")),
+                    ("confirm", json!(true)),
+                    ("note", json!("self-grant attempt")),
+                ]),
+                client,
+            )
+            .await
+            .expect("a request is not an error");
+        let text = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<String>();
+        assert!(
+            text.contains("cannot widen your own sandbox"),
+            "{client:?}: {text}"
+        );
+        assert!(text.contains("A human must approve"), "{client:?}: {text}");
+        assert!(
+            !text.contains("✓"),
+            "{client:?} must not report a grant: {text}"
+        );
+    }
+    let settings = home_dir.path().join(".ahma").join("settings.toml");
+    assert!(
+        !settings.exists()
+            || !std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("self-grant"),
+        "nothing may be written on the model's confirm alone"
+    );
+    assert!(
+        !service.adapter.sandbox().is_path_in_scope(target.path()),
+        "the live sandbox must not widen either"
+    );
+    unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+}
 
-    let first = service
+/// With a human surface attached (here: a notifier standing in for the TUI
+/// modal, which persists through the same chokepoint the real one uses), a
+/// `confirm: true` request that the human approves ends up in the settings
+/// file, audited, and applied to the live session.
+#[tokio::test]
+async fn sandbox_grant_human_approval_applies_live_and_persists() {
+    use crate::sandbox::ScopeGrantNotifier;
+    use ahma_common::config::ScopeAccess;
+    use ahma_common::scope_grant::{GrantReason, NewGrant, persist_grant};
+
+    #[derive(Debug)]
+    struct ApprovingHuman {
+        file: PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl ScopeGrantNotifier for ApprovingHuman {
+        async fn notify_violation(
+            &self,
+            path: &std::path::Path,
+            access: ScopeAccess,
+            _reason: GrantReason,
+            tool: Option<String>,
+        ) {
+            persist_grant(
+                &self.file,
+                NewGrant {
+                    path,
+                    access,
+                    granted_by: tool,
+                    granted_at: Some("2026-10-02".into()),
+                    note: None,
+                    surface: "tui",
+                    live_scopes: &[],
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    unsafe { std::env::set_var("AHMA_TEST_HOME", &home) };
+    let settings_file = home.join(".ahma").join("settings.toml");
+
+    let (service, _scope) = crate::test_utils::in_process::build_test_service_with_notifier(
+        std::sync::Arc::new(ApprovingHuman {
+            file: settings_file.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let external_dir = tmp.path().join("external_cache");
+    std::fs::create_dir_all(&external_dir).unwrap();
+    let canon_external = dunce::canonicalize(&external_dir).unwrap();
+    assert!(!service.adapter.sandbox().is_path_in_scope(&canon_external));
+
+    let result = service
         .handle_sandbox_grant(
             args(&[
-                ("path", json!(target.path().to_string_lossy())),
-                ("access", json!("ro")),
-                ("confirm", json!(true)),
-                ("note", json!("test provenance")),
-            ]),
-            crate::client_type::McpClientType::Cursor,
-        )
-        .await;
-
-    // Granting the same path again with a different access level must update
-    // the existing entry rather than duplicate it (`GrantOutcome::Updated`).
-    let second = service
-        .handle_sandbox_grant(
-            args(&[
-                ("path", json!(target.path().to_string_lossy())),
+                ("path", json!(canon_external.to_string_lossy())),
                 ("access", json!("rw")),
                 ("confirm", json!(true)),
             ]),
             crate::client_type::McpClientType::Cursor,
         )
-        .await;
-
-    let settings_contents =
-        std::fs::read_to_string(home_dir.path().join(".ahma").join("settings.toml"));
-
-    unsafe { std::env::remove_var("AHMA_TEST_HOME") };
-
-    let first_text = first
-        .expect("no peer attached -> pre-existing trust model persists directly")
-        .content
-        .iter()
-        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-        .collect::<String>();
-    assert!(first_text.contains("✓ Granted"), "{first_text}");
-    assert!(
-        first_text.contains("takes effect immediately for this session"),
-        "{first_text}"
-    );
-
-    let second_text = second
-        .expect("re-granting the same path should update, not fail")
-        .content
-        .iter()
-        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-        .collect::<String>();
-    assert!(second_text.contains("Updated grant"), "{second_text}");
-    assert!(second_text.contains("read-only"), "{second_text}");
-    assert!(second_text.contains("read+write"), "{second_text}");
-
-    let settings_contents = settings_contents.expect("settings.toml must have been written");
-    assert!(
-        settings_contents.contains("test provenance") || settings_contents.contains("rw"),
-        "settings file should reflect the persisted grant: {settings_contents}"
-    );
-}
-
-// ── handler: persist_grant failure is reported through the handler's map_err ─
-
-#[tokio::test]
-async fn handler_reports_persist_failure_when_settings_file_unwritable() {
-    let home_dir = tempdir().unwrap();
-    let target = tempdir().unwrap();
-    // Make `~/.ahma/settings.toml` a directory instead of a file so reading it
-    // as a settings file fails, exercising `persist_grant`'s error path and the
-    // handler's `.map_err("failed to persist grant to ...")`.
-    std::fs::create_dir_all(home_dir.path().join(".ahma").join("settings.toml")).unwrap();
-
-    let (service, _scope) = crate::test_utils::in_process::build_test_service()
         .await
-        .unwrap();
-
-    unsafe { std::env::set_var("AHMA_TEST_HOME", home_dir.path()) };
-    let result = service
-        .handle_sandbox_grant(
-            args(&[
-                ("path", json!(target.path().to_string_lossy())),
-                ("confirm", json!(true)),
-            ]),
-            crate::client_type::McpClientType::Cursor,
-        )
-        .await;
+        .expect("an approved request succeeds");
     unsafe { std::env::remove_var("AHMA_TEST_HOME") };
 
-    let err = result.expect_err(
-        "writing to a directory in place of the settings file must surface a persist failure",
-    );
+    let text = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<String>();
+    assert!(text.contains("A human approved"), "{text}");
     assert!(
-        err.message.contains("failed to persist grant to"),
-        "{}",
-        err.message
+        service.adapter.sandbox().is_path_in_scope(&canon_external),
+        "a human-approved grant widens the live session immediately (R5.4.6)"
     );
+    let written = std::fs::read_to_string(&settings_file).unwrap();
+    assert!(written.contains("external_cache"), "{written}");
+    let audit = std::fs::read_to_string(home.join(".ahma").join("permissions-audit.jsonl"))
+        .expect("the chokepoint audits every grant");
+    assert!(audit.contains("\"surface\":\"tui\""), "{audit}");
 }
 
 /// The hard denylist must hold when `$HOME` reaches ahma through a symlink.
@@ -779,54 +739,5 @@ fn denylist_holds_when_home_is_reached_through_a_symlink() {
             GrantRisk::Refused(_)
         ),
         "granting ~/.ssh must be refused even when $HOME is a symlink"
-    );
-}
-
-#[tokio::test]
-async fn handler_applies_confirmed_grant_immediately_to_live_sandbox() {
-    let tmp = tempdir().unwrap();
-    let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    unsafe { std::env::set_var("AHMA_TEST_HOME", &home) };
-
-    let (service, _scope) = crate::test_utils::in_process::build_test_service()
-        .await
-        .unwrap();
-
-    let external_dir = tmp.path().join("external_cache");
-    std::fs::create_dir_all(&external_dir).unwrap();
-    let canon_external = dunce::canonicalize(&external_dir).unwrap();
-
-    // Verify initially NOT in scope
-    assert!(!service.adapter.sandbox().is_path_in_scope(&canon_external));
-
-    let result = service
-        .handle_sandbox_grant(
-            args(&[
-                ("path", json!(canon_external.to_string_lossy())),
-                ("access", json!("rw")),
-                ("confirm", json!(true)),
-            ]),
-            crate::client_type::McpClientType::Cursor,
-        )
-        .await;
-
-    unsafe { std::env::remove_var("AHMA_TEST_HOME") };
-
-    let tool_result = result.expect("confirmed grant must succeed");
-    let text = tool_result
-        .content
-        .iter()
-        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-        .collect::<String>();
-    assert!(
-        text.contains("takes effect immediately for this session"),
-        "{text}"
-    );
-
-    // Verify it is NOW immediately in scope without a server restart!
-    assert!(
-        service.adapter.sandbox().is_path_in_scope(&canon_external),
-        "confirmed grant must immediately widen the live sandbox session"
     );
 }

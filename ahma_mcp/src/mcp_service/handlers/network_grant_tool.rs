@@ -12,12 +12,14 @@
 //!    Blanket `*` wildcards, localhost/local domains, private RFC 1918 IPs,
 //!    loopback IPs, and cloud metadata/link-local IPs (`169.254.169.254`) are
 //!    refused **even with `confirm: true`**. The AI cannot override this.
-//! 2. **A human decision, not the model's word.** For the autonomous in-process
-//!    agent ([`McpClientType::Ahma`](crate::client_type::McpClientType)), `confirm: true`
-//!    does **not** self-persist: the request informs the human to run `ahma network allow <host>`.
-//!    For external clients (Cursor, VS Code, …), `confirm: true` raises an MCP
-//!    `elicitation/create` prompt when supported, persisting only on explicit human
-//!    approval.
+//! 2. **A human decision, not the model's word.** `confirm: true` never persists
+//!    by itself, for any client. When the connected client declared the MCP
+//!    `elicitation` capability it raises a real prompt there and persists only on
+//!    an explicit human approval; otherwise — the in-process agent, a headless
+//!    harness, a client with no prompt — it returns the `ahma network allow
+//!    <host>` instruction for the human to run. A client that cannot show a
+//!    prompt is never assumed to have asked a human before the call (SPEC
+//!    R5.4.5, R-WEB.16.11).
 //! 3. **A two-phase confirm**. Without `confirm: true` the tool only *previews*
 //!    (writes nothing). The default is always Deny.
 //!
@@ -192,46 +194,53 @@ impl AhmaMcpService {
             )));
         }
 
-        // Autonomous in-process agent cannot self-persist.
-        if matches!(client_type, crate::client_type::McpClientType::Ahma) {
-            return Ok(common::text_result(agent_requested_text(
-                &host,
-                &settings_file,
-            )));
-        }
-
-        // External client: raise elicitation prompt if supported.
-        let human_approved = {
+        // `confirm: true` is the model's word, never the human's (SPEC R5.4.5).
+        // Ask a human through the client's elicitation prompt when it has one;
+        // `None` means nobody could be asked, which is a request, not a grant.
+        let human_approved: Option<bool> = {
             let peer = self.peer.read().clone();
-            match peer {
-                None => true,
-                Some(peer) => {
+            match (client_type, peer) {
+                (crate::client_type::McpClientType::Ahma, _) | (_, None) => None,
+                (client_type, Some(peer)) => {
                     match peer
                         .elicit_with_timeout::<NetApprovalForm>(
                             grant_prompt_message(&host, &settings_file, &risk),
-                            Some(std::time::Duration::from_secs(120)),
+                            Some(client_type.elicitation_budget()),
                         )
                         .await
                     {
-                        Ok(Some(form)) => matches!(
+                        Ok(Some(form)) => Some(matches!(
                             parse_answer(&form.decision),
                             NetApprovalDecision::AllowAlways
                                 | NetApprovalDecision::AllowSession
                                 | NetApprovalDecision::AllowOnce
-                        ),
-                        Ok(None) | Err(rmcp::service::ElicitationError::UserDeclined) => false,
-                        Err(rmcp::service::ElicitationError::CapabilityNotSupported) => true,
+                        )),
+                        Ok(None) | Err(rmcp::service::ElicitationError::UserDeclined) => {
+                            Some(false)
+                        }
+                        // The client cannot elicit: nobody was asked. Never persist
+                        // on the assumption that the client gated the call itself.
+                        Err(rmcp::service::ElicitationError::CapabilityNotSupported) => None,
                         Err(e) => {
                             tracing::debug!("network_grant elicitation unavailable: {e}");
-                            false
+                            Some(false)
                         }
                     }
                 }
             }
         };
 
-        if !human_approved {
-            return Ok(common::text_result(declined_text(&host, &settings_file)));
+        match human_approved {
+            None => {
+                return Ok(common::text_result(agent_requested_text(
+                    &host,
+                    &settings_file,
+                )));
+            }
+            Some(false) => {
+                return Ok(common::text_result(declined_text(&host, &settings_file)));
+            }
+            Some(true) => {}
         }
 
         // Persist to ~/.ahma/settings.toml
@@ -286,8 +295,9 @@ fn preview_text(host: &str, settings_file: &Path, risk: &NetGrantRisk) -> String
         NetGrantRisk::Refused(_) => {}
     }
     out.push_str(&format!(
-        "To apply this grant, call `network_grant` with `confirm: true`,\n\
-         or run `ahma network allow {host}` in your terminal."
+        "Only a human can grant this. Calling `network_grant` with `confirm: true` raises an \
+         approval prompt in a client that supports one; it never grants by itself. Otherwise \
+         the human runs `ahma network allow {host}` in a terminal."
     ));
     out
 }
@@ -295,7 +305,8 @@ fn preview_text(host: &str, settings_file: &Path, risk: &NetGrantRisk) -> String
 fn agent_requested_text(host: &str, settings_file: &Path) -> String {
     format!(
         "Network grant requested for '{host}'.\n\n\
-         As an autonomous agent, you cannot self-persist network grants to {}.\n\
+         You cannot self-persist network grants to {}: `confirm: true` only asks a human, \
+         and no client prompt was available to ask one.\n\
          The human user must approve this grant by running:\n\
            ahma network allow {host}\n\
          or by adding \"{host}\" to `[network].allow` in {}.",

@@ -308,6 +308,23 @@ pub async fn build_test_service() -> Result<(AhmaMcpService, tempfile::TempDir)>
 pub async fn build_test_service_with_configs(
     configs: HashMap<String, ToolConfig>,
 ) -> Result<(AhmaMcpService, tempfile::TempDir)> {
+    build_test_service_inner(configs, None).await
+}
+
+/// Like [`build_test_service`] but with a scope-grant notifier installed on the
+/// adapter, standing in for the human surfaces (TUI modal, elicitation) a real
+/// server wires up — so a test can play the human who answers a
+/// `sandbox_grant` request.
+pub async fn build_test_service_with_notifier(
+    notifier: Arc<dyn crate::sandbox::ScopeGrantNotifier>,
+) -> Result<(AhmaMcpService, tempfile::TempDir)> {
+    build_test_service_inner(HashMap::new(), Some(notifier)).await
+}
+
+async fn build_test_service_inner(
+    configs: HashMap<String, ToolConfig>,
+    notifier: Option<Arc<dyn crate::sandbox::ScopeGrantNotifier>>,
+) -> Result<(AhmaMcpService, tempfile::TempDir)> {
     let temp_dir = tempfile::tempdir()?;
 
     let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
@@ -323,11 +340,11 @@ pub async fn build_test_service_with_configs(
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();
     let sandbox = Arc::new(sandbox);
-    let adapter = Arc::new(Adapter::new(
-        Arc::clone(&operation_monitor),
-        shell_pool,
-        sandbox,
-    )?);
+    let mut adapter = Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox)?;
+    if let Some(notifier) = notifier {
+        adapter = adapter.with_scope_grant_notifier(notifier);
+    }
+    let adapter = Arc::new(adapter);
 
     let service = AhmaMcpService::new(
         adapter,

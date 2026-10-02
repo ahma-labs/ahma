@@ -202,11 +202,11 @@ impl BuiltinTool {
     /// persists a log-symlink exception outside it
     /// (`sandbox::add_log_exception`); `run_terminal_command` runs an
     /// arbitrary command, the least contained of all of them. `sandbox_grant`
-    /// is exempt despite writing the permission ledger: its own handler
-    /// already refuses to self-persist for the autonomous agent-loop client,
-    /// routing `confirm: true` to the human approval surface instead
-    /// (`handle_sandbox_grant`) — gating it again here would be redundant,
-    /// not safer. Everything else only reads or only steers ahma's own
+    /// is exempt despite touching the permission ledger: its handler never
+    /// writes on the model's word for any client — `confirm: true` routes to
+    /// the human approval ladder and only a human answer persists
+    /// (`handle_sandbox_grant`, SPEC R5.4.5) — so gating it again here would
+    /// be redundant, not safer. Everything else only reads or only steers ahma's own
     /// control plane. Each is exempted explicitly, never by omission — the
     /// same fail-closed shape as the MTDF default.
     pub const fn is_mutating(self) -> bool {
@@ -243,7 +243,7 @@ impl BuiltinTool {
     /// so a trusted folder (SPEC R-PERM.1.3) must not auto-approve it.
     ///
     /// `logs_approve` persists a log-symlink exception outside the workspace.
-    /// `sandbox_grant` widens the scope itself and already routes to a human.
+    /// `sandbox_grant` asks a human to widen the scope and never does so itself.
     /// `fetch_webpage` reaches the network, which has its own egress gate
     /// (R-WEB.6) and is never the folder's to trust. Everything else runs inside
     /// the kernel sandbox, or only steers ahma's own control plane.

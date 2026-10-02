@@ -287,13 +287,14 @@ default. There is no special flag for it — the supported remedy is the standar
 1. ahma detects the denied path from the command's stderr and returns a structured
    `sandbox_denial` error (over MCP) or prints an `ahma sandbox grant …` hint (in a
    hooked native terminal).
-2. **Grant the path** — via the `sandbox_grant` MCP tool (preview, then `confirm: true`),
-   or on the CLI: `ahma sandbox grant ~/.cargo/bin` (and `~/.cargo` for the
-   manifest). The grant is written to `~/.ahma/settings.toml`, which lives outside
-   every sandbox scope. Credential/config files are never auto-granted and the
-   path is risk-classified before it is offered. When confirmed via `sandbox_grant`,
-   the grant takes effect **immediately** for the running session and persists.
-   (If granted via CLI or offline editing, restart the server for it to take effect.)
+2. **A human grants the path** — at the prompt the `sandbox_grant` MCP tool raises
+   (preview first; `confirm: true` asks you, in your client or the ahma TUI, and never
+   grants by itself), or on the CLI: `ahma sandbox grant ~/.cargo/bin` (and `~/.cargo`
+   for the manifest). The grant is written to `~/.ahma/settings.toml`, which lives
+   outside every sandbox scope. Credential/config files are never auto-granted and the
+   path is risk-classified before it is offered. A grant you approve at the prompt takes
+   effect **immediately** for the running session and persists. (If granted via CLI or
+   offline editing, restart the server for it to take effect.)
 3. **Re-run** the original command.
 
 If a maintenance script bootstraps tools (e.g. `cargo install cargo-binstall`),
