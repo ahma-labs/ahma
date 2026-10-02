@@ -1305,6 +1305,7 @@ fn default_sandbox_profiles() -> Vec<String> {
         "android".to_string(),
         "apple".to_string(),
         "common".to_string(),
+        "gh".to_string(),
     ]
 }
 

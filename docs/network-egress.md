@@ -43,7 +43,7 @@ people fall back to permits everything.
 ## The mechanism: profiles already solved this for paths
 
 A [sandbox profile](permissions.md) is a pre-answered bundle of grant questions.
-`rust`, `node`, `go`, `android`, `apple` and `common` each declare the filesystem paths their
+`rust`, `node`, `go`, `android`, `apple`, `common` and `gh` each declare the filesystem paths their
 toolchain needs, ship enabled by default, and are refusable individually through
 `[sandbox] profiles`.
 
@@ -102,6 +102,18 @@ trust it.
 Nothing. A shared cache directory is not an ecosystem and reaches nothing of its
 own; every host belongs to the toolchain that fetches it. Inventing an entry here
 would grant it to everyone who left `common` enabled, which is everyone.
+
+### `gh`
+
+| Host | Why | Source |
+|---|---|---|
+| `api.github.com` | The REST and GraphQL API every `gh` command calls | [docs.github.com](https://docs.github.com/en/rest) |
+| `github.com` | Authentication and the git operations `gh` performs | same |
+
+The profile also lets `gh` write its own cache (`~/.cache/gh`), without which
+`gh run view --log-failed` fails inside the sandbox. Run-log downloads redirect to
+GitHub's blob storage; add that host yourself if you restrict the network and need
+logs.
 
 ### Deliberately *not* shipped
 
@@ -221,7 +233,7 @@ removing `go` from `[sandbox] profiles` would answer a different — usually wro
 
 ```toml
 [sandbox]
-profiles = ["rust", "node", "go", "android", "apple", "common"]
+profiles = ["rust", "node", "go", "android", "apple", "common", "gh"]
 
 [network]
 restrict = true

@@ -192,7 +192,7 @@ they give away and turn any of them off:
 ```toml
 # ~/.ahma/settings.toml
 [sandbox]
-profiles = ["rust"]   # only rust; drop node, go, android, apple, common
+profiles = ["rust"]   # only rust; drop node, go, android, apple, common, gh
 # profiles = []       # nothing — grant every toolchain path explicitly
 ```
 
