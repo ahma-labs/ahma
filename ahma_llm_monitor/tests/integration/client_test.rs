@@ -367,3 +367,45 @@ fn a_latest_tag_is_the_same_model() {
     let client = LlmClient::new("http://127.0.0.1:1/v1", "llama3", None);
     assert!(client.is_model_resident(&["llama3:latest".to_string()]));
 }
+
+/// External MCP tools are named `server::tool` inside ahma, which OpenAI and
+/// Anthropic reject (`^[a-zA-Z0-9_-]{1,64}$`). The request carries a valid
+/// name and the provider's call comes back under ahma's own.
+#[tokio::test]
+async fn tool_names_are_valid_on_the_wire_and_ahmas_in_the_reply() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "jira__search", "arguments": "{\"q\":\"x\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = LlmClient::new(server.uri(), "test-model", None);
+    let tools = [json!({
+        "type": "function",
+        "function": {"name": "jira::search", "parameters": {"type": "object"}}
+    })];
+    let resp = client
+        .chat_completion_with_tools(&[json!({"role": "user", "content": "find x"})], &tools)
+        .await
+        .expect("a tool call");
+    assert_eq!(resp.tool_calls[0].name, "jira::search");
+
+    let sent = &server.received_requests().await.unwrap()[0];
+    let body = String::from_utf8_lossy(&sent.body);
+    assert!(!body.contains("::"), "{body}");
+    assert!(body.contains("jira__search"), "{body}");
+}

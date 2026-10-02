@@ -224,6 +224,17 @@ pub struct ChatToolCall {
     pub arguments_raw: String,
 }
 
+/// Map the provider's tool-call names back to ahma's (see `tool_names`).
+fn restore_tool_names(
+    mut resp: ChatCompletionResponse,
+    names: &crate::tool_names::WireNames,
+) -> ChatCompletionResponse {
+    for call in &mut resp.tool_calls {
+        call.name = names.original(&call.name).to_string();
+    }
+    resp
+}
+
 /// Token usage metrics returned by the LLM.
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
@@ -702,6 +713,10 @@ impl LlmClient {
         messages: &[Value],
         tools: &[Value],
     ) -> Result<ChatCompletionResponse, LlmMonitorError> {
+        // Names a provider would reject (`server::tool`) are renamed for this
+        // request and mapped back below (see `tool_names`).
+        let (wire_tools, wire_messages, names) = crate::tool_names::to_wire(tools, messages);
+        let (messages, tools) = (wire_messages.as_slice(), wire_tools.as_slice());
         let (url, body) = self.build_chat_completion_request_payload(messages, tools);
 
         let started = std::time::Instant::now();
@@ -742,7 +757,8 @@ impl LlmClient {
         let parsed = match self.flavor {
             ApiFlavor::OpenAi => parse_chat_completion_response(json),
             ApiFlavor::Anthropic => anthropic::parse_messages_response(json),
-        };
+        }
+        .map(|resp| restore_tool_names(resp, &names));
         if let Ok(ref resp) = parsed {
             self.log_chat_completion_metrics(resp, started, "chat completion received");
         }
@@ -841,6 +857,8 @@ impl LlmClient {
             return Ok(resp);
         }
 
+        let (wire_tools, wire_messages, names) = crate::tool_names::to_wire(tools, messages);
+        let (messages, tools) = (wire_messages.as_slice(), wire_tools.as_slice());
         let mut body = json!({
             "model": self.model,
             "messages": messages,
@@ -885,7 +903,8 @@ impl LlmClient {
         let byte_stream = response.bytes_stream();
         let response_json =
             drain_streaming_deltas(byte_stream, &deltas, &self.model, started).await?;
-        let parsed = parse_chat_completion_response(response_json);
+        let parsed =
+            parse_chat_completion_response(response_json).map(|r| restore_tool_names(r, &names));
         if let Ok(ref resp) = parsed {
             self.log_chat_completion_metrics(resp, started, "streaming chat completion assembled");
         }

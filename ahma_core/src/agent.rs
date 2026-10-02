@@ -994,8 +994,12 @@ async fn handle_completion_stream_error(
     system_prompt: &Option<String>,
     mcp: &Option<McpChatConfig>,
     tx: &Sender<AgentEvent>,
+    tools_used: bool,
 ) {
-    if e.is_tools_rejected() {
+    // Falling back rebuilds the conversation from the turn's original
+    // messages, so it is only safe before any tool has run; after one has, the
+    // model evidently supports tools and the error is something else.
+    if e.is_tools_rejected() && !tools_used {
         info!(error = %e, "agent: model rejected tools — falling back to plain chat (no tool use this turn)");
         let _ = tx
             .send(AgentEvent::Error(
@@ -1043,7 +1047,11 @@ async fn fetch_completion(
     match stream_completion_via_http(client, msg_json, tool_defs, tx).await {
         Ok(c) => Some((c, true)),
         Err(e) => {
-            handle_completion_stream_error(e, client, messages, system_prompt, mcp, tx).await;
+            let tools_used = msg_json
+                .iter()
+                .any(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("tool"));
+            handle_completion_stream_error(e, client, messages, system_prompt, mcp, tx, tools_used)
+                .await;
             None
         }
     }
@@ -5046,6 +5054,60 @@ mod tests {
             AgentEvent::Error(e) => assert!(e.message.contains("does not support tools"), "{e}"),
             o => panic!("unexpected {o:?}"),
         }
+    }
+
+    /// Once tools have worked in this run, the model supports them: a later
+    /// rejection is reported as itself, never a silent fall back to plain chat
+    /// that would rebuild the conversation without the run's tool calls and
+    /// results.
+    #[tokio::test]
+    async fn no_fallback_to_plain_chat_after_tools_have_been_used() {
+        let router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "tools are not supported by this model",
+                )
+            }),
+        );
+        let base = serve_router(router).await;
+        let client = LlmClient::new(base, "m", None);
+        let (tx, mut rx) = mpsc::channel(16);
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "status", "arguments": "{}"}}
+            ]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
+        ];
+        let res = fetch_completion(
+            &client,
+            &msgs,
+            &[],
+            &None,
+            &tx,
+            &[ChatMessage::user("hi")],
+            &None,
+        )
+        .await;
+        assert!(res.is_none());
+        match rx.recv().await.unwrap() {
+            AgentEvent::Error(e) => {
+                assert!(!e.message.contains("Falling back"), "{e}");
+                assert!(
+                    e.message.contains("not supported"),
+                    "the provider's own words: {e}"
+                );
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .map_or(true, |m| m.is_none()),
+            "no plain-chat task was started"
+        );
     }
 
     #[tokio::test]
