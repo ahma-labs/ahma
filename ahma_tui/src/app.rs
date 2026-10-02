@@ -2758,9 +2758,23 @@ fn handle_web_approval_key(
         return false;
     }
 
+    // A granting key typed before the question could be read answers
+    // nothing (SPEC R-PERM.3.5); it is consumed so it lands nowhere else.
+    let armed = state.web_approval.as_ref().is_some_and(|g| g.armed());
     match (key.code, key.modifiers) {
+        (KeyCode::Char('a' | 's' | 'o'), KeyModifiers::NONE) if !armed => true,
         (KeyCode::Char('a'), KeyModifiers::NONE) => {
-            resolve_web_approval(state, WebApprovalDecision::AllowAlways);
+            // Saving to settings shows the exact line first; the second
+            // press saves it (SPEC R-PERM.3.5).
+            let confirmed = state
+                .web_approval
+                .as_ref()
+                .is_some_and(|g| g.confirm_always);
+            if confirmed {
+                resolve_web_approval(state, WebApprovalDecision::AllowAlways);
+            } else if let Some(gate) = state.web_approval.as_mut() {
+                gate.confirm_always = true;
+            }
             true
         }
         (KeyCode::Char('s'), KeyModifiers::NONE) => {
@@ -2786,6 +2800,15 @@ fn handle_web_approval_key(
 /// Resolve the pending web-approval prompt: send the decision to the hub (which
 /// applies it to the live session and, for `always`, persists it) and log it. The
 /// request that raised the prompt was already denied, so the user retries it.
+/// The next waiting web-egress question takes the screen, unread from this
+/// moment (SPEC R-PERM.3.5).
+fn show_next_web_approval(state: &mut crate::state::AppState) {
+    state.web_approval = state.web_approval_queue.pop_front().map(|mut gate| {
+        gate.shown_at = std::time::Instant::now();
+        gate
+    });
+}
+
 fn resolve_web_approval(
     state: &mut crate::state::AppState,
     decision: ahma_common::web_approval::WebApprovalDecision,
@@ -2796,6 +2819,7 @@ fn resolve_web_approval(
     let Some(gate) = state.web_approval.take() else {
         return;
     };
+    show_next_web_approval(state);
 
     send_incoming(ahma_common::hub::ClientMsg::SubmitWebApproval {
         decision_id: gate.decision_id,
@@ -5540,15 +5564,34 @@ fn handle_source_gate_event(
             }
         }
         SourceEvent::WebApprovalRequested { request } => {
-            state.web_approval = Some(crate::state::WebApprovalGate::from_request(request));
+            // Same queue rule as scope grants: a repeat is ignored, and a new
+            // question waits behind the open one instead of replacing it.
+            let known = state
+                .web_approval
+                .iter()
+                .chain(state.web_approval_queue.iter())
+                .any(|g| g.decision_id == request.decision_id);
+            if !known {
+                let gate = crate::state::WebApprovalGate::from_request(request);
+                if state.web_approval.is_none() {
+                    state.web_approval = Some(gate);
+                } else {
+                    state.web_approval_queue.push_back(gate);
+                }
+            }
         }
-        SourceEvent::WebApprovalDismiss { decision_id }
+        SourceEvent::WebApprovalDismiss { decision_id } => {
             if state
                 .web_approval
                 .as_ref()
-                .is_some_and(|g| g.decision_id == decision_id) =>
-        {
-            state.web_approval = None;
+                .is_some_and(|g| g.decision_id == decision_id)
+            {
+                show_next_web_approval(state);
+            } else {
+                state
+                    .web_approval_queue
+                    .retain(|g| g.decision_id != decision_id);
+            }
         }
         _ => {}
     }
@@ -8105,12 +8148,79 @@ mod tests {
     #[cfg(test)]
     fn test_web_approval_gate() -> crate::state::WebApprovalGate {
         use ahma_common::web_approval::WebApprovalRequest;
-        crate::state::WebApprovalGate::from_request(WebApprovalRequest {
+        let mut gate = crate::state::WebApprovalGate::from_request(WebApprovalRequest {
             decision_id: "web_test".to_string(),
             domain: "api.github.com".to_string(),
             url: "https://api.github.com/repos".to_string(),
             tool: Some("fetch_webpage".to_string()),
-        })
+        });
+        // On screen long enough to be read, so a key can answer it.
+        gate.shown_at = std::time::Instant::now() - crate::state::GRANT_ARMING_DELAY * 2;
+        gate
+    }
+
+    fn web_gate_with_id(id: &str) -> crate::state::WebApprovalGate {
+        let mut gate = test_web_approval_gate();
+        gate.decision_id = id.to_string();
+        gate
+    }
+
+    /// The web modal follows the same rules as the scope modal (SPEC
+    /// R-PERM.3.5): an early granting key answers nothing, `a` shows the
+    /// settings line before saving, and a second question waits its turn
+    /// and is unread when it takes the screen.
+    #[test]
+    fn web_approval_questions_are_read_before_answered_and_wait_their_turn() {
+        use crate::mcp_source::SourceEvent;
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        let mut fresh = test_web_approval_gate();
+        fresh.shown_at = std::time::Instant::now();
+        state.web_approval = Some(fresh);
+        assert!(super::handle_web_approval_key(key('s'), &mut state));
+        assert!(state.web_approval.is_some(), "an early s grants nothing");
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.web_approval = Some(test_web_approval_gate());
+        assert!(super::handle_web_approval_key(key('a'), &mut state));
+        assert!(
+            state
+                .web_approval
+                .as_ref()
+                .is_some_and(|g| g.confirm_always),
+            "the first a shows the settings line"
+        );
+        assert!(super::handle_web_approval_key(key('a'), &mut state));
+        assert!(state.web_approval.is_none(), "the second a saves");
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        let req = |id: &str| ahma_common::web_approval::WebApprovalRequest {
+            decision_id: id.to_string(),
+            domain: "api.github.com".to_string(),
+            url: "https://api.github.com/repos".to_string(),
+            tool: None,
+        };
+        for id in ["a", "b", "b"] {
+            super::handle_source_gate_event(
+                SourceEvent::WebApprovalRequested { request: req(id) },
+                &mut state,
+            );
+        }
+        assert_eq!(state.web_approval.as_ref().unwrap().decision_id, "a");
+        assert_eq!(state.web_approval_queue.len(), 1, "b once");
+        state.web_approval = Some(web_gate_with_id("a"));
+        state.web_approval_queue[0].shown_at =
+            std::time::Instant::now() - crate::state::GRANT_ARMING_DELAY * 4;
+        assert!(super::handle_web_approval_key(key('n'), &mut state));
+        assert_eq!(state.web_approval.as_ref().unwrap().decision_id, "b");
+        assert!(super::handle_web_approval_key(key('s'), &mut state));
+        assert!(
+            state.web_approval.is_some(),
+            "the s meant for the first question must not answer the second"
+        );
     }
 
     /// `a`/`s` resolve to allow-always / allow-session, clear the gate, and are
@@ -8120,7 +8230,7 @@ mod tests {
         use crate::state::{AppState, Focus};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        for code in [KeyCode::Char('a'), KeyCode::Char('s')] {
+        for code in [KeyCode::Char('s'), KeyCode::Char('o')] {
             let mut state = AppState::new("http://localhost:3000", "HTTP", true);
             state.focus = Focus::Chat;
             state.web_approval = Some(test_web_approval_gate());

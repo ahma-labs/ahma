@@ -3899,11 +3899,17 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
     let Some(gate) = &state.web_approval else {
         return;
     };
-    let popup = centered_rect(76, 14, area);
+    let popup = centered_rect(76, if gate.confirm_always { 15 } else { 14 }, area);
     frame.render_widget(Clear, popup);
 
+    let waiting = state.web_approval_queue.len();
+    let title = if waiting == 0 {
+        " Web · allow egress? ".to_string()
+    } else {
+        format!(" Web · allow egress? ({waiting} more waiting) ")
+    };
     let block = Block::default()
-        .title(Span::styled(" Web · allow egress? ", theme.title().bold()))
+        .title(Span::styled(title, theme.title().bold()))
         .borders(Borders::ALL)
         .border_style(theme.border_focused());
     let inner = block.inner(popup);
@@ -3957,6 +3963,15 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
         ]),
         Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
     ]);
+    if gate.confirm_always {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  [a] again writes \"{}\" to [web].always_allow in ~/.ahma/settings.toml",
+                gate.domain
+            ),
+            theme.pending().bold(),
+        )));
+    }
     lines.extend(gate_typing_note(state, theme));
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -5764,6 +5779,8 @@ mod tests {
                 domain: "example.com".into(),
                 url: url.to_string(),
                 tool: Some("fetch_webpage".into()),
+                shown_at: std::time::Instant::now(),
+                confirm_always: false,
             });
             let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
             terminal
