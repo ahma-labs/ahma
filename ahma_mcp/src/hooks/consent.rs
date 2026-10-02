@@ -21,6 +21,36 @@ struct Marker {
     session: String,
     /// How many commands have run unsandboxed under this consent.
     count: u64,
+    /// When consent was given, Unix seconds; it lapses after
+    /// [`CONSENT_LEASE_SECS`]. A marker without one (an older ahma) is stale.
+    #[serde(default)]
+    granted_at: u64,
+}
+
+/// How long consent to run hooked commands unsandboxed lasts: a working day.
+/// Bound to the boot as well, so a reboot ends it sooner; a machine that is
+/// never restarted no longer keeps hooks unsandboxed for weeks (R5.5.3).
+pub const CONSENT_LEASE_SECS: u64 = 8 * 3_600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Where hook markers live: ahma's owner-only runtime directory, which a
+/// sandboxed command cannot write (R5.4.8) and another local user cannot
+/// reach (R-HUB.2). The shared temp directory was both: on Linux any local
+/// user could pre-create the consent marker, and a sandboxed command could
+/// write it. With no runtime directory there is nowhere safe, so none.
+fn consent_dir_from(runtime: Option<PathBuf>) -> Option<PathBuf> {
+    runtime
+}
+
+/// [`consent_dir_from`] for this process.
+fn consent_dir() -> Option<PathBuf> {
+    consent_dir_from(ahma_common::hub::runtime_dir())
 }
 
 /// A consent store bound to a session nonce and a marker directory.
@@ -30,9 +60,11 @@ pub struct HookConsentStore {
 }
 
 impl HookConsentStore {
-    /// The store for the current session, using the system temp directory.
+    /// The store for the current session, in ahma's runtime directory. With
+    /// no runtime directory the store is empty and cannot record consent, so
+    /// fall-open stays closed.
     pub fn current() -> Self {
-        Self::with(std::env::temp_dir(), session_nonce())
+        Self::with(consent_dir().unwrap_or_default(), session_nonce())
     }
 
     /// Construct a store with an explicit marker directory and session nonce
@@ -46,13 +78,29 @@ impl HookConsentStore {
     }
 
     fn read_marker(&self) -> Option<Marker> {
+        self.read_marker_at(now_secs())
+    }
+
+    fn read_marker_at(&self, now: u64) -> Option<Marker> {
+        if self.dir.as_os_str().is_empty() {
+            return None;
+        }
         let raw = std::fs::read_to_string(self.marker_path()).ok()?;
         let marker: Marker = serde_json::from_str(&raw).ok()?;
-        // A marker from a different session (e.g. before a reboot) is stale.
-        (marker.session == self.session).then_some(marker)
+        // A marker from a different session (e.g. before a reboot) is stale,
+        // and so is one past its lease.
+        let fresh =
+            marker.granted_at != 0 && now.saturating_sub(marker.granted_at) <= CONSENT_LEASE_SECS;
+        (marker.session == self.session && fresh).then_some(marker)
     }
 
     fn write_marker(&self, marker: &Marker) -> std::io::Result<()> {
+        if self.dir.as_os_str().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "ahma's runtime directory is unavailable, so consent cannot be recorded",
+            ));
+        }
         std::fs::create_dir_all(&self.dir)?;
         let raw = serde_json::to_string(marker).expect("marker serializes");
         std::fs::write(self.marker_path(), raw)
@@ -63,12 +111,18 @@ impl HookConsentStore {
         self.read_marker().is_some()
     }
 
+    /// [`Self::is_consented`] at `now` (Unix seconds).
+    pub fn is_consented_at(&self, now: u64) -> bool {
+        self.read_marker_at(now).is_some()
+    }
+
     /// Record explicit user consent (R5.5.3). Idempotent; preserves the count.
     pub fn grant(&self) -> std::io::Result<()> {
         let count = self.read_marker().map(|m| m.count).unwrap_or(0);
         self.write_marker(&Marker {
             session: self.session.clone(),
             count,
+            granted_at: now_secs(),
         })
     }
 
@@ -221,9 +275,10 @@ struct DisclosureMarker {
 }
 
 impl HookDisclosureStore {
-    /// The store for the current boot session, using the system temp directory.
+    /// The store for the current boot session, in ahma's runtime directory
+    /// (see [`consent_dir_from`]); with none, every scope disclosure is shown.
     pub fn current() -> Self {
-        Self::with(std::env::temp_dir(), session_nonce())
+        Self::with(consent_dir().unwrap_or_default(), session_nonce())
     }
 
     /// Construct a store with an explicit marker directory and session nonce
@@ -296,5 +351,38 @@ mod disclosure_tests {
         // A new boot session forgets everything.
         let rebooted = HookDisclosureStore::with(td.path().to_path_buf(), "boot-2".into());
         assert!(rebooted.should_disclose("sess-a", "fp2"));
+    }
+}
+
+#[cfg(test)]
+mod placement_and_lease_tests {
+    use super::*;
+
+    /// Consent to run hooked commands unsandboxed is the widest grant ahma has
+    /// (R5.5.3), so its marker must live where neither a sandboxed command nor
+    /// another local user can write it: ahma's owner-only runtime directory,
+    /// never the shared temp directory.
+    #[test]
+    fn the_consent_marker_lives_in_the_runtime_directory_or_nowhere() {
+        let rt = PathBuf::from("/run/user/501/ahma");
+        assert_eq!(consent_dir_from(Some(rt.clone())), Some(rt));
+        assert_eq!(
+            consent_dir_from(None),
+            None,
+            "with no runtime directory, consent is unavailable — never the shared temp dir"
+        );
+    }
+
+    /// Consent lapses after a working day even without a reboot: a machine
+    /// that is never restarted must not keep hooks unsandboxed for weeks.
+    #[test]
+    fn consent_lapses_after_its_lease() {
+        let td = tempfile::tempdir().unwrap();
+        let store = HookConsentStore::with(td.path().to_path_buf(), "boot:x".into());
+        store.grant().unwrap();
+        let now = now_secs();
+        assert!(store.is_consented_at(now));
+        assert!(store.is_consented_at(now + CONSENT_LEASE_SECS - 60));
+        assert!(!store.is_consented_at(now + CONSENT_LEASE_SECS + 60));
     }
 }
