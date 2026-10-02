@@ -137,6 +137,9 @@ pub struct PermissionBroker {
     elicitation: RwLock<Option<Arc<dyn ElicitationSurface>>>,
     /// Rung 2: the hub channel a connected TUI drains to show its modal.
     hub_tx: Option<tokio::sync::mpsc::UnboundedSender<ScopeGrantRequest>>,
+    /// How many TUIs the hub says are watching ([`ahma_common::hub::HubMsg::Viewers`]).
+    /// Rung 2 is used only while this is above zero (SPEC R-PERM.3.6).
+    tui_viewers: Arc<std::sync::atomic::AtomicUsize>,
     harness: Mutex<HarnessState>,
     /// Session-health disclosure (#485): `grant_pending` / `grant_decided`
     /// events emitted *beside* the asking surfaces, never instead of them.
@@ -161,10 +164,18 @@ impl PermissionBroker {
             coordinator,
             elicitation: RwLock::new(None),
             hub_tx,
+            tui_viewers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             harness: Mutex::new(HarnessState::Untried),
             session_events: RwLock::new(None),
             sandbox: RwLock::new(None),
         }
+    }
+
+    /// Share the count of watching TUIs that the hub reporter keeps up to
+    /// date. Without it the count stays zero and rung 2 is never used.
+    pub fn with_tui_viewers(mut self, viewers: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.tui_viewers = viewers;
+        self
     }
 
     /// Install the live sandbox so an approval is applied to it and stamped
@@ -253,7 +264,11 @@ impl PermissionBroker {
         }
 
         // ── Rung 2: an attached TUI ───────────────────────────────────────────
+        // A hub channel is not a person. Sending succeeds whenever the hub
+        // reporter is alive, with or without a TUI open, so the question is
+        // sent only while the hub says one is watching (SPEC R-PERM.3.6).
         if let Some(tx) = &self.hub_tx
+            && self.tui_viewers.load(std::sync::atomic::Ordering::SeqCst) > 0
             && tx.send(req.clone()).is_ok()
         {
             tracing::warn!(
@@ -717,10 +732,14 @@ mod tests {
         Option<tokio::sync::mpsc::UnboundedReceiver<ScopeGrantRequest>>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // `hub` means a TUI is attached: wired *and* someone watching it.
         let broker = PermissionBroker::new(
             Arc::new(GrantCoordinator::new()),
             if hub { Some(tx) } else { None },
-        );
+        )
+        .with_tui_viewers(Arc::new(std::sync::atomic::AtomicUsize::new(usize::from(
+            hub,
+        ))));
         if let Some(h) = harness {
             broker.set_elicitation_surface(h);
         }
@@ -922,6 +941,32 @@ mod tests {
         );
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_ok(), "both questions reach the TUI");
+    }
+
+    /// A hub with no TUI watching is not someone to ask (SPEC R-PERM.3.6).
+    /// The question used to be sent into it and reported as "asking in the
+    /// ahma TUI", then sat pending for the rest of the session with nobody to
+    /// answer it, and its being in flight stopped the same path from being
+    /// asked again even after a TUI opened.
+    #[tokio::test]
+    async fn a_hub_with_no_tui_watching_is_not_a_rung() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let viewers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let broker = PermissionBroker::new(Arc::new(GrantCoordinator::new()), Some(tx))
+            .with_tui_viewers(viewers.clone());
+
+        violate(&broker, "/opt/cache").await;
+        assert!(
+            rx.try_recv().is_err(),
+            "nobody is watching, so nothing is sent"
+        );
+
+        viewers.store(1, Ordering::SeqCst);
+        violate(&broker, "/opt/cache").await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "once a TUI is open, the same path is asked there"
+        );
     }
 
     #[tokio::test]

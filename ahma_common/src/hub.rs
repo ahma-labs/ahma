@@ -571,6 +571,11 @@ pub enum HubMsg {
     /// Liveness probe sent from hub to a connected instance.
     /// The instance should respond with a matching [`ClientMsg::Pong`].
     Ping { seq: u32 },
+    /// How many TUIs are watching, sent to an instance when it registers and
+    /// to every instance whenever the number changes. An instance asks a
+    /// permission question at the TUI rung only while this is above zero
+    /// (SPEC R-PERM.3.6): a hub nobody is watching is not someone to ask.
+    Viewers { count: usize },
     /// Forward prompt run command to registered instance.
     RunPrompt {
         messages: Vec<HubChatMessage>,
@@ -1262,6 +1267,8 @@ struct Hub {
     op_history: Arc<Mutex<std::collections::HashMap<String, InstanceOpHistory>>>,
     op_seq: AtomicU64,
     connection_count: Arc<AtomicUsize>,
+    /// Subscribers (TUIs) connected right now; see [`HubMsg::Viewers`].
+    viewers: AtomicUsize,
     pending_approvals: Arc<Mutex<std::collections::HashMap<String, PendingApproval>>>,
     /// `session_id` → the instance id first assigned to it, so a re-register
     /// keeps its identity (and its retained history) instead of arriving as a
@@ -1297,6 +1304,7 @@ impl Hub {
                 op_history: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 op_seq: AtomicU64::new(0),
                 connection_count: Arc::new(AtomicUsize::new(0)),
+                viewers: AtomicUsize::new(0),
                 pending_approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 session_ids: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 pending_decisions: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -1306,6 +1314,14 @@ impl Hub {
             },
             rx,
         )
+    }
+
+    /// Tell every instance how many TUIs are watching (SPEC R-PERM.3.6).
+    async fn announce_viewers(&self) {
+        let count = self.viewers.load(Ordering::SeqCst);
+        for tx in self.instance_txs.lock().await.values() {
+            let _ = tx.try_send(HubMsg::Viewers { count });
+        }
     }
 
     /// Evict the oldest finished op once an instance's retained history grows
@@ -2073,7 +2089,7 @@ where
             .await
         }
 
-        ClientMsg::Subscribe => serve_subscriber(&mut writer, &hub).await,
+        ClientMsg::Subscribe => serve_subscriber(&mut reader, &mut writer, &hub).await,
 
         ClientMsg::ListInstances => {
             let instances = hub.instance_snapshot().await;
@@ -2395,6 +2411,9 @@ async fn serve_instance<R, W>(
     hub.instances.lock().await.insert(id.clone(), info.clone());
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<HubMsg>(100);
+    let _ = tx.try_send(HubMsg::Viewers {
+        count: hub.viewers.load(Ordering::SeqCst),
+    });
     hub.instance_txs.lock().await.insert(id.clone(), tx);
 
     let _ = hub
@@ -2553,7 +2572,43 @@ async fn serve_instance<R, W>(
 
 /// Serve a TUI subscriber: send the current instance list, replay retained op
 /// history, then stream live events until the connection closes.
-async fn serve_subscriber<W>(writer: &mut W, hub: &Arc<Hub>)
+async fn serve_subscriber<R, W>(reader: &mut BufReader<R>, writer: &mut W, hub: &Arc<Hub>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    // A subscriber is a TUI someone is looking at: every instance learns
+    // that it now has someone to ask, and learns again when it goes. The
+    // stream alone notices a closed TUI only at its next write, which may be
+    // never on an idle hub, so the connection is also watched for EOF.
+    hub.viewers.fetch_add(1, Ordering::SeqCst);
+    hub.announce_viewers().await;
+    tokio::select! {
+        () = stream_to_subscriber(writer, hub) => {}
+        () = until_closed(reader) => {}
+    }
+    hub.viewers.fetch_sub(1, Ordering::SeqCst);
+    hub.announce_viewers().await;
+}
+
+/// Read and discard until the peer closes its side. A subscriber sends
+/// nothing after `Subscribe`, so anything it does send is ignored, as it
+/// always was.
+async fn until_closed<R>(reader: &mut BufReader<R>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+async fn stream_to_subscriber<W>(writer: &mut W, hub: &Arc<Hub>)
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -3369,6 +3424,17 @@ mod tests {
     // All spawned tasks are cancelled when the test runtime drops, and dropping
     // the server unlinks its socket.
 
+    /// The next message an instance receives, skipping the viewer counts the
+    /// hub sends on registration and whenever a TUI opens or closes.
+    async fn recv_instance_msg<R: tokio::io::AsyncRead + Unpin>(r: &mut BufReader<R>) -> HubMsg {
+        loop {
+            match recv_msg::<_, HubMsg>(r).await.unwrap() {
+                HubMsg::Viewers { .. } => continue,
+                other => return other,
+            }
+        }
+    }
+
     /// Bind a hub at `sock` and serve it for the rest of the test. It is bound
     /// before this returns, so a connect straight after succeeds.
     async fn start_hub(sock: &std::path::Path) {
@@ -3376,6 +3442,65 @@ mod tests {
             .await
             .expect("the hub binds a fresh socket");
         tokio::spawn(async move { server.serve().await });
+    }
+
+    /// Every instance hears how many TUIs are watching: once when it
+    /// registers, and again each time one opens or closes (SPEC R-PERM.3.6).
+    #[tokio::test]
+    async fn instances_hear_how_many_tuis_are_watching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hub.sock");
+        start_hub(&sock).await;
+
+        let inst = connect_to_hub_at(&sock).await.expect("connect instance");
+        let (ir, mut iw) = tokio::io::split(inst);
+        let mut inst_reader = BufReader::new(ir);
+        send_msg(
+            &mut iw,
+            &ClientMsg::Register {
+                pid: std::process::id(),
+                mode: "stdio".to_string(),
+                scope: "/test/scope".to_string(),
+                label: "TestInstance".to_string(),
+                client: None,
+                session_id: None,
+                client_pid: None,
+                sampling: false,
+                elicitation: false,
+                scopes: vec![],
+                read_scopes: vec![],
+                grants: vec![],
+                enforcement: None,
+            },
+        )
+        .await
+        .unwrap();
+        async fn next_viewers<R: tokio::io::AsyncRead + Unpin>(r: &mut BufReader<R>) -> usize {
+            let wait = crate::timeouts::TestTimeouts::get(crate::timeouts::TimeoutCategory::Quick);
+            tokio::time::timeout(wait, async {
+                loop {
+                    if let HubMsg::Viewers { count } = recv_msg::<_, HubMsg>(r).await.unwrap() {
+                        return count;
+                    }
+                }
+            })
+            .await
+            .expect("the hub reports its viewers")
+        }
+        assert_eq!(
+            next_viewers(&mut inst_reader).await,
+            0,
+            "nobody watching yet"
+        );
+
+        let sub = connect_to_hub_at(&sock).await.expect("connect subscriber");
+        let (sr, mut sw) = tokio::io::split(sub);
+        send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();
+        assert_eq!(next_viewers(&mut inst_reader).await, 1, "a TUI opened");
+
+        drop(sw);
+        drop(sr);
+        assert_eq!(next_viewers(&mut inst_reader).await, 0, "the TUI closed");
     }
 
     #[tokio::test]
@@ -5272,7 +5397,7 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, HubMsg>(&mut irdr).await.unwrap() {
+        match recv_instance_msg(&mut irdr).await {
             HubMsg::RunPrompt {
                 messages,
                 system_prompt,
@@ -5297,7 +5422,7 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, HubMsg>(&mut irdr).await.unwrap() {
+        match recv_instance_msg(&mut irdr).await {
             HubMsg::CancelPrompt => {}
             other => panic!("expected CancelPrompt, got {other:?}"),
         }
@@ -5313,7 +5438,7 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, HubMsg>(&mut irdr).await.unwrap() {
+        match recv_instance_msg(&mut irdr).await {
             HubMsg::CancelOperation { op_id } => assert_eq!(op_id, "op-7"),
             other => panic!("expected CancelOperation, got {other:?}"),
         }
@@ -5330,7 +5455,7 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, HubMsg>(&mut irdr).await.unwrap() {
+        match recv_instance_msg(&mut irdr).await {
             HubMsg::SubmitApproval { id: _, approved } => assert!(approved),
             other => panic!("expected SubmitApproval, got {other:?}"),
         }
@@ -5349,7 +5474,7 @@ mod tests {
         )
         .await
         .unwrap();
-        match recv_msg::<_, HubMsg>(&mut irdr).await.unwrap() {
+        match recv_instance_msg(&mut irdr).await {
             HubMsg::SubmitScopeGrant {
                 decision_id,
                 decision,

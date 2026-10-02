@@ -41,6 +41,10 @@ pub struct GrantReporting {
     /// The live sandbox an approved grant is applied to, and whose committed
     /// scope stamps the grant's workspace (SPEC R5.4.6, R5.4.11).
     pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
+    /// How many TUIs the hub says are watching, shared with the
+    /// [`crate::sandbox::PermissionBroker`]. Zero while disconnected from the
+    /// hub (SPEC R-PERM.3.6).
+    pub tui_viewers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The shared web-approval plumbing handed to the reporter (SPEC R-WEB.6). Parallel
@@ -488,6 +492,7 @@ async fn run_reporter_loop(
     // of one struct across two select branches.
     let grant_coordinator = grant.as_ref().map(|g| g.coordinator.clone());
     let grant_sandbox = grant.as_ref().and_then(|g| g.sandbox.clone());
+    let tui_viewers = grant.as_ref().map(|g| g.tui_viewers.clone());
     let mut grant_req_rx = grant.map(|g| g.req_rx);
     // Same split for the web-approval plumbing.
     let web_coordinator = web.as_ref().map(|w| w.coordinator.clone());
@@ -672,9 +677,16 @@ async fn run_reporter_loop(
                         grant_coordinator.as_ref(),
                         grant_sandbox.as_ref(),
                         web_coordinator.as_ref(),
+                        tui_viewers.as_ref(),
                     ).await;
                 }
             }
+        }
+
+        // Nobody can be reached through a hub this instance is not connected
+        // to; the next registration hears the real count again.
+        if let Some(v) = &tui_viewers {
+            v.store(0, std::sync::atomic::Ordering::SeqCst);
         }
 
         // Back-off before reconnect attempt.
@@ -763,6 +775,7 @@ async fn handle_incoming(
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
     grant_sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
     web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
+    tui_viewers: Option<&Arc<std::sync::atomic::AtomicUsize>>,
 ) -> bool {
     let msg = match incoming {
         Ok(msg) => msg,
@@ -787,6 +800,12 @@ async fn handle_incoming(
             model,
         } => spawn_prompt_run(messages, system_prompt, provider, model, hub_tx, session).await,
         HubMsg::CancelPrompt => cancel_prompt_run(hub_tx, session).await,
+        HubMsg::Viewers { count } => {
+            debug!("hub_reporter: {count} TUI(s) watching");
+            if let Some(v) = tui_viewers {
+                v.store(count, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         HubMsg::CancelOperation { op_id } => {
             let cancelled = monitor
                 .cancel_operation_with_reason(&op_id, Some("Cancelled from ahma tui".into()))
@@ -2307,6 +2326,74 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
+    /// The reporter keeps the broker's count of watching TUIs: what the hub
+    /// last said while connected, and zero once the hub is gone (SPEC
+    /// R-PERM.3.6).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn reporter_keeps_the_count_of_watching_tuis() {
+        use crate::operation_monitor::MonitorConfig;
+        use ahma_common::scope_grant::GrantCoordinator;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _lock = HUB_SOCK_MUTEX.lock();
+        let unique = HUB_SOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let sock =
+            std::env::temp_dir().join(format!("ahma_rep_{}_{}.sock", std::process::id(), unique));
+        let _ = std::fs::remove_file(&sock);
+        let prev = std::env::var_os("AHMA_HUB_SOCK");
+        unsafe { std::env::set_var("AHMA_HUB_SOCK", &sock) };
+        let _env_guard = EnvGuard { prev };
+        let listener = LocalListener::bind(&sock).expect("bind temp hub socket");
+
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            TestTimeouts::scale_secs(60),
+        )));
+        let viewers = Arc::new(AtomicUsize::new(0));
+        let (_grant_tx, grant_rx) = mpsc::unbounded_channel::<ScopeGrantRequest>();
+        let grant = GrantReporting {
+            coordinator: Arc::new(GrantCoordinator::new()),
+            req_rx: grant_rx,
+            sandbox: None,
+            tui_viewers: viewers.clone(),
+        };
+        let reporter = tokio::spawn(run_reporter_loop(
+            monitor,
+            "stdio".to_string(),
+            "ws-scope".to_string(),
+            "VSCode".to_string(),
+            Some(grant),
+            None,
+            tokio::sync::watch::channel(None).0,
+        ));
+
+        let (server_reader, mut server_writer, _reg) = accept_register(&listener).await;
+        send_msg(&mut server_writer, &HubMsg::Viewers { count: 2 })
+            .await
+            .unwrap();
+        let wait = TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick);
+        let until = |want: usize| {
+            let viewers = viewers.clone();
+            async move {
+                tokio::time::timeout(wait, async {
+                    while viewers.load(Ordering::SeqCst) != want {
+                        tokio::time::sleep(TestTimeouts::poll_interval()).await;
+                    }
+                })
+                .await
+                .is_ok()
+            }
+        };
+        assert!(until(2).await, "the hub's count reaches the broker");
+
+        drop(server_writer);
+        drop(server_reader);
+        assert!(until(0).await, "a lost hub means nobody is watching");
+
+        reporter.abort();
+        let _ = std::fs::remove_file(&sock);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     // The std Mutex deliberately serializes this whole async test (the hub
     // socket path is process-global state); holding it across awaits is the point.
@@ -2369,6 +2456,7 @@ mod tests {
             coordinator: coord.clone(),
             req_rx: grant_rx,
             sandbox: None,
+            tui_viewers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
         // ── Run the loop in the background. ──────────────────────────────────────

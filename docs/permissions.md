@@ -33,7 +33,9 @@ ahma asks you in the best place available, in this order:
 1. **Your IDE / agent** (Cursor, Claude Code, …). If it can show a prompt, that's
    where the question appears — you're already looking at it, and it arrives with
    the context of whatever you were doing.
-2. **The ahma TUI**, if one is attached: a modal, over whichever view you're in.
+2. **The ahma TUI**, if one is open: a modal, over whichever view you're in. A question
+   goes there only while a TUI is actually open; with none open it falls to the next rung
+   rather than waiting for a TUI nobody is looking at.
 3. **Nowhere left to ask** → the command **fails**, and tells you exactly what to do:
 
    ```
