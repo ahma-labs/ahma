@@ -1446,7 +1446,15 @@ pub struct ScopeGrantGate {
     /// The advisor's recommendation, when one arrived in time (SPEC R-PERM.8).
     /// Shown as advice; it never changes the default or answers.
     pub advice: Option<ahma_core::advisor::GrantAdvice>,
+    /// When the question appeared. Granting keys pressed sooner than
+    /// [`GRANT_ARMING_DELAY`] after it are swallowed: they were typed for
+    /// something else, not in answer to a question nobody has read yet.
+    pub shown_at: std::time::Instant,
 }
+
+/// How long a grant question must be on screen before a key can grant it.
+/// Deny keys work at once.
+pub const GRANT_ARMING_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
 
 impl ScopeGrantGate {
     /// Build a gate from a hub [`ahma_common::scope_grant::ScopeGrantRequest`].
@@ -1460,7 +1468,13 @@ impl ScopeGrantGate {
             request,
             show_detail: false,
             advice: None,
+            shown_at: std::time::Instant::now(),
         }
+    }
+
+    /// Whether a granting key may answer yet ([`GRANT_ARMING_DELAY`]).
+    pub fn armed(&self) -> bool {
+        self.shown_at.elapsed() >= GRANT_ARMING_DELAY
     }
 }
 

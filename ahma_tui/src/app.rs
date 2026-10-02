@@ -2610,6 +2610,21 @@ fn handle_scope_grant_key(
                 .find(|o| o.key == c)
             {
                 Some(o) => {
+                    let Some(gate) = state.scope_grant.as_mut() else {
+                        return false;
+                    };
+                    // Typed ahead, not read: swallow it (deny never waits).
+                    if o.decision != GrantDecision::Deny && !gate.armed() {
+                        return true;
+                    }
+                    // A grant that is saved to settings is never given without
+                    // the exact line it writes on screen (SPEC R-PERM.2): the
+                    // first press from the compact view shows it, the second
+                    // saves.
+                    if o.decision.tier().is_persistent() && !gate.show_detail {
+                        gate.show_detail = true;
+                        return true;
+                    }
                     resolve_scope_grant(state, o.decision);
                     true
                 }
@@ -2618,6 +2633,16 @@ fn handle_scope_grant_key(
         }
         _ => false,
     }
+}
+
+/// The next waiting question, if any, takes the screen. It is unread from
+/// this moment however long it waited, so its arming delay starts now: a key
+/// typed for the question that just left must not answer this one.
+fn show_next_scope_grant(state: &mut crate::state::AppState) {
+    state.scope_grant = state.scope_grant_queue.pop_front().map(|mut gate| {
+        gate.shown_at = std::time::Instant::now();
+        gate
+    });
 }
 
 /// Resolve the pending scope-grant prompt: send the decision to the hub, where
@@ -2633,8 +2658,7 @@ fn resolve_scope_grant(
     let Some(gate) = state.scope_grant.take() else {
         return;
     };
-    // The next waiting question, if any, takes the screen.
-    state.scope_grant = state.scope_grant_queue.pop_front();
+    show_next_scope_grant(state);
 
     let advice_line = gate.advice.as_ref().map(|a| a.line());
     let advice_followed = gate.advice.as_ref().map(|a| a.matches(decision));
@@ -5508,7 +5532,7 @@ fn handle_source_gate_event(
                 .as_ref()
                 .is_some_and(|g| g.decision_id == decision_id)
             {
-                state.scope_grant = state.scope_grant_queue.pop_front();
+                show_next_scope_grant(state);
             } else {
                 state
                     .scope_grant_queue
@@ -7559,6 +7583,14 @@ mod tests {
     /// Build a pending scope-grant gate for the key-handler tests.
     #[cfg(test)]
     fn test_scope_grant_gate() -> crate::state::ScopeGrantGate {
+        let mut gate = fresh_scope_grant_gate();
+        // On screen long enough to be read, so a key can answer it.
+        gate.shown_at = std::time::Instant::now() - crate::state::GRANT_ARMING_DELAY * 2;
+        gate
+    }
+
+    /// A question that has only just appeared.
+    fn fresh_scope_grant_gate() -> crate::state::ScopeGrantGate {
         use ahma_common::scope_grant::{GrantReason, ScopeGrantRequest};
         crate::state::ScopeGrantGate::from_request(ScopeGrantRequest {
             decision_id: "dec_test".to_string(),
@@ -7633,6 +7665,90 @@ mod tests {
         );
         assert_eq!(state.scope_grant.as_ref().unwrap().decision_id, "c");
         assert!(state.scope_grant_queue.is_empty());
+    }
+
+    /// A question that waited behind another is unread when it takes the
+    /// screen, however long it waited: a granting key pressed at once is
+    /// swallowed, whether the open one was answered or withdrawn.
+    #[test]
+    fn a_waiting_question_is_rearmed_when_it_takes_the_screen() {
+        use crate::mcp_source::SourceEvent;
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let waited = |id: &str| {
+            let mut gate = gate_with_id(id);
+            gate.shown_at = std::time::Instant::now() - crate::state::GRANT_ARMING_DELAY * 4;
+            gate
+        };
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(waited("first"));
+        state.scope_grant_queue.push_back(waited("second"));
+        super::handle_scope_grant_key(y, &mut state);
+        assert_eq!(state.scope_grant.as_ref().unwrap().decision_id, "second");
+        super::handle_scope_grant_key(y, &mut state);
+        assert_eq!(
+            state.scope_grant.as_ref().map(|g| g.decision_id.as_str()),
+            Some("second"),
+            "the y meant for the first question must not answer the second"
+        );
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(waited("first"));
+        state.scope_grant_queue.push_back(waited("second"));
+        super::handle_source_gate_event(
+            SourceEvent::ScopeGrantDismiss {
+                decision_id: "first".into(),
+            },
+            &mut state,
+        );
+        super::handle_scope_grant_key(y, &mut state);
+        assert!(
+            state.scope_grant.is_some(),
+            "a question that replaced a withdrawn one is unread too"
+        );
+    }
+
+    /// A granting key typed before the question could be read does nothing;
+    /// a deny works at once.
+    #[test]
+    fn a_grant_key_typed_ahead_of_the_question_is_swallowed() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(fresh_scope_grant_gate());
+        assert!(super::handle_scope_grant_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut state,
+        ));
+        assert!(state.scope_grant.is_some(), "an early y grants nothing");
+        assert!(super::handle_scope_grant_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut state,
+        ));
+        assert!(state.scope_grant.is_none(), "deny never waits");
+    }
+
+    /// A grant saved to settings is never given from the compact view: the
+    /// first press shows the exact line it writes, the second saves.
+    #[test]
+    fn saving_a_grant_shows_its_settings_line_first() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(test_scope_grant_gate());
+        let press = |state: &mut AppState| {
+            super::handle_scope_grant_key(
+                KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+                state,
+            )
+        };
+        assert!(press(&mut state));
+        let gate = state.scope_grant.as_ref().expect("not answered yet");
+        assert!(gate.show_detail, "the exact settings line is now on screen");
+        assert!(press(&mut state));
+        assert!(state.scope_grant.is_none(), "the second press saves");
     }
 
     /// `y` widens to read+write, clears the gate, and is consumed even with chat
