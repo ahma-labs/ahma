@@ -1,8 +1,9 @@
 # LLM Provider Configuration
 
-Ahma supports any OpenAI-compatible LLM API. All providers — local (Ollama, vLLM,
-LM Studio, llama.cpp) and remote (OpenAI, Anthropic-compatible, Azure OpenAI) — share
-the same `/v1/chat/completions` interface.
+Ahma speaks two wire formats. Every OpenAI-compatible server uses `/chat/completions`:
+local ones (Ollama, vLLM, LM Studio, llama.cpp) and remote ones (OpenAI, Azure OpenAI,
+OpenRouter, Together, Fireworks). Anthropic uses its native Messages API, chosen
+automatically for `api.anthropic.com` or with `kind = "anthropic"` on a provider.
 
 ## Named providers in `~/.ahma/config.toml`
 
@@ -31,20 +32,24 @@ api_key       = "${OPENAI_API_KEY}"   # ← env-var reference, not a literal key
 
 [[providers]]
 name          = "azure-openai"
-base_url      = "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/v1"
-default_model = "gpt-4o"
+base_url      = "https://my-resource.openai.azure.com/openai/v1"
+default_model = "my-gpt-4o-deployment"   # the deployment name
 api_key       = "${AZURE_OPENAI_KEY}"
 ```
 
-### Referencing a named provider in a tool file
+### Configuring the provider in a tool file
+
+A `livelog` tool names its model inside its `livelog` block:
 
 ```json
 {
   "name": "analyse-logs",
   "tool_type": "livelog",
-  "llm_provider": {
-    "base_url": "http://localhost:11434/v1",
-    "model": "llama3.2"
+  "livelog": {
+    "llm_provider": {
+      "base_url": "http://localhost:11434/v1",
+      "model": "llama3.2"
+    }
   }
 }
 ```
@@ -62,10 +67,12 @@ Ahma will expand the placeholder at runtime from the process environment and wil
 
 ```json
 {
-  "llm_provider": {
-    "base_url": "https://api.openai.com/v1",
-    "model": "gpt-4o-mini",
-    "api_key": "${OPENAI_API_KEY}"
+  "livelog": {
+    "llm_provider": {
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o-mini",
+      "api_key": "${OPENAI_API_KEY}"
+    }
   }
 }
 ```
@@ -136,7 +143,7 @@ tools:
 | LM Studio | `http://localhost:1234/v1` | No auth needed |
 | llama.cpp server | `http://localhost:8080/v1` | No auth needed |
 | OpenAI | `https://api.openai.com/v1` | `api_key` required |
-| Azure OpenAI | `https://<resource>.openai.azure.com/openai/deployments/<deploy>/v1` | `api_key` required |
+| Azure OpenAI | `https://<resource>.openai.azure.com/openai/v1` | `api_key` required; the model is your deployment name. The older `/openai/deployments/…?api-version=` URLs are not supported. |
 | Together AI | `https://api.together.xyz/v1` | `api_key` required |
 | Fireworks | `https://api.fireworks.ai/inference/v1` | `api_key` required |
 
@@ -174,6 +181,12 @@ automatically. The rules are in [SPEC.md](../SPEC.md) R-HTTP.
   server `server::tool`; OpenAI and Anthropic accept only letters, digits, `_` and `-` in a
   function name. Each request sends such a tool as `server__tool` and maps the model's calls
   back, so nothing changes in your configuration.
+- **Parallel tool calls stay separate.** Some servers stream several tool calls in one turn
+  without numbering them. ahma starts a new call at each new call id, so two calls never
+  merge into one with both argument sets glued together.
+- **The request fits the model.** OpenAI's own API and Azure OpenAI get
+  `max_completion_tokens`; every other server gets `max_tokens`. Reasoning models (o1, o3,
+  o4, gpt-5) are sent no `temperature`, since they accept only the default.
 - **An error is reported as itself.** When a provider rejects a request, the chat shows the
   provider's own message. ahma retries a turn without tools only when the provider says the
   model does not support tools, and never once tools have already run in the conversation.

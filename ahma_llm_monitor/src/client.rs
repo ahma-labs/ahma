@@ -85,6 +85,30 @@ fn build_http_client(local: bool) -> Client {
     }
 }
 
+/// Whether `base_url` is OpenAI's own API or Azure OpenAI, the endpoints
+/// that take `max_completion_tokens` instead of `max_tokens`.
+fn is_openai_hosted(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|h| h == "api.openai.com" || h.ends_with(".openai.azure.com"))
+}
+
+/// Whether `model` names an OpenAI reasoning model (o1, o3, o4, gpt-5
+/// families), which accept only the default temperature. A gateway prefix
+/// such as `openai/` is ignored.
+fn is_reasoning_model(model: &str) -> bool {
+    let name = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    ["o1", "o3", "o4", "gpt-5"].iter().any(|family| {
+        name.strip_prefix(family)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.', ':']))
+    })
+}
+
 /// Whether `base_url` points at this machine (a loopback host).
 pub fn is_loopback_url(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
@@ -397,6 +421,58 @@ impl LlmClient {
         }
     }
 
+    /// Set the output-token limit and temperature the way this endpoint and
+    /// model accept them. OpenAI's own API (and Azure OpenAI) takes
+    /// `max_completion_tokens`, rejects `max_tokens` for reasoning models and
+    /// has deprecated it for the rest; every other OpenAI-compatible server
+    /// keeps `max_tokens`. Reasoning models reject any `temperature` but the
+    /// default, so none is sent to them. A rejected parameter is a 400, which
+    /// costs the user the turn.
+    fn apply_sampling(&self, body: &mut Value, max_tokens: Option<u32>, temperature: f64) {
+        if let Some(n) = max_tokens {
+            let key = if is_openai_hosted(&self.base_url) {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            body[key] = json!(n);
+        }
+        if !is_reasoning_model(&self.model) {
+            body["temperature"] = json!(temperature);
+        }
+    }
+
+    /// The OpenAI-flavor body for the terse log-classification call.
+    fn detect_issues_body(&self, messages: &[Value]) -> Value {
+        let mut body = json!({ "model": self.model, "messages": messages });
+        self.apply_sampling(&mut body, Some(256), 0.0);
+        body
+    }
+
+    /// The OpenAI-flavor body for a chat turn that may call tools.
+    fn tools_body(&self, messages: &[Value], tools: &[Value], stream: bool) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": stream,
+        });
+        if stream {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
+        self.apply_sampling(&mut body, Some(8192), 0.2);
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools.to_vec());
+            body["tool_choice"] = json!("auto");
+        }
+        self.apply_num_ctx(&mut body);
+        body
+    }
+
+    /// [`Self::tools_body`] for the streaming path.
+    fn streaming_tools_body(&self, messages: &[Value], tools: &[Value]) -> Value {
+        self.tools_body(messages, tools, true)
+    }
+
     /// Override the wire-format flavor (e.g. when a `kind = "anthropic"`
     /// provider points at a proxy whose URL doesn't carry the Anthropic host).
     ///
@@ -535,12 +611,7 @@ impl LlmClient {
         let (url, body) = match self.flavor {
             ApiFlavor::OpenAi => (
                 format!("{}/chat/completions", self.base_url),
-                json!({
-                    "model": self.model,
-                    "messages": messages,
-                    "max_tokens": 256,
-                    "temperature": 0.0,
-                }),
+                self.detect_issues_body(&messages),
             ),
             ApiFlavor::Anthropic => {
                 let (system, amsgs) = anthropic::openai_to_anthropic(&messages);
@@ -616,6 +687,7 @@ impl LlmClient {
         match self.flavor {
             ApiFlavor::OpenAi => {
                 let mut body = build_chat_stream_body(&self.model, messages, system_prompt);
+                self.apply_sampling(&mut body, None, 0.7);
                 self.apply_num_ctx(&mut body);
                 (format!("{}/chat/completions", self.base_url), body)
             }
@@ -771,21 +843,10 @@ impl LlmClient {
         tools: &[Value],
     ) -> (String, Value) {
         match self.flavor {
-            ApiFlavor::OpenAi => {
-                let mut body = json!({
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": 0.2,
-                    "max_tokens": 8192,
-                    "stream": false,
-                });
-                if !tools.is_empty() {
-                    body["tools"] = Value::Array(tools.to_vec());
-                    body["tool_choice"] = json!("auto");
-                }
-                self.apply_num_ctx(&mut body);
-                (format!("{}/chat/completions", self.base_url), body)
-            }
+            ApiFlavor::OpenAi => (
+                format!("{}/chat/completions", self.base_url),
+                self.tools_body(messages, tools, false),
+            ),
             ApiFlavor::Anthropic => {
                 let (system, amsgs) = anthropic::openai_to_anthropic(messages);
                 let atools = anthropic::openai_tools_to_anthropic(tools);
@@ -859,19 +920,7 @@ impl LlmClient {
 
         let (wire_tools, wire_messages, names) = crate::tool_names::to_wire(tools, messages);
         let (messages, tools) = (wire_messages.as_slice(), wire_tools.as_slice());
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 8192,
-            "stream": true,
-            "stream_options": { "include_usage": true },
-        });
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools.to_vec());
-            body["tool_choice"] = json!("auto");
-        }
-        self.apply_num_ctx(&mut body);
+        let body = self.streaming_tools_body(messages, tools);
 
         let started = std::time::Instant::now();
         info!(
@@ -1152,7 +1201,6 @@ fn build_chat_stream_body(
         "model": model,
         "messages": all_messages,
         "stream": true,
-        "temperature": 0.7,
     })
 }
 
@@ -1765,6 +1813,41 @@ mod tests {
         let resp = parse_chat_completion_response(acc.into_response_json(None, None)).unwrap();
         assert_eq!(resp.content, "Hello world");
         assert!(resp.tool_calls.is_empty());
+    }
+
+    /// OpenAI's own API rejects `max_tokens` for reasoning models and
+    /// deprecated it for the rest, and reasoning models reject any
+    /// `temperature` but the default. Every other OpenAI-compatible server
+    /// (Ollama, LM Studio, vLLM, llama.cpp) keeps `max_tokens`. Checked on
+    /// every OpenAI-flavor body ahma builds.
+    #[test]
+    fn token_limit_and_temperature_follow_the_endpoint_and_model() {
+        let bodies = |c: &LlmClient| -> Vec<Value> {
+            let msgs = [json!({"role": "user", "content": "hi"})];
+            vec![
+                c.build_chat_completion_request_payload(&msgs, &[]).1,
+                c.streaming_tools_body(&msgs, &[]),
+                c.detect_issues_body(&msgs),
+                c.build_chat_stream_request(&[ChatMessage::user("hi")], None)
+                    .1,
+            ]
+        };
+        let reasoning = LlmClient::new("https://api.openai.com/v1", "o3-mini", None);
+        for b in bodies(&reasoning) {
+            assert!(b.get("max_tokens").is_none(), "{b}");
+            assert!(b.get("temperature").is_none(), "{b}");
+        }
+        assert_eq!(bodies(&reasoning)[0]["max_completion_tokens"], json!(8192));
+        let gpt4o = LlmClient::new("https://api.openai.com/v1", "gpt-4o", None);
+        let b = &bodies(&gpt4o)[0];
+        assert!(b.get("max_tokens").is_none(), "{b}");
+        assert_eq!(b["max_completion_tokens"], json!(8192));
+        assert_eq!(b["temperature"], json!(0.2));
+        let local = LlmClient::new("http://localhost:11434/v1", "qwen3:8b", None);
+        let b = &bodies(&local)[0];
+        assert_eq!(b["max_tokens"], json!(8192));
+        assert!(b.get("max_completion_tokens").is_none(), "{b}");
+        assert_eq!(b["temperature"], json!(0.2));
     }
 
     #[test]
