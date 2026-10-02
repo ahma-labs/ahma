@@ -62,7 +62,7 @@ A few deliberate details:
 | Tier | Lives | Use it when |
 |---|---|---|
 | **once** | This command only. Never written down. | You're not sure yet. |
-| **session** | Until ahma restarts. Memory only. | A one-off task. |
+| **session** | Until the session that approved it ends (your MCP server, or the terminal you ran `ahma sandbox grant --session` in), at most 12 hours. Never written to the file; terminal hooks and the edit guard honour it too. | A one-off task. |
 | **always** | `~/.ahma/settings.toml`, until you revoke it. | A cache your builds always need. |
 
 Only **always** touches disk, and only after you've seen the exact file and the
@@ -77,7 +77,12 @@ exact line.
   have no workspace.
 - **Tier**: at a prompt you can answer for this session only (`read-write-session`
   / `read-only-session`, or `[s]` / `[o]` in the TUI): applied now, audited, never
-  written to the file.
+  written to the file. The answer is also recorded for terminal hooks and the edit
+  guard in the same workspace (under ahma's runtime directory, ending with the
+  session or after 12 hours), so a hooked command gets the same session tier an
+  MCP session does. From a terminal, `ahma sandbox grant <dir> --session` does the
+  same for the shell you typed it in. Every tier, session included, passes the
+  denylist below: a session answer on `~/.ssh` is refused, not applied.
 - **Terminal hooks**: on your **next command**. Hooks re-derive the sandbox each
   time, so there's nothing to restart.
 - **The MCP server** (your IDE's connection): when a human approves a request the
@@ -88,6 +93,23 @@ exact line.
   ahma never assumes it asked you before the call. For offline configuration edits
   (`ahma sandbox grant` or `ahma network allow` CLI, or direct `~/.ahma/settings.toml`
   edits), it takes effect on the next server start (or after using the `restart` tool).
+
+## Git authentication (SSH and HTTPS)
+
+The sandbox denies reads of your private keys (`~/.ssh/id_*`) and forwards the SSH
+agent socket instead, so a sandboxed `git fetch` or `git push` over SSH can
+authenticate only through the agent. On the host, ssh reads the key file directly,
+so an **empty agent is invisible until the first sandboxed push** fails with
+`Permission denied (publickey)`. One thing to do: `ssh-add --apple-use-keychain
+~/.ssh/id_ed25519` (macOS) or `ssh-add ~/.ssh/id_ed25519`.
+
+HTTPS is the more common transport and ahma does not block it: the login keychain
+is allowed (`[sandbox] allow_keychain`, on by default), so `osxkeychain` and `gh`
+credential helpers work, and `~/.config/gh` is readable unless you added it to
+`deny_credential_reads`. If a sandboxed push over HTTPS fails with `could not read
+Username` or `Authentication failed`, no helper answered: `gh auth login` then `gh
+auth setup-git` on the host fixes it. `ahma doctor` checks both transports and
+names the exact command or settings key when one cannot work.
 
 ## What ahma will never grant
 
@@ -124,11 +146,17 @@ they give away and turn any of them off:
 ```toml
 # ~/.ahma/settings.toml
 [sandbox]
-profiles = ["rust"]   # only rust; drop node, go, common
+profiles = ["rust"]   # only rust; drop node, go, android, apple, common
 # profiles = []       # nothing — grant every toolchain path explicitly
 ```
 
-Built-in: `rust`, `node`, `go`, `common`. All enabled by default.
+Built-in: `rust`, `node`, `go`, `android`, `apple`, `common`. All enabled by default.
+A profile whose toolchain is not installed grants paths that do not exist, which is
+harmless; `android` (Gradle, Maven, the SDK, Kotlin/Native) and `apple` (Xcode
+DerivedData, SwiftPM and CocoaPods caches, simulators read-only) exist so an iOS or
+Android build does not have to stop and ask a human for five cache directories one
+at a time. Both carry a `cost` line in `ahma permissions list`: like the cargo
+caches, Gradle and SwiftPM *execute* what they find in those shared directories.
 
 Note what the `rust` profile deliberately does **not** do: it never makes
 `~/.cargo/bin`, `~/.cargo/config.toml`, or `~/.cargo/credentials.toml` writable.
@@ -174,7 +202,8 @@ ahma permissions revoke fs-scope ~/cache --yes # revoke (previews without --yes)
 ahma permissions revoke net-host crates.io --yes # revoke network host
 ahma permissions revoke tool cargo_build       # per-workspace tool approval
 
-ahma sandbox grant ~/cache [--read-only]       # kind-scoped shortcut
+ahma sandbox grant ~/cache [--read-only]       # kind-scoped shortcut, bound to this workspace
+ahma sandbox grant ~/cache --session           # this terminal session only; never written to the file
 ahma sandbox list
 ahma sandbox revoke ~/cache
 

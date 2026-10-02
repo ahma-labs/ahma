@@ -86,11 +86,13 @@ impl Sandbox {
         // SPEC R6.2.6: signals stay inside this command's own sandbox unless
         // the user opted out — see `super::signals`.
         let signal_rules = super::signals::seatbelt_signal_rule();
+        // SPEC R6.2.7: the GPU is a capability, denied unless `[sandbox] allow_gpu`.
+        let gpu_rules = super::gpu::seatbelt_gpu_rules();
         let profile = format!(
             r#"(version 1)
 (deny default)
 (allow process*)
-{signal_rules}(allow sysctl-read)
+{signal_rules}{gpu_rules}(allow sysctl-read)
 {system_rules}{git_dir_rules}{credential_deny_rules}{keychain_rules}{profile_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
 {working_dir_write}{temp_rules}(allow file-read* (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))
@@ -104,6 +106,7 @@ impl Sandbox {
             working_dir = wd_str,
             working_dir_write = working_dir_write,
             signal_rules = signal_rules,
+            gpu_rules = gpu_rules,
             system_rules = system_rules,
             credential_deny_rules = credential_deny_rules,
             keychain_rules = keychain_rules,

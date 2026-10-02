@@ -59,6 +59,11 @@ pub enum ContaminationKind {
     /// SSH publickey authentication failed because `~/.ssh/id_*` private keys are
     /// blocked from reading by the sandbox and the key was not loaded into ssh-agent.
     SshPublicKeyAuth,
+    /// HTTPS authentication failed: no credential helper answered inside the
+    /// sandbox (none configured, or the keychain/`gh` helper is blocked by a
+    /// sandbox setting). The more common transport, so it gets the same
+    /// first-class, exact remediation as SSH.
+    HttpsAuth,
 }
 
 /// True for a token that looks like a Rust build artifact path (the things a
@@ -87,6 +92,15 @@ fn looks_like_build_script_copy(line: &str) -> bool {
         || line.contains("during build setup")
 }
 
+fn looks_like_https_auth_failure(line: &str) -> bool {
+    line.contains("could not read Username for 'https://")
+        || line.contains("could not read Password for 'https://")
+        || line.contains("Authentication failed for 'https://")
+        || line.contains("Invalid username or token")
+        || line.contains("Password authentication is not supported")
+        || line.contains("Support for password authentication was removed")
+}
+
 fn looks_like_ssh_publickey_failure(line: &str) -> bool {
     line.contains("Permission denied (publickey)")
         || (line.contains("fatal: Could not read from remote repository")
@@ -110,6 +124,12 @@ pub fn diagnose_streams(stderr: &str, stdout: &str) -> Option<ContaminationHint>
             return Some(ContaminationHint {
                 kind: ContaminationKind::SshPublicKeyAuth,
                 remediation: SSH_PUBLICKEY_REMEDIATION.to_string(),
+            });
+        }
+        if looks_like_https_auth_failure(line) {
+            return Some(ContaminationHint {
+                kind: ContaminationKind::HttpsAuth,
+                remediation: HTTPS_AUTH_REMEDIATION.to_string(),
             });
         }
     }
@@ -174,6 +194,14 @@ provenance-stamped source file. It is most common when a host sandbox (Cursor/VS
 Fix: re-run the build with the host's full-permission/unsandboxed approval, run the build \
 through ahma's own sandbox (its terminal hook or `run_terminal_command`, which keeps the build \
 inside the workspace), or clear the redirected build cache and rebuild.";
+
+const HTTPS_AUTH_REMEDIATION: &str = "Git over HTTPS could not authenticate inside the sandbox. \
+ahma does not block HTTPS credential helpers: the login keychain is allowed (unless `[sandbox] \
+allow_keychain = false`) and `~/.config/gh` is readable (unless listed in `deny_credential_reads`). \
+One thing for the human to do, on the host: `gh auth login` then `gh auth setup-git` (or `git config \
+--global credential.helper osxkeychain` on macOS) so a helper the sandbox can reach holds the token; \
+`ahma doctor` reports which helper git uses (`git config --get-all credential.helper`) and whether a \
+sandbox setting blocks it.";
 
 const SSH_PUBLICKEY_REMEDIATION: &str = "SSH authentication failed (`Permission denied (publickey)`). \
 Ahma's sandbox secures private keys in `~/.ssh/` from direct file reads, but forwards `$SSH_AUTH_SOCK`. \
@@ -312,5 +340,46 @@ mod tests {
         assert_eq!(hit.kind, ContaminationKind::SshPublicKeyAuth);
         assert!(hit.remediation.contains("ssh-add"));
         assert!(hit.remediation.contains("SSH_AUTH_SOCK"));
+    }
+}
+
+#[cfg(test)]
+mod https_auth_tests {
+    use super::*;
+
+    /// HTTPS is the more common git transport; its failure inside the sandbox
+    /// has to come with the exact fix, not a generic "credentials".
+    #[test]
+    fn https_auth_failure_is_diagnosed_with_exact_fix() {
+        let stderr =
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled";
+        let hit = diagnose(stderr).expect("https auth failure should match");
+        assert_eq!(hit.kind, ContaminationKind::HttpsAuth);
+        assert!(
+            hit.remediation.contains("gh auth login"),
+            "{}",
+            hit.remediation
+        );
+        assert!(
+            hit.remediation.contains("credential.helper"),
+            "{}",
+            hit.remediation
+        );
+        assert!(
+            hit.remediation.contains("allow_keychain"),
+            "names the one sandbox setting that can block a keychain helper: {}",
+            hit.remediation
+        );
+        for line in [
+            "remote: Invalid username or token. Password authentication is not supported for Git operations.",
+            "fatal: Authentication failed for 'https://github.com/x/y.git/'",
+        ] {
+            assert_eq!(
+                diagnose(line).map(|h| h.kind),
+                Some(ContaminationKind::HttpsAuth),
+                "{line}"
+            );
+        }
+        assert!(diagnose("fatal: repository 'https://x/y' not found").is_none());
     }
 }

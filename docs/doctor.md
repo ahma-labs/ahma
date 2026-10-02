@@ -53,6 +53,8 @@ Example report:
 | Whether this folder is trusted, and what is always allowed here | info | none — `/settings trust` |
 | Log size, and the most repeated warnings in the newest log | info / warn | none |
 | Antigravity permission grants (`~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/config.json`) | warn / info | prune bloated one-off/malformed entries and install clean prefix token grants |
+| Git authentication from inside the sandbox: SSH agent holds a key; HTTPS credential helper not blocked by a sandbox setting | warn / info | none — the finding names the exact `ssh-add` command or settings key |
+| Sandbox profiles in effect and the GPU capability (`[sandbox] allow_gpu`) are shown on every scope surface | info | none |
 
 Every applied fix is written through the same strict read-modify-write the
 rest of ahma uses (it will not rewrite a file it cannot parse) and appended to

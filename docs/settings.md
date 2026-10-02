@@ -83,6 +83,7 @@ Run `ahma settings init` to generate this file automatically.
 # ── Sandbox & filesystem security ────────────────────────────────────────────
 # [sandbox]
 # tmp_access   = false    # add system temp dir to sandbox scope
+# allow_gpu    = false    # macOS: let sandboxed commands open the GPU (Metal); a capability, not a path (R6.2.7)
 # disable_temp = false    # block all access to system temp dir (overrides tmp_access)
 # defer        = false    # defer sandbox lock until client provides roots/list
 # allow_git_hooks = false           # let tools write <git dir>/hooks/** (default: denied)
@@ -232,7 +233,7 @@ sandbox.disable                               = false  # default
 Three `[sandbox]` keys are worth knowing:
 
 - **`profiles`** — the shipped toolchain carve-outs (`rust`, `node`, `go`,
-  `common`). These used to be hard-coded in the sandbox backends, invisible and
+  `android`, `apple`, `common`). These used to be hard-coded in the sandbox backends, invisible and
   un-refusable; they are now data you can inspect and disable. Set to `[]` to
   enable none of them.
 - **`package_cache_write`** (default `true`) — whether package-manager caches

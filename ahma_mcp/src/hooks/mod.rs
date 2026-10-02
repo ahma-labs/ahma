@@ -1493,7 +1493,15 @@ pub fn resolve_hook_sandbox_scopes(cwd: &Path) -> Vec<PathBuf> {
 
 async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     let payload = args.resolve_payload()?;
-    let hook_scopes = resolve_hook_sandbox_scopes(Path::new(&payload.cwd));
+    let mut hook_scopes = resolve_hook_sandbox_scopes(Path::new(&payload.cwd));
+    // Session-tier grants a human approved at the TUI or a harness prompt apply
+    // to hooked commands in the same workspace (SPEC R-PERM.4.4); they arrive as
+    // workspace-bound persistent records so the same filter applies.
+    let mut persistent_scopes = cfg.persistent_scopes.clone();
+    persistent_scopes.extend(crate::sandbox::session_scopes_for(&hook_scopes));
+    // SPEC R5.5.7: the harness's own working set (Claude Code plan files, its
+    // per-session scratchpad) is writable without a grant.
+    hook_scopes.extend(edit_guard::harness_owned_dirs_for_this_user());
     std::env::set_current_dir(&payload.cwd)
         .with_context(|| format!("Failed to change directory to {}", payload.cwd))?;
 
@@ -1505,6 +1513,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // or worktree root, plus cwd). This ensures intra-repo builds, target dirs,
         // and shared worktree dependencies do not hit false sandbox denials (SPEC R5.2.1).
         sandbox_scopes: hook_scopes,
+        persistent_scopes,
         use_scratch_dir: false,
         ..cfg
     };
@@ -1751,14 +1760,12 @@ fn report_shell_execution_error(e: anyhow::Error) -> Result<()> {
     let Some(remediation) = remediation else {
         return Err(e);
     };
-    // The grant applies to the **next command**: each hooked command spawns a
-    // fresh `ahma hooks run-shell` that re-reads the ledger, so there is no
-    // server to restart. Say so — it is the difference between "fix this
-    // later" and "fix this now".
-    let msg = format!(
-        "{e}\n\n{remediation}\n\nThe grant takes effect on your next command \
-         — terminal hooks re-read it each time, so nothing needs restarting."
-    );
+    // One statement of when a grant applies, computed for *this* surface: each
+    // hooked command spawns a fresh `ahma hooks run-shell` that re-reads the
+    // ledger, so there is no server to restart. The CLI text must not also
+    // say "next server start" here — two answers to "do I need to do
+    // anything?" in one message is what confused the owner.
+    let msg = format!("{e}\n\n{remediation}");
     eprintln!("{msg}");
     Err(anyhow!("{msg}"))
 }

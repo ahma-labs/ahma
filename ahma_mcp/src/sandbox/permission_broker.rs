@@ -382,10 +382,29 @@ impl PermissionBroker {
                         "Scope granted for this session only (not written to settings)."
                     );
                 }
-                // R5.4.6: a human-approved grant takes effect in the live session.
+                // R5.4.6: a human-approved grant takes effect in the live session —
+                // after the live gate (R-PERM.4.3), which is the only denylist the
+                // `session` tier ever meets.
                 if let Some(sb) = sandbox {
-                    sb.add_live_grant(&path, access);
-                    crate::hub_reporter::publish_committed_scope(&sb);
+                    match sb.add_live_grant(&path, access) {
+                        Ok(()) => {
+                            crate::hub_reporter::publish_committed_scope(&sb);
+                            if !tier.is_persistent() {
+                                // R-PERM.4.4: a session answer reaches hooked commands too.
+                                crate::sandbox::record_session_grant(
+                                    &path,
+                                    access,
+                                    workspace.as_deref(),
+                                    std::process::id(),
+                                    "harness",
+                                );
+                            }
+                        }
+                        Err(why) => tracing::warn!(
+                            path = %path.display(),
+                            "approved grant not applied: {why}"
+                        ),
+                    }
                 }
             }
             GrantResolveOutcome::Denied { path } => {

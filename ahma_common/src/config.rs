@@ -1147,6 +1147,14 @@ pub struct SandboxSettings {
     /// build. Turn on only for a workflow that genuinely has to stop a
     /// pre-existing server. Default: `false`
     pub signal_other_processes: bool,
+    /// macOS: let sandboxed commands open the GPU (Metal). Off by default (SPEC
+    /// R6.2.7): the Seatbelt profile grants no `iokit-open`, so Metal cannot
+    /// create a device inside the sandbox and GPU work falls back to the CPU or
+    /// fails (`failed to create command queue`). Turning it on adds only the
+    /// Metal user-client classes Apple's own profiles use, never a blanket IOKit
+    /// allow. A capability, not a path: it cannot be granted at a prompt.
+    /// Default: `false`
+    pub allow_gpu: bool,
     /// macOS only. Additional credential directories whose **reads** are denied
     /// to sandboxed tools, on top of the built-in default set (`~/.ahma`,
     /// `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.kube`, `~/.docker`,
@@ -1229,6 +1237,8 @@ fn default_sandbox_profiles() -> Vec<String> {
         "rust".to_string(),
         "node".to_string(),
         "go".to_string(),
+        "android".to_string(),
+        "apple".to_string(),
         "common".to_string(),
     ]
 }
@@ -1290,6 +1300,7 @@ impl Default for SandboxSettings {
             env_allow: Vec::new(),
             allow_keychain: true,
             signal_other_processes: false,
+            allow_gpu: false,
             deny_credential_reads: Vec::new(),
             allow_credential_reads: Vec::new(),
             profiles: default_sandbox_profiles(),
@@ -2247,6 +2258,12 @@ impl AhmaSettings {
             d.sandbox.signal_other_processes.to_string(),
         );
         w.setting(
+            "macOS: let sandboxed commands open the GPU (Metal). Off = GPU work falls back to the CPU; a capability, not a path, so no prompt can grant it (SPEC R6.2.7).",
+            "allow_gpu",
+            self.sandbox.allow_gpu.to_string(),
+            d.sandbox.allow_gpu.to_string(),
+        );
+        w.setting(
             "macOS: extra credential dirs to deny reads (on top of the built-in default set; e.g. ~/.ssh to harden further).",
             "deny_credential_reads",
             toml_path_list(&self.sandbox.deny_credential_reads),
@@ -2999,6 +3016,7 @@ mod tests {
                 env_allow: vec!["GITHUB_TOKEN".into()],
                 allow_keychain: false,
                 signal_other_processes: true,
+                allow_gpu: false,
                 deny_credential_reads: vec![PathBuf::from("~/.ssh")],
                 allow_credential_reads: vec![PathBuf::from("~/.aws")],
                 profiles: vec!["rust".into()],

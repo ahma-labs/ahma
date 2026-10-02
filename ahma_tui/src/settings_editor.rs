@@ -637,6 +637,14 @@ impl SettingsEditor {
                 security_tier: true,
             },
             SettingItem {
+                key: "sandbox.allow_gpu",
+                label: "Allow GPU (Metal)",
+                description: "macOS: let sandboxed commands open the GPU; off = GPU work falls back to CPU (a capability, not a path)",
+                value: SettingValue::Bool(s.allow_gpu),
+                default_value: SettingValue::Bool(d.allow_gpu),
+                security_tier: true,
+            },
+            SettingItem {
                 key: "sandbox.allow_git_hooks",
                 label: "Allow git hooks",
                 description: "Let tools write <git dir>/hooks/**; a hook runs OUTSIDE the sandbox",
@@ -950,8 +958,9 @@ impl SettingsEditor {
             3 => s.defer = *v,
             4 => s.package_cache_write = *v,
             5 => s.allow_keychain = *v,
-            6 => s.allow_git_hooks = *v,
-            7 => s.allow_project_tool_config = *v,
+            6 => s.allow_gpu = *v,
+            7 => s.allow_git_hooks = *v,
+            8 => s.allow_project_tool_config = *v,
             _ => {}
         }
     }
@@ -1461,7 +1470,7 @@ mod tests {
         assert_eq!(editor.items_for_category(SettingsCategory::Tools).len(), 5);
         assert_eq!(
             editor.items_for_category(SettingsCategory::Sandbox).len(),
-            8
+            9
         );
         assert_eq!(
             editor.items_for_category(SettingsCategory::Logging).len(),
@@ -1578,6 +1587,7 @@ mod tests {
         // The two trust-handoff hatches are default-off, so "changed" is `true`.
         e.apply_sandbox(6, &SettingValue::Bool(true));
         e.apply_sandbox(7, &SettingValue::Bool(true));
+        e.apply_sandbox(8, &SettingValue::Bool(true));
         let s = &e.settings().sandbox;
         assert!(s.disable);
         assert!(s.tmp_access);
@@ -1585,6 +1595,7 @@ mod tests {
         assert!(s.defer);
         assert!(!s.package_cache_write);
         assert!(!s.allow_keychain);
+        assert!(s.allow_gpu);
         assert!(s.allow_git_hooks);
         assert!(s.allow_project_tool_config);
         // Non-bool early return guard.

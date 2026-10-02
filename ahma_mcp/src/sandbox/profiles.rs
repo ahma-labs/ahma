@@ -218,6 +218,8 @@ pub fn builtin_profiles() -> &'static [SandboxProfile] {
             include_str!("../../profiles/rust.toml"),
             include_str!("../../profiles/node.toml"),
             include_str!("../../profiles/go.toml"),
+            include_str!("../../profiles/android.toml"),
+            include_str!("../../profiles/apple.toml"),
             include_str!("../../profiles/common.toml"),
         ];
         SOURCES
@@ -515,6 +517,15 @@ pub fn platform_enforcement() -> PlatformEnforcement {
              (a platform limitation — APFS firmlinks defeat read subpath matching). Treat \
              any file this user can read as readable by a sandboxed command.",
         );
+        if !super::gpu::allow_gpu_enabled() {
+            // R6.2.7: a capability the profile withholds, disclosed so a CPU
+            // fallback or a `failed to create command queue` is not a mystery.
+            notes.push(
+                "macOS: the GPU is not reachable from sandboxed commands (Metal cannot open a \
+                 device), so GPU work falls back to the CPU or fails. `[sandbox] allow_gpu = \
+                 true` enables it; no prompt can grant it.",
+            );
+        }
     }
 
     if cfg!(target_os = "windows") {
@@ -574,8 +585,8 @@ mod tests {
         let profiles = builtin_profiles();
         assert_eq!(
             profiles.len(),
-            4,
-            "all four shipped profiles parse: {:?}",
+            6,
+            "all six shipped profiles parse: {:?}",
             profiles.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
         for p in profiles {
@@ -775,6 +786,9 @@ mod tests {
         assert!(of("rust").contains(&"static.crates.io".to_string()));
         assert!(of("node").contains(&"registry.npmjs.org".to_string()));
         assert!(of("go").contains(&"proxy.golang.org".to_string()));
+        assert!(of("android").contains(&"services.gradle.org".to_string()));
+        assert!(of("android").contains(&"dl.google.com".to_string()));
+        assert!(of("apple").contains(&"cdn.cocoapods.org".to_string()));
         assert!(
             of("common").is_empty(),
             "a shared cache directory is not an ecosystem and reaches nothing of its own; \

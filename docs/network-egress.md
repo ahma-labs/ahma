@@ -43,7 +43,7 @@ people fall back to permits everything.
 ## The mechanism: profiles already solved this for paths
 
 A [sandbox profile](permissions.md) is a pre-answered bundle of grant questions.
-`rust`, `node`, `go` and `common` each declare the filesystem paths their
+`rust`, `node`, `go`, `android`, `apple` and `common` each declare the filesystem paths their
 toolchain needs, ship enabled by default, and are refusable individually through
 `[sandbox] profiles`.
 
@@ -221,7 +221,7 @@ removing `go` from `[sandbox] profiles` would answer a different — usually wro
 
 ```toml
 [sandbox]
-profiles = ["rust", "node", "go", "common"]
+profiles = ["rust", "node", "go", "android", "apple", "common"]
 
 [network]
 restrict = true

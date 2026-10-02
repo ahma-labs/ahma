@@ -1858,6 +1858,9 @@ pub enum SandboxCommand {
         /// Apply this grant to every workspace on this machine. Rarely right: a grant made for one project then reaches every other project's agent.
         #[arg(long = "global")]
         global: bool,
+        /// Grant for this terminal session only: nothing is written to settings.toml. Terminal hooks and the edit guard honour it in the workspace until the shell you ran this in exits (at most 12 hours). Use it for a one-off task; omit it for a cache your builds always need.
+        #[arg(long = "session", conflicts_with = "global")]
+        session: bool,
         /// Record what asked for this scope (e.g. a tool name), for auditing.
         #[arg(long = "by", value_name = "WHO")]
         by: Option<String>,
@@ -3008,6 +3011,14 @@ fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::
     // SPEC R6.2.6: signals stay inside the command's own sandbox unless the
     // user opted out in settings.
     sandbox::set_signal_other_processes(s.sandbox.signal_other_processes);
+    // SPEC R6.2.7: the GPU is denied unless the user opted in; say so at startup
+    // because the failure mode downstream is a silent CPU fallback.
+    sandbox::set_allow_gpu(s.sandbox.allow_gpu);
+    if cfg!(target_os = "macos") && s.sandbox.allow_gpu {
+        tracing::info!(
+            "[sandbox] allow_gpu=true: sandboxed commands may open the GPU (Metal user clients)"
+        );
+    }
     if cfg!(target_os = "macos") && s.sandbox.signal_other_processes {
         tracing::warn!(
             "[sandbox] signal_other_processes=true: sandboxed commands may kill processes \
