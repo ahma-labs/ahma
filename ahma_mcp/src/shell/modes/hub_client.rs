@@ -202,9 +202,7 @@ pub(crate) fn hub_command(
     // and log dir — every session's logs landed in one checkout, and that
     // checkout's `.ahma/` became the trusted tool set of every other project
     // (SPEC R-HUB.12). Start it somewhere neutral.
-    if let Some(dir) = ahma_common::hub::runtime_dir() {
-        cmd.current_dir(dir);
-    }
+    cmd.current_dir(hub_working_dir(ahma_common::hub::runtime_dir().as_deref()));
     // The one socket (SPEC R-HUB.2): the MCP endpoint, the event stream and
     // the lock beside it all follow from this path.
     cmd.args(["--unix-socket-path", socket_path]);
@@ -249,6 +247,41 @@ pub(crate) fn may_spawn_hub_from(exe: &Path) -> bool {
         || exe.file_stem().is_some_and(|stem| stem == "ahma")
 }
 
+/// A hub started from inside a sandbox inherits it for life and then serves
+/// every session on the machine confined to one checkout — the exact shape
+/// `ahma doctor` hunts for (SPEC R-DOCTOR.7, R-HUB.12). A confined process
+/// therefore never starts one; it serves its own session in-process instead.
+pub(crate) fn may_spawn_hub_here() -> Result<()> {
+    if crate::sandbox::process_is_seatbelt_confined() {
+        anyhow::bail!(
+            "refusing to start the shared ahma hub from inside a sandbox: it would serve every \
+             session on this machine confined to this one. Serving this session in-process; a hub \
+             starts from the next unsandboxed ahma."
+        );
+    }
+    Ok(())
+}
+
+/// Where a hub starts (SPEC R-HUB.12): the runtime directory when this process
+/// can enter it, else the temp directory. Inside a sandbox `~/.ahma` is
+/// unreadable by design (R5.4.8), and a spawn whose working directory cannot
+/// be entered fails with a bare `No such file or directory` that reads as a
+/// missing binary; a neutral directory it *can* enter keeps the hub out of
+/// any checkout just as well.
+pub(crate) fn hub_working_dir(runtime: Option<&std::path::Path>) -> std::path::PathBuf {
+    if let Some(dir) = runtime
+        && std::fs::read_dir(dir).is_ok()
+    {
+        return dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    }
+    let tmp = std::env::temp_dir();
+    tracing::debug!(
+        "ahma hub: runtime directory not enterable from here; starting the hub in {}",
+        tmp.display()
+    );
+    dunce::canonicalize(&tmp).unwrap_or(tmp)
+}
+
 /// Start the hub, detached, and wait until it answers on its socket.
 async fn spawn_hub(socket_path: &str, idle_timeout_secs: Option<u64>) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
@@ -259,6 +292,7 @@ async fn spawn_hub(socket_path: &str, idle_timeout_secs: Option<u64>) -> Result<
             exe.display()
         );
     }
+    may_spawn_hub_here()?;
     hub_command(&exe, socket_path, idle_timeout_secs)
         .spawn()
         .context("Failed to spawn the ahma hub")?;
@@ -439,5 +473,33 @@ mod tests {
             msg.contains("not replaced"),
             "the message must say what did NOT happen to other sessions: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod working_dir_tests {
+    use super::*;
+
+    /// Inside a sandbox `~/.ahma` is unreadable (R5.4.8), and a spawn whose
+    /// working directory cannot be entered fails with a bare ENOENT. The hub
+    /// then starts somewhere neutral it *can* enter, and says so.
+    #[test]
+    fn hub_working_dir_falls_back_when_the_runtime_dir_cannot_be_entered() {
+        let td = tempfile::tempdir().unwrap();
+        let readable = td.path().join("run");
+        std::fs::create_dir_all(&readable).unwrap();
+        assert_eq!(
+            hub_working_dir(Some(&readable)),
+            dunce::canonicalize(&readable).unwrap_or(readable.clone())
+        );
+        let missing = td.path().join("gone");
+        let fallback = hub_working_dir(Some(&missing));
+        assert_ne!(fallback, missing, "a missing dir is never chosen");
+        assert!(
+            fallback.is_dir(),
+            "the fallback exists: {}",
+            fallback.display()
+        );
+        assert!(hub_working_dir(None).is_dir());
     }
 }

@@ -78,6 +78,134 @@ fn outer_write_blocked() -> bool {
     false
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Daemons left behind inside a sandbox (SPEC R-DOCTOR.7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether `pid` runs inside a Seatbelt sandbox, asked of the kernel. Any
+/// pid may be asked; a daemon a sandboxed command left behind inherits the
+/// command's profile and answers `true` for the rest of its life.
+#[cfg(target_os = "macos")]
+pub fn pid_is_seatbelt_confined(pid: u32) -> bool {
+    const SANDBOX_CHECK_NO_REPORT: libc::c_int = 0x0002;
+    unsafe extern "C" {
+        fn sandbox_check(
+            pid: libc::pid_t,
+            operation: *const libc::c_char,
+            type_: libc::c_int,
+            ...
+        ) -> libc::c_int;
+    }
+    // SAFETY: a NULL operation only asks whether the pid is sandboxed at all.
+    unsafe {
+        sandbox_check(
+            pid as libc::pid_t,
+            std::ptr::null(),
+            SANDBOX_CHECK_NO_REPORT,
+        ) == 1
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn pid_is_seatbelt_confined(_pid: u32) -> bool {
+    false
+}
+
+/// Long-lived helpers running *inside* a sandbox that no longer has a parent:
+/// a build daemon (sccache, a Gradle or Kotlin daemon) started by a sandboxed
+/// command, reparented to launchd when that command ended, serving every
+/// session on the machine but able to write only the checkout it was born
+/// in. The rule is structural, not a list of programs: confined, orphaned,
+/// and the user's own executable (under `$HOME`, so an App-Sandboxed Apple
+/// application or a system helper never matches).
+pub fn confined_daemons() -> Vec<ahma_common::doctor::ConfinedDaemon> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let Some(home) = ahma_common::config::ahma_home_dir() else {
+        return Vec::new();
+    };
+    let home = dunce::canonicalize(&home).unwrap_or(home);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_user(UpdateKind::OnlyIfNotSet),
+    );
+    let me = std::process::id();
+    let mut out: Vec<ahma_common::doctor::ConfinedDaemon> = sys
+        .processes()
+        .iter()
+        .filter_map(|(pid, p)| {
+            let pid = pid.as_u32();
+            if pid == me || p.parent().map(|pp| pp.as_u32()) != Some(1) {
+                return None;
+            }
+            let exe = p.exe()?;
+            if !exe.starts_with(&home) || exe.starts_with(home.join("Applications")) {
+                return None;
+            }
+            let name = exe.file_name()?.to_string_lossy().into_owned();
+            if name.starts_with("ahma") {
+                return None;
+            }
+            if !pid_is_seatbelt_confined(pid) {
+                return None;
+            }
+            Some(ahma_common::doctor::ConfinedDaemon {
+                name,
+                pid,
+                confined_to: None,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.pid.cmp(&b.pid)));
+    out
+}
+
+/// At startup of an *unconfined* ahma process: if a confined sccache server is
+/// serving this machine, restart it so no checkout's build fails on it. Only
+/// sccache, whose `--stop-server`/`--start-server` protocol is known; other
+/// confined daemons are reported by `ahma doctor`, not touched.
+pub fn restart_confined_sccache_if_any() {
+    if super::prerequisites::process_is_seatbelt_confined() {
+        return;
+    }
+    let confined: Vec<_> = confined_daemons()
+        .into_iter()
+        .filter(|d| d.name == "sccache")
+        .collect();
+    if confined.is_empty() {
+        return;
+    }
+    let pids: Vec<String> = confined.iter().map(|d| d.pid.to_string()).collect();
+    tracing::warn!(
+        "a sccache server (pid {}) is running inside a sandbox and can write only the checkout \
+         it was started in; restarting it unconfined so every checkout's build works",
+        pids.join(", ")
+    );
+    let _ = std::process::Command::new("sccache")
+        .arg("--stop-server")
+        .output();
+    match std::process::Command::new("sccache")
+        .arg("--start-server")
+        .env("SCCACHE_IDLE_TIMEOUT", "0")
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            tracing::info!("sccache server restarted outside the sandbox")
+        }
+        Ok(o) => tracing::warn!(
+            "sccache --start-server failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("could not run sccache: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::host_detect::HostSandbox;

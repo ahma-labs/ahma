@@ -93,6 +93,7 @@ impl Sandbox {
 (deny default)
 (allow process*)
 {signal_rules}{gpu_rules}(allow sysctl-read)
+(allow process-info*)
 {system_rules}{git_dir_rules}{credential_deny_rules}{keychain_rules}{profile_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
 {working_dir_write}{temp_rules}(allow file-read* (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))

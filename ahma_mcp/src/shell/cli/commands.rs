@@ -1913,8 +1913,12 @@ pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
         Some(p) => p,
         None => std::env::current_dir().context("cannot read the current directory")?,
     };
-    let findings =
-        ahma_common::doctor::run(&ahma_common::doctor::DoctorInput::for_workspace(&workspace));
+    let findings = ahma_common::doctor::run(&{
+        let mut input = ahma_common::doctor::DoctorInput::for_workspace(&workspace);
+        // SPEC R-DOCTOR.7: build daemons left running inside a sandbox.
+        input.confined_daemons = crate::sandbox::confinement::confined_daemons();
+        input
+    });
     print!("{}", ahma_common::doctor::render(&findings));
     let fixes = ahma_common::doctor::fixes(&findings);
     if fixes.is_empty() {
@@ -1948,6 +1952,126 @@ pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
         } else {
             println!("Skipped.");
         }
+    }
+    Ok(())
+}
+
+/// `ahma queue`: who holds each workspace's write lease (SPEC R2.7.9). The
+/// first line answers whether anything is blocked at all.
+pub(crate) fn run_queue_command() -> Result<()> {
+    let Some(lock_dir) = crate::adapter::workspace_queue::default_lock_dir() else {
+        anyhow::bail!("cannot locate ahma's runtime directory");
+    };
+    let holders = crate::adapter::workspace_queue::list_holders(
+        &lock_dir,
+        &crate::sandbox::session_tier::pid_alive,
+    );
+    let live: Vec<_> = holders.iter().filter(|h| h.alive).collect();
+    if live.is_empty() {
+        println!("Nothing more to do: no workspace is held; writers run as soon as they are sent.");
+    } else {
+        println!(
+            "Blocked until {} finish{}: every writer in {} workspace{} waits behind them. Readers \
+             (git status, grep, ps, …) run at once.",
+            live.len(),
+            if live.len() == 1 { "es" } else { "" },
+            live.len(),
+            if live.len() == 1 { "" } else { "s" }
+        );
+    }
+    let now = ahma_common::session_grants::now_secs();
+    for h in &holders {
+        let age = now.saturating_sub(h.holder.since_unix);
+        println!(
+            "  {} {:>5}s  pid {:<7} {}  ({})",
+            if h.alive { "LIVE " } else { "dead " },
+            age,
+            h.holder.pid,
+            h.holder.title,
+            h.holder.op_id
+        );
+    }
+    if !live.is_empty() {
+        println!();
+        println!(
+            "To stop one: open `ahma tui`, select it and cancel, or call the `cancel` tool from \
+             the session that started it. A holder is the ahma process running the command; \
+             killing it ends that whole session."
+        );
+    }
+    if holders.iter().any(|h| !h.alive) {
+        println!(
+            "A dead holder released its OS lock when it died; its record is listed so you can \
+             see what was running, and it blocks nothing."
+        );
+    }
+    Ok(())
+}
+
+/// `ahma ps`: the process list a sandboxed agent cannot get from `/bin/ps`,
+/// which is setuid and therefore unexecutable under any sandbox (SPEC R6.2.8).
+/// Marks processes that are themselves sandboxed, which is how a confined
+/// build daemon (SPEC R-DOCTOR.7) shows up at a glance.
+pub(crate) fn run_ps_command(filter: Option<&str>) -> Result<()> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_exe(UpdateKind::OnlyIfNotSet),
+    );
+    let mut rows: Vec<(u32, u32, u64, bool, String)> = sys
+        .processes()
+        .iter()
+        .map(|(pid, p)| {
+            let cmd: Vec<String> = p
+                .cmd()
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            let line = if cmd.is_empty() {
+                p.name().to_string_lossy().into_owned()
+            } else {
+                cmd.join(" ")
+            };
+            (
+                pid.as_u32(),
+                p.parent().map(|pp| pp.as_u32()).unwrap_or(0),
+                p.start_time(),
+                crate::sandbox::confinement::pid_is_seatbelt_confined(pid.as_u32()),
+                line,
+            )
+        })
+        .filter(|(_, _, _, _, line)| filter.is_none_or(|f| line.contains(f)))
+        .collect();
+    rows.sort_by_key(|r| r.0);
+    println!(
+        "{:>7} {:>7} {:>8} {:<9} COMMAND",
+        "PID", "PPID", "STARTED", "SANDBOX"
+    );
+    let now = ahma_common::session_grants::now_secs();
+    for (pid, ppid, started, confined, line) in &rows {
+        let age = now.saturating_sub(*started);
+        let started = if age < 3_600 {
+            format!("{}m ago", age / 60)
+        } else if age < 86_400 {
+            format!("{}h ago", age / 3_600)
+        } else {
+            format!("{}d ago", age / 86_400)
+        };
+        let shown: String = line.chars().take(160).collect();
+        println!(
+            "{pid:>7} {ppid:>7} {started:>8} {:<9} {shown}",
+            if *confined { "confined" } else { "-" }
+        );
+    }
+    if rows.is_empty() {
+        println!(
+            "Nothing matched{}.",
+            filter.map(|f| format!(" '{f}'")).unwrap_or_default()
+        );
     }
     Ok(())
 }

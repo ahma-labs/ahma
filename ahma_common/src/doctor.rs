@@ -67,6 +67,14 @@ pub enum Fix {
         ide_mcp: Option<PathBuf>,
         clean_grants: Vec<String>,
     },
+    /// Restart a build daemon that is running inside a sandbox, from a process
+    /// that is not (SPEC R-DOCTOR.7). Refused when the doctor itself is
+    /// confined: the restarted daemon would inherit that sandbox too.
+    RestartDaemon { name: String },
+    /// Stop a confined helper that has no restart protocol of its own (a
+    /// Gradle or Kotlin daemon, …): the next build starts a fresh, unconfined
+    /// one. Only ever offered, never applied without the user's `y`.
+    StopProcess { name: String, pid: u32 },
 }
 
 impl Fix {
@@ -83,6 +91,14 @@ impl Fix {
                 paths.len(),
                 join_paths(paths)
             ),
+            Fix::RestartDaemon { name } => format!(
+                "Restart the {name} server from this (unsandboxed) process: `{name} --stop-server` \
+                 then `{name} --start-server`"
+            ),
+            Fix::StopProcess { name, pid } => format!(
+                "Stop the sandboxed {name} daemon (pid {pid}) so the next build starts a fresh one \
+                 outside any sandbox"
+            ),
             Fix::RepairAntigravityPermissions { .. } => {
                 "Clean up bloated one-off and malformed grants in ~/.gemini configs, and repair Antigravity MCP settings".to_string()
             }
@@ -96,6 +112,8 @@ impl Fix {
         match self {
             Fix::RemoveMissingScopes(paths) => apply_remove_missing_scopes(paths, now),
             Fix::ForgetMissingWorkspaces(paths) => apply_forget_missing_workspaces(paths, now),
+            Fix::RestartDaemon { name } => apply_restart_daemon(name),
+            Fix::StopProcess { name, pid } => apply_stop_process(name, *pid),
             Fix::RepairAntigravityPermissions {
                 cli_settings,
                 config_file,
@@ -213,6 +231,23 @@ pub struct DoctorInput {
     /// How git can authenticate from inside the sandbox (SSH agent, HTTPS
     /// credential helpers). `None` skips the check (tests, no git on PATH).
     pub git_auth: Option<GitAuthProbe>,
+    /// Build daemons found running *inside* a sandbox (SPEC R-DOCTOR.7).
+    /// Collected by the caller, which has the platform probe; empty when none
+    /// were found or the platform cannot tell.
+    pub confined_daemons: Vec<ConfinedDaemon>,
+}
+
+/// A long-lived build helper (sccache above all) that was started from inside
+/// a session's sandbox and therefore inherited it: it serves every session on
+/// the machine but can write only the checkout it was started in, so every
+/// other checkout's build fails with a bare `Operation not permitted`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfinedDaemon {
+    /// The program name (`sccache`).
+    pub name: String,
+    pub pid: u32,
+    /// The checkout it can still write, when the probe could tell.
+    pub confined_to: Option<PathBuf>,
 }
 
 impl DoctorInput {
@@ -231,6 +266,7 @@ impl DoctorInput {
             git_auth: Some(GitAuthProbe::collect(
                 crate::config::ahma_home_dir().as_deref(),
             )),
+            confined_daemons: Vec::new(),
         }
     }
 }
@@ -264,6 +300,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
         };
         check_git_auth(probe, settings, &mut findings);
     }
+    check_confined_daemons(&input.confined_daemons, &mut findings);
     check_logs(&input.workspace, &mut findings);
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
     findings
@@ -1118,6 +1155,7 @@ mod tests {
             version: "1".into(),
             build_id: "b".into(),
             git_auth: None,
+            confined_daemons: Vec::new(),
         }
     }
 
@@ -1458,6 +1496,7 @@ mod hook_and_grant_tool_tests {
             version: "1".into(),
             build_id: "b".into(),
             git_auth: None,
+            confined_daemons: Vec::new(),
         }
     }
 
@@ -1849,4 +1888,223 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
             fix: None,
         });
     }
+}
+
+#[cfg(test)]
+mod confined_daemon_tests {
+    use super::*;
+
+    /// A build daemon that was started inside a session's sandbox serves every
+    /// session on the machine but can write only that session's checkout.
+    /// The doctor names it and the exact restart (SPEC R-DOCTOR.7).
+    #[test]
+    fn a_confined_sccache_server_is_reported_with_the_restart_command() {
+        let mut out = Vec::new();
+        check_confined_daemons(
+            &[ConfinedDaemon {
+                name: "sccache".into(),
+                pid: 4242,
+                confined_to: Some(PathBuf::from("/Users/me/github/alt4/neubit4")),
+            }],
+            &mut out,
+        );
+        let f = out.first().expect("a finding");
+        assert_eq!(f.level, Level::Warn);
+        assert!(f.title.contains("sccache"), "{}", f.title);
+        assert!(
+            f.detail.starts_with(
+                "One thing to do: run `sccache --stop-server && sccache --start-server`"
+            ),
+            "{}",
+            f.detail
+        );
+        assert!(f.detail.contains("4242"), "{}", f.detail);
+        assert!(f.detail.contains("alt4/neubit4"), "{}", f.detail);
+        let mut none = Vec::new();
+        check_confined_daemons(&[], &mut none);
+        assert!(none.is_empty());
+
+        // A Gradle/Kotlin daemon has no restart protocol: the advice is to stop it.
+        let mut out = Vec::new();
+        check_confined_daemons(
+            &[ConfinedDaemon {
+                name: "java".into(),
+                pid: 90823,
+                confined_to: None,
+            }],
+            &mut out,
+        );
+        let f = out.first().unwrap();
+        assert!(f.detail.contains("gradlew --stop"), "{}", f.detail);
+        assert!(f.detail.contains("kill 90823"), "{}", f.detail);
+        assert!(!f.detail.contains("--start-server"), "{}", f.detail);
+        assert_eq!(
+            f.fix,
+            Some(Fix::StopProcess {
+                name: "java".into(),
+                pid: 90823
+            })
+        );
+    }
+}
+
+/// What a confined helper is, and the one thing to do about it, by program.
+/// The detection is by shape (confined, orphaned, the user's own executable);
+/// only the advice is per program, and the fallback advice is generic.
+fn confined_daemon_advice(d: &ConfinedDaemon) -> (String, String, Fix) {
+    let name = d.name.as_str();
+    match name {
+        "sccache" => (
+            "a shared compiler cache: every Rust build on this machine compiles through it, \
+             so every checkout but the one it was born in fails under its own `target/` with a \
+             bare `Operation not permitted`"
+                .to_string(),
+            format!(
+                "run `{name} --stop-server && {name} --start-server` in a terminal that is not \
+                 inside any sandbox (a plain Terminal window, not an agent's shell)"
+            ),
+            Fix::RestartDaemon {
+                name: name.to_string(),
+            },
+        ),
+        "java" => (
+            "most likely a Gradle or Kotlin compiler daemon: builds in other checkouts reuse \
+             it, and its writes there are refused"
+                .to_string(),
+            format!(
+                "run `./gradlew --stop` in the project that started it, or `kill {}`, from a \
+                 terminal that is not inside any sandbox; the next build starts a fresh daemon",
+                d.pid
+            ),
+            Fix::StopProcess {
+                name: name.to_string(),
+                pid: d.pid,
+            },
+        ),
+        _ => (
+            "a long-lived helper other sessions may be using; anything it writes outside \
+             that checkout is refused"
+                .to_string(),
+            format!(
+                "stop it (`kill {}`) from a terminal that is not inside any sandbox, then start \
+                 it again from there if you need it",
+                d.pid
+            ),
+            Fix::StopProcess {
+                name: name.to_string(),
+                pid: d.pid,
+            },
+        ),
+    }
+}
+
+/// A helper confined to one session's sandbox serves the whole machine but can
+/// write only that checkout; the only fix is to restart it from a shell that is
+/// not inside any sandbox (SPEC R-DOCTOR.7).
+fn check_confined_daemons(daemons: &[ConfinedDaemon], out: &mut Vec<Finding>) {
+    for d in daemons {
+        let (what, action, fix) = confined_daemon_advice(d);
+        let scope = d
+            .confined_to
+            .as_ref()
+            .map(|p| format!(" (it can still write {})", p.display()))
+            .unwrap_or_default();
+        out.push(Finding {
+            level: Level::Warn,
+            title: format!(
+                "The {} process (pid {}) is running inside a sandbox",
+                d.name, d.pid
+            ),
+            detail: format!(
+                "One thing to do: {action}.\n\nThe {name} process (pid {pid}) was started by a \
+                 command running under ahma's sandbox and inherited it for life, so it can \
+                 write only that session's checkout{scope}. It is {what}.",
+                name = d.name,
+                pid = d.pid,
+            ),
+            fix: Some(fix),
+        });
+    }
+}
+
+/// Send SIGTERM to a confined helper the user chose to stop.
+fn apply_stop_process(name: &str, pid: u32) -> anyhow::Result<String> {
+    let out = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run kill: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "kill {pid} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(format!(
+        "Stopped the sandboxed {name} daemon (pid {pid}). Nothing more to do: the next build \
+         starts a fresh one outside any sandbox."
+    ))
+}
+
+/// Whether this process runs inside a macOS Seatbelt sandbox, asked of the
+/// kernel (`sandbox_check(getpid(), NULL, …)`). A daemon restarted from a
+/// confined process inherits the confinement, which is the very fault being
+/// repaired, so [`Fix::RestartDaemon`] refuses in that case.
+#[cfg(target_os = "macos")]
+fn this_process_is_confined() -> bool {
+    const SANDBOX_CHECK_NO_REPORT: std::ffi::c_int = 0x0002;
+    unsafe extern "C" {
+        fn sandbox_check(
+            pid: std::ffi::c_int,
+            operation: *const std::ffi::c_char,
+            type_: std::ffi::c_int,
+            ...
+        ) -> std::ffi::c_int;
+    }
+    // SAFETY: a NULL operation asks only whether the pid is sandboxed at all.
+    let rc = unsafe {
+        sandbox_check(
+            std::process::id() as std::ffi::c_int,
+            std::ptr::null(),
+            SANDBOX_CHECK_NO_REPORT,
+        )
+    };
+    rc == 1
+}
+
+#[cfg(not(target_os = "macos"))]
+fn this_process_is_confined() -> bool {
+    false
+}
+
+/// Stop and start a `--stop-server`/`--start-server` style daemon (sccache's
+/// protocol; the only one ahma restarts on its own).
+fn apply_restart_daemon(name: &str) -> anyhow::Result<String> {
+    if this_process_is_confined() {
+        anyhow::bail!(
+            "this `ahma doctor` is itself running inside a sandbox, so a server it started \
+             would be confined too. Run `{name} --stop-server && {name} --start-server` from a \
+             plain terminal instead."
+        );
+    }
+    let stop = std::process::Command::new(name)
+        .arg("--stop-server")
+        .output();
+    if let Err(e) = stop {
+        anyhow::bail!("could not run `{name} --stop-server`: {e}");
+    }
+    let start = std::process::Command::new(name)
+        .arg("--start-server")
+        .env("SCCACHE_IDLE_TIMEOUT", "0")
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run `{name} --start-server`: {e}"))?;
+    if !start.status.success() {
+        anyhow::bail!(
+            "`{name} --start-server` failed: {}",
+            String::from_utf8_lossy(&start.stderr).trim()
+        );
+    }
+    Ok(format!(
+        "Restarted the {name} server outside any sandbox. Nothing more to do: every checkout's \
+         builds use it from their next command."
+    ))
 }

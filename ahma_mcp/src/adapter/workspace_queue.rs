@@ -1052,3 +1052,84 @@ mod tests {
         unsafe { std::env::remove_var(HELD_LEASE_ENV) };
     }
 }
+
+#[cfg(test)]
+mod holder_listing_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// `ahma queue` reads the published holder records, so a human (or an
+    /// agent whose every command is waiting) can see *who* holds a workspace
+    /// and whether that process is even alive (SPEC R2.7.9).
+    #[test]
+    fn list_holders_reports_each_workspace_and_its_liveness() {
+        let td = tempdir().unwrap();
+        let lock_dir = td.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let live = HolderInfo {
+            op_id: "op_live".into(),
+            title: "cargo nextest run".into(),
+            pid: 1,
+            since_unix: 1_000,
+        };
+        let dead = HolderInfo {
+            op_id: "op_dead".into(),
+            title: "cargo build".into(),
+            pid: 2,
+            since_unix: 2_000,
+        };
+        for (key, h) in [("/ws/a", &live), ("/ws/b", &dead)] {
+            let path = lock_dir.join(format!("ws-{}.holder.json", key_id(Path::new(key))));
+            std::fs::write(&path, serde_json::to_string(h).unwrap()).unwrap();
+        }
+        let listed = list_holders(&lock_dir, &|pid| pid == 1);
+        assert_eq!(listed.len(), 2);
+        let a = listed.iter().find(|r| r.holder.op_id == "op_live").unwrap();
+        assert!(a.alive);
+        let b = listed.iter().find(|r| r.holder.op_id == "op_dead").unwrap();
+        assert!(!b.alive, "a dead holder is shown as such, not hidden");
+        assert!(list_holders(td.path().join("nope").as_path(), &|_| true).is_empty());
+    }
+}
+
+/// One workspace lease as published beside its lock, with whether the holder
+/// process is still alive (SPEC R2.7.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueHolderRecord {
+    /// The hashed workspace key (`ws-<id>`), the only identity the record has.
+    pub key_id: String,
+    pub holder: HolderInfo,
+    pub alive: bool,
+}
+
+/// Every published holder under `lock_dir`, for `ahma queue`. Reading the
+/// records takes no lock and never queues: it is what an agent whose every
+/// command is waiting can still run to learn *who* it is waiting for. A dead
+/// holder is listed as dead rather than hidden, because the OS lock it left
+/// behind has already been released (R2.7.7) and the stale record is the only
+/// thing still pointing at it.
+pub fn list_holders(lock_dir: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<QueueHolderRecord> {
+    let Ok(entries) = std::fs::read_dir(lock_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<QueueHolderRecord> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let key_id = name
+                .strip_prefix("ws-")?
+                .strip_suffix(".holder.json")?
+                .to_string();
+            let holder: HolderInfo =
+                serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+            let alive = alive(holder.pid);
+            Some(QueueHolderRecord {
+                key_id,
+                holder,
+                alive,
+            })
+        })
+        .collect();
+    out.sort_by_key(|r| r.holder.since_unix);
+    out
+}
