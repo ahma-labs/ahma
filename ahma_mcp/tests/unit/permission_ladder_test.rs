@@ -116,7 +116,7 @@ async fn an_approval_at_the_harness_is_persisted_and_applied_beside_the_locked_s
         .expect("the ledger was written and parses");
     let granted = settings
         .sandbox
-        .find_scope(&cache)
+        .find_scope(&cache, primary_before.as_deref())
         .expect("the approved scope is persisted");
     assert_eq!(granted.access, ScopeAccess::Rw);
     assert_eq!(

@@ -489,7 +489,11 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
             note,
         } => run_sandbox_grant(&file, dir, read_only, workspace, global, session, by, note),
         SandboxCommand::List => run_sandbox_list(&file),
-        SandboxCommand::Revoke { path: dir } => run_sandbox_revoke(&file, dir),
+        SandboxCommand::Revoke {
+            path: dir,
+            workspace,
+            global,
+        } => run_sandbox_revoke(&file, dir, resolve_cli_workspace(workspace, global)?),
     }
 }
 
@@ -507,6 +511,57 @@ fn default_grant_workspace() -> Option<PathBuf> {
     crate::hooks::resolve_hook_sandbox_scopes(&cwd)
         .into_iter()
         .next()
+}
+
+/// The workspace a CLI grant or revoke names (SPEC R5.4.11): `None` for the
+/// legacy global record (`--global`), else the named directory or the default,
+/// canonicalized so it matches what the broker and the TUI stamp.
+fn resolve_cli_workspace(workspace: Option<PathBuf>, global: bool) -> Result<Option<PathBuf>> {
+    if global {
+        return Ok(None);
+    }
+    let ws = workspace
+        .or_else(default_grant_workspace)
+        .context("cannot determine the workspace; pass --workspace <DIR> or --global")?;
+    let expanded = ahma_common::config::expand_home(&ws);
+    Ok(Some(dunce::canonicalize(&expanded).unwrap_or(expanded)))
+}
+
+/// What to say when `(path, workspace)` holds no grant: where the path *is*
+/// granted, and the exact flag that names it.
+fn print_revoke_not_found(
+    settings: &ahma_common::config::AhmaSettings,
+    path: &std::path::Path,
+    workspace: Option<&std::path::Path>,
+    command: &str,
+) {
+    let which = workspace
+        .map(|w| format!("workspace {}", w.display()))
+        .unwrap_or_else(|| "every workspace (global)".to_string());
+    println!(
+        "Nothing to revoke: {} is not granted for {which}.",
+        path.display()
+    );
+    let holders = settings.sandbox.workspaces_holding(path);
+    if holders.is_empty() {
+        println!("Run `ahma sandbox list` to see current grants.");
+        return;
+    }
+    println!("It is granted for:");
+    for h in holders {
+        match h {
+            Some(ws) => println!(
+                "  {}   →  {command} {} --workspace {}",
+                ws.display(),
+                path.display(),
+                ws.display()
+            ),
+            None => println!(
+                "  every workspace (global)   →  {command} {} --global",
+                path.display()
+            ),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -527,15 +582,7 @@ fn run_sandbox_grant(
     } else {
         ScopeAccess::Rw
     };
-    let workspace: Option<PathBuf> = if global {
-        None
-    } else {
-        let ws = workspace.or_else(default_grant_workspace).context(
-            "cannot determine the workspace for this grant; pass --workspace <DIR> or --global",
-        )?;
-        let expanded = ahma_common::config::expand_home(&ws);
-        Some(dunce::canonicalize(&expanded).unwrap_or(expanded))
-    };
+    let workspace = resolve_cli_workspace(workspace, global)?;
     let settings = load_sandbox_settings(file)?;
 
     // Surface the elevated-risk warnings before writing; the hard denylist
@@ -739,11 +786,14 @@ fn print_persistent_scope(s: &ahma_common::config::PersistentScope) {
     }
 }
 
-fn run_sandbox_revoke(file: &std::path::Path, dir: PathBuf) -> Result<()> {
+fn run_sandbox_revoke(
+    file: &std::path::Path,
+    dir: PathBuf,
+    workspace: Option<PathBuf>,
+) -> Result<()> {
     let mut settings = load_sandbox_settings(file)?;
-    let Some(removed) = settings.sandbox.revoke_scope(&dir) else {
-        println!("No persistent scope matching {} was found.", dir.display());
-        println!("Run `ahma sandbox list` to see current grants.");
+    let Some(removed) = settings.sandbox.revoke_scope(&dir, workspace.as_deref()) else {
+        print_revoke_not_found(&settings, &dir, workspace.as_deref(), "ahma sandbox revoke");
         return Ok(());
     };
 
@@ -843,8 +893,9 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
             kind,
             subject,
             workspace,
+            global,
             yes,
-        } => revoke_permission(&file, load()?, &kind, &subject, workspace, yes),
+        } => revoke_permission(&file, load()?, &kind, &subject, workspace, global, yes),
     }
 }
 
@@ -1086,17 +1137,32 @@ type RevokeFn = Box<dyn FnOnce(&mut ahma_common::config::AhmaSettings) -> bool>;
 fn preview_revoke_fs_scope(
     settings: &ahma_common::config::AhmaSettings,
     subject: &str,
+    workspace: Option<PathBuf>,
 ) -> Option<(String, RevokeFn)> {
     let path = PathBuf::from(subject);
-    if settings.sandbox.find_scope(&path).is_none() {
-        println!("No filesystem scope matching {subject} is granted.");
-        println!("Run `ahma permissions list` to see what is.");
+    if settings
+        .sandbox
+        .find_scope(&path, workspace.as_deref())
+        .is_none()
+    {
+        print_revoke_not_found(
+            settings,
+            &path,
+            workspace.as_deref(),
+            "ahma permissions revoke fs-scope",
+        );
         return None;
     }
+    let which = workspace
+        .as_deref()
+        .map(|w| format!("workspace {}", w.display()))
+        .unwrap_or_else(|| "every workspace (global)".to_string());
     Some((
-        format!("remove the filesystem scope {subject}"),
+        format!("remove the filesystem scope {subject} granted for {which}"),
         Box::new(move |s: &mut ahma_common::config::AhmaSettings| {
-            s.sandbox.revoke_scope(&path).is_some()
+            s.sandbox
+                .revoke_scope(&path, workspace.as_deref())
+                .is_some()
         }),
     ))
 }
@@ -1185,6 +1251,7 @@ fn revoke_permission(
     kind: &str,
     subject: &str,
     workspace: Option<PathBuf>,
+    global: bool,
     yes: bool,
 ) -> Result<()> {
     let kind = parse_kind(kind)?;
@@ -1192,7 +1259,11 @@ fn revoke_permission(
     // Preview first, always. A revoke is less dangerous than a grant, but the
     // user should still never be surprised by what a command wrote (R-PERM.2).
     let preview = match kind {
-        GrantKind::FsScope => preview_revoke_fs_scope(&settings, subject),
+        GrantKind::FsScope => preview_revoke_fs_scope(
+            &settings,
+            subject,
+            resolve_cli_workspace(workspace.clone(), global)?,
+        ),
         GrantKind::WebDomain => preview_revoke_web_domain(&settings, subject),
         GrantKind::NetHost => preview_revoke_net_host(&settings, subject),
         GrantKind::Tool => preview_revoke_tool(&settings, subject, workspace),
@@ -2587,6 +2658,8 @@ mod tests {
         run_sandbox_command(SandboxArgs {
             command: SandboxCommand::Revoke {
                 path: scope_dir.clone(),
+                workspace: None,
+                global: true,
             },
         })
         .unwrap();
@@ -2595,6 +2668,8 @@ mod tests {
         run_sandbox_command(SandboxArgs {
             command: SandboxCommand::Revoke {
                 path: tmp.path().join("never-granted"),
+                workspace: None,
+                global: true,
             },
         })
         .unwrap();
@@ -3001,7 +3076,7 @@ mod tests {
             ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
         let scope = settings
             .sandbox
-            .find_scope(&cache)
+            .find_scope(&cache, None)
             .expect("the grant is persisted");
         assert_eq!(scope.access, ahma_common::config::ScopeAccess::Ro);
 
@@ -3050,6 +3125,7 @@ mod tests {
                 kind: "fs-scope".into(),
                 subject: cache.display().to_string(),
                 workspace: None,
+                global: true,
                 yes: false,
             },
         })
@@ -3057,7 +3133,7 @@ mod tests {
         let settings =
             ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
         assert!(
-            settings.sandbox.find_scope(&cache).is_some(),
+            settings.sandbox.find_scope(&cache, None).is_some(),
             "a preview must not write — the user has not confirmed yet"
         );
 
@@ -3067,6 +3143,7 @@ mod tests {
                 kind: "fs-scope".into(),
                 subject: cache.display().to_string(),
                 workspace: None,
+                global: true,
                 yes: true,
             },
         })
@@ -3074,9 +3151,82 @@ mod tests {
         let settings =
             ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
         assert!(
-            settings.sandbox.find_scope(&cache).is_none(),
+            settings.sandbox.find_scope(&cache, None).is_none(),
             "a confirmed revoke removes the grant"
         );
+    }
+
+    /// SPEC R5.4.11: a revoke names a workspace, and another workspace's grant
+    /// of the same path survives it.
+    #[test]
+    fn revoking_one_workspaces_grant_leaves_another_workspaces_grant() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let cache = home.path().join("caches").join("shared");
+        let ws_a = home.path().join("proj-a");
+        let ws_b = home.path().join("proj-b");
+        for d in [&cache, &ws_a, &ws_b] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for ws in [&ws_a, &ws_b] {
+            run_sandbox_command(SandboxArgs {
+                command: SandboxCommand::Grant {
+                    workspace: Some(ws.clone()),
+                    global: false,
+                    session: false,
+                    path: cache.clone(),
+                    read_only: false,
+                    by: None,
+                    note: None,
+                },
+            })
+            .unwrap();
+        }
+        let settings =
+            ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
+        assert_eq!(
+            settings.sandbox.persistent_scopes.len(),
+            2,
+            "B's grant must not overwrite A's"
+        );
+
+        run_sandbox_command(SandboxArgs {
+            command: SandboxCommand::Revoke {
+                path: cache.clone(),
+                workspace: Some(ws_b.clone()),
+                global: false,
+            },
+        })
+        .unwrap();
+        let settings =
+            ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
+        let canon = |p: &std::path::Path| dunce::canonicalize(p).unwrap();
+        assert!(
+            settings
+                .sandbox
+                .find_scope(&cache, Some(&canon(&ws_a)))
+                .is_some(),
+            "A's grant survives B's revoke"
+        );
+        assert!(
+            settings
+                .sandbox
+                .find_scope(&cache, Some(&canon(&ws_b)))
+                .is_none()
+        );
+
+        // A revoke for a workspace holding no grant changes nothing.
+        run_sandbox_command(SandboxArgs {
+            command: SandboxCommand::Revoke {
+                path: cache.clone(),
+                workspace: None,
+                global: true,
+            },
+        })
+        .unwrap();
+        let settings =
+            ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
+        assert_eq!(settings.sandbox.persistent_scopes.len(), 1);
     }
 
     #[test]
@@ -3089,6 +3239,7 @@ mod tests {
                 kind: "flesscope".into(),
                 subject: "/tmp/x".into(),
                 workspace: None,
+                global: false,
                 yes: true,
             },
         })
@@ -3210,6 +3361,7 @@ mod tests {
                 kind: "net-host".into(),
                 subject: "crates.io".into(),
                 workspace: None,
+                global: false,
                 yes: false,
             },
         })
@@ -3223,6 +3375,7 @@ mod tests {
                 kind: "net-host".into(),
                 subject: "crates.io".into(),
                 workspace: None,
+                global: false,
                 yes: true,
             },
         })

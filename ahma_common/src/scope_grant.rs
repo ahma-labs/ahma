@@ -568,19 +568,30 @@ impl GrantCoordinator {
 /// used by `path_security::validate_path` for paths that do not exist yet.
 fn canonicalize_best_effort(path: &Path) -> PathBuf {
     let expanded = expand_home(path);
-    if let Ok(c) = dunce::canonicalize(&expanded) {
-        return c;
-    }
-    // Path may not exist (or a component is missing): canonicalize the deepest
-    // existing ancestor and re-attach the remainder.
-    match (expanded.parent(), expanded.file_name()) {
-        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
-            match dunce::canonicalize(parent) {
-                Ok(c) => c.join(name),
-                Err(_) => expanded,
-            }
+    // Canonicalize the deepest ancestor that exists and re-attach the rest.
+    // Stopping one level up, as this once did, left a path two levels below a
+    // symlink (`/var` → `/private/var` on macOS, a symlinked home) in its
+    // unresolved spelling, and the denylist — which compares resolved paths —
+    // then did not recognise `~/.ssh/<key>` when `~/.ssh` did not exist yet.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = expanded.as_path();
+    loop {
+        // A filesystem root holds no symlink to resolve, and canonicalizing
+        // one only changes the spelling (`/` becomes `D:\` on Windows): a path
+        // whose only existing ancestor is the root keeps the form it was given.
+        if cur.parent().is_none() {
+            return expanded;
         }
-        _ => expanded,
+        if let Ok(c) = dunce::canonicalize(cur) {
+            return tail.iter().rev().fold(c, |acc, part| acc.join(part));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                tail.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return expanded,
+        }
     }
 }
 
@@ -595,6 +606,56 @@ pub enum GrantRisk {
     /// An ordinary grant (a build cache, a dependency source dir, a sibling
     /// project, …).
     Normal,
+}
+
+/// When something trusted executes what is written at `path` later, the
+/// factual sentence that says what and when (SPEC R-HANDOFF.1, R-PERM.3.4).
+/// Shown as a high-risk warning at every grant surface; never a refusal,
+/// because editing these files is a thing people legitimately ask for.
+fn auto_execution_warning(path: &Path, home: Option<&Path>) -> Option<String> {
+    let shown = path.display();
+    let in_git_hooks = path
+        .components()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0].as_os_str() == ".git" && w[1].as_os_str() == "hooks");
+    if in_git_hooks {
+        return Some(format!(
+            "git runs the scripts in '{shown}' by itself on commit, checkout, merge and push, as \
+             you and outside the sandbox: whatever a grant lets the agent write there runs later \
+             without anyone asking"
+        ));
+    }
+    let home = home?;
+    const SHELL_STARTUP: &[&str] = &[
+        ".zshrc",
+        ".zprofile",
+        ".zshenv",
+        ".zlogin",
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".profile",
+    ];
+    if SHELL_STARTUP.iter().any(|f| path == home.join(f))
+        || path.starts_with(home.join(".config").join("fish"))
+    {
+        return Some(format!(
+            "your shell runs '{shown}' every time a new shell starts (each terminal tab, and many \
+             tools), as you and outside the sandbox: whatever a grant lets the agent write there \
+             runs later without anyone asking"
+        ));
+    }
+    if path.starts_with(home.join("Library").join("LaunchAgents"))
+        || path.starts_with(home.join(".config").join("autostart"))
+    {
+        return Some(format!(
+            "your computer starts the programs listed in '{shown}' each time you log in, outside \
+             any sandbox: whatever a grant lets the agent write there runs later without anyone \
+             asking"
+        ));
+    }
+    None
 }
 
 /// Check if `candidate_parent` is the enclosing git repository root (or main repo of a worktree)
@@ -696,17 +757,37 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
         }
     }
 
-    // 4. Credential directories and ahma's own settings directory.
+    // 4. Credential directories and ahma's own settings directory — with
+    //    everything inside them. `Path::starts_with` compares whole components,
+    //    so `~/.sshx` is not `~/.ssh`. This was an equality test, which refused
+    //    the directory and offered the key inside it as an ordinary grant.
     if let Some(home) = home {
-        const SENSITIVE: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube", ".docker", ".ahma"];
-        if SENSITIVE.iter().any(|name| path == home.join(name))
-            || path == home.join(".config").join("gh")
-            || path == home.join(".config").join("gcloud")
+        const SENSITIVE: &[&[&str]] = &[
+            &[".ssh"],
+            &[".aws"],
+            &[".gnupg"],
+            &[".kube"],
+            &[".docker"],
+            &[".ahma"],
+            &[".config", "gh"],
+            &[".config", "gcloud"],
+        ];
+        if let Some(dir) = SENSITIVE
+            .iter()
+            .map(|parts| parts.iter().fold(home.to_path_buf(), |p, c| p.join(c)))
+            .find(|dir| path.starts_with(dir))
         {
+            let hint = if dir.ends_with(".ssh") {
+                " Git and ssh still work inside the sandbox through your SSH agent, which \
+                 ahma forwards; add a new host key by connecting once from your own terminal."
+            } else {
+                ""
+            };
             return GrantRisk::Refused(format!(
-                "'{}' holds credentials/secrets (or ahma's own settings) and must never be \
-                 exposed to a sandboxed tool",
-                path.display()
+                "'{}' is inside {}, which holds credentials/secrets (or ahma's own settings) and \
+                 must never be exposed to a sandboxed tool.{hint}",
+                path.display(),
+                dir.display()
             ));
         }
     }
@@ -744,6 +825,13 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
             "'{}' does not exist on disk — confirm the path is correct and not a typo",
             path.display()
         ));
+    }
+
+    // A target something trusted executes later (R-HANDOFF.1): say what runs
+    // it, because the path alone does not tell a non-expert that a write
+    // becomes a future execution.
+    if let Some(w) = auto_execution_warning(path, home) {
+        warnings.push(w);
     }
 
     // A hidden directory directly under home that is not a known build cache.
@@ -1194,7 +1282,7 @@ mod tests {
         let reloaded = AhmaSettings::load_from_result(&file).unwrap();
         let scope = reloaded
             .sandbox
-            .find_scope(&target)
+            .find_scope(&target, None)
             .expect("scope persisted");
         assert_eq!(scope.access, ScopeAccess::Rw);
         assert_eq!(scope.granted_by.as_deref(), Some("sccache"));
@@ -1224,7 +1312,7 @@ mod tests {
             "updated in place, not duplicated"
         );
         assert_eq!(
-            reloaded.sandbox.find_scope(&target).unwrap().access,
+            reloaded.sandbox.find_scope(&target, None).unwrap().access,
             ScopeAccess::Ro
         );
     }
@@ -1324,7 +1412,10 @@ mod tests {
         g.workspace = Some(&ws);
         persist_grant(&file, g).unwrap();
         let reloaded = AhmaSettings::load_from_result(&file).unwrap();
-        let rec = reloaded.sandbox.find_scope(&target).unwrap();
+        let rec = reloaded
+            .sandbox
+            .find_scope(&target, Some(&dunce::canonicalize(&ws).unwrap()))
+            .unwrap();
         assert_eq!(
             rec.workspace.as_deref(),
             Some(dunce::canonicalize(&ws).unwrap().as_path())
@@ -1667,5 +1758,117 @@ mod request_context_tests {
             PROMPT_BUDGET + 1
         );
         assert!(c.budget_exhausted());
+    }
+}
+
+#[cfg(test)]
+mod denylist_by_prefix_tests {
+    use super::*;
+
+    fn refused(path: &Path, home: &Path) -> bool {
+        matches!(
+            classify_grant_risk(path, Some(home), &[]),
+            GrantRisk::Refused(_)
+        )
+    }
+
+    /// SPEC R5.4.5: the credential directories are refused *with everything in
+    /// them*. The rule used to compare by equality, so the directory was
+    /// refused while the key inside it was offered as an ordinary grant.
+    #[test]
+    fn everything_inside_a_credential_directory_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let h = dunce::canonicalize(home.path()).unwrap();
+        for inside in [
+            ".ssh/id_ed25519",
+            ".ssh/known_hosts",
+            ".aws/credentials",
+            ".gnupg/private-keys-v1.d",
+            ".kube/config",
+            ".docker/config.json",
+            ".ahma/settings.toml",
+            ".config/gh/hosts.yml",
+            ".config/gcloud/credentials.db",
+        ] {
+            assert!(refused(&h.join(inside), &h), "{inside} must be refused");
+        }
+        // Neighbours with a shared prefix are not inside: `.sshx` is not `.ssh`.
+        assert!(!refused(&h.join(".sshx"), &h));
+        assert!(!refused(&h.join(".config/ghostty"), &h));
+    }
+
+    /// A path that does not exist yet is resolved through its deepest existing
+    /// ancestor, so a symlink two or more levels up cannot carry it past the
+    /// denylist in its unresolved spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_path_under_a_symlink_is_resolved_before_the_denylist() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real-home");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.path().join("link-home");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let resolved = canonicalize_best_effort(&link.join(".ssh").join("id_ed25519"));
+        assert_eq!(
+            resolved,
+            dunce::canonicalize(&real)
+                .unwrap()
+                .join(".ssh")
+                .join("id_ed25519")
+        );
+    }
+
+    /// A path with no existing ancestor below the root keeps its spelling: the
+    /// root holds nothing to resolve, and on Windows canonicalizing it would
+    /// turn `/opt/one` into `D:\opt\one`.
+    #[test]
+    fn a_path_existing_only_at_the_root_keeps_its_spelling() {
+        let p = Path::new("/definitely-not-a-dir-7f3a/x/y");
+        assert_eq!(canonicalize_best_effort(p), p.to_path_buf());
+    }
+
+    /// A refused path is never raised as a question (R-PERM.4.3), so no surface
+    /// can be handed a credential file to approve.
+    #[test]
+    fn a_credential_file_is_never_raised_as_a_question() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let key = home.path().join(".ssh").join("id_ed25519");
+        let c = GrantCoordinator::new();
+        assert!(
+            c.begin(&key, ScopeAccess::Ro, GrantReason::StderrHeuristic, None)
+                .is_none()
+        );
+    }
+
+    fn warnings(path: &Path, home: &Path) -> Vec<String> {
+        match classify_grant_risk(path, Some(home), &[]) {
+            GrantRisk::High(w) => w,
+            other => panic!("{} should be high risk, got {other:?}", path.display()),
+        }
+    }
+
+    /// The prompt says, factually, what will *run* a file a grant lets the agent
+    /// write (R-HANDOFF.1): the consequence a non-expert cannot infer from the
+    /// path alone.
+    #[test]
+    fn auto_executed_targets_name_what_runs_them() {
+        let home = tempfile::tempdir().unwrap();
+        let h = dunce::canonicalize(home.path()).unwrap();
+        for (rel, trigger) in [
+            (".zshrc", "new shell"),
+            (".bashrc", "new shell"),
+            (".profile", "new shell"),
+            ("Library/LaunchAgents", "log in"),
+            (".config/autostart", "log in"),
+            ("proj/.git/hooks", "git"),
+        ] {
+            let w = warnings(&h.join(rel), &h).join(" | ");
+            assert!(
+                w.contains(trigger),
+                "{rel}: the warning must name what runs it ({trigger}): {w}"
+            );
+        }
     }
 }
