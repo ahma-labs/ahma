@@ -284,6 +284,23 @@ pub struct PermissionSettings {
     /// `~/.config/ahma/approvals.json`).
     /// Default: empty list
     pub tool_approvals: Vec<ToolApproval>,
+    /// Show a model's one-line recommendation beside a grant prompt in the TUI
+    /// (SPEC R-PERM.8). The model sees the evidence, never the agent's own
+    /// words; it recommends and never answers. Default: `true`
+    #[serde(default = "default_true")]
+    pub advisor: bool,
+    /// How long the TUI waits for the advisor before showing the prompt
+    /// without it. Default: `6`
+    #[serde(default = "default_advisor_timeout_secs")]
+    pub advisor_timeout_secs: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_advisor_timeout_secs() -> u64 {
+    6
 }
 
 impl PermissionSettings {
@@ -761,6 +778,13 @@ pub struct AuditEntry {
     /// The risk class shown at the prompt (`normal`, `high`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<String>,
+    /// The advisor's one-line recommendation shown at the prompt, if any
+    /// (SPEC R-PERM.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice: Option<String>,
+    /// Whether the human's answer was the one the advisor recommended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice_followed: Option<bool>,
 }
 
 impl AuditEntry {
@@ -776,6 +800,24 @@ impl AuditEntry {
         self.risk = risk.map(str::to_string);
         self
     }
+
+    /// Attach what the advisor said and whether the answer followed it.
+    pub fn with_advice(mut self, advice: Option<String>, followed: Option<bool>) -> Self {
+        self.advice = advice;
+        self.advice_followed = followed;
+        self
+    }
+}
+
+/// Every parseable line of the audit log at `path`, oldest first. A corrupt
+/// line is skipped: the log is append-only and a torn tail is expected.
+pub fn read_audit_entries(path: &Path) -> Vec<AuditEntry> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<AuditEntry>(l).ok())
+        .collect()
 }
 
 /// The audit log path, `~/.ahma/permissions-audit.jsonl`.
@@ -840,6 +882,8 @@ pub fn audit_entry(
         request_id: None,
         time_to_decision_ms: None,
         risk: None,
+        advice: None,
+        advice_followed: None,
     }
 }
 

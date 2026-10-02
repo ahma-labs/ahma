@@ -2633,10 +2633,14 @@ fn resolve_scope_grant(
         return;
     };
 
+    let advice_line = gate.advice.as_ref().map(|a| a.line());
+    let advice_followed = gate.advice.as_ref().map(|a| a.matches(decision));
     send_incoming(ahma_common::hub::ClientMsg::SubmitScopeGrant {
         decision_id: gate.decision_id,
         decision,
         target_instance_id: None,
+        advice: advice_line,
+        advice_followed,
     });
 
     let (level, message) = match decision {
@@ -4871,6 +4875,39 @@ fn request_tool_approval(
     );
 }
 
+/// Ask the selected model for a recommendation on a pending grant prompt
+/// (SPEC R-PERM.8). Evidence only, time-boxed, fail-quiet: the modal is
+/// complete without it, and the answer is shown as advice beside the keys.
+/// Skipped when the setting is off, no model is selected, or the model is a
+/// client's own (`mcp://`), which would route through the asking agent.
+fn spawn_grant_advisor(
+    state: &crate::state::AppState,
+    request: ahma_common::scope_grant::ScopeGrantRequest,
+) {
+    let settings = ahma_common::config::AhmaSettings::load();
+    if !settings.permissions.advisor {
+        return;
+    }
+    let (base_url, model) = parse_llm_selection(state);
+    if base_url.is_empty() || model.is_empty() || base_url.starts_with("mcp://") {
+        return;
+    }
+    let Some(tx) = state.bridge_tx.clone() else {
+        return;
+    };
+    let budget = std::time::Duration::from_secs(settings.permissions.advisor_timeout_secs.max(1));
+    tokio::spawn(async move {
+        let client = crate::llm_bridge::build_configured_client(base_url, model);
+        let advice = ahma_core::advisor::advise(&client, &request, budget).await;
+        let _ = tx
+            .send(crate::llm_bridge::BridgeEvent::GrantAdvice {
+                decision_id: request.decision_id,
+                advice,
+            })
+            .await;
+    });
+}
+
 fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate::state::AppState) {
     use crate::llm_bridge::BridgeEvent;
     use crate::state::ChatEntry;
@@ -4899,6 +4936,16 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             state.chat_scroll = 0;
         }
         BridgeEvent::TurnSendFailed(msg) => end_turn_with_error(state, &msg, true),
+        BridgeEvent::GrantAdvice {
+            decision_id,
+            advice,
+        } => {
+            if let Some(gate) = state.scope_grant.as_mut()
+                && gate.decision_id == decision_id
+            {
+                gate.advice = advice;
+            }
+        }
         BridgeEvent::Decomposed { steps } => {
             handle_decomposed_event(steps, state);
         }
@@ -5418,7 +5465,8 @@ fn handle_source_gate_event(
             request_tool_approval(state, id, tool, args, workspace, None);
         }
         SourceEvent::ScopeGrantRequested { request } => {
-            state.scope_grant = Some(crate::state::ScopeGrantGate::from_request(request));
+            state.scope_grant = Some(crate::state::ScopeGrantGate::from_request(request.clone()));
+            spawn_grant_advisor(state, request);
         }
         SourceEvent::ScopeGrantDismiss { decision_id }
             if state

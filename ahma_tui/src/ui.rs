@@ -3840,6 +3840,15 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
             lines.push(Line::from(Span::styled(format!("  {l}"), theme.normal())));
         }
     }
+    // SPEC R-PERM.8: the advisor's line is labelled, visually distinct, and
+    // changes nothing below it.
+    if let Some(advice) = &gate.advice {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", advice.line()),
+            theme.pending().italic(),
+        )));
+    }
     lines.push(Line::from(""));
     let mut keys: Vec<Span<'static>> = vec![Span::styled("  ", theme.normal())];
     for o in &body.options {

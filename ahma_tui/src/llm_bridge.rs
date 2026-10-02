@@ -77,6 +77,12 @@ pub enum BridgeEvent {
     SessionEstablished {
         session_id: String,
     },
+    /// The grant advisor answered (or gave up) for a pending scope-grant
+    /// prompt (SPEC R-PERM.8).
+    GrantAdvice {
+        decision_id: String,
+        advice: Option<ahma_core::advisor::GrantAdvice>,
+    },
 }
 
 pub type McpChatConfig = ahma_core::agent::McpChatConfig;

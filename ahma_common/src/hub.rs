@@ -515,6 +515,12 @@ pub enum ClientMsg {
         decision_id: String,
         decision: crate::scope_grant::GrantDecision,
         target_instance_id: Option<String>,
+        /// The advisor line shown beside the prompt, for the audit (R-PERM.8).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advice: Option<String>,
+        /// Whether the answer followed it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advice_followed: Option<bool>,
     },
     /// An instance announcing a scope-grant decision is resolved, so the hub can
     /// dismiss the prompt on any other TUI showing the same `decision_id`.
@@ -587,6 +593,10 @@ pub enum HubMsg {
     SubmitScopeGrant {
         decision_id: String,
         decision: crate::scope_grant::GrantDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advice: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advice_followed: Option<bool>,
     },
     /// Tell every TUI to dismiss the scope-grant modal for `decision_id` (a twin
     /// surface answered, or the instance withdrew it).
@@ -2085,6 +2095,8 @@ where
             decision_id,
             decision,
             target_instance_id,
+            advice,
+            advice_followed,
         } => {
             route_decision_to_instance(
                 &hub,
@@ -2093,6 +2105,8 @@ where
                 HubMsg::SubmitScopeGrant {
                     decision_id: decision_id.clone(),
                     decision,
+                    advice,
+                    advice_followed,
                 },
             )
             .await
@@ -3235,6 +3249,8 @@ mod tests {
                 decision_id: "dec-42".into(),
                 decision: GrantDecision::GrantRo,
                 target_instance_id: Some("inst-1".into()),
+                advice: None,
+                advice_followed: None,
             },
             ClientMsg::ScopeGrantResolved {
                 decision_id: "dec-42".into(),
@@ -3251,6 +3267,8 @@ mod tests {
             HubMsg::SubmitScopeGrant {
                 decision_id: "dec-42".into(),
                 decision: GrantDecision::Deny,
+                advice: None,
+                advice_followed: None,
             },
             HubMsg::ScopeGrantDismiss {
                 decision_id: "dec-42".into(),
@@ -5290,6 +5308,8 @@ mod tests {
                 decision_id: "d1".into(),
                 decision: GrantDecision::GrantRo,
                 target_instance_id: None,
+                advice: None,
+                advice_followed: None,
             },
         )
         .await
@@ -5298,6 +5318,7 @@ mod tests {
             HubMsg::SubmitScopeGrant {
                 decision_id,
                 decision,
+                ..
             } => {
                 assert_eq!(decision_id, "d1");
                 assert!(matches!(decision, GrantDecision::GrantRo));
