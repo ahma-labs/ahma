@@ -12,6 +12,7 @@ pub mod client;
 pub mod discovery;
 pub mod error;
 pub mod prompt;
+pub mod tool_names;
 
 pub use client::{
     ApiFlavor, ChatCompletionResponse, ChatMessage, ChatRole, ChatToolCall, LlmClient,

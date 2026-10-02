@@ -168,6 +168,16 @@ Details: error sending request for url (http://localhost:11434/v1/chat/completio
 In `ahma tui`, a turn that fails this way before any answer arrived is sent again once
 automatically. The rules are in [SPEC.md](../SPEC.md) R-HTTP.
 
+## Tool calling
+
+- **External MCP tools work with every provider.** ahma names a tool on an external MCP
+  server `server::tool`; OpenAI and Anthropic accept only letters, digits, `_` and `-` in a
+  function name. Each request sends such a tool as `server__tool` and maps the model's calls
+  back, so nothing changes in your configuration.
+- **An error is reported as itself.** When a provider rejects a request, the chat shows the
+  provider's own message. ahma retries a turn without tools only when the provider says the
+  model does not support tools, and never once tools have already run in the conversation.
+
 ## See also
 
 - [docs/settings.md](settings.md) — `[lmstudio]`, `[agent]` and the chat token budgets

@@ -128,22 +128,42 @@ impl LlmMonitorError {
         matches!(self, Self::Timeout(_))
     }
 
-    /// True when the provider rejected the request in a way that suggests the
-    /// tool definitions were the problem (the model or endpoint does not
-    /// support tools), so retrying the turn *without* tools may succeed.
+    /// True when the provider says the model or endpoint does not support
+    /// tools, so retrying the turn *without* tools may succeed.
     ///
-    /// Preserves the pre-typed heuristic exactly: any HTTP 400, or a provider
-    /// message mentioning "tool" / "not supported". Transport and parse
-    /// failures never qualify.
+    /// The message must say so — name tools or function calling *and* say they
+    /// are unsupported or unrecognised (Ollama's "… does not support tools",
+    /// OpenAI's "Unrecognized request argument supplied: tools"). A bare 400
+    /// used to qualify, which turned every request-shape error — a bad
+    /// `max_tokens`, an invalid tool name, a context overflow — into a silent
+    /// "no tools this turn" that also dropped the run's tool history.
+    /// Throttling, auth and context-length errors never qualify; nor do
+    /// transport and parse failures.
     pub fn is_tools_rejected(&self) -> bool {
         match self {
-            Self::Api {
-                status, message, ..
-            } => {
-                *status == 400 || {
-                    let m = message.to_ascii_lowercase();
-                    m.contains("tool") || m.contains("not supported")
+            Self::Api { kind, message, .. } => {
+                if matches!(
+                    kind,
+                    ApiErrorKind::RateLimited
+                        | ApiErrorKind::Auth
+                        | ApiErrorKind::ContextLengthExceeded
+                ) {
+                    return false;
                 }
+                let m = message.to_ascii_lowercase();
+                let names_tools = m.contains("tool") || m.contains("function call");
+                let unsupported = [
+                    "not support",
+                    "unsupported",
+                    "unrecognized",
+                    "unrecognised",
+                    "not permitted",
+                    "not allowed",
+                    "unknown field",
+                ]
+                .iter()
+                .any(|p| m.contains(p));
+                names_tools && unsupported
             }
             _ => false,
         }
@@ -391,12 +411,23 @@ mod tests {
     }
 
     #[test]
-    fn tools_rejection_heuristic_preserved() {
-        // Any 400 qualifies (pre-typed behavior: message contained "400").
-        assert!(api(400, "bad request").is_tools_rejected());
-        // A non-400 whose message names tools qualifies.
-        assert!(api(500, "tools are not supported by this model").is_tools_rejected());
-        // A plain 500 does not.
+    fn only_a_message_saying_tools_are_unsupported_is_a_tools_rejection() {
+        for msg in [
+            r#"{"error":"registry.ollama.ai/library/gemma:2b does not support tools"}"#,
+            r#"{"error":{"message":"Unrecognized request argument supplied: tools"}}"#,
+            "tools are not supported by this model",
+            "function calling is not supported for this model",
+        ] {
+            assert!(api(400, msg).is_tools_rejected(), "{msg}");
+        }
+        for msg in [
+            "bad request",
+            r#"{"error":{"message":"Invalid value for 'max_tokens'"}}"#,
+            r#"{"error":{"message":"Invalid 'tools[0].function.name': string does not match pattern"}}"#,
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}"#,
+        ] {
+            assert!(!api(400, msg).is_tools_rejected(), "{msg}");
+        }
         assert!(!api(500, "server exploded").is_tools_rejected());
         // Transport/parse failures never qualify.
         assert!(!LlmMonitorError::Parse("missing choices[0].message".into()).is_tools_rejected());
