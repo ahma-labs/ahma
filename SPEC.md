@@ -387,7 +387,10 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   It reads the records without taking a lock, so it is exactly what an agent whose every
   command is waiting can still run; before it existed the agent could neither see nor name
   what it was waiting for. A dead holder is listed as dead (its OS lock is already gone,
-  R2.7.7), never hidden.
+  R2.7.7), never hidden. A lock directory that exists but cannot be read — inside ahma's own sandbox it is out of
+  scope by design — **must** be reported as "cannot tell", with where to look instead, and
+  never as "no workspace is held": that answer once told a waiting agent nobody was in its way
+  while someone was.
 
 ### R3: Performance
 
@@ -2204,5 +2207,5 @@ Stated here so that no other document implies otherwise.
 - **Bundle trust**: no signature and no load-time gate; the checksum detects corruption only.
 - **Server-side output minimization**: dormant (`ahma_output_optimizer/SPEC.md`).
 - **OAuth**: endpoints fixed to Atlassian; no token refresh.
-- **Multi-session scope decisions** (R5.3.3, R5.3.4, R5.3.6): specified but not wired; the building blocks are unit-tested only.
+- **Scope-downgrade prompts** (R5.3.1–R5.3.6): specified but not wired. No running ahma asks before a scope downgrade (broader client roots, `--tmp`, disabling enforcement) and none commits an `elicited` scope; the building blocks (`ahma_common::elicitation`, `workspace_scope`, `scope_decision`) have no caller outside their own tests. Live elicitation exists only for grants (R-PERM.3). Wiring it replaces the single commit point (R5.1.1) and must be done whole.
 - **Log-exception grants** (`logs_approve`): stored in `<platform config dir>/ahma/log_exceptions.json` (relocatable with `AHMA_CONFIG_DIR`), not in the unified ledger that R-PERM.1 requires.
