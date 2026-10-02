@@ -576,6 +576,12 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = expanded.as_path();
     loop {
+        // A filesystem root holds no symlink to resolve, and canonicalizing
+        // one only changes the spelling (`/` becomes `D:\` on Windows): a path
+        // whose only existing ancestor is the root keeps the form it was given.
+        if cur.parent().is_none() {
+            return expanded;
+        }
         if let Ok(c) = dunce::canonicalize(cur) {
             return tail.iter().rev().fold(c, |acc, part| acc.join(part));
         }
@@ -1810,6 +1816,15 @@ mod denylist_by_prefix_tests {
                 .join(".ssh")
                 .join("id_ed25519")
         );
+    }
+
+    /// A path with no existing ancestor below the root keeps its spelling: the
+    /// root holds nothing to resolve, and on Windows canonicalizing it would
+    /// turn `/opt/one` into `D:\opt\one`.
+    #[test]
+    fn a_path_existing_only_at_the_root_keeps_its_spelling() {
+        let p = Path::new("/definitely-not-a-dir-7f3a/x/y");
+        assert_eq!(canonicalize_best_effort(p), p.to_path_buf());
     }
 
     /// A refused path is never raised as a question (R-PERM.4.3), so no surface
