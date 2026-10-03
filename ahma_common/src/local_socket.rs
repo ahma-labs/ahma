@@ -945,8 +945,9 @@ mod imp {
     }
 
     impl BlockingSocket for Socket {
-        // Measured on windows-latest: an accepted AF_UNIX socket's half-close
-        // never reached the peer while a `recv` was blocked on it.
+        // Measured on windows-latest: an AF_UNIX socket's half-close, accepted
+        // (#168) or connecting (#169, a client's request), never reached the
+        // peer while a `recv` was blocked on it.
         const HALF_CLOSE_NEEDS_QUIET_RECEIVE: bool = true;
 
         fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -1195,6 +1196,28 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serves_concurrent_connections() {
+        run_concurrent_connections().await;
+    }
+
+    /// The Windows hang, repeated until it would show: in a CI experiment
+    /// (#169) round 140 of 150 stalled. A client's half-close made while its
+    /// own receive was blocked in `recv` never reached the server, which
+    /// waited for the end of a request that never came. Each round is a few
+    /// milliseconds, so the whole repeat stays well inside the budget.
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_connections_survive_many_rounds() {
+        for _ in 0..150 {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_concurrent_connections());
+        }
+    }
+
+    async fn run_concurrent_connections() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.sock");
         let listener = LocalListener::bind(&path).expect("bind");

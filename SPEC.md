@@ -1508,8 +1508,8 @@ lifetime.
     Windows the bridge's receiving thread is blocked in `recv`, which `shutdown` does not wake,
     so it is cancelled (`CancelIoEx`) once the caller is gone and the send side has finished.
   - **A half-close is never lost to a receive in progress.** Measured on Windows: an accepted
-    `AF_UNIX` socket's half-close did not reach the peer while the bridge's receiving thread was
-    blocked in `recv` on it — the hub answering `400`/`404` and half-closing while still
+    `AF_UNIX` socket's half-close (accepted or connecting) did not reach the peer while the
+    bridge's receiving thread was blocked in `recv` on it — the hub answering `400`/`404` and half-closing while still
     receiving, and the client waiting for an end that never came. There the receive steps out
     of `recv` for the half-close (cancelled with `CancelIoEx`, acknowledged, resumed after).
   - **The ownership check binds the directory ahma chose, not one it was handed.** An
