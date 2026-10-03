@@ -4186,6 +4186,25 @@ mod tests {
         assert!(needs_approval("server::git_commit", false, &non_mutating));
     }
 
+    /// `sandbox_grant` and `logs_approve` raise their own question through
+    /// the permission ladder and record nothing without a human answer (SPEC
+    /// R5.4.5, R9.2). A tool-approval prompt in front of that question would
+    /// ask the human twice for one decision, so the default (tool approval
+    /// off) lets the call through to the question it exists to ask.
+    #[test]
+    fn needs_approval_does_not_double_prompt_for_tools_that_ask_a_human() {
+        let non_mutating = builtin_non_mutating_tool_names();
+        for tool in ["sandbox_grant", "logs_approve"] {
+            assert!(
+                !needs_approval(tool, false, &non_mutating),
+                "{tool} asks the human itself"
+            );
+        }
+        // The writers still prompt.
+        assert!(needs_approval("write_file", false, &non_mutating));
+        assert!(needs_approval("run_terminal_command", false, &non_mutating));
+    }
+
     // ── resolve_llm_connection (URL fast-path) ──
     // Note: a URL provider never *requires* config, but `num_ctx` is enriched
     // from a matching configured provider when one exists (#484). These tests
