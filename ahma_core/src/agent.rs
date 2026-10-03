@@ -1007,6 +1007,26 @@ async fn stream_completion_via_http(
     result
 }
 
+/// An Ollama server on a port its URL does not reveal is recognised by what it
+/// answers, and spoken to in its own API, the only one on which it honours a
+/// context size (ahma_llm_monitor SPEC, "Ollama's own API"). Any other client
+/// is returned unchanged.
+async fn prefer_ollamas_own_api(client: LlmClient) -> LlmClient {
+    if client.flavor() != ahma_llm_monitor::ApiFlavor::OpenAi {
+        return client;
+    }
+    match client.server_context().await {
+        Some(found) if found.server == ahma_llm_monitor::ModelServer::Ollama => {
+            info!(
+                base_url = client.base_url(),
+                "agent: Ollama recognised; using its own chat API"
+            );
+            client.with_flavor(ahma_llm_monitor::ApiFlavor::Ollama)
+        }
+        _ => client,
+    }
+}
+
 /// Size this run's budgets from what the model's server says (ahma_llm_monitor
 /// SPEC, "Context window"). A model that runs on this machine gets the
 /// small-model budgets: every token of context is prompt it reads on local
@@ -1523,6 +1543,7 @@ pub fn spawn_agent_task(
     gate: Arc<dyn AgentApprovalGate>,
 ) {
     tokio::spawn(async move {
+        let client = prefer_ollamas_own_api(client).await;
         let sys_prompt = system_prompt_for_run(system_prompt, &mcp);
         let mut msg_json = initial_msg_json(&sys_prompt, &messages);
 
@@ -2044,12 +2065,7 @@ impl LlmConnection {
     fn into_client(self) -> LlmClient {
         let client = LlmClient::new(self.base_url, self.model, self.api_key);
         let client = match self.kind {
-            Some(ahma_common::config::ProviderKind::Anthropic) => {
-                client.with_flavor(ahma_llm_monitor::ApiFlavor::Anthropic)
-            }
-            Some(ahma_common::config::ProviderKind::OpenAi) => {
-                client.with_flavor(ahma_llm_monitor::ApiFlavor::OpenAi)
-            }
+            Some(kind) => client.with_provider_kind(kind),
             None => client,
         };
         client.with_num_ctx(self.num_ctx)
@@ -2852,8 +2868,9 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// A server shaped like Ollama: `/api/ps` reports the model loaded at
-    /// `loaded_ctx` (or not loaded), and `/v1/chat/completions` says "ok".
+    /// A server shaped like Ollama on a port that does not say so: `/api/ps`
+    /// reports the model loaded at `loaded_ctx` (or not loaded), and only its
+    /// own `/api/chat` answers, with "ok".
     async fn ollama_like(loaded_ctx: Option<u32>) -> String {
         let ps = match loaded_ctx {
             Some(n) => {
@@ -2870,12 +2887,9 @@ mod tests {
                 }),
             )
             .route(
-                "/v1/chat/completions",
+                "/api/chat",
                 axum::routing::post(|| async {
-                    axum::response::Response::builder()
-                        .header("content-type", "text/event-stream")
-                        .body("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\ndata: [DONE]\n".to_string())
-                        .unwrap()
+                    "{\"message\":{\"content\":\"ok\"},\"done\":false}\n{\"message\":{\"content\":\"\"},\"done\":true}\n"
                 }),
             );
         serve_router(router).await
@@ -2961,14 +2975,20 @@ mod tests {
                 Arc::new(AutoApproveGate),
             );
             let mut announced = false;
+            let mut reply = String::new();
             while let Some(evt) = rx.recv().await {
                 match evt {
                     AgentEvent::Status { phase, .. } if phase == "context" => announced = true,
-                    AgentEvent::Done | AgentEvent::Error(_) => break,
+                    AgentEvent::Token(t) => reply.push_str(&t),
+                    AgentEvent::Done => break,
+                    AgentEvent::Error(e) => panic!("{e}"),
                     _ => {}
                 }
             }
             assert_eq!(announced, learned, "configured {configured:?}");
+            // Recognised as Ollama by what it answered, and spoken to in its
+            // own API although its port does not say Ollama.
+            assert_eq!(reply, "ok");
         }
     }
 
@@ -4275,7 +4295,11 @@ mod tests {
             kind: Some(ProviderKind::OpenAi),
         };
         let client = conn.into_client();
-        assert_eq!(client.flavor(), ahma_llm_monitor::ApiFlavor::OpenAi);
+        assert_eq!(
+            client.flavor(),
+            ahma_llm_monitor::ApiFlavor::Ollama,
+            "an OpenAI-compatible entry at Ollama gets Ollama's own API"
+        );
         assert!(
             client.sends_num_ctx(),
             "num_ctx must survive the with_flavor call"

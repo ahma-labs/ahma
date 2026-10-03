@@ -16,8 +16,6 @@ use tokio::sync::mpsc::Sender;
 /// When no entry claims this URL, the heuristic is left in charge — that is
 /// the correct behavior for ad-hoc and auto-discovered endpoints.
 pub fn build_configured_client(base_url: impl Into<String>, model: impl Into<String>) -> LlmClient {
-    use ahma_common::config::ProviderKind;
-
     let base_url = base_url.into();
     let config = ahma_common::config::AhmaConfig::load();
     // The entry's key too, or every call to a keyed cloud provider is a 401.
@@ -27,8 +25,7 @@ pub fn build_configured_client(base_url: impl Into<String>, model: impl Into<Str
         .and_then(|r| r.api_key);
     let client = LlmClient::new(base_url.clone(), model.into(), api_key);
     let client = match config.kind_for_base_url(&base_url) {
-        Some(ProviderKind::Anthropic) => client.with_flavor(ahma_llm_monitor::ApiFlavor::Anthropic),
-        Some(ProviderKind::OpenAi) => client.with_flavor(ahma_llm_monitor::ApiFlavor::OpenAi),
+        Some(kind) => client.with_provider_kind(kind),
         None => client,
     };
     client.with_num_ctx(config.num_ctx_for_base_url(&base_url))

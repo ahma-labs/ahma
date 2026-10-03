@@ -174,10 +174,11 @@ pub struct ProviderEntry {
     /// Optional context-window size (in tokens) to request from the provider.
     ///
     /// Only meaningful for providers that accept a per-request context override —
-    /// in practice Ollama, via the `options.num_ctx` field on its
-    /// OpenAI-compatible endpoint. For hosted OpenAI-protocol clouds the context
-    /// window is fixed by the model and this value is ignored (and not offered in
-    /// the TUI). See [`endpoint_supports_num_ctx`].
+    /// in practice Ollama, which ahma speaks to through its own `/api/chat`
+    /// (its OpenAI-compatible `/v1` ignores the setting). For hosted
+    /// OpenAI-protocol clouds the context window is fixed by the model and this
+    /// value is ignored (and not offered in the TUI). Unset, ahma uses the size
+    /// the server reports. See [`endpoint_supports_num_ctx`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<u32>,
 }
@@ -191,8 +192,9 @@ pub const DEFAULT_OLLAMA_NUM_CTX: u32 = 16_384;
 /// Whether an endpoint accepts a per-request context-window override
 /// (`options.num_ctx`).
 ///
-/// Today this is true only for Ollama's OpenAI-compatible endpoint, detected by
-/// its default port (`11434`) or an `ollama` host. Hosted clouds (OpenAI,
+/// Today this is true only for Ollama, detected by its default port (`11434`)
+/// or an `ollama` host, and spoken to through its own `/api/chat`, the only
+/// Ollama endpoint that honours `options.num_ctx`. Hosted clouds (OpenAI,
 /// Together, Groq, …) pin the context to the model and reject unknown fields, so
 /// the TUI greys out the `num_ctx` control for them.
 pub fn endpoint_supports_num_ctx(base_url: &str, kind: ProviderKind) -> bool {
@@ -444,6 +446,60 @@ impl AhmaConfig {
             );
         }
         entry.num_ctx = num_ctx;
+        let text = toml::to_string_pretty(&cfg).context("Failed to serialize config to TOML")?;
+        atomic_write_toml(path, &text)
+    }
+
+    /// Set (or clear) the context size of the provider at `base_url`, as the
+    /// TUI's `/provider numctx` does. An entry is found by name or URL and
+    /// updated in place; a provider with no entry yet (one the TUI discovered
+    /// on this machine) is recorded with `name` and `model`, so the size
+    /// reaches every later run.
+    pub fn set_num_ctx_for_endpoint(
+        name: &str,
+        base_url: &str,
+        model: &str,
+        num_ctx: Option<u32>,
+    ) -> Result<()> {
+        let path = ahma_config_path()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine ~/.ahma/config.toml path"))?;
+        Self::set_num_ctx_for_endpoint_to(&path, name, base_url, model, num_ctx)
+    }
+
+    /// [`Self::set_num_ctx_for_endpoint`] against an explicit path (for tests).
+    pub fn set_num_ctx_for_endpoint_to(
+        path: &Path,
+        name: &str,
+        base_url: &str,
+        model: &str,
+        num_ctx: Option<u32>,
+    ) -> Result<()> {
+        let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+        let mut cfg = Self::read_config_for_edit(path)?;
+        let entry = cfg
+            .providers
+            .iter_mut()
+            .find(|p| p.name == name || same(&p.base_url, base_url));
+        let (url, kind) = entry
+            .as_ref()
+            .map_or((base_url, ProviderKind::OpenAi), |e| {
+                (e.base_url.as_str(), e.kind)
+            });
+        if num_ctx.is_some() && !endpoint_supports_num_ctx(url, kind) {
+            anyhow::bail!("Provider '{name}' ({url}) does not support a num_ctx override");
+        }
+        match entry {
+            Some(entry) => entry.num_ctx = num_ctx,
+            None if num_ctx.is_none() => return Ok(()),
+            None => cfg.providers.push(ProviderEntry {
+                name: name.to_string(),
+                kind: ProviderKind::OpenAi,
+                base_url: base_url.to_string(),
+                default_model: model.to_string(),
+                api_key: None,
+                num_ctx,
+            }),
+        }
         let text = toml::to_string_pretty(&cfg).context("Failed to serialize config to TOML")?;
         atomic_write_toml(path, &text)
     }
@@ -3057,6 +3113,66 @@ mod tests {
         );
         // Duplicate name is rejected.
         assert!(AhmaConfig::add_provider_to(&path, entry).is_err());
+    }
+
+    /// Setting a context size for a provider the TUI discovered (no entry in
+    /// config.toml yet) records the entry with it, so the size reaches every
+    /// later run; an existing entry, found by name or URL, is updated in place.
+    #[test]
+    fn a_discovered_ollama_gets_its_context_size_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        AhmaConfig::set_num_ctx_for_endpoint_to(
+            &path,
+            "Ollama",
+            "http://localhost:11434/v1",
+            "qwen3:8b",
+            Some(12288),
+        )
+        .unwrap();
+        let cfg = AhmaConfig::load_from(&path);
+        assert_eq!(
+            cfg.num_ctx_for_base_url("http://localhost:11434/v1"),
+            Some(12288)
+        );
+        assert_eq!(
+            cfg.providers.iter().filter(|p| p.name == "Ollama").count(),
+            1
+        );
+
+        AhmaConfig::set_num_ctx_for_endpoint_to(
+            &path,
+            "other-name",
+            "http://localhost:11434/v1/",
+            "qwen3:8b",
+            Some(4096),
+        )
+        .unwrap();
+        let cfg = AhmaConfig::load_from(&path);
+        assert_eq!(
+            cfg.providers
+                .iter()
+                .filter(|p| p.base_url.contains(":11434"))
+                .count(),
+            1,
+            "found by URL, not duplicated"
+        );
+        assert_eq!(
+            cfg.num_ctx_for_base_url("http://localhost:11434/v1"),
+            Some(4096)
+        );
+
+        assert!(
+            AhmaConfig::set_num_ctx_for_endpoint_to(
+                &path,
+                "cloud",
+                "https://api.openai.com/v1",
+                "gpt-5",
+                Some(4096)
+            )
+            .is_err(),
+            "a hosted cloud fixes the size itself"
+        );
     }
 
     #[test]

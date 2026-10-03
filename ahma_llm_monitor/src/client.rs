@@ -11,6 +11,7 @@ use ahma_common::http_retry::{Idempotency, RetryPolicy, send_with_retry};
 
 use crate::anthropic;
 use crate::error::LlmMonitorError;
+use crate::ollama;
 use crate::prompt::build_messages;
 
 /// Max time to establish a TCP/TLS connection to the LLM endpoint.
@@ -303,16 +304,19 @@ pub struct LocalProvider {
 
 /// Which provider wire format an [`LlmClient`] speaks.
 ///
-/// ahma's internal message shape is OpenAI-compatible; the Anthropic flavor
-/// translates to/from the native Messages API at the HTTP boundary (see
-/// [`crate::anthropic`]).
+/// ahma's internal message shape is OpenAI-compatible; the Anthropic and
+/// Ollama flavors translate to/from their native APIs at the HTTP boundary
+/// (see [`crate::anthropic`], [`crate::ollama`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApiFlavor {
-    /// OpenAI-compatible `/chat/completions` (Ollama, llama.cpp, LM Studio, OpenAI…).
+    /// OpenAI-compatible `/chat/completions` (llama.cpp, LM Studio, vLLM, OpenAI…).
     #[default]
     OpenAi,
     /// Anthropic native Messages API (`/messages`, `x-api-key`).
     Anthropic,
+    /// Ollama's own chat API (`/api/chat`), the only one on which Ollama
+    /// honours a context size. Chosen automatically for Ollama endpoints.
+    Ollama,
 }
 
 /// Which program serves a local endpoint, as its own API identified it
@@ -419,6 +423,8 @@ impl LlmClient {
         // plumbing. Explicit configuration overrides via `with_flavor`.
         let flavor = if anthropic::looks_like_anthropic(&base_url) {
             ApiFlavor::Anthropic
+        } else if ollama::looks_like_ollama(&base_url) {
+            ApiFlavor::Ollama
         } else {
             ApiFlavor::OpenAi
         };
@@ -449,28 +455,33 @@ impl LlmClient {
         self
     }
 
-    /// Whether this client will actually send a `num_ctx` override on requests
-    /// (i.e. one is configured *and* the endpoint is Ollama).
+    /// Whether this client will actually send a `num_ctx` override on requests:
+    /// one is configured *and* the client speaks Ollama's own API, the only
+    /// endpoint that honours it (Ollama's `/v1` ignores it).
     pub fn sends_num_ctx(&self) -> bool {
-        self.num_ctx.is_some()
-            && ahma_common::config::endpoint_supports_num_ctx(
-                &self.base_url,
-                match self.flavor {
-                    ApiFlavor::OpenAi => ahma_common::config::ProviderKind::OpenAi,
-                    ApiFlavor::Anthropic => ahma_common::config::ProviderKind::Anthropic,
-                },
-            )
+        self.num_ctx.is_some() && self.flavor == ApiFlavor::Ollama
     }
 
-    /// Inject `options.num_ctx` into an OpenAI-compatible request body when a
-    /// context override is configured and the endpoint is Ollama. No-op
-    /// otherwise, so hosted clouds never see an unknown field.
-    fn apply_num_ctx(&self, body: &mut Value) {
-        if let Some(n) = self.num_ctx
-            && self.sends_num_ctx()
-        {
-            body["options"] = json!({ "num_ctx": n });
+    /// The `options` of an Ollama `/api/chat` request: output limit,
+    /// temperature (none for reasoning models, as [`Self::apply_sampling`]),
+    /// and the configured context size.
+    fn ollama_options(&self, max_tokens: Option<u32>, temperature: f64) -> Value {
+        let mut options = json!({});
+        if let Some(n) = max_tokens {
+            options["num_predict"] = json!(n);
         }
+        if !is_reasoning_model(&self.model) {
+            options["temperature"] = json!(temperature);
+        }
+        if let Some(n) = self.num_ctx {
+            options["num_ctx"] = json!(n);
+        }
+        options
+    }
+
+    /// `/api/chat` on this client's Ollama server.
+    fn ollama_chat_url(&self) -> String {
+        format!("{}/api/chat", ollama::root(&self.base_url))
     }
 
     /// Set the output-token limit and temperature the way this endpoint and
@@ -516,7 +527,6 @@ impl LlmClient {
             body["tools"] = Value::Array(tools.to_vec());
             body["tool_choice"] = json!("auto");
         }
-        self.apply_num_ctx(&mut body);
         body
     }
 
@@ -551,17 +561,29 @@ impl LlmClient {
     /// `kind = "anthropic"` from `~/.ahma/config.toml`, so it works for proxies
     /// and gateways whose `base_url` doesn't carry the Anthropic host.
     pub fn for_provider(provider: &ahma_common::config::ResolvedProvider) -> Self {
-        let flavor = match provider.kind {
-            ahma_common::config::ProviderKind::OpenAi => ApiFlavor::OpenAi,
-            ahma_common::config::ProviderKind::Anthropic => ApiFlavor::Anthropic,
-        };
         Self::new(
             provider.base_url.clone(),
             provider.default_model.clone(),
             provider.api_key.clone(),
         )
-        .with_flavor(flavor)
+        .with_provider_kind(provider.kind)
         .with_num_ctx(provider.num_ctx)
+    }
+
+    /// Apply a configured provider `kind`. `anthropic` forces the Anthropic
+    /// API. `openai` means "OpenAI-compatible", which an Ollama server is, so
+    /// an Ollama endpoint still gets Ollama's own API: the configuration says
+    /// what the server understands, not which of its APIs to prefer.
+    pub fn with_provider_kind(self, kind: ahma_common::config::ProviderKind) -> Self {
+        match kind {
+            ahma_common::config::ProviderKind::Anthropic => self.with_flavor(ApiFlavor::Anthropic),
+            ahma_common::config::ProviderKind::OpenAi
+                if ollama::looks_like_ollama(&self.base_url) =>
+            {
+                self.with_flavor(ApiFlavor::Ollama)
+            }
+            ahma_common::config::ProviderKind::OpenAi => self.with_flavor(ApiFlavor::OpenAi),
+        }
     }
 
     /// The wire-format flavor this client speaks.
@@ -638,7 +660,7 @@ impl LlmClient {
     /// for this model; Ollama states it only once the model is loaded, since
     /// the size it will load at is the server's choice.
     pub async fn server_context(&self) -> Option<ServerContext> {
-        if !self.local || self.flavor != ApiFlavor::OpenAi {
+        if !self.local || self.flavor == ApiFlavor::Anthropic {
             return None;
         }
         let root = self.base_url.trim_end_matches('/');
@@ -737,7 +759,7 @@ impl LlmClient {
     /// required `anthropic-version` header.
     fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.flavor {
-            ApiFlavor::OpenAi => match &self.api_key {
+            ApiFlavor::OpenAi | ApiFlavor::Ollama => match &self.api_key {
                 Some(key) => request.bearer_auth(key),
                 None => request,
             },
@@ -769,6 +791,16 @@ impl LlmClient {
             ApiFlavor::OpenAi => (
                 format!("{}/chat/completions", self.base_url),
                 self.detect_issues_body(&messages),
+            ),
+            ApiFlavor::Ollama => (
+                self.ollama_chat_url(),
+                ollama::chat_body(
+                    &self.model,
+                    &messages,
+                    &[],
+                    false,
+                    self.ollama_options(Some(256), 0.0),
+                ),
             ),
             ApiFlavor::Anthropic => {
                 let (system, amsgs) = anthropic::openai_to_anthropic(&messages);
@@ -812,6 +844,7 @@ impl LlmClient {
         let pointer = match self.flavor {
             ApiFlavor::OpenAi => "/choices/0/message/content",
             ApiFlavor::Anthropic => "/content/0/text",
+            ApiFlavor::Ollama => "/message/content",
         };
         let text = json
             .pointer(pointer)
@@ -845,8 +878,24 @@ impl LlmClient {
             ApiFlavor::OpenAi => {
                 let mut body = build_chat_stream_body(&self.model, messages, system_prompt);
                 self.apply_sampling(&mut body, None, 0.7);
-                self.apply_num_ctx(&mut body);
                 (format!("{}/chat/completions", self.base_url), body)
+            }
+            ApiFlavor::Ollama => {
+                let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+                if let Some(sys) = system_prompt {
+                    msgs.push(json!({"role": "system", "content": sys}));
+                }
+                msgs.extend(messages.iter().map(ChatMessage::as_openai_message));
+                (
+                    self.ollama_chat_url(),
+                    ollama::chat_body(
+                        &self.model,
+                        &msgs,
+                        &[],
+                        true,
+                        self.ollama_options(None, 0.7),
+                    ),
+                )
             }
             ApiFlavor::Anthropic => {
                 let mut openai_msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
@@ -987,6 +1036,7 @@ impl LlmClient {
         let parsed = match self.flavor {
             ApiFlavor::OpenAi => parse_chat_completion_response(json),
             ApiFlavor::Anthropic => anthropic::parse_messages_response(json),
+            ApiFlavor::Ollama => parse_chat_completion_response(ollama::response_to_openai(&json)),
         }
         .map(|resp| restore_tool_names(resp, &names));
         if let Ok(ref resp) = parsed {
@@ -1004,6 +1054,16 @@ impl LlmClient {
             ApiFlavor::OpenAi => (
                 format!("{}/chat/completions", self.base_url),
                 self.tools_body(messages, tools, false),
+            ),
+            ApiFlavor::Ollama => (
+                self.ollama_chat_url(),
+                ollama::chat_body(
+                    &self.model,
+                    messages,
+                    tools,
+                    false,
+                    self.ollama_options(Some(8192), 0.2),
+                ),
             ),
             ApiFlavor::Anthropic => {
                 let (system, amsgs) = anthropic::openai_to_anthropic(messages);
@@ -1055,16 +1115,17 @@ impl LlmClient {
     /// lets it surface reasoning tokens, instead of blocking on one opaque
     /// 120-second request.
     ///
-    /// Only the OpenAI flavor streams here; Anthropic falls back to the
-    /// non-streaming path (its tool-call streaming format differs) and emits its
-    /// visible content as a single delta so callers still see output.
+    /// The OpenAI and Ollama flavors stream here (Ollama's lines are rewritten
+    /// into OpenAI chunks, [`ollama::ndjson_as_sse`]); Anthropic falls back to
+    /// the non-streaming path (its tool-call streaming format differs) and
+    /// emits its visible content as a single delta so callers still see output.
     pub async fn chat_completion_with_tools_streaming(
         &self,
         messages: &[Value],
         tools: &[Value],
         deltas: tokio::sync::mpsc::Sender<StreamDelta>,
     ) -> Result<ChatCompletionResponse, LlmMonitorError> {
-        if self.flavor != ApiFlavor::OpenAi {
+        if self.flavor == ApiFlavor::Anthropic {
             // Anthropic: keep the proven non-streaming path, but still feed the
             // visible content to the UI as one delta so it isn't silent.
             let resp = self.chat_completion_with_tools(messages, tools).await?;
@@ -1078,7 +1139,22 @@ impl LlmClient {
 
         let (wire_tools, wire_messages, names) = crate::tool_names::to_wire(tools, messages);
         let (messages, tools) = (wire_messages.as_slice(), wire_tools.as_slice());
-        let body = self.streaming_tools_body(messages, tools);
+        let (url, body) = match self.flavor {
+            ApiFlavor::Ollama => (
+                self.ollama_chat_url(),
+                ollama::chat_body(
+                    &self.model,
+                    messages,
+                    tools,
+                    true,
+                    self.ollama_options(Some(8192), 0.2),
+                ),
+            ),
+            _ => (
+                format!("{}/chat/completions", self.base_url),
+                self.streaming_tools_body(messages, tools),
+            ),
+        };
 
         let started = std::time::Instant::now();
         info!(
@@ -1090,7 +1166,6 @@ impl LlmClient {
             "llm: requesting chat completion with tools (streaming)"
         );
 
-        let url = format!("{}/chat/completions", self.base_url);
         let response = send_with_backoff(|| {
             self.apply_auth(
                 self.http
@@ -1107,9 +1182,18 @@ impl LlmClient {
             return Err(api_error_from_response(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
-        let response_json =
-            drain_streaming_deltas(byte_stream, &deltas, &self.model, started).await?;
+        let byte_stream = Box::pin(response.bytes_stream());
+        let response_json = if self.flavor == ApiFlavor::Ollama {
+            drain_streaming_deltas(
+                ollama::ndjson_as_sse(byte_stream),
+                &deltas,
+                &self.model,
+                started,
+            )
+            .await?
+        } else {
+            drain_streaming_deltas(byte_stream, &deltas, &self.model, started).await?
+        };
         let parsed =
             parse_chat_completion_response(response_json).map(|r| restore_tool_names(r, &names));
         if let Ok(ref resp) = parsed {
@@ -1376,7 +1460,7 @@ async fn chat_stream_start(
             .json(&body)
             .header("Accept", "text/event-stream");
         match flavor {
-            ApiFlavor::OpenAi => match &api_key {
+            ApiFlavor::OpenAi | ApiFlavor::Ollama => match &api_key {
                 Some(key) => req.bearer_auth(key),
                 None => req,
             },
@@ -1409,11 +1493,18 @@ async fn chat_stream_start(
 
     debug!("llm: streaming response started");
     use futures::TryStreamExt as _;
-    let byte_stream = resp.bytes_stream().map_err(LlmMonitorError::from);
+    let byte_stream = Box::pin(resp.bytes_stream().map_err(LlmMonitorError::from));
+    let stream: std::pin::Pin<
+        Box<dyn Stream<Item = Result<bytes::Bytes, LlmMonitorError>> + Send>,
+    > = if flavor == ApiFlavor::Ollama {
+        Box::pin(ollama::ndjson_as_sse(byte_stream))
+    } else {
+        byte_stream
+    };
     Some((
         Ok(String::new()), // empty first yield to advance state
         ChatStreamState::Streaming {
-            stream: Box::pin(byte_stream),
+            stream,
             buffer: String::new(),
             flavor,
         },
@@ -1639,7 +1730,7 @@ enum PollLineOutcome {
 /// sentinel check from [`chat_stream_poll`]'s read loop.
 fn resolve_poll_line(flavor: ApiFlavor, line: &str) -> PollLineOutcome {
     let parsed = match flavor {
-        ApiFlavor::OpenAi => parse_sse_line(line),
+        ApiFlavor::OpenAi | ApiFlavor::Ollama => parse_sse_line(line),
         ApiFlavor::Anthropic => anthropic::parse_sse_line(line),
     };
     match parsed {
@@ -2001,11 +2092,17 @@ mod tests {
         assert!(b.get("max_tokens").is_none(), "{b}");
         assert_eq!(b["max_completion_tokens"], json!(8192));
         assert_eq!(b["temperature"], json!(0.2));
-        let local = LlmClient::new("http://localhost:11434/v1", "qwen3:8b", None);
+        let local = LlmClient::new("http://localhost:1234/v1", "qwen3:8b", None);
         let b = &bodies(&local)[0];
         assert_eq!(b["max_tokens"], json!(8192));
         assert!(b.get("max_completion_tokens").is_none(), "{b}");
         assert_eq!(b["temperature"], json!(0.2));
+        // Ollama's own API takes both inside `options`.
+        let ollama = LlmClient::new("http://localhost:11434/v1", "qwen3:8b", None);
+        let b = &bodies(&ollama)[0];
+        assert_eq!(b["options"]["num_predict"], json!(8192));
+        assert_eq!(b["options"]["temperature"], json!(0.2));
+        assert!(b.get("max_tokens").is_none(), "{b}");
     }
 
     /// A non-streaming completion that timed out was most likely received,
@@ -2024,22 +2121,26 @@ mod tests {
     }
 
     #[test]
-    fn num_ctx_injected_only_for_ollama_endpoints() {
-        // Ollama endpoint + configured num_ctx → options.num_ctx is sent.
+    fn num_ctx_is_sent_only_where_ollama_honours_it() {
+        // Ollama endpoint + configured num_ctx → in options, on /api/chat.
         let ollama = LlmClient::new("http://localhost:11434/v1", "ornith:35b", None)
             .with_num_ctx(Some(16384));
         assert!(ollama.sends_num_ctx());
-        let mut body = json!({"model": "ornith:35b", "messages": []});
-        ollama.apply_num_ctx(&mut body);
-        assert_eq!(body["options"]["num_ctx"], json!(16384));
+        assert_eq!(ollama.ollama_options(None, 0.2)["num_ctx"], json!(16384));
+        assert_eq!(ollama.ollama_chat_url(), "http://localhost:11434/api/chat");
 
         // Hosted OpenAI cloud → never sends num_ctx (would 400 on unknown field).
         let cloud = LlmClient::new("https://api.openai.com/v1", "gpt-4o-mini", None)
             .with_num_ctx(Some(16384));
         assert!(!cloud.sends_num_ctx());
-        let mut body = json!({"model": "gpt-4o-mini", "messages": []});
-        cloud.apply_num_ctx(&mut body);
+        let body = cloud.tools_body(&[], &[], false);
         assert!(body.get("options").is_none());
+
+        // Ollama forced onto its /v1, which ignores it → not sent.
+        let v1 = LlmClient::new("http://localhost:11434/v1", "m", None)
+            .with_flavor(ApiFlavor::OpenAi)
+            .with_num_ctx(Some(16384));
+        assert!(!v1.sends_num_ctx());
 
         // Ollama endpoint but no override configured → nothing sent.
         let bare = LlmClient::new("http://localhost:11434/v1", "ornith:35b", None);

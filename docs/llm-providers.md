@@ -168,10 +168,24 @@ every token of the prompt on local hardware. A LiteLLM proxy on localhost
 forwards the work elsewhere, so it keeps the normal budgets. Remote endpoints
 are never asked.
 
-Ollama's OpenAI-compatible `/v1` endpoint ignores `num_ctx` (checked against
-Ollama 0.35): the model loads at the server's own default whatever the request
-says. Until ahma speaks Ollama's own API, set Ollama's size on the server
-(`OLLAMA_CONTEXT_LENGTH`) and let ahma read it.
+### Ollama: its own API, and a size you can choose
+
+ahma talks to Ollama through Ollama's own chat API (`/api/chat`), chosen
+automatically: by the default port `11434` or an `ollama` host name, and
+otherwise when the server answers as Ollama. Its OpenAI-compatible `/v1`
+endpoint ignores a requested context size (checked against Ollama 0.35: every
+size loaded the model at the server default), so `/api/chat` is the only way a
+size you choose takes effect. Your `base_url` stays `http://host:11434/v1`.
+
+Ollama is the one server that takes a context size per request:
+
+- Leave it unset and Ollama picks the size; ahma reads it back from `/api/ps`.
+- Set `num_ctx` in the provider entry, or `/provider numctx <tokens>` in the
+  TUI, to load the model at that size. A smaller size uses much less memory
+  (a 3B model: 3 GB at 8,192 tokens, 13 GB at 131,072).
+
+Other servers fix the size when they load the model (LM Studio's load
+settings, llama.cpp's `--ctx-size`, vLLM's `--max-model-len`); ahma reads it.
 
 ## Testing connectivity
 
