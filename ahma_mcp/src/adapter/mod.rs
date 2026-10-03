@@ -50,6 +50,7 @@ pub mod mutex_groups;
 mod preparer;
 mod pty_exec;
 pub mod spill;
+mod time_limit;
 mod types;
 pub mod workspace_queue;
 
@@ -799,10 +800,9 @@ impl Adapter {
                 return SyncRun {
                     outcome: audit::Outcome::TimedOut,
                     exit_code: None,
-                    result: Err(anyhow::anyhow!(
-                        "Operation timed out (exceeded timeout limit): {} seconds",
+                    result: Err(anyhow::anyhow!(time_limit::limit_reached(
                         timeout.as_secs()
-                    )),
+                    ))),
                 };
             }
             Ok(Err(e)) => {
@@ -2007,8 +2007,9 @@ async fn cancel_operation_timed_out(
     duration_ms: u64,
 ) {
     let timeout_reason = format!(
-        "Operation timed out after {}ms (exceeded timeout limit)",
-        duration_ms
+        "Operation timed out after {}ms (exceeded timeout limit). {}",
+        duration_ms,
+        time_limit::how_to_raise(duration_ms.div_ceil(1000))
     );
     monitor
         .update_status(
@@ -2083,6 +2084,10 @@ async fn execute_with_streaming(
     let mut collected_stderr = BoundedLineCollector::default();
 
     let timeout_deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    // Warn once at 80% of the limit (SPEC R2.6.6), so a healthy job near it
+    // is not stopped without notice.
+    let near_limit_at = tokio::time::Instant::now() + Duration::from_millis(timeout_ms * 8 / 10);
+    let mut warned_near_limit = false;
 
     let mut still_running_interval = tokio::time::interval(Duration::from_secs(10));
     still_running_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2131,6 +2136,13 @@ async fn execute_with_streaming(
                 drop(lease.take());
                 handle_cancellation(op_monitor, op_id).await;
                 return (audit::Outcome::Cancelled, None);
+            }
+
+            _ = tokio::time::sleep_until(near_limit_at), if !warned_near_limit => {
+                warned_near_limit = true;
+                op_monitor
+                    .append_alert(op_id, time_limit::near_limit(timeout_ms.div_ceil(1000)))
+                    .await;
             }
 
             // Timeout
