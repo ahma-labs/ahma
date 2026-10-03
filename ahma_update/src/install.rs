@@ -58,9 +58,8 @@ pub async fn install_release_asset(
         .with_context(|| format!("Failed to create {}", install_dir.display()))?;
 
     // Digests for the install receipt, taken before anything can change the bytes.
-    // `should_skip_verify` covers the retired env vars `verify_artifact` still honours:
-    // a receipt must never claim a verification that was skipped.
-    let verified = if insecure_skip_verify || verify::should_skip_verify() {
+    // A receipt must never claim a verification that was skipped.
+    let verified = if insecure_skip_verify {
         None
     } else {
         Some(receipt::VerifiedArtifact {
