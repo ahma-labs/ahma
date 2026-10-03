@@ -14,64 +14,195 @@
 //! resists DNS-rebinding: a domain that flips its DNS to a private address
 //! after approval is still blocked when the socket is actually opened. IP
 //! *literals* (which bypass DNS) are rejected up front by [`check_url`] and, for
-//! redirect targets, by the redirect policy.
+//! redirect targets, by the redirect policy or — on a fetch that follows its own
+//! redirects under a [`RedirectDomainGuard`] — by `check_url` again on every hop.
 //!
 //! `block_private` is a parameter rather than a hard constant so a legitimate
 //! dev workflow (or a test hitting a loopback mock server) can opt out — the
 //! equivalent of SPEC R-WEB.3.3's `block_private_ranges = false`. Tool code
 //! always uses the strict (`true`) default.
 
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
+use ahma_common::web_policy::WebDecision;
 use anyhow::{Result, anyhow};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
 
-/// Maximum redirects followed before failing the request.
-const MAX_REDIRECTS: usize = 10;
+pub use ahma_common::config::RedirectPolicy;
 
-/// Decides whether a **cross-domain** redirect hop may be followed (SPEC R-WEB.8).
+/// Maximum redirects followed before failing the request.
+pub const MAX_REDIRECTS: usize = 10;
+
+/// What to do with one redirect hop (SPEC R-WEB.8). Produced by
+/// [`decide_redirect`], the single place the `on_redirect_to_new_domain` rules
+/// live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedirectStep {
+    /// Follow the hop.
+    Follow,
+    /// Refuse the hop; the message is the user-facing reason.
+    Refuse(String),
+    /// `prompt` mode only: ask a human about `domain` exactly as for a fresh
+    /// request to it, and follow the hop iff the answer is yes.
+    Ask {
+        /// The redirect target's host, lowercased.
+        domain: String,
+    },
+}
+
+/// Decide what to do with a redirect from `origin_host` to `target_host`
+/// under `mode` (`[web] on_redirect_to_new_domain`), given `verdict` — what the
+/// live `[web]` policy, with this session's grants and denies, decides for the
+/// target URL.
+///
+/// - Same host (case-insensitive, any scheme/port — so `http` → `https` too):
+///   always [`RedirectStep::Follow`] (R-WEB.8.3).
+/// - `policy`: follow iff `verdict` is `Allow`; otherwise refuse with the
+///   `ahma web allow <host>` hint. Never asks.
+/// - `block`: refuse every other host, whatever the policy says.
+/// - `prompt`: `Allow` follows and `Deny` refuses without asking; an unknown
+///   host (`Prompt`, strict `deny` mode) yields [`RedirectStep::Ask`], i.e. the
+///   same three-tier approval a fresh request to that host would get.
+///
+/// Pure: the private-range checks (R-WEB.3 / R-WEB.8.4) are the caller's, on
+/// every hop, before and independently of this decision.
+pub fn decide_redirect(
+    origin_host: &str,
+    target_host: &str,
+    target_url: &str,
+    mode: RedirectPolicy,
+    verdict: &WebDecision,
+) -> RedirectStep {
+    if target_host.eq_ignore_ascii_case(origin_host) {
+        return RedirectStep::Follow;
+    }
+    let host = target_host;
+    let not_approved = |why: &str| {
+        RedirectStep::Refuse(format!(
+            "egress blocked: '{origin_host}' redirected to '{host}' ({target_url}), a different \
+             domain than the approved request, and {why} (R-WEB.8). To allow it, run \
+             `ahma web allow {host}` and retry."
+        ))
+    };
+    match (mode, verdict) {
+        (RedirectPolicy::Block, _) => RedirectStep::Refuse(format!(
+            "egress blocked: '{origin_host}' redirected to '{host}' ({target_url}), a different \
+             domain, and [web] on_redirect_to_new_domain = \"block\" never follows a redirect \
+             to another host (R-WEB.8). Fetch that URL directly if you need it, or set \
+             on_redirect_to_new_domain to \"policy\" or \"prompt\" in ~/.ahma/settings.toml."
+        )),
+        (_, WebDecision::Allow { .. }) => RedirectStep::Follow,
+        (_, WebDecision::Deny { reason }) => {
+            not_approved(&format!("the [web] policy refuses it: {reason}"))
+        }
+        (RedirectPolicy::Prompt, WebDecision::Prompt { domain }) => RedirectStep::Ask {
+            domain: domain.clone(),
+        },
+        (RedirectPolicy::Policy, WebDecision::Prompt { .. }) => {
+            not_approved("the [web] policy does not approve it")
+        }
+    }
+}
+
+/// The live `[web]` verdict for a redirect target URL (with this session's
+/// grants and denies — read at the time of the hop, not when the request began).
+pub type RedirectVerdictFn = Arc<dyn Fn(&str) -> WebDecision + Send + Sync>;
+
+/// The answer to one `prompt`-mode approval: `Ok(())` to follow the hop, or
+/// `Err(reason)` to fail the request with that reason.
+pub type ApproveFuture = Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send>>;
+
+/// `prompt` mode's approval, called with `(domain, url)` of the redirect
+/// target. The caller wires it to the same three-tier approval flow a fresh
+/// request uses (R-WEB.5–R-WEB.7). Build one with
+/// [`RedirectDomainGuard::with_approver`].
+pub type RedirectApproveFn = Arc<dyn Fn(String, String) -> ApproveFuture + Send + Sync>;
+
+/// Enforces `[web] on_redirect_to_new_domain` on a fetch (SPEC R-WEB.8).
 ///
 /// The SSRF resolver already blocks any hop that resolves to a private address,
 /// but it says nothing about a hop to a *different public domain*: an approved
 /// `api.github.com` that returns `302 Location: https://evil.example/` would
 /// otherwise be followed, laundering an unapproved domain through an approved
-/// one. This guard closes that hole. The `origin_host` (the host of the URL the
-/// tool actually requested) is always permitted; every other host is consulted
-/// through `allow`, which the caller wires to the live `[web]` policy so a
-/// redirect target is followed only if the policy would independently approve it.
+/// one. A fetch given this guard follows redirects itself (automatic redirects
+/// are off), so every hop can be decided by [`decide_redirect`] — including the
+/// asynchronous approval `prompt` mode needs, which reqwest's synchronous
+/// redirect callback could not await.
 #[derive(Clone)]
 pub struct RedirectDomainGuard {
-    origin_host: String,
-    allow: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    mode: RedirectPolicy,
+    verdict: RedirectVerdictFn,
+    approve: Option<RedirectApproveFn>,
 }
 
 impl RedirectDomainGuard {
-    /// Build a guard for a request whose original host is `origin_host`. `allow`
-    /// returns `true` for any other host the caller's policy independently
-    /// approves as a redirect target.
-    pub fn new(
-        origin_host: impl Into<String>,
-        allow: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    ) -> Self {
+    /// A guard applying `mode`, with `verdict` giving the live policy decision
+    /// for a redirect target URL. Without an approver (see
+    /// [`Self::with_approver`]) a hop that `prompt` mode would ask about is
+    /// refused with the `ahma web allow` hint, as `policy` mode refuses it.
+    pub fn new(mode: RedirectPolicy, verdict: RedirectVerdictFn) -> Self {
         Self {
-            origin_host: origin_host.into(),
-            allow,
+            mode,
+            verdict,
+            approve: None,
         }
     }
 
-    /// Whether a redirect to `host` may be followed: the origin host itself
-    /// (case-insensitive) always may; any other host must be approved by `allow`.
-    fn permits(&self, host: &str) -> bool {
-        host.eq_ignore_ascii_case(&self.origin_host) || (self.allow)(host)
+    /// Attach the approval flow `prompt` mode asks through: `approve(domain,
+    /// url)` resolves to `Ok(())` to follow the hop or `Err(reason)` to refuse.
+    pub fn with_approver<F, Fut>(mut self, approve: F) -> Self
+    where
+        F: Fn(String, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<(), String>> + Send + 'static,
+    {
+        self.approve = Some(Arc::new(
+            move |domain: String, url: String| -> ApproveFuture { Box::pin(approve(domain, url)) },
+        ));
+        self
+    }
+
+    /// The configured mode.
+    pub fn mode(&self) -> RedirectPolicy {
+        self.mode
+    }
+
+    /// Decide one hop from `origin_host` to `target`: [`decide_redirect`] with
+    /// the live verdict for `target`.
+    pub fn decide(&self, origin_host: &str, target: &reqwest::Url) -> RedirectStep {
+        let target_host = target.host_str().unwrap_or_default();
+        let verdict = (self.verdict)(target.as_str());
+        decide_redirect(
+            origin_host,
+            target_host,
+            target.as_str(),
+            self.mode,
+            &verdict,
+        )
+    }
+
+    /// Resolve a [`RedirectStep::Ask`] through the approver. `Ok(())` means
+    /// approved; with no approver attached nothing can ask, so it is refused.
+    pub async fn ask(&self, domain: &str, url: &str) -> std::result::Result<(), String> {
+        match &self.approve {
+            Some(approve) => approve(domain.to_string(), url.to_string()).await,
+            None => Err(format!(
+                "egress blocked: a redirect went to '{domain}' ({url}), which is not approved, \
+                 and no approval prompt is available (R-WEB.8). To allow it, run \
+                 `ahma web allow {domain}` and retry."
+            )),
+        }
     }
 }
 
 impl std::fmt::Debug for RedirectDomainGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedirectDomainGuard")
-            .field("origin_host", &self.origin_host)
+            .field("mode", &self.mode)
+            .field("approver", &self.approve.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -126,6 +257,13 @@ impl std::fmt::Display for EgressBlocked {
 
 impl std::error::Error for EgressBlocked {}
 
+impl EgressBlocked {
+    /// A refusal with this user-facing message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
 /// Whether `error` was caused by the guard refusing its destination.
 pub fn is_egress_blocked(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
@@ -173,14 +311,11 @@ impl Resolve for GuardedResolver {
     }
 }
 
-/// Redirect policy: cap the chain, reject any redirect whose target host is a
-/// blocked IP *literal* (hostname targets are re-checked by the resolver), and —
-/// when a [`RedirectDomainGuard`] is supplied — reject a cross-domain hop to a
-/// host the `[web]` policy would not approve (R-WEB.8).
-fn redirect_policy(
-    block_private: bool,
-    domain_guard: Option<RedirectDomainGuard>,
-) -> redirect::Policy {
+/// Redirect policy for a fetch **without** a [`RedirectDomainGuard`]: cap the
+/// chain and reject any redirect whose target host is a blocked IP *literal*
+/// (hostname targets are re-checked by the resolver). A guarded fetch turns
+/// automatic redirects off and applies the same checks per hop itself.
+fn redirect_policy(block_private: bool) -> redirect::Policy {
     redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= MAX_REDIRECTS {
             return attempt.error(anyhow!("too many redirects (>{MAX_REDIRECTS})"));
@@ -195,21 +330,6 @@ fn redirect_policy(
         if let Some(ip) = blocked {
             return attempt.error(anyhow!(
                 "egress blocked: redirect to private/loopback address {ip} (SSRF protection)"
-            ));
-        }
-        // R-WEB.8: a redirect to a *new* domain does not inherit the source
-        // domain's approval. We cannot raise an interactive prompt inside this
-        // synchronous callback, so an unapproved cross-domain hop is refused with
-        // an actionable message rather than followed.
-        if let Some(guard) = &domain_guard
-            && let Some(host) = attempt.url().host_str()
-            && !guard.permits(host)
-        {
-            let host = host.to_string();
-            return attempt.error(anyhow!(
-                "egress blocked: redirect to '{host}' is a different domain than the approved \
-                 request and the [web] policy does not approve it (R-WEB.8). To allow it, run \
-                 `ahma web allow {host}` and retry."
             ));
         }
         attempt.follow()
@@ -241,16 +361,22 @@ pub fn check_url(url: &str, block_private: bool) -> Result<()> {
     Ok(())
 }
 
-/// Build a [`reqwest::Client`] whose DNS resolution and redirect handling are
-/// guarded against SSRF, and — when `domain_guard` is set — against cross-domain
-/// redirect laundering (R-WEB.8). `block_private` should be `true` for all tool
-/// code.
+/// Build a [`reqwest::Client`] whose DNS resolution is guarded against SSRF on
+/// every connection. With `follow_redirects` it follows redirects itself under
+/// `redirect_policy`; without, a 3xx is returned to the caller, which must
+/// follow it under a [`RedirectDomainGuard`] (re-running [`check_url`] on each
+/// hop). `block_private` should be `true` for all tool code.
 pub fn guarded_client(
     block_private: bool,
-    domain_guard: Option<RedirectDomainGuard>,
+    follow_redirects: bool,
 ) -> reqwest::Result<reqwest::Client> {
+    let policy = if follow_redirects {
+        redirect_policy(block_private)
+    } else {
+        redirect::Policy::none()
+    };
     reqwest::Client::builder()
-        .redirect(redirect_policy(block_private, domain_guard))
+        .redirect(policy)
         .dns_resolver(Arc::new(GuardedResolver { block_private }))
         .build()
 }
@@ -329,26 +455,165 @@ mod tests {
 
     #[test]
     fn guarded_client_builds() {
-        assert!(guarded_client(true, None).is_ok());
-        assert!(guarded_client(false, None).is_ok());
-        let guard = RedirectDomainGuard::new("api.github.com", Arc::new(|_| false));
-        assert!(guarded_client(true, Some(guard)).is_ok());
+        assert!(guarded_client(true, true).is_ok());
+        assert!(guarded_client(false, true).is_ok());
+        assert!(guarded_client(true, false).is_ok());
+    }
+
+    fn allow() -> WebDecision {
+        WebDecision::Allow {
+            matched: "always_allow".into(),
+        }
+    }
+    fn deny() -> WebDecision {
+        WebDecision::Deny {
+            reason: "'cdn.example' matches never_allow pattern 'cdn.example'".into(),
+        }
+    }
+    fn unknown() -> WebDecision {
+        WebDecision::Prompt {
+            domain: "cdn.example".into(),
+        }
+    }
+
+    const MODES: [RedirectPolicy; 3] = [
+        RedirectPolicy::Policy,
+        RedirectPolicy::Block,
+        RedirectPolicy::Prompt,
+    ];
+
+    /// R-WEB.8.3: a hop to the origin host is followed in every mode, whatever
+    /// the policy would say about it — the host was already approved.
+    #[test]
+    fn same_host_redirect_follows_in_every_mode() {
+        for mode in MODES {
+            for verdict in [allow(), deny(), unknown()] {
+                assert_eq!(
+                    decide_redirect(
+                        "api.github.com",
+                        "API.GitHub.com",
+                        "https://API.GitHub.com/x",
+                        mode,
+                        &verdict
+                    ),
+                    RedirectStep::Follow,
+                    "{mode:?} / {verdict:?}"
+                );
+            }
+        }
+    }
+
+    fn other_host(mode: RedirectPolicy, verdict: WebDecision) -> RedirectStep {
+        decide_redirect(
+            "api.github.com",
+            "cdn.example",
+            "https://cdn.example/f",
+            mode,
+            &verdict,
+        )
+    }
+
+    fn assert_refused(step: RedirectStep, must_contain: &[&str]) {
+        let RedirectStep::Refuse(msg) = step else {
+            panic!("expected Refuse, got {step:?}");
+        };
+        for needle in must_contain {
+            assert!(msg.contains(needle), "missing '{needle}' in: {msg}");
+        }
     }
 
     #[test]
-    fn redirect_domain_guard_permits_origin_and_allowed_hosts_only() {
-        // `allow` approves exactly one extra host; everything else is refused.
-        let guard = RedirectDomainGuard::new(
-            "api.github.com",
-            Arc::new(|h: &str| h == "codeload.github.com"),
+    fn policy_mode_follows_iff_the_policy_allows_and_never_asks() {
+        assert_eq!(
+            other_host(RedirectPolicy::Policy, allow()),
+            RedirectStep::Follow
         );
-        // Origin host is always permitted, case-insensitively.
-        assert!(guard.permits("api.github.com"));
-        assert!(guard.permits("API.GitHub.com"));
-        // A host the policy approves is permitted.
-        assert!(guard.permits("codeload.github.com"));
-        // An unapproved cross-domain target is refused.
-        assert!(!guard.permits("evil.example"));
-        assert!(!guard.permits("github.com"));
+        assert_refused(
+            other_host(RedirectPolicy::Policy, deny()),
+            &["cdn.example", "never_allow", "ahma web allow cdn.example"],
+        );
+        assert_refused(
+            other_host(RedirectPolicy::Policy, unknown()),
+            &[
+                "cdn.example",
+                "different domain",
+                "ahma web allow cdn.example",
+            ],
+        );
+    }
+
+    #[test]
+    fn block_mode_refuses_every_other_host_even_an_allowed_one() {
+        for verdict in [allow(), deny(), unknown()] {
+            assert_refused(
+                other_host(RedirectPolicy::Block, verdict),
+                &[
+                    "cdn.example",
+                    "https://cdn.example/f",
+                    "on_redirect_to_new_domain = \"block\"",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_mode_asks_only_when_a_fresh_request_would() {
+        assert_eq!(
+            other_host(RedirectPolicy::Prompt, allow()),
+            RedirectStep::Follow
+        );
+        assert_refused(
+            other_host(RedirectPolicy::Prompt, deny()),
+            &["cdn.example", "never_allow"],
+        );
+        assert_eq!(
+            other_host(RedirectPolicy::Prompt, unknown()),
+            RedirectStep::Ask {
+                domain: "cdn.example".into()
+            }
+        );
+    }
+
+    #[test]
+    fn guard_decides_with_the_live_verdict_for_the_target_url() {
+        // The verdict closure sees the full target URL (scheme and port included,
+        // so a scheme/port-qualified always_allow pattern can match).
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = Arc::clone(&seen);
+        let guard = RedirectDomainGuard::new(
+            RedirectPolicy::Policy,
+            Arc::new(move |url: &str| {
+                seen2.lock().unwrap().push(url.to_string());
+                if url.starts_with("https://codeload.github.com") {
+                    allow()
+                } else {
+                    unknown()
+                }
+            }),
+        );
+        let ok = reqwest::Url::parse("https://codeload.github.com:8443/a").unwrap();
+        let bad = reqwest::Url::parse("https://evil.example/").unwrap();
+        assert_eq!(guard.decide("api.github.com", &ok), RedirectStep::Follow);
+        assert!(matches!(
+            guard.decide("api.github.com", &bad),
+            RedirectStep::Refuse(_)
+        ));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "https://codeload.github.com:8443/a".to_string(),
+                "https://evil.example/".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_without_approver_refuses_an_ask_with_the_hint() {
+        let guard = RedirectDomainGuard::new(RedirectPolicy::Prompt, Arc::new(|_: &str| unknown()));
+        let err = guard
+            .ask("cdn.example", "https://cdn.example/f")
+            .await
+            .unwrap_err();
+        assert!(err.contains("ahma web allow cdn.example"), "{err}");
     }
 }

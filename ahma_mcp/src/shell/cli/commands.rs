@@ -1508,9 +1508,11 @@ fn web_command_at(file: &std::path::Path, command: WebCommand) -> Result<()> {
                 "block_private_ranges = {}",
                 settings.web.block_private_ranges
             );
+            let redirect = settings.web.on_redirect_to_new_domain;
             println!(
-                "on_redirect          = {:?}",
-                settings.web.on_redirect_to_new_domain
+                "on_redirect_to_new_domain = \"{}\"  # a redirect to another host is {}",
+                redirect.as_str(),
+                redirect.describe()
             );
             println!();
             print_web_list("always_allow (permitted)", &settings.web.always_allow);

@@ -79,7 +79,7 @@ Models trained on other harnesses can use those names: `Read`, `Write`, `Edit`,
 | `list_dir` | `path` | One level, sorted |
 | `file_search` | `pattern`, `base_dir` | Glob on the relative path; `.gitignore` respected, hidden skipped; newest first; ≤ 1000 |
 | `grep_search` | `query`, `is_regex`, `case_sensitive`, `include_pattern`, `context`, `output_mode` (`content`/`files`/`count`), `max_results` | `.gitignore` respected; binary and >10 MB files skipped |
-| `fetch_webpage` | `url`, `query` | Readable text, ≤ 50,000 chars; `query` keeps matching lines |
+| `fetch_webpage` | `url`, `query` | Readable text, ≤ 50,000 chars; `query` keeps matching lines. Governed by `[web]`; a redirect to another host follows `[web] on_redirect_to_new_domain` ([permissions.md](permissions.md#web-domains-and-redirects)) |
 
 ## See also
 

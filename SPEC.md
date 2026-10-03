@@ -1010,7 +1010,7 @@ When a request is blocked under `default_policy = "deny"` and a TUI is attached:
 ### R-WEB.8: Redirect chain validation
 
 - **R-WEB.8.1**: A 3xx redirect to a **different** host **must** be checked against the policy independently; redirects do not inherit the source's approval.
-- **R-WEB.8.2**: A redirect to another host is followed only if the live policy (R-WEB.2, with session grants and denies) allows that host; otherwise the request fails with an error naming `ahma web allow <host>`. A redirect never raises a prompt. The `[web] on_redirect_to_new_domain` key (`"block"` default, `"prompt"`) is parsed and shown by `ahma web list` but not enforced on the fetch path (open: §11).
+- **R-WEB.8.2**: `[web] on_redirect_to_new_domain` decides a redirect to another host. `"policy"` (the default): followed only if the live policy (R-WEB.2, with session grants and denies) allows that host, otherwise the request fails with an error naming `ahma web allow <host>`; never prompts. `"block"`: never followed, even to an allowed host; the error names the target and the setting. `"prompt"`: treated exactly like a fresh request to that host, so an allowed host is followed, a denied one refused, and an unknown one goes through the approval flow (R-WEB.5–R-WEB.7) and is followed only if approved. Redirects on the guarded path are followed by hand, one hop at a time, so every hop is decided and re-checked (R-WEB.3, R-WEB.8.4). An unknown value aborts startup (R-CFG6.1).
 - **R-WEB.8.3**: Same-host redirects (including HTTP→HTTPS for the same host) are always followed.
 - **R-WEB.8.4**: The redirect target's resolved IP is always checked against R-WEB.3.
 
@@ -1055,8 +1055,8 @@ default_policy = "allow"
 # STRONGLY recommended: keep true. Setting false enables SSRF attacks against local services.
 block_private_ranges = true
 
-# "block" (default) or "prompt". Not enforced: redirects follow R-WEB.8.2 (open: §11).
-on_redirect_to_new_domain = "block"
+# "policy" (default), "block" or "prompt" (R-WEB.8.2).
+on_redirect_to_new_domain = "policy"
 
 # Domains always permitted without a runtime prompt.
 # Syntax: exact ("api.github.com"), single-level wildcard ("*.github.com"),
@@ -1097,7 +1097,7 @@ Path-based approval (`github.com/api/*` allowed, `github.com/login/*` denied) is
 
 - **`WebPolicy`**, **`WebPattern`**, **`WebDecision`** (`ahma_common::web_policy`): the `[web]` settings, the validated pattern (R-WEB.4), and the verdict for a URL.
 - **`WebApprovalCoordinator`**, **`WebApprovalRequest`**, **`WebApprovalDecision`** (`ahma_common::web_approval`): per-domain prompt dedup (R-WEB.7), session grants and denies; `persist_web_allow` writes an "always" answer.
-- **Fetching**: `fetch_webpage` uses `ahma_harness_tools::fetch_webpage_with_redirect_guard`, whose resolver blocks private addresses on every hop (R-WEB.3) and whose `RedirectDomainGuard` re-checks each new host against the live policy (R-WEB.8). Every ahma-originated outbound HTTP request made on an agent's behalf **must** use this path, never a bare `reqwest::Client`.
+- **Fetching**: `fetch_webpage` uses `ahma_harness_tools::fetch_webpage_with_redirect_guard`, whose resolver blocks private addresses on every hop (R-WEB.3) and whose `RedirectDomainGuard` decides each redirect to a new host by `on_redirect_to_new_domain` against the live policy (R-WEB.8). Every ahma-originated outbound HTTP request made on an agent's behalf **must** use this path, never a bare `reqwest::Client`.
 - The TUI's `draw_web_approval_modal` follows `draw_scope_grant_modal`: drawn last, `[n]` the default, Enter/Esc deny.
 
 ### R-WEB.15: Interaction with other approval systems
@@ -1901,4 +1901,3 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **Shared scope decisions** (R5.3.3, R5.3.4, R5.3.6, R-HUB.11): one downgrade decision fanned to every session of a workspace with most-restrictive-wins, and a TUI-only answer held as a pending scope, need a per-workspace scope replacing the per-session `ScopeLock` and concurrent asking in the broker. No running ahma commits an `elicited` scope.
 - **Log-target approval asks no human** (`logs_approve`, R9.2, R-PERM.3): the tool writes a `log-target` grant when an MCP client calls it; only the ahma TUI's own agent must ask first. It should raise the question through the permission ladder as `sandbox_grant` does (R5.4.5).
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.
-- **Cross-domain redirect setting** (R-WEB.8.2): `[web] on_redirect_to_new_domain` is parsed and shown by `ahma web` but not enforced; a redirect to a new domain is followed iff the live web policy allows that host, and is never prompted.
