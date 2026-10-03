@@ -59,6 +59,16 @@ are the two commands above. A client that cannot show a prompt is told to relay 
 body to you unchanged. Ahma raises at most five such questions per ten minutes per
 session; past that the agent is told to ask you in conversation instead.
 
+**Commands run through Claude Code's Bash tool** (the terminal hook) are refused
+mid-command, where no prompt is possible. ahma remembers the refusal, and before
+the **next** command in that workspace Claude Code shows its own permission dialog
+with ahma's question: which directory, which refused paths it covers, and what yes
+and no mean. **Yes** grants it for this Claude Code session and runs the command;
+**no** runs nothing, and ahma does not ask about that directory again this session.
+Related paths are asked as one directory when that is safe (`~/.cache/neubit`, never
+`~/.cache`, your home folder, a folder of projects, or anything holding credentials).
+For "always", the dialog names the `ahma sandbox grant` command (SPEC R-PERM.10).
+
 That last rung is the important one: ahma never fails *open*. If nobody can be
 asked, the answer is no — and you get a command you can paste rather than a
 mystery.
