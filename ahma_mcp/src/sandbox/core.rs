@@ -1143,9 +1143,7 @@ impl Sandbox {
     /// R5.2.8 working-directory refusal.
     ///
     /// `Unestablished` is the honest answer for a scope that has no provenance
-    /// yet — nothing explicit, no usable roots, no container. `Elicited` and
-    /// `PendingTui` are not derivable from these flags; a caller holding richer
-    /// provenance should render those instead.
+    /// yet — nothing explicit, no usable roots, no container.
     pub fn scope_source(&self) -> ScopeSource {
         if self.has_explicit_scopes() {
             ScopeSource::Explicit
