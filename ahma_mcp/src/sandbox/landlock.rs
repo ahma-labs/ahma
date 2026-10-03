@@ -42,12 +42,16 @@ fn build_landlock_ruleset_with(
         RulesetCreatedAttr,
     };
 
-    // Use V1 for maximum kernel compatibility — it includes all the core FS access
-    // flags we actually enforce (ReadFile, WriteFile, Execute, MakeDir, …).
-    // V5 only adds IoctlDev which we don't use, and requesting it causes a
-    // `PartiallyEnforced` status on kernels < 6.10 (e.g. ubuntu-latest 5.15/6.5
-    // GitHub Actions runners), making enforcement appear weaker than it is.
-    let abi = ABI::V1;
+    // V2: V1's core access flags plus `Refer`. Without `Refer`, Landlock refuses
+    // every rename or link that changes a file's directory with EXDEV, even
+    // inside the writable scope: `mv` hides it with a copy fallback, but any
+    // program calling rename(2) across directories failed (ahma's own trash
+    // tests did, run through ahma on Linux). `Refer` is granted only where
+    // writes are (`access_all`), so it moves files within writable areas and
+    // reaches nothing new. Best effort: on kernels before 5.19 it is dropped
+    // and V1 behaviour remains. Not V5: its `IoctlDev` is unused and would
+    // report `PartiallyEnforced` on every kernel before 6.10.
+    let abi = ABI::V2;
     let access_all = AccessFs::from_all(abi);
     let access_read = AccessFs::from_read(abi);
 
