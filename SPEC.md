@@ -1477,6 +1477,12 @@ lifetime.
     (`ahma_http_mcp_client::local_socket_client`). The hub binds no TCP port, and the frontend
     has no HTTP fallback: a probe of the `serve http` port only ever finds some *other* server
     (R-ISO.1).
+  - **A request and its half-close are never dropped for arriving early.** A Windows `AF_UNIX`
+    `connect()` can return before the listener has accepted the connection, so a client may
+    send and half-close while its connection still waits in the queue. The Windows bridge
+    retries a call refused as not connected (`WSAENOTCONN`) until the accept lands (bounded),
+    and never takes that refusal for the end of the stream: a lost half-close leaves the
+    server waiting for the end of a request and the client waiting for the answer, forever.
   - **The ownership check binds the directory ahma chose, not one it was handed.** An
     operator-named `--unix-socket-path` (or `[http] unix_socket_path`) is a deliberate
     placement decision and is honoured; where its directory is writable by others *and* lacks
