@@ -3681,7 +3681,8 @@ fn draw_blocked_symlink_banner(
             theme.dim(),
         )),
         Line::from(Span::styled(
-            "  Approving affects this view only — it records no persistent grant.",
+            "  Approving saves a read-only log-target grant for this workspace in \
+             ~/.ahma/settings.toml; undo with `ahma permissions revoke log-target`.",
             theme.dim(),
         )),
         Line::from(""),

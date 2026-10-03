@@ -615,11 +615,37 @@ pub fn persist_log_target(
     target: &Path,
     surface: &str,
 ) -> anyhow::Result<bool> {
+    let granted_by = surface.strip_prefix("mcp:").unwrap_or(surface);
+    persist_log_target_as(settings_file, workspace, target, granted_by, surface)
+}
+
+/// [`persist_log_target`] with the provenance spelled out: `granted_by` is the
+/// tool or person that asked (`logs_approve`, `ahma tui`) and `surface` the
+/// place a human answered (`harness`, `tui`). The one write path for a
+/// `log-target` row: the human answer to `logs_approve`'s question (SPEC
+/// R9.2) and the TUI's own `[a]` both come here.
+///
+/// The hard denylist (SPEC R-PERM.4.3) runs here too, so no caller can write a
+/// credential file or a system directory as a log target by skipping its own
+/// check: the agent can plant a `.ahma/logs` link to anything.
+pub fn persist_log_target_as(
+    settings_file: &Path,
+    workspace: &Path,
+    target: &Path,
+    granted_by: &str,
+    surface: &str,
+) -> anyhow::Result<bool> {
+    if let Some(why) = crate::scope_grant::refusal_reason(target) {
+        anyhow::bail!(
+            "refusing to record {} as a log target: {why}",
+            target.display()
+        );
+    }
     let key = workspace_key(workspace);
     let stamp = crate::config::fmt_utc_datetime(crate::config::unix_now());
     // `YYYY-MM-DD`, the `granted_at` convention every other grant uses.
     let date = stamp.get(..10).map(str::to_string);
-    let granted_by = surface.strip_prefix("mcp:").unwrap_or(surface).to_string();
+    let granted_by = granted_by.to_string();
     let mut added = false;
     AhmaSettings::update_at(settings_file, |s| {
         added = s.log_targets.approve_target(
@@ -1656,6 +1682,53 @@ mod tests {
             "granted_at is a YYYY-MM-DD date: {:?}",
             entry.granted_at
         );
+    }
+
+    /// The agent can plant a `.ahma/logs` link to anything, so the one write
+    /// path for a `log-target` row applies the hard denylist itself (SPEC
+    /// R-PERM.4.3): a key file is refused whoever asks, and nothing is written.
+    #[test]
+    fn persist_log_target_refuses_a_hard_denylisted_target() {
+        let home = tempdir().unwrap();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let key_file = ssh.join("id_ed25519");
+        std::fs::write(&key_file, "secret").unwrap();
+        let key_file = dunce::canonicalize(&key_file).unwrap();
+        let settings_file = home.path().join(".ahma").join("settings.toml");
+        // SAFETY: nextest runs every test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let result = persist_log_target_as(
+            &settings_file,
+            home.path(),
+            &key_file,
+            "logs_approve",
+            "harness",
+        );
+        unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+        assert!(result.is_err(), "a credential file is never a log target");
+        assert!(
+            !settings_file.exists(),
+            "a refused target must not reach the ledger"
+        );
+    }
+
+    /// `persist_log_target_as` records who asked and where a human answered,
+    /// separately.
+    #[test]
+    fn persist_log_target_as_records_granted_by_and_surface() {
+        let home = tempdir().unwrap();
+        let settings_file = home.path().join(".ahma").join("settings.toml");
+        let ws = home.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let target = home.path().join("outside.log");
+        assert!(
+            persist_log_target_as(&settings_file, &ws, &target, "logs_approve", "harness").unwrap()
+        );
+        let s = AhmaSettings::load_from_result(&settings_file).unwrap();
+        let entry = &s.log_targets.approvals[0];
+        assert_eq!(entry.granted_by.as_deref(), Some("logs_approve"));
+        assert_eq!(entry.surface.as_deref(), Some("harness"));
     }
 
     #[test]

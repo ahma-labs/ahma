@@ -86,7 +86,7 @@ pub use command::{
 };
 pub use confinement::outer_confinement;
 pub use core::{ContainerNarrowing, Sandbox, ScopeCommit};
-pub use core::{add_log_exception, is_target_allowed, load_exceptions};
+pub use core::{add_log_exception, approve_log_link, is_target_allowed, load_exceptions};
 pub use credential_reads::{
     default_credential_read_denies, effective_credential_read_denies, keychain_access_allowed,
     set_credential_read_denies, set_keychain_access_allowed,

@@ -98,6 +98,9 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
     // `--tmp` asks for exactly the access the flag means; nothing was refused,
     // so "minimum that would work" is the request itself.
     let startup = req.reason == GrantReason::StartupFlag;
+    // `logs_approve`: nothing was refused either, and the answer is a
+    // read-only `log-target` grant, never an `fs-scope` one (SPEC R9.2).
+    let log_target = req.reason == GrantReason::LogTarget;
     let saved_tiers = req.reason.offers_saved_tiers();
     let minimum_access = if ctx.write_denied || (startup && req.access.is_write()) {
         ScopeAccess::Rw
@@ -125,7 +128,12 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
     };
 
     // 2. What was blocked
-    let mut blocked = if startup {
+    let mut blocked = if log_target {
+        format!(
+            "nothing was blocked: a log file in .ahma/logs links to this file outside the \
+             workspace; approving lets ahma's log tools read it: {path}"
+        )
+    } else if startup {
         format!(
             "nothing was blocked: this server was started with --tmp (or [sandbox] tmp_access \
              = true), which asks for {} access to the system temp directory {}",
@@ -161,6 +169,10 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
         GrantReason::StartupFlag => blocked.push_str(
             "\nthe path is exact: this machine's temp directory, shared by every program you \
              run, and part of no project",
+        ),
+        GrantReason::LogTarget => blocked.push_str(
+            "\nthe path is exact: where the link resolves now. The agent can create links in \
+             .ahma/logs itself, so check this is a log you expect it to read",
         ),
         GrantReason::Unknown => blocked.push_str(
             "\nsent by a newer ahma for a reason this version does not recognise: double-check \
@@ -199,6 +211,8 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
         path,
         if startup {
             " (what --tmp asks for; deny and it stays out of this session's scope)"
+        } else if log_target {
+            " (a log target is only ever read, never written)"
         } else if ctx.write_denied {
             " (a write was refused, so read-only would not fix it)"
         } else {
@@ -215,7 +229,13 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
     } else {
         "read"
     };
-    let allows = if saved_tiers {
+    let allows = if log_target {
+        format!(
+            "ahma's log tools, and every command in {workspace_label}, may read {path} — until \
+             this session ends (session), or until you revoke it (always). It is never writable, \
+             and nothing else outside the workspace changes."
+        )
+    } else if saved_tiers {
         format!(
             "every command in {workspace_label} may {verb} {path} — for the next command \
              (once), until this session ends (session), for 24 hours (lease), or until you \
@@ -246,7 +266,14 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
 
     // 7. The exact line `always` writes — or, for a session-only question,
     // that there is none.
-    let always = if saved_tiers {
+    let always = if log_target {
+        let ws = workspace
+            .clone()
+            .unwrap_or_else(|| "<this workspace>".to_string());
+        format!(
+            "~/.ahma/settings.toml gets:\n[[log_targets.approvals]]\nworkspace = \"{ws}\"\ntargets = [\"{path}\"]\nRevoke any time with: ahma permissions revoke log-target {path} --workspace {ws}"
+        )
+    } else if saved_tiers {
         format!(
             "~/.ahma/settings.toml gets:\n[[sandbox.persistent_scopes]]\npath = \"{}\"\naccess = \"{}\"\nworkspace = \"{}\"\nRevoke any time with: ahma sandbox revoke {}",
             path,
@@ -306,21 +333,17 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
 }
 
 /// The choices a question raised for `reason` offers, deny first: every
-/// option for a blocked path, and only deny / once / session for a question
+/// option for a blocked path; only deny / once / session for a question
 /// whose answer must not be saved ([`GrantReason::offers_saved_tiers`] — the
-/// `--tmp` question). Every surface builds its choices from this, so the form,
+/// `--tmp` question); and only deny / read-only session / read-only always for
+/// a log target. Every surface builds its choices from this, so the form,
 /// the TUI keys and the text body agree; [`crate::scope_grant::GrantCoordinator::resolve`]
-/// holds any answer outside it to the session.
+/// holds any answer outside it to what it offers ([`GrantReason::offers`]).
 pub fn options_for(reason: GrantReason) -> Vec<PromptOption> {
     options()
         .into_iter()
-        // Deny is always offered (it is the default, R5.3.1); a reason without
-        // saved tiers drops only the grants that would persist.
-        .filter(|o| {
-            reason.offers_saved_tiers()
-                || o.decision.access().is_none()
-                || !o.decision.tier().is_persistent()
-        })
+        // Deny is always offered (it is the default, R5.3.1).
+        .filter(|o| reason.offers(o.decision))
         .collect()
 }
 
@@ -590,5 +613,63 @@ mod tests {
         assert_eq!(options_for(GrantReason::Unknown), offered);
         assert_eq!(options_for(GrantReason::PreExecViolation), options());
         assert_eq!(options_for(GrantReason::StderrHeuristic), options());
+    }
+
+    fn log_target_request() -> ScopeGrantRequest {
+        ScopeGrantRequest {
+            decision_id: "d-log".into(),
+            path: "/opt/app/logs/app.log".into(),
+            access: ScopeAccess::Ro,
+            reason: GrantReason::LogTarget,
+            tool: Some("logs_approve".into()),
+            context: Default::default(),
+        }
+    }
+
+    /// SPEC R9.2: the `logs_approve` question says what the link is and what
+    /// approving does, and an `always` answer names the `log-target` row it
+    /// writes — never a `persistent_scopes` line.
+    #[test]
+    fn the_log_target_question_says_what_the_link_is_and_what_always_writes() {
+        let body = render(&log_target_request());
+        let text = body.to_message();
+        assert!(
+            text.contains(
+                "a log file in .ahma/logs links to this file outside the workspace; approving \
+                 lets ahma's log tools read it"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("/opt/app/logs/app.log"), "{text}");
+        assert!(!text.contains("tried to"), "nothing tried anything: {text}");
+        assert!(
+            body.title.contains(ScopeAccess::Ro.label()),
+            "a log target is read-only: {}",
+            body.title
+        );
+        assert!(text.contains("[[log_targets.approvals]]"), "{text}");
+        assert!(
+            text.contains("ahma permissions revoke log-target"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("[[sandbox.persistent_scopes]]"),
+            "an always answer is a log-target row, not an fs-scope grant: {text}"
+        );
+        assert_eq!(
+            body.sections.len(),
+            7,
+            "the same seven sections (R-PERM.3.4)"
+        );
+    }
+
+    /// Deny, read-only for the session, read-only always: nothing writable,
+    /// no once, no 24 hours.
+    #[test]
+    fn the_log_target_question_offers_deny_session_and_always_read_only() {
+        let offered = options_for(GrantReason::LogTarget);
+        let values: Vec<&str> = offered.iter().map(|o| o.value).collect();
+        assert_eq!(values, ["deny", "read-only-session", "read-only"]);
+        assert_eq!(render(&log_target_request()).options, offered);
     }
 }

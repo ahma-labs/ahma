@@ -199,8 +199,8 @@ impl BuiltinTool {
     /// itself so `needs_approval` has one classification covering both.
     ///
     /// `write_file` and `replace_in_file` write the workspace; `logs_approve`
-    /// persists a log-symlink exception outside it
-    /// (`sandbox::add_log_exception`); `run_terminal_command` runs an
+    /// asks a human to let ahma read a file outside it through a log symlink
+    /// (SPEC R9.2); `run_terminal_command` runs an
     /// arbitrary command, the least contained of all of them. `sandbox_grant`
     /// is exempt despite touching the permission ledger: its handler never
     /// writes on the model's word for any client — `confirm: true` routes to
@@ -242,7 +242,8 @@ impl BuiltinTool {
     /// Whether this built-in's effect reaches **outside** the workspace sandbox,
     /// so a trusted folder (SPEC R-PERM.1.3) must not auto-approve it.
     ///
-    /// `logs_approve` persists a log-symlink exception outside the workspace.
+    /// `logs_approve` asks a human to approve a log-symlink target outside the
+    /// workspace, and records it only on their answer (SPEC R9.2).
     /// `sandbox_grant` asks a human to widen the scope and never does so itself.
     /// `fetch_webpage` reaches the network, which has its own egress gate
     /// (R-WEB.6) and is never the folder's to trust. Everything else runs inside
@@ -370,8 +371,8 @@ mod tests {
     }
 
     /// The two file-mutating builtins and `run_terminal_command` (arbitrary
-    /// execution) must require approval; `logs_approve` persists a log
-    /// exception and must too. This is a regression guard: it's the
+    /// execution) must require approval; `logs_approve` can widen what
+    /// ahma reads outside the workspace and must too. This is a regression guard: it's the
     /// classification `needs_approval` reads to decide whether a builtin
     /// prompts when the interactive tool-approval setting is off.
     #[test]

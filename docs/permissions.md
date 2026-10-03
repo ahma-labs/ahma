@@ -95,11 +95,13 @@ same names.
 | `web-domain` | a domain ahma's own HTTP tools may fetch | a prompt, `ahma web allow` | `[web]` |
 | `net-host` | a host sandboxed commands may reach under `--restrict-network` | a prompt, `ahma network allow` | `[network].allow` |
 | `tool` | a tool the agent may run in a workspace without asking again | a tool-approval prompt | `[permissions].tool_approvals` |
-| `log-target` | a file outside the workspace that a `.ahma/logs/*.log` symlink points at, readable (never writable) by live-log monitoring | the `logs_approve` tool | `[log_targets].approvals` |
+| `log-target` | a file outside the workspace that a `.ahma/logs/*.log` symlink points at, readable (never writable) by live-log monitoring | a human's `always` answer to the question `logs_approve` raises, or `a` on the log in `ahma tui` | `[log_targets].approvals` |
 
 `tool` and `log-target` grants are bound to the workspace they were granted in, and so
 is an `fs-scope` grant unless it was made `--global`; `web-domain` and `net-host` grants
-apply everywhere. A `log-target` grant takes effect from the next session; see
+apply everywhere. A `log-target` grant answered at a prompt applies to the session that
+asked at once; one made with `a` in `ahma tui` reaches sandboxed log monitors from the
+next session; see
 [Live log monitoring](live-log-monitoring.md#log-files-that-link-outside-the-workspace).
 
 ## When a grant takes effect

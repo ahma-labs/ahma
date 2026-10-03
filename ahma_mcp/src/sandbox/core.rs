@@ -53,6 +53,66 @@ pub fn add_log_exception(primary_root: &Path, target: &Path) -> std::io::Result<
 /// The surface a `logs_approve` grant is recorded as coming from.
 const LOGS_APPROVE_SURFACE: &str = "mcp:logs_approve";
 
+/// Record the target of the `.ahma/logs` symlink `link` as a `log-target`
+/// grant for `workspace`, because a **human** chose to at an unsandboxed ahma
+/// surface — the TUI's `[a]` on a blocked log, pressed with the target on
+/// screen (SPEC R9.2). Returns the canonical target and whether it was newly
+/// approved.
+///
+/// This is deliberately not reachable from any MCP tool: `logs_approve` only
+/// *asks* (its answer is applied by the permission broker), so the one way to
+/// approve a log target without a question is to be the human at the TUI. An
+/// MCP client cannot press a TUI key, and an argument it could send would be
+/// its own word, not a human's.
+///
+/// `shown_target` is the link target as it was displayed; when given, the
+/// link must still resolve to the same file, so a link swapped between the
+/// banner and the key press records nothing. The hard denylist applies
+/// (R-PERM.4.3), inside the shared write path.
+///
+/// Blocking file I/O, like every other ledger write a TUI key makes.
+pub fn approve_log_link(
+    workspace: &Path,
+    link: &Path,
+    shown_target: Option<&Path>,
+    granted_by: &str,
+    surface: &str,
+) -> std::result::Result<(PathBuf, bool), String> {
+    let meta = std::fs::symlink_metadata(link)
+        .map_err(|e| format!("cannot read {}: {e}", link.display()))?;
+    if !meta.file_type().is_symlink() {
+        return Err(format!("{} is not a symbolic link", link.display()));
+    }
+    let base = link.parent().unwrap_or_else(|| Path::new(""));
+    let raw = std::fs::read_link(link)
+        .map_err(|e| format!("cannot read the link {}: {e}", link.display()))?;
+    let target = dunce::canonicalize(base.join(&raw))
+        .map_err(|e| format!("{} does not resolve: {e}", link.display()))?;
+    if let Some(shown) = shown_target {
+        let shown = dunce::canonicalize(base.join(shown)).unwrap_or_else(|_| base.join(shown));
+        if shown != target {
+            return Err(format!(
+                "{} now points at {}, not the {} you were shown; nothing was recorded. Look \
+                 again and decide on what it points at now.",
+                link.display(),
+                target.display(),
+                shown.display()
+            ));
+        }
+    }
+    let settings_file = ahma_common::config::settings_path()
+        .ok_or("cannot determine the home directory holding ~/.ahma/settings.toml")?;
+    ahma_common::permissions::persist_log_target_as(
+        &settings_file,
+        workspace,
+        &target,
+        granted_by,
+        surface,
+    )
+    .map(|added| (target, added))
+    .map_err(|e| format!("{e:#}"))
+}
+
 pub fn is_target_allowed(target: &Path, scopes: &[PathBuf], exceptions: &[PathBuf]) -> bool {
     if scopes.iter().any(|scope| target.starts_with(scope)) {
         return true;
