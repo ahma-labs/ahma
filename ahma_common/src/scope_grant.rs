@@ -18,13 +18,6 @@
 //! (R5.4.6) and announces it. A `session`-tier answer is applied live only and
 //! never written.
 //!
-//! ## Why a sibling, not an extension of [`crate::elicitation`]
-//!
-//! [`crate::elicitation::ElicitationDecision`] coordinates scope *downgrades*
-//! (most-restrictive-wins, narrow-now). A grant is the opposite direction —
-//! *widen-on-next-start* — so it gets its own coordinator rather than overloading
-//! the downgrade fold.
-//!
 //! ## What [`GrantCoordinator`] guarantees
 //!
 //!  - **Dedup / debounce**: a given `(canonical_path, access)` is asked **at most

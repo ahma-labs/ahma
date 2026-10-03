@@ -557,7 +557,7 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 - **R5.3.3**: **Dual-modal coordination**: When multiple sessions are attached to one workspace instance, a single downgrade decision is fanned to all capable sessions under one `decision_id`. The server (not any client) owns the decision. When any session answers, the server **must** dismiss the prompt on the others via `notifications/cancelled` for that `decision_id`. When a session that holds an open prompt terminates (e.g. the IDE is closed), the server **must** resolve that prompt as cancelled-not-decided and dismiss any twin.
 - **R5.3.4**: **Conflict resolution — most-restrictive-wins, then re-confirm**: If two sessions answer the same `decision_id` within a short debounce window, the **narrowest** answer wins regardless of arrival order; a widening answer can never win over a narrowing one by timing. When answers conflicted, the committed (narrowest) scope **must** be shown for re-confirmation before lock; because the narrowest option is always the safe choice, this re-confirmation may auto-accept after a brief visible window.
 - **R5.3.5**: **Decision freshness**: A `decision_id` **must** bind to the session generation that created it. An answer that arrives after the handshake deadline (R10) or after the session was recycled **must** be rejected, never applied to a new session.
-- **R5.3.6**: **TUI-only establishment is pending**: An answer given in the TUI when no IDE session is live **must** establish the scope as **pending** (shown as such), applied when the next IDE session attaches to the workspace instance; it **must not** silently lock a scope that no live session is using as if it were active. _Status_: **not implemented.** The building blocks (`WorkspaceScope` with `commit_pending` / `promote_pending`, and `ElicitationDecision` with the most-restrictive fold and generation freshness) exist and are unit-tested in `ahma_common`, but nothing in production calls them: the live commit point is `Sandbox::commit_scopes` over the per-session `ScopeLock`, which has no pending state and no cross-session sharing. Wiring it needs a hub message for the answer (add-only, R24.5) and a per-workspace `Arc<WorkspaceScope>` replacing the per-session lock — a change to the single commit point of R5.1.1, so it must be done whole, never piecemeal.
+- **R5.3.6**: **TUI-only establishment is pending**: An answer given in the TUI when no IDE session is live **must** establish the scope as **pending** (shown as such), applied when the next IDE session attaches to the workspace instance; it **must not** silently lock a scope that no live session is using as if it were active. _Status_: **not implemented.** The live commit point is `Sandbox::commit_scopes` over the per-session `ScopeLock`, which has no pending state and no cross-session sharing. A first set of building blocks for R5.3.1–R5.3.6 (a separate downgrade coordinator and a per-workspace scope type) was written, never called, and deleted in 0.22.1: they duplicated the fan-out, first-answer-wins and dismiss rules the permission ladder already implements (R-PERM.3.3). When downgrade prompts are built they **must** be raised through that ladder (`PermissionBroker` and `GrantCoordinator`), not a second coordinator, and the change to the single commit point of R5.1.1 must be done whole, never piecemeal.
 
 #### Subprocess propagation and defaults
 
@@ -1864,11 +1864,11 @@ Operation ids are counters, and counters restart with the process that issues th
   `spawned_under_test_harness()` (R-ISO.1). A test that wrote the developer's
   history would also read it back into its own assertions.
 
-- **R-HUB.11 — What this deliberately does not do.** The per-workspace
-  `WorkspaceScope` machinery (R5.3.6) stays unwired: the per-session `ScopeLock`
-  remains the single commit door, and the hub holds no scope state of its
-  own. R5.3.6 warns that a partial wiring is a second door, and this change adds
-  no door.
+- **R-HUB.11 — What this deliberately does not do.** The hub holds no scope
+  state of its own: the per-session `ScopeLock` remains the single commit door
+  (R5.1.1), and pending TUI-established scopes (R5.3.6) are not implemented.
+  R5.3.6 warns that a partial wiring is a second door, and this change adds no
+  door.
 
 ### R-ISO: Test/Live Endpoint Isolation
 
@@ -2212,5 +2212,5 @@ Stated here so that no other document implies otherwise.
 - **Bundle trust**: no signature and no load-time gate; the checksum detects corruption only.
 - **Server-side output minimization**: dormant (`ahma_output_optimizer/SPEC.md`).
 - **OAuth**: endpoints fixed to Atlassian; no token refresh.
-- **Scope-downgrade prompts** (R5.3.1–R5.3.6): specified but not wired. No running ahma asks before a scope downgrade (broader client roots, `--tmp`, disabling enforcement) and none commits an `elicited` scope; the building blocks (`ahma_common::elicitation`, `workspace_scope`, `scope_decision`) have no caller outside their own tests. Live elicitation exists only for grants (R-PERM.3). Wiring it replaces the single commit point (R5.1.1) and must be done whole.
+- **Scope-downgrade prompts** (R5.3.1–R5.3.6): specified but not wired. No running ahma asks before a scope downgrade (broader client roots, `--tmp`, disabling enforcement) and none commits an `elicited` scope; unused building blocks for it were deleted in 0.22.1. Live elicitation exists only for grants (R-PERM.3), and downgrade prompts, when built, go through the same ladder. Building them changes the single commit point (R5.1.1) and must be done whole.
 - **Log-exception grants** (`logs_approve`): stored in `<platform config dir>/ahma/log_exceptions.json` (relocatable with `AHMA_CONFIG_DIR`), not in the unified ledger that R-PERM.1 requires.

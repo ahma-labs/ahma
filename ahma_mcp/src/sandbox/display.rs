@@ -47,9 +47,9 @@ pub enum ScopeSource {
     /// It is shown as pending and applied when the next session attaches to this
     /// workspace instance (SPEC R5.3.6).
     ///
-    /// **Not yet reachable**: `WorkspaceScope::commit_pending`, which produces
-    /// this state, has no production caller. The variant exists so the display
-    /// vocabulary is complete and so the meaning above cannot be conflated with
+    /// **Not yet reachable**: nothing produces this state, because R5.3.6 is
+    /// not implemented. The variant exists so the display vocabulary is
+    /// complete and so the meaning above cannot be conflated with
     /// [`ScopeSource::Unestablished`] again.
     PendingTui,
 }

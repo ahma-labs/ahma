@@ -24,9 +24,8 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
   is set, never its value (R-CFG1.2).
 - `permissions`: the unified permission ledger — filesystem grants, web domains, tool
   approvals — stored under `~/.ahma`, outside every sandbox scope (R-PERM.1, R-PERM.2).
-- `workspace_scope`, `scope_decision`, `scope_grant`, `sandbox_state`, `elicitation`: scope
-  ownership with a single commit point (R5.1.1), downgrade classification and the
-  elicitation coordinator (R5.3), and the sandbox lifecycle state machine.
+- `scope_grant`, `sandbox_state`: the grant coordinator (ask once per path, R-PERM.3) and
+  the sandbox lifecycle state machine.
 - `hook_consent`, `net_approval`, `web_approval`, `web_policy`: the terminal-hook fall-open
   consent ledger (R5.5.3), subprocess-egress and `fetch_webpage` session approvals, and the
   web domain policy (R-WEB).
