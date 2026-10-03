@@ -98,11 +98,14 @@ async fn shell_commands_append_redirect_once() {
     .expect("command");
 
     assert_eq!(program, "/bin/sh");
-    assert_eq!(args_vec, vec!["-c".to_string(), "echo hi 2>&1".to_string()]);
+    assert_eq!(
+        args_vec,
+        vec!["-c".to_string(), "{ echo hi\n} 2>&1".to_string()]
+    );
 }
 
 #[tokio::test]
-async fn shell_commands_do_not_duplicate_redirect() {
+async fn a_script_that_redirects_itself_is_still_grouped_whole() {
     let temp_manager = test_temp_manager();
     let mut args_map = Map::new();
     args_map.insert("args".to_string(), json!(["ls 2>&1"]));
@@ -117,7 +120,11 @@ async fn shell_commands_do_not_duplicate_redirect() {
     .await
     .expect("command");
 
-    assert_eq!(args_vec, vec!["-c".to_string(), "ls 2>&1".to_string()]);
+    // Its own `2>&1` covered only its last command; the group covers all.
+    assert_eq!(
+        args_vec,
+        vec!["-c".to_string(), "{ ls 2>&1\n} 2>&1".to_string()]
+    );
 }
 
 #[tokio::test]
