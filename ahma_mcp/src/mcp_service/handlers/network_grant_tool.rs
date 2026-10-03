@@ -121,11 +121,7 @@ pub fn network_grant_schema() -> Arc<Map<String, Value>> {
     );
     props.insert(
         "confirm".to_string(),
-        schema::boolean_property(
-            "Must be `true` to actually write the grant. Omit (or `false`) to PREVIEW only: the \
-             tool returns the full settings-file path and the exact line it would add so you can \
-             show the human and get approval first. The default is always Deny.",
-        ),
+        schema::boolean_property(super::sandbox_grant_tool::CONFIRM_DESCRIPTION),
     );
     props.insert(
         "note".to_string(),
@@ -323,9 +319,10 @@ fn preview_text(host: &str, settings_file: &Path, risk: &NetGrantRisk) -> String
         NetGrantRisk::Refused(_) => {}
     }
     out.push_str(&format!(
-        "Only a human can grant this. Calling `network_grant` with `confirm: true` raises an \
-         approval prompt in a client that supports one; it never grants by itself. Otherwise \
-         the human runs `ahma network allow {host}` in a terminal."
+        "Only a human can grant this. Calling `network_grant` with `confirm: true` asks them at \
+         a prompt in a client that supports one, which is their decision, so there is no need \
+         to ask in chat first; it never grants by itself. Otherwise the human runs \
+         `ahma network allow {host}` in a terminal."
     ));
     out
 }

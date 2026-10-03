@@ -4758,4 +4758,25 @@ mod requires_user_interaction_tests {
         let plain = service.build_builtin_tool(crate::builtin_tool::BuiltinTool::Status);
         assert!(plain.meta.is_none());
     }
+
+    /// Each call of a grant tool costs the human an approval click in a
+    /// harness that honours the annotation, so the schema must not send the
+    /// agent through a preview and a chat round before the real question,
+    /// and must not claim that `confirm: true` writes anything (SPEC R5.4.5).
+    #[test]
+    fn grant_tools_ask_once_and_say_what_confirm_does() {
+        use crate::mcp_service::handlers::{network_grant_tool, sandbox_grant_tool};
+        for schema in [
+            sandbox_grant_tool::sandbox_grant_schema(),
+            network_grant_tool::network_grant_schema(),
+        ] {
+            let confirm = schema["properties"]["confirm"]["description"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(!confirm.contains("actually write"), "{confirm}");
+            assert!(!confirm.contains("get approval first"), "{confirm}");
+            assert!(confirm.contains("asks the human"), "{confirm}");
+        }
+    }
 }

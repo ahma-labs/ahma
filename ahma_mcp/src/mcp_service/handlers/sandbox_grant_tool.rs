@@ -53,6 +53,15 @@ pub use ahma_common::scope_grant::{
     GrantRisk, classify_grant_risk, is_enclosing_git_repo, is_known_cache_dir, is_system_dir,
 };
 
+/// What `confirm` does, for both grant tools (SPEC R5.4.5). Each call of a
+/// grant tool costs the human an approval click in a harness that honours
+/// `requiresUserInteraction`, so the agent is sent straight to the one real
+/// question instead of a preview, a chat round and then the question.
+pub(crate) const CONFIRM_DESCRIPTION: &str = "`true` asks the human now, at a prompt that shows \
+    them your reason, the evidence, the risk and the exact settings line; nothing is written \
+    unless they approve, and the default is Deny. That prompt is their decision, so do not ask \
+    in chat first. Omit (or `false`) only to see what a grant would write without asking anyone.";
+
 /// Build the JSON input schema advertised for the `sandbox_grant` tool.
 pub fn sandbox_grant_schema() -> Arc<Map<String, Value>> {
     let mut props = Map::new();
@@ -74,11 +83,7 @@ pub fn sandbox_grant_schema() -> Arc<Map<String, Value>> {
     );
     props.insert(
         "confirm".to_string(),
-        schema::boolean_property(
-            "Must be `true` to actually write the grant. Omit (or `false`) to PREVIEW only: the \
-             tool returns the full settings-file path and the exact line it would add so you can \
-             show the human and get approval first. The default is always Deny.",
-        ),
+        schema::boolean_property(CONFIRM_DESCRIPTION),
     );
     props.insert(
         "reason".to_string(),
@@ -320,11 +325,11 @@ fn preview_text(
          Proposed grant: {access} access to\n  {path}\n\n\
          {banner}\n\n\
          Would append this line to {file}:\n  {line}\n\n\
-         This file lives outside every sandbox scope and only a human can change it. Tell the \
-         human what you need and why, using the narrowest directory and `ro` unless a write was \
-         denied. Then call `sandbox_grant` again with `confirm: true`: that does not grant — it \
-         raises an approval prompt for the human (in your client, or the ahma TUI). The default \
-         is Deny.",
+         This file lives outside every sandbox scope and only a human can change it. Ask for \
+         the narrowest directory, and `ro` unless a write was denied. Calling `sandbox_grant` \
+         again with `confirm: true` asks the human (in your client, or the ahma TUI) at a prompt \
+         that shows them your reason and this line; that prompt is their decision, so there is \
+         no need to ask in chat first. The default is Deny.",
         access = access.label(),
         path = path.display(),
         banner = risk_banner(risk),
