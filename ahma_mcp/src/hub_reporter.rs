@@ -967,12 +967,38 @@ async fn resolve_scope_grant(
         return;
     };
     match coord.resolve(&decision_id, decision) {
+        // `logs_approve`'s question: a `log-target` grant, never an `fs-scope`
+        // one — the same write path the harness answer takes (SPEC R9.2).
+        GrantResolveOutcome::Persist {
+            path,
+            tool,
+            tier,
+            time_to_decision_ms,
+            reason: ahma_common::scope_grant::GrantReason::LogTarget,
+            ..
+        } => {
+            if let Err(why) = crate::sandbox::permission_broker::apply_log_target_answer(
+                sandbox,
+                &path,
+                tier,
+                tool.as_deref(),
+                "tui",
+                &decision_id,
+                time_to_decision_ms,
+            ) {
+                warn!(
+                    path = %path.display(),
+                    "hub_reporter: approved log target not applied: {why}"
+                );
+            }
+        }
         GrantResolveOutcome::Persist {
             path,
             access,
             tool,
             tier,
             time_to_decision_ms,
+            reason: _,
         } => persist_resolved_grant(
             &path,
             access,
@@ -986,12 +1012,13 @@ async fn resolve_scope_grant(
         GrantResolveOutcome::Denied {
             path,
             time_to_decision_ms,
+            reason,
         } => {
             ahma_common::permissions::append_audit(
                 &ahma_common::permissions::audit_entry(
                     chrono::Local::now().to_rfc3339(),
                     ahma_common::permissions::AuditAction::Deny,
-                    ahma_common::permissions::GrantKind::FsScope,
+                    crate::sandbox::permission_broker::audit_kind(reason),
                     path.display().to_string(),
                     None,
                     ahma_common::permissions::GrantTier::Session,

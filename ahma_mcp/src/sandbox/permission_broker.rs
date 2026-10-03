@@ -54,7 +54,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use ahma_common::config::{ScopeAccess, settings_path};
-use ahma_common::permissions::{AuditAction, GrantKind, GrantTier, append_audit, audit_entry};
+use ahma_common::permissions::{
+    AuditAction, GrantKind, GrantTier, append_audit, audit_entry, persist_log_target_as,
+};
 use ahma_common::scope_grant::{
     GrantContext, GrantCoordinator, GrantDecision, GrantReason, GrantResolveOutcome, GrantStatus,
     NewGrant, ScopeGrantRequest, persist_grant,
@@ -334,12 +336,40 @@ impl PermissionBroker {
             GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
         }
         match outcome {
+            // `logs_approve`'s question: the answer is a `log-target` grant,
+            // never an `fs-scope` one, so it must not reach `persist_grant`
+            // below (SPEC R9.2). One write path, shared with the TUI's answer.
+            GrantResolveOutcome::Persist {
+                path,
+                tool,
+                tier,
+                time_to_decision_ms,
+                reason: GrantReason::LogTarget,
+                ..
+            } => {
+                let sandbox = self.sandbox.read().clone();
+                if let Err(why) = apply_log_target_answer(
+                    sandbox.as_ref(),
+                    &path,
+                    tier,
+                    tool.as_deref(),
+                    "harness",
+                    &req.decision_id,
+                    time_to_decision_ms,
+                ) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "approved log target not applied: {why}"
+                    );
+                }
+            }
             GrantResolveOutcome::Persist {
                 path,
                 access,
                 tool,
                 tier,
                 time_to_decision_ms,
+                reason: _,
             } => {
                 let risk_class = req.context.risk.as_ref().map(|r| r.class.clone());
                 let sandbox = self.sandbox.read().clone();
@@ -446,12 +476,13 @@ impl PermissionBroker {
             GrantResolveOutcome::Denied {
                 path,
                 time_to_decision_ms,
+                reason,
             } => {
                 append_audit(
                     &audit_entry(
                         chrono::Local::now().to_rfc3339(),
                         AuditAction::Deny,
-                        GrantKind::FsScope,
+                        audit_kind(reason),
                         path.display().to_string(),
                         None,
                         GrantTier::Session,
@@ -475,6 +506,87 @@ impl PermissionBroker {
     }
 }
 
+/// The ledger kind an answer to a question raised for `reason` is audited as:
+/// `logs_approve`'s question is about a `log-target`, every other one about a
+/// filesystem scope.
+pub(crate) fn audit_kind(reason: GrantReason) -> GrantKind {
+    if reason == GrantReason::LogTarget {
+        GrantKind::LogTarget
+    } else {
+        GrantKind::FsScope
+    }
+}
+
+/// Apply a human's yes to a log-target question ([`GrantReason::LogTarget`],
+/// raised by `logs_approve`, SPEC R9.2). The one place both surfaces that
+/// receive an answer — this broker (the harness) and the hub reporter (the
+/// TUI modal) — turn it into access, so neither can write an `fs-scope` grant
+/// for it by taking the ordinary path.
+///
+/// An `always` answer is a `log-target` row in the ledger, through the one
+/// audited, denylisted write path (`persist_log_target_as`, R-PERM.4.3). Any
+/// other tier is this session only: audited, never written. The question
+/// offers only those two ([`GrantReason::offers`]), and the coordinator holds
+/// any other answer to them, so a lease never becomes a permanent row here.
+/// Either way the target joins this session's **read-only** scope at once
+/// (R-PERM.4.1), behind the live gate.
+///
+/// `Err` says why it was not applied, for the log and the agent's reply.
+pub(crate) fn apply_log_target_answer(
+    sandbox: Option<&Arc<super::Sandbox>>,
+    target: &Path,
+    tier: GrantTier,
+    granted_by: Option<&str>,
+    surface: &str,
+    decision_id: &str,
+    time_to_decision_ms: Option<u64>,
+) -> Result<(), String> {
+    let workspace = sandbox.and_then(|sb| sb.scopes().first().cloned());
+    if tier == GrantTier::Always {
+        let file = settings_path().ok_or("cannot record the log target: home directory unknown")?;
+        let workspace = workspace
+            .as_deref()
+            .ok_or("cannot record the log target: this session has no workspace scope")?;
+        let added = persist_log_target_as(
+            &file,
+            workspace,
+            target,
+            granted_by.unwrap_or("logs_approve"),
+            surface,
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        tracing::info!(
+            log_target = %target.display(),
+            "Log target approved for workspace {} and {} {}; readable from this session on.",
+            workspace.display(),
+            if added { "saved to" } else { "already in" },
+            file.display(),
+        );
+    } else {
+        append_audit(
+            &audit_entry(
+                chrono::Local::now().to_rfc3339(),
+                AuditAction::Grant,
+                GrantKind::LogTarget,
+                target.display().to_string(),
+                Some("ro".to_string()),
+                GrantTier::Session,
+                Some(surface.to_string()),
+            )
+            .with_request(decision_id, time_to_decision_ms, None),
+        );
+        tracing::info!(
+            log_target = %target.display(),
+            "Log target approved for this session only (never written)."
+        );
+    }
+    if let Some(sb) = sandbox {
+        sb.add_live_grant(target, ScopeAccess::Ro)?;
+        crate::hub_reporter::publish_committed_scope(sb);
+    }
+    Ok(())
+}
+
 /// When a grant answered at `tier` ends: a lease ends
 /// [`ahma_common::scope_grant::PROMPT_LEASE_SECS`] from now; nothing else does.
 pub(crate) fn lease_end(tier: GrantTier) -> Option<u64> {
@@ -493,6 +605,16 @@ fn cli_hint(req: &ScopeGrantRequest) -> String {
     // The `--tmp` question is session-only: pointing at `ahma sandbox grant`
     // would turn a refused per-launch request into a permanent, machine-wide
     // grant nobody asked for.
+    // A log target has no `ahma sandbox grant` equivalent: that would grant
+    // an `fs-scope`, a different and wider thing than the question asked.
+    if req.reason == GrantReason::LogTarget {
+        return format!(
+            "open the ahma TUI (`ahma tui`), pick the log with `l` and approve it with `a`, or use \
+             a client that supports elicitation, to be asked about {}; until then it stays \
+             unreadable.",
+            req.path.display()
+        );
+    }
     if req.reason == GrantReason::StartupFlag {
         return format!(
             "open the ahma TUI (`ahma tui`) before the session starts, or use a client that \

@@ -350,7 +350,8 @@ The scope summary shows where it stands: `tmp  : requested, awaiting consent`, `
 With `--log-monitor` (or `[logging] log_monitor = true`) the sandbox also grants read-only
 access to the targets of symlinks in `.ahma/logs/` at startup, so a `livelog` tool can
 follow a log file that lives outside the workspace. A target outside the workspace is
-added only once approved with the `logs_approve` tool — see
+added only once a human approves it — `logs_approve` asks, it never approves on the
+agent's word — see
 [live-log-monitoring.md](live-log-monitoring.md) and SPEC R9.
 
 ## Task Vaults

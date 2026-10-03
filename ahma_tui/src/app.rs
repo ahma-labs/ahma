@@ -450,53 +450,85 @@ fn submit_log_switcher(state: &mut crate::state::AppState) {
     state.close_modal();
 }
 
+/// `a` on a blocked log: the human at the TUI approves reading the file the
+/// link points at, which the banner shows (SPEC R9.2).
+///
+/// The key press is the human's decision, so it is recorded here, straight
+/// into the ledger through the one `log-target` write path
+/// (`ahma_mcp::sandbox::approve_log_link`, denylisted and audited, surface
+/// `tui`) — not by calling `logs_approve`. That tool only *asks*: over MCP
+/// every caller is the model's word, and no argument a client could send
+/// may stand in for a human. An MCP client cannot press a TUI key. The link is
+/// re-resolved at the press and must still point at the file that was shown.
+///
+/// Blocking ledger write on a key press, like "Trust this folder?".
 fn approve_symlink(state: &mut crate::state::AppState) {
-    if let Some(ref active_file) = state.active_log_file
-        && let Some(info) = state.log_files.iter().find(|f| f.name == *active_file)
-        && !info.is_approved
-        && let Some(tx) = &state.bridge_tx
-    {
-        let tx = tx.clone();
-        let file_to_approve = active_file.clone();
-        let (minimize_tokens, small_model_harness, context_length) = resolve_token_prefs(state);
+    use crate::state::{LogEntry, LogLevel};
 
-        let mcp = crate::llm_bridge::McpChatConfig {
-            base_url: state.server_url.clone(),
-            workspace_root: std::path::PathBuf::from(&state.workspace),
-            session_id: state.session_id.clone(),
-            external_http_servers: std::collections::BTreeMap::new(),
-            max_turns: ahma_common::config::AhmaSettings::load().tools.max_turns,
-            tool_approval: false,
-            mcp_connections: state.mcp_connections.clone(),
-            minimize_tokens,
-            small_model_harness,
-            context_length,
-            // This auto-triggered logs_approve call bypasses needs_approval
-            // entirely (spawn_tool_call_task below, not the agent loop's
-            // resolve_tool_approval), so this field is never consulted here.
-            non_mutating_tool_names: std::sync::Arc::new(
-                ahma_core::agent::builtin_non_mutating_tool_names(),
-            ),
-            tool_menu: None,
-        };
-        tokio::spawn(async move {
-            crate::llm_bridge::spawn_tool_call_task(
-                "logs_approve".to_string(),
-                serde_json::json!({ "file": file_to_approve }),
-                mcp,
-                tx,
-            );
-        });
-        // Optimistically set approved
-        if let Some(pos) = state.log_files.iter().position(|f| f.name == *active_file) {
-            state.log_files[pos].is_approved = true;
-            if let Some(ref src_tx) = state.mcp_source_tx {
-                let _ = src_tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(Some(
-                    active_file.clone(),
-                )));
-            }
-        }
+    let Some(active_file) = state.active_log_file.clone() else {
+        return;
+    };
+    let Some(info) = state
+        .log_files
+        .iter()
+        .find(|f| f.name == active_file)
+        .cloned()
+    else {
+        return;
+    };
+    if info.is_approved {
+        return;
     }
+    let (level, message) = if state.workspace.is_empty() {
+        (
+            LogLevel::Warn,
+            format!(
+                "Could not approve {}: this TUI has no workspace to record it for.",
+                info.name
+            ),
+        )
+    } else {
+        let workspace = std::path::PathBuf::from(&state.workspace);
+        match ahma_mcp::sandbox::approve_log_link(
+            &workspace,
+            std::path::Path::new(&info.path),
+            info.symlink_target.as_deref().map(std::path::Path::new),
+            "ahma tui",
+            "tui",
+        ) {
+            Ok((target, _newly)) => {
+                if let Some(pos) = state.log_files.iter().position(|f| f.name == active_file) {
+                    state.log_files[pos].is_approved = true;
+                }
+                if let Some(ref src_tx) = state.mcp_source_tx {
+                    let _ = src_tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(
+                        Some(active_file.clone()),
+                    ));
+                }
+                (
+                    LogLevel::Info,
+                    format!(
+                        "Approved reading {target} for this workspace (saved to \
+                         ~/.ahma/settings.toml; sandboxed log monitors read it from the next \
+                         session). Undo: ahma permissions revoke log-target {target} \
+                         --workspace {workspace}",
+                        target = target.display(),
+                        workspace = workspace.display()
+                    ),
+                )
+            }
+            Err(why) => (
+                LogLevel::Warn,
+                format!("Could not approve {}: {why}", info.name),
+            ),
+        }
+    };
+    set_footer_hint(state, message.clone());
+    state.push_log(LogEntry {
+        timestamp: chrono::Local::now(),
+        level,
+        message,
+    });
 }
 
 /// Maximise/restore the focused pane. Enter on the log pane and `z` on any
@@ -9451,5 +9483,60 @@ mod tests {
         // Click on item 2
         super::handle_click_target(ClickTarget::SettingsItem(2), &mut state);
         assert_eq!(state.settings_editor.selected_item, 2);
+    }
+
+    /// `a` on a blocked log is the human's decision at the TUI (SPEC R9.2):
+    /// it records the target as a `log-target` grant straight away, with the
+    /// TUI as its surface — not through `logs_approve`, which only asks.
+    #[cfg(unix)]
+    #[test]
+    fn pressing_a_on_a_blocked_log_records_it_as_the_humans_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::HOME_SEAM_GUARD.lock();
+        let home = dir.path().join("home");
+        let workspace = dir.path().join("ws");
+        let logs = workspace.join(".ahma").join("logs");
+        let outside = dir.path().join("outside");
+        for d in [&home, &logs, &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let target = outside.join("app.log");
+        std::fs::write(&target, "line").unwrap();
+        let link = logs.join("app.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", &home) };
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.workspace = dunce::canonicalize(&workspace)
+            .unwrap()
+            .display()
+            .to_string();
+        state.log_files = vec![crate::state::LogFileInfo {
+            name: "app.log".into(),
+            path: link.display().to_string(),
+            size_bytes: 4,
+            modified: None,
+            is_symlink: true,
+            symlink_target: Some(target.display().to_string()),
+            is_approved: false,
+        }];
+        state.active_log_file = Some("app.log".into());
+
+        super::approve_symlink(&mut state);
+        unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+
+        assert!(state.log_files[0].is_approved);
+        let settings =
+            ahma_common::config::AhmaSettings::load_from(&home.join(".ahma").join("settings.toml"));
+        let key = ahma_common::permissions::workspace_key(&workspace);
+        assert_eq!(
+            settings.log_targets.approved_targets(&key),
+            vec![dunce::canonicalize(&target).unwrap()]
+        );
+        assert_eq!(
+            settings.log_targets.approvals[0].surface.as_deref(),
+            Some("tui")
+        );
     }
 }

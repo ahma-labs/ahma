@@ -10,11 +10,17 @@
 //! normalised away by `canonicalize` and rejected if they escape the log directory.
 //!
 //! Raw (un-redacted) output requires the caller to pass `"raw": true` explicitly.
+//!
+//! `logs_approve` never approves anything on the model's word (SPEC R9.2,
+//! R5.4.5): the agent can plant a `.ahma/logs` link to any file, so the call
+//! only *asks* a human, through the permission ladder (R-PERM.3), and only the
+//! human's answer — applied by the broker or the TUI reporter — records it.
 
 use super::common::{mcp_internal, mcp_invalid_params, text_result};
 use crate::AhmaMcpService;
 use crate::log_monitor::redact_sensitive_line;
 use crate::utils::logging::project_log_dir;
+use ahma_common::scope_grant::GrantStatus;
 use rmcp::model::{CallToolResult, ErrorData as McpError};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -57,7 +63,18 @@ impl AhmaMcpService {
         Ok(text_result(json))
     }
 
-    /// `logs_approve` — approve a blocked out-of-scope log symlink target.
+    /// `logs_approve` — ask a human to let the log tools read the file outside
+    /// the workspace that a `.ahma/logs/*.log` symlink points at.
+    ///
+    /// The call is a request, never an approval, for every client: whether
+    /// the caller is the TUI's agent, an IDE that gates tool calls or a
+    /// headless harness that auto-approves them, the question is raised as a
+    /// [`GrantReason::LogTarget`] grant question through the permission ladder
+    /// and only a human's answer is applied (the broker or the hub reporter
+    /// records an `always` answer as a `log-target` row and applies either
+    /// answer to this session's read scope). This handler reports the answer.
+    ///
+    /// [`GrantReason::LogTarget`]: ahma_common::scope_grant::GrantReason::LogTarget
     pub async fn handle_logs_approve(
         &self,
         args: Map<String, Value>,
@@ -100,31 +117,114 @@ impl AhmaMcpService {
             )));
         }
 
-        let primary_root = self
-            .adapter
-            .sandbox()
+        // SPEC R-PERM.3.4: the human sees the agent's own stated reason,
+        // labelled as its claim. A request without one is one nobody can judge.
+        let reason = super::common::require_str(
+            &args,
+            "reason",
+            "logs_approve requires a `reason`: one sentence saying why you need to read this log, \
+             for the human who decides",
+        )?;
+
+        let sandbox = self.adapter.sandbox_arc();
+        let primary_root = sandbox
             .scopes()
             .first()
             .cloned()
             .ok_or_else(|| mcp_internal("No sandbox scopes configured"))?;
 
-        // A `log-target` grant in the permission ledger (~/.ahma/settings.toml),
-        // which no sandbox scope includes, so a sandboxed agent cannot grant
-        // itself access by writing a file. The ledger write path is synchronous
-        // (strict read, atomic rename), shared with the CLI and TUI.
-        let (root_for_write, target_for_write) = (primary_root.clone(), canonical_target.clone());
-        let newly_added = tokio::task::spawn_blocking(move || {
-            crate::sandbox::add_log_exception(&root_for_write, &target_for_write)
-        })
-        .await
-        .map_err(|e| mcp_internal(format!("Log target approval task failed: {e}")))?
-        .map_err(|e| mcp_internal(format!("Failed to record the log target approval: {e}")))?;
+        // Already approved for this workspace: nothing to ask.
+        let key = ahma_common::permissions::workspace_key_async(&primary_root).await;
+        if ahma_common::config::AhmaSettings::load_async()
+            .await
+            .log_targets
+            .is_target_approved(&key, &canonical_target)
+        {
+            return Ok(text_result(already_approved_text(
+                &canonical_target,
+                &primary_root,
+            )));
+        }
 
-        Ok(text_result(approve_reply(
-            &canonical_target,
-            &primary_root,
-            newly_added,
-        )))
+        let Some(notifier) = self.adapter.scope_grant_notifier().cloned() else {
+            return Ok(text_result(not_raised_text(
+                &canonical_target,
+                &primary_root,
+                "Not raised: no surface can ask a human in this session. Nothing is recorded.",
+            )));
+        };
+        // The risk section inspects the target (and the ledger): blocking I/O,
+        // so not on this async task.
+        let context = {
+            let sandbox = sandbox.clone();
+            let target = canonical_target.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::sandbox::grant_channel::build_context(
+                    &sandbox,
+                    &target,
+                    None,
+                    None,
+                    None,
+                    Some(reason.as_str()),
+                    false,
+                )
+            })
+            .await
+            .unwrap_or_default()
+        };
+        let raised = notifier
+            .notify_violation_with(
+                &canonical_target,
+                ahma_common::config::ScopeAccess::Ro,
+                ahma_common::scope_grant::GrantReason::LogTarget,
+                Some("logs_approve".to_string()),
+                context,
+            )
+            .await;
+
+        let text = match &raised {
+            None if self.adapter.grant_budget_exhausted() => not_raised_text(
+                &canonical_target,
+                &primary_root,
+                "Not raised: this session has used its prompt budget. Stop requesting approvals; \
+                 tell the human in conversation what you need and why, and continue with what \
+                 you have.",
+            ),
+            None => not_raised_text(
+                &canonical_target,
+                &primary_root,
+                "Not raised: this file was already asked about this session, or is refused \
+                 outright. Nothing is recorded.",
+            ),
+            Some(req) => match self.adapter.grant_status(&req.decision_id) {
+                GrantStatus::Decided(decision) if decision.access().is_some() => {
+                    let tier = decision.tier();
+                    // Report what is true, not what was answered: the answer is
+                    // applied by the surface that received it, and a failed
+                    // save or a refused live grant must not read as approved.
+                    let live = sandbox.read_scopes().contains(&canonical_target);
+                    let saved = tier != ahma_common::permissions::GrantTier::Always
+                        || ahma_common::config::AhmaSettings::load_async()
+                            .await
+                            .log_targets
+                            .is_target_approved(&key, &canonical_target);
+                    if live && saved {
+                        approved_text(&canonical_target, &primary_root, tier)
+                    } else {
+                        format!(
+                            "A human approved reading\n  {}\n\nbut ahma could not apply it (the \
+                             server log says why). Nothing changed. Tell the human, and do not \
+                             ask again.",
+                            canonical_target.display()
+                        )
+                    }
+                }
+                GrantStatus::Decided(_) => declined_text(&canonical_target),
+                GrantStatus::Pending => pending_text(&canonical_target, &primary_root, req),
+                GrantStatus::Closed => nobody_asked_text(&canonical_target, &primary_root, req),
+            },
+        };
+        Ok(text_result(text))
     }
 
     /// `logs_read` — return lines from a log file with optional offset and limit.
@@ -279,38 +379,132 @@ pub fn logs_search_schema() -> Arc<Map<String, Value>> {
 }
 
 /// Input schema for `logs_approve`.
+///
+/// There is deliberately no argument that approves: whatever a client sends
+/// is the model's word (SPEC R5.4.5). Only a human answering the question this
+/// raises — or pressing `a` on the log in the ahma TUI — approves a target.
 pub fn logs_approve_schema() -> Arc<Map<String, Value>> {
     let mut props = Map::new();
     props.insert(
         "file".to_string(),
         json!({
             "type": "string",
-            "description": "Name of the log file symlink to approve (e.g. 'sys.log')."
+            "description": "Name of the log file symlink whose target you need to read (e.g. 'sys.log')."
         }),
     );
-    schema::object_input_schema(props, &["file"])
+    props.insert(
+        "reason".to_string(),
+        schema::string_property(
+            "One sentence, for the human: why you need to read this log. Shown at the prompt as \
+             YOUR claim, next to the file the link points at, so write it for a person deciding \
+             in ten seconds. Required.",
+        ),
+    );
+    schema::object_input_schema(props, &["file", "reason"])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// What `logs_approve` tells the agent: what was recorded, where, when it
-/// applies, and how a human takes it back.
-fn approve_reply(target: &Path, workspace: &Path, newly_added: bool) -> String {
-    let file = ahma_common::config::settings_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "~/.ahma/settings.toml".to_string());
-    let what = if newly_added {
-        "Successfully approved symlink target"
+/// How a human approves a log target without the agent: the paste-able
+/// alternative every reply that leaves it unapproved carries. There is no
+/// CLI command that approves one, and nothing a tool call passes can.
+fn human_alternatives(workspace: &Path) -> String {
+    format!(
+        "A human can approve it themselves: open `ahma tui` in {workspace}, pick this log with \
+         `l` and press `a`; or use a client that shows permission prompts. Review approvals with \
+         `ahma permissions list --kind log-target`.",
+        workspace = workspace.display()
+    )
+}
+
+/// The question never reached a human.
+fn not_raised_text(target: &Path, workspace: &Path, status: &str) -> String {
+    format!(
+        "Requested read access to the log target\n  {target}\n\n{status}\n\n{alt}",
+        target = target.display(),
+        alt = human_alternatives(workspace),
+    )
+}
+
+/// The question waits in the ahma TUI. Carries the exact body the human sees
+/// (SPEC R-PERM.3.4) so the agent can relay it.
+fn pending_text(
+    target: &Path,
+    workspace: &Path,
+    req: &ahma_common::scope_grant::ScopeGrantRequest,
+) -> String {
+    format!(
+        "Requested read access to the log target\n  {target}\n\nBlocked until a human answers. \
+         The question is waiting in the ahma TUI. It is NOT approved until a person approves it; \
+         Enter/Esc deny. Do not ask again; tell the human it is waiting there.\n\n{body}\n{alt}",
+        target = target.display(),
+        body = ahma_common::grant_prompt::render(req).to_message(),
+        alt = human_alternatives(workspace),
+    )
+}
+
+/// The question reached no human surface (rung 3, SPEC R-PERM.3): the agent is
+/// the only way it reaches a person.
+fn nobody_asked_text(
+    target: &Path,
+    workspace: &Path,
+    req: &ahma_common::scope_grant::ScopeGrantRequest,
+) -> String {
+    format!(
+        "Requested read access to the log target\n  {target}\n\nBlocked until a human approves \
+         it: no surface could ask them (this client shows no prompts and no ahma TUI is \
+         attached). Nothing is recorded. Show the human the text below UNCHANGED, then stop \
+         asking.\n\n{body}\n{alt}",
+        target = target.display(),
+        body = ahma_common::grant_prompt::render(req).to_message(),
+        alt = human_alternatives(workspace),
+    )
+}
+
+/// A human declined. It is an answer: not asked again this session (R-PERM.4).
+fn declined_text(target: &Path) -> String {
+    format!(
+        "A human declined reading the log target\n  {}\n\nNothing is recorded, and it will not be \
+         asked about again this session. Continue without it, or explain in conversation why \
+         you need it.",
+        target.display()
+    )
+}
+
+/// A human approved: the tier they chose decides whether anything was written.
+fn approved_text(
+    target: &Path,
+    workspace: &Path,
+    tier: ahma_common::permissions::GrantTier,
+) -> String {
+    let how_long = if tier == ahma_common::permissions::GrantTier::Always {
+        let file = ahma_common::config::settings_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.ahma/settings.toml".to_string());
+        format!(
+            "Recorded as a `log-target` grant for this workspace in {file} and applied to this \
+             session now. Review with `ahma permissions list --kind log-target`; revoke with \
+             `ahma permissions revoke log-target {target} --workspace {workspace}`.",
+            target = target.display(),
+            workspace = workspace.display()
+        )
     } else {
-        "Symlink target was already approved"
+        "Approved for this session only (never written to disk) and applied now.".to_string()
     };
     format!(
-        "{what}: {target}. Recorded as a `log-target` grant in {file}. Live-log monitoring \
-         can read it from the next session (this session's sandbox read scope is fixed). \
-         Review with `ahma permissions list --kind log-target`; revoke with \
-         `ahma permissions revoke log-target {target} --workspace {workspace}`.",
+        "✓ A human approved reading the log target\n  {}\n\n{how_long}",
+        target.display()
+    )
+}
+
+/// Already approved for this workspace: nothing was asked.
+fn already_approved_text(target: &Path, workspace: &Path) -> String {
+    format!(
+        "The log target\n  {target}\n\nwas already approved for this workspace; nothing was \
+         asked. Revoke with `ahma permissions revoke log-target {target} --workspace \
+         {workspace}`.",
         target = target.display(),
         workspace = workspace.display()
     )
@@ -912,6 +1106,8 @@ mod tests {
         assert_eq!(required, vec!["file", "pattern"]);
     }
 
+    /// `logs_approve` takes the link and the agent's reason — and nothing
+    /// that could pass for a human's approval (SPEC R5.4.5).
     #[test]
     fn test_logs_approve_schema() {
         let schema = logs_approve_schema();
@@ -920,7 +1116,9 @@ mod tests {
             .get("properties")
             .and_then(Value::as_object)
             .expect("properties");
-        assert!(props.contains_key("file"));
+        let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["file", "reason"]);
         let required: Vec<&str> = schema
             .get("required")
             .and_then(Value::as_array)
@@ -928,7 +1126,7 @@ mod tests {
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(required, vec!["file"]);
+        assert_eq!(required, vec!["file", "reason"]);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1210,107 +1408,472 @@ mod tests {
         );
     }
 
-    /// Approving an out-of-scope symlink records a `log-target` grant, with
-    /// provenance, in the permission ledger (`~/.ahma/settings.toml`) and
-    /// audits it; `logs_list` then reports the link as approved. The home is
-    /// redirected to a temp dir via `AHMA_TEST_HOME`, so the real ledger is
-    /// never touched.
+    // ─────────────────────────────────────────────────────────────────────
+    // logs_approve asks a human; only the human's answer records (SPEC R9.2)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A temp home, a log dir holding `sys.log` → a file outside the
+    /// workspace, and the env guards that point ahma at them. The guards
+    /// restore the environment on drop.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn handle_logs_approve_success() {
-        use std::os::unix::fs::symlink;
-        let (service, scope) = build_test_service().await.unwrap();
-        let log_dir = tempdir().unwrap();
-        let external = tempdir().unwrap();
-        let home = tempdir().unwrap();
-        let external_file = external.path().join("sys.log");
-        std::fs::write(&external_file, "external content").unwrap();
-        symlink(&external_file, log_dir.path().join("sys.log")).unwrap();
+    struct LogLinkFixture {
+        tmp: tempfile::TempDir,
+        workspace: PathBuf,
+        log_dir: PathBuf,
+        home: PathBuf,
+        /// The canonical target `sys.log` points at.
+        target: PathBuf,
+        _log_guard: EnvVarGuard,
+        _home_guard: EnvVarGuard,
+    }
 
-        let _log_guard = EnvVarGuard::set("AHMA_TEST_LOG_DIR", log_dir.path());
-        let _home_guard = EnvVarGuard::set("AHMA_TEST_HOME", home.path());
+    #[cfg(unix)]
+    impl LogLinkFixture {
+        fn new() -> Self {
+            let tmp = tempdir().unwrap();
+            let workspace = tmp.path().join("workspace");
+            let log_dir = tmp.path().join("logs");
+            let home = tmp.path().join("home");
+            let external = tmp.path().join("external");
+            for d in [&workspace, &log_dir, &home, &external] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let external_file = external.join("sys.log");
+            std::fs::write(&external_file, "external content").unwrap();
+            std::os::unix::fs::symlink(&external_file, log_dir.join("sys.log")).unwrap();
+            let target = dunce::canonicalize(&external_file).unwrap();
+            let _log_guard = EnvVarGuard::set("AHMA_TEST_LOG_DIR", &log_dir);
+            let _home_guard = EnvVarGuard::set("AHMA_TEST_HOME", &home);
+            Self {
+                tmp,
+                workspace,
+                log_dir,
+                home,
+                target,
+                _log_guard,
+                _home_guard,
+            }
+        }
 
-        // `logs_list` reports whether a link's target is approved, read from
-        // the ledger on every call.
-        let svc = &service;
-        let listed_approved = || async move {
-            let listed = svc.handle_logs_list(Map::new()).await.unwrap();
-            let entries: Vec<Value> = serde_json::from_str(&text_of(&listed)).unwrap();
-            entries
-                .iter()
-                .find(|e| e["name"] == "sys.log")
-                .and_then(|e| e["is_approved"].as_bool())
-                .expect("sys.log is listed")
-        };
-        assert!(
-            !listed_approved().await,
-            "an out-of-workspace target starts unapproved"
-        );
+        fn ledger(&self) -> PathBuf {
+            self.home.join(".ahma").join("settings.toml")
+        }
 
+        /// The `log-target` rows in the ledger for this workspace.
+        fn approved(&self) -> Vec<PathBuf> {
+            let settings = ahma_common::config::AhmaSettings::load_from(&self.ledger());
+            let key = ahma_common::permissions::workspace_key(&self.workspace);
+            settings.log_targets.approved_targets(&key)
+        }
+
+        fn audit(&self) -> Vec<ahma_common::permissions::AuditEntry> {
+            ahma_common::permissions::read_audit_entries(
+                &self.home.join(".ahma").join("permissions-audit.jsonl"),
+            )
+        }
+
+        /// No `fs-scope` grant was written for anything: a log-target answer
+        /// never takes the ordinary scope-grant path.
+        fn assert_no_fs_scope_grant(&self) {
+            let settings = ahma_common::config::AhmaSettings::load_from(&self.ledger());
+            assert!(
+                settings.sandbox.persistent_scopes.is_empty(),
+                "a log target is never an fs-scope grant: {:?}",
+                settings.sandbox.persistent_scopes
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn approve_args() -> Map<String, Value> {
         let mut args = Map::new();
         args.insert("file".to_string(), Value::String("sys.log".to_string()));
-        let result = service.handle_logs_approve(args.clone()).await.unwrap();
-        let text = text_of(&result);
-        assert!(
-            text.contains("Successfully approved symlink target") && text.contains("log-target"),
-            "approve: {text}"
+        args.insert(
+            "reason".to_string(),
+            Value::String("the app's errors are in its own log".to_string()),
         );
+        args
+    }
 
-        // The grant is a ledger row, keyed by the workspace, with provenance.
-        let ledger = home.path().join(".ahma").join("settings.toml");
-        let settings = ahma_common::config::AhmaSettings::load_from_result(&ledger)
-            .expect("the ledger is written and parses");
-        let target = dunce::canonicalize(&external_file).unwrap();
-        let key = ahma_common::permissions::workspace_key(scope.path());
-        assert!(
-            settings.log_targets.is_target_approved(&key, &target),
-            "a log-target row for {} under {}: {:?}",
-            target.display(),
-            key.display(),
-            settings.log_targets
-        );
-        let entry = &settings.log_targets.approvals[0];
-        assert_eq!(entry.granted_by.as_deref(), Some("logs_approve"));
-        assert_eq!(entry.surface.as_deref(), Some("mcp:logs_approve"));
-        assert!(entry.granted_at.is_some(), "the grant is dated");
+    /// A server whose client shows elicitation prompts and answers each with
+    /// `answer` (`None` declines, as the elicitation `decline` action).
+    #[cfg(unix)]
+    async fn server_answering(
+        f: &LogLinkFixture,
+        client: crate::test_utils::recording_client::RecordingClient,
+    ) -> crate::test_utils::in_process::InProcessMcp<
+        crate::test_utils::recording_client::RecordingClient,
+    > {
+        let (mcp, _broker) = crate::test_utils::in_process::create_in_process_mcp_with_broker(
+            client,
+            &f.workspace,
+            None,
+        )
+        .await
+        .unwrap();
+        mcp
+    }
 
-        // …and it is audited.
-        let audit = ahma_common::permissions::read_audit_entries(
-            &home.path().join(".ahma").join("permissions-audit.jsonl"),
+    #[cfg(unix)]
+    async fn listed_as_approved(service: &AhmaMcpService) -> bool {
+        let listed = service.handle_logs_list(Map::new()).await.unwrap();
+        let entries: Vec<Value> = serde_json::from_str(&text_of(&listed)).unwrap();
+        entries
+            .iter()
+            .find(|e| e["name"] == "sys.log")
+            .and_then(|e| e["is_approved"].as_bool())
+            .expect("sys.log is listed")
+    }
+
+    /// `reason` is required, like `sandbox_grant`'s: the human is shown it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handle_logs_approve_requires_a_reason() {
+        let f = LogLinkFixture::new();
+        let (service, _scope) = build_test_service().await.unwrap();
+        let mut args = approve_args();
+        args.remove("reason");
+        let err = service.handle_logs_approve(args).await.unwrap_err();
+        assert!(err.message.contains("`reason`"), "{}", err.message);
+        assert!(f.approved().is_empty());
+    }
+
+    /// The bug this fixes: an MCP call alone recorded the grant. With nobody
+    /// to ask — no notifier wired, or a client that shows no prompts and no
+    /// TUI — the call writes NOTHING, and says how a human can approve it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn logs_approve_without_a_human_answer_writes_nothing() {
+        let f = LogLinkFixture::new();
+
+        // No permission broker at all.
+        let (service, _scope) = build_test_service().await.unwrap();
+        let text = text_of(&service.handle_logs_approve(approve_args()).await.unwrap());
+        assert!(text.contains("Not raised"), "{text}");
+        assert!(text.contains("ahma tui"), "the human alternative: {text}");
+        assert!(!text.contains('✓'), "{text}");
+
+        // The real ladder, with a client that cannot elicit and no TUI.
+        let mcp = server_answering(
+            &f,
+            crate::test_utils::recording_client::RecordingClient::new("cursor"),
+        )
+        .await;
+        let text = text_of(
+            &mcp.service
+                .handle_logs_approve(approve_args())
+                .await
+                .unwrap(),
         );
         assert!(
-            audit
+            text.contains("no surface could ask them"),
+            "nobody was asked: {text}"
+        );
+        assert!(
+            text.contains("a log file in .ahma/logs links to this file outside the workspace"),
+            "the body the human must be shown: {text}"
+        );
+        assert!(!text.contains('✓'), "{text}");
+
+        assert!(
+            ahma_common::config::AhmaSettings::load_from(&f.ledger())
+                .log_targets
+                .approvals
+                .is_empty(),
+            "nothing reached the ledger, for any workspace"
+        );
+        assert!(
+            !f.audit()
                 .iter()
-                .any(|a| a.kind == ahma_common::permissions::GrantKind::LogTarget
-                    && a.action == ahma_common::permissions::AuditAction::Grant
-                    && a.subject == target.display().to_string()),
-            "a log-target grant audit entry: {audit:?}"
+                .any(|a| a.action == ahma_common::permissions::AuditAction::Grant),
+            "nothing was granted: {:?}",
+            f.audit()
         );
-
         assert!(
-            listed_approved().await,
-            "logs_list shows the approval at once, from the ledger"
+            !mcp.service
+                .adapter
+                .sandbox()
+                .read_scopes()
+                .contains(&f.target),
+            "the live session did not widen either"
         );
+        assert!(!listed_as_approved(&mcp.service).await);
+    }
 
-        // Re-approving is idempotent: no second row.
-        let again = service.handle_logs_approve(args).await.unwrap();
+    /// A human's `always` answer at the client's prompt records exactly one
+    /// audited `log-target` row — with the agent's tool as `granted_by` and
+    /// the surface that answered — applies it to this session, and writes no
+    /// `fs-scope` grant. The prompt says what the link is and shows the
+    /// agent's reason. Asking again is answered from the ledger.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn logs_approve_always_answer_records_one_audited_row() {
+        let f = LogLinkFixture::new();
+        let client = crate::test_utils::recording_client::RecordingClient::new("cursor")
+            .with_elicitation(Some("read-only"));
+        let prompts = client.elicitation().expect("elicitation enabled");
+        let mcp = server_answering(&f, client).await;
+        let service = &mcp.service;
+        assert!(!listed_as_approved(service).await);
+
+        let text = text_of(&service.handle_logs_approve(approve_args()).await.unwrap());
+        assert!(text.contains("A human approved"), "{text}");
+        assert!(text.contains("log-target"), "{text}");
+
+        let asked = prompts.messages();
+        assert_eq!(asked.len(), 1, "one question: {asked:?}");
         assert!(
-            text_of(&again).contains("already approved"),
+            asked[0].contains(
+                "a log file in .ahma/logs links to this file outside the workspace; approving \
+                 lets ahma's log tools read it"
+            ),
             "{}",
-            text_of(&again)
+            asked[0]
         );
-        let settings = ahma_common::config::AhmaSettings::load_from_result(&ledger).unwrap();
-        assert_eq!(settings.log_targets.approved_targets(&key), vec![target]);
+        assert!(
+            asked[0].contains("the app's errors are in its own log"),
+            "the agent's claim is shown: {}",
+            asked[0]
+        );
+
+        assert_eq!(f.approved(), vec![f.target.clone()]);
+        let settings = ahma_common::config::AhmaSettings::load_from(&f.ledger());
+        let row = &settings.log_targets.approvals[0];
+        assert_eq!(row.granted_by.as_deref(), Some("logs_approve"));
+        assert_eq!(row.surface.as_deref(), Some("harness"));
+        f.assert_no_fs_scope_grant();
+
+        let grants: Vec<_> = f
+            .audit()
+            .into_iter()
+            .filter(|a| a.action == ahma_common::permissions::AuditAction::Grant)
+            .collect();
+        assert_eq!(grants.len(), 1, "one audited grant: {grants:?}");
+        assert_eq!(
+            grants[0].kind,
+            ahma_common::permissions::GrantKind::LogTarget
+        );
+        assert_eq!(grants[0].subject, f.target.display().to_string());
+        assert_eq!(grants[0].surface.as_deref(), Some("harness"));
+
+        assert!(
+            service.adapter.sandbox().read_scopes().contains(&f.target),
+            "an approved target is readable this session (R-PERM.4.1)"
+        );
+        assert!(listed_as_approved(service).await);
+
+        // Asking again is answered from the ledger: no second question, no
+        // second row.
+        let again = text_of(&service.handle_logs_approve(approve_args()).await.unwrap());
+        assert!(again.contains("already approved"), "{again}");
+        assert_eq!(prompts.messages().len(), 1);
+        assert_eq!(f.approved(), vec![f.target.clone()]);
 
         // The retired store is never written.
         assert!(
-            !home
-                .path()
+            !f.home
                 .join(".config")
                 .join("ahma")
                 .join("log_exceptions.json")
-                .exists(),
-            "nothing may be written to the retired log_exceptions.json"
+                .exists()
         );
+    }
+
+    /// `deny` is an answer: nothing recorded, the denial audited as a
+    /// `log-target`, and not asked again this session (R-PERM.4).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn logs_approve_deny_answer_writes_nothing() {
+        let f = LogLinkFixture::new();
+        let client = crate::test_utils::recording_client::RecordingClient::new("cursor")
+            .with_elicitation(Some("deny"));
+        let prompts = client.elicitation().expect("elicitation enabled");
+        let mcp = server_answering(&f, client).await;
+
+        let text = text_of(
+            &mcp.service
+                .handle_logs_approve(approve_args())
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("A human declined"), "{text}");
+        assert!(f.approved().is_empty());
+        f.assert_no_fs_scope_grant();
+        assert!(
+            f.audit()
+                .iter()
+                .any(|a| a.action == ahma_common::permissions::AuditAction::Deny
+                    && a.kind == ahma_common::permissions::GrantKind::LogTarget),
+            "the denial is audited as a log-target: {:?}",
+            f.audit()
+        );
+        assert!(
+            !mcp.service
+                .adapter
+                .sandbox()
+                .read_scopes()
+                .contains(&f.target)
+        );
+
+        let again = text_of(
+            &mcp.service
+                .handle_logs_approve(approve_args())
+                .await
+                .unwrap(),
+        );
+        assert!(again.contains("Not raised"), "{again}");
+        assert_eq!(
+            prompts.messages().len(),
+            1,
+            "a denied target is not re-asked"
+        );
+    }
+
+    /// The client cancelling the prompt is nobody's decision (SPEC R5.3.1):
+    /// nothing is recorded, it is not reported as a denial, and the next call
+    /// asks again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn logs_approve_cancel_is_not_a_denial() {
+        let f = LogLinkFixture::new();
+        let client = crate::test_utils::recording_client::RecordingClient::new("cursor")
+            .with_elicitation_cancel();
+        let prompts = client.elicitation().expect("elicitation enabled");
+        let mcp = server_answering(&f, client).await;
+
+        let text = text_of(
+            &mcp.service
+                .handle_logs_approve(approve_args())
+                .await
+                .unwrap(),
+        );
+        assert!(!text.contains("declined"), "a cancel is not a no: {text}");
+        assert!(text.contains("no surface could ask them"), "{text}");
+        assert!(f.approved().is_empty());
+        assert!(
+            !f.audit()
+                .iter()
+                .any(|a| a.kind == ahma_common::permissions::GrantKind::LogTarget),
+            "no decision was made, so none is audited: {:?}",
+            f.audit()
+        );
+
+        let _ = mcp
+            .service
+            .handle_logs_approve(approve_args())
+            .await
+            .unwrap();
+        assert_eq!(
+            prompts.messages().len(),
+            2,
+            "a dismissed question is asked again"
+        );
+    }
+
+    /// A `session` answer makes the target readable now and writes nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn logs_approve_session_answer_is_live_and_never_written() {
+        let f = LogLinkFixture::new();
+        let client = crate::test_utils::recording_client::RecordingClient::new("cursor")
+            .with_elicitation(Some("read-only-session"));
+        let mcp = server_answering(&f, client).await;
+
+        let text = text_of(
+            &mcp.service
+                .handle_logs_approve(approve_args())
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("this session only"), "{text}");
+        assert!(
+            mcp.service
+                .adapter
+                .sandbox()
+                .read_scopes()
+                .contains(&f.target),
+            "readable this session"
+        );
+        assert!(f.approved().is_empty(), "a session answer is never written");
+        f.assert_no_fs_scope_grant();
+        assert!(
+            f.audit()
+                .iter()
+                .any(|a| a.kind == ahma_common::permissions::GrantKind::LogTarget
+                    && a.tier == ahma_common::permissions::GrantTier::Session),
+            "{:?}",
+            f.audit()
+        );
+    }
+
+    /// A target on the hard denylist is refused before any question is put
+    /// to a human — even one who would say yes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_denylisted_target_is_refused_before_any_question() {
+        let f = LogLinkFixture::new();
+        let ssh = f.home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let key = ssh.join("id_ed25519");
+        std::fs::write(&key, "secret").unwrap();
+        std::os::unix::fs::symlink(&key, f.log_dir.join("key.log")).unwrap();
+
+        let client = crate::test_utils::recording_client::RecordingClient::new("cursor")
+            .with_elicitation(Some("read-only"));
+        let prompts = client.elicitation().expect("elicitation enabled");
+        let mcp = server_answering(&f, client).await;
+
+        let mut args = approve_args();
+        args.insert("file".to_string(), Value::String("key.log".to_string()));
+        let err = mcp.service.handle_logs_approve(args).await.unwrap_err();
+        assert!(err.message.contains("REFUSED"), "{}", err.message);
+        assert!(prompts.messages().is_empty(), "nobody is asked");
+        assert!(f.approved().is_empty());
+    }
+
+    /// The TUI's `[a]` on a blocked log is a human's decision at an
+    /// unsandboxed surface, not an MCP call: it still records the row, with
+    /// the TUI as its surface — and records nothing when the link was swapped
+    /// after it was shown.
+    #[cfg(unix)]
+    #[test]
+    fn the_tui_approval_of_a_log_link_still_records() {
+        let f = LogLinkFixture::new();
+        let link = f.log_dir.join("sys.log");
+        let shown = std::fs::read_link(&link).unwrap();
+
+        let (target, added) =
+            crate::sandbox::approve_log_link(&f.workspace, &link, Some(&shown), "ahma tui", "tui")
+                .unwrap();
+        assert!(added);
+        assert_eq!(target, f.target);
+        assert_eq!(f.approved(), vec![f.target.clone()]);
+        let settings = ahma_common::config::AhmaSettings::load_from(&f.ledger());
+        assert_eq!(
+            settings.log_targets.approvals[0].surface.as_deref(),
+            Some("tui")
+        );
+        assert!(
+            f.audit()
+                .iter()
+                .any(|a| a.kind == ahma_common::permissions::GrantKind::LogTarget
+                    && a.surface.as_deref() == Some("tui"))
+        );
+
+        // The agent swaps the link between the banner and the key press.
+        let other = f.tmp.path().join("external").join("other.log");
+        std::fs::write(&other, "x").unwrap();
+        let swapped = f.log_dir.join("swap.log");
+        std::os::unix::fs::symlink(&other, &swapped).unwrap();
+        let err = crate::sandbox::approve_log_link(
+            &f.workspace,
+            &swapped,
+            Some(&shown),
+            "ahma tui",
+            "tui",
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing was recorded"), "{err}");
+        assert_eq!(f.approved(), vec![f.target.clone()]);
     }
 }

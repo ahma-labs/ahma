@@ -246,16 +246,32 @@ cloned repository to read any file you can.
 
 1. `logs_list` lists every log, with the symlink target and `is_approved`. A link
    that points outside the workspace starts out `is_approved: false`.
-2. `logs_approve` with `{"file": "app.log"}` records a **`log-target`** grant for
-   that exact target, in this workspace, in `~/.ahma/settings.toml`
-   (`[log_targets]`) — the permission ledger no sandboxed command can write — with
-   who asked and when, and appends it to `~/.ahma/permissions-audit.jsonl`. It
-   changes nothing else: neighbouring files stay unreadable, and the target is
-   never writable. The grant is written when the tool is called: `ahma tui`'s agent
-   asks you first (trusting the folder does not skip that question), while another
-   MCP client confirms the call only if its own tool-permission settings say so.
-3. The grant applies **from the next session**: the sandbox's read scope is fixed
-   when it starts. `logs_list` shows it as approved straight away.
+2. `logs_approve` with `{"file": "app.log", "reason": "…"}` **asks a human**; it
+   approves nothing itself, whichever client calls it and however that client's
+   tool-permission settings are set — an agent that could approve its own link could read
+   any file you can. The question goes through the
+   [permission ladder](permissions.md): your client's own prompt when it supports
+   elicitation, else an attached `ahma tui`, else nobody (the agent is told so, and how
+   you can approve it yourself). The prompt says *a log file in .ahma/logs links to this
+   file outside the workspace; approving lets ahma's log tools read it*, shows the
+   resolved target and the agent's reason, and offers:
+
+   | Answer | Effect |
+   |---|---|
+   | **deny** (default) | nothing recorded; not asked again this session |
+   | **read-only, this session** | readable now, until the session ends; never written |
+   | **read-only, always** | a **`log-target`** grant for that exact file, in this workspace, in `~/.ahma/settings.toml` (`[log_targets]`) — the ledger no sandboxed command can write — with who asked and the surface that answered, appended to `~/.ahma/permissions-audit.jsonl`; readable now and in every later session |
+
+   There is no once or 24-hour answer (a log is read for as long as it is monitored), and
+   the target is never writable. A client that cancels the prompt has not answered: nothing
+   is recorded and the next call asks again. A target on the hard denylist (credential
+   directories such as `~/.ssh`, `~/.ahma`, system directories) is refused before anyone is
+   asked.
+3. In `ahma tui`, pressing `a` on a blocked log (the banner shows where the link points)
+   is the same decision made by you directly: it records the `log-target` grant at once,
+   with `tui` as its surface, provided the link still points at the file shown. A
+   sandboxed log monitor picks it up from the next session; `logs_list` shows it as
+   approved straight away.
 4. Review and withdraw it like any other permission:
 
 ```bash

@@ -483,7 +483,7 @@ impl AhmaMcpService {
                 handlers::log_tools::logs_list_schema(),
             ),
             BuiltinTool::LogsApprove => (
-                "Approve a blocked out-of-scope log symlink target to allow AI read access.",
+                "Ask the human to let ahma's log tools read the file outside the workspace that a `.ahma/logs/*.log` symlink points at (`logs_list` shows it as `is_approved: false`). Nothing is approved on your call: it raises a question in your client (or the ahma TUI) that shows the human your `reason` and the exact file, and only their answer approves it — read-only, for this session or until revoked. That prompt is their decision, so do not ask in chat first. Targets on the hard denylist (credentials, system directories) are refused outright.",
                 handlers::log_tools::logs_approve_schema(),
             ),
             BuiltinTool::LogsRead => (

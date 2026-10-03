@@ -61,6 +61,14 @@ pub enum GrantReason {
     /// so a saved (`always` or 24-hour) answer is never offered or accepted
     /// ([`GrantReason::offers_saved_tiers`]).
     StartupFlag,
+    /// Nothing was blocked: the agent called `logs_approve` for a
+    /// `.ahma/logs/*.log` symlink whose target lies outside the workspace
+    /// (SPEC R9.2). The agent can plant such a link itself, so the target is
+    /// read only on a human's answer: read-only always (a `log-target` row in
+    /// the ledger, never an `fs-scope` grant) or read-only for this session.
+    /// No once tier (a log is read for as long as it is monitored) and no
+    /// lease ([`GrantReason::offers`]).
+    LogTarget,
     /// A reason sent by a newer ahma that this build does not know. Never
     /// produced here; it exists so a request carrying a future reason still
     /// decodes and reaches the human instead of being dropped as an unknown
@@ -83,8 +91,33 @@ impl GrantReason {
     /// same access for this session. Narrower than asked, never wider.
     pub fn offers_saved_tiers(self) -> bool {
         match self {
-            GrantReason::PreExecViolation | GrantReason::StderrHeuristic => true,
+            GrantReason::PreExecViolation
+            | GrantReason::StderrHeuristic
+            | GrantReason::LogTarget => true,
             GrantReason::StartupFlag | GrantReason::Unknown => false,
+        }
+    }
+
+    /// Whether a question raised for this reason offers `decision` as an
+    /// answer. Deny always is (it is the default, SPEC R5.3.1). A log target
+    /// offers read-only for this session or always, nothing else: it is never
+    /// writable, and a once or 24-hour answer means nothing for a file that is
+    /// read for as long as it is monitored. Every other reason offers every
+    /// tier it allows ([`Self::offers_saved_tiers`]).
+    ///
+    /// [`crate::grant_prompt::options_for`] builds every surface's choices from
+    /// this, and [`GrantDecision::within_offer`] holds an answer outside it to
+    /// one inside it.
+    pub fn offers(self, decision: GrantDecision) -> bool {
+        if decision.access().is_none() {
+            return true;
+        }
+        match self {
+            GrantReason::LogTarget => matches!(
+                decision,
+                GrantDecision::GrantRoSession | GrantDecision::GrantRo
+            ),
+            _ => self.offers_saved_tiers() || !decision.tier().is_persistent(),
         }
     }
 }
@@ -262,7 +295,25 @@ impl GrantDecision {
     /// when the reason does not offer saved tiers
     /// ([`GrantReason::offers_saved_tiers`]). Deny, once and session pass
     /// through unchanged. The result is never wider than the answer.
+    ///
+    /// A log-target question ([`GrantReason::LogTarget`]) offers read-only
+    /// session and always only: a read-write answer becomes the read-only one
+    /// at the same tier, a 24-hour answer the session one, and a once answer —
+    /// which cannot be honoured for a file read as long as it is monitored, and
+    /// would be widened by any tier that can — becomes a deny.
     pub fn within_offer(self, reason: GrantReason) -> GrantDecision {
+        if reason == GrantReason::LogTarget {
+            return match self {
+                GrantDecision::GrantRo | GrantDecision::GrantRw => GrantDecision::GrantRo,
+                GrantDecision::GrantRoSession
+                | GrantDecision::GrantRwSession
+                | GrantDecision::GrantRoLease
+                | GrantDecision::GrantRwLease => GrantDecision::GrantRoSession,
+                GrantDecision::Deny | GrantDecision::GrantRoOnce | GrantDecision::GrantRwOnce => {
+                    GrantDecision::Deny
+                }
+            };
+        }
         if reason.offers_saved_tiers() {
             return self;
         }
@@ -291,6 +342,10 @@ pub enum GrantResolveOutcome {
         tier: crate::permissions::GrantTier,
         /// How long the question was open, for the audit line.
         time_to_decision_ms: Option<u64>,
+        /// Why it was asked. Decides *what* is granted: a
+        /// [`GrantReason::LogTarget`] answer is a `log-target` grant, never an
+        /// `fs-scope` one, so the surface that applies it must route on this.
+        reason: GrantReason,
     },
     /// The human denied; nothing is persisted. The `(path, access)` is now dismissed
     /// for the session.
@@ -299,6 +354,8 @@ pub enum GrantResolveOutcome {
         path: PathBuf,
         /// How long the question was open, for the audit line.
         time_to_decision_ms: Option<u64>,
+        /// Why it was asked, so the denial is audited as the right kind.
+        reason: GrantReason,
     },
     /// This `decision_id` was already resolved (a twin surface answered first).
     AlreadyResolved,
@@ -560,6 +617,7 @@ impl GrantCoordinator {
                 GrantResolveOutcome::Denied {
                     path: req.path,
                     time_to_decision_ms,
+                    reason: req.reason,
                 }
             }
             Some(access) => {
@@ -573,6 +631,7 @@ impl GrantCoordinator {
                     tool: req.tool,
                     tier: decision.tier(),
                     time_to_decision_ms,
+                    reason: req.reason,
                 }
             }
         }
@@ -2081,6 +2140,113 @@ mod startup_flag_tests {
                 assert_eq!(tier, crate::permissions::GrantTier::Always)
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_target_has_a_stable_wire_name() {
+        assert_eq!(
+            serde_json::to_value(GrantReason::LogTarget).unwrap(),
+            json!("log_target")
+        );
+        let back: GrantReason = serde_json::from_value(json!("log_target")).unwrap();
+        assert_eq!(back, GrantReason::LogTarget);
+    }
+
+    /// A log-target question offers deny, read-only session and read-only
+    /// always — nothing writable, no once, no lease (SPEC R9.2).
+    #[test]
+    fn a_log_target_question_offers_read_only_session_and_always_only() {
+        let offered: Vec<GrantDecision> = [
+            GrantDecision::Deny,
+            GrantDecision::GrantRoOnce,
+            GrantDecision::GrantRwOnce,
+            GrantDecision::GrantRoSession,
+            GrantDecision::GrantRwSession,
+            GrantDecision::GrantRoLease,
+            GrantDecision::GrantRwLease,
+            GrantDecision::GrantRo,
+            GrantDecision::GrantRw,
+        ]
+        .into_iter()
+        .filter(|d| GrantReason::LogTarget.offers(*d))
+        .collect();
+        assert_eq!(
+            offered,
+            vec![
+                GrantDecision::Deny,
+                GrantDecision::GrantRoSession,
+                GrantDecision::GrantRo
+            ]
+        );
+        // The other reasons keep exactly what they offered before.
+        assert!(GrantReason::PreExecViolation.offers(GrantDecision::GrantRwLease));
+        assert!(GrantReason::StderrHeuristic.offers(GrantDecision::GrantRoOnce));
+        assert!(!GrantReason::StartupFlag.offers(GrantDecision::GrantRw));
+        assert!(GrantReason::StartupFlag.offers(GrantDecision::GrantRwSession));
+        assert!(!GrantReason::Unknown.offers(GrantDecision::GrantRoLease));
+    }
+
+    /// Whatever surface answers a log-target question — an older TUI that
+    /// still shows every key, a client that ignores the form's `oneOf` — the
+    /// answer is held to what the question offers, never wider: writes become
+    /// reads, a lease becomes the session, and a once answer is a deny.
+    #[test]
+    fn an_answer_to_a_log_target_question_is_held_to_its_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("app.log");
+        std::fs::write(&target, "x").unwrap();
+        for (answer, held) in [
+            (GrantDecision::GrantRw, GrantDecision::GrantRo),
+            (GrantDecision::GrantRo, GrantDecision::GrantRo),
+            (GrantDecision::GrantRwLease, GrantDecision::GrantRoSession),
+            (GrantDecision::GrantRoLease, GrantDecision::GrantRoSession),
+            (GrantDecision::GrantRwSession, GrantDecision::GrantRoSession),
+            (GrantDecision::GrantRoSession, GrantDecision::GrantRoSession),
+            (GrantDecision::GrantRoOnce, GrantDecision::Deny),
+            (GrantDecision::GrantRwOnce, GrantDecision::Deny),
+            (GrantDecision::Deny, GrantDecision::Deny),
+        ] {
+            let c = GrantCoordinator::new();
+            let req = c
+                .begin(
+                    &target,
+                    ScopeAccess::Ro,
+                    GrantReason::LogTarget,
+                    Some("logs_approve".into()),
+                )
+                .expect("an ordinary file is askable");
+            let outcome = c.resolve(&req.decision_id, answer);
+            assert_eq!(
+                c.status(&req.decision_id),
+                GrantStatus::Decided(held),
+                "{answer:?} must be recorded as {held:?}"
+            );
+            match outcome {
+                GrantResolveOutcome::Persist {
+                    access,
+                    tier,
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(
+                        access,
+                        ScopeAccess::Ro,
+                        "{answer:?}: a log target is read-only"
+                    );
+                    assert_eq!(tier, held.tier(), "{answer:?}");
+                    assert_eq!(
+                        reason,
+                        GrantReason::LogTarget,
+                        "the outcome carries the reason, so the surface applying it can route it"
+                    );
+                }
+                GrantResolveOutcome::Denied { reason, .. } => {
+                    assert_eq!(held, GrantDecision::Deny, "{answer:?}");
+                    assert_eq!(reason, GrantReason::LogTarget);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
 }
