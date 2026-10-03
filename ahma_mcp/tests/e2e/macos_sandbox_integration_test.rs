@@ -1035,6 +1035,187 @@ fn an_app_opened_from_the_sandbox_never_runs_outside_it() {
     );
 }
 
+/// Compile a Metal compute probe outside any sandbox: it opens the device,
+/// allocates a 256 MB buffer, compiles a kernel from source at runtime and
+/// dispatches it, printing one line per step. `None` (skip) without a Swift
+/// toolchain or without a Metal device on the host.
+#[cfg(target_os = "macos")]
+fn metal_compute_probe(dir: &Path) -> Option<std::path::PathBuf> {
+    let src = dir.join("metal_compute.swift");
+    std::fs::write(
+        &src,
+        r#"import Metal
+guard let d = MTLCreateSystemDefaultDevice() else { print("DEVICE NONE"); exit(0) }
+print("DEVICE OK")
+if d.makeBuffer(length: 256 << 20, options: .storageModeShared) != nil { print("BUFFER OK") } else { print("BUFFER NIL") }
+let src = "kernel void k(device float *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = float(i) * 2.0; }"
+do {
+  let lib = try d.makeLibrary(source: src, options: nil)
+  print("COMPILE OK")
+  let p = try d.makeComputePipelineState(function: lib.makeFunction(name: "k")!)
+  let out = d.makeBuffer(length: 64 * 4, options: .storageModeShared)!
+  let q = d.makeCommandQueue()!
+  let cb = q.makeCommandBuffer()!
+  let e = cb.makeComputeCommandEncoder()!
+  e.setComputePipelineState(p); e.setBuffer(out, offset: 0, index: 0)
+  e.dispatchThreads(MTLSize(width: 64, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+  e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+  let v = out.contents().bindMemory(to: Float.self, capacity: 64)
+  print(v[10] == 20.0 ? "DISPATCH OK" : "DISPATCH WRONG \(v[10])")
+} catch { print("COMPILE ERR \(error)") }
+"#,
+    )
+    .ok()?;
+    let bin = dir.join("metal_compute");
+    let built = Command::new("xcrun")
+        .args(["swiftc", "-O", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .ok()?;
+    if !built.status.success() {
+        eprintln!(
+            "skipping: swiftc unavailable: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        return None;
+    }
+    let host = Command::new(&bin).output().ok()?;
+    if !String::from_utf8_lossy(&host.stdout).contains("DISPATCH OK") {
+        eprintln!(
+            "skipping: this host cannot run Metal compute: {}",
+            String::from_utf8_lossy(&host.stdout)
+        );
+        return None;
+    }
+    Some(bin)
+}
+
+/// Metal *compute* works with `[sandbox] allow_gpu` — device, a 256 MB
+/// buffer, a kernel compiled at runtime and a dispatch — and the device is
+/// withheld without it (SPEC R6.2.7). An app crashed with "fails to allocate a
+/// Metal buffer" because the GPU was off, not because `allow_gpu` fell short:
+/// CI showed the current rules already cover all four steps.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_compute_runs_with_allow_gpu_and_not_without() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_allow_gpu};
+    let scope = TempDir::new().expect("scope dir");
+    let Some(bin) = metal_compute_probe(scope.path()) else {
+        return;
+    };
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    set_allow_gpu(false);
+    let off = run_probe_in(
+        &sandbox.generate_seatbelt_profile_test(scope.path()),
+        &bin,
+        scope.path(),
+    );
+    set_allow_gpu(true);
+    let on = run_probe_in(
+        &sandbox.generate_seatbelt_profile_test(scope.path()),
+        &bin,
+        scope.path(),
+    );
+    set_allow_gpu(false);
+    assert!(
+        off.contains("DEVICE NONE"),
+        "GPU withheld by default: {off}"
+    );
+    for step in ["DEVICE OK", "BUFFER OK", "COMPILE OK", "DISPATCH OK"] {
+        assert!(on.contains(step), "{step} with allow_gpu: {on}");
+    }
+}
+
+/// Compile a Swift probe outside any sandbox; `None` when swiftc is missing
+/// or the unsandboxed baseline does not print `want`.
+#[cfg(target_os = "macos")]
+fn swift_probe(dir: &Path, name: &str, source: &str, want: &str) -> Option<std::path::PathBuf> {
+    let src = dir.join(format!("{name}.swift"));
+    std::fs::write(&src, source).ok()?;
+    let bin = dir.join(name);
+    let built = Command::new("xcrun")
+        .args(["swiftc", "-O", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .ok()?;
+    if !built.status.success() {
+        eprintln!(
+            "skipping {name}: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        return None;
+    }
+    let host = Command::new(&bin).output().ok()?;
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&host.stdout),
+        String::from_utf8_lossy(&host.stderr)
+    );
+    if !out.contains(want) {
+        eprintln!("skipping {name}: baseline did not print {want}: {out}");
+        return None;
+    }
+    Some(bin)
+}
+
+/// A WebKit view runs JavaScript in the default sandbox, with no grant: the
+/// sandbox-extension messages WebKit prints there are noise, not failures.
+/// CI showed WebKit working with and without its issue-extension rules, so
+/// no WebKit capability is needed; its cache folder is an ordinary path.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_webkit_view_runs_in_the_default_sandbox() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+    let scope = TempDir::new().expect("scope dir");
+    let Some(bin) = swift_probe(scope.path(), "webkit_probe", WEBKIT_SRC, "JS 2") else {
+        return;
+    };
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let out = run_probe_in(
+        &sandbox.generate_seatbelt_profile_test(scope.path()),
+        &bin,
+        scope.path(),
+    );
+    assert!(out.contains("JS 2"), "WebKit in the default sandbox: {out}");
+}
+
+#[cfg(target_os = "macos")]
+const WEBKIT_SRC: &str = r#"import AppKit
+import WebKit
+final class D: NSObject, WKNavigationDelegate {
+  func webView(_ w: WKWebView, didFinish n: WKNavigation!) {
+    w.evaluateJavaScript("1+1") { r, e in print(e == nil ? "JS \(r ?? "nil")" : "JS ERR \(e!)"); exit(0) }
+  }
+  func webView(_ w: WKWebView, didFail n: WKNavigation!, withError e: Error) { print("NAV ERR \(e)"); exit(0) }
+  func webViewWebContentProcessDidTerminate(_ w: WKWebView) { print("CONTENT DIED"); exit(0) }
+}
+let app = NSApplication.shared
+let d = D()
+let w = WKWebView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+w.navigationDelegate = d
+w.loadHTMLString("<html><body>x</body></html>", baseURL: nil)
+DispatchQueue.main.asyncAfter(deadline: .now() + 30) { print("TIMEOUT"); exit(0) }
+app.run()
+"#;
+
 /// SPEC R6.2.8: a sandboxed command can see processes. `/bin/ps` is setuid
 /// root and no sandbox can exec a setuid binary (a kernel rule), so the
 /// profile grants `process-info*` for `pgrep`/`lsof` and ahma ships `ahma ps`.
