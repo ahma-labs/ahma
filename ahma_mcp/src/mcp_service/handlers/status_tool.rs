@@ -166,6 +166,13 @@ impl AhmaMcpService {
             "  Only a human can widen this: they approve a prompt in the ahma TUI or run \
              `ahma sandbox grant <dir>`; `sandbox_grant` only asks.\n",
         );
+        // SPEC R7.8: what confines the client's *own* terminal, which is not
+        // this sandbox unless ahma's terminal hook routes it here.
+        if let Some(line) =
+            crate::hooks::native_terminal::NativeTerminal::status_line_for_this_session()
+        {
+            out.push_str(&format!("  {line}\n"));
+        }
         out
     }
 
@@ -284,6 +291,23 @@ mod sandbox_report_tests {
         assert!(text.contains("=== SANDBOX ==="), "{text}");
         // SPEC R2.7.9: the queue's facts reach the agent here too.
         assert!(text.contains("=== WORKSPACE QUEUE ==="), "{text}");
+    }
+
+    /// SPEC R7.8: a client with no ahma terminal hook (VS Code) is told that
+    /// its own terminal is outside the sandbox.
+    #[tokio::test]
+    async fn status_says_when_the_clients_own_terminal_is_outside_the_sandbox() {
+        let (service, _scope) = build_test_service().await.unwrap();
+        assert!(
+            !service.sandbox_report().contains("own terminal"),
+            "nothing is claimed before the client is known"
+        );
+        crate::hub_reporter::set_client_identity("vscode", false, false);
+        let report = service.sandbox_report();
+        assert!(
+            report.contains("VSCode/Copilot's own terminal: OUTSIDE ahma's sandbox"),
+            "{report}"
+        );
     }
 
     #[test]

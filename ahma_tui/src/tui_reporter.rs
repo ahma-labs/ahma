@@ -86,6 +86,7 @@ pub fn register_msg(session_id: &str, workspace: &str) -> ClientMsg {
         read_scopes: vec![],
         grants: vec![],
         enforcement: None,
+        native_terminal: None,
     }
 }
 

@@ -199,6 +199,11 @@ pub struct InstanceInfo {
     /// `ActiveSandbox` token). `None` until the instance reported it.
     #[serde(default)]
     pub enforcement: Option<String>,
+    /// Whether the client's **own** terminal runs inside ahma's sandbox:
+    /// `hooked` (its terminal hook is installed and active) or `unconfined`
+    /// (SPEC R7.8). `None` for a client ahma cannot identify.
+    #[serde(default)]
+    pub native_terminal: Option<String>,
 }
 
 /// An operation event forwarded from an instance to the hub.
@@ -470,6 +475,9 @@ pub enum ClientMsg {
         /// See [`InstanceInfo::enforcement`].
         #[serde(default)]
         enforcement: Option<String>,
+        /// See [`InstanceInfo::native_terminal`].
+        #[serde(default)]
+        native_terminal: Option<String>,
     },
     /// An operation event from a registered instance.
     Event { payload: HubEvent },
@@ -2116,6 +2124,7 @@ where
             read_scopes,
             grants,
             enforcement,
+            native_terminal,
         } => {
             serve_instance(
                 &mut reader,
@@ -2135,6 +2144,7 @@ where
                     read_scopes,
                     grants,
                     enforcement,
+                    native_terminal,
                 },
             )
             .await
@@ -2411,6 +2421,7 @@ struct Registration {
     read_scopes: Vec<String>,
     grants: Vec<GrantSummary>,
     enforcement: Option<String>,
+    native_terminal: Option<String>,
 }
 
 /// Serve a registered ahma instance: register it, then exchange events and
@@ -2457,6 +2468,7 @@ async fn serve_instance<R, W>(
         read_scopes: reg.read_scopes,
         grants: reg.grants,
         enforcement: reg.enforcement,
+        native_terminal: reg.native_terminal,
     };
     let pid = reg.pid;
     hub.instances.lock().await.insert(id.clone(), info.clone());
@@ -2873,6 +2885,7 @@ mod tests {
             read_scopes: vec![],
             grants: vec![],
             enforcement: None,
+            native_terminal: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -3119,6 +3132,7 @@ mod tests {
             read_scopes: vec![],
             grants: vec![],
             enforcement: None,
+            native_terminal: None,
         };
         let mut buf = Vec::<u8>::new();
         send_msg(&mut buf, &msg).await.unwrap();
@@ -3242,6 +3256,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             }],
         };
         let mut buf = Vec::<u8>::new();
@@ -3544,6 +3559,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -3667,6 +3683,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -3740,6 +3757,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -3856,6 +3874,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -4481,6 +4500,7 @@ mod tests {
             read_scopes: vec![],
             grants: vec![],
             enforcement: None,
+            native_terminal: None,
         }
     }
 
@@ -4737,6 +4757,7 @@ mod tests {
             read_scopes: vec![],
             grants: vec![],
             enforcement: None,
+            native_terminal: None,
         };
         hub.instances.lock().await.insert("i1".into(), info.clone());
         hub.record_op_event("i1", &started_ev("op-1")).await;
@@ -4934,6 +4955,7 @@ mod tests {
                     read_scopes: vec![],
                     grants: vec![],
                     enforcement: None,
+                    native_terminal: None,
                 },
             );
             hub.record_op_event("i1", &started_ev("done")).await;
@@ -5076,6 +5098,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         );
         hub.record_op_event("i1", &started_ev("op-1")).await;
@@ -5274,6 +5297,7 @@ mod tests {
                     read_scopes: vec![],
                     grants: vec![],
                     enforcement: None,
+                    native_terminal: None,
                 },
             )
             .await
@@ -5370,6 +5394,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -5569,6 +5594,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -5735,6 +5761,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
