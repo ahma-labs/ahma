@@ -307,9 +307,16 @@ drops work — and it is built so that no crash, kill or power loss can leave it
     command wrongly classified read-only fails with a permission error; it cannot write.
     Where the kernel cannot enforce it (Windows, Test-mode sandboxes, a macOS ahma nested
     in another Seatbelt profile, a kernel without Landlock) the read-only lane **must not**
-    exist and every command is exclusive.
+    exist and every command is exclusive, except a watcher, which is service.
   - *Service* — long-lived by design, like the log monitors (`livelog`) — takes no lease,
-    because holding it for a server's life would stall every later command.
+    because holding it for a server's life would stall every later command. A shell line
+    is service in two cases, both only when no program writes through its own arguments
+    (`sed`, `sort -o`, `curl -o`, …) or runs under an environment assignment: every program
+    reads and every writing redirection or `tee` file lies outside the workspace and every
+    sandbox scope, resolved through symlinks (a CI log written to the session's scratch
+    directory); or the line is a watcher (`gh run watch`, `gh pr checks --watch`, `tail -f`)
+    where no read-only lane exists. Service trades the kernel's read-only guarantee for
+    ordering only, which is why it requires the stricter program set.
   - *MTDF tools* take their lane from `concurrency` (`exclusive` | `read_only` |
     `service`), the nearest declaration winning (subcommand over parent subcommand over
     tool), resolved once when the definition is parsed. The bundled tools **must** declare
@@ -319,17 +326,20 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   - *Shell command lines* are classified by a conservative classifier. It reads as
     readers: plain readers (`git status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, `tail` —
     followers included, since a reader that never ends must not hold the workspace for its
-    whole life —, `ps`, `sed` without `-i`, `gh` viewing commands, `curl` without an output
-    file, ahma's own listing commands, …); **pipelines and lists** of readers (`grep … |
-    head`, `cd src && ls`, `2>&1`, `>/dev/null`, a plain `$VAR`); `sleep`; a `NAME=value`
+    whole life —, `ps`, `sed` without `-i`, `gh` viewing commands including `gh run watch`
+    (`gh api` only with no method other than GET and no `-f`/`-F`/`--field`/`--raw-field`/
+    `--input`), `curl` without an output file, ahma's own listing commands, …); **pipelines
+    and lists** of readers (`grep … | head`, `cd src && ls`, `2>&1`, `>&2`, `>/dev/null`,
+    `&>/dev/null`, `< /dev/null`, `tee` with no file, a plain `$VAR`); `sleep`; a `NAME=value`
     assignment before a reader, or on its own (`S=/path; grep … $S`); an
     `until`/`while`/`if`/`for … in` list (a standalone `!` negating a command included) whose every command reads (a CI poll such as
     `until gh pr checks 87; do sleep 60; done`); and the system diagnostics an agent runs to
     see why a job is slow (`uptime`, `sysctl` without `-w` or `name=value`, `vm_stat`,
     `iostat`, `top`, `lsof`, `pgrep`). Those must never queue behind the job they inspect. A `$(…)` substitution is judged by the command it runs, so
     `echo "$(gh pr view 87)"` is a reader and `echo $(rm x)` is not. It treats a backtick
-    substitution, a writing redirection, grouping, an escape or an unknown program as
-    exclusive. It is permissive only where the kernel lane makes a mistake harmless.
+    substitution, a writing redirection into a workspace or to a target it cannot resolve
+    without expansion (`$OUT`, a glob, `~`, a relative path after `cd`), grouping, an escape
+    or an unknown program as exclusive. It is permissive only where the kernel lane makes a mistake harmless.
 - **R2.7.5**: **No result is lost to a forgotten `await`.** Each session remembers every
   operation it started whose call returned without the result. Once one has finished, its
   outcome (identity line, output tail, output file) **must** be prepended to the next tool

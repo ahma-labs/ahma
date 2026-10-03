@@ -12,8 +12,20 @@
 //!
 //! Anything the classifier cannot parse with certainty — shell operators,
 //! substitutions, redirections, escapes, an unknown program — is exclusive.
+//!
+//! Two verdicts take no lease *without* the kernel's read-only lane, and are
+//! held to a stricter test because a mistake there costs ordering, not just a
+//! turn (the command still runs in the ordinary sandbox, so it is never an
+//! escape): a line of readers that writes files only **outside every
+//! workspace** (`gh pr checks 87 --watch > /tmp/ci.log`), which the read-only
+//! lane would refuse to open, and — where the kernel has no read-only lane at
+//! all — a line of readers that **watches** remote or log state until it ends
+//! (`gh run watch`, `gh pr checks --watch`, `tail -f`). Both are the service
+//! lane, and both require that no program in the line can write a file through
+//! its own arguments (`writes_through_args`). See [`classify_shell_command_at`].
 
 use super::workspace_queue::{Lane, SourceEffect};
+use std::path::{Path, PathBuf};
 
 /// Programs that only read, whatever their (plain) arguments.
 const READ_ONLY_PROGRAMS: &[&str] = &[
@@ -118,44 +130,90 @@ const READ_ONLY_GIT: &[&str] = &[
 
 /// Characters that make a command line mean more than "run some programs with
 /// these words, piped or listed": substitutions, grouping, escapes, comments,
-/// history expansion, heredocs. Pipes, lists and the few harmless
-/// redirections are parsed explicitly below.
+/// history expansion, heredocs. Pipes, lists and redirections are parsed
+/// explicitly below.
 const SHELL_OPERATORS: &[char] = &['`', '(', ')', '{', '}', '\\', '\n', '\r', '#', '!'];
-
-/// Redirections that cannot write a file: merging or discarding streams.
-const HARMLESS_REDIRECTIONS: &[&str] = &[
-    "2>&1",
-    "1>&2",
-    ">/dev/null",
-    "2>/dev/null",
-    "&>/dev/null",
-    "</dev/null",
-    "> /dev/null",
-    "2> /dev/null",
-];
 
 /// A simple command: the words of one pipeline segment.
 type Segment = Vec<String>;
+
+/// A command line split into pipeline/list segments, with the files its
+/// redirections write taken out of the words.
+struct Line {
+    segs: Vec<Segment>,
+    /// Targets of the writing redirections (`>`, `>>`, `>|`, `2>`, `&>`, …),
+    /// exactly as written. `/dev/null` and stream merges (`2>&1`) are not
+    /// here: they write no file.
+    writes: Vec<String>,
+}
+
+/// What one redirection word does.
+enum Redirection {
+    /// `2>&1`, `>&2`, `2>&-`: streams merged or closed, no file opened.
+    Stream,
+    /// Output to a file; `None` when the file is the next word (`> f`).
+    Write(Option<String>),
+    /// Input from a file; `None` when the file is the next word (`< f`).
+    Read(Option<String>),
+}
+
+/// Read a word with an unquoted `<` or `>` as a redirection. `None` for
+/// anything else — `a>b`, `>&file`, `&>&2` — which the caller cannot model.
+fn redirection(word: &str) -> Option<Redirection> {
+    let file = |rest: &str| (!rest.is_empty()).then(|| rest.to_string());
+    if let Some(rest) = word.strip_prefix('<') {
+        return (!rest.contains(['<', '>', '&'])).then(|| Redirection::Read(file(rest)));
+    }
+    // `&>` and `&>>` redirect stdout and stderr; `2>`, `1>>` one descriptor.
+    let (both, rest) = match word.strip_prefix('&') {
+        Some(rest) => (true, rest),
+        None => (false, word.trim_start_matches(|c: char| c.is_ascii_digit())),
+    };
+    let rest = rest.strip_prefix('>')?;
+    let rest = rest.strip_prefix(['>', '|']).unwrap_or(rest);
+    if let Some(fd) = rest.strip_prefix('&') {
+        let to_fd = fd == "-" || (!fd.is_empty() && fd.chars().all(|c| c.is_ascii_digit()));
+        return (!both && to_fd).then_some(Redirection::Stream);
+    }
+    (!rest.contains(['<', '>'])).then(|| Redirection::Write(file(rest)))
+}
 
 /// Split a command line into pipeline/list segments of words, honouring plain
 /// single and double quotes. `None` for anything with a shell operator this
 /// module does not model, an unbalanced quote, a writing redirection, or a
 /// substitution — the caller treats that as "cannot tell", i.e. exclusive.
 fn segments(command: &str) -> Option<Vec<Segment>> {
+    let line = parse_line(command)?;
+    line.writes.is_empty().then_some(line.segs)
+}
+
+/// [`segments`], with writing redirections parsed out into [`Line::writes`]
+/// instead of refused. Input redirections other than `< /dev/null` are still
+/// refused: they are reads, but not ones this module models.
+fn parse_line(command: &str) -> Option<Line> {
     if command.contains("<<") {
         return None;
     }
     // Tokenize: words, quoted strings, and the operators `|`, `||`, `&&`, `;`.
-    // Any other `&` (background, `>&2` outside the harmless list) is unknown.
-    let mut segs: Vec<Segment> = vec![Vec::new()];
+    // Any other `&` (background, `>&2` outside a redirection) is unknown.
+    // Each word carries whether a `<` or `>` in it was *quoted*: that is an
+    // argument (`grep '>' f`), never a redirection.
+    type Word = (String, bool);
+    let mut segs: Vec<Vec<Word>> = vec![Vec::new()];
     let mut cur = String::new();
+    let mut quoted_angle = false;
     let mut in_word = false;
     let mut quote: Option<char> = None;
     let chars: Vec<char> = command.chars().collect();
     let mut i = 0;
-    let flush = |cur: &mut String, in_word: &mut bool, segs: &mut Vec<Segment>| {
+    let flush = |cur: &mut String,
+                 quoted_angle: &mut bool,
+                 in_word: &mut bool,
+                 segs: &mut Vec<Vec<Word>>| {
         if *in_word {
-            segs.last_mut().unwrap().push(std::mem::take(cur));
+            segs.last_mut()
+                .unwrap()
+                .push((std::mem::take(cur), std::mem::take(quoted_angle)));
             *in_word = false;
         }
     };
@@ -163,7 +221,10 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
         let c = chars[i];
         match quote {
             Some(q) if c == q => quote = None,
-            Some(_) => cur.push(c),
+            Some(_) => {
+                quoted_angle |= c == '<' || c == '>';
+                cur.push(c);
+            }
             None => match c {
                 // `!` standing alone negates the command after it: a word of
                 // its own, which the classifier skips like a loop keyword.
@@ -183,6 +244,17 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
                     cur.push(c);
                     in_word = true;
                 }
+                '|' if cur.ends_with('>') => {
+                    // `>|file`: write even under `noclobber`, not a pipe.
+                    cur.push(c);
+                    in_word = true;
+                }
+                '&' if chars.get(i + 1) == Some(&'>') => {
+                    // `&>file`, `&>>file`: a redirection word of its own.
+                    flush(&mut cur, &mut quoted_angle, &mut in_word, &mut segs);
+                    cur.push(c);
+                    in_word = true;
+                }
                 '|' | ';' | '&' => {
                     let next = chars.get(i + 1).copied();
                     let op_len = match (c, next) {
@@ -192,7 +264,7 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
                         ('&', _) => return None,
                         _ => 1,
                     };
-                    flush(&mut cur, &mut in_word, &mut segs);
+                    flush(&mut cur, &mut quoted_angle, &mut in_word, &mut segs);
                     if segs.last().is_some_and(Vec::is_empty) {
                         return None; // `| cmd`, `cmd ||  | cmd`: not a command line we read
                     }
@@ -200,7 +272,9 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
                     i += op_len;
                     continue;
                 }
-                c if c.is_whitespace() => flush(&mut cur, &mut in_word, &mut segs),
+                c if c.is_whitespace() => {
+                    flush(&mut cur, &mut quoted_angle, &mut in_word, &mut segs)
+                }
                 _ => {
                     cur.push(c);
                     in_word = true;
@@ -212,44 +286,60 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
     if quote.is_some() {
         return None;
     }
-    flush(&mut cur, &mut in_word, &mut segs);
+    flush(&mut cur, &mut quoted_angle, &mut in_word, &mut segs);
     if segs.last().is_some_and(Vec::is_empty) {
         return None; // trailing operator
     }
-    // Redirections: drop the harmless ones, refuse anything else with `<`/`>`.
-    for seg in &mut segs {
+    // Redirections: drop the ones that open no file, collect the files the
+    // writing ones open, refuse anything else with `<`/`>`.
+    let mut writes = Vec::new();
+    let mut cleaned_segs = Vec::with_capacity(segs.len());
+    for seg in segs {
         let mut cleaned = Vec::new();
-        let mut skip_next = false;
-        for (idx, w) in seg.iter().enumerate() {
-            if skip_next {
-                skip_next = false;
+        let mut words = seg.into_iter();
+        while let Some((w, quoted_angle)) = words.next() {
+            if !w.contains(['<', '>']) {
+                // `$(…)` is a substitution; a plain `$VAR` reference only reads
+                // the environment and is left to the shell.
+                if w.contains("$(") {
+                    return None;
+                }
+                cleaned.push(w);
                 continue;
             }
-            if HARMLESS_REDIRECTIONS.contains(&w.as_str()) {
-                continue;
-            }
-            // `> /dev/null` and `2> /dev/null` as two words.
-            if (w == ">" || w == "2>") && seg.get(idx + 1).map(String::as_str) == Some("/dev/null")
-            {
-                skip_next = true;
-                continue;
-            }
-            if w.contains('<') || w.contains('>') {
+            if quoted_angle {
                 return None;
             }
-            // `$(…)` is a substitution; a plain `$VAR` reference only reads the
-            // environment and is left to the shell.
-            if w.contains("$(") {
+            let (writing, target) = match redirection(&w)? {
+                Redirection::Stream => continue,
+                Redirection::Write(target) => (true, target),
+                Redirection::Read(target) => (false, target),
+            };
+            // `> file`: the file is the next word, which must be a plain one.
+            let target = match target {
+                Some(target) => target,
+                None => match words.next() {
+                    Some((next, _)) if !next.is_empty() && !next.contains(['<', '>']) => next,
+                    _ => return None,
+                },
+            };
+            if target == "/dev/null" {
+                continue;
+            }
+            if !writing {
                 return None;
             }
-            cleaned.push(w.clone());
+            writes.push(target);
         }
         if cleaned.is_empty() {
             return None;
         }
-        *seg = cleaned;
+        cleaned_segs.push(cleaned);
     }
-    Some(segs)
+    Some(Line {
+        segs: cleaned_segs,
+        writes,
+    })
 }
 
 /// Programs that only read, beyond [`READ_ONLY_PROGRAMS`], whose arguments
@@ -291,21 +381,16 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
                 || a.starts_with("-o") && a.len() > 2 && !a.starts_with("--")
         }),
         // `gh`: the viewing subcommands, and `api` without a mutating method.
+        // Each writes only under its own config and cache directories, never
+        // the working directory. `gh run watch` follows a run until it ends.
         "gh" => {
             let mut it = args.iter().map(String::as_str);
             match (it.next(), it.next()) {
                 (Some("pr"), Some("view" | "checks" | "list" | "status" | "diff")) => true,
-                (Some("run"), Some("view" | "list")) => true,
+                (Some("run"), Some("view" | "list" | "watch")) => true,
                 (Some("issue"), Some("view" | "list")) => true,
                 (Some("repo"), Some("view")) => true,
-                (Some("api"), Some(_)) => {
-                    !has("-X")
-                        && !has("--method")
-                        && !has("-f")
-                        && !has("-F")
-                        && !has("--input")
-                        && !starts("--method=")
-                }
+                (Some("api"), Some(_)) => gh_api_reads(&args[1..]),
                 (Some("--version"), _) | (Some("auth"), Some("status")) => true,
                 _ => false,
             }
@@ -330,7 +415,6 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
     }
 }
 
-/// The lane for a `run_terminal_command` command line.
 /// Shell keywords that open or close a loop or a conditional around the
 /// commands of a list: `until gh pr checks 87; do sleep 60; done` is a reader
 /// exactly when every command in it is.
@@ -345,23 +429,270 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
+/// `gh api <args>` (endpoint included) reads unless it names a method other
+/// than GET or sends a body: fields (`-f`, `-F`, `--field`, `--raw-field`)
+/// turn it into a POST, and `--input` sends one.
+fn gh_api_reads(args: &[String]) -> bool {
+    let mut it = args.iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        let method = match a {
+            "-X" | "--method" => Some(it.next().unwrap_or("")),
+            _ => a.strip_prefix("--method=").or_else(|| a.strip_prefix("-X")),
+        };
+        if let Some(method) = method {
+            if !method.eq_ignore_ascii_case("GET") {
+                return false;
+            }
+            continue;
+        }
+        if ["-f", "-F", "--field", "--raw-field", "--input"]
+            .iter()
+            .any(|p| a.starts_with(p))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether a reading program can still write a file through its own
+/// arguments — `sort -o`, `uniq in out`, a `sed` `w` command, `env` running
+/// another program. Harmless in the read-only lane, where the kernel refuses
+/// the write; disqualifying for a service verdict (SPEC R2.7.4), which runs in
+/// the ordinary sandbox without the lease.
+fn writes_through_args(program: &str, args: &[String]) -> bool {
+    let short_has = |letters: &[char]| {
+        args.iter()
+            .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(letters))
+    };
+    let long_has = |names: &[&str]| args.iter().any(|a| names.iter().any(|n| a.starts_with(n)));
+    let operands = || args.iter().filter(|a| !a.starts_with('-')).count();
+    match program {
+        // Run another program, or a script that may write.
+        "env" => !args.is_empty(),
+        "sed" | "gsed" | "awk" | "gawk" | "mawk" => true,
+        // Interactive: `s` saves, `!` runs a shell.
+        "less" | "more" => true,
+        "xxd" => operands() > 1,
+        "uniq" => operands() > 1,
+        "sort" => short_has(&['o']) || long_has(&["--output"]),
+        "tree" => short_has(&['o']),
+        "file" => short_has(&['C']) || long_has(&["--compile"]),
+        "base64" => short_has(&['o']) || long_has(&["--output"]),
+        "curl" => {
+            short_has(&['o', 'O', 'D', 'c', 'K'])
+                || long_has(&[
+                    "--output",
+                    "--remote-name",
+                    "--dump-header",
+                    "--cookie-jar",
+                    "--trace",
+                    "--stderr",
+                    "--libcurl",
+                    "--etag-save",
+                    "--hsts",
+                    "--alt-svc",
+                    "--config",
+                ])
+        }
+        _ => false,
+    }
+}
+
+/// Whether a reading program follows remote or log state until it ends: a
+/// CI watch or a log follower, which may run for most of an hour.
+fn is_watcher(program: &str, args: &[String]) -> bool {
+    let sub = (
+        args.first().map(String::as_str),
+        args.get(1).map(String::as_str),
+    );
+    match program {
+        "gh" => match sub {
+            (Some("run"), Some("watch")) => true,
+            (Some("pr"), Some("checks")) => {
+                args.iter().any(|a| a == "--watch" || a == "--watch=true")
+            }
+            _ => false,
+        },
+        "tail" => args.iter().any(|a| {
+            a.starts_with("--follow")
+                || (a.starts_with('-') && !a.starts_with("--") && a.contains(['f', 'F']))
+        }),
+        _ => false,
+    }
+}
+
+/// The files `tee` writes, or `None` for an option this module does not model.
+/// `tee` with no file only copies its input to its output.
+fn tee_files(args: &[String]) -> Option<Vec<String>> {
+    let mut files = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-a" | "--append" | "-i" | "--ignore-interrupts" | "-p" | "-ai" | "-ia" => {}
+            a if a.starts_with('-') => return None,
+            _ => files.push(a.clone()),
+        }
+    }
+    Some(files)
+}
+
+/// What the programs of a command line do, when every one of them reads.
+#[derive(Default)]
+struct Reading {
+    /// Some program can write a file through its own arguments
+    /// ([`writes_through_args`]), or runs under an environment assignment.
+    writes_through_args: bool,
+    /// Some program watches until its subject ends ([`is_watcher`]).
+    watches: bool,
+    /// The line changes directory, so a relative path in it may not be
+    /// relative to the directory it started in.
+    changes_dir: bool,
+    /// Files `tee` writes, as written.
+    tee_files: Vec<String>,
+}
+
+/// Judge a command line's programs. `None` unless every one only reads (or is
+/// `tee`, whose files are returned for the caller to place). A `$(…)` runs a
+/// command of its own: it is judged the same way and must write no file.
+fn read_line(command: &str) -> Option<(Line, Reading)> {
+    let (command, inner) = lift_substitutions(command)?;
+    let line = parse_line(&command)?;
+    let mut reading = read_segments(&line.segs)?;
+    for c in &inner {
+        let (inner_line, inner_reading) = read_line(c)?;
+        if !inner_line.writes.is_empty() || !inner_reading.tee_files.is_empty() {
+            return None;
+        }
+        reading.writes_through_args |= inner_reading.writes_through_args;
+        reading.watches |= inner_reading.watches;
+    }
+    Some((line, reading))
+}
+
+/// The lane for a `run_terminal_command` command line, judged without knowing
+/// where it runs: a line that writes any file — even through a redirection
+/// outside the workspace — is exclusive. [`classify_shell_command_at`] is the
+/// verdict the adapter uses.
 pub fn classify_shell_command(command: &str) -> Lane {
-    // A `$(…)` runs a command of its own: judge it, then read the rest with a
-    // plain word in its place. A reader inside a reader is a reader.
-    let Some((command, inner)) = lift_substitutions(command) else {
+    match read_line(command) {
+        Some((line, reading)) if line.writes.is_empty() && reading.tee_files.is_empty() => {
+            Lane::ReadOnly
+        }
+        _ => Lane::Exclusive,
+    }
+}
+
+/// Where a command line runs, for [`classify_shell_command_at`].
+pub struct RunSite<'a> {
+    /// The directory the line starts in; a relative redirection target is
+    /// relative to it.
+    pub cwd: &'a Path,
+    /// Whether the kernel can hold a command to the read-only lane here
+    /// (`Sandbox::can_enforce_read_only`).
+    pub read_only_enforced: bool,
+    /// Whether writing this path writes a workspace: this one, or any other
+    /// the session can write ([`writes_inside`]).
+    pub writes_workspace: &'a dyn Fn(&Path) -> bool,
+}
+
+/// The lane for a `run_terminal_command` command line run at `site`
+/// (SPEC R2.7.4).
+///
+/// - A line of readers that writes no file is read-only where the kernel
+///   enforces that lane. Where it does not, it is exclusive — unless it
+///   watches (`gh run watch`, `gh pr checks --watch`, `tail -f`), which would
+///   otherwise hold the workspace for its whole life: then it is service.
+/// - A line of readers whose redirections (and `tee`) write only files
+///   outside every workspace — `gh pr checks 87 --watch > /tmp/ci.log` — is
+///   service. The read-only lane would refuse to open those files.
+/// - Everything else is exclusive: a writer, a file inside a workspace, a
+///   target the shell would expand (`$X`, a glob, `~`), a relative target
+///   after a `cd`, or a program that writes through its arguments.
+pub fn classify_shell_command_at(command: &str, site: &RunSite<'_>) -> Lane {
+    let Some((line, reading)) = read_line(command) else {
         return Lane::Exclusive;
     };
-    if inner
-        .iter()
-        .any(|c| classify_shell_command(c) != Lane::ReadOnly)
-    {
+    let mut targets = line.writes.iter().chain(&reading.tee_files).peekable();
+    if targets.peek().is_none() {
+        return if site.read_only_enforced {
+            Lane::ReadOnly
+        } else if reading.watches && !reading.writes_through_args {
+            Lane::Service
+        } else {
+            Lane::Exclusive
+        };
+    }
+    if reading.writes_through_args {
         return Lane::Exclusive;
     }
-    let command = command.as_str();
-    let Some(segs) = segments(command) else {
-        return Lane::Exclusive;
+    let all_outside = targets.all(|word| {
+        redirection_target(word, site.cwd, reading.changes_dir)
+            .is_some_and(|path| !(site.writes_workspace)(&path))
+    });
+    if all_outside {
+        Lane::Service
+    } else {
+        Lane::Exclusive
+    }
+}
+
+/// The path a redirection target names, read the way the shell would without
+/// expanding anything: `None` for a word the shell would expand (a variable,
+/// a glob, `~`, a brace) and for a relative path in a line that changes
+/// directory first.
+fn redirection_target(word: &str, cwd: &Path, changes_dir: bool) -> Option<PathBuf> {
+    if word.is_empty() || word.contains(['$', '*', '?', '[', ']', '{', '}', '~', '`']) {
+        return None;
+    }
+    let path = Path::new(word);
+    if !path.has_root() && changes_dir {
+        return None;
+    }
+    Some(cwd.join(path))
+}
+
+/// Whether writing `path` would write inside `workspace` or any of `scopes`
+/// (SPEC R2.7.2, R2.7.4), resolved the way the kernel will: the deepest part
+/// of the path that exists is canonicalized, so a symlink into a workspace
+/// counts as the workspace, and the rest is appended. Anything that cannot be
+/// resolved with certainty — a dangling symlink, a `..` beyond what exists —
+/// counts as inside. Compared without regard to case, which can only make it
+/// say "inside" more often.
+pub fn writes_inside(path: &Path, workspace: &Path, scopes: &[PathBuf]) -> bool {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    let resolved = loop {
+        match dunce::canonicalize(existing) {
+            Ok(real) => break real,
+            Err(_) => {
+                // An entry that exists but does not resolve is a dangling
+                // symlink: writing it creates its target, wherever that is.
+                if std::fs::symlink_metadata(existing).is_ok() {
+                    return true;
+                }
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return true;
+                };
+                rest.push(name);
+                existing = parent;
+            }
+        }
     };
-    for seg in &segs {
+    let full = rest.iter().rev().fold(resolved, |p, name| p.join(name));
+    let fold = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    let full = fold(&full);
+    std::iter::once(workspace)
+        .chain(scopes.iter().map(PathBuf::as_path))
+        .any(|root| {
+            let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            full.starts_with(fold(&root))
+        })
+}
+
+/// Judge each segment of a parsed line: `None` as soon as one does not read.
+fn read_segments(segs: &[Segment]) -> Option<Reading> {
+    let mut reading = Reading::default();
+    for seg in segs {
         // Loop and conditional keywords, and `NAME=value` assignments, only
         // frame the command that follows; the command decides. The read lane
         // is still the kernel's word: an assignment such as `LD_PRELOAD` that
@@ -385,25 +716,39 @@ pub fn classify_shell_command(command: &str) -> Lane {
         {
             continue;
         }
-        let Some((program, args)) = words.split_first() else {
-            return Lane::Exclusive;
-        };
+        let (program, args) = words.split_first()?;
         let program = program.as_str();
         let args: Vec<String> = args.iter().map(|a| (*a).clone()).collect();
         let args = args.as_slice();
         // A path to a program: not worth guessing.
         if program.contains('=') || program.contains('/') {
-            return Lane::Exclusive;
+            return None;
         }
         // `cd <dir>` changes nothing on disk; the segment after it decides.
         if program == "cd" && args.len() <= 1 {
+            reading.changes_dir = true;
+            continue;
+        }
+        // `tee` copies its input to its output and to its files, which the
+        // caller places like a redirection's.
+        if program == "tee" {
+            reading.tee_files.extend(tee_files(args)?);
             continue;
         }
         if !program_is_read_only(program, args) {
-            return Lane::Exclusive;
+            return None;
         }
+        // An environment assignment before a program (`LD_PRELOAD=…`) can
+        // make a reader do anything; only the kernel's read-only lane makes
+        // that harmless, so it rules out a service verdict.
+        let assigns = seg
+            .iter()
+            .take_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
+            .any(|w| is_assignment(w));
+        reading.writes_through_args |= assigns || writes_through_args(program, args);
+        reading.watches |= is_watcher(program, args);
     }
-    Lane::ReadOnly
+    Some(reading)
 }
 
 /// Replace every `$(…)` outside single quotes with a plain word, returning
@@ -1050,5 +1395,285 @@ mod poll_loop_tests {
         ] {
             assert_eq!(classify_shell_command(cmd), Lane::Exclusive, "{cmd}");
         }
+    }
+}
+
+/// SPEC R2.7.4: CI watchers and redirections outside every workspace. A
+/// `gh pr checks 113 --watch --interval 60 > /tmp/…/ci.log` was classified
+/// exclusive for its redirection, held the workspace for a twenty-minute CI
+/// run, and every later possibly-writing command queued behind it.
+#[cfg(test)]
+mod watch_and_redirect_tests {
+    use super::*;
+
+    const WS: &str = "/ws/repo";
+
+    /// Classify at a fake site: the workspace is `/ws/repo`, judged lexically.
+    fn at(cmd: &str, read_only_enforced: bool) -> Lane {
+        let inside = |p: &Path| p.starts_with(WS);
+        classify_shell_command_at(
+            cmd,
+            &RunSite {
+                cwd: Path::new(WS),
+                read_only_enforced,
+                writes_workspace: &inside,
+            },
+        )
+    }
+
+    #[test]
+    fn gh_commands_that_only_read_remote_state_are_read_only() {
+        for cmd in [
+            "gh pr view 113",
+            "gh pr view 113 --json state,mergeable",
+            "gh pr checks 113",
+            "gh pr list --state open",
+            "gh run view 42 --log-failed",
+            "gh run list --limit 5",
+            "gh run watch 42",
+            "gh api repos/o/r/pulls/1",
+            "gh api -X GET repos/o/r/pulls",
+            "gh api --method=get repos/o/r/pulls",
+            "gh api repos/o/r/pulls --paginate --jq '.[].number'",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::ReadOnly, "{cmd}");
+            assert_eq!(at(cmd, true), Lane::ReadOnly, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn gh_commands_that_change_anything_stay_exclusive() {
+        for cmd in [
+            "gh pr merge 113 --squash",
+            "gh pr create --fill",
+            "gh pr checkout 113",
+            "gh run rerun 42",
+            "gh run download 42",
+            "gh api -X POST repos/o/r/issues",
+            "gh api -XPOST repos/o/r/issues",
+            "gh api --method=PATCH repos/o/r/issues/1",
+            "gh api --method DELETE x",
+            "gh api -X",
+            "gh api repos/o/r/issues -f title=x",
+            "gh api repos/o/r/issues -Ftitle=x",
+            "gh api repos/o/r/issues --field title=x",
+            "gh api repos/o/r/issues --raw-field title=x",
+            "gh api repos/o/r/issues --input body.json",
+        ] {
+            for enforced in [true, false] {
+                assert_eq!(at(cmd, enforced), Lane::Exclusive, "{cmd}");
+            }
+            // Not even with the output sent outside the workspace.
+            assert_eq!(at(&format!("{cmd} > /tmp/out.log"), true), Lane::Exclusive);
+        }
+    }
+
+    /// Where the kernel has a read-only lane a watcher already takes no lease
+    /// there; where it has none, a watcher is service rather than holding the
+    /// workspace for the whole run.
+    #[test]
+    fn watchers_never_hold_the_workspace() {
+        for cmd in [
+            "gh run watch 42",
+            "gh run watch 42 --exit-status",
+            "gh pr checks 113 --watch",
+            "gh pr checks 113 --watch --interval 60",
+            "gh pr checks --watch --fail-fast 113",
+            "gh pr checks 113 --watch 2>&1 | tail -20",
+            "tail -f build.log",
+            "tail -n 50 -F build.log | grep --line-buffered ERROR",
+        ] {
+            assert_eq!(at(cmd, true), Lane::ReadOnly, "{cmd}");
+            assert_eq!(at(cmd, false), Lane::Service, "{cmd}");
+        }
+        // A finite reader is not a watcher: without the kernel lane it stays
+        // exclusive, exactly as before.
+        for cmd in [
+            "gh pr checks 113",
+            "gh run view 42 --log-failed",
+            "tail -n 5 f",
+        ] {
+            assert_eq!(at(cmd, false), Lane::Exclusive, "{cmd}");
+        }
+        // A watcher beside something that could write through its arguments,
+        // or under an environment assignment, gets no service verdict.
+        for cmd in [
+            "tail -f build.log | sed -n /ERROR/p",
+            "gh run watch 42; sort -o out.txt in.txt",
+            "LD_PRELOAD=/x.so gh run watch 42",
+            "gh run watch 42 && cargo build",
+        ] {
+            assert_eq!(at(cmd, false), Lane::Exclusive, "{cmd}");
+        }
+    }
+
+    /// The observed failure, and every redirection spelling of it: a file
+    /// outside every workspace is not a workspace write. The read-only lane
+    /// would refuse to open it, so the line is service — on every platform.
+    #[test]
+    fn output_sent_outside_every_workspace_takes_no_lease() {
+        for cmd in [
+            "gh pr checks 113 --watch --interval 60 > /private/tmp/scratch/ci.log",
+            "gh pr checks 113 --watch --interval 60 >/private/tmp/scratch/ci.log",
+            "gh pr checks 113 --watch >> /tmp/ci.log",
+            "gh pr checks 113 --watch > /tmp/ci.log 2>&1",
+            "gh pr checks 113 --watch 2> /tmp/ci.err",
+            "gh pr checks 113 --watch 2>>/tmp/ci.err",
+            "gh pr checks 113 --watch &> /tmp/ci.log",
+            "gh pr checks 113 --watch &>>/tmp/ci.log",
+            "gh pr checks 113 --watch >| /tmp/ci.log",
+            "gh pr checks 113 --watch > '/tmp/with space/ci.log'",
+            "gh pr checks 113 --watch | tee /tmp/ci.log",
+            "gh pr checks 113 --watch 2>&1 | tee -a /tmp/ci.log",
+            "git log --oneline -20 > /tmp/log.txt",
+            "rg -n TODO src > /tmp/todo.txt",
+            "echo \"$(gh pr view 113 --json state)\" > /tmp/state.json",
+        ] {
+            assert_eq!(at(cmd, true), Lane::Service, "{cmd}");
+            assert_eq!(at(cmd, false), Lane::Service, "{cmd}");
+            assert_eq!(
+                classify_shell_command(cmd),
+                Lane::Exclusive,
+                "without a site, a file write is exclusive: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_sent_into_the_workspace_stays_exclusive() {
+        for cmd in [
+            "gh pr checks 113 --watch --interval 60 > ci.log",
+            "gh pr checks 113 --watch > ./target/ci.log",
+            "gh pr checks 113 --watch > /ws/repo/ci.log",
+            "gh pr checks 113 --watch 2> err.log",
+            "gh pr checks 113 --watch &> ci.log",
+            "gh pr checks 113 --watch | tee ci.log",
+            "gh pr checks 113 --watch | tee /tmp/a.log ci.log",
+            "gh pr checks 113 --watch > /tmp/ci.log 2> err.log",
+            "git log > /tmp/a.log; git status > status.txt",
+            "gh run watch 42 > sub/../ci.log",
+        ] {
+            for enforced in [true, false] {
+                assert_eq!(at(cmd, enforced), Lane::Exclusive, "{cmd}");
+            }
+        }
+    }
+
+    /// A target the shell would expand, a relative one after a `cd`, a
+    /// redirection this module does not model, or a writer anywhere in the
+    /// line: exclusive, as before.
+    #[test]
+    fn ambiguous_or_writing_lines_stay_exclusive() {
+        for cmd in [
+            "gh pr checks 113 --watch > $OUT",
+            "gh pr checks 113 --watch > \"$TMPDIR/ci.log\"",
+            "gh pr checks 113 --watch > ${TMPDIR}/ci.log",
+            "gh pr checks 113 --watch > /tmp/*.log",
+            "gh pr checks 113 --watch > /tmp/ci?.log",
+            "gh pr checks 113 --watch > ~/ci.log",
+            "gh pr checks 113 --watch > >(cat)",
+            "gh pr checks 113 --watch >&ci.log",
+            "gh pr checks 113 --watch >",
+            "gh pr checks 113 --watch | tee --unknown /tmp/x",
+            "gh pr checks 113 --watch | tee - ",
+            "cd /tmp && gh pr checks 113 --watch > ci.log",
+            "gh pr checks 113 --watch > /tmp/ci.log; rm -f x",
+            "cargo build > /tmp/build.log 2>&1",
+            "sort -o out.txt in.txt > /tmp/x",
+            "sed -n 1p f > /tmp/x",
+            "env rm -rf x > /tmp/x",
+            "XDG_CACHE_HOME=/tmp/c gh pr checks 113 > /tmp/x",
+            "echo $(sed 'w f' x) > /tmp/x",
+            "echo $(gh pr checks 1 > f) > /tmp/x",
+            "curl -s -D headers.txt https://x > /tmp/x",
+            "grep '>' /tmp/x",
+            "cat < /tmp/in > /tmp/out",
+            "gh pr checks 113 --watch 3>&1 1>&2 > /tmp/x &",
+        ] {
+            for enforced in [true, false] {
+                assert_eq!(at(cmd, enforced), Lane::Exclusive, "{cmd}");
+            }
+        }
+    }
+
+    /// `&>/dev/null`, `< /dev/null` and stream merges open no file: the
+    /// read-only lane can run them.
+    #[test]
+    fn redirections_that_open_no_file_keep_a_reader_read_only() {
+        for cmd in [
+            "gh pr checks 113 &>/dev/null",
+            "gh pr checks 113 &> /dev/null",
+            "gh pr checks 113 >&2",
+            "gh pr checks 113 2>&-",
+            "gh pr checks 113 < /dev/null",
+            "gh pr checks 113 >> /dev/null 2>&1",
+            "gh pr checks 113 | tee",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::ReadOnly, "{cmd}");
+            assert_eq!(at(cmd, true), Lane::ReadOnly, "{cmd}");
+        }
+    }
+}
+
+/// [`writes_inside`] resolves a path the way the kernel will.
+#[cfg(test)]
+mod writes_inside_tests {
+    use super::*;
+
+    fn dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let td = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(td.path()).unwrap();
+        let ws = root.join("ws");
+        let out = root.join("out");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        (td, ws, out)
+    }
+
+    #[test]
+    fn a_new_file_outside_the_workspace_is_outside() {
+        let (_td, ws, out) = dirs();
+        assert!(!writes_inside(&out.join("ci.log"), &ws, &[]));
+        assert!(!writes_inside(&out.join("new/dir/ci.log"), &ws, &[]));
+    }
+
+    #[test]
+    fn a_file_in_the_workspace_or_any_scope_is_inside() {
+        let (_td, ws, out) = dirs();
+        assert!(writes_inside(&ws.join("ci.log"), &ws, &[]));
+        assert!(writes_inside(&ws.join("sub/new/ci.log"), &ws, &[]));
+        assert!(writes_inside(&out.join("../ws/ci.log"), &ws, &[]));
+        assert!(
+            writes_inside(&out.join("ci.log"), &ws, std::slice::from_ref(&out)),
+            "another workspace the session can write is a workspace too"
+        );
+        let shouted = PathBuf::from(ws.to_string_lossy().to_uppercase()).join("ci.log");
+        assert!(
+            writes_inside(&shouted, &ws, &[]),
+            "case is ignored, which only ever says inside more often"
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_resolved_is_inside() {
+        let (_td, ws, out) = dirs();
+        assert!(writes_inside(
+            &out.join("missing/../../ws/ci.log"),
+            &ws,
+            &[]
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_the_workspace_is_the_workspace() {
+        let (_td, ws, out) = dirs();
+        std::os::unix::fs::symlink(&ws, out.join("link")).unwrap();
+        assert!(writes_inside(&out.join("link/ci.log"), &ws, &[]));
+        std::os::unix::fs::symlink(ws.join("not-yet.log"), out.join("dangling")).unwrap();
+        assert!(
+            writes_inside(&out.join("dangling"), &ws, &[]),
+            "writing a dangling symlink creates its target"
+        );
     }
 }
