@@ -332,25 +332,39 @@ fn default_working_directory() -> Option<String> {
 }
 
 fn print_cli_error(error: &anyhow::Error) {
-    let error_message = error.to_string();
-    if error_message.contains("Canceled: Canceled") {
-        eprintln!(
-            "Operation cancelled by user request (was: {})",
-            error_message
-        );
-    } else if error_message.contains("task cancelled for reason") {
-        eprintln!(
-            "Operation cancelled by user request or system signal (detected MCP cancellation)"
-        );
-    } else if error_message.to_lowercase().contains("cancel") {
-        eprintln!("Operation cancelled: {}", error_message);
+    eprintln!("{}", cli_error_text(error));
+}
+
+/// What `ahma tool run` prints for a failed call. Cancellation is decided by
+/// the error's type, or by a message that *is* a cancellation — never by the
+/// word appearing anywhere in it: a failed test run's own output says
+/// "Cancelling due to test failure", and was reported as a cancellation.
+fn cli_error_text(error: &anyhow::Error) -> String {
+    let cancelled_by_type = error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rmcp::service::ServiceError>(),
+            Some(rmcp::service::ServiceError::Cancelled { .. })
+        )
+    });
+    let message = error.to_string();
+    let headline = message.trim_start().to_ascii_lowercase();
+    let cancelled_by_message = [
+        "canceled",
+        "cancelled",
+        "task cancelled",
+        "operation cancelled",
+    ]
+    .iter()
+    .any(|p| headline.starts_with(p));
+    if cancelled_by_type || cancelled_by_message {
+        format!("Operation cancelled: {message}")
     } else if ahma_common::http_retry::find_service_error(error).is_some() {
         // An outside service failed: lead with which one, in plain words
         // (SPEC R-HTTP.3).
-        eprintln!("{}", ahma_common::http_retry::user_message(error));
+        ahma_common::http_retry::user_message(error)
     } else {
         // `{:#}`: the whole cause chain, not just the outermost context.
-        eprintln!("Error executing tool: {error:#}");
+        format!("Error executing tool: {error:#}")
     }
 }
 
@@ -776,6 +790,35 @@ mod tests {
     }
 
     // ============= print_cli_error tests =============
+
+    /// A failed test run whose output mentions cancelling ("Cancelling due to
+    /// test failure", nextest) is a failure, not a cancellation: only a typed
+    /// cancellation, or a message that is one, says "cancelled". The confined
+    /// CI job reported a failed suite as "Operation cancelled".
+    #[test]
+    fn a_failure_whose_output_mentions_cancelling_is_not_called_cancelled() {
+        let err = anyhow::anyhow!(
+            "Mcp error: -32603: Synchronous execution failed: Command failed with exit code 100: \
+             stderr: , stdout:  FAIL [0.01s] t\n  Cancelling due to test failure: 3 tests still running"
+        );
+        let text = cli_error_text(&err);
+        assert!(text.starts_with("Error executing tool:"), "{text}");
+        assert!(!text.starts_with("Operation cancelled"), "{text}");
+
+        let cancelled: anyhow::Error = rmcp::service::ServiceError::Cancelled {
+            reason: Some("user request".into()),
+        }
+        .into();
+        assert!(
+            cli_error_text(&cancelled).starts_with("Operation cancelled"),
+            "{}",
+            cli_error_text(&cancelled)
+        );
+        assert!(
+            cli_error_text(&anyhow::anyhow!("task cancelled for reason: timeout"))
+                .starts_with("Operation cancelled")
+        );
+    }
 
     #[test]
     fn test_print_cli_error_canceled_canceled() {
