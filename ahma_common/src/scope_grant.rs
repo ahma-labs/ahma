@@ -69,6 +69,15 @@ pub enum GrantReason {
     /// No once tier (a log is read for as long as it is monitored) and no
     /// lease ([`GrantReason::offers`]).
     LogTarget,
+    /// A terminal-hook command was refused this directory and ahma recorded
+    /// it, to ask before the agent's next command in the harness's own dialog
+    /// (SPEC R-PERM.10). The TUI lists these and may answer first
+    /// (R-PERM.10(e)); it builds the request itself from the records, and it
+    /// never travels the hub. The path is exact. No once tier: nothing would
+    /// spend it, since the next hooked command builds its sandbox from the
+    /// session grants and the settings file, not from the TUI
+    /// ([`GrantReason::offers`]).
+    HarnessRefusal,
     /// A reason sent by a newer ahma that this build does not know. Never
     /// produced here; it exists so a request carrying a future reason still
     /// decodes and reaches the human instead of being dropped as an unknown
@@ -93,7 +102,8 @@ impl GrantReason {
         match self {
             GrantReason::PreExecViolation
             | GrantReason::StderrHeuristic
-            | GrantReason::LogTarget => true,
+            | GrantReason::LogTarget
+            | GrantReason::HarnessRefusal => true,
             GrantReason::StartupFlag | GrantReason::Unknown => false,
         }
     }
@@ -103,7 +113,8 @@ impl GrantReason {
     /// offers read-only for this session or always, nothing else: it is never
     /// writable, and a once or 24-hour answer means nothing for a file that is
     /// read for as long as it is monitored. Every other reason offers every
-    /// tier it allows ([`Self::offers_saved_tiers`]).
+    /// tier it allows ([`Self::offers_saved_tiers`]), except that a harness
+    /// refusal ([`GrantReason::HarnessRefusal`]) offers no once tier.
     ///
     /// [`crate::grant_prompt::options_for`] builds every surface's choices from
     /// this, and [`GrantDecision::within_offer`] holds an answer outside it to
@@ -117,6 +128,7 @@ impl GrantReason {
                 decision,
                 GrantDecision::GrantRoSession | GrantDecision::GrantRo
             ),
+            GrantReason::HarnessRefusal => decision.tier() != crate::permissions::GrantTier::Once,
             _ => self.offers_saved_tiers() || !decision.tier().is_persistent(),
         }
     }
@@ -313,6 +325,13 @@ impl GrantDecision {
                     GrantDecision::Deny
                 }
             };
+        }
+        // A harness refusal has no once tier, and any tier that can honour
+        // a once answer would widen it: it becomes a deny.
+        if reason == GrantReason::HarnessRefusal
+            && self.tier() == crate::permissions::GrantTier::Once
+        {
+            return GrantDecision::Deny;
         }
         if reason.offers_saved_tiers() {
             return self;

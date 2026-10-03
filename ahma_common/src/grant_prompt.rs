@@ -101,6 +101,9 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
     // `logs_approve`: nothing was refused either, and the answer is a
     // read-only `log-target` grant, never an `fs-scope` one (SPEC R9.2).
     let log_target = req.reason == GrantReason::LogTarget;
+    // A terminal-hook refusal answered ahead of the harness dialog
+    // (R-PERM.10(e)): the session is the harness's, and there is no once.
+    let harness = req.reason == GrantReason::HarnessRefusal;
     let saved_tiers = req.reason.offers_saved_tiers();
     let minimum_access = if ctx.write_denied || (startup && req.access.is_write()) {
         ScopeAccess::Rw
@@ -174,6 +177,11 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
             "\nthe path is exact: where the link resolves now. The agent can create links in \
              .ahma/logs itself, so check this is a log you expect it to read",
         ),
+        GrantReason::HarnessRefusal => blocked.push_str(
+            "\nthe path is exact: the kernel refused it and ahma's terminal hook recorded it. \
+             Unless you answer here, the agent's harness asks you in its own dialog before its \
+             next command",
+        ),
         GrantReason::Unknown => blocked.push_str(
             "\nsent by a newer ahma for a reason this version does not recognise: double-check \
              the path",
@@ -234,6 +242,12 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
             "ahma's log tools, and every command in {workspace_label}, may read {path} — until \
              this session ends (session), or until you revoke it (always). It is never writable, \
              and nothing else outside the workspace changes."
+        )
+    } else if harness {
+        format!(
+            "every command in {workspace_label} may {verb} {path} — until the agent's harness \
+             exits (session: its hooked commands and edits, at most 12 hours), for 24 hours \
+             (lease), or until you revoke it (always). Nothing else outside the workspace changes."
         )
     } else if saved_tiers {
         format!(
@@ -336,7 +350,8 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
 /// option for a blocked path; only deny / once / session for a question
 /// whose answer must not be saved ([`GrantReason::offers_saved_tiers`] — the
 /// `--tmp` question); and only deny / read-only session / read-only always for
-/// a log target. Every surface builds its choices from this, so the form,
+/// a log target; and everything but once for a terminal-hook refusal the TUI
+/// answers ahead of the harness. Every surface builds its choices from this, so the form,
 /// the TUI keys and the text body agree; [`crate::scope_grant::GrantCoordinator::resolve`]
 /// holds any answer outside it to what it offers ([`GrantReason::offers`]).
 pub fn options_for(reason: GrantReason) -> Vec<PromptOption> {
@@ -988,6 +1003,123 @@ Choices (deny is the default):
   read-only            read-only, always (saved; bound to this workspace)
 "#;
 
+    /// A terminal-hook refusal as the TUI lists it ahead of the harness
+    /// dialog (SPEC R-PERM.10(e)): the harness process asks, the refused paths
+    /// are the evidence, and there is no command or claim.
+    fn harness_refusal_request() -> ScopeGrantRequest {
+        use crate::scope_grant::{GrantContext, GrantEvidence, GrantRequester, GrantRiskSummary};
+        ScopeGrantRequest {
+            decision_id: "harness-ask-0123456789abcdef".into(),
+            path: "/home/u/.cache/neubit".into(),
+            access: ScopeAccess::Rw,
+            reason: GrantReason::HarnessRefusal,
+            tool: Some("an earlier hooked command".into()),
+            context: GrantContext {
+                requester: Some(GrantRequester {
+                    client: Some("terminal hook".into()),
+                    session_id: None,
+                    workspace: Some("/home/u/proj".into()),
+                    pid: 4242,
+                }),
+                evidence: Some(GrantEvidence {
+                    raw_path: Some("/home/u/.cache/neubit/heavy.lock.holder".into()),
+                    pattern: None,
+                    line: Some(
+                        "refused: /home/u/.cache/neubit/heavy.lock.holder, \
+                         /home/u/.cache/neubit/db/index.db"
+                            .into(),
+                    ),
+                }),
+                risk: Some(GrantRiskSummary {
+                    class: "normal".into(),
+                    warnings: vec![],
+                    facts: vec!["directory with 2 entries".into()],
+                }),
+                write_denied: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    const GOLDEN_HARNESS_REFUSAL_TEXT: &str = r#"Allow read+write access to /home/u/.cache/neubit?
+
+Who is asking
+  terminal hook · workspace /home/u/proj · session unknown · pid 4242
+
+What was blocked
+  an earlier hooked command tried to write /home/u/.cache/neubit/heavy.lock.holder
+  the path is exact: the kernel refused it and ahma's terminal hook recorded it. Unless you answer here, the agent's harness asks you in its own dialog before its next command
+  evidence: refused: /home/u/.cache/neubit/heavy.lock.holder, /home/u/.cache/neubit/db/index.db
+
+What the agent says it needs
+  nothing — the agent gave no reason
+
+Minimum that would work
+  read+write on /home/u/.cache/neubit (a write was refused, so read-only would not fix it)
+
+What a grant allows
+  every command in /home/u/proj may read and write /home/u/.cache/neubit — until the agent's harness exits (session: its hooked commands and edits, at most 12 hours), for 24 hours (lease), or until you revoke it (always). Nothing else outside the workspace changes.
+
+Risk
+  NORMAL
+  - directory with 2 entries
+
+If you choose always
+  ~/.ahma/settings.toml gets:
+  [[sandbox.persistent_scopes]]
+  path = "/home/u/.cache/neubit"
+  access = "rw"
+  workspace = "/home/u/proj"
+  Revoke any time with: ahma sandbox revoke /home/u/.cache/neubit
+
+Choices (deny is the default):
+  deny                 Deny (default; Enter and Esc)
+  read-only-session    read-only, this session
+  read-write-session   read-write, this session
+  read-only-24h        read-only for 24 hours (saved; ends on its own)
+  read-write-24h       read-write for 24 hours (saved; ends on its own)
+  read-only            read-only, always (saved; bound to this workspace)
+  read-write           read-write, always (saved; bound to this workspace)
+"#;
+
+    /// SPEC R-PERM.10(e): the TUI's copy of a harness question says the path
+    /// is exact and who will ask if nobody answers here, and offers every
+    /// tier but once — nothing would spend a once answer.
+    #[test]
+    fn golden_harness_refusal_question() {
+        assert_golden(
+            "harness refusal",
+            &render(&harness_refusal_request()).to_text(),
+            GOLDEN_HARNESS_REFUSAL_TEXT,
+        );
+        let offered = options_for(GrantReason::HarnessRefusal);
+        assert_eq!(offered[0].decision, GrantDecision::Deny, "deny first");
+        assert!(
+            offered
+                .iter()
+                .all(|o| o.decision.tier() != crate::permissions::GrantTier::Once),
+            "{offered:#?}"
+        );
+        assert_eq!(
+            offered.len(),
+            options().len() - 2,
+            "only the two once tiers go"
+        );
+        assert_eq!(
+            GrantDecision::GrantRwOnce.within_offer(GrantReason::HarnessRefusal),
+            GrantDecision::Deny,
+            "a once answer from anywhere is narrowed to deny, never widened"
+        );
+        assert_eq!(
+            GrantDecision::GrantRwSession.within_offer(GrantReason::HarnessRefusal),
+            GrantDecision::GrantRwSession
+        );
+        assert_eq!(
+            GrantDecision::GrantRo.within_offer(GrantReason::HarnessRefusal),
+            GrantDecision::GrantRo
+        );
+    }
+
     /// The body plus the choices by name — the shape a text-only surface
     /// would print. Deny first, every tier the reason offers, no key letters.
     #[test]
@@ -1060,6 +1192,7 @@ Choices (deny is the default):
             ("hook", hook_body()),
             ("--tmp", render(&tmp_request())),
             ("log target", render(&log_target_request())),
+            ("harness refusal", render(&harness_refusal_request())),
         ];
         for (what, body) in &bodies {
             for text in [body.to_message(), body.to_text()] {

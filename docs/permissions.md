@@ -68,6 +68,9 @@ and no mean. **Yes** grants it for this Claude Code session and runs the command
 Related paths are asked as one directory when that is safe (`~/.cache/neubit`, never
 `~/.cache`, your home folder, a folder of projects, or anything holding credentials).
 For "always", the dialog names the `ahma sandbox grant` command (SPEC R-PERM.10).
+If `ahma tui` is open, the same question appears there as soon as the refusal is
+recorded, and answering it in the TUI (deny, this session, 24 hours or always) means
+Claude Code never shows the dialog for it.
 
 That last rung is the important one: ahma never fails *open*. If nobody can be
 asked, the answer is no — and you get a command you can paste rather than a

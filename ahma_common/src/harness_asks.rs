@@ -22,13 +22,17 @@
 //! `runtime_dir()/harness-asks/`, beside the session grants. A sandboxed
 //! command cannot write there (the runtime directory is outside every scope),
 //! which is what makes the token's word trustworthy.
+//!
+//! The TUI reads the same records ([`load_all`], [`pending_questions`]) and
+//! may answer a question first (SPEC R-PERM.10(e)); it records the answer
+//! ([`mark_answered`]) so the harness dialog does not ask it again.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ScopeAccess;
+use crate::config::{PersistentScope, ScopeAccess};
 use crate::scope_grant::{GrantRisk, classify_grant_risk, sensitive_dirs};
 
 /// Refusals and questions older than this are forgotten: the session tier's
@@ -104,6 +108,34 @@ pub struct Question {
     pub covers: Vec<PathBuf>,
 }
 
+/// A question a human answered at another surface (the TUI) before the
+/// harness dialog asked it (SPEC R-PERM.10(e)). Whatever the answer, the
+/// dialog does not ask about these refusals again: a yes became a grant, and
+/// a no is remembered like a no in the dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answered {
+    /// The directory the question named.
+    pub dir: PathBuf,
+    /// The access it asked for; a read-write question settles reads too.
+    pub access: ScopeAccess,
+    /// Unix seconds of the answer.
+    pub at: u64,
+    /// The harness process whose refusals it answered. Refusals a later
+    /// harness session records are its own question, as in the dialog
+    /// (one question per directory per harness session). `None` answers all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_pid: Option<u32>,
+}
+
+impl Answered {
+    /// Whether this answer settles `refusal`.
+    fn settles(&self, refusal: &Refusal) -> bool {
+        refusal.path.starts_with(&self.dir)
+            && (self.access.is_write() || !refusal.access.is_write())
+            && (self.harness_pid.is_none() || self.harness_pid == refusal.harness_pid)
+    }
+}
+
 /// Everything recorded for one workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceAsks {
@@ -112,6 +144,9 @@ pub struct WorkspaceAsks {
     pub refusals: Vec<Refusal>,
     #[serde(default)]
     pub asked: Vec<Asked>,
+    /// Questions answered at another surface before the dialog asked them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answered: Vec<Answered>,
 }
 
 /// The directory these records live in: `runtime_dir()/harness-asks`.
@@ -260,11 +295,63 @@ pub fn load(dir: &Path, workspace: &Path, now: u64) -> WorkspaceAsks {
             workspace: workspace.to_path_buf(),
             ..WorkspaceAsks::default()
         });
+    forget_expired(&mut asks, now);
+    asks
+}
+
+/// Drop the refusals, questions and answers older than [`MAX_AGE_SECS`].
+fn forget_expired(asks: &mut WorkspaceAsks, now: u64) {
     asks.refusals
         .retain(|r| now.saturating_sub(r.at) <= MAX_AGE_SECS);
     asks.asked
         .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
-    asks
+    asks.answered
+        .retain(|a| now.saturating_sub(a.at) <= MAX_AGE_SECS);
+}
+
+/// Every workspace's records in `dir`, without what has expired, ordered by
+/// workspace: what a surface that lists every waiting question reads (the
+/// TUI, SPEC R-PERM.10(e)). A file that cannot be read, or whose name is not
+/// the one its workspace would have, is skipped.
+pub fn load_all(dir: &Path, now: u64) -> Vec<WorkspaceAsks> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut all: Vec<WorkspaceAsks> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| {
+            let asks = serde_json::from_slice::<WorkspaceAsks>(&std::fs::read(&p).ok()?).ok()?;
+            (file_for(dir, &asks.workspace) == p).then_some(asks)
+        })
+        .map(|mut asks| {
+            forget_expired(&mut asks, now);
+            asks
+        })
+        .collect();
+    all.sort_by(|a, b| a.workspace.cmp(&b.workspace));
+    all
+}
+
+/// Whether a grant in `granted` already lets a command in `workspace` reach
+/// `path` with `access` (SPEC R-PERM.10(c)): the test the hook and the TUI
+/// both apply before asking.
+pub fn grant_covers(
+    granted: &[PersistentScope],
+    workspace: &Path,
+    path: &Path,
+    access: ScopeAccess,
+) -> bool {
+    granted.iter().any(|g| {
+        let applies = g
+            .workspace
+            .as_deref()
+            .is_none_or(|w| workspace.starts_with(w));
+        let root = crate::config::expand_home(&g.path);
+        let root = dunce::canonicalize(&root).unwrap_or(root);
+        applies && (g.access.is_write() || !access.is_write()) && path.starts_with(&root)
+    })
 }
 
 /// Remember that a hooked command in `workspace` was refused `refusal.path`.
@@ -279,8 +366,9 @@ pub fn record_refusal(dir: &Path, workspace: &Path, refusal: Refusal) -> Result<
 /// The question to ask next in harness session `session_id`, if any.
 ///
 /// Refusals that `covered` says a grant already covers are skipped, as are
-/// those under a question already asked in this session: one question per
-/// directory per session, whatever the answer was.
+/// those under a question already asked in this session (one question per
+/// directory per session, whatever the answer was) and those a human answered
+/// at another surface ([`mark_answered`]).
 pub fn next_question(
     asks: &WorkspaceAsks,
     session_id: &str,
@@ -299,14 +387,70 @@ pub fn next_question(
         .iter()
         .filter(|r| !covered(&r.path, r.access))
         .filter(|r| !asked_here.iter().any(|d| r.path.starts_with(d)))
+        .filter(|r| !asks.answered.iter().any(|a| a.settles(r)))
         .cloned()
         .collect();
-    group(&open, home, scopes).into_iter().find(|q| {
-        !matches!(
-            classify_grant_risk(&q.dir, home, scopes),
-            GrantRisk::Refused(_)
-        )
-    })
+    group(&open, home, scopes)
+        .into_iter()
+        .find(|q| !denylisted(q, home, scopes))
+}
+
+/// Every question still waiting in `asks`, for a surface that may answer
+/// ahead of the harness dialog (the TUI, SPEC R-PERM.10(e)).
+///
+/// A refusal waits while no grant covers it (`covered`), no harness dialog
+/// has asked about it for the harness process that was refused, and no
+/// surface has answered it. Grouped as [`next_question`] groups them, without
+/// what the denylist refuses.
+pub fn pending_questions(
+    asks: &WorkspaceAsks,
+    covered: &dyn Fn(&Path, ScopeAccess) -> bool,
+    home: Option<&Path>,
+    scopes: &[PathBuf],
+) -> Vec<Question> {
+    let open: Vec<Refusal> = asks
+        .refusals
+        .iter()
+        .filter(|r| !covered(&r.path, r.access))
+        .filter(|r| {
+            !asks.asked.iter().any(|a| {
+                r.path.starts_with(&a.question.dir)
+                    && (a.harness_pid.is_none() || a.harness_pid == r.harness_pid)
+            })
+        })
+        .filter(|r| !asks.answered.iter().any(|a| a.settles(r)))
+        .cloned()
+        .collect();
+    group(&open, home, scopes)
+        .into_iter()
+        .filter(|q| !denylisted(q, home, scopes))
+        .collect()
+}
+
+/// Whether the hard denylist refuses `question`'s directory: never asked.
+fn denylisted(question: &Question, home: Option<&Path>, scopes: &[PathBuf]) -> bool {
+    matches!(
+        classify_grant_risk(&question.dir, home, scopes),
+        GrantRisk::Refused(_)
+    )
+}
+
+/// Record that a human answered `question` at another surface for the
+/// refusals of `harness_pid`, so the harness dialog does not ask it too.
+pub fn mark_answered(
+    dir: &Path,
+    workspace: &Path,
+    question: &Question,
+    harness_pid: Option<u32>,
+    now: u64,
+) -> Result<()> {
+    let answered = Answered {
+        dir: question.dir.clone(),
+        access: question.access,
+        at: now,
+        harness_pid,
+    };
+    update(dir, workspace, now, |asks| asks.answered.push(answered))
 }
 
 /// Record that `question` was put to the human in `session_id` for `command`,
@@ -541,6 +685,165 @@ mod tests {
         record_refusal(&dir, &ws, r).unwrap();
         assert_eq!(load(&dir, &ws, 100 + MAX_AGE_SECS + 1).refusals.len(), 0);
         assert_eq!(load(&dir, &ws, 101).refusals.len(), 1);
+    }
+
+    /// SPEC R-PERM.10(e): the TUI lists what no surface has answered, and an
+    /// answer there means the dialog does not ask it — for that harness
+    /// session. A later session's refusal of the same path is its own question.
+    #[test]
+    fn an_answer_at_the_tui_means_the_dialog_does_not_ask() {
+        let (root, dir, ws) = store();
+        let home = root.path().join("home");
+        let cache = home.join(".cache/neubit");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut r = refusal(&cache.join("heavy.lock.holder"), ScopeAccess::Rw);
+        r.harness_pid = Some(4242);
+        record_refusal(&dir, &ws, r.clone()).unwrap();
+        let none = |_: &Path, _: ScopeAccess| false;
+        let scopes = std::slice::from_ref(&ws);
+
+        let asks = load(&dir, &ws, 200);
+        let waiting = pending_questions(&asks, &none, Some(&home), scopes);
+        assert_eq!(waiting.len(), 1, "{waiting:?}");
+        assert_eq!(waiting[0].dir, cache);
+        let granted = |p: &Path, _: ScopeAccess| p.starts_with(&cache);
+        assert!(
+            pending_questions(&asks, &granted, Some(&home), scopes).is_empty(),
+            "a covered refusal is not waiting"
+        );
+
+        mark_answered(&dir, &ws, &waiting[0], Some(4242), 201).unwrap();
+        let asks = load(&dir, &ws, 202);
+        assert!(
+            pending_questions(&asks, &none, Some(&home), scopes).is_empty(),
+            "answered: no longer waiting"
+        );
+        assert!(
+            next_question(&asks, "s1", &none, Some(&home), scopes).is_none(),
+            "the dialog does not ask what the TUI answered"
+        );
+
+        let mut later = r;
+        later.harness_pid = Some(5151);
+        later.at = 203;
+        record_refusal(&dir, &ws, later).unwrap();
+        let asks = load(&dir, &ws, 204);
+        assert_eq!(
+            pending_questions(&asks, &none, Some(&home), scopes).len(),
+            1,
+            "another harness session's refusal waits again"
+        );
+        assert!(next_question(&asks, "s2", &none, Some(&home), scopes).is_some());
+    }
+
+    /// A question the dialog put to the human for a harness process leaves
+    /// the TUI's list; another process's refusal under it stays.
+    #[test]
+    fn a_question_the_dialog_asked_is_not_listed_for_that_harness() {
+        let (root, dir, ws) = store();
+        let home = root.path().join("home");
+        let cache = home.join(".cache/neubit");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut r = refusal(&cache.join("heavy.lock.holder"), ScopeAccess::Rw);
+        r.harness_pid = Some(4242);
+        record_refusal(&dir, &ws, r).unwrap();
+        let none = |_: &Path, _: ScopeAccess| false;
+        let scopes = std::slice::from_ref(&ws);
+        let asks = load(&dir, &ws, 200);
+        let q = next_question(&asks, "s1", &none, Some(&home), scopes).unwrap();
+        mark_asked(&dir, &ws, "s1", &q, "make heavy", Some(4242), 200).unwrap();
+
+        let asks = load(&dir, &ws, 201);
+        assert!(pending_questions(&asks, &none, Some(&home), scopes).is_empty());
+
+        let mut other = refusal(&cache.join("other.lock"), ScopeAccess::Rw);
+        other.harness_pid = Some(5151);
+        record_refusal(&dir, &ws, other).unwrap();
+        let asks = load(&dir, &ws, 202);
+        let waiting = pending_questions(&asks, &none, Some(&home), scopes);
+        assert_eq!(waiting.len(), 1, "{waiting:?}");
+        assert_eq!(waiting[0].covers, vec![cache.join("other.lock")]);
+    }
+
+    #[test]
+    fn load_all_reads_every_workspace_and_trusts_no_misnamed_file() {
+        let (root, dir, ws) = store();
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        record_refusal(
+            &dir,
+            &ws,
+            refusal(Path::new("/opt/a/x.db"), ScopeAccess::Rw),
+        )
+        .unwrap();
+        record_refusal(
+            &dir,
+            &other,
+            refusal(Path::new("/opt/b/y.db"), ScopeAccess::Rw),
+        )
+        .unwrap();
+        let stray = WorkspaceAsks {
+            workspace: root.path().join("elsewhere"),
+            refusals: vec![refusal(Path::new("/opt/c/z.db"), ScopeAccess::Rw)],
+            ..WorkspaceAsks::default()
+        };
+        std::fs::write(
+            dir.join("0000000000000000.json"),
+            serde_json::to_vec(&stray).unwrap(),
+        )
+        .unwrap();
+
+        let all = load_all(&dir, 200);
+        let got: Vec<PathBuf> = all.iter().map(|a| a.workspace.clone()).collect();
+        let mut want = vec![ws.clone(), other.clone()];
+        want.sort();
+        assert_eq!(got, want, "both workspaces, never the misnamed file");
+        assert!(load_all(&root.path().join("missing"), 200).is_empty());
+        assert!(
+            load_all(&dir, 100 + MAX_AGE_SECS + 1)
+                .iter()
+                .all(|a| a.refusals.is_empty()),
+            "expired refusals are dropped"
+        );
+    }
+
+    #[test]
+    fn a_grant_covers_its_workspace_and_access() {
+        let ws = PathBuf::from("/w/proj");
+        let g = |path: &str, access, workspace: Option<&str>| PersistentScope {
+            path: PathBuf::from(path),
+            access,
+            workspace: workspace.map(PathBuf::from),
+            granted_by: None,
+            granted_at: None,
+            note: None,
+            expires_at: None,
+        };
+        let p = Path::new("/c/neubit/lock");
+        assert!(grant_covers(
+            &[g("/c/neubit", ScopeAccess::Rw, None)],
+            &ws,
+            p,
+            ScopeAccess::Rw
+        ));
+        assert!(!grant_covers(
+            &[g("/c/neubit", ScopeAccess::Ro, None)],
+            &ws,
+            p,
+            ScopeAccess::Rw
+        ));
+        assert!(grant_covers(
+            &[g("/c/neubit", ScopeAccess::Ro, None)],
+            &ws,
+            p,
+            ScopeAccess::Ro
+        ));
+        assert!(!grant_covers(
+            &[g("/c/neubit", ScopeAccess::Rw, Some("/w/other"))],
+            &ws,
+            p,
+            ScopeAccess::Rw
+        ));
     }
 
     #[test]

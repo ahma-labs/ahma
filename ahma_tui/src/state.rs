@@ -1447,6 +1447,11 @@ pub struct ScopeGrantGate {
     /// [`GRANT_ARMING_DELAY`] after it are swallowed: they were typed for
     /// something else, not in answer to a question nobody has read yet.
     pub shown_at: std::time::Instant,
+    /// Set only for a question the TUI read from the terminal-hook records
+    /// itself (SPEC R-PERM.10(e)): its answer is applied here, never sent to
+    /// the hub. A request that arrives over the hub never sets it, whatever
+    /// its reason says.
+    pub harness: Option<crate::harness_asks::HarnessAsk>,
 }
 
 /// How long a grant question must be on screen before a key can grant it.
@@ -1466,7 +1471,16 @@ impl ScopeGrantGate {
             show_detail: false,
             advice: None,
             shown_at: std::time::Instant::now(),
+            harness: None,
         }
+    }
+
+    /// Build a gate for a question a refused terminal-hook command left for
+    /// the harness dialog (SPEC R-PERM.10(e)); the TUI answers it itself.
+    pub fn from_harness_ask(ask: crate::harness_asks::HarnessAsk) -> Self {
+        let mut gate = Self::from_request(ask.request());
+        gate.harness = Some(ask);
+        gate
     }
 
     /// Whether a granting key may answer yet ([`GRANT_ARMING_DELAY`]).

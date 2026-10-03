@@ -139,6 +139,9 @@ pub async fn run(
     // fallback work from what is actually running rather than a startup
     // snapshot.
     let mut last_discovery = std::time::Instant::now();
+    // Questions a refused terminal-hook command left for the harness dialog
+    // (SPEC R-PERM.10(e)), re-read on the tick; `None` reads on the first one.
+    let mut last_harness_ask_poll: Option<std::time::Instant> = None;
     // Populate the external MCP tools counter at startup (avoids needing `/mcp refresh`).
     crate::llm_bridge::spawn_external_tools_refresh(
         state.mcp_connections.clone(),
@@ -318,6 +321,16 @@ pub async fn run(
                     }
                     update_scroll_animations(&mut state);
                 }
+            }
+
+            // Checked on every pass, not only on the idle tick, so a busy
+            // event stream cannot starve it; the read itself is throttled.
+            let now = std::time::Instant::now();
+            if last_harness_ask_poll
+                .is_none_or(|t| now.duration_since(t) >= crate::harness_asks::POLL_EVERY)
+            {
+                last_harness_ask_poll = Some(now);
+                sync_harness_asks(&mut state, crate::harness_asks::pending());
             }
 
             // Drain the ready backlog from the event channels before drawing,
@@ -2691,6 +2704,46 @@ fn show_next_scope_grant(state: &mut crate::state::AppState) {
     });
 }
 
+/// Bring the terminal-hook questions in the grant queue in line with the
+/// records (SPEC R-PERM.10(e)): a new one waits its turn like any other grant
+/// question (R-PERM.3.5), and one no longer waiting — asked in the harness
+/// dialog, covered by a grant, answered in another TUI, or its harness gone —
+/// is withdrawn wherever it is, as the hub withdraws a question (R5.3.3).
+fn sync_harness_asks(
+    state: &mut crate::state::AppState,
+    pending: Vec<crate::harness_asks::HarnessAsk>,
+) {
+    let ids: std::collections::HashSet<String> = pending
+        .iter()
+        .map(crate::harness_asks::HarnessAsk::decision_id)
+        .collect();
+    let withdrawn =
+        |g: &crate::state::ScopeGrantGate| g.harness.is_some() && !ids.contains(&g.decision_id);
+    state.scope_grant_queue.retain(|g| !withdrawn(g));
+    if state.scope_grant.as_ref().is_some_and(withdrawn) {
+        show_next_scope_grant(state);
+    }
+    for ask in pending {
+        let id = ask.decision_id();
+        let known = state
+            .scope_grant
+            .iter()
+            .chain(state.scope_grant_queue.iter())
+            .any(|g| g.decision_id == id);
+        if known {
+            continue;
+        }
+        let gate = crate::state::ScopeGrantGate::from_harness_ask(ask);
+        let request = gate.request.clone();
+        if state.scope_grant.is_none() {
+            state.scope_grant = Some(gate);
+        } else {
+            state.scope_grant_queue.push_back(gate);
+        }
+        spawn_grant_advisor(state, request);
+    }
+}
+
 /// Resolve the pending scope-grant prompt: send the decision to the hub, where
 /// the owning instance applies it to its live session (and writes it at the
 /// `always` tier, bound to that session's workspace), and log it.
@@ -2705,6 +2758,31 @@ fn resolve_scope_grant(
         return;
     };
     show_next_scope_grant(state);
+
+    // A question read from the terminal-hook records has no instance behind
+    // it: the TUI applies the answer itself (SPEC R-PERM.10(e)).
+    if let Some(ask) = &gate.harness {
+        let (level, message) = match crate::harness_asks::answer(ask, decision) {
+            Ok(line) => (
+                if decision.within_offer(gate.reason) == GrantDecision::Deny {
+                    LogLevel::Warn
+                } else {
+                    LogLevel::Info
+                },
+                line,
+            ),
+            Err(e) => (
+                LogLevel::Warn,
+                format!("Could not apply the answer for {}: {e:#}", gate.path),
+            ),
+        };
+        state.push_log(LogEntry {
+            timestamp: chrono::Local::now(),
+            level,
+            message,
+        });
+        return;
+    }
 
     let advice_line = gate.advice.as_ref().map(|a| a.line());
     let advice_followed = gate.advice.as_ref().map(|a| a.matches(decision));
@@ -7923,6 +8001,132 @@ mod tests {
             &mut state,
         ));
         assert!(state.scope_grant.is_none(), "y answers it for the session");
+    }
+
+    /// A terminal-hook question as the TUI lists it (SPEC R-PERM.10(e)).
+    fn harness_ask(root: &std::path::Path, n: u32) -> crate::harness_asks::HarnessAsk {
+        crate::harness_asks::HarnessAsk {
+            workspace: root.join("ws"),
+            question: ahma_common::harness_asks::Question {
+                dir: root.join(format!("cache-{n}")),
+                access: ahma_common::config::ScopeAccess::Rw,
+                covers: vec![root.join(format!("cache-{n}")).join("x.lock")],
+            },
+            harness_pid: std::process::id(),
+        }
+    }
+
+    /// SPEC R-PERM.10(e) with R-PERM.3.5: a terminal-hook question waits
+    /// behind the open one, is queued once however often it is read, and is
+    /// withdrawn wherever it is once it stops waiting; hub questions stay.
+    #[test]
+    fn harness_questions_join_the_grant_queue_and_leave_when_no_longer_waiting() {
+        use crate::state::AppState;
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = (harness_ask(root.path(), 1), harness_ask(root.path(), 2));
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(gate_with_id("hub"));
+        super::sync_harness_asks(&mut state, vec![a.clone(), b.clone()]);
+        super::sync_harness_asks(&mut state, vec![a.clone(), b.clone()]);
+        assert_eq!(
+            state.scope_grant.as_ref().unwrap().decision_id,
+            "hub",
+            "never replaces the open question"
+        );
+        assert_eq!(state.scope_grant_queue.len(), 2, "each once");
+        super::sync_harness_asks(&mut state, vec![b.clone()]);
+        assert_eq!(state.scope_grant_queue.len(), 1);
+        assert_eq!(state.scope_grant_queue[0].decision_id, b.decision_id());
+        assert_eq!(state.scope_grant.as_ref().unwrap().decision_id, "hub");
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::sync_harness_asks(&mut state, vec![a.clone()]);
+        assert_eq!(
+            state.scope_grant.as_ref().map(|g| g.decision_id.clone()),
+            Some(a.decision_id()),
+            "with nothing open it takes the screen"
+        );
+        let mut waited = gate_with_id("hub");
+        waited.shown_at = std::time::Instant::now() - crate::state::GRANT_ARMING_DELAY * 4;
+        state.scope_grant_queue.push_back(waited);
+        super::sync_harness_asks(&mut state, vec![]);
+        let shown = state.scope_grant.as_ref().expect("the next one");
+        assert_eq!(shown.decision_id, "hub");
+        assert!(
+            !shown.armed(),
+            "the question that replaced a withdrawn one is unread"
+        );
+    }
+
+    /// Its keys are the ones it offers — no once — and an answer is applied
+    /// by the TUI and recorded, so the harness dialog does not ask it too.
+    #[test]
+    fn a_harness_question_offers_no_once_key_and_is_answered_here() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let root = tempfile::tempdir().unwrap();
+        let ask = harness_ask(root.path(), 1);
+        let mut gate = crate::state::ScopeGrantGate::from_harness_ask(ask.clone());
+        gate.shown_at = std::time::Instant::now() - crate::state::GRANT_ARMING_DELAY * 2;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(gate);
+        for c in ['o', 'w'] {
+            assert!(
+                !super::handle_scope_grant_key(
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                    &mut state
+                ),
+                "{c} (once) is not offered"
+            );
+            assert!(state.scope_grant.is_some(), "{c} answered nothing");
+        }
+        assert!(super::handle_scope_grant_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut state,
+        ));
+        assert!(state.scope_grant.is_none());
+        let line = &state.log.back().expect("logged").message;
+        assert!(line.contains("will not ask about it again"), "{line}");
+        let dir = ahma_common::harness_asks::default_dir().expect("a runtime dir under test");
+        let recorded = ahma_common::harness_asks::load(
+            &dir,
+            &ask.workspace,
+            ahma_common::session_grants::now_secs(),
+        );
+        assert_eq!(recorded.answered.len(), 1, "{recorded:?}");
+        assert_eq!(recorded.answered[0].dir, ask.question.dir);
+    }
+
+    /// The modal shows the shared body for it: who asks is the terminal hook,
+    /// and no once choice is drawn.
+    #[test]
+    fn a_harness_question_renders_the_shared_body() {
+        use crate::state::AppState;
+        let root = tempfile::tempdir().unwrap();
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(crate::state::ScopeGrantGate::from_harness_ask(harness_ask(
+            root.path(),
+            1,
+        )));
+        let theme = crate::theme::Theme::new(true);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
+        terminal
+            .draw(|f| crate::ui::draw(f, &state, &theme))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(screen.contains("Allow read+write access to"), "{screen}");
+        assert!(screen.contains("terminal hook"), "{screen}");
+        assert!(!screen.contains("next command only"), "{screen}");
     }
 
     /// `y` widens to read+write, clears the gate, and is consumed even with chat

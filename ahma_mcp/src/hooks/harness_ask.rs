@@ -86,25 +86,6 @@ pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess) {
     }
 }
 
-/// Whether a grant in `granted` already lets a command in `workspace` reach
-/// `path` with `access`.
-fn covered(
-    granted: &[PersistentScope],
-    workspace: &Path,
-    path: &Path,
-    access: ScopeAccess,
-) -> bool {
-    granted.iter().any(|g| {
-        let applies = g
-            .workspace
-            .as_deref()
-            .is_none_or(|w| workspace.starts_with(w));
-        let root = ahma_common::config::expand_home(&g.path);
-        let root = dunce::canonicalize(&root).unwrap_or(root);
-        applies && (g.access.is_write() || !access.is_write()) && path.starts_with(&root)
-    })
-}
-
 /// The question to put to the human before the next command in `cwd`, in
 /// harness session `session_id`, with the token that approves it. Recording
 /// the question is what makes it the only time it is asked this session.
@@ -132,16 +113,16 @@ pub(super) fn next_ask(
     let mut granted = persistent.to_vec();
     granted.extend(crate::sandbox::session_scopes_for(&scopes));
     let home = ahma_common::config::ahma_home_dir().map(|h| dunce::canonicalize(&h).unwrap_or(h));
-    let is_covered = |p: &Path, a: ScopeAccess| covered(&granted, &workspace, p, a);
+    let is_covered =
+        |p: &Path, a: ScopeAccess| harness_asks::grant_covers(&granted, &workspace, p, a);
     let question =
         harness_asks::next_question(&asks, session_id, &is_covered, home.as_deref(), &scopes)?;
     // A grant must outlive this hook: without the harness's pid nothing can
     // bound it, so nothing is asked and the one-line note stays the answer.
-    let pid = asks
-        .refusals
-        .iter()
-        .find_map(|r| r.harness_pid)
-        .or_else(harness_pid)?;
+    // The harness asking now is the one whose dialog shows the question, so
+    // its life bounds the grant. A stored pid is only a fallback: it may be a
+    // harness that has exited, or another window on the same workspace.
+    let pid = harness_pid().or_else(|| asks.refusals.iter().find_map(|r| r.harness_pid))?;
     let token = harness_asks::mark_asked(
         &dir,
         &workspace,
@@ -325,6 +306,47 @@ mod tests {
         assert!(again.contains("already used"), "{again}");
     }
 
+    /// The question's grant is bound to the harness asking now, never to a
+    /// pid stored with an older refusal (a harness that has exited, or another
+    /// window on the same workspace).
+    #[test]
+    fn the_grant_is_bound_to_the_harness_asking_now() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let cache = tmp.path().join("tool-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cache = dunce::canonicalize(&cache).unwrap();
+        let dir = harness_asks::default_dir().unwrap();
+        let stale = u32::MAX - 7;
+        harness_asks::record_refusal(
+            &dir,
+            &workspace_for(&ws),
+            Refusal {
+                path: cache.join("lock"),
+                grant_dir: cache.clone(),
+                access: ScopeAccess::Rw,
+                at: ahma_common::session_grants::now_secs(),
+                harness_pid: Some(stale),
+            },
+        )
+        .unwrap();
+        let live = harness_pid().expect("the test runner has a parent");
+        next_ask(&ws, "s-live", "make", &[]).expect("a question");
+        let asks = harness_asks::load(
+            &dir,
+            &workspace_for(&ws),
+            ahma_common::session_grants::now_secs(),
+        );
+        let asked = asks
+            .asked
+            .iter()
+            .find(|a| a.session_id == "s-live")
+            .unwrap();
+        assert_eq!(asked.harness_pid, Some(live), "not the stale {stale}");
+    }
+
     #[test]
     fn a_command_carrying_a_token_of_its_own_is_refused() {
         use super::super::{HookScope, HooksDecision, compute_exec_decision_internal};
@@ -357,45 +379,6 @@ mod tests {
         ));
         assert!(!carries_approval(
             "'/x/ahma' 'hooks' 'run-shell' '--command' 'make'"
-        ));
-    }
-
-    #[test]
-    fn a_grant_covers_its_workspace_and_access() {
-        let ws = PathBuf::from("/w/proj");
-        let g = |path: &str, access, workspace: Option<&str>| PersistentScope {
-            path: PathBuf::from(path),
-            access,
-            workspace: workspace.map(PathBuf::from),
-            granted_by: None,
-            granted_at: None,
-            note: None,
-            expires_at: None,
-        };
-        let p = Path::new("/c/neubit/lock");
-        assert!(covered(
-            &[g("/c/neubit", ScopeAccess::Rw, None)],
-            &ws,
-            p,
-            ScopeAccess::Rw
-        ));
-        assert!(!covered(
-            &[g("/c/neubit", ScopeAccess::Ro, None)],
-            &ws,
-            p,
-            ScopeAccess::Rw
-        ));
-        assert!(covered(
-            &[g("/c/neubit", ScopeAccess::Ro, None)],
-            &ws,
-            p,
-            ScopeAccess::Ro
-        ));
-        assert!(!covered(
-            &[g("/c/neubit", ScopeAccess::Rw, Some("/w/other"))],
-            &ws,
-            p,
-            ScopeAccess::Rw
         ));
     }
 
