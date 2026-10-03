@@ -30,35 +30,33 @@ subtly wrong on its own.*
   (`supports_progress`, request budget) off it, so it is never normalized.
 - Every timeout is supplied by the caller; nothing is hardcoded here.
 - `delete_session` ends a session with `DELETE /mcp` (R8.3.6).
-- Every POST retries per root SPEC R-HTTP: a request that never arrived, or that the server
-  answered 429/503 (overloaded, or not ready yet), is re-sent; a timeout or 5xx is re-sent only for the
-  read-only `*/list` methods, never for `tools/call` or `initialize`. A retried request keeps
-  its JSON-RPC id. A final failure is a `ServiceError` naming "the MCP server at host:port";
-  callers that know better (the agent: "the ahma hub") re-attribute it with
-  `ServiceError::for_service`. `with_retry_policy` overrides the default policy.
+- Every POST retries per root SPEC R-HTTP (R-HTTP.2; `initialize` and `tools/call` are
+  never re-sent after an interruption). A retried request keeps its JSON-RPC id. A final
+  failure is a `ServiceError` naming "the MCP server at host:port"; callers that know better
+  (the agent: "the ahma hub") re-attribute it with `ServiceError::for_service`.
+  `with_retry_policy` overrides the default policy.
 - JSON-RPC request ids are unique across **every** client in the process, not per client:
   callers `attach` a fresh client per call against one shared session and run calls
   concurrently, and the bridge refuses an id that is already in flight (R8.3.7).
 
 **Other transports**
 - `client::HttpMcpTransport`: an `rmcp` `Transport` over HTTP POST + SSE for external MCP
-  servers, with optional OAuth 2.0 authorization-code + PKCE. The OAuth endpoints are
-  currently Atlassian's (`auth.atlassian.com`). The callback listens on `127.0.0.1` only.
+  servers, with optional OAuth 2.0 authorization-code + PKCE. The callback listens on
+  `127.0.0.1` only.
 - Tokens persist in `~/.ahma/mcp_http_token.json` (file `0600`, directory `0700` on Unix),
-  outside every sandbox scope. The retired `AHMA_HTTP_CLIENT_TOKEN_PATH` is ignored with a
-  warning (R-CFG1.2).
+  outside every sandbox scope. `AHMA_HTTP_CLIENT_TOKEN_PATH` is ignored with a warning
+  (R-CFG1.2).
 - `local_socket_client`: the same Streamable HTTP transport over an `AF_UNIX` socket, on
-  every OS including Windows (through `ahma_common::local_socket`), for the per-user
-  hub's MCP endpoint (root SPEC R-HUB.2) and `ahma serve unix`. rmcp's own
-  `UnixSocketHttpClient` is built on `tokio::net::UnixStream` and does not exist on
-  Windows; this is that client with only the connect replaced.
+  every OS including Windows (through `ahma_common::local_socket`), for the per-user hub's
+  MCP endpoint (root SPEC R-HUB.2) and `ahma serve unix`. It is rmcp's
+  `UnixSocketHttpClient` with only the connect replaced, since rmcp's uses
+  `tokio::net::UnixStream`, which does not exist on Windows.
 - `http_client::HttpClient`: how `streamable` sends. It builds every request with
-  `reqwest` and sends it through `reqwest` over TCP, or through hyper over the local
-  socket for a `unix://` base URL, returning an ordinary `reqwest::Response` with its
-  body streaming either way. `reqwest` reaches an `AF_UNIX` socket only on Unix and its
-  connector cannot be replaced, so this is what lets the TUI and the agent attach to the
-  hub on Windows. Both transports are retried by the same rules (R-HTTP.2): a failed
-  connect never delivered the request; anything later may have.
+  `reqwest` and sends it through `reqwest` over TCP, or through hyper over the local socket
+  for a `unix://` base URL, returning an ordinary `reqwest::Response` with its body
+  streaming either way; this is what lets the TUI and the agent reach the hub on Windows,
+  where `reqwest` cannot reach an `AF_UNIX` socket. Both transports are retried by the same
+  rules (R-HTTP.2): a failed connect never delivered the request; anything later may have.
 
 ## 3. Non-Functional Requirements
 
@@ -68,4 +66,5 @@ subtly wrong on its own.*
 ## 4. Out of Scope
 
 - Hosting an MCP endpoint (`ahma_http_bridge`).
-- OAuth token refresh and provider-configurable OAuth endpoints (not implemented).
+- Configurable OAuth endpoints and token refresh: the OAuth endpoints are fixed to
+  Atlassian's (`auth.atlassian.com`), and there is no token refresh.

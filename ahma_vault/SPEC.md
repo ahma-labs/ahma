@@ -16,8 +16,9 @@ easy one.* User guide: [docs/task-vault.md](../docs/task-vault.md).
 - `TaskVault::create_at(root)` creates (or reuses, never overwriting the audit log) the
   layout `inputs/`, `workdir/`, `outputs/`, `trash/`, `audit.jsonl`. `TaskVault::create`
   picks `~/.ahma/tasks/<utc>-<slug>-<hex>/`.
-- With `--task-vault <root>`, `workdir/` is the primary sandbox scope, and `trash/` and
-  `audit.jsonl` are the only other writable paths (`ahma_mcp::shell::cli`).
+- With `--task-vault <root>` (or `[sandbox] task_vault`), the sandbox scopes are exactly
+  `workdir/` (the primary scope), `trash/` and `audit.jsonl`; `inputs/` and `outputs/` are
+  outside them (`resolve_sandbox_scopes` in `ahma_mcp::shell::cli`).
 - `rm_interceptor::RmInterceptor` recognises `rm` commands and moves their targets into
   `trash/` instead of deleting them; `trash::TrashManager` stages, lists and purges.
 - `audit::AuditEvent` is the append-only JSONL wire format. The execution audit log

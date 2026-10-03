@@ -65,10 +65,8 @@ product rules this crate implements; the list below is what this crate must guar
 - Always present: `status`, `await`, `cancel`, `run_terminal_command`, `restart`,
   `sandbox_grant`, `logs_list`/`logs_read`/`logs_search`/`logs_approve`, `log_monitor`,
   `fetch_webpage`, `agent`.
-- Harness file tools — `read_file`, `write_file`, `replace_in_file`, `multi_edit`,
-  `apply_patch`, `list_dir`, `file_search`, `grep_search`, `todo_write` — are **withheld
-  from clients that ship native equivalents** (`client_type::has_native_file_tools`), so a
-  client never has two ways to edit a file (R26).
+- Harness file tools (R26) are withheld from clients that ship native equivalents
+  (`client_type::has_native_file_tools`).
 - `status`, `await`, `cancel`, `sandbox_grant`, `restart` and `todo_write` may run before
   the sandbox scope settles; every other tool waits for it (R5.1.2).
 - `agent` is not offered inside ahma's own agent loop, so a run cannot recurse into itself.
@@ -76,15 +74,15 @@ product rules this crate implements; the list below is what this crate must guar
   failure-loop detection) is always on.
 
 **Supply chain**
-- `ahma bundle audit|checksum|verify` expose `ahma_bundle`. The checksum manifest detects
-  corruption only; it is unsigned and **must not** be described as a signature anywhere.
+- `ahma bundle audit|checksum|verify` expose `ahma_bundle`; what the checksum manifest does
+  and does not prove is stated in [ahma_bundle/SPEC.md](../ahma_bundle/SPEC.md).
 
 ## 3. Non-Functional Requirements
 
-- **Latency**: trivial async dispatch (start → terminal event) stays well under 1 s
-  (~6 ms median today). Guarded by the ignored `latency_guard_test` benchmarks.
+- **Latency**: trivial async dispatch (start → terminal event) stays under 1 s; budget
+  enforced by the ignored `latency_guard_test` benchmarks (R3.1).
 - **Streaming cost**: per-line handling (redaction, bounded collection, spill, events)
-  handles 5 000 lines in under 10 s (~37 ms today).
+  handles 5 000 lines in under 10 s; budget enforced by the same benchmarks.
 - **Path security**: every user-supplied path is validated through `path_security`
   (`dunce::canonicalize`, no traversal or symlink escape) before the kernel ever sees it.
 - **Async hygiene**: no blocking I/O in async code (AGENTS.md).

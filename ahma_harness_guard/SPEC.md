@@ -12,9 +12,11 @@ retry loops stopped, so that one malformed call does not burn my whole turn budg
 
 ## 2. Acceptance Criteria
 
-- `heal_tool_name` maps an unknown tool name to a known one within Levenshtein distance 2.
-- `heal_tool_arguments` repairs common argument-shape mistakes (for example a string where
-  an array is expected); `clean_json_trailing_commas` repairs trailing-comma JSON.
+- `heal_tool_name` and `heal_tool_arguments` map other harnesses' tool and argument names
+  as root R26.6 requires (`TOOL_ALIASES`, `rename_args`). Beyond that, `heal_tool_name` maps
+  an unknown name to a known one within Levenshtein distance 2, and `heal_tool_arguments`
+  repairs argument-shape mistakes (for example a string where an array is expected);
+  `clean_json_trailing_commas` repairs trailing-comma JSON.
 - `LoopDetector` blocks a call repeated identically after it has failed 3 times, answering
   with a `LOOP_DETECTED` message; a success resets the count.
 - `HarnessGuard` runs these as an ordered pipeline of `ToolGuard`s (name healing, argument

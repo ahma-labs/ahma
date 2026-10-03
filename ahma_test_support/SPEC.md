@@ -7,7 +7,7 @@
 
 ## 1. User Story / Problem Statement
 
-*As a test anywhere in the workspace, I want platform-correct path helpers, so that tests do not hardcode `/tmp` or `/dev/null` and then fail on the Windows CI runner — the single most common source of platform-only test breakage.*
+*As a test anywhere in the workspace, I want platform-correct path helpers, so that tests do not hardcode `/tmp` or `/dev/null` and then fail on the Windows CI runner.*
 
 ## 2. Acceptance Criteria
 
