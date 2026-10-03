@@ -5303,7 +5303,7 @@ mod tests {
     /// or not its own sandbox is on — a session ran unsandboxed for days on
     /// exactly that false inference. The full (impure) decision path is
     /// exercised: real env, real consent/disclosure stores (pointed at this
-    /// test's own runtime directory via XDG_RUNTIME_DIR), hooks forced active.
+    /// test's own runtime directory via its own test home), hooks forced active.
     fn assert_rewrites_under_marker(marker: &str) {
         let temp = tempdir().unwrap();
         // nextest runs each test in its own process, so env mutation is local.
@@ -5318,6 +5318,9 @@ mod tests {
             // let parallel tests race on the same disclosure marker.
             std::env::set_var("XDG_RUNTIME_DIR", temp.path().join("run"));
             std::env::set_var("LOCALAPPDATA", temp.path().join("local"));
+            // Under the test harness Unix ignores XDG_RUNTIME_DIR for the
+            // private test home (SPEC R-ISO.1); give this process its own.
+            std::env::set_var("AHMA_TEST_HOME", temp.path().join("home"));
         }
         let env = test_env();
         let cwd = temp.path().join("proj");

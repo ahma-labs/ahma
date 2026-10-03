@@ -38,35 +38,34 @@ pub(super) fn workspace_for(cwd: &Path) -> PathBuf {
 /// Its life bounds a session grant approved in its dialog. `None` when it
 /// cannot be found, and then nothing is asked, because nothing could bound it.
 pub(super) fn harness_pid() -> Option<u32> {
-    #[cfg(unix)]
-    {
-        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-        const PASS_THROUGH: &[&str] = &[
-            "sh", "bash", "zsh", "dash", "fish", "ksh", "env", "ahma", "timeout",
-        ];
-        let mut sys = System::new();
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing(),
-        );
-        // SAFETY: getppid cannot fail.
-        let mut pid = Pid::from_u32(unsafe { libc::getppid() } as u32);
-        for _ in 0..8 {
-            let proc = sys.process(pid)?;
-            let name = proc.name().to_string_lossy().to_ascii_lowercase();
-            let name = name.trim_start_matches('-');
-            if !PASS_THROUGH.contains(&name) {
-                return (pid.as_u32() > 1).then_some(pid.as_u32());
-            }
-            pid = proc.parent()?;
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    const PASS_THROUGH: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "fish",
+        "ksh",
+        "env",
+        "ahma",
+        "timeout",
+        "cmd",
+        "pwsh",
+        "powershell",
+    ];
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let mut pid = sys.process(Pid::from_u32(std::process::id()))?.parent()?;
+    for _ in 0..8 {
+        let proc = sys.process(pid)?;
+        let name = proc.name().to_string_lossy().to_ascii_lowercase();
+        let name = name.trim_start_matches('-').trim_end_matches(".exe");
+        if !PASS_THROUGH.contains(&name) {
+            return (pid.as_u32() > 1).then_some(pid.as_u32());
         }
-        None
+        pid = proc.parent()?;
     }
-    #[cfg(not(unix))]
-    {
-        None
-    }
+    None
 }
 
 /// Remember that a hooked command in `cwd`'s workspace was refused `path`.
