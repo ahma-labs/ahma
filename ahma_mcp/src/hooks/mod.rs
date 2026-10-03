@@ -13,6 +13,7 @@ use tempfile::NamedTempFile;
 
 mod consent;
 pub mod edit_guard;
+pub mod native_terminal;
 pub use consent::HookConsentStore;
 
 pub mod post_exec;
