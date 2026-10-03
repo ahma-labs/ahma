@@ -464,7 +464,8 @@ mod nested_and_sccache_tests {
         let hit = diagnose(stderr).expect("macro plugin refusal should match");
         assert_eq!(hit.kind, ContaminationKind::NestedSandbox);
         assert!(
-            hit.remediation.contains("OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox"),
+            hit.remediation
+                .contains("OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox"),
             "{}",
             hit.remediation
         );
