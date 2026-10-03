@@ -1216,6 +1216,110 @@ DispatchQueue.main.asyncAfter(deadline: .now() + 30) { print("TIMEOUT"); exit(0)
 app.run()
 "#;
 
+/// A sandboxed command can allocate and use a pseudo-terminal of its own
+/// (SPEC R6.2.11): `script` runs a command on one. The iOS test runner needs
+/// the same, and failed with `openpty: Operation not permitted`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandboxed_command_can_open_its_own_terminal() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+    let scope = TempDir::new().expect("scope dir");
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    let out = Command::new("sandbox-exec")
+        .args([
+            "-p",
+            &profile,
+            "script",
+            "-q",
+            "/dev/null",
+            "echo",
+            "on-a-tty",
+        ])
+        .current_dir(scope.path())
+        .output()
+        .expect("run script");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && all.contains("on-a-tty") && !all.contains("openpty"),
+        "script under the profile: {all}"
+    );
+}
+
+/// The other half of SPEC R6.2.11: a terminal the command did not allocate,
+/// such as the user's own shell, stays unreachable. The test allocates one
+/// outside the sandbox and the sandboxed command must not write to it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandboxed_command_cannot_reach_another_terminal() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+    let (mut master, mut slave) = (-1, -1);
+    let mut name = [0 as libc::c_char; 128];
+    // SAFETY: `name` is large enough for a pty path, and the null termios and
+    // winsize pointers are documented as "use defaults".
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            name.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty outside the sandbox");
+    // SAFETY: openpty wrote a NUL-terminated path into `name`.
+    let tty = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let write_to_tty = format!("echo injected > {tty}");
+
+    // Baseline: unsandboxed, the write lands (else there is nothing to prove).
+    let baseline = Command::new("sh")
+        .args(["-c", &write_to_tty])
+        .status()
+        .expect("run sh");
+    assert!(baseline.success(), "unsandboxed write to {tty}");
+
+    let scope = TempDir::new().expect("scope dir");
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    let out = Command::new("sandbox-exec")
+        .args(["-p", &profile, "sh", "-c", &write_to_tty])
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandboxed sh");
+    // SAFETY: both fds came from the successful openpty above.
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+    assert!(
+        !out.status.success(),
+        "a sandboxed command wrote to a terminal it did not open ({tty}): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// SPEC R6.2.8: a sandboxed command can see processes. `/bin/ps` is setuid
 /// root and no sandbox can exec a setuid binary (a kernel rule), so the
 /// profile grants `process-info*` for `pgrep`/`lsof` and ahma ships `ahma ps`.
