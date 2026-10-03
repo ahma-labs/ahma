@@ -1255,6 +1255,30 @@ struct PendingApproval {
 /// hub without one (embedded in a test, say) refuses the request.
 type ExitHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// A question an instance raised that no surface has answered yet.
+#[derive(Debug, Clone)]
+struct PendingQuestion {
+    decision_id: String,
+    instance_id: String,
+    /// The relay exactly as the instance sent it, so a replay is the same
+    /// message a TUI that was already open received.
+    relay: HubRelay,
+}
+
+impl PendingQuestion {
+    /// The message that withdraws this question from every TUI.
+    fn dismiss(&self) -> HubMsg {
+        match self.relay {
+            HubRelay::WebApprovalRequested { .. } => HubMsg::WebApprovalDismiss {
+                decision_id: self.decision_id.clone(),
+            },
+            _ => HubMsg::ScopeGrantDismiss {
+                decision_id: self.decision_id.clone(),
+            },
+        }
+    }
+}
+
 struct Hub {
     instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
     instance_txs: Arc<Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<HubMsg>>>>,
@@ -1277,6 +1301,11 @@ struct Hub {
     /// `decision_id` → the instance that raised it, so an answer is routed
     /// back to the session that asked the question.
     pending_decisions: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Scope-grant and web-approval questions still waiting for an answer,
+    /// oldest first, with the instance that asked. Replayed to a TUI that
+    /// opens while they wait, and dismissed at every TUI when the asking
+    /// instance goes (SPEC R-PERM.3.7).
+    pending_questions: Mutex<Vec<PendingQuestion>>,
     /// Instances that have disconnected but whose operations are still inside
     /// the replay window, stamped with when they went (SPEC R-HUB.7).
     ///
@@ -1308,12 +1337,34 @@ impl Hub {
                 pending_approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 session_ids: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 pending_decisions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                pending_questions: Mutex::new(Vec::new()),
                 ended_instances: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 exit_hook: parking_lot::Mutex::new(None),
                 history: parking_lot::Mutex::new(None),
             },
             rx,
         )
+    }
+
+    /// Keep an unanswered question so a TUI that opens later is shown it.
+    /// A repeat of the same decision replaces nothing.
+    async fn remember_question(&self, decision_id: &str, instance_id: &str, relay: &HubRelay) {
+        let mut pending = self.pending_questions.lock().await;
+        if !pending.iter().any(|q| q.decision_id == decision_id) {
+            pending.push(PendingQuestion {
+                decision_id: decision_id.to_string(),
+                instance_id: instance_id.to_string(),
+                relay: relay.clone(),
+            });
+        }
+    }
+
+    /// Drop a question once it is answered or withdrawn.
+    async fn forget_question(&self, decision_id: &str) {
+        self.pending_questions
+            .lock()
+            .await
+            .retain(|q| q.decision_id != decision_id);
     }
 
     /// Tell every instance how many TUIs are watching (SPEC R-PERM.3.6).
@@ -2446,10 +2497,12 @@ async fn serve_instance<R, W>(
                     }
                     Ok(ClientMsg::ScopeGrantResolved { decision_id }) => {
                         hub.pending_decisions.lock().await.remove(&decision_id);
+                        hub.forget_question(&decision_id).await;
                         let _ = hub.broadcast.send(HubMsg::ScopeGrantDismiss { decision_id });
                     }
                     Ok(ClientMsg::WebApprovalResolved { decision_id }) => {
                         hub.pending_decisions.lock().await.remove(&decision_id);
+                        hub.forget_question(&decision_id).await;
                         let _ = hub.broadcast.send(HubMsg::WebApprovalDismiss { decision_id });
                     }
                     // Everything the hub forwards untouched. One arm, so a new
@@ -2486,12 +2539,14 @@ async fn serve_instance<R, W>(
                                     .lock()
                                     .await
                                     .insert(request.decision_id.clone(), id.clone());
+                                hub.remember_question(&request.decision_id, &id, &relay).await;
                             }
                             HubRelay::WebApprovalRequested { request } => {
                                 hub.pending_decisions
                                     .lock()
                                     .await
                                     .insert(request.decision_id.clone(), id.clone());
+                                hub.remember_question(&request.decision_id, &id, &relay).await;
                             }
                             _ => {}
                         }
@@ -2555,6 +2610,17 @@ async fn serve_instance<R, W>(
         .lock()
         .await
         .retain(|_, owner| owner != &id);
+    // Its unanswered questions can no longer be answered: take them off
+    // every TUI rather than leave a modal whose answer reaches nobody.
+    let orphaned: Vec<PendingQuestion> = {
+        let mut pending = hub.pending_questions.lock().await;
+        let (gone, kept) = pending.drain(..).partition(|q| q.instance_id == id);
+        *pending = kept;
+        gone
+    };
+    for q in orphaned {
+        let _ = hub.broadcast.send(q.dismiss());
+    }
     // The operation history deliberately stays (SPEC R-HUB.7): it ages out
     // of the replay window instead, so work done by a session that has since
     // closed — or by a hook, which is an instance for the length of one
@@ -2636,6 +2702,13 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let mut backlog = hub.replay_events().await;
+    backlog.extend(
+        hub.pending_questions
+            .lock()
+            .await
+            .iter()
+            .map(|q| HubMsg::Relay(q.relay.clone())),
+    );
     backlog.extend(
         hub.pending_approvals
             .lock()
@@ -3442,6 +3515,113 @@ mod tests {
             .await
             .expect("the hub binds a fresh socket");
         tokio::spawn(async move { server.serve().await });
+    }
+
+    /// A TUI that opens while a question waits is shown it; an answered
+    /// question is not replayed; and when the asking instance goes, every TUI
+    /// is told to take its questions down (SPEC R-PERM.3.7).
+    #[tokio::test]
+    async fn waiting_questions_reach_a_late_tui_and_leave_with_their_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hub.sock");
+        start_hub(&sock).await;
+
+        let inst = connect_to_hub_at(&sock).await.expect("connect instance");
+        let (ir, mut iw) = tokio::io::split(inst);
+        send_msg(
+            &mut iw,
+            &ClientMsg::Register {
+                pid: std::process::id(),
+                mode: "stdio".to_string(),
+                scope: "/test/scope".to_string(),
+                label: "TestInstance".to_string(),
+                client: None,
+                session_id: None,
+                client_pid: None,
+                sampling: false,
+                elicitation: false,
+                scopes: vec![],
+                read_scopes: vec![],
+                grants: vec![],
+                enforcement: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ask = |id: &str| {
+            ClientMsg::Relay(HubRelay::ScopeGrantRequested {
+                request: crate::scope_grant::ScopeGrantRequest {
+                    decision_id: id.into(),
+                    path: std::path::PathBuf::from("/opt/x"),
+                    access: crate::config::ScopeAccess::Rw,
+                    reason: crate::scope_grant::GrantReason::StderrHeuristic,
+                    tool: Some("sccache".into()),
+                    context: Default::default(),
+                },
+            })
+        };
+        // An early TUI is the sync point: once it has seen the answered
+        // question dismissed, the hub has handled every message before it.
+        let early = connect_to_hub_at(&sock).await.expect("connect early TUI");
+        let (er, mut ew) = tokio::io::split(early);
+        let mut erdr = BufReader::new(er);
+        send_msg(&mut ew, &ClientMsg::Subscribe).await.unwrap();
+        send_msg(&mut iw, &ask("answered")).await.unwrap();
+        send_msg(&mut iw, &ask("waiting")).await.unwrap();
+        send_msg(
+            &mut iw,
+            &ClientMsg::ScopeGrantResolved {
+                decision_id: "answered".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let wait = crate::timeouts::TestTimeouts::get(crate::timeouts::TimeoutCategory::Quick);
+        tokio::time::timeout(wait, async {
+            loop {
+                if let HubMsg::ScopeGrantDismiss { decision_id } =
+                    recv_msg::<_, HubMsg>(&mut erdr).await.unwrap()
+                    && decision_id == "answered"
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the early TUI sees the answered question dismissed");
+
+        let sub = connect_to_hub_at(&sock).await.expect("connect subscriber");
+        let (sr, mut sw) = tokio::io::split(sub);
+        let mut srdr = BufReader::new(sr);
+        send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();
+        let shown = tokio::time::timeout(wait, async {
+            loop {
+                if let HubMsg::Relay(HubRelay::ScopeGrantRequested { request }) =
+                    recv_msg::<_, HubMsg>(&mut srdr).await.unwrap()
+                {
+                    return request.decision_id;
+                }
+            }
+        })
+        .await
+        .expect("a waiting question is replayed to a TUI that opens later");
+        assert_eq!(shown, "waiting", "an answered question is not replayed");
+
+        drop(iw);
+        drop(ir);
+        let dismissed = tokio::time::timeout(wait, async {
+            loop {
+                if let HubMsg::ScopeGrantDismiss { decision_id } =
+                    recv_msg::<_, HubMsg>(&mut srdr).await.unwrap()
+                {
+                    return decision_id;
+                }
+            }
+        })
+        .await
+        .expect("the instance's question is withdrawn when it goes");
+        assert_eq!(dismissed, "waiting");
     }
 
     /// Every instance hears how many TUIs are watching: once when it
