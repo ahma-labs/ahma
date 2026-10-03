@@ -84,7 +84,9 @@ fn build_landlock_ruleset_with(
     // and no ordering, so a granted git dir's `hooks/` is writable from
     // `run_terminal_command` on Linux. That is the platform's already-stated
     // limit — disclosed by `profiles::platform_enforcement` — and not something
-    // this ruleset can carve out. Refusing unverified dirs is what bounds it.
+    // this ruleset can carve out (the opt-in `sandbox::deny_tier` namespace
+    // holds it with a read-only mount instead). Refusing unverified dirs is
+    // what bounds it.
     let mut all_scopes = scopes.to_vec();
     let grants = super::exec_config::grantable_git_dirs(scopes, scopes);
     super::exec_config::report_refusals(&grants.refused);
@@ -172,6 +174,22 @@ pub fn enforce_landlock_sandbox(
         package_cache_write,
         None,
     )?;
+
+    // SPEC R6.1.7: a child inherits the Landlock domain of the thread that
+    // forks it, and a task inside a domain may not mount — so restricting this
+    // thread would silently drop the read-only deny tier for every command
+    // later spawned from it. In `linux_deny_tier = "namespace"` mode the ruleset
+    // is still built (the fail-fast check above stands) but not applied here;
+    // commands are confined per spawn exactly as before.
+    if super::deny_tier::namespace_prevention_active() {
+        tracing::info!(
+            "Landlock ruleset validated; not restricting this server thread, because \
+             [sandbox] linux_deny_tier = \"namespace\" needs every command ahma spawns to be \
+             able to mount its read-only deny tier. Each command is still Landlock-confined \
+             at spawn."
+        );
+        return Ok(());
+    }
 
     let status = ruleset
         .restrict_self()

@@ -3199,6 +3199,15 @@ fn configure_handoff_allowances(cli: &Cli, s: &ahma_common::config::AhmaSettings
     }
 }
 
+/// Install `[sandbox] linux_deny_tier` (SPEC R6.1.7), read at every Linux
+/// spawn. Settings-only: it is an enum with a safe default, not a boolean
+/// switch (R-CFG1.4), and `[sandbox]` is security-tier, so a project file cannot
+/// set it. Installing it probes nothing — the probe runs once, from
+/// `initialize_sandbox`, and only when the mode asks for it.
+fn configure_linux_deny_tier(s: &ahma_common::config::AhmaSettings) {
+    sandbox::set_linux_deny_tier(s.sandbox.linux_deny_tier);
+}
+
 /// `--allow-git-hooks` / `--allow-project-tool-config` widen the default-denied
 /// policy; `[sandbox] allow_git_hooks` / `allow_project_tool_config` do the same
 /// persistently. Either source is enough.
@@ -3278,6 +3287,7 @@ pub fn build_app_config_with_settings(
     // `sandbox::seatbelt` both read this process-global, so it has to be
     // installed before any Seatbelt profile is generated or any write is guarded.
     configure_handoff_allowances(cli, &s);
+    configure_linux_deny_tier(&s);
 
     // ── Tool loading ────────────────────────────────────────────────────────
     // R-CFG1.2: AHMA_TOOLS_DIR is RETIRED — warn and ignore.
@@ -3477,6 +3487,14 @@ pub(crate) fn initialize_sandbox(cfg: &AppConfig) -> Result<Option<Arc<sandbox::
         scopes,
         policy.tmp_access && seeds_temp_scope_at_startup(cfg),
     );
+    // SPEC R6.1.7: probe for per-command namespaces (when `[sandbox]
+    // linux_deny_tier = "namespace"` asks for them) and say how the deny tier
+    // is held — before `create_sandbox_instance` applies process-level
+    // Landlock, because a thread inside a Landlock domain cannot mount and a
+    // probe forked from it would report the wrong reason.
+    if !policy.no_sandbox {
+        sandbox::deny_tier::disclose_at_startup();
+    }
     let sandbox = create_sandbox_instance(scopes, &policy, cfg)?;
 
     log_sandbox_mode(policy.no_sandbox, deferred_host);
@@ -3635,6 +3653,27 @@ mod tests {
         assert_eq!(
             sandbox::HandoffAllowances::current(),
             sandbox::HandoffAllowances::default()
+        );
+    }
+
+    /// `[sandbox] linux_deny_tier` reaches the process global every Linux spawn
+    /// reads (SPEC R6.1.7).
+    #[test]
+    fn configure_linux_deny_tier_installs_the_process_global() {
+        init_test();
+        let mut settings = ahma_common::config::AhmaSettings::default();
+        settings.sandbox.linux_deny_tier = sandbox::LinuxDenyTier::Namespace;
+        configure_linux_deny_tier(&settings);
+        assert_eq!(
+            sandbox::deny_tier::linux_deny_tier(),
+            sandbox::LinuxDenyTier::Namespace
+        );
+
+        // Restore the default for anything sharing this process.
+        configure_linux_deny_tier(&ahma_common::config::AhmaSettings::default());
+        assert_eq!(
+            sandbox::deny_tier::linux_deny_tier(),
+            sandbox::LinuxDenyTier::Detect
         );
     }
 

@@ -9,7 +9,9 @@
 //! write `.git/hooks/pre-commit`, which the user's own `git` later runs outside
 //! any sandbox. Windows has no filesystem boundary at all (R6.3.9). Kernel
 //! prevention on Linux needs user and mount namespaces, which stock Ubuntu 24.04
-//! denies to unprivileged processes.
+//! denies to unprivileged processes; where they are allowed it is the opt-in
+//! [`super::deny_tier`] (`[sandbox] linux_deny_tier = "namespace"`), and this
+//! watch keeps running beside it.
 //!
 //! So where the kernel does not hold the tier, ahma **detects** instead: it takes
 //! a bounded inventory of the deny-tier paths just before a command starts and
@@ -123,6 +125,10 @@ impl HandoffWatchMode {
 /// (R-HANDOFF.4). Linux (Landlock, R6.1.7) and Windows (no boundary, R6.3.9)
 /// never enforce it, and neither does a sandbox that is not enforcing at all
 /// (`--no-sandbox`, or deferring to a host sandbox, R7.6).
+///
+/// Linux's opt-in read-only namespace ([`super::deny_tier`]) does not change
+/// the answer: it covers only paths that exist when a command starts, and a
+/// child that cannot enter it runs without it, so the watch stays on there.
 pub fn deny_tier_kernel_enforced(sandbox: &Sandbox) -> bool {
     cfg!(target_os = "macos") && sandbox.is_enforced()
 }

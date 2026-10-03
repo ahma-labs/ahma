@@ -1221,6 +1221,42 @@ fn scope_paths_equiv(a: &Path, b: &Path) -> bool {
     expand_home(a) == expand_home(b)
 }
 
+/// How Linux holds the trust-handoff deny tier — every resolved
+/// `<git dir>/hooks` and the workspace's own `.ahma/` — against commands ahma
+/// runs (`[sandbox] linux_deny_tier`, SPEC R6.1.7). Ignored on other platforms:
+/// macOS Seatbelt subtracts the tier at the kernel already, and Windows has no
+/// filesystem boundary to subtract it from.
+///
+/// An unknown value is a parse error, so — `[sandbox]` being a security table —
+/// it aborts startup rather than silently picking a mode (R-CFG6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinuxDenyTier {
+    /// Default. Landlock cannot subtract a path from an allowed directory, so a
+    /// command may write the tier; ahma compares it before and after every
+    /// command and reports a change as `TRUST-HANDOFF WRITE`. Needs no
+    /// privilege and works everywhere.
+    #[default]
+    Detect,
+    /// Additionally run each command in its own user and mount namespace with
+    /// every existing deny-tier path bind-mounted read-only, so a write fails
+    /// with `EROFS`. Needs unprivileged user namespaces, which stock Ubuntu
+    /// 23.10+ and Docker's default seccomp profile deny; where they are denied
+    /// ahma says so at startup and falls back to detection. Detection stays on
+    /// in this mode too.
+    Namespace,
+}
+
+impl LinuxDenyTier {
+    /// The TOML token (matches the serde representation).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinuxDenyTier::Detect => "detect",
+            LinuxDenyTier::Namespace => "namespace",
+        }
+    }
+}
+
 /// Sandbox and filesystem security settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1442,6 +1478,13 @@ pub struct SandboxSettings {
     /// Default: `false`
     #[serde(default)]
     pub allow_project_tool_config: bool,
+    /// Linux only. How the trust-handoff deny tier (`<git dir>/hooks`, the
+    /// workspace's `.ahma/`) is held against commands: `"detect"` reports a
+    /// write after the command, `"namespace"` also makes the kernel refuse it
+    /// where unprivileged user namespaces are allowed. See [`LinuxDenyTier`].
+    /// Default: `"detect"`
+    #[serde(default)]
+    pub linux_deny_tier: LinuxDenyTier,
 }
 
 /// Every shipped profile, enabled — the opt-out default (R-PERM.5).
@@ -1558,6 +1601,7 @@ impl Default for SandboxSettings {
             profiles: default_sandbox_profiles(),
             allow_git_hooks: false,
             allow_project_tool_config: false,
+            linux_deny_tier: LinuxDenyTier::Detect,
         }
     }
 }
@@ -2602,6 +2646,12 @@ impl AhmaSettings {
             self.sandbox.allow_project_tool_config.to_string(),
             d.sandbox.allow_project_tool_config.to_string(),
         );
+        w.setting(
+            "Linux: \"detect\" reports a command's write to git hooks or .ahma/ after it runs; \"namespace\" also mounts them read-only in each command's own namespace so the write fails (needs unprivileged user namespaces; falls back to detect, loudly, where denied).",
+            "linux_deny_tier",
+            toml_str(self.sandbox.linux_deny_tier.as_str()),
+            toml_str(d.sandbox.linux_deny_tier.as_str()),
+        );
 
         // ── Logging ──────────────────────────────────────────────────────────
         w.section("Logging", "logging");
@@ -3420,6 +3470,7 @@ mod tests {
                 profiles: vec!["rust".into()],
                 allow_git_hooks: true,
                 allow_project_tool_config: true,
+                linux_deny_tier: LinuxDenyTier::Namespace,
             },
             logging: LoggingSettings {
                 target: "stderr".into(),
@@ -4392,6 +4443,50 @@ persistent_scopes = [
         assert!(!s.sandbox.allow_git_hooks);
     }
 
+    /// `[sandbox] linux_deny_tier` (SPEC R6.1.7): `detect` is the default —
+    /// what ahma did before the key existed — and each value parses to its own
+    /// mode and renders back to the same token.
+    #[test]
+    fn linux_deny_tier_defaults_to_detect_and_parses_each_value() {
+        assert_eq!(
+            SandboxSettings::default().linux_deny_tier,
+            LinuxDenyTier::Detect
+        );
+        assert_eq!(
+            AhmaSettings::parse("[sandbox]\n")
+                .unwrap()
+                .sandbox
+                .linux_deny_tier,
+            LinuxDenyTier::Detect
+        );
+        for (token, want) in [
+            ("detect", LinuxDenyTier::Detect),
+            ("namespace", LinuxDenyTier::Namespace),
+        ] {
+            let parsed =
+                AhmaSettings::parse(&format!("[sandbox]\nlinux_deny_tier = \"{token}\"\n"))
+                    .unwrap_or_else(|e| panic!("'{token}' must parse: {e}"));
+            assert_eq!(parsed.sandbox.linux_deny_tier, want, "{token}");
+            assert_eq!(want.as_str(), token, "display round-trips");
+        }
+    }
+
+    /// `[sandbox]` is a security table: a misspelt mode must fail the parse
+    /// (and so abort startup, R-CFG6.1) rather than quietly mean `detect`,
+    /// which would leave someone believing the kernel holds the tier.
+    #[test]
+    fn linux_deny_tier_unknown_value_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[sandbox]\nlinux_deny_tier = \"bwrap\"\n").unwrap();
+        let err = AhmaSettings::load_from_result(&path)
+            .expect_err("unknown linux_deny_tier value must be rejected");
+        assert!(
+            err.contains("linux_deny_tier") || err.contains("bwrap"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn grant_scope_adds_then_updates_in_place() {
         let mut sb = SandboxSettings::default();
@@ -4802,6 +4897,9 @@ mod tier_tests {
             ("sandbox", "package_cache_write"),
             ("sandbox", "task_vault"),
             ("sandbox", "defer"),
+            // A cloned repository must not be able to switch kernel prevention
+            // of its own hook directory off.
+            ("sandbox", "linux_deny_tier"),
             ("auth", "require_token"),
             ("auth", "require_token_path"),
             ("auth", "rate_limit_rps"),

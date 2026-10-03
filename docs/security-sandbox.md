@@ -68,7 +68,7 @@ A Landlock rule is an allow-list of file descriptors, so the read-only set is ex
 
 Moving or hard-linking a file into another directory works wherever writes do. On kernels before 5.19, Landlock refuses any rename that changes a file's directory with "Invalid cross-device link"; `mv` still works there (it copies), but programs that call `rename(2)` directly fail (SPEC R6.1.8).
 
-**Git hooks and `.ahma/` are watched, not protected** (SPEC R6.1.7). Inside the workspace, Landlock cannot deny the trust-handoff paths — every resolved `<git dir>/hooks` and the project's `.ahma/` — so a command run through `run_terminal_command` can write `.git/hooks/pre-commit`, and your `git` will run it later outside any sandbox. ahma detects this instead: it inventories those paths before every command and compares afterwards, and a change leads the tool result with a `TRUST-HANDOFF WRITE` line. Nothing is reverted. See [Detected, not prevented](#detected-not-prevented-linux-and-windows).
+**Git hooks and `.ahma/` are watched, not protected — unless you opt in** (SPEC R6.1.7). Inside the workspace, Landlock cannot deny the trust-handoff paths — every resolved `<git dir>/hooks` and the project's `.ahma/` — so by default a command run through `run_terminal_command` can write `.git/hooks/pre-commit`, and your `git` will run it later outside any sandbox. ahma detects this instead: it inventories those paths before every command and compares afterwards, and a change leads the tool result with a `TRUST-HANDOFF WRITE` line. Nothing is reverted. See [Detected, not prevented](#detected-not-prevented-linux-and-windows). Where the host allows unprivileged user namespaces, `[sandbox] linux_deny_tier = "namespace"` makes the kernel refuse those writes: see [Prevented, where the host allows it](#prevented-where-the-host-allows-it-linux-opt-in).
 
 **Older kernels / Raspberry Pi**: Landlock requires kernel ≥ 5.13. On older Pi OS kernels, run with:
 
@@ -139,14 +139,60 @@ A denied write fails with the structured `sandbox_denial` payload naming the pat
 | Platform | Deny-write tier |
 |---|---|
 | **macOS** | kernel-enforced for the fixed-subpath rules — SBPL is last-match-wins, so a `(deny file-write* …)` emitted after the workspace allow genuinely subtracts |
-| **Linux** | **application-layer only, and detected — not prevented — for shell commands.** Landlock's ABI is additive-allow with no deny rule and no ordering, so the hole cannot be expressed to the kernel (SPEC R6.1.7). ahma enforces it in its own file tools, which means it is **bypassable from `run_terminal_command`**: a shell child inherits the workspace-wide write right and can create a hook script directly. Such a write is reported after the command (below) |
+| **Linux** | **application-layer only by default, and detected — not prevented — for shell commands.** Landlock's ABI is additive-allow with no deny rule and no ordering, so the hole cannot be expressed to it (SPEC R6.1.7). ahma enforces it in its own file tools, which means it is **bypassable from `run_terminal_command`**: a shell child inherits the workspace-wide write right and can create a hook script directly. Such a write is reported after the command (below). The opt-in `[sandbox] linux_deny_tier = "namespace"` holds the existing paths with a read-only mount instead, where the host allows it (below) |
 | **Windows** | no filesystem enforcement yet (SPEC R6.3.9); the application-layer check is the only control, and shell-command writes are detected and reported as on Linux |
 
 The shape-matched rules are application-layer on *every* platform by construction: a kernel deny on every `bin/python*` would break a legitimate `python -m venv`.
 
+### Prevented, where the host allows it (Linux, opt-in)
+
+```toml
+# ~/.ahma/settings.toml
+[sandbox]
+linux_deny_tier = "namespace"   # default "detect"
+```
+
+With this set, each command ahma runs enters a user and mount namespace of its own before Landlock is applied, and every deny-tier path that exists when it starts — each resolved `<git dir>/hooks`, the workspace's `.ahma/` — is bind-mounted onto itself read-only. A write there fails in the command:
+
+```text
+$ echo x > .git/hooks/pre-commit
+sh: 1: cannot create .git/hooks/pre-commit: Read-only file system
+```
+
+Everything else in the workspace stays writable, the hooks stay readable, and `git commit` run by the command still executes them (ahma never adds `noexec`). The child cannot undo the mount: Landlock, applied right after, forbids a sandboxed task to change its mounts.
+
+**It needs unprivileged user namespaces, and many hosts refuse them.** ahma forks one probe at startup that performs the whole sequence on a temporary directory and checks that a write really fails; if it does not, nothing is attempted per command, a `warn` says why, and `ahma status` and the startup scope disclosure carry the reason (SPEC R-PERM.5.1). The common cases:
+
+| Probe result | Typical cause | To get prevention |
+|---|---|---|
+| id maps refused | Ubuntu 23.10+ (`kernel.apparmor_restrict_unprivileged_userns = 1`): the namespace is created but holds no privilege | an administrator installs an AppArmor profile for the ahma binary that allows `userns` (below), or sets that sysctl to `0` |
+| user namespaces refused | a container's seccomp profile (Docker's default), `user.max_user_namespaces = 0` | run the container with a profile that allows `unshare(CLONE_NEWUSER)` |
+| already confined | this ahma runs inside another ahma's sandbox (or a command run through one) | run ahma outside the other sandbox |
+
+An AppArmor profile in the form Ubuntu documents for programs that need user namespaces (adjust the path to where `ahma` is installed; `sudo apparmor_parser -r /etc/apparmor.d/ahma` loads it):
+
+```text
+# /etc/apparmor.d/ahma
+abi <abi/4.0>,
+include <tunables/global>
+
+profile ahma /home/*/.local/bin/ahma flags=(unconfined) {
+  userns,
+  include if exists <local/ahma>
+}
+```
+
+What it does **not** cover, which is why detection stays on in this mode too:
+
+- **A path created during the command.** A bind needs an existing mount point, so a `git init`, a `git clone` or a first `.ahma/` is covered from the next command; ahma never creates the directory to protect it.
+- **Renaming an ancestor.** `mv .git .git.old` and rebuilding `.git` sidesteps any path-based rule — on macOS too. Detection reports the new hook.
+- **A child that cannot enter its namespace** (for instance one forked from a thread already inside a Landlock domain) runs without it rather than failing; its write is detected as in the default mode. So that ahma's own threads are never such a thread, in this mode the server does not apply Landlock to the thread that commits the scope — every command is still Landlock-confined at spawn, which is where command containment has always come from.
+
+Inside the namespace, files owned by other users (root included) show as owned by `nobody`, because only your own uid and gid are mapped. Access checks are unchanged — they use the real ids — and setuid programs such as `sudo` already do not work under Landlock's `no_new_privs`.
+
 ### Detected, not prevented (Linux and Windows)
 
-Kernel prevention on Linux would need a private mount namespace per command, and stock Ubuntu 24.04 refuses unprivileged user namespaces. Until that or a Landlock "no-inherit" rule exists, ahma closes the *silent* half of the gap. Wherever the kernel does not hold the deny tier — Linux, Windows, and any session running with `--no-sandbox` — every command that may write is bracketed by two inventories of the deny-tier paths (the same set the macOS kernel rules deny: every resolved `<git dir>/hooks`, every `<scope>/.ahma`). An entry that was created, modified, removed or made executable while the command ran is reported three ways:
+Kernel prevention on Linux needs a private mount namespace per command, which is the opt-in above, and stock Ubuntu 24.04 refuses unprivileged user namespaces. Until that is generally available or a Landlock "no-inherit" rule exists, ahma closes the *silent* half of the gap. Wherever the kernel does not hold the deny tier — Linux, Windows, and any session running with `--no-sandbox` — every command that may write is bracketed by two inventories of the deny-tier paths (the same set the macOS kernel rules deny: every resolved `<git dir>/hooks`, every `<scope>/.ahma`). An entry that was created, modified, removed or made executable while the command ran is reported three ways:
 
 1. **At the top of the tool result**, after the identity line, one line per entry:
 
