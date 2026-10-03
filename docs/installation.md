@@ -74,7 +74,7 @@ export PATH="$HOME/.local/bin:$PATH"
 > ```
 > If you're already hitting silent `Killed: 9` / exit 137 on an existing install, this
 > same command fixes it in place — no reinstall needed. See [R-SIGN in
-> SPEC.md](../SPEC.md#r-sign-binary-code-signing--in-progress-macos-runtime-stability-windowslinux-distribution-only)
+> SPEC.md](../SPEC.md#r-sign-binary-code-signing)
 > for the full failure mode.
 
 ### Windows (PowerShell 5.1+)
