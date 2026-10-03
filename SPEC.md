@@ -172,12 +172,8 @@ may change.
 | HTTP MCP client | tests-pass | OAuth 2.0 + PKCE (`ahma_http_mcp_client/SPEC.md`) |
 | Web egress policy for `fetch_webpage` (R-WEB) | tests-pass | Three-tier approval, private-range block, redirect guard |
 | Subprocess egress restriction (R-WEB.16) | tests-pass | Opt-in `--restrict-network`; kernel-enforced on macOS and Linux 6.7+ |
-<<<<<<< HEAD
 | Outbound HTTP retry and failure wording (R-HTTP) | tests-pass | `ahma_common::http_retry`; SSE reconnect and `xtask` not covered (R-HTTP.4) |
-||||||| parent of 33ab6857 (feat(sandbox): listening beyond loopback is a capability the human grants)
-=======
 | Listening beyond loopback (R-LISTEN) | in-progress | Refused unless `[network] listen = "any"`; kernel-enforced on macOS only (disclosed elsewhere); the prompt (R-LISTEN.4) is not built yet |
->>>>>>> 33ab6857 (feat(sandbox): listening beyond loopback is a capability the human grants)
 | Live log monitoring (`livelog`, `--log-monitor`) | tests-pass | §5.5, R9 |
 | TUI | tests-pass | R24, R25 (`ahma_tui/SPEC.md`) |
 | Task vaults | experimental | `--task-vault` (`ahma_vault/SPEC.md`) |
@@ -1117,7 +1113,6 @@ Covers HTTP traffic from **sandboxed subprocesses** when `--restrict-network` / 
 - **R-WEB.16.1**: With restriction on, `ahma serve` **must** bind an HTTP proxy to a random localhost port and inject `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY=127.0.0.1,::1,localhost` into the subprocess environment.
 - **R-WEB.16.2**: Requests to domains **not** on the effective allowlist (`[network] allow` ∪ enabled profiles' hosts, R-PERM.5.3) **must** get `407 Proxy Authentication Required` (CONNECT / HTTPS) or `403 Forbidden` (plain HTTP), indistinguishable from a real network failure so the agent cannot detect the proxy from error content.
 - **R-WEB.16.3**: Allowlist entries use the host-pattern syntax of R-WEB.16.9. An empty effective allowlist means deny all.
-<<<<<<< HEAD
 - **R-WEB.16.4**: The proxy **must not** decrypt HTTPS (no MITM): CONNECT tunnels are forwarded for approved domains and rejected otherwise.
 - **R-WEB.16.5**: The proxy applies the private-range block (R-WEB.3.1) regardless of allowlist.
 - **R-WEB.16.6**: QUIC (HTTP/3) is not intercepted by an HTTP proxy. On macOS the Seatbelt rule confining outbound IP to the proxy also stops direct QUIC; on Linux (Landlock filters TCP only) and Windows it does not, so tools that speak HTTP/3 **should** have it disabled in their own configuration.
@@ -1129,49 +1124,6 @@ Covers HTTP traffic from **sandboxed subprocesses** when `--restrict-network` / 
   - "With `restrict = true` and an empty `allow`, all egress is denied" holds only when there are **also** no profile-contributed hosts (R-PERM.5.3); any statement of the deny-all condition **must** name both halves.
 - **R-WEB.16.10** (session precedence): A per-session decision from R-WEB.16.8 (grant or deny) **must** be consulted before the static allowlist. A session deny **must** block a domain even if the allowlist covers it, and is answered from the coordinator's in-memory state without a DNS lookup.
 - **R-WEB.16.11** (`network_grant` MCP tool): the agent-facing tool for proposing grants to `[network].allow` in `~/.ahma/settings.toml`, with `sandbox_grant`'s two-phase model: preview-only when `confirm: false` (default); a hard denylist refusing blanket `*`, localhost/local domains and private/loopback/cloud-metadata IPs (`169.254.169.254`) even with confirmation. `confirm: true` **must never** persist on its own for any client: when the client declared the MCP `elicitation` capability it prompts there and persists only on explicit human approval; otherwise (the in-process agent, a client with no prompt, a headless harness) it returns the `ahma network allow <host>` instruction for the human to run, and is **not** assumed to have been gated by the client. Human-approved grants apply immediately to the live session and are audit-logged under kind `net-host` with the chosen tier; only `always` is appended to `[network].allow` — `session` (or an out-of-spec `once`, which has no connection to bind to) lasts until the session ends and writes nothing. A timeout or broken prompt is reported as unanswered, never as a decline, and a decline tells the agent not to ask again.
-||||||| parent of 33ab6857 (feat(sandbox): listening beyond loopback is a capability the human grants)
-- **R-WEB.16.4**: The proxy **must not** decrypt HTTPS traffic (no MITM). CONNECT tunnels are forwarded for approved domains and rejected for unapproved ones.
-- **R-WEB.16.5**: The private-range block (R-WEB.3.1) is applied by the proxy regardless of allowlist entries.
-- **R-WEB.16.6**: QUIC (HTTP/3) connections are not intercepted by an HTTP proxy. On macOS the Seatbelt rule that confines outbound IP to the proxy also stops direct QUIC; on Linux (Landlock filters TCP only) and Windows it does not, so tools that speak HTTP/3 **should** have it disabled in their own configuration.
-- **R-WEB.16.7**: `ahma_mcp::egress::EgressGrants` computes the effective allowlist and `EgressAllowlist` holds it; `HostPattern` is the single matcher. No second matcher may be introduced.
-- **R-WEB.16.8** (interactive approval, R-NET): When `--restrict-network` (or `[network] restrict`) is on and a subprocess reaches a domain not in `[network] allow`, the proxy **must** raise an MCP `elicitation/create` prompt at the attached peer before denying, offering the same three-tier answer as R-WEB.5 (`once` / `session` / `always`, persisted to `[network].allow`) plus `deny`. Concurrent connections to the same in-flight domain are **not** double-prompted (R-WEB.5's dedup applies identically). When no peer is attached, the client lacks the elicitation capability, the prompt times out, or the human declines, the connection **must** fail exactly as R-WEB.16.2 specifies — indistinguishable from a real network failure. A denied or unanswerable prompt is cancelled rather than left in flight, so a later connection (e.g. once a capable client attaches) may re-ask.
-- **R-WEB.16.9** (host matching): Allowlist matching **must** be **label-boundary-anchored**, never a substring or suffix test. Both sides are ASCII-lowercased and one trailing root dot is stripped; `crates.io` matches only itself, and `*.crates.io` matches exactly one additional non-empty label (not the apex, not `a.b.crates.io`). A plain suffix comparison would make `evilcrates.io` match `crates.io`, which turns an allowlist into an attacker-registrable namespace.
-  - Non-ASCII hostnames **must** be **rejected**, not folded to punycode. `сrates.io` with a Cyrillic `с` is visually identical to the real entry, so silently normalizing it would make the allowlist say one thing and mean another; one matcher serves every allowlist so no two can diverge.
-  - A malformed entry **must** be dropped with a warning, never coerced into something that matches. Guessing at a broken pattern is how an allowlist grows a hole its author cannot see.
-  - Consequently, "with `restrict = true` and an empty `allow`, all egress is denied" holds only when there are **also** no profile-contributed hosts (R-PERM.5.3). Any statement of the deny-all condition **must** name both halves.
-- **R-WEB.16.10** (session precedence): A per-session decision from R-WEB.16.8 (session grant or session deny) **must** be consulted before the static allowlist, not after. A session deny **must** block a domain even if it is also covered by the allowlist (a config entry must not silently override an explicit interactive answer already given). Checking the allowlist first is also a reliability hazard, not just an ordering nit: a domain the allowlist happens to cover falls through to the real DNS lookup in the CONNECT path instead of being rejected from the coordinator's in-memory state, which is unbounded and has hung past CI's hang-bound timeouts under network contention.
-- **R-WEB.16.11** (`network_grant` MCP tool): The AI-facing tool for proposing network egress grants to `[network].allow` in `~/.ahma/settings.toml`. Follows the same two-phase confirmation and security model as `sandbox_grant`: preview-only when `confirm: false` (default), hard denylist refusing blanket `*`, localhost/local domains, and private/loopback/cloud-metadata IPs (`169.254.169.254`) even with confirmation. `confirm: true` **must never** persist on its own for any client: when the connected client declared the MCP `elicitation` capability it raises an interactive prompt there and persists only on an explicit human approval; otherwise — the in-process agent, a client with no prompt, a headless harness — it returns the `ahma network allow <host>` instruction for the human to run, and is **not** assumed to have been gated by the client. Human-approved grants apply immediately to the live session and are audit-logged under kind `net-host` with the tier the human chose; only an `always` answer is appended to `[network].allow` — a `session` answer (or an out-of-spec `once`, which has no connection to bind to) applies until the session ends and writes nothing. A timeout or broken prompt is reported as unanswered, never as the human's decline, and a decline tells the agent not to ask again.
-
----
-
-### Security invariants summary (R-WEB)
-
-| Invariant | Requirement |
-|-----------|------------|
-| Private ranges blocked at DNS resolution time, not just pattern match | R-WEB.3.2 |
-| Enter/Esc is always Deny in every approval modal | R-WEB.6.3 |
-| Persistent grants written only to out-of-sandbox settings file | R-WEB.5.2 |
-| Session grants are never serialized to disk | R-WEB.5.1 |
-| Redirect targets are independently checked (no inherited approval) | R-WEB.8.1 |
-| No path-based filtering (explicitly excluded to avoid false safety) | R-WEB.13 |
-| All agent-driven outbound HTTP uses the guarded fetch path, not a bare `reqwest` client | R-WEB.14 |
-| Every request is audit-logged regardless of policy | R-WEB.9.1 |
-| `never_allow` cannot be overridden by session grants or `always_allow` | R-WEB.2.3 |
-| `block_private_ranges` cannot be overridden by any domain pattern | R-WEB.3.1 |
-=======
-- **R-WEB.16.4**: The proxy **must not** decrypt HTTPS traffic (no MITM). CONNECT tunnels are forwarded for approved domains and rejected for unapproved ones.
-- **R-WEB.16.5**: The private-range block (R-WEB.3.1) is applied by the proxy regardless of allowlist entries.
-- **R-WEB.16.6**: QUIC (HTTP/3) connections are not intercepted by an HTTP proxy. On macOS the Seatbelt rule that confines outbound IP to the proxy also stops direct QUIC; on Linux (Landlock filters TCP only) and Windows it does not, so tools that speak HTTP/3 **should** have it disabled in their own configuration.
-- **R-WEB.16.7**: `ahma_mcp::egress::EgressGrants` computes the effective allowlist and `EgressAllowlist` holds it; `HostPattern` is the single matcher. No second matcher may be introduced.
-- **R-WEB.16.8** (interactive approval, R-NET): When `--restrict-network` (or `[network] restrict`) is on and a subprocess reaches a domain not in `[network] allow`, the proxy **must** raise an MCP `elicitation/create` prompt at the attached peer before denying, offering the same three-tier answer as R-WEB.5 (`once` / `session` / `always`, persisted to `[network].allow`) plus `deny`. Concurrent connections to the same in-flight domain are **not** double-prompted (R-WEB.5's dedup applies identically). When no peer is attached, the client lacks the elicitation capability, the prompt times out, or the human declines, the connection **must** fail exactly as R-WEB.16.2 specifies — indistinguishable from a real network failure. A denied or unanswerable prompt is cancelled rather than left in flight, so a later connection (e.g. once a capable client attaches) may re-ask.
-- **R-WEB.16.9** (host matching): Allowlist matching **must** be **label-boundary-anchored**, never a substring or suffix test. Both sides are ASCII-lowercased and one trailing root dot is stripped; `crates.io` matches only itself, and `*.crates.io` matches exactly one additional non-empty label (not the apex, not `a.b.crates.io`). A plain suffix comparison would make `evilcrates.io` match `crates.io`, which turns an allowlist into an attacker-registrable namespace.
-  - Non-ASCII hostnames **must** be **rejected**, not folded to punycode. `сrates.io` with a Cyrillic `с` is visually identical to the real entry, so silently normalizing it would make the allowlist say one thing and mean another; one matcher serves every allowlist so no two can diverge.
-  - A malformed entry **must** be dropped with a warning, never coerced into something that matches. Guessing at a broken pattern is how an allowlist grows a hole its author cannot see.
-  - Consequently, "with `restrict = true` and an empty `allow`, all egress is denied" holds only when there are **also** no profile-contributed hosts (R-PERM.5.3). Any statement of the deny-all condition **must** name both halves.
-- **R-WEB.16.10** (session precedence): A per-session decision from R-WEB.16.8 (session grant or session deny) **must** be consulted before the static allowlist, not after. A session deny **must** block a domain even if it is also covered by the allowlist (a config entry must not silently override an explicit interactive answer already given). Checking the allowlist first is also a reliability hazard, not just an ordering nit: a domain the allowlist happens to cover falls through to the real DNS lookup in the CONNECT path instead of being rejected from the coordinator's in-memory state, which is unbounded and has hung past CI's hang-bound timeouts under network contention.
-- **R-WEB.16.11** (`network_grant` MCP tool): The AI-facing tool for proposing network egress grants to `[network].allow` in `~/.ahma/settings.toml`. Follows the same two-phase confirmation and security model as `sandbox_grant`: preview-only when `confirm: false` (default), hard denylist refusing blanket `*`, localhost/local domains, and private/loopback/cloud-metadata IPs (`169.254.169.254`) even with confirmation. `confirm: true` **must never** persist on its own for any client: when the connected client declared the MCP `elicitation` capability it raises an interactive prompt there and persists only on an explicit human approval; otherwise — the in-process agent, a client with no prompt, a headless harness — it returns the `ahma network allow <host>` instruction for the human to run, and is **not** assumed to have been gated by the client. Human-approved grants apply immediately to the live session and are audit-logged under kind `net-host` with the tier the human chose; only an `always` answer is appended to `[network].allow` — a `session` answer (or an out-of-spec `once`, which has no connection to bind to) applies until the session ends and writes nothing. A timeout or broken prompt is reported as unanswered, never as the human's decline, and a decline tells the agent not to ask again.
-
----
 
 ### R-LISTEN: Listening sockets
 
@@ -1183,22 +1135,6 @@ A command that listens on loopback reaches nothing outside the machine; one that
 - **R-LISTEN.2** (beyond loopback is a capability): TCP listening on any other address **must** be refused unless granted: `[network] listen = "any"` in `~/.ahma/settings.toml` (always, every workspace) or a grant answered under R-LISTEN.4. macOS enforces it in the Seatbelt profile (`network-bind` on `local tcp`, loopback re-allowed). Linux Landlock filters binds by port only and cannot tell loopback from every interface, so on Linux (and on Windows) it is **not enforced**, and that **must** be disclosed on every R5.4 scope surface (R-PERM.5.1). UDP is not restricted on any platform — DNS and QUIC clients bind every address to send — which the user guide states.
 - **R-LISTEN.3** (a refusal names the capability): A bind the sandbox refused **must** be recognised from the command's output (`bind`/`listen` with `operation not permitted`/`EPERM`) and explained as this capability: what was refused, that it is not a directory, and the one thing that grants it. It **must never** be offered as a filesystem grant (the R7.7 rule for capabilities).
 - **R-LISTEN.4** (asked, with the easiest answer first): The grant is asked through the permission ladder (R-PERM.3) with the shared prompt body, budget and arming rules. Deny stays first and the default (R5.3.1, R-PERM.3.4: Enter never widens). Among the allow answers, **"every interface, always, every workspace"** is listed first, then this workspace always, this session, and once. The risk line says who could connect: every device on the networks this machine is on. Unlike the GPU (R6.2.7), listening is promptable because the answer is a policy the human can state in one line, and the alternative — editing a setting by hand mid-task — is what makes people turn a boundary off. _Status_: not yet built; until it is, the refusal (R-LISTEN.3) names the setting and `ahma network listen any`.
-
-### Security invariants summary (R-WEB)
-
-| Invariant | Requirement |
-|-----------|------------|
-| Private ranges blocked at DNS resolution time, not just pattern match | R-WEB.3.2 |
-| Enter/Esc is always Deny in every approval modal | R-WEB.6.3 |
-| Persistent grants written only to out-of-sandbox settings file | R-WEB.5.2 |
-| Session grants are never serialized to disk | R-WEB.5.1 |
-| Redirect targets are independently checked (no inherited approval) | R-WEB.8.1 |
-| No path-based filtering (explicitly excluded to avoid false safety) | R-WEB.13 |
-| All agent-driven outbound HTTP uses the guarded fetch path, not a bare `reqwest` client | R-WEB.14 |
-| Every request is audit-logged regardless of policy | R-WEB.9.1 |
-| `never_allow` cannot be overridden by session grants or `always_allow` | R-WEB.2.3 |
-| `block_private_ranges` cannot be overridden by any domain pattern | R-WEB.3.1 |
->>>>>>> 33ab6857 (feat(sandbox): listening beyond loopback is a capability the human grants)
 
 ---
 
