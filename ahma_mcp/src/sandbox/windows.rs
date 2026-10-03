@@ -1876,7 +1876,7 @@ fn well_known_sid(
 /// Print the probe report to stdout and return the exit code.
 ///
 /// A closed stdout ends the probe quietly with exit code 1 rather than a panic:
-/// `println!` panics on a write error (SPEC R5.6.1).
+/// the standard print macro panics on a write error (SPEC R5.6.1).
 #[cfg(target_os = "windows")]
 fn run_probe(cases: &[ProbeCase]) -> i32 {
     use std::io::Write as _;
