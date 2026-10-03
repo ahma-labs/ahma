@@ -535,6 +535,16 @@ pub fn hook_denial_text(
 /// command that failed; a refusal the command shrugged off is a warning, not
 /// a block. `None` when the output shows no refusal outside the scope.
 pub fn hook_side_refusal_note(output: &str, who: &HookRequester) -> Option<String> {
+    let (path, access) = hook_side_refusal(output, who)?;
+    Some(refusal_note(&path, access))
+}
+
+/// The out-of-scope path and access a hooked command that **succeeded** was
+/// refused, by the evidence rules of [`hook_side_refusal_note`].
+pub fn hook_side_refusal(
+    output: &str,
+    who: &HookRequester,
+) -> Option<(PathBuf, ahma_common::config::ScopeAccess)> {
     // A sandbox-extension failure is a framework declining to hand a helper
     // access (WebKit and fonts), not the command being refused an access.
     let output: String = output
@@ -588,19 +598,25 @@ pub fn hook_side_refusal_note(output: &str, who: &HookRequester) -> Option<Strin
     {
         return None;
     }
+    Some((path.clone(), hit.access))
+}
+
+/// The one-line note for a refusal a hooked command shrugged off.
+pub fn refusal_note(path: &Path, access: ahma_common::config::ScopeAccess) -> String {
     let target = grant_dir_for(path);
-    let (verb, ro) = if hit.access.is_write() {
+    let (verb, ro) = if access.is_write() {
         ("write", "")
     } else {
         ("read", " --read-only")
     };
-    Some(format!(
+    format!(
         "ahma: the sandbox refused a {verb} outside the workspace ({}) and the command went on \
          without it; if it needs that, a human can run `ahma sandbox grant {}{ro}` (add \
-         `--session` for this terminal session only).",
+         `--session` for this terminal session only); in Claude Code, ahma asks in its \
+         dialog before the next command here.",
         path.display(),
         target.display()
-    ))
+    )
 }
 
 /// Wiring helper: a sandboxed command failed; scan its stderr for a denial and, if
