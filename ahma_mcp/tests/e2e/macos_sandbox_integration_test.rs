@@ -915,6 +915,50 @@ fn gpu_allowed_profile_exposes_metal_device() {
     );
 }
 
+/// An xcrun shim (`strings`) runs in the read-only lane: it may write its
+/// cache file in the per-user temp directory, and nothing else there. The
+/// cache is removed first, so the tool has to write it.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_xcrun_tool_runs_in_the_read_only_lane() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+    let scope = TempDir::new().expect("scope dir");
+    let tmp = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&tmp) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with("xcrun_db") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_read_only_seatbelt_profile_test(scope.path());
+    let out = Command::new("sandbox-exec")
+        .args(["-p", &profile, "strings", "/bin/ls"])
+        .current_dir(scope.path())
+        .output()
+        .expect("run strings");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && !stderr.contains("couldn't create cache file"),
+        "strings in the read-only lane: {stderr}"
+    );
+    let write = Command::new("sandbox-exec")
+        .args(["-p", &profile, "sh", "-c"])
+        .arg(format!("echo x > {}/ahma-not-xcrun", tmp.display()))
+        .output()
+        .expect("run sh");
+    assert!(!write.status.success(), "other temp writes stay refused");
+}
+
 /// SPEC R6.2.8: a sandboxed command can see processes. `/bin/ps` is setuid
 /// root and no sandbox can exec a setuid binary (a kernel rule), so the
 /// profile grants `process-info*` for `pgrep`/`lsof` and ahma ships `ahma ps`.

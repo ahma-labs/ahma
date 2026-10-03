@@ -5,6 +5,12 @@ use super::core::Sandbox;
 
 /// Read access to `path`, plus write access when `writable` (the read-only
 /// lane passes `false`, SPEC R2.7.4).
+/// xcrun's cache file in the per-user temp directory (`$TMPDIR/xcrun_db…`),
+/// the only temp write the read-only lane allows: macOS developer tools such
+/// as `strings`, `otool` and `nm` are xcrun shims and fail without it.
+const XCRUN_CACHE_RULE: &str =
+    "(allow file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db[^/]*$\"))\n";
+
 fn macos_path_rules(path: &Path, writable: bool) -> String {
     let mut rules = format!("(allow file-read* (subpath \"{}\"))\n", path.display());
     if writable {
@@ -75,10 +81,14 @@ impl Sandbox {
         let profile_rules = self.get_macos_profile_rules();
         // The read-only lane grants no temp writes either: a workspace under
         // the temp directory would otherwise be writable through that rule.
+        // The one exception is xcrun's cache file, named and placed exactly,
+        // without which `strings`, `otool` and `nm` (xcrun shims) fail.
         let temp_rules = if writable {
             self.get_macos_temp_rules()
-        } else {
+        } else if self.no_temp_files {
             String::new()
+        } else {
+            XCRUN_CACHE_RULE.to_string()
         };
         let network_rules = self.get_macos_network_rules();
         let exec_config_deny_rules = self.get_macos_exec_config_deny_rules(&git_resolution_roots);
@@ -517,6 +527,33 @@ mod tests {
         let p = sb.generate_seatbelt_profile_test(dir.path());
         assert!(p.contains("(allow network*)"));
         assert!(!p.contains("(deny network-outbound"));
+    }
+
+    /// The read-only lane may write xcrun's cache file and nothing else under
+    /// the temp directory: `strings`, `otool` and `nm` are xcrun shims that
+    /// fail without it, and a broader temp rule would make a workspace under
+    /// the temp directory writable (bug report: `strings` refused with
+    /// "couldn't create cache file …/T/xcrun_db-…").
+    #[test]
+    fn the_read_only_lane_lets_xcrun_cache_and_nothing_else_in_temp() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let p = sb.generate_read_only_seatbelt_profile_test(dir.path());
+        assert!(
+            p.contains(r#"(allow file-write* (regex #"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db[^/]*$"))"#),
+            "{p}"
+        );
+        assert!(
+            !p.contains("(allow file-write* (subpath \"/private/var/folders\"))"),
+            "no broad temp write in the read-only lane: {p}"
+        );
     }
 
     /// Regression test for the bug behind `test_credential_read_deny_is_kernel_enforced`

@@ -950,6 +950,11 @@ mod poll_loop_tests {
             "top -l 1 -n 10",
             "lsof -p 123",
             "pgrep -fl gradle",
+            // From an agent in another repository (clownbot): globs, a shell
+            // variable and paths outside the workspace are all still reads.
+            "ls ~/.cargo/registry/src/*/ | grep dioxus; grep -n Event $T/src/event.rs",
+            "grep -n with_menu ~/.cargo/registry/src/index.crates.io-1949/dioxus-desktop-0.7.10/src/*.rs",
+            "strings target/debug/app | grep -c ahma",
         ]
         .into_iter()
         .filter(|c| classify_shell_command(c) != Lane::ReadOnly)
