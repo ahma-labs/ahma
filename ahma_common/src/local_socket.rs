@@ -435,6 +435,160 @@ mod tests {
         assert!(result.is_err(), "connect to a dropped listener succeeded");
     }
 
+    /// EXPERIMENT (never merged): what Windows `AF_UNIX` does with a
+    /// half-close, measured on raw blocking sockets with no tokio and no
+    /// bridge. Two tests hang intermittently on Windows CI with a peer stuck
+    /// waiting for an EOF its partner already sent. Prints a table and fails
+    /// on purpose so the table is in the CI log.
+    #[cfg(windows)]
+    #[test]
+    fn afunix_half_close_probe_table() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        use std::collections::BTreeMap;
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        use std::sync::{Arc, mpsc};
+
+        const ROUNDS: usize = 200;
+        const GIVE_UP_AFTER: usize = 10;
+        let dir = tempfile::tempdir().unwrap();
+        let wait = TestTimeouts::scale_secs(1);
+
+        let sock = || Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        let listen = |i: usize, tag: &str| {
+            let path = dir.path().join(format!("{tag}-{i}.sock"));
+            let l = sock();
+            l.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+            l.listen(8).unwrap();
+            (l, path)
+        };
+        let connect = |path: &Path| {
+            let c = sock();
+            c.connect(&SockAddr::unix(path).unwrap()).unwrap();
+            c
+        };
+        // Read until EOF or the read timeout: "eof" or "timeout".
+        let read_to_eof = |s: &Socket| -> &'static str {
+            s.set_read_timeout(Some(wait)).unwrap();
+            let mut buf = [0u8; 256];
+            loop {
+                match (&*s).read(&mut buf) {
+                    Ok(0) => return "eof",
+                    Ok(_) => continue,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return "timeout";
+                    }
+                    Err(_) => return "error",
+                }
+            }
+        };
+
+        let mut table: BTreeMap<String, usize> = BTreeMap::new();
+        let mut tally = |probe: &str, outcome: &str| {
+            *table.entry(format!("{probe}: {outcome}")).or_default() += 1;
+        };
+
+        // (a) The client half-closes before the server has accepted.
+        let mut bad = 0;
+        for i in 0..ROUNDS {
+            let (l, path) = listen(i, "a");
+            let c = connect(&path);
+            (&c).write_all(b"x").unwrap();
+            let _ = c.shutdown(Shutdown::Write);
+            let (conn, _) = l.accept().unwrap();
+            let outcome = read_to_eof(&conn);
+            tally("a shutdown before accept", outcome);
+            if outcome != "eof" {
+                bad += 1;
+                if bad >= GIVE_UP_AFTER {
+                    break;
+                }
+            }
+        }
+
+        // (b) The client half-closes while its own other thread is blocked in
+        // `recv` on the same socket, waiting for the answer.
+        let mut bad = 0;
+        for i in 0..ROUNDS {
+            let (l, path) = listen(i, "b");
+            let c = Arc::new(connect(&path));
+            let (conn, _) = l.accept().unwrap();
+            let reader = Arc::clone(&c);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                reader.set_read_timeout(Some(wait * 2)).unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 256];
+                let end = loop {
+                    match (&*reader).read(&mut buf) {
+                        Ok(0) => break "eof",
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                        Err(_) => break "timeout",
+                    }
+                };
+                let _ = tx.send((got, end));
+            });
+            std::thread::sleep(TestTimeouts::poll_interval());
+            (&*c).write_all(b"x").unwrap();
+            let _ = c.shutdown(Shutdown::Write);
+            let server = read_to_eof(&conn);
+            tally("b server sees client EOF (recv pending)", server);
+            let _ = (&conn).write_all(b"answer");
+            let _ = conn.shutdown(Shutdown::Write);
+            let client = rx
+                .recv_timeout(wait * 3)
+                .map(|(got, end)| if got == b"answer" { end } else { "short" })
+                .unwrap_or("stuck");
+            tally("b client sees answer + EOF", client);
+            if server != "eof" || client != "eof" {
+                bad += 1;
+                if bad >= GIVE_UP_AFTER {
+                    break;
+                }
+            }
+        }
+
+        // (c) Does shutdown(Read), then shutdown(Both), from one thread wake a
+        // `recv` blocked in another? Decides how a close-on-drop fix unblocks
+        // the bridge's reader thread.
+        for i in 0..20 {
+            let (l, path) = listen(i, "c");
+            let c = Arc::new(connect(&path));
+            let (_conn, _) = l.accept().unwrap();
+            let reader = Arc::clone(&c);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 16];
+                let r = (&*reader).read(&mut buf);
+                let _ = tx.send(format!("{r:?}"));
+            });
+            std::thread::sleep(TestTimeouts::poll_interval());
+            let _ = c.shutdown(Shutdown::Read);
+            let outcome = match rx.recv_timeout(wait) {
+                Ok(r) => format!("woke on Read ({r})"),
+                Err(_) => {
+                    let _ = c.shutdown(Shutdown::Both);
+                    match rx.recv_timeout(wait) {
+                        Ok(r) => format!("woke on Both ({r})"),
+                        Err(_) => "stuck after Read and Both".to_string(),
+                    }
+                }
+            };
+            tally("c blocked recv after local shutdown", &outcome);
+        }
+
+        let rows: Vec<String> = table.iter().map(|(k, v)| format!("{v:>4}  {k}")).collect();
+        panic!(
+            "\n==== Windows AF_UNIX half-close probes ({ROUNDS} rounds, read timeout {wait:?}) ====\n{}\n",
+            rows.join("\n")
+        );
+    }
+
     /// `futures::future::join_all` without the dependency.
     async fn futures_join_all<F: std::future::Future<Output = ()> + Send + 'static>(
         futs: impl Iterator<Item = F>,
