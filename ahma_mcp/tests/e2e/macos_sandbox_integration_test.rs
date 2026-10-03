@@ -915,6 +915,149 @@ fn gpu_allowed_profile_exposes_metal_device() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SPEC R-LISTEN: listening beyond loopback is a capability the human grants.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compile a tiny bind probe outside any sandbox: for each address it binds a
+/// TCP socket (and, for `udp:` addresses, a UDP one) to port 0 and prints
+/// `<addr> OK` or `<addr> ERR <errno>`. `None` (skip) without a C compiler.
+#[cfg(target_os = "macos")]
+fn bind_probe(dir: &Path) -> Option<std::path::PathBuf> {
+    let src = dir.join("bind_probe.c");
+    std::fs::write(
+        &src,
+        r#"#include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  for (int i = 1; i < argc; i++) {
+    const char *a = argv[i];
+    int udp = strncmp(a, "udp:", 4) == 0;
+    const char *ip = udp ? a + 4 : a;
+    int v6 = strchr(ip, ':') != NULL;
+    int s = socket(v6 ? AF_INET6 : AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+    int rc;
+    if (v6) {
+      struct sockaddr_in6 sa; memset(&sa, 0, sizeof sa);
+      sa.sin6_family = AF_INET6; inet_pton(AF_INET6, ip, &sa.sin6_addr);
+      rc = bind(s, (struct sockaddr *)&sa, sizeof sa);
+    } else {
+      struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+      sa.sin_family = AF_INET; inet_pton(AF_INET, ip, &sa.sin_addr);
+      rc = bind(s, (struct sockaddr *)&sa, sizeof sa);
+    }
+    if (rc == 0) printf("%s OK\n", a); else printf("%s ERR %d\n", a, errno);
+    close(s);
+  }
+  return 0;
+}
+"#,
+    )
+    .ok()?;
+    let bin = dir.join("bind_probe");
+    let built = Command::new("cc")
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .ok()?;
+    if !built.status.success() {
+        eprintln!(
+            "skipping: no C compiler: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        return None;
+    }
+    Some(bin)
+}
+
+#[cfg(target_os = "macos")]
+fn run_bind_probe(profile: Option<&str>, bin: &Path, cwd: &Path) -> String {
+    const ADDRS: &[&str] = &["127.0.0.1", "::1", "0.0.0.0", "::", "udp:0.0.0.0"];
+    let mut cmd = match profile {
+        Some(p) => {
+            let mut c = Command::new("sandbox-exec");
+            c.args(["-p", p]).arg(bin);
+            c
+        }
+        None => Command::new(bin),
+    };
+    let out = cmd
+        .args(ADDRS)
+        .current_dir(cwd)
+        .output()
+        .expect("run bind probe");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// What the probe said about one address: `Some(true)` bound, `Some(false)`
+/// refused, `None` not attempted or unavailable on this host.
+#[cfg(target_os = "macos")]
+fn bound(out: &str, addr: &str) -> Option<bool> {
+    out.lines().find_map(|l| {
+        let rest = l.strip_prefix(addr)?.strip_prefix(' ')?;
+        Some(rest == "OK")
+    })
+}
+
+/// The kernel keeps TCP listening on loopback: 127.0.0.1 and ::1 bind, every
+/// interface (0.0.0.0, ::) is refused, and UDP is left alone. With
+/// `[network] listen = "any"` every address binds (SPEC R-LISTEN.1, .2).
+#[cfg(target_os = "macos")]
+#[test]
+fn listening_beyond_loopback_is_refused_unless_granted() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_listen_any};
+    let scope = TempDir::new().expect("scope dir");
+    let Some(bin) = bind_probe(scope.path()) else {
+        return;
+    };
+    let host = run_bind_probe(None, &bin, scope.path());
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+
+    set_listen_any(false);
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    let confined = run_bind_probe(Some(&profile), &bin, scope.path());
+    set_listen_any(true);
+    let granted_profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    set_listen_any(false);
+    let granted = run_bind_probe(Some(&granted_profile), &bin, scope.path());
+
+    for addr in ["127.0.0.1", "::1", "0.0.0.0", "::", "udp:0.0.0.0"] {
+        // An address this host cannot bind at all (no IPv6) proves nothing.
+        if bound(&host, addr) != Some(true) {
+            eprintln!("host cannot bind {addr}; not asserting it: {host}");
+            continue;
+        }
+        let loopback_or_udp = matches!(addr, "127.0.0.1" | "::1" | "udp:0.0.0.0");
+        assert_eq!(
+            bound(&confined, addr),
+            Some(loopback_or_udp),
+            "{addr} under the default profile:\n{confined}\nprofile:\n{profile}"
+        );
+        assert_eq!(
+            bound(&granted, addr),
+            Some(true),
+            "{addr} with listen = any:\n{granted}"
+        );
+    }
+}
+
 /// SPEC R6.2.8: a sandboxed command can see processes. `/bin/ps` is setuid
 /// root and no sandbox can exec a setuid binary (a kernel rule), so the
 /// profile grants `process-info*` for `pgrep`/`lsof` and ahma ships `ahma ps`.

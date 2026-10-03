@@ -307,6 +307,7 @@ ahma sandbox revoke ~/cache                    # this workspace's grant; --works
 ahma network allow crates.io                   # subprocess egress hosts
 ahma network list
 ahma network revoke crates.io
+ahma network listen any                        # let commands listen on every interface (R-LISTEN)
 
 ahma web allow api.github.com                  # outbound domains (HTTP fetch tools)
 ahma web list

@@ -2039,6 +2039,21 @@ pub enum NetworkCommand {
         #[arg(value_name = "HOST")]
         host: String,
     },
+    /// Choose where sandboxed commands may listen for TCP connections (`[network] listen`). `loopback` (the default) keeps servers on 127.0.0.1/::1, reachable from this machine only; `any` lets them listen on every interface, so any device on your networks can connect to what a command serves — a dev server, a debugger port, a database. Enforced on macOS (SPEC R-LISTEN).
+    Listen {
+        /// `loopback` or `any`.
+        #[arg(value_enum, value_name = "WHERE")]
+        on: ListenArg,
+    },
+}
+
+/// Where sandboxed commands may listen (`ahma network listen`).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenArg {
+    /// 127.0.0.1 and ::1 only: reachable from this machine only.
+    Loopback,
+    /// Every interface: any device on your networks can connect.
+    Any,
 }
 
 // ── logs ─────────────────────────────────────────────────────────────────────
@@ -3102,6 +3117,14 @@ fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::
     // SPEC R6.2.7: the GPU is denied unless the user opted in; say so at startup
     // because the failure mode downstream is a silent CPU fallback.
     sandbox::set_allow_gpu(s.sandbox.allow_gpu);
+    // SPEC R-LISTEN: listening beyond loopback is a capability the human grants.
+    let listen_any = s.network.listen == ahma_common::config::ListenPolicy::Any;
+    sandbox::set_listen_any(listen_any);
+    if listen_any {
+        tracing::info!(
+            "[network] listen=\"any\": sandboxed commands may listen on every network interface"
+        );
+    }
     // SPEC R-DOCTOR.7: a sccache server confined to one session's sandbox
     // breaks every other checkout's build; an unconfined ahma fixes it on the
     // way up, so the human never has to learn why.

@@ -75,6 +75,9 @@ pub enum GrantKind {
     /// Consent for terminal hooks to run a command unsandboxed (session-scoped by
     /// R5.5.3 — recorded here for listing, never persisted to disk).
     HookUnsandboxed,
+    /// Sandboxed commands may listen on every network interface, not only
+    /// loopback (`[network] listen = "any"`, SPEC R-LISTEN).
+    Listen,
 }
 
 impl GrantKind {
@@ -87,16 +90,18 @@ impl GrantKind {
             GrantKind::Tool => "tool",
             GrantKind::LogTarget => "log-target",
             GrantKind::HookUnsandboxed => "hook-unsandboxed",
+            GrantKind::Listen => "listen",
         }
     }
 
     /// Every kind, in the order `ahma permissions list` groups them.
-    pub const ALL: [GrantKind; 6] = [
+    pub const ALL: [GrantKind; 7] = [
         GrantKind::FsScope,
         GrantKind::WebDomain,
         GrantKind::NetHost,
         GrantKind::Tool,
         GrantKind::LogTarget,
+        GrantKind::Listen,
         GrantKind::HookUnsandboxed,
     ];
 
@@ -110,7 +115,8 @@ impl GrantKind {
             | GrantKind::WebDomain
             | GrantKind::NetHost
             | GrantKind::Tool
-            | GrantKind::LogTarget => true,
+            | GrantKind::LogTarget
+            | GrantKind::Listen => true,
             GrantKind::HookUnsandboxed => false,
         }
     }
@@ -255,6 +261,24 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
                 expires_at: None,
             });
         }
+    }
+
+    if settings.network.listen == crate::config::ListenPolicy::Any {
+        out.push(GrantRecord {
+            kind: GrantKind::Listen,
+            subject: "every network interface".to_string(),
+            access: None,
+            tier: GrantTier::Always,
+            granted_by: None,
+            granted_at: None,
+            surface: None,
+            note: Some(
+                "any device on your networks can connect to a server a sandboxed command runs"
+                    .to_string(),
+            ),
+            scope_note: None,
+            expires_at: None,
+        });
     }
 
     for host in &settings.network.allow {
@@ -1685,9 +1709,14 @@ mod tests {
                 GrantKind::NetHost,
                 GrantKind::Tool,
                 GrantKind::LogTarget,
+                GrantKind::Listen,
             ]
         );
         assert!(!GrantKind::HookUnsandboxed.is_persisted());
+        assert_eq!(
+            serde_json::to_string(&GrantKind::Listen).unwrap(),
+            format!("\"{}\"", GrantKind::Listen.label())
+        );
         assert_eq!(GrantKind::LogTarget.label(), "log-target");
         assert_eq!(
             serde_json::to_string(&GrantKind::LogTarget).unwrap(),

@@ -1902,6 +1902,35 @@ pub struct NetworkSettings {
     /// list entirely.
     /// Default: empty list
     pub deny_profile_hosts: Vec<String>,
+    /// Where sandboxed commands may listen for TCP connections (SPEC R-LISTEN).
+    ///
+    /// `"loopback"` (the default): on `127.0.0.1`/`::1` only, which reaches
+    /// nothing outside this machine. `"any"`: on every interface too, so any
+    /// device on the networks this machine is on can connect to what the
+    /// command serves. Kernel-enforced on macOS; Linux and Windows cannot tell
+    /// the two apart and do not enforce it (disclosed at startup).
+    pub listen: ListenPolicy,
+}
+
+/// Where sandboxed commands may listen (`[network] listen`, SPEC R-LISTEN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenPolicy {
+    /// Loopback only (`127.0.0.1`, `::1`).
+    #[default]
+    Loopback,
+    /// Every interface.
+    Any,
+}
+
+impl ListenPolicy {
+    /// The value as written in settings.toml.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ListenPolicy::Loopback => "loopback",
+            ListenPolicy::Any => "any",
+        }
+    }
 }
 
 impl Default for NetworkSettings {
@@ -1913,6 +1942,7 @@ impl Default for NetworkSettings {
             allow: Vec::new(),
             profile_hosts: true,
             deny_profile_hosts: Vec::new(),
+            listen: ListenPolicy::Loopback,
         }
     }
 }
@@ -2744,6 +2774,12 @@ impl AhmaSettings {
             toml_str_list(&self.network.deny_profile_hosts),
             toml_str_list(&d.network.deny_profile_hosts),
         );
+        w.setting(
+            "Where sandboxed commands may listen for TCP connections: \"loopback\" (this machine only) or \"any\" (every interface: any device on your networks can connect). Enforced on macOS (SPEC R-LISTEN).",
+            "listen",
+            format!("\"{}\"", self.network.listen.as_str()),
+            format!("\"{}\"", d.network.listen.as_str()),
+        );
 
         // ── Permissions ──────────────────────────────────────────────────────
         w.section("Permission ledger (SPEC R-PERM)", "permissions");
@@ -3011,6 +3047,18 @@ fn atomic_write_toml(path: &Path, text: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// `[network] listen` defaults to loopback, accepts `any`, and refuses a
+    /// value it does not know rather than guessing (SPEC R-LISTEN).
+    #[test]
+    fn listen_policy_defaults_to_loopback() {
+        assert_eq!(NetworkSettings::default().listen, ListenPolicy::Loopback);
+        let any: AhmaSettings = toml::from_str("[network]\nlisten = \"any\"\n").unwrap();
+        assert_eq!(any.network.listen, ListenPolicy::Any);
+        assert!(toml::from_str::<AhmaSettings>("[network]\nlisten = \"lan\"\n").is_err());
+        let rendered = AhmaSettings::default().render_documented();
+        assert!(rendered.contains("listen = \"loopback\""), "{rendered}");
+    }
+
     use super::*;
 
     /// Under the test harness, a test that did not choose a home never gets
@@ -3425,6 +3473,7 @@ mod tests {
                 allow: vec!["crates.io".into(), "*.crates.io".into()],
                 profile_hosts: false,
                 deny_profile_hosts: vec!["go".into()],
+                listen: ListenPolicy::Any,
             },
             permissions: crate::permissions::PermissionSettings {
                 tool_approvals: vec![crate::permissions::ToolApproval {

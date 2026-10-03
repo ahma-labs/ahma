@@ -191,8 +191,9 @@ impl Sandbox {
     /// network through the allow-listed, SSRF-guarded proxy. Uses last-match-wins
     /// SBPL semantics: start from `(allow network*)` (keeps unix sockets, mach,
     /// local binds, DNS-via-mDNSResponder working), deny all outbound IP, then
-    /// re-allow the single proxy address. `network-inbound`/`bind` and unix-socket
-    /// egress are intentionally left permitted.
+    /// re-allow the single proxy address. TCP binds beyond loopback are refused
+    /// unless `[network] listen = "any"` (SPEC R-LISTEN); `network-inbound`, UDP
+    /// binds and unix-socket egress are intentionally left permitted.
     ///
     /// That permission used to be justified with "local IPC cannot exfiltrate off
     /// the host on its own". **That reasoning is wrong and is not why unix sockets
@@ -208,10 +209,14 @@ impl Sandbox {
     /// a *network* operation, so `(allow network*)` here would otherwise let the
     /// connection through no matter what the network rules said.
     fn get_macos_network_rules(&self) -> String {
+        // Listening beyond loopback follows the blanket allow so it wins
+        // (SPEC R-LISTEN.2); empty when `[network] listen = "any"`.
+        let listen = super::listen::seatbelt_listen_rules();
         match *self.egress_proxy_addr.read() {
-            None => "(allow network*)\n".to_string(),
+            None => format!("(allow network*)\n{listen}"),
             Some(addr) => format!(
                 "(allow network*)\n\
+                 {listen}\
                  (deny network-outbound (remote ip \"*:*\"))\n\
                  (allow network-outbound (remote ip \"{}:{}\"))\n",
                 addr.ip(),
@@ -517,6 +522,32 @@ mod tests {
         let p = sb.generate_seatbelt_profile_test(dir.path());
         assert!(p.contains("(allow network*)"));
         assert!(!p.contains("(deny network-outbound"));
+    }
+
+    /// Listening beyond loopback is refused in the profile unless granted, and
+    /// the refusal comes after `(allow network*)` so it wins (SPEC R-LISTEN.2).
+    #[test]
+    fn listening_is_loopback_only_in_the_profile() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        crate::sandbox::set_listen_any(false);
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+        let open = p.find("(allow network*)").expect("network open");
+        let deny = p
+            .find("(deny network-bind (local tcp \"*:*\"))")
+            .unwrap_or_else(|| panic!("no bind restriction in:\n{p}"));
+        assert!(open < deny, "the restriction must follow the blanket allow");
+        crate::sandbox::set_listen_any(true);
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+        assert!(!p.contains("network-bind"), "granted: no restriction");
+        crate::sandbox::set_listen_any(false);
     }
 
     /// Regression test for the bug behind `test_credential_read_deny_is_kernel_enforced`

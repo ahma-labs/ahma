@@ -633,6 +633,14 @@ pub fn platform_enforcement() -> PlatformEnforcement {
         );
     }
 
+    if !super::listen::listen_enforced_here() && !super::listen::listen_any_enabled() {
+        // R-LISTEN.2: Landlock filters binds by port only, and Windows has no
+        // filter, so neither can keep a server on loopback.
+        notes.push(
+            "Listening is not restricted here: a sandboxed command may listen on every network              interface, so any device on your networks can connect to what it serves (the              kernel cannot tell loopback from every interface). Ask for servers bound to              127.0.0.1.",
+        );
+    }
+
     PlatformEnforcement {
         reads_unrestricted,
         writes_unrestricted,
@@ -1040,6 +1048,28 @@ mod tests {
                 "a disclosure has to say what is not enforced AND what to do about it; \
                  {note:?} is too short to do both"
             );
+        }
+    }
+
+    /// Where the kernel cannot keep listening on loopback (SPEC R-LISTEN.2),
+    /// every scope surface says so, with what a user can do instead.
+    #[test]
+    fn listening_beyond_loopback_is_disclosed_where_it_is_not_enforced() {
+        super::super::listen::set_listen_any(false);
+        let e = platform_enforcement();
+        let note = e
+            .notes
+            .iter()
+            .find(|n| n.contains("every network interface"));
+        if super::super::listen::listen_enforced_here() {
+            assert!(
+                note.is_none(),
+                "enforced here, nothing to disclose: {:?}",
+                e.notes
+            );
+        } else {
+            let note = note.expect("not enforced here, so it must be disclosed");
+            assert!(note.contains("127.0.0.1"), "{note}");
         }
     }
 

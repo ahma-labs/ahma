@@ -289,6 +289,7 @@ ahma permissions revoke log-target <file> --yes  # revoke a log-symlink target a
 ahma network allow <host>                      # allow subprocess egress to host
 ahma network list                              # view active allowlist
 ahma network revoke <host>                     # remove host from allowlist
+ahma network listen any|loopback               # listen beyond 127.0.0.1 (refused by default on macOS)
 ```
 
 ---

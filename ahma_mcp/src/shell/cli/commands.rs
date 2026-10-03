@@ -6,9 +6,9 @@
 
 use super::{
     AppConfig, BundleArgs, BundleAuditArgs, BundleChecksumArgs, BundleChecksumVerifyArgs,
-    BundleCommand, InfoArgs, LogsArgs, LogsCommand, NetworkArgs, NetworkCommand, PermissionsArgs,
-    PermissionsCommand, PromptsArgs, PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs,
-    SettingsCommand, SettingsOriginCtx, WebArgs, WebCommand,
+    BundleCommand, InfoArgs, ListenArg, LogsArgs, LogsCommand, NetworkArgs, NetworkCommand,
+    PermissionsArgs, PermissionsCommand, PromptsArgs, PromptsCommand, SandboxArgs, SandboxCommand,
+    SettingsArgs, SettingsCommand, SettingsOriginCtx, WebArgs, WebCommand,
 };
 use crate::shell::{list_tools, resolution};
 // The settings row model and its provenance resolution live in `ahma_common`:
@@ -917,9 +917,10 @@ fn parse_kind(s: &str) -> Result<GrantKind> {
         "net-host" | "net" | "network" | "host" => Ok(GrantKind::NetHost),
         "tool" => Ok(GrantKind::Tool),
         "log-target" | "log" | "logs" => Ok(GrantKind::LogTarget),
+        "listen" => Ok(GrantKind::Listen),
         other => anyhow::bail!(
             "unknown permission kind '{other}' (expected: fs-scope, web-domain, net-host, \
-             tool, or log-target)"
+             tool, log-target, or listen)"
         ),
     }
 }
@@ -1369,6 +1370,25 @@ fn preview_revoke_log_target(
     ))
 }
 
+/// `ahma permissions revoke listen`: back to loopback only (SPEC R-LISTEN).
+fn preview_revoke_listen(
+    settings: &ahma_common::config::AhmaSettings,
+) -> Option<(String, RevokeFn)> {
+    use ahma_common::config::ListenPolicy;
+    if settings.network.listen != ListenPolicy::Any {
+        println!("Sandboxed commands already listen on loopback only; nothing to revoke.");
+        return None;
+    }
+    Some((
+        "let sandboxed commands listen on loopback only ([network] listen = \"loopback\")"
+            .to_string(),
+        Box::new(|s: &mut ahma_common::config::AhmaSettings| {
+            s.network.listen = ListenPolicy::Loopback;
+            true
+        }),
+    ))
+}
+
 fn revoke_permission(
     file: &std::path::Path,
     mut settings: ahma_common::config::AhmaSettings,
@@ -1396,6 +1416,7 @@ fn revoke_permission(
             "hook consent is session-scoped and never persisted; revoke it with \
                  `ahma hooks revoke`"
         ),
+        GrantKind::Listen => preview_revoke_listen(&settings),
     };
     let Some((description, apply)) = preview else {
         return Ok(());
@@ -1683,6 +1704,51 @@ fn network_command_at(file: &std::path::Path, command: NetworkCommand) -> Result
             }
             println!();
             println!("Manage with: ahma network allow|revoke <HOST>, or `ahma permissions list`.");
+            Ok(())
+        }
+        NetworkCommand::Listen { on } => {
+            use ahma_common::config::ListenPolicy;
+            let mut settings = load()?;
+            let policy = match on {
+                ListenArg::Any => ListenPolicy::Any,
+                ListenArg::Loopback => ListenPolicy::Loopback,
+            };
+            if settings.network.listen == policy {
+                println!(
+                    "[network] listen is already \"{}\"; nothing to do.",
+                    policy.as_str()
+                );
+                return Ok(());
+            }
+            settings.network.listen = policy;
+            settings
+                .save_to(file)
+                .with_context(|| format!("Failed to write {}", file.display()))?;
+            let action = match policy {
+                ListenPolicy::Any => AuditAction::Grant,
+                ListenPolicy::Loopback => AuditAction::Revoke,
+            };
+            audit(
+                action,
+                GrantKind::Listen,
+                "every network interface".into(),
+                None,
+            );
+            match policy {
+                ListenPolicy::Any => {
+                    println!("✓ Sandboxed commands may now listen on every network interface.");
+                    println!("  Any device on your networks can connect to a server they run.");
+                    println!("  Take it back with: ahma network listen loopback");
+                }
+                ListenPolicy::Loopback => {
+                    println!("✓ Sandboxed commands may listen on 127.0.0.1 and ::1 only.");
+                }
+            }
+            println!();
+            println!("Recorded in: {}", file.display());
+            println!(
+                "  Next command for terminal hooks; next server start for an MCP session. Enforced on macOS."
+            );
             Ok(())
         }
         NetworkCommand::Revoke { host } => {
@@ -3608,6 +3674,38 @@ mod tests {
                 .all(|l| l.contains("never over a value you set"))
         );
         assert!(profile_env_lines("rust", std::path::Path::new("/w")).is_empty());
+    }
+
+    /// `ahma network listen any` is the one line that lets sandboxed commands
+    /// listen on every interface; `loopback` takes it back (SPEC R-LISTEN).
+    #[test]
+    fn network_listen_sets_and_clears_the_capability() {
+        use ahma_common::config::{AhmaSettings, ListenPolicy};
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("settings.toml");
+        network_command_at(&file, NetworkCommand::Listen { on: ListenArg::Any }).unwrap();
+        let s = AhmaSettings::load_from_result(&file).unwrap();
+        assert_eq!(s.network.listen, ListenPolicy::Any);
+        assert!(
+            ahma_common::permissions::records(&s)
+                .iter()
+                .any(|r| r.kind == GrantKind::Listen),
+            "the grant is listed with every other permission"
+        );
+        network_command_at(
+            &file,
+            NetworkCommand::Listen {
+                on: ListenArg::Loopback,
+            },
+        )
+        .unwrap();
+        let s = AhmaSettings::load_from_result(&file).unwrap();
+        assert_eq!(s.network.listen, ListenPolicy::Loopback);
+        assert!(
+            !ahma_common::permissions::records(&s)
+                .iter()
+                .any(|r| r.kind == GrantKind::Listen)
+        );
     }
 
     #[test]

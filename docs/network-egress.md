@@ -272,6 +272,8 @@ ahma network revoke crates.io       # remove host from [network].allow
 
 ahma permissions list --kind net-host             # view network grants in ledger
 ahma permissions revoke net-host crates.io --yes  # revoke via unified ledger
+
+ahma network listen any|loopback                  # where sandboxed commands may listen
 ```
 
 ### The `network_grant` MCP tool
@@ -281,6 +283,46 @@ When an AI agent encounters a network block, it can invoke the `network_grant` t
 - **Hard denylist**: Blanket `*`, `localhost`, and private/loopback/cloud-metadata IP addresses (`169.254.169.254`) are refused outright even with confirmation.
 - **Human approval gate**: `confirm: true` never grants by itself, for any client. A client that declared MCP elicitation gets a real prompt; every other caller (the in-process agent, a headless harness, a client with no prompt) is told the `ahma network allow <host>` command the human must run — it is never assumed to have asked you first.
 - **Immediate effect**: Human-approved grants take effect immediately for the active session and persist to `~/.ahma/settings.toml` across restarts.
+
+## Listening for connections
+
+> Introduced in 0.22.1 (SPEC R-LISTEN).
+
+A sandboxed command may listen on **loopback** — `127.0.0.1` or `::1`, any
+port — and on unix sockets in its scope, without asking. Test servers, language
+servers and a dev server on `localhost` work the first time; nothing outside
+this machine can reach them.
+
+Listening on **every interface** (`0.0.0.0`, `::`) or a LAN address is
+different: any device on the networks this machine is on — a café's Wi-Fi, an
+office LAN — can connect to whatever the command serves: a dev server with
+debug endpoints, a debugger port, a database without a password. So it is a
+capability you grant, not something a command gets by default:
+
+```bash
+ahma network listen any          # every interface, every workspace, until revoked
+ahma network listen loopback     # back to the default
+ahma permissions revoke listen --yes
+```
+
+or `[network] listen = "any"` in `~/.ahma/settings.toml`. It takes effect on
+the next command for terminal hooks and on the next server start for an MCP
+session, and is listed and audited like every other grant.
+
+A refused bind shows as `operation not permitted` (`listen EPERM` in Node,
+`bind: operation not permitted` in Go). ahma recognises it and tells the agent
+the two ways forward: bind to `127.0.0.1` (most dev servers take
+`--host 127.0.0.1`), or ask you for the grant. It never offers a directory
+grant for it.
+
+| Platform | Enforced |
+|---|---|
+| macOS | Yes: TCP binds are refused except on `localhost` (Seatbelt `network-bind`). |
+| Linux | No. Landlock filters binds by port only and cannot tell loopback from every interface; ahma says so at startup and in `status`. |
+| Windows | No, and disclosed the same way. |
+
+UDP is not restricted on any platform: DNS and QUIC clients bind every address
+just to send.
 
 ## Limits you still have
 
