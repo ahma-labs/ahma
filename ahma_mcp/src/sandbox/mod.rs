@@ -50,6 +50,7 @@ pub mod confinement;
 pub(crate) mod core;
 pub mod credential_reads;
 pub mod denial_scan;
+pub mod deny_tier;
 pub mod display;
 mod error;
 pub mod exec_config;
@@ -94,6 +95,7 @@ pub use credential_reads::{
     set_credential_read_denies, set_keychain_access_allowed,
 };
 pub use denial_scan::{DenialHit, scan_denial, scan_denial_streams};
+pub use deny_tier::{LinuxDenyTier, set_linux_deny_tier};
 pub use display::{ActiveSandbox, ScopeSource, ScopeView};
 pub use error::SandboxError;
 pub use exec_config::{

@@ -793,3 +793,119 @@ fn denylist_holds_when_home_is_reached_through_a_symlink() {
         "granting ~/.ssh must be refused even when $HOME is a symlink"
     );
 }
+
+/// GOLDEN: the `sandbox_grant` result while the question waits in the TUI
+/// (rung 2) — the body the agent relays plus the CLI alternatives (SPEC
+/// R-PERM.3.4: the tool result renders the same body).
+const GOLDEN_TOOL_PENDING: &str = r#"Requested read-only access to
+  /cache/x
+
+Blocked until a human answers. The question is waiting in the ahma TUI. It is NOT granted until a person approves it; Enter/Esc deny. Do not ask again; tell the human it is waiting there.
+
+Allow read-only access to /cache/x?
+
+Who is asking
+  unknown session (a terminal hook, or an older ahma)
+
+What was blocked
+  sandbox_grant tried to read /cache/x
+  blocked before it ran: the path is exact
+
+What the agent says it needs
+  "the build reads the shared model cache"
+  (the agent's claim, in the agent's own words — it is the party asking, not a witness)
+
+Minimum that would work
+  read-only on /cache/x (no write was refused; read-only is enough until one is)
+
+What a grant allows
+  every command in this workspace may read /cache/x — for the next command (once), until this session ends (session), for 24 hours (lease), or until you revoke it (always). Nothing else outside the workspace changes.
+
+Risk
+  not assessed (no live scope to compare against)
+
+If you choose always
+  ~/.ahma/settings.toml gets:
+  [[sandbox.persistent_scopes]]
+  path = "/cache/x"
+  access = "ro"
+  workspace = "<this workspace>"
+  Revoke any time with: ahma sandbox revoke /cache/x
+
+A human can also run:
+  ahma sandbox grant /cache/x --read-only --session   # this terminal session
+  ahma sandbox grant /cache/x --read-only             # until revoked
+
+Grants are written to /home/u/.ahma/settings.toml (outside every sandbox scope); a human-approved grant applies to this session immediately."#;
+
+/// GOLDEN: the `sandbox_grant` result when nobody could be asked (rung 3).
+const GOLDEN_TOOL_NOBODY: &str = r#"Requested read-only access to
+  /cache/x
+
+Blocked until a human grants it: no surface could ask them (this client shows no prompts and no ahma TUI is attached). Nothing is granted. Show the human the text below UNCHANGED, then stop asking.
+
+Allow read-only access to /cache/x?
+
+Who is asking
+  unknown session (a terminal hook, or an older ahma)
+
+What was blocked
+  sandbox_grant tried to read /cache/x
+  blocked before it ran: the path is exact
+
+What the agent says it needs
+  "the build reads the shared model cache"
+  (the agent's claim, in the agent's own words — it is the party asking, not a witness)
+
+Minimum that would work
+  read-only on /cache/x (no write was refused; read-only is enough until one is)
+
+What a grant allows
+  every command in this workspace may read /cache/x — for the next command (once), until this session ends (session), for 24 hours (lease), or until you revoke it (always). Nothing else outside the workspace changes.
+
+Risk
+  not assessed (no live scope to compare against)
+
+If you choose always
+  ~/.ahma/settings.toml gets:
+  [[sandbox.persistent_scopes]]
+  path = "/cache/x"
+  access = "ro"
+  workspace = "<this workspace>"
+  Revoke any time with: ahma sandbox revoke /cache/x
+
+A human can also run:
+  ahma sandbox grant /cache/x --read-only --session   # this terminal session
+  ahma sandbox grant /cache/x --read-only             # until revoked
+
+Grants are written to /home/u/.ahma/settings.toml (outside every sandbox scope); a human-approved grant applies to this session immediately."#;
+
+#[test]
+fn golden_sandbox_grant_results() {
+    let req = sample_request();
+    let path = Path::new("/cache/x");
+    let file = Path::new(SETTINGS);
+    for (what, got, want) in [
+        (
+            "pending",
+            pending_text(path, ScopeAccess::Ro, file, &req),
+            GOLDEN_TOOL_PENDING,
+        ),
+        (
+            "nobody asked",
+            nobody_asked_text(path, ScopeAccess::Ro, file, &req),
+            GOLDEN_TOOL_NOBODY,
+        ),
+    ] {
+        assert_eq!(got, want, "the {what} sandbox_grant result changed:\n{got}");
+        for o in ahma_common::grant_prompt::options() {
+            let key = format!("[{}]", o.key);
+            assert!(
+                !got.contains(&key),
+                "{what}: TUI key {key} in a tool result"
+            );
+        }
+    }
+}
+
+// ------------------------------------------------------------ END PART 2 ---

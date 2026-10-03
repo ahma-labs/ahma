@@ -1,0 +1,1 @@
+{"model":"granite4.2:3b","messages":[{"role":"system","content":"You are terse. Do not deliberate."},{"role":"user","content":"Reply with just: Hello there, friend."}],"stream":true,"options":{"temperature":0.7,"num_ctx":4096}}

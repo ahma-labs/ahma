@@ -726,8 +726,22 @@ pub fn default_socket_path() -> PathBuf {
 /// second local user gets to see, and squat, another user's endpoints.
 #[cfg(unix)]
 pub fn runtime_dir() -> Option<PathBuf> {
-    let dir = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
+    // Under a test harness the private test home, never the real user's
+    // `XDG_RUNTIME_DIR` (SPEC R-ISO.1): a test must not leave session grants
+    // or questions in the developer's own runtime directory, and a test run
+    // inside ahma's sandbox can only write the test home.
+    #[cfg(debug_assertions)]
+    if crate::test_isolation::spawned_under_test_harness() {
+        return ensure_runtime_dir(crate::config::ahma_home_dir()?.join(".ahma"));
+    }
+    runtime_dir_under(std::env::var("XDG_RUNTIME_DIR").ok())
+}
+
+/// The runtime directory for a given `XDG_RUNTIME_DIR`: `<xdg>/ahma`, else
+/// `~/.ahma`.
+#[cfg(unix)]
+fn runtime_dir_under(xdg: Option<String>) -> Option<PathBuf> {
+    let dir = xdg
         .filter(|x| !x.is_empty())
         .map(|xdg| PathBuf::from(xdg).join("ahma"))
         .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))?;
@@ -4290,11 +4304,8 @@ mod tests {
     fn runtime_dir_is_created_private() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let _g = ENV_MUTEX.lock();
-        let prev = std::env::var_os("XDG_RUNTIME_DIR");
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-
-        let dir = runtime_dir().expect("XDG_RUNTIME_DIR yields a runtime dir");
+        let dir = runtime_dir_under(Some(tmp.path().display().to_string()))
+            .expect("XDG_RUNTIME_DIR yields a runtime dir");
         assert_eq!(dir, tmp.path().join("ahma"));
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -4302,11 +4313,24 @@ mod tests {
             "runtime dir must be created 0700, got {mode:o}"
         );
         verify_runtime_dir_secure(&dir).expect("freshly created dir passes its own check");
+    }
 
+    /// SPEC R-ISO.1: under a test harness the runtime directory is the
+    /// private test home, never the real user's `XDG_RUNTIME_DIR`.
+    #[cfg(unix)]
+    #[test]
+    fn under_a_test_harness_the_runtime_dir_is_the_test_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = ENV_MUTEX.lock();
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let dir = runtime_dir().expect("a runtime dir");
         match prev {
             Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
             None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
         }
+        assert!(!dir.starts_with(tmp.path()), "{}", dir.display());
+        assert_eq!(dir, crate::config::ahma_home_dir().unwrap().join(".ahma"));
     }
 
     #[test]

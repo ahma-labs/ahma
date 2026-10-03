@@ -464,7 +464,7 @@ async fn streaming_final_result_is_bounded_and_marks_truncation() {
             AsyncExecOptions {
                 id: Some("test_op_11".to_string()),
                 args: Some(Map::new()),
-                timeout: Some(20),
+                timeout: Some(TestTimeouts::get(TimeoutCategory::ToolCall).as_secs()),
                 subcommand_config: None,
                 log_monitor_config: monitor_config(LogLevel::Error, MonitorStream::Both),
             },

@@ -112,6 +112,8 @@ Run `ahma settings init` to generate this file automatically.
 # defer        = false    # defer sandbox lock until client provides roots/list
 # allow_git_hooks = false           # let tools write <git dir>/hooks/** (default: denied)
 # allow_project_tool_config = false # let tools write this workspace's .ahma/ (default: denied)
+# linux_deny_tier = "detect"        # Linux: "namespace" also mounts git hooks and .ahma/ read-only
+#                                   # in each command's own namespace, so a write to them fails (R6.1.7)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # [logging]
@@ -330,6 +332,27 @@ Both toggles remove the **kernel** rule as well as the write-tool check, so an
 enabled hatch genuinely works rather than failing later with a bare
 `Operation not permitted`. Turning one on is strictly narrower than
 `[sandbox] disable = true`, which is the outcome these hatches exist to prevent.
+
+### Linux: prevent, not only detect (`linux_deny_tier`)
+
+On Linux the kernel does not hold that deny list by default — Landlock cannot
+subtract a path from a directory it allows — so a command run through
+`run_terminal_command` can write `.git/hooks/pre-commit`, and ahma reports it as
+`TRUST-HANDOFF WRITE` afterwards (SPEC R6.1.7). One key changes that where the
+host allows it:
+
+| Key | Values | Default | Effect |
+|---|---|---|---|
+| `linux_deny_tier` | `"detect"`, `"namespace"` | `"detect"` | `"namespace"` runs each command in its own user and mount namespace with every existing git hooks directory and the workspace's `.ahma/` mounted read-only, so a write to them fails with `Read-only file system`. Needs unprivileged user namespaces; where they are refused (stock Ubuntu 23.10+, Docker's default seccomp profile, an ahma nested inside another) ahma logs why at startup, shows it in `ahma status`, and keeps detecting. Detection stays on in both modes. Ignored off Linux. |
+
+```toml
+[sandbox]
+linux_deny_tier = "namespace"
+```
+
+It is a `[sandbox]` key, so a repository's own `.ahma/settings.toml` cannot
+turn it off (R-CFG2.2). What it needs and what it does not cover:
+[security-sandbox.md](security-sandbox.md#prevented-where-the-host-allows-it-linux-opt-in).
 
 ## See also
 
