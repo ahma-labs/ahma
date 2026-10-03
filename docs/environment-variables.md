@@ -82,6 +82,7 @@ meant setting one changed the chat client's behaviour but not the server's.
 | `AHMA_DISABLE_TEMP` | `--disable-temp-files` CLI flag or `sandbox.disable_temp = true` in settings.toml |
 | `AHMA_NO_PACKAGE_CACHE_WRITE` | `--no-package-cache-write` flag or `sandbox.package_cache_write = false` in settings.toml |
 | `AHMA_TASK_VAULT` | `--task-vault` CLI flag |
+| `AHMA_CONFIG_DIR` | Nothing — every permission, approved log targets included, lives in `~/.ahma/settings.toml` (`ahma permissions list`). The retired `<config dir>/ahma/approvals.json` and `log_exceptions.json` are migrated from the platform config directory only, once, at startup; a test build with a redirected home (`AHMA_TEST_HOME`) looks for them in `<home>/.config/ahma/` instead. |
 | `AHMA_PREFER_OWN_SANDBOX` | Nothing — it is now the only behaviour. A terminal hook always applies ahma's own sandbox and never defers on an environment marker (`CLAUDECODE`, `CURSOR_SANDBOX`, …); it defers only when the kernel refuses to nest its profile (SPEC R7.2, R7.6). |
 
 ---
@@ -185,7 +186,6 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_TEST_LOG_DIR` | Redirects the project log directory in `ahma_mcp` unit tests. Read only under `cfg!(test)` — no shipped binary contains the read |
 | `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS` | Shortens the stdio frontend's wait for `initialize` in tests. Debug builds only |
 | `AHMA_RECONNECT_BACKOFF_MS` | Shortens the stdio proxy's reconnect backoff in tests. Debug builds only |
-| `AHMA_CONFIG_DIR` | Relocates the platform config directory holding `log_exceptions.json` and the legacy `approvals.json` read by the one-time migration. Used by tests; see SPEC §11 (known gaps) |
 | `AHMA_TEST_HOME` | Redirects `~` resolution (`ahma_common::config::ahma_home_dir`) at a temp directory so a test can supply its own `~/.ahma/settings.toml`. Compiled in **debug builds only** (`#[cfg(debug_assertions)]`) — a release binary ignores it |
 | `AHMA_TEST_ISOLATION` | Set by test harnesses on spawned ahma binaries: forces private (non-global) bridge/hub endpoints (SPEC R-ISO.1) |
 | `NEXTEST` / `NEXTEST_RUN_ID` | Set by `cargo nextest`, inherited by spawned binaries; read solely to force the same private-endpoint isolation as `AHMA_TEST_ISOLATION` — the single R-CFG9.2 carve-out (SPEC R-ISO.1) |

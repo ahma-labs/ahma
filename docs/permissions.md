@@ -84,6 +84,24 @@ A few deliberate details:
 Only **always** touches disk, and only after you've seen the exact file and the
 exact line.
 
+## Kinds of permission
+
+`ahma permissions list` groups every grant by kind; `--kind` and `revoke` take the
+same names.
+
+| Kind | What it allows | Granted by | Lives in |
+|---|---|---|---|
+| `fs-scope` | a directory outside the workspace, read-only or read-write | a prompt, `ahma sandbox grant` | `[sandbox].persistent_scopes` |
+| `web-domain` | a domain ahma's own HTTP tools may fetch | a prompt, `ahma web allow` | `[web]` |
+| `net-host` | a host sandboxed commands may reach under `--restrict-network` | a prompt, `ahma network allow` | `[network].allow` |
+| `tool` | a tool the agent may run in a workspace without asking again | a tool-approval prompt | `[permissions].tool_approvals` |
+| `log-target` | a file outside the workspace that a `.ahma/logs/*.log` symlink points at, readable (never writable) by live-log monitoring | the `logs_approve` tool | `[log_targets].approvals` |
+
+`tool` and `log-target` grants are bound to the workspace they were granted in, and so
+is an `fs-scope` grant unless it was made `--global`; `web-domain` and `net-host` grants
+apply everywhere. A `log-target` grant takes effect from the next session; see
+[Live log monitoring](live-log-monitoring.md#log-files-that-link-outside-the-workspace).
+
 ## When a grant takes effect
 
 - **Scope**: a filesystem grant is bound to the workspace it was approved for
@@ -249,6 +267,8 @@ ahma permissions list --kind net-host          # just network hosts
 ahma permissions revoke fs-scope ~/cache --yes # revoke this workspace's grant (previews without --yes)
 ahma permissions revoke net-host crates.io --yes # revoke network host
 ahma permissions revoke tool cargo_build       # per-workspace tool approval
+ahma permissions list --kind log-target        # log files outside the workspace that live-log may read
+ahma permissions revoke log-target /var/log/app.log --workspace ~/code/proj
 
 ahma sandbox grant ~/cache [--read-only]       # kind-scoped shortcut, bound to this workspace
 ahma sandbox grant ~/cache --session           # this terminal session only; never written to the file

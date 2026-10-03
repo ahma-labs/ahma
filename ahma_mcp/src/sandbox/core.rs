@@ -11,73 +11,47 @@ use super::types::{SandboxMode, ScopesGuard};
 // Livelog symlink resolution helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Path to the out-of-sandbox log-symlink exceptions file
-/// (`~/.config/ahma/log_exceptions.json`), or `None` if no config dir exists.
+/// The out-of-workspace log-symlink targets approved for `primary_root`
+/// (`[log_targets]` in `~/.ahma/settings.toml`, SPEC R-PERM.1).
 ///
-/// These approvals are stored *outside* any workspace scope so a sandboxed
-/// agent cannot grant itself access to out-of-scope log targets by writing the
-/// file — the same reasoning as `ahma_core`-style tool-approval grants.
-/// Exceptions are keyed by workspace root:
-///
-/// ```json
-/// { "/Users/you/github/ahma": ["/abs/target/one", "/abs/target/two"] }
-/// ```
-fn log_exceptions_path() -> Option<PathBuf> {
-    // Honors `AHMA_CONFIG_DIR` (tests / relocation), else the platform config dir.
-    std::env::var_os("AHMA_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(dirs::config_dir)
-        .map(|d| d.join("ahma").join("log_exceptions.json"))
-}
-
-/// Normalise a workspace root into the map key (canonical where possible).
-fn workspace_key(primary_root: &Path) -> String {
-    dunce::canonicalize(primary_root)
-        .unwrap_or_else(|_| primary_root.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn read_exceptions_map(path: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
-}
-
+/// They live in the unified permission ledger, which is *outside* every
+/// workspace scope (SPEC R5.4.8), so a sandboxed agent cannot grant itself read
+/// access to an out-of-scope file by writing an approval. A ledger that cannot
+/// be read or parsed yields no approvals: fail closed.
 pub fn load_exceptions(primary_root: &Path) -> Vec<PathBuf> {
-    let Some(path) = log_exceptions_path() else {
+    let Some(settings_file) = ahma_common::config::settings_path() else {
         return vec![];
     };
-    let map = read_exceptions_map(&path);
-    map.get(&workspace_key(primary_root))
-        .map(|targets| targets.iter().map(PathBuf::from).collect())
-        .unwrap_or_default()
+    ahma_common::config::AhmaSettings::load_from(&settings_file)
+        .log_targets
+        .approved_targets(&ahma_common::permissions::workspace_key(primary_root))
 }
 
-/// Persist an approved out-of-scope symlink `target` for `primary_root` to the
-/// out-of-sandbox exceptions file. Idempotent.
-pub fn add_log_exception(primary_root: &Path, target: &Path) -> std::io::Result<()> {
-    let Some(path) = log_exceptions_path() else {
-        return Ok(()); // no config dir — nothing we can do, fail soft
-    };
-
-    let mut map = read_exceptions_map(&path);
-    let key = workspace_key(primary_root);
-    let target_str = target.to_string_lossy().into_owned();
-    let entry = map.entry(key).or_default();
-    if !entry.iter().any(|t| t == &target_str) {
-        entry.push(target_str);
-        entry.sort();
-    }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let serialized = serde_json::to_string_pretty(&map)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&path, serialized)
+/// Approve the out-of-scope log symlink `target` for `primary_root`: a
+/// `log-target` grant in the ledger, with provenance, and an audit record
+/// (SPEC R-PERM.2.1). Idempotent; returns `true` when the target was newly
+/// approved. Takes effect when the next sandbox is built — the read scope of a
+/// running one is fixed.
+///
+/// Blocking file I/O: call it from `spawn_blocking` in async code.
+pub fn add_log_exception(primary_root: &Path, target: &Path) -> std::io::Result<bool> {
+    let settings_file = ahma_common::config::settings_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cannot determine the home directory holding ~/.ahma/settings.toml",
+        )
+    })?;
+    ahma_common::permissions::persist_log_target(
+        &settings_file,
+        primary_root,
+        target,
+        LOGS_APPROVE_SURFACE,
+    )
+    .map_err(|e| std::io::Error::other(format!("{e:#}")))
 }
+
+/// The surface a `logs_approve` grant is recorded as coming from.
+const LOGS_APPROVE_SURFACE: &str = "mcp:logs_approve";
 
 pub fn is_target_allowed(target: &Path, scopes: &[PathBuf], exceptions: &[PathBuf]) -> bool {
     if scopes.iter().any(|scope| target.starts_with(scope)) {

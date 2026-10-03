@@ -552,10 +552,11 @@ async fn red_team_global_read_access_blocked() {
 ///   except the explicit livelog read-scope grant for `outside_target`.
 /// - --disable-temp-files prevents a blanket /tmp Landlock grant that would
 ///   otherwise make all temp dirs accessible.
-/// - An `exceptions.json` is written into the scope dir so livelog's
-///   `is_target_allowed` check approves the out-of-scope symlink target.
-///   Without this the symlink would be silently blocked by `resolve_log_symlink`
-///   and never added to Landlock read_scopes.
+/// - The out-of-scope symlink target is approved as a `log-target` grant in the
+///   permission ledger (`~/.ahma/settings.toml` under a temp `AHMA_TEST_HOME`,
+///   inherited by the spawned server) so livelog's `is_target_allowed` check
+///   admits it. Without this the symlink would be silently blocked by
+///   `resolve_log_symlink` and never added to Landlock read_scopes.
 #[tokio::test]
 #[cfg(target_os = "linux")]
 #[ignore]
@@ -581,12 +582,15 @@ async fn red_team_livelog_symlink_read_allowed() {
     std::fs::write(&outside_forbidden, "forbidden content").unwrap();
 
     // Approve the outside target so livelog's is_target_allowed() admits it to
-    // the Landlock read_scopes. Approvals live out-of-sandbox now; redirect the
-    // config dir to a temp location for isolation (nextest = process-per-test).
-    // Without this, the out-of-scope symlink target would be silently blocked
-    // by resolve_log_symlink and never added to read_scopes.
-    let config_dir = create_non_tmp_tempdir();
-    unsafe { std::env::set_var("AHMA_CONFIG_DIR", config_dir.path()) };
+    // the Landlock read_scopes. Approvals live in the permission ledger, outside
+    // every sandbox scope; redirect the home to a temp location for isolation
+    // (nextest = process-per-test). The spawned server inherits AHMA_TEST_HOME,
+    // so it reads the same ledger. Without this, the out-of-scope symlink target
+    // would be silently blocked by resolve_log_symlink and never added to
+    // read_scopes.
+    let home_dir = create_non_tmp_tempdir();
+    unsafe { std::env::set_var("AHMA_TEST_HOME", home_dir.path()) };
+    let outside_target = dunce::canonicalize(&outside_target).unwrap();
     ahma_mcp::sandbox::add_log_exception(scope_dir.path(), &outside_target).unwrap();
 
     let malicious_link = log_dir.join("live.log");

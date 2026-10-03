@@ -134,11 +134,16 @@ async fn run() -> Result<()> {
             Ok(false) => {}
             Err(e) => tracing::warn!("could not sync settings.toml defaults: {e}"),
         }
-        // Fold the retired ~/.config/ahma/approvals.json into the one ledger
-        // (SPEC R-PERM.1). Idempotent and non-destructive: it runs once, renames
-        // the legacy file aside rather than deleting it, and does nothing at all
-        // on the overwhelming majority of startups where no legacy file exists.
+        // Fold the retired ~/.config/ahma/approvals.json and log_exceptions.json
+        // into the one ledger (SPEC R-PERM.1). Idempotent and non-destructive:
+        // each runs once, renames its legacy file aside rather than deleting it,
+        // and does nothing at all on the overwhelming majority of startups where
+        // no legacy file exists. The legacy tree is no longer relocatable, so a
+        // set `AHMA_CONFIG_DIR` is reported as ignored (R-CFG1.2) rather than
+        // silently not migrated.
+        ahma_mcp::warn_retired_env("AHMA_CONFIG_DIR");
         ahma_common::permissions::migrate_legacy_approvals_best_effort();
+        ahma_common::permissions::migrate_legacy_log_exceptions_best_effort();
     }
 
     #[cfg(target_os = "windows")]

@@ -21,11 +21,12 @@
 //!     into the ledger without losing a grant, and without destroying the file.
 //!
 //! `AHMA_TEST_HOME` is the documented test seam for `~/.ahma`
-//! (`config::ahma_home_dir` honors it in debug builds); `AHMA_CONFIG_DIR` still
-//! redirects the *legacy* location so the migration path is testable. Both are
-//! process-global, so each scenario is pinned in a SINGLE test with exactly one
-//! writer of the env per test binary — correct under both `cargo nextest`
-//! (process per test) and `cargo test` (threads sharing one process).
+//! (`config::ahma_home_dir` honors it in debug builds); with it set, the
+//! *legacy* tree resolves to `<home>/.config/ahma/` rather than the real
+//! config dir, so the migration path is testable. It is process-global, so
+//! each scenario is pinned in a SINGLE test with exactly one writer of the env
+//! per test binary — correct under both `cargo nextest` (process per test) and
+//! `cargo test` (threads sharing one process).
 
 use std::path::{Path, PathBuf};
 

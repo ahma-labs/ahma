@@ -1972,6 +1972,13 @@ pub struct AhmaSettings {
     /// in `[sandbox].persistent_scopes` and web domains in `[web]`; they are all
     /// the *same ledger*, rendered together by `ahma permissions list`.
     pub permissions: crate::permissions::PermissionSettings,
+    /// Files outside the workspace that its `.ahma/logs/*.log` symlinks may
+    /// point at, approved with the `logs_approve` tool — part of the same
+    /// ledger (SPEC R-PERM.1), migrated out of the retired
+    /// `~/.config/ahma/log_exceptions.json`. A table of its own because
+    /// `[permissions]` rejects unknown keys (see
+    /// [`LogTargetSettings`](crate::permissions::LogTargetSettings)).
+    pub log_targets: crate::permissions::LogTargetSettings,
 }
 
 impl AhmaSettings {
@@ -2746,6 +2753,18 @@ impl AhmaSettings {
             toml_tool_approvals(&d.permissions.tool_approvals),
         );
 
+        // ── Approved log targets ─────────────────────────────────────────────
+        w.section(
+            "Approved log targets (log symlinks that point outside the workspace; SPEC R-PERM)",
+            "log_targets",
+        );
+        w.setting(
+            "Per-workspace files a .ahma/logs/*.log symlink may point at, readable by live-log monitoring (approve with the logs_approve tool; manage via `ahma permissions list|revoke log-target`). Migrated from the retired ~/.config/ahma/log_exceptions.json.",
+            "approvals",
+            toml_log_target_approvals(&self.log_targets.approvals),
+            toml_log_target_approvals(&d.log_targets.approvals),
+        );
+
         w.into_string()
     }
 
@@ -2888,6 +2907,26 @@ fn toml_tool_approvals(v: &[crate::permissions::ToolApproval]) -> String {
             let mut parts = vec![
                 format!("workspace = {}", toml_path(&a.workspace)),
                 format!("tools = {}", toml_str_list(&a.tools)),
+            ];
+            push_opt_str_field(&mut parts, "granted_at", &a.granted_at);
+            push_opt_str_field(&mut parts, "granted_by", &a.granted_by);
+            push_opt_str_field(&mut parts, "surface", &a.surface);
+            format!("{{ {} }}", parts.join(", "))
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Render approved log targets as an inline TOML array of inline tables,
+/// omitting the optional fields that are unset (matching serde's
+/// `skip_serializing_if`).
+fn toml_log_target_approvals(v: &[crate::permissions::LogTargetApproval]) -> String {
+    let items: Vec<String> = v
+        .iter()
+        .map(|a| {
+            let mut parts = vec![
+                format!("workspace = {}", toml_path(&a.workspace)),
+                format!("targets = {}", toml_path_list(&a.targets)),
             ];
             push_opt_str_field(&mut parts, "granted_at", &a.granted_at);
             push_opt_str_field(&mut parts, "granted_by", &a.granted_by);
@@ -3396,6 +3435,18 @@ mod tests {
                 }],
                 advisor: true,
                 advisor_timeout_secs: 6,
+            },
+            log_targets: crate::permissions::LogTargetSettings {
+                approvals: vec![crate::permissions::LogTargetApproval {
+                    workspace: PathBuf::from("/home/u/proj"),
+                    targets: vec![
+                        PathBuf::from("/var/log/app.log"),
+                        PathBuf::from("/var/log/sys.log"),
+                    ],
+                    granted_at: Some("2026-10-03".into()),
+                    granted_by: Some("logs_approve".into()),
+                    surface: Some("mcp:logs_approve".into()),
+                }],
             },
         }
     }
@@ -4519,6 +4570,10 @@ const SECURITY_TABLES: &[&str] = &[
     // The grant ledger itself. A project file proposing grants would be the
     // whole R5.4.5 gate bypassed in one line.
     "permissions",
+    // Approved log targets are ledger grants too: each one widens what the
+    // sandbox may read. A cloned repository must not be able to approve a log
+    // symlink of its own pointing at `~/.ssh/id_ed25519`.
+    "log_targets",
 ];
 
 /// Individual Security-tier keys inside otherwise-Preference tables.
@@ -4666,6 +4721,8 @@ mod tier_tests {
             ("auth", "require_token_path"),
             ("auth", "rate_limit_rps"),
             ("http", "unix_socket_path"),
+            ("permissions", "tool_approvals"),
+            ("log_targets", "approvals"),
         ] {
             assert_eq!(
                 settings_tier(table, key),
@@ -4926,6 +4983,9 @@ require_token = "attacker-chosen"
 [network]
 allow = ["evil.example"]
 
+[log_targets]
+approvals = [{ workspace = "/w", targets = ["/home/u/.ssh/id_ed25519"] }]
+
 [tools]
 timeout_secs = 42
 "#,
@@ -4940,6 +5000,7 @@ timeout_secs = 42
             "sandbox.package_cache_write",
             "auth.require_token",
             "network.allow",
+            "log_targets.approvals",
         ] {
             assert!(
                 load.rejected_security.iter().any(|k| k == refused),
@@ -4951,6 +5012,11 @@ timeout_secs = 42
         assert!(
             !load.accepted.contains_key("sandbox"),
             "not one sandbox key may survive; accepted: {:?}",
+            load.accepted
+        );
+        assert!(
+            !load.accepted.contains_key("log_targets"),
+            "a project file cannot approve a log target; accepted: {:?}",
             load.accepted
         );
 

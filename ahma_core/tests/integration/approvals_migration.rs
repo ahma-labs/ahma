@@ -1,10 +1,11 @@
 //! Migration of the retired `~/.config/ahma/approvals.json` into the unified
 //! permission ledger (SPEC R-PERM.1).
 //!
-//! This lives in its own test binary because it drives *two* process-global env
-//! seams at once (`AHMA_TEST_HOME` for `~/.ahma`, `AHMA_CONFIG_DIR` for the
-//! legacy tree), and because it must observe the migration running exactly once
-//! — which the `OnceLock` in `approvals` guarantees per process, not per test.
+//! This drives the process-global `AHMA_TEST_HOME` seam, and it must observe the
+//! migration running exactly once — which the `OnceLock` in `approvals`
+//! guarantees per process, not per test. With the home redirected, a test build
+//! looks for the legacy tree at `<home>/.config/ahma/` (never the real user's
+//! config dir; `AHMA_CONFIG_DIR` is retired).
 //!
 //! What matters here is not just "the grants moved". It is that a user who has
 //! been trusting `cargo_build` for months does not silently start getting
@@ -22,11 +23,11 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn legacy_approvals_are_migrated_once_and_the_old_file_is_archived() {
     let home = TempDir::new().unwrap();
-    let legacy_root = TempDir::new().unwrap();
     let workspace = TempDir::new().unwrap();
 
-    // A pre-existing approvals.json, exactly as a released ahma would have left it.
-    let legacy_dir = legacy_root.path().join("ahma");
+    // A pre-existing approvals.json, exactly as a released ahma would have left it,
+    // in the legacy tree a redirected home resolves to.
+    let legacy_dir = home.path().join(".config").join("ahma");
     std::fs::create_dir_all(&legacy_dir).unwrap();
     let legacy_file = legacy_dir.join("approvals.json");
     let key = workspace_key(workspace.path());
@@ -39,11 +40,10 @@ async fn legacy_approvals_are_migrated_once_and_the_old_file_is_archived() {
     )
     .unwrap();
 
-    // SAFETY: set once, before any approvals call; single-test binary, so there is
-    // exactly one writer of these process-global vars.
+    // SAFETY: set once, before any approvals call; nextest runs each test in its
+    // own process, so there is exactly one writer of this process-global var.
     unsafe {
         std::env::set_var("AHMA_TEST_HOME", home.path());
-        std::env::set_var("AHMA_CONFIG_DIR", legacy_root.path());
     }
 
     // The very first read through the approvals API triggers the migration.
