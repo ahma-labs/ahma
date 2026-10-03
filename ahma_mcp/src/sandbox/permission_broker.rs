@@ -709,14 +709,24 @@ fn grant_form_schema(reason: GrantReason) -> rmcp::model::ElicitationSchema {
         ConstTitle, ElicitationSchema, EnumSchema, PrimitiveSchemaDefinition,
         SingleSelectEnumSchema, TitledSingleSelectEnumSchema,
     };
-    let one_of: Vec<ConstTitle> = ahma_common::grant_prompt::options_for(reason)
+    let options = ahma_common::grant_prompt::options_for(reason);
+    // Name only the tiers this question offers: a log target has no `once`.
+    let unsaved = match (
+        options.iter().any(|o| o.value.contains("session")),
+        options.iter().any(|o| o.value.contains("once")),
+    ) {
+        (true, true) => " Session and once answers are never written to disk.",
+        (true, false) => " A session answer is never written to disk.",
+        (false, true) => " A once answer is never written to disk.",
+        (false, false) => "",
+    };
+    let one_of: Vec<ConstTitle> = options
         .into_iter()
         .map(|o| ConstTitle::new(o.value, o.label))
         .collect();
     let mut select = TitledSingleSelectEnumSchema::new(one_of);
     select.title = Some("Your decision".into());
-    select.description =
-        Some("Deny is the default. Session and once answers are never written to disk.".into());
+    select.description = Some(format!("Deny is the default.{unsaved}").into());
     select.default = Some("deny".to_string());
     let mut props = std::collections::BTreeMap::new();
     props.insert(
@@ -1206,5 +1216,25 @@ mod tests {
             text.contains("revoke"),
             "how to undo it, before they agree to it"
         );
+    }
+
+    /// The form names only the tiers it offers: a log target has no `once`.
+    #[test]
+    fn the_form_names_only_the_unsaved_tiers_it_offers() {
+        let says = |reason| {
+            serde_json::to_value(grant_form_schema(reason)).unwrap()["properties"]["decision"]
+                ["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let log = says(GrantReason::LogTarget);
+        assert!(!log.contains("once"), "{log}");
+        assert!(
+            log.contains("A session answer is never written to disk"),
+            "{log}"
+        );
+        let path = says(GrantReason::PreExecViolation);
+        assert!(path.contains("Session and once answers"), "{path}");
     }
 }
