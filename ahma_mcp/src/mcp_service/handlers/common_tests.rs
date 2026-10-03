@@ -407,6 +407,41 @@ fn failure_states_the_nonzero_exit_code() {
     assert!(text.contains("error[E0433]"), "must keep stderr: {text:?}");
 }
 
+// ─── Trust-handoff alert (SPEC R6.1.7) ───────────────────────────────────────
+
+const ALERT: &str = "TRUST-HANDOFF WRITE: /ws/.git/hooks/pre-commit (created) — git runs \
+                     files in .git/hooks outside any sandbox; review before your next git command";
+
+#[test]
+fn a_trust_handoff_alert_follows_the_identity_line_and_leads_the_output() {
+    let mut op = completed_op("op_4_sh", "make hooks", "done", "", 0);
+    op.result.as_mut().unwrap()["handoff_alert"] = json!(ALERT);
+    let text = text_of(&format_completed_operation(&op));
+
+    let (first, rest) = text.split_once('\n').expect("identity line then body");
+    assert!(
+        first.contains("make hooks") && first.contains("exit 0"),
+        "R2.6.2 keeps the identity line first: {first:?}"
+    );
+    assert_eq!(rest, format!("{ALERT}\n\ndone"), "{text}");
+}
+
+#[test]
+fn a_result_without_an_alert_is_unchanged() {
+    let op = completed_op("op_5_echo", "echo hi", "hi\n", "", 0);
+    assert!(handoff_alert(&op).is_none());
+    assert!(!text_of(&format_completed_operation(&op)).contains("TRUST-HANDOFF"));
+}
+
+#[test]
+fn serialized_operations_lead_with_their_alert() {
+    let mut op = completed_op("op_6_sh", "make hooks", "done", "", 0);
+    op.result.as_mut().unwrap()["handoff_alert"] = json!(ALERT);
+    let blocks = serialize_operations_to_content(&[op]);
+    assert_eq!(blocks.len(), 2, "the alert, then the operation");
+    assert_eq!(blocks[0].as_text().unwrap().text, ALERT);
+}
+
 // ─── Ignored-argument disclosure (SPEC R2.6.4) ───────────────────────────────
 
 #[test]

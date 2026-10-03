@@ -121,6 +121,33 @@ durable half.
 Recorded only after the bytes reach disk. A refused (`DenyWrite`) or failed write
 produces no entry — the log must never report a handoff that did not happen.
 
+### `handoff_write`
+
+A write ahma would have refused and could not stop. On Linux and Windows the
+kernel does not hold the deny-write tier — every resolved `<git dir>/hooks` and
+the project's `.ahma/` — so a shell command can write there (SPEC R6.1.7,
+R-HANDOFF.4). ahma inventories those paths before each command and compares
+after it; every entry that changed is one record, alongside the
+`TRUST-HANDOFF WRITE` line at the top of the tool result. See
+[security-sandbox.md](security-sandbox.md#detected-not-prevented-linux-and-windows).
+
+```json
+{
+  "timestamp": "2026-10-03T09:14:52.310+00:00",
+  "type": "handoff_write",
+  "operation_id": "op_52_bash",
+  "path": "/home/me/project/.git/hooks/pre-commit",
+  "change": "created",
+  "trigger": "git runs files in .git/hooks outside any sandbox; review before your next git command",
+  "tool_name": "bash"
+}
+```
+
+`change` is one of `created`, `modified`, `removed`, `made_executable`. The
+record says the entry changed while the command ran, not that the command
+changed it: your editor, or another agent, may have written it in that window.
+Not written on macOS, where the kernel refuses the write itself.
+
 ### `sandbox_denial`
 
 The durable copy of the structured `sandbox_denial` payload (SPEC R5.4.7): a
@@ -159,9 +186,10 @@ audit trail.
 
 The consequence is that the file grows for as long as the project is worked on.
 Entries are small (a few hundred bytes; hard-capped well under 4 KiB) and there
-are two per command plus one per disclosed write, so a heavy day of ten thousand
-commands costs single-digit megabytes. If you want a retention policy, apply your
-own — deliberately, and ideally by archiving rather than deleting.
+are two per command plus one per disclosed or detected write, so a heavy day of
+ten thousand commands costs single-digit megabytes. If you want a retention
+policy, apply your own — deliberately, and ideally by archiving rather than
+deleting.
 
 ## Failure behaviour
 
