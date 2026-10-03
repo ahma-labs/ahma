@@ -878,10 +878,13 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
 
     let file = settings_path()
         .context("Cannot determine ~/.ahma/settings.toml (home directory not found)")?;
-    // Fold any retired ~/.config/ahma/approvals.json into the ledger first, so
-    // `list` shows the truth rather than a partial picture.
+    // Fold any retired ~/.config/ahma/{approvals,log_exceptions}.json into the
+    // ledger first, so `list` shows the truth rather than a partial picture.
     if let Err(e) = ahma_common::permissions::migrate_legacy_approvals(&file) {
         eprintln!("warning: could not migrate legacy approvals: {e:#}");
+    }
+    if let Err(e) = ahma_common::permissions::migrate_legacy_log_exceptions(&file) {
+        eprintln!("warning: could not migrate legacy log exceptions: {e:#}");
     }
     let load = || -> Result<AhmaSettings> {
         AhmaSettings::load_from_result(&file).map_err(|e| anyhow::anyhow!(e))
@@ -913,8 +916,10 @@ fn parse_kind(s: &str) -> Result<GrantKind> {
         "web-domain" | "web" | "domain" => Ok(GrantKind::WebDomain),
         "net-host" | "net" | "network" | "host" => Ok(GrantKind::NetHost),
         "tool" => Ok(GrantKind::Tool),
+        "log-target" | "log" | "logs" => Ok(GrantKind::LogTarget),
         other => anyhow::bail!(
-            "unknown permission kind '{other}' (expected: fs-scope, web-domain, net-host, or tool)"
+            "unknown permission kind '{other}' (expected: fs-scope, web-domain, net-host, \
+             tool, or log-target)"
         ),
     }
 }
@@ -992,7 +997,9 @@ fn print_permissions(
         return Ok(());
     }
 
-    for kind in [GrantKind::FsScope, GrantKind::WebDomain, GrantKind::Tool] {
+    // Every persisted kind, never a hand-kept list: one of those once left
+    // `net-host` grants out of this output entirely.
+    for kind in GrantKind::persisted() {
         let of_kind: Vec<_> = rows.iter().filter(|r| r.kind == kind).collect();
         if of_kind.is_empty() {
             continue;
@@ -1319,6 +1326,49 @@ fn preview_revoke_net_host(
     ))
 }
 
+/// The ledger spelling of a log-target subject typed at the CLI: `~` expanded
+/// and canonicalized, as `logs_approve` stored it. Falls back to the expanded
+/// path when the file no longer exists, so a grant for a deleted log can still
+/// be revoked by the path `ahma permissions list` printed.
+fn log_target_subject(subject: &str) -> PathBuf {
+    let expanded = ahma_common::config::expand_home(std::path::Path::new(subject));
+    dunce::canonicalize(&expanded).unwrap_or(expanded)
+}
+
+/// Preview a log-target revoke; see [`preview_revoke_fs_scope`] for the `None` contract.
+fn preview_revoke_log_target(
+    settings: &ahma_common::config::AhmaSettings,
+    subject: &str,
+    workspace: Option<PathBuf>,
+) -> Option<(String, RevokeFn)> {
+    let ws = workspace
+        .map(|w| workspace_key(&ahma_common::config::expand_home(&w)))
+        .unwrap_or_else(|| workspace_key(&std::env::current_dir().unwrap_or_default()));
+    let target = log_target_subject(subject);
+    if !settings.log_targets.is_target_approved(&ws, &target) {
+        println!(
+            "Log target {} is not approved in {}.",
+            target.display(),
+            ws.display()
+        );
+        println!(
+            "Log-target approvals are per-workspace; pass --workspace to target another one, \
+             or run `ahma permissions list --kind log-target`."
+        );
+        return None;
+    }
+    Some((
+        format!(
+            "remove the approved log target {} for workspace {}",
+            target.display(),
+            ws.display()
+        ),
+        Box::new(move |s: &mut ahma_common::config::AhmaSettings| {
+            s.log_targets.revoke_target(&ws, &target)
+        }),
+    ))
+}
+
 fn revoke_permission(
     file: &std::path::Path,
     mut settings: ahma_common::config::AhmaSettings,
@@ -1341,6 +1391,7 @@ fn revoke_permission(
         GrantKind::WebDomain => preview_revoke_web_domain(&settings, subject),
         GrantKind::NetHost => preview_revoke_net_host(&settings, subject),
         GrantKind::Tool => preview_revoke_tool(&settings, subject, workspace),
+        GrantKind::LogTarget => preview_revoke_log_target(&settings, subject, workspace),
         GrantKind::HookUnsandboxed => anyhow::bail!(
             "hook consent is session-scoped and never persisted; revoke it with \
                  `ahma hooks revoke`"
@@ -1376,13 +1427,14 @@ fn revoke_permission(
         GrantKind::FsScope => ahma_common::config::expand_home(std::path::Path::new(subject))
             .display()
             .to_string(),
+        GrantKind::LogTarget => log_target_subject(subject).display().to_string(),
         _ => subject.to_string(),
     };
     audit(AuditAction::Revoke, kind, audited, None);
     println!("✓ Revoked: {description}");
     println!();
     println!("Updated: {}", file.display());
-    if kind == GrantKind::FsScope {
+    if matches!(kind, GrantKind::FsScope | GrantKind::LogTarget) {
         println!("Takes effect the next time an ahma server starts.");
     }
     Ok(())
@@ -3600,5 +3652,95 @@ mod tests {
         .unwrap();
         let s = ahma_common::config::AhmaSettings::load_from_result(&file).unwrap();
         assert!(s.network.allow.is_empty());
+    }
+
+    #[test]
+    fn parse_kind_accepts_log_target() {
+        for spelling in ["log-target", "log", "logs"] {
+            assert_eq!(parse_kind(spelling).unwrap(), GrantKind::LogTarget);
+        }
+        let err = parse_kind("nope").unwrap_err();
+        assert!(format!("{err:#}").contains("log-target"), "{err:#}");
+    }
+
+    #[test]
+    fn permissions_list_includes_log_targets_and_net_hosts() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let file = ledger(home.path());
+        let mut s = ahma_common::config::AhmaSettings::default();
+        s.network.allow.push("crates.io".into());
+        s.log_targets.approve_target(
+            std::path::Path::new("/ws"),
+            std::path::Path::new("/var/log/app.log"),
+            None,
+            Some("logs_approve".into()),
+            Some("mcp:logs_approve".into()),
+        );
+        s.save_to(&file).unwrap();
+
+        for kind in [
+            None,
+            Some("log-target".to_string()),
+            Some("net-host".to_string()),
+        ] {
+            run_permissions_command(PermissionsArgs {
+                command: PermissionsCommand::List {
+                    kind,
+                    expiring: None,
+                },
+            })
+            .expect("listing log targets and network hosts succeeds");
+        }
+    }
+
+    #[test]
+    fn permissions_revoke_log_target_previews_then_removes() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let file = ledger(home.path());
+        let ws = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("sys.log");
+        std::fs::write(&target, "x").unwrap();
+        let canonical = dunce::canonicalize(&target).unwrap();
+        ahma_common::permissions::persist_log_target(&file, ws.path(), &canonical, "test").unwrap();
+        let key = workspace_key(ws.path());
+
+        let revoke = |yes: bool| {
+            run_permissions_command(PermissionsArgs {
+                command: PermissionsCommand::Revoke {
+                    kind: "log-target".into(),
+                    // As typed by a human: not necessarily canonical.
+                    subject: target.display().to_string(),
+                    workspace: Some(ws.path().to_path_buf()),
+                    global: false,
+                    yes,
+                },
+            })
+            .unwrap();
+            ahma_common::config::AhmaSettings::load_from_result(&file).unwrap()
+        };
+
+        assert!(
+            revoke(false)
+                .log_targets
+                .is_target_approved(&key, &canonical),
+            "a preview changes nothing"
+        );
+        assert!(
+            !revoke(true)
+                .log_targets
+                .is_target_approved(&key, &canonical),
+            "--yes removes the grant"
+        );
+        assert!(
+            ahma_common::config::AhmaSettings::load_from_result(&file)
+                .unwrap()
+                .log_targets
+                .approvals
+                .is_empty(),
+            "the emptied workspace entry is removed"
+        );
     }
 }

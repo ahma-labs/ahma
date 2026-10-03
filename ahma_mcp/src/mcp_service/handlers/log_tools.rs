@@ -37,10 +37,18 @@ impl AhmaMcpService {
             let guard = self.adapter.sandbox().scopes();
             guard.to_vec()
         };
-        let exceptions = if let Some(primary) = scopes.first() {
-            crate::sandbox::load_exceptions(primary)
-        } else {
-            vec![]
+        // Approved targets come from the permission ledger, read fresh on every
+        // call: an approval made earlier in this session shows as approved here
+        // even though the sandbox's read scope only picks it up next session.
+        let exceptions = match scopes.first() {
+            Some(primary) => {
+                let key = ahma_common::permissions::workspace_key_async(primary).await;
+                ahma_common::config::AhmaSettings::load_async()
+                    .await
+                    .log_targets
+                    .approved_targets(&key)
+            }
+            None => vec![],
         };
         let sources = collect_log_sources(&log_dir, &scopes, &exceptions)
             .await
@@ -83,6 +91,15 @@ impl AhmaMcpService {
             .await
             .map_err(|e| mcp_internal(format!("Failed to canonicalize target path: {e}")))?;
 
+        // The agent can write `.ahma/logs`, so it can plant a link to anything:
+        // the hard denylist every filesystem grant obeys (R-PERM.4.3) applies.
+        if let Some(why) = ahma_common::scope_grant::refusal_reason(&canonical_target) {
+            return Err(mcp_invalid_params(format!(
+                "logs_approve REFUSED for {}: {why}. No approval can make it a log target.",
+                canonical_target.display()
+            )));
+        }
+
         let primary_root = self
             .adapter
             .sandbox()
@@ -91,14 +108,22 @@ impl AhmaMcpService {
             .cloned()
             .ok_or_else(|| mcp_internal("No sandbox scopes configured"))?;
 
-        // Persisted out-of-sandbox (~/.config/ahma/) so a sandboxed agent
-        // cannot grant itself access by writing the file inside the workspace.
-        crate::sandbox::add_log_exception(&primary_root, &canonical_target)
-            .map_err(|e| mcp_internal(format!("Failed to write log exceptions: {e}")))?;
+        // A `log-target` grant in the permission ledger (~/.ahma/settings.toml),
+        // which no sandbox scope includes, so a sandboxed agent cannot grant
+        // itself access by writing a file. The ledger write path is synchronous
+        // (strict read, atomic rename), shared with the CLI and TUI.
+        let (root_for_write, target_for_write) = (primary_root.clone(), canonical_target.clone());
+        let newly_added = tokio::task::spawn_blocking(move || {
+            crate::sandbox::add_log_exception(&root_for_write, &target_for_write)
+        })
+        .await
+        .map_err(|e| mcp_internal(format!("Log target approval task failed: {e}")))?
+        .map_err(|e| mcp_internal(format!("Failed to record the log target approval: {e}")))?;
 
-        Ok(text_result(format!(
-            "Successfully approved symlink target: {}. Please restart the TUI/session to apply changes.",
-            canonical_target.display()
+        Ok(text_result(approve_reply(
+            &canonical_target,
+            &primary_root,
+            newly_added,
         )))
     }
 
@@ -269,6 +294,27 @@ pub fn logs_approve_schema() -> Arc<Map<String, Value>> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// What `logs_approve` tells the agent: what was recorded, where, when it
+/// applies, and how a human takes it back.
+fn approve_reply(target: &Path, workspace: &Path, newly_added: bool) -> String {
+    let file = ahma_common::config::settings_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.ahma/settings.toml".to_string());
+    let what = if newly_added {
+        "Successfully approved symlink target"
+    } else {
+        "Symlink target was already approved"
+    };
+    format!(
+        "{what}: {target}. Recorded as a `log-target` grant in {file}. Live-log monitoring \
+         can read it from the next session (this session's sandbox read scope is fixed). \
+         Review with `ahma permissions list --kind log-target`; revoke with \
+         `ahma permissions revoke log-target {target} --workspace {workspace}`.",
+        target = target.display(),
+        workspace = workspace.display()
+    )
+}
 
 /// Extracts the required `file` argument and enforces that it is a plain
 /// filename: no path separators, no leading dot. Shared by
@@ -1129,35 +1175,142 @@ mod tests {
         assert!(err.message.contains("not a symbolic link"));
     }
 
-    /// Approving an out-of-scope symlink persists an exception and returns a
-    /// success message. The exceptions file is redirected to a temp dir via
-    /// `AHMA_CONFIG_DIR` so the real user config is never touched.
+    /// The agent can plant a link in `.ahma/logs`, so the hard denylist that
+    /// binds every filesystem grant (R-PERM.4.3) binds a log target too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handle_logs_approve_refuses_a_hard_denylisted_target() {
+        use std::os::unix::fs::symlink;
+        let (service, _scope) = build_test_service().await.unwrap();
+        let log_dir = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let key = ssh.join("id_ed25519");
+        std::fs::write(&key, "secret").unwrap();
+        // The agent can write `.ahma/logs`, so it can plant this link itself.
+        symlink(&key, log_dir.path().join("key.log")).unwrap();
+
+        let _log_guard = EnvVarGuard::set("AHMA_TEST_LOG_DIR", log_dir.path());
+        let _home_guard = EnvVarGuard::set("AHMA_TEST_HOME", home.path());
+
+        let mut args = Map::new();
+        args.insert("file".to_string(), Value::String("key.log".to_string()));
+        let err = service
+            .handle_logs_approve(args)
+            .await
+            .expect_err("a credential file can never become a log target (R-PERM.4.3)");
+        assert!(err.message.contains("REFUSED"), "{}", err.message);
+
+        let settings = home.path().join(".ahma").join("settings.toml");
+        let written = std::fs::read_to_string(&settings).unwrap_or_default();
+        assert!(
+            !written.contains("id_ed25519"),
+            "a refused target must not reach the ledger: {written}"
+        );
+    }
+
+    /// Approving an out-of-scope symlink records a `log-target` grant, with
+    /// provenance, in the permission ledger (`~/.ahma/settings.toml`) and
+    /// audits it; `logs_list` then reports the link as approved. The home is
+    /// redirected to a temp dir via `AHMA_TEST_HOME`, so the real ledger is
+    /// never touched.
     #[cfg(unix)]
     #[tokio::test]
     async fn handle_logs_approve_success() {
         use std::os::unix::fs::symlink;
-        let (service, _scope) = build_test_service().await.unwrap();
+        let (service, scope) = build_test_service().await.unwrap();
         let log_dir = tempdir().unwrap();
         let external = tempdir().unwrap();
-        let config = tempdir().unwrap();
+        let home = tempdir().unwrap();
         let external_file = external.path().join("sys.log");
         std::fs::write(&external_file, "external content").unwrap();
         symlink(&external_file, log_dir.path().join("sys.log")).unwrap();
 
         let _log_guard = EnvVarGuard::set("AHMA_TEST_LOG_DIR", log_dir.path());
-        let _cfg_guard = EnvVarGuard::set("AHMA_CONFIG_DIR", config.path());
+        let _home_guard = EnvVarGuard::set("AHMA_TEST_HOME", home.path());
+
+        // `logs_list` reports whether a link's target is approved, read from
+        // the ledger on every call.
+        let svc = &service;
+        let listed_approved = || async move {
+            let listed = svc.handle_logs_list(Map::new()).await.unwrap();
+            let entries: Vec<Value> = serde_json::from_str(&text_of(&listed)).unwrap();
+            entries
+                .iter()
+                .find(|e| e["name"] == "sys.log")
+                .and_then(|e| e["is_approved"].as_bool())
+                .expect("sys.log is listed")
+        };
+        assert!(
+            !listed_approved().await,
+            "an out-of-workspace target starts unapproved"
+        );
 
         let mut args = Map::new();
         args.insert("file".to_string(), Value::String("sys.log".to_string()));
-        let result = service.handle_logs_approve(args).await.unwrap();
+        let result = service.handle_logs_approve(args.clone()).await.unwrap();
         let text = text_of(&result);
         assert!(
-            text.contains("Successfully approved symlink target"),
+            text.contains("Successfully approved symlink target") && text.contains("log-target"),
             "approve: {text}"
         );
 
-        // Exception file was written under the redirected config dir.
-        let exceptions = config.path().join("ahma").join("log_exceptions.json");
-        assert!(exceptions.exists(), "exceptions file must be persisted");
+        // The grant is a ledger row, keyed by the workspace, with provenance.
+        let ledger = home.path().join(".ahma").join("settings.toml");
+        let settings = ahma_common::config::AhmaSettings::load_from_result(&ledger)
+            .expect("the ledger is written and parses");
+        let target = dunce::canonicalize(&external_file).unwrap();
+        let key = ahma_common::permissions::workspace_key(scope.path());
+        assert!(
+            settings.log_targets.is_target_approved(&key, &target),
+            "a log-target row for {} under {}: {:?}",
+            target.display(),
+            key.display(),
+            settings.log_targets
+        );
+        let entry = &settings.log_targets.approvals[0];
+        assert_eq!(entry.granted_by.as_deref(), Some("logs_approve"));
+        assert_eq!(entry.surface.as_deref(), Some("mcp:logs_approve"));
+        assert!(entry.granted_at.is_some(), "the grant is dated");
+
+        // …and it is audited.
+        let audit = ahma_common::permissions::read_audit_entries(
+            &home.path().join(".ahma").join("permissions-audit.jsonl"),
+        );
+        assert!(
+            audit
+                .iter()
+                .any(|a| a.kind == ahma_common::permissions::GrantKind::LogTarget
+                    && a.action == ahma_common::permissions::AuditAction::Grant
+                    && a.subject == target.display().to_string()),
+            "a log-target grant audit entry: {audit:?}"
+        );
+
+        assert!(
+            listed_approved().await,
+            "logs_list shows the approval at once, from the ledger"
+        );
+
+        // Re-approving is idempotent: no second row.
+        let again = service.handle_logs_approve(args).await.unwrap();
+        assert!(
+            text_of(&again).contains("already approved"),
+            "{}",
+            text_of(&again)
+        );
+        let settings = ahma_common::config::AhmaSettings::load_from_result(&ledger).unwrap();
+        assert_eq!(settings.log_targets.approved_targets(&key), vec![target]);
+
+        // The retired store is never written.
+        assert!(
+            !home
+                .path()
+                .join(".config")
+                .join("ahma")
+                .join("log_exceptions.json")
+                .exists(),
+            "nothing may be written to the retired log_exceptions.json"
+        );
     }
 }

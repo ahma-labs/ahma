@@ -194,17 +194,51 @@ mod unix_tests {
 
         symlink(&actual_log, log_dir.join("current.log")).unwrap();
 
-        // Approvals are stored out-of-sandbox; point the config dir at a temp
-        // location for isolation (nextest runs each test in its own process).
-        let config_dir = tempdir().unwrap();
-        unsafe { std::env::set_var("AHMA_CONFIG_DIR", config_dir.path()) };
-        ahma_mcp::sandbox::add_log_exception(&scope, &resolved_target).unwrap();
+        // Approvals live in the permission ledger (`~/.ahma/settings.toml`);
+        // redirect the home to a temp dir so the real ledger is never touched
+        // (nextest runs each test in its own process).
+        let home = tempdir().unwrap();
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        assert!(
+            ahma_mcp::sandbox::add_log_exception(&scope, &resolved_target).unwrap(),
+            "a first approval is a new grant"
+        );
 
-        let sandbox = Sandbox::new(vec![scope], SandboxMode::Strict, false, true, false).unwrap();
+        // The approval is a `log-target` row in the ledger, not a side file.
+        let settings = ahma_common::config::AhmaSettings::load_from_result(
+            &home.path().join(".ahma").join("settings.toml"),
+        )
+        .unwrap();
+        assert!(settings.log_targets.is_target_approved(
+            &ahma_common::permissions::workspace_key(&scope),
+            &resolved_target
+        ));
+
+        let sandbox =
+            Sandbox::new(vec![scope.clone()], SandboxMode::Strict, false, true, false).unwrap();
         let read_scopes = sandbox.read_scopes();
         assert!(
             read_scopes.contains(&resolved_target),
             "should allow approved out-of-scope symlink"
+        );
+
+        // Approved for this workspace only: another workspace whose log links to
+        // the same file is still blocked.
+        let other = tempdir().unwrap();
+        let other_logs = other.path().join(".ahma").join("logs");
+        std::fs::create_dir_all(&other_logs).unwrap();
+        symlink(&actual_log, other_logs.join("current.log")).unwrap();
+        let other_sandbox = Sandbox::new(
+            vec![other.path().to_path_buf()],
+            SandboxMode::Strict,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !other_sandbox.read_scopes().contains(&resolved_target),
+            "a log-target approval is workspace-scoped"
         );
     }
 }

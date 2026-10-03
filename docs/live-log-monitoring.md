@@ -236,6 +236,38 @@ ollama pull llama3.2
 
 ---
 
+## Log files that link outside the workspace
+
+A project's `.ahma/logs/` may hold `*.log` symlinks to files elsewhere on disk — an
+app's log under `/var/log`, a simulator's log in a cache directory. Live-log
+monitoring reads such a target only when it is inside the sandbox scope or has been
+approved; anything else stays blocked, because a symlink is otherwise a way for a
+cloned repository to read any file you can.
+
+1. `logs_list` lists every log, with the symlink target and `is_approved`. A link
+   that points outside the workspace starts out `is_approved: false`.
+2. `logs_approve` with `{"file": "app.log"}` records a **`log-target`** grant for
+   that exact target, in this workspace, in `~/.ahma/settings.toml`
+   (`[log_targets]`) — the permission ledger no sandboxed command can write — with
+   who asked and when, and appends it to `~/.ahma/permissions-audit.jsonl`. It
+   changes nothing else: neighbouring files stay unreadable, and the target is
+   never writable. The grant is written when the tool is called: `ahma tui`'s agent
+   asks you first (trusting the folder does not skip that question), while another
+   MCP client confirms the call only if its own tool-permission settings say so.
+3. The grant applies **from the next session**: the sandbox's read scope is fixed
+   when it starts. `logs_list` shows it as approved straight away.
+4. Review and withdraw it like any other permission:
+
+```bash
+ahma permissions list --kind log-target
+ahma permissions revoke log-target /var/log/app.log --workspace ~/code/proj   # previews; add --yes
+```
+
+Approvals made by an older ahma, in `<config dir>/ahma/log_exceptions.json`, are moved
+into the ledger once at startup; the old file is kept as `log_exceptions.json.migrated`.
+
+---
+
 ## Using a Cloud LLM Provider
 
 If you prefer a cloud API (e.g. OpenAI) instead of Ollama, add an `api_key` and point `base_url` to the provider:
@@ -255,5 +287,6 @@ If you prefer a cloud API (e.g. OpenAI) instead of Ollama, add an `api_key` and 
 ## Configuration Reference
 
 See [SPEC.md Section 5.5](../SPEC.md) for the full `LivelogConfig` and `LlmProviderConfig` field reference.
+How `log-target` grants fit with every other permission: [docs/permissions.md](permissions.md).
 
 The MTDF JSON schema (which includes `LivelogConfig`) is at [docs/mtdf-schema.json](mtdf-schema.json).

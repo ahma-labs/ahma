@@ -1523,7 +1523,7 @@ pub enum PermissionsCommand {
     /// Show every permission currently granted, with its kind, tier, and
     /// provenance, and name the file that holds them.
     List {
-        /// Show only one kind: `fs-scope`, `web-domain`, or `tool`.
+        /// Show only one kind: `fs-scope`, `web-domain`, `net-host`, `tool`, or `log-target` (a file outside the workspace that a `.ahma/logs/*.log` symlink may point at, approved with `logs_approve`).
         #[arg(long = "kind", value_name = "KIND")]
         kind: Option<String>,
         /// Show only leases that end within this long (`12h`, `2d`): what to renew before a long unattended run.
@@ -1536,14 +1536,15 @@ pub enum PermissionsCommand {
     /// never a surprise. Examples:
     ///   ahma permissions revoke fs-scope ~/Library/Caches/sccache
     ///   ahma permissions revoke tool cargo_build --workspace ~/code/proj
+    ///   ahma permissions revoke log-target /var/log/app.log --workspace ~/code/proj
     Revoke {
-        /// Kind of permission: `fs-scope`, `web-domain`, or `tool`.
+        /// Kind of permission: `fs-scope`, `web-domain`, `net-host`, `tool`, or `log-target`.
         #[arg(value_name = "KIND")]
         kind: String,
-        /// The path, domain pattern, or tool name to revoke.
+        /// The path, domain pattern, host, or tool name to revoke.
         #[arg(value_name = "SUBJECT")]
         subject: String,
-        /// For `tool` and `fs-scope`: which workspace the permission is bound to. Defaults to the current directory for `tool`, and to the git repository enclosing it for `fs-scope`.
+        /// For `tool`, `log-target` and `fs-scope`: which workspace the permission is bound to. Defaults to the current directory for `tool` and `log-target`, and to the git repository enclosing it for `fs-scope`.
         #[arg(long = "workspace", value_name = "PATH", conflicts_with = "global")]
         workspace: Option<PathBuf>,
         /// For `fs-scope`: revoke the legacy global grant, the one that applies to every workspace.
