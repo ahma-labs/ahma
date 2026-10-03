@@ -133,7 +133,8 @@ pub fn confined_daemons() -> Vec<ahma_common::doctor::ConfinedDaemon> {
         true,
         ProcessRefreshKind::nothing()
             .with_exe(UpdateKind::OnlyIfNotSet)
-            .with_user(UpdateKind::OnlyIfNotSet),
+            .with_user(UpdateKind::OnlyIfNotSet)
+            .with_environ(UpdateKind::OnlyIfNotSet),
     );
     let me = std::process::id();
     let mut out: Vec<ahma_common::doctor::ConfinedDaemon> = sys
@@ -155,6 +156,14 @@ pub fn confined_daemons() -> Vec<ahma_common::doctor::ConfinedDaemon> {
             if !pid_is_seatbelt_confined(pid) {
                 return None;
             }
+            let environ: Vec<String> = p
+                .environ()
+                .iter()
+                .map(|e| e.to_string_lossy().into_owned())
+                .collect();
+            if serves_one_workspace(&name, &environ) {
+                return None;
+            }
             Some(ahma_common::doctor::ConfinedDaemon {
                 name,
                 pid,
@@ -164,6 +173,18 @@ pub fn confined_daemons() -> Vec<ahma_common::doctor::ConfinedDaemon> {
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.pid.cmp(&b.pid)));
     out
+}
+
+/// A confined daemon that serves only the workspace it can write is working as
+/// designed, not a problem: a sccache server started on a port of its own
+/// (the `sccache` profile's per-workspace port, SPEC R-PERM.5.5, or a port the
+/// user chose) is reached only by clients that asked for that port.
+fn serves_one_workspace(name: &str, environ: &[String]) -> bool {
+    name == "sccache"
+        && environ.iter().any(|e| {
+            e.strip_prefix("SCCACHE_SERVER_PORT=")
+                .is_some_and(|p| !p.is_empty())
+        })
 }
 
 /// At startup of an *unconfined* ahma process: if a confined sccache server is
@@ -210,6 +231,20 @@ pub fn restart_confined_sccache_if_any() {
 mod tests {
     use super::super::host_detect::HostSandbox;
     use super::*;
+
+    /// A per-workspace sccache server is confined by design and is neither
+    /// restarted nor reported; one on the shared default port still is.
+    #[test]
+    fn a_server_of_one_workspace_is_not_a_confined_daemon_problem() {
+        let own = vec![
+            "HOME=/u".to_string(),
+            "SCCACHE_SERVER_PORT=41234".to_string(),
+        ];
+        let shared = vec!["HOME=/u".to_string()];
+        assert!(serves_one_workspace("sccache", &own));
+        assert!(!serves_one_workspace("sccache", &shared));
+        assert!(!serves_one_workspace("gradle", &own));
+    }
 
     #[test]
     fn not_confined_when_write_succeeds() {

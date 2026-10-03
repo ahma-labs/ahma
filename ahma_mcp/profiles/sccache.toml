@@ -1,0 +1,25 @@
+# sccache sandbox profile: one compile-cache server per workspace.
+#
+# sccache runs a long-lived server that every compiler call in a build talks
+# to. A server started by a sandboxed build inherits that build's sandbox, so
+# it can write only the checkout it was started in — and every other checkout
+# on this machine then fails to compile through it (SPEC R-DOCTOR.7). Giving
+# each workspace its own server, cache and port means a server born confined
+# only ever serves the checkout it can write.
+#
+# These are variables, not grants: the cache lives inside the workspace, so no
+# path outside it is opened. A variable you set yourself (a shared SCCACHE_DIR,
+# your own port) is never overridden (SPEC R-PERM.5.5).
+name = "sccache"
+description = "sccache: a compile-cache server, cache and port of its own per workspace"
+rules = []
+
+[[env]]
+name = "SCCACHE_DIR"
+value = "${WORKSPACE}/target/sccache"
+reason = "the cache lives inside the workspace, which a sandboxed server can write; `cargo clean` empties it"
+
+[[env]]
+name = "SCCACHE_SERVER_PORT"
+value = "${WORKSPACE_PORT}"
+reason = "a port of this workspace's own, so its builds never reach a server confined to another checkout"

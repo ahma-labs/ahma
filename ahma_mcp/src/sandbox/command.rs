@@ -366,6 +366,20 @@ impl Sandbox {
         // proxy vars are never mistaken for secrets.
         apply_egress_proxy_env(&mut cmd);
 
+        // Variables enabled profiles set for this workspace (SPEC R-PERM.5.5),
+        // e.g. a sccache server of the workspace's own. Never over a variable
+        // already in the environment: a value the user chose wins.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(workspace) = self.scopes().first() {
+            for var in
+                super::profiles::profile_env(super::profiles::enabled_profile_names(), workspace)
+            {
+                if std::env::var_os(&var.name).is_none() {
+                    cmd.env(&var.name, &var.value);
+                }
+            }
+        }
+
         // Run each command as its own process-group leader so the whole tree can
         // be killed as a unit on timeout/cancellation. On macOS the direct child
         // is `sandbox-exec`, which execs `sh -c "<cmd>"`, which may fan out to
@@ -941,6 +955,40 @@ mod tests {
         assert!(
             !scrubbed.contains(&"PATH".to_string()),
             "non-secret var must survive"
+        );
+    }
+
+    /// A profile's variables reach the command, and a variable the user set
+    /// is never overridden: their choice wins (SPEC R-PERM.5.5).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn profile_env_reaches_the_command_but_never_overrides_yours() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::remove_var("SCCACHE_SERVER_PORT");
+            std::env::set_var("SCCACHE_DIR", "/mine");
+        }
+        let td = tempdir().unwrap();
+        let sandbox = make_test_sandbox(td.path());
+        let cmd = sandbox.base_command("env", &[], td.path());
+        let set: std::collections::HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert!(
+            set.get("SCCACHE_SERVER_PORT")
+                .is_some_and(|p| p.parse::<u16>().is_ok()),
+            "the per-workspace port is set: {set:?}"
+        );
+        assert!(
+            !set.contains_key("SCCACHE_DIR"),
+            "a variable the user set is left alone: {set:?}"
         );
     }
 

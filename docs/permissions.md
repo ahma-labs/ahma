@@ -194,17 +194,42 @@ they give away and turn any of them off:
 ```toml
 # ~/.ahma/settings.toml
 [sandbox]
-profiles = ["rust"]   # only rust; drop node, go, android, apple, common, gh
+profiles = ["rust"]   # only rust; drop node, go, android, apple, common, gh, sccache
 # profiles = []       # nothing — grant every toolchain path explicitly
 ```
 
-Built-in: `rust`, `node`, `go`, `android`, `apple`, `common`. All enabled by default.
+Built-in: `rust`, `node`, `go`, `android`, `apple`, `common`, `gh`, `sccache`. All enabled by default.
 A profile whose toolchain is not installed grants paths that do not exist, which is
 harmless; `android` (Gradle, Maven, the SDK, Kotlin/Native) and `apple` (Xcode
 DerivedData, SwiftPM and CocoaPods caches, simulators read-only) exist so an iOS or
 Android build does not have to stop and ask a human for five cache directories one
 at a time. Both carry a `cost` line in `ahma permissions list`: like the cargo
 caches, Gradle and SwiftPM *execute* what they find in those shared directories.
+
+### Profiles that set environment variables
+
+A profile may also set variables on every sandboxed command, each with a stated
+reason. The one that does today is `sccache`. sccache runs a long-lived server that
+every compiler call talks to, and a server started by a sandboxed build can write
+only the checkout it started in, so every other checkout's builds failed through it.
+The `sccache` profile gives each workspace its own server instead:
+
+| Variable | Value | Why |
+|---|---|---|
+| `SCCACHE_DIR` | `<workspace>/target/sccache` | the cache lives where a sandboxed server can write; `cargo clean` empties it |
+| `SCCACHE_SERVER_PORT` | a port derived from the workspace path, 20000–59999, the same every time | that workspace's builds only ever reach its own server |
+
+The cost is a cold cache per checkout (the first build in each is slower) and more
+disk. Nothing built for one project is ever served to another. Rules for every
+profile variable:
+- it never overrides a variable you have already set (a shared `SCCACHE_DIR` of
+  your own wins);
+- `ahma permissions list` shows each one, with its value for the current folder
+  and its reason;
+- it goes when you remove the profile from `[sandbox] profiles`.
+
+`ahma doctor` and ahma's startup check leave these per-workspace servers alone;
+they still restart a sccache server stuck confined on the shared default port.
 
 Note what the `rust` profile deliberately does **not** do: it never makes
 `~/.cargo/bin`, `~/.cargo/config.toml`, or `~/.cargo/credentials.toml` writable.
