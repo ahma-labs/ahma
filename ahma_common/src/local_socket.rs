@@ -231,6 +231,11 @@ mod bridge {
         /// receiving thread has finished. A `shutdown` is not enough on
         /// Windows: it does not wake a `recv` blocked in another thread.
         fn abort_recv(&self) -> io::Result<()>;
+        /// Whether a half-close made while a `recv` is blocked on the same
+        /// socket in another thread can be lost, so the receive must step out
+        /// of `recv` for it (measured on Windows `AF_UNIX`: the peer of an
+        /// accepted socket never saw the end of the stream).
+        const HALF_CLOSE_NEEDS_QUIET_RECEIVE: bool = false;
     }
 
     #[derive(Default)]
@@ -242,6 +247,11 @@ mod bridge {
         /// The receiving thread has finished: it read the peer's end of
         /// stream or an error, or it was aborted.
         rx_done: bool,
+        /// The sending thread asks the receiving one to step out of `recv`
+        /// while it half-closes ([`BlockingSocket::HALF_CLOSE_NEEDS_QUIET_RECEIVE`]).
+        pause: bool,
+        /// The receiving thread is out of `recv` and waits for `pause` to end.
+        paused: bool,
     }
 
     /// What the caller's stream and the two relay threads tell each other.
@@ -263,6 +273,22 @@ mod bridge {
 
         fn rx_done(&self) -> bool {
             self.state.lock().rx_done
+        }
+
+        /// If the sender asked for a pause, acknowledge it and wait until it
+        /// ends (or the receive is aborted). Returns whether there was one.
+        fn wait_out_pause(&self) -> bool {
+            let mut state = self.state.lock();
+            if !state.pause {
+                return false;
+            }
+            state.paused = true;
+            self.changed.notify_all();
+            while state.pause && !state.abort {
+                self.changed.wait(&mut state);
+            }
+            state.paused = false;
+            true
         }
     }
 
@@ -364,6 +390,10 @@ mod bridge {
         let mut buf = vec![0u8; BUF];
         let mut forwarding = true;
         while !lifecycle.aborting() {
+            lifecycle.wait_out_pause();
+            if lifecycle.aborting() {
+                break;
+            }
             let read = not_connected::retry(
                 not_connected::GRACE,
                 || lifecycle.aborting(),
@@ -375,6 +405,9 @@ mod bridge {
                 // An aborted receive may report itself as interrupted; the
                 // loop condition tells the two apart.
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // A receive the sender interrupted to half-close: not an
+                // error, and the loop takes it up again after the pause.
+                Err(_) if lifecycle.wait_out_pause() => continue,
                 Err(e) => {
                     if !lifecycle.aborting() {
                         tracing::debug!(error = %e, "local socket: receive failed");
@@ -417,7 +450,9 @@ mod bridge {
             }
         };
         let closed = match relayed {
-            Ok(()) => half_close(sock, || lifecycle.rx_done()),
+            Ok(()) => {
+                with_quiet_receive(sock, lifecycle, || half_close(sock, || lifecycle.rx_done()))
+            }
             Err(e) => {
                 tracing::debug!(error = %e, "local socket: send failed");
                 sock.shutdown_write()
@@ -427,6 +462,40 @@ mod bridge {
             tracing::debug!(error = %e, "local socket: half-close failed");
         }
         abort_receive_once_the_caller_is_gone(sock, lifecycle);
+    }
+
+    /// Run `f` (the half-close) with no `recv` in progress on the socket, where
+    /// the platform needs that ([`BlockingSocket::HALF_CLOSE_NEEDS_QUIET_RECEIVE`]):
+    /// ask the receiving thread to pause, cancel its blocked `recv` until it
+    /// says it is out, run `f`, and let it resume. Bounded by `ABORT_GRACE`;
+    /// past that `f` runs anyway, as it did before.
+    fn with_quiet_receive<S: BlockingSocket, T>(
+        sock: &S,
+        lifecycle: &Lifecycle,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        if !S::HALF_CLOSE_NEEDS_QUIET_RECEIVE {
+            return f();
+        }
+        {
+            let mut state = lifecycle.state.lock();
+            if state.rx_done {
+                drop(state);
+                return f();
+            }
+            state.pause = true;
+            lifecycle.changed.notify_all();
+            let deadline = Instant::now() + ABORT_GRACE;
+            while !state.paused && !state.rx_done && Instant::now() < deadline {
+                if let Err(e) = MutexGuard::unlocked(&mut state, || sock.abort_recv()) {
+                    tracing::debug!(error = %e, "local socket: pausing the receive failed");
+                }
+                lifecycle.changed.wait_for(&mut state, ABORT_RETRY);
+            }
+        }
+        let out = f();
+        lifecycle.update(|s| s.pause = false);
+        out
     }
 
     fn abort_receive_once_the_caller_is_gone<S: BlockingSocket>(sock: &S, lifecycle: &Lifecycle) {
@@ -508,6 +577,8 @@ mod bridge {
         struct LossyFin<S>(S);
 
         impl<S: BlockingSocket> BlockingSocket for LossyFin<S> {
+            const HALF_CLOSE_NEEDS_QUIET_RECEIVE: bool = S::HALF_CLOSE_NEEDS_QUIET_RECEIVE;
+
             fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
                 self.0.recv(buf)
             }
@@ -629,6 +700,122 @@ mod bridge {
             .expect("the answer within budget")
             .expect("read the answer");
             assert_eq!(answer, b"pong");
+        }
+
+        /// A socket that, like an accepted Windows `AF_UNIX` socket, loses a
+        /// half-close made while a `recv` is blocked on it, and whose abort
+        /// reaches only a `recv` already in progress.
+        #[derive(Default)]
+        struct FinState {
+            in_recv: bool,
+            aborted: bool,
+            peer_saw_eof: bool,
+            lost_fins: usize,
+            incoming: Vec<u8>,
+            peer_closed: bool,
+        }
+
+        #[derive(Default)]
+        struct Fin {
+            state: Mutex<FinState>,
+            changed: Condvar,
+        }
+
+        struct LosesFinDuringRecv(Arc<Fin>);
+
+        impl BlockingSocket for LosesFinDuringRecv {
+            const HALF_CLOSE_NEEDS_QUIET_RECEIVE: bool = true;
+
+            fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+                let fin = &*self.0;
+                let mut s = fin.state.lock();
+                let out = loop {
+                    if !s.incoming.is_empty() {
+                        let n = s.incoming.len().min(buf.len());
+                        buf[..n].copy_from_slice(&s.incoming[..n]);
+                        s.incoming.drain(..n);
+                        break Ok(n);
+                    }
+                    if s.peer_closed {
+                        break Ok(0);
+                    }
+                    if s.aborted {
+                        s.aborted = false;
+                        break Err(io::Error::other("the I/O operation has been aborted"));
+                    }
+                    s.in_recv = true;
+                    fin.changed.notify_all();
+                    fin.changed.wait(&mut s);
+                };
+                s.in_recv = false;
+                out
+            }
+            fn send(&self, data: &[u8]) -> io::Result<usize> {
+                Ok(data.len())
+            }
+            fn shutdown_write(&self) -> io::Result<()> {
+                let fin = &*self.0;
+                let mut s = fin.state.lock();
+                if s.in_recv {
+                    s.lost_fins += 1;
+                } else {
+                    s.peer_saw_eof = true;
+                }
+                fin.changed.notify_all();
+                Ok(())
+            }
+            fn abort_recv(&self) -> io::Result<()> {
+                let fin = &*self.0;
+                let mut s = fin.state.lock();
+                if s.in_recv {
+                    s.aborted = true;
+                    fin.changed.notify_all();
+                }
+                Ok(())
+            }
+        }
+
+        /// The hub's case: the server half-closes its answer while its own
+        /// receive still waits on the socket. Where that half-close would be
+        /// lost (an accepted Windows AF_UNIX socket), the receive steps out of
+        /// `recv` for it, the peer sees the end, and receiving resumes.
+        #[test]
+        fn a_half_close_is_not_lost_to_a_receive_in_progress() {
+            let rt = runtime();
+            let fin = Arc::new(Fin::default());
+            let mut stream =
+                bridge(LosesFinDuringRecv(Arc::clone(&fin)), rt.handle().clone()).expect("bridge");
+            let wait_until = |what: &str, done: &dyn Fn(&FinState) -> bool| {
+                let deadline = std::time::Instant::now() + quick();
+                let mut s = fin.state.lock();
+                while !done(&s) {
+                    assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+                    fin.changed.wait_for(&mut s, quick());
+                }
+            };
+            wait_until("the receive is blocked", &|s| s.in_recv);
+
+            rt.block_on(async {
+                stream.write_all(b"answer").await?;
+                stream.shutdown().await
+            })
+            .expect("answer and half-close");
+            wait_until("the peer sees the end", &|s| s.peer_saw_eof);
+            assert_eq!(fin.state.lock().lost_fins, 0, "a half-close was lost");
+
+            {
+                let mut s = fin.state.lock();
+                s.incoming.extend_from_slice(b"more");
+                s.peer_closed = true;
+                fin.changed.notify_all();
+            }
+            let mut got = Vec::new();
+            rt.block_on(async {
+                tokio::time::timeout(quick(), stream.read_to_end(&mut got)).await
+            })
+            .expect("receiving resumed")
+            .expect("read");
+            assert_eq!(got, b"more");
         }
 
         #[derive(Default)]
@@ -758,6 +945,10 @@ mod imp {
     }
 
     impl BlockingSocket for Socket {
+        // Measured on windows-latest: an accepted AF_UNIX socket's half-close
+        // never reached the peer while a `recv` was blocked on it.
+        const HALF_CLOSE_NEEDS_QUIET_RECEIVE: bool = true;
+
         fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
             let mut this = self;
             this.read(buf)
