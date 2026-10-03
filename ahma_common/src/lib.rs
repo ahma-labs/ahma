@@ -17,7 +17,7 @@
 //! | Per-user hub | [`hub`], [`hub_history`] |
 //! | MCP wire | [`mcp_methods`], [`mcp_protocol`], [`session_event`], [`keepalive`], [`sse`], [`peer_factory`] |
 //! | Process and platform | [`exe_identity`], [`test_isolation`], [`process_guard`], [`timeouts`], [`file_uri`], [`hostname`], [`fs_lock`], [`local_socket`], [`local_tls`], [`digest`] |
-//! | Shared definitions | [`prompts`], [`skills`], [`simplify_args`], [`state_machine`], [`doctor`], [`observability`] |
+//! | Shared definitions | [`harness`], [`prompts`], [`skills`], [`simplify_args`], [`state_machine`], [`doctor`], [`observability`] |
 //!
 //! ## Design Goal: Workspace Consistency
 //!
@@ -42,6 +42,9 @@ pub mod exe_identity;
 pub mod file_uri;
 pub mod fs_lock;
 pub mod grant_prompt;
+/// Every AI harness ahma knows, listed once; the MCP-client, setup-target and
+/// terminal-hook tables in `ahma_mcp` are views of it.
+pub mod harness;
 pub mod harness_asks;
 pub mod hook_consent;
 pub mod hostname;
