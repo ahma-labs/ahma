@@ -1353,6 +1353,9 @@ let a = CommandLine.arguments
 guard a.count >= 3 else { print("USAGE"); exit(2) }
 let scheme = a[2] as CFString
 switch a[1] {
+case "register":
+    let url = URL(fileURLWithPath: a[2]) as CFURL
+    print("REG:\(LSRegisterURL(url, true))")
 case "set":
     let bundleId = a[3] as CFString
     let s = LSSetDefaultHandlerForURLScheme(scheme, bundleId)
@@ -1394,6 +1397,21 @@ fn default_handler_for(tool: &Path, scheme: &str) -> String {
         .output()
         .expect("run ls_handler get");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Poll the handler until it is `want` or the `Quick` budget passes: the
+/// LaunchServices database updates asynchronously.
+#[cfg(target_os = "macos")]
+fn handler_becomes(tool: &Path, scheme: &str, want: &str) -> String {
+    use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+    let deadline = std::time::Instant::now() + TestTimeouts::get(TimeoutCategory::Quick);
+    loop {
+        let got = default_handler_for(tool, scheme);
+        if got == want || std::time::Instant::now() >= deadline {
+            return got;
+        }
+        std::thread::sleep(TestTimeouts::poll_interval());
+    }
 }
 
 /// Best-effort teardown: drop any LaunchServices registration of `app` so a
@@ -1444,18 +1462,24 @@ fn ls_handler_registration_from_sandbox_experiment() {
     if let Some(lsreg) = &lsreg {
         let _ = Command::new(lsreg).arg("-f").arg(&base_app).status();
     }
+    let base_reg = Command::new(&tool)
+        .arg("register")
+        .arg(&base_app)
+        .output()
+        .expect("run ls_handler register (baseline)");
+    let base_reg_out = String::from_utf8_lossy(&base_reg.stdout).trim().to_string();
     let base_set = Command::new(&tool)
         .args(["set", &base_scheme, &base_id])
         .output()
         .expect("run ls_handler set (baseline)");
     let base_set_out = String::from_utf8_lossy(&base_set.stdout).trim().to_string();
-    let base_handler = default_handler_for(&tool, &base_scheme);
+    let base_handler = handler_becomes(&tool, &base_scheme, &format!("HANDLER:{base_id}"));
     let baseline_works = base_handler == format!("HANDLER:{base_id}");
     unregister_app(&base_app);
     if !baseline_works {
         panic!(
             "EXPERIMENT SKIP: this host does not let even an unsandboxed process set a default \
-             URL-scheme handler (set={base_set_out} handler={base_handler}); nothing to prove"
+             URL-scheme handler (register={base_reg_out} set={base_set_out} handler={base_handler}); nothing to prove"
         );
     }
 
@@ -1494,6 +1518,22 @@ fn ls_handler_registration_from_sandbox_experiment() {
         })
         .unwrap_or_else(|| "lsregister not present on host".to_string());
 
+    // (a2) LSRegisterURL from inside the sandbox
+    let box_reg = Command::new("sandbox-exec")
+        .args(["-p", &profile])
+        .arg(&tool)
+        .arg("register")
+        .arg(&box_app)
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandbox-exec (ls_handler register)");
+    let box_reg_desc = format!(
+        "exit={:?} out={} err={}",
+        box_reg.status.code(),
+        String::from_utf8_lossy(&box_reg.stdout).trim(),
+        String::from_utf8_lossy(&box_reg.stderr).trim(),
+    );
+
     // (b) LSSetDefaultHandlerForURLScheme from inside the sandbox
     let box_set = Command::new("sandbox-exec")
         .args(["-p", &profile])
@@ -1510,7 +1550,7 @@ fn ls_handler_registration_from_sandbox_experiment() {
     );
 
     // (c) Query the handler from OUTSIDE the sandbox.
-    let box_handler = default_handler_for(&tool, &box_scheme);
+    let box_handler = handler_becomes(&tool, &box_scheme, &format!("HANDLER:{box_id}"));
     let became_handler = box_handler == format!("HANDLER:{box_id}");
     unregister_app(&box_app);
 
@@ -1519,6 +1559,7 @@ fn ls_handler_registration_from_sandbox_experiment() {
          baseline set (unsandboxed)      : {base_set_out}\n\
          baseline handler (unsandboxed)  : {base_handler}  -> host CAN register: {baseline_works}\n\
          sandboxed lsregister -f         : {box_lsreg_desc}\n\
+         sandboxed LSRegisterURL         : {box_reg_desc}\n\
          sandboxed LSSetDefaultHandler   : {box_set_desc}\n\
          handler after sandboxed attempt : {box_handler}\n\
          => sandboxed app became default : {became_handler}\n\
