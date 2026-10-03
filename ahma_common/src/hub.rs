@@ -4141,7 +4141,14 @@ mod tests {
     /// socket also serve `/mcp`.
     #[tokio::test]
     async fn the_event_stream_is_an_upgrade_and_nothing_else_is_served() {
+        use crate::local_socket::trace;
         use tokio::io::AsyncReadExt;
+        // EXPERIMENT: this test has no timeout of its own; dump the bridge
+        // trace from a plain thread if it is still running after `Quick`.
+        let _watchdog = trace::Watchdog::start(
+            "the_event_stream_is_an_upgrade_and_nothing_else_is_served",
+            TestTimeouts::get(crate::timeouts::TimeoutCategory::Quick),
+        );
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("upgrade.sock");
         let server = Arc::new(HubServer::bind_at(sock.clone()).await.unwrap());
@@ -4150,6 +4157,7 @@ mod tests {
             tokio::spawn(async move { server.serve().await })
         };
 
+        trace::ev_for(0, "test.list_instances", 0);
         assert!(
             list_instances_at(&sock).await.unwrap().is_empty(),
             "an upgraded connection speaks the event protocol"
@@ -4158,10 +4166,13 @@ mod tests {
         let reply_to = |request: &'static [u8]| {
             let sock = sock.clone();
             async move {
+                trace::ev_for(0, "test.reply_to.connect", request.len() as i64);
                 let mut raw = LocalStream::connect(&sock).await.unwrap();
                 raw.write_all(request).await.unwrap();
+                trace::ev_for(0, "test.reply_to.sent", 0);
                 let mut reply = String::new();
                 raw.read_to_string(&mut reply).await.unwrap();
+                trace::ev_for(0, "test.reply_to.eof", reply.len() as i64);
                 reply
             }
         };
@@ -5360,6 +5371,11 @@ mod tests {
     #[tokio::test]
     async fn hub_forwards_instance_events_to_subscriber() {
         use crate::scope_grant::{GrantReason, ScopeGrantRequest};
+        // EXPERIMENT: see the_event_stream_is_an_upgrade_and_nothing_else_is_served.
+        let _watchdog = crate::local_socket::trace::Watchdog::start(
+            "hub_forwards_instance_events_to_subscriber",
+            TestTimeouts::get(crate::timeouts::TimeoutCategory::Quick),
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("events.sock");

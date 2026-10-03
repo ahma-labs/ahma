@@ -165,11 +165,167 @@ mod not_connected {
                         && !give_up()
                         && Instant::now() < deadline =>
                 {
+                    super::trace::ev("notconn.retry", pause.as_millis() as i64);
                     std::thread::sleep(pause);
                     pause = (pause * 2).min(MAX_PAUSE);
                 }
-                result => return result,
+                result => {
+                    if let Err(e) = &result
+                        && e.kind() == io::ErrorKind::NotConnected
+                    {
+                        super::trace::ev("notconn.final", super::trace::code(e));
+                    }
+                    return result;
+                }
             }
+        }
+    }
+}
+
+/// EXPERIMENT ONLY — NEVER MERGE. A process-wide ring buffer of Windows bridge
+/// events, one connection id per bridged socket, dumped by [`trace::Watchdog`]
+/// when a test overruns. Under nextest each test is its own process, so the
+/// ring holds that test's events only.
+#[cfg(any(windows, test))]
+#[allow(dead_code)]
+pub(crate) mod trace {
+    use std::{
+        cell::Cell,
+        collections::{BTreeMap, VecDeque},
+        fmt::Write as _,
+        io,
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    const CAP: usize = 16 * 1024;
+
+    #[derive(Clone, Copy)]
+    struct Event {
+        us: u64,
+        conn: u64,
+        thread: &'static str,
+        what: &'static str,
+        n: i64,
+    }
+
+    static RING: parking_lot::Mutex<VecDeque<Event>> = parking_lot::const_mutex(VecDeque::new());
+    static START: OnceLock<Instant> = OnceLock::new();
+    static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
+
+    thread_local! {
+        static CONN: Cell<u64> = const { Cell::new(0) };
+        static ROLE: Cell<&'static str> = const { Cell::new("caller") };
+    }
+
+    /// A fresh connection id (0 is "no connection": accept/connect threads).
+    pub(crate) fn new_conn() -> u64 {
+        NEXT_CONN.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Tag this OS thread: every later [`ev`] on it is filed under `conn`.
+    pub(crate) fn enter(conn: u64, thread: &'static str) {
+        CONN.set(conn);
+        ROLE.set(thread);
+    }
+
+    pub(crate) fn ev(what: &'static str, n: i64) {
+        ev_for(CONN.get(), what, n);
+    }
+
+    pub(crate) fn ev_for(conn: u64, what: &'static str, n: i64) {
+        let us = START.get_or_init(Instant::now).elapsed().as_micros() as u64;
+        let thread = ROLE.get();
+        let mut ring = RING.lock();
+        if ring.len() == CAP {
+            ring.pop_front();
+        }
+        ring.push_back(Event {
+            us,
+            conn,
+            thread,
+            what,
+            n,
+        });
+    }
+
+    /// The OS error code, or -1 when there is none.
+    pub(crate) fn code(e: &io::Error) -> i64 {
+        e.raw_os_error().map_or(-1, i64::from)
+    }
+
+    /// Every event, grouped by connection in time order, then each
+    /// connection's last event per thread: where each one is parked now.
+    pub(crate) fn dump() -> String {
+        let now = START.get_or_init(Instant::now).elapsed().as_micros() as u64;
+        let ring = RING.lock().clone();
+        let mut by_conn: BTreeMap<u64, Vec<Event>> = BTreeMap::new();
+        for e in &ring {
+            by_conn.entry(e.conn).or_default().push(*e);
+        }
+        let mut out = format!(
+            "--- local_socket trace: {} events (cap {CAP}), now = {}us ---\n",
+            ring.len(),
+            now
+        );
+        for (conn, events) in &by_conn {
+            let _ = writeln!(out, "conn {conn}:");
+            for e in events {
+                let _ = writeln!(
+                    out,
+                    "  {:>10}us {:<7} {:<22} {}",
+                    e.us, e.thread, e.what, e.n
+                );
+            }
+        }
+        let _ = writeln!(out, "--- last event per (conn, thread) ---");
+        let mut last: BTreeMap<(u64, &'static str), Event> = BTreeMap::new();
+        for e in &ring {
+            last.insert((e.conn, e.thread), *e);
+        }
+        for ((conn, thread), e) in &last {
+            let _ = writeln!(
+                out,
+                "  conn {conn:<3} {thread:<7} {:<22} {:<6} {}us ago",
+                e.what,
+                e.n,
+                now.saturating_sub(e.us)
+            );
+        }
+        out
+    }
+
+    /// Dumps the trace from a plain OS thread if the guarded test is still
+    /// running after `budget`, and again after twice that — so it fires even
+    /// when every runtime worker is stuck, and the two dumps tell a stall from
+    /// slow progress. Dropping it (the test finished) stops it silently.
+    pub(crate) struct Watchdog {
+        _done: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Watchdog {
+        pub(crate) fn start(name: &'static str, budget: Duration) -> Self {
+            let (done, finished) = std::sync::mpsc::channel::<()>();
+            std::thread::Builder::new()
+                .name("ahma-trace-watchdog".into())
+                .spawn(move || {
+                    for round in 1..=2u32 {
+                        match finished.recv_timeout(budget) {
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => eprintln!(
+                                "=== WATCHDOG {name}: still running after {:?}\n{}",
+                                budget * round,
+                                dump()
+                            ),
+                            _ => return,
+                        }
+                    }
+                })
+                .expect("watchdog thread");
+            ev_for(0, "watchdog.armed", budget.as_millis() as i64);
+            Self { _done: done }
         }
     }
 }
@@ -194,9 +350,76 @@ mod imp {
         sync::{Mutex, mpsc},
     };
 
-    use super::not_connected;
+    use super::{not_connected, trace};
 
-    pub(super) type Stream = tokio::io::DuplexStream;
+    pub(super) type Stream = Traced;
+
+    /// EXPERIMENT: the caller's end, recording every poll it sees.
+    pub(super) struct Traced {
+        io: tokio::io::DuplexStream,
+        conn: u64,
+    }
+
+    impl Drop for Traced {
+        fn drop(&mut self) {
+            trace::ev_for(self.conn, "caller.drop", 0);
+        }
+    }
+
+    fn polled<T>(conn: u64, what: &'static str, p: &std::task::Poll<io::Result<T>>, n: i64) {
+        use std::task::Poll;
+        match p {
+            Poll::Pending => trace::ev_for(conn, what, -2),
+            Poll::Ready(Ok(_)) => trace::ev_for(conn, what, n),
+            Poll::Ready(Err(e)) => trace::ev_for(conn, what, -1000 - trace::code(e).abs()),
+        }
+    }
+
+    impl tokio::io::AsyncRead for Traced {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let p = std::pin::Pin::new(&mut self.io).poll_read(cx, buf);
+            let n = (buf.filled().len() - before) as i64;
+            polled(self.conn, "caller.read", &p, n);
+            p
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Traced {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            let p = std::pin::Pin::new(&mut self.io).poll_write(cx, buf);
+            let n = match &p {
+                std::task::Poll::Ready(Ok(n)) => *n as i64,
+                _ => 0,
+            };
+            polled(self.conn, "caller.write", &p, n);
+            p
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let p = std::pin::Pin::new(&mut self.io).poll_shutdown(cx);
+            polled(self.conn, "caller.shutdown", &p, 0);
+            p
+        }
+    }
 
     /// Per-direction copy buffer, and the in-memory pipe's capacity.
     const BUF: usize = 64 * 1024;
@@ -225,11 +448,19 @@ mod imp {
             let thread = std::thread::Builder::new()
                 .name("ahma-local-accept".into())
                 .spawn(move || {
+                    trace::enter(0, "accept");
                     loop {
+                        trace::ev("accept.enter", 0);
                         let accepted = socket.accept().map(|(conn, _)| conn);
+                        match &accepted {
+                            Ok(_) => trace::ev("accept.ok", 0),
+                            Err(e) => trace::ev("accept.err", trace::code(e)),
+                        }
                         if stop.load(Ordering::Acquire) || tx.blocking_send(accepted).is_err() {
+                            trace::ev("accept.stop", 0);
                             break;
                         }
+                        trace::ev("accept.handed", 0);
                     }
                 })?;
             Ok(Self {
@@ -248,7 +479,8 @@ mod imp {
                 .recv()
                 .await
                 .ok_or_else(|| io::Error::other("local socket accept thread stopped"))??;
-            bridge(conn, Handle::current())
+            trace::ev_for(0, "accept.dequeued", 0);
+            bridge(conn, Handle::current(), 0)
         }
     }
 
@@ -261,25 +493,38 @@ mod imp {
         fn drop(&mut self) {
             self.closing.store(true, Ordering::Release);
             self.conns.get_mut().close();
+            trace::ev_for(0, "listener.drop.wake", 0);
             let woke = new_socket()
                 .and_then(|s| s.connect(&SockAddr::unix(&self.path)?))
                 .is_ok();
+            trace::ev_for(0, "listener.drop.woke", i64::from(woke));
             if woke && let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
+            trace::ev_for(0, "listener.drop.joined", 0);
         }
     }
 
     pub(super) async fn connect(path: &Path) -> io::Result<Stream> {
         let addr = SockAddr::unix(path)?;
+        trace::ev_for(0, "connect.spawn", 0);
         let conn = tokio::task::spawn_blocking(move || {
+            trace::enter(0, "connect");
+            // A long gap after `connect.spawn` is a starved blocking pool.
+            trace::ev("connect.running", 0);
             let conn = new_socket()?;
-            conn.connect(&addr)?;
+            let r = conn.connect(&addr);
+            match &r {
+                Ok(()) => trace::ev("connect.ok", 0),
+                Err(e) => trace::ev("connect.err", trace::code(e)),
+            }
+            r?;
             Ok::<_, io::Error>(conn)
         })
         .await
         .map_err(io::Error::other)??;
-        bridge(conn, Handle::current())
+        trace::ev_for(0, "connect.joined", 0);
+        bridge(conn, Handle::current(), 1)
     }
 
     /// Send all of `data`, retrying a send refused because the listener has
@@ -287,11 +532,16 @@ mod imp {
     /// been heard to finish or fail, after which that refusal is final.
     fn send_all(conn: &Socket, mut data: &[u8], rx_done: &AtomicBool) -> io::Result<()> {
         while !data.is_empty() {
+            trace::ev("send.enter", data.len() as i64);
             let sent = not_connected::retry(
                 not_connected::GRACE,
                 || rx_done.load(Ordering::Acquire),
                 || conn.send(data),
             );
+            match &sent {
+                Ok(n) => trace::ev("send.ret", *n as i64),
+                Err(e) => trace::ev("send.err", trace::code(e)),
+            }
             match sent {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => data = &data[n..],
@@ -305,11 +555,17 @@ mod imp {
     /// Half-close the connection, with the same retry as [`send_all`]: the
     /// end of a request is as much a part of it as its bytes.
     fn half_close(conn: &Socket, rx_done: &AtomicBool) -> io::Result<()> {
-        not_connected::retry(
+        trace::ev("halfclose.enter", 0);
+        let r = not_connected::retry(
             not_connected::GRACE,
             || rx_done.load(Ordering::Acquire),
             || conn.shutdown(Shutdown::Write),
-        )
+        );
+        match &r {
+            Ok(()) => trace::ev("halfclose.ok", 0),
+            Err(e) => trace::ev("halfclose.err", trace::code(e)),
+        }
+        r
     }
 
     /// Serve a blocking socket to async code: one thread copies socket →
@@ -323,7 +579,10 @@ mod imp {
     /// refused as not connected is retried, never taken for the end of the
     /// stream (SPEC R-HUB.2). Taking it for the end loses the request or its
     /// half-close, and both ends then wait on each other forever.
-    fn bridge(conn: Socket, rt: Handle) -> io::Result<Stream> {
+    /// `role`: 0 = accepted (server side), 1 = connected (client side).
+    fn bridge(conn: Socket, rt: Handle, role: i64) -> io::Result<Stream> {
+        let id = trace::new_conn();
+        trace::ev_for(id, "bridge", role);
         let (caller, ours) = tokio::io::duplex(BUF);
         let (mut from_caller, mut to_caller) = tokio::io::split(ours);
         let conn = Arc::new(conn);
@@ -337,13 +596,20 @@ mod imp {
         std::thread::Builder::new()
             .name("ahma-local-rx".into())
             .spawn(move || {
+                trace::enter(id, "rx");
+                trace::ev("rx.start", 0);
                 let mut buf = vec![0u8; BUF];
                 loop {
+                    trace::ev("recv.enter", 0);
                     let read = not_connected::retry(
                         not_connected::GRACE,
                         || false,
                         || (&*rx_conn).read(&mut buf),
                     );
+                    match &read {
+                        Ok(n) => trace::ev("recv.ret", *n as i64),
+                        Err(e) => trace::ev("recv.err", trace::code(e)),
+                    }
                     let n = match read {
                         Ok(0) => break,
                         Ok(n) => n,
@@ -353,22 +619,48 @@ mod imp {
                             break;
                         }
                     };
-                    if rx_rt.block_on(to_caller.write_all(&buf[..n])).is_err() {
+                    trace::ev("fwd.block_on.enter", n as i64);
+                    let fwd = rx_rt.block_on(to_caller.write_all(&buf[..n]));
+                    trace::ev("fwd.block_on.leave", i64::from(fwd.is_ok()));
+                    if fwd.is_err() {
                         // The caller dropped the stream.
                         let _ = rx_conn.shutdown(Shutdown::Read);
                         break;
                     }
                 }
                 rx_finished.store(true, Ordering::Release);
+                trace::ev("rx.eof-to-caller.enter", 0);
                 let _ = rx_rt.block_on(to_caller.shutdown());
+                trace::ev("rx.exit", 0);
             })?;
 
         std::thread::Builder::new()
             .name("ahma-local-tx".into())
             .spawn(move || {
+                trace::enter(id, "tx");
+                trace::ev("tx.start", 0);
                 let mut buf = vec![0u8; BUF];
                 let relayed = loop {
-                    match rt.block_on(from_caller.read(&mut buf)) {
+                    // Enter/leave of block_on, and every poll of the read
+                    // inside it: a `caller.write`/`caller.shutdown` that is
+                    // not followed by a `read.poll` here is a lost wake; a
+                    // poll that came and went `pending` is an empty pipe.
+                    trace::ev("block_on.enter", 0);
+                    let read = rt.block_on(async {
+                        let mut read = std::pin::pin!(from_caller.read(&mut buf));
+                        std::future::poll_fn(|cx| {
+                            let p = read.as_mut().poll(cx);
+                            let n = match &p {
+                                std::task::Poll::Ready(Ok(n)) => *n as i64,
+                                _ => 0,
+                            };
+                            polled(id, "read.poll", &p, n);
+                            p
+                        })
+                        .await
+                    });
+                    trace::ev("block_on.leave", read.as_ref().map_or(-1, |n| *n as i64));
+                    match read {
                         Ok(0) => break Ok(()),
                         Ok(n) => {
                             if let Err(e) = send_all(&conn, &buf[..n], &rx_done) {
@@ -388,9 +680,13 @@ mod imp {
                 if let Err(e) = closed {
                     tracing::debug!(error = %e, "local socket: half-close failed");
                 }
+                trace::ev("tx.exit", 0);
             })?;
 
-        Ok(caller)
+        Ok(Traced {
+            io: caller,
+            conn: id,
+        })
     }
 
     #[cfg(test)]
@@ -461,9 +757,14 @@ mod tests {
         what: &str,
         fut: impl std::future::Future<Output = T>,
     ) -> T {
-        tokio::time::timeout(TestTimeouts::get(category), fut)
-            .await
-            .unwrap_or_else(|_| panic!("timed out: {what}"))
+        // EXPERIMENT: a plain-thread watchdog at half the budget (fires even
+        // if the runtime is wedged), and a final dump if the timeout fires.
+        let budget = TestTimeouts::get(category);
+        let _watchdog = trace::Watchdog::start("local_socket test", budget / 2);
+        tokio::time::timeout(budget, fut).await.unwrap_or_else(|_| {
+            eprintln!("=== TIMEOUT {what}\n{}", trace::dump());
+            panic!("timed out: {what}")
+        })
     }
 
     /// Serve one connection: read to EOF, answer with the bytes upper-cased, close.
@@ -504,6 +805,27 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serves_concurrent_connections() {
+        run_concurrent_connections().await;
+    }
+
+    /// EXPERIMENT (never merged): the intermittent Windows hang shows up about
+    /// once in a dozen CI runs, so run the same scenario many times in one
+    /// test, each on a fresh two-worker runtime, with the trace watchdog armed.
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_connections_repeated_for_the_hang() {
+        for round in 0..150 {
+            eprintln!("concurrent round {round}");
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_concurrent_connections());
+        }
+    }
+
+    async fn run_concurrent_connections() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.sock");
         let listener = LocalListener::bind(&path).expect("bind");
@@ -520,24 +842,32 @@ mod tests {
         within("concurrent connections", async {
             let server = async {
                 let mut conns = Vec::new();
-                for _ in 0..N {
+                for i in 0..N {
                     conns.push(listener.accept().await.expect("accept"));
+                    trace::ev_for(0, "test.server.accepted", i as i64);
                 }
                 // Answer in reverse order: no connection depends on another.
-                for mut conn in conns.into_iter().rev() {
+                for (i, mut conn) in conns.into_iter().enumerate().rev() {
                     let mut got = Vec::new();
+                    trace::ev_for(0, "test.server.reading", i as i64);
                     conn.read_to_end(&mut got).await.expect("server read");
+                    trace::ev_for(0, "test.server.read", got.len() as i64);
                     conn.write_all(&got.to_ascii_uppercase())
                         .await
                         .expect("server write");
                     conn.shutdown().await.expect("server shutdown");
+                    trace::ev_for(0, "test.server.answered", i as i64);
                 }
             };
             let clients = futures_join_all((0..N).map(|i| {
                 let path = path.clone();
                 async move {
                     let msg = format!("client-{i}");
+                    trace::ev_for(0, "test.client.start", i as i64);
                     let answer = ask_upper(&path, msg.as_bytes()).await;
+                    // Recorded before the assert: a wrong answer that panics a
+                    // client task while the server waits looks like a hang.
+                    trace::ev_for(0, "test.client.answer", answer.len() as i64);
                     assert_eq!(answer, msg.to_ascii_uppercase().into_bytes());
                 }
             }));
