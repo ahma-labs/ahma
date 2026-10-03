@@ -3,14 +3,20 @@ use std::path::{Path, PathBuf};
 
 use super::core::Sandbox;
 
-/// Read access to `path`, plus write access when `writable` (the read-only
-/// lane passes `false`, SPEC R2.7.4).
+// TODO(generalize): the xcrun cache rule and the pseudo-terminal rules are
+// each the answer to one tool's failure (Apple's developer tools, the iOS test
+// runner). The long-term shape is a small set of general, documented
+// capabilities (a tool's own temp files, terminals of its own, …) that any
+// tool can use safely, rather than a rule per tool that hit a wall.
+
 /// xcrun's cache file in the per-user temp directory (`$TMPDIR/xcrun_db…`),
 /// the only temp write the read-only lane allows: macOS developer tools such
 /// as `strings`, `otool` and `nm` are xcrun shims and fail without it.
 const XCRUN_CACHE_RULE: &str =
     "(allow file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db[^/]*$\"))\n";
 
+/// Read access to `path`, plus write access when `writable` (the read-only
+/// lane passes `false`, SPEC R2.7.4).
 fn macos_path_rules(path: &Path, writable: bool) -> String {
     let mut rules = format!("(allow file-read* (subpath \"{}\"))\n", path.display());
     if writable {
@@ -111,6 +117,9 @@ impl Sandbox {
 (allow file-write* (literal "/dev/tty"))
 (allow file-read* (literal "/dev/zero"))
 (allow file-write* (literal "/dev/zero"))
+(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
+(allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]*") (extension "com.apple.sandbox.pty")))
 {exec_config_deny_rules}{network_rules}(allow mach-lookup)
 (allow ipc-posix-shm*)
 "#,
@@ -553,6 +562,36 @@ mod tests {
         assert!(
             !p.contains("(allow file-write* (subpath \"/private/var/folders\"))"),
             "no broad temp write in the read-only lane: {p}"
+        );
+    }
+
+    /// A command may open pseudo-terminals of its own, and only those (SPEC
+    /// R6.2.11): Apple's form, where `/dev/ttys*` is reachable only with the
+    /// pty extension the kernel issues to the process that allocated it. The
+    /// iOS test runner and `script` failed with `openpty: Operation not
+    /// permitted`.
+    #[test]
+    fn a_command_may_open_its_own_pseudo_terminal_and_no_other() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+        assert!(p.contains("(allow pseudo-tty)"), "{p}");
+        assert!(
+            p.contains(r#"(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))"#),
+            "{p}"
+        );
+        assert!(
+            p.contains(
+                r#"(require-all (regex #"^/dev/ttys[0-9]*") (extension "com.apple.sandbox.pty"))"#
+            ),
+            "a tty only with the pty extension: {p}"
         );
     }
 
