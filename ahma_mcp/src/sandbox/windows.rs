@@ -2166,7 +2166,7 @@ pub mod experiment {
         /// `Some(true)`/`Some(false)` from the owner check, `None` if it failed.
         pub owned: Option<bool>,
         /// Whether it is safe to add and then restore an ACE here (owned by the
-        /// current user, within the profile root).
+        /// current user or one of its owner groups, within the profile root).
         pub eligible: bool,
         /// A short human note: `included`, `skip: not owner`, `stop: profile
         /// root`, `stop: outside profile`, or `err: ...`.
@@ -2223,9 +2223,44 @@ pub mod experiment {
         !r.is_empty() && (p == r || p.starts_with(&format!("{r}\\")))
     }
 
-    /// Whether `path`'s owner SID equals `user`. Read-only (`GetNamedSecurityInfoW`
-    /// with `OWNER_SECURITY_INFORMATION`).
-    fn path_owner_is(path: &Path, user: &OwnedSid) -> anyhow::Result<bool> {
+    /// The SIDs that own what this user creates: the user, plus every token group
+    /// carrying `SE_GROUP_OWNER`. On an elevated administrator account (a CI
+    /// runner) that is `BUILTIN\Administrators`, which then owns the user's own
+    /// profile directories; a plain user owns them directly.
+    fn owner_sids() -> anyhow::Result<Vec<OwnedSid>> {
+        use windows_sys::Win32::Security::{SID_AND_ATTRIBUTES, TOKEN_GROUPS, TokenGroups};
+        const SE_GROUP_OWNER: u32 = 0x0000_0008;
+
+        let mut out = vec![current_user_sid()?];
+        // SAFETY: `GetCurrentProcess` is a pseudo-handle; `token` is a valid
+        // out-pointer and is closed once; each group SID lives in `buf`, which
+        // outlives its copy.
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == FALSE {
+                anyhow::bail!(
+                    "OpenProcessToken failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let buf = super::token_information(token, TokenGroups);
+            let _ = CloseHandle(token);
+            let buf = buf.map_err(|e| anyhow::anyhow!("GetTokenInformation(TokenGroups): {e}"))?;
+            let groups = buf.as_ptr().cast::<TOKEN_GROUPS>();
+            let count = (*groups).GroupCount as usize;
+            let first = std::ptr::addr_of!((*groups).Groups).cast::<SID_AND_ATTRIBUTES>();
+            for entry in std::slice::from_raw_parts(first, count) {
+                if entry.Attributes & SE_GROUP_OWNER != 0 {
+                    out.push(OwnedSid::copy_from(entry.Sid)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `path`'s owner as an `S-1-...` string, and whether it is one of `owners`.
+    /// Read-only (`GetNamedSecurityInfoW` with `OWNER_SECURITY_INFORMATION`).
+    fn path_owner_is(path: &Path, owners: &[OwnedSid]) -> anyhow::Result<(bool, String)> {
         // SAFETY: `wpath` is NUL-terminated; the out-pointers are valid; the
         // returned security descriptor is freed on both exits.
         unsafe {
@@ -2249,9 +2284,13 @@ pub mod experiment {
                     std::io::Error::from_raw_os_error(rc as i32)
                 );
             }
-            let eq = !owner.is_null() && EqualSid(owner, user.as_psid()) != FALSE;
+            let eq = !owner.is_null()
+                && owners
+                    .iter()
+                    .any(|sid| EqualSid(owner, sid.as_psid()) != FALSE);
+            let name = super::sid_string(owner);
             LocalFree(psd.cast());
-            Ok(eq)
+            Ok((eq, name))
         }
     }
 
@@ -2263,7 +2302,7 @@ pub mod experiment {
         scope: &Path,
         profile_root: &Path,
     ) -> anyhow::Result<Vec<AncestorInfo>> {
-        let user = current_user_sid()?;
+        let owners = owner_sids()?;
         // Compare long-form paths: %TEMP% on a runner is the 8.3 short form
         // (`C:\Users\RUNNER~1\...`) while the profile root is long
         // (`C:\Users\runneradmin`), so a raw prefix test calls every ancestor
@@ -2292,18 +2331,18 @@ pub mod experiment {
                 });
                 break;
             }
-            match path_owner_is(ancestor, &user) {
-                Ok(true) => out.push(AncestorInfo {
+            match path_owner_is(ancestor, &owners) {
+                Ok((true, owner)) => out.push(AncestorInfo {
                     path: ancestor.to_path_buf(),
                     owned: Some(true),
                     eligible: true,
-                    note: "included".to_string(),
+                    note: format!("included (owner {owner})"),
                 }),
-                Ok(false) => out.push(AncestorInfo {
+                Ok((false, owner)) => out.push(AncestorInfo {
                     path: ancestor.to_path_buf(),
                     owned: Some(false),
                     eligible: false,
-                    note: "skip: not owner".to_string(),
+                    note: format!("skip: not owner (owner {owner})"),
                 }),
                 Err(e) => out.push(AncestorInfo {
                     path: ancestor.to_path_buf(),
