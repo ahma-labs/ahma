@@ -959,6 +959,82 @@ fn an_xcrun_tool_runs_in_the_read_only_lane() {
     assert!(!write.status.success(), "other temp writes stay refused");
 }
 
+/// An app a sandboxed command opens through LaunchServices never runs
+/// outside the sandbox (SPEC R6.2.10). A scratch `.app` planted in the scope
+/// would write a marker outside it; opened without a sandbox it does, which
+/// proves the probe, and opened from inside the profile it must not.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_app_opened_from_the_sandbox_never_runs_outside_it() {
+    skip_if_nested_sandbox!();
+    use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+    use std::os::unix::fs::PermissionsExt;
+    let scope = TempDir::new().expect("scope dir");
+    let outside = TempDir::new().expect("outside dir");
+    let marker = outside.path().join("escaped");
+    let id = format!("fi.ahma.escape-probe.{}", std::process::id());
+    let app = scope.path().join("Escape.app");
+    std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    std::fs::write(
+        app.join("Contents/Info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>CFBundleExecutable</key><string>escape</string>\
+             <key>CFBundleIdentifier</key><string>{id}</string>\
+             <key>CFBundlePackageType</key><string>APPL</string></dict></plist>\n"
+        ),
+    )
+    .unwrap();
+    let exe = app.join("Contents/MacOS/escape");
+    std::fs::write(
+        &exe,
+        format!("#!/bin/sh\necho escaped > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let wait_for_marker = || {
+        let deadline = std::time::Instant::now() + TestTimeouts::get(TimeoutCategory::Quick);
+        while std::time::Instant::now() < deadline {
+            if marker.exists() {
+                return true;
+            }
+            std::thread::sleep(TestTimeouts::poll_interval());
+        }
+        marker.exists()
+    };
+
+    // Baseline: unsandboxed, LaunchServices runs it (else this host cannot
+    // launch apps at all, and there is nothing to prove).
+    let _ = Command::new("open").args(["-g"]).arg(&app).status();
+    if !wait_for_marker() {
+        eprintln!("skipping: LaunchServices does not launch apps on this host");
+        return;
+    }
+    std::fs::remove_file(&marker).unwrap();
+
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    let out = Command::new("sandbox-exec")
+        .args(["-p", &profile, "open", "-g"])
+        .arg(&app)
+        .output()
+        .expect("run open");
+    assert!(
+        !wait_for_marker(),
+        "an app opened from the sandbox ran outside it: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// SPEC R6.2.8: a sandboxed command can see processes. `/bin/ps` is setuid
 /// root and no sandbox can exec a setuid binary (a kernel rule), so the
 /// profile grants `process-info*` for `pgrep`/`lsof` and ahma ships `ahma ps`.
