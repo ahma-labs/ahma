@@ -340,6 +340,18 @@ fn is_assignment(word: &str) -> bool {
 }
 
 pub fn classify_shell_command(command: &str) -> Lane {
+    // A `$(…)` runs a command of its own: judge it, then read the rest with a
+    // plain word in its place. A reader inside a reader is a reader.
+    let Some((command, inner)) = lift_substitutions(command) else {
+        return Lane::Exclusive;
+    };
+    if inner
+        .iter()
+        .any(|c| classify_shell_command(c) != Lane::ReadOnly)
+    {
+        return Lane::Exclusive;
+    }
+    let command = command.as_str();
     let Some(segs) = segments(command) else {
         return Lane::Exclusive;
     };
@@ -386,6 +398,56 @@ pub fn classify_shell_command(command: &str) -> Lane {
         }
     }
     Lane::ReadOnly
+}
+
+/// Replace every `$(…)` outside single quotes with a plain word, returning
+/// the rewritten line and the commands the substitutions run. `None` for an
+/// unbalanced one. Single-quoted text is literal, so `'$(rm x)'` is not lifted.
+fn lift_substitutions(command: &str) -> Option<(String, Vec<String>)> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let mut inner = Vec::new();
+    let mut in_single = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            in_single = !in_single;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if !in_single && c == '$' && chars.get(i + 1) == Some(&'(') {
+            let start = i + 2;
+            let mut depth = 1;
+            let mut j = start;
+            let mut quoted = false;
+            while j < chars.len() {
+                match chars[j] {
+                    '\'' => quoted = !quoted,
+                    '(' if !quoted => depth += 1,
+                    ')' if !quoted => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                return None;
+            }
+            inner.push(chars[start..j].iter().collect());
+            out.push_str("SUBSTITUTION");
+            i = j + 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    Some((out, inner))
 }
 
 /// What a command line does to the workspace's source files (SPEC R2.7.8), for
@@ -907,6 +969,30 @@ mod poll_loop_tests {
                 Lane::Exclusive,
                 "{command}"
             );
+        }
+    }
+
+    /// A `$(…)` substitution is classified by what it runs: a reader inside a
+    /// reader is a reader. A CI watch that printed `$(gh pr checks …)` held the
+    /// workspace's write lease for half an hour and queued every later command.
+    #[test]
+    fn substitutions_are_judged_by_what_they_run() {
+        for cmd in [
+            "echo \"== $p: $(gh pr checks 87 --json name)\"",
+            "for p in 1 2; do gh pr checks $p --watch; echo \"$(gh pr view $p)\"; done",
+            "echo $(echo $(ls))",
+            "N=$(git rev-parse HEAD); git log -1 $N",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::ReadOnly, "{cmd}");
+        }
+        for cmd in [
+            "echo $(rm -rf x)",
+            "X=$(cargo build); echo $X",
+            "echo \"$(touch f)\"",
+            "echo $(ls",
+            "echo `ls`",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::Exclusive, "{cmd}");
         }
     }
 
