@@ -1068,6 +1068,7 @@ fn zz_listen_inbound_experiment() {
     use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_listen_any};
     use std::io::{BufRead, BufReader, Read};
     use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
     let scope = TempDir::new().expect("scope dir");
     let src = scope.path().join("serve.c");
     std::fs::write(
