@@ -198,28 +198,35 @@ impl BuiltinTool {
     /// answers for MTDF-defined tools, asked here for the tools ahma answers
     /// itself so `needs_approval` has one classification covering both.
     ///
-    /// `write_file` and `replace_in_file` write the workspace; `logs_approve`
-    /// asks a human to let ahma read a file outside it through a log symlink
-    /// (SPEC R9.2); `run_terminal_command` runs an
-    /// arbitrary command, the least contained of all of them. `sandbox_grant`
-    /// is exempt despite touching the permission ledger: its handler never
-    /// writes on the model's word for any client — `confirm: true` routes to
-    /// the human approval ladder and only a human answer persists
-    /// (`handle_sandbox_grant`, SPEC R5.4.5) — so gating it again here would
-    /// be redundant, not safer. Everything else only reads or only steers ahma's own
-    /// control plane. Each is exempted explicitly, never by omission — the
-    /// same fail-closed shape as the MTDF default.
+    /// `write_file`, `replace_in_file`, `multi_edit` and `apply_patch` write
+    /// the workspace; `run_terminal_command` runs an arbitrary command, the
+    /// least contained of all of them.
+    ///
+    /// The tools that exist only to ask a human — `sandbox_grant`,
+    /// `network_grant` and `logs_approve` — are exempt despite touching the
+    /// permission ledger: none of their handlers writes on the model's word,
+    /// for any client. Each raises its own question at a human surface and
+    /// only a human answer is applied
+    /// (`handle_sandbox_grant`, SPEC R5.4.5; `handle_logs_approve`, SPEC R9.2),
+    /// so gating the call here as well would ask the same human the same
+    /// question twice — a second prompt for one decision, not a safer one.
+    /// They still [cross the sandbox boundary](Self::crosses_sandbox_boundary),
+    /// which is what keeps a trusted folder from answering for them.
+    ///
+    /// Everything else only reads or only steers ahma's own control plane.
+    /// Each is exempted explicitly, never by omission — the same fail-closed
+    /// shape as the MTDF default.
     pub const fn is_mutating(self) -> bool {
         match self {
             BuiltinTool::WriteFile
             | BuiltinTool::ReplaceInFile
             | BuiltinTool::MultiEdit
             | BuiltinTool::ApplyPatch
-            | BuiltinTool::RunTerminalCommand
-            | BuiltinTool::LogsApprove => true,
+            | BuiltinTool::RunTerminalCommand => true,
             BuiltinTool::Await
             | BuiltinTool::Status
             | BuiltinTool::LogsList
+            | BuiltinTool::LogsApprove
             | BuiltinTool::LogsRead
             | BuiltinTool::LogsSearch
             | BuiltinTool::Restart
@@ -245,9 +252,11 @@ impl BuiltinTool {
     /// `logs_approve` asks a human to approve a log-symlink target outside the
     /// workspace, and records it only on their answer (SPEC R9.2).
     /// `sandbox_grant` asks a human to widen the scope and never does so itself.
-    /// `fetch_webpage` reaches the network, which has its own egress gate
-    /// (R-WEB.6) and is never the folder's to trust. Everything else runs inside
-    /// the kernel sandbox, or only steers ahma's own control plane.
+    /// Neither is [mutating](Self::is_mutating), because each asks its own
+    /// question; trust must still never answer it for them. `fetch_webpage`
+    /// reaches the network, which has its own egress gate (R-WEB.6) and is
+    /// never the folder's to trust. Everything else runs inside the kernel
+    /// sandbox, or only steers ahma's own control plane.
     pub const fn crosses_sandbox_boundary(self) -> bool {
         matches!(
             self,
@@ -370,9 +379,8 @@ mod tests {
         assert_eq!(BuiltinTool::from_name("await "), None);
     }
 
-    /// The two file-mutating builtins and `run_terminal_command` (arbitrary
-    /// execution) must require approval; `logs_approve` can widen what
-    /// ahma reads outside the workspace and must too. This is a regression guard: it's the
+    /// The file-mutating builtins and `run_terminal_command` (arbitrary
+    /// execution) must require approval. This is a regression guard: it's the
     /// classification `needs_approval` reads to decide whether a builtin
     /// prompts when the interactive tool-approval setting is off.
     #[test]
@@ -380,26 +388,56 @@ mod tests {
         for tool in [
             BuiltinTool::WriteFile,
             BuiltinTool::ReplaceInFile,
+            BuiltinTool::MultiEdit,
+            BuiltinTool::ApplyPatch,
             BuiltinTool::RunTerminalCommand,
-            BuiltinTool::LogsApprove,
         ] {
             assert!(tool.is_mutating(), "{} must be mutating", tool.name());
         }
     }
 
-    /// `sandbox_grant` writes the permission ledger but is exempt here: its
-    /// own handler refuses to self-persist for the agent-loop client and
-    /// routes to the human approval surface instead, so gating it a second
-    /// time through `needs_approval` would be redundant.
+    /// `sandbox_grant` and `logs_approve` touch the permission ledger but are
+    /// exempt here: each handler refuses to self-persist for every client and
+    /// raises its own question at the human approval surface instead, so
+    /// gating it a second time through `needs_approval` would be a double
+    /// prompt for one decision.
     #[test]
     fn is_mutating_exempts_sandbox_grant_and_read_only_tools() {
         for tool in [
             BuiltinTool::SandboxGrant,
+            BuiltinTool::LogsApprove,
             BuiltinTool::ReadFile,
             BuiltinTool::Status,
             BuiltinTool::Await,
         ] {
             assert!(!tool.is_mutating(), "{} must not be mutating", tool.name());
         }
+    }
+
+    /// `logs_approve` became a request through the permission ladder
+    /// (`GrantReason::LogTarget`, SPEC R9.2), exactly like `sandbox_grant`
+    /// (SPEC R5.4.5): it asks a human and records nothing on the model's word.
+    /// Same mechanism, same answers to the approval questions — not mutating
+    /// (its own question is the prompt), and still past the sandbox boundary
+    /// (a trusted folder never answers it).
+    ///
+    /// `is_sandbox_exempt` is deliberately *not* compared: `sandbox_grant` is
+    /// exempt only because it is how a stuck scope gets unstuck, while
+    /// `logs_approve` resolves its target against the settled scope.
+    #[test]
+    fn logs_approve_is_classified_like_sandbox_grant() {
+        let (logs, grant) = (BuiltinTool::LogsApprove, BuiltinTool::SandboxGrant);
+        assert_eq!(logs.is_mutating(), grant.is_mutating(), "is_mutating");
+        assert_eq!(
+            logs.crosses_sandbox_boundary(),
+            grant.crosses_sandbox_boundary(),
+            "crosses_sandbox_boundary"
+        );
+        assert_eq!(
+            logs.is_denied_in_agent_loop(),
+            grant.is_denied_in_agent_loop(),
+            "is_denied_in_agent_loop"
+        );
+        assert!(!logs.is_mutating() && logs.crosses_sandbox_boundary());
     }
 }

@@ -14,6 +14,7 @@ use tempfile::NamedTempFile;
 mod consent;
 pub mod edit_guard;
 mod harness_ask;
+pub mod native_terminal;
 pub use consent::HookConsentStore;
 
 pub mod post_exec;

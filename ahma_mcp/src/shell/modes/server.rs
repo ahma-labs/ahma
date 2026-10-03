@@ -684,6 +684,13 @@ fn default_socket_path() -> String {
 /// parent-death watchdog, and a test-spawned server must keep that watchdog
 /// armed so it cannot outlive the test process. Test isolation is applied to the
 /// version check separately — see [`is_test_isolated`].
+/// Whether this process's stdio is the client itself: served directly to an
+/// editor (the in-process fallback, SPEC R-LIFECYCLE.3), not as a worker behind
+/// the bridge, which reports the client's push channel separately.
+fn stdio_is_the_client(config: &AppConfig) -> bool {
+    !is_test_or_server_child(config)
+}
+
 fn is_test_or_server_child(config: &AppConfig) -> bool {
     std::env::var("AHMA_SERVER_CHILD").is_ok() || config.is_server_child
 }
@@ -792,6 +799,12 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         .build()
         .await?;
     let service_handler = service;
+    // SPEC R2.6.5: an editor on this stdio is a live push channel, so `await`
+    // may use its full budget; behind the bridge the bridge says so instead.
+    service_handler.push_channel_open.store(
+        stdio_is_the_client(&config),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     crate::register_active_service(Arc::new(service_handler.clone()));
 
     // Route sandboxed subprocesses through the guarded egress proxy when
@@ -1007,6 +1020,18 @@ mod tests {
     /// Serializes tests that mutate process-global environment variables
     /// (e.g. `AHMA_SERVER_CHILD`). See AGENTS.md env-var test conventions.
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// SPEC R2.6.5: served straight over the editor's stdio, the pipe *is* a
+    /// live push channel; a worker behind the bridge learns it from the bridge.
+    #[test]
+    fn direct_stdio_is_a_live_push_channel_and_a_bridge_worker_is_told() {
+        let _env = ENV_MUTEX.lock();
+        let mut cfg = base_cfg();
+        cfg.is_server_child = false;
+        assert!(stdio_is_the_client(&cfg));
+        cfg.is_server_child = true;
+        assert!(!stdio_is_the_client(&cfg));
+    }
 
     fn base_cfg() -> AppConfig {
         AppConfig {

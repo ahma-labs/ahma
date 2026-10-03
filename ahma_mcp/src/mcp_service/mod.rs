@@ -588,7 +588,10 @@ impl AhmaMcpService {
             ),
         };
         let mut built = self_titled_tool(tool.name(), description, input_schema);
-        if matches!(tool, BuiltinTool::SandboxGrant | BuiltinTool::NetworkGrant) {
+        if matches!(
+            tool,
+            BuiltinTool::SandboxGrant | BuiltinTool::NetworkGrant | BuiltinTool::LogsApprove
+        ) {
             // Claude Code honours `_meta["anthropic/requiresUserInteraction"]`:
             // the call prompts the human directly even under an allow rule,
             // never reaches the auto-mode classifier, and is denied outright in
@@ -3604,6 +3607,9 @@ mod tests {
         assert!(names.contains(BuiltinTool::ReadFile.name()));
         assert!(!names.contains(BuiltinTool::WriteFile.name()));
         assert!(!names.contains(BuiltinTool::RunTerminalCommand.name()));
+        // The tools that ask a human themselves are not gated a second time.
+        assert!(names.contains(BuiltinTool::SandboxGrant.name()));
+        assert!(names.contains(BuiltinTool::LogsApprove.name()));
 
         // Configured tools.
         assert!(names.contains("status_check"), "mutates: false must exempt");
@@ -4753,7 +4759,7 @@ mod requires_user_interaction_tests {
             .await
             .expect("in-process service");
         let service = &mcp.service;
-        for name in ["sandbox_grant", "network_grant"] {
+        for name in ["sandbox_grant", "network_grant", "logs_approve"] {
             let tool = service
                 .build_builtin_tool(crate::builtin_tool::BuiltinTool::from_name(name).expect(name));
             let meta = tool.meta.expect("meta present");
