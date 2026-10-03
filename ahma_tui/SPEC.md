@@ -47,9 +47,11 @@ Criteria specified in §3 or in the root SPEC are cited by id, not restated.
   turn, a tool call or a replayed event — and every use is disclosed twice: a warning log line
   naming the command, and an `UNSANDBOXED` label on its output window. Disclosure, not
   prohibition, is what R7 requires of an escape hatch.
-- **Approval gates (root R-WEB.6, R-WEB.6.3, R-PERM.7.1, R-PERM.3.8)**: the TUI renders and resolves
-  chat tool approval (`y`/`n`), sandbox scope grants and web egress; all three deny on
-  Enter/Esc. A denied operation is selectable and `a` re-raises its grant question.
+- **Approval gates (root R-WEB.6, R-WEB.6.3, R-PERM.7.1, R-PERM.3.8, R-PERM.10(e))**: the TUI
+  renders and resolves chat tool approval (`y`/`n`), sandbox scope grants and web egress; all
+  three deny on Enter/Esc. A denied operation is selectable and `a` re-raises its grant
+  question. The grant queue also holds the questions refused terminal-hook commands left for
+  the harness dialog, read from their records (`harness_asks`) and answered by the TUI itself.
 - **Trusted folders (root R-PERM.1.2, R-PERM.1.3)**.
 - **Guided setup, help and settings (R24.12)**.
 - **Minimal chrome (R24.11)**.
