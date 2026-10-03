@@ -165,6 +165,12 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
             Some(q) if c == q => quote = None,
             Some(_) => cur.push(c),
             None => match c {
+                // `!` standing alone negates the command after it: a word of
+                // its own, which the classifier skips like a loop keyword.
+                '!' if !in_word && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => {
+                    cur.push('!');
+                    in_word = true;
+                }
                 // An operator this module does not model, outside quotes only:
                 // a `}` inside a sed script is just a character.
                 c if SHELL_OPERATORS.contains(&c) => return None,
@@ -328,7 +334,7 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
 /// Shell keywords that open or close a loop or a conditional around the
 /// commands of a list: `until gh pr checks 87; do sleep 60; done` is a reader
 /// exactly when every command in it is.
-const LIST_KEYWORDS: &[&str] = &["until", "while", "if", "elif", "then", "else", "do"];
+const LIST_KEYWORDS: &[&str] = &["until", "while", "if", "elif", "then", "else", "do", "!"];
 
 /// Whether `word` is a `NAME=value` environment assignment.
 fn is_assignment(word: &str) -> bool {
@@ -999,6 +1005,26 @@ mod poll_loop_tests {
         ] {
             assert_eq!(classify_shell_command(cmd), Lane::Exclusive, "{cmd}");
         }
+    }
+
+    /// `!` negates the command after it and changes nothing on disk, so a
+    /// poll written `until ! cmd` is a reader exactly when `cmd` is. Treated as
+    /// an unknown operator, a CI watch held the workspace for half an hour.
+    #[test]
+    fn a_negated_command_is_judged_by_the_command() {
+        assert_eq!(
+            classify_shell_command(
+                "until ! gh pr checks 87 --json state | grep -q PENDING; do sleep 60; done"
+            ),
+            Lane::ReadOnly
+        );
+        assert_eq!(classify_shell_command("! grep -q x f.txt"), Lane::ReadOnly);
+        assert_eq!(classify_shell_command("! rm -f x"), Lane::Exclusive);
+        assert_eq!(
+            classify_shell_command("echo hi!"),
+            Lane::Exclusive,
+            "a bare ! inside a word is not modelled"
+        );
     }
 
     #[test]

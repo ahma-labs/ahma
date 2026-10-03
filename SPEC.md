@@ -323,7 +323,7 @@ drops work — and it is built so that no crash, kill or power loss can leave it
     file, ahma's own listing commands, …); **pipelines and lists** of readers (`grep … |
     head`, `cd src && ls`, `2>&1`, `>/dev/null`, a plain `$VAR`); `sleep`; a `NAME=value`
     assignment before a reader, or on its own (`S=/path; grep … $S`); an
-    `until`/`while`/`if`/`for … in` list whose every command reads (a CI poll such as
+    `until`/`while`/`if`/`for … in` list (a standalone `!` negating a command included) whose every command reads (a CI poll such as
     `until gh pr checks 87; do sleep 60; done`); and the system diagnostics an agent runs to
     see why a job is slow (`uptime`, `sysctl` without `-w` or `name=value`, `vm_stat`,
     `iostat`, `top`, `lsof`, `pgrep`). Those must never queue behind the job they inspect. A `$(…)` substitution is judged by the command it runs, so
