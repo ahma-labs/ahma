@@ -6,6 +6,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use super::platform::{ArchiveFormat, Platform};
+use super::receipt;
 use super::release::{ReleaseAsset, parse_checksum_line};
 use super::verify;
 
@@ -56,10 +57,43 @@ pub async fn install_release_asset(
         .await
         .with_context(|| format!("Failed to create {}", install_dir.display()))?;
 
+    // Digests for the install receipt, taken before anything can change the bytes.
+    // `should_skip_verify` covers the retired env vars `verify_artifact` still honours:
+    // a receipt must never claim a verification that was skipped.
+    let verified = if insecure_skip_verify || verify::should_skip_verify() {
+        None
+    } else {
+        Some(receipt::VerifiedArtifact {
+            name: asset.asset_name.clone(),
+            sha256: file_sha256_hex(&archive_path).await?,
+        })
+    };
+    let released_sha256 = file_sha256_hex(&extracted).await?;
+
     install_binary(&extracted, &target).await?;
+    // Best-effort: the binary is installed; a missing receipt only makes a later
+    // `ahma verify --self` on a re-signed macOS binary fail strictly.
+    if let Err(e) = receipt::record_install(
+        &target,
+        "ahma update",
+        &asset.version,
+        verified.as_ref(),
+        &released_sha256,
+    )
+    .await
+    {
+        eprintln!("warning: could not record the install receipt: {e:#}");
+    }
     cleanup_legacy_binaries(install_dir).await?;
 
     Ok(target)
+}
+
+async fn file_sha256_hex(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)
+        .await
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(super::sha256_hex(&bytes))
 }
 
 async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
@@ -185,33 +219,11 @@ async fn install_binary(source: &Path, target: &Path) -> Result<()> {
         perms.set_mode(0o755);
         fs::set_permissions(&staged, perms).await?;
 
-        // Re-sign the staged binary with the hardened runtime (SPEC R-SIGN.1,
-        // local part): a linker-ad-hoc signature fails code-page re-validation
-        // under memory pressure and gets the process SIGKILLed. Best-effort —
-        // an install must not fail because codesign is unavailable.
+        // SPEC R-SIGN.1 on macOS: keep a Developer ID signature, re-sign anything
+        // else ad hoc with the hardened runtime. Signing happens on the staged
+        // copy, before it takes the path.
         #[cfg(target_os = "macos")]
-        {
-            let result = tokio::process::Command::new("codesign")
-                .args(["--force", "--sign", "-", "--options", "runtime"])
-                .arg(&staged)
-                .kill_on_drop(true) // owned child (SPEC R-PROC.1)
-                .output()
-                .await;
-            match result {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => eprintln!(
-                    "warning: codesign of {} failed ({}); the binary may be killed \
-                     under memory pressure (SPEC R-SIGN.1): {}",
-                    staged.display(),
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-                Err(e) => eprintln!(
-                    "warning: could not run codesign for {}: {e} (SPEC R-SIGN.1)",
-                    staged.display()
-                ),
-            }
-        }
+        sign_for_install(&staged).await;
 
         // Keep a rollback copy. Best-effort: even if this rename fails, the
         // atomic rename below still replaces the path without touching the
@@ -265,6 +277,132 @@ async fn install_binary(source: &Path, target: &Path) -> Result<()> {
 
     println!("Installed {}", target.display());
     Ok(())
+}
+
+/// What `codesign -dvv` reports about a binary's code signature.
+///
+/// Only the two facts an installer needs (SPEC R-SIGN.1). `codesign -dvv` writes its
+/// report to **stderr**.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CodeSignature {
+    /// The leaf certificate — the first `Authority=` line — is a
+    /// `Developer ID Application` certificate.
+    pub developer_id: bool,
+    /// The `CodeDirectory` flags include `runtime` (the hardened runtime).
+    pub hardened_runtime: bool,
+}
+
+/// Parse `codesign -dvv` output. Pure, so it is tested on every platform.
+///
+/// Signatures the parser sees in practice: the linker's ad-hoc signature of a cargo
+/// build (`flags=0x20002(adhoc,linker-signed)`, no `Authority=`), an installer's ad-hoc
+/// re-sign (`flags=0x10002(adhoc,runtime)`, no `Authority=`), and a Developer ID
+/// release (`flags=0x10000(runtime)`, `Authority=Developer ID Application: …`).
+pub fn parse_codesign_display(output: &str) -> CodeSignature {
+    let mut signature = CodeSignature::default();
+    let mut seen_authority = false;
+    for line in output.lines().map(str::trim) {
+        if let Some(authority) = line.strip_prefix("Authority=") {
+            // The chain is printed leaf first; only the leaf identifies the signer.
+            // ("Developer ID Certification Authority" is an intermediate.)
+            if !seen_authority {
+                signature.developer_id = authority.starts_with("Developer ID Application:");
+                seen_authority = true;
+            }
+        } else if line.starts_with("CodeDirectory ") {
+            signature.hardened_runtime = code_directory_flags(line).any(|f| f == "runtime");
+        }
+    }
+    signature
+}
+
+/// The symbolic flags of a `CodeDirectory … flags=0x10002(adhoc,runtime) …` line.
+fn code_directory_flags(line: &str) -> impl Iterator<Item = &str> {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix("flags="))
+        .and_then(|flags| {
+            let open = flags.find('(')?;
+            let close = flags.rfind(')')?;
+            flags.get(open + 1..close)
+        })
+        .into_iter()
+        .flat_map(|names| names.split(','))
+        .map(str::trim)
+}
+
+/// Whether an installer must keep a binary's existing signature instead of
+/// re-signing it ad hoc (SPEC R-SIGN.1).
+///
+/// Only a signature that passes `codesign --verify --strict` **and** is a Developer ID
+/// with the hardened runtime is kept. That is the release signature: replacing it
+/// would discard the notarized identity and change the binary's bytes, so it would no
+/// longer match its attestation. Anything else — the linker's ad-hoc signature above
+/// all — is what the local re-sign exists to replace.
+///
+/// This decides nothing about provenance: by the time it runs, the release has
+/// already passed attestation verification, and any Developer ID is accepted.
+pub fn keeps_existing_signature(strict_verify_passed: bool, codesign_display: &str) -> bool {
+    let signature = parse_codesign_display(codesign_display);
+    strict_verify_passed && signature.developer_id && signature.hardened_runtime
+}
+
+/// Sign a staged binary for install on macOS (SPEC R-SIGN.1): keep a valid Developer
+/// ID signature with the hardened runtime; otherwise re-sign ad hoc with the hardened
+/// runtime, because a linker-ad-hoc signature fails code-page re-validation under
+/// memory pressure and the process is SIGKILLed. Best-effort: an install must not fail
+/// because codesign is unavailable.
+#[cfg(target_os = "macos")]
+async fn sign_for_install(staged: &Path) {
+    if has_kept_signature(staged).await {
+        println!("Keeping the release's Developer ID signature (hardened runtime).");
+        return;
+    }
+    match run_codesign(&["--force", "--sign", "-", "--options", "runtime"], staged).await {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => eprintln!(
+            "warning: codesign of {} failed ({}); the binary may be killed \
+             under memory pressure (SPEC R-SIGN.1): {}",
+            staged.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => eprintln!(
+            "warning: could not run codesign for {}: {e} (SPEC R-SIGN.1)",
+            staged.display()
+        ),
+    }
+}
+
+/// `codesign --verify --strict` passes and `codesign -dvv` shows a Developer ID with
+/// the hardened runtime — see [`keeps_existing_signature`].
+#[cfg(target_os = "macos")]
+async fn has_kept_signature(path: &Path) -> bool {
+    let strict_verify_passed = matches!(
+        run_codesign(&["--verify", "--strict"], path).await,
+        Ok(out) if out.status.success()
+    );
+    if !strict_verify_passed {
+        return false;
+    }
+    match run_codesign(&["-dvv"], path).await {
+        Ok(out) if out.status.success() => {
+            // The report is on stderr; read both streams in case that ever changes.
+            let mut report = String::from_utf8_lossy(&out.stderr).into_owned();
+            report.push_str(&String::from_utf8_lossy(&out.stdout));
+            keeps_existing_signature(true, &report)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn run_codesign(args: &[&str], path: &Path) -> std::io::Result<std::process::Output> {
+    tokio::process::Command::new("codesign")
+        .args(args)
+        .arg(path)
+        .kill_on_drop(true) // owned child (SPEC R-PROC.1)
+        .output()
+        .await
 }
 
 /// Where a running Windows binary is moved aside to: `<name>.old`, or — when
@@ -691,6 +829,115 @@ mod tests {
             !target.with_extension("new").exists(),
             "no staged temp file may remain after install"
         );
+    }
+
+    // ── codesign -dvv parsing (SPEC R-SIGN.1) ─────────────────────────────────
+    //
+    // Fixtures are verbatim `codesign -dvv` output (stderr) captured on macOS 27,
+    // with only the user's home directory rewritten in the `Executable=` lines.
+    // `developer_id_no_runtime.txt` is `developer_id_runtime.txt` with the flags
+    // rewritten to the `flags=0x0(none)` form codesign prints for a signature without
+    // the hardened runtime: no such Developer ID binary was at hand to capture.
+
+    /// `cargo build` output: the linker's ad-hoc signature.
+    const LINKER_ADHOC: &str = include_str!("../tests/fixtures/codesign/linker_adhoc.txt");
+    /// What the installer's own `codesign --force --sign - --options runtime` produces.
+    const ADHOC_RUNTIME: &str = include_str!("../tests/fixtures/codesign/adhoc_runtime.txt");
+    /// A notarized Developer ID command-line binary with the hardened runtime.
+    const DEVELOPER_ID_RUNTIME: &str =
+        include_str!("../tests/fixtures/codesign/developer_id_runtime.txt");
+    /// A Developer ID signature without the hardened runtime.
+    const DEVELOPER_ID_NO_RUNTIME: &str =
+        include_str!("../tests/fixtures/codesign/developer_id_no_runtime.txt");
+
+    #[test]
+    fn codesign_parse_linker_adhoc() {
+        assert_eq!(
+            parse_codesign_display(LINKER_ADHOC),
+            CodeSignature {
+                developer_id: false,
+                hardened_runtime: false
+            }
+        );
+    }
+
+    #[test]
+    fn codesign_parse_adhoc_with_runtime() {
+        assert_eq!(
+            parse_codesign_display(ADHOC_RUNTIME),
+            CodeSignature {
+                developer_id: false,
+                hardened_runtime: true
+            }
+        );
+    }
+
+    #[test]
+    fn codesign_parse_developer_id_with_runtime() {
+        assert_eq!(
+            parse_codesign_display(DEVELOPER_ID_RUNTIME),
+            CodeSignature {
+                developer_id: true,
+                hardened_runtime: true
+            }
+        );
+    }
+
+    #[test]
+    fn codesign_parse_developer_id_without_runtime() {
+        assert_eq!(
+            parse_codesign_display(DEVELOPER_ID_NO_RUNTIME),
+            CodeSignature {
+                developer_id: true,
+                hardened_runtime: false
+            }
+        );
+    }
+
+    /// Only the leaf authority identifies the signer: an Apple platform binary's chain
+    /// (and the "Developer ID Certification Authority" intermediate under a real
+    /// Developer ID leaf) must not read as a Developer ID Application signature.
+    #[test]
+    fn codesign_parse_uses_only_the_leaf_authority() {
+        let apple_platform = "CodeDirectory v=20400 size=325 flags=0x0(none) hashes=5+2 location=embedded\n\
+                              Authority=macOS Software Signing\n\
+                              Authority=Apple Code Signing Certification Authority\n\
+                              Authority=Apple Root CA\n";
+        assert!(!parse_codesign_display(apple_platform).developer_id);
+
+        let intermediate_first = "CodeDirectory v=20500 flags=0x10000(runtime)\n\
+                                  Authority=Developer ID Certification Authority\n\
+                                  Authority=Developer ID Application: Example (ABCDE12345)\n";
+        assert!(!parse_codesign_display(intermediate_first).developer_id);
+    }
+
+    /// `runtime` is matched as a whole flag name, never as a substring of another
+    /// line (`Runtime Version=`) or of an unrelated flag.
+    #[test]
+    fn codesign_parse_runtime_is_a_whole_code_directory_flag() {
+        let no_flag = "CodeDirectory v=20500 size=10 flags=0x2(adhoc) hashes=1+0 location=embedded\n\
+                       Runtime Version=27.0.0\n";
+        assert!(!parse_codesign_display(no_flag).hardened_runtime);
+        assert_eq!(parse_codesign_display(""), CodeSignature::default());
+        assert_eq!(
+            parse_codesign_display("code object is not signed at all"),
+            CodeSignature::default()
+        );
+    }
+
+    /// The installer keeps a signature only when strict verification passed and it is
+    /// a Developer ID with the hardened runtime; every other case is re-signed ad hoc.
+    #[test]
+    fn keeps_existing_signature_only_for_valid_developer_id_with_runtime() {
+        assert!(keeps_existing_signature(true, DEVELOPER_ID_RUNTIME));
+
+        assert!(
+            !keeps_existing_signature(false, DEVELOPER_ID_RUNTIME),
+            "a Developer ID that fails `codesign --verify --strict` is not kept"
+        );
+        assert!(!keeps_existing_signature(true, DEVELOPER_ID_NO_RUNTIME));
+        assert!(!keeps_existing_signature(true, LINKER_ADHOC));
+        assert!(!keeps_existing_signature(true, ADHOC_RUNTIME));
     }
 
     // ── cleanup_legacy_binaries ───────────────────────────────────────────────

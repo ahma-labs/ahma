@@ -1,0 +1,12 @@
+Executable=/Users/me/.local/bin/ahma.new
+Identifier=ahma-555549443ab11e34571f36e7bbe1efd13c04bec5
+Format=Mach-O thin (arm64)
+CodeDirectory v=20500 size=110158 flags=0x10002(adhoc,runtime) hashes=3436+2 location=embedded
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Runtime Version=27.0.0
+Sealed Resources=none
+Internal requirements count=0 size=12
+Total signatures=1
+Chosen signature=1
