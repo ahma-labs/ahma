@@ -84,23 +84,22 @@
 //! [`appcontainer_spawn_enabled`](crate::sandbox::windows::appcontainer_spawn_enabled), which is the single place that verdict lives,
 //! and `sandbox/command.rs`, which reads it.
 //!
-//! What the evidence does and does not establish (the `AppContainer diagnostics`
-//! step of CI run 37103491457, 2026-10-03):
+//! What the evidence establishes (`appcontainer_dacl_diagnostics`, CI run 37108502254,
+//! 2026-10-03):
 //!
-//! * **The grant is written.** `icacls` on the scope shows the container SID with
-//!   an inheritable `(OI)(CI)(M,DC)` ACE, so the DACL code does what it says.
-//! * **The ancestors grant the container nothing.** `AppData`, `Local` and `Temp`
-//!   carry no package or capability ACE.
-//! * **The child never reached the write.** The probe shell was Windows
-//!   PowerShell 5.1, and inside the container it could not resolve
-//!   `Write-Output`, `Set-Content` or `Test-Path` (`CommandNotFoundException`: its
-//!   own modules failed to load), and `whoami /groups` printed nothing.
+//! * **The boundary holds both ways.** Inside the container the shell-free
+//!   probe and `cmd.exe` write and read inside the scope, and are denied writing or
+//!   reading a sibling directory outside it, with or without a Low integrity label,
+//!   under `%TEMP%` and `D:\a\_temp`.
+//! * **`NUL` is denied.** The `NUL` device grants application packages nothing, so
+//!   any tool that writes to it fails; changing that needs an administrator.
+//! * **Ancestors are denied.** stat, list and canonicalize of every ancestor of the
+//!   scope fail (they grant the container nothing), so `GetFinalPathNameByHandle`
+//!   on an in-scope file fails, and Windows PowerShell 5.1 fails when its working
+//!   directory is an 8.3 short path, because .NET Framework expands it with
+//!   `GetLongPathName`. PowerShell 7 works.
 //!
-//! So the earlier reading, "a write *inside* the scope is denied", is **not
-//! established**. The only artefact behind it was PowerShell's `Access to the path
-//! '...' is denied`, which names no path, and fits PowerShell failing on its own
-//! state (module cache, profile, registry) as well as it fits the target file.
-//! Whether the boundary holds, in either direction, is unknown.
+//! The spawn stays disabled until those two blockers have a design.
 //!
 //! Everything below therefore compiles and is unit-tested, and none of it is
 //! reachable in production. That is deliberate while a fix is in flight; if it

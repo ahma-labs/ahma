@@ -1052,10 +1052,11 @@ mod appcontainer {
     /// nothing while the in-scope half fails, which is exactly the "blocks
     /// everything, proves nothing" case this test exists to rule out.
     /// `appcontainer_dacl_diagnostics` measures the boundary without depending
-    /// on PowerShell; remove this `#[ignore]` once a `windows-latest` run
-    /// demonstrates the in-scope write succeeding.
-    #[ignore = "AppContainer isolation is off (SPEC R6.3.3 not yet proven): the in-scope \
-                write failed on windows-latest, cause unknown (see appcontainer_dacl_diagnostics)"]
+    /// on PowerShell; remove this `#[ignore]` once the spawn is enabled
+    /// (appcontainer_spawn_enabled).
+    #[ignore = "AppContainer isolation is off (SPEC R6.3.3): its boundary holds, but this test \
+                drives Windows PowerShell 5.1, which cannot start inside the container from an \
+                8.3 short-path scope, and NUL is denied (see appcontainer_dacl_diagnostics)"]
     #[tokio::test]
     async fn writes_outside_the_scope_are_blocked_and_inside_still_work() {
         let scope = tempfile::tempdir().unwrap();
@@ -1156,7 +1157,7 @@ mod appcontainer {
     ///
     /// **Failed on `windows-latest` CI** for the same reason as
     /// `writes_outside_the_scope_are_blocked_and_inside_still_work` above: the
-    /// first session's in-scope write already fails, cause unknown. Remove this
+    /// first session's PowerShell cannot start inside the container. Remove this
     /// `#[ignore]` alongside that one.
     #[ignore = "AppContainer isolation is off (SPEC R6.3.3 not yet proven) — see \
                 writes_outside_the_scope_are_blocked_and_inside_still_work"]
