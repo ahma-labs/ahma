@@ -11,7 +11,7 @@
 //! | Area | Modules |
 //! |------|---------|
 //! | Configuration | [`config`] (settings schema, trust tiers, provider registry, retired-env handling) |
-//! | Permissions and scope | [`permissions`], [`workspace_scope`], [`scope_decision`], [`scope_grant`], [`sandbox_state`], [`elicitation`], [`hook_consent`] |
+//! | Permissions and scope | [`permissions`], [`scope_grant`], [`sandbox_state`], [`hook_consent`] |
 //! | Network policy and outbound HTTP | [`web_policy`], [`web_approval`], [`net_approval`], [`http_retry`] |
 //! | Operations | [`event_dispatcher`], [`op_identity`] |
 //! | Per-user hub | [`hub`], [`hub_history`] |
@@ -37,7 +37,6 @@ pub mod config;
 /// SHA-256 hex digests, one encoder for every `SHA256SUMS`-style surface.
 pub mod digest;
 pub mod doctor;
-pub mod elicitation;
 pub mod event_dispatcher;
 pub mod exe_identity;
 pub mod file_uri;
@@ -62,7 +61,6 @@ pub mod permissions;
 pub mod process_guard;
 pub mod prompts;
 pub mod sandbox_state;
-pub mod scope_decision;
 pub mod scope_grant;
 pub mod session_event;
 pub mod session_grants;
@@ -76,4 +74,3 @@ pub mod test_isolation;
 pub mod timeouts;
 pub mod web_approval;
 pub mod web_policy;
-pub mod workspace_scope;
