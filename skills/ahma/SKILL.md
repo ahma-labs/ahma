@@ -326,8 +326,8 @@ ahma tls init && ahma tls status        # ahma tls rotate replaces certificate
 * **GPU / Metal errors** (`failed to create command queue`, no Metal device, llama.cpp falling back to CPU): the sandbox withholds the GPU; it is a *setting*, not a path, so do not request a directory grant. Tell the human that `[sandbox] allow_gpu = true` in `~/.ahma/settings.toml` enables it, or continue on the CPU.
 * **Gradle, Maven, Xcode or SwiftPM cache denials** (`~/.gradle`, `~/.m2`, `DerivedData`, `~/Library/Caches/org.swift.swiftpm`): the shipped `android` and `apple` profiles already grant these; if a denial still names one, the profile is disabled in `[sandbox] profiles` — ask the human to re-enable it rather than requesting the paths one by one. The `sccache` profile gives each workspace its own sccache server and cache (`SCCACHE_SERVER_PORT`, `SCCACHE_DIR`); don't point a build at a shared server instead.
 * **"ahma is DEFERRING to … sandbox"**: ahma is inside an outer sandbox it can't nest inside (macOS Seatbelt refuses nesting). Commands still run, confined by the outer sandbox — expected when running ahma's own test suite or a nested `ahma serve`. For ahma's own enforcement, start it from a plain terminal.
-* **Tool still running**: `status(operation_id)` to check, or `cancel(operation_id)`.
-* **Linux old kernel**: Landlock needs kernel 5.13+; use `--no-sandbox` on older systems.
+* **Tool still running**: `status(operation_id)` to check, or `cancel(operation_id)`. **Linux old kernel**: Landlock needs 5.13+; use `--no-sandbox` there.
+* **`Permission denied (publickey)`** on git push/fetch: private keys are unreadable by design. Ask the human to switch the repo to HTTPS once (`gh auth setup-git`, then `git remote set-url origin https://github.com/<owner>/<repo>.git`); that works inside the sandbox.
 
 ---
 

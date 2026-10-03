@@ -233,10 +233,13 @@ One thing for the human to do, on the host: `gh auth login` then `gh auth setup-
 `ahma doctor` reports which helper git uses (`git config --get-all credential.helper`) and whether a \
 sandbox setting blocks it.";
 
-const SSH_PUBLICKEY_REMEDIATION: &str = "SSH authentication failed (`Permission denied (publickey)`). \
-Ahma's sandbox secures private keys in `~/.ssh/` from direct file reads, but forwards `$SSH_AUTH_SOCK`. \
-To allow sandboxed git operations to authenticate via SSH, run `ssh-add` on the host to load your key into \
-the SSH agent (e.g. `ssh-add ~/.ssh/id_ed25519`).";
+const SSH_PUBLICKEY_REMEDIATION: &str = "SSH authentication failed (`Permission denied (publickey)`): \
+ahma's sandbox keeps the private keys in `~/.ssh/` unreadable, by design. The simplest way through, which \
+works inside the sandbox, is HTTPS with the GitHub CLI's credentials (kept in the keychain): the human runs \
+`gh auth setup-git` once, and `git remote set-url origin https://github.com/<owner>/<repo>.git` in each \
+repository. Alternatively, with the key loaded into the SSH agent on the host (`ssh-add \
+--apple-use-keychain ~/.ssh/id_ed25519` on macOS), sandboxed git signs through the forwarded \
+`$SSH_AUTH_SOCK`. No directory grant can help.";
 
 #[cfg(test)]
 mod tests {
@@ -368,8 +371,15 @@ mod tests {
             fatal: Could not read from remote repository.";
         let hit = diagnose_streams("", stdout).expect("ssh publickey failure should match");
         assert_eq!(hit.kind, ContaminationKind::SshPublicKeyAuth);
+        // HTTPS through gh works inside the sandbox today (verified against
+        // a private repository); it leads, and the agent route follows.
+        assert!(
+            hit.remediation.contains("gh auth setup-git"),
+            "{}",
+            hit.remediation
+        );
+        assert!(hit.remediation.contains("git remote set-url"));
         assert!(hit.remediation.contains("ssh-add"));
-        assert!(hit.remediation.contains("SSH_AUTH_SOCK"));
     }
 }
 
