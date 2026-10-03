@@ -20,7 +20,7 @@
 //!
 //! ## One harness table
 //!
-//! [`McpClientType`] is a view of [`ahma_common::harness::Harness`]: each
+//! [`McpClientType`](crate::client_type::McpClientType) is a view of [`ahma_common::harness::Harness`]: each
 //! variant other than `Unknown` names one harness, and every per-client fact
 //! (name matching, display name, progress, native file tools, elicitation
 //! budget) is read from there rather than listed again here.

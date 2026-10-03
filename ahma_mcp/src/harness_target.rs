@@ -13,7 +13,7 @@
 //! filling in the matches the compiler then flags — uninstall cannot be
 //! forgotten.
 //!
-//! A [`Platform`] is a view of [`Harness`]: its names, whether it answers
+//! A [`Platform`](crate::harness_target::Platform) is a view of [`Harness`](ahma_common::harness::Harness): its names, whether it answers
 //! `roots/list` and which terminal hook it has are read from there, so the
 //! setup wizard cannot call a harness something `ahma hooks` or `status`
 //! does not.

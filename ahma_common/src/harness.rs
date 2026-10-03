@@ -6,7 +6,7 @@
 //! the `ahma setup` targets (`ahma_mcp::harness_target::Platform`) and the
 //! terminal-hook flavours (`ahma_mcp::hooks::HookPlatform`) each listed their
 //! own subset with their own names. They are now views of this enum: each one
-//! maps its variants onto a [`Harness`] and reads the facts from here, so a
+//! maps its variants onto a [`Harness`](crate::harness::Harness) and reads the facts from here, so a
 //! harness cannot be "Claude Code" in one table and something else in another.
 //!
 //! What stays out of this module is what a *surface* does with a harness —
@@ -15,7 +15,7 @@
 //! are mechanisms; this is identity.
 //!
 //! Some facts below are only observable for some harnesses today: a harness
-//! [`Harness::from_client_name`] never returns has no MCP-client behaviour
+//! [`Harness::from_client_name`](crate::harness::Harness::from_client_name) never returns has no MCP-client behaviour
 //! anyone can see, and one that is not an `ahma setup` target has no setup
 //! label anyone can see. Their values are still filled in so every method is
 //! total — and they are chosen to equal what ahma does *today* for that
@@ -46,7 +46,7 @@ pub enum Harness {
     /// Google Gemini CLI. Listed so it has one name; today a Gemini CLI
     /// session is *detected* as `agy` (Antigravity) — `GEMINI_CLI` in the
     /// environment makes the stdio proxy report `agy` — and
-    /// [`Harness::from_client_name`] never returns it.
+    /// [`Harness::from_client_name`](crate::harness::Harness::from_client_name) never returns it.
     GeminiCli,
     /// LM Studio.
     LmStudio,
