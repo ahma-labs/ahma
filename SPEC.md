@@ -214,6 +214,13 @@ may change.
   is exempt from the sandbox-ready gate (R5.1.2), whether ahma's own agent loop
   may call it, and whether it is a harness file tool withheld from clients with
   native equivalents. These are exhaustive matches, not membership lists.
+* **R1.5.5**: **A tool that asks a human is not asked about.** `sandbox_grant`,
+  `network_grant` and `logs_approve` exist to raise one human question through the
+  permission ladder (R-PERM.3) and record nothing without its answer, so they are not
+  "mutating" for tool approval (a second prompt for one decision is not safer), they
+  still cross the sandbox boundary so trusting a folder never answers for them
+  (R-PERM.1.3), and they carry `_meta["anthropic/requiresUserInteraction"]` so a
+  harness never auto-approves them (R5.4.5).
 * **R1.5.4**: The `instructions` field of the MCP `initialize` response directs the model to
   use `run_terminal_command` for command execution and describes the session's actual
   execution mode (R2.1).

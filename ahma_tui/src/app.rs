@@ -7331,6 +7331,10 @@ mod tests {
         // Not gating read_file by default
         assert!(!needs_approval("read_file", false, &non_mutating));
         assert!(!needs_approval("srv::read_file", false, &non_mutating));
+        // Not gating the tools that raise their own grant question: a tool
+        // prompt first would ask the human twice for one decision.
+        assert!(!needs_approval("sandbox_grant", false, &non_mutating));
+        assert!(!needs_approval("logs_approve", false, &non_mutating));
 
         // When tool_approval is enabled, all tools need approval
         assert!(needs_approval("read_file", true, &non_mutating));

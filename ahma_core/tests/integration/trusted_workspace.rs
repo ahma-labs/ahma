@@ -42,7 +42,10 @@ async fn trusting_a_folder_allows_sandboxed_tools_but_not_boundary_crossing_ones
             "{tool} runs inside the sandbox"
         );
     }
-    // Past the boundary: still asks, even in a trusted folder.
+    // Past the boundary: still asks, even in a trusted folder. `sandbox_grant`
+    // and `logs_approve` are not mutating — each asks the human its own
+    // question, so with tool approval off there is no tool prompt to skip —
+    // but trust must never stand in for that question's answer.
     for tool in [
         "sandbox_grant",
         "logs_approve",
