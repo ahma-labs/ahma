@@ -17,41 +17,19 @@ pub enum ScopeSource {
     Explicit,
     /// Workspace roots reported by the MCP client via `roots/list`.
     RootsList,
-    /// A user answered a downgrade elicitation.
-    Elicited,
     /// Derived from the user's `[sandbox] container_root` — the directory that
     /// holds their projects — because the client reported no usable roots and no
     /// explicit scope was configured (SPEC R5.2.3). Always subject to
     /// auto-narrowing (R5.2.6).
     ///
-    /// This replaced a `Default` variant that meant "fell back to `~/sandbox`", a
-    /// directory ahma invented rather than the user choosing. R5.2.3 now forbids
-    /// inventing one at all, so there is no longer any such thing as a default
-    /// scope — only a container the user named.
+    /// There is no default scope (R5.2.3): only a container the user named.
     Container,
     /// No provenance yet: nothing explicit, no usable roots, no container root.
     ///
     /// A scope in this state is not a scope anyone chose, so surfaces that would
     /// act on the user's behalf must refuse rather than proceed — see
     /// `handlers::working_directory`, which will not substitute it.
-    ///
-    /// **Distinct from [`ScopeSource::PendingTui`], deliberately.** One variant
-    /// named `Pending` used to carry both meanings: `Sandbox::scope_source`
-    /// derived it as this residual, while the doc comment described it as
-    /// R5.3.6's TUI-parked answer. They are opposites — "nobody has said
-    /// anything" versus "a human chose this and it applies at the next attach" —
-    /// and collapsing them meant R5.3.6, once wired, would silently inherit the
-    /// working-directory refusal that only the residual case deserves.
     Unestablished,
-    /// A scope a user established from the TUI while no IDE session was live.
-    /// It is shown as pending and applied when the next session attaches to this
-    /// workspace instance (SPEC R5.3.6).
-    ///
-    /// **Not yet reachable**: nothing produces this state, because R5.3.6 is
-    /// not implemented. The variant exists so the display vocabulary is
-    /// complete and so the meaning above cannot be conflated with
-    /// [`ScopeSource::Unestablished`] again.
-    PendingTui,
 }
 
 impl ScopeSource {
@@ -61,12 +39,8 @@ impl ScopeSource {
         match self {
             ScopeSource::Explicit => "explicit",
             ScopeSource::RootsList => "roots/list",
-            ScopeSource::Elicited => "elicited",
             ScopeSource::Container => "container",
-            // The wire vocabulary R5.4 defines has one `pending` token; the two
-            // variants differ in what ahma does about it, not in what the user
-            // is told, and a new token would break every existing parser.
-            ScopeSource::Unestablished | ScopeSource::PendingTui => "pending",
+            ScopeSource::Unestablished => "pending",
         }
     }
 }
@@ -430,7 +404,7 @@ mod tests {
             tmp_access: false,
             tmp_requested: true,
             enforced: true,
-            source: ScopeSource::Elicited,
+            source: ScopeSource::Container,
         };
         let json = view.to_json();
         assert_eq!(json["enforced"], serde_json::json!(true));
@@ -438,7 +412,7 @@ mod tests {
         assert_eq!(json["tmp"], serde_json::json!(false));
         assert_eq!(json["tmp_requested"], serde_json::json!(true));
         assert_eq!(json["tmp_in_scope"], serde_json::json!(false));
-        assert_eq!(json["source"], serde_json::json!("elicited"));
+        assert_eq!(json["source"], serde_json::json!("container"));
         assert_eq!(json["write"], serde_json::json!(["/a", "/b"]));
         assert_eq!(json["read"], serde_json::json!(["/r"]));
     }
@@ -494,28 +468,8 @@ mod tests {
     fn source_tokens_match_spec_vocabulary() {
         assert_eq!(ScopeSource::Explicit.as_str(), "explicit");
         assert_eq!(ScopeSource::RootsList.as_str(), "roots/list");
-        assert_eq!(ScopeSource::Elicited.as_str(), "elicited");
         assert_eq!(ScopeSource::Container.as_str(), "container");
-        // Both pending variants share the one wire token R5.4 defines: they
-        // differ in what ahma does, not in what the user is told, and adding a
-        // token would break every existing parser.
         assert_eq!(ScopeSource::Unestablished.as_str(), "pending");
-        assert_eq!(ScopeSource::PendingTui.as_str(), "pending");
-    }
-
-    /// The two pending meanings must stay distinct *as values* even though they
-    /// render identically — the whole reason for the split is that one is
-    /// substitutable as a working directory and the other is not.
-    #[test]
-    fn the_two_pending_meanings_are_not_the_same_value() {
-        assert_ne!(
-            ScopeSource::Unestablished,
-            ScopeSource::PendingTui,
-            "\"nobody has said anything yet\" and \"a human chose this at the TUI\" are \
-             opposite claims about provenance; one variant carrying both is how R5.3.6 \
-             would have inherited the working-directory refusal that only the residual \
-             case deserves (SPEC R5.2.8 vs R5.3.6)"
-        );
     }
 
     #[test]

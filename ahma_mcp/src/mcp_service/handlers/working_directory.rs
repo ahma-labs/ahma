@@ -150,11 +150,6 @@ pub fn resolve(
         // nobody chose *for this task* (R5.2.8). Unestablished: the scope has no
         // provenance at all, so substituting it would be running in a directory
         // whose origin ahma cannot even attribute. Both refuse.
-        //
-        // `PendingTui` is deliberately absent: that scope *was* chosen, by a
-        // human at the TUI (R5.3.6), so it is as substitutable as `Explicit`.
-        // Both meanings used to share one `Pending` variant, which would have
-        // made R5.3.6 inherit this refusal the moment it was wired up.
         tracing::warn!(
             tool = %tool,
             scope = %scope,
