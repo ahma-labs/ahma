@@ -43,6 +43,7 @@ mod livelog_integration_test;
 mod livelog_pipeline_test;
 mod log_monitor_integration_test;
 mod logging_unit_test;
+mod long_commands_warn_before_the_limit_test;
 mod mcp_service_coverage_improvement_test;
 mod network_grant_tiers_test;
 mod operation_monitor;

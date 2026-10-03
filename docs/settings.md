@@ -84,7 +84,9 @@ Run `ahma settings init` to generate this file automatically.
 
 # ── Tool execution ───────────────────────────────────────────────────────────
 # [tools]
-# timeout_secs = 1800     # default tool timeout (seconds; 30 minutes)
+# timeout_secs = 1800     # longest one command may run (seconds; 30 minutes). A repo whose build gate
+#                         # runs near it can raise it in its own .ahma/settings.toml; an async
+#                         # operation is alerted at 80% (SPEC R2.6.6)
 # await_timeout_secs = 1800 # default `await` soft timeout (seconds); does not cancel the operation
 # idle_timeout_secs = 1800  # tool execution idle timeout (seconds without output); 0 disables
 # request_budget_override_secs = 0 # override the fallback single-request budget (SPEC R2.6.5); 0 = unset, use the built-in default
