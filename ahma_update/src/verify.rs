@@ -32,8 +32,10 @@
 //! ## Callers
 //!
 //! - `ahma verify <path>` — explicit CLI verification.
-//! - `ahma verify --self` — runs against the running binary; called by install scripts
-//!   as a post-install smoke test.
+//! - `ahma verify --self` — runs against the running binary; install scripts run it on
+//!   the staged binary before it takes the install path. On an installed binary that
+//!   an installer re-signed after verifying it (macOS, SPEC R-SIGN.1), the install
+//!   receipt beside it explains the digest difference — see [`crate::receipt`].
 //! - `ahma update` — runs against each downloaded archive before installing.
 //!
 //! ## Escape hatch
@@ -49,6 +51,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use std::path::{Path, PathBuf};
 
+use crate::receipt::{self, InstallReceipt};
 use github_attestation::GITHUB_API_BASE;
 use policy::AhmaReleaseIdentity;
 use sigstore::bundle::Bundle;
@@ -340,6 +343,46 @@ fn is_sigstore_transparency_error(err: &VerificationError) -> bool {
     matches!(err, VerificationError::Signature(_)) && err.to_string() == SIGSTORE_TRANSPARENCY_ERROR
 }
 
+/// The outcome of [`verify_installed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstalledVerification {
+    /// The file's own digest has an attestation that passed every check.
+    Attested,
+    /// The file is an installer's locally re-signed copy of a release it verified
+    /// before installing; the receipt says what was verified.
+    ResignedAfterVerifiedInstall(InstallReceipt),
+}
+
+/// Verify an installed binary, accounting for an installer's local re-sign.
+///
+/// On macOS an installer re-signs a release binary ad hoc with the hardened runtime
+/// unless it carries a Developer ID signature (SPEC R-SIGN.1). That changes the
+/// binary's SHA-256, so no attestation can name the installed file. When the installer
+/// recorded an install receipt for exactly these bytes, this reports the receipt
+/// instead of failing as if the binary had been tampered with. Otherwise it is
+/// [`verify_artifact`].
+///
+/// A receipt is a local record, not a signature (see [`crate::receipt`]). This is for
+/// reporting on an installed binary; install flows gate on [`verify_artifact`].
+pub async fn verify_installed(path: &Path) -> Result<InstalledVerification> {
+    if let Some(receipt) = receipt::read_matching(path).await {
+        return Ok(InstalledVerification::ResignedAfterVerifiedInstall(receipt));
+    }
+    verify_artifact(path).await?;
+    Ok(InstalledVerification::Attested)
+}
+
+/// Appended to a failed `ahma verify --self` on macOS when no install receipt
+/// accounts for the binary's digest.
+const MACOS_NO_RECEIPT_NOTE: &str = "\
+Note (macOS): this need not mean tampering. Installers older than this ahma \
+(scripts/install.sh, or `ahma update` run from an older ahma) re-signed the \
+installed binary ad hoc after verifying the download (SPEC R-SIGN.1). That \
+changes its SHA-256, so no attestation can match it, and they left no install \
+receipt to say so. Reinstall with `ahma update --force` to get a binary that \
+`ahma verify --self` can account for. A binary you built yourself (cargo \
+install, scripts/install-local.sh) has no attestation at all.";
+
 /// Verify the currently running ahma binary.
 pub async fn verify_self() -> Result<()> {
     let path = std::env::current_exe()
@@ -349,6 +392,7 @@ pub async fn verify_self() -> Result<()> {
 
 /// Entry point for `ahma verify` CLI subcommand.
 pub async fn run_cli(args: VerifyArgs) -> Result<()> {
+    let verifying_self = args.self_check || args.path.is_none();
     let path = if let Some(p) = args.path.filter(|_| !args.self_check) {
         p
     } else {
@@ -363,17 +407,27 @@ pub async fn run_cli(args: VerifyArgs) -> Result<()> {
     }
 
     println!("Verifying: {} ...", path.display());
-    verify_artifact(&path).await?;
-    println!(
-        "Verified: {} was built by {}/{} via the official CI pipeline.",
-        path.display(),
-        OWNER,
-        REPO
-    );
+    match verify_installed(&path).await {
+        Ok(InstalledVerification::Attested) => println!(
+            "Verified: {} was built by {}/{} via the official CI pipeline.",
+            path.display(),
+            OWNER,
+            REPO
+        ),
+        Ok(InstalledVerification::ResignedAfterVerifiedInstall(receipt)) => {
+            println!("{}", receipt.explain(&path));
+        }
+        Err(e) if verifying_self && cfg!(target_os = "macos") => {
+            bail!("{e:#}\n\n{MACOS_NO_RECEIPT_NOTE}")
+        }
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
-fn should_skip_verify() -> bool {
+/// Whether the retired skip variables are set. `ahma update` also consults this, so
+/// an install receipt never claims a verification this function skipped.
+pub(crate) fn should_skip_verify() -> bool {
     for var in &["AHMA_INSECURE_SKIP_VERIFY", "AHMA_INSECURE_SKIP_SIGNATURE"] {
         if std::env::var(var)
             .ok()
@@ -633,6 +687,69 @@ mod tests {
             result.is_ok(),
             "expected Ok from run_cli --self with None path and skip env set: {result:?}"
         );
+    }
+
+    /// A receipt beside the binary that names its exact bytes is reported as what it
+    /// is — a release verified at install, then re-signed (SPEC R-SIGN.1) — instead of
+    /// a lookup for an attestation that cannot exist for those bytes. Offline with
+    /// the skip variables cleared: the receipt path must not touch the network.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verify_installed_reports_matching_receipt_for_resigned_binary() {
+        let _g = ENV_MUTEX.lock();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("ahma");
+        std::fs::write(&bin, b"re-signed binary").unwrap();
+        let receipt = resigned_receipt(&crate::sha256_hex(b"re-signed binary"));
+        std::fs::write(receipt::receipt_path(&bin), receipt.render()).unwrap();
+
+        assert_eq!(
+            verify_installed(&bin).await.unwrap(),
+            InstalledVerification::ResignedAfterVerifiedInstall(receipt)
+        );
+
+        // `ahma verify <installed binary>` succeeds and explains, rather than failing
+        // as if the binary had been tampered with.
+        let args = VerifyArgs {
+            path: Some(bin.clone()),
+            self_check: false,
+        };
+        assert!(run_cli(args).await.is_ok());
+    }
+
+    /// A receipt for other bytes (the binary changed since) vouches for nothing:
+    /// verification falls through to the strict attestation check, which the skip
+    /// variable short-circuits here so the test stays offline.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verify_installed_ignores_a_stale_receipt() {
+        let _g = ENV_MUTEX.lock();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("ahma");
+        std::fs::write(&bin, b"modified after install").unwrap();
+        let receipt = resigned_receipt(&crate::sha256_hex(b"re-signed binary"));
+        std::fs::write(receipt::receipt_path(&bin), receipt.render()).unwrap();
+
+        let result = verify_installed(&bin).await;
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        assert_eq!(result.unwrap(), InstalledVerification::Attested);
+    }
+
+    fn resigned_receipt(installed_sha256: &str) -> InstallReceipt {
+        InstallReceipt {
+            installer: "ahma update".to_string(),
+            version: "0.22.1".to_string(),
+            verified_artifact: "ahma-release-darwin-arm64.tar.gz".to_string(),
+            verified_sha256: "a".repeat(64),
+            released_sha256: "b".repeat(64),
+            installed_sha256: installed_sha256.to_string(),
+        }
     }
 
     // Exercises the digest helper on a larger, multi-kilobyte input and asserts

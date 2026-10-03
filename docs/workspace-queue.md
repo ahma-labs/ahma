@@ -34,6 +34,16 @@ status()                                     → ── Finished since your last
 - **Readers never wait.** `git status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, `pgrep`, `ahma ps`, `sed -n`, `gh pr view`, `curl`, `sleep`, the diagnostics you run to see why a job is slow (`uptime`, `sysctl -n`, `vm_stat`, `top -l 1`, `lsof`) and similar — and **pipelines, lists and loops of them** (`grep … | head`, `cd src && ls`, `2>&1`, `>/dev/null`, `FOO=1 gh pr checks 87`, `S=/path; grep … $S`, `for f in a b; do grep -c x $f; done`, `until gh pr checks 87; do sleep 60; done`) —
   plain reads skip the queue — under a sandbox that grants the workspace **no write access**,
   so a misclassified command fails instead of writing.
+- **Watching CI never holds the workspace.** `gh run watch`, `gh pr checks --watch` and
+  `tail -f` read until their subject ends, which can be most of an hour. They take no lease:
+  read-only where the kernel enforces that lane, `service` where it does not.
+- **Output sent outside every workspace is not a workspace write.** A reader whose
+  redirections (`>`, `>>`, `2>`, `&>`, `| tee`) write only files outside the workspace and
+  every other sandbox scope — `gh pr checks 87 --watch > /tmp/ci.log` — runs in the
+  `service` lane. The same line writing `ci.log` in the workspace queues as a writer, as
+  does any target the shell would expand (`$OUT`, a glob, `~`), a relative target after a
+  `cd`, or a line with a program that can write through its own arguments (`sort -o`,
+  `sed`, `env …`).
 - **Nothing is lost to a forgotten `await`.** A result the model never collected is put at
   the top of its next tool result, once.
 - **Drift is reported.** Edits made by a harness's own editor never pass through ahma, so
@@ -105,11 +115,12 @@ missing or broken ahma cannot block editing.
 |---|---|---|
 | `exclusive` (default) | yes | Anything that may write: builds, tests, formatters, `git commit`, any shell command line the classifier cannot prove is a plain read |
 | `read_only` | no | Plain reads; spawned with the workspace read-only (Landlock on Linux, a write-free Seatbelt profile on macOS) and `GIT_OPTIONAL_LOCKS=0` |
-| `service` | no | Long-lived processes such as `livelog` monitors or a declared dev server, which must not hold the workspace for their whole life |
+| `service` | no | Long-lived processes such as `livelog` monitors or a declared dev server, which must not hold the workspace for their whole life; shell lines of readers that write only outside every workspace; CI watchers where there is no read-only lane |
 
 The read-only lane exists only where the kernel can enforce it. On **Windows** (no
 filesystem boundary yet, R6.3.3), in Test-mode sandboxes, and in a macOS ahma nested inside
-another Seatbelt profile, every command is exclusive.
+another Seatbelt profile, a command that would be read-only is exclusive instead — except a
+watcher, which is `service`.
 
 The bundled tools declare theirs: `file-tools` reads (`ls`, `cat`, `grep`, `find`, `head`,
 `tail`, `diff`, `pwd`, `cd`), `git` `status` and `log`, and the `gh` list/view commands are

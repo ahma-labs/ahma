@@ -669,15 +669,20 @@ Before committing: `cargo fmt --all && cargo clippy --all-targets && cargo nexte
 
 ### Working Model — One Writer, Feature Branches, Integration Through CI
 
-* **The main agent is the only one that changes files.** Subagents research, review and
-  propose; they return findings or proposed code in their report and the main agent applies
-  it. Two writers on one checkout race each other and the build lock; two writers in two
-  checkouts diverge silently until a merge surfaces it.
-* **Work on a normal feature branch in the main checkout**, branched from a fresh
-  `origin/main` (`/ahmadev land` step 1). **Avoid git worktrees.** They are not forbidden,
-  but each one is a cold `target/` (see [Target Directory & Cache
+* **One writer: the main agent is the only one that writes to the repository.** It edits
+  files, switches branches, builds, commits and pushes. Two writers on one checkout race
+  each other and the build lock; two writers in two checkouts diverge silently until a
+  merge surfaces it.
+* **Use as many subagents as help you finish quickly, concurrently.** They research, read
+  code, analyse CI logs, review, and draft code, tests or experiments, and return the
+  result in their report (or as files in the session's scratch directory, outside the
+  repo); the main agent reads it and applies it. Give each subagent the rule in its prompt:
+  no edits inside the repo, no state-changing git commands, no builds.
+* **No git worktrees** — not for the main agent, not for subagents (`isolation: worktree`).
+  Each one is a cold `target/` (see [Target Directory & Cache
   Management](#target-directory--cache-management)), a second sandbox scope, and a place
-  for work to be stranded; they have caused more trouble here than they saved.
+  for work to be stranded. **Work on a normal feature branch in the main checkout**,
+  branched from a fresh `origin/main` (`/ahmadev land` step 1).
 * **Integrate separate lines of work through CI, as separate PRs**, landed one after the
   other — not by merging branches locally. A large change is a sequence of small PRs, each
   branched after the previous one merges.

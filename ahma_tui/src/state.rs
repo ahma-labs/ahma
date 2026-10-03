@@ -3965,6 +3965,7 @@ mod tests {
             read_scopes: vec![],
             grants: vec![],
             enforcement: None,
+            native_terminal: None,
         }
     }
 

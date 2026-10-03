@@ -194,6 +194,11 @@ Verify your installed binary at any time:
 ahma verify --self
 ```
 
+On macOS the installer may have re-signed the binary after verifying it. Re-signing changes
+the binary's SHA-256, so the installer records what it verified in `ahma.install-receipt`
+beside the binary, and `ahma verify --self` reports that instead of a mismatch. See
+[release-signing.md](release-signing.md#macos-signing-at-install-and-ahma-verify---self).
+
 Or use the `gh` CLI for out-of-band verification:
 
 ```bash
