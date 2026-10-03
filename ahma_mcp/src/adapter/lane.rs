@@ -638,10 +638,15 @@ pub fn classify_shell_command_at(command: &str, site: &RunSite<'_>) -> Lane {
 
 /// The path a redirection target names, read the way the shell would without
 /// expanding anything: `None` for a word the shell would expand (a variable,
-/// a glob, `~`, a brace) and for a relative path in a line that changes
+/// a glob, a leading `~`, a brace) and for a relative path in a line that changes
 /// directory first.
 fn redirection_target(word: &str, cwd: &Path, changes_dir: bool) -> Option<PathBuf> {
-    if word.is_empty() || word.contains(['$', '*', '?', '[', ']', '{', '}', '~', '`']) {
+    // A `~` expands only at the start of a word; inside a path it is literal
+    // (Windows 8.3 short names such as `RUNNER~1`).
+    if word.is_empty()
+        || word.starts_with('~')
+        || word.contains(['$', '*', '?', '[', ']', '{', '}', '`'])
+    {
         return None;
     }
     let path = Path::new(word);
@@ -1405,6 +1410,21 @@ mod poll_loop_tests {
 #[cfg(test)]
 mod watch_and_redirect_tests {
     use super::*;
+
+    /// The shell expands `~` only at the start of a word, so a tilde inside a
+    /// path is literal: Windows' 8.3 short names (`C:\Users\RUNNER~1\...`,
+    /// which is what %TEMP% often is) must not make an outside target ambiguous.
+    #[test]
+    fn a_tilde_inside_a_path_is_literal_and_only_a_leading_one_expands() {
+        assert_eq!(
+            at("gh pr checks 113 --watch > /scratch/RUNNER~1/ci.log", true),
+            Lane::Service
+        );
+        assert_eq!(
+            at("gh pr checks 113 --watch > ~/ci.log", true),
+            Lane::Exclusive
+        );
+    }
 
     const WS: &str = "/ws/repo";
 
