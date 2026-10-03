@@ -4113,21 +4113,40 @@ fn provider_numctx_command(arg: &str, state: &mut crate::state::AppState) {
             }
         }
     };
-    match ahma_common::config::AhmaConfig::set_provider_num_ctx(&name, num_ctx) {
+    // A provider the TUI discovered has no config entry yet; its URL and the
+    // selected model are what get recorded with the size.
+    let base_url = state
+        .available_providers
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.base_url.clone())
+        .or_else(|| state.current_provider_url.clone())
+        .unwrap_or_default();
+    let model = state
+        .llm_selection
+        .as_ref()
+        .map(|s| s.model.clone())
+        .unwrap_or_default();
+    match ahma_common::config::AhmaConfig::set_num_ctx_for_endpoint(
+        &name, &base_url, &model, num_ctx,
+    ) {
         Ok(()) => {
             rebuild_available_providers(state);
+            *state.ctx_window_cache.borrow_mut() = None;
             let msg = match num_ctx {
                 Some(n) => format!(
                     "Set num_ctx={n} for provider '{name}'. It takes effect on the next prompt."
                 ),
-                None => format!("Cleared num_ctx for provider '{name}'."),
+                None => format!(
+                    "Cleared num_ctx for provider '{name}': the size now comes from the server."
+                ),
             };
             push_assistant_message(state, msg);
         }
         Err(e) => push_assistant_message(
             state,
             format!(
-                "Could not set num_ctx: {e}. (Tip: add it to config first with /provider add, and note hosted clouds don't support it.)"
+                "Could not set num_ctx: {e}. Only Ollama takes a context size per request; other servers set it when they load the model."
             ),
         ),
     }
@@ -4146,12 +4165,29 @@ fn current_provider_name(state: &crate::state::AppState) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The context part of a provider row: the configured size; else the size its
+/// server reported; and, for Ollama (the one server that takes a size per
+/// request), how to set one by hand. Hosted clouds fix the size themselves and
+/// say nothing until a size is known.
+fn provider_context_label(
+    settable: bool,
+    configured: Option<u32>,
+    reported: Option<u32>,
+) -> String {
+    let set_hint = " · /provider numctx to set";
+    match (configured, reported) {
+        (Some(n), _) => format!("  · num_ctx {n}"),
+        (None, Some(n)) if settable => format!("  · context {n} (server){set_hint}"),
+        (None, Some(n)) => format!("  · context {n} (server)"),
+        (None, None) if settable => format!("  · context auto{set_hint}"),
+        (None, None) => String::new(),
+    }
+}
+
 fn open_provider_picker(state: &mut crate::state::AppState) {
     use crate::state::PickerState;
 
-    // Annotate each row with its num_ctx capability so the control reads as
-    // "16384" / "settable" for Ollama, and a dim "num_ctx: n/a" for hosted
-    // clouds that pin context to the model (greyed/not-supported).
+    // Annotate each row with where its context size comes from.
     let cfg = ahma_common::config::AhmaConfig::load();
     let items: Vec<String> = state
         .available_providers
@@ -4166,12 +4202,17 @@ fn open_provider_picker(state: &mut crate::state::AppState) {
                 .iter()
                 .find(|c| c.name == p.name || c.base_url == p.base_url)
                 .and_then(|c| c.num_ctx);
-            let ctx = match (supports, configured) {
-                (_, Some(n)) => format!("  · num_ctx {n}"),
-                (true, None) => "  · num_ctx settable".to_string(),
-                (false, None) => "  · num_ctx n/a".to_string(),
-            };
-            format!("{}  {}{}", p.name, p.base_url, ctx)
+            let reported = state
+                .server_context
+                .as_ref()
+                .filter(|(url, _)| *url == p.base_url)
+                .map(|&(_, n)| n);
+            format!(
+                "{}  {}{}",
+                p.name,
+                p.base_url,
+                provider_context_label(supports, configured, reported)
+            )
         })
         .collect();
 
@@ -7934,6 +7975,63 @@ mod tests {
         assert!(
             !super::handle_intro_key(key(KeyCode::Esc), &mut state),
             "closed: not ours"
+        );
+    }
+
+    /// Each provider row says where its context size comes from: the
+    /// configured one, the one its server reported, or (for Ollama) that it is
+    /// automatic and can be set by hand.
+    #[test]
+    fn provider_rows_say_where_the_context_size_comes_from() {
+        use super::provider_context_label as label;
+        assert_eq!(label(true, Some(8192), Some(12288)), "  · num_ctx 8192");
+        assert_eq!(
+            label(true, None, Some(12288)),
+            "  · context 12288 (server) · /provider numctx to set"
+        );
+        assert_eq!(
+            label(true, None, None),
+            "  · context auto · /provider numctx to set"
+        );
+        assert_eq!(
+            label(false, None, Some(32768)),
+            "  · context 32768 (server)"
+        );
+        assert_eq!(label(false, None, None), "");
+    }
+
+    /// `/provider numctx` works for an Ollama the TUI discovered, with no
+    /// entry in config.toml yet: the entry is recorded with the size, and
+    /// `off` clears it again (the size then comes from the server).
+    #[test]
+    fn a_context_size_can_be_set_for_a_discovered_ollama() {
+        use crate::state::{AppState, LlmSelection};
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+
+        let url = "http://localhost:11434/v1";
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.available_providers = vec![ahma_llm_monitor::LocalProvider {
+            name: "Ollama".into(),
+            base_url: url.into(),
+            models: vec!["qwen3:8b".into()],
+        }];
+        state.llm_selection = Some(LlmSelection::named("Ollama", "qwen3:8b"));
+        state.current_provider_url = Some(url.into());
+
+        super::provider_numctx_command("12288", &mut state);
+        let cfg = ahma_common::config::AhmaConfig::load();
+        assert_eq!(
+            cfg.num_ctx_for_base_url(url),
+            Some(12288),
+            "{:?}",
+            state.chat.entries()
+        );
+        super::provider_numctx_command("off", &mut state);
+        assert_eq!(
+            ahma_common::config::AhmaConfig::load().num_ctx_for_base_url(url),
+            None
         );
     }
 

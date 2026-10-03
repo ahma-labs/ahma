@@ -54,9 +54,17 @@ takes over.
   Enter will chat with there and, once it has been used, its context fill and
   tokens in/out. The chat input's title carries the same meter for the window
   you are typing to, plus the live tokens/second and elapsed time while a turn
-  streams. Context fill needs the model's window size (`--context-length`, or
-  `num_ctx` for the provider in `~/.ahma/config.toml`); without one it is left
-  out rather than guessed. Providers that report no usage get a `~N tok est`.
+  streams. Context fill needs the model's window size: `--context-length`,
+  `num_ctx` for the provider in `~/.ahma/config.toml`, or the size the model's
+  own server reported (Ollama, LM Studio, llama.cpp, vLLM, LiteLLM); without
+  one it is left out rather than guessed. Providers that report no usage get a
+  `~N tok est`.
+- **Context size is automatic; Ollama's can be set by hand.** The provider
+  picker shows where each provider's size comes from. For Ollama,
+  `/provider numctx <tokens>` sets the size the model is loaded with (also for
+  an Ollama the TUI found on its own, which it then records in
+  `~/.ahma/config.toml`), and `/provider numctx off` hands the choice back to
+  the server. See [LLM providers](llm-providers.md#context-window).
 - **A section per client session.** Two windows of the same editor on the same
   project are numbered, so you can tell them apart. Hooked commands fold into
   one `hooks` section — a hook is one instance per command — and your own `!`
