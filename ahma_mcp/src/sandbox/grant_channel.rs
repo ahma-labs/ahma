@@ -564,6 +564,22 @@ pub fn hook_side_refusal_note(output: &str, who: &HookRequester) -> Option<Strin
     if normal_parts < 2 || SYSTEM.iter().any(|p| path.starts_with(p)) {
         return None;
     }
+    // For a command that succeeded, the evidence must be one line: the path
+    // and the refusal together. Borrowing a path from an earlier line (the
+    // multi-line form the failure path uses) paired `SSH_AUTH_SOCK=…` with an
+    // unrelated `Permission denied (publickey)`.
+    let shown = path.display().to_string();
+    let refused_here = output.lines().any(|l| {
+        let lower = l.to_ascii_lowercase();
+        l.contains(&shown)
+            && (lower.contains("operation not permitted")
+                || lower.contains("permission denied")
+                || lower.contains("read-only file system"))
+            && !lower.contains("(publickey)")
+    });
+    if !refused_here {
+        return None;
+    }
     let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     if who
         .scopes
@@ -1009,6 +1025,8 @@ mod context_tests {
             "src/x.rs:12:    // operation not permitted: the path // is never granted",
             "cat: /usr/libexec/secret: Operation not permitted",
             "ls: /: Operation not permitted",
+            // A path on one line and an unrelated refusal on the next.
+            "SSH_AUTH_SOCK=/var/run/com.apple.launchd.2sJPtUp0xm/Listeners\ngit@github.com: Permission denied (publickey).",
         ] {
             assert!(hook_side_refusal_note(out, &who).is_none(), "{out}");
         }
