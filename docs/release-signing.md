@@ -143,8 +143,9 @@ so no attestation can name it. …
   were no receipt.
 - **Older installs have no receipt.** On macOS `ahma verify --self` then fails, with a note
   naming the likely cause. Run `ahma update --force` to reinstall with a receipt.
-- **No receipt when verification was skipped.** `--insecure-skip-verify` (or a retired
-  `AHMA_INSECURE_SKIP_*` variable) leaves none, and removes an old one.
+- **No receipt when verification was skipped.** `ahma update --insecure-skip-verify`, or the
+  bootstrap installer run with `AHMA_INSECURE_SKIP_VERIFY=1`, leaves none, and removes an old
+  one. To `ahma` itself that variable is retired and has no effect.
 - **Uninstall removes it.** `ahma uninstall` deletes the receipt with the binary.
 
 On Linux and Windows the installed binary is never re-signed, so it is always byte-identical

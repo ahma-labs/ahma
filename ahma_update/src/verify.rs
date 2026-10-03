@@ -40,9 +40,12 @@
 //!
 //! ## Escape hatch
 //!
-//! Set `AHMA_INSECURE_SKIP_VERIFY=1` (or `AHMA_INSECURE_SKIP_SIGNATURE=1` for backward
-//! compatibility) to bypass attestation verification. This should only be used in
-//! air-gapped environments or when Sigstore/GitHub API is unreachable.
+//! `ahma update --insecure-skip-verify` bypasses attestation verification, for
+//! air-gapped installs or when Sigstore/GitHub is unreachable. It is a CLI flag only
+//! (SPEC R-CFG2.3): the retired `AHMA_INSECURE_SKIP_VERIFY` and
+//! `AHMA_INSECURE_SKIP_SIGNATURE` variables are warned about and have no effect.
+//! (The bootstrap installer `scripts/install.sh`, which runs before any `ahma`
+//! exists, still reads them; R-CFG1.2.1.)
 
 mod github_attestation;
 mod policy;
@@ -113,7 +116,7 @@ const SIGSTORE_TRANSPARENCY_ERROR: &str = "signature transparency materials are 
     long_about = "Verify that an artifact was produced by the official ahma-labs/ahma CI pipeline.\n\n\
         Uses GitHub's Sigstore-backed Build Provenance Attestations to prove that a binary or \
         archive was built from the ahma-labs/ahma repository on the main branch.\n\n\
-        Set AHMA_INSECURE_SKIP_VERIFY=1 to skip verification (offline/air-gapped use only).",
+        For an offline/air-gapped install, `ahma update --insecure-skip-verify` skips verification.",
     after_help = "EXAMPLES:
   # Verify a downloaded archive
   ahma verify ahma-release-linux-x86_64.tar.gz
@@ -139,13 +142,12 @@ pub struct VerifyArgs {
 /// constraint failed (no attestation, wrong identity, expired cert, network error, etc.)
 /// so install scripts can surface it verbatim.
 ///
-/// Set `AHMA_INSECURE_SKIP_VERIFY=1` (or `AHMA_INSECURE_SKIP_SIGNATURE=1`) to skip.
+/// It never skips: a caller that may skip does so with its own CLI flag
+/// (`ahma update --insecure-skip-verify`, R-CFG2.3), and the retired
+/// `AHMA_INSECURE_SKIP_*` variables have no effect here.
 pub async fn verify_artifact(path: &Path) -> Result<()> {
-    if should_skip_verify() {
-        eprintln!(
-            "WARNING: Sigstore attestation verification bypassed via AHMA_INSECURE_SKIP_VERIFY. \
-             Only use this in offline/air-gapped environments."
-        );
+    #[cfg(test)]
+    if SKIP_FOR_TEST.with(std::cell::Cell::get) {
         return Ok(());
     }
 
@@ -170,7 +172,7 @@ async fn verify_artifact_via(client: &reqwest::Client, api_base: &str, path: &Pa
             .with_context(|| {
                 format!(
                     "Failed to query GitHub attestation API for {} (sha256:{}).\n\
-                     Check your network connection or set AHMA_INSECURE_SKIP_VERIFY=1 for offline use.",
+                     Check your network connection, or use `ahma update --insecure-skip-verify` for offline use.",
                     path.display(),
                     sha256
                 )
@@ -182,7 +184,7 @@ async fn verify_artifact_via(client: &reqwest::Client, api_base: &str, path: &Pa
              This artifact was not produced by the official ahma-labs/ahma CI pipeline,\n\
              or the attestation is not yet available.\n\
              Out-of-band check: gh attestation verify {} --repo ahma-labs/ahma\n\
-             Set AHMA_INSECURE_SKIP_VERIFY=1 to bypass (only for offline/air-gapped use).",
+             `ahma update --insecure-skip-verify` bypasses it (only for offline/air-gapped use).",
             path.display(),
             sha256,
             path.display()
@@ -206,7 +208,7 @@ async fn verify_artifact_via(client: &reqwest::Client, api_base: &str, path: &Pa
         // know there is something to verify.
         let verifier = Verifier::production().await.map_err(|e| anyhow!(e)).context(
             "Failed to load the public-good Sigstore trust root from tuf-repo-cdn.sigstore.dev.\n\
-             Check your network connection or set AHMA_INSECURE_SKIP_VERIFY=1 for offline use.",
+             Check your network connection, or use `ahma update --insecure-skip-verify` for offline use.",
         )?;
         let identity = AhmaReleaseIdentity::new(OWNER, REPO);
 
@@ -235,7 +237,7 @@ async fn verify_artifact_via(client: &reqwest::Client, api_base: &str, path: &Pa
          official CI pipeline, or its attestation is not trustworthy.\n\
          Reasons:\n  - {}\n\
          Out-of-band check: gh attestation verify {} --repo ahma-labs/ahma\n\
-         Set AHMA_INSECURE_SKIP_VERIFY=1 to bypass (only for offline/air-gapped use).",
+         `ahma update --insecure-skip-verify` bypasses it (only for offline/air-gapped use).",
         bundles.len(),
         path.display(),
         sha256,
@@ -425,18 +427,31 @@ pub async fn run_cli(args: VerifyArgs) -> Result<()> {
     Ok(())
 }
 
-/// Whether the retired skip variables are set. `ahma update` also consults this, so
-/// an install receipt never claims a verification this function skipped.
-pub(crate) fn should_skip_verify() -> bool {
-    for var in &["AHMA_INSECURE_SKIP_VERIFY", "AHMA_INSECURE_SKIP_SIGNATURE"] {
-        if std::env::var(var)
-            .ok()
-            .is_some_and(|val| matches!(val.trim(), "1" | "true" | "yes" | "on"))
-        {
-            return true;
-        }
+#[cfg(test)]
+thread_local! {
+    static SKIP_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: make `verify_artifact` succeed without the network on this thread
+/// (tokio tests run on one thread). Production has no way to skip inside
+/// `verify_artifact`; skipping is the caller's `--insecure-skip-verify` flag, and
+/// the retired `AHMA_INSECURE_SKIP_*` variables are only warned about (R-CFG2.3).
+#[cfg(test)]
+pub(crate) struct SkipVerificationForTest;
+
+#[cfg(test)]
+impl SkipVerificationForTest {
+    pub(crate) fn on() -> Self {
+        SKIP_FOR_TEST.with(|c| c.set(true));
+        Self
     }
-    false
+}
+
+#[cfg(test)]
+impl Drop for SkipVerificationForTest {
+    fn drop(&mut self) {
+        SKIP_FOR_TEST.with(|c| c.set(false));
+    }
 }
 
 /// Lowercase hex sha256 of the artifact at `path` — the digest GitHub keys its
@@ -470,60 +485,6 @@ mod tests {
 
     // SAFETY: all env-var writes are guarded by ENV_MUTEX; nextest runs each
     // test binary in an isolated process, so there is no cross-binary interference.
-
-    #[test]
-    fn skip_verify_false_when_unset() {
-        let _g = ENV_MUTEX.lock();
-        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
-        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
-        assert!(!should_skip_verify());
-    }
-
-    #[test]
-    fn skip_verify_truthy_values() {
-        let _g = ENV_MUTEX.lock();
-        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
-        for val in ["1", "true", "yes", "on"] {
-            unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", val) };
-            assert!(
-                should_skip_verify(),
-                "expected skip for AHMA_INSECURE_SKIP_VERIFY={val}"
-            );
-        }
-        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
-    }
-
-    #[test]
-    fn skip_verify_falsy_values() {
-        let _g = ENV_MUTEX.lock();
-        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
-        for val in ["0", "false", "no", "off"] {
-            unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", val) };
-            assert!(
-                !should_skip_verify(),
-                "expected no skip for AHMA_INSECURE_SKIP_VERIFY={val}"
-            );
-        }
-        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
-    }
-
-    #[test]
-    fn skip_verify_trims_whitespace() {
-        let _g = ENV_MUTEX.lock();
-        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
-        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", " 1 ") };
-        assert!(should_skip_verify());
-        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
-    }
-
-    #[test]
-    fn skip_verify_legacy_var_honored() {
-        let _g = ENV_MUTEX.lock();
-        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
-        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_SIGNATURE", "1") };
-        assert!(should_skip_verify());
-        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
-    }
 
     #[tokio::test]
     async fn sha256_known_value() {
@@ -565,21 +526,26 @@ mod tests {
     // keep concurrent env-mutating tests out. Safe here — `#[tokio::test]` uses a
     // current-thread runtime (the guard never moves between threads) and nothing
     // under the lock re-acquires `ENV_MUTEX`, so it cannot deadlock.
+    /// SPEC R-CFG2.3: skipping verification is a CLI flag only. The retired
+    /// `AHMA_INSECURE_SKIP_*` variables must never make `verify_artifact`
+    /// return early: with both set, a missing artifact is still an error.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn verify_artifact_ok_when_skip_env_set() {
+    async fn the_retired_env_vars_never_skip_verification() {
         let _g = ENV_MUTEX.lock();
+        // SAFETY: guarded by ENV_MUTEX.
         unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
-        // Path need not exist — we return before reading it.
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_SIGNATURE", "1") };
         let result = verify_artifact(std::path::Path::new("/nonexistent/artifact")).await;
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
         assert!(
-            result.is_ok(),
-            "expected Ok when skip env var is set: {result:?}"
+            result.is_err(),
+            "a retired env var skipped verification: {result:?}"
         );
     }
 
-    // See `verify_artifact_ok_when_skip_env_set`: the `ENV_MUTEX` guard must span
+    // See `the_retired_env_vars_never_skip_verification`: the `ENV_MUTEX` guard must span
     // the await so the cleared env vars stay cleared for the whole `run_cli` call.
     // Safe for the same reasons (current-thread test runtime, no re-lock).
     #[allow(clippy::await_holding_lock)]
@@ -601,32 +567,32 @@ mod tests {
     }
 
     // Covers `verify_self`: resolves `current_exe()` and delegates to
-    // `verify_artifact`. With the skip env var set, `verify_artifact` returns
+    // `verify_artifact`. With the test-only skip on, `verify_artifact` returns
     // before any network call, so this exercises the resolve+delegate path offline.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_self_ok_when_skip_env_set() {
         let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
-        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+        let _skip = SkipVerificationForTest::on();
         let result = verify_self().await;
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
         assert!(
             result.is_ok(),
-            "expected Ok from verify_self when skip env var is set: {result:?}"
+            "expected Ok from verify_self when test-only skip is on: {result:?}"
         );
     }
 
     // Covers `run_cli` happy path with an explicit existing artifact: the
     // `args.path.filter(|_| !args.self_check)` Some-branch, the `path.exists()`
     // true case, and the success println!/verify/println! tail. Offline via the
-    // skip env var.
+    // test-only skip.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_cli_ok_with_existing_artifact_and_skip_env() {
         let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
-        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+        let _skip = SkipVerificationForTest::on();
 
         let dir = tempdir().unwrap();
         let artifact = dir.path().join("ahma-release.tar.gz");
@@ -640,7 +606,7 @@ mod tests {
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
         assert!(
             result.is_ok(),
-            "expected Ok from run_cli on existing artifact with skip env set: {result:?}"
+            "expected Ok from run_cli on existing artifact with the test-only skip: {result:?}"
         );
     }
 
@@ -653,7 +619,7 @@ mod tests {
     async fn run_cli_self_check_uses_current_exe_and_ignores_path() {
         let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
-        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+        let _skip = SkipVerificationForTest::on();
 
         // Provide a bogus, non-existent path: it must be ignored because self_check
         // is true, so resolution falls back to current_exe (which exists).
@@ -665,7 +631,7 @@ mod tests {
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
         assert!(
             result.is_ok(),
-            "expected Ok from run_cli --self (current_exe) with skip env set: {result:?}"
+            "expected Ok from run_cli --self (current_exe) with the test-only skip: {result:?}"
         );
     }
 
@@ -676,7 +642,7 @@ mod tests {
     async fn run_cli_self_check_with_no_path_uses_current_exe() {
         let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
-        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+        let _skip = SkipVerificationForTest::on();
         let args = VerifyArgs {
             path: None,
             self_check: true,
@@ -728,7 +694,7 @@ mod tests {
     async fn verify_installed_ignores_a_stale_receipt() {
         let _g = ENV_MUTEX.lock();
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
-        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+        let _skip = SkipVerificationForTest::on();
 
         let dir = tempdir().unwrap();
         let bin = dir.path().join("ahma");
