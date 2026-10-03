@@ -1426,7 +1426,7 @@ fn ls_handler_registration_from_sandbox_experiment() {
 
     let scope = TempDir::new().expect("scope dir");
     let Some(tool) = ls_handler_tool(scope.path()) else {
-        return; // no Swift toolchain — nothing to measure
+        panic!("EXPERIMENT SKIP: the Swift probe did not build (see stderr)");
     };
     let lsreg = lsregister_path(); // may be None on a stripped host
 
@@ -1453,11 +1453,10 @@ fn ls_handler_registration_from_sandbox_experiment() {
     let baseline_works = base_handler == format!("HANDLER:{base_id}");
     unregister_app(&base_app);
     if !baseline_works {
-        eprintln!(
-            "skipping: this host does not let even an unsandboxed process set a default \
+        panic!(
+            "EXPERIMENT SKIP: this host does not let even an unsandboxed process set a default \
              URL-scheme handler (set={base_set_out} handler={base_handler}); nothing to prove"
         );
-        return;
     }
 
     // ── Sandboxed: attempt the same registration from inside the Strict
