@@ -3601,7 +3601,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("SCCACHE_DIR=/work/alpha/target/sccache") && l.contains("—")),
+                .any(|l| l.contains("SCCACHE_DIR=/work/alpha/.sccache") && l.contains("—")),
             "{lines:?}"
         );
         assert!(

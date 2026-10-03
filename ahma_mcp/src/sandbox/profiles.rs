@@ -119,6 +119,9 @@ struct RawEnv {
     name: String,
     value: String,
     reason: String,
+    /// The value is a cache directory: prepared with [`prepare_cache_dir`].
+    #[serde(default)]
+    cache_dir: bool,
 }
 
 /// A variable an enabled profile sets on every sandboxed command, resolved
@@ -133,6 +136,9 @@ pub struct ProfileEnv {
     pub value: String,
     /// Why the toolchain needs it.
     pub reason: String,
+    /// The value is a cache directory inside the workspace, prepared before a
+    /// command runs so it never shows up as project content.
+    pub cache_dir: bool,
 }
 
 /// A profile as written in its TOML file.
@@ -530,10 +536,52 @@ pub fn profile_env(enabled: &[String], workspace: &Path) -> Vec<ProfileEnv> {
                 name: raw.name.clone(),
                 value: expand_vars(&value),
                 reason: raw.reason.clone(),
+                cache_dir: raw.cache_dir,
             });
         }
     }
     out
+}
+
+/// Create a cache directory a profile variable names (`cache_dir = true`)
+/// so that no tool sees it as project content: a `.gitignore` of `*` keeps it
+/// out of `git status` whatever the repository's own ignore rules, and a
+/// `CACHEDIR.TAG` (<https://bford.info/cachedir/>) keeps it out of backups.
+/// Only inside `workspace`; never overwrites a file already there.
+pub fn prepare_cache_dir(dir: &Path, workspace: &Path) -> std::io::Result<()> {
+    let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let inside = dir.starts_with(workspace) || dir.starts_with(canon(workspace));
+    let escapes = dir
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir));
+    if !inside || escapes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "a profile cache directory must be inside the workspace: {}",
+                dir.display()
+            ),
+        ));
+    }
+    std::fs::create_dir_all(dir)?;
+    let write_new = |name: &str, contents: &str| -> std::io::Result<()> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(name))
+        {
+            Ok(mut f) => std::io::Write::write_all(&mut f, contents.as_bytes()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
+    };
+    write_new(".gitignore", "*\n")?;
+    write_new(
+        "CACHEDIR.TAG",
+        "Signature: 8a477f597d28d172789f06886806bc55\n\
+         # This directory is a compile cache kept by ahma's sandbox profiles.\n\
+         # For information about cache directory tags see https://bford.info/cachedir/\n",
+    )
 }
 
 /// A port of the workspace's own: FNV-1a of its path, folded into
@@ -719,6 +767,52 @@ mod tests {
         );
     }
 
+    /// A compile cache never shows up in `git status` or a backup, whatever
+    /// the repository's layout (neubit4 keeps its Rust code in a subdirectory,
+    /// so a root `target/` was not ignored and 440 MB appeared untracked).
+    #[test]
+    fn the_sccache_cache_is_a_hidden_directory_that_ignores_itself() {
+        let ws = tempfile::tempdir().unwrap();
+        let env = profile_env(&["sccache".to_string()], ws.path());
+        let dir = env
+            .iter()
+            .find(|e| e.name == "SCCACHE_DIR")
+            .expect("sccache sets its cache directory");
+        assert!(dir.cache_dir, "declared a cache directory");
+        assert_eq!(std::path::Path::new(&dir.value), ws.path().join(".sccache"));
+        assert!(
+            env.iter().any(|e| e.name == "SCCACHE_CACHE_SIZE"),
+            "each workspace's cache is bounded"
+        );
+    }
+
+    #[test]
+    fn preparing_a_cache_directory_hides_it_from_git_and_backups() {
+        let ws = tempfile::tempdir().unwrap();
+        let cache = ws.path().join(".sccache");
+        prepare_cache_dir(&cache, ws.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cache.join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        let tag = std::fs::read_to_string(cache.join("CACHEDIR.TAG")).unwrap();
+        assert!(
+            tag.starts_with("Signature: 8a477f597d28d172789f06886806bc55"),
+            "{tag}"
+        );
+        // Never overwrites what is there.
+        std::fs::write(cache.join(".gitignore"), "mine\n").unwrap();
+        prepare_cache_dir(&cache, ws.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cache.join(".gitignore")).unwrap(),
+            "mine\n"
+        );
+        // Never creates anything outside the workspace.
+        let outside = tempfile::tempdir().unwrap();
+        assert!(prepare_cache_dir(&outside.path().join("c"), ws.path()).is_err());
+        assert!(!outside.path().join("c").exists());
+    }
+
     #[test]
     fn every_builtin_profile_parses() {
         // A malformed shipped profile is a build-time bug that would silently
@@ -763,7 +857,7 @@ mod tests {
                 .map(|e| e.value.clone())
                 .unwrap_or_else(|| panic!("{name} not set: {env:?}"))
         };
-        assert_eq!(get(&env_a, "SCCACHE_DIR"), "/work/alpha/target/sccache");
+        assert_eq!(get(&env_a, "SCCACHE_DIR"), "/work/alpha/.sccache");
         let port_a: u16 = get(&env_a, "SCCACHE_SERVER_PORT").parse().unwrap();
         assert!((20_000..60_000).contains(&port_a), "{port_a}");
         assert_eq!(
