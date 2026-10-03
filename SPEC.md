@@ -166,7 +166,7 @@ may change. `dormant`: present but not active.
 | Grant prompts | tests-pass | One body on every surface, `grant_prompt::render` (R-PERM.3.4); per-session budget (R-PERM.4.5) |
 | Grant advisor and decision habits | tests-pass | R-PERM.8, R-DOCTOR.8 |
 | Scope-downgrade prompts (R5.3) | in-progress | Specified; not wired (§11) |
-| Configuration standard (R-CFG) | in-progress | Pending R-CFG5.2, R-CFG6.3 |
+| Configuration standard (R-CFG) | tests-pass | Sources, tiers, provenance (`ahma settings show --origin`, startup report), strict parsing |
 | STDIO, HTTP bridge, Streamable HTTP, session isolation | tests-pass | R8, R10 (`ahma_http_bridge/SPEC.md`) |
 | Per-user hub (R-HUB) | tests-pass | One `AF_UNIX` rendezvous on every OS (R-HUB.2) |
 | HTTP MCP client | tests-pass | OAuth 2.0 + PKCE (`ahma_http_mcp_client/SPEC.md`) |
@@ -455,14 +455,14 @@ Server configuration (everything except MTDF tool definitions) **must** be deter
 ### R-CFG5: Provenance and Observability
 
 - **R-CFG5.1**: `ahma settings show --origin` **must** print every effective setting with its value, source (`cli` / `project` / `user` / `default`), and for file sources the file path.
-- **R-CFG5.2**: At startup the server **must** log one `info` line per setting whose effective value differs from the compiled-in default, including its source. Security-tier deviations **must** log at `warn`. (open: §11)
+- **R-CFG5.2**: At startup the server **must** log one `info` line per setting whose effective value differs from the compiled-in default, including its source. Security-tier deviations, and keys with no known tier, **must** log at `warn`. The report and `ahma settings show --origin` use one provenance resolver (`ahma_common::settings_origin`), so they cannot name different sources for one key.
 - **R-CFG5.3**: The documented precedence and the implemented precedence **must** be the same and **must** be covered by a matrix test (every source pair, at least one Preference and one Security key).
 
 ### R-CFG6: Strict Parsing (Fail Closed)
 
 - **R-CFG6.1**: A settings file that exists **and can be read** but fails to parse **must** abort startup with a clear error. Silently falling back to defaults is forbidden — a tampered or corrupted file must not silently change behavior. This applies only to a *read-but-unparseable* file: a settings file that cannot be *read* at all — missing, or permission-denied because it lives in the out-of-scope control-plane directory `~/.ahma` (R5.4.8) — is **not** a parse failure and **must** fall back to compiled-in defaults (with a `warn` for the permission-denied case), never abort.
 - **R-CFG6.2**: Unknown keys in the `[sandbox]` and `[auth]` tables **must** abort startup (a typo in a security key must not be silently ignored). Unknown keys elsewhere **must** produce a `warn` listing each key (forward compatibility).
-- **R-CFG6.3**: On Unix, a settings file that is group- or world-writable **should** produce a startup `warn`. (open: §11)
+- **R-CFG6.3**: On Unix, a settings file that is group- or world-writable **should** produce a startup `warn` naming the file and `chmod go-w`.
 
 ### R-CFG7: Retired `AHMA_*` configuration variables
 
@@ -1891,7 +1891,6 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **Windows filesystem boundary** (R6.3.3, R6.3.9, R-HANDOFF.4): AppContainer spawn isolation is built but disabled; no OS filesystem boundary until a `windows-latest` run proves it both ways.
 - **Linux trust-handoff deny tier** (R6.1.7): application-layer only; Landlock ABI V1 has no deny rule.
 - **Developer-ID signing and notarization** (R-SIGN.1): blocked on Apple Developer credentials; local installs are re-signed ad hoc.
-- **Configuration provenance and permissions** (R-CFG5.2, R-CFG6.3): no per-setting startup log lines; no warning for a group/world-writable settings file.
 - **Scope-downgrade prompts** (R5.3.1–R5.3.6, R-HUB.11): specified but not wired: no running ahma asks before a scope downgrade (`--tmp`, broader roots) or commits an `elicited` scope. Live elicitation exists only for grants (R-PERM.3); downgrade prompts, when built, go through the same ladder.
 - **Log-symlink exceptions** (`logs_approve`, R9, R-PERM.1): stored in `<platform config dir>/ahma/log_exceptions.json`, not in the unified ledger.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.

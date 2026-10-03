@@ -22,6 +22,10 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
   and `${VAR}` interpolation for tool files. Settings resolve once (R-CFG4). Retired
   `AHMA_*` variables go through `warn_retired_env`, which reports only *whether* a variable
   is set, never its value (R-CFG1.2).
+- `settings_origin`: per-key provenance of the effective settings (cli / project / user /
+  default) and the startup report built from it: one line per non-default setting
+  (R-CFG5.2) and a warning per group- or world-writable settings file (R-CFG6.3). Both
+  `ahma settings show --origin` and the startup log resolve sources through it (R-CFG5.1).
 - `permissions`: the unified permission ledger — filesystem grants, web domains, tool
   approvals — stored under `~/.ahma`, outside every sandbox scope (R-PERM.1, R-PERM.2).
 - `scope_grant`, `sandbox_state`: the grant coordinator (ask once per path, R-PERM.3) and

@@ -11,82 +11,16 @@ use super::{
     SettingsCommand, SettingsOriginCtx, WebArgs, WebCommand,
 };
 use crate::shell::{list_tools, resolution};
+// The settings row model and its provenance resolution live in `ahma_common`:
+// the startup settings report (R-CFG5.2) is built from the same rows, so the
+// `--origin` report and the startup log cannot disagree about a value's source.
+use ahma_common::settings_origin::{SettingRow, resolve_origins, setting_rows};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings command
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// One displayed setting: its dotted key, effective (file-resolved) value, and
-/// compiled-in default value, both pre-rendered with `{:?}`.
-struct SettingRow {
-    key: &'static str,
-    value: String,
-    default: String,
-}
-
-/// Flatten the displayed subset of [`AhmaSettings`](ahma_common::config::AhmaSettings) into dotted-key rows.
-///
-/// Single source of truth for *which* settings both `settings show` variants
-/// print, so the plain and `--origin` outputs can never drift apart.
-fn setting_rows(
-    s: &ahma_common::config::AhmaSettings,
-    d: &ahma_common::config::AhmaSettings,
-) -> Vec<SettingRow> {
-    let mut rows = Vec::new();
-    macro_rules! row {
-        ($key:expr, $field:ident . $($rest:ident).+) => {
-            rows.push(SettingRow {
-                key: $key,
-                value: format!("{:?}", s.$field.$($rest).+),
-                default: format!("{:?}", d.$field.$($rest).+),
-            });
-        };
-    }
-    row!("lmstudio.base_url", lmstudio.base_url);
-    row!("lmstudio.model", lmstudio.model);
-    row!("tools.timeout_secs", tools.timeout_secs);
-    row!("tools.execution_mode", tools.execution_mode);
-    row!("tools.skip_probes", tools.skip_probes);
-    row!("sandbox.disable", sandbox.disable);
-    row!("sandbox.tmp_access", sandbox.tmp_access);
-    row!("sandbox.disable_temp", sandbox.disable_temp);
-    row!("sandbox.defer", sandbox.defer);
-    row!("sandbox.container_root", sandbox.container_root);
-    row!("sandbox.scratch_directory", sandbox.scratch_directory);
-    row!(
-        "sandbox.use_scratch_directory",
-        sandbox.use_scratch_directory
-    );
-    row!("logging.target", logging.target);
-    row!("logging.log_monitor", logging.log_monitor);
-    row!(
-        "logging.monitor_rate_limit_secs",
-        logging.monitor_rate_limit_secs
-    );
-    row!("http.handshake_timeout_secs", http.handshake_timeout_secs);
-    row!("http.disable_quic", http.disable_quic);
-    row!("http.disable_http1_1", http.disable_http1_1);
-    row!("auth.require_token_path", auth.require_token_path);
-    row!("auth.rate_limit_rps", auth.rate_limit_rps);
-    row!("auth.rate_limit_burst", auth.rate_limit_burst);
-    row!("instance.label", instance.label);
-    rows
-}
-
-/// Whether the raw settings-file TOML explicitly sets `dotted` (e.g.
-/// `"tools.timeout_secs"`), regardless of what value it sets it to.
-fn file_sets_key(file_toml: Option<&toml::Value>, dotted: &str) -> bool {
-    let Some(mut v) = file_toml else { return false };
-    for part in dotted.split('.') {
-        match v.get(part) {
-            Some(next) => v = next,
-            None => return false,
-        }
-    }
-    true
-}
 
 /// Render the `ahma settings show --origin` report (R-CFG5.1): every setting
 /// with its effective value and true source — `cli` (flag passed this
@@ -107,20 +41,10 @@ fn render_settings_origin(
     write_settings_origin_header(&mut out, file_path, ctx);
     out.push('\n');
 
-    let user_label = file_path
-        .map(|p| format!("user ({})", p.display()))
-        .unwrap_or_else(|| "user".to_string());
-    let project_label = ctx
-        .project
-        .as_ref()
-        .map(|p| format!("project ({})", p.path.display()))
-        .unwrap_or_else(|| "project".to_string());
-    for row in rows {
-        // Precedence order, highest first (R-CFG1.1): cli > project > user >
-        // default. Rendered in that order so the report cannot disagree with the
-        // resolution it describes.
-        let (value, source) = resolve_row_source(row, file_toml, ctx, &user_label, &project_label);
-        let _ = writeln!(out, "{:<45} = {}  # {}", row.key, value, source);
+    // Precedence order, highest first (R-CFG1.1): cli > project > user >
+    // default — resolved by the same function the startup report uses.
+    for o in resolve_origins(rows, &ctx.provenance_inputs(file_path, file_toml)) {
+        let _ = writeln!(out, "{:<45} = {}  # {}", o.key, o.value, o.source);
     }
     out
 }
@@ -191,32 +115,6 @@ fn write_settings_origin_rejections(out: &mut String, ctx: &SettingsOriginCtx) {
     }
 }
 
-/// Resolve one settings row's effective display value and source label, in
-/// R-CFG1.1 precedence order (highest first): cli > project > user > default.
-fn resolve_row_source<'a>(
-    row: &'a SettingRow,
-    file_toml: Option<&toml::Value>,
-    ctx: &'a SettingsOriginCtx,
-    user_label: &'a str,
-    project_label: &'a str,
-) -> (&'a str, &'a str) {
-    let cli_value = ctx
-        .cli_overrides
-        .iter()
-        .find(|(k, _)| *k == row.key)
-        .map(|(_, v)| v);
-    let project_sets = ctx
-        .project
-        .as_ref()
-        .is_some_and(|p| p.keys.iter().any(|k| k == row.key));
-    match cli_value {
-        Some(v) => (v.as_str(), "cli"),
-        None if project_sets => (row.value.as_str(), project_label),
-        None if file_sets_key(file_toml, row.key) => (row.value.as_str(), user_label),
-        None => (row.value.as_str(), "default"),
-    }
-}
-
 /// `ahma settings init`: write a defaults file and tell the user where it went.
 fn run_settings_init(force: bool, path: Option<PathBuf>) -> Result<()> {
     use ahma_common::config::{AhmaSettings, settings_path};
@@ -281,15 +179,11 @@ fn print_settings_file_footer(file_path: Option<&std::path::Path>) {
 /// `ahma settings show`: resolve the settings actually in effect for this
 /// invocation, then hand the rows to the plain or `--origin` renderer.
 fn run_settings_show(origin: bool, origin_ctx: &SettingsOriginCtx) -> Result<()> {
-    use ahma_common::config::{AhmaSettings, settings_path};
+    use ahma_common::config::AhmaSettings;
 
     // Honor --no-settings / --settings-path exactly like server startup does, so
     // `settings show` reports the configuration actually in effect.
-    let file_path = if origin_ctx.no_settings {
-        None
-    } else {
-        origin_ctx.settings_path.clone().or_else(settings_path)
-    };
+    let file_path = origin_ctx.user_settings_file();
     let mut s = match &file_path {
         Some(p) => AhmaSettings::load_from(p),
         None => AhmaSettings::default(),
@@ -2541,6 +2435,7 @@ mod tests {
             settings_path: None,
             cli_overrides: vec![("tools.timeout_secs", "30".to_string())],
             project: None,
+            ..SettingsOriginCtx::default()
         };
         let path = std::path::Path::new("settings.toml");
         let out = render_settings_origin(&rows, Some(path), Some(&file_toml), &ctx);
@@ -2578,6 +2473,7 @@ mod tests {
             settings_path: Some(file),
             cli_overrides: vec![],
             project: None,
+            ..SettingsOriginCtx::default()
         };
         run_settings_command(
             SettingsArgs {

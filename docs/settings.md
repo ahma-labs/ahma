@@ -19,6 +19,24 @@ the same invocation overrides the key (e.g. `ahma --timeout 30 settings show --o
 to the default value — and `default` otherwise. Both `--settings-path` and
 `--no-settings` are honored.
 
+### What a server logs about its settings at startup
+
+Every server process (`ahma serve …` and the per-user hub) logs one line for each
+setting whose effective value differs from the compiled-in default, naming the
+key, the value, the default and the source — the same source `--origin` reports:
+
+```
+INFO  setting tools.timeout_secs = 600 (default 1800) from user (/home/me/.ahma/settings.toml) (SPEC R-CFG5.2)
+WARN  security-tier setting sandbox.tmp_access = true (default false) from user (/home/me/.ahma/settings.toml) (SPEC R-CFG5.2)
+```
+
+Security-tier settings (everything in `[sandbox]`, `[auth]`, `[web]`, `[network]`,
+`[permissions]`, plus `http.unix_socket_path`) log at `warn`, so anything that
+shapes the sandbox is visible in the log without asking. A setting left at its
+default logs nothing. On Unix, a settings file that group or others can write
+also logs a `warn` with the fix (`chmod go-w <file>`): whoever can edit that
+file can change how ahma confines your agent (SPEC R-CFG6.3).
+
 ## File location
 
 | Platform | Default path |
