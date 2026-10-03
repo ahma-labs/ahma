@@ -16,8 +16,14 @@ rules = []
 
 [[env]]
 name = "SCCACHE_DIR"
-value = "${WORKSPACE}/target/sccache"
-reason = "the cache lives inside the workspace, which a sandboxed server can write; `cargo clean` empties it"
+value = "${WORKSPACE}/.sccache"
+cache_dir = true
+reason = "the cache lives inside the workspace, which a sandboxed server can write; ahma marks the directory ignored by git and by backups (delete it any time)"
+
+[[env]]
+name = "SCCACHE_CACHE_SIZE"
+value = "4G"
+reason = "each workspace has a cache of its own, so each is bounded rather than taking sccache's default 10G per checkout"
 
 [[env]]
 name = "SCCACHE_SERVER_PORT"

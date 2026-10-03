@@ -375,6 +375,20 @@ impl Sandbox {
                 super::profiles::profile_env(super::profiles::enabled_profile_names(), workspace)
             {
                 if std::env::var_os(&var.name).is_none() {
+                    // A cache directory is made invisible to git and backups
+                    // before the tool first writes it (SPEC R-PERM.5.5).
+                    if var.cache_dir
+                        && let Err(e) = super::profiles::prepare_cache_dir(
+                            std::path::Path::new(&var.value),
+                            workspace,
+                        )
+                    {
+                        tracing::debug!(
+                            "profile {}: cache directory {} not prepared: {e}",
+                            var.profile,
+                            var.value
+                        );
+                    }
                     cmd.env(&var.name, &var.value);
                 }
             }
@@ -1031,6 +1045,22 @@ mod tests {
             !set.contains_key("SCCACHE_DIR"),
             "a variable the user set is left alone: {set:?}"
         );
+    }
+
+    /// Building a sandboxed command prepares a profile's cache directory, so
+    /// the tool's first write never leaves it visible to git (R-PERM.5.5).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_profile_cache_directory_is_ready_before_the_command_runs() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::remove_var("SCCACHE_DIR") };
+        let td = tempdir().unwrap();
+        let sandbox = make_test_sandbox(td.path());
+        let _cmd = sandbox.base_command("env", &[], td.path());
+        let ws = sandbox.scopes().first().unwrap().clone();
+        let ignore = ws.join(".sccache").join(".gitignore");
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "*\n");
+        assert!(ws.join(".sccache").join("CACHEDIR.TAG").exists());
     }
 
     /// A tool subprocess must not inherit a secret-looking env var.

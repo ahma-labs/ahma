@@ -295,6 +295,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
     );
     check_grant_tools_auto_allowed(input.home_dir.as_deref(), &input.workspace, &mut findings);
     check_hook_coverage(input.home_dir.as_deref(), &mut findings);
+    check_old_sccache_dir(&input.workspace, &mut findings);
     if let Some(probe) = &input.git_auth {
         let default_settings;
         let settings = match &settings {
@@ -1491,9 +1492,50 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
     }
 }
 
+/// ahma's sccache profile once kept a workspace's cache in
+/// `<workspace>/target/sccache`. In a repository whose Rust code lives in a
+/// subdirectory that root `target/` was not ignored, so hundreds of megabytes
+/// showed up as untracked. The cache now lives in `<workspace>/.sccache`,
+/// which ignores itself (SPEC R-PERM.5.5); an old one is only a stale cache.
+fn check_old_sccache_dir(workspace: &Path, out: &mut Vec<Finding>) {
+    let old = workspace.join("target").join("sccache");
+    if !old.is_dir() {
+        return;
+    }
+    out.push(Finding {
+        level: Level::Info,
+        title: "An old sccache cache can be deleted".to_string(),
+        detail: format!(
+            "One thing to do, if you want the space back: `rm -rf {}`. ahma's sccache profile \
+             used to keep this workspace's compile cache there; it now uses {} instead, which \
+             git and backups ignore. The old directory is only a stale cache.",
+            old.display(),
+            workspace.join(".sccache").display()
+        ),
+        fix: None,
+    });
+}
+
 #[cfg(test)]
 mod hook_and_grant_tool_tests {
     use super::*;
+
+    #[test]
+    fn an_old_sccache_cache_is_reported_as_safe_to_delete() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let none = run(&input(home.path(), ws.path()));
+        assert!(!none.iter().any(|f| f.title.contains("sccache cache")));
+        std::fs::create_dir_all(ws.path().join("target").join("sccache")).unwrap();
+        let found = run(&input(home.path(), ws.path()));
+        let f = found
+            .iter()
+            .find(|f| f.title.contains("old sccache cache"))
+            .expect("reported");
+        assert_eq!(f.level, Level::Info);
+        assert!(f.detail.contains("rm -rf"), "{}", f.detail);
+        assert!(f.detail.contains(".sccache"), "{}", f.detail);
+    }
 
     fn input(home: &Path, workspace: &Path) -> DoctorInput {
         DoctorInput {

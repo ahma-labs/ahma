@@ -281,11 +281,22 @@ The `sccache` profile gives each workspace its own server instead:
 
 | Variable | Value | Why |
 |---|---|---|
-| `SCCACHE_DIR` | `<workspace>/target/sccache` | the cache lives where a sandboxed server can write; `cargo clean` empties it |
+| `SCCACHE_DIR` | `<workspace>/.sccache` | the cache lives where a sandboxed server can write |
+| `SCCACHE_CACHE_SIZE` | `4G` | each workspace's cache is bounded, rather than sccache's default 10G per checkout |
 | `SCCACHE_SERVER_PORT` | a port derived from the workspace path, 20000–59999, the same every time | that workspace's builds only ever reach its own server |
 
-The cost is a cold cache per checkout (the first build in each is slower) and more
-disk. Nothing built for one project is ever served to another. Rules for every
+A variable that names a cache directory is marked as one in the profile
+(`cache_dir = true`). Before a command runs, ahma creates that directory with a
+`.gitignore` of `*` and a `CACHEDIR.TAG`. So it never shows up in `git status`,
+whatever your repository's own ignore rules, and backup tools that honour the tag
+(Time Machine via `tmutil`, restic, borg, tar `--exclude-caches`) skip it. Delete it
+whenever you like; it is only a cache. It is only ever created inside the
+workspace. (Before this, the cache was `<workspace>/target/sccache`: in a
+repository whose Rust code is in a subdirectory, that root `target/` was not
+ignored. An old `target/sccache` can be deleted.)
+
+The cost is a cold cache per checkout (the first build in each is slower) and up
+to 4G of disk each. Nothing built for one project is ever served to another. Rules for every
 profile variable:
 - it never overrides a variable you have already set (a shared `SCCACHE_DIR` of
   your own wins);
