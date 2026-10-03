@@ -329,6 +329,20 @@ pub const KEY_REFERENCE: &[KeyDoc] = &[
         action: "reject — Enter and Esc also deny a grant",
         footer: None,
     },
+    KeyDoc {
+        scope: KeyScope::Gate,
+        keys: &[
+            (KeyCode::Up, NONE),
+            (KeyCode::Down, NONE),
+            (KeyCode::Char('k'), NONE),
+            (KeyCode::Char('j'), NONE),
+            (KeyCode::PageUp, NONE),
+            (KeyCode::PageDown, NONE),
+        ],
+        label: "↑↓ j k PgUp PgDn",
+        action: "scroll a grant question (its answers stay put)",
+        footer: None,
+    },
 ];
 
 /// The documented keys for a scope, in table order.

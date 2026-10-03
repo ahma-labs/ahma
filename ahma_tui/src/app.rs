@@ -2641,12 +2641,21 @@ fn handle_scope_grant_key(
         return false;
     }
 
+    // Scroll keys move the question's body; the answers stay put (SPEC
+    // R-PERM.3.8).
+    if scroll_grant_body(key, state) {
+        return true;
+    }
     // The keys are the ones the shared prompt body advertises (SPEC R-PERM.3.4);
     // lower-case is this session, upper-case is always, `o`/`w` once, `l`/`L`
     // 24 hours, `?` detail.
     if let (KeyCode::Char('?'), _) = (key.code, key.modifiers) {
         if let Some(gate) = state.scope_grant.as_mut() {
             gate.show_detail = !gate.show_detail;
+            gate.scroll = 0;
+            gate.reveal_save_line = false;
+            // A different body: nothing on it has been seen yet.
+            gate.view.set(crate::state::GateView::default());
         }
         return true;
     }
@@ -2678,10 +2687,21 @@ fn handle_scope_grant_key(
                     }
                     // A grant that is saved to settings is never given without
                     // the exact line it writes on screen (SPEC R-PERM.2): the
-                    // first press from the compact view shows it, the second
-                    // saves.
-                    if o.decision.tier().is_persistent() && !gate.show_detail {
+                    // first press scrolls that line into view, and a second
+                    // saves only if the last frame showed it whole (R-PERM.3.5).
+                    if o.decision.tier().is_persistent()
+                        && !(gate.show_detail && gate.view.get().save_line_visible)
+                    {
+                        let already_shown = gate.show_detail && gate.reveal_save_line;
                         gate.show_detail = true;
+                        gate.reveal_save_line = true;
+                        if already_shown {
+                            set_footer_hint(
+                                state,
+                                "The settings line this answer writes does not fit on screen: \
+                                 enlarge the terminal to save it, or answer for this session",
+                            );
+                        }
                         return true;
                     }
                     resolve_scope_grant(state, o.decision);
@@ -2692,6 +2712,59 @@ fn handle_scope_grant_key(
         }
         _ => false,
     }
+}
+
+/// Scroll the open grant question's body if `key` is a scroll key (SPEC
+/// R-PERM.3.8): the scope question first, as its answer keys are, then the web
+/// one. `false` for any other key.
+fn scroll_grant_body(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
+    if let Some(gate) = state.scope_grant.as_mut() {
+        let moved = scroll_gate(key, &mut gate.scroll, &gate.view);
+        if moved {
+            gate.reveal_save_line = false;
+        }
+        return moved;
+    }
+    if let Some(gate) = state.web_approval.as_mut() {
+        return scroll_gate(key, &mut gate.scroll, &gate.view);
+    }
+    false
+}
+
+/// Move a grant question's body for a scroll key, from what the last frame
+/// showed. None of these keys answers a question: the answers are
+/// `n o w r y s l L R Y ?` (scope) and `n o s a` (web), and these are the
+/// work view's own scroll keys (`↑↓ j k`, `PgUp PgDn`, `g G`, Home, End).
+fn scroll_gate(
+    key: crossterm::event::KeyEvent,
+    scroll: &mut usize,
+    view: &std::cell::Cell<crate::state::GateView>,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let v = view.get();
+    let plain = key.modifiers == KeyModifiers::NONE;
+    let page = v.page.max(1);
+    let to = match key.code {
+        KeyCode::Up => v.scroll.saturating_sub(1),
+        KeyCode::Char('k') if plain => v.scroll.saturating_sub(1),
+        KeyCode::Down => v.scroll + 1,
+        KeyCode::Char('j') if plain => v.scroll + 1,
+        KeyCode::PageUp => v.scroll.saturating_sub(page),
+        KeyCode::PageDown => v.scroll + page,
+        KeyCode::Home => 0,
+        KeyCode::Char('g') if plain => 0,
+        KeyCode::End | KeyCode::Char('G') => v.max_scroll,
+        _ => return false,
+    }
+    .min(v.max_scroll);
+    *scroll = to;
+    // What is on screen changes: nothing on it counts as seen until drawn.
+    view.set(crate::state::GateView {
+        scroll: to,
+        save_line_visible: false,
+        ..v
+    });
+    true
 }
 
 /// The next waiting question, if any, takes the screen (SPEC R-PERM.3.5). It is unread from
@@ -2882,6 +2955,9 @@ fn handle_web_approval_key(
         return false;
     }
 
+    if scroll_grant_body(key, state) {
+        return true;
+    }
     // A granting key typed before the question could be read answers
     // nothing (SPEC R-PERM.3.5); it is consumed so it lands nowhere else.
     let armed = state.web_approval.as_ref().is_some_and(|g| g.armed());
@@ -6727,6 +6803,18 @@ fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
 /// Pages a full-screen detail overlay's scroll offset, if one is open.
 /// Returns `false` (and does nothing) when no overlay is capturing paging.
 fn page_overlay_scroll(up: bool, state: &mut crate::state::AppState) -> bool {
+    // A grant question is drawn over everything, so it pages first.
+    let key = crossterm::event::KeyEvent::new(
+        if up {
+            crossterm::event::KeyCode::PageUp
+        } else {
+            crossterm::event::KeyCode::PageDown
+        },
+        crossterm::event::KeyModifiers::NONE,
+    );
+    if scroll_grant_body(key, state) {
+        return true;
+    }
     let detail_max = state.detail_max_scroll.get();
     let overlay_scroll = match &mut state.modal {
         crate::state::ModalState::OperationDetail(d) => Some(&mut d.scroll),
@@ -7964,9 +8052,120 @@ mod tests {
         };
         assert!(press(&mut state));
         let gate = state.scope_grant.as_ref().expect("not answered yet");
-        assert!(gate.show_detail, "the exact settings line is now on screen");
+        assert!(gate.show_detail && gate.reveal_save_line);
+        draw_frame(&state, 80, 24);
+        assert!(
+            state
+                .scope_grant
+                .as_ref()
+                .unwrap()
+                .view
+                .get()
+                .save_line_visible,
+            "the exact settings line is now on screen"
+        );
         assert!(press(&mut state));
         assert!(state.scope_grant.is_none(), "the second press saves");
+    }
+
+    /// Draw one frame of the whole TUI, as the event loop does after every key.
+    fn draw_frame(state: &crate::state::AppState, w: u16, h: u16) {
+        let theme = crate::theme::Theme::new(true);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| crate::ui::draw(f, state, &theme))
+            .unwrap();
+    }
+
+    /// The second press of a saving key saves only once a frame has shown
+    /// the settings line whole (SPEC R-PERM.3.5, R-PERM.3.8): not before
+    /// anything is drawn, and not on a terminal too short to show it.
+    #[test]
+    fn a_saving_answer_waits_until_its_settings_line_was_drawn() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let press = |state: &mut AppState| {
+            super::handle_scope_grant_key(
+                KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+                state,
+            )
+        };
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(test_scope_grant_gate());
+        assert!(press(&mut state));
+        assert!(press(&mut state), "no frame yet: consumed, not saved");
+        assert!(state.scope_grant.is_some());
+
+        // 60×16, the smallest supported size: the pinned answers leave the
+        // body three rows, and the seven-row section cannot fit.
+        draw_frame(&state, 60, 16);
+        assert!(
+            !state
+                .scope_grant
+                .as_ref()
+                .unwrap()
+                .view
+                .get()
+                .save_line_visible
+        );
+        assert!(press(&mut state));
+        assert!(state.scope_grant.is_some(), "never saved unseen");
+        assert!(
+            state
+                .footer_hint
+                .as_ref()
+                .is_some_and(|(h, _)| h.contains("does not fit")),
+            "and the human is told why"
+        );
+
+        draw_frame(&state, 80, 24);
+        assert!(press(&mut state));
+        assert!(state.scope_grant.is_none(), "seen whole, so saved");
+    }
+
+    /// Scroll keys move the body and answer nothing; they work before the
+    /// arming delay (they grant nothing) and a scroll forgets the reveal.
+    #[test]
+    fn scroll_keys_move_the_grant_body_and_answer_nothing() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        let mut gate = fresh_scope_grant_gate();
+        gate.show_detail = true;
+        state.scope_grant = Some(gate);
+        draw_frame(&state, 80, 24);
+        let max = state.scope_grant.as_ref().unwrap().view.get().max_scroll;
+        assert!(max > 0, "the detail view must overflow 80x24 for this test");
+
+        for code in [KeyCode::Down, KeyCode::Char('j'), KeyCode::PageDown] {
+            assert!(super::handle_scope_grant_key(key(code), &mut state));
+            draw_frame(&state, 80, 24);
+        }
+        let gate = state
+            .scope_grant
+            .as_ref()
+            .expect("scrolling answers nothing");
+        assert!(gate.scroll > 2 && gate.scroll <= max);
+
+        assert!(super::handle_scope_grant_key(
+            key(KeyCode::Char('G')),
+            &mut state
+        ));
+        assert_eq!(state.scope_grant.as_ref().unwrap().scroll, max);
+        assert!(super::handle_scope_grant_key(
+            key(KeyCode::Char('g')),
+            &mut state
+        ));
+        assert_eq!(state.scope_grant.as_ref().unwrap().scroll, 0);
+
+        // PgUp/PgDn are taken before the gate handlers; the gate pages first.
+        super::handle_page_up_down(false, &mut state);
+        assert!(state.scope_grant.as_ref().unwrap().scroll > 0);
+        assert!(state.scope_grant.is_some());
     }
 
     /// The `--tmp` question offers no saved answer (SPEC R5.2.5): its `always`

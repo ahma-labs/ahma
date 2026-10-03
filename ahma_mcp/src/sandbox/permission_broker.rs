@@ -709,14 +709,24 @@ fn grant_form_schema(reason: GrantReason) -> rmcp::model::ElicitationSchema {
         ConstTitle, ElicitationSchema, EnumSchema, PrimitiveSchemaDefinition,
         SingleSelectEnumSchema, TitledSingleSelectEnumSchema,
     };
-    let one_of: Vec<ConstTitle> = ahma_common::grant_prompt::options_for(reason)
+    let options = ahma_common::grant_prompt::options_for(reason);
+    // Name only the tiers this question offers: a log target has no `once`.
+    let unsaved = match (
+        options.iter().any(|o| o.value.contains("session")),
+        options.iter().any(|o| o.value.contains("once")),
+    ) {
+        (true, true) => " Session and once answers are never written to disk.",
+        (true, false) => " A session answer is never written to disk.",
+        (false, true) => " A once answer is never written to disk.",
+        (false, false) => "",
+    };
+    let one_of: Vec<ConstTitle> = options
         .into_iter()
         .map(|o| ConstTitle::new(o.value, o.label))
         .collect();
     let mut select = TitledSingleSelectEnumSchema::new(one_of);
     select.title = Some("Your decision".into());
-    select.description =
-        Some("Deny is the default. Session and once answers are never written to disk.".into());
+    select.description = Some(format!("Deny is the default.{unsaved}").into());
     select.default = Some("deny".to_string());
     let mut props = std::collections::BTreeMap::new();
     props.insert(
@@ -1208,16 +1218,35 @@ mod tests {
         );
     }
 
+    /// The form names only the tiers it offers: a log target has no `once`.
+    #[test]
+    fn the_form_names_only_the_unsaved_tiers_it_offers() {
+        let says = |reason| {
+            serde_json::to_value(grant_form_schema(reason)).unwrap()["properties"]["decision"]
+                ["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let log = says(GrantReason::LogTarget);
+        assert!(!log.contains("once"), "{log}");
+        assert!(
+            log.contains("A session answer is never written to disk"),
+            "{log}"
+        );
+        let path = says(GrantReason::PreExecViolation);
+        assert!(path.contains("Session and once answers"), "{path}");
+    }
+
     /// The exact JSON form a harness renders for one reason's choices.
-    fn golden_form(one_of: serde_json::Value) -> serde_json::Value {
+    fn golden_form(one_of: serde_json::Value, description: &str) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "decision": {
                     "type": "string",
                     "title": "Your decision",
-                    "description":
-                        "Deny is the default. Session and once answers are never written to disk.",
+                    "description": description,
                     "oneOf": one_of,
                     "default": "deny"
                 }
@@ -1261,7 +1290,13 @@ mod tests {
             (GrantReason::LogTarget, log_target),
         ] {
             let got = serde_json::to_value(grant_form_schema(reason)).unwrap();
-            assert_eq!(got, golden_form(one_of), "{reason:?}");
+            // A log target offers no `once` tier, so its form does not mention one.
+            let description = if reason == GrantReason::LogTarget {
+                "Deny is the default. A session answer is never written to disk."
+            } else {
+                "Deny is the default. Session and once answers are never written to disk."
+            };
+            assert_eq!(got, golden_form(one_of, description), "{reason:?}");
             let text = got.to_string();
             for o in ahma_common::grant_prompt::options() {
                 let key = format!("[{}]", o.key);

@@ -409,11 +409,20 @@ impl Sandbox {
             let mut cmd = self.base_command(program, args, working_dir);
             if let Some(fd) = self.spawn_landlock_ruleset_fd()? {
                 use std::os::fd::AsRawFd;
+                // SPEC R6.1.7: in `linux_deny_tier = "namespace"` mode the
+                // deny tier is mounted read-only first — a Landlock-restricted
+                // task may not mount, which is also what stops the child from
+                // undoing it. Only alongside Landlock for that reason.
+                let mounts = self.spawn_deny_tier_mounts(working_dir);
                 // SAFETY: the closure only performs async-signal-safe syscalls
-                // (prctl + landlock_restrict_self); the OwnedFd moved into it
-                // stays open across fork so the raw fd remains valid in the child.
+                // (unshare, /proc writes, mount, prctl, landlock_restrict_self)
+                // on buffers built before fork; the OwnedFd moved into it stays
+                // open across fork so the raw fd remains valid in the child.
                 unsafe {
                     cmd.pre_exec(move || {
+                        if let Some(mounts) = &mounts {
+                            mounts.enter_in_child()?;
+                        }
                         super::landlock::apply_landlock_ruleset_in_child(fd.as_raw_fd())
                     });
                 }
@@ -537,6 +546,38 @@ impl Sandbox {
             );
         }
         Ok(fd)
+    }
+
+    /// The read-only binds that hold the trust-handoff deny tier for one child
+    /// (SPEC R6.1.7), computed before `fork` because the child may not allocate.
+    ///
+    /// `None` — spawn exactly as in `detect` mode — unless `[sandbox]
+    /// linux_deny_tier = "namespace"`, the startup probe found per-command
+    /// namespaces usable, and at least one deny-tier path exists. The roots are
+    /// the ones every other deny-tier consumer resolves git directories from:
+    /// every scope plus the working directory.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_deny_tier_mounts(
+        &self,
+        working_dir: &Path,
+    ) -> Option<super::deny_tier::DenyTierMounts> {
+        if self.mode == SandboxMode::Test || !super::deny_tier::namespace_prevention_active() {
+            return None;
+        }
+        let mut roots: Vec<std::path::PathBuf> = self.scopes().to_vec();
+        let cwd = dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+        if !roots.contains(&cwd) {
+            roots.push(cwd.clone());
+        }
+        let targets = super::deny_tier::mount_targets(&roots);
+        let mounts = super::deny_tier::DenyTierMounts::plan(&targets, Some(cwd.as_path()));
+        if let Some(mounts) = &mounts {
+            tracing::debug!(
+                "Deny tier mounted read-only for this command (SPEC R6.1.7): {:?}",
+                mounts.paths()
+            );
+        }
+        mounts
     }
 
     /// Whether this sandbox can spawn a command the **kernel** forbids from

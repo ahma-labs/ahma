@@ -1452,11 +1452,37 @@ pub struct ScopeGrantGate {
     /// the hub. A request that arrives over the hub never sets it, whatever
     /// its reason says.
     pub harness: Option<crate::harness_asks::HarnessAsk>,
+    /// Body rows scrolled past. Only the body scrolls; the answers under it
+    /// are pinned (SPEC R-PERM.3.8).
+    pub scroll: usize,
+    /// Keep the "If you choose always" section in view instead of `scroll`:
+    /// set by the first press of a saving key, cleared by a scroll key or `?`.
+    pub reveal_save_line: bool,
+    /// What the last frame showed, published by the renderer.
+    pub view: std::cell::Cell<GateView>,
 }
 
 /// How long a grant question must be on screen before a key can grant it.
 /// Deny keys work at once.
 pub const GRANT_ARMING_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// What the last frame of a grant question's popup showed (SPEC R-PERM.3.8).
+///
+/// The renderer writes it and the key handler reads it, as `detail_max_scroll`
+/// does for the detail overlays; it lives in the gate so it dies with the
+/// question and never describes another one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GateView {
+    /// First body row on screen.
+    pub scroll: usize,
+    /// The largest `scroll` that still fills the body area.
+    pub max_scroll: usize,
+    /// Body rows on screen: one PgUp/PgDn.
+    pub page: usize,
+    /// Whether the whole "If you choose always" section was on screen. A
+    /// saving answer is taken only then (SPEC R-PERM.3.5).
+    pub save_line_visible: bool,
+}
 
 impl ScopeGrantGate {
     /// Build a gate from a hub [`ahma_common::scope_grant::ScopeGrantRequest`].
@@ -1472,6 +1498,9 @@ impl ScopeGrantGate {
             advice: None,
             shown_at: std::time::Instant::now(),
             harness: None,
+            scroll: 0,
+            reveal_save_line: false,
+            view: Default::default(),
         }
     }
 
@@ -1507,6 +1536,10 @@ pub struct WebApprovalGate {
     /// `a` was pressed once: the exact settings line is on screen and a
     /// second `a` saves it (SPEC R-PERM.3.5).
     pub confirm_always: bool,
+    /// Body rows scrolled past; the answers are pinned (SPEC R-PERM.3.8).
+    pub scroll: usize,
+    /// What the last frame showed, published by the renderer.
+    pub view: std::cell::Cell<GateView>,
 }
 
 impl WebApprovalGate {
@@ -1519,6 +1552,8 @@ impl WebApprovalGate {
             tool: request.tool,
             shown_at: std::time::Instant::now(),
             confirm_always: false,
+            scroll: 0,
+            view: Default::default(),
         }
     }
 

@@ -187,6 +187,7 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS` | Shortens the stdio frontend's wait for `initialize` in tests. Debug builds only |
 | `AHMA_RECONNECT_BACKOFF_MS` | Shortens the stdio proxy's reconnect backoff in tests. Debug builds only |
 | `AHMA_TEST_HOME` | Redirects `~` resolution (`ahma_common::config::ahma_home_dir`) at a temp directory so a test can supply its own `~/.ahma/settings.toml`. Compiled in **debug builds only** (`#[cfg(debug_assertions)]`) — a release binary ignores it |
+| `AHMA_TEST_REQUIRE_DENY_TIER_NAMESPACE` | Set by CI's deny-tier step: a `deny_tier_namespace` test that would skip because this host refuses unprivileged user namespaces fails instead (SPEC R6.1.7). Read only by `#[cfg(test)]` code |
 | `AHMA_TEST_ISOLATION` | Set by test harnesses on spawned ahma binaries: forces private (non-global) bridge/hub endpoints (SPEC R-ISO.1) |
 | `NEXTEST` / `NEXTEST_RUN_ID` | Set by `cargo nextest`, inherited by spawned binaries; read solely to force the same private-endpoint isolation as `AHMA_TEST_ISOLATION` — the single R-CFG9.2 carve-out (SPEC R-ISO.1) |
 

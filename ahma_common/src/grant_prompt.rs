@@ -281,11 +281,24 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
     // 7. The exact line `always` writes — or, for a session-only question,
     // that there is none.
     let always = if log_target {
-        let ws = workspace
-            .clone()
-            .unwrap_or_else(|| "<this workspace>".to_string());
+        // A command to paste never carries a placeholder: with the workspace
+        // unknown, the revoke runs from it (its default) instead.
+        let (ws, revoke) = match workspace.clone() {
+            Some(ws) => (
+                ws.clone(),
+                format!(
+                    "Revoke any time with: ahma permissions revoke log-target {path} --workspace {ws}"
+                ),
+            ),
+            None => (
+                "<this workspace>".to_string(),
+                format!(
+                    "Revoke any time, from that workspace, with: ahma permissions revoke log-target {path}"
+                ),
+            ),
+        };
         format!(
-            "~/.ahma/settings.toml gets:\n[[log_targets.approvals]]\nworkspace = \"{ws}\"\ntargets = [\"{path}\"]\nRevoke any time with: ahma permissions revoke log-target {path} --workspace {ws}"
+            "~/.ahma/settings.toml gets:\n[[log_targets.approvals]]\nworkspace = \"{ws}\"\ntargets = [\"{path}\"]\n{revoke}"
         )
     } else if saved_tiers {
         format!(
@@ -688,6 +701,19 @@ mod tests {
         assert_eq!(render(&log_target_request()).options, offered);
     }
 
+    /// A command the human may paste never carries a placeholder: with the
+    /// workspace unknown, the log-target revoke runs from that workspace.
+    #[test]
+    fn a_revoke_command_never_carries_a_placeholder() {
+        let text = render(&log_target_request()).to_message();
+        let revoke = text
+            .lines()
+            .find(|l| l.contains("ahma permissions revoke log-target"))
+            .expect("the always section says how to revoke");
+        assert!(!revoke.contains('<'), "{revoke}");
+        assert!(revoke.contains("from that workspace"), "{revoke}");
+    }
+
     // ── golden text, one per surface shape (SPEC R-PERM.3.4) ────────────────
     //
     // Every constant is the exact text a human reads. To accept an intended
@@ -995,7 +1021,7 @@ If you choose always
   [[log_targets.approvals]]
   workspace = "<this workspace>"
   targets = ["/opt/app/logs/app.log"]
-  Revoke any time with: ahma permissions revoke log-target /opt/app/logs/app.log --workspace <this workspace>
+  Revoke any time, from that workspace, with: ahma permissions revoke log-target /opt/app/logs/app.log
 
 Choices (deny is the default):
   deny                 Deny (default; Enter and Esc)
