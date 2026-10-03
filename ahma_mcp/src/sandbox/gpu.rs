@@ -112,6 +112,7 @@ fn looks_like_gpu_denial(line: &str) -> bool {
         || lower.contains("unable to create metal device")
         // ggml (whisper.cpp, llama.cpp) and Metal buffer allocations.
         || (metal && lower.contains("failed to allocate"))
+        || (metal && lower.contains("failed to initialize"))
         || (lower.contains("mtlbuffer") && lower.contains("nil"))
         || (lower.contains("deny(") && lower.contains("iokit-open"))
 }
@@ -165,9 +166,13 @@ mod tests {
             "ggml_metal_init: error: failed to allocate buffer, size = 256.00 MiB",
             "ggml_backend_metal_buffer_type_alloc_buffer: error: failed to allocate buffer",
             "whisper_init: MTLBuffer allocation returned nil",
+            // llama.cpp, reported by an agent in another repository.
+            "ggml_backend_metal_init: error: failed to initialize backend",
+            "llama_init_from_model: failed to initialize Metal backend",
         ] {
             assert!(gpu_denial_note(line, "").is_some(), "{line}");
         }
         assert!(gpu_denial_note("failed to allocate buffer for tokenizer", "").is_none());
+        assert!(gpu_denial_note("failed to initialize backend: cuda", "").is_none());
     }
 }
