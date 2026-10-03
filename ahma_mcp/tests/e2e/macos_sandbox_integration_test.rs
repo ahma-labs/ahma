@@ -1058,6 +1058,66 @@ fn listening_beyond_loopback_is_refused_unless_granted() {
     }
 }
 
+/// TEMPORARY experiment (remove before merge): which SBPL form keeps TCP
+/// binds on loopback? Fails on purpose so the table reaches the CI log.
+#[cfg(target_os = "macos")]
+#[test]
+fn zz_listen_rule_experiment() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_listen_any};
+    let scope = TempDir::new().expect("scope dir");
+    let Some(bin) = bind_probe(scope.path()) else {
+        return;
+    };
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    set_listen_any(true);
+    let base = sandbox.generate_seatbelt_profile_test(scope.path());
+    let variants: &[(&str, &str)] = &[
+        (
+            "A tcp localhost",
+            "(deny network-bind (local tcp \"*:*\"))\n(allow network-bind (local tcp \"localhost:*\"))\n",
+        ),
+        (
+            "B ip localhost",
+            "(deny network-bind (local ip \"*:*\"))\n(allow network-bind (local ip \"localhost:*\"))\n",
+        ),
+        (
+            "C tcp 127.0.0.1",
+            "(deny network-bind (local tcp \"*:*\"))\n(allow network-bind (local tcp \"127.0.0.1:*\"))\n",
+        ),
+        (
+            "D tcp4 localhost",
+            "(deny network-bind (local tcp4 \"*:*\"))\n(allow network-bind (local tcp4 \"localhost:*\"))\n",
+        ),
+        (
+            "E deny only *:*",
+            "(deny network-bind (local tcp \"*:*\"))\n",
+        ),
+        (
+            "F inbound remote",
+            "(deny network-inbound (remote tcp \"*:*\"))\n(allow network-inbound (remote tcp \"localhost:*\"))\n",
+        ),
+    ];
+    let mut table = String::new();
+    for (name, rules) in variants {
+        let profile = base.replacen(
+            "(allow network*)\n",
+            &format!("(allow network*)\n{rules}"),
+            1,
+        );
+        let out = run_bind_probe(Some(&profile), &bin, scope.path());
+        table.push_str(&format!("== {name}\n{out}\n"));
+    }
+    panic!("EXPERIMENT RESULTS\n{table}");
+}
+
 /// SPEC R6.2.8: a sandboxed command can see processes. `/bin/ps` is setuid
 /// root and no sandbox can exec a setuid binary (a kernel rule), so the
 /// profile grants `process-info*` for `pgrep`/`lsof` and ahma ships `ahma ps`.

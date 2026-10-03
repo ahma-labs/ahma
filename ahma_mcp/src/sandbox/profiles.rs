@@ -637,7 +637,10 @@ pub fn platform_enforcement() -> PlatformEnforcement {
         // R-LISTEN.2: Landlock filters binds by port only, and Windows has no
         // filter, so neither can keep a server on loopback.
         notes.push(
-            "Listening is not restricted here: a sandboxed command may listen on every network              interface, so any device on your networks can connect to what it serves (the              kernel cannot tell loopback from every interface). Ask for servers bound to              127.0.0.1.",
+            "Listening is not restricted here: a sandboxed command may listen on every network \
+             interface, so any device on your networks can connect to what it serves (the \
+             kernel cannot tell loopback from every interface). Ask for servers bound to \
+             127.0.0.1.",
         );
     }
 
