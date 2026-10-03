@@ -130,6 +130,38 @@ apply everywhere. A `log-target` grant takes effect from the next session; see
   (`ahma sandbox grant` or `ahma network allow` CLI, or direct `~/.ahma/settings.toml`
   edits), it takes effect on the next server start (or after using the `restart` tool).
 
+## Web domains and redirects
+
+`fetch_webpage` asks about a domain only in strict mode (`[web] default_policy =
+"deny"`); under the default `allow` policy only `never_allow` domains, and ones you
+denied this session, are refused. Approving `api.github.com` approves that host and
+nothing else, so when a page **redirects to a different host**, the new host is
+decided on its own (SPEC R-WEB.8). `[web] on_redirect_to_new_domain` says how:
+
+| Value | A redirect to another host is… |
+|---|---|
+| `"policy"` (default) | followed if the `[web]` policy — `always_allow`, `never_allow`, this session's answers, `default_policy` — allows the new host; otherwise the fetch fails with the `ahma web allow <host>` command to approve it. Never prompts. |
+| `"block"` | never followed, even to a host the policy allows. The fetch fails with an error naming the target and this setting; fetch the target URL directly if you want it. |
+| `"prompt"` | treated exactly like a new request to that host: allowed or refused by the policy as usual, and, if the policy would ask (strict mode, a host you have not answered for), you get the same once / session / always question, deduplicated the same way. The redirect is followed only if you say yes. |
+
+Whatever the value, a redirect to the **same** host (including `http` → `https`)
+is always followed, a chain stops after 10 hops, and every hop is checked against
+the private-address block (loopback, RFC-1918, cloud metadata) before it connects.
+
+```toml
+# ~/.ahma/settings.toml
+[web]
+on_redirect_to_new_domain = "prompt"   # or "policy" (default), "block"
+```
+
+`ahma web list` shows the value in effect. An unrecognised value is a parse error:
+`[web]` is security-tier, so ahma refuses to start rather than guess.
+
+> **Upgrading:** before this setting was enforced, every redirect behaved as
+> `"policy"`, whatever the file said, and the documented default was `"block"`.
+> The default is now `"policy"`, so nothing changes unless your settings file
+> sets the key — but a file that explicitly says `"block"` now really blocks.
+
 ## Git authentication (SSH and HTTPS)
 
 The sandbox denies reads of your private keys (`~/.ssh/id_*`) and forwards the SSH
@@ -321,4 +353,4 @@ either.
 ## See also
 
 - [`docs/security-sandbox.md`](security-sandbox.md) — how the sandbox itself works
-- [SPEC.md](../SPEC.md) — R-PERM (this model), R5 (sandbox scope), R-WEB (egress)
+- [SPEC.md](../SPEC.md) — R-PERM (this model), R5 (sandbox scope), R-WEB (egress; R-WEB.8 for redirects)

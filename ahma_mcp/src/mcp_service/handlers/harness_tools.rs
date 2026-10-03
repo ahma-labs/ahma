@@ -361,6 +361,37 @@ impl AhmaMcpService {
         deny()
     }
 
+    /// `[web] on_redirect_to_new_domain = "prompt"`: approve one redirect hop
+    /// to `domain` exactly as a fresh request to it would be approved (R-WEB.8,
+    /// R-WEB.5–R-WEB.7) — audited, then the TUI modal or MCP elicitation,
+    /// deduplicated per domain by the session coordinator. `Ok(())` follows the
+    /// hop; `Err` carries the reason the request fails with.
+    async fn approve_redirect_hop(&self, domain: String, url: String) -> Result<(), String> {
+        use crate::egress::web_audit::{self, FetchAction};
+        use ahma_common::web_policy::WebDecision;
+
+        let decision = WebDecision::Prompt {
+            domain: domain.clone(),
+        };
+        let ts = chrono::Local::now().to_rfc3339();
+        web_audit::append(&web_audit::record(
+            "fetch_webpage",
+            &url,
+            &domain,
+            &decision,
+            ts,
+        ))
+        .await;
+        match self.approve_web_egress(&domain, &url).await {
+            FetchAction::Proceed => Ok(()),
+            FetchAction::Deny(reason) => Err(format!(
+                "the page redirected to {url}, a different domain, which needs its own approval \
+                 ([web] on_redirect_to_new_domain = \"prompt\", R-WEB.8) and did not get it. \
+                 {reason}"
+            )),
+        }
+    }
+
     pub async fn handle_fetch_webpage(
         &self,
         args: Map<String, Value>,
@@ -384,6 +415,7 @@ impl AhmaMcpService {
             use ahma_common::web_policy::{WebDecision, WebPolicy, url_coordinates};
 
             let settings = ahma_common::config::AhmaSettings::load_async().await;
+            let redirect_mode = settings.web.on_redirect_to_new_domain;
             let (policy, errors) = WebPolicy::from_settings(&settings.web);
             for e in errors {
                 tracing::warn!("ignoring invalid [web] pattern: {e}");
@@ -412,22 +444,31 @@ impl AhmaMcpService {
             }
 
             // R-WEB.8: the initial URL passed the policy, but a 30x redirect could
-            // still bounce to a *different* domain the policy would not approve.
-            // Build a guard from the same policy so the fetcher refuses such a hop
-            // instead of laundering egress through the approved origin. In
-            // default-`allow` mode the policy approves every host, so this is a
-            // no-op; it only bites in `deny` mode.
-            let allow = std::sync::Arc::new(move |host: &str| {
-                matches!(
-                    policy.decide(
-                        &format!("https://{host}/"),
-                        &session_grants,
-                        &session_denies
-                    ),
-                    WebDecision::Allow { .. }
+            // still bounce to a *different* host. `[web] on_redirect_to_new_domain`
+            // says what happens then — `policy` (default): follow iff the policy
+            // allows the new host; `block`: never; `prompt`: ask exactly as for a
+            // fresh request to it. The verdict reads this session's grants and
+            // denies at the time of the hop, so an approval given mid-chain (or by
+            // a concurrent request) counts.
+            let coordinator = std::sync::Arc::clone(&self.web_approval);
+            let verdict = std::sync::Arc::new(move |target: &str| {
+                policy.decide(
+                    target,
+                    &coordinator.session_grants(),
+                    &coordinator.session_denies(),
                 )
             });
-            ahma_harness_tools::egress_guard::RedirectDomainGuard::new(domain, allow)
+            let guard =
+                ahma_harness_tools::egress_guard::RedirectDomainGuard::new(redirect_mode, verdict);
+            if redirect_mode == ahma_common::config::RedirectPolicy::Prompt {
+                let svc = self.clone();
+                guard.with_approver(move |domain, url| {
+                    let svc = svc.clone();
+                    async move { svc.approve_redirect_hop(domain, url).await }
+                })
+            } else {
+                guard
+            }
         };
 
         let result = self

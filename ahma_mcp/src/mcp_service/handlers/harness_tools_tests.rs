@@ -1199,3 +1199,227 @@ async fn fetch_webpage_prompt_mode_denies_without_peer() {
         err.message
     );
 }
+
+// ── handle_fetch_webpage: `[web] on_redirect_to_new_domain` wiring (R-WEB.8) ──
+//
+// The redirect loop itself (manual hop-following against loopback mock
+// servers) is tested in `ahma_harness_tools`. These tests check what this
+// handler hands it: the mode read from settings, a verdict that reads the
+// live policy and session grants, and — in `prompt` mode — an approver that
+// goes through the same `approve_web_egress` flow as a fresh request.
+
+/// A fetcher that never touches the network and keeps the redirect guard the
+/// handler passed it, so a test can drive the guard's decisions directly.
+#[derive(Default)]
+struct GuardCapturingFetcher {
+    guard: parking_lot::Mutex<Option<ahma_harness_tools::egress_guard::RedirectDomainGuard>>,
+}
+
+impl GuardCapturingFetcher {
+    fn take(&self) -> ahma_harness_tools::egress_guard::RedirectDomainGuard {
+        self.guard
+            .lock()
+            .take()
+            .expect("handle_fetch_webpage must fetch through the redirect guard")
+    }
+}
+
+#[async_trait::async_trait]
+impl WebPageFetcher for GuardCapturingFetcher {
+    async fn fetch(&self, _url: &str, _query: Option<&str>) -> Result<WebFetchResult> {
+        Err(anyhow::anyhow!("the guarded path must be used"))
+    }
+
+    async fn fetch_with_redirect_guard(
+        &self,
+        url: &str,
+        _query: Option<&str>,
+        guard: ahma_harness_tools::egress_guard::RedirectDomainGuard,
+    ) -> Result<WebFetchResult> {
+        *self.guard.lock() = Some(guard);
+        Ok(WebFetchResult {
+            url: url.to_string(),
+            title: None,
+            text: String::new(),
+        })
+    }
+}
+
+/// Point settings at a temp home holding `web_toml` as its `[web]` table, run
+/// `fetch_webpage` for `url` on `svc`, and restore the environment. SAFETY:
+/// nextest runs each test in its own process (see
+/// `fetch_webpage_never_allow_blocks`).
+async fn fetch_with_web_settings(svc: &AhmaMcpService, web_toml: &str, url: &str) {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".ahma")).unwrap();
+    std::fs::write(
+        home.path().join(".ahma").join("settings.toml"),
+        format!("[web]\n{web_toml}\n"),
+    )
+    .unwrap();
+    unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+    let result = svc
+        .handle_fetch_webpage(make_args(&[("url", json!(url))]))
+        .await;
+    unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+    result.expect("the initial request is allowed in every case here");
+}
+
+fn target(url: &str) -> reqwest::Url {
+    reqwest::Url::parse(url).unwrap()
+}
+
+#[tokio::test]
+async fn fetch_webpage_redirect_default_mode_is_policy() {
+    use ahma_harness_tools::egress_guard::{RedirectPolicy, RedirectStep};
+    let fetcher = Arc::new(GuardCapturingFetcher::default());
+    let svc = make_service_with(Arc::new(MockFileOpsProvider::default()), fetcher.clone()).await;
+    fetch_with_web_settings(
+        &svc,
+        "never_allow = [\"evil.example\"]",
+        "https://start.example/",
+    )
+    .await;
+
+    let guard = fetcher.take();
+    assert_eq!(guard.mode(), RedirectPolicy::Policy);
+    // Default `allow` policy: an unlisted host is followed, a never_allow one is not.
+    assert_eq!(
+        guard.decide("start.example", &target("https://cdn.example/f")),
+        RedirectStep::Follow
+    );
+    match guard.decide("start.example", &target("https://evil.example/")) {
+        RedirectStep::Refuse(msg) => assert!(msg.contains("never_allow"), "{msg}"),
+        other => panic!("a never_allow redirect target must be refused, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fetch_webpage_redirect_block_mode_refuses_any_other_host() {
+    use ahma_harness_tools::egress_guard::{RedirectPolicy, RedirectStep};
+    let fetcher = Arc::new(GuardCapturingFetcher::default());
+    let svc = make_service_with(Arc::new(MockFileOpsProvider::default()), fetcher.clone()).await;
+    fetch_with_web_settings(
+        &svc,
+        "on_redirect_to_new_domain = \"block\"",
+        "https://start.example/",
+    )
+    .await;
+
+    let guard = fetcher.take();
+    assert_eq!(guard.mode(), RedirectPolicy::Block);
+    // Allowed by the (default `allow`) policy, and still refused.
+    match guard.decide("start.example", &target("https://cdn.example/f")) {
+        RedirectStep::Refuse(msg) => {
+            assert!(
+                msg.contains("on_redirect_to_new_domain = \"block\""),
+                "{msg}"
+            );
+            assert!(msg.contains("cdn.example"), "{msg}");
+        }
+        other => panic!("block mode must refuse another host, got {other:?}"),
+    }
+    assert_eq!(
+        guard.decide("start.example", &target("https://start.example/next")),
+        RedirectStep::Follow,
+        "a same-host redirect is always followed (R-WEB.8.3)"
+    );
+}
+
+#[tokio::test]
+async fn fetch_webpage_redirect_prompt_mode_asks_through_the_approval_flow() {
+    use ahma_harness_tools::egress_guard::{RedirectPolicy, RedirectStep};
+    let fetcher = Arc::new(GuardCapturingFetcher::default());
+    let (svc, _client, _server) = wire_elicit_service(
+        Arc::new(MockFileOpsProvider::default()),
+        fetcher.clone(),
+        true,
+        vec![ElicitReply::Accept("session".to_string())],
+    )
+    .await;
+    fetch_with_web_settings(
+        &svc,
+        "default_policy = \"deny\"\non_redirect_to_new_domain = \"prompt\"\n\
+         always_allow = [\"start.example\"]",
+        "https://start.example/",
+    )
+    .await;
+
+    let guard = fetcher.take();
+    assert_eq!(guard.mode(), RedirectPolicy::Prompt);
+    let hop = target("https://cdn.example/f");
+    assert_eq!(
+        guard.decide("start.example", &hop),
+        RedirectStep::Ask {
+            domain: "cdn.example".to_string()
+        },
+        "an unknown host in strict mode is asked about, as a fresh request would be"
+    );
+    guard
+        .ask("cdn.example", hop.as_str())
+        .await
+        .expect("the scripted 'session' answer approves the hop");
+    // The answer went through the session coordinator, and the guard's verdict
+    // reads it live: the same host is now followed without asking again.
+    assert!(
+        svc.web_approval
+            .session_grants()
+            .contains(&"cdn.example".to_string())
+    );
+    assert_eq!(guard.decide("start.example", &hop), RedirectStep::Follow);
+}
+
+#[tokio::test]
+async fn fetch_webpage_redirect_prompt_mode_refuses_a_declined_hop() {
+    let fetcher = Arc::new(GuardCapturingFetcher::default());
+    let (svc, _client, _server) = wire_elicit_service(
+        Arc::new(MockFileOpsProvider::default()),
+        fetcher.clone(),
+        true,
+        vec![ElicitReply::Decline],
+    )
+    .await;
+    fetch_with_web_settings(
+        &svc,
+        "default_policy = \"deny\"\non_redirect_to_new_domain = \"prompt\"\n\
+         always_allow = [\"start.example\"]",
+        "https://start.example/",
+    )
+    .await;
+
+    let err = fetcher
+        .take()
+        .ask("cdn.example", "https://cdn.example/f")
+        .await
+        .expect_err("a declined redirect must not be followed");
+    assert!(err.contains("on_redirect_to_new_domain"), "{err}");
+    assert!(err.contains("ahma web allow cdn.example"), "{err}");
+}
+
+#[tokio::test]
+async fn fetch_webpage_redirect_policy_mode_has_no_approver() {
+    // Outside `prompt` mode nothing may ask: an unknown host in strict mode is
+    // refused with the hint, and `ask` (never reached by the fetch loop in this
+    // mode) refuses too rather than prompting.
+    use ahma_harness_tools::egress_guard::RedirectStep;
+    let fetcher = Arc::new(GuardCapturingFetcher::default());
+    let svc = make_service_with(Arc::new(MockFileOpsProvider::default()), fetcher.clone()).await;
+    fetch_with_web_settings(
+        &svc,
+        "default_policy = \"deny\"\nalways_allow = [\"start.example\"]",
+        "https://start.example/",
+    )
+    .await;
+
+    let guard = fetcher.take();
+    match guard.decide("start.example", &target("https://cdn.example/f")) {
+        RedirectStep::Refuse(msg) => assert!(msg.contains("ahma web allow cdn.example"), "{msg}"),
+        other => panic!("policy mode must refuse an unapproved host, got {other:?}"),
+    }
+    assert!(
+        guard
+            .ask("cdn.example", "https://cdn.example/f")
+            .await
+            .is_err()
+    );
+}

@@ -318,11 +318,12 @@ impl FileOpsProvider for DefaultFileOpsProvider {
 pub trait WebPageFetcher: Send + Sync {
     async fn fetch(&self, url: &str, query: Option<&str>) -> Result<WebFetchResult>;
 
-    /// Fetch with a cross-domain redirect guard applied (SPEC R-WEB.8): a redirect
-    /// to a host the `[web]` policy would not approve is refused rather than
-    /// followed. The default ignores the guard and delegates to [`Self::fetch`] —
-    /// adequate for mock/test fetchers that never follow real redirects; the
-    /// production [`DefaultWebPageFetcher`] overrides it to enforce the guard.
+    /// Fetch with a cross-domain redirect guard applied (SPEC R-WEB.8): each
+    /// redirect to a different host is followed, refused or put to a human as
+    /// `[web] on_redirect_to_new_domain` (`policy`/`block`/`prompt`) says. The
+    /// default ignores the guard and delegates to [`Self::fetch`] — adequate for
+    /// mock/test fetchers that never follow real redirects; the production
+    /// [`DefaultWebPageFetcher`] overrides it to enforce the guard.
     async fn fetch_with_redirect_guard(
         &self,
         url: &str,

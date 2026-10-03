@@ -1781,16 +1781,59 @@ pub enum WebDefaultPolicy {
     Deny,
 }
 
-/// What to do when an approved request is redirected to a **different** domain.
+/// What `fetch_webpage` does when a response redirects to a **different** host
+/// (`[web] on_redirect_to_new_domain`, SPEC R-WEB.8).
+///
+/// A redirect to the *same* host — including `http` → `https` — is always
+/// followed whatever this says (R-WEB.8.3), and every hop's resolved address is
+/// re-checked against the private-range block (R-WEB.3, R-WEB.8.4). In no mode
+/// does a redirect target inherit the source host's approval (R-WEB.8.1).
+///
+/// An unknown value is a parse error, so — `[web]` being a security table — it
+/// aborts startup rather than silently picking a mode (R-CFG6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RedirectPolicy {
-    /// Fail the request (default). A cross-domain redirect does not inherit the
-    /// source domain's approval.
+    /// Default. Follow the redirect iff the live `[web]` policy (with this
+    /// session's grants and denies) allows the new host; otherwise fail with the
+    /// `ahma web allow <host>` hint. Never prompts. This is what ahma did before
+    /// the key was enforced, whatever the file said.
     #[default]
+    Policy,
+    /// Never follow a redirect to a different host, even one the policy allows;
+    /// the request fails with an error naming the target and this setting.
     Block,
-    /// Raise a fresh approval prompt for the redirect target domain.
+    /// Treat the new host exactly like a fresh request to it: the full
+    /// three-tier approval flow (R-WEB.5–R-WEB.7) — the TUI modal or MCP
+    /// elicitation, deduplicated per domain — and follow the redirect iff it is
+    /// approved. A host the policy already allows is followed without asking,
+    /// and a denied one is refused without asking.
     Prompt,
+}
+
+impl RedirectPolicy {
+    /// The TOML token (matches the serde representation).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RedirectPolicy::Policy => "policy",
+            RedirectPolicy::Block => "block",
+            RedirectPolicy::Prompt => "prompt",
+        }
+    }
+
+    /// One line saying what this mode does with a redirect to another host,
+    /// for `ahma web list`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            RedirectPolicy::Policy => {
+                "followed iff the [web] policy allows the new host; never prompts"
+            }
+            RedirectPolicy::Block => "never followed; the fetch fails",
+            RedirectPolicy::Prompt => {
+                "treated as a new request to that host: allowed, refused, or asked about"
+            }
+        }
+    }
 }
 
 /// Web-egress policy for outbound HTTP made by ahma's own tools (SPEC §4.6
@@ -1811,8 +1854,9 @@ pub struct WebSettings {
     /// resolution time (resists DNS rebinding). STRONGLY recommended `true`;
     /// `false` enables SSRF against local services and must warn loudly.
     pub block_private_ranges: bool,
-    /// `block` (default): cross-domain redirects fail. `prompt`: raise a new
-    /// approval for the redirect target.
+    /// What to do with a redirect to a different host: `policy` (default:
+    /// follow iff the live policy allows the new host), `block` (never follow),
+    /// or `prompt` (ask exactly as for a fresh request). See [`RedirectPolicy`].
     pub on_redirect_to_new_domain: RedirectPolicy,
     /// Domains always permitted without a prompt. Syntax: exact
     /// (`api.github.com`), single-level wildcard (`*.github.com`),
@@ -1830,7 +1874,7 @@ impl Default for WebSettings {
         Self {
             default_policy: WebDefaultPolicy::Allow,
             block_private_ranges: true,
-            on_redirect_to_new_domain: RedirectPolicy::Block,
+            on_redirect_to_new_domain: RedirectPolicy::Policy,
             always_allow: Vec::new(),
             never_allow: Vec::new(),
         }
@@ -2699,10 +2743,10 @@ impl AhmaSettings {
             d.web.block_private_ranges.to_string(),
         );
         w.setting(
-            "Cross-domain redirects: \"block\" (default) fails; \"prompt\" asks for the new domain.",
+            "Redirect to another host: \"policy\" (default) follows iff the policy allows it; \"block\" never follows; \"prompt\" asks as for a new request.",
             "on_redirect_to_new_domain",
-            toml_str(redirect_policy_str(self.web.on_redirect_to_new_domain)),
-            toml_str(redirect_policy_str(d.web.on_redirect_to_new_domain)),
+            toml_str(self.web.on_redirect_to_new_domain.as_str()),
+            toml_str(d.web.on_redirect_to_new_domain.as_str()),
         );
         w.setting(
             "Domains always permitted (exact, *.wildcard, scheme/port-qualified). github.com != api.github.com.",
@@ -2795,14 +2839,6 @@ fn web_default_policy_str(p: WebDefaultPolicy) -> &'static str {
     match p {
         WebDefaultPolicy::Allow => "allow",
         WebDefaultPolicy::Deny => "deny",
-    }
-}
-
-/// TOML token for a [`RedirectPolicy`] (matches its serde representation).
-fn redirect_policy_str(p: RedirectPolicy) -> &'static str {
-    match p {
-        RedirectPolicy::Block => "block",
-        RedirectPolicy::Prompt => "prompt",
     }
 }
 
@@ -4222,6 +4258,52 @@ timeout_secs = 600
         assert!(
             AhmaSettings::load_from_result(&path).is_err(),
             "unknown key in [auth] should be rejected"
+        );
+    }
+
+    /// `[web] on_redirect_to_new_domain` (SPEC R-WEB.8): `policy` is the
+    /// default — what ahma did before the key was enforced — and each of the
+    /// three values parses to its own mode.
+    #[test]
+    fn on_redirect_to_new_domain_defaults_to_policy_and_parses_each_value() {
+        assert_eq!(
+            AhmaSettings::default().web.on_redirect_to_new_domain,
+            RedirectPolicy::Policy
+        );
+        assert_eq!(
+            AhmaSettings::parse("[web]\n")
+                .unwrap()
+                .web
+                .on_redirect_to_new_domain,
+            RedirectPolicy::Policy
+        );
+        for (token, want) in [
+            ("policy", RedirectPolicy::Policy),
+            ("block", RedirectPolicy::Block),
+            ("prompt", RedirectPolicy::Prompt),
+        ] {
+            let parsed =
+                AhmaSettings::parse(&format!("[web]\non_redirect_to_new_domain = \"{token}\"\n"))
+                    .unwrap_or_else(|e| panic!("'{token}' must parse: {e}"));
+            assert_eq!(parsed.web.on_redirect_to_new_domain, want, "{token}");
+            assert_eq!(want.as_str(), token, "display round-trips");
+        }
+    }
+
+    /// `[web]` is a security table: an unknown redirect mode must fail the
+    /// parse (and so abort startup, R-CFG6.1), never fall back to a default.
+    #[test]
+    fn on_redirect_to_new_domain_unknown_value_rejected() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "[web]\non_redirect_to_new_domain = \"follow\"").unwrap();
+        let err = AhmaSettings::load_from_result(&path)
+            .expect_err("unknown on_redirect_to_new_domain value must be rejected");
+        assert!(
+            err.contains("on_redirect_to_new_domain") || err.contains("follow"),
+            "{err}"
         );
     }
 
