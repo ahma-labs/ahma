@@ -44,6 +44,11 @@ env:
   RUSTFLAGS: -C debuginfo=0 --cfg reqwest_unstable
   RUST_BACKTRACE: 1
   RUSTC_WRAPPER: sccache
+  # The confined run can outlast sccache's default 10-minute idle exit. A test
+  # that then builds a binary on demand would have to start a new server from
+  # inside the sandbox, whose log lives outside the scope, and fails. Keep the
+  # server started unconfined below alive for the whole job.
+  SCCACHE_IDLE_TIMEOUT: "0"
 
 jobs:
   job-confined-tests:
@@ -89,11 +94,12 @@ jobs:
       # Unconfined, like a developer's first build. It also starts the sccache
       # server outside any sandbox, which is how a shared daemon must start
       # (SPEC R-DOCTOR.7): one born confined could write only one checkout.
-      # Building the tests here too means the confined run below mostly
-      # executes them rather than compiling them.
+      # Building every workspace binary and the tests here means the confined
+      # run below executes them rather than compiling them: tests that need a
+      # binary (`generate-tool-schema`) find it already built.
       - name: Build ahma and the test binaries (unconfined)
         run: |
-          cargo build --locked -p ahma_bin
+          cargo build --locked
           cargo nextest run --profile ci --locked --no-run
 
       # The same invocation as build.yml's main leg, sent through ahma. The
