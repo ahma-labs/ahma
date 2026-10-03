@@ -535,8 +535,35 @@ pub fn hook_denial_text(
 /// command that failed; a refusal the command shrugged off is a warning, not
 /// a block. `None` when the output shows no refusal outside the scope.
 pub fn hook_side_refusal_note(output: &str, who: &HookRequester) -> Option<String> {
-    let hit = super::denial_scan::scan_denial_streams(output, "")?;
+    // A sandbox-extension failure is a framework declining to hand a helper
+    // access (WebKit and fonts), not the command being refused an access.
+    let output: String = output
+        .lines()
+        .filter(|l| !l.contains("sandbox_extension"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hit = super::denial_scan::scan_denial_streams(&output, "")?;
     let path = &hit.path;
+    // Never suggest granting a filesystem root or a system directory: the
+    // first is text that merely mentions a refusal (a `//` in listed source),
+    // the second nobody should grant.
+    let normal_parts = path
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count();
+    const SYSTEM: &[&str] = &[
+        "/System",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/dev",
+        "/etc",
+        "/private/etc",
+        "/Library/Apple",
+    ];
+    if normal_parts < 2 || SYSTEM.iter().any(|p| path.starts_with(p)) {
+        return None;
+    }
     let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     if who
         .scopes
@@ -962,6 +989,29 @@ mod context_tests {
             hook_side_refusal_note(&inside, &who).is_none(),
             "a refusal inside the scope is not the sandbox's"
         );
+    }
+
+    /// The one-line note fires on a refusal, not on text that mentions one:
+    /// a WebKit sandbox-extension failure for a system font, or source code
+    /// listed by `grep` whose comments say "operation not permitted" next to
+    /// a `//`, produced grant suggestions for `/System/…` and `//`.
+    #[test]
+    fn the_one_line_note_ignores_what_is_not_a_refused_access() {
+        let ws = tempfile::tempdir().unwrap();
+        let who = HookRequester {
+            harness: None,
+            session_id: None,
+            scopes: vec![ws.path().to_path_buf()],
+            command: None,
+        };
+        for out in [
+            "sandbox_extension_issue_file failed for /System/Library/AssetsV2/com_apple_MobileAsset_Font7: 1 (Operation not permitted)",
+            "src/x.rs:12:    // operation not permitted: the path // is never granted",
+            "cat: /usr/libexec/secret: Operation not permitted",
+            "ls: /: Operation not permitted",
+        ] {
+            assert!(hook_side_refusal_note(out, &who).is_none(), "{out}");
+        }
     }
 
     #[test]
