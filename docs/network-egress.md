@@ -282,6 +282,21 @@ When an AI agent encounters a network block, it can invoke the `network_grant` t
 - **Human approval gate**: `confirm: true` never grants by itself, for any client. A client that declared MCP elicitation gets a real prompt; every other caller (the in-process agent, a headless harness, a client with no prompt) is told the `ahma network allow <host>` command the human must run — it is never assumed to have asked you first.
 - **Immediate effect**: Human-approved grants take effect immediately for the active session and persist to `~/.ahma/settings.toml` across restarts.
 
+## Listening for connections
+
+ahma does not restrict where a sandboxed command listens. A dev server it starts
+on every interface (`0.0.0.0`, the default for Next.js, Spring Boot, a Go `:8080`
+and many others) can be reached by any device on the networks this machine is on:
+a café's Wi-Fi, an office LAN. ahma says so at startup, in `status` and in the TUI,
+and asks agents to bind `127.0.0.1` instead (most dev servers take
+`--host 127.0.0.1`).
+
+It is not a grant because no kernel ahma uses can express "loopback only". On
+macOS, Seatbelt can refuse every TCP bind but cannot re-allow loopback, and its
+inbound filter has no effect. Linux Landlock filters binds by port only, and
+Windows has no filter. Refusing all listening would break every local test server.
+SPEC R-LISTEN records the evidence.
+
 ## Limits you still have
 
 * Interactive approval still applies: a subprocess reaching an unlisted host

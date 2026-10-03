@@ -139,7 +139,7 @@ instructions describe the session's mode (R1.5.4).
 | The session scope (workspace) | the agent | Everything here is untrusted input to ahma (invariant 4) |
 | `~/.ahma` (settings, ledger, logs outside the tree) | the user, ahma outside the sandbox | Never inside any sandbox scope (R5.4.8), so the agent cannot read or extend its own grants |
 | Paths a trusted program executes (git hooks, editor/harness auto-run config, hub sockets) | — | Deny-write, or allow with loud disclosure (R-HANDOFF) |
-| The network | — | Unrestricted unless `--restrict-network` (R-WEB.16); `fetch_webpage` is governed by `[web]` (R-WEB) |
+| The network | — | Outbound unrestricted unless `--restrict-network` (R-WEB.16); listening never restricted, disclosed (R-LISTEN); `fetch_webpage` is governed by `[web]` (R-WEB) |
 
 ## Quick Status
 
@@ -1126,6 +1126,18 @@ Covers HTTP traffic from **sandboxed subprocesses** when `--restrict-network` / 
   - "With `restrict = true` and an empty `allow`, all egress is denied" holds only when there are **also** no profile-contributed hosts (R-PERM.5.3); any statement of the deny-all condition **must** name both halves.
 - **R-WEB.16.10** (session precedence): A per-session decision from R-WEB.16.8 (grant or deny) **must** be consulted before the static allowlist. A session deny **must** block a domain even if the allowlist covers it, and is answered from the coordinator's in-memory state without a DNS lookup.
 - **R-WEB.16.11** (`network_grant` MCP tool): the agent-facing tool for proposing grants to `[network].allow` in `~/.ahma/settings.toml`, with `sandbox_grant`'s two-phase model: preview-only when `confirm: false` (default); a hard denylist refusing blanket `*`, localhost/local domains and private/loopback/cloud-metadata IPs (`169.254.169.254`) even with confirmation. `confirm: true` **must never** persist on its own for any client: when the client declared the MCP `elicitation` capability it prompts there and persists only on explicit human approval; otherwise (the in-process agent, a client with no prompt, a headless harness) it returns the `ahma network allow <host>` instruction for the human to run, and is **not** assumed to have been gated by the client. Human-approved grants apply immediately to the live session and are audit-logged under kind `net-host` with the chosen tier; only `always` is appended to `[network].allow` — `session` (or an out-of-spec `once`, which has no connection to bind to) lasts until the session ends and writes nothing. A timeout or broken prompt is reported as unanswered, never as a decline, and a decline tells the agent not to ask again.
+
+### R-LISTEN: Listening sockets
+
+> User guide: `docs/network-egress.md` ("Listening for connections").
+
+- **R-LISTEN.1**: **Listening is not restricted, and every scope surface says so.** A sandboxed command may listen on any address. A server it starts on every interface (`0.0.0.0`, the default for Next.js, Spring Boot, a Go `:8080` and many others) can be reached by any device on the networks this machine is on. This **must** be disclosed on every R5.4 scope surface (startup, `status`, TUI; R-PERM.5.1), with what to do instead: bind `127.0.0.1`.
+- **R-LISTEN.2**: **Why not a grant.** "Loopback only, every interface on request" was specified (0.22.1) and disproved on macOS CI runners before it shipped:
+  - `(deny network-bind (local tcp "*:*"))` refuses every TCP bind, but no rule re-allows loopback: `(local tcp "localhost:*")` never matches `127.0.0.1` or `::1`, a literal IP is a syntax error ("host must be * or localhost"), and the `ip`/`tcp4` deny forms refuse nothing.
+  - `(deny network-inbound (remote tcp "*:*"))`, with or without a localhost allow, has no effect: a server inside the profile served a LAN address exactly as it served loopback.
+  - Landlock filters binds by port only, and Windows has no filter.
+
+  So the only enforceable rule refuses all listening, localhost included, which would break every local test server. A real boundary needs a privileged network filter (a macOS Network Extension or pf anchor, Linux nftables), which is a separate design.
 
 ---
 
