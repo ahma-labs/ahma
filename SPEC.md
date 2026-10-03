@@ -866,6 +866,7 @@ A "host sandbox" is an outer kernel sandbox ahma runs inside (Cursor, Claude Cod
 #### What the human is told
 
 - **R-PERM.9**: **Every user-facing permission message leads with whether the user must do anything.** The first line after a grant, a denial or a disclosure **must** be one of `Nothing more to do…`, `One thing to do: <the exact command or key>…`, or `Blocked until <who> <does what>…`, computed from the surface it is printed on (terminal hooks and the edit guard re-read grants per command; a running MCP session, until it watches the ledger, needs its connection restarted or the prompt it raised answered) — never hedged with "may" or "the next time a server starts", and never two answers in one message. When the user must act, the message names the exact action — the full command to paste, or the key to press and where — never "restart your IDE" or "grant it in the TUI".
+- **R-PERM.9.1**: **A refusal is reported once, in proportion.** A terminal-hook command that failed with a refusal outside the workspace gets the full prompt body once (it was printed twice: to stderr and again as the returned error), led by what was refused rather than "blocked", since the command may have failed for another reason. A command that **succeeded** although one of its accesses was refused (a lock-holder file, a cache it can do without) gets one line: what was refused and the `ahma sandbox grant` that would allow it.
 
 ---
 

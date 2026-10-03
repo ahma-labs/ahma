@@ -1330,7 +1330,8 @@ pub fn hook_scope_disclosure(scopes: &[PathBuf]) -> String {
          Writes are confined to: {listed}, plus any persistent grants in ~/.ahma/settings.toml.\
          {no_project} {reads} A write outside the scope fails; to allow one, ask the human — they \
          approve it in the ahma TUI or run `ahma sandbox grant <dir>`. You cannot widen the scope \
-         yourself."
+         yourself, and a harness's own sandbox switch (Claude Code's `dangerouslyDisableSandbox`) \
+         turns off that harness's sandbox, not this one."
     )
 }
 
@@ -1710,6 +1711,12 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             // instead of a log line. This is the same reasoning the file already
             // applies to `write_exec_output` a few hundred lines up.
             crate::utils::stdio::emit_stdout_text(&format!("{output}\n"))?;
+            // A refusal the command shrugged off is said once, in one line.
+            if let Some(note) =
+                crate::sandbox::grant_channel::hook_side_refusal_note(&output, &requester)
+            {
+                crate::utils::stdio::emit_stdout_text(&format!("{note}\n"))?;
+            }
             Ok(())
         }
         // The sandbox initialized successfully (the `initialize_sandbox` arms
@@ -1803,9 +1810,9 @@ fn report_shell_execution_error(
     // ledger, so there is no server to restart. The CLI text must not also
     // say "next server start" here — two answers to "do I need to do
     // anything?" in one message is what confused the owner.
-    let msg = format!("{e}\n\n{remediation}");
-    eprintln!("{msg}");
-    Err(anyhow!("{msg}"))
+    // Returned, not also printed: the caller prints the error, and printing it
+    // here too showed the whole panel twice.
+    Err(anyhow!("{e}\n\n{remediation}"))
 }
 
 /// Fallback path when ahma's own execution cannot sandbox the command (SPEC
@@ -5261,6 +5268,10 @@ mod tests {
         assert!(line.contains("/w/repo"));
         assert!(line.contains("ahma sandbox grant"));
         assert!(line.contains("cannot widen"));
+        assert!(
+            line.contains("dangerouslyDisableSandbox"),
+            "the agent learns its harness's switch does not turn ahma off: {line}"
+        );
         assert!(hook_scope_disclosure(&[]).contains("(none)"));
         assert_ne!(
             scope_fingerprint(&[PathBuf::from("/a")]),

@@ -183,7 +183,7 @@ narrowing, trust-handoff writes, network egress, platform internals):
 | Scope (HTTP) | Workspace roots from MCP `roots/list` |
 | Override | `--sandbox-scope /path/a` (repeat for multiple paths) |
 | Temp dir | `--tmp` adds `/tmp` (`%TEMP%` on Windows); needed for compilers/build tools |
-| Nested sandbox | Ahma applies its own sandbox everywhere, hooks included — an environment marker such as `CLAUDECODE` never makes it stand down. It defers (`deferred_to_host`) only when the kernel refuses to nest its profile inside an outer one (macOS Seatbelt), and says so on every such command. `--no-sandbox` is the explicit opt-out. |
+| Nested sandbox | Ahma applies its own sandbox everywhere, hooks included — an environment marker such as `CLAUDECODE` never makes it stand down. It defers (`deferred_to_host`) only when the kernel refuses to nest its profile inside an outer one (macOS Seatbelt), and says so on every such command. `--no-sandbox` is the explicit opt-out; a harness's own switch (Claude Code's `dangerouslyDisableSandbox`) does not turn ahma's sandbox off. |
 | Platform | Linux: Landlock (kernel 5.13+) · macOS: Seatbelt · Windows: Job Objects (+ AppContainer, in progress) |
 
 ---

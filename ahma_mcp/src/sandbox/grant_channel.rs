@@ -514,8 +514,9 @@ pub fn hook_denial_text(
         " --read-only"
     };
     format!(
-        "Blocked until a human grants it: ahma's kernel sandbox refused an out-of-scope {} to \
-         '{}'.\n\n{}\nOne thing to do (pick a tier), then re-run the command:\n  ahma sandbox \
+        "The sandbox refused a {} outside the workspace: '{}'. If this command needs it, a human \
+         must grant it; ahma will not run it unsandboxed.\n\n{}\nOne thing to do (pick a tier), \
+         then re-run the command:\n  ahma sandbox \
          grant {target}{ro_flag} --session   # this terminal session only, at most 12h\n  ahma \
          sandbox grant {target}{ro_flag}             # until revoked, bound to this workspace\n\n\
          Either applies on your next command; nothing to restart.",
@@ -525,6 +526,38 @@ pub fn hook_denial_text(
         target = target.display(),
         ro_flag = ro_flag,
     )
+}
+
+/// One line for a hooked command that **succeeded** although the sandbox
+/// refused one of its accesses outside the workspace (a lock-holder file, a
+/// cache it can do without): what was refused and the command that would
+/// allow it, said once. The full panel of [`hook_denial_text`] is for a
+/// command that failed; a refusal the command shrugged off is a warning, not
+/// a block. `None` when the output shows no refusal outside the scope.
+pub fn hook_side_refusal_note(output: &str, who: &HookRequester) -> Option<String> {
+    let hit = super::denial_scan::scan_denial_streams(output, "")?;
+    let path = &hit.path;
+    let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if who
+        .scopes
+        .iter()
+        .any(|s| canon(path).starts_with(canon(s)) || path.starts_with(s))
+    {
+        return None;
+    }
+    let target = grant_dir_for(path);
+    let (verb, ro) = if hit.access.is_write() {
+        ("write", "")
+    } else {
+        ("read", " --read-only")
+    };
+    Some(format!(
+        "ahma: the sandbox refused a {verb} outside the workspace ({}) and the command went on \
+         without it; if it needs that, a human can run `ahma sandbox grant {}{ro}` (add \
+         `--session` for this terminal session only).",
+        path.display(),
+        target.display()
+    ))
 }
 
 /// Wiring helper: a sandboxed command failed; scan its stderr for a denial and, if
@@ -899,6 +932,38 @@ mod grant_dir_gate_tests {
 mod context_tests {
     use super::*;
 
+    /// A command that succeeded although the sandbox refused one of its writes
+    /// gets one line naming the path and the grant, not the blocking panel
+    /// (bug report: a build's lock-holder write printed the full panel inside
+    /// every successful build).
+    #[test]
+    fn a_refused_write_in_a_command_that_succeeded_is_one_line() {
+        let ws = tempfile::tempdir().unwrap();
+        let who = HookRequester {
+            harness: None,
+            session_id: None,
+            scopes: vec![ws.path().to_path_buf()],
+            command: None,
+        };
+        let out = "heavy: line 1: /opt/cache/neubit/heavy.lock.holder: Operation not permitted\nBUILD SUCCESSFUL";
+        let note = hook_side_refusal_note(out, &who).expect("a note");
+        assert_eq!(note.lines().count(), 1, "{note}");
+        assert!(
+            note.contains("/opt/cache/neubit/heavy.lock.holder"),
+            "{note}"
+        );
+        assert!(
+            note.contains("ahma sandbox grant /opt/cache/neubit"),
+            "{note}"
+        );
+        assert!(hook_side_refusal_note("BUILD SUCCESSFUL", &who).is_none());
+        let inside = format!("x: {}/f: Operation not permitted", ws.path().display());
+        assert!(
+            hook_side_refusal_note(&inside, &who).is_none(),
+            "a refusal inside the scope is not the sandbox's"
+        );
+    }
+
     #[test]
     fn hook_denial_text_leads_with_blocked_and_has_every_section() {
         let ws = tempfile::tempdir().unwrap();
@@ -914,7 +979,12 @@ mod context_tests {
             "write to /opt/cache/x.bin: Operation not permitted",
             &who,
         );
-        assert!(t.starts_with("Blocked until a human grants it"), "{t}");
+        // What was refused, and that a human must act if the command needs it;
+        // not "blocked": the command may have failed for another reason.
+        assert!(
+            t.starts_with("The sandbox refused a write outside the workspace: '/opt/cache/x.bin'"),
+            "{t}"
+        );
         for h in [
             "Who is asking",
             "What was blocked",
