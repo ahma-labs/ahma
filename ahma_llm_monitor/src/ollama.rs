@@ -41,7 +41,9 @@ pub fn root(base_url: &str) -> &str {
 ///   string. Arguments that do not parse are sent as `{}`: Ollama rejects
 ///   anything but an object, and the model already saw the call fail.
 /// * A tool result names its tool (`tool_name`), found from the call it
-///   answers; Ollama has no call ids to match on.
+///   answers. Ollama (0.35) also gives each call an `id` and accepts
+///   `tool_call_id` back, but neither is sent yet, so two calls to one tool in
+///   a turn are matched by their order.
 /// * Reasoning text from earlier turns is not sent back.
 pub fn to_ollama_messages(messages: &[Value]) -> Vec<Value> {
     let mut names_by_id = std::collections::HashMap::<String, String>::new();

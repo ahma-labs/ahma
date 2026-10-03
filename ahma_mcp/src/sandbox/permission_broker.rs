@@ -709,14 +709,24 @@ fn grant_form_schema(reason: GrantReason) -> rmcp::model::ElicitationSchema {
         ConstTitle, ElicitationSchema, EnumSchema, PrimitiveSchemaDefinition,
         SingleSelectEnumSchema, TitledSingleSelectEnumSchema,
     };
-    let one_of: Vec<ConstTitle> = ahma_common::grant_prompt::options_for(reason)
+    let options = ahma_common::grant_prompt::options_for(reason);
+    // Name only the tiers this question offers: a log target has no `once`.
+    let unsaved = match (
+        options.iter().any(|o| o.value.contains("session")),
+        options.iter().any(|o| o.value.contains("once")),
+    ) {
+        (true, true) => " Session and once answers are never written to disk.",
+        (true, false) => " A session answer is never written to disk.",
+        (false, true) => " A once answer is never written to disk.",
+        (false, false) => "",
+    };
+    let one_of: Vec<ConstTitle> = options
         .into_iter()
         .map(|o| ConstTitle::new(o.value, o.label))
         .collect();
     let mut select = TitledSingleSelectEnumSchema::new(one_of);
     select.title = Some("Your decision".into());
-    select.description =
-        Some("Deny is the default. Session and once answers are never written to disk.".into());
+    select.description = Some(format!("Deny is the default.{unsaved}").into());
     select.default = Some("deny".to_string());
     let mut props = std::collections::BTreeMap::new();
     props.insert(
@@ -1207,4 +1217,96 @@ mod tests {
             "how to undo it, before they agree to it"
         );
     }
+
+    /// The form names only the tiers it offers: a log target has no `once`.
+    #[test]
+    fn the_form_names_only_the_unsaved_tiers_it_offers() {
+        let says = |reason| {
+            serde_json::to_value(grant_form_schema(reason)).unwrap()["properties"]["decision"]
+                ["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let log = says(GrantReason::LogTarget);
+        assert!(!log.contains("once"), "{log}");
+        assert!(
+            log.contains("A session answer is never written to disk"),
+            "{log}"
+        );
+        let path = says(GrantReason::PreExecViolation);
+        assert!(path.contains("Session and once answers"), "{path}");
+    }
+
+    /// The exact JSON form a harness renders for one reason's choices.
+    fn golden_form(one_of: serde_json::Value, description: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "title": "Your decision",
+                    "description": description,
+                    "oneOf": one_of,
+                    "default": "deny"
+                }
+            },
+            "required": ["decision"]
+        })
+    }
+
+    /// GOLDEN (SPEC R-PERM.3.4 per surface): a titled single-select, `deny`
+    /// first, labels in words, never a TUI key letter — for every reason.
+    #[test]
+    fn golden_elicitation_form_per_reason() {
+        let every_tier = serde_json::json!([
+                {"const": "deny", "title": "Deny (default; Enter and Esc)"},
+                {"const": "read-only-once", "title": "read-only, next command only"},
+                {"const": "read-write-once", "title": "read-write, next command only"},
+                {"const": "read-only-session", "title": "read-only, this session"},
+                {"const": "read-write-session", "title": "read-write, this session"},
+                {"const": "read-only-24h", "title": "read-only for 24 hours (saved; ends on its own)"},
+                {"const": "read-write-24h", "title": "read-write for 24 hours (saved; ends on its own)"},
+                {"const": "read-only", "title": "read-only, always (saved; bound to this workspace)"},
+                {"const": "read-write", "title": "read-write, always (saved; bound to this workspace)"}
+        ]);
+        let session_at_most = serde_json::json!([
+                {"const": "deny", "title": "Deny (default; Enter and Esc)"},
+                {"const": "read-only-once", "title": "read-only, next command only"},
+                {"const": "read-write-once", "title": "read-write, next command only"},
+                {"const": "read-only-session", "title": "read-only, this session"},
+                {"const": "read-write-session", "title": "read-write, this session"}
+        ]);
+        let log_target = serde_json::json!([
+                {"const": "deny", "title": "Deny (default; Enter and Esc)"},
+                {"const": "read-only-session", "title": "read-only, this session"},
+                {"const": "read-only", "title": "read-only, always (saved; bound to this workspace)"}
+        ]);
+        for (reason, one_of) in [
+            (GrantReason::PreExecViolation, every_tier.clone()),
+            (GrantReason::StderrHeuristic, every_tier),
+            (GrantReason::StartupFlag, session_at_most.clone()),
+            (GrantReason::Unknown, session_at_most),
+            (GrantReason::LogTarget, log_target),
+        ] {
+            let got = serde_json::to_value(grant_form_schema(reason)).unwrap();
+            // A log target offers no `once` tier, so its form does not mention one.
+            let description = if reason == GrantReason::LogTarget {
+                "Deny is the default. A session answer is never written to disk."
+            } else {
+                "Deny is the default. Session and once answers are never written to disk."
+            };
+            assert_eq!(got, golden_form(one_of, description), "{reason:?}");
+            let text = got.to_string();
+            for o in ahma_common::grant_prompt::options() {
+                let key = format!("[{}]", o.key);
+                assert!(
+                    !text.contains(&key),
+                    "{reason:?}: TUI key {key} in the form"
+                );
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ END PART 4 ---
 }

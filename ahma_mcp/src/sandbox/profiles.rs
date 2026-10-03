@@ -623,16 +623,45 @@ pub fn platform_enforcement() -> PlatformEnforcement {
     if cfg!(target_os = "linux") {
         // R6.1.7 / R-HANDOFF.4: Landlock ABI V1 is additive-allow with no deny
         // rule and no ordering, so a hole *inside* an allowed subtree cannot be
-        // expressed to the kernel at all.
-        notes.push(
-            "Linux: the workspace is kernel-scoped, but the trust-handoff deny list (git \
-             hook directories, the project's own .ahma/, hub sockets) is enforced only \
-             in ahma's own file tools — Landlock cannot carve a denied hole inside an \
-             allowed directory. A command run through run_terminal_command can still write \
-             those paths; ahma compares them before and after every command and reports a \
-             change as TRUST-HANDOFF WRITE in the result and the audit log, but does not \
-             prevent or undo it. Review .git/hooks before your next git command.",
-        );
+        // expressed to the kernel at all. The opt-in per-command namespace
+        // (`super::deny_tier`) holds it with a read-only mount instead, where
+        // the host allows one; the note says which of the three states this is.
+        use super::deny_tier::{DenyTierState, state};
+        match state() {
+            DenyTierState::Namespace => notes.push(
+                "Linux: the workspace is kernel-scoped, and the trust-handoff deny list (git \
+                 hook directories, the project's own .ahma/) is mounted read-only in each \
+                 command's own namespace ([sandbox] linux_deny_tier = \"namespace\"), so a \
+                 command run through run_terminal_command gets \"Read-only file system\" writing \
+                 them. A path created during a command is covered from the next one; ahma still \
+                 compares those paths before and after every command and reports a change as \
+                 TRUST-HANDOFF WRITE. Review .git/hooks if one appears.",
+            ),
+            DenyTierState::Detect => notes.push(
+                "Linux: the workspace is kernel-scoped, but the trust-handoff deny list (git \
+                 hook directories, the project's own .ahma/, hub sockets) is enforced only \
+                 in ahma's own file tools — Landlock cannot carve a denied hole inside an \
+                 allowed directory. A command run through run_terminal_command can still write \
+                 those paths; ahma compares them before and after every command and reports a \
+                 change as TRUST-HANDOFF WRITE in the result and the audit log, but does not \
+                 prevent or undo it. Review .git/hooks before your next git command. \
+                 [sandbox] linux_deny_tier = \"namespace\" makes the kernel refuse those writes \
+                 where unprivileged user namespaces are allowed.",
+            ),
+            DenyTierState::NamespaceUnavailable(reason) => {
+                notes.push(
+                    "Linux: the workspace is kernel-scoped, but the trust-handoff deny list (git \
+                     hook directories, the project's own .ahma/, hub sockets) is enforced only \
+                     in ahma's own file tools — Landlock cannot carve a denied hole inside an \
+                     allowed directory. A command run through run_terminal_command can still \
+                     write those paths; ahma compares them before and after every command and \
+                     reports a change as TRUST-HANDOFF WRITE in the result and the audit log, \
+                     but does not prevent or undo it. Review .git/hooks before your next git \
+                     command.",
+                );
+                notes.push(reason.note());
+            }
+        }
     }
 
     // SPEC R-LISTEN: no kernel ahma uses can keep a server on loopback

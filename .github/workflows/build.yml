@@ -465,6 +465,27 @@ jobs:
             -p ahma_mcp \
             -E 'test(red_team_global_read_access_blocked) or test(red_team_livelog_symlink_read_allowed)'
 
+      # SPEC R6.1.7: `[sandbox] linux_deny_tier = "namespace"` needs unprivileged user
+      # namespaces, which ubuntu-latest refuses by default
+      # (kernel.apparmor_restrict_unprivileged_userns=1). The main nextest run above keeps
+      # that default and so proves the fallback: the startup probe names the reason and
+      # the deny_tier_namespace tests skip with it. This step lifts the restriction and
+      # re-runs only those tests with AHMA_TEST_REQUIRE_DENY_TIER_NAMESPACE set, so a skip
+      # FAILS the step instead of passing it quietly: it is the proof that a sandboxed
+      # `echo x > .git/hooks/pre-commit` fails with EROFS. Same flavour as the main run, so
+      # nothing is rebuilt. The sysctl stays lifted for the rest of this job, which changes
+      # nothing for later steps: ahma's default `detect` mode never probes, and the
+      # namespace tests merely run instead of skipping.
+      - name: Cargo Nextest (deny-tier namespace prevention, Linux only)
+        if: matrix.test_mode == 'full' && runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          AHMA_TEST_REQUIRE_DENY_TIER_NAMESPACE=1 cargo nextest run --profile ci --locked \
+            -E 'test(deny_tier_namespace)'
+
       - name: ARM64 smoke validation (compile-only)
         if: matrix.test_mode == 'smoke'
         timeout-minutes: 25

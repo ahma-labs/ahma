@@ -1,4 +1,5 @@
 use crate::shell::cli::AppConfig;
+use ahma_common::harness::Harness;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand, ValueEnum};
@@ -13,6 +14,7 @@ use tempfile::NamedTempFile;
 
 mod consent;
 pub mod edit_guard;
+mod harness_ask;
 pub mod native_terminal;
 pub use consent::HookConsentStore;
 
@@ -74,6 +76,18 @@ enum HooksDecision {
         user_message: String,
         agent_message: String,
     },
+    /// **Ask the human first** (SPEC R-PERM.10): an earlier command here was
+    /// refused a path. The harness shows its own dialog with `reason`; a yes
+    /// runs `updated_input`, the sandboxed command carrying a one-use token
+    /// that applies the session grant. Only built for harnesses whose hook
+    /// contract has `ask` (Claude Code).
+    AskGrant {
+        updated_input: Value,
+        reason: String,
+    },
+    /// **Refuse**: the command is one only the hook may write (an approval
+    /// token the agent tried to pass itself).
+    Refuse { reason: String },
 }
 
 impl HooksDecision {
@@ -84,6 +98,8 @@ impl HooksDecision {
             HooksDecision::AllowRewrite { .. } => "rewrite",
             HooksDecision::DenyPendingConsent { .. } => "deny_pending_consent",
             HooksDecision::AllowWithWarning { .. } => "allow_unsandboxed",
+            HooksDecision::AskGrant { .. } => "ask_grant",
+            HooksDecision::Refuse { .. } => "refuse_forged_approval",
         }
     }
 }
@@ -256,6 +272,11 @@ pub struct HooksRunShellArgs {
     /// Raw command and arguments (optional trailing args if not using `--command`).
     #[arg(last = true)]
     pub raw_command: Vec<String>,
+
+    /// One-use token for a grant the human approved in the harness's own
+    /// dialog (SPEC R-PERM.10). Written only by the hook.
+    #[arg(long = "approve-grant", hide = true)]
+    pub approve_grant: Option<String>,
 }
 
 impl HooksRunShellArgs {
@@ -292,6 +313,9 @@ impl HooksRunShellArgs {
     }
 }
 
+/// A terminal-hook flavour: one per harness ahma can hook
+/// ([`Harness::has_terminal_hook`]). The variant names are the `--platform`
+/// values clap accepts, and equal [`Harness::cli_name`] for their harness.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum HookPlatform {
     Cursor,
@@ -302,6 +326,23 @@ pub enum HookPlatform {
 }
 
 impl HookPlatform {
+    /// The harness this hook flavour belongs to.
+    pub fn harness(self) -> Harness {
+        match self {
+            Self::Cursor => Harness::Cursor,
+            Self::Claude => Harness::ClaudeCode,
+            Self::Codex => Harness::Codex,
+            Self::Copilot => Harness::CopilotCli,
+            Self::Antigravity => Harness::Antigravity,
+        }
+    }
+
+    /// The hook flavour for `harness`, or `None` when ahma has no terminal
+    /// hook for it.
+    pub fn of(harness: Harness) -> Option<Self> {
+        Self::all().into_iter().find(|p| p.harness() == harness)
+    }
+
     fn all() -> Vec<Self> {
         vec![
             Self::Cursor,
@@ -313,13 +354,7 @@ impl HookPlatform {
     }
 
     fn label(self) -> &'static str {
-        match self {
-            Self::Cursor => "Cursor",
-            Self::Claude => "Claude Code",
-            Self::Codex => "Codex",
-            Self::Copilot => "GitHub Copilot CLI",
-            Self::Antigravity => "Antigravity",
-        }
+        self.harness().label()
     }
 
     fn config_path(self, scope_root: &Path, scope: HookScope) -> PathBuf {
@@ -353,13 +388,7 @@ impl HookPlatform {
     }
 
     fn cli_name(self) -> &'static str {
-        match self {
-            Self::Cursor => "cursor",
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Copilot => "copilot",
-            Self::Antigravity => "antigravity",
-        }
+        self.harness().cli_name()
     }
 
     /// Whether `ahma setup` installs terminal hooks for this client **by default**
@@ -544,7 +573,7 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
         HooksCommand::Install(args) => run_install(args),
         HooksCommand::Uninstall(args) => run_uninstall(args),
         HooksCommand::Status(args) => run_status(args),
-        HooksCommand::Exec(args) => run_exec(args).await,
+        HooksCommand::Exec(args) => run_exec(args, &cfg).await,
         HooksCommand::Observe(args) => run_observe(args),
         HooksCommand::RunShell(args) => run_shell(args, cfg).await,
         HooksCommand::ApproveUnsandboxed => run_approve_unsandboxed(),
@@ -1092,7 +1121,7 @@ fn print_hooks_mcp_coexistence_note(
     println!();
 }
 
-async fn run_exec(args: HooksExecArgs) -> Result<()> {
+async fn run_exec(args: HooksExecArgs, cfg: &AppConfig) -> Result<()> {
     // Parse stdin first. On any failure allow through — the editor may have sent an
     // empty or malformed payload (e.g. during IDE shutdown) and we must not block.
     let stdin = match read_stdin_json() {
@@ -1124,6 +1153,7 @@ async fn run_exec(args: HooksExecArgs) -> Result<()> {
     }
 
     let decision = compute_exec_decision(&stdin, args.scope, &env);
+    let decision = ask_first_if_refused_before(decision, &stdin, &args, &env, cfg);
     // SPEC R5.4.10 / R-HANDOFF.10: every decision leaves a trace. A pass-through
     // that no one can find afterwards is how a session ran unsandboxed for days.
     let command = extract_tool_args(&stdin)
@@ -1511,7 +1541,16 @@ pub fn resolve_hook_sandbox_scopes(cwd: &Path) -> Vec<PathBuf> {
 }
 
 async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
+    let approval = args.approve_grant.clone();
     let payload = args.resolve_payload()?;
+    // A grant the human just approved in the harness dialog applies before
+    // the scopes are read, so this very command runs with it (R-PERM.10).
+    if let Some(token) = approval
+        && let Some(line) =
+            harness_ask::apply_approval(&token, Path::new(&payload.cwd), &payload.command)
+    {
+        eprintln!("{line}");
+    }
     let mut hook_scopes = resolve_hook_sandbox_scopes(Path::new(&payload.cwd));
     // Session-tier grants a human approved at the TUI or a harness prompt apply
     // to hooked commands in the same workspace (SPEC R-PERM.4.4); they arrive as
@@ -1712,10 +1751,13 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             // instead of a log line. This is the same reasoning the file already
             // applies to `write_exec_output` a few hundred lines up.
             crate::utils::stdio::emit_stdout_text(&format!("{output}\n"))?;
-            // A refusal the command shrugged off is said once, in one line.
-            if let Some(note) =
-                crate::sandbox::grant_channel::hook_side_refusal_note(&output, &requester)
+            // A refusal the command shrugged off is said once, in one line,
+            // and remembered so the next command here can ask (R-PERM.10).
+            if let Some((path, access)) =
+                crate::sandbox::grant_channel::hook_side_refusal(&output, &requester)
             {
+                harness_ask::record_refusal(Path::new(&payload.cwd), &path, access);
+                let note = crate::sandbox::grant_channel::refusal_note(&path, access);
                 crate::utils::stdio::emit_stdout_text(&format!("{note}\n"))?;
             }
             Ok(())
@@ -1737,7 +1779,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // grant ...` recovery line so the agent gets a next step instead of a raw
         // `os error 1`. The native-terminal hook uses the CLI grant path (not the
         // MCP grant/restart tools).
-        Err(e) => report_shell_execution_error(e, &requester),
+        Err(e) => report_shell_execution_error(e, &requester, Path::new(&payload.cwd)),
     }
 }
 
@@ -1780,10 +1822,15 @@ fn die_by_signal(signo: i32) -> Result<String> {
 fn report_shell_execution_error(
     e: anyhow::Error,
     who: &crate::sandbox::grant_channel::HookRequester,
+    cwd: &Path,
 ) -> Result<()> {
     let Some(sandbox_err) = e.downcast_ref::<crate::sandbox::SandboxError>() else {
         return Err(e);
     };
+    // Remembered so the next command here can ask first (R-PERM.10).
+    if let crate::sandbox::SandboxError::RuntimeDenial { path, access, .. } = sandbox_err {
+        harness_ask::record_refusal(cwd, path, *access);
+    }
     let remediation = match sandbox_err {
         crate::sandbox::SandboxError::RuntimeDenial {
             path,
@@ -1954,6 +2001,56 @@ fn extract_command_and_key(args_obj: &Map<String, Value>) -> Option<(&str, &str)
     }
 }
 
+/// SPEC R-PERM.10: when an earlier hooked command in this workspace was
+/// refused a path, ask the human in the harness's own dialog before this one
+/// runs, instead of letting it fail the same way. Claude Code only: its hook
+/// contract has `ask` with a rewritten input. Anything else, or nothing to
+/// ask, leaves `decision` as it was.
+fn ask_first_if_refused_before(
+    decision: HooksDecision,
+    input: &Value,
+    args: &HooksExecArgs,
+    env: &HookEnvironment,
+    cfg: &AppConfig,
+) -> HooksDecision {
+    if args.platform != HookPlatform::Claude
+        || !matches!(decision, HooksDecision::AllowRewrite { .. })
+    {
+        return decision;
+    }
+    let Some(session_id) = input.get("session_id").and_then(Value::as_str) else {
+        return decision;
+    };
+    let Ok(Some(tool)) = extract_tool_args(input) else {
+        return decision;
+    };
+    let Ok(cwd) = extract_command_cwd(input, &tool.tool_input) else {
+        return decision;
+    };
+    let Some((question, token)) = harness_ask::next_ask(
+        Path::new(&cwd),
+        session_id,
+        &tool.command,
+        &cfg.persistent_scopes,
+    ) else {
+        return decision;
+    };
+    match build_wrapped_shell_command(
+        args.scope,
+        env,
+        &cwd,
+        &tool.command,
+        Some(session_id.to_string()),
+        Some(&token),
+    ) {
+        Ok(wrapped) => HooksDecision::AskGrant {
+            updated_input: updated_tool_input(&tool.tool_input, wrapped, &tool.arg_key),
+            reason: harness_ask::ask_reason(&question),
+        },
+        Err(_) => decision,
+    }
+}
+
 /// Compute the hook decision for a given tool invocation.
 ///
 /// This is the testable core of [`run_exec`]. The decision tree:
@@ -2012,6 +2109,18 @@ fn compute_exec_decision_internal(
         Ok(None) | Err(_) => return HooksDecision::AllowUnchanged,
     };
 
+    // Only the hook writes an approval token, into a command the human then
+    // approves in the harness dialog. One the agent wrote itself would approve
+    // its own question (SPEC R-PERM.10), with or without the wrapper marker.
+    if harness_ask::carries_approval(&args.command) {
+        return HooksDecision::Refuse {
+            reason: "ahma: an approval token is written only by ahma's hook, into a command \
+                     the human approves in this harness's dialog; a command cannot carry one \
+                     itself. Run the command plainly."
+                .to_string(),
+        };
+    }
+
     if is_wrapped_shell_command(&args.command) {
         return HooksDecision::AllowUnchanged;
     }
@@ -2040,7 +2149,7 @@ fn compute_exec_decision_internal(
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    match build_wrapped_shell_command(scope, env, &cwd, &args.command, session_id) {
+    match build_wrapped_shell_command(scope, env, &cwd, &args.command, session_id, None) {
         Ok(wrapped) => {
             let updated = updated_tool_input(&args.tool_input, wrapped.clone(), &args.arg_key);
             HooksDecision::AllowRewrite {
@@ -2142,6 +2251,13 @@ fn build_cursor_hook_output(decision: HooksDecision) -> Value {
             "user_message": user_message,
             "agent_message": agent_message,
         }),
+        // Never built for Cursor; should one arrive, refusing is the safe
+        // reading of a question this contract cannot ask.
+        HooksDecision::AskGrant { reason, .. } | HooksDecision::Refuse { reason } => json!({
+            "permission": "deny",
+            "user_message": reason,
+            "agent_message": reason,
+        }),
     }
 }
 
@@ -2185,6 +2301,11 @@ fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
         HooksDecision::DenyPendingConsent { user_message, .. } => json!({
             "decision": "deny",
             "reason": user_message,
+        }),
+        // Never built for Antigravity (see the Cursor builder).
+        HooksDecision::AskGrant { reason, .. } | HooksDecision::Refuse { reason } => json!({
+            "decision": "deny",
+            "reason": reason,
         }),
     }
 }
@@ -2305,6 +2426,29 @@ fn build_structured_hook_output(decision: HooksDecision) -> Value {
             }),
             Some(user_message),
         ),
+        // SPEC R-PERM.10: the harness's own dialog asks; a yes runs the
+        // sandboxed command that carries the approval token.
+        HooksDecision::AskGrant {
+            updated_input,
+            reason,
+        } => (
+            json!({
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "ask",
+                "permissionDecisionReason": reason,
+                "updatedInput": updated_input.clone(),
+                "modifiedArgs": updated_input,
+            }),
+            None,
+        ),
+        HooksDecision::Refuse { reason } => (
+            json!({
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }),
+            None,
+        ),
     };
     let mut out = json!({"hookSpecificOutput": hook_specific});
     if let Some(msg) = system_message {
@@ -2319,15 +2463,19 @@ fn build_wrapped_shell_command(
     cwd: &str,
     command: &str,
     session_id: Option<String>,
+    approval_token: Option<&str>,
 ) -> Result<String> {
-    let mut args = vec![
-        "hooks".to_string(),
-        "run-shell".to_string(),
+    let mut args = vec!["hooks".to_string(), "run-shell".to_string()];
+    if let Some(token) = approval_token {
+        args.push(harness_ask::APPROVE_FLAG.to_string());
+        args.push(token.to_string());
+    }
+    args.extend([
         "--wrapped-by".to_string(),
         WRAPPED_BY_MARKER.to_string(),
         "--cwd".to_string(),
         cwd.to_string(),
-    ];
+    ]);
     if let Some(ref sid) = session_id {
         args.push("--session-id".to_string());
         args.push(sid.clone());
@@ -4077,6 +4225,33 @@ mod tests {
         }
     }
 
+    /// The hook table and the harness table agree in both directions: every
+    /// harness with a hook has exactly this flavour, and no other harness has
+    /// one.
+    #[test]
+    fn hook_platforms_are_exactly_the_hooked_harnesses() {
+        for h in Harness::ALL.iter().copied() {
+            assert_eq!(
+                HookPlatform::of(h).is_some(),
+                h.has_terminal_hook(),
+                "{h:?}"
+            );
+        }
+        for p in HookPlatform::all() {
+            assert_eq!(HookPlatform::of(p.harness()), Some(p), "{p:?}");
+        }
+    }
+
+    /// clap derives the `--platform` spellings from the variant names, not
+    /// from `cli_name`; they must still be the same strings.
+    #[test]
+    fn clap_platform_values_match_cli_names() {
+        for p in HookPlatform::all() {
+            let value = p.to_possible_value().expect("every variant is a value");
+            assert_eq!(value.get_name(), p.cli_name(), "{p:?}");
+        }
+    }
+
     #[test]
     fn test_hook_platform_event_keys() {
         assert_eq!(HookPlatform::Cursor.event_key(), "preToolUse");
@@ -4480,9 +4655,15 @@ mod tests {
     #[test]
     fn test_build_wrapped_shell_command_project_uses_path_lookup() {
         let env = test_env();
-        let cmd =
-            build_wrapped_shell_command(HookScope::Project, &env, "/work", "cargo build", None)
-                .unwrap();
+        let cmd = build_wrapped_shell_command(
+            HookScope::Project,
+            &env,
+            "/work",
+            "cargo build",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(cmd.starts_with("ahma hooks run-shell"));
         assert!(cmd.contains("--wrapped-by"));
         assert!(cmd.contains(WRAPPED_BY_MARKER));
@@ -4493,9 +4674,15 @@ mod tests {
     #[test]
     fn test_build_wrapped_shell_command_is_human_readable() {
         let env = test_env();
-        let cmd =
-            build_wrapped_shell_command(HookScope::Project, &env, "/work/dir", "echo x", None)
-                .unwrap();
+        let cmd = build_wrapped_shell_command(
+            HookScope::Project,
+            &env,
+            "/work/dir",
+            "echo x",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(cmd.contains("/work/dir"));
         assert!(cmd.contains("echo x"));
     }
@@ -4508,6 +4695,7 @@ mod tests {
             session_id: Some("session-42".to_string()),
             command: Some("cargo test".to_string()),
             wrapped_by: WRAPPED_BY_MARKER.to_string(),
+            approve_grant: None,
             raw_command: Vec::new(),
         };
         let payload = args.resolve_payload().unwrap();
@@ -4524,6 +4712,7 @@ mod tests {
             session_id: None,
             command: None,
             wrapped_by: WRAPPED_BY_MARKER.to_string(),
+            approve_grant: None,
             raw_command: vec![
                 "cargo".to_string(),
                 "check".to_string(),
@@ -4550,6 +4739,7 @@ mod tests {
             session_id: None,
             command: None,
             wrapped_by: WRAPPED_BY_MARKER.to_string(),
+            approve_grant: None,
             raw_command: Vec::new(),
         };
         let payload = args.resolve_payload().unwrap();
@@ -5150,7 +5340,7 @@ mod tests {
     /// or not its own sandbox is on — a session ran unsandboxed for days on
     /// exactly that false inference. The full (impure) decision path is
     /// exercised: real env, real consent/disclosure stores (pointed at this
-    /// test's own runtime directory via XDG_RUNTIME_DIR), hooks forced active.
+    /// test's own runtime directory via its own test home), hooks forced active.
     fn assert_rewrites_under_marker(marker: &str) {
         let temp = tempdir().unwrap();
         // nextest runs each test in its own process, so env mutation is local.
@@ -5165,6 +5355,9 @@ mod tests {
             // let parallel tests race on the same disclosure marker.
             std::env::set_var("XDG_RUNTIME_DIR", temp.path().join("run"));
             std::env::set_var("LOCALAPPDATA", temp.path().join("local"));
+            // Under the test harness Unix ignores XDG_RUNTIME_DIR for the
+            // private test home (SPEC R-ISO.1); give this process its own.
+            std::env::set_var("AHMA_TEST_HOME", temp.path().join("home"));
         }
         let env = test_env();
         let cwd = temp.path().join("proj");

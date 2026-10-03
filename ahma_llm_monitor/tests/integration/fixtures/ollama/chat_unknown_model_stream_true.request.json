@@ -1,0 +1,1 @@
+{"model":"no-such-model:1b","messages":[{"role":"user","content":"hi"}],"stream":true,"options":{"num_predict":8192,"temperature":0.2,"num_ctx":4096}}

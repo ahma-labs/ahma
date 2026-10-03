@@ -1,0 +1,1 @@
+{"model":"granite4.2:3b","messages":[{"role":"user","content":"Reply with just the word: pong"}],"stream":false,"options":{"num_predict":8192,"temperature":0.2,"num_ctx":4096}}
