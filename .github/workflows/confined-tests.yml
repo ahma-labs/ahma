@@ -130,6 +130,19 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The tool's result is one escaped line that the job log may drop when it
+      # is large; keep the whole thing.
+      - name: Upload confined log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: confined-log-${{ matrix.os }}
+          path: |
+            confined.log
+            confined.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Verify sccache (ghac)
         if: always()
         uses: ./.github/actions/sccache-verify
