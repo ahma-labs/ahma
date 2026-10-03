@@ -10,7 +10,7 @@
 //!
 //! | Area | Modules |
 //! |------|---------|
-//! | Configuration | [`config`] (settings schema, trust tiers, provider registry, retired-env handling) |
+//! | Configuration | [`config`] (settings schema, trust tiers, provider registry, retired-env handling), [`settings_origin`] (per-key provenance and the startup settings report) |
 //! | Permissions and scope | [`permissions`], [`scope_grant`], [`sandbox_state`], [`hook_consent`] |
 //! | Network policy and outbound HTTP | [`web_policy`], [`web_approval`], [`net_approval`], [`http_retry`] |
 //! | Operations | [`event_dispatcher`], [`op_identity`] |
@@ -64,6 +64,7 @@ pub mod sandbox_state;
 pub mod scope_grant;
 pub mod session_event;
 pub mod session_grants;
+pub mod settings_origin;
 /// clap arguments for `ahma simplify`, shared by the CLI parser (`ahma_mcp`) and
 /// the analysis engine (`ahma_simplify`) so neither depends on the other.
 pub mod simplify_args;

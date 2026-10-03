@@ -915,6 +915,7 @@ fn arm_watchdog_if_test_launched() {
 }
 
 async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
+    log_startup_settings(&cfg);
     if !matches!(serve_args.transport, Some(ServeTransport::Stdio(_))) {
         arm_watchdog_if_test_launched();
     }
@@ -1715,6 +1716,45 @@ pub struct SettingsOriginCtx {
     /// provenance. Its rejection is reported at `warn` at startup instead
     /// (R-CFG2.2).
     pub project: Option<ProjectOrigin>,
+    /// What a server process logs about its settings at startup: one line per
+    /// setting that differs from the compiled-in default (R-CFG5.2) and one per
+    /// settings file others can write (R-CFG6.3). Computed by
+    /// [`build_app_config_with_settings`] while configuration is resolved, so
+    /// [`log_startup_settings`] only emits it and does no file I/O.
+    pub startup_lines: Vec<ahma_common::settings_origin::StartupLine>,
+}
+
+impl SettingsOriginCtx {
+    /// The user settings file in effect: `--settings-path`, else
+    /// `~/.ahma/settings.toml`; `None` under `--no-settings`. The same choice
+    /// [`load_settings`] makes, so every provenance surface names the file the
+    /// resolution actually read.
+    pub fn user_settings_file(&self) -> Option<PathBuf> {
+        if self.no_settings {
+            return None;
+        }
+        self.settings_path
+            .clone()
+            .or_else(ahma_common::config::settings_path)
+    }
+
+    /// This invocation's provenance inputs, for
+    /// [`resolve_origins`](ahma_common::settings_origin::resolve_origins).
+    pub fn provenance_inputs<'a>(
+        &'a self,
+        user_file: Option<&'a Path>,
+        user_toml: Option<&'a toml::Value>,
+    ) -> ahma_common::settings_origin::ProvenanceInputs<'a> {
+        ahma_common::settings_origin::ProvenanceInputs {
+            cli_overrides: &self.cli_overrides,
+            project: self
+                .project
+                .as_ref()
+                .map(|p| (p.path.as_path(), p.keys.as_slice())),
+            user_file,
+            user_toml,
+        }
+    }
 }
 
 /// Where a project settings file was, and which keys survived its trust filter.
@@ -1739,6 +1779,7 @@ pub fn settings_origin_ctx(cli: &Cli) -> SettingsOriginCtx {
         settings_path: cli.settings_path.clone(),
         cli_overrides,
         project,
+        startup_lines: Vec::new(),
     }
 }
 
@@ -1786,8 +1827,11 @@ fn collect_boolean_flag_overrides(cli: &Cli, out: &mut Vec<(&'static str, String
     if cli.log_to_stderr {
         out.push(("logging.target", "\"stderr\"".to_string()));
     }
+    // `{:?}`, the format the settings rows render values in: a flag that
+    // restates the default must compare equal to it, or the startup report
+    // (R-CFG5.2) would log `--async` as a deviation from `Async`.
     if let Some(mode) = cli_execution_mode(cli) {
-        out.push(("tools.execution_mode", format!("\"{mode}\"")));
+        out.push(("tools.execution_mode", format!("{mode:?}")));
     }
 }
 
@@ -3258,6 +3302,9 @@ pub fn build_app_config_with_settings(
     let small_model_harness = cli.small_model_harness || s.tools.small_model_harness;
     let mutex_groups = s.tools.mutex_groups.clone();
 
+    let mut settings_origin = settings_origin_ctx(cli);
+    settings_origin.startup_lines = startup_settings_lines(&s, &settings_origin);
+
     AppConfig {
         tools_dir,
         explicit_tools_dir,
@@ -3336,7 +3383,43 @@ pub fn build_app_config_with_settings(
         session_id: cli.session_id.clone(),
         client_pid: cli.client_pid,
         is_server_child: cli.server_child || std::env::var("AHMA_SERVER_CHILD").is_ok(),
-        settings_origin: settings_origin_ctx(cli),
+        settings_origin,
+    }
+}
+
+/// The startup settings report for this invocation (R-CFG5.2, R-CFG6.3): the
+/// effective settings' deviations from the compiled-in defaults, with their
+/// sources, then a warning for each settings file others can write.
+///
+/// Built from the same rows and the same provenance resolution as
+/// `ahma settings show --origin`, so the two cannot name different sources for
+/// one key.
+fn startup_settings_lines(
+    s: &ahma_common::config::AhmaSettings,
+    ctx: &SettingsOriginCtx,
+) -> Vec<ahma_common::settings_origin::StartupLine> {
+    use ahma_common::settings_origin::{resolve_origins, setting_rows, startup_settings_report};
+    let user_file = ctx.user_settings_file();
+    let rows = setting_rows(s, &ahma_common::config::AhmaSettings::default());
+    let origins = resolve_origins(&rows, &ctx.provenance_inputs(user_file.as_deref(), None));
+    let mut files: Vec<&Path> = user_file.iter().map(PathBuf::as_path).collect();
+    if let Some(project) = &ctx.project {
+        files.push(&project.path);
+    }
+    startup_settings_report(&origins, &files)
+}
+
+/// Log the startup settings report computed by `startup_settings_lines`:
+/// `warn` for Security-tier deviations and loose file permissions, `info` for
+/// the rest. Called once per server process — from `ahma serve` and from the
+/// hub — never from short-lived subcommands, whose output is not a server log.
+pub fn log_startup_settings(cfg: &AppConfig) {
+    use ahma_common::settings_origin::StartupLevel;
+    for line in &cfg.settings_origin.startup_lines {
+        match line.level {
+            StartupLevel::Warn => tracing::warn!("{}", line.message),
+            StartupLevel::Info => tracing::info!("{}", line.message),
+        }
     }
 }
 
@@ -5314,6 +5397,146 @@ mod tests {
             cfg.explicit_tools_dir,
             "--tools-dir must mark the tools dir explicit"
         );
+    }
+
+    // ─── startup settings report (R-CFG5.2, R-CFG6.3) ──────────────────────────
+
+    /// The report lines of `cfg` whose message names `key`.
+    fn startup_lines_for<'a>(
+        cfg: &'a AppConfig,
+        key: &str,
+    ) -> Vec<&'a ahma_common::settings_origin::StartupLine> {
+        let needle = format!(" {key} = ");
+        cfg.settings_origin
+            .startup_lines
+            .iter()
+            .filter(|l| l.message.contains(&needle))
+            .collect()
+    }
+
+    /// R-CFG5.2: every setting the files move off its default is reported once,
+    /// with its source and file path; the Security tier at `warn`.
+    #[test]
+    fn startup_report_names_file_deviations_with_source_and_tier() {
+        use ahma_common::settings_origin::StartupLevel;
+        let _guard = ENV_MUTEX.lock();
+        init_test();
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("settings.toml");
+        std::fs::write(
+            &file,
+            "[tools]\ntimeout_secs = 600\n[sandbox]\ntmp_access = true\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from([
+            "ahma",
+            "--settings-path",
+            file.to_str().unwrap(),
+            "--tools-dir",
+            tmp.path().join("no-project").to_str().unwrap(),
+            "serve",
+            "stdio",
+        ]);
+        let cfg = build_app_config(&cli);
+
+        let timeout = startup_lines_for(&cfg, "tools.timeout_secs");
+        assert_eq!(timeout.len(), 1, "{:?}", cfg.settings_origin.startup_lines);
+        assert_eq!(timeout[0].level, StartupLevel::Info);
+        assert!(
+            timeout[0]
+                .message
+                .contains(&format!("user ({})", file.display())),
+            "the source names the file: {}",
+            timeout[0].message
+        );
+
+        let tmp_access = startup_lines_for(&cfg, "sandbox.tmp_access");
+        assert_eq!(tmp_access.len(), 1);
+        assert_eq!(
+            tmp_access[0].level,
+            StartupLevel::Warn,
+            "a security-tier deviation must log at warn"
+        );
+
+        assert!(
+            startup_lines_for(&cfg, "tools.execution_mode").is_empty(),
+            "a setting left at its default is not reported"
+        );
+    }
+
+    /// A flag that changes a setting is reported with source `cli`; a flag that
+    /// restates the default is not a deviation, whatever format it renders in.
+    #[test]
+    fn startup_report_names_cli_deviations_and_skips_restated_defaults() {
+        use ahma_common::settings_origin::StartupLevel;
+        let _guard = ENV_MUTEX.lock();
+        init_test();
+        let tmp = tempdir().unwrap();
+        let cli = Cli::parse_from([
+            "ahma",
+            "--no-settings",
+            "--tools-dir",
+            tmp.path().to_str().unwrap(),
+            "--no-sandbox",
+            "--async",
+            "--timeout",
+            "1800",
+            "serve",
+            "stdio",
+        ]);
+        let cfg = build_app_config(&cli);
+
+        let disable = startup_lines_for(&cfg, "sandbox.disable");
+        assert_eq!(disable.len(), 1, "{:?}", cfg.settings_origin.startup_lines);
+        assert_eq!(disable[0].level, StartupLevel::Warn);
+        assert!(
+            disable[0].message.contains("from cli"),
+            "{}",
+            disable[0].message
+        );
+
+        assert!(
+            startup_lines_for(&cfg, "tools.execution_mode").is_empty(),
+            "--async restates the default: {:?}",
+            cfg.settings_origin.startup_lines
+        );
+        assert!(
+            startup_lines_for(&cfg, "tools.timeout_secs").is_empty(),
+            "--timeout 1800 restates the default"
+        );
+    }
+
+    /// R-CFG6.3: a settings file others can write is warned about at startup.
+    #[cfg(unix)] // needs PermissionsExt to set mode bits
+    #[test]
+    fn startup_report_warns_about_a_world_writable_settings_file() {
+        use ahma_common::settings_origin::StartupLevel;
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_MUTEX.lock();
+        init_test();
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("settings.toml");
+        std::fs::write(&file, "").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let cli = Cli::parse_from([
+            "ahma",
+            "--settings-path",
+            file.to_str().unwrap(),
+            "--tools-dir",
+            tmp.path().join("no-project").to_str().unwrap(),
+            "serve",
+            "stdio",
+        ]);
+        let cfg = build_app_config(&cli);
+        let perm: Vec<_> = cfg
+            .settings_origin
+            .startup_lines
+            .iter()
+            .filter(|l| l.message.contains("R-CFG6.3"))
+            .collect();
+        assert_eq!(perm.len(), 1, "{:?}", cfg.settings_origin.startup_lines);
+        assert_eq!(perm[0].level, StartupLevel::Warn);
+        assert!(perm[0].message.contains(&file.display().to_string()));
     }
 
     // ─── dispatch_subcommand bail arms (crate-split stubs) ────────────────────

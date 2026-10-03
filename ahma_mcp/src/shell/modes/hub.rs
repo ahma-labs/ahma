@@ -468,6 +468,9 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
         idle_timeout_secs,
         "ahma hub: serving the MCP endpoint and the event stream"
     );
+    // Once, now that this process is the hub that will serve (a hub that lost
+    // the startup race has already returned): R-CFG5.2, R-CFG6.3.
+    crate::shell::cli::log_startup_settings(&config);
 
     let hub_connections = hub.connection_count();
     let interrupted = Arc::new(parking_lot::Mutex::new(Vec::new()));
