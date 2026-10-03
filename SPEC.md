@@ -1653,7 +1653,7 @@ These are per-call arguments of the MCP request, never forwarded to the command 
 
 ### 8.3 Unified Shell Output
 
-- **R12.1**: All shell commands **must** redirect stderr to stdout (`2>&1`).
+- **R12.1**: All shell commands **must** redirect stderr to stdout (`2>&1`), for the **whole** script. A POSIX shell script is run as one group, `{ script` + newline + `} 2>&1`: appending ` 2>&1` to the text redirected only the last command, was swallowed by a trailing comment, and broke a heredoc whose terminator ended the script (`EOF 2>&1` terminates nothing). fish, PowerShell and cmd keep the plain suffix.
 - **R12.2**: AI clients receive single, chronologically ordered stream.
 
 ### 8.4 Cancellation Handling
