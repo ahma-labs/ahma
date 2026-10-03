@@ -147,6 +147,32 @@ tools:
 | Together AI | `https://api.together.xyz/v1` | `api_key` required |
 | Fireworks | `https://api.fireworks.ai/inference/v1` | `api_key` required |
 
+## Context window
+
+ahma sizes its conversation budgets and compaction to the model's context
+window. You rarely need to set it:
+
+1. **A size you configured wins**: `--context-length`, `[tools] context_length`
+   in `~/.ahma/settings.toml`, or a provider's `num_ctx` in `~/.ahma/config.toml`.
+2. **Otherwise ahma asks the server on this machine**, through each server's own
+   API, how much context it gives the model: Ollama (`/api/ps`, the size the
+   model is loaded with), LM Studio (`/api/v0/models`), llama.cpp (`/props`),
+   vLLM (`max_model_len`) and LiteLLM (`/model/info`). The TUI's context meter
+   shows the reported size.
+3. **Until the server states one** (Ollama states it once the model is loaded),
+   a model running on this machine is budgeted at 16,384 tokens and asked
+   again on the next turn.
+
+A model served on this machine also gets the small-model budgets: it reads
+every token of the prompt on local hardware. A LiteLLM proxy on localhost
+forwards the work elsewhere, so it keeps the normal budgets. Remote endpoints
+are never asked.
+
+Ollama's OpenAI-compatible `/v1` endpoint ignores `num_ctx` (checked against
+Ollama 0.35): the model loads at the server's own default whatever the request
+says. Until ahma speaks Ollama's own API, set Ollama's size on the server
+(`OLLAMA_CONTEXT_LENGTH`) and let ahma read it.
+
 ## Testing connectivity
 
 ```bash

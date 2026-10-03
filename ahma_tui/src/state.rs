@@ -2123,6 +2123,10 @@ pub struct AppState {
     /// `(base_url, num_ctx)` of the provider last looked up, so the header can
     /// show context fill each frame without re-reading the config file.
     pub ctx_window_cache: std::cell::RefCell<Option<(String, Option<u32>)>>,
+    /// `(base_url, tokens)`: the context size the model's own server reported
+    /// for the provider in use when the agent said it (`Status` phase
+    /// `context`). Used when nothing is configured.
+    pub server_context: Option<(String, u32)>,
     /// A model-list refresh the user asked for is in flight; its result may
     /// open the model picker. Unrequested refreshes never do.
     pub model_picker_requested: bool,
@@ -2447,8 +2451,9 @@ impl AppState {
 
     /// The model's context window in tokens: `--context-length`, else the
     /// selected provider's `num_ctx` from `~/.ahma/config.toml` (looked up
-    /// once per provider). `None` when neither says — a percentage of an
-    /// unknown whole is noise, so it is not guessed.
+    /// once per provider), else the size that provider's server reported.
+    /// `None` when none says — a percentage of an unknown whole is noise, so
+    /// it is not guessed.
     pub fn context_window(&self, base_url: &str) -> Option<u32> {
         if let Some(n) = self.token_prefs.context_length.filter(|&n| n > 0) {
             return Some(n);
@@ -2456,16 +2461,22 @@ impl AppState {
         if base_url.is_empty() {
             return None;
         }
+        let reported = || {
+            self.server_context
+                .as_ref()
+                .filter(|(url, _)| url == base_url)
+                .map(|&(_, n)| n)
+        };
         if let Some((url, n)) = self.ctx_window_cache.borrow().as_ref()
             && url == base_url
         {
-            return *n;
+            return n.or_else(reported);
         }
         let n = ahma_common::config::AhmaConfig::load()
             .num_ctx_for_base_url(base_url)
             .filter(|&n| n > 0);
         *self.ctx_window_cache.borrow_mut() = Some((base_url.to_string(), n));
-        n
+        n.or_else(reported)
     }
 
     /// True while the user is typing into the chat input. Gate keys (`y`/`a`/
@@ -2766,6 +2777,7 @@ impl AppState {
             server_down_since: None,
             hub_down_since: None,
             ctx_window_cache: std::cell::RefCell::new(None),
+            server_context: None,
             model_picker_requested: false,
             quit_armed_at: None,
             footer_hint: None,

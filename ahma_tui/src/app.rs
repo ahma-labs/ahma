@@ -2103,17 +2103,26 @@ fn resolve_token_prefs(state: &crate::state::AppState) -> (bool, bool, Option<u3
             if base_url.is_empty() {
                 None
             } else {
-                provider_num_ctx(&base_url).or_else(|| {
-                    if ahma_common::config::endpoint_supports_num_ctx(
-                        &base_url,
-                        ahma_common::config::ProviderKind::OpenAi,
-                    ) || ahma_llm_monitor::client::is_loopback_url(&base_url)
-                    {
-                        Some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX)
-                    } else {
-                        None
-                    }
-                })
+                provider_num_ctx(&base_url)
+                    .or_else(|| {
+                        // What the provider's own server reported (agent `context` status).
+                        state
+                            .server_context
+                            .as_ref()
+                            .filter(|(url, _)| *url == base_url)
+                            .map(|&(_, n)| n)
+                    })
+                    .or_else(|| {
+                        if ahma_common::config::endpoint_supports_num_ctx(
+                            &base_url,
+                            ahma_common::config::ProviderKind::OpenAi,
+                        ) || ahma_llm_monitor::client::is_loopback_url(&base_url)
+                        {
+                            Some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX)
+                        } else {
+                            None
+                        }
+                    })
             }
         });
     (minimize_tokens, small_model_harness, context_length)
@@ -5772,6 +5781,12 @@ fn handle_source_chat_event(
             state.chat_scroll = 0;
         }
         SourceEvent::ChatStatus { phase, detail } => {
+            // The size the model's server reported, for the provider in use.
+            if phase == "context"
+                && let (Some(url), Ok(n)) = (state.current_provider_url.clone(), detail.parse())
+            {
+                state.server_context = Some((url, n));
+            }
             if let Some(turn) = state.turn.as_mut() {
                 // Loading and reading only ever come before output; a late one
                 // must not pull a turn that is already writing back.
@@ -7920,6 +7935,35 @@ mod tests {
             !super::handle_intro_key(key(KeyCode::Esc), &mut state),
             "closed: not ours"
         );
+    }
+
+    /// The size the model's server reported fills the context meter, for
+    /// that provider only, and a configured size still wins over it.
+    #[test]
+    fn the_context_size_the_server_reported_fills_the_meter() {
+        use crate::mcp_source::SourceEvent;
+        use crate::state::{AppState, ChatTurn};
+
+        let url = "http://localhost:11434/v1";
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.current_provider_url = Some(url.into());
+        state.turn = Some(ChatTurn::new(None));
+        assert_eq!(state.context_window(url), None, "nothing known yet");
+        super::handle_source_chat_event(
+            SourceEvent::ChatStatus {
+                phase: "context".into(),
+                detail: "12288".into(),
+            },
+            &mut state,
+        );
+        assert_eq!(state.context_window(url), Some(12_288));
+        assert_eq!(
+            state.context_window("http://localhost:1234/v1"),
+            None,
+            "another provider's size is not this one's"
+        );
+        state.token_prefs.context_length = Some(4096);
+        assert_eq!(state.context_window(url), Some(4096), "configured wins");
     }
 
     /// A dropped connection before any answer is retried once, visibly; a

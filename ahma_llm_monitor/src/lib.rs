@@ -16,7 +16,7 @@ pub mod tool_names;
 
 pub use client::{
     ApiFlavor, ChatCompletionResponse, ChatMessage, ChatRole, ChatToolCall, LlmClient,
-    LocalProvider,
+    LocalProvider, ModelServer, ServerContext,
 };
 pub use discovery::discover_local_providers;
 pub use error::{ApiErrorKind, LlmMonitorError, llm_service_name};
