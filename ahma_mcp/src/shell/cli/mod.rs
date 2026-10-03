@@ -118,7 +118,7 @@ pub struct AppConfig {
     pub execution_mode_cli: Option<ahma_common::config::ExecutionPolicy>,
     /// Skip tool availability probes at startup (AHMA_SKIP_PROBES=1).
     pub skip_availability_probes: bool,
-    /// Enable output compression and token minimization (AHMA_MINIMIZE_TOKENS=1).
+    /// Append a conciseness rule to the chat system prompt (`--minimize-tokens`).
     pub minimize_tokens: bool,
     /// Enable small-model harness adaptations (AHMA_SMALL_MODEL_HARNESS=1).
     pub small_model_harness: bool,

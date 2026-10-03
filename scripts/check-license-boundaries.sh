@@ -20,7 +20,6 @@ PERMISSIVE_CRATES=(
   ahma_vault
   ahma_log_monitor
   ahma_harness_guard
-  ahma_output_optimizer
   ahma_simplify
   ahma_test_support
   ahma_harness_tools

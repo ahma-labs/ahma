@@ -197,7 +197,6 @@ PROTOCOL_DIRS=(
   ahma_mcp/src/adapter
   ahma_mcp/src/sandbox
   ahma_mcp/src/livelog
-  ahma_output_optimizer/src
   ahma_http_bridge/src
 )
 STDOUT_VIOLATIONS=$(grep -rn --include='*.rs' -E '(^|[^a-z_])print(ln)?!' "${PROTOCOL_DIRS[@]}" 2>/dev/null \

@@ -4,7 +4,7 @@
 * **License**: MIT OR Apache-2.0
 * **Depends on**: `ahma_common` and the feature crates `ahma_bundle`, `ahma_harness_guard`,
   `ahma_harness_tools`, `ahma_http_bridge`, `ahma_http_mcp_client`, `ahma_llm_monitor`,
-  `ahma_log_monitor`, `ahma_output_optimizer`, `ahma_update`, `ahma_vault`
+  `ahma_log_monitor`, `ahma_update`, `ahma_vault`
 * **Used by**: `ahma_core`, `ahma_tui`, `ahma_bin`, `generate_tool_schema`
 
 ## 1. User Story / Problem Statement
@@ -93,5 +93,5 @@ product rules this crate implements; the list below is what this crate must guar
 - Serving MCP over a network socket — that is `ahma_http_bridge`, which this crate embeds
   for `ahma serve http|unix`.
 - The TUI and the chat agent loop (`ahma_tui`, `ahma_core`).
-- Server-side output minimization. `--minimize-tokens` affects only the TUI chat prompt;
-  `ahma_output_optimizer`'s streaming stage is present in the adapter but never enabled.
+- Server-side output minimization: command output is redacted and bounded, never rewritten.
+  `--minimize-tokens` only appends a conciseness rule to the chat system prompt.

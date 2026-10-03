@@ -568,7 +568,7 @@ impl SettingsEditor {
             SettingItem {
                 key: "tools.minimize_tokens",
                 label: "Minimize tokens",
-                description: "Output compression and token minimization",
+                description: "Append a conciseness rule to the system prompt",
                 value: SettingValue::Bool(t.minimize_tokens),
                 default_value: SettingValue::Bool(d.minimize_tokens),
                 security_tier: false,
