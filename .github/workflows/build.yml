@@ -943,6 +943,16 @@ jobs:
       id-token: write      # for Sigstore OIDC token (GitHub attestation)
       attestations: write  # to write SLSA provenance to GitHub's attestation API
       contents: read       # for checkout
+    # Developer-ID signing + notarization of the macOS binary (SPEC R-SIGN.1) switches on by
+    # itself when the maintainer adds the repository secrets listed in
+    # docs/release-signing.md, and is a no-op until then. A step's `if:` cannot read the
+    # `secrets` context, so the job carries a *flag* derived from it -- "true"/"false", never
+    # the secret. The secrets themselves are handed only to the one step that signs. Putting
+    # them in job-level env would export the Developer ID private key to every step of this
+    # job, including `cargo build`, which runs the build script and proc-macros of every
+    # third-party crate in the graph.
+    env:
+      APPLE_DEVELOPER_ID_SIGNING: ${{ secrets.APPLE_DEVELOPER_ID_P12 != '' }}
     defaults:
       run:
         shell: bash
@@ -1113,6 +1123,148 @@ jobs:
           # Disable sccache for cross builds (incompatible with cross's Docker containers)
           unset RUSTC_WRAPPER
           cross build --release --locked --target ${{ matrix.target }} -p ahma_bin --features otel
+
+      # ── Developer-ID signing + notarization (SPEC R-SIGN.1) ─────────────────────────────
+      # ORDER IS LOAD-BEARING. Signing rewrites the Mach-O's signature blob, so it changes
+      # the binary's bytes and therefore its sha256. It must happen here -- after the build,
+      # before "Package release binaries" copies the binary into dist/, writes its
+      # SHA256SUMS, archives it, and before "Attest build provenance" records those digests.
+      # `ahma update` and `ahma verify --self` look attestations up BY DIGEST
+      # (ahma_update/src/verify.rs); a binary modified after attestation would have no
+      # attestation at all. Notarization does not modify the file (a bare Mach-O cannot be
+      # stapled), but it runs here too, so a rejected binary never reaches upload or attest.
+      - name: Developer-ID signing skipped (secrets not configured)
+        if: runner.os == 'macOS' && env.APPLE_DEVELOPER_ID_SIGNING != 'true'
+        run: |
+          echo "::notice::Developer-ID signing skipped: APPLE_DEVELOPER_ID_P12 not set (SPEC R-SIGN.1)"
+
+      - name: Developer-ID sign and notarize (macOS)
+        if: runner.os == 'macOS' && env.APPLE_DEVELOPER_ID_SIGNING == 'true'
+        # notarytool --wait usually returns in minutes, but Apple's queue occasionally takes
+        # much longer. Bounded so a stuck submission fails the leg instead of holding the
+        # runner for the 6-hour job default; re-running the failed leg rebuilds and resubmits.
+        timeout-minutes: 60
+        env:
+          BIN: target/${{ matrix.target }}/release/ahma
+          SIGN_DIR: ${{ runner.temp }}/ahma-signing
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_DEVELOPER_ID_NAME: ${{ secrets.APPLE_DEVELOPER_ID_NAME }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+
+          # A half-configured secret set is a mistake, not an opt-out: signing without
+          # notarizing would ship a binary Gatekeeper still rejects. Fail loudly, naming
+          # every missing secret at once.
+          missing=0
+          for var in APPLE_DEVELOPER_ID_P12 APPLE_DEVELOPER_ID_P12_PASSWORD APPLE_DEVELOPER_ID_NAME \
+                     APPLE_NOTARY_KEY_P8 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::APPLE_DEVELOPER_ID_P12 is set but ${var} is not. Developer-ID signing needs all six secrets (docs/release-signing.md, SPEC R-SIGN.1)."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          rm -rf "$SIGN_DIR"
+          mkdir -p "$SIGN_DIR"
+          chmod 700 "$SIGN_DIR"
+          keychain="$SIGN_DIR/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          echo "::add-mask::${keychain_password}"
+
+          # Throwaway keychain holding only the Developer ID identity. The key partition list
+          # lets codesign use the private key without a UI prompt, which on a headless runner
+          # would otherwise hang until the step times out. The keychain is prepended to the
+          # user search list (keeping the existing entries) so the timestamp/chain lookups
+          # that codesign does by name also see it.
+          printf '%s' "$APPLE_DEVELOPER_ID_P12" | tr -d '\r\n ' | base64 --decode > "$SIGN_DIR/developer-id.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$SIGN_DIR/developer-id.p12" -k "$keychain" -f pkcs12 \
+            -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$SIGN_DIR/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain" > /dev/null
+          existing_keychains=()
+          while IFS= read -r kc; do
+            kc="${kc#"${kc%%[![:space:]]*}"}"
+            kc="${kc//\"/}"
+            [ -n "$kc" ] && existing_keychains+=("$kc")
+          done < <(security list-keychains -d user)
+          # The `+` form keeps `set -u` quiet on an empty list under macOS's bash 3.2.
+          security list-keychains -d user -s "$keychain" ${existing_keychains[@]+"${existing_keychains[@]}"}
+
+          identities="$(security find-identity -v -p codesigning "$keychain")"
+          if ! grep -qF "$APPLE_DEVELOPER_ID_NAME" <<< "$identities"; then
+            echo "::error::No valid code-signing identity named '${APPLE_DEVELOPER_ID_NAME}' in APPLE_DEVELOPER_ID_P12. Identities found:"
+            echo "$identities"
+            exit 1
+          fi
+
+          # Hardened runtime (--options runtime) is what notarization requires, and what
+          # R-SIGN.1 needs for code-page re-validation under memory pressure. --timestamp
+          # takes a secure timestamp from Apple's TSA; notarization rejects a signature
+          # without one.
+          codesign --force --options runtime --timestamp --keychain "$keychain" \
+            --sign "$APPLE_DEVELOPER_ID_NAME" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          signature_details="$(codesign --display --verbose=4 "$BIN" 2>&1)"
+          echo "$signature_details"
+          if ! grep -q '^Authority=Developer ID Application' <<< "$signature_details"; then
+            echo "::error::$BIN is not signed by a Developer ID Application certificate. Apple notarizes only Developer ID signatures."
+            exit 1
+          fi
+          if ! grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]*\(.*runtime' <<< "$signature_details"; then
+            echo "::error::$BIN was signed without the hardened runtime flag."
+            exit 1
+          fi
+
+          # Notarize. notarytool accepts a zip, not a bare Mach-O; the zip is only the
+          # submission envelope and is not published. Apple notarizes the binary inside it,
+          # by its code-directory hash, so the ticket matches the very file packaged below.
+          key_file="$SIGN_DIR/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          printf '%s' "$APPLE_NOTARY_KEY_P8" | tr -d '\r\n ' | base64 --decode > "$key_file"
+          chmod 600 "$key_file"
+          notary_auth=(--key "$key_file" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID")
+          submission_zip="$SIGN_DIR/ahma-notarize.zip"
+          ditto -c -k --keepParent "$BIN" "$submission_zip"
+
+          result_plist="$SIGN_DIR/notary-result.plist"
+          notary_rc=0
+          xcrun notarytool submit "$submission_zip" "${notary_auth[@]}" \
+            --wait --timeout 50m --output-format plist > "$result_plist" || notary_rc=$?
+          submission_id="$(plutil -extract id raw -o - "$result_plist" 2>/dev/null || true)"
+          status="$(plutil -extract status raw -o - "$result_plist" 2>/dev/null || true)"
+          echo "notarytool exit=${notary_rc} submission=${submission_id:-<none>} status=${status:-<none>}"
+
+          if [ "$status" != "Accepted" ]; then
+            if [ -n "$submission_id" ]; then
+              echo "Notarization log for ${submission_id}:"
+              xcrun notarytool log "$submission_id" "${notary_auth[@]}" || true
+            else
+              cat "$result_plist" || true
+            fi
+            echo "::error::Notarization of $BIN was not Accepted (status: ${status:-unknown}, notarytool exit ${notary_rc}). The release leg fails rather than ship an un-notarized binary (SPEC R-SIGN.1)."
+            exit 1
+          fi
+
+          # No `stapler staple`: a bare Mach-O has nowhere to hold a ticket (stapling works
+          # only for .app/.pkg/.dmg). Gatekeeper finds the ticket online, by the binary's
+          # code-directory hash, the first time a quarantined copy is launched.
+          echo "::notice::Developer-ID signed and notarized ${BIN} (submission ${submission_id})"
+
+      - name: Remove signing keychain
+        if: always() && runner.os == 'macOS' && env.APPLE_DEVELOPER_ID_SIGNING == 'true'
+        env:
+          SIGN_DIR: ${{ runner.temp }}/ahma-signing
+        run: |
+          security delete-keychain "$SIGN_DIR/signing.keychain-db" 2> /dev/null || true
+          rm -rf "$SIGN_DIR"
 
       - name: Package release binaries
         id: package
