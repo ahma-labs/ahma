@@ -220,17 +220,7 @@ pub async fn run(
                                 && state.log_files_selected().is_none()
                             {
                                 handle_page_up_down(key.code == crossterm::event::KeyCode::PageUp, &mut state);
-                            } else if handle_settings_key(key, &mut state)
-                                || handle_help_key(key, &mut state)
-                                || handle_picker_key(key, &mut state)
-                                || handle_trust_key(key, &mut state)
-                                || handle_doctor_confirm_key(key, &mut state)
-                                || handle_intro_key(key, &mut state)
-                                || handle_scope_grant_key(key, &mut state)
-                                || handle_web_approval_key(key, &mut state)
-                                || handle_approval_key(key, &mut state)
-                                || handle_chat_input_key(key, &mut state)
-                            {
+                            } else if handle_overlay_key(key, &mut state) {
                                 // handled directly by an overlay/editor widget
                             } else {
                                 let action = map_key(
@@ -2425,6 +2415,24 @@ fn handle_intro_key(key: crossterm::event::KeyEvent, state: &mut crate::state::A
         _ => {}
     }
     true
+}
+
+/// Offer `key` to every overlay and editor that takes keys, topmost first: the
+/// order matches `ui::draw`, so the overlay a key reaches is the one on screen.
+/// The trust and doctor questions are drawn over grant questions; grant
+/// questions are drawn over help, settings and every other modal (SPEC
+/// R-PERM.3.8), so Esc denies a grant instead of closing help beneath it.
+fn handle_overlay_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
+    handle_trust_key(key, state)
+        || handle_doctor_confirm_key(key, state)
+        || handle_scope_grant_key(key, state)
+        || handle_web_approval_key(key, state)
+        || handle_settings_key(key, state)
+        || handle_help_key(key, state)
+        || handle_picker_key(key, state)
+        || handle_intro_key(key, state)
+        || handle_approval_key(key, state)
+        || handle_chat_input_key(key, state)
 }
 
 fn handle_help_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
@@ -6710,6 +6718,19 @@ fn scroll_log(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) 
 }
 
 fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
+    // A grant question is drawn over everything, so the wheel scrolls its body
+    // wherever the pointer is (SPEC R-PERM.3.8). Scrolling answers nothing.
+    let line = crossterm::event::KeyEvent::new(
+        if up {
+            crossterm::event::KeyCode::Up
+        } else {
+            crossterm::event::KeyCode::Down
+        },
+        crossterm::event::KeyModifiers::NONE,
+    );
+    if scroll_grant_body(line, state) {
+        return;
+    }
     if state.settings_editor.open {
         if up {
             state.settings_editor.item_up();
@@ -8166,6 +8187,53 @@ mod tests {
         super::handle_page_up_down(false, &mut state);
         assert!(state.scope_grant.as_ref().unwrap().scroll > 0);
         assert!(state.scope_grant.is_some());
+    }
+
+    /// A grant question is drawn over help and settings, so it takes the keys
+    /// first (SPEC R-PERM.3.8): Esc denies it rather than closing what lies
+    /// underneath, and the overlay below is still there afterwards.
+    #[test]
+    fn a_grant_question_over_help_or_settings_takes_the_keys() {
+        use crate::state::{AppState, ModalState};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.modal = ModalState::Help;
+        state.scope_grant = Some(test_scope_grant_gate());
+        assert!(super::handle_overlay_key(esc, &mut state));
+        assert!(state.scope_grant.is_none(), "Esc denied the grant on top");
+        assert!(state.is_help_open(), "help, underneath, is untouched");
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.settings_editor.open = true;
+        state.web_approval = Some(test_web_approval_gate());
+        assert!(super::handle_overlay_key(esc, &mut state));
+        assert!(state.web_approval.is_none(), "Esc denied the web question");
+        assert!(state.settings_editor.open);
+    }
+
+    /// The mouse wheel scrolls an open grant question's body, wherever the
+    /// pointer is: the question is drawn over everything (SPEC R-PERM.3.8).
+    #[test]
+    fn the_mouse_wheel_scrolls_the_grant_body() {
+        use crate::state::AppState;
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        let mut gate = fresh_scope_grant_gate();
+        gate.show_detail = true;
+        state.scope_grant = Some(gate);
+        draw_frame(&state, 80, 24);
+        assert!(state.scope_grant.as_ref().unwrap().view.get().max_scroll > 1);
+
+        for _ in 0..2 {
+            super::handle_mouse_scroll(0, 0, false, &mut state);
+            draw_frame(&state, 80, 24);
+        }
+        assert_eq!(state.scope_grant.as_ref().unwrap().scroll, 2);
+        super::handle_mouse_scroll(0, 0, true, &mut state);
+        assert_eq!(state.scope_grant.as_ref().unwrap().scroll, 1);
+        assert!(state.scope_grant.is_some(), "the wheel answers nothing");
     }
 
     /// The `--tmp` question offers no saved answer (SPEC R5.2.5): its `always`
