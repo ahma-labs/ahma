@@ -88,6 +88,10 @@ What keeps secrets unreadable on macOS is therefore an explicit **denylist**, no
 
 > **A denylist is a weaker guarantee than a scope, and is worth reading as one.** A scope denies everything it does not name; a denylist denies only what it *does* name, so any secret nobody thought to enumerate is readable. It is the best available answer on this platform — not an equivalent of the Linux position above.
 
+#### Git authentication: HTTPS through `gh`, or SSH through the agent
+
+Private key files (`~/.ssh/id_*`) are unreadable inside the sandbox, so `git push`/`fetch` over SSH fails with `Permission denied (publickey)` unless the key is already loaded into the SSH agent on the host (`ssh-add --apple-use-keychain ~/.ssh/id_ed25519` on macOS); the agent's socket is forwarded. The simplest way through is HTTPS with the GitHub CLI's credentials, which live in the keychain and work inside the sandbox: run `gh auth setup-git` once, then `git remote set-url origin https://github.com/<owner>/<repo>.git` in each repository. ahma names both when it sees the SSH refusal.
+
 #### Keychain access (`gh auth` / `git-credential-osxkeychain`)
 
 The login **keychain** (`~/Library/Keychains`) is **allowed by default** (read + write, plus the `com.apple.security*` preference plists). This is what lets `gh`, `git-credential-osxkeychain`, and other Keychain-backed credential helpers work under the sandbox.
