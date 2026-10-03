@@ -1501,6 +1501,12 @@ lifetime.
     retries a call refused as not connected (`WSAENOTCONN`) until the accept lands (bounded),
     and never takes that refusal for the end of the stream: a lost half-close leaves the
     server waiting for the end of a request and the client waiting for the answer, forever.
+  - **Dropping a connection closes it.** When either end drops its `LocalStream`, everything it
+    wrote is sent, the stream is half-closed, and the socket is closed — whether or not the
+    peer ever sends or closes anything. A peer that waits for the end of a reply (the hub's
+    `400`/`404`) gets it, and a quiet peer costs no thread and no socket once dropped. On
+    Windows the bridge's receiving thread is blocked in `recv`, which `shutdown` does not wake,
+    so it is cancelled (`CancelIoEx`) once the caller is gone and the send side has finished.
   - **The ownership check binds the directory ahma chose, not one it was handed.** An
     operator-named `--unix-socket-path` (or `[http] unix_socket_path`) is a deliberate
     placement decision and is honoured; where its directory is writable by others *and* lacks

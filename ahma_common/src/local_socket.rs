@@ -23,6 +23,12 @@
 //! the server waiting for an end of request that never comes and the client
 //! waiting for an answer to it.
 //!
+//! Dropping a [`LocalStream`] closes the connection on every OS, whether or not
+//! the peer ever sends or closes anything (SPEC R-HUB.2). On Windows that takes
+//! more than letting go of the socket: the receiving thread is blocked in
+//! `recv`, which no `shutdown` wakes, so the bridge sends what was written,
+//! half-closes, and then cancels that receive (`CancelIoEx`).
+//!
 //! Neither type removes the socket file: whoever owns the rendezvous (the hub,
 //! holding `hub.lock`) unlinks a stale file before [`LocalListener::bind`] and
 //! after dropping the listener.
@@ -174,6 +180,550 @@ mod not_connected {
     }
 }
 
+/// The Windows bridge between one blocking socket and async callers. It is
+/// written against a `BlockingSocket` trait rather than `socket2` so that
+/// its lifecycle — above all, that dropping the stream closes the socket — is
+/// tested on every OS, not only on the one that ships it.
+#[cfg(any(windows, test))]
+mod bridge {
+    use std::{
+        io,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+        time::{Duration, Instant},
+    };
+
+    use parking_lot::{Condvar, Mutex, MutexGuard};
+    use tokio::{
+        io::{
+            AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf,
+            WriteHalf,
+        },
+        runtime::Handle,
+    };
+
+    use super::not_connected;
+
+    /// Per-direction copy buffer, and the in-memory pipe's capacity.
+    const BUF: usize = 64 * 1024;
+
+    /// Pause between attempts to abort a receive. An abort reaches only a
+    /// receive already in progress (see [`BlockingSocket::abort_recv`]), so one
+    /// that lands just before the receiving thread blocks is repeated.
+    const ABORT_RETRY: Duration = Duration::from_millis(20);
+
+    /// How long a receive that will not wake is aborted before it is left
+    /// blocked, holding the socket until the peer acts — what happened to every
+    /// dropped connection before aborting existed.
+    const ABORT_GRACE: Duration = Duration::from_secs(5);
+
+    /// The blocking calls the bridge makes on its socket.
+    pub(super) trait BlockingSocket: Send + Sync + 'static {
+        fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+        fn send(&self, data: &[u8]) -> io::Result<usize>;
+        fn shutdown_write(&self) -> io::Result<()>;
+        /// Make a `recv` blocked in another thread return, with anything.
+        ///
+        /// Called only once the caller has dropped the stream, so whatever that
+        /// receive would have produced is discarded anyway. It need not affect
+        /// a `recv` that starts afterwards: the bridge repeats it until the
+        /// receiving thread has finished. A `shutdown` is not enough on
+        /// Windows: it does not wake a `recv` blocked in another thread.
+        fn abort_recv(&self) -> io::Result<()>;
+    }
+
+    #[derive(Default)]
+    struct State {
+        /// The caller dropped its end of the stream.
+        caller_gone: bool,
+        /// The receiving thread is to stop; set only once `caller_gone`.
+        abort: bool,
+        /// The receiving thread has finished: it read the peer's end of
+        /// stream or an error, or it was aborted.
+        rx_done: bool,
+    }
+
+    /// What the caller's stream and the two relay threads tell each other.
+    #[derive(Default)]
+    struct Lifecycle {
+        state: Mutex<State>,
+        changed: Condvar,
+    }
+
+    impl Lifecycle {
+        fn update(&self, f: impl FnOnce(&mut State)) {
+            f(&mut self.state.lock());
+            self.changed.notify_all();
+        }
+
+        fn aborting(&self) -> bool {
+            self.state.lock().abort
+        }
+
+        fn rx_done(&self) -> bool {
+            self.state.lock().rx_done
+        }
+    }
+
+    /// The caller's end of a bridged connection: an in-memory pipe to the two
+    /// relay threads, which also tells them when the caller lets go of it.
+    pub(super) struct BridgedStream {
+        pipe: DuplexStream,
+        lifecycle: Arc<Lifecycle>,
+    }
+
+    impl Drop for BridgedStream {
+        /// Runs before `pipe` is dropped, so the relay that sees the pipe close
+        /// already knows the caller is gone rather than merely half-closed.
+        fn drop(&mut self) {
+            self.lifecycle.update(|s| s.caller_gone = true);
+        }
+    }
+
+    impl AsyncRead for BridgedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.pipe).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for BridgedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.pipe).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.pipe).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.pipe).poll_shutdown(cx)
+        }
+    }
+
+    /// Serve a blocking socket to async code: one thread copies socket →
+    /// caller, one copies caller → socket, both through a duplex pipe whose
+    /// other end is what the caller gets. EOF and errors propagate as a
+    /// half-close in the same direction, so `shutdown()` and `read_to_end()`
+    /// behave as they do on a tokio socket.
+    ///
+    /// Either thread may run before the listener has accepted the connection
+    /// (a client that connects, writes and half-closes at once), so a call
+    /// refused as not connected is retried, never taken for the end of the
+    /// stream (SPEC R-HUB.2). Taking it for the end loses the request or its
+    /// half-close, and both ends then wait on each other forever.
+    ///
+    /// Dropping the stream closes the socket once everything written before
+    /// the drop has been sent and half-closed, whether or not the peer ever
+    /// sends or closes anything (SPEC R-HUB.2). The socket is shared by the two
+    /// threads and closes when the second lets go of it.
+    pub(super) fn bridge<S: BlockingSocket>(sock: S, rt: Handle) -> io::Result<BridgedStream> {
+        let (caller, ours) = tokio::io::duplex(BUF);
+        let (from_caller, to_caller) = tokio::io::split(ours);
+        let sock = Arc::new(sock);
+        let lifecycle = Arc::new(Lifecycle::default());
+
+        let rx = {
+            let (sock, lifecycle, rt) = (Arc::clone(&sock), Arc::clone(&lifecycle), rt.clone());
+            move || receive(&*sock, to_caller, &lifecycle, &rt)
+        };
+        std::thread::Builder::new()
+            .name("ahma-local-rx".into())
+            .spawn(rx)?;
+
+        let tx = {
+            let lifecycle = Arc::clone(&lifecycle);
+            move || transmit(&*sock, from_caller, &lifecycle, &rt)
+        };
+        std::thread::Builder::new()
+            .name("ahma-local-tx".into())
+            .spawn(tx)?;
+
+        Ok(BridgedStream {
+            pipe: caller,
+            lifecycle,
+        })
+    }
+
+    /// Socket → caller, until the peer ends its stream, the socket fails, or
+    /// [`transmit`] aborts the receive because the caller is gone.
+    fn receive<S: BlockingSocket>(
+        sock: &S,
+        mut to_caller: WriteHalf<DuplexStream>,
+        lifecycle: &Lifecycle,
+        rt: &Handle,
+    ) {
+        let mut buf = vec![0u8; BUF];
+        let mut forwarding = true;
+        while !lifecycle.aborting() {
+            let read = not_connected::retry(
+                not_connected::GRACE,
+                || lifecycle.aborting(),
+                || sock.recv(&mut buf),
+            );
+            let n = match read {
+                Ok(0) => break,
+                Ok(n) => n,
+                // An aborted receive may report itself as interrupted; the
+                // loop condition tells the two apart.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    if !lifecycle.aborting() {
+                        tracing::debug!(error = %e, "local socket: receive failed");
+                    }
+                    break;
+                }
+            };
+            // Once the caller is gone, keep reading and discarding until
+            // aborted rather than stopping: closing a socket with unread data
+            // in it can reset the connection, and a reset can destroy the
+            // reply still on its way to the peer.
+            if forwarding && rt.block_on(to_caller.write_all(&buf[..n])).is_err() {
+                forwarding = false;
+            }
+        }
+        lifecycle.update(|s| s.rx_done = true);
+        let _ = rt.block_on(to_caller.shutdown());
+    }
+
+    /// Caller → socket, then the end of the connection: once the caller's
+    /// last bytes are sent and the half-close is made, wait for the caller to
+    /// drop the stream and abort the receive, so that the socket closes even
+    /// when the peer never acts.
+    fn transmit<S: BlockingSocket>(
+        sock: &S,
+        mut from_caller: ReadHalf<DuplexStream>,
+        lifecycle: &Lifecycle,
+        rt: &Handle,
+    ) {
+        let mut buf = vec![0u8; BUF];
+        let relayed = loop {
+            match rt.block_on(from_caller.read(&mut buf)) {
+                Ok(0) => break Ok(()),
+                Ok(n) => {
+                    if let Err(e) = send_all(sock, &buf[..n], || lifecycle.rx_done()) {
+                        break Err(e);
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        let closed = match relayed {
+            Ok(()) => half_close(sock, || lifecycle.rx_done()),
+            Err(e) => {
+                tracing::debug!(error = %e, "local socket: send failed");
+                sock.shutdown_write()
+            }
+        };
+        if let Err(e) = closed {
+            tracing::debug!(error = %e, "local socket: half-close failed");
+        }
+        abort_receive_once_the_caller_is_gone(sock, lifecycle);
+    }
+
+    fn abort_receive_once_the_caller_is_gone<S: BlockingSocket>(sock: &S, lifecycle: &Lifecycle) {
+        let mut state = lifecycle.state.lock();
+        while !state.caller_gone && !state.rx_done {
+            lifecycle.changed.wait(&mut state);
+        }
+        if state.rx_done {
+            return;
+        }
+        state.abort = true;
+        let deadline = Instant::now() + ABORT_GRACE;
+        while !state.rx_done {
+            if Instant::now() >= deadline {
+                tracing::debug!(
+                    "local socket: a blocked receive did not abort; the socket stays open until the peer closes it"
+                );
+                return;
+            }
+            if let Err(e) = MutexGuard::unlocked(&mut state, || sock.abort_recv()) {
+                tracing::debug!(error = %e, "local socket: aborting the receive failed");
+            }
+            lifecycle.changed.wait_for(&mut state, ABORT_RETRY);
+        }
+    }
+
+    /// Send all of `data`, retrying a send refused because the listener has
+    /// not accepted the connection yet. Once `give_up()` — the peer has been
+    /// heard to finish or fail — that refusal is final.
+    pub(super) fn send_all<S: BlockingSocket>(
+        sock: &S,
+        mut data: &[u8],
+        give_up: impl Fn() -> bool,
+    ) -> io::Result<()> {
+        while !data.is_empty() {
+            match not_connected::retry(not_connected::GRACE, &give_up, || sock.send(data)) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => data = &data[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Half-close the connection, with the same retry as [`send_all`]: the
+    /// end of a request is as much a part of it as its bytes.
+    pub(super) fn half_close<S: BlockingSocket>(
+        sock: &S,
+        give_up: impl Fn() -> bool,
+    ) -> io::Result<()> {
+        not_connected::retry(not_connected::GRACE, give_up, || sock.shutdown_write())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::timeouts::{TestTimeouts, TimeoutCategory};
+        use std::{
+            io::{Read, Write},
+            net::Shutdown,
+        };
+
+        fn quick() -> Duration {
+            TestTimeouts::get(TimeoutCategory::Quick)
+        }
+
+        /// A runtime for the bridge's threads to drive the in-memory pipe
+        /// with; the test itself runs on a plain thread.
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime")
+        }
+
+        /// A socket whose half-close never reaches the peer, so the peer can
+        /// learn that the stream ended only from the socket being closed.
+        struct LossyFin<S>(S);
+
+        impl<S: BlockingSocket> BlockingSocket for LossyFin<S> {
+            fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+                self.0.recv(buf)
+            }
+            fn send(&self, data: &[u8]) -> io::Result<usize> {
+                self.0.send(data)
+            }
+            fn shutdown_write(&self) -> io::Result<()> {
+                Ok(())
+            }
+            fn abort_recv(&self) -> io::Result<()> {
+                self.0.abort_recv()
+            }
+        }
+
+        #[cfg(unix)]
+        type Sock = std::os::unix::net::UnixStream;
+
+        /// Test-only: the production Unix path is tokio's own socket.
+        #[cfg(unix)]
+        impl BlockingSocket for Sock {
+            fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+                let mut this = self;
+                this.read(buf)
+            }
+            fn send(&self, data: &[u8]) -> io::Result<usize> {
+                let mut this = self;
+                this.write(data)
+            }
+            fn shutdown_write(&self) -> io::Result<()> {
+                self.shutdown(Shutdown::Write)
+            }
+            /// Unlike on Windows, `shutdown(Read)` wakes a blocked `recv` here
+            /// (and every later one returns at once), and it sends the peer
+            /// nothing it could read as the end of the stream.
+            fn abort_recv(&self) -> io::Result<()> {
+                self.shutdown(Shutdown::Read)
+            }
+        }
+
+        /// Ours, the peer's, and whatever must outlive them.
+        #[cfg(unix)]
+        fn connected_pair() -> (Option<tempfile::TempDir>, Sock, Sock) {
+            let (ours, peer) = Sock::pair().expect("socket pair");
+            (None, ours, peer)
+        }
+
+        #[cfg(windows)]
+        type Sock = socket2::Socket;
+
+        /// Ours (accepted, as the hub's side is), the peer's, and the
+        /// directory holding the socket file.
+        #[cfg(windows)]
+        fn connected_pair() -> (Option<tempfile::TempDir>, Sock, Sock) {
+            use socket2::{Domain, SockAddr, Type};
+            let dir = tempfile::tempdir().unwrap();
+            let addr = SockAddr::unix(dir.path().join("t.sock")).unwrap();
+            let new = || Sock::new(Domain::UNIX, Type::STREAM, None).unwrap();
+            let listener = new();
+            listener.bind(&addr).unwrap();
+            listener.listen(1).unwrap();
+            let peer = new();
+            peer.connect(&addr).unwrap();
+            let (ours, _) = listener.accept().unwrap();
+            (Some(dir), ours, peer)
+        }
+
+        /// Dropping the stream closes the socket even when nothing else would:
+        /// the half-close is lost and the peer never sends or closes anything.
+        /// The reply written just before the drop still arrives, then the end
+        /// of the stream. Before this, the receiving thread stayed blocked in
+        /// `recv`, holding the socket open, until the peer acted — one thread
+        /// and one socket leaked for each client that went quiet after the
+        /// hub's last reply, and a peer waiting for our end waited forever.
+        #[test]
+        fn a_dropped_stream_closes_its_socket_even_if_the_half_close_is_lost() {
+            let rt = runtime();
+            let (_dir, ours, peer) = connected_pair();
+            let reply = b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
+            let mut stream = bridge(LossyFin(ours), rt.handle().clone()).expect("bridge");
+            rt.block_on(stream.write_all(reply))
+                .expect("write the reply");
+            drop(stream);
+
+            peer.set_read_timeout(Some(quick())).unwrap();
+            let mut got = Vec::new();
+            (&peer)
+                .read_to_end(&mut got)
+                .expect("the reply and then the end of the stream, the peer doing nothing");
+            assert_eq!(got, reply);
+        }
+
+        /// The receive is aborted for a caller that is gone, never for one
+        /// that has only finished sending: a half-closed stream still gets
+        /// its answer.
+        #[test]
+        fn a_half_closed_stream_still_receives_the_answer() {
+            let rt = runtime();
+            let (_dir, ours, peer) = connected_pair();
+            let mut stream = bridge(ours, rt.handle().clone()).expect("bridge");
+            rt.block_on(async {
+                stream.write_all(b"ping").await?;
+                stream.shutdown().await
+            })
+            .expect("request and half-close");
+
+            peer.set_read_timeout(Some(quick())).unwrap();
+            let mut request = Vec::new();
+            (&peer)
+                .read_to_end(&mut request)
+                .expect("the request, then its half-close");
+            assert_eq!(request, b"ping");
+            (&peer).write_all(b"pong").expect("answer");
+            peer.shutdown(Shutdown::Write).expect("end the answer");
+
+            let mut answer = Vec::new();
+            rt.block_on(async {
+                tokio::time::timeout(quick(), stream.read_to_end(&mut answer)).await
+            })
+            .expect("the answer within budget")
+            .expect("read the answer");
+            assert_eq!(answer, b"pong");
+        }
+
+        #[derive(Default)]
+        struct LateState {
+            in_recv: bool,
+            waiting: bool,
+            aborts: usize,
+            closed: bool,
+        }
+
+        #[derive(Default)]
+        struct Late {
+            state: Mutex<LateState>,
+            changed: Condvar,
+        }
+
+        impl Late {
+            /// Wait, within the `Quick` budget, until `done` holds.
+            fn wait(&self, what: &str, done: impl Fn(&LateState) -> bool) {
+                let deadline = Instant::now() + quick();
+                let mut s = self.state.lock();
+                while !done(&s) {
+                    let timed_out = self.changed.wait_until(&mut s, deadline).timed_out();
+                    assert!(
+                        !timed_out || done(&s),
+                        "timed out: {what} ({} aborts)",
+                        s.aborts
+                    );
+                }
+            }
+        }
+
+        /// A socket whose `recv` blocks only after the first abort has come
+        /// and gone, and which a later abort wakes — the order in which a
+        /// Windows `CancelIoEx` misses a receive that has not started yet.
+        struct LateReceiver(Arc<Late>);
+
+        impl BlockingSocket for LateReceiver {
+            fn recv(&self, _: &mut [u8]) -> io::Result<usize> {
+                let late = &*self.0;
+                let mut s = late.state.lock();
+                s.in_recv = true;
+                late.changed.notify_all();
+                while s.aborts == 0 {
+                    late.changed.wait(&mut s);
+                }
+                s.waiting = true;
+                while s.waiting {
+                    late.changed.wait(&mut s);
+                }
+                Err(io::ErrorKind::Interrupted.into())
+            }
+            fn send(&self, data: &[u8]) -> io::Result<usize> {
+                Ok(data.len())
+            }
+            fn shutdown_write(&self) -> io::Result<()> {
+                Ok(())
+            }
+            fn abort_recv(&self) -> io::Result<()> {
+                let late = &*self.0;
+                let mut s = late.state.lock();
+                s.aborts += 1;
+                s.waiting = false;
+                late.changed.notify_all();
+                Ok(())
+            }
+        }
+
+        impl Drop for LateReceiver {
+            fn drop(&mut self) {
+                let late = &*self.0;
+                late.state.lock().closed = true;
+                late.changed.notify_all();
+            }
+        }
+
+        /// An abort that misses the receive is repeated until the receiving
+        /// thread has finished, and only then is the socket closed.
+        #[test]
+        fn an_abort_that_misses_the_receive_is_repeated() {
+            let rt = runtime();
+            let late = Arc::new(Late::default());
+            let stream =
+                bridge(LateReceiver(Arc::clone(&late)), rt.handle().clone()).expect("bridge");
+            late.wait("the receiving thread enters recv", |s| s.in_recv);
+            drop(stream);
+            late.wait("the socket is closed", |s| s.closed);
+            assert!(
+                late.state.lock().aborts >= 2,
+                "the first abort was bound to miss"
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::{
@@ -184,25 +734,67 @@ mod imp {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        thread::JoinHandle,
+        time::Duration,
     };
 
     use socket2::{Domain, SockAddr, Socket, Type};
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
         runtime::Handle,
-        sync::{Mutex, mpsc},
+        sync::{Mutex, mpsc, oneshot},
     };
 
-    use super::not_connected;
+    use super::bridge::{BlockingSocket, BridgedStream, bridge};
 
-    pub(super) type Stream = tokio::io::DuplexStream;
+    pub(super) type Stream = BridgedStream;
 
-    /// Per-direction copy buffer, and the in-memory pipe's capacity.
-    const BUF: usize = 64 * 1024;
+    /// How long dropping a listener waits for its accept thread to close the
+    /// listening socket. It is woken by a connection of our own and normally
+    /// takes no time; the bound only keeps a runtime thread from blocking
+    /// forever in `Drop` if that ever stops being true.
+    const ACCEPT_STOP_WAIT: Duration = Duration::from_secs(5);
 
     fn new_socket() -> io::Result<Socket> {
         Socket::new(Domain::UNIX, Type::STREAM, None)
+    }
+
+    impl BlockingSocket for Socket {
+        fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut this = self;
+            this.read(buf)
+        }
+
+        fn send(&self, data: &[u8]) -> io::Result<usize> {
+            Socket::send(self, data)
+        }
+
+        fn shutdown_write(&self) -> io::Result<()> {
+            self.shutdown(Shutdown::Write)
+        }
+
+        /// `CancelIoEx` with no `OVERLAPPED` cancels every operation pending
+        /// on the socket, issued by any thread; a blocking receive is one, as
+        /// `socket2` opens sockets for overlapped I/O. It does not affect a
+        /// receive that starts afterwards, which the bridge allows for.
+        fn abort_recv(&self) -> io::Result<()> {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::{Foundation::ERROR_NOT_FOUND, System::IO::CancelIoEx};
+
+            // SAFETY: the handle is this live socket's own, borrowed for the
+            // duration of the call; a null OVERLAPPED is documented to mean
+            // "all I/O on the handle".
+            let cancelled =
+                unsafe { CancelIoEx(self.as_raw_socket() as usize as _, std::ptr::null()) };
+            if cancelled != 0 {
+                return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            // Nothing was pending: the receiving thread is between calls.
+            if e.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
     }
 
     /// A blocking listener whose accept loop runs on its own thread and hands
@@ -211,7 +803,8 @@ mod imp {
         conns: Mutex<mpsc::Receiver<io::Result<Socket>>>,
         closing: Arc<AtomicBool>,
         path: PathBuf,
-        thread: Option<JoinHandle<()>>,
+        /// Disconnected once the accept thread has closed the listening socket.
+        stopped: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
     impl Listener {
@@ -220,9 +813,10 @@ mod imp {
             socket.bind(&SockAddr::unix(path)?)?;
             socket.listen(128)?;
             let (tx, rx) = mpsc::channel(16);
+            let (stopped_tx, stopped) = std::sync::mpsc::channel::<()>();
             let closing = Arc::new(AtomicBool::new(false));
             let stop = Arc::clone(&closing);
-            let thread = std::thread::Builder::new()
+            std::thread::Builder::new()
                 .name("ahma-local-accept".into())
                 .spawn(move || {
                     loop {
@@ -231,12 +825,15 @@ mod imp {
                             break;
                         }
                     }
+                    // Close the listening socket, then say so.
+                    drop(socket);
+                    drop(stopped_tx);
                 })?;
             Ok(Self {
                 conns: Mutex::new(rx),
                 closing,
                 path: path.to_path_buf(),
-                thread: Some(thread),
+                stopped: parking_lot::Mutex::new(stopped),
             })
         }
 
@@ -257,144 +854,48 @@ mod imp {
         /// refuses connections. The accept thread is parked in a blocking
         /// `accept()`: closing the channel releases it if it is waiting to hand
         /// over a connection, and a connection of our own wakes it to see
-        /// `closing` and drop the socket.
+        /// `closing` and drop the socket. The wait for that is bounded: this
+        /// runs on whichever thread drops the listener, often a runtime worker.
         fn drop(&mut self) {
             self.closing.store(true, Ordering::Release);
             self.conns.get_mut().close();
             let woke = new_socket()
                 .and_then(|s| s.connect(&SockAddr::unix(&self.path)?))
                 .is_ok();
-            if woke && let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+            if woke
+                && let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    self.stopped.get_mut().recv_timeout(ACCEPT_STOP_WAIT)
+            {
+                tracing::debug!("local socket: the accept thread did not stop in time");
             }
         }
     }
 
+    /// The blocking `connect` runs on a thread of its own rather than through
+    /// `spawn_blocking`: a runtime waits for its blocking tasks when it shuts
+    /// down, so one connect that never returned would hang the shutdown with
+    /// it. A caller that gives up on the connect (a `timeout`) leaves only a
+    /// detached thread behind.
     pub(super) async fn connect(path: &Path) -> io::Result<Stream> {
         let addr = SockAddr::unix(path)?;
-        let conn = tokio::task::spawn_blocking(move || {
-            let conn = new_socket()?;
-            conn.connect(&addr)?;
-            Ok::<_, io::Error>(conn)
-        })
-        .await
-        .map_err(io::Error::other)??;
+        let (done, connected) = oneshot::channel();
+        std::thread::Builder::new()
+            .name("ahma-local-connect".into())
+            .spawn(move || {
+                let _ = done.send(new_socket().and_then(|conn| {
+                    conn.connect(&addr)?;
+                    Ok(conn)
+                }));
+            })?;
+        let conn = connected
+            .await
+            .map_err(|_| io::Error::other("local socket connect thread stopped"))??;
         bridge(conn, Handle::current())
-    }
-
-    /// Send all of `data`, retrying a send refused because the listener has
-    /// not accepted the connection yet. `rx_done` is set once the peer has
-    /// been heard to finish or fail, after which that refusal is final.
-    fn send_all(conn: &Socket, mut data: &[u8], rx_done: &AtomicBool) -> io::Result<()> {
-        while !data.is_empty() {
-            let sent = not_connected::retry(
-                not_connected::GRACE,
-                || rx_done.load(Ordering::Acquire),
-                || conn.send(data),
-            );
-            match sent {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => data = &data[n..],
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    /// Half-close the connection, with the same retry as [`send_all`]: the
-    /// end of a request is as much a part of it as its bytes.
-    fn half_close(conn: &Socket, rx_done: &AtomicBool) -> io::Result<()> {
-        not_connected::retry(
-            not_connected::GRACE,
-            || rx_done.load(Ordering::Acquire),
-            || conn.shutdown(Shutdown::Write),
-        )
-    }
-
-    /// Serve a blocking socket to async code: one thread copies socket →
-    /// caller, one copies caller → socket, both through a duplex pipe whose
-    /// other end is what the caller gets. EOF and errors propagate as a
-    /// half-close in the same direction, so `shutdown()` and `read_to_end()`
-    /// behave as they do on a tokio socket.
-    ///
-    /// Either thread may run before the listener has accepted the connection
-    /// (a client that connects, writes and half-closes at once), so a call
-    /// refused as not connected is retried, never taken for the end of the
-    /// stream (SPEC R-HUB.2). Taking it for the end loses the request or its
-    /// half-close, and both ends then wait on each other forever.
-    fn bridge(conn: Socket, rt: Handle) -> io::Result<Stream> {
-        let (caller, ours) = tokio::io::duplex(BUF);
-        let (mut from_caller, mut to_caller) = tokio::io::split(ours);
-        let conn = Arc::new(conn);
-        // Set once the peer's EOF or an error has been read: the connection was
-        // accepted (or is dead), so a not-connected refusal is no longer transient.
-        let rx_done = Arc::new(AtomicBool::new(false));
-
-        let rx_conn = Arc::clone(&conn);
-        let rx_rt = rt.clone();
-        let rx_finished = Arc::clone(&rx_done);
-        std::thread::Builder::new()
-            .name("ahma-local-rx".into())
-            .spawn(move || {
-                let mut buf = vec![0u8; BUF];
-                loop {
-                    let read = not_connected::retry(
-                        not_connected::GRACE,
-                        || false,
-                        || (&*rx_conn).read(&mut buf),
-                    );
-                    let n = match read {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "local socket: receive failed");
-                            break;
-                        }
-                    };
-                    if rx_rt.block_on(to_caller.write_all(&buf[..n])).is_err() {
-                        // The caller dropped the stream.
-                        let _ = rx_conn.shutdown(Shutdown::Read);
-                        break;
-                    }
-                }
-                rx_finished.store(true, Ordering::Release);
-                let _ = rx_rt.block_on(to_caller.shutdown());
-            })?;
-
-        std::thread::Builder::new()
-            .name("ahma-local-tx".into())
-            .spawn(move || {
-                let mut buf = vec![0u8; BUF];
-                let relayed = loop {
-                    match rt.block_on(from_caller.read(&mut buf)) {
-                        Ok(0) => break Ok(()),
-                        Ok(n) => {
-                            if let Err(e) = send_all(&conn, &buf[..n], &rx_done) {
-                                break Err(e);
-                            }
-                        }
-                        Err(e) => break Err(e),
-                    }
-                };
-                let closed = match relayed {
-                    Ok(()) => half_close(&conn, &rx_done),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "local socket: send failed");
-                        conn.shutdown(Shutdown::Write)
-                    }
-                };
-                if let Err(e) = closed {
-                    tracing::debug!(error = %e, "local socket: half-close failed");
-                }
-            })?;
-
-        Ok(caller)
     }
 
     #[cfg(test)]
     mod tests {
+        use super::super::bridge::{half_close, send_all};
         use super::*;
         use crate::timeouts::{TestTimeouts, TimeoutCategory};
 
@@ -416,9 +917,8 @@ mod imp {
             let client = std::thread::spawn(move || {
                 let conn = new_socket()?;
                 conn.connect(&addr)?;
-                let rx_done = AtomicBool::new(false);
-                send_all(&conn, b"early", &rx_done)?;
-                half_close(&conn, &rx_done)?;
+                send_all(&conn, b"early", || false)?;
+                half_close(&conn, || false)?;
                 let _ = done_tx.send(());
                 // Hand the socket back so it stays open until the server has
                 // read: the server must see a half-close, not a closed socket.
