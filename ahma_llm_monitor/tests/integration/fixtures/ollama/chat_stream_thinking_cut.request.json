@@ -1,0 +1,1 @@
+{"model":"granite4.2:3b","messages":[{"role":"system","content":"You are terse."},{"role":"user","content":"Say hello in exactly three words."}],"stream":true,"options":{"num_predict":24,"temperature":0.0,"num_ctx":4096}}

@@ -853,6 +853,23 @@ impl LlmClient {
             .trim()
             .to_string();
 
+        // An empty reply says nothing about the log. A reasoning model can
+        // spend the whole 256-token budget thinking and answer "" (recorded
+        // from Ollama: `done_reason: "length"`); reporting that as an issue
+        // with an empty summary was a false alarm.
+        if text.is_empty() {
+            let why = json
+                .pointer("/done_reason")
+                .or_else(|| json.pointer("/choices/0/finish_reason"))
+                .or_else(|| json.pointer("/stop_reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(LlmMonitorError::Parse(format!(
+                "the model returned no answer (stop reason: {why}); a reasoning model may \
+                 have used its whole budget thinking"
+            )));
+        }
+
         // The LLM is instructed to respond with "CLEAN" when no issues are found.
         if text.eq_ignore_ascii_case("clean") || text.to_ascii_uppercase().starts_with("CLEAN") {
             debug!("LLM response: CLEAN");

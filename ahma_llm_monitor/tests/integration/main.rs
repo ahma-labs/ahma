@@ -7,4 +7,5 @@
 
 mod anthropic_test;
 mod client_test;
+mod ollama_recorded_test;
 mod ollama_test;
