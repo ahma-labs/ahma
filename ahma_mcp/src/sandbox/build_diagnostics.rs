@@ -101,6 +101,8 @@ fn looks_like_nested_sandbox_refusal(line: &str) -> bool {
     line.contains("sandbox_apply: Operation not permitted")
         || line.contains("sandbox-exec: sandbox_apply")
         || line.contains("sandbox_apply failed")
+        // Swift's macro plugin server sandboxes itself and dies inside ours.
+        || (line.contains("swift-plugin-server") && line.contains("malformed response"))
 }
 
 fn looks_like_https_auth_failure(line: &str) -> bool {
@@ -214,7 +216,10 @@ build --disable-sandbox` / `swift package resolve --disable-sandbox` for SwiftPM
 `xcodebuild`, add the flag yourself: `xcodebuild -IDEPackageSupportDisableManifestSandbox=YES …` \
 (it turns off only SwiftPM's own manifest sandbox for that command; ahma's sandbox still \
 confines the build). To make it permanent, the human can run `defaults write \
-com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES` once.";
+com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES` once. Swift macros (`@Observable`: \
+\"swift-plugin-server produced malformed response\") are the same limit: add \
+`'OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox'` to the xcodebuild command, or `-disable-sandbox` \
+to swiftc.";
 
 const BUILD_SCRIPT_COPY_REMEDIATION: &str = "Build failed with `Operation not permitted` while a \
 dependency's build script copied a file (e.g. `aws-lc-sys` copying its include headers). On macOS \
@@ -443,6 +448,24 @@ mod nested_and_sccache_tests {
         assert!(
             !hit.remediation.contains("sandbox_grant"),
             "a capability refusal must not send the agent hunting for a path: {}",
+            hit.remediation
+        );
+    }
+
+    /// Swift's macro plugin server applies its own sandbox too; inside ahma's
+    /// every macro (`@Observable`) fails with "produced malformed response".
+    /// `-disable-sandbox` (an `OTHER_SWIFT_FLAGS` setting for xcodebuild)
+    /// fixes it, verified inside ahma's sandbox.
+    #[test]
+    fn a_swift_macro_plugin_refusal_names_the_compiler_flag() {
+        let stderr = "AppViewModel.swift:22:2: error: external macro implementation type \
+            'ObservationMacros.ObservableMacro' could not be found for macro 'Observable()'; \
+            '/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/usr/bin/swift-plugin-server' produced malformed response";
+        let hit = diagnose(stderr).expect("macro plugin refusal should match");
+        assert_eq!(hit.kind, ContaminationKind::NestedSandbox);
+        assert!(
+            hit.remediation.contains("OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox"),
+            "{}",
             hit.remediation
         );
     }
