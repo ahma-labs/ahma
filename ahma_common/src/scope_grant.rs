@@ -882,35 +882,23 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
     //    everything inside them. `Path::starts_with` compares whole components,
     //    so `~/.sshx` is not `~/.ssh`. This was an equality test, which refused
     //    the directory and offered the key inside it as an ordinary grant.
-    if let Some(home) = home {
-        const SENSITIVE: &[&[&str]] = &[
-            &[".ssh"],
-            &[".aws"],
-            &[".gnupg"],
-            &[".kube"],
-            &[".docker"],
-            &[".ahma"],
-            &[".config", "gh"],
-            &[".config", "gcloud"],
-        ];
-        if let Some(dir) = SENSITIVE
-            .iter()
-            .map(|parts| parts.iter().fold(home.to_path_buf(), |p, c| p.join(c)))
+    if let Some(home) = home
+        && let Some(dir) = sensitive_dirs(home)
+            .into_iter()
             .find(|dir| path.starts_with(dir))
-        {
-            let hint = if dir.ends_with(".ssh") {
-                " Git and ssh still work inside the sandbox through your SSH agent, which \
+    {
+        let hint = if dir.ends_with(".ssh") {
+            " Git and ssh still work inside the sandbox through your SSH agent, which \
                  ahma forwards; add a new host key by connecting once from your own terminal."
-            } else {
-                ""
-            };
-            return GrantRisk::Refused(format!(
-                "'{}' is inside {}, which holds credentials/secrets (or ahma's own settings) and \
+        } else {
+            ""
+        };
+        return GrantRisk::Refused(format!(
+            "'{}' is inside {}, which holds credentials/secrets (or ahma's own settings) and \
                  must never be exposed to a sandboxed tool.{hint}",
-                path.display(),
-                dir.display()
-            ));
-        }
+            path.display(),
+            dir.display()
+        ));
     }
 
     // 5. OS system directories.
@@ -974,6 +962,27 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
     } else {
         GrantRisk::High(warnings)
     }
+}
+
+/// Credential directories and ahma's own settings directory, relative to the
+/// home directory: never granted, and never inside a grant (SPEC R5.4.5).
+const SENSITIVE: &[&[&str]] = &[
+    &[".ssh"],
+    &[".aws"],
+    &[".gnupg"],
+    &[".kube"],
+    &[".docker"],
+    &[".ahma"],
+    &[".config", "gh"],
+    &[".config", "gcloud"],
+];
+
+/// The credential directories under `home`: never granted, never inside a grant.
+pub fn sensitive_dirs(home: &Path) -> Vec<PathBuf> {
+    SENSITIVE
+        .iter()
+        .map(|parts| parts.iter().fold(home.to_path_buf(), |p, c| p.join(c)))
+        .collect()
 }
 
 /// Whether `path` is exactly an OS system directory that must never be granted.

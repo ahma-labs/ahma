@@ -314,9 +314,16 @@ drops work — and it is built so that no crash, kill or power loss can leave it
     command wrongly classified read-only fails with a permission error; it cannot write.
     Where the kernel cannot enforce it (Windows, Test-mode sandboxes, a macOS ahma nested
     in another Seatbelt profile, a kernel without Landlock) the read-only lane **must not**
-    exist and every command is exclusive.
+    exist and every command is exclusive, except a watcher, which is service.
   - *Service* — long-lived by design, like the log monitors (`livelog`) — takes no lease,
-    because holding it for a server's life would stall every later command.
+    because holding it for a server's life would stall every later command. A shell line
+    is service in two cases, both only when no program writes through its own arguments
+    (`sed`, `sort -o`, `curl -o`, …) or runs under an environment assignment: every program
+    reads and every writing redirection or `tee` file lies outside the workspace and every
+    sandbox scope, resolved through symlinks (a CI log written to the session's scratch
+    directory); or the line is a watcher (`gh run watch`, `gh pr checks --watch`, `tail -f`)
+    where no read-only lane exists. Service trades the kernel's read-only guarantee for
+    ordering only, which is why it requires the stricter program set.
   - *MTDF tools* take their lane from `concurrency` (`exclusive` | `read_only` |
     `service`), the nearest declaration winning (subcommand over parent subcommand over
     tool), resolved once when the definition is parsed. The bundled tools **must** declare
@@ -326,17 +333,20 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   - *Shell command lines* are classified by a conservative classifier. It reads as
     readers: plain readers (`git status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, `tail` —
     followers included, since a reader that never ends must not hold the workspace for its
-    whole life —, `ps`, `sed` without `-i`, `gh` viewing commands, `curl` without an output
-    file, ahma's own listing commands, …); **pipelines and lists** of readers (`grep … |
-    head`, `cd src && ls`, `2>&1`, `>/dev/null`, a plain `$VAR`); `sleep`; a `NAME=value`
+    whole life —, `ps`, `sed` without `-i`, `gh` viewing commands including `gh run watch`
+    (`gh api` only with no method other than GET and no `-f`/`-F`/`--field`/`--raw-field`/
+    `--input`), `curl` without an output file, ahma's own listing commands, …); **pipelines
+    and lists** of readers (`grep … | head`, `cd src && ls`, `2>&1`, `>&2`, `>/dev/null`,
+    `&>/dev/null`, `< /dev/null`, `tee` with no file, a plain `$VAR`); `sleep`; a `NAME=value`
     assignment before a reader, or on its own (`S=/path; grep … $S`); an
     `until`/`while`/`if`/`for … in` list (a standalone `!` negating a command included) whose every command reads (a CI poll such as
     `until gh pr checks 87; do sleep 60; done`); and the system diagnostics an agent runs to
     see why a job is slow (`uptime`, `sysctl` without `-w` or `name=value`, `vm_stat`,
     `iostat`, `top`, `lsof`, `pgrep`). Those must never queue behind the job they inspect. A `$(…)` substitution is judged by the command it runs, so
     `echo "$(gh pr view 87)"` is a reader and `echo $(rm x)` is not. It treats a backtick
-    substitution, a writing redirection, grouping, an escape or an unknown program as
-    exclusive. It is permissive only where the kernel lane makes a mistake harmless.
+    substitution, a writing redirection into a workspace or to a target it cannot resolve
+    without expansion (`$OUT`, a glob, `~`, a relative path after `cd`), grouping, an escape
+    or an unknown program as exclusive. It is permissive only where the kernel lane makes a mistake harmless.
 - **R2.7.5**: **No result is lost to a forgotten `await`.** Each session remembers every
   operation it started whose call returned without the result. Once one has finished, its
   outcome (identity line, output tail, output file) **must** be prepended to the next tool
@@ -881,6 +891,7 @@ A "host sandbox" is an outer kernel sandbox ahma runs inside (Cursor, Claude Cod
 
 - **R-PERM.9**: **Every user-facing permission message leads with whether the user must do anything.** The first line after a grant, a denial or a disclosure **must** be one of `Nothing more to do…`, `One thing to do: <the exact command or key>…`, or `Blocked until <who> <does what>…`, computed from the surface it is printed on (terminal hooks and the edit guard re-read grants per command; a running MCP session, until it watches the ledger, needs its connection restarted or the prompt it raised answered) — never hedged with "may" or "the next time a server starts", and never two answers in one message. When the user must act, the message names the exact action — the full command to paste, or the key to press and where — never "restart your IDE" or "grant it in the TUI".
 - **R-PERM.9.1**: **A refusal is reported once, in proportion.** A terminal-hook command that failed with a refusal outside the workspace gets the full prompt body once (it was printed twice: to stderr and again as the returned error), led by what was refused rather than "blocked", since the command may have failed for another reason. A command that **succeeded** although one of its accesses was refused (a lock-holder file, a cache it can do without) gets one line: what was refused and the `ahma sandbox grant` that would allow it.
+- **R-PERM.10**: **A hooked command refused a path asks before the next command, in the harness's own dialog.** A terminal-hook command cannot be asked mid-run (the hook answered before it started, and the kernel policy is fixed at spawn), so its out-of-scope refusal is recorded per workspace, owner-only under the runtime directory, outside every scope. The next Bash call in that workspace from a harness whose hook contract has `ask` (Claude Code) is answered `ask`, with the dialog text naming the directory, the refused paths it covers, what yes and no mean, and the `ahma sandbox grant` for always. A yes runs the sandboxed command carrying a one-use token, valid for one hour and for that exact command, which applies a **session** grant bound to the harness process and the workspace before the sandbox is built. Rules: (a) **one question per directory per harness session**, whatever the answer, so a no is remembered without the harness reporting it; (b) refusals with a common parent become **one** question when widening to the parent is safe: never home or above, never a folder many tools share (`~/.cache`, `~/.config`, `~/.local`, `~/Library`, `~/Library/Caches`, `~/Library/Application Support`, …) or one containing it, never a folder containing a credential directory, never a folder of projects (two or more git repositories), never a parent of the workspace, and never what the denylist refuses; (c) a path a live grant already covers is not asked; (d) a command the agent wrote with an approval token is refused, so a token can never approve its own question; (e) *(in progress)* the TUI lists these questions (R-PERM.3.7).
 
 ---
 
@@ -1656,7 +1667,7 @@ pages are invalidated — by a rebuild overwriting the running binary, or by pag
 memory pressure, where ad-hoc re-validation fails on fault-in. The on-disk file still verifies;
 the client sees only `Connection closed`, and SIGKILL leaves no panic and no flushed log.
 
-- **R-SIGN.1 (macOS — required).** Release binaries MUST be signed with a stable Developer ID identity (hardened runtime, secure timestamp) and notarized, **before** they are packaged, hashed or attested, so `SHA256SUMS` and the provenance attestation describe the signed bytes. The release workflow does this whenever the Apple signing secrets are configured and emits a notice when they are not (open: §11). Locally built/installed binaries SHOULD be re-signed with a stable signature (`codesign --force --sign - --options runtime`) instead of left linker-ad-hoc. On macOS this is a **runtime-stability** requirement, not merely a Gatekeeper/distribution one.
+- **R-SIGN.1 (macOS — required).** Release binaries MUST be signed with a stable Developer ID identity (hardened runtime, secure timestamp) and notarized, **before** they are packaged, hashed or attested, so `SHA256SUMS` and the provenance attestation describe the signed bytes. The release workflow does this whenever the Apple signing secrets are configured and emits a notice when they are not (open: §11). Locally built/installed binaries SHOULD be re-signed with a stable signature (`codesign --force --sign - --options runtime`) instead of left linker-ad-hoc. On macOS this is a **runtime-stability** requirement, not merely a Gatekeeper/distribution one. Installers (`scripts/install.sh`, `ahma update`) re-sign ad hoc only a binary that lacks a valid Developer ID signature with the hardened runtime (`codesign --verify --strict` passes, leaf authority `Developer ID Application`, flags include `runtime`), so a Developer-ID release is installed byte-identical. When an installer changes a verified binary's bytes it writes `<binary>.install-receipt` (verified artifact and digest, released digest, installed digest), and `ahma verify` reports a binary matching its receipt as verified at install and re-signed locally, not as an attestation failure. The receipt is a local record, not a signature.
 - **R-SIGN.2 (atomic install — all platforms).** `ahma setup` / `update` / install flows MUST install the binary out-of-place (write a new file, then atomic rename) and never overwrite the inode of a running `ahma`. This removes the "rebuild kills the running server" trigger everywhere. They MUST NOT stop a running `ahma` either: the hub hands over to the new build itself (R-HUB.5). The install scripts stage and verify the new binary beside the old one before it takes the path, so a failed verification leaves the previous install untouched. On Windows, which will not replace a running `.exe` but will rename one, the running binary is moved aside to `<name>.old` (or `<name>.<secs>.old` when an earlier one is still running) and the hub removes those on its next start.
 - **R-SIGN.3 (Windows — distribution-only).** Windows is **not** expected to share the macOS runtime kill: a running `.exe` is locked against in-place replacement (R-SIGN.2's trigger cannot occur), and Authenticode is validated at image load, not re-validated on page fault. Authenticode signing is still wanted for **distribution trust** (SmartScreen/Defender reputation), not runtime stability. Assumption: no WDAC / Smart App Control policy kills a running page-evicted process; if one is observed, this becomes a runtime requirement like R-SIGN.1.
 - **R-SIGN.4 (Linux — not applicable).** The kernel does not validate ELF code-page signatures, and replacing a running binary keeps the original inode mapped, so neither trigger exists. No signing is required for stability or load. (IMA/EVM appraisal is out of scope unless a specific deployment target enables it.)
@@ -1926,5 +1937,5 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 
 - **Windows filesystem boundary** (R6.3.3, R6.3.9, R-HANDOFF.4): AppContainer spawn isolation holds both ways on `windows-latest` but is disabled: ordinary tools need `NUL` (denied to application packages; fixing it needs an administrator) and the scope's ancestors (traverse and stat denied). Enabling it needs a design for granting both.
 - **Linux trust-handoff deny tier** (R6.1.7): prevention is open. Landlock has no deny rule, and per-command user and mount namespaces are blocked for unprivileged users on Ubuntu 24.04 and later. Writes are detected and reported (`handoff_write`).
-- **Developer-ID signing and notarization** (R-SIGN.1): wired in the release workflow and activates when the maintainer adds the six Apple secrets (docs/release-signing.md); until then releases are ad-hoc signed. `scripts/install.sh` and `ahma update` still re-sign the installed copy ad hoc, which would discard a Developer ID signature.
+- **Developer-ID signing and notarization** (R-SIGN.1): wired in the release workflow and activates when the maintainer adds the six Apple secrets (docs/release-signing.md); until then releases are ad-hoc signed. `scripts/install.sh` and `ahma update` keep a valid Developer ID signature with the hardened runtime and re-sign anything else ad hoc (docs/release-signing.md).
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.

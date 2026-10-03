@@ -1,0 +1,16 @@
+Executable=/Applications/Firefox.app/Contents/MacOS/crashhelper
+Identifier=crashhelper
+Format=Mach-O universal (x86_64 arm64)
+CodeDirectory v=20500 size=4887 flags=0x0(none) hashes=147+2 location=embedded
+Signature size=8988
+Authority=Developer ID Application: Mozilla Corporation (43AQ936H96)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=24. Sep 2026 at 14.22.06
+Info.plist=not bound
+TeamIdentifier=43AQ936H96
+Runtime Version=26.5.0
+Sealed Resources=none
+Internal requirements count=1 size=172
+Total signatures=1
+Chosen signature=1

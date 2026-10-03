@@ -53,6 +53,29 @@ compute_sha256() {
     fi
 }
 
+# SPEC R-SIGN.1: does this binary already carry the release's own signature, one we
+# must keep? True only when `codesign --verify --strict` passes, the leaf (first)
+# `Authority=` line of `codesign -dvv` is a "Developer ID Application" certificate, and
+# the CodeDirectory flags include `runtime` (hardened runtime). Anything else, such as
+# the linker's ad-hoc signature, is re-signed ad hoc with the hardened runtime instead.
+# Mirrors ahma_update::install::keeps_existing_signature.
+has_developer_id_runtime_signature() {
+    local bin="$1" display authority flags
+    codesign --verify --strict "$bin" >/dev/null 2>&1 || return 1
+    display="$(codesign -dvv "$bin" 2>&1)" || return 1
+    authority="$(printf '%s\n' "$display" | grep -m 1 '^Authority=' || true)"
+    case "$authority" in
+        "Authority=Developer ID Application:"*) ;;
+        *) return 1 ;;
+    esac
+    flags="$(printf '%s\n' "$display" | grep -m 1 '^CodeDirectory ' \
+        | sed -n 's/.* flags=0x[0-9a-fA-F]*(\([^)]*\)).*/\1/p' || true)"
+    case ",$flags," in
+        *,runtime,*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Detect libc type on Linux
 detect_libc() {
     if [ "$OS" != "linux" ]; then
@@ -292,6 +315,10 @@ rm -f "$STAGED_BIN"
 cp "$TEMP_DIR/ahma" "$STAGED_BIN"
 chmod +x "$STAGED_BIN"
 
+# SHA-256 of the binary exactly as released, before anything below can change it.
+RELEASED_SHA256="$(compute_sha256 "$STAGED_BIN")"
+VERIFIED_AT_INSTALL=0
+
 # Cryptographic verification: confirm the new binary has a valid GitHub Build Provenance
 # Attestation (Sigstore SLSA Level 3) from the official ahma-labs/ahma CI pipeline.
 # This is the canonical trust check — even if an attacker substituted the release asset,
@@ -308,23 +335,58 @@ if [ "${AHMA_INSECURE_SKIP_VERIFY:-}" != "1" ] && [ "${AHMA_INSECURE_SKIP_SIGNAT
         rm -f "$STAGED_BIN"
         exit 1
     fi
+    # Recorded in the install receipt below only when nothing could have told the
+    # binary to skip its check (it also honours "true", "yes" and "on").
+    if [ -z "${AHMA_INSECURE_SKIP_VERIFY:-}" ] && [ -z "${AHMA_INSECURE_SKIP_SIGNATURE:-}" ]; then
+        VERIFIED_AT_INSTALL=1
+    fi
 else
     echo "WARNING: Sigstore attestation verification bypassed (AHMA_INSECURE_SKIP_VERIFY=1)." >&2
 fi
 
-# On macOS: re-sign with the hardened runtime entitlement to prevent CODESIGNING SIGKILL
-# under memory pressure. Ad-hoc signed binaries built with `cargo` lack --options runtime,
-# so the OS cannot safely evict and re-fault their code pages. When memory pressure forces
-# a page-out, re-validation of the ad-hoc signature fails and the kernel sends SIGKILL
-# (crash type EXC_BAD_ACCESS, termination namespace=CODESIGNING, indicator=Invalid Page).
-# This step runs after Sigstore attestation is verified so the security guarantee is preserved.
+# On macOS (SPEC R-SIGN.1): a release signed with a Developer ID and the hardened runtime
+# keeps that signature. Anything else is re-signed with the hardened runtime to prevent
+# CODESIGNING SIGKILL under memory pressure. Ad-hoc signed binaries built with `cargo` lack
+# --options runtime, so the OS cannot safely evict and re-fault their code pages. When
+# memory pressure forces a page-out, re-validation of the ad-hoc signature fails and the
+# kernel sends SIGKILL (crash type EXC_BAD_ACCESS, termination namespace=CODESIGNING,
+# indicator=Invalid Page). This step runs after Sigstore attestation is verified so the
+# security guarantee is preserved.
 if [ "$OS" = "darwin" ]; then
-    echo "Re-signing with hardened runtime (prevents macOS CODESIGNING SIGKILL under memory pressure)..."
-    codesign --force --sign - --options runtime "$STAGED_BIN"
+    if has_developer_id_runtime_signature "$STAGED_BIN"; then
+        echo "Keeping the release's Developer ID signature (hardened runtime)."
+    else
+        echo "Re-signing with hardened runtime (prevents macOS CODESIGNING SIGKILL under memory pressure)..."
+        codesign --force --sign - --options runtime "$STAGED_BIN"
+    fi
 fi
+INSTALLED_SHA256="$(compute_sha256 "$STAGED_BIN")"
 
 INSTALLED_BIN="$INSTALL_DIR/ahma"
 mv -f "$STAGED_BIN" "$INSTALLED_BIN"
+
+# Install receipt (same format as ahma_update/src/receipt.rs). Re-signing changed the
+# binary's SHA-256, so no attestation names the installed file any more; the receipt
+# records what was verified so `ahma verify --self` can say so instead of reporting a
+# mismatch as tampering. It is a local record, not a signature. Without a change, or
+# without a verification to describe, any old receipt is removed instead.
+RECEIPT="$INSTALL_DIR/ahma.install-receipt"
+INSTALLED_VERSION="$("$INSTALLED_BIN" --version 2>/dev/null | awk '{print $2}' || true)"
+if [ "$VERIFIED_AT_INSTALL" = "1" ] && [ "$INSTALLED_SHA256" != "$RELEASED_SHA256" ]; then
+    {
+        echo "# ahma install receipt (SPEC R-SIGN.1; see docs/release-signing.md)."
+        echo "# Written by scripts/install.sh. This is a local record, not a signature."
+        echo "installer=scripts/install.sh"
+        echo "version=${INSTALLED_VERSION}"
+        echo "verified_artifact=ahma (from ${ASSET_NAME})"
+        echo "verified_sha256=${RELEASED_SHA256}"
+        echo "released_sha256=${RELEASED_SHA256}"
+        echo "installed_sha256=${INSTALLED_SHA256}"
+    } > "$RECEIPT.tmp" && mv -f "$RECEIPT.tmp" "$RECEIPT" \
+        || echo "Warning: could not write $RECEIPT; 'ahma verify --self' will not be able to explain the re-sign." >&2
+else
+    rm -f "$RECEIPT"
+fi
 
 "$INSTALLED_BIN" --version
 echo "Success! Installed and verified ahma to ${INSTALL_DIR}"

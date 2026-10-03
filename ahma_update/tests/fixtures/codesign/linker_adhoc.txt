@@ -1,0 +1,9 @@
+Executable=/Users/me/.local/bin/ahma.new
+Identifier=ahma-b1f53ff74993a6db
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=1111662 flags=0x20002(adhoc,linker-signed) hashes=34736+0 location=embedded
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements=none

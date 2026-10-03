@@ -610,15 +610,20 @@ fn uninstall_binary_in(install_dir: &Path, dry_run: bool) -> Result<()> {
     } else {
         "ahma.old"
     });
+    // Written beside a binary an installer re-signed on macOS (SPEC R-SIGN.1).
+    let receipt_path = crate::update::receipt::receipt_path(&binary_path);
 
     if dry_run {
-        print_dry_run_binary_removal(&[&binary_path, &old_path]);
+        print_dry_run_binary_removal(&[&binary_path, &old_path, &receipt_path]);
         print_custom_install_hint(install_dir);
         return Ok(());
     }
 
     #[cfg(unix)]
-    remove_binary_unix(&binary_path, &old_path)?;
+    {
+        let _ = std::fs::remove_file(&receipt_path);
+        remove_binary_unix(&binary_path, &old_path)?;
+    }
 
     #[cfg(windows)]
     print_windows_removal_instructions(&binary_path, &old_path);
@@ -1749,6 +1754,21 @@ mod tests {
         uninstall_binary_in(tmp.path(), false)?;
         assert!(!bin.exists(), "binary removed");
         assert!(!old.exists(), "ahma.old removed");
+        Ok(())
+    }
+
+    /// The install receipt beside a re-signed binary (SPEC R-SIGN.1) goes with it.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_binary_removes_install_receipt() -> Result<()> {
+        let tmp = tempdir()?;
+        let bin = tmp.path().join("ahma");
+        let receipt = tmp.path().join("ahma.install-receipt");
+        std::fs::write(&bin, "binary").ok();
+        std::fs::write(&receipt, "receipt").ok();
+        uninstall_binary_in(tmp.path(), false)?;
+        assert!(!bin.exists(), "binary removed");
+        assert!(!receipt.exists(), "install receipt removed");
         Ok(())
     }
 

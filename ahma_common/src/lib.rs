@@ -45,6 +45,7 @@ pub mod grant_prompt;
 /// Every AI harness ahma knows, listed once; the MCP-client, setup-target and
 /// terminal-hook tables in `ahma_mcp` are views of it.
 pub mod harness;
+pub mod harness_asks;
 pub mod hook_consent;
 pub mod hostname;
 pub mod http_retry;
