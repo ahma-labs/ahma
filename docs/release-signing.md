@@ -317,7 +317,7 @@ turn signing off, delete `APPLE_DEVELOPER_ID_P12`.
 | macOS binary in the release archive | Linker ad-hoc signature | Developer ID, hardened runtime, secure timestamp, notarized |
 | Browser-downloaded (quarantined) tarball | Gatekeeper blocks it; you need `xattr -d com.apple.quarantine` | Runs. Gatekeeper checks the ticket online on first launch |
 | `ahma update`, `ahma verify`, `gh attestation verify`, `SHA256SUMS` | Work | Work unchanged. They are computed over the signed bytes |
-| `scripts/install.sh`, `ahma update` | Re-sign the installed copy ad hoc with `--options runtime` (R-SIGN.1, local part) | Unchanged for now. The installed copy is still re-signed ad hoc, which replaces the Developer ID signature (SPEC §11) |
+| `scripts/install.sh`, `ahma update` | Re-sign the installed copy ad hoc with `--options runtime` (R-SIGN.1, local part) | Keep the Developer ID signature, so the installed file is byte-identical to the release and `ahma verify --self` finds its attestation; anything else is still re-signed ad hoc (see "macOS: signing at install") |
 | Linux, Windows | — | No change |
 
 ## Offline / air-gapped use
