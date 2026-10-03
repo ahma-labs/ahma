@@ -1214,7 +1214,25 @@ fn print_profile_entry(
         };
         println!("      {}  ({access})", r.path.display());
     }
+    let here = std::env::current_dir().unwrap_or_default();
+    for line in profile_env_lines(&profile.name, &here) {
+        println!("{line}");
+    }
     print_profile_hosts(settings, &profile.name, hosts);
+}
+
+/// The variables one profile sets, as `ahma permissions list` shows them for
+/// the workspace it runs in, each with its reason (SPEC R-PERM.5.5).
+fn profile_env_lines(profile: &str, workspace: &std::path::Path) -> Vec<String> {
+    crate::sandbox::profiles::profile_env(&[profile.to_string()], workspace)
+        .into_iter()
+        .map(|e| {
+            format!(
+                "      sets {}={}  (here; never over a value you set) — {}",
+                e.name, e.value, e.reason
+            )
+        })
+        .collect()
 }
 
 /// The host half of one profile's cost (SPEC R-PERM.5.2).
@@ -3623,6 +3641,25 @@ mod tests {
         .unwrap();
         let s = ahma_common::config::AhmaSettings::load_from_result(&file).unwrap();
         assert!(s.network.allow.is_empty());
+    }
+
+    /// A profile's variables are listed with their value for this workspace
+    /// and their reason, like its paths and hosts (SPEC R-PERM.5.5).
+    #[test]
+    fn profile_variables_are_listed_with_their_reason() {
+        let lines = profile_env_lines("sccache", std::path::Path::new("/work/alpha"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("SCCACHE_DIR=/work/alpha/target/sccache") && l.contains("—")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.contains("never over a value you set"))
+        );
+        assert!(profile_env_lines("rust", std::path::Path::new("/w")).is_empty());
     }
 
     #[test]

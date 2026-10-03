@@ -110,6 +110,31 @@ struct RawHost {
     reason: String,
 }
 
+/// One environment variable as written in a profile's TOML. `reason` is
+/// mandatory for the same reason a host's is: a variable a user cannot
+/// explain is one they cannot judge (R-PERM.5.2).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEnv {
+    name: String,
+    value: String,
+    reason: String,
+}
+
+/// A variable an enabled profile sets on every sandboxed command, resolved
+/// for one workspace (SPEC R-PERM.5.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileEnv {
+    /// The profile that sets it, for provenance in every display.
+    pub profile: String,
+    /// The variable's name.
+    pub name: String,
+    /// Its value for this workspace.
+    pub value: String,
+    /// Why the toolchain needs it.
+    pub reason: String,
+}
+
 /// A profile as written in its TOML file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +145,7 @@ struct RawProfile {
     /// confined to its own toolchain has no cross-project consequence to state.
     #[serde(default)]
     cost: Option<String>,
+    #[serde(default)]
     rules: Vec<RawRule>,
     /// Hostnames the toolchain must reach when `--restrict-network` is on.
     ///
@@ -134,6 +160,9 @@ struct RawProfile {
     /// instead of quietly handing over `~/.cargo/credentials.toml`.
     #[serde(default)]
     deny_write: Vec<String>,
+    /// Variables set on every sandboxed command (SPEC R-PERM.5.5).
+    #[serde(default)]
+    env: Vec<RawEnv>,
 }
 
 /// A rule with its path resolved against the real environment.
@@ -200,6 +229,8 @@ pub struct SandboxProfile {
     deny_write: Vec<String>,
     /// Hostnames it contributes to the egress allowlist under restriction.
     hosts: Vec<RawHost>,
+    /// Variables it sets on sandboxed commands, values still unresolved.
+    env: Vec<RawEnv>,
 }
 
 /// The profiles ahma ships, parsed from the TOML data files in `profiles/`.
@@ -222,6 +253,7 @@ pub fn builtin_profiles() -> &'static [SandboxProfile] {
             include_str!("../../profiles/apple.toml"),
             include_str!("../../profiles/common.toml"),
             include_str!("../../profiles/gh.toml"),
+            include_str!("../../profiles/sccache.toml"),
         ];
         SOURCES
             .iter()
@@ -233,6 +265,7 @@ pub fn builtin_profiles() -> &'static [SandboxProfile] {
                     rules: raw.rules,
                     deny_write: raw.deny_write,
                     hosts: raw.hosts,
+                    env: raw.env,
                 }),
                 Err(e) => {
                     // A malformed builtin is a build-time bug, not a user problem; it
@@ -473,6 +506,49 @@ pub fn profile_hosts(enabled: &[String]) -> Vec<ProfileHost> {
     out
 }
 
+/// The variables every enabled profile sets, resolved for `workspace` (SPEC
+/// R-PERM.5.5). Values may use `${WORKSPACE}` (the workspace path),
+/// `${WORKSPACE_PORT}` (a port in 20000..60000 derived from it, stable across
+/// runs and ahma versions) and the environment, as rule paths do.
+///
+/// Order follows [`builtin_profiles`], as [`profile_hosts`] does.
+pub fn profile_env(enabled: &[String], workspace: &Path) -> Vec<ProfileEnv> {
+    let ws = workspace.to_string_lossy();
+    let port = workspace_port(workspace).to_string();
+    let mut out = Vec::new();
+    for profile in builtin_profiles() {
+        if !enabled.iter().any(|n| n == &profile.name) {
+            continue;
+        }
+        for raw in &profile.env {
+            let value = raw
+                .value
+                .replace("${WORKSPACE_PORT}", &port)
+                .replace("${WORKSPACE}", &ws);
+            out.push(ProfileEnv {
+                profile: profile.name.clone(),
+                name: raw.name.clone(),
+                value: expand_vars(&value),
+                reason: raw.reason.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// A port of the workspace's own: FNV-1a of its path, folded into
+/// 20000..60000. A fixed function rather than `std`'s hasher, whose output may
+/// change between Rust releases, so a workspace keeps its port across
+/// upgrades and never orphans a server on the old one.
+pub fn workspace_port(workspace: &Path) -> u16 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in workspace.to_string_lossy().bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    20_000 + (hash % 40_000) as u16
+}
+
 /// What this platform's kernel does *not* enforce, in the honest register R7.5
 /// requires (SPEC R-PERM.5.1, R-HANDOFF.4, R6.2.2, R6.3.9, R6.1.7).
 ///
@@ -610,14 +686,59 @@ mod tests {
         let profiles = builtin_profiles();
         assert_eq!(
             profiles.len(),
-            7,
-            "all seven shipped profiles parse: {:?}",
+            8,
+            "all eight shipped profiles parse: {:?}",
             profiles.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
         for p in profiles {
             assert!(!p.description.is_empty(), "{} needs a description", p.name);
-            assert!(!p.rules.is_empty(), "{} grants nothing", p.name);
+            assert!(
+                !p.rules.is_empty() || !p.env.is_empty(),
+                "{} grants nothing and sets nothing",
+                p.name
+            );
+            for e in &p.env {
+                assert!(
+                    !e.reason.trim().is_empty(),
+                    "{}: {} needs a reason",
+                    p.name,
+                    e.name
+                );
+            }
         }
+    }
+
+    /// The `sccache` profile gives each workspace its own cache server: the
+    /// cache inside the workspace, and a port derived from the workspace path,
+    /// stable across runs and different between workspaces (SPEC R-PERM.5.5).
+    #[test]
+    fn sccache_gets_a_server_of_its_own_per_workspace() {
+        let enabled = vec!["sccache".to_string()];
+        let a = Path::new("/work/alpha");
+        let b = Path::new("/work/beta");
+        let env_a = profile_env(&enabled, a);
+        let get = |env: &[ProfileEnv], name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .map(|e| e.value.clone())
+                .unwrap_or_else(|| panic!("{name} not set: {env:?}"))
+        };
+        assert_eq!(get(&env_a, "SCCACHE_DIR"), "/work/alpha/target/sccache");
+        let port_a: u16 = get(&env_a, "SCCACHE_SERVER_PORT").parse().unwrap();
+        assert!((20_000..60_000).contains(&port_a), "{port_a}");
+        assert_eq!(
+            get(&profile_env(&enabled, a), "SCCACHE_SERVER_PORT"),
+            port_a.to_string()
+        );
+        assert_ne!(
+            get(&profile_env(&enabled, b), "SCCACHE_SERVER_PORT"),
+            port_a.to_string()
+        );
+        assert!(env_a.iter().all(|e| e.profile == "sccache"));
+        assert!(
+            profile_env(&[], a).is_empty(),
+            "a disabled profile sets nothing"
+        );
     }
 
     #[test]

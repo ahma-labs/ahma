@@ -1400,6 +1400,7 @@ fn default_sandbox_profiles() -> Vec<String> {
         "apple".to_string(),
         "common".to_string(),
         "gh".to_string(),
+        "sccache".to_string(),
     ]
 }
 
