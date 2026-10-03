@@ -2085,6 +2085,629 @@ unsafe fn from_wide(ptr: *const u16) -> String {
 }
 
 // ===========================================================================
+// R6.3.3 EXPERIMENT support (not production; never reached by a tool call)
+// ===========================================================================
+
+/// Win32 helpers that the R6.3.3 **experiment** round of
+/// `appcontainer_dacl_diagnostics` drives. They exist to measure candidate fixes
+/// for the two blockers that keep AppContainer spawn isolation disabled (`NUL` is
+/// denied; the scope's ancestors grant the container nothing), so a design can be
+/// chosen from evidence. Nothing here changes production behaviour —
+/// [`super::appcontainer_spawn_enabled`] stays `false`, and none of this runs on a
+/// tool path. It is `#[doc(hidden)]` because it is a diagnostic instrument, not API.
+///
+/// Everything mutating is bounded to directories the **current user owns** and is
+/// reverted through a guard that also verifies the restore. It never touches
+/// `C:\`, `C:\Users`, a device object, or anything needing administrator rights:
+/// reads of `\\.\NUL` and of ancestor DACLs are the only contact with those, and
+/// they are read-only.
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub mod experiment {
+    use super::{OwnedSid, appcontainer_name_for_scope, derive_container_sid, from_wide, to_wide};
+    use std::path::{Path, PathBuf};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_SUCCESS, FALSE, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW,
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, GetSecurityInfo,
+        NO_MULTIPLE_TRUSTEE, SDDL_REVISION_1, SE_FILE_OBJECT, SetEntriesInAclW, SetSecurityInfo,
+        TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, EqualSid, NO_INHERITANCE, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
+        WRITE_DAC,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// The `ALL APPLICATION PACKAGES` group. Every AppContainer token is a member,
+    /// so an ACE for it covers the container without naming the per-scope SID.
+    pub const ALL_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-1";
+
+    /// The minimal rights the experiment grants on an ancestor: enough to walk
+    /// through it and stat it, nothing else. `FILE_TRAVERSE` is directory "pass
+    /// through", `FILE_READ_ATTRIBUTES` lets a stat succeed, `SYNCHRONIZE` is the
+    /// standard right every open needs.
+    #[must_use]
+    pub fn traverse_mask() -> u32 {
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    }
+
+    /// Which trustee an experiment ACE names.
+    #[derive(Debug, Clone)]
+    pub enum Trustee {
+        /// The per-scope AppContainer SID (derived from the scope's container name).
+        ContainerForScope(PathBuf),
+        /// A literal SID string, e.g. [`ALL_APPLICATION_PACKAGES_SID`].
+        StringSid(String),
+    }
+
+    impl Trustee {
+        fn resolve(&self) -> anyhow::Result<OwnedSid> {
+            match self {
+                Trustee::ContainerForScope(scope) => {
+                    derive_container_sid(&appcontainer_name_for_scope(scope))
+                }
+                Trustee::StringSid(s) => sid_from_string(s),
+            }
+        }
+    }
+
+    /// One ancestor of the scope and what the experiment decided to do with it.
+    #[derive(Debug, Clone)]
+    pub struct AncestorInfo {
+        pub path: PathBuf,
+        /// `Some(true)`/`Some(false)` from the owner check, `None` if it failed.
+        pub owned: Option<bool>,
+        /// Whether it is safe to add and then restore an ACE here (owned by the
+        /// current user, within the profile root).
+        pub eligible: bool,
+        /// A short human note: `included`, `skip: not owner`, `stop: profile
+        /// root`, `stop: outside profile`, or `err: ...`.
+        pub note: String,
+    }
+
+    /// Build a SID from its string form (`S-1-15-2-1`). The storage is copied out,
+    /// so the `LocalAlloc`ed original is freed before returning.
+    fn sid_from_string(s: &str) -> anyhow::Result<OwnedSid> {
+        // SAFETY: `w` is NUL-terminated; `psid` is a valid out-pointer; on success
+        // the returned SID is `LocalAlloc`ed and is freed once below.
+        unsafe {
+            let w = to_wide(s);
+            let mut psid: PSID = std::ptr::null_mut();
+            if ConvertStringSidToSidW(w.as_ptr(), &mut psid) == FALSE {
+                anyhow::bail!(
+                    "ConvertStringSidToSidW('{s}') failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let owned = OwnedSid::copy_from(psid);
+            LocalFree(psid.cast());
+            owned
+        }
+    }
+
+    /// The current process user's SID.
+    fn current_user_sid() -> anyhow::Result<OwnedSid> {
+        // SAFETY: `GetCurrentProcess` is a pseudo-handle; `token` is a valid
+        // out-pointer and is closed once; the `TOKEN_USER` lives in `buf`, which
+        // outlives the copy.
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == FALSE {
+                anyhow::bail!(
+                    "OpenProcessToken failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let buf = super::token_information(token, TokenUser);
+            let _ = CloseHandle(token);
+            let buf = buf.map_err(|e| anyhow::anyhow!("GetTokenInformation(TokenUser): {e}"))?;
+            let sid = (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+            OwnedSid::copy_from(sid)
+        }
+    }
+
+    /// Case-insensitive "is `path` within `root`" (Windows paths are
+    /// case-insensitive; `Path::starts_with` is not).
+    fn within(path: &Path, root: &Path) -> bool {
+        let p = path.to_string_lossy().to_ascii_lowercase();
+        let r = root.to_string_lossy().to_ascii_lowercase();
+        let r = r.trim_end_matches(['\\', '/']);
+        !r.is_empty() && (p == r || p.starts_with(&format!("{r}\\")))
+    }
+
+    /// Whether `path`'s owner SID equals `user`. Read-only (`GetNamedSecurityInfoW`
+    /// with `OWNER_SECURITY_INFORMATION`).
+    fn path_owner_is(path: &Path, user: &OwnedSid) -> anyhow::Result<bool> {
+        // SAFETY: `wpath` is NUL-terminated; the out-pointers are valid; the
+        // returned security descriptor is freed on both exits.
+        unsafe {
+            let wpath = to_wide(&path.to_string_lossy());
+            let mut owner: PSID = std::ptr::null_mut();
+            let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let rc = GetNamedSecurityInfoW(
+                wpath.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut psd,
+            );
+            if rc != ERROR_SUCCESS {
+                anyhow::bail!(
+                    "GetNamedSecurityInfoW(owner, '{}') failed: {}",
+                    path.display(),
+                    std::io::Error::from_raw_os_error(rc as i32)
+                );
+            }
+            let eq = !owner.is_null() && EqualSid(owner, user.as_psid()) != FALSE;
+            LocalFree(psd.cast());
+            Ok(eq)
+        }
+    }
+
+    /// The ancestors of `scope`, nearest first, up to (and excluding) `profile_root`,
+    /// each tagged with whether the current user owns it and whether it is safe to
+    /// experiment on. Stops at the profile root or the first ancestor outside it, so
+    /// `C:\`, `C:\Users` and anything above the profile are never considered.
+    pub fn user_owned_ancestors(
+        scope: &Path,
+        profile_root: &Path,
+    ) -> anyhow::Result<Vec<AncestorInfo>> {
+        let user = current_user_sid()?;
+        let mut out = Vec::new();
+        for ancestor in scope.ancestors().skip(1) {
+            if ancestor == profile_root {
+                out.push(AncestorInfo {
+                    path: ancestor.to_path_buf(),
+                    owned: None,
+                    eligible: false,
+                    note: "stop: profile root".to_string(),
+                });
+                break;
+            }
+            if !within(ancestor, profile_root) {
+                out.push(AncestorInfo {
+                    path: ancestor.to_path_buf(),
+                    owned: None,
+                    eligible: false,
+                    note: "stop: outside profile".to_string(),
+                });
+                break;
+            }
+            match path_owner_is(ancestor, &user) {
+                Ok(true) => out.push(AncestorInfo {
+                    path: ancestor.to_path_buf(),
+                    owned: Some(true),
+                    eligible: true,
+                    note: "included".to_string(),
+                }),
+                Ok(false) => out.push(AncestorInfo {
+                    path: ancestor.to_path_buf(),
+                    owned: Some(false),
+                    eligible: false,
+                    note: "skip: not owner".to_string(),
+                }),
+                Err(e) => out.push(AncestorInfo {
+                    path: ancestor.to_path_buf(),
+                    owned: None,
+                    eligible: false,
+                    note: format!("err: {e}"),
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// A directory handle that closes on drop.
+    struct HandleGuard(HANDLE);
+
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from `CreateFileW` and is closed once.
+            unsafe {
+                if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    /// Open a directory for reading and rewriting its DACL (`FILE_FLAG_BACKUP_SEMANTICS`
+    /// is required to get a handle to a directory).
+    fn open_dir(path: &Path, access: u32) -> anyhow::Result<HandleGuard> {
+        // SAFETY: `wpath` is NUL-terminated; all optional pointers are null; the
+        // returned handle is owned by `HandleGuard`.
+        unsafe {
+            let wpath = to_wide(&path.to_string_lossy());
+            let h = CreateFileW(
+                wpath.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            );
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                anyhow::bail!(
+                    "CreateFileW('{}') failed: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+            Ok(HandleGuard(h))
+        }
+    }
+
+    /// The DACL of an open object as an SDDL string (DACL only — this is for
+    /// before/after comparison, not a full descriptor).
+    fn dacl_sddl(handle: HANDLE) -> anyhow::Result<String> {
+        // SAFETY: `handle` is a live object handle; the out-pointers are valid; the
+        // descriptor and the SDDL string are each freed exactly once.
+        unsafe {
+            let mut owner: PSID = std::ptr::null_mut();
+            let mut group: PSID = std::ptr::null_mut();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut sacl: *mut ACL = std::ptr::null_mut();
+            let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let rc = GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                &mut sacl,
+                &mut psd,
+            );
+            if rc != ERROR_SUCCESS {
+                anyhow::bail!(
+                    "GetSecurityInfo failed: {}",
+                    std::io::Error::from_raw_os_error(rc as i32)
+                );
+            }
+            let mut s: *mut u16 = std::ptr::null_mut();
+            let mut len: u32 = 0;
+            let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                psd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut s,
+                &mut len,
+            );
+            let out = if ok == FALSE {
+                Err(anyhow::anyhow!(
+                    "ConvertSecurityDescriptorToStringSecurityDescriptorW failed: {}",
+                    std::io::Error::last_os_error()
+                ))
+            } else {
+                let o = from_wide(s);
+                LocalFree(s.cast());
+                Ok(o)
+            };
+            LocalFree(psd.cast());
+            out
+        }
+    }
+
+    /// Copy an open object's DACL out into an aligned, owned blob. A `u64` backing
+    /// store guarantees the 4-byte alignment `ACL` wants; the slice is the single
+    /// contiguous structure `SetSecurityInfo` will later copy back in.
+    fn copy_dacl(handle: HANDLE) -> anyhow::Result<Vec<u64>> {
+        // SAFETY: `handle` is live; the out-pointers are valid; `dacl` (when
+        // non-null) points at `AclSize` contiguous bytes inside `psd`, which is
+        // freed once.
+        unsafe {
+            let mut owner: PSID = std::ptr::null_mut();
+            let mut group: PSID = std::ptr::null_mut();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut sacl: *mut ACL = std::ptr::null_mut();
+            let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let rc = GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                &mut sacl,
+                &mut psd,
+            );
+            if rc != ERROR_SUCCESS {
+                anyhow::bail!(
+                    "GetSecurityInfo failed: {}",
+                    std::io::Error::from_raw_os_error(rc as i32)
+                );
+            }
+            let bytes = if dacl.is_null() {
+                Vec::new()
+            } else {
+                let size = (*dacl).AclSize as usize;
+                let src = std::slice::from_raw_parts(dacl.cast::<u8>(), size);
+                let mut buf = vec![0u64; size.div_ceil(8).max(1)];
+                std::ptr::copy_nonoverlapping(src.as_ptr(), buf.as_mut_ptr().cast::<u8>(), size);
+                buf
+            };
+            LocalFree(psd.cast());
+            Ok(bytes)
+        }
+    }
+
+    /// Replace an open object's DACL with a previously captured blob (empty = a
+    /// NULL DACL, which is what the original had if `copy_dacl` returned empty).
+    fn set_dacl(handle: HANDLE, dacl: &[u64]) -> anyhow::Result<()> {
+        // SAFETY: `handle` is live; `dacl`, when non-empty, is a valid contiguous
+        // `ACL` captured by `copy_dacl` from the same object.
+        unsafe {
+            let p: *const ACL = if dacl.is_empty() {
+                std::ptr::null()
+            } else {
+                dacl.as_ptr().cast::<ACL>()
+            };
+            let rc = SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                p,
+                std::ptr::null(),
+            );
+            if rc != ERROR_SUCCESS {
+                anyhow::bail!(
+                    "SetSecurityInfo (restore) failed: {}",
+                    std::io::Error::from_raw_os_error(rc as i32)
+                );
+            }
+            Ok(())
+        }
+    }
+
+    /// Add one non-inheritable allow ACE for `sid` to an open object's DACL,
+    /// merging it with the existing entries (`GRANT_ACCESS`).
+    fn add_ace(handle: HANDLE, sid: &OwnedSid, mask: u32) -> anyhow::Result<()> {
+        // SAFETY: `handle` is live; `sid` is valid for the call's duration; the
+        // old DACL comes from `GetSecurityInfo` inside the same descriptor, which
+        // is freed once, and the new DACL from `SetEntriesInAclW` is freed once.
+        unsafe {
+            let mut owner: PSID = std::ptr::null_mut();
+            let mut group: PSID = std::ptr::null_mut();
+            let mut old_dacl: *mut ACL = std::ptr::null_mut();
+            let mut sacl: *mut ACL = std::ptr::null_mut();
+            let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let rc = GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut old_dacl,
+                &mut sacl,
+                &mut psd,
+            );
+            if rc != ERROR_SUCCESS {
+                anyhow::bail!(
+                    "GetSecurityInfo failed: {}",
+                    std::io::Error::from_raw_os_error(rc as i32)
+                );
+            }
+            let result = (|| -> anyhow::Result<()> {
+                let mut trustee: TRUSTEE_W = std::mem::zeroed();
+                trustee.pMultipleTrustee = std::ptr::null_mut();
+                trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
+                trustee.TrusteeForm = TRUSTEE_IS_SID;
+                // Both a container SID and ALL APPLICATION PACKAGES are group SIDs.
+                trustee.TrusteeType = TRUSTEE_IS_GROUP;
+                trustee.ptstrName = sid.as_psid().cast();
+
+                let mut access: EXPLICIT_ACCESS_W = std::mem::zeroed();
+                access.grfAccessPermissions = mask;
+                access.grfAccessMode = GRANT_ACCESS;
+                // No inheritance: this grants traverse on exactly this directory,
+                // never on the user's files underneath it.
+                access.grfInheritance = NO_INHERITANCE;
+                access.Trustee = trustee;
+
+                let mut new_dacl: *mut ACL = std::ptr::null_mut();
+                let rc = SetEntriesInAclW(1, &access, old_dacl, &mut new_dacl);
+                if rc != ERROR_SUCCESS {
+                    anyhow::bail!(
+                        "SetEntriesInAclW failed: {}",
+                        std::io::Error::from_raw_os_error(rc as i32)
+                    );
+                }
+                let rc = SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    new_dacl,
+                    std::ptr::null(),
+                );
+                LocalFree(new_dacl.cast());
+                if rc != ERROR_SUCCESS {
+                    anyhow::bail!(
+                        "SetSecurityInfo (add) failed: {}",
+                        std::io::Error::from_raw_os_error(rc as i32)
+                    );
+                }
+                Ok(())
+            })();
+            LocalFree(psd.cast());
+            result
+        }
+    }
+
+    /// One temporary traverse ACE on a user-owned directory, guaranteed to be
+    /// removed. The original DACL is captured before the ACE is added and is
+    /// restored by [`TraverseAceGuard::restore_and_verify`]; if that is never
+    /// called (early return or panic), `Drop` restores it best-effort. The handle
+    /// stays open for the guard's life so add and restore act on the same object.
+    pub struct TraverseAceGuard {
+        handle: HandleGuard,
+        path: PathBuf,
+        original_dacl: Vec<u64>,
+        original_sddl: String,
+        restored: bool,
+    }
+
+    impl TraverseAceGuard {
+        /// Capture `path`'s DACL, then add one non-inheritable `mask` ACE for the
+        /// resolved `trustee`. `path` must be a user-owned directory (the caller
+        /// checks via [`user_owned_ancestors`]); the open needs `WRITE_DAC`, which
+        /// the owner always holds.
+        pub fn add(path: &Path, trustee: &Trustee, mask: u32) -> anyhow::Result<Self> {
+            let sid = trustee.resolve()?;
+            let handle = open_dir(path, READ_CONTROL | WRITE_DAC)?;
+            let original_dacl = copy_dacl(handle.0)?;
+            let original_sddl = dacl_sddl(handle.0)?;
+            add_ace(handle.0, &sid, mask)?;
+            Ok(Self {
+                handle,
+                path: path.to_path_buf(),
+                original_dacl,
+                original_sddl,
+                restored: false,
+            })
+        }
+
+        /// The DACL as it stands now (with the experiment ACE), for the report.
+        pub fn current_sddl(&self) -> anyhow::Result<String> {
+            dacl_sddl(self.handle.0)
+        }
+
+        fn restore_inner(&self) -> String {
+            match set_dacl(self.handle.0, &self.original_dacl) {
+                Err(e) => format!("restore FAILED: {e:#}"),
+                Ok(()) => match dacl_sddl(self.handle.0) {
+                    Ok(now) if now == self.original_sddl => "restored:verified".to_string(),
+                    Ok(now) => format!(
+                        "restored, SDDL DIFFERS: before={} after={now}",
+                        self.original_sddl
+                    ),
+                    Err(e) => format!("restored, verify-read failed: {e:#}"),
+                },
+            }
+        }
+
+        /// Restore the original DACL and confirm its SDDL matches what was captured.
+        /// Returns a one-line outcome for the report. Consumes the guard, so `Drop`
+        /// afterwards is a no-op.
+        pub fn restore_and_verify(mut self) -> String {
+            let outcome = self.restore_inner();
+            self.restored = true;
+            outcome
+        }
+    }
+
+    impl Drop for TraverseAceGuard {
+        fn drop(&mut self) {
+            if !self.restored {
+                let outcome = self.restore_inner();
+                eprintln!(
+                    "ahma: TraverseAceGuard drop-restore on '{}': {outcome}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+
+    /// The security descriptor of the `\\.\NUL` device as SDDL (owner + group +
+    /// DACL). **Read-only**: it opens the device for `READ_CONTROL | GENERIC_READ`,
+    /// reads via `GetSecurityInfo`, and never writes. This answers whether
+    /// `ALL APPLICATION PACKAGES` is missing from the device's DACL.
+    pub fn nul_device_sddl() -> anyhow::Result<String> {
+        use windows_sys::Win32::Security::GROUP_SECURITY_INFORMATION;
+        let handle = open_nul_readonly()?;
+        // SAFETY: `handle` is a live device handle; out-pointers are valid; both
+        // the descriptor and the SDDL string are freed once.
+        unsafe {
+            let info =
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+            let mut owner: PSID = std::ptr::null_mut();
+            let mut group: PSID = std::ptr::null_mut();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut sacl: *mut ACL = std::ptr::null_mut();
+            let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let rc = GetSecurityInfo(
+                handle.0,
+                SE_FILE_OBJECT,
+                info,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                &mut sacl,
+                &mut psd,
+            );
+            if rc != ERROR_SUCCESS {
+                anyhow::bail!(
+                    "GetSecurityInfo(\\\\.\\NUL) failed: {}",
+                    std::io::Error::from_raw_os_error(rc as i32)
+                );
+            }
+            let mut s: *mut u16 = std::ptr::null_mut();
+            let mut len: u32 = 0;
+            let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                psd,
+                SDDL_REVISION_1,
+                info,
+                &mut s,
+                &mut len,
+            );
+            let out = if ok == FALSE {
+                Err(anyhow::anyhow!(
+                    "ConvertSecurityDescriptorToStringSecurityDescriptorW(\\\\.\\NUL) failed: {}",
+                    std::io::Error::last_os_error()
+                ))
+            } else {
+                let o = from_wide(s);
+                LocalFree(s.cast());
+                Ok(o)
+            };
+            LocalFree(psd.cast());
+            out
+        }
+    }
+
+    /// Open `\\.\NUL` for a read-only security query. Separate so the one device
+    /// contact in this module is visibly read-only.
+    fn open_nul_readonly() -> anyhow::Result<HandleGuard> {
+        // SAFETY: a constant NUL-terminated device name; no optional pointers; the
+        // handle is owned by `HandleGuard`.
+        unsafe {
+            let wpath = to_wide(r"\\.\NUL");
+            let h = CreateFileW(
+                wpath.as_ptr(),
+                READ_CONTROL | GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                anyhow::bail!(
+                    "CreateFileW(\\\\.\\NUL) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            Ok(HandleGuard(h))
+        }
+    }
+}
+
+// ===========================================================================
 // Tests — the platform-independent half, which is why it is written that way
 // ===========================================================================
 
