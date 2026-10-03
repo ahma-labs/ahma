@@ -1330,7 +1330,8 @@ pub fn hook_scope_disclosure(scopes: &[PathBuf]) -> String {
          Writes are confined to: {listed}, plus any persistent grants in ~/.ahma/settings.toml.\
          {no_project} {reads} A write outside the scope fails; to allow one, ask the human — they \
          approve it in the ahma TUI or run `ahma sandbox grant <dir>`. You cannot widen the scope \
-         yourself."
+         yourself, and a harness's own sandbox switch (Claude Code's `dangerouslyDisableSandbox`) \
+         turns off that harness's sandbox, not this one."
     )
 }
 
@@ -5267,6 +5268,10 @@ mod tests {
         assert!(line.contains("/w/repo"));
         assert!(line.contains("ahma sandbox grant"));
         assert!(line.contains("cannot widen"));
+        assert!(
+            line.contains("dangerouslyDisableSandbox"),
+            "the agent learns its harness's switch does not turn ahma off: {line}"
+        );
         assert!(hook_scope_disclosure(&[]).contains("(none)"));
         assert_ne!(
             scope_fingerprint(&[PathBuf::from("/a")]),
