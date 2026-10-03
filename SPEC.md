@@ -321,8 +321,11 @@ drops work — and it is built so that no crash, kill or power loss can leave it
     whole life —, `ps`, `sed` without `-i`, `gh` viewing commands, `curl` without an output
     file, ahma's own listing commands, …); **pipelines and lists** of readers (`grep … |
     head`, `cd src && ls`, `2>&1`, `>/dev/null`, a plain `$VAR`); `sleep`; a `NAME=value`
-    assignment before a reader; and an `until`/`while`/`if` list whose every command reads
-    (a CI poll such as `until gh pr checks 87; do sleep 60; done`). It treats a
+    assignment before a reader, or on its own (`S=/path; grep … $S`); an
+    `until`/`while`/`if`/`for … in` list whose every command reads (a CI poll such as
+    `until gh pr checks 87; do sleep 60; done`); and the system diagnostics an agent runs to
+    see why a job is slow (`uptime`, `sysctl` without `-w` or `name=value`, `vm_stat`,
+    `iostat`, `top`, `lsof`, `pgrep`). Those must never queue behind the job they inspect. It treats a
     substitution, a writing redirection, grouping, an escape or an unknown program as
     exclusive. It is permissive only where the kernel lane makes a mistake harmless.
 - **R2.7.5**: **No result is lost to a forgotten `await`.** Each session remembers every
