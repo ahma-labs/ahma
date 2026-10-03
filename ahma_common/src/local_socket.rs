@@ -462,9 +462,33 @@ mod tests {
             l.listen(8).unwrap();
             (l, path)
         };
+        // Every step is logged and bounded: a first run hung for 240 s with no
+        // output, so where it blocks is itself the finding.
+        let step = |what: &str| eprintln!("probe step: {what}");
+        // Accept with a deadline: Err("accept-timeout") instead of blocking.
+        let accept = |l: &Socket| -> Result<Socket, &'static str> {
+            l.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + wait;
+            loop {
+                match l.accept() {
+                    Ok((s, _)) => {
+                        s.set_nonblocking(false).unwrap();
+                        return Ok(s);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err("accept-timeout");
+                        }
+                        std::thread::sleep(TestTimeouts::poll_interval());
+                    }
+                    Err(_) => return Err("accept-error"),
+                }
+            }
+        };
         let connect = |path: &Path| {
             let c = sock();
             c.connect(&SockAddr::unix(path).unwrap()).unwrap();
+            c.set_write_timeout(Some(wait)).unwrap();
             c
         };
         // Read until EOF or the read timeout: "eof" or "timeout".
@@ -497,11 +521,27 @@ mod tests {
         let mut bad = 0;
         for i in 0..ROUNDS {
             let (l, path) = listen(i, "a");
+            step(&format!("a{i} connect"));
             let c = connect(&path);
-            (&c).write_all(b"x").unwrap();
-            let _ = c.shutdown(Shutdown::Write);
-            let (conn, _) = l.accept().unwrap();
-            let outcome = read_to_eof(&conn);
+            step(&format!("a{i} write"));
+            if (&c).write_all(b"x").is_err() {
+                tally("a write before accept", "error");
+            }
+            step(&format!("a{i} shutdown"));
+            if let Err(e) = c.shutdown(Shutdown::Write) {
+                tally(
+                    "a shutdown before accept",
+                    &format!("shutdown error {:?}", e.kind()),
+                );
+            }
+            step(&format!("a{i} accept"));
+            let outcome = match accept(&l) {
+                Ok(conn) => {
+                    step(&format!("a{i} read"));
+                    read_to_eof(&conn)
+                }
+                Err(e) => e,
+            };
             tally("a shutdown before accept", outcome);
             if outcome != "eof" {
                 bad += 1;
@@ -516,8 +556,12 @@ mod tests {
         let mut bad = 0;
         for i in 0..ROUNDS {
             let (l, path) = listen(i, "b");
+            step(&format!("b{i} connect+accept"));
             let c = Arc::new(connect(&path));
-            let (conn, _) = l.accept().unwrap();
+            let Ok(conn) = accept(&l) else {
+                tally("b accept", "timeout");
+                continue;
+            };
             let reader = Arc::clone(&c);
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
@@ -534,10 +578,14 @@ mod tests {
                 let _ = tx.send((got, end));
             });
             std::thread::sleep(TestTimeouts::poll_interval());
-            (&*c).write_all(b"x").unwrap();
+            step(&format!("b{i} write+shutdown"));
+            let _ = (&*c).write_all(b"x");
             let _ = c.shutdown(Shutdown::Write);
+            step(&format!("b{i} server read"));
             let server = read_to_eof(&conn);
             tally("b server sees client EOF (recv pending)", server);
+            conn.set_write_timeout(Some(wait)).unwrap();
+            step(&format!("b{i} answer"));
             let _ = (&conn).write_all(b"answer");
             let _ = conn.shutdown(Shutdown::Write);
             let client = rx
@@ -558,8 +606,12 @@ mod tests {
         // the bridge's reader thread.
         for i in 0..20 {
             let (l, path) = listen(i, "c");
+            step(&format!("c{i} connect+accept"));
             let c = Arc::new(connect(&path));
-            let (_conn, _) = l.accept().unwrap();
+            let Ok(_conn) = accept(&l) else {
+                tally("c accept", "timeout");
+                continue;
+            };
             let reader = Arc::clone(&c);
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
