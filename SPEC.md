@@ -325,7 +325,8 @@ drops work — and it is built so that no crash, kill or power loss can leave it
     `until`/`while`/`if`/`for … in` list whose every command reads (a CI poll such as
     `until gh pr checks 87; do sleep 60; done`); and the system diagnostics an agent runs to
     see why a job is slow (`uptime`, `sysctl` without `-w` or `name=value`, `vm_stat`,
-    `iostat`, `top`, `lsof`, `pgrep`). Those must never queue behind the job they inspect. It treats a
+    `iostat`, `top`, `lsof`, `pgrep`). Those must never queue behind the job they inspect. A `$(…)` substitution is judged by the command it runs, so
+    `echo "$(gh pr view 87)"` is a reader and `echo $(rm x)` is not. It treats a backtick
     substitution, a writing redirection, grouping, an escape or an unknown program as
     exclusive. It is permissive only where the kernel lane makes a mistake harmless.
 - **R2.7.5**: **No result is lost to a forgotten `await`.** Each session remembers every
