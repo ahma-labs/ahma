@@ -2264,6 +2264,14 @@ pub mod experiment {
         profile_root: &Path,
     ) -> anyhow::Result<Vec<AncestorInfo>> {
         let user = current_user_sid()?;
+        // Compare long-form paths: %TEMP% on a runner is the 8.3 short form
+        // (`C:\Users\RUNNER~1\...`) while the profile root is long
+        // (`C:\Users\runneradmin`), so a raw prefix test calls every ancestor
+        // "outside profile" and the experiment grants nothing.
+        let scope = dunce::canonicalize(scope).unwrap_or_else(|_| scope.to_path_buf());
+        let profile_root =
+            dunce::canonicalize(profile_root).unwrap_or_else(|_| profile_root.to_path_buf());
+        let profile_root = profile_root.as_path();
         let mut out = Vec::new();
         for ancestor in scope.ancestors().skip(1) {
             if ancestor == profile_root {
