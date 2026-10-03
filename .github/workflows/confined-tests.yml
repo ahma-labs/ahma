@@ -97,7 +97,9 @@ jobs:
           cargo nextest run --profile ci --locked --no-run
 
       # The same invocation as build.yml's main leg, sent through ahma. The
-      # checkout is the only writable scope; nothing else is granted.
+      # checkout is the only writable scope; nothing else is granted. No
+      # colour: `ahma tool run` reports a failed command's output as one
+      # escaped string, which the report step below has to read.
       - name: Cargo Nextest, inside ahma's sandbox
         timeout-minutes: 60
         run: |
@@ -107,7 +109,7 @@ jobs:
             --timeout 3600 \
             --log-to-stderr \
             run_terminal_command \
-            "cargo nextest run --profile ci --locked --no-fail-fast -E 'not (test(kotlin) or test(android))'" \
+            "cargo nextest run --profile ci --locked --no-fail-fast --color never -E 'not (test(kotlin) or test(android))'" \
             2>&1 | tee confined.log
 
       - name: Report confined failures
@@ -116,9 +118,12 @@ jobs:
           {
             echo "### Tests that failed inside ahma's sandbox (${{ matrix.os }})"
             echo ""
-            if grep -qE '^\s+(FAIL|TIMEOUT) \[' confined.log 2>/dev/null; then
+            # A failed command's output arrives as one escaped string.
+            sed 's/\\n/\n/g' confined.log > confined.txt 2>/dev/null || true
+            if grep -qE '(FAIL|TIMEOUT) \[' confined.txt 2>/dev/null; then
               echo '```'
-              grep -hE '^\s+(FAIL|TIMEOUT) \[' confined.log | sort -u
+              grep -hoE '(FAIL|TIMEOUT) \[[^]]*\] +\([^)]*\) +[^ ]+ +[^ ]+' confined.txt | sort -u
+              grep -hoE 'Summary \[[^]]*\] +[0-9]+ tests run:[^\\]*' confined.txt | head -1
               echo '```'
             else
               echo "_None._"
