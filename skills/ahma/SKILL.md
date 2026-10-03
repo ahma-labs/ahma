@@ -87,7 +87,7 @@ Ahma groups command-line tools into logical bundles loaded at startup via `--too
 run_terminal_command(command="cargo build --release", working_directory="/path/to/project", timeout_seconds=300)
 ```
 
-Runs inside the kernel sandbox. Supports pipes, redirects, multi-command strings. A command may run 30 minutes (`[tools] timeout_secs`); for a longer job pass `timeout_seconds`, and heed the alert sent at 80% of the limit.
+Runs inside the kernel sandbox. Supports pipes, redirects, multi-command strings. A command may run 30 minutes (`[tools] timeout_secs`); for a longer job pass `timeout_seconds`, and heed the alert sent at 80% of the limit. Start servers on `127.0.0.1`: listening is not restricted, so one on `0.0.0.0` is reachable from the network.
 `monitor_level` (`error`/`warn`/`info`) + `monitor_stream` (`stderr`/`stdout`/`both`) trigger
 LLM log alerts.
 

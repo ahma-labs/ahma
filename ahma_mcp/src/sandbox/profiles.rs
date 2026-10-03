@@ -633,6 +633,15 @@ pub fn platform_enforcement() -> PlatformEnforcement {
         );
     }
 
+    // SPEC R-LISTEN: no kernel ahma uses can keep a server on loopback
+    // (Seatbelt's local filter never matches it and its inbound filter has no
+    // effect; Landlock filters binds by port), so every platform says so.
+    notes.push(
+        "Listening is not restricted: a server a sandboxed command starts on every network \
+         interface (0.0.0.0, the default for many dev servers) can be reached by any device on \
+         your networks. Ask for servers bound to 127.0.0.1.",
+    );
+
     PlatformEnforcement {
         reads_unrestricted,
         writes_unrestricted,
@@ -1041,6 +1050,20 @@ mod tests {
                  {note:?} is too short to do both"
             );
         }
+    }
+
+    /// No kernel ahma uses can keep a sandboxed server on loopback, so every
+    /// platform says a server a command starts can be reached from the
+    /// network, and how to avoid it (SPEC R-LISTEN).
+    #[test]
+    fn every_platform_says_a_sandboxed_server_is_reachable_from_the_network() {
+        let e = platform_enforcement();
+        let note = e
+            .notes
+            .iter()
+            .find(|n| n.contains("every network interface"))
+            .expect("listening is disclosed on every platform");
+        assert!(note.contains("127.0.0.1"), "{note}");
     }
 
     #[test]
