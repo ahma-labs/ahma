@@ -73,6 +73,11 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "strings",
     "nproc",
     "uptime",
+    "vm_stat",
+    "iostat",
+    "free",
+    // `top` only prints; `top -l 1` is how an agent samples it.
+    "top",
     "sw_vers",
     "lsof",
     "netstat",
@@ -299,6 +304,8 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
                 _ => false,
             }
         }
+        // `sysctl` reads unless it is setting a value (`-w`, `name=value`).
+        "sysctl" => !has("-w") && !args.iter().any(|a| a.contains('=')),
         // `cargo`/`rustc`/`rustup` only to say what they are.
         "cargo" | "rustc" | "rustup" => args.first().map(String::as_str) == Some("--version"),
         // ahma's own read-only commands, so a queued agent can still ask who is
@@ -346,6 +353,18 @@ pub fn classify_shell_command(command: &str) -> Lane {
             .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
             .collect();
         if matches!(words.as_slice(), [w] if matches!(w.as_str(), "done" | "fi")) {
+            continue;
+        }
+        // `S=/path;` on its own sets a shell variable and nothing else.
+        if words.is_empty() && seg.iter().all(|w| is_assignment(w)) {
+            continue;
+        }
+        // `for f in a b` only names what the loop body reads; the body decides.
+        if let [first, name, rest @ ..] = words.as_slice()
+            && first.as_str() == "for"
+            && is_assignment(&format!("{name}=x"))
+            && rest.first().is_none_or(|w| w.as_str() == "in")
+        {
             continue;
         }
         let Some((program, args)) = words.split_first() else {
@@ -852,6 +871,45 @@ mod poll_loop_tests {
     /// held the workspace's write lease for forty minutes and every later
     /// command queued behind it. The kernel's read-only lane still enforces
     /// it: a misclassified poll fails, it cannot write.
+    /// The diagnostics an agent runs to see why a long job is slow must not
+    /// queue behind that job (bug report from an agent in another repo:
+    /// "ahma queued my uptime diagnostic behind the very job I was trying to
+    /// inspect").
+    #[test]
+    fn diagnostics_of_a_running_job_never_wait_for_it() {
+        let queued = [
+            "uptime; sysctl -n hw.ncpu; ls -la ~/.cache/neubit/; cat ~/.cache/neubit/heavy.lock.holder; date",
+            "rg -n 'lintAnalyze' build 2>/dev/null",
+            "for f in a.log b.log; do grep -c ERROR $f; done",
+            "S=/tmp/x; grep -n foo $S",
+            "which timeout gtimeout",
+            "git diff --numstat",
+            "vm_stat",
+            "top -l 1 -n 10",
+            "lsof -p 123",
+            "pgrep -fl gradle",
+        ]
+        .into_iter()
+        .filter(|c| classify_shell_command(c) != Lane::ReadOnly)
+        .collect::<Vec<_>>();
+        assert!(
+            queued.is_empty(),
+            "still queued behind writers: {queued:#?}"
+        );
+        // Still exclusive: these write.
+        for command in [
+            "sysctl -w kern.x=1",
+            "top -l 1 > top.txt",
+            "for f in *; do rm $f; done",
+        ] {
+            assert_eq!(
+                classify_shell_command(command),
+                Lane::Exclusive,
+                "{command}"
+            );
+        }
+    }
+
     #[test]
     fn polls_and_waits_are_read_only() {
         for cmd in [
