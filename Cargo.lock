@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_bin"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "ahma_core",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_bundle"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "anyhow",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_common"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_core"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "ahma_http_mcp_client",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_harness_guard"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "parking_lot",
  "serde_json",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_harness_tools"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "anyhow",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_http_bridge"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "ahma_mcp",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_http_mcp_client"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "anyhow",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_llm_monitor"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "bytes",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_log_monitor"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "regex",
  "serde",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_mcp"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_bundle",
  "ahma_common",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_simplify"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "anyhow",
@@ -339,14 +339,14 @@ dependencies = [
 
 [[package]]
 name = "ahma_test_support"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "ahma_tui"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "ahma_core",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_update"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "anyhow",
@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_vault"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_common",
  "anyhow",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "generate_tool_schema"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ahma_mcp",
  "schemars 1.2.2",
@@ -7248,7 +7248,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "chrono",
  "regex",
