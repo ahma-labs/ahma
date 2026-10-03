@@ -3560,14 +3560,32 @@ mod tests {
                 },
             })
         };
-        // An early TUI is the sync point: once it has seen the answered
-        // question dismissed, the hub has handled every message before it.
+        send_msg(&mut iw, &ask("answered")).await.unwrap();
+        send_msg(&mut iw, &ask("waiting")).await.unwrap();
+
+        // An early TUI is the sync point. It sees both questions whether they
+        // reach it live or as a replay, and either way it is subscribed once
+        // it has: a replay is sent only after subscribing. (Subscribing and
+        // then sending at once raced on Windows, whose socket threads let the
+        // instance's messages land before the subscription.)
+        let wait = crate::timeouts::TestTimeouts::get(crate::timeouts::TimeoutCategory::Quick);
         let early = connect_to_hub_at(&sock).await.expect("connect early TUI");
         let (er, mut ew) = tokio::io::split(early);
         let mut erdr = BufReader::new(er);
         send_msg(&mut ew, &ClientMsg::Subscribe).await.unwrap();
-        send_msg(&mut iw, &ask("answered")).await.unwrap();
-        send_msg(&mut iw, &ask("waiting")).await.unwrap();
+        tokio::time::timeout(wait, async {
+            let mut seen = std::collections::HashSet::new();
+            while seen.len() < 2 {
+                if let HubMsg::Relay(HubRelay::ScopeGrantRequested { request }) =
+                    recv_msg::<_, HubMsg>(&mut erdr).await.unwrap()
+                {
+                    seen.insert(request.decision_id);
+                }
+            }
+        })
+        .await
+        .expect("the early TUI is shown both questions");
+
         send_msg(
             &mut iw,
             &ClientMsg::ScopeGrantResolved {
@@ -3576,8 +3594,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        let wait = crate::timeouts::TestTimeouts::get(crate::timeouts::TimeoutCategory::Quick);
         tokio::time::timeout(wait, async {
             loop {
                 if let HubMsg::ScopeGrantDismiss { decision_id } =
