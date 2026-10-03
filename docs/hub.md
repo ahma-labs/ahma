@@ -83,7 +83,10 @@ checked and not only the socket.
 
 On **Windows** (10 1803 or later) it is the same kind of `AF_UNIX` socket
 file, with the same lock; access control comes from the per-user profile ACL
-rather than mode bits. The hub opens no TCP port on any OS.
+rather than mode bits. The hub opens no TCP port on any OS. Tokio cannot drive
+`AF_UNIX` sockets on Windows, so each connection is served by two threads; closing a
+connection still closes its socket at once, after the last reply and its end-of-stream
+have been sent, even when the other side never answers (SPEC R-HUB.2).
 
 ## Lifetime
 
