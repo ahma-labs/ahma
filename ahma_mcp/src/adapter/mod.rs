@@ -65,6 +65,7 @@ pub use types::{AsyncExecOptions, ExecutionMode};
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use crate::retry::{self, RetryConfig};
 use crate::sandbox;
+use crate::sandbox::handoff_watch::{HandoffReport, HandoffWatch, HandoffWatchMode};
 use crate::shell_pool::{ProcessGroupGuard, ShellPoolManager, kill_process_tree};
 use ahma_common::event_dispatcher::EventDispatcher;
 use anyhow::Result;
@@ -119,6 +120,19 @@ struct SyncRun {
 }
 
 impl SyncRun {
+    /// Lead the result with a trust-handoff alert (SPEC R6.1.7). A typed
+    /// sandbox denial keeps its type, because the MCP boundary turns it into a
+    /// structured `sandbox_denial` payload; the alert then reaches the log and
+    /// the audit trail only.
+    fn with_handoff_alert(mut self, alert: &str) -> Self {
+        self.result = match self.result {
+            Ok(output) => Ok(format!("{alert}\n\n{output}")),
+            Err(e) if e.downcast_ref::<sandbox::SandboxError>().is_some() => Err(e),
+            Err(e) => Err(anyhow::anyhow!("{alert}\n\n{e}")),
+        };
+        self
+    }
+
     /// A run that never produced an exit status (spawn or sandbox-wrap failure).
     fn failed(err: anyhow::Error) -> Self {
         Self {
@@ -243,6 +257,10 @@ pub struct Adapter {
     /// detection (the default). The notifier only *persists* an approved grant — it
     /// never widens the live session (SPEC R5).
     scope_grant_notifier: Option<Arc<dyn sandbox::ScopeGrantNotifier>>,
+    /// Whether the trust-handoff deny tier is inventoried around each command
+    /// (SPEC R6.1.7). [`HandoffWatchMode::Auto`] watches exactly where the
+    /// kernel does not hold the tier; [`Adapter::with_handoff_watch`] overrides it.
+    handoff_watch: HandoffWatchMode,
 }
 
 impl Adapter {
@@ -294,7 +312,26 @@ impl Adapter {
             workspace_queue: workspace_queue::WorkspaceQueue::disabled(),
             queue_wait_notice: None,
             scope_grant_notifier: None,
+            handoff_watch: HandoffWatchMode::Auto,
         })
+    }
+
+    /// Choose when the trust-handoff deny tier is watched (SPEC R6.1.7).
+    ///
+    /// The default, [`HandoffWatchMode::Auto`], watches wherever the kernel does
+    /// not refuse writes to `<git_dir>/hooks` and `<workspace>/.ahma` itself —
+    /// Linux, Windows, and any sandbox that is not enforcing. `Always` lets a
+    /// test exercise detection on macOS too.
+    pub fn with_handoff_watch(mut self, mode: HandoffWatchMode) -> Self {
+        self.handoff_watch = mode;
+        self
+    }
+
+    /// Whether a command in `lane` is watched. A read-only command is not: the
+    /// read-only lane exists only where the kernel forbids it every write
+    /// (SPEC R2.7.4), the deny tier included.
+    fn watches_handoff(&self, lane: workspace_queue::Lane) -> bool {
+        lane != workspace_queue::Lane::ReadOnly && self.handoff_watch.is_active(&self.sandbox)
     }
 
     /// Enable (or replace) the workspace write queue (SPEC R2.7).
@@ -650,8 +687,17 @@ impl Adapter {
         )
         .await;
 
+        // SPEC R6.1.7: where the kernel does not hold the deny tier, take its
+        // inventory now and compare after the process is gone — before the
+        // lease is released, so the next command's writes are not this one's.
+        let handoff = if self.watches_handoff(lane) {
+            Some(begin_handoff_watch(&self.sandbox, &safe_wd).await)
+        } else {
+            None
+        };
+
         let start_time = Instant::now();
-        let run = self
+        let mut run = self
             .run_sync_prepared(
                 command,
                 &op_id,
@@ -663,6 +709,11 @@ impl Adapter {
                 lease.as_ref(),
             )
             .await;
+        if let Some(watch) = handoff
+            && let Some(report) = finish_handoff_watch(watch, &op_id, command).await
+        {
+            run = run.with_handoff_alert(&report.render_alert());
+        }
         drop(lease);
         audit::record_tool_complete(
             &op_id,
@@ -1161,6 +1212,7 @@ impl Adapter {
             workspace,
             drift_root,
             display_command,
+            watch_handoff: self.watches_handoff(lane),
         }));
 
         // Store the handle for graceful shutdown
@@ -1233,6 +1285,8 @@ impl Adapter {
         let command_str = command_str.to_string();
         let task_handles = self.task_handles.clone();
         let op_id_task = op_id.clone();
+        let tool_task = tool_name.to_string();
+        let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
         // A PTY command is an arbitrary shell command: exclusive (SPEC R2.7).
         let ticket = self.enqueue_exclusive(
             workspace_queue::Lane::Exclusive,
@@ -1258,6 +1312,11 @@ impl Adapter {
                 task_handles.lock().await.remove(&op_id_task);
                 return;
             };
+            let handoff = if watch_handoff {
+                Some(begin_handoff_watch(&sandbox, &safe_wd).await)
+            } else {
+                None
+            };
             let (outcome, exit_code) = pty_exec::run_pty_operation(
                 &sandbox,
                 &command_str,
@@ -1268,6 +1327,11 @@ impl Adapter {
                 &monitor,
             )
             .await;
+            // The PTY path publishes its own result, so a deny-tier write here
+            // reaches the log and the audit trail, not the result text.
+            if let Some(watch) = handoff {
+                let _ = finish_handoff_watch(watch, &op_id_task, &tool_task).await;
+            }
             drop(lease);
             audit::record_tool_complete(
                 &op_id_task,
@@ -1343,6 +1407,8 @@ impl Adapter {
         let command_str = command_str.to_string();
         let task_handles = self.task_handles.clone();
         let op_id_task = op_id.clone();
+        let tool_task = tool_name.to_string();
+        let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
         // A session command is an arbitrary shell command: exclusive (SPEC R2.7).
         let ticket = self.enqueue_exclusive(
             workspace_queue::Lane::Exclusive,
@@ -1368,6 +1434,11 @@ impl Adapter {
                 task_handles.lock().await.remove(&op_id_task);
                 return;
             };
+            let handoff = if watch_handoff {
+                Some(begin_handoff_watch(&sandbox, &safe_wd).await)
+            } else {
+                None
+            };
             let (outcome, exit_code) = run_session_operation(
                 &sessions,
                 &sandbox,
@@ -1380,6 +1451,10 @@ impl Adapter {
                 &monitor,
             )
             .await;
+            // As for PTY: the session path publishes its own result.
+            if let Some(watch) = handoff {
+                let _ = finish_handoff_watch(watch, &op_id_task, &tool_task).await;
+            }
             drop(lease);
             audit::record_tool_complete(
                 &op_id_task,
@@ -1488,6 +1563,8 @@ struct AsyncOperationRun {
     /// The command line as the caller wrote it (for a shell tool, the shell
     /// string — `command` is then just the shell program).
     display_command: String,
+    /// Inventory the trust-handoff deny tier around the run (SPEC R6.1.7).
+    watch_handoff: bool,
 }
 
 async fn run_async_operation(ctx: AsyncOperationRun) {
@@ -1511,6 +1588,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         workspace,
         drift_root,
         display_command,
+        watch_handoff,
     } = ctx;
 
     // Timed from the moment the task starts, so queueing behind a command mutex
@@ -1627,6 +1705,14 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         lane,
     });
 
+    // SPEC R6.1.7: the "before" inventory of the deny tier, taken as late as
+    // possible — after the queue and the mutex gate, just before the spawn.
+    let mut handoff = if watch_handoff {
+        Some(begin_handoff_watch(&sandbox, &wd_path).await)
+    } else {
+        None
+    };
+
     // Single execution path: stream stdout/stderr line-by-line for every
     // operation (SPEC R15.2).  Lines flow through the OperationMonitor, which
     // appends to the tail buffer and emits `OutputLine` on the unified event
@@ -1645,9 +1731,17 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         &command,
         &wd_path,
         drift.as_ref(),
+        &mut handoff,
         &mut lease,
     )
     .await;
+    // Normally compared inside, where the alert can lead the result. Still
+    // here only when the run ended another way — timeout, cancellation, spawn
+    // failure — and its result is already published: a partial run can still
+    // have written a hook, so the log and the audit trail hear about it.
+    if let Some(watch) = handoff.take() {
+        let _ = finish_handoff_watch(watch, &op_id, &command).await;
+    }
     // Normally already released inside, just before the terminal transition.
     drop(lease);
     audit_complete(outcome, exit_code).await;
@@ -1730,6 +1824,65 @@ fn stamp_lease(cmd: &mut tokio::process::Command, lease: Option<&workspace_queue
             workspace_queue::child_lease_env(lease.key()),
         );
     }
+}
+
+/// Take the "before" inventory of the trust-handoff deny tier for a command
+/// running in `working_dir` (SPEC R6.1.7). The roots are the ones the Seatbelt
+/// profile resolves git directories from — every writable scope plus the
+/// working directory — so the watched set is the kernel-denied set on macOS.
+async fn begin_handoff_watch(sandbox: &sandbox::Sandbox, working_dir: &Path) -> HandoffWatch {
+    // Copied out in its own statement: the scope guard is a lock and must not
+    // be held across the `.await` below.
+    let mut roots: Vec<std::path::PathBuf> = sandbox.scopes().to_vec();
+    if !roots.iter().any(|r| r == working_dir) {
+        roots.push(working_dir.to_path_buf());
+    }
+    HandoffWatch::begin(&roots).await
+}
+
+/// Compare the deny tier with `watch`'s inventory and, when anything changed,
+/// say so the two durable ways — a `warn` and a `handoff_write` audit record
+/// per entry (SPEC R-HANDOFF.10). Returns the report for the caller to put in
+/// front of the result; `None` when there is nothing to say.
+async fn finish_handoff_watch(
+    watch: HandoffWatch,
+    op_id: &str,
+    tool: &str,
+) -> Option<HandoffReport> {
+    let report = watch.finish().await;
+    if report.is_empty() {
+        return None;
+    }
+    for change in &report.changes {
+        tracing::warn!(
+            operation_id = op_id,
+            path = %change.path.display(),
+            change = change.kind.wire(),
+            "{} {} ({}) — {}",
+            sandbox::handoff_watch::ALERT_PREFIX,
+            change.path.display(),
+            change.kind.as_str(),
+            change.trigger
+        );
+        audit::record_handoff_write(
+            Some(op_id),
+            &change.path,
+            change.kind.wire(),
+            change.trigger,
+            tool,
+        )
+        .await;
+    }
+    for target in &report.capped {
+        tracing::warn!(
+            operation_id = op_id,
+            "{} {} holds more than {} entries; the rest were not compared",
+            sandbox::handoff_watch::INCOMPLETE_PREFIX,
+            target.display(),
+            sandbox::handoff_watch::MAX_INVENTORY_ENTRIES
+        );
+    }
+    Some(report)
 }
 
 /// Where and how to look for files that changed while an operation ran
@@ -2057,6 +2210,7 @@ async fn execute_with_streaming(
     tool: &str,
     working_dir: &Path,
     drift: Option<&DriftProbe>,
+    handoff: &mut Option<HandoffWatch>,
     lease: &mut Option<workspace_queue::Lease>,
 ) -> (audit::Outcome, Option<i32>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -2289,6 +2443,7 @@ async fn execute_with_streaming(
         tool,
         working_dir,
         drift,
+        handoff,
         lease,
     )
     .await
@@ -2461,6 +2616,7 @@ async fn finalize_streaming_operation(
     tool: &str,
     working_dir: &Path,
     drift: Option<&DriftProbe>,
+    handoff: &mut Option<HandoffWatch>,
     lease: &mut Option<workspace_queue::Lease>,
 ) -> (audit::Outcome, Option<i32>) {
     let exit_status = child.wait().await;
@@ -2497,6 +2653,12 @@ async fn finalize_streaming_operation(
         Some(probe) => probe.report(start_time.elapsed()).await,
         None => None,
     };
+    // The process tree is gone: compare the deny tier with its inventory from
+    // before the spawn (SPEC R6.1.7).
+    let handoff_report = match handoff.take() {
+        Some(watch) => finish_handoff_watch(watch, op_id, tool).await,
+        None => None,
+    };
 
     let mut final_output = json!({
         "stdout": stdout_str,
@@ -2512,6 +2674,14 @@ async fn finalize_streaming_operation(
     });
     if let Some(changed) = changed_during_run {
         final_output["changed_during_run"] = changed;
+    }
+    if let Some(report) = handoff_report {
+        let alert = report.render_alert();
+        final_output["handoff_writes"] = report.to_json();
+        final_output["handoff_alert"] = json!(alert);
+        // Before the terminal transition, while the operation is still active:
+        // the `Alert` event is what the hub and the TUI show.
+        op_monitor.append_alert(op_id, alert).await;
     }
     // The process tree is gone and the drift probe has looked: hand the
     // workspace on *before* anyone can observe this operation as finished, so

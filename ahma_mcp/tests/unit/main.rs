@@ -34,6 +34,7 @@ mod file_tools_schema_validation_test;
 mod flattened_tool_test;
 mod graceful_shutdown_test;
 mod guard_rail_test;
+mod handoff_watch_test;
 mod harness_tool_client_gating_test;
 mod hooks_readiness_test;
 mod idle_watchdog_liveness_test;

@@ -22,17 +22,31 @@ pub fn parse_comma_separated_filter(args: &Map<String, Value>, key: &str) -> Vec
 }
 
 /// Serializes operations to Content text entries, logging errors.
+///
+/// An operation that changed the trust-handoff deny tier (SPEC R6.1.7) is
+/// preceded by its alert as plain text, so the alert is read before the JSON
+/// rather than found inside it.
 pub fn serialize_operations_to_content(operations: &[Operation]) -> Vec<ContentBlock> {
-    operations
-        .iter()
-        .filter_map(|op| match serde_json::to_string_pretty(op) {
-            Ok(s) => Some(ContentBlock::text(s)),
-            Err(e) => {
-                tracing::error!("Serialization error: {}", e);
-                None
-            }
-        })
-        .collect()
+    let mut out = Vec::with_capacity(operations.len());
+    for op in operations {
+        if let Some(alert) = handoff_alert(op) {
+            out.push(ContentBlock::text(alert.to_string()));
+        }
+        match serde_json::to_string_pretty(op) {
+            Ok(s) => out.push(ContentBlock::text(s)),
+            Err(e) => tracing::error!("Serialization error: {}", e),
+        }
+    }
+    out
+}
+
+/// The trust-handoff alert an operation's result carries (SPEC R6.1.7), if any.
+pub(crate) fn handoff_alert(op: &Operation) -> Option<&str> {
+    op.result
+        .as_ref()
+        .and_then(|r| r.get("handoff_alert"))
+        .and_then(Value::as_str)
+        .filter(|a| !a.is_empty())
 }
 
 /// Checks whether an operation matches the given tool name prefixes and optional operation ID.
@@ -336,7 +350,12 @@ pub(crate) fn render_completed_operation(op: &Operation) -> String {
     } else {
         body.trim_end()
     };
-    let mut text = format!("{}\n{}", identity_line(op), body);
+    // A trust-handoff alert (SPEC R6.1.7) leads everything but the identity
+    // line, which R2.6.2 reserves the first line for.
+    let mut text = match handoff_alert(op) {
+        Some(alert) => format!("{}\n{alert}\n\n{body}", identity_line(op)),
+        None => format!("{}\n{}", identity_line(op), body),
+    };
     for note in concurrency_notes(op) {
         text.push_str("\n\n");
         text.push_str(&note);

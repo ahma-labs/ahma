@@ -55,6 +55,7 @@ mod error;
 pub mod exec_config;
 pub mod gpu;
 pub mod grant_channel;
+pub mod handoff_watch;
 pub mod host_detect;
 #[cfg(target_os = "linux")]
 mod landlock;

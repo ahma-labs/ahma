@@ -312,6 +312,9 @@ sockets — are denied outright; editor and harness configuration is allowed but
 disclosed loudly when written. That deny tier is kernel-enforced on macOS,
 **application-layer only on Linux** (so a shell command through
 `run_terminal_command` can still write those paths), and unenforced on Windows.
+Where the kernel does not hold it, ahma compares those paths before and after every
+command and reports a change as `TRUST-HANDOFF WRITE` in the result and the audit
+log — detection, not prevention.
 See [`docs/security-sandbox.md`](security-sandbox.md#writable-but-not-everything-trust-handoff)
 and SPEC R-HANDOFF.
 

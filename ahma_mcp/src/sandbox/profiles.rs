@@ -629,7 +629,9 @@ pub fn platform_enforcement() -> PlatformEnforcement {
              hook directories, the project's own .ahma/, hub sockets) is enforced only \
              in ahma's own file tools — Landlock cannot carve a denied hole inside an \
              allowed directory. A command run through run_terminal_command can still write \
-             those paths.",
+             those paths; ahma compares them before and after every command and reports a \
+             change as TRUST-HANDOFF WRITE in the result and the audit log, but does not \
+             prevent or undo it. Review .git/hooks before your next git command.",
         );
     }
 

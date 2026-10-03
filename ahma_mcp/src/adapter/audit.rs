@@ -228,6 +228,28 @@ pub enum AuditEventKind {
         access: String,
         tool_name: String,
     },
+
+    /// A deny-tier path (a resolved `<git_dir>/hooks`, a project's `.ahma/`)
+    /// changed while a command ran, on a platform whose kernel does not stop
+    /// that write (SPEC R6.1.7, R-HANDOFF.4). Detected by comparing an inventory
+    /// taken before the command with one taken after it
+    /// ([`crate::sandbox::handoff_watch`]); nothing is reverted.
+    ///
+    /// Unlike [`AuditEventKind::TrustHandoffDisclosure`], which ahma's own write tools emit
+    /// for a write they *allowed*, this records a write ahma would have refused
+    /// and could not stop. The command, or another process during its run, made
+    /// it.
+    HandoffWrite {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        /// Absolute path of the changed entry.
+        path: String,
+        /// `created`, `modified`, `removed` or `made_executable`.
+        change: String,
+        /// What will execute it, and when.
+        trigger: String,
+        tool_name: String,
+    },
 }
 
 /// Terminal outcome label recorded on a [`AuditEventKind::ToolComplete`].
@@ -491,6 +513,25 @@ pub async fn record(kind: AuditEventKind) {
 pub async fn record_trust_handoff(path: &str, trigger: &str, tool_name: &str) {
     record(AuditEventKind::TrustHandoffDisclosure {
         path: redact_and_bound(path, MAX_ARGS_SUMMARY_CHARS),
+        trigger: redact_and_bound(trigger, MAX_ARGS_SUMMARY_CHARS),
+        tool_name: tool_name.to_string(),
+    })
+    .await;
+}
+
+/// Record a deny-tier write the kernel did not stop (SPEC R6.1.7,
+/// R-HANDOFF.10).
+pub async fn record_handoff_write(
+    operation_id: Option<&str>,
+    path: &Path,
+    change: &str,
+    trigger: &str,
+    tool_name: &str,
+) {
+    record(AuditEventKind::HandoffWrite {
+        operation_id: operation_id.map(str::to_string),
+        path: redact_and_bound(&path.display().to_string(), MAX_ARGS_SUMMARY_CHARS),
+        change: change.to_string(),
         trigger: redact_and_bound(trigger, MAX_ARGS_SUMMARY_CHARS),
         tool_name: tool_name.to_string(),
     })
@@ -897,6 +938,31 @@ mod tests {
             Some(crate::utils::logging::project_log_dir().as_path()),
             "the audit log is a sibling of operations/, not inside it"
         );
+    }
+
+    /// The wire shape docs/execution-audit-log.md documents for a deny-tier
+    /// write the kernel did not stop (SPEC R6.1.7).
+    #[tokio::test]
+    async fn a_handoff_write_is_one_typed_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AuditLog::at(tmp.path().join("audit.jsonl"));
+        log.emit(AuditEventKind::HandoffWrite {
+            operation_id: Some("op_9".into()),
+            path: "/w/.git/hooks/pre-commit".into(),
+            change: "created".into(),
+            trigger: "git runs files in .git/hooks outside any sandbox".into(),
+            tool_name: "bash".into(),
+        })
+        .await
+        .unwrap();
+
+        let contents = tokio::fs::read_to_string(log.path()).await.unwrap();
+        let events = parse_lines(&contents);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "handoff_write");
+        assert_eq!(events[0]["operation_id"], "op_9");
+        assert_eq!(events[0]["path"], "/w/.git/hooks/pre-commit");
+        assert_eq!(events[0]["change"], "created");
     }
 
     #[test]

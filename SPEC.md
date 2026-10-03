@@ -156,11 +156,11 @@ may change.
 | Output spill files | tests-pass | `<log dir>/operations/<id>.log`, advertised as `output_file` |
 | Built-in tools | tests-pass | `BuiltinTool::ALL`; file tools withheld from clients with native ones (R26) |
 | Tool reload | tests-pass | Explicit `restart` only (R1.4) |
-| Linux sandbox (Landlock) | tests-pass | Reads and writes confined; deny tier application-layer only (R6.1.7) |
+| Linux sandbox (Landlock) | tests-pass | Reads and writes confined; deny tier application-layer only, shell writes to it detected and reported (R6.1.7) |
 | macOS sandbox (Seatbelt) | tests-pass | Writes confined; reads unconfined except a credential denylist (R6.2.2, R6.2.3); signals and GPU confined (R6.2.6, R6.2.7) |
 | Windows sandbox | in-progress | Job Objects only; no OS path boundary (R6.3.3) |
 | Nested sandbox detection and deferral (R7) | tests-pass | Hooks and MCP server apply ahma's own sandbox; defer only on kernel proof (R7.6) |
-| Trust-handoff hardening (R-HANDOFF) | in-progress | Kernel-enforced on macOS; application-layer on Linux; none on Windows |
+| Trust-handoff hardening (R-HANDOFF) | in-progress | Kernel-enforced on macOS; elsewhere ahma's file tools refuse and shell-command writes are detected after the fact (R6.1.7) |
 | Execution audit log | tests-pass | `<log dir>/audit.jsonl` on every execution path (R-HANDOFF.10) |
 | Unified permissions and doctor | tests-pass | One ledger under `~/.ahma`; `ahma doctor [--fix]` (R-PERM, R-DOCTOR) |
 | Grant prompts | tests-pass | One body on every surface, `grant_prompt::render` (R-PERM.3.4); per-session budget (R-PERM.4.5) |
@@ -502,7 +502,7 @@ The sandbox scope defines the root directory boundary. AI has **full read/write 
 
 | Platform | Writes outside scope | Reads outside scope | Mechanism | Gap |
 |---|---|---|---|---|
-| Linux | denied | denied (R6.1.6) | Landlock, applied per spawn (R6.1.4) | trust-handoff deny tier is application-layer only (R6.1.7, R-HANDOFF.4) |
+| Linux | denied | denied (R6.1.6) | Landlock, applied per spawn (R6.1.4) | trust-handoff deny tier is application-layer only; command writes to it are detected and reported (R6.1.7, R-HANDOFF.4) |
 | macOS | denied | **allowed**, except a credential denylist (R6.2.3) | Seatbelt (R6.2) | reads not kernel-scoped (R6.2.2) |
 | Windows | **allowed** | **allowed** | Job Object: process lifetime only (R6.3.2) | no OS filesystem boundary (R6.3.3, R6.3.9; open: §11) |
 
@@ -642,6 +642,7 @@ Status: of the downgrades below, `--tmp` is asked (R5.2.5), widening beyond the 
 - **R6.1.5**: **Availability probing**: Landlock availability **must** be determined by calling `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` — never by kernel version or `/sys/kernel/security/lsm`, both of which report false positives in containers (seccomp-blocked syscall, unmounted securityfs, LSM compiled out).
 - **R6.1.6**: **Reads are confined on Linux**: Landlock rules are file-descriptor-based allow-lists, so the read-only set is as explicit as the writable one: platform-invariant system directories are added read+execute by the backend (`sandbox/landlock.rs`, `add_landlock_system_rules`), toolchain directories arrive through shipped profiles (R-PERM.5), and anything not named is unreadable. This **must not** be generalized to the other backends (§4 table).
 - **R6.1.7**: **Landlock cannot carve a deny hole inside an allowed subtree**: the ABI ahma targets grants access through `PathBeneath` rules, with no deny rule and no ordering, so a path *beneath* an allowed directory cannot be subtracted. Any rule of the form "the workspace is writable **except** these paths inside it" is unenforceable by the Linux kernel and **must** be implemented as an application-layer check and disclosed as such (R-HANDOFF.4). macOS SBPL is last-match-wins, so a later `deny` genuinely subtracts.
+  - **Detection where the kernel cannot prevent.** Where the deny tier is not kernel-enforced (Linux; Windows, R6.3.9; any sandbox that is not enforcing), every command that may write **must** be bracketed by a bounded inventory of the deny-tier set (resolved as in R-HANDOFF.2: every `<git_dir>/hooks` and `<root>/.ahma`, excluding ahma's own log directory). Any created, modified, removed or newly executable entry **must** be reported as a `TRUST-HANDOFF WRITE` line leading the result after the identity line (R2.6.2), at `warn`, as an operation alert, and as a `handoff_write` audit event (R-HANDOFF.10). It is detection only: nothing is reverted, and a target past the bound is disclosed as incomplete on every command. Owned by `sandbox::handoff_watch`. Kernel prevention stays open (§11).
 - **R6.1.8**: **Moves within writable areas work**: a rename or hard link that changes a file's directory **must** succeed when both directories are writable. Landlock ABI 1 refuses every such operation with `EXDEV` ("Invalid cross-device link"); `mv` hides it with a copy fallback, but any program calling `rename(2)` across directories failed. The ruleset therefore targets ABI 2 and grants its `Refer` right wherever it grants writes, and nowhere else. On kernels before 5.19 the right is dropped (best effort) and the old behaviour remains.
 
 #### R6.2: macOS (Seatbelt)
@@ -740,8 +741,8 @@ A "host sandbox" is an outer kernel sandbox ahma runs inside (Cursor, Claude Cod
 - **R-HANDOFF.3.4**: **A grant question names what will run the target**: when a grant would let the agent write a path *outside* the scope that something trusted executes later — a shell startup file (every new shell), a login item (`~/Library/LaunchAgents`, `~/.config/autostart`; at login) or a `.git/hooks` directory (git on commit, checkout and push) — the prompt classifies it high risk and says in one factual sentence what will run it and that nobody will be asked when it does. These are warnings, not refusals. The list lives with the denylist (`scope_grant::auto_execution_warning`).
 - **R-HANDOFF.4**: **Enforcement is asymmetric across platforms, and the asymmetry is a requirement-level fact**: the deny-write tier is a **hole inside an allowed subtree**, and platforms differ on whether the kernel can express one.
   - **macOS — kernel-enforced, for rules that are concrete subpaths.** SBPL is last-match-wins, so a `(deny file-write* …)` after the workspace allow subtracts (as the credential read denies do, R6.2.3). A *shape*-matched rule (the virtualenv interpreter case, where a kernel deny on every `bin/python*` would break `python -m venv`) is application-layer everywhere, so the kernel deny set and the write-tool-only set are **different sets** and code **must not** blur them.
-  - **Linux — application-layer only** (R6.1.7). ahma enforces the hole in its own file tools, so it is **bypassable via `run_terminal_command`**: a shell child inherits the workspace-wide Landlock write right.
-  - **Windows** — the application-layer check is the only control (§4 table).
+  - **Linux — application-layer only** (R6.1.7). ahma enforces the hole in its own file tools, so it is **bypassable via `run_terminal_command`**: a shell child inherits the workspace-wide Landlock write right. Such a write is detected and reported after the command (R6.1.7), never prevented.
+  - **Windows** — the application-layer check is the only control (§4 table); shell-command writes are detected as on Linux (R6.1.7).
 
   Per R7 and R7.5 this asymmetry **must** be disclosed wherever the protection is claimed: a Linux user **must** be able to learn from ahma itself that the protection stops at the shell, because an application-layer check presented as kernel-enforced is relied upon.
 - **R-HANDOFF.5**: **A child's environment is part of the handoff surface**: two categories **must** be stripped from every sandboxed child environment, alongside the secret-pattern scrub owned by `sandbox/command.rs`:
@@ -764,6 +765,7 @@ A "host sandbox" is an outer kernel sandbox ahma runs inside (Cursor, Claude Cod
   - ahma **must** write an append-only execution audit log on **every** execution path — synchronous, asynchronous, PTY and session — not only inside a task vault. Each execution records a `tool_call` **before** the process is spawned, and exactly one matching `tool_complete` on **every** terminal path (success, failure, timeout, cancellation, spawn error), so no panic, `SIGKILL` or power loss can leave the log without a record of what was asked for.
   - Sandbox denials **must** land in the same log, whether refused by path validation or surfaced as a kernel denial at runtime (R5.4.7). The wire format **must** be the vault's (`ahma_mcp::vault::audit::AuditEvent`), so one reader parses both logs, and a test **must** assert the compatibility.
   - Recorded fields **must** be redacted through the *same* function operation output uses, and every free-form field **must** be individually bounded, which keeps one event one `write` syscall so concurrent `O_APPEND` writes do not interleave without a process-wide lock.
+  - A deny-tier write the kernel did not stop (R6.1.7) **must** land in the same log as a `handoff_write` event, one per entry.
   - **An audit write failure must never fail the operation it records** (R-PERM.2.2, generalized), but **must** be reported at `warn` naming the path.
 
 ### R-PERM: Unified Permissions Model
@@ -1908,6 +1910,6 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 `(open: §11)`.
 
 - **Windows filesystem boundary** (R6.3.3, R6.3.9, R-HANDOFF.4): AppContainer spawn isolation holds both ways on `windows-latest` but is disabled: ordinary tools need `NUL` (denied to application packages; fixing it needs an administrator) and the scope's ancestors (traverse and stat denied). Enabling it needs a design for granting both.
-- **Linux trust-handoff deny tier** (R6.1.7): application-layer only; Landlock ABI V1 has no deny rule.
+- **Linux trust-handoff deny tier** (R6.1.7): prevention is open. Landlock has no deny rule, and per-command user and mount namespaces are blocked for unprivileged users on Ubuntu 24.04 and later. Writes are detected and reported (`handoff_write`).
 - **Developer-ID signing and notarization** (R-SIGN.1): blocked on Apple Developer credentials; local installs are re-signed ad hoc.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.

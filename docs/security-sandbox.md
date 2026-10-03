@@ -68,6 +68,8 @@ A Landlock rule is an allow-list of file descriptors, so the read-only set is ex
 
 Moving or hard-linking a file into another directory works wherever writes do. On kernels before 5.19, Landlock refuses any rename that changes a file's directory with "Invalid cross-device link"; `mv` still works there (it copies), but programs that call `rename(2)` directly fail (SPEC R6.1.8).
 
+**Git hooks and `.ahma/` are watched, not protected** (SPEC R6.1.7). Inside the workspace, Landlock cannot deny the trust-handoff paths — every resolved `<git dir>/hooks` and the project's `.ahma/` — so a command run through `run_terminal_command` can write `.git/hooks/pre-commit`, and your `git` will run it later outside any sandbox. ahma detects this instead: it inventories those paths before every command and compares afterwards, and a change leads the tool result with a `TRUST-HANDOFF WRITE` line. Nothing is reverted. See [Detected, not prevented](#detected-not-prevented-linux-and-windows).
+
 **Older kernels / Raspberry Pi**: Landlock requires kernel ≥ 5.13. On older Pi OS kernels, run with:
 
 ```bash
@@ -133,10 +135,36 @@ A denied write fails with the structured `sandbox_denial` payload naming the pat
 | Platform | Deny-write tier |
 |---|---|
 | **macOS** | kernel-enforced for the fixed-subpath rules — SBPL is last-match-wins, so a `(deny file-write* …)` emitted after the workspace allow genuinely subtracts |
-| **Linux** | **application-layer only.** Landlock's ABI is additive-allow with no deny rule and no ordering, so the hole cannot be expressed to the kernel (SPEC R6.1.7). ahma enforces it in its own file tools, which means it is **bypassable from `run_terminal_command`**: a shell child inherits the workspace-wide write right and can create a hook script directly |
-| **Windows** | no filesystem enforcement yet (SPEC R6.3.9); the application-layer check is the only control |
+| **Linux** | **application-layer only, and detected — not prevented — for shell commands.** Landlock's ABI is additive-allow with no deny rule and no ordering, so the hole cannot be expressed to the kernel (SPEC R6.1.7). ahma enforces it in its own file tools, which means it is **bypassable from `run_terminal_command`**: a shell child inherits the workspace-wide write right and can create a hook script directly. Such a write is reported after the command (below) |
+| **Windows** | no filesystem enforcement yet (SPEC R6.3.9); the application-layer check is the only control, and shell-command writes are detected and reported as on Linux |
 
 The shape-matched rules are application-layer on *every* platform by construction: a kernel deny on every `bin/python*` would break a legitimate `python -m venv`.
+
+### Detected, not prevented (Linux and Windows)
+
+Kernel prevention on Linux would need a private mount namespace per command, and stock Ubuntu 24.04 refuses unprivileged user namespaces. Until that or a Landlock "no-inherit" rule exists, ahma closes the *silent* half of the gap. Wherever the kernel does not hold the deny tier — Linux, Windows, and any session running with `--no-sandbox` — every command that may write is bracketed by two inventories of the deny-tier paths (the same set the macOS kernel rules deny: every resolved `<git dir>/hooks`, every `<scope>/.ahma`). An entry that was created, modified, removed or made executable while the command ran is reported three ways:
+
+1. **At the top of the tool result**, after the identity line, one line per entry:
+
+   ```text
+   TRUST-HANDOFF WRITE: /home/me/project/.git/hooks/pre-commit (created) — git runs files in .git/hooks outside any sandbox; review before your next git command
+   Detected after the command ran, not prevented: on this platform the kernel does not stop writes to these paths (SPEC R6.1.7). Another process, such as your editor, may have made the change. Nothing was reverted.
+   ```
+
+   A change under `.ahma/` names its own trigger instead: ahma loads those tool definitions on its next start or `restart`.
+2. **At `warn` in ahma's log**, with the same wording.
+3. **In the execution audit log** as a `handoff_write` record per entry — the durable half, because the hook runs later, when nobody is reading the transcript ([execution-audit-log.md](execution-audit-log.md#handoff_write)).
+
+The hub and the TUI receive the alert as the operation's alert event. A PTY or persistent-session command (`pty: true`, `session_id`) publishes its own result, so for those the alert goes to the log and the audit trail only.
+
+What this does **not** do, on purpose:
+
+- **Revert.** The change may be your own edit made while the command ran; ahma says so rather than undoing it.
+- **Watch a repository the command itself creates.** The paths are resolved when the command starts, the same floor as the macOS kernel rules (SPEC R-HANDOFF.2); a `git clone` is covered from the next command.
+- **Walk anything else.** Only the deny-tier directories are inventoried, at most 500 entries each and four levels deep. A directory that holds more is reported as `TRUST-HANDOFF WATCH INCOMPLETE` on every command while it stays that way, so a planted pile of files cannot push a real hook out of view quietly.
+- **Attribute the change.** Entries are compared by size, modification time and permission bits (on Unix also inode number and inode-change time, which `touch -r` cannot forge), not by who wrote them.
+- **Report ahma's own writes.** ahma's log directory (by default `.ahma/logs`, which receives the operation output and this audit log while a command runs), the `.ahma/.gitignore` it maintains for it, and the user-level `~/.ahma` are left out of the inventory.
+- **Run on macOS**, where the kernel already refuses these writes. An operator opt-in (`--allow-git-hooks`, `--allow-project-tool-config`) removes its path from the watched set too, exactly as it does from the deny set.
 
 **The child's environment is part of the same surface.** Variables that cause an unrelated process to load code of the agent's choosing (`BASH_ENV`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES` and family) or that re-point a trusted client at an attacker-chosen endpoint (`DOCKER_HOST`) are stripped from every sandboxed child. `SSH_AUTH_SOCK` is deliberately **kept**: it is a capability to *use* keys, not to read them, and it is what lets git-over-ssh keep working while the key files stay denied (SPEC R-HANDOFF.5).
 

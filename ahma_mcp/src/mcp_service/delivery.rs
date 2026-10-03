@@ -99,7 +99,13 @@ fn summarize(op: &Operation) -> String {
         .as_ref()
         .map(|p| format!(" Full output: {}", p.display()))
         .unwrap_or_default();
-    format!("{first}\n[… earlier output omitted.{file}]\n{tail}")
+    // A trust-handoff alert (SPEC R6.1.7) sits right under the identity line,
+    // which is exactly what the cut above drops; it is never the part to lose.
+    let alert = super::handlers::common::handoff_alert(op)
+        .filter(|a| !tail.contains(*a))
+        .map(|a| format!("{a}\n"))
+        .unwrap_or_default();
+    format!("{first}\n{alert}[… earlier output omitted.{file}]\n{tail}")
 }
 
 /// The answer for a call whose operation has not started because it is
@@ -196,6 +202,36 @@ mod tests {
             result.content[1].as_text().unwrap().text,
             "git status output"
         );
+    }
+
+    /// SPEC R6.1.7: the piggyback cut keeps the identity line and the tail —
+    /// exactly what drops a trust-handoff alert, which sits between them.
+    #[tokio::test]
+    async fn a_long_piggybacked_result_keeps_its_trust_handoff_alert() {
+        let m = monitor();
+        m.add_operation(Operation::new(
+            "op3".into(),
+            "run_terminal_command".into(),
+            "x".into(),
+            None,
+        ))
+        .await;
+        let alert = "TRUST-HANDOFF WRITE: /ws/.git/hooks/pre-commit (created) — git runs files";
+        m.update_status(
+            "op3",
+            OperationStatus::Completed,
+            Some(serde_json::json!({
+                "stdout": "line\n".repeat(PIGGYBACK_MAX_CHARS),
+                "stderr": "",
+                "exit_code": 0,
+                "handoff_alert": alert,
+            })),
+        )
+        .await;
+        let op = m.check_completion_history_pub("op3").await.unwrap();
+        let text = summarize(&op);
+        assert!(text.contains("earlier output omitted"), "{text}");
+        assert!(text.contains(alert), "{text}");
     }
 
     #[test]
