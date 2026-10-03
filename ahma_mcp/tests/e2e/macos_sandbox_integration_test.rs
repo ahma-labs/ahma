@@ -1213,6 +1213,7 @@ int main(void) {
             .unwrap_or_else(|e| e.to_string());
         row.push_str(&format!("\n   outbound curl: {}", curl.trim()));
         let _ = child.kill();
+        let _ = child.wait();
         let mut rest = String::new();
         let _ = out.read_to_string(&mut rest);
         row.push_str(&format!(
