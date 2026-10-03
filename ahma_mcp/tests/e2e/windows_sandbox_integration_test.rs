@@ -261,7 +261,7 @@ mod appcontainer {
     use ahma_common::timeouts::TestTimeouts;
     use ahma_mcp::sandbox::windows::{
         PROBE_DONE_KEY, ProbeCase, ProbeOp, appcontainer_name_for_scope,
-        check_windows_sandbox_available, cleanup_windows_sandbox, parse_probe_report,
+        check_windows_sandbox_available, cleanup_windows_sandbox, experiment, parse_probe_report,
         plan_windows_sandboxed_spawn, probe_args, probe_case_key, resolve_launcher_exe,
     };
     use ahma_mcp::sandbox::{Sandbox, SandboxMode};
@@ -496,14 +496,19 @@ mod appcontainer {
             self.row(round, probe, PROBE_DONE_KEY, done);
         }
 
-        fn print_table(&self) {
+        /// Print the whole table-so-far under `title`, then flush. Called after
+        /// every round (`partial: ...`) as well as at the end, so a run killed by
+        /// the CI timeout still leaves the evidence it had gathered — the final
+        /// `print_table` is not reached if the process is terminated mid-round.
+        fn dump(&self, title: &str) {
+            use std::io::Write as _;
             let mut width = ["round".len(), "probe".len(), "key".len()];
             for row in &self.rows {
                 for (w, cell) in width.iter_mut().zip(row.iter()) {
                     *w = (*w).max(cell.len());
                 }
             }
-            println!("==== R6.3.3 AppContainer diagnostics: results ====");
+            println!("==== {title} ====");
             println!(
                 "{:<w0$}  {:<w1$}  {:<w2$}  value",
                 "round",
@@ -521,6 +526,11 @@ mod appcontainer {
                     w2 = width[2]
                 );
             }
+            let _ = std::io::stdout().flush();
+        }
+
+        fn print_table(&self) {
+            self.dump("R6.3.3 AppContainer diagnostics: results");
         }
     }
 
@@ -696,6 +706,131 @@ mod appcontainer {
             ),
             Err(e) => println!("---- icacls {}: could not run: {e}", path.display()),
         }
+    }
+
+    /// The ancestor-sensitive cases: resolving the scope's final path, listing its
+    /// parent, and stat-ing each ancestor — exactly the opens that failed in the
+    /// baseline because the scope's ancestors grant the container nothing.
+    fn ancestor_experiment_cases(scope: &Path) -> Vec<ProbeCase> {
+        let mut cases = vec![ProbeCase::new("in_canon", ProbeOp::Canonicalize, scope)];
+        if let Some(parent) = scope.parent() {
+            cases.push(ProbeCase::new("parent_list", ProbeOp::List, parent));
+        }
+        for (i, ancestor) in scope.ancestors().skip(1).enumerate() {
+            cases.push(ProbeCase::new(
+                format!("anc{i}_stat"),
+                ProbeOp::Stat,
+                ancestor,
+            ));
+        }
+        cases
+    }
+
+    /// EXPERIMENT (not production): add a non-inheritable traverse ACE for
+    /// `trustee` to every user-owned ancestor of the scope (stopping at the profile
+    /// root), rerun the ancestor/canon/parent probe inside the container, then
+    /// remove every ACE and verify the DACL is byte-for-byte restored. Records
+    /// which cases now succeed under `round`.
+    ///
+    /// This measures a candidate fix for the ancestor-traversal blocker. It changes
+    /// nothing permanent: `appcontainer_spawn_enabled()` stays `false`, only
+    /// directories the current user owns are touched (never `C:\` or `C:\Users`),
+    /// and a guard restores each ACE even on early return.
+    async fn experiment_ancestor_round(
+        d: &mut Diagnostics,
+        ahma: &Path,
+        round: &str,
+        scope: &Path,
+        trustee: &experiment::Trustee,
+    ) {
+        let profile_root = match std::env::var_os("USERPROFILE") {
+            Some(p) => PathBuf::from(p),
+            None => {
+                d.row(round, "ancestors", "skipped", "USERPROFILE is unset");
+                return;
+            }
+        };
+        let ancestors = match experiment::user_owned_ancestors(scope, &profile_root) {
+            Ok(a) => a,
+            Err(e) => {
+                d.row(round, "ancestors", "enumerate", format!("err: {e:#}"));
+                return;
+            }
+        };
+
+        let mut guards = Vec::new();
+        for info in &ancestors {
+            let owned = info.owned.map_or("?", |b| if b { "yes" } else { "no" });
+            d.row(
+                round,
+                "ancestors",
+                &info.path.display().to_string(),
+                format!("owned={owned} eligible={} {}", info.eligible, info.note),
+            );
+            if !info.eligible {
+                continue;
+            }
+            match experiment::TraverseAceGuard::add(
+                &info.path,
+                trustee,
+                experiment::traverse_mask(),
+            ) {
+                Ok(guard) => {
+                    let sddl = guard
+                        .current_sddl()
+                        .unwrap_or_else(|e| format!("<sddl read failed: {e:#}>"));
+                    d.row(
+                        round,
+                        "grant",
+                        &info.path.display().to_string(),
+                        format!("ace added; dacl={sddl}"),
+                    );
+                    guards.push((info.path.clone(), guard));
+                }
+                Err(e) => d.row(
+                    round,
+                    "grant",
+                    &info.path.display().to_string(),
+                    format!("add FAILED: {e:#}"),
+                ),
+            }
+        }
+
+        // Rerun only the ancestor-sensitive cases, now that the traverse ACEs are
+        // in place, through the same launcher plan a tool would use.
+        let ahma_str = ahma.to_string_lossy();
+        let cases = ancestor_experiment_cases(scope);
+        let run = run_contained(scope, &ahma_str, &probe_args(&cases), &[], Some(scope)).await;
+        d.record(round, "probe", &run);
+
+        // Remove every ACE and confirm the DACL matches what was captured.
+        for (path, guard) in guards {
+            let outcome = guard.restore_and_verify();
+            d.row(round, "revoke", &path.display().to_string(), outcome);
+        }
+    }
+
+    /// EXPERIMENT (not production): probe the several spellings of the null device
+    /// from inside the container, and print `\\.\NUL`'s security descriptor as
+    /// SDDL — read-only, so we can see whether ALL APPLICATION PACKAGES is absent
+    /// from its DACL. No device or system object is modified.
+    async fn experiment_nul_round(d: &mut Diagnostics, ahma: &Path, scope: &Path) {
+        match experiment::nul_device_sddl() {
+            Ok(sddl) => d.row("exp-nul", "host", "nul.sddl", sddl),
+            Err(e) => d.row("exp-nul", "host", "nul.sddl", format!("err: {e:#}")),
+        }
+        let cases = vec![
+            ProbeCase::new("nul_dotdevice", ProbeOp::Write, r"\\.\NUL"),
+            ProbeCase::new("nul_bare", ProbeOp::Write, "NUL"),
+            ProbeCase::new(
+                "nul_globalroot",
+                ProbeOp::Write,
+                r"\\?\GLOBALROOT\Device\Null",
+            ),
+        ];
+        let ahma_str = ahma.to_string_lossy();
+        let run = run_contained(scope, &ahma_str, &probe_args(&cases), &[], Some(scope)).await;
+        d.record("exp-nul", "probe", &run);
     }
 
     /// One round: a fresh scope and a sibling "outside" directory under `base`
@@ -946,6 +1081,29 @@ mod appcontainer {
             )
             .await;
             d.record(round, "pwsh", &run);
+
+            // R6.3.3 EXPERIMENT rounds (not production): measure candidate fixes
+            // for the two blockers. Each grants only to user-owned ancestors and
+            // restores every ACE; the NUL round is read-only on the device.
+            experiment_ancestor_round(
+                d,
+                ahma,
+                "exp-ancestor-user",
+                &scope_path,
+                &experiment::Trustee::ContainerForScope(scope_path.clone()),
+            )
+            .await;
+            experiment_ancestor_round(
+                d,
+                ahma,
+                "exp-ancestor-aap",
+                &scope_path,
+                &experiment::Trustee::StringSid(
+                    experiment::ALL_APPLICATION_PACKAGES_SID.to_string(),
+                ),
+            )
+            .await;
+            experiment_nul_round(d, ahma, &scope_path).await;
         }
 
         cleanup_windows_sandbox();
@@ -1017,10 +1175,13 @@ mod appcontainer {
             launcher.display().to_string(),
         );
         diagnose_round(&mut d, &ahma, "temp", None, false, true).await;
+        d.dump("partial: after temp");
         diagnose_round(&mut d, &ahma, "temp+low-label", None, true, false).await;
+        d.dump("partial: after temp+low-label");
         match std::env::var_os("RUNNER_TEMP").map(PathBuf::from) {
             Some(base) if base.is_dir() => {
                 diagnose_round(&mut d, &ahma, "runner_temp", Some(&base), false, false).await;
+                d.dump("partial: after runner_temp");
             }
             _ => d.row(
                 "runner_temp",

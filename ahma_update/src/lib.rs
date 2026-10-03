@@ -10,6 +10,7 @@
 mod github;
 pub mod install;
 pub mod platform;
+pub mod receipt;
 pub mod ref_mode;
 pub mod release;
 pub mod source;

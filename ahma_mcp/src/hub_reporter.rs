@@ -106,6 +106,8 @@ pub struct InstanceIdentity {
     pub grants: Vec<ahma_common::hub::GrantSummary>,
     /// The `ActiveSandbox` token: which sandbox protects this instance.
     pub enforcement: Option<String>,
+    /// Whether the client's own terminal is inside ahma's sandbox (SPEC R7.8).
+    pub native_terminal: Option<String>,
 }
 
 static INSTANCE_IDENTITY: std::sync::LazyLock<tokio::sync::watch::Sender<InstanceIdentity>> =
@@ -142,12 +144,23 @@ pub fn set_client_identity(name: impl Into<String>, sampling: bool, elicitation:
         {
             false
         } else {
+            cur.native_terminal = native_terminal_of(Some(&name), cur.scope.as_deref());
             cur.client = Some(name);
             cur.sampling = sampling;
             cur.elicitation = elicitation;
             true
         }
     });
+}
+
+/// Whether `client`'s own terminal runs inside ahma's sandbox, for a session
+/// scoped to `scope` (SPEC R7.8). Derived whenever either becomes known, so
+/// the TUI session list can say it.
+fn native_terminal_of(client: Option<&str>, scope: Option<&str>) -> Option<String> {
+    let client = crate::client_type::McpClientType::from_client_name(client?);
+    let workspace = std::path::PathBuf::from(scope.unwrap_or("."));
+    crate::hooks::native_terminal::native_terminal_for(client, &workspace)
+        .map(|n| n.wire().to_string())
 }
 
 /// Record the sandbox scope this instance actually locked (SPEC R5.1's single
@@ -205,6 +218,7 @@ pub fn publish_committed_scope(sandbox: &crate::sandbox::Sandbox) {
         next.read_scopes = read_scopes.clone();
         next.grants = grants.clone();
         next.enforcement = enforcement.clone();
+        next.native_terminal = native_terminal_of(next.client.as_deref(), next.scope.as_deref());
         let changed = next != *cur;
         *cur = next;
         changed
@@ -551,6 +565,7 @@ async fn run_reporter_loop(
             read_scopes: identity.read_scopes.clone(),
             grants: identity.grants.clone(),
             enforcement: identity.enforcement.clone(),
+            native_terminal: identity.native_terminal.clone(),
         };
         if let Err(e) = send_msg(&mut writer, &reg).await {
             debug!("hub_reporter: register failed ({e})");

@@ -68,6 +68,7 @@ async fn a_departed_instance_still_reaches_the_tui_with_its_work() {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await

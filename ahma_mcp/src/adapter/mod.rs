@@ -360,19 +360,36 @@ impl Adapter {
     }
 
     /// Which lane a call runs in (SPEC R2.7.4): what the MTDF definition
-    /// declares, else — for a shell command line — what the classifier says,
-    /// else exclusive. A read-only verdict the kernel cannot enforce here is
-    /// demoted to exclusive: the queue never trusts a classifier alone.
+    /// declares, else — for a shell command line run in `working_dir` — what
+    /// the classifier says, else exclusive. A read-only verdict the kernel
+    /// cannot enforce here is demoted to exclusive: the queue never trusts a
+    /// classifier alone.
     pub fn resolve_lane(
         &self,
         args: Option<&Map<String, serde_json::Value>>,
         subcommand_config: Option<&crate::config::SubcommandConfig>,
+        working_dir: &std::path::Path,
     ) -> workspace_queue::Lane {
         use workspace_queue::Lane;
         let lane = subcommand_config
             .and_then(|s| s.concurrency)
             .unwrap_or_else(|| match shell_command_line(args) {
-                Some(line) => lane::classify_shell_command(line),
+                Some(line) => {
+                    // A redirection writes the workspace when its file lies in
+                    // this workspace or in any other the session can write.
+                    let workspace = self.workspace_key_for(working_dir);
+                    let scopes = self.sandbox.scopes().to_vec();
+                    let writes_workspace =
+                        |path: &std::path::Path| lane::writes_inside(path, &workspace, &scopes);
+                    lane::classify_shell_command_at(
+                        line,
+                        &lane::RunSite {
+                            cwd: working_dir,
+                            read_only_enforced: self.sandbox.can_enforce_read_only(),
+                            writes_workspace: &writes_workspace,
+                        },
+                    )
+                }
                 None => Lane::Exclusive,
             });
         if lane == Lane::ReadOnly && !self.sandbox.can_enforce_read_only() {
@@ -667,7 +684,7 @@ impl Adapter {
         // hooks, CLI one-shots, `synchronous: true` tools — queues exactly like
         // an async operation, so a hooked `sed -i` never lands in the middle of
         // an MCP `cargo nextest run`.
-        let lane = self.resolve_lane(args.as_ref(), subcommand_config);
+        let lane = self.resolve_lane(args.as_ref(), subcommand_config, &safe_wd);
         let title = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| format!("{program} {}", args_vec.join(" ")));
@@ -1156,7 +1173,7 @@ impl Adapter {
 
         // Workspace write queue (SPEC R2.7): the place in line is taken here,
         // synchronously, before anything is spawned.
-        let lane = self.resolve_lane(args.as_ref(), subcommand_config);
+        let lane = self.resolve_lane(args.as_ref(), subcommand_config, &safe_wd);
         let workspace = self.workspace_key_for(&safe_wd);
         let drift_root = workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd);
         let holder_title = operation
@@ -3000,27 +3017,74 @@ mod tests {
     #[test]
     fn a_reading_command_is_read_only_only_where_the_kernel_enforces_it() {
         use workspace_queue::Lane;
-        let (test_mode, _t) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let (test_mode, t) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
         assert_eq!(
-            test_mode.resolve_lane(Some(&shell_args("git status")), None),
+            test_mode.resolve_lane(Some(&shell_args("git status")), None, t.path()),
             Lane::Exclusive,
             "no kernel enforcement, no read-only lane"
         );
 
-        let (strict, _s) = adapter_with_mode(crate::sandbox::SandboxMode::Strict);
+        let (strict, s) = adapter_with_mode(crate::sandbox::SandboxMode::Strict);
         let expected = if strict.sandbox().can_enforce_read_only() {
             Lane::ReadOnly
         } else {
             Lane::Exclusive
         };
         assert_eq!(
-            strict.resolve_lane(Some(&shell_args("git status")), None),
+            strict.resolve_lane(Some(&shell_args("git status")), None, s.path()),
             expected
         );
         assert_eq!(
-            strict.resolve_lane(Some(&shell_args("cargo build")), None),
+            strict.resolve_lane(Some(&shell_args("cargo build")), None, s.path()),
             Lane::Exclusive
         );
+    }
+
+    /// SPEC R2.7.4: a CI watch whose output goes to a file outside every
+    /// workspace takes no lease — on every platform, enforced or not — while
+    /// the same watch writing into the workspace still does. The observed
+    /// failure: `gh pr checks 113 --watch --interval 60 > <scratchpad>/ci.log`
+    /// held the workspace for a twenty-minute CI run.
+    #[test]
+    fn a_watch_writing_outside_every_workspace_takes_no_lease() {
+        use workspace_queue::Lane;
+        let scratch = tempfile::tempdir().unwrap();
+        let outside = scratch.path().join("ci.log");
+        for mode in [
+            crate::sandbox::SandboxMode::Test,
+            crate::sandbox::SandboxMode::Strict,
+        ] {
+            let (adapter, ws) = adapter_with_mode(mode);
+            let watch = "gh pr checks 113 --watch --interval 60";
+            assert_eq!(
+                adapter.resolve_lane(
+                    Some(&shell_args(&format!("{watch} > '{}'", outside.display()))),
+                    None,
+                    ws.path(),
+                ),
+                Lane::Service,
+                "{mode:?}"
+            );
+            assert_eq!(
+                adapter.resolve_lane(
+                    Some(&shell_args(&format!("{watch} > ci.log"))),
+                    None,
+                    ws.path()
+                ),
+                Lane::Exclusive,
+                "{mode:?}: a relative file is in the workspace"
+            );
+            let inside = ws.path().join("ci.log");
+            assert_eq!(
+                adapter.resolve_lane(
+                    Some(&shell_args(&format!("{watch} > '{}'", inside.display()))),
+                    None,
+                    ws.path()
+                ),
+                Lane::Exclusive,
+                "{mode:?}"
+            );
+        }
     }
 
     /// SPEC R2.7.4: an MTDF declaration wins over the classifier, and a
@@ -3028,20 +3092,20 @@ mod tests {
     #[test]
     fn a_declared_lane_wins_and_undeclared_tools_are_exclusive() {
         use workspace_queue::Lane;
-        let (adapter, _t) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let (adapter, t) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
         let mut sc = crate::mcp_service::AhmaMcpService::build_shell_subcommand_config(
             None,
             &ExecutionMode::AsyncResultPush,
         );
         sc.concurrency = Some(Lane::Service);
         assert_eq!(
-            adapter.resolve_lane(Some(&shell_args("npm run dev")), Some(&sc)),
+            adapter.resolve_lane(Some(&shell_args("npm run dev")), Some(&sc), t.path()),
             Lane::Service
         );
         let mut not_shell = Map::new();
         not_shell.insert("command".into(), json!("git status"));
         assert_eq!(
-            adapter.resolve_lane(Some(&not_shell), None),
+            adapter.resolve_lane(Some(&not_shell), None, t.path()),
             Lane::Exclusive,
             "only a shell command line (c_flag) is classified"
         );

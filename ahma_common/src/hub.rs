@@ -199,6 +199,11 @@ pub struct InstanceInfo {
     /// `ActiveSandbox` token). `None` until the instance reported it.
     #[serde(default)]
     pub enforcement: Option<String>,
+    /// Whether the client's **own** terminal runs inside ahma's sandbox:
+    /// `hooked` (its terminal hook is installed and active) or `unconfined`
+    /// (SPEC R7.8). `None` for a client ahma cannot identify.
+    #[serde(default)]
+    pub native_terminal: Option<String>,
 }
 
 /// An operation event forwarded from an instance to the hub.
@@ -470,6 +475,9 @@ pub enum ClientMsg {
         /// See [`InstanceInfo::enforcement`].
         #[serde(default)]
         enforcement: Option<String>,
+        /// See [`InstanceInfo::native_terminal`].
+        #[serde(default)]
+        native_terminal: Option<String>,
     },
     /// An operation event from a registered instance.
     Event { payload: HubEvent },
@@ -718,8 +726,22 @@ pub fn default_socket_path() -> PathBuf {
 /// second local user gets to see, and squat, another user's endpoints.
 #[cfg(unix)]
 pub fn runtime_dir() -> Option<PathBuf> {
-    let dir = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
+    // Under a test harness the private test home, never the real user's
+    // `XDG_RUNTIME_DIR` (SPEC R-ISO.1): a test must not leave session grants
+    // or questions in the developer's own runtime directory, and a test run
+    // inside ahma's sandbox can only write the test home.
+    #[cfg(debug_assertions)]
+    if crate::test_isolation::spawned_under_test_harness() {
+        return ensure_runtime_dir(crate::config::ahma_home_dir()?.join(".ahma"));
+    }
+    runtime_dir_under(std::env::var("XDG_RUNTIME_DIR").ok())
+}
+
+/// The runtime directory for a given `XDG_RUNTIME_DIR`: `<xdg>/ahma`, else
+/// `~/.ahma`.
+#[cfg(unix)]
+fn runtime_dir_under(xdg: Option<String>) -> Option<PathBuf> {
+    let dir = xdg
         .filter(|x| !x.is_empty())
         .map(|xdg| PathBuf::from(xdg).join("ahma"))
         .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))?;
@@ -2116,6 +2138,7 @@ where
             read_scopes,
             grants,
             enforcement,
+            native_terminal,
         } => {
             serve_instance(
                 &mut reader,
@@ -2135,6 +2158,7 @@ where
                     read_scopes,
                     grants,
                     enforcement,
+                    native_terminal,
                 },
             )
             .await
@@ -2411,6 +2435,7 @@ struct Registration {
     read_scopes: Vec<String>,
     grants: Vec<GrantSummary>,
     enforcement: Option<String>,
+    native_terminal: Option<String>,
 }
 
 /// Serve a registered ahma instance: register it, then exchange events and
@@ -2457,6 +2482,7 @@ async fn serve_instance<R, W>(
         read_scopes: reg.read_scopes,
         grants: reg.grants,
         enforcement: reg.enforcement,
+        native_terminal: reg.native_terminal,
     };
     let pid = reg.pid;
     hub.instances.lock().await.insert(id.clone(), info.clone());
@@ -2873,6 +2899,7 @@ mod tests {
             read_scopes: vec![],
             grants: vec![],
             enforcement: None,
+            native_terminal: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -3119,6 +3146,7 @@ mod tests {
             read_scopes: vec![],
             grants: vec![],
             enforcement: None,
+            native_terminal: None,
         };
         let mut buf = Vec::<u8>::new();
         send_msg(&mut buf, &msg).await.unwrap();
@@ -3242,6 +3270,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             }],
         };
         let mut buf = Vec::<u8>::new();
@@ -3544,6 +3573,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -3667,6 +3697,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -3740,6 +3771,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -3856,6 +3888,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -4271,11 +4304,8 @@ mod tests {
     fn runtime_dir_is_created_private() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let _g = ENV_MUTEX.lock();
-        let prev = std::env::var_os("XDG_RUNTIME_DIR");
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-
-        let dir = runtime_dir().expect("XDG_RUNTIME_DIR yields a runtime dir");
+        let dir = runtime_dir_under(Some(tmp.path().display().to_string()))
+            .expect("XDG_RUNTIME_DIR yields a runtime dir");
         assert_eq!(dir, tmp.path().join("ahma"));
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -4283,11 +4313,24 @@ mod tests {
             "runtime dir must be created 0700, got {mode:o}"
         );
         verify_runtime_dir_secure(&dir).expect("freshly created dir passes its own check");
+    }
 
+    /// SPEC R-ISO.1: under a test harness the runtime directory is the
+    /// private test home, never the real user's `XDG_RUNTIME_DIR`.
+    #[cfg(unix)]
+    #[test]
+    fn under_a_test_harness_the_runtime_dir_is_the_test_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = ENV_MUTEX.lock();
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let dir = runtime_dir().expect("a runtime dir");
         match prev {
             Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
             None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
         }
+        assert!(!dir.starts_with(tmp.path()), "{}", dir.display());
+        assert_eq!(dir, crate::config::ahma_home_dir().unwrap().join(".ahma"));
     }
 
     #[test]
@@ -4481,6 +4524,7 @@ mod tests {
             read_scopes: vec![],
             grants: vec![],
             enforcement: None,
+            native_terminal: None,
         }
     }
 
@@ -4737,6 +4781,7 @@ mod tests {
             read_scopes: vec![],
             grants: vec![],
             enforcement: None,
+            native_terminal: None,
         };
         hub.instances.lock().await.insert("i1".into(), info.clone());
         hub.record_op_event("i1", &started_ev("op-1")).await;
@@ -4934,6 +4979,7 @@ mod tests {
                     read_scopes: vec![],
                     grants: vec![],
                     enforcement: None,
+                    native_terminal: None,
                 },
             );
             hub.record_op_event("i1", &started_ev("done")).await;
@@ -5076,6 +5122,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         );
         hub.record_op_event("i1", &started_ev("op-1")).await;
@@ -5274,6 +5321,7 @@ mod tests {
                     read_scopes: vec![],
                     grants: vec![],
                     enforcement: None,
+                    native_terminal: None,
                 },
             )
             .await
@@ -5370,6 +5418,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -5569,6 +5618,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await
@@ -5735,6 +5785,7 @@ mod tests {
                 read_scopes: vec![],
                 grants: vec![],
                 enforcement: None,
+                native_terminal: None,
             },
         )
         .await

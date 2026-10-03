@@ -2441,10 +2441,19 @@ fn session_scope_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
             Some("deferred_to_host") | Some("disabled") => theme.pending(),
             _ => theme.normal(),
         };
-        lines.push(Line::from(vec![
+        let mut row = vec![
             Span::styled(format!("  {who}: "), theme.dim()),
             Span::styled(format!("{enforcement} · {roots}{grants}"), style),
-        ]));
+        ];
+        // SPEC R7.8: the client's own terminal is a separate fact from the
+        // sandbox above, and the one most easily assumed.
+        if inst.native_terminal.as_deref() == Some("unconfined") {
+            row.push(Span::styled(
+                " · its own terminal: NOT sandboxed".to_string(),
+                theme.pending(),
+            ));
+        }
+        lines.push(Line::from(row));
     }
     if live.len() > 8 {
         lines.push(Line::from(Span::styled(
@@ -4752,6 +4761,41 @@ fn settings_footer_line(state: &AppState, theme: &Theme) -> Line<'static> {
 // ─── Stub when `tui` feature is disabled ─────────────────────────────────────
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod native_terminal_tests {
+    use super::*;
+
+    /// SPEC R7.8: a session whose client runs its own terminal outside the
+    /// sandbox says so on its row; a hooked one does not.
+    #[test]
+    fn a_session_whose_own_terminal_is_unconfined_says_so() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        let inst = |client: &str, native: Option<&str>| ahma_common::hub::InstanceInfo {
+            id: client.into(),
+            mode: "http".into(),
+            scope: "/w/proj".into(),
+            client: Some(client.into()),
+            enforcement: Some("ahma".into()),
+            native_terminal: native.map(str::to_string),
+            ..Default::default()
+        };
+        state.active_instances = vec![
+            inst("vscode", Some("unconfined")),
+            inst("claude-code", Some("hooked")),
+        ];
+        let text: Vec<String> = session_scope_lines(&state, &Theme::new(true))
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let row = |who: &str| text.iter().find(|l| l.contains(who)).unwrap().clone();
+        assert!(
+            row("vscode").contains("its own terminal: NOT sandboxed"),
+            "{text:?}"
+        );
+        assert!(!row("claude-code").contains("NOT sandboxed"), "{text:?}");
+    }
+}
 
 #[cfg(test)]
 mod tests {
