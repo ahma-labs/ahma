@@ -1278,3 +1278,256 @@ fn sandboxed_pgrep_and_ahma_ps_can_list_processes() {
         "a setuid binary cannot run under any sandbox; if this starts passing, drop `ahma ps`"
     );
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// SPEC R6.2.10 / R-HANDOFF.1: a sandboxed command must not be able to make a
+// workspace .app the default LaunchServices handler for a URL scheme.
+//
+//
+// FIRST RUN IS AN EXPERIMENT: it prints a result table and then fails on
+// purpose so the table is visible in CI logs (this repo's established pattern,
+// e.g. `appcontainer_dacl_diagnostics`). Once we know the answer, delete the
+// experiment function and rename the `_asserting` function below (and drop its
+// `#[ignore]`) — or weaken/strengthen its assertion to match the measured
+// behaviour.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Path to the `lsregister` helper, or `None` if this host does not ship it.
+#[cfg(target_os = "macos")]
+fn lsregister_path() -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
+         LaunchServices.framework/Support/lsregister",
+    );
+    p.exists().then_some(p)
+}
+
+/// Build a scratch `.app` inside `dir` that declares `scheme` as a URL scheme
+/// it handles. Returns the app bundle path and its bundle identifier.
+///
+/// The app does nothing on launch beyond writing a marker, mirroring
+/// `an_app_opened_from_the_sandbox_never_runs_outside_it` — we only ever query
+/// *which app is the default handler*, we never ask LaunchServices to open it.
+#[cfg(target_os = "macos")]
+fn build_scheme_handler_app(dir: &Path, name: &str, scheme: &str) -> (std::path::PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let id = format!("fi.ahma.ls-probe.{name}.{}", std::process::id());
+    let app = dir.join(format!("{name}.app"));
+    std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    std::fs::write(
+        app.join("Contents/Info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <plist version=\"1.0\"><dict>\
+             <key>CFBundleExecutable</key><string>handler</string>\
+             <key>CFBundleIdentifier</key><string>{id}</string>\
+             <key>CFBundlePackageType</key><string>APPL</string>\
+             <key>CFBundleURLTypes</key><array><dict>\
+             <key>CFBundleURLName</key><string>{id}.url</string>\
+             <key>CFBundleURLSchemes</key><array><string>{scheme}</string></array>\
+             </dict></array></dict></plist>\n"
+        ),
+    )
+    .unwrap();
+    let exe = app.join("Contents/MacOS/handler");
+    std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (app, id)
+}
+
+/// Compile, outside any sandbox, a tiny Swift tool that can both *set* and
+/// *query* the default URL-scheme handler, so the measurement does not depend
+/// on `lsregister` alone changing the default. Mirrors `metal_probe`: returns
+/// `None` (skip) when there is no Swift toolchain.
+///
+/// Usage:
+///   <bin> set <scheme> <bundle-id>   -> prints "SET:<OSStatus>"
+///   <bin> get <scheme>               -> prints "HANDLER:<bundle-id>" or "HANDLER:none"
+#[cfg(target_os = "macos")]
+fn ls_handler_tool(dir: &Path) -> Option<std::path::PathBuf> {
+    let src = dir.join("ls_handler.swift");
+    std::fs::write(
+        &src,
+        r#"import Foundation
+import CoreServices
+let a = CommandLine.arguments
+guard a.count >= 3 else { print("USAGE"); exit(2) }
+let scheme = a[2] as CFString
+switch a[1] {
+case "set":
+    let bundleId = a[3] as CFString
+    let s = LSSetDefaultHandlerForURLScheme(scheme, bundleId)
+    print("SET:\(s)")
+case "get":
+    if let h = LSCopyDefaultHandlerForURLScheme(scheme)?.takeRetainedValue() {
+        print("HANDLER:\(h as String)")
+    } else {
+        print("HANDLER:none")
+    }
+default:
+    print("USAGE"); exit(2)
+}
+"#,
+    )
+    .ok()?;
+    let bin = dir.join("ls_handler");
+    let built = Command::new("xcrun")
+        .args(["swiftc", "-O", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .ok()?;
+    if !built.status.success() {
+        eprintln!(
+            "skipping: swiftc unavailable: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        return None;
+    }
+    Some(bin)
+}
+
+/// Query the current default handler for `scheme` from OUTSIDE the sandbox.
+#[cfg(target_os = "macos")]
+fn default_handler_for(tool: &Path, scheme: &str) -> String {
+    let out = Command::new(tool)
+        .args(["get", scheme])
+        .output()
+        .expect("run ls_handler get");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Best-effort teardown: drop any LaunchServices registration of `app` so a
+/// test run does not pollute the host's LaunchServices database.
+#[cfg(target_os = "macos")]
+fn unregister_app(app: &Path) {
+    if let Some(lsreg) = lsregister_path() {
+        let _ = Command::new(&lsreg).arg("-u").arg(app).status();
+    }
+}
+
+/// EXPERIMENT (first run only): can a sandboxed command make a workspace `.app`
+/// the default LaunchServices handler for a made-up URL scheme?
+///
+/// The profile carries a blanket `(allow mach-lookup)`, so a sandboxed command
+/// can likely reach `com.apple.lsd.modifydb` / `com.apple.lsd.mapdb`. If it
+/// can register a handler, the human later opening a `ahma-probe-<pid>:` URL
+/// runs the planted app UNSANDBOXED — the R-HANDOFF.1 shape. `open`/lsopen is
+/// already blocked (`an_app_opened_from_the_sandbox_never_runs_outside_it`);
+/// this probes the *registration* side, which that test does not cover.
+///
+/// This prints a result table and fails on purpose so the table shows up in CI
+/// logs. The permanent form is `sandboxed_command_cannot_register_ls_handler`
+/// below; switch to it once the answer is known.
+#[cfg(target_os = "macos")]
+#[test]
+fn ls_handler_registration_from_sandbox_experiment() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+
+    let scope = TempDir::new().expect("scope dir");
+    let Some(tool) = ls_handler_tool(scope.path()) else {
+        return; // no Swift toolchain — nothing to measure
+    };
+    let lsreg = lsregister_path(); // may be None on a stripped host
+
+    // Fresh, unique schemes so the baseline registration never pollutes the
+    // sandboxed measurement, and neither collides with a parallel run.
+    let pid = std::process::id();
+    let base_scheme = format!("ahma-probe-base-{pid}");
+    let box_scheme = format!("ahma-probe-box-{pid}");
+
+    let (base_app, base_id) = build_scheme_handler_app(scope.path(), "Base", &base_scheme);
+    let (box_app, box_id) = build_scheme_handler_app(scope.path(), "Boxed", &box_scheme);
+
+    // ── Baseline (unsandboxed): prove the host CAN make an app the default
+    //    handler at all; otherwise there is nothing to prove and we skip. ──
+    if let Some(lsreg) = &lsreg {
+        let _ = Command::new(lsreg).arg("-f").arg(&base_app).status();
+    }
+    let base_set = Command::new(&tool)
+        .args(["set", &base_scheme, &base_id])
+        .output()
+        .expect("run ls_handler set (baseline)");
+    let base_set_out = String::from_utf8_lossy(&base_set.stdout).trim().to_string();
+    let base_handler = default_handler_for(&tool, &base_scheme);
+    let baseline_works = base_handler == format!("HANDLER:{base_id}");
+    unregister_app(&base_app);
+    if !baseline_works {
+        eprintln!(
+            "skipping: this host does not let even an unsandboxed process set a default \
+             URL-scheme handler (set={base_set_out} handler={base_handler}); nothing to prove"
+        );
+        return;
+    }
+
+    // ── Sandboxed: attempt the same registration from inside the Strict
+    //    profile, scope = the tempdir, then query the handler from OUTSIDE. ──
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+
+    // (a) lsregister -f from inside the sandbox
+    let box_lsreg = lsreg.as_ref().map(|lsreg| {
+        Command::new("sandbox-exec")
+            .args(["-p", &profile])
+            .arg(lsreg)
+            .arg("-f")
+            .arg(&box_app)
+            .current_dir(scope.path())
+            .output()
+            .expect("run sandbox-exec (lsregister)")
+    });
+    let box_lsreg_desc = box_lsreg
+        .as_ref()
+        .map(|o| {
+            format!(
+                "exit={:?} out={} err={}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout).trim(),
+                String::from_utf8_lossy(&o.stderr).trim(),
+            )
+        })
+        .unwrap_or_else(|| "lsregister not present on host".to_string());
+
+    // (b) LSSetDefaultHandlerForURLScheme from inside the sandbox
+    let box_set = Command::new("sandbox-exec")
+        .args(["-p", &profile])
+        .arg(&tool)
+        .args(["set", &box_scheme, &box_id])
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandbox-exec (ls_handler set)");
+    let box_set_desc = format!(
+        "exit={:?} out={} err={}",
+        box_set.status.code(),
+        String::from_utf8_lossy(&box_set.stdout).trim(),
+        String::from_utf8_lossy(&box_set.stderr).trim(),
+    );
+
+    // (c) Query the handler from OUTSIDE the sandbox.
+    let box_handler = default_handler_for(&tool, &box_scheme);
+    let became_handler = box_handler == format!("HANDLER:{box_id}");
+    unregister_app(&box_app);
+
+    let table = format!(
+        "\n==== LaunchServices handler registration from sandbox (SPEC R6.2.10 / R-HANDOFF.1) ====\n\
+         baseline set (unsandboxed)      : {base_set_out}\n\
+         baseline handler (unsandboxed)  : {base_handler}  -> host CAN register: {baseline_works}\n\
+         sandboxed lsregister -f         : {box_lsreg_desc}\n\
+         sandboxed LSSetDefaultHandler   : {box_set_desc}\n\
+         handler after sandboxed attempt : {box_handler}\n\
+         => sandboxed app became default : {became_handler}\n\
+         ======================================================================================\n"
+    );
+
+    // Established CI-experiment pattern: print, then fail on purpose so the
+    // table is in the log either way. Delete this function once the answer is
+    // recorded and switch to the asserting form below.
+    panic!("{table}");
+}
