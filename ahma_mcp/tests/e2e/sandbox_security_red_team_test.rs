@@ -496,7 +496,7 @@ fn red_team_no_temp_files_flag_setting() {
 ///   the --disable-temp-files check in validate_path does not reject it.
 #[tokio::test]
 #[cfg(target_os = "linux")]
-#[ignore]
+#[ignore = "creates its fixtures in the current directory (inside the repository), since a /tmp fixture would be covered by the temp rule; run by build.yml's dedicated Landlock red-team step"]
 async fn red_team_global_read_access_blocked() {
     init_test_logging();
     skip_if_landlock_unavailable!();
@@ -559,7 +559,7 @@ async fn red_team_global_read_access_blocked() {
 ///   `resolve_log_symlink` and never added to Landlock read_scopes.
 #[tokio::test]
 #[cfg(target_os = "linux")]
-#[ignore]
+#[ignore = "creates its fixtures in the current directory (inside the repository), since a /tmp fixture would be covered by the temp rule; run by build.yml's dedicated Landlock red-team step"]
 async fn red_team_livelog_symlink_read_allowed() {
     init_test_logging();
     skip_if_landlock_unavailable!();
