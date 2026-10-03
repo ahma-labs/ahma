@@ -425,29 +425,35 @@ jobs:
           # integration tests run here regardless of ahma_bin's `simplify` feature.
           cargo nextest run --profile ci --locked --no-fail-fast -E 'not (test(kotlin) or test(android))'
 
-      # Evidence, not a gate. SPEC R6.3.3 is open because a windows-latest run
-      # proved the AppContainer grant DACL does not take effect — an in-scope
-      # write is denied along with an out-of-scope one — and the only artefact
-      # anyone has is the string "Access to the path '...' is denied", which
-      # names no path, does not say whether the ACE was ever written, and does
-      # not say which SID the child ran as. Nobody can debug that, and nobody
-      # has a Windows box to attach to.
+      # Evidence, not a gate. SPEC R6.3.3 is open: no windows-latest run has
+      # shown an in-scope write succeeding inside the AppContainer, and the
+      # cause is unknown. The previous probe was Windows PowerShell 5.1, which
+      # could not load its own modules inside the container (Write-Output,
+      # Set-Content and Test-Path were all CommandNotFound), so it never
+      # reached the write it was meant to observe.
       #
-      # `appcontainer_dacl_diagnostics` dumps `icacls` for the scope and every
-      # ancestor, the derived container SID, the child's own `whoami /groups`
-      # and `$env:TEMP`, and the full stdout/stderr — enough to tell the five
-      # live hypotheses apart. continue-on-error because the point is to get a
-      # dump out of a *failing* configuration; making it fatal would just stop
-      # the run before it printed anything useful.
+      # `appcontainer_dacl_diagnostics` now measures without depending on a
+      # shell: ahma.exe's own probe mode, launched into the container, reports
+      # the raw GetLastError for in-scope, out-of-scope and NUL opens plus the
+      # token it holds. Next to it run a host control, cmd.exe redirects and a
+      # PowerShell module-load probe, across %TEMP%, %TEMP% with a Low
+      # integrity label, and %RUNNER_TEMP%. It prints one result table and
+      # fails only when the harness itself did not run.
+      #
+      # --no-capture streams the output live, so a child that hangs until the
+      # step timeout still leaves everything before it in the log. --retries 0
+      # overrides the e2e binary's CI retries: a rerun would only print the
+      # same table twice.
+      # continue-on-error: the point is the table, red or green.
       #
       # Delete this step when R6.3.3 closes.
       - name: AppContainer diagnostics (Windows only, evidence not a gate)
         if: matrix.test_mode == 'full' && runner.os == 'Windows'
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           cargo nextest run --profile ci --locked \
-            --run-ignored only --success-output immediate \
+            --run-ignored only --no-capture --retries 0 \
             -p ahma_mcp -E 'test(appcontainer_dacl_diagnostics)'
 
       - name: Cargo Nextest (Landlock red-team, Linux only)
