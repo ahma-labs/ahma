@@ -140,6 +140,137 @@ long-lived private key anywhere. An attacker who compromises GitHub Actions woul
 impersonate the exact OIDC identity of `ahma-labs/ahma` on `refs/heads/main` — which
 GitHub's OIDC service refuses to issue outside of a legitimate workflow run.
 
+This is about **provenance**. The macOS Developer-ID signature below is a separate layer that
+Apple requires, and it does use long-lived credentials. They prove nothing about provenance
+and `ahma` never checks them: holding them would let someone make a binary that macOS
+accepts, but not one that `ahma update` or `ahma verify` accepts.
+
+## macOS: Developer-ID signing and notarization
+
+Status: **wired, inactive.** The release workflow signs and notarizes the macOS binary as
+soon as the maintainer adds the secrets below. Until then, release binaries are signed ad hoc
+by the linker, as before. SPEC R-SIGN.1 requires the Developer-ID signature, and SPEC §11
+tracks it until the secrets are added.
+
+**Why.** On Apple Silicon, ad-hoc signed code pages can fail re-validation when they fault
+back in after eviction under memory pressure, and the kernel `SIGKILL`s the process (SPEC
+R-SIGN). A Developer-ID signature with the hardened runtime and a secure timestamp is the
+stable identity the OS expects. Notarization also lets a quarantined copy, such as a tarball
+downloaded in a browser, run without the "cannot be verified" Gatekeeper block.
+
+### What the workflow does
+
+`job-release-binaries` in `.github/workflows/build.yml`, `darwin-arm64` leg only:
+
+1. Builds the binary.
+2. **If `APPLE_DEVELOPER_ID_P12` is set:**
+   1. Imports the identity into a throwaway keychain.
+   2. Runs `codesign --force --options runtime --timestamp` with the Developer ID.
+   3. Checks the result with `codesign --verify --strict`, and confirms it has a
+      `Developer ID Application` authority and the `runtime` flag.
+   4. Zips the binary with `ditto` and submits it with `xcrun notarytool submit --wait`.
+   5. Fails the leg, and prints the notarization log, unless Apple returns `Accepted`.
+3. **If it is not set:** emits
+   `::notice::Developer-ID signing skipped: APPLE_DEVELOPER_ID_P12 not set (SPEC R-SIGN.1)`
+   and carries on.
+4. Packages the binary, writes `SHA256SUMS`, uploads, and attests. Only then.
+5. Deletes the keychain in an `always()` step.
+
+**The order matters.** Signing rewrites the binary, which changes its SHA-256. The
+attestations and `SHA256SUMS` are computed from whatever bytes exist when the "Package" step
+runs, and `ahma update` / `ahma verify` find attestations **by digest**. Signing therefore
+happens before packaging. That way the published archive, the published `SHA256SUMS` and the
+attestation all describe the signed binary. Notarization does not change the file.
+
+The workflow does not run `stapler staple`. A bare Mach-O executable has nowhere to hold a
+ticket: only `.app`, `.pkg` and `.dmg` can be stapled. Gatekeeper looks the ticket up online,
+using the binary's code-directory hash, the first time it launches a quarantined copy.
+
+The secrets go only to the one step that signs, never to the job's environment. That keeps
+the Developer ID private key away from `cargo build`, which runs the build scripts and
+proc-macros of every third-party dependency.
+
+### Turning on Developer-ID signing
+
+You need an [Apple Developer Program](https://developer.apple.com/programs/) membership. Only
+the **Account Holder** can create a Developer ID certificate.
+
+Add these six **repository secrets** (*Settings → Secrets and variables → Actions*). Set all
+six or none. If `APPLE_DEVELOPER_ID_P12` is set and any of the others is missing, the release
+leg fails and names every missing secret. It never ships a signed but un-notarized binary.
+
+| Secret | Value |
+|---|---|
+| `APPLE_DEVELOPER_ID_P12` | Base64 of a `.p12` export of the **Developer ID Application** certificate *with its private key* |
+| `APPLE_DEVELOPER_ID_P12_PASSWORD` | The password you set when exporting the `.p12` |
+| `APPLE_DEVELOPER_ID_NAME` | The full identity name, e.g. `Developer ID Application: Example Ltd (ABCDE12345)` |
+| `APPLE_NOTARY_KEY_P8` | Base64 of the App Store Connect API key file `AuthKey_<KEY_ID>.p8` |
+| `APPLE_NOTARY_KEY_ID` | That key's Key ID (10 characters) |
+| `APPLE_NOTARY_ISSUER_ID` | The Issuer ID (a UUID) shown above the key list in App Store Connect |
+
+**1. Create and export the Developer ID certificate.**
+
+1. In Xcode, open *Settings → Accounts*, select the team, then *Manage Certificates… → + →
+   Developer ID Application*. Or create it at
+   [developer.apple.com → Certificates](https://developer.apple.com/account/resources/certificates/list)
+   from a CSR made in Keychain Access.
+2. In Keychain Access, open *login → My Certificates*. Expand the certificate to confirm it
+   has its private key, right-click it, and choose *Export… → Personal Information Exchange
+   (.p12)*. Set a strong password.
+3. Store the secrets:
+
+```bash
+security find-identity -v -p codesigning     # copy the "Developer ID Application: …" name
+base64 -i DeveloperID.p12 | gh secret set APPLE_DEVELOPER_ID_P12 --repo ahma-labs/ahma
+gh secret set APPLE_DEVELOPER_ID_P12_PASSWORD --repo ahma-labs/ahma    # prompts
+gh secret set APPLE_DEVELOPER_ID_NAME --repo ahma-labs/ahma \
+  --body 'Developer ID Application: Example Ltd (ABCDE12345)'
+rm DeveloperID.p12
+```
+
+**2. Create the notarization API key.**
+
+1. In [App Store Connect → Users and Access → Integrations → App Store Connect
+   API](https://appstoreconnect.apple.com/access/integrations/api), under *Team Keys*,
+   generate a key with the **Developer** role.
+2. Download `AuthKey_<KEY_ID>.p8`. Apple lets you download it **only once**.
+3. Note the Key ID and the Issuer ID.
+4. Check the key works, then store it:
+
+```bash
+xcrun notarytool history --key AuthKey_ABC123DEFG.p8 \
+  --key-id ABC123DEFG --issuer 00000000-0000-0000-0000-000000000000
+base64 -i AuthKey_ABC123DEFG.p8 | gh secret set APPLE_NOTARY_KEY_P8 --repo ahma-labs/ahma
+gh secret set APPLE_NOTARY_KEY_ID --repo ahma-labs/ahma --body ABC123DEFG
+gh secret set APPLE_NOTARY_ISSUER_ID --repo ahma-labs/ahma \
+  --body 00000000-0000-0000-0000-000000000000
+```
+
+The next version bump that releases will sign and notarize. Look for
+`Developer-ID signed and notarized …` in the `Release Binaries (darwin-arm64)` log, and check
+a published binary:
+
+```bash
+tar -xzf ahma-release-darwin-arm64.tar.gz ahma
+codesign --verify --strict --verbose=2 ahma
+codesign --display --verbose=4 ahma 2>&1 | grep -E '^(Authority|Timestamp|CodeDirectory)'
+# Authority=Developer ID Application: …   flags=0x10000(runtime)
+```
+
+**Rotation.** A Developer ID Application certificate is valid for five years. To replace the
+certificate or the API key, overwrite the matching secrets; the workflow needs no change. To
+turn signing off, delete `APPLE_DEVELOPER_ID_P12`.
+
+### What changes for users
+
+| | Before secrets are set (today) | After |
+|---|---|---|
+| macOS binary in the release archive | Linker ad-hoc signature | Developer ID, hardened runtime, secure timestamp, notarized |
+| Browser-downloaded (quarantined) tarball | Gatekeeper blocks it; you need `xattr -d com.apple.quarantine` | Runs. Gatekeeper checks the ticket online on first launch |
+| `ahma update`, `ahma verify`, `gh attestation verify`, `SHA256SUMS` | Work | Work unchanged. They are computed over the signed bytes |
+| `scripts/install.sh`, `ahma update` | Re-sign the installed copy ad hoc with `--options runtime` (R-SIGN.1, local part) | Unchanged for now. The installed copy is still re-signed ad hoc, which replaces the Developer ID signature (SPEC §11) |
+| Linux, Windows | — | No change |
+
 ## Offline / air-gapped use
 
 Pass `--insecure-skip-verify` to bypass attestation verification:
