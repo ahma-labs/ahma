@@ -323,9 +323,10 @@ fn test_update_scopes_no_sandbox_dir_replaces() {
     );
 }
 
-/// update_scopes preserves both sandbox_dir AND temp when both are set.
+/// A commit preserves the scratch dir; `--tmp` is a request a human answers,
+/// so the temp dir is not carried in alongside it (SPEC R5.2.5, R5.3).
 #[test]
-fn test_update_scopes_preserves_sandbox_dir_and_tmp() {
+fn test_update_scopes_preserves_sandbox_dir_but_not_a_tmp_request() {
     let sandbox_dir_tmp = tempdir().unwrap();
     let workspace_tmp = tempdir().unwrap();
 
@@ -360,8 +361,8 @@ fn test_update_scopes_preserves_sandbox_dir_and_tmp() {
         scopes.to_vec()
     );
     assert!(
-        scopes.contains(&canonical_temp),
-        "temp dir present when tmp_access=true: {:?}",
+        !scopes.contains(&canonical_temp),
+        "a tmp_access request must not put the temp dir in scope: {:?}",
         scopes.to_vec()
     );
 }

@@ -2614,7 +2614,12 @@ fn handle_scope_grant_key(
             // `s` stays an alias of `y` (read-write, this session) for the
             // fingers that learned it.
             let c = if c == 's' { 'y' } else { c };
-            match ahma_common::grant_prompt::options()
+            // Only the keys this question offers: the `--tmp` question has no
+            // `always` or 24-hour answer (GrantReason::offers_saved_tiers).
+            let Some(reason) = state.scope_grant.as_ref().map(|g| g.request.reason) else {
+                return false;
+            };
+            match ahma_common::grant_prompt::options_for(reason)
                 .into_iter()
                 .find(|o| o.key == c)
             {
@@ -7848,6 +7853,40 @@ mod tests {
         assert!(gate.show_detail, "the exact settings line is now on screen");
         assert!(press(&mut state));
         assert!(state.scope_grant.is_none(), "the second press saves");
+    }
+
+    /// The `--tmp` question offers no saved answer (SPEC R5.2.5): its `always`
+    /// and 24-hour keys do nothing, and `y` still answers for the session.
+    #[test]
+    fn the_tmp_question_has_no_saving_keys() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let tmp_gate = || {
+            let mut request = test_scope_grant_gate().request;
+            request.reason = ahma_common::scope_grant::GrantReason::StartupFlag;
+            let mut gate = crate::state::ScopeGrantGate::from_request(request);
+            gate.shown_at = std::time::Instant::now() - crate::state::GRANT_ARMING_DELAY * 2;
+            gate
+        };
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(tmp_gate());
+        for (c, m) in [
+            ('Y', KeyModifiers::SHIFT),
+            ('R', KeyModifiers::SHIFT),
+            ('l', KeyModifiers::NONE),
+            ('L', KeyModifiers::SHIFT),
+        ] {
+            assert!(
+                !super::handle_scope_grant_key(KeyEvent::new(KeyCode::Char(c), m), &mut state),
+                "{c} is not offered on the --tmp question"
+            );
+            assert!(state.scope_grant.is_some(), "{c} answered nothing");
+        }
+        assert!(super::handle_scope_grant_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut state,
+        ));
+        assert!(state.scope_grant.is_none(), "y answers it for the session");
     }
 
     /// `y` widens to read+write, clears the gate, and is consumed even with chat

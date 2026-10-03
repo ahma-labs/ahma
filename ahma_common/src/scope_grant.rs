@@ -53,6 +53,40 @@ pub enum GrantReason {
     /// from which a candidate path was extracted. The path is a *suggestion* — only
     /// the human's explicit approval persists anything.
     StderrHeuristic,
+    /// Nothing was blocked: the server was started with `--tmp` (or
+    /// `[sandbox] tmp_access = true`), which *asks* for the system temp
+    /// directory. Asking it is a scope downgrade (SPEC R5.2.5, R5.3), so the
+    /// directory joins the scope only on a human's answer, and only for this
+    /// session: the temp directory is shared by every program on the machine,
+    /// so a saved (`always` or 24-hour) answer is never offered or accepted
+    /// ([`GrantReason::offers_saved_tiers`]).
+    StartupFlag,
+    /// A reason sent by a newer ahma that this build does not know. Never
+    /// produced here; it exists so a request carrying a future reason still
+    /// decodes and reaches the human instead of being dropped as an unknown
+    /// message (the hub wire evolves by adding, SPEC R24.5). Treated as
+    /// conservatively as [`GrantReason::StartupFlag`]: no saved tiers.
+    #[serde(other)]
+    Unknown,
+}
+
+impl GrantReason {
+    /// Whether a question raised for this reason may be answered with a tier
+    /// that is written to the settings file (`always`, or a 24-hour lease).
+    ///
+    /// `false` for [`GrantReason::StartupFlag`]: the system temp directory is
+    /// shared machine-wide, and `--tmp` is a per-launch request, so the answer
+    /// lives and dies with the session. Every surface offers only the tiers
+    /// this allows ([`crate::grant_prompt::options_for`]), and
+    /// [`GrantCoordinator::resolve`] holds an answer that names a saved tier
+    /// anyway — an older TUI, a client that ignores the form's `oneOf` — to the
+    /// same access for this session. Narrower than asked, never wider.
+    pub fn offers_saved_tiers(self) -> bool {
+        match self {
+            GrantReason::PreExecViolation | GrantReason::StderrHeuristic => true,
+            GrantReason::StartupFlag | GrantReason::Unknown => false,
+        }
+    }
 }
 
 /// A request to **persist** a new sandbox scope grant (widen-on-next-start, never
@@ -220,6 +254,22 @@ impl GrantDecision {
                 crate::permissions::GrantTier::Lease
             }
             _ => crate::permissions::GrantTier::Always,
+        }
+    }
+
+    /// This answer held to what a question raised for `reason` offers: a
+    /// saved tier (`always`, a lease) becomes the same access for this session
+    /// when the reason does not offer saved tiers
+    /// ([`GrantReason::offers_saved_tiers`]). Deny, once and session pass
+    /// through unchanged. The result is never wider than the answer.
+    pub fn within_offer(self, reason: GrantReason) -> GrantDecision {
+        if reason.offers_saved_tiers() {
+            return self;
+        }
+        match self {
+            GrantDecision::GrantRo | GrantDecision::GrantRoLease => GrantDecision::GrantRoSession,
+            GrantDecision::GrantRw | GrantDecision::GrantRwLease => GrantDecision::GrantRwSession,
+            other => other,
         }
     }
 }
@@ -481,6 +531,11 @@ impl GrantCoordinator {
     /// which the live sandbox still blocks until restart — does not re-prompt. A
     /// grant additionally dismisses the *other* access variant for the same path
     /// (granting rw subsumes a pending ro need, and vice-versa).
+    ///
+    /// The answer is first held to what the question offered
+    /// ([`GrantDecision::within_offer`]): every surface resolves through here,
+    /// so a saved tier given to a session-only question (`--tmp`) is applied
+    /// for the session, whichever surface sent it.
     pub fn resolve(&self, decision_id: &str, decision: GrantDecision) -> GrantResolveOutcome {
         let mut inner = self.inner.lock();
         if inner.resolved.contains(decision_id) {
@@ -489,6 +544,7 @@ impl GrantCoordinator {
         let Some(req) = inner.in_flight.remove(decision_id) else {
             return GrantResolveOutcome::Unknown;
         };
+        let decision = decision.within_offer(req.reason);
         inner.resolved.insert(decision_id.to_string());
         inner.decided.insert(decision_id.to_string(), decision);
         inner.active_keys.remove(&(req.path.clone(), req.access));
@@ -1887,6 +1943,144 @@ mod denylist_by_prefix_tests {
                 w.contains(trigger),
                 "{rel}: the warning must name what runs it ({trigger}): {w}"
             );
+        }
+    }
+}
+
+/// The `--tmp` question (SPEC R5.2.5, R5.3): asked through the same ladder as
+/// every grant, held to the session, and decodable by every reader.
+#[cfg(test)]
+mod startup_flag_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The denylist must not silently swallow the `--tmp` question: a request
+    /// it refuses is never raised at any surface (R-PERM.4.3), so a temp
+    /// directory it matched would turn `--tmp` into a no-op nobody was told
+    /// about.
+    #[test]
+    fn the_denylist_does_not_refuse_the_system_temp_directory() {
+        let temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+        assert_eq!(
+            refusal_reason(&temp),
+            None,
+            "the canonical temp dir {} must be askable",
+            temp.display()
+        );
+    }
+
+    #[test]
+    fn startup_flag_has_a_stable_wire_name() {
+        assert_eq!(
+            serde_json::to_value(GrantReason::StartupFlag).unwrap(),
+            json!("startup_flag")
+        );
+        let back: GrantReason = serde_json::from_value(json!("startup_flag")).unwrap();
+        assert_eq!(back, GrantReason::StartupFlag);
+    }
+
+    /// R24.5: the hub socket has no version. `HubMsg` carries an untagged
+    /// `Relay` variant, so a request whose `reason` this build did not know
+    /// would fail to match *any* variant and the whole question would be
+    /// skipped as an unknown message — the human would never see it. A future
+    /// reason must decode, as `Unknown`, and keep its question.
+    #[test]
+    fn a_request_with_a_future_reason_still_reaches_the_reader() {
+        let request = json!({
+            "decision_id": "d-future",
+            "path": "/opt/cache",
+            "access": "rw",
+            "reason": "a_reason_from_a_newer_ahma",
+            "tool": null,
+        });
+        let req: ScopeGrantRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(req.reason, GrantReason::Unknown);
+        assert!(
+            !req.reason.offers_saved_tiers(),
+            "an unknown reason is held to the session"
+        );
+
+        let msg: crate::hub::HubMsg =
+            serde_json::from_value(json!({"type": "ScopeGrantRequested", "request": request}))
+                .expect("a ScopeGrantRequested with a future reason must decode, not be skipped");
+        match msg {
+            crate::hub::HubMsg::Relay(crate::hub::HubRelay::ScopeGrantRequested { request }) => {
+                assert_eq!(request.decision_id, "d-future");
+                assert_eq!(request.reason, GrantReason::Unknown);
+            }
+            other => panic!("expected ScopeGrantRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_violation_reasons_offer_saved_tiers() {
+        assert!(GrantReason::PreExecViolation.offers_saved_tiers());
+        assert!(GrantReason::StderrHeuristic.offers_saved_tiers());
+        assert!(!GrantReason::StartupFlag.offers_saved_tiers());
+        assert!(!GrantReason::Unknown.offers_saved_tiers());
+    }
+
+    /// Whatever surface answers, a saved tier on the `--tmp` question is
+    /// applied for this session only — the same access, never wider. An older
+    /// TUI still shows its `always` keys; this is what makes pressing one safe.
+    #[test]
+    fn a_saved_answer_to_a_session_only_question_is_held_to_the_session() {
+        let temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+        for (answer, held) in [
+            (GrantDecision::GrantRw, GrantDecision::GrantRwSession),
+            (GrantDecision::GrantRwLease, GrantDecision::GrantRwSession),
+            (GrantDecision::GrantRo, GrantDecision::GrantRoSession),
+            (GrantDecision::GrantRoLease, GrantDecision::GrantRoSession),
+            (GrantDecision::GrantRwOnce, GrantDecision::GrantRwOnce),
+            (GrantDecision::GrantRwSession, GrantDecision::GrantRwSession),
+            (GrantDecision::Deny, GrantDecision::Deny),
+        ] {
+            let c = GrantCoordinator::new();
+            let req = c
+                .begin(
+                    &temp,
+                    ScopeAccess::Rw,
+                    GrantReason::StartupFlag,
+                    Some("--tmp".into()),
+                )
+                .expect("the temp dir is askable");
+            let outcome = c.resolve(&req.decision_id, answer);
+            assert_eq!(
+                c.status(&req.decision_id),
+                GrantStatus::Decided(held),
+                "{answer:?} must be recorded as {held:?}"
+            );
+            match outcome {
+                GrantResolveOutcome::Persist { tier, .. } => {
+                    assert!(
+                        !tier.is_persistent(),
+                        "{answer:?} must never be saved: {tier:?}"
+                    )
+                }
+                GrantResolveOutcome::Denied { .. } => assert_eq!(held, GrantDecision::Deny),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// The same answers to an ordinary violation are untouched.
+    #[test]
+    fn a_saved_answer_to_a_violation_question_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = GrantCoordinator::new();
+        let req = c
+            .begin(
+                dir.path(),
+                ScopeAccess::Rw,
+                GrantReason::PreExecViolation,
+                None,
+            )
+            .unwrap();
+        match c.resolve(&req.decision_id, GrantDecision::GrantRw) {
+            GrantResolveOutcome::Persist { tier, .. } => {
+                assert_eq!(tier, crate::permissions::GrantTier::Always)
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 }

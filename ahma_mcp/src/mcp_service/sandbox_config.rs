@@ -503,6 +503,10 @@ impl AhmaMcpService {
         }
 
         self.announce_committed_scope(peer, client_root).await;
+        // Only after `sandbox/configured` is out, and detached: the question
+        // can take as long as the human does, and must not hold the
+        // configuration latch that `tools/call` waits on (SPEC R5.1.2).
+        self.spawn_tmp_consent();
     }
 
     /// SPEC R5.2.2 explicit-scope fast path: if the sandbox was given an
@@ -539,7 +543,122 @@ impl AhmaMcpService {
             return true;
         }
         self.announce_committed_scope(peer, None).await;
+        self.spawn_tmp_consent();
         true
+    }
+
+    /// Ask the human about `--tmp` without holding anything up: off the
+    /// message loop and off the configuration latch (SPEC R5.1.2), after the
+    /// scope is committed and announced. A no-op when there is nothing to ask.
+    pub(crate) fn spawn_tmp_consent(&self) {
+        let sandbox = self.adapter.sandbox();
+        // Cheap pre-checks, repeated inside: no task for a session that never
+        // asked for the temp directory.
+        if !sandbox.is_tmp_access() || sandbox.is_test_mode() {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let _ = service.request_tmp_consent().await;
+        });
+    }
+
+    /// Put `--tmp` to a human as a session-tier grant of the canonical system
+    /// temp directory (SPEC R5.2.5, R5.3).
+    ///
+    /// `--tmp` is a *request*, never an unprompted widening: once the workspace
+    /// scope is committed, the question goes up the existing ladder (R-PERM.3:
+    /// the client's elicitation, else an attached TUI, else nobody) as
+    /// [`GrantReason::StartupFlag`], offering deny, once and session only, and
+    /// the temp directory joins the scope through the broker's live grant —
+    /// behind the hard denylist (R-PERM.4.3) — only on a human's yes. With
+    /// nobody to ask it stays out: fail closed, never auto-added.
+    ///
+    /// Raised at most once a session ([`Sandbox::claim_tmp_consent`]), and not
+    /// at all when `--tmp` was not given, the sandbox is not enforcing (Test
+    /// mode: there is no scope to widen), the scope is not committed yet, the
+    /// temp directory is already in scope, or the denylist would refuse the
+    /// grant for this workspace (a workspace inside the temp directory: the
+    /// grant would widen above it) — a question that cannot be granted is not
+    /// asked. Returns the request that was raised, if any.
+    ///
+    /// [`GrantReason::StartupFlag`]: ahma_common::scope_grant::GrantReason::StartupFlag
+    /// [`Sandbox::claim_tmp_consent`]: crate::sandbox::Sandbox::claim_tmp_consent
+    pub async fn request_tmp_consent(&self) -> Option<ahma_common::scope_grant::ScopeGrantRequest> {
+        let sandbox = self.adapter.sandbox_arc();
+        if !sandbox.is_tmp_access() || sandbox.is_test_mode() || !sandbox.is_committed() {
+            return None;
+        }
+        if sandbox.tmp_in_scope() {
+            tracing::debug!("--tmp: the temp directory is already in scope; nothing to ask");
+            return None;
+        }
+        if !sandbox.claim_tmp_consent() {
+            return None;
+        }
+        let raised = self.raise_tmp_question(&sandbox).await;
+        sandbox.settle_tmp_consent();
+        crate::hub_reporter::publish_committed_scope(&sandbox);
+        tracing::info!(
+            "--tmp: {}",
+            if sandbox.tmp_in_scope() {
+                "the temp directory was granted for this session"
+            } else {
+                "the temp directory is not in this session's scope"
+            }
+        );
+        raised
+    }
+
+    /// The question itself, once [`Self::request_tmp_consent`] has claimed it.
+    async fn raise_tmp_question(
+        &self,
+        sandbox: &std::sync::Arc<crate::sandbox::Sandbox>,
+    ) -> Option<ahma_common::scope_grant::ScopeGrantRequest> {
+        use ahma_common::scope_grant::{GrantReason, GrantRisk, classify_grant_risk};
+        let temp = crate::sandbox::Sandbox::canonical_temp_dir()?;
+        let live: Vec<PathBuf> = sandbox.scopes().to_vec();
+        if let GrantRisk::Refused(why) = classify_grant_risk(
+            &temp,
+            ahma_common::config::ahma_home_dir().as_deref(),
+            &live,
+        ) {
+            tracing::warn!(
+                "--tmp ignored: {} cannot be granted to this session ({why}).",
+                temp.display()
+            );
+            return None;
+        }
+        let Some(notifier) = self.adapter.scope_grant_notifier().cloned() else {
+            tracing::warn!(
+                "--tmp: nobody can be asked about {} (no permission broker is wired); it stays \
+                 out of this session's scope.",
+                temp.display()
+            );
+            return None;
+        };
+        // The risk section lists the directory (bounded `read_dir`): blocking
+        // I/O, so not on this async task.
+        let context = {
+            let sandbox = sandbox.clone();
+            let temp = temp.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::sandbox::grant_channel::build_context(
+                    &sandbox, &temp, None, None, None, None, false,
+                )
+            })
+            .await
+            .unwrap_or_default()
+        };
+        notifier
+            .notify_violation_with(
+                &temp,
+                ahma_common::config::ScopeAccess::Rw,
+                GrantReason::StartupFlag,
+                Some("--tmp".to_string()),
+                context,
+            )
+            .await
     }
 
     /// Requests `roots/list` under the handshake-class deadline (must NOT use
@@ -822,6 +941,7 @@ mod tests {
             write_scopes: &writes,
             read_scopes: &reads,
             tmp_access: true,
+            tmp_requested: true,
             enforced: true,
             source: crate::sandbox::ScopeSource::RootsList,
         }

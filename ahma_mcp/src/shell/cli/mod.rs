@@ -582,6 +582,19 @@ fn resolve_deferred_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     Ok(Some(Vec::new()))
 }
 
+/// Whether `--tmp` puts the temp directory straight into the scope this
+/// process starts with.
+///
+/// Only when a human ran a one-shot command — `ahma tool run`, or a terminal
+/// hook running one command under the user's own `[sandbox] tmp_access` —
+/// because there the flag *is* the human's answer and there is no session to
+/// ask in. A server (`serve`) records `--tmp` as a request and asks once the
+/// workspace scope is committed (SPEC R5.2.5, R5.3): an MCP config is
+/// client-owned (R5.4.2), so a `--tmp` in it is nobody's consent.
+fn seeds_temp_scope_at_startup(cfg: &AppConfig) -> bool {
+    cfg.run_tool.is_some()
+}
+
 fn add_temp_scope_if_requested(
     scopes: Option<Vec<PathBuf>>,
     tmp_access: bool,
@@ -596,13 +609,9 @@ fn add_temp_scope_if_requested(
     // scope, never stand in as the sole sandbox root. If the scope set is empty
     // (deferred sandbox, or awaiting client `roots/list`), do NOT seed it with
     // the temp dir — doing so would make the sandbox appear "already configured"
-    // and lock it to the temp directory, rejecting the actual workspace. The
-    // temp dir is re-added by `Sandbox::update_scopes` once real roots arrive.
+    // and lock it to the temp directory, rejecting the actual workspace.
     if scopes.is_empty() {
-        tracing::debug!(
-            "Skipping temp scope: no workspace scope yet (temp is re-added once \
-             client roots/list resolves)"
-        );
+        tracing::debug!("Skipping temp scope: no workspace scope yet");
         return Some(scopes);
     }
 
@@ -610,7 +619,7 @@ fn add_temp_scope_if_requested(
     match dunce::canonicalize(&temp_dir) {
         Ok(canonical_temp) if !scopes.contains(&canonical_temp) => {
             tracing::info!(
-                "Adding temp directory to sandbox scopes via AHMA_TMP_ACCESS: {:?}",
+                "Adding temp directory to sandbox scopes via --tmp: {:?}",
                 canonical_temp
             );
             scopes.push(canonical_temp);
@@ -618,7 +627,7 @@ fn add_temp_scope_if_requested(
         Ok(_) => {}
         Err(_) => {
             tracing::warn!(
-                "Could not canonicalize temp directory {:?}, skipping AHMA_TMP_ACCESS scope addition",
+                "Could not canonicalize temp directory {:?}, skipping --tmp scope addition",
                 temp_dir
             );
         }
@@ -774,7 +783,7 @@ fn create_sandbox_instance(
     // SPEC R5.5: scopes are "explicit" when the user named them directly via
     // --sandbox-scope, --working-directories, or a task vault. Those must never
     // be widened/replaced via roots/list. Scopes derived implicitly (CWD
-    // fallback, --tmp) are provisional and yield to client-provided roots.
+    // fallback) are provisional and yield to client-provided roots.
     let explicit_scopes =
         cfg.task_vault.is_some() || !cfg.sandbox_scopes.is_empty() || !cfg.working_dirs.is_empty();
 
@@ -1131,8 +1140,9 @@ pub struct Cli {
     #[arg(long = "tools-dir", global = true)]
     pub tools_dir: Option<PathBuf>,
 
-    /// Add the system temp directory to the sandbox scope.
-    /// Useful for workflows that need scratch space (compilers, build systems).
+    /// Ask for the system temp directory in the sandbox scope, for tools that need scratch space outside the workspace (compilers, build systems).
+    /// A server (`serve`) treats this as a request: once the workspace scope is set, a human is asked once — in the client's own prompt, else the ahma TUI — whether to allow it for this session, and with nobody to ask it stays out.
+    /// `ahma tool run --tmp` adds it directly, since you typed it.
     #[arg(long = "tmp", global = true)]
     pub tmp: bool,
 
@@ -3461,7 +3471,12 @@ pub(crate) fn initialize_sandbox(cfg: &AppConfig) -> Result<Option<Arc<sandbox::
     };
 
     let scopes = resolve_sandbox_scopes(cfg)?;
-    let scopes = add_temp_scope_if_requested(scopes, policy.tmp_access);
+    // A server asks about `--tmp` after its scope commits (SPEC R5.3); only a
+    // one-shot command a human ran takes the flag as its answer.
+    let scopes = add_temp_scope_if_requested(
+        scopes,
+        policy.tmp_access && seeds_temp_scope_at_startup(cfg),
+    );
     let sandbox = create_sandbox_instance(scopes, &policy, cfg)?;
 
     log_sandbox_mode(policy.no_sandbox, deferred_host);
@@ -3975,6 +3990,69 @@ mod tests {
             Some(Vec::new()),
             "empty scope set must stay empty so the sandbox waits for client roots"
         );
+    }
+
+    /// SPEC R5.2.5 / R5.3: only a one-shot command a human ran takes `--tmp`
+    /// as its own answer; a server asks.
+    #[test]
+    fn only_a_one_shot_command_seeds_temp_at_startup() {
+        assert!(
+            !seeds_temp_scope_at_startup(&make_cfg()),
+            "serve: --tmp is a request"
+        );
+        let run = AppConfig {
+            run_tool: Some("run_terminal_command".into()),
+            ..make_cfg()
+        };
+        assert!(
+            seeds_temp_scope_at_startup(&run),
+            "tool run: --tmp is the answer"
+        );
+    }
+
+    /// A server started with `--tmp` and an explicit scope records the request
+    /// but starts without the temp directory: it is asked for once the scope
+    /// is committed, never assumed.
+    #[test]
+    fn a_server_with_tmp_starts_without_the_temp_dir() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let canonical_temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+        let cfg = AppConfig {
+            no_sandbox: true,
+            tmp_access: true,
+            sandbox_scopes: vec![tmp.path().to_path_buf()],
+            ..make_cfg()
+        };
+        let sandbox = initialize_sandbox(&cfg).unwrap().unwrap();
+        assert!(sandbox.is_tmp_access(), "the request is recorded");
+        assert!(
+            !sandbox.scopes().contains(&canonical_temp),
+            "serve must not seed the temp dir: {:?}",
+            sandbox.scopes().to_vec()
+        );
+    }
+
+    /// `ahma tool run --tmp` keeps today's behaviour: the human typed it.
+    #[test]
+    fn a_one_shot_run_with_tmp_starts_with_the_temp_dir() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let canonical_temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+        let cfg = AppConfig {
+            no_sandbox: true,
+            tmp_access: true,
+            sandbox_scopes: vec![tmp.path().to_path_buf()],
+            run_tool: Some("run_terminal_command".into()),
+            ..make_cfg()
+        };
+        let sandbox = initialize_sandbox(&cfg).unwrap().unwrap();
+        assert!(
+            sandbox.scopes().contains(&canonical_temp),
+            "{:?}",
+            sandbox.scopes().to_vec()
+        );
+        assert!(sandbox.tmp_in_scope());
     }
 
     // ─── create_sandbox_instance & log_sandbox_mode ──────────────────────────

@@ -1230,8 +1230,10 @@ pub struct SandboxSettings {
     /// parses so an existing file does not abort startup, and a `true` value is
     /// warned about. Default: `false`
     pub disable: bool,
-    /// Add the system temp directory to the sandbox scope.
+    /// Ask for the system temp directory in the sandbox scope.
     /// Useful for workflows that need scratch space (compilers, build systems).
+    /// Under `ahma serve` this is a request a human answers for the session
+    /// (SPEC R5.2.5, R5.3); `ahma tool run` and terminal hooks add it directly.
     /// Default: `false`
     pub tmp_access: bool,
     /// Block all access to the system temp directory.

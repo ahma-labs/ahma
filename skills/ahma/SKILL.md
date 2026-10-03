@@ -182,7 +182,7 @@ narrowing, trust-handoff writes, network egress, platform internals):
 | Scope (STDIO) | `cwd` from mcp.json (usually `${workspaceFolder}`) |
 | Scope (HTTP) | Workspace roots from MCP `roots/list` |
 | Override | `--sandbox-scope /path/a` (repeat for multiple paths) |
-| Temp dir | `--tmp` adds `/tmp` (`%TEMP%` on Windows); needed for compilers/build tools |
+| Temp dir | `--tmp` asks for `/tmp` (`%TEMP%` on Windows); under `serve` the human is asked once per session (deny / once / session) after the scope commits, and it stays out until they say yes |
 | Nested sandbox | Ahma applies its own sandbox everywhere, hooks included — an environment marker such as `CLAUDECODE` never makes it stand down. It defers (`deferred_to_host`) only when the kernel refuses to nest its profile inside an outer one (macOS Seatbelt), and says so on every such command. `--no-sandbox` is the explicit opt-out; a harness's own switch (Claude Code's `dangerouslyDisableSandbox`) does not turn ahma's sandbox off. |
 | Platform | Linux: Landlock (kernel 5.13+) · macOS: Seatbelt · Windows: Job Objects (+ AppContainer, in progress) |
 
@@ -264,7 +264,7 @@ Validate configs: `ahma tool validate .ahma/`
 | `--sandbox-scope` / `sandbox.scopes` | cwd | Sandbox scope paths |
 | `sandbox.container_root` | unset | Directory holding your projects; scope fallback when the client reports no roots |
 | `--scratch` / `sandbox.use_scratch_directory` | off | Add a persistent secondary scope |
-| `--tmp` / `sandbox.tmp_access` | off | Add temp dir to sandbox scope (opt-in) |
+| `--tmp` / `sandbox.tmp_access` | off | Ask for the temp dir in scope (opt-in; a human approves it per session under `serve`) |
 | `--disable-temp-files` / `sandbox.disable_temp` | off | Block all temp dir access |
 | `--no-package-cache-write` | off | Disable cargo cache writes (strictest isolation) |
 | `--log-to-stderr` / `logging.target` | file | Log to stderr |
@@ -316,7 +316,7 @@ ahma tls init && ahma tls status        # ahma tls rotate replaces certificate
 
 * **Tool not found**: check the tool's bundle is in `--tools` at startup (e.g. `--tools git,fileutils`).
 * **Timeout**: `--timeout 600` in mcp.json args, or `tools.timeout_secs = 600` in `~/.ahma/settings.toml`.
-* **Permission denied / sandbox error**: the path is outside the sandbox scope — check `--sandbox-scope`, set `[sandbox] container_root`, or add `--tmp` for temp-file access.
+* **Permission denied / sandbox error**: the path is outside the sandbox scope — check `--sandbox-scope`, set `[sandbox] container_root`, or start with `--tmp` and ask the human to approve the temp dir when prompted.
 * **"sandbox scope is your container root"**: the session scope spans every project; pass `working_directory` naming the project subdirectory so ahma knows which subtree to narrow to.
 * **Cargo/tool-install permission errors** (`cargo add`, `cargo install`, `npm i -g`, …): do **not** add `--sandbox-scope ~/.cargo` — that grants write to the whole cargo home including credentials. The built-in `package_cache_write` feature (on by default) already handles `cargo add`/`update`. For installs into `~/.cargo/bin`, ask the human for a grant with the `sandbox_grant` tool (`confirm: true` raises their approval prompt; it never grants by itself) — an approved grant takes effect immediately and persists — or install into the workspace instead (`cargo install --root <workspace>/.tools`). Full rationale: [docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs](https://github.com/ahma-labs/ahma/blob/main/docs/security-sandbox.md#cargo-install--cargo-binstall-and-other-tool-installs).
 * **Every command waits, even `git status`**: the `status` tool, or `ahma queue` (never queued itself), shows who holds the workspace and whether that process is alive; pipelines of readers (`grep … | head`, `pgrep -lf x`) run at once, so prefer them over a writer when you only need to look.
