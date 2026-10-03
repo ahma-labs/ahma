@@ -71,9 +71,6 @@ pub fn seatbelt_gpu_rules() -> String {
 /// the agent learns it hit a boundary a human can lift in settings — and does
 /// not ask for a directory grant that cannot help.
 pub fn gpu_denial_note(stderr: &str, stdout: &str) -> Option<String> {
-    if allow_gpu_enabled() {
-        return None;
-    }
     let hit = stderr
         .lines()
         .chain(stdout.lines())
@@ -81,25 +78,41 @@ pub fn gpu_denial_note(stderr: &str, stdout: &str) -> Option<String> {
     if !hit {
         return None;
     }
+    if allow_gpu_enabled() {
+        // The GPU is opened, but something Metal needs is still withheld (a
+        // buffer, a shader compile): say so rather than call it the tool's
+        // own failure, which is what silence implied.
+        return Some(
+            "A Metal operation failed although `[sandbox] allow_gpu` is already on (SPEC R6.2.7), \
+             so a part of the GPU stack the sandbox still withholds is suspected. This is a \
+             capability, not a path — no `sandbox_grant` can help. Tell the human, and quote the \
+             failing lines above so the missing piece can be identified; or continue on the CPU."
+                .to_string(),
+        );
+    }
     Some(
         "The sandbox denied GPU access: Metal cannot open the GPU inside a sandboxed command \
          (SPEC R6.2.7), so GPU-accelerated work falls back to the CPU or fails with errors like \
-         `failed to create command queue` / no Metal device. This is a capability, not a path — \
-         no `sandbox_grant` can help. Nothing more for you to do here: tell the human that \
-         `[sandbox] allow_gpu = true` in ~/.ahma/settings.toml enables it (takes effect on the \
-         next command for terminal hooks, on the next server start for an MCP session), or \
-         continue on the CPU."
+         `failed to create command queue`, a failed Metal buffer allocation, or no Metal device. \
+         This is a capability, not a path — no `sandbox_grant` can help. Nothing more for you to \
+         do here: tell the human that `[sandbox] allow_gpu = true` in ~/.ahma/settings.toml \
+         enables it (takes effect on the next command for terminal hooks, on the next server \
+         start for an MCP session), or continue on the CPU."
             .to_string(),
     )
 }
 
 fn looks_like_gpu_denial(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
+    let metal = lower.contains("metal") || lower.contains("mtl");
     (lower.contains("failed to create command queue"))
         || lower.contains("mtlcreatesystemdefaultdevice")
         || lower.contains("no metal device")
         || lower.contains("metal device not found")
         || lower.contains("unable to create metal device")
+        // ggml (whisper.cpp, llama.cpp) and Metal buffer allocations.
+        || (metal && lower.contains("failed to allocate"))
+        || (lower.contains("mtlbuffer") && lower.contains("nil"))
         || (lower.contains("deny(") && lower.contains("iokit-open"))
 }
 
@@ -133,10 +146,28 @@ mod tests {
         assert!(gpu_denial_note("", "MTLCreateSystemDefaultDevice() returned nil").is_some());
         assert!(gpu_denial_note("Permission denied: /etc/shadow", "").is_none());
         set_allow_gpu(true);
+        let allowed = gpu_denial_note("failed to create command queue", "")
+            .expect("a Metal failure with the GPU allowed is still explained");
         assert!(
-            gpu_denial_note("failed to create command queue", "").is_none(),
-            "with the GPU allowed, the failure is the tool's own"
+            allowed.contains("allow_gpu` is already on") && allowed.contains("quote"),
+            "{allowed}"
         );
         set_allow_gpu(false);
+    }
+
+    /// whisper.cpp and llama.cpp report a failed Metal allocation through
+    /// ggml; that is the same withheld capability (bug report: an app
+    /// segfaulted after "fails to allocate a Metal buffer").
+    #[test]
+    fn a_failed_metal_allocation_is_recognised() {
+        set_allow_gpu(false);
+        for line in [
+            "ggml_metal_init: error: failed to allocate buffer, size = 256.00 MiB",
+            "ggml_backend_metal_buffer_type_alloc_buffer: error: failed to allocate buffer",
+            "whisper_init: MTLBuffer allocation returned nil",
+        ] {
+            assert!(gpu_denial_note(line, "").is_some(), "{line}");
+        }
+        assert!(gpu_denial_note("failed to allocate buffer for tokenizer", "").is_none());
     }
 }

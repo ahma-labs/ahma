@@ -896,6 +896,7 @@ impl Adapter {
             let result = match sandbox::signal_denial_note(stderr, stdout)
                 .or_else(|| sandbox::gpu_denial_note(stderr, stdout))
                 .or_else(|| sandbox::setuid_denial_note(stderr, stdout))
+                .or_else(|| sandbox::launch_services_denial_note(stderr, stdout))
             {
                 Some(note) => result.map_err(|e| anyhow::anyhow!("{e}\n\n{note}")),
                 None => result,
@@ -2399,6 +2400,7 @@ async fn record_failure_diagnostics(
         && let Some(note) = sandbox::signal_denial_note(stderr_str, stdout_str)
             .or_else(|| sandbox::gpu_denial_note(stderr_str, stdout_str))
             .or_else(|| sandbox::setuid_denial_note(stderr_str, stdout_str))
+            .or_else(|| sandbox::launch_services_denial_note(stderr_str, stdout_str))
     {
         op_monitor.append_alert(op_id, note).await;
     }

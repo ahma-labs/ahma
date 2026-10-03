@@ -58,6 +58,7 @@ pub mod grant_channel;
 pub mod host_detect;
 #[cfg(target_os = "linux")]
 mod landlock;
+pub mod launch_services;
 pub mod permission_broker;
 mod prerequisites;
 pub mod profiles;
@@ -106,6 +107,7 @@ pub use landlock::{
     apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_read_only_ruleset_fd,
     landlock_ruleset_fd,
 };
+pub use launch_services::launch_services_denial_note;
 pub use permission_broker::{
     AskedAt, ElicitOutcome, ElicitationSurface, PeerElicitationSurface, PermissionBroker,
     hook_fail_closed_message,
