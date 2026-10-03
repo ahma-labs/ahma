@@ -1207,4 +1207,71 @@ mod tests {
             "how to undo it, before they agree to it"
         );
     }
+
+    /// The exact JSON form a harness renders for one reason's choices.
+    fn golden_form(one_of: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "title": "Your decision",
+                    "description":
+                        "Deny is the default. Session and once answers are never written to disk.",
+                    "oneOf": one_of,
+                    "default": "deny"
+                }
+            },
+            "required": ["decision"]
+        })
+    }
+
+    /// GOLDEN (SPEC R-PERM.3.4 per surface): a titled single-select, `deny`
+    /// first, labels in words, never a TUI key letter — for every reason.
+    #[test]
+    fn golden_elicitation_form_per_reason() {
+        let every_tier = serde_json::json!([
+                {"const": "deny", "title": "Deny (default; Enter and Esc)"},
+                {"const": "read-only-once", "title": "read-only, next command only"},
+                {"const": "read-write-once", "title": "read-write, next command only"},
+                {"const": "read-only-session", "title": "read-only, this session"},
+                {"const": "read-write-session", "title": "read-write, this session"},
+                {"const": "read-only-24h", "title": "read-only for 24 hours (saved; ends on its own)"},
+                {"const": "read-write-24h", "title": "read-write for 24 hours (saved; ends on its own)"},
+                {"const": "read-only", "title": "read-only, always (saved; bound to this workspace)"},
+                {"const": "read-write", "title": "read-write, always (saved; bound to this workspace)"}
+        ]);
+        let session_at_most = serde_json::json!([
+                {"const": "deny", "title": "Deny (default; Enter and Esc)"},
+                {"const": "read-only-once", "title": "read-only, next command only"},
+                {"const": "read-write-once", "title": "read-write, next command only"},
+                {"const": "read-only-session", "title": "read-only, this session"},
+                {"const": "read-write-session", "title": "read-write, this session"}
+        ]);
+        let log_target = serde_json::json!([
+                {"const": "deny", "title": "Deny (default; Enter and Esc)"},
+                {"const": "read-only-session", "title": "read-only, this session"},
+                {"const": "read-only", "title": "read-only, always (saved; bound to this workspace)"}
+        ]);
+        for (reason, one_of) in [
+            (GrantReason::PreExecViolation, every_tier.clone()),
+            (GrantReason::StderrHeuristic, every_tier),
+            (GrantReason::StartupFlag, session_at_most.clone()),
+            (GrantReason::Unknown, session_at_most),
+            (GrantReason::LogTarget, log_target),
+        ] {
+            let got = serde_json::to_value(grant_form_schema(reason)).unwrap();
+            assert_eq!(got, golden_form(one_of), "{reason:?}");
+            let text = got.to_string();
+            for o in ahma_common::grant_prompt::options() {
+                let key = format!("[{}]", o.key);
+                assert!(
+                    !text.contains(&key),
+                    "{reason:?}: TUI key {key} in the form"
+                );
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ END PART 4 ---
 }

@@ -1090,4 +1090,50 @@ mod context_tests {
         );
         assert_eq!(redact_command("cargo test -p stat3"), "cargo test -p stat3");
     }
+
+    const GOLDEN_HOOK_HEAD: &str = "The sandbox refused a write outside the workspace: \
+        '/opt/cache/x.bin'. If this command needs it, a human must grant it; ahma will not run it \
+        unsandboxed.";
+    const GOLDEN_HOOK_TAIL: &str = r#"One thing to do (pick a tier), then re-run the command:
+  ahma sandbox grant /opt/cache --session   # this terminal session only, at most 12h
+  ahma sandbox grant /opt/cache             # until revoked, bound to this workspace
+
+Either applies on your next command; nothing to restart."#;
+
+    #[test]
+    fn golden_hook_denial_frame() {
+        let who = HookRequester {
+            harness: Some("Claude Code".into()),
+            session_id: Some("8d387500-2ff3-4b2e".into()),
+            scopes: vec![PathBuf::from("/home/u/proj")],
+            command: Some("cargo build --release".into()),
+        };
+        let path = Path::new("/opt/cache/x.bin");
+        let details = "write to /opt/cache/x.bin: Operation not permitted";
+        let target = grant_dir_for(path);
+        assert_eq!(
+            target,
+            Path::new("/opt/cache"),
+            "precondition: a missing file with an extension is offered as its directory"
+        );
+        let body = ahma_common::grant_prompt::render_for_hook(
+            &target,
+            ScopeAccess::Rw,
+            details,
+            who.context(&target, true),
+        )
+        .to_message();
+        let want = format!("{GOLDEN_HOOK_HEAD}\n\n{body}\n{GOLDEN_HOOK_TAIL}");
+        let got = hook_denial_text(path, ScopeAccess::Rw, details, &who);
+        assert_eq!(got, want, "the hook's denial text changed:\n{got}");
+        for o in ahma_common::grant_prompt::options() {
+            let key = format!("[{}]", o.key);
+            assert!(
+                !got.contains(&key),
+                "TUI key {key} in a terminal hook's text"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------ END PART 3 ---
 }

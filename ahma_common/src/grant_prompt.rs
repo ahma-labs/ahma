@@ -672,4 +672,412 @@ mod tests {
         assert_eq!(values, ["deny", "read-only-session", "read-only"]);
         assert_eq!(render(&log_target_request()).options, offered);
     }
+
+    // ── golden text, one per surface shape (SPEC R-PERM.3.4) ────────────────
+    //
+    // Every constant is the exact text a human reads. To accept an intended
+    // change, review the diff the failing assertion prints and paste the new
+    // text here; a byte-for-byte comparison is the point.
+
+    /// A sender that knows nothing (no requester, no evidence, no claim, no
+    /// risk) still yields all seven sections, each saying so.
+    fn minimal_request() -> ScopeGrantRequest {
+        ScopeGrantRequest {
+            decision_id: "d-min".into(),
+            path: "/srv/data".into(),
+            access: ScopeAccess::Ro,
+            reason: GrantReason::PreExecViolation,
+            tool: None,
+            context: Default::default(),
+        }
+    }
+
+    /// A requester that is present but empty: every field reads "unknown",
+    /// and pid 0 is omitted rather than printed.
+    fn blank_requester_request() -> ScopeGrantRequest {
+        let mut req = minimal_request();
+        req.decision_id = "d-blank".into();
+        req.context.requester = Some(crate::scope_grant::GrantRequester::default());
+        req
+    }
+
+    /// A reason sent by a newer ahma: no saved tiers, and the always section
+    /// says why.
+    fn unknown_reason_request() -> ScopeGrantRequest {
+        ScopeGrantRequest {
+            decision_id: "d-unknown".into(),
+            path: "/srv/data".into(),
+            access: ScopeAccess::Ro,
+            reason: GrantReason::Unknown,
+            tool: Some("future_tool".into()),
+            context: Default::default(),
+        }
+    }
+
+    /// What a terminal hook knows, fully specified. The real hook's pid and
+    /// risk come from the machine (`std::process::id()`, a stat of the
+    /// target); here they are fixed so the text is the same everywhere.
+    fn hook_body() -> PromptBody {
+        use crate::scope_grant::{GrantContext, GrantRequester, GrantRiskSummary};
+        render_for_hook(
+            Path::new("/opt/cache"),
+            ScopeAccess::Rw,
+            "write to /opt/cache/x.bin: Operation not permitted\nsecond line is not evidence",
+            GrantContext {
+                requester: Some(GrantRequester {
+                    client: Some("Claude Code (terminal hook)".into()),
+                    session_id: Some("8d387500-2ff3-4b2e".into()),
+                    workspace: Some("/home/u/proj".into()),
+                    pid: 4242,
+                }),
+                command: Some("cargo build --release".into()),
+                risk: Some(GrantRiskSummary {
+                    class: "normal".into(),
+                    warnings: vec![],
+                    facts: vec!["directory with 3 entries".into()],
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Fail with the full text, so accepting a change is a copy, not a hunt.
+    #[track_caller]
+    fn assert_golden(what: &str, got: &str, want: &str) {
+        assert_eq!(
+            got, want,
+            "the {what} grant prompt changed; review it and update its golden constant:\n{got}"
+        );
+    }
+
+    const GOLDEN_FULL_TEXT: &str = r#"Allow read+write access to /Users/u/Library/Caches/sccache?
+
+Who is asking
+  claude-code · workspace /Users/u/github/proj · session 8d387500 · pid 4242
+
+What was blocked
+  cargo_build tried to write /Users/u/Library/Caches/sccache/0/1/obj
+  command: cargo build --release
+  read from the command's error output: double-check the path
+  evidence: error: failed to write /Users/u/Library/Caches/sccache/0/1/obj: Operation not permitted
+  asked 2 times this session (first at 09:05 UTC)
+
+What the agent says it needs
+  "sccache keeps its compiler cache there"
+  (the agent's claim, in the agent's own words — it is the party asking, not a witness)
+
+Minimum that would work
+  read+write on /Users/u/Library/Caches/sccache (a write was refused, so read-only would not fix it)
+
+What a grant allows
+  every command in /Users/u/github/proj may read and write /Users/u/Library/Caches/sccache — for the next command (once), until this session ends (session), for 24 hours (lease), or until you revoke it (always). Nothing else outside the workspace changes.
+
+Risk
+  HIGH
+  ! is a hidden-data directory in your home folder
+  - directory with 12 entries
+
+If you choose always
+  ~/.ahma/settings.toml gets:
+  [[sandbox.persistent_scopes]]
+  path = "/Users/u/Library/Caches/sccache"
+  access = "rw"
+  workspace = "/Users/u/github/proj"
+  Revoke any time with: ahma sandbox revoke /Users/u/Library/Caches/sccache
+
+Choices (deny is the default):
+  deny                 Deny (default; Enter and Esc)
+  read-only-once       read-only, next command only
+  read-write-once      read-write, next command only
+  read-only-session    read-only, this session
+  read-write-session   read-write, this session
+  read-only-24h        read-only for 24 hours (saved; ends on its own)
+  read-write-24h       read-write for 24 hours (saved; ends on its own)
+  read-only            read-only, always (saved; bound to this workspace)
+  read-write           read-write, always (saved; bound to this workspace)
+"#;
+
+    const GOLDEN_MINIMAL_MESSAGE: &str = r#"Allow read-only access to /srv/data?
+
+Who is asking
+  unknown session (a terminal hook, or an older ahma)
+
+What was blocked
+  a sandboxed command tried to read /srv/data
+  blocked before it ran: the path is exact
+
+What the agent says it needs
+  nothing — the agent gave no reason
+
+Minimum that would work
+  read-only on /srv/data (no write was refused; read-only is enough until one is)
+
+What a grant allows
+  every command in this workspace may read /srv/data — for the next command (once), until this session ends (session), for 24 hours (lease), or until you revoke it (always). Nothing else outside the workspace changes.
+
+Risk
+  not assessed (no live scope to compare against)
+
+If you choose always
+  ~/.ahma/settings.toml gets:
+  [[sandbox.persistent_scopes]]
+  path = "/srv/data"
+  access = "ro"
+  workspace = "<this workspace>"
+  Revoke any time with: ahma sandbox revoke /srv/data
+"#;
+
+    const GOLDEN_BLANK_REQUESTER_MESSAGE: &str = r#"Allow read-only access to /srv/data?
+
+Who is asking
+  unknown · workspace unknown · session unknown
+
+What was blocked
+  a sandboxed command tried to read /srv/data
+  blocked before it ran: the path is exact
+
+What the agent says it needs
+  nothing — the agent gave no reason
+
+Minimum that would work
+  read-only on /srv/data (no write was refused; read-only is enough until one is)
+
+What a grant allows
+  every command in this workspace may read /srv/data — for the next command (once), until this session ends (session), for 24 hours (lease), or until you revoke it (always). Nothing else outside the workspace changes.
+
+Risk
+  not assessed (no live scope to compare against)
+
+If you choose always
+  ~/.ahma/settings.toml gets:
+  [[sandbox.persistent_scopes]]
+  path = "/srv/data"
+  access = "ro"
+  workspace = "<this workspace>"
+  Revoke any time with: ahma sandbox revoke /srv/data
+"#;
+
+    const GOLDEN_UNKNOWN_REASON_TEXT: &str = r#"Allow read-only access to /srv/data?
+
+Who is asking
+  unknown session (a terminal hook, or an older ahma)
+
+What was blocked
+  future_tool tried to read /srv/data
+  sent by a newer ahma for a reason this version does not recognise: double-check the path
+
+What the agent says it needs
+  nothing — the agent gave no reason
+
+Minimum that would work
+  read-only on /srv/data (no write was refused; read-only is enough until one is)
+
+What a grant allows
+  every command in this workspace may read /srv/data — for the next command (once) or until this session ends (session). It is never saved. Nothing else outside the workspace changes.
+
+Risk
+  not assessed (no live scope to compare against)
+
+If you choose always
+  not offered for a question this version of ahma does not recognise: nothing is written to ~/.ahma/settings.toml.
+
+Choices (deny is the default):
+  deny                 Deny (default; Enter and Esc)
+  read-only-once       read-only, next command only
+  read-write-once      read-write, next command only
+  read-only-session    read-only, this session
+  read-write-session   read-write, this session
+"#;
+
+    const GOLDEN_HOOK_MESSAGE: &str = r#"Allow read+write access to /opt/cache?
+
+Who is asking
+  Claude Code (terminal hook) · workspace /home/u/proj · session 8d387500 · pid 4242
+
+What was blocked
+  a hooked shell command tried to write /opt/cache
+  command: cargo build --release
+  read from the command's error output: double-check the path
+  evidence: write to /opt/cache/x.bin: Operation not permitted
+
+What the agent says it needs
+  nothing — the agent gave no reason
+
+Minimum that would work
+  read+write on /opt/cache (a write was refused, so read-only would not fix it)
+
+What a grant allows
+  every command in /home/u/proj may read and write /opt/cache — for the next command (once), until this session ends (session), for 24 hours (lease), or until you revoke it (always). Nothing else outside the workspace changes.
+
+Risk
+  NORMAL
+  - directory with 3 entries
+
+If you choose always
+  ~/.ahma/settings.toml gets:
+  [[sandbox.persistent_scopes]]
+  path = "/opt/cache"
+  access = "rw"
+  workspace = "/home/u/proj"
+  Revoke any time with: ahma sandbox revoke /opt/cache
+"#;
+
+    const GOLDEN_TMP_TEXT: &str = r#"Allow read+write access to /private/var/folders/xy/T?
+
+Who is asking
+  unknown session (a terminal hook, or an older ahma)
+
+What was blocked
+  nothing was blocked: this server was started with --tmp (or [sandbox] tmp_access = true), which asks for read+write access to the system temp directory /private/var/folders/xy/T
+  the path is exact: this machine's temp directory, shared by every program you run, and part of no project
+
+What the agent says it needs
+  nothing — the agent gave no reason
+
+Minimum that would work
+  read+write on /private/var/folders/xy/T (what --tmp asks for; deny and it stays out of this session's scope)
+
+What a grant allows
+  every command in this workspace may read and write /private/var/folders/xy/T — for the next command (once) or until this session ends (session). It is never saved. Nothing else outside the workspace changes.
+
+Risk
+  not assessed (no live scope to compare against)
+
+If you choose always
+  not offered: the temp directory is shared by the whole machine, so this answer is never written to ~/.ahma/settings.toml. To stop being asked, start ahma without --tmp and remove tmp_access from [sandbox] in ~/.ahma/settings.toml.
+
+Choices (deny is the default):
+  deny                 Deny (default; Enter and Esc)
+  read-only-once       read-only, next command only
+  read-write-once      read-write, next command only
+  read-only-session    read-only, this session
+  read-write-session   read-write, this session
+"#;
+
+    const GOLDEN_LOG_TARGET_TEXT: &str = r#"Allow read-only access to /opt/app/logs/app.log?
+
+Who is asking
+  unknown session (a terminal hook, or an older ahma)
+
+What was blocked
+  nothing was blocked: a log file in .ahma/logs links to this file outside the workspace; approving lets ahma's log tools read it: /opt/app/logs/app.log
+  the path is exact: where the link resolves now. The agent can create links in .ahma/logs itself, so check this is a log you expect it to read
+
+What the agent says it needs
+  nothing — the agent gave no reason
+
+Minimum that would work
+  read-only on /opt/app/logs/app.log (a log target is only ever read, never written)
+
+What a grant allows
+  ahma's log tools, and every command in this workspace, may read /opt/app/logs/app.log — until this session ends (session), or until you revoke it (always). It is never writable, and nothing else outside the workspace changes.
+
+Risk
+  not assessed (no live scope to compare against)
+
+If you choose always
+  ~/.ahma/settings.toml gets:
+  [[log_targets.approvals]]
+  workspace = "<this workspace>"
+  targets = ["/opt/app/logs/app.log"]
+  Revoke any time with: ahma permissions revoke log-target /opt/app/logs/app.log --workspace <this workspace>
+
+Choices (deny is the default):
+  deny                 Deny (default; Enter and Esc)
+  read-only-session    read-only, this session
+  read-only            read-only, always (saved; bound to this workspace)
+"#;
+
+    /// The body plus the choices by name — the shape a text-only surface
+    /// would print. Deny first, every tier the reason offers, no key letters.
+    #[test]
+    fn golden_full_request_with_choices() {
+        assert_golden(
+            "full (to_text)",
+            &render(&full_request()).to_text(),
+            GOLDEN_FULL_TEXT,
+        );
+    }
+
+    /// SPEC R-PERM.3.4 "Context is required": nothing known is still seven
+    /// sections, never a shorter body.
+    #[test]
+    fn golden_minimal_request_is_still_complete() {
+        assert_golden(
+            "minimal",
+            &render(&minimal_request()).to_message(),
+            GOLDEN_MINIMAL_MESSAGE,
+        );
+        assert_golden(
+            "blank requester",
+            &render(&blank_requester_request()).to_message(),
+            GOLDEN_BLANK_REQUESTER_MESSAGE,
+        );
+    }
+
+    #[test]
+    fn golden_unknown_reason_offers_no_saved_tier() {
+        assert_golden(
+            "unknown reason",
+            &render(&unknown_reason_request()).to_text(),
+            GOLDEN_UNKNOWN_REASON_TEXT,
+        );
+    }
+
+    /// The body inside a terminal hook's denial (the hook wraps it in its own
+    /// first line and tier commands, pinned in `grant_channel.rs`). Only the
+    /// first line of `details` becomes the evidence.
+    #[test]
+    fn golden_hook_body() {
+        assert_golden("hook", &hook_body().to_message(), GOLDEN_HOOK_MESSAGE);
+    }
+
+    #[test]
+    fn golden_tmp_question() {
+        assert_golden("--tmp", &render(&tmp_request()).to_text(), GOLDEN_TMP_TEXT);
+    }
+
+    #[test]
+    fn golden_log_target_question() {
+        assert_golden(
+            "log target",
+            &render(&log_target_request()).to_text(),
+            GOLDEN_LOG_TARGET_TEXT,
+        );
+    }
+
+    /// SPEC R-PERM.3.4 "Only the TUI shows key letters": the text every
+    /// non-TUI surface sends — the elicitation message, the hook body, the
+    /// relayed tool result — names choices by value, never by a key nobody
+    /// can press there. Checked for every key, every reason, both renderings.
+    #[test]
+    fn no_tui_key_letter_reaches_a_text_surface() {
+        let bodies = [
+            ("full", render(&full_request())),
+            ("minimal", render(&minimal_request())),
+            ("blank requester", render(&blank_requester_request())),
+            ("unknown reason", render(&unknown_reason_request())),
+            ("hook", hook_body()),
+            ("--tmp", render(&tmp_request())),
+            ("log target", render(&log_target_request())),
+        ];
+        for (what, body) in &bodies {
+            for text in [body.to_message(), body.to_text()] {
+                for o in options() {
+                    let key = format!("[{}]", o.key);
+                    assert!(!text.contains(&key), "{what}: {key} leaked into:\n{text}");
+                }
+            }
+        }
+        // ...while the TUI still has a distinct key for every choice it binds.
+        for (what, body) in &bodies {
+            let mut keys: Vec<char> = body.options.iter().map(|o| o.key).collect();
+            let n = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(keys.len(), n, "{what}: duplicate TUI keys");
+        }
+    }
+
+    // ------------------------------------------------------------ END PART 1 ---
 }

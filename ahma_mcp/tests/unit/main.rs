@@ -82,6 +82,7 @@ mod tool_availability_integration_test;
 mod tool_config_schema_validation_test;
 mod tool_examples_execution_test;
 mod tool_suite;
+mod tripwire_budget_test;
 mod update_test;
 mod vscode_mcp_config_test;
 mod workspace_queue_test;
