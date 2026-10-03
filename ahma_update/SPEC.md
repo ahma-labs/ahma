@@ -22,22 +22,21 @@ project's CI, and to never leave me with a half-installed or unrunnable binary.*
   matching the artifact's sha256, and a Rekor entry for this envelope logged while the
   certificate was valid. `ahma verify --self` runs the same checks on the running binary.
 - `--insecure-skip-verify` skips provenance and is CLI-flag-only (R-CFG2.3).
-- **Install** is atomic and out of place: the new binary is written beside the target and
-  renamed over it, never modified in place. On macOS it is re-signed locally after install
-  (R-SIGN.2), because an in-place rewrite of an ad-hoc-signed binary gets `SIGKILL (Code
-  Signature Invalid)`.
+- **Install** follows root SPEC R-SIGN.2: the new binary is written beside the target and
+  renamed over it, never modified in place. On macOS it is then re-signed locally (R-SIGN.1),
+  because an in-place rewrite of an ad-hoc-signed binary gets `SIGKILL (Code Signature
+  Invalid)`.
 - After install, `ahma setup` runs by re-executing the **new** binary, with `kill_on_drop`.
-- `--prefer-musl` (Linux) and `--install-dir` replace the retired `AHMA_PREFER_MUSL` and
-  `AHMA_INSTALL_DIR`.
+- `--prefer-musl` (Linux) selects the musl build; `--install-dir` sets the install directory.
 
 ## 3. Non-Functional Requirements
 
 - No MCP-engine dependency: this crate can be tested without starting a server.
 - Every GitHub request (release lookup, download, `SHA256SUMS`, attestations) goes through
-  `github::get`: bounded connect and read timeouts, transient failures retried with backoff,
-  and a final failure that leads with "Couldn't reach GitHub." or "GitHub … " before the
-  technical detail (root SPEC R-HTTP).
+  `github::get`: bounded connect and read timeouts, retries per root SPEC R-HTTP, and a final
+  failure that leads with "Couldn't reach GitHub." or "GitHub … " before the technical detail.
 
 ## 4. Out of Scope
 
-- Developer-ID signing and notarization of release binaries (R-SIGN.1, not implemented).
+- Developer-ID signing and notarization of release binaries (root R-SIGN.1; open, root SPEC
+  §11).

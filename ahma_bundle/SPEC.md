@@ -18,11 +18,11 @@ commands ahma executes.*
   arguments without `format: "path"`, and exfiltration-shaped command patterns.
   `--strict` fails the audit on any finding.
 - `BundleChecksummer` writes a SHA-256 manifest of the bundle's files; `BundleVerifier`
-  re-hashes and compares. This detects **corruption only**. The manifest is unsigned and
-  lives inside the bundle, so anyone who can edit a file can regenerate it.
-- No surface — CLI output, docs, type names — may call the manifest a signature or imply it
-  establishes trust.
-- Nothing gates loading on trust: an unaudited bundle in a tools directory still loads.
+  re-hashes and compares. The checksum detects **corruption only**; it is not a signature:
+  the manifest is unsigned and lives inside the bundle, so anyone who can edit a file can
+  regenerate it. No surface — CLI output, docs, type names — may call the manifest a
+  signature or imply it establishes trust.
+- There is no load-time gate: an unaudited bundle in a tools directory still loads.
 
 ## 3. Non-Functional Requirements
 
@@ -30,5 +30,5 @@ commands ahma executes.*
 
 ## 4. Out of Scope
 
-- Signing, key rings, trusted indexes and load-time trust gates. Tamper evidence needs a
-  detached signature verified against a key the bundle cannot supply; it is not implemented.
+- Signing, key rings, trusted indexes, load-time trust gates, and detached signature
+  verification against a key the bundle cannot supply (the only form of tamper evidence).

@@ -13,18 +13,18 @@
 
 - **Scope-Validated Filesystem API**: `read_file`, `write_file`, `replace_in_file`, `multi_edit`, `apply_patch`, `list_dir`, `file_search` and `grep_search` each accept a `scopes: &[PathBuf]` allowlist. Any path that canonicalizes outside every listed scope MUST be rejected with an error.
 - **Symlink Resolution**: Validation canonicalizes before comparing, so a symlink pointing out of scope is rejected rather than followed.
-- **Safe Edits** (R26): an edit's `old_string` must match exactly once; `multi_edit` and `apply_patch` are all-or-nothing (every edit or hunk applies, or the file is untouched); every write is atomic (`atomic_write`: temp file + rename).
+- **Safe Edits** (root R26: R26.2, R26.3): an edit's `old_str` must match exactly once unless `replace_all` is set; `multi_edit` and `apply_patch` are all-or-nothing (every edit or hunk applies, or the file is untouched); every write is atomic (`atomic_write`: temp file + rename).
 - **Search**: Glob-pattern file discovery and plain-text or regex line search, both confined to the same scope allowlist and `.gitignore`-aware.
-- **Bounded Output**: `read_file` returns at most `DEFAULT_READ_LINES` (2000) lines of at most `MAX_LINE_CHARS` (2000) characters; `file_search` at most `FILE_SEARCH_MAX` (1000) paths; `fetch_webpage` at most `MAX_FETCH_CHARS` (50 000) characters.
-- **SSRF Egress Guard** (SPEC R-WEB.3.3): Outbound HTTP made by ahma's own tools is blocked **at connection time on the resolved IP**, not on the hostname string, via a custom `reqwest` DNS resolver. This blocks cloud-metadata endpoints (`169.254.169.254`), loopback admin services, and RFC-1918 hosts.
+- **Bounded Output** (root R26.4): `read_file` returns at most `DEFAULT_READ_LINES` (2000) lines of at most `MAX_LINE_CHARS` (2000) characters; `grep_search` at most 200 results by default (`max_results`); `file_search` at most `FILE_SEARCH_MAX` (1000) paths; `fetch_webpage` at most `MAX_FETCH_CHARS` (50 000) characters.
+- **SSRF Egress Guard** (root R-WEB.3.2, R-WEB.3.4): Outbound HTTP made by ahma's own tools is blocked **at connection time on the resolved IP**, not on the hostname string, via a custom `reqwest` DNS resolver in `egress_guard`. This blocks cloud-metadata endpoints (`169.254.169.254`), loopback admin services, and RFC-1918 hosts.
 - **DNS-Rebinding Resistance**: Because the resolver runs for the initial request *and every redirect hop*, a domain that flips its DNS to a private address after approval is still blocked when the socket is opened. IP literals bypass DNS and MUST be rejected up front by `check_url` and, for redirect targets, by the redirect policy.
-- **Cross-Domain Redirect Guard** (SPEC R-WEB.8): A redirect to a *different public domain* is followed only if the caller's live `[web]` policy would independently approve that host. The origin host is always permitted. Without this, an approved host returning `302 Location: https://evil.example/` would launder an unapproved domain through an approved one.
+- **Cross-Domain Redirect Guard** (root R-WEB.8): `RedirectDomainGuard` always permits a hop to the origin host (case-insensitive). A hop to any other host is followed only if the caller's live `[web]` policy, with this session's grants and denies, decides `Allow` for that host; otherwise the request fails with an error naming the host and `ahma web allow <host>`. The guard never prompts and does not read `on_redirect_to_new_domain`: under the default `allow` policy it refuses only a `never_allow` host or one denied this session; in `deny` mode it also refuses any host that is not in `always_allow` or granted this session.
 - **Bounded Redirects**: At most `MAX_REDIRECTS` (10) hops before the request fails.
 
 ## 3. Non-Functional Requirements
 
 - **Defence in Depth**: Scope validation here duplicates the kernel sandbox deliberately — it is the in-process guard for callers that have not yet crossed a kernel boundary, not a replacement for it.
-- **Configurable Strictness**: `block_private` is a parameter, not a constant, so a legitimate dev workflow or a test hitting a loopback mock can opt out. Tool code MUST always use the strict (`true`) default.
+- **Configurable Strictness**: `block_private` is a parameter, not a constant, so a legitimate dev workflow or a test hitting a loopback mock can opt out (the `block_private_ranges = false` case, root R-WEB.3.3). Tool code MUST always use the strict (`true`) default.
 
 ## 4. Out of Scope
 

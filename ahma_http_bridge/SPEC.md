@@ -26,13 +26,13 @@ honest gating.
 - **R8.3**: JSON-RPC via POST at `/mcp`. Protocol conformance details that bind both POST transports:
   - **R8.3.1**: Notifications (id-less messages) are answered **HTTP 202** with no JSON-RPC body.
   - **R8.3.2**: An unknown or terminated `Mcp-Session-Id` is answered **HTTP 404**, which is the signal a spec-conforming client (rmcp included) uses to drop the stale session and re-`initialize`. It must not be 403 — clients treat that as terminal.
-  - **R8.3.3**: JSON-RPC batch arrays are rejected with **HTTP 400** (batching was removed from the MCP spec in 2025-06-18; forwarding a raw array to the subprocess is undefined behavior).
+  - **R8.3.3**: JSON-RPC batch arrays are rejected with **HTTP 400** (MCP 2025-06-18 has no batching; a raw array is never forwarded to the subprocess).
   - **R8.3.4**: Requests carrying a non-loopback `Origin` header are rejected (server-side DNS-rebinding validation per the MCP transport security requirements; CORS headers alone only gate what a browser lets a page *read*, not what the server *executes*). Non-browser clients send no `Origin` and are unaffected.
-  - **R8.3.5**: **`MCP-Protocol-Version` header** (2025-06-18 Streamable HTTP): the bridge validates the header when present — an unsupported value gets HTTP 400 naming the supported set — and assumes `2025-03-26` when absent (the spec's backwards-compatibility rule, which is also what keeps every pre-2025-06-18 client working). ahma's own first-party HTTP clients (the stdio proxy, the TUI, the external-tool client) negotiate the current revision at `initialize` and echo the **server-answered** version in the header on every subsequent request, via the one shared implementation in `ahma_common::mcp_protocol` — protocol currency must not be re-implemented per client.
+  - **R8.3.5**: **`MCP-Protocol-Version` header** (2025-06-18 Streamable HTTP): the bridge validates the header when present — an unsupported value gets HTTP 400 naming the supported set — and assumes `2025-03-26` when absent (the spec's backwards-compatibility rule). ahma's own first-party HTTP clients (the stdio proxy, the TUI, the external-tool client) negotiate the current revision at `initialize` and echo the **server-answered** version in the header on every subsequent request, via the one shared implementation in `ahma_common::mcp_protocol` — protocol currency must not be re-implemented per client.
   - **R8.3.6**: HTTP `DELETE /mcp` with a valid `Mcp-Session-Id` terminates that session (its subprocess is stopped) and is answered **HTTP 204**; a missing header gets 400, an unknown id gets the R8.3.2 404.
-  - **R8.3.7**: **A JSON-RPC id already in flight on a session is refused, never allowed to orphan the earlier request.** Several HTTP clients may share one `Mcp-Session-Id` (the TUI's status source and its agent's tool calls, for instance), so the bridge cannot trust ids to be unique per session. A second request reusing an in-flight id is answered **HTTP 400** / JSON-RPC `-32600` naming the id; the first request is untouched. Replacing the first request's response slot instead dropped its channel, so a healthy request failed instantly with HTTP 500 "Response channel closed" — which is how every parallel pair of agent tool calls used to fail. ahma's own clients mint ids from one process-wide counter, so they never trip this.
+  - **R8.3.7**: **A JSON-RPC id already in flight on a session is refused, never allowed to orphan the earlier request.** Several HTTP clients may share one `Mcp-Session-Id` (the TUI's status source and its agent's tool calls, for instance), so the bridge cannot trust ids to be unique per session. A second request reusing an in-flight id is answered **HTTP 400** / JSON-RPC `-32600` naming the id; the first request is untouched. ahma's own clients mint ids from one process-wide counter, so they never trip this.
 - **R8.4**: **Subprocess death fails the session loudly; there is no auto-restart.** A crashed subprocess answers its session's in-flight requests with a classified error (R-SIGN.5) and the session terminates; the client re-initializes into a fresh session via R8.3.2's 404.
-- **R8.4.1**: **Stateful by design — stateless mode is out of scope.** Every session is bound to a live subprocess holding a kernel sandbox lock (R5.1); a scope commit cannot be stateless, so the Streamable HTTP spec's optional stateless-server mode is deliberately not implemented. Conformance effort goes into the *stateful* session lifecycle instead: session header, DELETE termination, 202/404 semantics above.
+- **R8.4.1**: **Stateful by design — stateless mode is out of scope.** Every session is bound to a live subprocess holding a kernel sandbox lock (R5.1); a scope commit cannot be stateless, so the Streamable HTTP spec's optional stateless-server mode is not implemented.
 - **R8.5**: Content negotiation via `Accept` header (`text/event-stream` → SSE, `application/json` → JSON).
 - **R8.6**: **HTTP Streaming (MCP Streamable HTTP)**: POST requests support SSE response streaming for full multiplexing and reconnection resilience.
   - **R8.6.1**: POST with `Accept: text/event-stream` returns SSE-formatted response and interleaved server notifications within a single stream.
@@ -43,12 +43,11 @@ honest gating.
 - **R8.7**: **HTTP/3 (QUIC) Client Preference**: All HTTP clients built with `reqwest` use the `http3` feature to prefer HTTP/3 (QUIC) transport when the server advertises support via Alt-Svc headers.
   - **R8.7.1**: HTTP/3 uses QUIC (UDP-based) for reduced connection latency and improved multiplexing compared to HTTP/2 over TCP.
   - **R8.7.2**: Transparent fallback to HTTP/2 or HTTP/1.1 when the server does not support HTTP/3.
-  - **R8.7.3**: **Known limitation**: the GET SSE stream is **not served over HTTP/3** — the QUIC endpoint answers it with 406 Not Acceptable and an explanatory body, and clients fall back to HTTP/2 or HTTP/1.1 for the push channel. POST request/response works over HTTP/3.
 - **R8.8**: **Session-Health Disclosure** (client reference: `docs/session-health-notifications.md`): structured server→client disclosure of session-health changes the client cannot otherwise observe. Events are **information only** — they never demand a response, never gate server progress, and emission failure must never fail or block the operation that triggered the event.
   - **R8.8.1**: Canonical event notification `notifications/ahma/session_event` with envelope `{kind, timestamp, seq, detail}`; `seq` is per-emitter monotonic so a client can detect gaps. Kinds: `reconnected`, `reconnect_failed`, `grant_pending`, `grant_decided`, `health`.
   - **R8.8.2**: Every event is mirrored as a standard `notifications/message` logging notification (`data` = the event params; level `error` for `reconnect_failed`, `warning` for reconnect/grant kinds, `info` for `health`) so foreign clients surface the disclosure with zero ahma-specific code. The mirror uses the standard wire shape directly, because MCP deprecates the typed logging API (SEP-2577).
   - **R8.8.3**: The stdio proxy — the only party that knows a transparent reconnect happened — synthesizes `reconnected` after a successful rebuild and `reconnect_failed` once per outage when a reconnect burst fails, **downstream only**: session events must never reach the (fresh) bridge session, mirroring how the replayed handshake never reaches stdio.
-  - **R8.8.4**: The `notifications/ahma/heartbeat` payload carries `pending_grants` (grants awaiting a human decision, filled by the server from the `GrantCoordinator`) and `reconnects` (overlaid by the proxy — the server behind it cannot know). Both fields are `#[serde(default)]` and wire-compatible in both directions with pre-R8.8 peers.
+  - **R8.8.4**: The `notifications/ahma/heartbeat` payload carries `pending_grants` (grants awaiting a human decision, filled by the server from the `GrantCoordinator`) and `reconnects` (overlaid by the proxy — the server behind it cannot know). Both fields are `#[serde(default)]`, so peers that lack them interoperate in both directions.
   - **R8.8.5**: The permission broker emits `grant_pending` (with `grant_id` = the coordinator's `decision_id`) once per deduped `(path, access)` before the question ladder asks, and `grant_decided` (`granted`/`declined`) on resolution — **beside**, never instead of, the human asking surfaces. The R5.3/R5.4 grant security gates and session scope-immutability are unaffected: disclosure carries no approval authority.
 
 ### R10: Session isolation
@@ -96,27 +95,22 @@ honest gating.
 - **RB.3 — Live, deterministic POST-SSE stream**: the SSE response to a POST request starts
   at once — its headers are sent before the request is answered — and carries each broadcast
   event published while the request runs as it arrives, then, once the response is available,
-  exactly the events already queued, the response event, and closes. Holding the headers until
-  the response was ready stalled the client: rmcp's HTTP client performs one POST at a time, so
-  one long `tools/call` (an `await` may run 30 minutes) held every other request, progress
-  notification and liveness ping on the session behind it, and RB.4 then killed the session as
-  unresponsive. Refusals that are known before the request is sent (unknown session, duplicate
-  id, dead subprocess pipe) keep their HTTP status; anything later is an in-band JSON-RPC
-  error. No wall-clock windows: an event that arrives after the response is delivered on the
-  live `GET /mcp` stream and retained for `Last-Event-Id` replay, never raced against a timer.
+  exactly the events already queued, the response event, and closes. rmcp's HTTP client
+  performs one POST at a time, so a stream that waited for the response would stall every
+  other request and ping on the session behind one long `tools/call`. Refusals known before
+  the request is sent (unknown session, duplicate id, dead subprocess pipe) keep their HTTP
+  status; anything later is an in-band JSON-RPC error. No wall-clock windows: an event that
+  arrives after the response is delivered on the live `GET /mcp` stream and retained for
+  `Last-Event-Id` replay, never raced against a timer.
 - **RB.4 — Active client liveness probe**: the bridge periodically pings every session that has
   a live SSE subscriber, over the same routed-request channel used for sampling
   (`Session::routed_requests`), and terminates a session — cascading to its sandboxed worker
-  subprocess — once its client misses a fixed number of consecutive pings. This closes a gap the
-  subprocess's own liveness ping cannot see: that ping (SPEC R2.6.5.3) is answered by the bridge
-  on the client's behalf the moment an SSE subscriber is merely *attached*, so it proves only
-  that the socket looks open, never that anything is actually reading it — a crashed client, a
-  hung process, or a dead network path can leave a session (and its subprocess) alive
-  indefinitely otherwise. A session with **no** SSE subscriber at all is the
-  idle-eviction sweep's responsibility (`SessionManager::evict_oldest_inactive_session`), not
-  this probe's — pinging it would have nothing to reach. Nor is a session with a request
-  still in flight: its client is waiting on the bridge, and may be unable to answer until that
-  request returns.
+  subprocess — once its client misses a fixed number of consecutive pings. The subprocess's own
+  liveness ping (SPEC R2.6.5.3) is answered by the bridge whenever an SSE subscriber is
+  attached, so only this probe proves the client is actually reading. The probe skips a
+  session with **no** SSE subscriber (the idle-eviction sweep,
+  `SessionManager::evict_oldest_inactive_session`, owns it) and a session with a request still
+  in flight (its client may be unable to answer until that request returns).
 
 ## 3. Non-Functional Requirements
 
@@ -130,3 +124,6 @@ honest gating.
 - Executing commands or enforcing the sandbox — both belong to the `ahma serve stdio`
   subprocess (`ahma_mcp`).
 - Stateless Streamable HTTP (R8.4.1).
+- **R8.7.3**: The `GET /mcp` SSE push channel over HTTP/3. The QUIC endpoint answers it with
+  406 Not Acceptable and an explanatory body, and clients fall back to HTTP/2 or HTTP/1.1 for
+  the push channel; POST request/response works over HTTP/3.
