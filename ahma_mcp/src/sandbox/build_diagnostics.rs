@@ -211,10 +211,10 @@ const NESTED_SANDBOX_REMEDIATION: &str = "A tool in this command applied its own
 permitted`. SwiftPM's manifest loader and `xcodebuild` package resolution do this. It is a \
 capability, not a path: no directory grant can help, so do not request one. Options: `swift \
 build --disable-sandbox` / `swift package resolve --disable-sandbox` for SwiftPM; for \
-`xcodebuild`, the human runs `defaults write com.apple.dt.Xcode \
-IDEPackageSupportDisableManifestSandbox -bool YES` once (it turns off SwiftPM's own manifest \
-sandbox for Xcode; ahma's sandbox still confines the build). Resolving packages once outside \
-ahma also works, since a resolved workspace no longer loads manifests under sandbox-exec.";
+`xcodebuild`, add the flag yourself: `xcodebuild -IDEPackageSupportDisableManifestSandbox=YES …` \
+(it turns off only SwiftPM's own manifest sandbox for that command; ahma's sandbox still \
+confines the build). To make it permanent, the human can run `defaults write \
+com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES` once.";
 
 const BUILD_SCRIPT_COPY_REMEDIATION: &str = "Build failed with `Operation not permitted` while a \
 dependency's build script copied a file (e.g. `aws-lc-sys` copying its include headers). On macOS \
@@ -432,9 +432,11 @@ mod nested_and_sccache_tests {
             "{}",
             hit.remediation
         );
+        // The agent can fix xcodebuild itself, per command, with no human:
+        // verified inside ahma's sandbox on macOS 27 / Xcode 27.
         assert!(
             hit.remediation
-                .contains("IDEPackageSupportDisableManifestSandbox"),
+                .contains("xcodebuild -IDEPackageSupportDisableManifestSandbox=YES"),
             "{}",
             hit.remediation
         );
