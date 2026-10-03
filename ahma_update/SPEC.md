@@ -20,12 +20,16 @@ project's CI, and to never leave me with a half-installed or unrunnable binary.*
   embedded SCT, identity policy (GitHub Actions OIDC issuer, repository `ahma-labs/ahma`,
   signer URI under `https://github.com/ahma-labs/ahma/`), DSSE signature, in-toto subject
   matching the artifact's sha256, and a Rekor entry for this envelope logged while the
-  certificate was valid. `ahma verify --self` runs the same checks on the running binary.
+  certificate was valid. `ahma verify --self` runs the same checks on the running binary; a
+  binary that matches its install receipt is reported as verified at install and re-signed
+  locally (root R-SIGN.1), with both digests, never as an attestation failure.
 - `--insecure-skip-verify` skips provenance and is CLI-flag-only (R-CFG2.3).
 - **Install** follows root SPEC R-SIGN.2: the new binary is written beside the target and
-  renamed over it, never modified in place. On macOS it is then re-signed locally (R-SIGN.1),
-  because an in-place rewrite of an ad-hoc-signed binary gets `SIGKILL (Code Signature
-  Invalid)`.
+  renamed over it, never modified in place. On macOS a binary without a valid Developer ID
+  signature and hardened runtime is then re-signed locally (R-SIGN.1), because an in-place
+  rewrite of an ad-hoc-signed binary gets `SIGKILL (Code Signature Invalid)`; a Developer-ID
+  binary is kept byte-identical. When re-signing changes the verified bytes, the installer
+  writes `<binary>.install-receipt`.
 - After install, `ahma setup` runs by re-executing the **new** binary, with `kill_on_drop`.
 - `--prefer-musl` (Linux) selects the musl build; `--install-dir` sets the install directory.
 
