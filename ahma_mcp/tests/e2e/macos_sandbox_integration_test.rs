@@ -1058,17 +1058,63 @@ fn listening_beyond_loopback_is_refused_unless_granted() {
     }
 }
 
-/// TEMPORARY experiment (remove before merge): which SBPL form keeps TCP
-/// binds on loopback? Fails on purpose so the table reaches the CI log.
+/// TEMPORARY experiment 2 (remove before merge): can Seatbelt keep a server
+/// reachable from this machine only by filtering *inbound* connections on
+/// their remote address? Fails on purpose so the table reaches the CI log.
 #[cfg(target_os = "macos")]
 #[test]
-fn zz_listen_rule_experiment() {
+fn zz_listen_inbound_experiment() {
     skip_if_nested_sandbox!();
     use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_listen_any};
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::{SocketAddr, TcpStream};
     let scope = TempDir::new().expect("scope dir");
-    let Some(bin) = bind_probe(scope.path()) else {
+    let src = scope.path().join("serve.c");
+    std::fs::write(
+        &src,
+        r#"#include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(void) {
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  struct sockaddr_in sa; memset(&sa, 0, sizeof sa); sa.sin_family = AF_INET;
+  if (bind(s, (struct sockaddr *)&sa, sizeof sa) != 0) { printf("BIND ERR %d\n", errno); fflush(stdout); return 1; }
+  if (listen(s, 4) != 0) { printf("LISTEN ERR %d\n", errno); fflush(stdout); return 1; }
+  socklen_t l = sizeof sa; getsockname(s, (struct sockaddr *)&sa, &l);
+  printf("PORT %d\n", ntohs(sa.sin_port)); fflush(stdout);
+  alarm(25);
+  for (int i = 0; i < 4; i++) {
+    int c = accept(s, NULL, NULL);
+    if (c < 0) { printf("ACCEPT ERR %d\n", errno); fflush(stdout); continue; }
+    write(c, "hi\n", 3); close(c);
+    printf("ACCEPT OK\n"); fflush(stdout);
+  }
+  return 0;
+}
+"#,
+    )
+    .unwrap();
+    let bin = scope.path().join("serve");
+    if !Command::new("cc")
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("skipping: no C compiler");
         return;
-    };
+    }
+    // The address this machine uses on its network (no packet is sent).
+    let lan = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|u| u.connect("8.8.8.8:80").map(|_| u))
+        .and_then(|u| u.local_addr())
+        .map(|a| a.ip());
     let sandbox = Sandbox::new(
         vec![scope.path().to_path_buf()],
         SandboxMode::Strict,
@@ -1080,42 +1126,101 @@ fn zz_listen_rule_experiment() {
     set_listen_any(true);
     let base = sandbox.generate_seatbelt_profile_test(scope.path());
     let variants: &[(&str, &str)] = &[
+        ("none", ""),
         (
-            "A tcp localhost",
-            "(deny network-bind (local tcp \"*:*\"))\n(allow network-bind (local tcp \"localhost:*\"))\n",
-        ),
-        (
-            "B ip localhost",
-            "(deny network-bind (local ip \"*:*\"))\n(allow network-bind (local ip \"localhost:*\"))\n",
-        ),
-        (
-            "C tcp 127.0.0.1",
-            "(deny network-bind (local tcp \"*:*\"))\n(allow network-bind (local tcp \"127.0.0.1:*\"))\n",
-        ),
-        (
-            "D tcp4 localhost",
-            "(deny network-bind (local tcp4 \"*:*\"))\n(allow network-bind (local tcp4 \"localhost:*\"))\n",
-        ),
-        (
-            "E deny only *:*",
-            "(deny network-bind (local tcp \"*:*\"))\n",
-        ),
-        (
-            "F inbound remote",
+            "G inbound tcp",
             "(deny network-inbound (remote tcp \"*:*\"))\n(allow network-inbound (remote tcp \"localhost:*\"))\n",
         ),
+        (
+            "H inbound ip",
+            "(deny network-inbound (remote ip \"*:*\"))\n(allow network-inbound (remote ip \"localhost:*\"))\n",
+        ),
+        (
+            "I deny inbound only",
+            "(deny network-inbound (remote tcp \"*:*\"))\n",
+        ),
     ];
-    let mut table = String::new();
+    let try_connect = |addr: SocketAddr| -> String {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            Err(e) => format!("connect ERR {e}"),
+            Ok(mut st) => {
+                let _ = st.set_read_timeout(Some(Duration::from_secs(3)));
+                let mut buf = String::new();
+                match st.read_to_string(&mut buf) {
+                    Ok(_) if buf.contains("hi") => "served".to_string(),
+                    Ok(_) => "connected, nothing served".to_string(),
+                    Err(e) => format!("read ERR {e}"),
+                }
+            }
+        }
+    };
+    let mut table = format!("lan = {lan:?}\n");
     for (name, rules) in variants {
         let profile = base.replacen(
             "(allow network*)\n",
             &format!("(allow network*)\n{rules}"),
             1,
         );
-        let out = run_bind_probe(Some(&profile), &bin, scope.path());
-        table.push_str(&format!("== {name}\n{out}\n"));
+        let mut child = Command::new("sandbox-exec")
+            .args(["-p", &profile])
+            .arg(&bin)
+            .current_dir(scope.path())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server");
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let mut first = String::new();
+        let _ = out.read_line(&mut first);
+        let mut row = format!("== {name}: {}", first.trim());
+        if let Some(port) = first
+            .trim()
+            .strip_prefix("PORT ")
+            .and_then(|p| p.parse::<u16>().ok())
+        {
+            row.push_str(&format!(
+                "\n   loopback: {}",
+                try_connect(SocketAddr::from(([127, 0, 0, 1], port)))
+            ));
+            if let Ok(ip) = lan {
+                row.push_str(&format!(
+                    "\n   lan {ip}: {}",
+                    try_connect(SocketAddr::new(ip, port))
+                ));
+            }
+        }
+        let curl = Command::new("sandbox-exec")
+            .args(["-p", &profile])
+            .args([
+                "curl",
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                "10",
+                "https://github.com",
+            ])
+            .output()
+            .map(|o| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_else(|e| e.to_string());
+        row.push_str(&format!("\n   outbound curl: {}", curl.trim()));
+        let _ = child.kill();
+        let mut rest = String::new();
+        let _ = out.read_to_string(&mut rest);
+        row.push_str(&format!(
+            "\n   server said: {}\n",
+            rest.trim().replace('\n', " | ")
+        ));
+        table.push_str(&row);
     }
-    panic!("EXPERIMENT RESULTS\n{table}");
+    panic!("EXPERIMENT 2 RESULTS\n{table}");
 }
 
 /// SPEC R6.2.8: a sandboxed command can see processes. `/bin/ps` is setuid
