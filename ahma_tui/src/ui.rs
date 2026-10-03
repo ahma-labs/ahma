@@ -65,14 +65,16 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     if state.settings_editor.open {
         draw_settings_panel(frame, state, theme, full);
     }
-    // The scope-grant prompt is a security decision — draw it last so it sits on
-    // top of every other overlay.
-    if state.scope_grant.is_some() {
-        draw_scope_grant_modal(frame, state, theme, full);
-    }
-    // The web-approval prompt is likewise a security decision; draw it on top too.
+    // Grant questions are security decisions, drawn over every other overlay.
+    // With both open, the one on top must be the one the keys answer: the
+    // scope question takes keys first (`handle_scope_grant_key` runs before
+    // `handle_web_approval_key`), so it is drawn last. Drawn the other way,
+    // `s` on the visible web question granted the hidden filesystem one.
     if state.web_approval.is_some() {
         draw_web_approval_modal(frame, state, theme, full);
+    }
+    if state.scope_grant.is_some() {
+        draw_scope_grant_modal(frame, state, theme, full);
     }
     if state.trust_prompt.is_some() {
         draw_trust_modal(frame, state, theme, full);
@@ -3784,9 +3786,6 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
         return;
     };
     let body = ahma_common::grant_prompt::render(&gate.request);
-    let height = if gate.show_detail { 30 } else { 20 };
-    let popup = centered_rect(92, height.min(area.height.saturating_sub(2)), area);
-    frame.render_widget(Clear, popup);
 
     let waiting = state.scope_grant_queue.len();
     let title = if waiting == 0 {
@@ -3794,12 +3793,6 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
     } else {
         format!(" Sandbox · grant access? ({waiting} more waiting) ")
     };
-    let block = Block::default()
-        .title(Span::styled(title, theme.title().bold()))
-        .borders(Borders::ALL)
-        .border_style(theme.border_focused());
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
 
     // SPEC R-PERM.3.4: the same sections every surface shows. The compact view
     // keeps who / what / minimum / allows / risk; `?` adds the agent's claim,
@@ -3815,10 +3808,14 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
         body.title.clone(),
         theme.success().bold(),
     ))];
+    // The exact settings line (R-PERM.2): a saving answer is taken only while
+    // this whole section is on screen (R-PERM.3.5).
+    let mut save_section = None;
     for section in &body.sections {
         if !gate.show_detail && !compact_headings.contains(&section.heading.as_str()) {
             continue;
         }
+        let section_start = lines.len();
         let style = if section.heading == "Risk"
             && gate
                 .request
@@ -3843,6 +3840,9 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
         for l in text.lines() {
             lines.push(Line::from(Span::styled(format!("  {l}"), theme.normal())));
         }
+        if section.heading == "If you choose always" {
+            save_section = Some(section_start..lines.len());
+        }
     }
     // SPEC R-PERM.8: the advisor's line is labelled, visually distinct, and
     // changes nothing below it.
@@ -3854,34 +3854,274 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
         )));
     }
     lines.push(Line::from(""));
-    let mut keys: Vec<Span<'static>> = vec![Span::styled("  ", theme.normal())];
-    for o in &body.options {
-        let key_style = match o.decision {
-            ahma_common::scope_grant::GrantDecision::Deny => theme.failed().bold(),
-            // Saved grants, permanent or leased, stand out from the
-            // session-only ones.
-            ahma_common::scope_grant::GrantDecision::GrantRo
-            | ahma_common::scope_grant::GrantDecision::GrantRw
-            | ahma_common::scope_grant::GrantDecision::GrantRoLease
-            | ahma_common::scope_grant::GrantDecision::GrantRwLease => theme.pending().bold(),
-            _ => theme.success().bold(),
-        };
-        keys.push(Span::styled(format!("[{}] ", o.key), key_style));
-        keys.push(Span::styled(format!("{}   ", o.label), theme.normal()));
-    }
-    lines.push(Line::from(keys));
-    lines.push(Line::from(Span::styled(
+    let answers = body
+        .options
+        .iter()
+        .map(|o| {
+            let key_style = match o.decision {
+                ahma_common::scope_grant::GrantDecision::Deny => theme.failed().bold(),
+                // Saved grants, permanent or leased, stand out from the
+                // session-only ones.
+                ahma_common::scope_grant::GrantDecision::GrantRo
+                | ahma_common::scope_grant::GrantDecision::GrantRw
+                | ahma_common::scope_grant::GrantDecision::GrantRoLease
+                | ahma_common::scope_grant::GrantDecision::GrantRwLease => theme.pending().bold(),
+                _ => theme.success().bold(),
+            };
+            vec![
+                Span::styled(format!("[{}] ", o.key), key_style),
+                Span::styled(o.label.clone(), theme.normal()),
+            ]
+        })
+        .collect();
+    let mut notes = vec![Line::from(Span::styled(
         if gate.show_detail {
             "  Enter / Esc = Deny · [?] less detail"
         } else {
             "  Enter / Esc = Deny · [?] the agent's claim, evidence and the exact settings line"
         },
         theme.dim(),
-    )));
-    lines.extend(gate_typing_note(state, theme));
+    ))];
+    notes.extend(gate_typing_note(state, theme));
 
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
+    let view = draw_gate_popup(
+        frame,
+        theme,
+        area,
+        GatePopup {
+            title,
+            width: 92,
+            body: lines,
+            answers,
+            notes,
+            watched: save_section,
+            reveal_watched: gate.reveal_save_line,
+            scroll: gate.scroll,
+            unicode: state.unicode,
+        },
+    );
+    gate.view.set(view);
+}
+
+// ─── Grant question popup ─────────────────────────────────────────────────────
+
+/// One grant question, laid out by [`draw_gate_popup`] (SPEC R-PERM.3.8).
+struct GatePopup {
+    title: String,
+    /// Preferred width; a narrower terminal gets its whole width.
+    width: u16,
+    /// What the question says. Scrolls when it does not fit.
+    body: Vec<Line<'static>>,
+    /// One `[k] label` per answer, deny first. Pinned under the body, never
+    /// scrolled, and never split across rows unless one alone is too wide.
+    answers: Vec<Vec<Span<'static>>>,
+    /// Pinned under the answers: the deny hint and any confirmation line.
+    notes: Vec<Line<'static>>,
+    /// Body lines (logical indices) that must be on screen whole before the
+    /// answer they describe is taken: the exact settings line (R-PERM.3.5).
+    watched: Option<std::ops::Range<usize>>,
+    /// Scroll so `watched` starts at the top, instead of using `scroll`.
+    reveal_watched: bool,
+    scroll: usize,
+    unicode: bool,
+}
+
+/// Draw a grant question: its answers and deny hint pinned at the bottom and
+/// always drawn whole, its body scrolling above them (SPEC R-PERM.3.8).
+///
+/// The popup grows with its content up to the terminal less a one-row margin
+/// (none on a short terminal), instead of a fixed height that clipped the
+/// answers. When the body does not fit, its last row says how much is hidden
+/// and which keys show it (R24.8.5), and a scrollbar shows where you are.
+/// Returns what was drawn, for the key handler.
+fn draw_gate_popup(
+    frame: &mut Frame,
+    theme: &Theme,
+    area: Rect,
+    p: GatePopup,
+) -> crate::state::GateView {
+    let width = p.width.min(area.width);
+    let inner_w = width.saturating_sub(2) as usize;
+    // Reserve the scrollbar column before wrapping, as the detail overlay
+    // does, so showing the bar never re-wraps the body.
+    let text_w = inner_w.saturating_sub(1).max(1);
+
+    // Wrap first, recording where each logical line starts, so the watched
+    // section can be found in rows.
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let mut row_of = Vec::with_capacity(p.body.len() + 1);
+    for line in &p.body {
+        row_of.push(body.len());
+        body.extend(wrap_indented(line, text_w));
+    }
+    row_of.push(body.len());
+    let watched = p.watched.map(|r| row_of[r.start]..row_of[r.end]);
+
+    let mut footer = flow_answers(p.answers, inner_w);
+    for note in &p.notes {
+        footer.extend(wrap_indented(note, inner_w));
+    }
+
+    let max_h = if area.height > 20 {
+        area.height - 2
+    } else {
+        area.height
+    };
+    let wanted = body.len() + footer.len() + 2;
+    let height = wanted.min(max_h as usize) as u16;
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(p.title, theme.title().bold()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // The footer is placed first and takes what it needs; the body gets the
+    // rest.
+    let footer_h = (footer.len() as u16).min(inner.height);
+    let body_h = inner.height - footer_h;
+    let body_a = Rect {
+        height: body_h,
+        ..inner
+    };
+    let footer_a = Rect {
+        y: inner.y + body_h,
+        height: footer_h,
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(footer), footer_a);
+
+    let body_h = body_h as usize;
+    let overflow = body.len() > body_h;
+    // When the body does not fit, its last row says so.
+    let text_h = if overflow && body_h >= 2 {
+        body_h - 1
+    } else {
+        body_h
+    };
+    let max_scroll = body.len().saturating_sub(text_h);
+    let scroll = match (&watched, p.reveal_watched) {
+        (Some(w), true) => w.start,
+        _ => p.scroll,
+    }
+    .min(max_scroll);
+    let end = (scroll + text_h).min(body.len());
+    let save_line_visible = watched
+        .as_ref()
+        .is_some_and(|w| !w.is_empty() && w.start >= scroll && w.end <= end);
+
+    let mut shown: Vec<Line<'static>> = body[scroll..end].to_vec();
+    if overflow && body_h >= 2 {
+        let below = body.len() - end;
+        let (arrow, n, side) = match (below > 0, p.unicode) {
+            (true, true) => ("↓", below, "below"),
+            (true, false) => ("v", below, "below"),
+            (false, true) => ("↑", scroll, "above"),
+            (false, false) => ("^", scroll, "above"),
+        };
+        let keys = if p.unicode {
+            "↑↓ PgUp PgDn"
+        } else {
+            "j k PgUp PgDn"
+        };
+        shown.push(Line::from(Span::styled(
+            format!("  {arrow} {n} more {side} · {keys}"),
+            theme.pending(),
+        )));
+    }
+    let text_a = Rect {
+        width: (text_w as u16).min(body_a.width),
+        ..body_a
+    };
+    frame.render_widget(Paragraph::new(shown), text_a);
+    if text_h > 0 {
+        draw_scrollbar(
+            frame,
+            theme,
+            body.len(),
+            text_h,
+            scroll,
+            Rect {
+                height: text_h as u16,
+                ..body_a
+            },
+        );
+    }
+
+    crate::state::GateView {
+        scroll,
+        max_scroll,
+        page: text_h.max(1),
+        save_line_visible,
+    }
+}
+
+/// Lay the answers out in rows, two spaces in and three apart, starting a new
+/// row before an answer that would not fit — so no `[k] label` is split
+/// across a row break unless it alone is wider than the row.
+fn flow_answers(answers: Vec<Vec<Span<'static>>>, width: usize) -> Vec<Line<'static>> {
+    const INDENT: usize = 2;
+    const GAP: usize = 3;
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut row_w = 0;
+    for answer in answers {
+        let w: usize = answer.iter().map(|s| s.content.chars().count()).sum();
+        if row_w > 0 && row_w + GAP + w > width {
+            rows.push(Line::from(std::mem::take(&mut row)));
+            row_w = 0;
+        }
+        let pad = if row_w == 0 { INDENT } else { GAP };
+        row.push(Span::raw(" ".repeat(pad)));
+        row.extend(answer);
+        row_w += pad + w;
+    }
+    if !row.is_empty() {
+        rows.push(Line::from(row));
+    }
+    rows.iter().flat_map(|r| wrap_indented(r, width)).collect()
+}
+
+/// Wrap `line` at `width`, continuing each wrapped row under its first
+/// character rather than at the margin, so an indented body line keeps its
+/// indent on every row. (`Paragraph` with `Wrap` starts continuation rows at
+/// the margin.) An indent that would leave less than half the width is not
+/// kept.
+fn wrap_indented(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
+    let indent = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars())
+        .take_while(|c| *c == ' ')
+        .count();
+    if indent == 0 || indent * 2 >= width {
+        return wrap_line_to_rows(line, width);
+    }
+    let mut rest: Vec<Span<'static>> = Vec::new();
+    let mut skip = indent;
+    for s in &line.spans {
+        let n = s.content.chars().count();
+        if skip >= n {
+            skip -= n;
+            continue;
+        }
+        rest.push(Span::styled(
+            s.content.chars().skip(skip).collect::<String>(),
+            s.style,
+        ));
+        skip = 0;
+    }
+    let pad = " ".repeat(indent);
+    wrap_line_to_rows(&Line::from(rest), width - indent)
+        .into_iter()
+        .map(|row| {
+            let mut spans = vec![Span::raw(pad.clone())];
+            spans.extend(row.spans);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// While the chat input holds text the gate keys type into it instead of
@@ -3900,26 +4140,17 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
     let Some(gate) = &state.web_approval else {
         return;
     };
-    let popup = centered_rect(76, if gate.confirm_always { 15 } else { 14 }, area);
-    frame.render_widget(Clear, popup);
-
     let waiting = state.web_approval_queue.len();
     let title = if waiting == 0 {
         " Web · allow egress? ".to_string()
     } else {
         format!(" Web · allow egress? ({waiting} more waiting) ")
     };
-    let block = Block::default()
-        .title(Span::styled(title, theme.title().bold()))
-        .borders(Borders::ALL)
-        .border_style(theme.border_focused());
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
 
     let tool = gate.tool.as_deref().unwrap_or("A tool");
     // R-WEB.6.1: the URL is attacker-influenced text rendered inside a security
-    // prompt. Cap it so a crafted long URL cannot push the buttons off a
-    // fixed-height popup or bury the question in wrapped noise.
+    // prompt. Cap it so a crafted long URL cannot bury the question in wrapped
+    // noise; the answers are pinned below the body regardless (R-PERM.3.8).
     let url = truncate(&gate.url, 256);
 
     let mut lines = vec![
@@ -3952,20 +4183,33 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
             theme.dim(),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  [n] ", theme.failed().bold()),
-            Span::styled("Deny (default)  ", theme.normal().bold()),
+    ]);
+    let answers = vec![
+        vec![
+            Span::styled("[n] ", theme.failed().bold()),
+            Span::styled("Deny (default)", theme.normal().bold()),
+        ],
+        vec![
             Span::styled("[o] ", theme.pending().bold()),
-            Span::styled("Once  ", theme.normal()),
+            Span::styled("Once", theme.normal()),
+        ],
+        vec![
             Span::styled("[s] ", theme.pending().bold()),
-            Span::styled("Session  ", theme.normal()),
+            Span::styled("Session", theme.normal()),
+        ],
+        vec![
             Span::styled("[a] ", theme.success().bold()),
             Span::styled("Always", theme.normal()),
-        ]),
-        Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
-    ]);
+        ],
+    ];
+    let mut notes = vec![Line::from(Span::styled(
+        "  Enter / Esc = Deny",
+        theme.dim(),
+    ))];
+    // Pinned with the answers, so the line a second `a` saves is on screen
+    // whenever that key is (R-PERM.3.5).
     if gate.confirm_always {
-        lines.push(Line::from(Span::styled(
+        notes.push(Line::from(Span::styled(
             format!(
                 "  [a] again writes \"{}\" to [web].always_allow in ~/.ahma/settings.toml",
                 gate.domain
@@ -3973,10 +4217,25 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
             theme.pending().bold(),
         )));
     }
-    lines.extend(gate_typing_note(state, theme));
+    notes.extend(gate_typing_note(state, theme));
 
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
+    let view = draw_gate_popup(
+        frame,
+        theme,
+        area,
+        GatePopup {
+            title,
+            width: 76,
+            body: lines,
+            answers,
+            notes,
+            watched: None,
+            reveal_watched: false,
+            scroll: gate.scroll,
+            unicode: state.unicode,
+        },
+    );
+    gate.view.set(view);
 }
 
 fn style_raw_log_line<'a>(line: &str, theme: &Theme) -> Line<'a> {
@@ -5782,6 +6041,8 @@ mod tests {
                 tool: Some("fetch_webpage".into()),
                 shown_at: std::time::Instant::now(),
                 confirm_always: false,
+                scroll: 0,
+                view: Default::default(),
             });
             let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
             terminal
@@ -5820,6 +6081,275 @@ mod tests {
     fn web_modal_caps_a_hostile_url() {
         let long = format!("https://example.com/{}", "a".repeat(4000));
         assert!(truncate(&long, 256).chars().count() <= 256);
+    }
+
+    /// The standard full scope-grant question: every judgement aid filled
+    /// in, as `ahma_common::grant_prompt`'s golden fixture has it.
+    /// With a filesystem and a web question open at once, the one on screen
+    /// is the one the keys answer (the scope question, `handle_scope_grant_key`
+    /// runs first). Drawn the other way round, `s` on the visible web
+    /// question granted the hidden filesystem one.
+    #[test]
+    fn the_grant_question_on_top_is_the_one_the_keys_answer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(full_scope_grant_gate());
+        state.web_approval = Some(crate::state::WebApprovalGate {
+            decision_id: "w".into(),
+            domain: "web-question.example".into(),
+            url: "https://web-question.example/".into(),
+            tool: Some("fetch_webpage".into()),
+            shown_at: std::time::Instant::now(),
+            confirm_always: false,
+            scroll: 0,
+            view: Default::default(),
+        });
+        let (w, h) = (120u16, 40u16);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, &state, &theme)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|p| buf.cell(p).unwrap().symbol().to_string())
+            .collect();
+        assert!(screen.contains("sccache"), "the scope question is on top");
+        assert!(
+            !screen.contains("web-question.example"),
+            "the web question waits underneath until the scope question is answered"
+        );
+    }
+
+    fn full_scope_grant_gate() -> crate::state::ScopeGrantGate {
+        use ahma_common::config::ScopeAccess;
+        use ahma_common::scope_grant::{
+            GrantContext, GrantEvidence, GrantReason, GrantRequester, GrantRiskSummary,
+            ScopeGrantRequest,
+        };
+        crate::state::ScopeGrantGate::from_request(ScopeGrantRequest {
+            decision_id: "d-golden".into(),
+            path: "/Users/u/Library/Caches/sccache".into(),
+            access: ScopeAccess::Rw,
+            reason: GrantReason::StderrHeuristic,
+            tool: Some("cargo_build".into()),
+            context: GrantContext {
+                requester: Some(GrantRequester {
+                    client: Some("claude-code".into()),
+                    session_id: Some("8d387500-2ff3-4b2e-9a51".into()),
+                    workspace: Some("/Users/u/github/proj".into()),
+                    pid: 4242,
+                }),
+                op_id: Some("op_7".into()),
+                command: Some("cargo build --release".into()),
+                evidence: Some(GrantEvidence {
+                    raw_path: Some("/Users/u/Library/Caches/sccache/0/1/obj".into()),
+                    pattern: Some("Operation not permitted".into()),
+                    line: Some(
+                        "error: failed to write /Users/u/Library/Caches/sccache/0/1/obj: \
+                         Operation not permitted"
+                            .into(),
+                    ),
+                }),
+                agent_claim: Some("sccache keeps its compiler cache there".into()),
+                risk: Some(GrantRiskSummary {
+                    class: "high".into(),
+                    warnings: vec!["is a hidden-data directory in your home folder".into()],
+                    facts: vec!["directory with 12 entries".into()],
+                }),
+                times_asked: 2,
+                first_asked_at: Some(3_600 * 9 + 60 * 5),
+                write_denied: true,
+            },
+        })
+    }
+
+    /// Draw the scope-grant modal on a `w`×`h` terminal; the screen's rows,
+    /// and what the renderer published for the key handler.
+    fn render_scope_grant(
+        gate: crate::state::ScopeGrantGate,
+        w: u16,
+        h: u16,
+    ) -> (Vec<String>, crate::state::GateView) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(gate);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| draw_scope_grant_modal(f, &state, &theme, Rect::new(0, 0, w, h)))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let view = state.scope_grant.as_ref().unwrap().view.get();
+        (rows, view)
+    }
+
+    /// SPEC R-PERM.3.8: whatever the terminal size and however long the
+    /// question, every answer and the deny hint are on screen, each answer
+    /// whole on one row. Before this, a 120×40 terminal showed `[n]`, `[o]`
+    /// and half of `[w]`, and cut the deny hint and the `[?]` that leads to
+    /// the detail view.
+    #[test]
+    fn grant_modal_always_shows_every_answer_and_the_deny_hint() {
+        let options = ahma_common::grant_prompt::render(&full_scope_grant_gate().request).options;
+        for (w, h) in [(120, 40), (80, 24), (60, 16)] {
+            for detail in [false, true] {
+                let mut gate = full_scope_grant_gate();
+                gate.show_detail = detail;
+                let (rows, _) = render_scope_grant(gate, w, h);
+                let screen = rows.join("\n");
+                for o in &options {
+                    let answer = format!("[{}] {}", o.key, o.label);
+                    assert!(
+                        rows.iter().any(|r| r.contains(&answer)),
+                        "{w}x{h} detail={detail}: `{answer}` must be on screen, whole:\n{screen}"
+                    );
+                }
+                assert!(
+                    screen.contains("Enter / Esc = Deny · [?]"),
+                    "{w}x{h} detail={detail}: the deny hint must be on screen:\n{screen}"
+                );
+            }
+        }
+    }
+
+    /// The body scrolls under the pinned answers, says when more is hidden
+    /// (R24.8.5), and its last line — the `Revoke` command of the exact
+    /// settings line — is reachable (R24.8.4).
+    #[test]
+    fn grant_modal_body_scrolls_to_its_last_line() {
+        let last = "Revoke any time with: ahma sandbox revoke /Users/u/Library/Caches/sccache";
+        for (w, h) in [(120, 40), (80, 24)] {
+            let mut gate = full_scope_grant_gate();
+            gate.show_detail = true;
+            let (top, view) = render_scope_grant(gate.clone(), w, h);
+            let top = top.join("\n");
+            assert!(
+                !top.contains(last),
+                "{w}x{h}: the tail must be off-screen at rest, else this proves nothing:\n{top}"
+            );
+            assert!(top.contains("more below"), "{w}x{h}: say so:\n{top}");
+            assert!(view.max_scroll > 0);
+
+            gate.scroll = usize::MAX; // clamped to the true maximum
+            let (bottom, view) = render_scope_grant(gate, w, h);
+            let bottom = bottom.join("\n");
+            assert!(
+                bottom.contains(last),
+                "{w}x{h}: scrolling must reveal the last line:\n{bottom}"
+            );
+            assert_eq!(view.scroll, view.max_scroll);
+            assert!(bottom.contains("[Y]") && bottom.contains("Enter / Esc = Deny"));
+        }
+    }
+
+    /// A saving answer's first press brings the exact settings line into view,
+    /// and the renderer reports it seen only when the whole section is on
+    /// screen (R-PERM.3.5).
+    #[test]
+    fn a_saving_answer_brings_its_settings_line_into_view() {
+        let mut gate = full_scope_grant_gate();
+        gate.show_detail = true;
+        let (_, at_rest) = render_scope_grant(gate.clone(), 80, 24);
+        assert!(!at_rest.save_line_visible, "scrolled to the top it is not");
+
+        gate.reveal_save_line = true;
+        let (rows, revealed) = render_scope_grant(gate, 80, 24);
+        let screen = rows.join("\n");
+        assert!(revealed.save_line_visible, "{screen}");
+        for line in [
+            "If you choose always:",
+            "[[sandbox.persistent_scopes]]",
+            "path = \"/Users/u/Library/Caches/sccache\"",
+            "access = \"rw\"",
+            "workspace = \"/Users/u/github/proj\"",
+            "Revoke any time with:",
+        ] {
+            assert!(
+                screen.contains(line),
+                "`{line}` must be on screen:\n{screen}"
+            );
+        }
+    }
+
+    /// A wrapped body line continues under its first character, not at the
+    /// margin (`Paragraph` + `Wrap` dropped the indent).
+    #[test]
+    fn wrapped_grant_lines_keep_their_indent() {
+        let line = make_line("  every command in /ws may read and write /x — for the next command");
+        let rows = wrap_indented(&line, 24);
+        assert!(
+            rows.len() > 1,
+            "the line must wrap for this to prove anything"
+        );
+        for row in &rows {
+            let text: String = row
+                .spans
+                .iter()
+                .map(|s| -> &str { s.content.as_ref() })
+                .collect();
+            assert!(text.starts_with("  "), "row lost its indent: {text:?}");
+            assert!(!text[2..].starts_with(' '), "row over-indented: {text:?}");
+            assert!(text.chars().count() <= 24, "row too wide: {text:?}");
+        }
+    }
+
+    /// The web question shares the layout: a capped but still long URL never
+    /// pushes its answers, deny hint or the `[a] again` line off screen.
+    #[test]
+    fn web_modal_answers_survive_a_long_url_on_a_small_terminal() {
+        use crate::state::WebApprovalGate;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::new(true);
+        for (w, h) in [(80, 24), (60, 16)] {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            let mut gate =
+                WebApprovalGate::from_request(ahma_common::web_approval::WebApprovalRequest {
+                    decision_id: "d".into(),
+                    domain: "example.com".into(),
+                    url: format!("http://example.com/{}", "a".repeat(4000)),
+                    tool: Some("fetch_webpage".into()),
+                });
+            gate.confirm_always = true;
+            state.web_approval = Some(gate);
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| draw_web_approval_modal(f, &state, &theme, Rect::new(0, 0, w, h)))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let screen = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for must in [
+                "[n] Deny (default)",
+                "[o] Once",
+                "[s] Session",
+                "[a] Always",
+                "Enter / Esc = Deny",
+                "[a] again writes",
+            ] {
+                assert!(
+                    screen.contains(must),
+                    "{w}x{h}: `{must}` missing:\n{screen}"
+                );
+            }
+        }
     }
 
     #[test]
