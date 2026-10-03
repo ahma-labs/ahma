@@ -1,0 +1,132 @@
+# The suite, run inside ahma's own sandbox (dogfooding, SPEC R7).
+#
+# Every other job runs `cargo nextest` on a bare runner. A user who trusts ahma
+# runs their tests *through* it: confined writes, no hub of their own, shared
+# daemons started elsewhere. Run that way on a developer machine, ahma's own
+# suite once produced 86 failures that every bare CI leg passed — test homes
+# outside the scope, a runtime directory that silently failed to be created, a
+# test that needed a hub it was not allowed to start. None of them reached CI,
+# because nothing in CI ran confined.
+#
+# This job runs the same suite as build.yml's main leg, but as one
+# `run_terminal_command` through the `ahma` binary just built, with the
+# checkout as the only writable scope — what an agent does when it runs the
+# tests. A test that passes there and fails here is an environment-only
+# failure a user would also hit.
+#
+# Not part of `CI green` yet: it starts as a report, not a gate. Make it
+# required once it has been green on main for a while.
+name: Confined Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # 05:10 UTC daily, after the ignored-tests run.
+    - cron: "10 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: confined-tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  RUSTUP_MAX_RETRIES: 10
+  CARGO_TERM_COLOR: always
+  CARGO_PAGER: cat
+  CARGO_INCREMENTAL: 0
+  # Must match build.yml's env exactly, or sccache shares nothing with it.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_NET_RETRY: 10
+  CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: false
+  RUSTFLAGS: -C debuginfo=0 --cfg reqwest_unstable
+  RUST_BACKTRACE: 1
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  job-confined-tests:
+    name: Confined Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      # A macOS-only confinement failure must not hide a Linux one.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Cache Cargo registry and git
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-${{ runner.arch }}-
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache: false
+
+      - name: Set up sccache (ghac)
+        uses: ./.github/actions/sccache-ghac
+        with:
+          extra-tools: nextest
+
+      - name: Add Cargo Bin to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Unconfined, like a developer's first build. It also starts the sccache
+      # server outside any sandbox, which is how a shared daemon must start
+      # (SPEC R-DOCTOR.7): one born confined could write only one checkout.
+      # Building the tests here too means the confined run below mostly
+      # executes them rather than compiling them.
+      - name: Build ahma and the test binaries (unconfined)
+        run: |
+          cargo build --locked -p ahma_bin
+          cargo nextest run --profile ci --locked --no-run
+
+      # The same invocation as build.yml's main leg, sent through ahma. The
+      # checkout is the only writable scope; nothing else is granted.
+      - name: Cargo Nextest, inside ahma's sandbox
+        timeout-minutes: 60
+        run: |
+          set -o pipefail
+          ./target/debug/ahma tool run \
+            --sandbox-scope "$GITHUB_WORKSPACE" \
+            --timeout 3600 \
+            --log-to-stderr \
+            run_terminal_command \
+            "cargo nextest run --profile ci --locked --no-fail-fast -E 'not (test(kotlin) or test(android))'" \
+            2>&1 | tee confined.log
+
+      - name: Report confined failures
+        if: always()
+        run: |
+          {
+            echo "### Tests that failed inside ahma's sandbox (${{ matrix.os }})"
+            echo ""
+            if grep -qE '^\s+(FAIL|TIMEOUT) \[' confined.log 2>/dev/null; then
+              echo '```'
+              grep -hE '^\s+(FAIL|TIMEOUT) \[' confined.log | sort -u
+              echo '```'
+            else
+              echo "_None._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify sccache (ghac)
+        if: always()
+        uses: ./.github/actions/sccache-verify
+        with:
+          label: Confined Tests
