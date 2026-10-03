@@ -223,8 +223,6 @@ pub struct Adapter {
     pub command_executor: Arc<dyn executor::CommandExecutor>,
     /// Unified event dispatcher (P2).
     pub event_dispatcher: EventDispatcher,
-    /// Token minimization and output optimizer context.
-    pub output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     /// Persistent stateful shell sessions (`session_id` parameter).
     pub shell_sessions: Arc<crate::shell_session::ShellSessionManager>,
     /// Configurable per-(group, directory) command serialisation registry.
@@ -290,9 +288,6 @@ impl Adapter {
             retry_config: None,
             command_executor: Arc::new(executor::DefaultCommandExecutor),
             event_dispatcher,
-            output_optimizer: Arc::new(tokio::sync::Mutex::new(
-                crate::output_optimizer::OutputOptimizer::new(false, None),
-            )),
             shell_sessions: crate::shell_session::ShellSessionManager::new(),
             mutex_registry,
             workspace_queue: workspace_queue::WorkspaceQueue::disabled(),
@@ -1149,7 +1144,6 @@ impl Adapter {
             sandbox,
             task_handles,
             command_executor: self.command_executor.clone(),
-            output_optimizer: self.output_optimizer.clone(),
             mutex_registry: self.mutex_registry.clone(),
             scope_grant_notifier: self.scope_grant_notifier.clone(),
             lane,
@@ -1470,7 +1464,6 @@ struct AsyncOperationRun {
     sandbox: Arc<sandbox::Sandbox>,
     task_handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     command_executor: Arc<dyn executor::CommandExecutor>,
-    output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     mutex_registry: Arc<CommandMutexRegistry>,
     scope_grant_notifier: Option<Arc<dyn sandbox::ScopeGrantNotifier>>,
     /// Workspace-queue lane (SPEC R2.7.4).
@@ -1501,7 +1494,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         sandbox,
         task_handles,
         command_executor,
-        output_optimizer,
         mutex_registry,
         scope_grant_notifier,
         lane,
@@ -1638,7 +1630,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         &op_id,
         start_time,
         &monitor,
-        &output_optimizer,
         &sandbox,
         scope_grant_notifier.as_ref(),
         &command,
@@ -2050,7 +2041,6 @@ async fn execute_with_streaming(
     op_id: &str,
     start_time: Instant,
     op_monitor: &Arc<OperationMonitor>,
-    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     sandbox: &Arc<sandbox::Sandbox>,
     scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
     tool: &str,
@@ -2219,7 +2209,7 @@ async fn execute_with_streaming(
                 } else {
                     stderr_done = true;
                 }
-                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, op_id, op_monitor, output_optimizer, &mut spill).await;
+                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, op_id, op_monitor, &mut spill).await;
             }
 
             // Read stdout line
@@ -2230,7 +2220,7 @@ async fn execute_with_streaming(
                 } else {
                     stdout_done = true;
                 }
-                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, op_id, op_monitor, output_optimizer, &mut spill).await;
+                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, op_id, op_monitor, &mut spill).await;
             }
         }
 
@@ -2247,7 +2237,6 @@ async fn execute_with_streaming(
                     &mut log_monitor,
                     op_id,
                     op_monitor,
-                    output_optimizer,
                     &mut spill,
                 )
                 .await;
@@ -2292,7 +2281,6 @@ async fn drain_remaining_stream_lines(
     log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
-    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     spill: &mut spill::SpillWriter,
 ) {
     while let Ok(Some(line)) = stderr_reader.next_line().await {
@@ -2303,7 +2291,6 @@ async fn drain_remaining_stream_lines(
             log_monitor,
             op_id,
             op_monitor,
-            output_optimizer,
             spill,
         )
         .await;
@@ -2316,7 +2303,6 @@ async fn drain_remaining_stream_lines(
             log_monitor,
             op_id,
             op_monitor,
-            output_optimizer,
             spill,
         )
         .await;
@@ -2546,7 +2532,6 @@ async fn handle_cancellation(monitor: &Arc<OperationMonitor>, op_id: &str) {
 ///
 /// Dispatches to `process_streaming_line` on success, ignores closed-stream
 /// signals (`Ok(None)`), and logs a warning on read errors.
-#[allow(clippy::too_many_arguments)]
 async fn handle_stream_line(
     result: Result<Option<String>, std::io::Error>,
     is_stderr: bool,
@@ -2554,7 +2539,6 @@ async fn handle_stream_line(
     log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
-    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     spill: &mut spill::SpillWriter,
 ) {
     match result {
@@ -2566,7 +2550,6 @@ async fn handle_stream_line(
                 log_monitor,
                 op_id,
                 op_monitor,
-                output_optimizer,
                 spill,
             )
             .await;
@@ -2584,7 +2567,6 @@ async fn handle_stream_line(
 /// `op_monitor.append_output_line` is the single emission point for
 /// `OutputLine` events on the unified stream; `append_alert` likewise emits
 /// `Alert` — no direct dispatcher access is needed here.
-#[allow(clippy::too_many_arguments)]
 async fn process_streaming_line(
     line: &str,
     is_stderr: bool,
@@ -2592,27 +2574,18 @@ async fn process_streaming_line(
     log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
-    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     spill: &mut spill::SpillWriter,
 ) {
     let safe_line = crate::log_monitor::redact_sensitive_line(line);
 
-    // The spill file records the redacted-but-unminimised line — the faithful
-    // full record, independent of the bounded tail and token optimisation.
+    // The spill file records every redacted line — the faithful full record,
+    // independent of the bounded tail.
     spill.write_line(&safe_line, is_stderr).await;
 
-    let opt_lines = if let Ok(mut opt) = output_optimizer.try_lock() {
-        opt.process_streaming_line(&safe_line)
-    } else {
-        vec![safe_line.clone()]
-    };
-
-    for opt_line in opt_lines {
-        collector.push(opt_line.clone());
-        op_monitor
-            .append_output_line(op_id, opt_line, is_stderr)
-            .await;
-    }
+    collector.push(safe_line.clone());
+    op_monitor
+        .append_output_line(op_id, safe_line, is_stderr)
+        .await;
 
     if let Some(log_monitor) = log_monitor
         && let Some(snapshot) = log_monitor.process_line(line, is_stderr)

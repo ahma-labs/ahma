@@ -171,7 +171,7 @@ is recorded rather than applied unilaterally.
    feature — see finding 3 for the `otel` exception; the analyzer is an optional dependency of
    `ahma_bin`), `ahma_update` (takes the whole
    sigstore/zip/tar/flate2 tree off ahma_mcp's direct dependency edge), `ahma_vault`,
-   `ahma_log_monitor`, `ahma_output_optimizer`, `ahma_harness_guard`, `ahma_bundle`. That is
+   `ahma_log_monitor`, `ahma_harness_guard`, `ahma_bundle`. That is
    ~14 k of ~100 k source lines and 41 of 183 files. What is left is not leaf-shaped:
    `livelog/` needs `operation_monitor`, `shell_pool`, `config` and `sandbox`; `egress/` needs
    `sandbox::profiles`; `tool_availability/` needs `sandbox` and `config`; `hooks/`, `setup.rs`

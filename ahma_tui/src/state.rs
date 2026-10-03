@@ -591,11 +591,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/setup", "connect an LLM, step by step (alias /connect)"),
     ("/provider", "select LLM provider"),
     ("/model", "select model for current provider"),
-    (
-        "/minimize on",
-        "enable token minimization (concise prompts, compressed output)",
-    ),
-    ("/minimize off", "disable token minimization (default)"),
+    ("/minimize on", "ask the model for concise replies"),
+    ("/minimize off", "stop asking for concise replies (default)"),
     ("/mcp on", "enable ahma as MCP tool server"),
     ("/mcp off", "disable ahma MCP tool server"),
     ("/mcp list", "list configured MCP client servers"),

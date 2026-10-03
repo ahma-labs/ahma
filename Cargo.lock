@@ -273,7 +273,6 @@ dependencies = [
  "ahma_http_mcp_client",
  "ahma_llm_monitor",
  "ahma_log_monitor",
- "ahma_output_optimizer",
  "ahma_test_support",
  "ahma_update",
  "ahma_vault",
@@ -308,13 +307,6 @@ dependencies = [
  "url",
  "windows-sys 0.61.2",
  "wiremock",
- "workspace-hack",
-]
-
-[[package]]
-name = "ahma_output_optimizer"
-version = "0.22.1"
-dependencies = [
  "workspace-hack",
 ]
 

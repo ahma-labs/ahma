@@ -876,7 +876,8 @@ pub struct ToolSettings {
     /// Tool bundles to enable.
     /// Default: empty list
     pub tool_bundles: Vec<String>,
-    /// Enable output compression and token minimization.
+    /// Ask the chat model for concise replies (appends a conciseness rule to
+    /// the system prompt).
     /// Default: `false`
     pub minimize_tokens: bool,
     /// Enable small-model harness adaptations.
@@ -2314,7 +2315,7 @@ impl AhmaSettings {
             toml_str_list(&d.tools.tool_bundles),
         );
         w.setting(
-            "Enable output compression and token minimization.",
+            "Append a conciseness rule to the chat system prompt.",
             "minimize_tokens",
             self.tools.minimize_tokens.to_string(),
             d.tools.minimize_tokens.to_string(),

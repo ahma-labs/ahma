@@ -369,7 +369,6 @@ Ahma uses a dual-tier licensing model to keep the core library reusable while en
 | `ahma_llm_monitor` | MIT OR Apache-2.0 | Log-monitoring and LLM client support |
 | `ahma_harness_guard` | MIT OR Apache-2.0 | Small-model harness guards (argument healing, loop detection, skill injection) |
 | `ahma_log_monitor` | MIT OR Apache-2.0 | Live log monitor: level detection, redaction, context snapshots (`monitor_level`) |
-| `ahma_output_optimizer` | MIT OR Apache-2.0 | Token-economy output optimizer (dedup, truncation, pressure governor) |
 | `ahma_simplify` | MIT OR Apache-2.0 | Code complexity analysis (`ahma simplify`); optional in `ahma_bin`, feature `simplify` (default on) |
 | `ahma_test_support` | MIT OR Apache-2.0 | Test helpers for workspace crates |
 | `ahma_update` | MIT OR Apache-2.0 | Self-update: release download, Sigstore verification (`ahma verify`), git installs |

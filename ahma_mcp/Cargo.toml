@@ -26,7 +26,6 @@ ahma_http_bridge = { path = "../ahma_http_bridge" }
 ahma_http_mcp_client = { path = "../ahma_http_mcp_client" }
 ahma_llm_monitor = { path = "../ahma_llm_monitor" }
 ahma_log_monitor = { path = "../ahma_log_monitor" }
-ahma_output_optimizer = { path = "../ahma_output_optimizer" }
 ahma_update = { path = "../ahma_update" }
 ahma_vault = { path = "../ahma_vault" }
 anyhow.workspace = true

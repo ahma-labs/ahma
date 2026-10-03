@@ -3254,8 +3254,8 @@ fn skill_nav_commands(state: &crate::state::AppState) -> Vec<crate::state::NavCo
         .collect()
 }
 
-/// `/minimize [on|off]` — toggle token minimization (concise prompting + output
-/// compression for small models). With no argument it reports the current state.
+/// `/minimize [on|off]` — toggle the conciseness rule appended to the system
+/// prompt. With no argument it reports the current state.
 /// The choice is applied live and persisted to `settings.tools.minimize_tokens`
 /// so the hub agent loop (which reads settings) and the next session both
 /// honour it. Default is off.

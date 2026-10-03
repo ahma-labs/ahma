@@ -207,10 +207,6 @@ pub mod egress;
 /// re-exported so `ahma_mcp::bundle::…` paths keep working).
 pub use ahma_bundle as bundle;
 
-/// Token minimization and output optimization (the `ahma_output_optimizer`
-/// crate, re-exported so `ahma_mcp::output_optimizer::…` paths keep working).
-pub use ahma_output_optimizer as output_optimizer;
-
 /// Harness guards and small-model adaptations (the `ahma_harness_guard` crate,
 /// re-exported so `ahma_mcp::harness_guard::…` paths keep working).
 pub use ahma_harness_guard as harness_guard;

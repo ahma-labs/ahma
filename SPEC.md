@@ -54,7 +54,7 @@ invariant decides.
                  ▲
    ┌─────────────┼───────────────────────────────────────────────┐
  ahma_vault  ahma_bundle  ahma_update  ahma_llm_monitor  ahma_http_mcp_client  ahma_http_bridge
- ahma_log_monitor  ahma_harness_guard  ahma_harness_tools  ahma_output_optimizer   (no deps)
+ ahma_log_monitor  ahma_harness_guard  ahma_harness_tools   (no deps)
                  ▲
              ahma_mcp  (the engine and the whole `ahma` CLI)
                  ▲
@@ -145,7 +145,7 @@ instructions describe the session's mode (R1.5.4).
 
 `tests-pass`: implemented and covered by tests. `in-progress`: partly done; what is missing
 is listed in §11 Known gaps. `experimental`: implemented and tested, behind an opt-in, and
-may change. `dormant`: present but not active.
+may change.
 
 | Component | Status | Notes |
 |---|---|---|
@@ -181,7 +181,6 @@ may change. `dormant`: present but not active.
 | Self-update and provenance | tests-pass | `ahma_update/SPEC.md` |
 | Release signing (R-SIGN) | in-progress | Pending Developer-ID signing (R-SIGN.1); Windows is a stated assumption (R-SIGN.3) |
 | OpenTelemetry export | tests-pass | `otel` cargo feature, off by default |
-| Server-side output minimization | dormant | `ahma_output_optimizer/SPEC.md` |
 | Code complexity analysis (`ahma simplify`) | tests-pass | `ahma_simplify/SPEC.md` |
 
 ---
@@ -1895,5 +1894,4 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **Scope-downgrade prompts** (R5.3.1–R5.3.6, R-HUB.11): specified but not wired: no running ahma asks before a scope downgrade (`--tmp`, broader roots) or commits an `elicited` scope. Live elicitation exists only for grants (R-PERM.3); downgrade prompts, when built, go through the same ladder.
 - **Log-symlink exceptions** (`logs_approve`, R9, R-PERM.1): stored in `<platform config dir>/ahma/log_exceptions.json`, not in the unified ledger.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.
-- **Server-side output minimization**: dormant (`ahma_output_optimizer/SPEC.md`).
 - **Cross-domain redirect setting** (R-WEB.8.2): `[web] on_redirect_to_new_domain` is parsed and shown by `ahma web` but not enforced; a redirect to a new domain is followed iff the live web policy allows that host, and is never prompted.
