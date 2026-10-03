@@ -1,4 +1,5 @@
 use crate::shell::cli::AppConfig;
+use ahma_common::harness::Harness;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand, ValueEnum};
@@ -292,6 +293,9 @@ impl HooksRunShellArgs {
     }
 }
 
+/// A terminal-hook flavour: one per harness ahma can hook
+/// ([`Harness::has_terminal_hook`]). The variant names are the `--platform`
+/// values clap accepts, and equal [`Harness::cli_name`] for their harness.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum HookPlatform {
     Cursor,
@@ -302,6 +306,23 @@ pub enum HookPlatform {
 }
 
 impl HookPlatform {
+    /// The harness this hook flavour belongs to.
+    pub fn harness(self) -> Harness {
+        match self {
+            Self::Cursor => Harness::Cursor,
+            Self::Claude => Harness::ClaudeCode,
+            Self::Codex => Harness::Codex,
+            Self::Copilot => Harness::CopilotCli,
+            Self::Antigravity => Harness::Antigravity,
+        }
+    }
+
+    /// The hook flavour for `harness`, or `None` when ahma has no terminal
+    /// hook for it.
+    pub fn of(harness: Harness) -> Option<Self> {
+        Self::all().into_iter().find(|p| p.harness() == harness)
+    }
+
     fn all() -> Vec<Self> {
         vec![
             Self::Cursor,
@@ -313,13 +334,7 @@ impl HookPlatform {
     }
 
     fn label(self) -> &'static str {
-        match self {
-            Self::Cursor => "Cursor",
-            Self::Claude => "Claude Code",
-            Self::Codex => "Codex",
-            Self::Copilot => "GitHub Copilot CLI",
-            Self::Antigravity => "Antigravity",
-        }
+        self.harness().label()
     }
 
     fn config_path(self, scope_root: &Path, scope: HookScope) -> PathBuf {
@@ -353,13 +368,7 @@ impl HookPlatform {
     }
 
     fn cli_name(self) -> &'static str {
-        match self {
-            Self::Cursor => "cursor",
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Copilot => "copilot",
-            Self::Antigravity => "antigravity",
-        }
+        self.harness().cli_name()
     }
 
     /// Whether `ahma setup` installs terminal hooks for this client **by default**
@@ -4074,6 +4083,33 @@ mod tests {
         ] {
             assert_eq!(platform.label(), label);
             assert_eq!(platform.cli_name(), cli);
+        }
+    }
+
+    /// The hook table and the harness table agree in both directions: every
+    /// harness with a hook has exactly this flavour, and no other harness has
+    /// one.
+    #[test]
+    fn hook_platforms_are_exactly_the_hooked_harnesses() {
+        for h in Harness::ALL.iter().copied() {
+            assert_eq!(
+                HookPlatform::of(h).is_some(),
+                h.has_terminal_hook(),
+                "{h:?}"
+            );
+        }
+        for p in HookPlatform::all() {
+            assert_eq!(HookPlatform::of(p.harness()), Some(p), "{p:?}");
+        }
+    }
+
+    /// clap derives the `--platform` spellings from the variant names, not
+    /// from `cli_name`; they must still be the same strings.
+    #[test]
+    fn clap_platform_values_match_cli_names() {
+        for p in HookPlatform::all() {
+            let value = p.to_possible_value().expect("every variant is a value");
+            assert_eq!(value.get_name(), p.cli_name(), "{p:?}");
         }
     }
 

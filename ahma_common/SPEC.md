@@ -70,6 +70,11 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
   Agent Skills discovery (R-SK8), the `ahma simplify` arguments (here so the CLI parser and
   `ahma_simplify` need not depend on each other), the transport-agnostic MCP peer factory,
   and the workspace state-machine convention (R23).
+- `harness`: every AI harness ahma recognises, configures or hooks, listed once with its
+  names (`label`, `--platform` value, client display name) and capabilities (progress,
+  native file tools, elicitation budget, `roots/list`, terminal hook). `ahma_mcp`'s
+  MCP-client type, `ahma setup` targets and hook platforms map their variants onto it and
+  read those facts from it, so no two of them can name or treat a harness differently.
 
 **Features**
 - `otel` (off by default) compiles the OpenTelemetry SDK into `observability`. Without it

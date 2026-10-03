@@ -12,8 +12,15 @@
 //! stays in their own modules. Adding a harness means adding one variant and
 //! filling in the matches the compiler then flags — uninstall cannot be
 //! forgotten.
+//!
+//! A [`Platform`] is a view of [`Harness`]: its names, whether it answers
+//! `roots/list` and which terminal hook it has are read from there, so the
+//! setup wizard cannot call a harness something `ahma hooks` or `status`
+//! does not.
 
 use std::path::{Path, PathBuf};
+
+use ahma_common::harness::Harness;
 
 use crate::hooks::HookPlatform;
 
@@ -55,32 +62,28 @@ pub enum McpConfigFormat {
 }
 
 impl Platform {
+    /// The harness this setup target configures.
+    pub fn harness(self) -> Harness {
+        match self {
+            Platform::Antigravity => Harness::Antigravity,
+            Platform::ClaudeCode => Harness::ClaudeCode,
+            Platform::ClaudeDesktop => Harness::ClaudeDesktop,
+            Platform::Codex => Harness::Codex,
+            Platform::Cursor => Harness::Cursor,
+            Platform::Copilot => Harness::CopilotCli,
+            Platform::LmStudio => Harness::LmStudio,
+            Platform::VsCode => Harness::VsCode,
+        }
+    }
+
     /// Name shown in the wizards' platform menus.
     pub fn label(self) -> &'static str {
-        match self {
-            Platform::Antigravity => "Antigravity",
-            Platform::ClaudeCode => "Claude Code",
-            Platform::ClaudeDesktop => "Claude Desktop",
-            Platform::Codex => "Codex",
-            Platform::Cursor => "Cursor",
-            Platform::Copilot => "GitHub Copilot CLI",
-            Platform::LmStudio => "LM Studio",
-            Platform::VsCode => "VS Code (GitHub Copilot Chat)",
-        }
+        self.harness().label()
     }
 
     /// Value accepted by `--platform`.
     pub fn cli_name(self) -> &'static str {
-        match self {
-            Platform::Antigravity => "antigravity",
-            Platform::ClaudeCode => "claude",
-            Platform::ClaudeDesktop => "claude-desktop",
-            Platform::Codex => "codex",
-            Platform::Cursor => "cursor",
-            Platform::Copilot => "copilot",
-            Platform::LmStudio => "lmstudio",
-            Platform::VsCode => "vscode",
-        }
+        self.harness().cli_name()
     }
 
     /// Name reported after an MCP entry is written or removed.
@@ -100,24 +103,12 @@ impl Platform {
     }
 
     pub fn supports_hooks(self) -> bool {
-        !matches!(
-            self,
-            Platform::VsCode | Platform::ClaudeDesktop | Platform::LmStudio
-        )
+        self.harness().has_terminal_hook()
     }
 
     /// The terminal-hook flavour for this harness, if it has one.
     pub fn hook_platform(self) -> Option<HookPlatform> {
-        match self {
-            Platform::Antigravity => Some(HookPlatform::Antigravity),
-            Platform::ClaudeCode => Some(HookPlatform::Claude),
-            Platform::ClaudeDesktop => None,
-            Platform::Codex => Some(HookPlatform::Codex),
-            Platform::Cursor => Some(HookPlatform::Cursor),
-            Platform::Copilot => Some(HookPlatform::Copilot),
-            Platform::LmStudio => None,
-            Platform::VsCode => None,
-        }
+        HookPlatform::of(self.harness())
     }
 
     /// Whether this harness answers `roots/list`.
@@ -125,7 +116,7 @@ impl Platform {
     /// Harnesses that don't must be given an explicitly scoped server entry —
     /// ahma cannot discover the workspace from them.
     pub fn sends_roots_list(self) -> bool {
-        !matches!(self, Platform::Antigravity | Platform::LmStudio)
+        self.harness().sends_roots_list()
     }
 
     /// Where this harness keeps its MCP configuration, and in what format.
@@ -364,6 +355,83 @@ mod tests {
             .filter(|p| !matches!(p, Platform::Antigravity | Platform::LmStudio))
         {
             assert!(p.sends_roots_list(), "{} should send roots/list", p.label());
+        }
+    }
+
+    /// Every string a setup target shows, pinned: menu label, `--platform`
+    /// value, and the name reported after an MCP entry is written.
+    #[test]
+    fn platform_names_are_pinned() {
+        let expected = [
+            (
+                Platform::Antigravity,
+                "Antigravity",
+                "antigravity",
+                "Antigravity",
+            ),
+            (Platform::ClaudeCode, "Claude Code", "claude", "Claude Code"),
+            (
+                Platform::ClaudeDesktop,
+                "Claude Desktop",
+                "claude-desktop",
+                "Claude Desktop",
+            ),
+            (Platform::Codex, "Codex", "codex", "Codex CLI"),
+            (Platform::Cursor, "Cursor", "cursor", "Cursor"),
+            (
+                Platform::Copilot,
+                "GitHub Copilot CLI",
+                "copilot",
+                "GitHub Copilot CLI",
+            ),
+            (Platform::LmStudio, "LM Studio", "lmstudio", "LM Studio"),
+            (
+                Platform::VsCode,
+                "VS Code (GitHub Copilot Chat)",
+                "vscode",
+                "VS Code (GitHub Copilot Chat)",
+            ),
+        ];
+        assert_eq!(expected.len(), PLATFORMS.len());
+        for (p, label, cli, mcp_name) in expected {
+            assert_eq!(p.label(), label, "{p:?}");
+            assert_eq!(p.cli_name(), cli, "{p:?}");
+            assert_eq!(p.mcp_display_name(), mcp_name, "{p:?}");
+        }
+    }
+
+    /// The pre-unification hook and roots tables, pinned per setup target.
+    #[test]
+    fn hook_and_roots_tables_are_pinned() {
+        let expected = [
+            (
+                Platform::Antigravity,
+                Some(HookPlatform::Antigravity),
+                false,
+            ),
+            (Platform::ClaudeCode, Some(HookPlatform::Claude), true),
+            (Platform::ClaudeDesktop, None, true),
+            (Platform::Codex, Some(HookPlatform::Codex), true),
+            (Platform::Cursor, Some(HookPlatform::Cursor), true),
+            (Platform::Copilot, Some(HookPlatform::Copilot), true),
+            (Platform::LmStudio, None, false),
+            (Platform::VsCode, None, true),
+        ];
+        assert_eq!(expected.len(), PLATFORMS.len());
+        for (p, hook, roots) in expected {
+            assert_eq!(p.hook_platform(), hook, "{p:?}");
+            assert_eq!(p.supports_hooks(), hook.is_some(), "{p:?}");
+            assert_eq!(p.sends_roots_list(), roots, "{p:?}");
+        }
+    }
+
+    /// Two setup targets can never be the same harness.
+    #[test]
+    fn each_platform_is_a_distinct_harness() {
+        for (i, a) in PLATFORMS.iter().enumerate() {
+            for b in &PLATFORMS[i + 1..] {
+                assert_ne!(a.harness(), b.harness(), "{a:?} / {b:?}");
+            }
         }
     }
 

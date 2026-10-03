@@ -17,7 +17,15 @@
 //!
 //! - **Claude Desktop** (`claude-ai`) and **Claude Code** (`claude-code`): handle
 //!   progress notifications correctly.
+//!
+//! ## One harness table
+//!
+//! [`McpClientType`] is a view of [`ahma_common::harness::Harness`]: each
+//! variant other than `Unknown` names one harness, and every per-client fact
+//! (name matching, display name, progress, native file tools, elicitation
+//! budget) is read from there rather than listed again here.
 
+use ahma_common::harness::Harness;
 use rmcp::service::{Peer, RoleServer};
 
 /// Represents known MCP client types with their behavioral quirks.
@@ -50,46 +58,53 @@ pub enum McpClientType {
     Unknown,
 }
 
+/// The client type a harness connects as.
+///
+/// Total over [`Harness`], but [`Harness::from_client_name`] only ever yields
+/// harnesses with a variant of their own here. The three without one map to
+/// what ahma does for them today: Copilot CLI's names contain `copilot`, which
+/// is classified as VS Code; Codex and Gemini CLI are not recognised, so they
+/// are `Unknown`.
+impl From<Harness> for McpClientType {
+    fn from(harness: Harness) -> Self {
+        match harness {
+            Harness::Ahma => McpClientType::Ahma,
+            Harness::Antigravity => McpClientType::Antigravity,
+            Harness::ClaudeCode => McpClientType::ClaudeCode,
+            Harness::ClaudeDesktop => McpClientType::ClaudeDesktop,
+            Harness::CopilotCli | Harness::VsCode => McpClientType::VSCode,
+            Harness::Cursor => McpClientType::Cursor,
+            Harness::LmStudio => McpClientType::LmStudio,
+            Harness::Ollama => McpClientType::Ollama,
+            Harness::Zed => McpClientType::Zed,
+            Harness::Codex | Harness::GeminiCli => McpClientType::Unknown,
+        }
+    }
+}
+
 impl McpClientType {
+    /// The harness this client type is, or `None` for `Unknown`.
+    pub fn harness(self) -> Option<Harness> {
+        match self {
+            McpClientType::Ahma => Some(Harness::Ahma),
+            McpClientType::Cursor => Some(Harness::Cursor),
+            McpClientType::VSCode => Some(Harness::VsCode),
+            McpClientType::ClaudeDesktop => Some(Harness::ClaudeDesktop),
+            McpClientType::ClaudeCode => Some(Harness::ClaudeCode),
+            McpClientType::Zed => Some(Harness::Zed),
+            McpClientType::LmStudio => Some(Harness::LmStudio),
+            McpClientType::Ollama => Some(Harness::Ollama),
+            McpClientType::Antigravity => Some(Harness::Antigravity),
+            McpClientType::Unknown => None,
+        }
+    }
+
     /// Detect client type from the `Implementation.name` field sent during MCP initialization.
     ///
-    /// The matching is case-insensitive and looks for known substrings.
+    /// The matching is case-insensitive and looks for known substrings; the
+    /// table is [`Harness::from_client_name`].
     pub fn from_client_name(name: &str) -> Self {
-        let name_lower = name.to_lowercase();
-
-        if name_lower.contains("antigravity")
-            || name_lower.starts_with("local-agent-mode")
-            || name_lower == "agy"
-            || name_lower.starts_with("agy-")
-            || name_lower.starts_with("agy ")
-        {
-            McpClientType::Antigravity
-        } else if name_lower == "ahma"
-            || name_lower.starts_with("ahma-")
-            || name_lower.starts_with("ahma_")
-            || name_lower.contains("ahma-cli")
-            || name_lower.contains("ahma-ide")
-        {
-            McpClientType::Ahma
-        } else if name_lower.contains("cursor") {
-            McpClientType::Cursor
-        } else if name_lower.contains("claude-code") || name_lower.contains("claude code") {
-            McpClientType::ClaudeCode
-        } else if name_lower.contains("claude") {
-            McpClientType::ClaudeDesktop
-        } else if name_lower.contains("vscode") || name_lower.contains("copilot") {
-            McpClientType::VSCode
-        } else if name_lower.contains("zed") {
-            McpClientType::Zed
-        } else if name_lower.contains("lm studio") || name_lower.contains("lmstudio") {
-            McpClientType::LmStudio
-        } else if name_lower.contains("ollama") {
-            McpClientType::Ollama
-        } else if name_lower.contains("ahma") {
-            McpClientType::Ahma
-        } else {
-            McpClientType::Unknown
-        }
+        Harness::from_client_name(name).map_or(McpClientType::Unknown, Self::from)
     }
 
     /// Detect client type from an MCP peer's stored client info.
@@ -122,7 +137,7 @@ impl McpClientType {
     /// `--force-progress-notifications` let an operator override this
     /// suppression once a given Cursor version is known to have fixed it.
     pub fn supports_progress(&self) -> bool {
-        !matches!(self, McpClientType::Cursor)
+        self.harness().is_none_or(Harness::supports_progress)
     }
 
     /// Whether this client already ships native file read/write/search tools
@@ -134,29 +149,13 @@ impl McpClientType {
     /// see [`crate::builtin_tool::BuiltinTool::is_harness_file_tool`]. The
     /// gate is only ever applied to that subset of tools.
     pub fn has_native_file_tools(&self) -> bool {
-        matches!(
-            self,
-            McpClientType::ClaudeDesktop
-                | McpClientType::ClaudeCode
-                | McpClientType::Cursor
-                | McpClientType::VSCode
-        )
+        self.harness().is_some_and(Harness::has_native_file_tools)
     }
 
     /// Human-readable name for logging.
     pub fn display_name(&self) -> &'static str {
-        match self {
-            McpClientType::Ahma => "Ahma",
-            McpClientType::Cursor => "Cursor",
-            McpClientType::VSCode => "VSCode/Copilot",
-            McpClientType::ClaudeDesktop => "Claude Desktop",
-            McpClientType::ClaudeCode => "Claude Code",
-            McpClientType::Zed => "Zed",
-            McpClientType::LmStudio => "LM Studio",
-            McpClientType::Ollama => "Ollama",
-            McpClientType::Antigravity => "Antigravity",
-            McpClientType::Unknown => "Unknown",
-        }
+        self.harness()
+            .map_or("Unknown", Harness::client_display_name)
     }
 
     /// How long ahma may hold **one** MCP request open for this client before
@@ -210,23 +209,14 @@ impl McpClientType {
     /// deadline it had never disclosed. Each budget below is therefore set
     /// **strictly under** the client's own, so ahma is the one that resolves the
     /// prompt.
+    ///
+    /// The per-harness values live in [`Harness::elicitation_budget`]; an
+    /// unrecognised client is unmeasured, so it gets the shortest deadline
+    /// seen anywhere.
     pub fn elicitation_budget(&self) -> std::time::Duration {
-        use std::time::Duration;
-        match self {
-            // No observed client-side cancellation; a human gets two minutes.
-            McpClientType::Ahma
-            | McpClientType::ClaudeDesktop
-            | McpClientType::ClaudeCode
-            | McpClientType::Cursor
-            | McpClientType::VSCode
-            | McpClientType::Zed => Duration::from_secs(120),
-            // Measured cancelling at 60.005s — stay comfortably inside it.
-            McpClientType::Antigravity => Duration::from_secs(45),
-            // Unmeasured: assume the shortest deadline we have seen anywhere.
-            McpClientType::LmStudio | McpClientType::Ollama | McpClientType::Unknown => {
-                Duration::from_secs(45)
-            }
-        }
+        const UNMEASURED: std::time::Duration = std::time::Duration::from_secs(45);
+        self.harness()
+            .map_or(UNMEASURED, Harness::elicitation_budget)
     }
 }
 
@@ -511,6 +501,113 @@ mod tests {
                 expected,
                 "{} must share the uniform fallback budget",
                 client.display_name()
+            );
+        }
+    }
+
+    /// Every `McpClientType` variant, so the tests below cannot miss one.
+    const ALL_CLIENT_TYPES: [McpClientType; 10] = [
+        McpClientType::Ahma,
+        McpClientType::Cursor,
+        McpClientType::VSCode,
+        McpClientType::ClaudeDesktop,
+        McpClientType::ClaudeCode,
+        McpClientType::Zed,
+        McpClientType::LmStudio,
+        McpClientType::Ollama,
+        McpClientType::Antigravity,
+        McpClientType::Unknown,
+    ];
+
+    /// The view and the table it reads from agree: each client type is the
+    /// harness it names, and back.
+    #[test]
+    fn client_type_round_trips_through_its_harness() {
+        for client in ALL_CLIENT_TYPES {
+            let back = client
+                .harness()
+                .map_or(McpClientType::Unknown, McpClientType::from);
+            assert_eq!(back, client, "{client:?}");
+        }
+        for h in Harness::ALL.iter().copied() {
+            let client = McpClientType::from(h);
+            match client.harness() {
+                Some(same) if same == h => {}
+                other => assert!(
+                    matches!(
+                        (h, other),
+                        (Harness::CopilotCli, Some(Harness::VsCode))
+                            | (Harness::Codex | Harness::GeminiCli, None)
+                    ),
+                    "{h:?} maps to {client:?}, which names {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Whatever a harness maps to, it is treated exactly as that client type
+    /// is — so the three harnesses without a variant of their own behave as
+    /// they do today.
+    #[test]
+    fn a_harness_behaves_as_the_client_type_it_maps_to() {
+        for h in Harness::ALL.iter().copied() {
+            let client = McpClientType::from(h);
+            assert_eq!(client.supports_progress(), h.supports_progress(), "{h:?}");
+            assert_eq!(
+                client.has_native_file_tools(),
+                h.has_native_file_tools(),
+                "{h:?}"
+            );
+            assert_eq!(client.elicitation_budget(), h.elicitation_budget(), "{h:?}");
+        }
+    }
+
+    /// The observable display names, pinned (`status`, TUI, logs).
+    #[test]
+    fn display_names_are_pinned() {
+        let expected = [
+            (McpClientType::Ahma, "Ahma"),
+            (McpClientType::Cursor, "Cursor"),
+            (McpClientType::VSCode, "VSCode/Copilot"),
+            (McpClientType::ClaudeDesktop, "Claude Desktop"),
+            (McpClientType::ClaudeCode, "Claude Code"),
+            (McpClientType::Zed, "Zed"),
+            (McpClientType::LmStudio, "LM Studio"),
+            (McpClientType::Ollama, "Ollama"),
+            (McpClientType::Antigravity, "Antigravity"),
+            (McpClientType::Unknown, "Unknown"),
+        ];
+        assert_eq!(expected.len(), ALL_CLIENT_TYPES.len());
+        for (client, name) in expected {
+            assert_eq!(client.display_name(), name, "{client:?}");
+        }
+    }
+
+    /// The pre-unification capability table, pinned per client type.
+    #[test]
+    fn capabilities_are_pinned_per_client_type() {
+        use std::time::Duration;
+        // (client, progress, native file tools, elicitation secs)
+        let expected = [
+            (McpClientType::Ahma, true, false, 120),
+            (McpClientType::Cursor, false, true, 120),
+            (McpClientType::VSCode, true, true, 120),
+            (McpClientType::ClaudeDesktop, true, true, 120),
+            (McpClientType::ClaudeCode, true, true, 120),
+            (McpClientType::Zed, true, false, 120),
+            (McpClientType::LmStudio, true, false, 45),
+            (McpClientType::Ollama, true, false, 45),
+            (McpClientType::Antigravity, true, false, 45),
+            (McpClientType::Unknown, true, false, 45),
+        ];
+        assert_eq!(expected.len(), ALL_CLIENT_TYPES.len());
+        for (client, progress, files, elicit) in expected {
+            assert_eq!(client.supports_progress(), progress, "{client:?}");
+            assert_eq!(client.has_native_file_tools(), files, "{client:?}");
+            assert_eq!(
+                client.elicitation_budget(),
+                Duration::from_secs(elicit),
+                "{client:?}"
             );
         }
     }

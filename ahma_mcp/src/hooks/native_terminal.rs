@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+use ahma_common::harness::Harness;
+
 use crate::client_type::McpClientType;
 
 use super::{HookPlatform, HookScope};
@@ -66,17 +68,13 @@ impl NativeTerminal {
 
 /// The hook platform for an MCP client: `Some(None)` for a client ahma has no
 /// hook for, `None` for a client it cannot identify (nothing is claimed).
+///
+/// ahma itself is not described either: it has no terminal of its own for
+/// ahma to confine.
 fn hook_platform_of(client: McpClientType) -> Option<Option<HookPlatform>> {
-    match client {
-        McpClientType::ClaudeCode => Some(Some(HookPlatform::Claude)),
-        McpClientType::Cursor => Some(Some(HookPlatform::Cursor)),
-        McpClientType::Antigravity => Some(Some(HookPlatform::Antigravity)),
-        McpClientType::VSCode
-        | McpClientType::ClaudeDesktop
-        | McpClientType::Zed
-        | McpClientType::LmStudio
-        | McpClientType::Ollama => Some(None),
-        McpClientType::Ahma | McpClientType::Unknown => None,
+    match client.harness()? {
+        Harness::Ahma => None,
+        harness => Some(HookPlatform::of(harness)),
     }
 }
 
@@ -162,6 +160,29 @@ mod tests {
             classify(McpClientType::Cursor, &|p| p == HookPlatform::Claude, true),
             Some(NativeTerminal::Unconfined)
         );
+    }
+
+    /// The pre-unification table, pinned for every client type.
+    #[test]
+    fn hook_platform_of_every_client_type_is_pinned() {
+        let expected = [
+            (McpClientType::ClaudeCode, Some(Some(HookPlatform::Claude))),
+            (McpClientType::Cursor, Some(Some(HookPlatform::Cursor))),
+            (
+                McpClientType::Antigravity,
+                Some(Some(HookPlatform::Antigravity)),
+            ),
+            (McpClientType::VSCode, Some(None)),
+            (McpClientType::ClaudeDesktop, Some(None)),
+            (McpClientType::Zed, Some(None)),
+            (McpClientType::LmStudio, Some(None)),
+            (McpClientType::Ollama, Some(None)),
+            (McpClientType::Ahma, None),
+            (McpClientType::Unknown, None),
+        ];
+        for (client, hook) in expected {
+            assert_eq!(hook_platform_of(client), hook, "{client:?}");
+        }
     }
 
     #[test]
