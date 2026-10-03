@@ -6,7 +6,7 @@ use wiremock::{
     matchers::{method, path},
 };
 
-use ahma_llm_monitor::{ApiErrorKind, LlmClient};
+use ahma_llm_monitor::{ApiErrorKind, LlmClient, ModelServer};
 
 fn make_response(content: &str) -> serde_json::Value {
     json!({
@@ -408,4 +408,123 @@ async fn tool_names_are_valid_on_the_wire_and_ahmas_in_the_reply() {
     let body = String::from_utf8_lossy(&sent.body);
     assert!(!body.contains("::"), "{body}");
     assert!(body.contains("jira__search"), "{body}");
+}
+
+// ── Server context probe: ask the server how much context it gives ────────
+
+async fn mount_get(server: &MockServer, at: &str, body: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path(at))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn ollama_reports_the_context_the_model_is_loaded_with() {
+    let server = MockServer::start().await;
+    mount_get(
+        &server,
+        "/api/ps",
+        json!({"models": [{"name": "qwen3:8b", "model": "qwen3:8b", "context_length": 12288}]}),
+    )
+    .await;
+    let client = LlmClient::new(format!("{}/v1", server.uri()), "qwen3:8b", None);
+    let ctx = client.server_context().await.expect("probed");
+    assert_eq!(ctx.server, ModelServer::Ollama);
+    assert_eq!(ctx.context_length, Some(12288));
+}
+
+#[tokio::test]
+async fn ollama_with_the_model_not_loaded_yet_says_ollama_but_no_size() {
+    let server = MockServer::start().await;
+    mount_get(&server, "/api/ps", json!({"models": []})).await;
+    let client = LlmClient::new(format!("{}/v1", server.uri()), "qwen3:8b", None);
+    let ctx = client.server_context().await.expect("probed");
+    assert_eq!(ctx.server, ModelServer::Ollama);
+    assert_eq!(
+        ctx.context_length, None,
+        "a size it may not load at is not guessed"
+    );
+}
+
+#[tokio::test]
+async fn lm_studio_reports_the_loaded_context() {
+    let server = MockServer::start().await;
+    mount_get(
+        &server,
+        "/api/v0/models/qwen/qwen3-8b",
+        json!({"id": "qwen/qwen3-8b", "state": "loaded",
+               "max_context_length": 131072, "loaded_context_length": 8192}),
+    )
+    .await;
+    let client = LlmClient::new(format!("{}/v1", server.uri()), "qwen/qwen3-8b", None);
+    let ctx = client.server_context().await.expect("probed");
+    assert_eq!(ctx.server, ModelServer::LmStudio);
+    assert_eq!(ctx.context_length, Some(8192));
+}
+
+#[tokio::test]
+async fn llama_cpp_reports_its_slot_context() {
+    let server = MockServer::start().await;
+    mount_get(
+        &server,
+        "/props",
+        json!({"default_generation_settings": {"n_ctx": 32768}, "total_slots": 1}),
+    )
+    .await;
+    let client = LlmClient::new(format!("{}/v1", server.uri()), "any", None);
+    let ctx = client.server_context().await.expect("probed");
+    assert_eq!(ctx.server, ModelServer::LlamaCpp);
+    assert_eq!(ctx.context_length, Some(32768));
+}
+
+#[tokio::test]
+async fn vllm_reports_max_model_len() {
+    let server = MockServer::start().await;
+    mount_get(
+        &server,
+        "/v1/models",
+        json!({"object": "list", "data": [
+            {"id": "other", "owned_by": "vllm", "max_model_len": 4096},
+            {"id": "Qwen/Qwen3-8B", "owned_by": "vllm", "max_model_len": 40960}
+        ]}),
+    )
+    .await;
+    let client = LlmClient::new(format!("{}/v1", server.uri()), "Qwen/Qwen3-8B", None);
+    let ctx = client.server_context().await.expect("probed");
+    assert_eq!(ctx.server, ModelServer::Vllm);
+    assert_eq!(ctx.context_length, Some(40960));
+}
+
+#[tokio::test]
+async fn a_litellm_proxy_is_not_a_model_on_this_machine() {
+    let server = MockServer::start().await;
+    mount_get(
+        &server,
+        "/model/info",
+        json!({"data": [{"model_name": "gpt-5", "model_info": {"max_input_tokens": 272000}}]}),
+    )
+    .await;
+    let client = LlmClient::new(format!("{}/v1", server.uri()), "gpt-5", None);
+    let ctx = client.server_context().await.expect("probed");
+    assert_eq!(ctx.server, ModelServer::LiteLlm);
+    assert_eq!(ctx.context_length, Some(272000));
+    assert!(!ctx.server.runs_the_model_here());
+    assert!(ModelServer::Ollama.runs_the_model_here());
+}
+
+#[tokio::test]
+async fn an_unrecognised_local_server_is_unknown() {
+    let server = MockServer::start().await; // 404 for everything
+    let client = LlmClient::new(format!("{}/v1", server.uri()), "m", None);
+    let ctx = client.server_context().await.expect("probed");
+    assert_eq!(ctx.server, ModelServer::Unknown);
+    assert_eq!(ctx.context_length, None);
+}
+
+#[tokio::test]
+async fn a_remote_endpoint_is_never_probed() {
+    let client = LlmClient::new("https://api.example.invalid/v1", "m", None);
+    assert_eq!(client.server_context().await, None);
 }

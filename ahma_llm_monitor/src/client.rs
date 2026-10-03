@@ -315,6 +315,42 @@ pub enum ApiFlavor {
     Anthropic,
 }
 
+/// Which program serves a local endpoint, as its own API identified it
+/// ([`LlmClient::server_context`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelServer {
+    /// Ollama (`/api/ps`).
+    Ollama,
+    /// LM Studio (`/api/v0/models`).
+    LmStudio,
+    /// llama.cpp's `llama-server` (`/props`).
+    LlamaCpp,
+    /// vLLM (`max_model_len` in `/v1/models`).
+    Vllm,
+    /// A LiteLLM proxy (`/model/info`): the model usually runs elsewhere.
+    LiteLlm,
+    /// Something answered on this machine, but in no shape ahma knows.
+    Unknown,
+}
+
+impl ModelServer {
+    /// Whether the model itself runs on this machine, so every token of
+    /// prompt is read on local hardware. A proxy forwards the work elsewhere;
+    /// an unrecognised local server is assumed to run it here.
+    pub fn runs_the_model_here(self) -> bool {
+        !matches!(self, ModelServer::LiteLlm)
+    }
+}
+
+/// What a local server said about the model's context window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerContext {
+    /// The program that answered.
+    pub server: ModelServer,
+    /// Tokens of context the server gives this model, when it says.
+    pub context_length: Option<u32>,
+}
+
 /// An LLM client for issue detection and chat.
 ///
 /// Speaks either the OpenAI-compatible API or the native Anthropic Messages
@@ -588,6 +624,111 @@ impl LlmClient {
                     .strip_suffix(":latest")
                     .is_some_and(|base| base == self.model)
         })
+    }
+
+    /// Ask the server on this machine which program it is and how much
+    /// context it gives this model, so budgets follow what the server really
+    /// loaded instead of a guess from the hostname (ahma_llm_monitor SPEC,
+    /// "Context window").
+    ///
+    /// `None` for a remote endpoint or the Anthropic flavor: those are never
+    /// asked. Otherwise every known server's own endpoint is tried at once,
+    /// each with a short timeout, and the first that answers in its own shape
+    /// names the server. A size is reported only when the server states one
+    /// for this model; Ollama states it only once the model is loaded, since
+    /// the size it will load at is the server's choice.
+    pub async fn server_context(&self) -> Option<ServerContext> {
+        if !self.local || self.flavor != ApiFlavor::OpenAi {
+            return None;
+        }
+        let root = self.base_url.trim_end_matches('/');
+        let root = root.strip_suffix("/v1").unwrap_or(root);
+        let model = self.model.as_str();
+        let get = |url: String| async move {
+            let response = self
+                .apply_auth(self.http.get(url))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        };
+        let (ollama, lm_studio, llama_cpp, vllm, litellm) = tokio::join!(
+            get(format!("{root}/api/ps")),
+            get(format!("{root}/api/v0/models/{model}")),
+            get(format!("{root}/props")),
+            get(format!("{root}/v1/models")),
+            get(format!("{root}/model/info")),
+        );
+        let as_u32 = |v: Option<&Value>| {
+            v.and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+        };
+        let found = |server, context_length| {
+            Some(ServerContext {
+                server,
+                context_length,
+            })
+        };
+
+        if let Some(models) = ollama
+            .as_ref()
+            .and_then(|b| b.get("models")?.as_array().cloned())
+        {
+            let loaded = models.iter().find(|m| {
+                ["name", "model"].iter().any(|k| {
+                    m.get(*k).and_then(Value::as_str).is_some_and(|n| {
+                        n == model || n.strip_suffix(":latest").is_some_and(|b| b == model)
+                    })
+                })
+            });
+            return found(
+                ModelServer::Ollama,
+                as_u32(loaded.and_then(|m| m.get("context_length"))),
+            );
+        }
+        if let Some(body) = lm_studio.filter(|b| b.get("max_context_length").is_some()) {
+            return found(
+                ModelServer::LmStudio,
+                as_u32(body.get("loaded_context_length")),
+            );
+        }
+        if let Some(body) = llama_cpp.filter(|b| b.get("default_generation_settings").is_some()) {
+            return found(
+                ModelServer::LlamaCpp,
+                as_u32(body.pointer("/default_generation_settings/n_ctx")),
+            );
+        }
+        if let Some(entry) = vllm.as_ref().and_then(|b| {
+            b.get("data")?
+                .as_array()?
+                .iter()
+                .find(|m| m.get("max_model_len").is_some())
+                .map(|_| b)
+        }) {
+            let len = entry["data"]
+                .as_array()
+                .and_then(|d| {
+                    d.iter()
+                        .find(|m| m.get("id").and_then(Value::as_str) == Some(model))
+                })
+                .and_then(|m| m.get("max_model_len"));
+            return found(ModelServer::Vllm, as_u32(len));
+        }
+        if let Some(data) = litellm
+            .as_ref()
+            .and_then(|b| b.get("data")?.as_array().cloned())
+        {
+            let len = data
+                .iter()
+                .find(|m| m.get("model_name").and_then(Value::as_str) == Some(model))
+                .and_then(|m| m.pointer("/model_info/max_input_tokens"));
+            return found(ModelServer::LiteLlm, as_u32(len));
+        }
+        found(ModelServer::Unknown, None)
     }
 
     /// Apply flavor-appropriate auth/version headers to a request.

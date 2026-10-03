@@ -1007,6 +1007,51 @@ async fn stream_completion_via_http(
     result
 }
 
+/// Size this run's budgets from what the model's server says (ahma_llm_monitor
+/// SPEC, "Context window"). A model that runs on this machine gets the
+/// small-model budgets: every token of context is prompt it reads on local
+/// hardware before answering, and on a laptop that is minutes. Its context is
+/// the size the server reports, or [`DEFAULT_OLLAMA_NUM_CTX`] while it reports
+/// none. A local proxy (LiteLLM) forwards the work elsewhere, so it keeps the
+/// normal budgets and any size it states. Remote endpoints are not asked.
+///
+/// Says the size once it is known (`Status { phase: "context" }`), so the TUI
+/// can show it. Returns whether the server stated a size, i.e. whether there
+/// is nothing more to learn.
+///
+/// [`DEFAULT_OLLAMA_NUM_CTX`]: ahma_common::config::DEFAULT_OLLAMA_NUM_CTX
+async fn fit_to_server(
+    client: &LlmClient,
+    cfg: &mut McpChatConfig,
+    tx: &Sender<AgentEvent>,
+) -> bool {
+    let Some(server) = client.server_context().await else {
+        return true;
+    };
+    let here = server.server.runs_the_model_here();
+    if here {
+        cfg.small_model_harness = true;
+    }
+    cfg.context_length = server
+        .context_length
+        .or_else(|| here.then_some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX));
+    info!(
+        server = ?server.server,
+        stated = ?server.context_length,
+        context_length = ?cfg.context_length,
+        "agent: context window from the model server"
+    );
+    if let Some(n) = server.context_length {
+        let _ = tx
+            .send(AgentEvent::Status {
+                phase: "context".to_string(),
+                detail: n.to_string(),
+            })
+            .await;
+    }
+    server.context_length.is_some()
+}
+
 /// While a request waits for its first delta, say whether a local model is
 /// still being loaded into memory (SPEC R24.10.2): Ollama sends nothing while
 /// it loads, and without this the user sees "reading" for a minute that is
@@ -1482,6 +1527,14 @@ pub fn spawn_agent_task(
         let mut msg_json = initial_msg_json(&sys_prompt, &messages);
 
         let mut mcp = mcp;
+        // A context size nobody configured is learned from the server, and
+        // re-asked each turn until the server states one (Ollama does only
+        // once the model is loaded).
+        let auto_context = mcp.as_ref().is_some_and(|c| c.context_length.is_none());
+        let mut context_known = !auto_context;
+        if let Some(cfg) = mcp.as_mut().filter(|_| auto_context) {
+            context_known = fit_to_server(&client, cfg, &tx).await;
+        }
         let menu = mcp.as_ref().map(|cfg| {
             Arc::new(crate::tool_menu::ToolMenu::new(
                 available_tools.clone(),
@@ -1510,6 +1563,12 @@ pub fn spawn_agent_task(
 
         for turn in 0..max_turns {
             info!(turn = turn + 1, max_turns, "agent: turn start");
+            if turn > 0
+                && !context_known
+                && let Some(cfg) = mcp.as_mut()
+            {
+                context_known = fit_to_server(&client, cfg, &tx).await;
+            }
             let tool_defs = match &menu {
                 Some(menu) => {
                     let label = menu.label();
@@ -2033,13 +2092,10 @@ fn resolve_llm_connection(
                 None => None,
             };
             let kind = entry.map(|e| e.kind);
-            let is_ollama_or_local = ahma_common::config::endpoint_supports_num_ctx(
-                &p_name,
-                kind.unwrap_or(ahma_common::config::ProviderKind::OpenAi),
-            ) || ahma_llm_monitor::client::is_loopback_url(&p_name);
-            let num_ctx = entry.and_then(|e| e.num_ctx).or_else(|| {
-                is_ollama_or_local.then_some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX)
-            });
+            // Only a configured size: it is sent to the server, so a guess
+            // here would override the server's own choice. An unconfigured
+            // size is learned from the server by the agent loop.
+            let num_ctx = entry.and_then(|e| e.num_ctx);
             return Ok(LlmConnection {
                 base_url: p_name,
                 model: model.unwrap_or_default(),
@@ -2263,11 +2319,9 @@ async fn build_agent_run_context(
     // before the join above rather than after it.
     let ahma_config = ahma_common::config::AhmaConfig::load_async_with(&settings).await;
     let conn = resolve_llm_connection(provider, model, &ahma_config)?;
-    let local_model = ahma_llm_monitor::client::is_loopback_url(&conn.base_url);
-    let num_ctx = conn
-        .num_ctx
-        .or(settings.tools.context_length)
-        .or_else(|| local_model.then_some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX));
+    // Only what someone configured. When nothing is, the agent loop asks the
+    // server how much context it really gives (`fit_to_server`).
+    let num_ctx = conn.num_ctx.or(settings.tools.context_length);
     let client = conn.into_client();
 
     let workspace_root = service
@@ -2299,14 +2353,6 @@ async fn build_agent_run_context(
         interactive,
         non_mutating_tool_names,
     );
-    // A model on this machine gets the small-model budgets whether or not the
-    // user found the setting: every token of context is prompt it has to read
-    // before answering, and on a laptop that is minutes, not milliseconds.
-    let mcp_config = McpChatConfig {
-        small_model_harness: mcp_config.small_model_harness || local_model,
-        ..mcp_config
-    };
-
     Ok((client, mcp_config, available_tools))
 }
 
@@ -2527,7 +2573,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_llm_connection_defaults_context_length_for_ollama_endpoints() {
+    fn resolve_llm_connection_sends_no_guessed_context_size() {
         let config = ahma_common::config::AhmaConfig::default();
         let conn = resolve_llm_connection(
             Some("http://127.0.0.1:11434/v1".to_string()),
@@ -2535,10 +2581,7 @@ mod tests {
             &config,
         )
         .expect("resolves");
-        assert_eq!(
-            conn.num_ctx,
-            Some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX)
-        );
+        assert_eq!(conn.num_ctx, None, "the server chooses, ahma learns it");
     }
 
     #[test]
@@ -2809,6 +2852,126 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// A server shaped like Ollama: `/api/ps` reports the model loaded at
+    /// `loaded_ctx` (or not loaded), and `/v1/chat/completions` says "ok".
+    async fn ollama_like(loaded_ctx: Option<u32>) -> String {
+        let ps = match loaded_ctx {
+            Some(n) => {
+                serde_json::json!({"models": [{"name": "m", "model": "m", "context_length": n}]})
+            }
+            None => serde_json::json!({"models": []}),
+        };
+        let router = axum::Router::new()
+            .route(
+                "/api/ps",
+                axum::routing::get(move || {
+                    let ps = ps.clone();
+                    async move { axum::Json(ps) }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async {
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\ndata: [DONE]\n".to_string())
+                        .unwrap()
+                }),
+            );
+        serve_router(router).await
+    }
+
+    /// A model on this machine is sized by what its server actually loaded,
+    /// gets the small-model budgets, and the size is announced once known.
+    /// Before the server states a size, the conservative default holds and
+    /// the agent asks again next turn.
+    #[tokio::test]
+    async fn a_local_model_is_sized_by_what_its_server_loaded() {
+        let base = ollama_like(Some(12_288)).await;
+        let client = LlmClient::new(format!("{base}/v1"), "m", None);
+        let mut cfg = empty_mcp_config("http://127.0.0.1:1");
+        let (tx, mut rx) = mpsc::channel(10);
+        assert!(fit_to_server(&client, &mut cfg, &tx).await);
+        assert_eq!(cfg.context_length, Some(12_288));
+        assert!(cfg.small_model_harness);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AgentEvent::Status { phase, detail }) if phase == "context" && detail == "12288"
+        ));
+
+        let base = ollama_like(None).await;
+        let client = LlmClient::new(format!("{base}/v1"), "m", None);
+        let mut cfg = empty_mcp_config("http://127.0.0.1:1");
+        let (tx, mut rx) = mpsc::channel(10);
+        assert!(!fit_to_server(&client, &mut cfg, &tx).await, "ask again");
+        assert_eq!(
+            cfg.context_length,
+            Some(ahma_common::config::DEFAULT_OLLAMA_NUM_CTX)
+        );
+        assert!(rx.try_recv().is_err(), "a guess is not announced");
+    }
+
+    /// A proxy on localhost (LiteLLM) forwards the work to a big remote
+    /// model: it keeps the normal budgets. A remote endpoint is never asked.
+    #[tokio::test]
+    async fn a_local_proxy_keeps_normal_budgets_and_a_remote_one_is_not_asked() {
+        let router = axum::Router::new().route(
+            "/model/info",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"data": [
+                    {"model_name": "gpt-5", "model_info": {"max_input_tokens": 272000}}
+                ]}))
+            }),
+        );
+        let base = serve_router(router).await;
+        let client = LlmClient::new(format!("{base}/v1"), "gpt-5", None);
+        let mut cfg = empty_mcp_config("http://127.0.0.1:1");
+        let (tx, _rx) = mpsc::channel(10);
+        assert!(fit_to_server(&client, &mut cfg, &tx).await);
+        assert!(!cfg.small_model_harness);
+        assert_eq!(cfg.context_length, Some(272_000));
+
+        let remote = LlmClient::new("https://api.example.invalid/v1", "m", None);
+        let mut cfg = empty_mcp_config("http://127.0.0.1:1");
+        assert!(fit_to_server(&remote, &mut cfg, &tx).await);
+        assert!(!cfg.small_model_harness);
+        assert_eq!(cfg.context_length, None);
+    }
+
+    /// A size someone configured is never replaced by what the server says;
+    /// only an unconfigured run learns it.
+    #[tokio::test]
+    async fn a_configured_context_size_is_never_replaced_by_the_server() {
+        let base = ollama_like(Some(12_288)).await;
+        for (configured, learned) in [(Some(4096), false), (None, true)] {
+            let client = LlmClient::new(format!("{base}/v1"), "m", None);
+            let mcp = McpChatConfig {
+                context_length: configured,
+                max_turns: 1,
+                ..empty_mcp_config("http://127.0.0.1:1")
+            };
+            let (tx, mut rx) = mpsc::channel(100);
+            spawn_agent_task(
+                client,
+                vec![ChatMessage::user("hi")],
+                None,
+                Some(mcp),
+                Vec::new(),
+                tx,
+                Arc::new(AutoApproveGate),
+            );
+            let mut announced = false;
+            while let Some(evt) = rx.recv().await {
+                match evt {
+                    AgentEvent::Status { phase, .. } if phase == "context" => announced = true,
+                    AgentEvent::Done | AgentEvent::Error(_) => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(announced, learned, "configured {configured:?}");
+        }
+    }
+
     /// A small model starts with the core tools, opens a group when it needs
     /// one, and is refused — not served — a tool it was never offered.
     #[tokio::test]
@@ -3016,7 +3179,9 @@ mod tests {
             mcp_connections: ahma_mcp::mcp_client::McpConnectionManager::default(),
             minimize_tokens: false,
             small_model_harness: false,
-            context_length: None,
+            // A configured size, so the mock server on localhost is not asked
+            // and taken for a small local model: this test is about the tool loop.
+            context_length: Some(100_000),
             non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
             tool_menu: None,
         };
