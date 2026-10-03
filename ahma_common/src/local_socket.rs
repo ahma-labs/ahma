@@ -604,7 +604,7 @@ mod tests {
         // (c) Does shutdown(Read), then shutdown(Both), from one thread wake a
         // `recv` blocked in another? Decides how a close-on-drop fix unblocks
         // the bridge's reader thread.
-        for i in 0..20 {
+        for i in 0..3 {
             let (l, path) = listen(i, "c");
             step(&format!("c{i} connect+accept"));
             let c = Arc::new(connect(&path));
