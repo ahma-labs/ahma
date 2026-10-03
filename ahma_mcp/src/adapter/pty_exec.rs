@@ -215,10 +215,17 @@ mod unix {
             .context("failed to build Landlock ruleset for PTY command")?
         {
             use std::os::fd::AsRawFd;
-            // SAFETY: the closure only performs async-signal-safe syscalls; the
-            // OwnedFd moved into it stays open across fork.
+            // The read-only deny tier, as in `create_shell_command` (SPEC
+            // R6.1.7): rebuilding the command dropped that pre_exec hook too.
+            let mounts = sandbox.spawn_deny_tier_mounts(working_dir);
+            // SAFETY: the closure only performs async-signal-safe syscalls on
+            // buffers built before fork; the OwnedFd moved into it stays open
+            // across fork.
             unsafe {
                 cmd.pre_exec(move || {
+                    if let Some(mounts) = &mounts {
+                        mounts.enter_in_child()?;
+                    }
                     crate::sandbox::apply_landlock_ruleset_in_child(fd.as_raw_fd())
                 });
             }
