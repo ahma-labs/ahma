@@ -76,29 +76,53 @@
 //! * **Only the internet-client capability is granted.** No private-network, no
 //!   documents/pictures library, no removable storage.
 //!
-//! ## Verification status: executed, and **disproven**
+//! ## Verification status: executed, and **not yet explained**
 //!
 //! This was written on macOS and type-checked against `windows-sys`. It has since
-//! been executed on a `windows-latest` runner, and the run showed the scoped
-//! grant does **not** take effect: a write *inside* the locked scope is denied
-//! along with one outside it. A boundary that denies everything proves nothing —
-//! it is the exact failure mode the gate test's own docstring warns against — so
-//! the spawn path is switched off rather than shipped broken. See
+//! been executed on `windows-latest`, and no run has shown the in-scope write
+//! succeeding, so the spawn path is switched off rather than shipped unproven. See
 //! [`appcontainer_spawn_enabled`](crate::sandbox::windows::appcontainer_spawn_enabled), which is the single place that verdict lives,
 //! and `sandbox/command.rs`, which reads it.
+//!
+//! What the evidence does and does not establish (the `AppContainer diagnostics`
+//! step of CI run 37103491457, 2026-10-03):
+//!
+//! * **The grant is written.** `icacls` on the scope shows the container SID with
+//!   an inheritable `(OI)(CI)(M,DC)` ACE, so the DACL code does what it says.
+//! * **The ancestors grant the container nothing.** `AppData`, `Local` and `Temp`
+//!   carry no package or capability ACE.
+//! * **The child never reached the write.** The probe shell was Windows
+//!   PowerShell 5.1, and inside the container it could not resolve
+//!   `Write-Output`, `Set-Content` or `Test-Path` (`CommandNotFoundException`: its
+//!   own modules failed to load), and `whoami /groups` printed nothing.
+//!
+//! So the earlier reading, "a write *inside* the scope is denied", is **not
+//! established**. The only artefact behind it was PowerShell's `Access to the path
+//! '...' is denied`, which names no path, and fits PowerShell failing on its own
+//! state (module cache, profile, registry) as well as it fits the target file.
+//! Whether the boundary holds, in either direction, is unknown.
 //!
 //! Everything below therefore compiles and is unit-tested, and none of it is
 //! reachable in production. That is deliberate while a fix is in flight; if it
 //! stops being in flight, this note is the place to say so.
 //!
-//! **No root cause is known.** Every artefact so far is the string
-//! `Access to the path '...' is denied`, which names no path, does not say
-//! whether the ACE was ever written, and does not say which SID the child ran
-//! as. `windows_sandbox_integration_test::appcontainer::appcontainer_dacl_diagnostics`
-//! exists to produce that evidence — `icacls` for the scope and every ancestor,
-//! the container SID, the child's own token groups and `$env:TEMP` — and the
-//! `AppContainer diagnostics` step in `build.yml` runs it on every Windows leg.
-//! Read that output before changing anything here.
+//! ## The probe: evidence that needs no shell
+//!
+//! A shell is a poor instrument inside an AppContainer, because the shell itself
+//! may be what fails. So `ahma.exe` has a second reserved first argument,
+//! [`PROBE_ARGV0`](crate::sandbox::windows::PROBE_ARGV0). Started through the launcher above, it runs inside exactly
+//! the AppContainer and Job setup a tool would. It opens each path it is given with
+//! `std::fs` (that is `CreateFileW`, and a failure carries the raw `GetLastError`
+//! code), and it reports the token it actually holds: the AppContainer flag, the
+//! integrity level, the groups and the capabilities.
+//!
+//! `windows_sandbox_integration_test::appcontainer::appcontainer_dacl_diagnostics`
+//! drives it, together with a `cmd.exe` redirect probe and a PowerShell
+//! module-load probe. It varies the scope location (`%TEMP%`, `%RUNNER_TEMP%`) and
+//! the scope's integrity label, prints one labelled result table, and asserts
+//! only what the harness controls: that the probe ran and reported every case.
+//! The `AppContainer diagnostics` step in `build.yml` runs it on every Windows
+//! leg. Read that table before changing anything here.
 //!
 //! SPEC R6.3.3 stays open, R6.3.9's disclosure stays as written, and
 //! `red_team_command_write_escape_blocked` stays `#[cfg_attr(windows, ignore)]`
@@ -263,6 +287,258 @@ where
         program,
         args: it.collect(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// The diagnostic probe (SPEC R6.3.3)
+// ---------------------------------------------------------------------------
+
+/// Reserved first argument that re-enters `ahma.exe` as the AppContainer
+/// **diagnostic probe**. Like [`LAUNCHER_ARGV0`] it is consumed by
+/// [`appcontainer_launcher_hook`] before any CLI parsing, so it is not a clap
+/// subcommand and cannot collide with one.
+///
+/// It exists because a shell is a poor instrument inside an AppContainer: on
+/// `windows-latest`, Windows PowerShell 5.1 could not load its own modules there,
+/// so every PowerShell-based observation was of PowerShell failing, not of the
+/// boundary. The probe is ahma's own code. It needs nothing beyond the file
+/// system calls under test, and it reports exactly what each call returned.
+pub const PROBE_ARGV0: &str = "__ahma-appcontainer-probe";
+
+/// Every line the probe reports starts with this, so the report can be picked
+/// out of whatever else shares the stream.
+pub const PROBE_LINE_PREFIX: &str = "AHMA-PROBE ";
+
+/// The key the probe reports last. Its presence proves the probe ran to the end
+/// rather than dying part way through.
+pub const PROBE_DONE_KEY: &str = "done";
+
+/// One file-system operation the probe can attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOp {
+    /// Open for writing, creating the file if absent, then write a few bytes.
+    Write,
+    /// Read the whole file.
+    Read,
+    /// Query metadata, which opens the path with no data access.
+    Stat,
+    /// Enumerate a directory.
+    List,
+    /// Resolve the final path (`GetFinalPathNameByHandleW` on Windows).
+    Canonicalize,
+}
+
+impl ProbeOp {
+    /// The argv spelling of this operation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeOp::Write => "write",
+            ProbeOp::Read => "read",
+            ProbeOp::Stat => "stat",
+            ProbeOp::List => "list",
+            ProbeOp::Canonicalize => "canon",
+        }
+    }
+
+    /// Inverse of [`ProbeOp::as_str`].
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "write" => Some(ProbeOp::Write),
+            "read" => Some(ProbeOp::Read),
+            "stat" => Some(ProbeOp::Stat),
+            "list" => Some(ProbeOp::List),
+            "canon" => Some(ProbeOp::Canonicalize),
+            _ => None,
+        }
+    }
+}
+
+/// One labelled probe: what to attempt, and on which path. The label becomes the
+/// report key `case.<label>` (see [`probe_case_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeCase {
+    pub label: String,
+    pub op: ProbeOp,
+    pub path: PathBuf,
+}
+
+impl ProbeCase {
+    pub fn new(label: impl Into<String>, op: ProbeOp, path: impl Into<PathBuf>) -> Self {
+        Self {
+            label: label.into(),
+            op,
+            path: path.into(),
+        }
+    }
+}
+
+/// The report key under which a case's outcome appears.
+pub fn probe_case_key(label: &str) -> String {
+    format!("case.{label}")
+}
+
+/// The argv, after the executable, that re-enters `ahma.exe` as the probe: the
+/// marker, then one `<op> <label> <path>` triple per case.
+pub fn probe_args(cases: &[ProbeCase]) -> Vec<String> {
+    let mut out = Vec::with_capacity(1 + cases.len() * 3);
+    out.push(PROBE_ARGV0.to_string());
+    for case in cases {
+        out.push(case.op.as_str().to_string());
+        out.push(case.label.clone());
+        out.push(case.path.to_string_lossy().into_owned());
+    }
+    out
+}
+
+/// Decode a process argv (including `argv[0]`) into the probe's cases, or `None`
+/// when this process is not a probe re-entry.
+///
+/// A probe with no cases is valid: it still reports its token. A re-entry that
+/// starts with the marker but does not parse is an `Err`, for the same reason as
+/// in [`parse_launcher_args`]: it must never fall through to the ordinary CLI.
+pub fn parse_probe_args<I>(argv: I) -> Result<Option<Vec<ProbeCase>>, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut it = argv.into_iter();
+    let _exe = it.next();
+    match it.next() {
+        Some(marker) if marker == PROBE_ARGV0 => {}
+        _ => return Ok(None),
+    }
+    let rest: Vec<String> = it.collect();
+    if !rest.len().is_multiple_of(3) {
+        return Err(format!(
+            "{PROBE_ARGV0}: expected `<op> <label> <path>` triples, got {} trailing argument(s)",
+            rest.len() % 3
+        ));
+    }
+    rest.chunks(3)
+        .map(|triple| -> Result<ProbeCase, String> {
+            let op = ProbeOp::parse(&triple[0])
+                .ok_or_else(|| format!("{PROBE_ARGV0}: unknown operation {:?}", triple[0]))?;
+            let label = &triple[1];
+            if label.is_empty() || label.contains('=') || label.contains(char::is_whitespace) {
+                return Err(format!(
+                    "{PROBE_ARGV0}: label {label:?} must be non-empty, without `=` or whitespace"
+                ));
+            }
+            if triple[2].is_empty() {
+                return Err(format!("{PROBE_ARGV0}: empty path for {label:?}"));
+            }
+            Ok(ProbeCase::new(label.clone(), op, triple[2].clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Describe an I/O outcome the way the probe reports it: `ok`, `ok:<detail>`, or
+/// `err:<os error code>:<message>`. The code is the raw `GetLastError` value on
+/// Windows (`5` is `ERROR_ACCESS_DENIED`), so it can be read without guessing
+/// from a localised message.
+pub fn describe_probe_outcome(result: std::io::Result<String>) -> String {
+    match result {
+        Ok(detail) if detail.is_empty() => "ok".to_string(),
+        Ok(detail) => format!("ok:{detail}"),
+        Err(e) => match e.raw_os_error() {
+            Some(code) => format!("err:{code}:{e}"),
+            None => format!("err:-:{e}"),
+        },
+    }
+}
+
+/// Attempt one case against the real file system and describe the outcome.
+pub fn run_probe_case(case: &ProbeCase) -> String {
+    use std::io::Write as _;
+    let result: std::io::Result<String> = match case.op {
+        ProbeOp::Write => std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&case.path)
+            .and_then(|mut f| f.write_all(b"ahma-probe\n"))
+            .map(|()| String::new()),
+        ProbeOp::Read => std::fs::read(&case.path).map(|bytes| format!("{} bytes", bytes.len())),
+        ProbeOp::Stat => std::fs::metadata(&case.path).map(|m| {
+            if m.is_dir() {
+                "dir".to_string()
+            } else {
+                format!("file, {} bytes", m.len())
+            }
+        }),
+        ProbeOp::List => std::fs::read_dir(&case.path).and_then(|entries| {
+            let mut n = 0usize;
+            for entry in entries {
+                entry?;
+                n += 1;
+            }
+            Ok(format!("{n} entries"))
+        }),
+        ProbeOp::Canonicalize => {
+            std::fs::canonicalize(&case.path).map(|p| p.to_string_lossy().into_owned())
+        }
+    };
+    describe_probe_outcome(result)
+}
+
+/// Format one report line. Line breaks in the value are flattened, so one report
+/// is always one line.
+pub fn probe_report_line(key: &str, value: &str) -> String {
+    let value: String = value
+        .chars()
+        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+        .collect();
+    format!("{PROBE_LINE_PREFIX}{key}={value}")
+}
+
+/// Pick the `key=value` reports out of mixed output, in order. Lines without
+/// [`PROBE_LINE_PREFIX`] are ignored, and a repeated key keeps every occurrence
+/// (token groups repeat). Values are trimmed, because `cmd.exe`'s `echo` keeps
+/// the space before a closing parenthesis.
+pub fn parse_probe_report(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix(PROBE_LINE_PREFIX)?;
+            let (key, value) = rest.split_once('=').unwrap_or((rest, ""));
+            Some((key.trim().to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Run the probe: report its own context, the token (Windows only), every case
+/// in order, and finally [`PROBE_DONE_KEY`]. Each report goes to `emit` as soon as
+/// it is known, so a probe that hangs or dies still leaves what it had.
+pub fn probe_report(cases: &[ProbeCase], emit: &mut dyn FnMut(&str, &str)) {
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned());
+    emit("exe", &describe_probe_outcome(exe));
+    let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned());
+    emit("cwd", &describe_probe_outcome(cwd));
+    for var in ["TEMP", "TMP", "LOCALAPPDATA", "USERPROFILE"] {
+        let value = std::env::var(var).unwrap_or_else(|_| "<unset>".to_string());
+        emit(&format!("env.{var}"), &value);
+    }
+    #[cfg(target_os = "windows")]
+    probe_token_report(emit);
+    for case in cases {
+        emit(&probe_case_key(&case.label), &run_probe_case(case));
+    }
+    emit(PROBE_DONE_KEY, "1");
+}
+
+/// Name a mandatory integrity level from the last sub-authority (RID) of its
+/// `S-1-16-*` label SID.
+pub fn integrity_level_name(rid: u32) -> &'static str {
+    match rid {
+        0x0000 => "Untrusted",
+        0x1000 => "Low",
+        0x2000 => "Medium",
+        0x2100 => "Medium Plus",
+        0x3000 => "High",
+        0x4000 => "System",
+        0x5000 => "Protected Process",
+        _ => "unrecognised",
+    }
 }
 
 /// Locate the `ahma` executable that knows how to act as the launcher.
@@ -522,8 +798,10 @@ pub fn check_windows_sandbox_available() -> Result<(), SandboxError> {
 /// Currently `false` on every platform. On Windows it stays `false` until a
 /// `windows-latest` CI run demonstrates the R6.3.3 boundary in both directions —
 /// an in-scope write and read succeeding *and* the out-of-scope pair blocked. A
-/// containment layer that fails **broken** rather than **safe** is worse than none:
-/// the last run denied writes inside the locked scope as well as outside it.
+/// containment layer that fails **broken** rather than **safe** is worse than none,
+/// and no run has yet shown the in-scope write succeeding: the shell used to test
+/// it could not load its own modules inside the container, so whether the
+/// container or the shell was at fault is not known (see the module docs).
 ///
 /// Flipping this to `true` on Windows re-enables the container spawn path and
 /// re-disables `--restrict-network` there, together and by construction.
@@ -671,7 +949,9 @@ pub fn cleanup_windows_sandbox() {
 ///
 /// Returns normally when this process is an ordinary `ahma` invocation. When it is
 /// a launcher re-entry it never returns — it runs the real program inside the
-/// AppContainer and exits with that program's exit code.
+/// AppContainer and exits with that program's exit code. When it is a
+/// [`PROBE_ARGV0`] re-entry it never returns either: it prints the probe report
+/// and exits 0.
 pub fn appcontainer_launcher_hook() {
     #[cfg(target_os = "windows")]
     {
@@ -679,7 +959,19 @@ pub fn appcontainer_launcher_hook() {
         // not valid Unicode, and this is the first statement of `main`. Ahma's own
         // pipeline carries `String` throughout, so the lossy conversion cannot
         // alter anything ahma itself put here.
-        let argv = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
+        let argv: Vec<String> = std::env::args_os()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // The diagnostic probe (SPEC R6.3.3). Like the launcher, once its marker
+        // is seen it never falls through to the CLI.
+        match parse_probe_args(argv.iter().cloned()) {
+            Ok(None) => {}
+            Ok(Some(cases)) => std::process::exit(run_probe(&cases)),
+            Err(message) => {
+                eprintln!("ahma: {message}");
+                std::process::exit(2);
+            }
+        }
         let request = match parse_launcher_args(argv) {
             Ok(None) => return,
             Ok(Some(request)) => request,
@@ -1578,6 +1870,197 @@ fn well_known_sid(
 }
 
 // ---------------------------------------------------------------------------
+// The diagnostic probe, Windows half: running it and reading the token
+// ---------------------------------------------------------------------------
+
+/// Print the probe report to stdout and return the exit code.
+///
+/// A closed stdout ends the probe quietly with exit code 1 rather than a panic:
+/// `println!` panics on a write error (SPEC R5.6.1).
+#[cfg(target_os = "windows")]
+fn run_probe(cases: &[ProbeCase]) -> i32 {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let mut broken = false;
+    probe_report(cases, &mut |key, value| {
+        if !broken {
+            // Flushed per line: a probe that hangs on a later case must still
+            // have shown everything before it.
+            broken = writeln!(stdout, "{}", probe_report_line(key, value))
+                .and_then(|()| stdout.flush())
+                .is_err();
+        }
+    });
+    i32::from(broken)
+}
+
+/// Report the token this process actually runs under: whether it is an
+/// AppContainer token, its integrity level, its AppContainer SID, and every
+/// group and capability SID with its attributes. This replaces `whoami /groups`,
+/// which printed nothing inside the container.
+#[cfg(target_os = "windows")]
+fn probe_token_report(emit: &mut dyn FnMut(&str, &str)) {
+    use windows_sys::Win32::Security::{
+        TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        TokenAppContainerSid, TokenCapabilities, TokenGroups, TokenIntegrityLevel,
+        TokenIsAppContainer,
+    };
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that needs no closing,
+    // and `token` is a valid out-pointer.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == FALSE {
+        emit(
+            "token.error",
+            &format!("OpenProcessToken: {}", std::io::Error::last_os_error()),
+        );
+        return;
+    }
+
+    match token_information(token, TokenIsAppContainer) {
+        Ok(buf) => {
+            // SAFETY: `TokenIsAppContainer` fills a DWORD, and the buffer is at
+            // least 8 bytes and 8-byte aligned.
+            let flag = unsafe { *buf.as_ptr().cast::<u32>() };
+            emit(
+                "token.is_appcontainer",
+                if flag != 0 { "true" } else { "false" },
+            );
+        }
+        Err(e) => emit("token.is_appcontainer", &format!("err:{e}")),
+    }
+
+    match token_information(token, TokenIntegrityLevel) {
+        Ok(buf) => {
+            // SAFETY: `TokenIntegrityLevel` fills a `TOKEN_MANDATORY_LABEL` whose
+            // SID points into the same buffer, which outlives this use.
+            let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid };
+            emit("token.integrity", &describe_integrity(sid));
+        }
+        Err(e) => emit("token.integrity", &format!("err:{e}")),
+    }
+
+    match token_information(token, TokenAppContainerSid) {
+        Ok(buf) => {
+            // SAFETY: as above, for `TOKEN_APPCONTAINER_INFORMATION`. The SID is
+            // null for a token that is not an AppContainer token.
+            let sid = unsafe {
+                (*buf.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>()).TokenAppContainer
+            };
+            emit("token.appcontainer_sid", &sid_string(sid));
+        }
+        Err(e) => emit("token.appcontainer_sid", &format!("err:{e}")),
+    }
+
+    for (class, key) in [
+        (TokenGroups, "token.group"),
+        (TokenCapabilities, "token.capability"),
+    ] {
+        match token_information(token, class) {
+            Ok(buf) => {
+                let groups = buf.as_ptr().cast::<TOKEN_GROUPS>();
+                // SAFETY: both classes fill a `TOKEN_GROUPS` whose variable-length
+                // `Groups` array holds `GroupCount` entries inside this buffer.
+                // The element pointer is derived from the buffer pointer, not
+                // from a reference to the one-element array, so it may range
+                // over all of them.
+                let entries = unsafe {
+                    let count = (*groups).GroupCount as usize;
+                    let first = std::ptr::addr_of!((*groups).Groups).cast::<SID_AND_ATTRIBUTES>();
+                    std::slice::from_raw_parts(first, count)
+                };
+                if entries.is_empty() {
+                    emit(key, "<none>");
+                }
+                for entry in entries {
+                    emit(
+                        key,
+                        &format!("{} attrs=0x{:08x}", sid_string(entry.Sid), entry.Attributes),
+                    );
+                }
+            }
+            Err(e) => emit(key, &format!("err:{e}")),
+        }
+    }
+
+    // SAFETY: `token` was opened above and is closed exactly once.
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+}
+
+/// `GetTokenInformation` with the usual size-then-fill dance. The buffer is
+/// `u64`-backed because the structures it receives hold pointers.
+#[cfg(target_os = "windows")]
+fn token_information(
+    token: HANDLE,
+    class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+) -> std::io::Result<Vec<u64>> {
+    use windows_sys::Win32::Security::GetTokenInformation;
+
+    let mut needed: u32 = 0;
+    // SAFETY: a null buffer of length 0 is the documented way to ask for the
+    // size; the call fails and sets `needed`.
+    unsafe {
+        GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+    let len = (buf.len() * std::mem::size_of::<u64>()) as u32;
+    // SAFETY: `buf` is writable for `len` bytes.
+    let ok =
+        unsafe { GetTokenInformation(token, class, buf.as_mut_ptr().cast(), len, &mut needed) };
+    if ok == FALSE {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(buf)
+}
+
+/// A SID in `S-1-...` form, or a placeholder saying why there is none.
+#[cfg(target_os = "windows")]
+fn sid_string(sid: PSID) -> String {
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    if sid.is_null() {
+        return "<null>".to_string();
+    }
+    // SAFETY: `sid` is non-null and came from Windows; the returned string is
+    // `LocalAlloc`ed, read once, and freed with `LocalFree`.
+    unsafe {
+        let mut string_sid: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid, &mut string_sid) == FALSE {
+            return format!("<unconvertible: {}>", std::io::Error::last_os_error());
+        }
+        let out = from_wide(string_sid);
+        LocalFree(string_sid.cast());
+        out
+    }
+}
+
+/// `Low (S-1-16-4096)` and the like, from a mandatory label SID.
+#[cfg(target_os = "windows")]
+fn describe_integrity(sid: PSID) -> String {
+    use windows_sys::Win32::Security::{GetSidSubAuthority, GetSidSubAuthorityCount};
+
+    if sid.is_null() {
+        return "<null>".to_string();
+    }
+    // SAFETY: `sid` is a valid label SID from `GetTokenInformation`; the count is
+    // checked before the last sub-authority is read.
+    let rid = unsafe {
+        let count = *GetSidSubAuthorityCount(sid);
+        if count == 0 {
+            return sid_string(sid);
+        }
+        *GetSidSubAuthority(sid, u32::from(count - 1))
+    };
+    format!("{} ({})", integrity_level_name(rid), sid_string(sid))
+}
+
+// ---------------------------------------------------------------------------
 // Wide-string helpers
 // ---------------------------------------------------------------------------
 
@@ -1891,5 +2374,148 @@ mod tests {
     #[test]
     fn launcher_hook_is_inert_for_a_normal_invocation() {
         appcontainer_launcher_hook();
+    }
+
+    // -- the diagnostic probe (SPEC R6.3.3) ----------------------------------
+
+    fn sample_probe_cases() -> Vec<ProbeCase> {
+        vec![
+            ProbeCase::new("in_write", ProbeOp::Write, "C:\\ws\\a b\\probe.txt"),
+            ProbeCase::new("nul_write", ProbeOp::Write, "\\\\.\\NUL"),
+            ProbeCase::new("anc0_stat", ProbeOp::Stat, "C:\\"),
+            ProbeCase::new("in_list", ProbeOp::List, "C:\\ws"),
+            ProbeCase::new("in_canon", ProbeOp::Canonicalize, "C:\\ws"),
+            ProbeCase::new("in_read", ProbeOp::Read, "C:\\ws\\seed.txt"),
+        ]
+    }
+
+    /// The probe argv is a wire format between the diagnostic test and an
+    /// `ahma.exe` running inside the container. It must round-trip, and neither
+    /// re-entry may be mistaken for the other.
+    #[test]
+    fn probe_argv_round_trips_and_is_distinct_from_the_launcher() {
+        let cases = sample_probe_cases();
+        let mut argv = vec!["C:\\ahma.exe".to_string()];
+        argv.extend(probe_args(&cases));
+        assert_eq!(parse_probe_args(argv.clone()).unwrap(), Some(cases));
+        assert_eq!(
+            parse_launcher_args(argv).unwrap(),
+            None,
+            "a probe re-entry must not be read as a launcher re-entry"
+        );
+
+        let mut launcher = vec!["C:\\ahma.exe".to_string()];
+        launcher.extend(launcher_args("ahma-sandbox-beef", "cmd", &[]));
+        assert_eq!(parse_probe_args(launcher).unwrap(), None);
+        assert_eq!(
+            parse_probe_args(vec!["ahma".to_string(), "serve".to_string()]).unwrap(),
+            None
+        );
+    }
+
+    /// A probe with no cases still reports its token, so it is a valid request.
+    #[test]
+    fn a_probe_with_no_cases_parses() {
+        let argv = vec!["ahma".to_string(), PROBE_ARGV0.to_string()];
+        assert_eq!(parse_probe_args(argv).unwrap(), Some(Vec::new()));
+    }
+
+    /// Like the launcher, a malformed probe re-entry must be an error and never
+    /// fall through to the ordinary CLI.
+    #[test]
+    fn malformed_probe_reentry_is_an_error() {
+        let bad: [&[&str]; 6] = [
+            // An incomplete triple.
+            &["write", "label"],
+            // An unknown operation.
+            &["delete", "label", "C:\\x"],
+            // An empty label.
+            &["write", "", "C:\\x"],
+            // `=` or whitespace in a label would corrupt the `key=value` report.
+            &["write", "a=b", "C:\\x"],
+            &["write", "a b", "C:\\x"],
+            // An empty path.
+            &["write", "label", ""],
+        ];
+        for tail in bad {
+            let mut argv = vec!["ahma".to_string(), PROBE_ARGV0.to_string()];
+            argv.extend(tail.iter().map(|s| s.to_string()));
+            assert!(
+                parse_probe_args(argv.clone()).is_err(),
+                "must not parse: {argv:?}"
+            );
+        }
+    }
+
+    /// The probe's file-system half runs on every platform, so it is checked
+    /// here against outcomes that are known. Inside the container the outcomes
+    /// are the unknown; the reporting must not be.
+    #[test]
+    fn probe_report_covers_every_case_and_finishes() {
+        let td = tempfile::tempdir().unwrap();
+        let seed = td.path().join("seed.txt");
+        std::fs::write(&seed, b"seed").unwrap();
+        let cases = vec![
+            ProbeCase::new("write", ProbeOp::Write, td.path().join("new.txt")),
+            ProbeCase::new("read", ProbeOp::Read, seed.clone()),
+            ProbeCase::new("missing", ProbeOp::Read, td.path().join("absent.txt")),
+            ProbeCase::new("stat", ProbeOp::Stat, td.path()),
+            ProbeCase::new("list", ProbeOp::List, td.path()),
+            ProbeCase::new("canon", ProbeOp::Canonicalize, td.path()),
+        ];
+        let mut lines = Vec::new();
+        probe_report(&cases, &mut |key, value| {
+            lines.push(probe_report_line(key, value))
+        });
+        let report = parse_probe_report(&lines.join("\n"));
+        let value = |key: &str| {
+            report
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{key} not reported: {report:?}"))
+        };
+
+        assert_eq!(value("case.write"), "ok");
+        assert!(td.path().join("new.txt").is_file());
+        assert_eq!(value("case.read"), "ok:4 bytes");
+        // ENOENT and ERROR_FILE_NOT_FOUND are both 2, so this holds everywhere.
+        let missing = value("case.missing");
+        assert!(missing.starts_with("err:2:"), "{missing}");
+        assert_eq!(value("case.stat"), "ok:dir");
+        assert_eq!(value("case.list"), "ok:2 entries");
+        assert!(value("case.canon").starts_with("ok:"));
+        assert!(value("cwd").starts_with("ok:"));
+        assert_eq!(
+            report.last().map(|(k, _)| k.as_str()),
+            Some(PROBE_DONE_KEY),
+            "the done marker must come last"
+        );
+    }
+
+    #[test]
+    fn probe_report_lines_stay_on_one_line_and_parse_back() {
+        let line = probe_report_line("case.x", "err:5:Access is denied.\r\nmore");
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        let mixed = format!("noise\n{line}\r\n  AHMA-PROBE cmd.in_write=ok \nAHMA-PROBE done=1");
+        assert_eq!(
+            parse_probe_report(&mixed),
+            vec![
+                (
+                    "case.x".to_string(),
+                    "err:5:Access is denied.  more".to_string()
+                ),
+                ("cmd.in_write".to_string(), "ok".to_string()),
+                ("done".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn integrity_levels_are_named() {
+        assert_eq!(integrity_level_name(0x1000), "Low");
+        assert_eq!(integrity_level_name(0x2000), "Medium");
+        assert_eq!(integrity_level_name(0x3000), "High");
+        assert_eq!(integrity_level_name(0x1234), "unrecognised");
     }
 }

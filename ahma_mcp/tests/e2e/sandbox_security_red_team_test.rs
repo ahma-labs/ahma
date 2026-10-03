@@ -774,12 +774,14 @@ async fn red_team_spawned_child_landlock_enforced_from_worker_thread() {
 /// blocking depends entirely on the kernel-level sandbox wrapping the spawned
 /// shell. Linux (Landlock) and macOS (Seatbelt) run and enforce it.
 ///
-/// **Windows status: implemented, executed, disproven.** AppContainer spawn
-/// isolation exists (`sandbox/windows.rs`: per-session container SID, scope DACL
-/// grants, `STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` spawn
-/// through the `ahma.exe` launcher) — and a `windows-latest` run showed the
-/// scoped grant does not take effect: an in-scope write is denied along with an
-/// out-of-scope one. So the path is switched off
+/// **Windows status: implemented, executed, not yet shown to work.** AppContainer
+/// spawn isolation exists (`sandbox/windows.rs`: per-session container SID, scope
+/// DACL grants, `STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
+/// spawn through the `ahma.exe` launcher), and no `windows-latest` run has shown
+/// the in-scope write succeeding. Why is not known: the shell used to test it,
+/// Windows PowerShell 5.1, could not load its own modules inside the container,
+/// so the earlier "an in-scope write is denied" was never established. So the
+/// path is switched off
 /// (`windows::appcontainer_spawn_enabled` is `false`) and Windows currently has
 /// **no** OS-enforced path boundary at all, which is why this escape is not
 /// blocked there.
@@ -790,14 +792,14 @@ async fn red_team_spawned_child_landlock_enforced_from_worker_thread() {
 /// wording implies the mechanism probably works and is merely unverified.
 ///
 /// The `ignore` comes off when a `windows-latest` run shows the boundary holding
-/// in both directions — see `appcontainer_dacl_diagnostics`, which dumps the
-/// evidence needed to find out why it does not.
+/// in both directions — see `appcontainer_dacl_diagnostics`, which measures it
+/// without depending on a shell.
 #[tokio::test]
 #[cfg_attr(
     target_os = "windows",
-    ignore = "AppContainer spawn isolation (SPEC R6.3.3) is implemented but was disproven on \
-              windows-latest CI and is switched off, so Windows has no path boundary to \
-              enforce this; remove once a CI run shows the boundary holding both ways"
+    ignore = "AppContainer spawn isolation (SPEC R6.3.3) is implemented but not yet shown to \
+              work on windows-latest CI and is switched off, so Windows has no path boundary \
+              to enforce this; remove once a CI run shows the boundary holding both ways"
 )]
 async fn red_team_command_write_escape_blocked() {
     init_test_logging();
