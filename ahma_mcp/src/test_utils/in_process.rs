@@ -184,6 +184,22 @@ pub async fn create_in_process_mcp_with_broker<C: ClientHandler>(
     )?;
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();
+    create_in_process_mcp_with_broker_and_sandbox(client, sandbox, hub_tx).await
+}
+
+/// [`create_in_process_mcp_with_broker`] over a sandbox the test built itself:
+/// its mode, its `tmp_access` request, and whether its scope is committed
+/// before the client connects. Nothing is committed here.
+///
+/// A committed scope is what `ahma serve --sandbox-scope` starts with, so the
+/// server asks its startup questions (`--tmp`, SPEC R5.3) from
+/// `notifications/initialized`; an uncommitted one with a client that answers
+/// `roots/list` goes through the roots commit path, as an IDE client does.
+pub async fn create_in_process_mcp_with_broker_and_sandbox<C: ClientHandler>(
+    client: C,
+    sandbox: Sandbox,
+    hub_tx: Option<tokio::sync::mpsc::UnboundedSender<ahma_common::scope_grant::ScopeGrantRequest>>,
+) -> Result<(InProcessMcp<C>, Arc<crate::sandbox::PermissionBroker>)> {
     let sandbox = Arc::new(sandbox);
 
     let broker = Arc::new(crate::sandbox::PermissionBroker::new(

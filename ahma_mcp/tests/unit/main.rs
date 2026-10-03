@@ -74,6 +74,7 @@ mod sequence_integration_coverage_test;
 mod status_polling_anti_pattern_test;
 mod terminal_output_test;
 mod time_serde_test;
+mod tmp_consent_test;
 mod tmp_flag_test;
 mod tool_availability_coverage_test;
 mod tool_availability_integration_test;

@@ -1,9 +1,9 @@
-//! Tests for the --tmp CLI flag and AHMA_TMP_ACCESS environment variable.
+//! Tests for the temp directory as a sandbox scope (`--tmp`).
 //!
 //! These tests verify:
-//! - The --tmp flag adds temp directory to sandbox scopes
-//! - AHMA_TMP_ACCESS=1 environment variable works equivalently
-//! - Temp directory is properly canonicalized cross-platform
+//! - A temp directory in the scope is canonicalized and validates cross-platform
+//! - A commit never re-adds it for `--tmp` (a request a human answers; the
+//!   asking is covered by `tmp_consent_test`)
 //! - Interaction with --disable-temp-files flag
 
 use ahma_mcp::sandbox::{Sandbox, SandboxMode, ScopeCommit};
@@ -191,28 +191,27 @@ fn test_temp_dir_not_duplicated_in_scopes() {
     );
 }
 
-/// Test that update_scopes preserves temp dir when tmp_access=true.
-///
-/// This is the core regression test for the bug where `roots/list_changed`
-/// would replace all scopes, losing the temp directory added by `--tmp`.
+/// `--tmp` is a request, not a grant (SPEC R5.2.5, R5.3): the commit that
+/// replaces the provisional scope with the client's roots does not carry the
+/// temp directory over on the strength of `tmp_access`. It used to — that was
+/// the unprompted downgrade. Under `serve` a human is asked after the commit
+/// and a yes arrives as a live grant (see `tmp_consent_test`).
 #[test]
-fn test_update_scopes_preserves_temp_when_tmp_access() {
+fn test_commit_does_not_carry_temp_on_a_tmp_request() {
     let project1 = tempdir().unwrap();
     let project2 = tempdir().unwrap();
     let temp_dir = std::env::temp_dir();
     let canonical_temp = dunce::canonicalize(&temp_dir).unwrap();
 
-    // Create sandbox with tmp_access=true, initial scopes include temp
+    // A provisional scope that includes temp (as `ahma tool run --tmp` seeds it).
     let scopes = vec![project1.path().to_path_buf(), temp_dir.clone()];
     let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, true).unwrap();
-
-    // Verify temp is in initial scopes
     assert!(
         sandbox.scopes().iter().any(|s| s == &canonical_temp),
         "Initial scopes should contain temp dir"
     );
 
-    // Simulate roots/list_changed: update scopes to a new project (no temp)
+    // roots/list replaces the scope; the commit is the one door.
     assert_eq!(
         sandbox
             .commit_scopes(vec![project2.path().to_path_buf()])
@@ -220,15 +219,13 @@ fn test_update_scopes_preserves_temp_when_tmp_access() {
         ScopeCommit::Applied
     );
 
-    // Temp dir should still be in scopes because tmp_access=true
     let updated_scopes = sandbox.scopes();
     assert!(
-        updated_scopes.iter().any(|s| s == &canonical_temp),
-        "After update_scopes, temp dir should be preserved when tmp_access=true. Scopes: {:?}",
+        !updated_scopes.iter().any(|s| s == &canonical_temp),
+        "the commit must not re-add the temp dir for --tmp. Scopes: {:?}",
         updated_scopes.to_vec()
     );
-
-    // New project should also be there
+    assert!(sandbox.is_tmp_access(), "the request is still recorded");
     let canonical_project2 = dunce::canonicalize(project2.path()).unwrap();
     assert!(
         updated_scopes.iter().any(|s| s == &canonical_project2),

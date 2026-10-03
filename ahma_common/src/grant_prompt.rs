@@ -95,7 +95,11 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
         .and_then(|r| r.workspace.as_deref())
         .map(|w| w.display().to_string());
     let want_write = ctx.write_denied || req.access.is_write();
-    let minimum_access = if ctx.write_denied {
+    // `--tmp` asks for exactly the access the flag means; nothing was refused,
+    // so "minimum that would work" is the request itself.
+    let startup = req.reason == GrantReason::StartupFlag;
+    let saved_tiers = req.reason.offers_saved_tiers();
+    let minimum_access = if ctx.write_denied || (startup && req.access.is_write()) {
         ScopeAccess::Rw
     } else {
         ScopeAccess::Ro
@@ -121,20 +125,29 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
     };
 
     // 2. What was blocked
-    let mut blocked = format!(
-        "{} {} {}",
-        req.tool.as_deref().unwrap_or("a sandboxed command"),
-        if want_write {
-            "tried to write"
-        } else {
-            "tried to read"
-        },
-        ctx.evidence
-            .as_ref()
-            .and_then(|e| e.raw_path.as_deref())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| path.clone())
-    );
+    let mut blocked = if startup {
+        format!(
+            "nothing was blocked: this server was started with --tmp (or [sandbox] tmp_access \
+             = true), which asks for {} access to the system temp directory {}",
+            minimum_access.label(),
+            path
+        )
+    } else {
+        format!(
+            "{} {} {}",
+            req.tool.as_deref().unwrap_or("a sandboxed command"),
+            if want_write {
+                "tried to write"
+            } else {
+                "tried to read"
+            },
+            ctx.evidence
+                .as_ref()
+                .and_then(|e| e.raw_path.as_deref())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| path.clone())
+        )
+    };
     if let Some(cmd) = &ctx.command {
         blocked.push_str(&format!("\ncommand: {cmd}"));
     }
@@ -145,6 +158,14 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
         GrantReason::StderrHeuristic => {
             blocked.push_str("\nread from the command's error output: double-check the path")
         }
+        GrantReason::StartupFlag => blocked.push_str(
+            "\nthe path is exact: this machine's temp directory, shared by every program you \
+             run, and part of no project",
+        ),
+        GrantReason::Unknown => blocked.push_str(
+            "\nsent by a newer ahma for a reason this version does not recognise: double-check \
+             the path",
+        ),
     }
     if let Some(e) = &ctx.evidence
         && let Some(line) = &e.line
@@ -176,7 +197,9 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
         "{} on {}{}",
         minimum_access.label(),
         path,
-        if ctx.write_denied {
+        if startup {
+            " (what --tmp asks for; deny and it stays out of this session's scope)"
+        } else if ctx.write_denied {
             " (a write was refused, so read-only would not fix it)"
         } else {
             " (no write was refused; read-only is enough until one is)"
@@ -184,20 +207,27 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
     );
 
     // 5. What a grant allows
-    let allows = format!(
-        "every command in {} may {} {} — for the next command (once), until this session \
-         ends (session), for 24 hours (lease), or until you revoke it (always). Nothing else \
-         outside the workspace changes.",
-        workspace
-            .clone()
-            .unwrap_or_else(|| "this workspace".to_string()),
-        if minimum_access.is_write() {
-            "read and write"
-        } else {
-            "read"
-        },
-        path
-    );
+    let workspace_label = workspace
+        .clone()
+        .unwrap_or_else(|| "this workspace".to_string());
+    let verb = if minimum_access.is_write() {
+        "read and write"
+    } else {
+        "read"
+    };
+    let allows = if saved_tiers {
+        format!(
+            "every command in {workspace_label} may {verb} {path} — for the next command \
+             (once), until this session ends (session), for 24 hours (lease), or until you \
+             revoke it (always). Nothing else outside the workspace changes."
+        )
+    } else {
+        format!(
+            "every command in {workspace_label} may {verb} {path} — for the next command \
+             (once) or until this session ends (session). It is never saved. Nothing else \
+             outside the workspace changes."
+        )
+    };
 
     // 6. Risk
     let risk = match &ctx.risk {
@@ -214,16 +244,28 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
         None => "not assessed (no live scope to compare against)".to_string(),
     };
 
-    // 7. The exact line `always` writes
-    let always = format!(
-        "~/.ahma/settings.toml gets:\n[[sandbox.persistent_scopes]]\npath = \"{}\"\naccess = \"{}\"\nworkspace = \"{}\"\nRevoke any time with: ahma sandbox revoke {}",
-        path,
-        minimum_access.short(),
-        workspace
-            .clone()
-            .unwrap_or_else(|| "<this workspace>".to_string()),
-        path
-    );
+    // 7. The exact line `always` writes — or, for a session-only question,
+    // that there is none.
+    let always = if saved_tiers {
+        format!(
+            "~/.ahma/settings.toml gets:\n[[sandbox.persistent_scopes]]\npath = \"{}\"\naccess = \"{}\"\nworkspace = \"{}\"\nRevoke any time with: ahma sandbox revoke {}",
+            path,
+            minimum_access.short(),
+            workspace
+                .clone()
+                .unwrap_or_else(|| "<this workspace>".to_string()),
+            path
+        )
+    } else if startup {
+        "not offered: the temp directory is shared by the whole machine, so this answer is \
+         never written to ~/.ahma/settings.toml. To stop being asked, start ahma without --tmp \
+         and remove tmp_access from [sandbox] in ~/.ahma/settings.toml."
+            .to_string()
+    } else {
+        "not offered for a question this version of ahma does not recognise: nothing is \
+         written to ~/.ahma/settings.toml."
+            .to_string()
+    };
 
     let sections = vec![
         PromptSection {
@@ -259,8 +301,27 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
     PromptBody {
         title: format!("Allow {} access to {}?", minimum_access.label(), path),
         sections,
-        options: options(),
+        options: options_for(req.reason),
     }
+}
+
+/// The choices a question raised for `reason` offers, deny first: every
+/// option for a blocked path, and only deny / once / session for a question
+/// whose answer must not be saved ([`GrantReason::offers_saved_tiers`] — the
+/// `--tmp` question). Every surface builds its choices from this, so the form,
+/// the TUI keys and the text body agree; [`crate::scope_grant::GrantCoordinator::resolve`]
+/// holds any answer outside it to the session.
+pub fn options_for(reason: GrantReason) -> Vec<PromptOption> {
+    options()
+        .into_iter()
+        // Deny is always offered (it is the default, R5.3.1); a reason without
+        // saved tiers drops only the grants that would persist.
+        .filter(|o| {
+            reason.offers_saved_tiers()
+                || o.decision.access().is_none()
+                || !o.decision.tier().is_persistent()
+        })
+        .collect()
 }
 
 /// The choices, deny first, narrowest tier first (SPEC R5.3.1: Enter never widens).
@@ -459,5 +520,75 @@ mod tests {
                 .starts_with("deny")
         );
         assert!(!text.contains("[n]") && !text.contains("[Y]"), "{text}");
+    }
+
+    fn tmp_request() -> ScopeGrantRequest {
+        ScopeGrantRequest {
+            decision_id: "d-tmp".into(),
+            path: "/private/var/folders/xy/T".into(),
+            access: ScopeAccess::Rw,
+            reason: GrantReason::StartupFlag,
+            tool: Some("--tmp".into()),
+            context: Default::default(),
+        }
+    }
+
+    /// SPEC R5.3: the `--tmp` question says nothing was blocked, names the
+    /// flag and the literal temp path, and asks for what the flag means.
+    #[test]
+    fn the_tmp_question_says_nothing_was_blocked_and_names_the_path() {
+        let body = render(&tmp_request());
+        let text = body.to_message();
+        assert!(text.contains("nothing was blocked"), "{text}");
+        assert!(text.contains("--tmp"), "{text}");
+        assert!(text.contains("/private/var/folders/xy/T"), "{text}");
+        assert!(
+            !text.contains("tried to write"),
+            "nothing tried anything: {text}"
+        );
+        assert!(
+            body.title.contains(ScopeAccess::Rw.label()),
+            "--tmp asks for read-write: {}",
+            body.title
+        );
+        assert!(
+            !text.contains("[[sandbox.persistent_scopes]]"),
+            "no settings line is ever written for it: {text}"
+        );
+        assert_eq!(
+            body.sections.len(),
+            7,
+            "the same seven sections (R-PERM.3.4)"
+        );
+    }
+
+    /// The machine-wide temp directory is offered for the session at most:
+    /// deny, once, session — never always, never 24 hours.
+    #[test]
+    fn the_tmp_question_offers_only_deny_once_and_session() {
+        let offered = options_for(GrantReason::StartupFlag);
+        assert_eq!(offered[0].decision, GrantDecision::Deny, "deny first");
+        assert!(
+            offered
+                .iter()
+                .filter(|o| o.decision.access().is_some())
+                .all(|o| !o.decision.tier().is_persistent()),
+            "{offered:#?}"
+        );
+        let values: Vec<&str> = offered.iter().map(|o| o.value).collect();
+        assert_eq!(
+            values,
+            [
+                "deny",
+                "read-only-once",
+                "read-write-once",
+                "read-only-session",
+                "read-write-session"
+            ]
+        );
+        assert_eq!(render(&tmp_request()).options, offered);
+        assert_eq!(options_for(GrantReason::Unknown), offered);
+        assert_eq!(options_for(GrantReason::PreExecViolation), options());
+        assert_eq!(options_for(GrantReason::StderrHeuristic), options());
     }
 }

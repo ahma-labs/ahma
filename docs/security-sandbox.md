@@ -329,14 +329,19 @@ in-scope without any grant.
 
 ## Temp Directory Access (`--tmp`)
 
-By default, the system temp directory is accessible only via platform-implicit rules. Use `--tmp` (or `[sandbox] tmp_access = true`) to add it as an explicit read/write scope — useful for compilers and build tools.
+By default, the system temp directory is accessible only via platform-implicit rules. `--tmp` (or `[sandbox] tmp_access = true`) asks for it as an explicit read/write scope — useful for compilers and build tools that take a temp path as a working directory or argument.
+
+Under `ahma serve` that is a **request, not a grant** (SPEC R5.2.5, R5.3). The temp directory is shared by every program on the machine, and an MCP config file is client-owned, so a `--tmp` in it is nobody's consent. Once the workspace scope is committed — after `notifications/sandbox/configured`, never delaying it — ahma asks you once, through the same question ladder as every grant: your client's own prompt if it supports elicitation, else an attached `ahma tui`, else nobody. The question names the literal canonical temp path, says nothing was blocked, and offers **deny, next command only, or this session only** — never "always" or 24 hours. A yes adds the directory to this session's live scope; a deny, a dismissed prompt, or nobody to ask leaves it out (fail closed). A dismissed prompt (`cancel`) is not recorded as a denial. `ahma tool run --tmp` and terminal hooks keep the old behaviour: you typed the flag (or set it in your own settings), so it is the answer.
 
 | Flag combination | Behavior |
 |-----------------|----------|
 | (default) | Temp access via platform rules |
-| `--tmp` | Temp dir added as explicit scope |
+| `ahma serve … --tmp` | Asked once per session; temp dir in scope only after a yes |
+| `ahma tool run --tmp …` | Temp dir added as explicit scope |
 | `--disable-temp-files` | Temp access blocked entirely |
 | `--tmp --disable-temp-files` | `--disable-temp-files` wins (blocked) |
+
+The scope summary shows where it stands: `tmp  : requested, awaiting consent`, `tmp  : granted (session)` or `tmp  : off` in text, and `tmp` (in scope), `tmp_requested` and `tmp_in_scope` in the `notifications/sandbox/configured` payload. With a workspace that itself lives inside the temp directory, the grant would widen the scope above the workspace, so it is refused and not asked.
 
 **Security considerations**: `/tmp` is shared by all users and processes. Use `mktemp` with random suffixes to avoid TOCTOU attacks. Clean up sensitive temp files after use.
 

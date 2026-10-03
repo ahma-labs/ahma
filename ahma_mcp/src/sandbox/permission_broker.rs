@@ -490,6 +490,17 @@ pub(crate) fn lease_end(tier: GrantTier) -> Option<u64> {
 /// The paste-able remediation shown at rung 2 and rung 3 — the same string in
 /// both, so the user learns one command rather than two.
 fn cli_hint(req: &ScopeGrantRequest) -> String {
+    // The `--tmp` question is session-only: pointing at `ahma sandbox grant`
+    // would turn a refused per-launch request into a permanent, machine-wide
+    // grant nobody asked for.
+    if req.reason == GrantReason::StartupFlag {
+        return format!(
+            "open the ahma TUI (`ahma tui`) before the session starts, or use a client that \
+             supports elicitation, to be asked about {}; until then it stays out of this \
+             session's scope.",
+            req.path.display()
+        );
+    }
     let ro = if req.access.is_write() {
         ""
     } else {
@@ -568,12 +579,15 @@ impl PeerElicitationSurface {
 /// tier labelled in words (SPEC R-PERM.3.4). Built by hand rather than derived
 /// from a type so the client gets `oneOf` const/title pairs — buttons with
 /// readable labels — instead of a free-text box.
-fn grant_form_schema() -> rmcp::model::ElicitationSchema {
+///
+/// Only the choices `reason` offers: the `--tmp` question has no `always` or
+/// 24-hour answer (`GrantReason::offers_saved_tiers`).
+fn grant_form_schema(reason: GrantReason) -> rmcp::model::ElicitationSchema {
     use rmcp::model::{
         ConstTitle, ElicitationSchema, EnumSchema, PrimitiveSchemaDefinition,
         SingleSelectEnumSchema, TitledSingleSelectEnumSchema,
     };
-    let one_of: Vec<ConstTitle> = ahma_common::grant_prompt::options()
+    let one_of: Vec<ConstTitle> = ahma_common::grant_prompt::options_for(reason)
         .into_iter()
         .map(|o| ConstTitle::new(o.value, o.label))
         .collect();
@@ -625,7 +639,7 @@ impl ElicitationSurface for PeerElicitationSurface {
         let request = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
             meta: None,
             message,
-            requested_schema: grant_form_schema(),
+            requested_schema: grant_form_schema(req.reason),
         });
         let sent = tokio::time::timeout(
             timeout,
@@ -997,6 +1011,29 @@ mod tests {
             h.asks(),
             1,
             "ask-once (R-PERM.4): a denied path never re-prompts"
+        );
+    }
+
+    /// The `--tmp` form offers deny, once and session only: the temp directory
+    /// is shared machine-wide, so no answer to it is ever saved (SPEC R5.2.5).
+    #[test]
+    fn the_tmp_form_offers_no_saved_answer() {
+        let tmp = serde_json::to_string(&grant_form_schema(GrantReason::StartupFlag)).unwrap();
+        for saved in [
+            "\"read-write\"",
+            "\"read-only\"",
+            "\"read-write-24h\"",
+            "\"read-only-24h\"",
+        ] {
+            assert!(!tmp.contains(saved), "{saved} must not be offered: {tmp}");
+        }
+        assert!(tmp.contains("\"read-write-session\""), "{tmp}");
+        assert!(tmp.contains("\"deny\""), "{tmp}");
+        let full =
+            serde_json::to_string(&grant_form_schema(GrantReason::PreExecViolation)).unwrap();
+        assert!(
+            full.contains("\"read-write\""),
+            "violations keep every tier: {full}"
         );
     }
 

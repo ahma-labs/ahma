@@ -103,7 +103,7 @@ Run `ahma settings init` to generate this file automatically.
 
 # ── Sandbox & filesystem security ────────────────────────────────────────────
 # [sandbox]
-# tmp_access   = false    # add system temp dir to sandbox scope
+# tmp_access   = false    # ask for the system temp dir in scope (serve: you are asked once per session)
 # allow_gpu    = false    # macOS: let sandboxed commands open the GPU (Metal); a capability, not a path (R6.2.7)
 # [permissions]
 # advisor              = true   # TUI: the selected model recommends an answer beside a grant prompt (R-PERM.8)

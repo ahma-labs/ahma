@@ -21,9 +21,9 @@ use std::time::Duration;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, ElicitRequestParams, ElicitResult, ElicitationAction,
-    ElicitationCapability, FormElicitationCapability, Implementation, ListRootsResult,
-    ProgressNotificationParam, ProgressToken, ProtocolVersion, Root,
+    ClientCapabilities, ClientInfo, CustomNotification, ElicitRequestParams, ElicitResult,
+    ElicitationAction, ElicitationCapability, FormElicitationCapability, Implementation,
+    ListRootsResult, ProgressNotificationParam, ProgressToken, ProtocolVersion, Root,
 };
 use rmcp::service::{MaybeSendFuture, NotificationContext, RequestContext, RoleClient};
 
@@ -119,6 +119,21 @@ pub struct RecordingClient {
     client_name: String,
     roots: Vec<Root>,
     elicitation: Option<ElicitationLog>,
+    notifications: NotificationLog,
+}
+
+/// The methods of the custom notifications (`notifications/sandbox/configured`,
+/// …) a [`RecordingClient`] received, in arrival order. Cloneable.
+#[derive(Clone, Debug, Default)]
+pub struct NotificationLog {
+    methods: Arc<Mutex<Vec<String>>>,
+}
+
+impl NotificationLog {
+    /// Every custom notification method received so far, in order.
+    pub fn methods(&self) -> Vec<String> {
+        self.methods.lock().clone()
+    }
 }
 
 /// What a [`RecordingClient`] was asked through `elicitation/create`, and how it
@@ -129,6 +144,9 @@ pub struct ElicitationLog {
     /// The form value the client sends back (`"deny"`, `"read-write-session"`,
     /// …), or `None` to decline outright.
     answer: Option<String>,
+    /// Answer with the MCP `cancel` action instead — what a client sends when
+    /// it gives up on its own, with no human choice (SPEC R5.3.1).
+    cancel: bool,
 }
 
 impl ElicitationLog {
@@ -150,6 +168,7 @@ impl RecordingClient {
             client_name: client_name.into(),
             roots: Vec::new(),
             elicitation: None,
+            notifications: NotificationLog::default(),
         }
     }
 
@@ -161,8 +180,28 @@ impl RecordingClient {
         self.elicitation = Some(ElicitationLog {
             messages: Arc::new(Mutex::new(Vec::new())),
             answer: answer.map(str::to_string),
+            cancel: false,
         });
         self
+    }
+
+    /// Advertise form elicitation and answer every `elicitation/create` with
+    /// the MCP `cancel` action: dismissed with no choice made, as a client does
+    /// on its own deadline. Not a decline — the server must not read it as one
+    /// (SPEC R5.3.1). Messages are recorded as with [`Self::with_elicitation`].
+    pub fn with_elicitation_cancel(mut self) -> Self {
+        self.elicitation = Some(ElicitationLog {
+            messages: Arc::new(Mutex::new(Vec::new())),
+            answer: None,
+            cancel: true,
+        });
+        self
+    }
+
+    /// A handle to the custom notifications this client receives
+    /// (`notifications/sandbox/configured` above all).
+    pub fn notifications(&self) -> NotificationLog {
+        self.notifications.clone()
     }
 
     /// A handle to the elicitation prompts this client was shown, if
@@ -234,14 +273,27 @@ impl ClientHandler for RecordingClient {
                 if let ElicitRequestParams::FormElicitationParams { message, .. } = &request {
                     log.messages.lock().push(message.clone());
                 }
-                match &log.answer {
-                    Some(value) => ElicitResult::new(ElicitationAction::Accept)
-                        .with_content(serde_json::json!({ "decision": value })),
-                    None => ElicitResult::new(ElicitationAction::Decline),
+                if log.cancel {
+                    ElicitResult::new(ElicitationAction::Cancel)
+                } else {
+                    match &log.answer {
+                        Some(value) => ElicitResult::new(ElicitationAction::Accept)
+                            .with_content(serde_json::json!({ "decision": value })),
+                        None => ElicitResult::new(ElicitationAction::Decline),
+                    }
                 }
             }
         };
         std::future::ready(Ok(result))
+    }
+
+    fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
+        self.notifications.methods.lock().push(notification.method);
+        std::future::ready(())
     }
 }
 

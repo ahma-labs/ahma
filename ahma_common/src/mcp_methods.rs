@@ -284,9 +284,29 @@ pub struct SandboxScopeSummary {
     /// Read-only directories granted beyond the write roots (display form).
     #[serde(default, deserialize_with = "lenient_display_paths")]
     pub read: Vec<String>,
-    /// Whether the system temp directory was added via `--tmp`.
+    /// Whether the system temp directory is in the scope. Unchanged meaning
+    /// for readers that predate [`tmp_requested`](Self::tmp_requested): under
+    /// `serve`, `--tmp` is a request a human answers (SPEC R5.2.5, R5.3), so
+    /// this is `true` only once it was granted.
     #[serde(default, deserialize_with = "lenient")]
     pub tmp: bool,
+    /// Whether `--tmp` / `[sandbox] tmp_access` asked for the temp directory.
+    /// Add-only (R24.5); absent from older producers.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tmp_requested: Option<bool>,
+    /// Whether the temp directory is in the scope — the same fact as
+    /// [`tmp`](Self::tmp), under a name that cannot be read as "requested".
+    /// Add-only (R24.5).
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tmp_in_scope: Option<bool>,
     /// Provenance of the scope (`explicit` | `roots/list` | `elicited` |
     /// `container` | `pending`; SPEC R5.4).
     #[serde(default, deserialize_with = "lenient")]
@@ -494,6 +514,8 @@ mod tests {
                 write: vec!["/a".into(), "/b".into()],
                 read: vec!["/r".into()],
                 tmp: true,
+                tmp_requested: Some(true),
+                tmp_in_scope: Some(true),
                 source: "roots/list".into(),
                 reads_unrestricted: Some(true),
                 writes_unrestricted: None,

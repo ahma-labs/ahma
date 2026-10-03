@@ -177,8 +177,13 @@ pub struct ScopeView<'a> {
     pub write_scopes: &'a [PathBuf],
     /// Read-only directories granted beyond the write roots (e.g. livelog).
     pub read_scopes: &'a [PathBuf],
-    /// Whether the system temp directory was added via `--tmp`.
+    /// Whether the system temp directory is in the scope (granted, or seeded
+    /// by `ahma tool run --tmp`). Serialized as `tmp` and `tmp_in_scope`.
     pub tmp_access: bool,
+    /// Whether `--tmp` / `[sandbox] tmp_access` asked for it. Under `serve`
+    /// that is a request a human answers (SPEC R5.2.5, R5.3), so it can be
+    /// `true` while [`Self::tmp_access`] is still `false`.
+    pub tmp_requested: bool,
     /// Whether kernel enforcement is active (`false` == `--no-sandbox`).
     pub enforced: bool,
     /// Provenance of the scope.
@@ -224,10 +229,13 @@ impl ScopeView<'_> {
             }
         }
 
-        out.push_str(if self.tmp_access {
-            "  tmp  : ON\n"
-        } else {
-            "  tmp  : OFF\n"
+        out.push_str(match (self.tmp_requested, self.tmp_access) {
+            (true, true) => "  tmp  : granted (session)\n",
+            (true, false) => "  tmp  : requested, awaiting consent\n",
+            // In scope without --tmp: a grant on the temp dir, or a scope
+            // that already contains it.
+            (false, true) => "  tmp  : in scope\n",
+            (false, false) => "  tmp  : off\n",
         });
         out.push_str("  source: ");
         out.push_str(self.source.as_str());
@@ -253,7 +261,11 @@ impl ScopeView<'_> {
             "enforced": self.enforced,
             "write": display_paths(self.write_scopes),
             "read": display_paths(self.read_scopes),
+            // `tmp` keeps its meaning for every existing reader: in scope.
+            // The two keys after it are add-only (R24.5).
             "tmp": self.tmp_access,
+            "tmp_requested": self.tmp_requested,
+            "tmp_in_scope": self.tmp_access,
             "source": self.source.as_str(),
         });
         // Machine-readable surfaces get the disclosure too — a TUI or IDE
@@ -318,6 +330,7 @@ mod tests {
             write_scopes: &writes,
             read_scopes: &reads,
             tmp_access: false,
+            tmp_requested: false,
             enforced: true,
             source: ScopeSource::RootsList,
         };
@@ -340,6 +353,7 @@ mod tests {
             write_scopes: &writes,
             read_scopes: &reads,
             tmp_access: true,
+            tmp_requested: true,
             enforced: true,
             source: ScopeSource::Container,
         };
@@ -348,15 +362,43 @@ mod tests {
             text.contains("ENFORCED"),
             "should show enforcement state:\n{text}"
         );
-        // tmp is ON in this view
+        // --tmp was asked for and granted in this view
         assert!(
-            text.to_lowercase().contains("tmp") && text.to_uppercase().contains("ON"),
-            "should show tmp ON:\n{text}"
+            text.contains("tmp  : granted (session)"),
+            "should show the granted temp dir:\n{text}"
         );
         assert!(
             text.contains("container"),
             "should show source attribution:\n{text}"
         );
+    }
+
+    /// SPEC R5.4 / R5.3: a `--tmp` that was asked for but not (yet) granted
+    /// must not read as on — nor as never asked for.
+    #[test]
+    fn render_text_tells_a_tmp_request_from_a_tmp_grant() {
+        let writes = vec![p("/ws")];
+        let reads: Vec<PathBuf> = vec![];
+        let line = |tmp_requested: bool, tmp_access: bool| {
+            let text = ScopeView {
+                write_scopes: &writes,
+                read_scopes: &reads,
+                tmp_access,
+                tmp_requested,
+                enforced: true,
+                source: ScopeSource::Explicit,
+            }
+            .render_text();
+            text.lines()
+                .find(|l| l.trim_start().starts_with("tmp"))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(line(true, false), "tmp  : requested, awaiting consent");
+        assert_eq!(line(true, true), "tmp  : granted (session)");
+        assert_eq!(line(false, false), "tmp  : off");
+        assert_eq!(line(false, true), "tmp  : in scope");
     }
 
     #[test]
@@ -367,6 +409,7 @@ mod tests {
             write_scopes: &writes,
             read_scopes: &reads,
             tmp_access: false,
+            tmp_requested: false,
             enforced: false,
             source: ScopeSource::Explicit,
         };
@@ -384,13 +427,17 @@ mod tests {
         let view = ScopeView {
             write_scopes: &writes,
             read_scopes: &reads,
-            tmp_access: true,
+            tmp_access: false,
+            tmp_requested: true,
             enforced: true,
             source: ScopeSource::Elicited,
         };
         let json = view.to_json();
         assert_eq!(json["enforced"], serde_json::json!(true));
-        assert_eq!(json["tmp"], serde_json::json!(true));
+        // `tmp` keeps its meaning (in scope); the request is its own key.
+        assert_eq!(json["tmp"], serde_json::json!(false));
+        assert_eq!(json["tmp_requested"], serde_json::json!(true));
+        assert_eq!(json["tmp_in_scope"], serde_json::json!(false));
         assert_eq!(json["source"], serde_json::json!("elicited"));
         assert_eq!(json["write"], serde_json::json!(["/a", "/b"]));
         assert_eq!(json["read"], serde_json::json!(["/r"]));
@@ -479,6 +526,7 @@ mod tests {
             write_scopes: &writes,
             read_scopes: &reads,
             tmp_access: false,
+            tmp_requested: false,
             enforced: true,
             source: ScopeSource::RootsList,
         };
