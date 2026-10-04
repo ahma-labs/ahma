@@ -58,8 +58,12 @@ pub fn agent_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// The longest socket path a Unix socket address holds (macOS `sun_path`).
+/// The longest socket path a Unix socket address holds: 103 chars on macOS (104-byte `sun_path`),
+/// 107 chars on Linux (108-byte `sun_path`).
+#[cfg(target_os = "macos")]
 const SUN_PATH_MAX: usize = 103;
+#[cfg(not(target_os = "macos"))]
+const SUN_PATH_MAX: usize = 107;
 
 /// One command's broker, served on its own socket for as long as this lives.
 pub struct BrokerLease {
@@ -79,7 +83,7 @@ impl std::fmt::Debug for BrokerLease {
 impl BrokerLease {
     /// Serve `broker` on a new socket in `dir`.
     pub fn start(broker: Arc<Broker>, dir: &Path) -> std::io::Result<Self> {
-        let name: String = (0..16)
+        let name: String = (0..8)
             .map(|_| format!("{:x}", rand::random::<u8>() & 0xf))
             .collect();
         let socket = dir.join(format!("{name}.sock"));

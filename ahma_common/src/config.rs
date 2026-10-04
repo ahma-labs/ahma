@@ -643,7 +643,7 @@ fn test_run_home() -> PathBuf {
         .unwrap_or_else(|| {
             dirs::cache_dir()
                 .unwrap_or_else(std::env::temp_dir)
-                .join("ahma-test-homes")
+                .join("th")
         });
     static PRUNED: std::sync::Once = std::sync::Once::new();
     PRUNED.call_once(|| {
@@ -658,7 +658,7 @@ fn test_run_home() -> PathBuf {
 /// in the developer's cache directory. Best effort: a run still going (or one
 /// we cannot inspect) is left alone.
 #[cfg(debug_assertions)]
-/// `<target>/tmp/ahma-test-homes` for an executable built by cargo: a test
+/// `<target>/tmp/th` for an executable built by cargo: a test
 /// binary in `<target>/<profile>/deps/` or a binary in `<target>/<profile>/`.
 /// `<target>/tmp` is cargo's own `CARGO_TARGET_TMPDIR`, so a test binary and
 /// every `ahma` it spawns resolve the same directory.
@@ -671,10 +671,10 @@ fn test_homes_dir_for_exe(exe: &Path) -> Option<PathBuf> {
         dir
     };
     let target = profile.parent()?;
-    Some(target.join("tmp").join("ahma-test-homes"))
+    Some(target.join("tmp").join("th"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 mod test_home_location_tests {
     use super::*;
 
@@ -686,20 +686,21 @@ mod test_home_location_tests {
         let target = Path::new("/w/target");
         assert_eq!(
             test_homes_dir_for_exe(&target.join("debug/deps/unit-0123abcd")),
-            Some(target.join("tmp").join("ahma-test-homes"))
+            Some(target.join("tmp").join("th"))
         );
         assert_eq!(
             test_homes_dir_for_exe(&target.join("debug/ahma")),
-            Some(target.join("tmp").join("ahma-test-homes"))
+            Some(target.join("tmp").join("th"))
         );
         assert_eq!(
             test_homes_dir_for_exe(&target.join("release/deps/e2e-99")),
-            Some(target.join("tmp").join("ahma-test-homes"))
+            Some(target.join("tmp").join("th"))
         );
         assert_eq!(test_homes_dir_for_exe(Path::new("ahma")), None);
     }
 }
 
+#[cfg(debug_assertions)]
 fn prune_stale_test_homes(parent: &Path, max_age: std::time::Duration) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
@@ -3196,6 +3197,7 @@ mod tests {
     /// Under the test harness, a test that did not choose a home never gets
     /// the developer's real one (see `test_run_home`).
     #[test]
+    #[cfg(debug_assertions)]
     fn a_test_without_a_chosen_home_never_touches_the_real_one() {
         // SAFETY: nextest runs this test in its own process.
         unsafe {
@@ -3204,16 +3206,13 @@ mod tests {
         }
         let home = ahma_home_dir().unwrap();
         assert_ne!(Some(home.clone()), dirs::home_dir());
-        assert!(
-            home.to_string_lossy().contains("ahma-test-homes"),
-            "{}",
-            home.display()
-        );
+        assert!(home.to_string_lossy().contains("th"), "{}", home.display());
     }
 
     /// `update` works on the file as it is now, so a grant written by someone
     /// else after we last looked survives our write.
     #[test]
+    #[cfg(debug_assertions)]
     fn stale_test_homes_are_pruned_and_fresh_ones_kept() {
         let tmp = tempfile::tempdir().unwrap();
         let run = tmp.path().join("abcd1234");
