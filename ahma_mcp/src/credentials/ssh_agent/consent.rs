@@ -253,6 +253,22 @@ pub fn discover_upstream() -> Option<PathBuf> {
     None
 }
 
+/// Adopt `candidate` as this process's upstream agent (SPEC R-CRED.11): the
+/// one socket brokers forward to *and* the one the sandbox profile refuses a
+/// direct connect to, recorded once so the two can never name different
+/// agents. Only a live socket is adopted; one whose path a profile cannot hold
+/// safely is refused with a warning, and brokers then sign only with key files.
+pub fn adopt_upstream(candidate: Option<PathBuf>) -> Option<PathBuf> {
+    let socket = candidate.filter(|p| is_socket(p));
+    match crate::sandbox::set_upstream_agent(socket.as_deref()) {
+        Ok(()) => socket,
+        Err(why) => {
+            tracing::warn!("{why}");
+            None
+        }
+    }
+}
+
 fn is_socket(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     std::fs::metadata(path).is_ok_and(|m| m.file_type().is_socket())
@@ -286,6 +302,31 @@ impl BrokerFactory for RecordedBrokers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R-CRED.11: the upstream a broker forwards to is the one the
+    /// sandbox denies — adopted once, read back by both. A path that is not a
+    /// live socket, or that a profile cannot hold, is never adopted.
+    #[test]
+    fn the_adopted_upstream_is_the_one_the_sandbox_denies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("a.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        assert_eq!(adopt_upstream(Some(sock.clone())), Some(sock.clone()));
+        assert_eq!(crate::sandbox::upstream_agent(), Some(sock.clone()));
+
+        assert_eq!(adopt_upstream(Some(tmp.path().join("absent.sock"))), None);
+        assert_eq!(crate::sandbox::upstream_agent(), None, "not a socket");
+
+        let bad_dir = tmp.path().join("q\"");
+        std::fs::create_dir(&bad_dir).unwrap();
+        let bad = bad_dir.join("a.sock");
+        let _bad_listener = std::os::unix::net::UnixListener::bind(&bad).unwrap();
+        assert_eq!(adopt_upstream(Some(bad)), None, "a quote cannot be adopted");
+        assert_eq!(crate::sandbox::upstream_agent(), None);
+
+        assert_eq!(adopt_upstream(None), None);
+    }
 
     fn request(destination: Destination) -> SignRequest {
         SignRequest {

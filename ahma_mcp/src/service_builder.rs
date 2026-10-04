@@ -213,14 +213,18 @@ impl<'a> ServiceBuilder<'a> {
         );
         // Every command signs with SSH keys through a broker (SPEC R-CRED.1),
         // whose thread starts now, before the scope is committed and the
-        // process restricts itself (R-CRED.9).
+        // process restricts itself (R-CRED.9). It forwards to the upstream
+        // adopted at startup — the socket the profile refuses a command a
+        // direct connect to (R-CRED.11) — and is served only in `"broker"` mode.
         #[cfg(unix)]
-        let adapter = match ahma_common::config::ahma_home_dir() {
+        let adapter = match ahma_common::config::ahma_home_dir()
+            .filter(|_| crate::sandbox::ssh_agent_mode() == crate::sandbox::SshAgentMode::Broker)
+        {
             Some(home) => {
                 crate::credentials::ssh_agent::host::start();
                 let factory = crate::credentials::ssh_agent::consent::RecordedBrokers::new(
                     home,
-                    crate::credentials::ssh_agent::consent::discover_upstream(),
+                    crate::sandbox::upstream_agent(),
                     config.settings_origin.user_settings_file(),
                     None,
                     sandbox.scopes().to_vec(),

@@ -68,6 +68,7 @@ pub fn pty_available() -> bool {
 /// Returns how it ended so the caller can close the audit log's `tool_call` with
 /// exactly one matching `tool_complete`.
 #[cfg_attr(windows, allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_pty_operation(
     sandbox: &Sandbox,
     command_str: &str,
@@ -76,9 +77,11 @@ pub(super) async fn run_pty_operation(
     cancellation_token: &tokio_util::sync::CancellationToken,
     op_id: &str,
     monitor: &Arc<OperationMonitor>,
+    ssh_auth_sock: Option<&Path>,
 ) -> (crate::adapter::audit::Outcome, Option<i32>) {
     #[cfg(windows)]
     {
+        let _ = ssh_auth_sock;
         monitor
             .update_status(
                 op_id,
@@ -102,6 +105,7 @@ pub(super) async fn run_pty_operation(
         cancellation_token,
         op_id,
         monitor,
+        ssh_auth_sock,
     )
     .await
 }
@@ -149,7 +153,12 @@ mod unix {
 
     /// Open a PTY, spawn the sandbox-wrapped shell command attached to it,
     /// and start blocking reader/waiter threads.
-    fn setup_pty(sandbox: &Sandbox, command_str: &str, working_dir: &Path) -> Result<PtyParts> {
+    fn setup_pty(
+        sandbox: &Sandbox,
+        command_str: &str,
+        working_dir: &Path,
+        ssh_auth_sock: Option<&Path>,
+    ) -> Result<PtyParts> {
         use anyhow::Context;
 
         let wrapped = sandbox
@@ -191,6 +200,11 @@ mod unix {
                     cmd.env_remove(key);
                 }
             }
+        }
+        // Its own SSH key broker (SPEC R-CRED.1): the profile refuses it the
+        // human's agent (R-CRED.11), so this is the only agent it has.
+        if let Some(sock) = ssh_auth_sock {
+            cmd.env("SSH_AUTH_SOCK", sock);
         }
         cmd.stdin(std::process::Stdio::from(slave_fd.try_clone()?));
         cmd.stdout(std::process::Stdio::from(slave_fd.try_clone()?));
@@ -279,6 +293,7 @@ mod unix {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run(
         sandbox: &Sandbox,
         command_str: &str,
@@ -287,25 +302,26 @@ mod unix {
         cancellation_token: &tokio_util::sync::CancellationToken,
         op_id: &str,
         monitor: &Arc<OperationMonitor>,
+        ssh_auth_sock: Option<&Path>,
     ) -> (crate::adapter::audit::Outcome, Option<i32>) {
         use crate::adapter::audit::Outcome;
 
         let start_time = Instant::now();
 
-        let (killer, mut line_rx, mut exit_rx) = match setup_pty(sandbox, command_str, working_dir)
-        {
-            Ok(parts) => parts,
-            Err(e) => {
-                monitor
-                    .update_status(
-                        op_id,
-                        OperationStatus::Failed,
-                        Some(Value::String(format!("Failed to start PTY command: {e}"))),
-                    )
-                    .await;
-                return (Outcome::Failed, None);
-            }
-        };
+        let (killer, mut line_rx, mut exit_rx) =
+            match setup_pty(sandbox, command_str, working_dir, ssh_auth_sock) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    monitor
+                        .update_status(
+                            op_id,
+                            OperationStatus::Failed,
+                            Some(Value::String(format!("Failed to start PTY command: {e}"))),
+                        )
+                        .await;
+                    return (Outcome::Failed, None);
+                }
+            };
 
         let mut spill_writer = spill::SpillWriter::create(op_id).await;
         let mut collected = crate::adapter::BoundedLineCollector::default();
@@ -486,6 +502,7 @@ mod tests {
             &token,
             op_id,
             &monitor,
+            None,
         )
         .await;
 
@@ -505,6 +522,56 @@ mod tests {
         );
         assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(0));
         assert_eq!(result.get("pty").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    /// SPEC R-CRED.1, R-CRED.11: a PTY command signs through its own broker
+    /// like any other. The profile refuses it the human's agent, so without
+    /// the broker's socket in `SSH_AUTH_SOCK` it would have no agent at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_pty_points_ssh_at_the_broker_socket_it_is_given() {
+        if !pty_available() {
+            eprintln!("skipping: PTY allocation denied in this environment");
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let sandbox = test_sandbox(temp.path());
+        let monitor = test_monitor();
+        let op_id = "pty-broker-op";
+        monitor
+            .add_operation(Operation::new(
+                op_id.to_string(),
+                "pty_test".to_string(),
+                "echo".to_string(),
+                None,
+            ))
+            .await;
+        let broker = temp.path().join("broker.sock");
+
+        run_pty_operation(
+            &sandbox,
+            "echo \"sock=$SSH_AUTH_SOCK\"",
+            temp.path(),
+            10_000,
+            &CancellationToken::new(),
+            op_id,
+            &monitor,
+            Some(&broker),
+        )
+        .await;
+
+        let op = monitor
+            .check_completion_history_pub(op_id)
+            .await
+            .expect("operation should be in completion history");
+        let stdout = op
+            .result
+            .and_then(|r| r.get("stdout").and_then(|v| v.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        assert!(
+            stdout.contains(&format!("sock={}", broker.display())),
+            "the PTY command's SSH_AUTH_SOCK is the broker's: {stdout:?}"
+        );
     }
 
     /// A command that exits non-zero must end in `Failed` with the non-zero
@@ -540,6 +607,7 @@ mod tests {
             &token,
             op_id,
             &monitor,
+            None,
         )
         .await;
 
@@ -585,6 +653,7 @@ mod tests {
             &token,
             op_id,
             &monitor,
+            None,
         )
         .await;
 
@@ -627,6 +696,7 @@ mod tests {
             &token,
             op_id,
             &monitor,
+            None,
         )
         .await;
 
@@ -672,6 +742,7 @@ mod tests {
             &token,
             op_id,
             &monitor,
+            None,
         )
         .await;
 

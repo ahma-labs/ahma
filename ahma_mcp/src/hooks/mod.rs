@@ -1682,13 +1682,17 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // the workspace is explained there, not left as a silent hang.
     .with_queue_wait_notice(std::sync::Arc::new(|line: &str| eprintln!("{line}")));
     // The command signs with SSH keys through a broker, never with the key
-    // files (SPEC R-CRED.1). Its own agent socket is the broker's upstream.
+    // files (SPEC R-CRED.1), in `"broker"` mode. Its upstream is the agent
+    // adopted at startup from this hook's own environment (R-CRED.7) — the
+    // socket the profile refuses it a direct connect to (R-CRED.11).
     #[cfg(unix)]
-    let adapter = match ahma_common::config::ahma_home_dir() {
+    let adapter = match ahma_common::config::ahma_home_dir()
+        .filter(|_| crate::sandbox::ssh_agent_mode() == crate::sandbox::SshAgentMode::Broker)
+    {
         Some(home) => adapter.with_credential_brokers(std::sync::Arc::new(
             crate::credentials::ssh_agent::consent::RecordedBrokers::new(
                 home,
-                std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+                crate::sandbox::upstream_agent(),
                 cfg.settings_origin.user_settings_file(),
                 harness_ask::harness_pid(),
                 hook_scopes.clone(),

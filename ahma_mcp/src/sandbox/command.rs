@@ -154,8 +154,9 @@ pub fn is_secret_env_name(name: &str) -> bool {
 /// not an oversight: it is a capability handle (the agent can sign with keys it
 /// cannot read), but git-over-ssh is core to this workflow, and silently
 /// breaking `git push` is exactly the kind of surprise this project refuses to
-/// ship. Confining agent forwarding belongs to the ssh-agent, not to a strip
-/// list. Likewise **`PYTHONPATH` / `RUBYLIB` / `PERL5LIB` / `NODE_PATH` are not
+/// ship. Confining it is the SSH key broker's job (SPEC R-CRED.1, R-CRED.11),
+/// which points it at a consent-checking socket; only `[sandbox] ssh_agent =
+/// "off"` removes it, in [`scrub_secret_env`]. Likewise **`PYTHONPATH` / `RUBYLIB` / `PERL5LIB` / `NODE_PATH` are not
 /// stripped**: they are module search paths that real build and test invocations
 /// (`PYTHONPATH=src pytest`, tox, monorepo layouts) set as a matter of course,
 /// and ahma synthesises Python workers, so stripping them would break the common
@@ -260,6 +261,12 @@ pub fn scrub_secret_env(cmd: &mut tokio::process::Command, context: &str) {
         for key in &scrubbed {
             cmd.env_remove(key);
         }
+    }
+    // `[sandbox] ssh_agent = "off"` (SPEC R-CRED.11): no command gets an agent.
+    // Here rather than in a strip list because it is a mode, not a name, and
+    // `env_allow` must not be able to bring it back.
+    if super::ssh_agent::strips_agent_env() {
+        cmd.env_remove("SSH_AUTH_SOCK");
     }
 }
 
@@ -1133,11 +1140,43 @@ mod tests {
         );
         assert!(
             !removed.contains(&"SSH_AUTH_SOCK".to_string()),
-            "SSH_AUTH_SOCK must never be scrubbed; removed={removed:?}"
+            "SSH_AUTH_SOCK is scrubbed only under `ssh_agent = \"off\"`; removed={removed:?}"
         );
         unsafe {
             std::env::remove_var("PYTHONSTARTUP");
         }
+    }
+
+    /// SPEC R-CRED.11: `[sandbox] ssh_agent = "off"` removes `SSH_AUTH_SOCK`
+    /// from every command, whatever `env_allow` says; the other modes keep it
+    /// (`"broker"` then points it at the command's broker).
+    #[test]
+    fn ssh_agent_off_removes_ssh_auth_sock() {
+        use super::super::ssh_agent::{SshAgentMode, set_ssh_agent_mode};
+        let removed = |sandbox: &Sandbox, dir: &std::path::Path| -> bool {
+            sandbox
+                .base_command("env", &[], dir)
+                .as_std()
+                .get_envs()
+                .any(|(k, v)| k == "SSH_AUTH_SOCK" && v.is_none())
+        };
+        let td = tempdir().unwrap();
+        let sandbox = make_test_sandbox(td.path());
+        set_secret_env_allow(vec!["SSH_AUTH_SOCK".to_string()]);
+
+        set_ssh_agent_mode(SshAgentMode::Off);
+        assert!(
+            removed(&sandbox, td.path()),
+            "off: no command gets an agent"
+        );
+        for mode in [SshAgentMode::Passthrough, SshAgentMode::Broker] {
+            set_ssh_agent_mode(mode);
+            assert!(
+                !removed(&sandbox, td.path()),
+                "{mode:?} keeps SSH_AUTH_SOCK"
+            );
+        }
+        set_secret_env_allow(Vec::new());
     }
 
     /// create_command in Test mode delegates directly to base_command.
