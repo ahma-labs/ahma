@@ -218,11 +218,24 @@ mod bridge {
     /// dropped connection before aborting existed.
     const ABORT_GRACE: Duration = Duration::from_secs(5);
 
+    /// The longest a single `recv` waits before the receiving thread looks
+    /// again. The end of the peer's stream is not always delivered to a `recv`
+    /// that is already waiting (measured on Windows `AF_UNIX`: a server whose
+    /// receive was re-armed as the client's half-close landed waited for it
+    /// forever), but a `recv` that starts afterwards returns it. A bounded
+    /// receive turns that lost wake-up into a delay of at most this long, and
+    /// also honours a pause or an abort that `abort_recv` missed.
+    const RECV_RECHECK: Duration = Duration::from_millis(50);
+
     /// The blocking calls the bridge makes on its socket.
     pub(super) trait BlockingSocket: Send + Sync + 'static {
         fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
         fn send(&self, data: &[u8]) -> io::Result<usize>;
         fn shutdown_write(&self) -> io::Result<()>;
+        /// Make every later `recv` give up after `every` with
+        /// [`io::ErrorKind::TimedOut`] or [`io::ErrorKind::WouldBlock`]
+        /// (`SO_RCVTIMEO`), which the receiving thread takes as "nothing yet".
+        fn bound_recv(&self, every: Duration) -> io::Result<()>;
         /// Make a `recv` blocked in another thread return, with anything.
         ///
         /// Called only once the caller has dropped the stream, so whatever that
@@ -352,6 +365,7 @@ mod bridge {
     /// sends or closes anything (SPEC R-HUB.2). The socket is shared by the two
     /// threads and closes when the second lets go of it.
     pub(super) fn bridge<S: BlockingSocket>(sock: S, rt: Handle) -> io::Result<BridgedStream> {
+        sock.bound_recv(RECV_RECHECK)?;
         let (caller, ours) = tokio::io::duplex(BUF);
         let (from_caller, to_caller) = tokio::io::split(ours);
         let sock = Arc::new(sock);
@@ -402,9 +416,22 @@ mod bridge {
             let n = match read {
                 Ok(0) => break,
                 Ok(n) => n,
-                // An aborted receive may report itself as interrupted; the
-                // loop condition tells the two apart.
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // Nothing yet: the bounded receive gave up (`RECV_RECHECK`), or
+                // an aborted one reports itself as interrupted or, on Windows,
+                // as `TimedOut` (`WSA_OPERATION_ABORTED`). Look again; the loop
+                // condition and the pause check tell these apart. Taking a
+                // quiet spell for the end of the stream would cut the answer
+                // short, and never looking again can miss the end entirely.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue;
+                }
                 // A receive the sender interrupted to half-close: not an
                 // error, and the loop takes it up again after the pause.
                 Err(_) if lifecycle.wait_out_pause() => continue,
@@ -588,6 +615,9 @@ mod bridge {
             fn shutdown_write(&self) -> io::Result<()> {
                 Ok(())
             }
+            fn bound_recv(&self, every: Duration) -> io::Result<()> {
+                self.0.bound_recv(every)
+            }
             fn abort_recv(&self) -> io::Result<()> {
                 self.0.abort_recv()
             }
@@ -609,6 +639,9 @@ mod bridge {
             }
             fn shutdown_write(&self) -> io::Result<()> {
                 self.shutdown(Shutdown::Write)
+            }
+            fn bound_recv(&self, every: Duration) -> io::Result<()> {
+                self.set_read_timeout(Some(every))
             }
             /// Unlike on Windows, `shutdown(Read)` wakes a blocked `recv` here
             /// (and every later one returns at once), and it sends the peer
@@ -764,6 +797,10 @@ mod bridge {
                 fin.changed.notify_all();
                 Ok(())
             }
+            /// Unbounded on purpose: this models the cancel path alone.
+            fn bound_recv(&self, _: Duration) -> io::Result<()> {
+                Ok(())
+            }
             fn abort_recv(&self) -> io::Result<()> {
                 let fin = &*self.0;
                 let mut s = fin.state.lock();
@@ -874,6 +911,10 @@ mod bridge {
             fn shutdown_write(&self) -> io::Result<()> {
                 Ok(())
             }
+            /// Unbounded on purpose: only an abort may wake this receive.
+            fn bound_recv(&self, _: Duration) -> io::Result<()> {
+                Ok(())
+            }
             fn abort_recv(&self) -> io::Result<()> {
                 let late = &*self.0;
                 let mut s = late.state.lock();
@@ -907,6 +948,144 @@ mod bridge {
                 late.state.lock().aborts >= 2,
                 "the first abort was bound to miss"
             );
+        }
+
+        #[derive(Default)]
+        struct WakeState {
+            bound: Option<Duration>,
+            in_recv: bool,
+            timeouts: usize,
+            aborted: bool,
+            incoming: Vec<u8>,
+            peer_closed: bool,
+        }
+
+        #[derive(Default)]
+        struct Wake {
+            state: Mutex<WakeState>,
+            changed: Condvar,
+        }
+
+        impl Wake {
+            /// Wait, within the `Quick` budget, until `done` holds, and keep
+            /// the lock so the caller acts on exactly that state.
+            fn wait(
+                &self,
+                what: &str,
+                done: impl Fn(&WakeState) -> bool,
+            ) -> MutexGuard<'_, WakeState> {
+                let deadline = Instant::now() + quick();
+                let mut s = self.state.lock();
+                while !done(&s) {
+                    let timed_out = self.changed.wait_until(&mut s, deadline).timed_out();
+                    assert!(!timed_out || done(&s), "timed out: {what}");
+                }
+                s
+            }
+        }
+
+        /// A socket that loses the wake-up for the peer's end of stream when
+        /// it lands on a `recv` already waiting — the race seen on Windows
+        /// `AF_UNIX`. The end is recorded, so a `recv` that starts afterwards
+        /// returns 0; the waiting one is never told. Its `recv` honours
+        /// `bound_recv` as `SO_RCVTIMEO` does.
+        struct LosesEofWakeup(Arc<Wake>);
+
+        impl BlockingSocket for LosesEofWakeup {
+            fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+                let wake = &*self.0;
+                let mut s = wake.state.lock();
+                if s.peer_closed && s.incoming.is_empty() {
+                    return Ok(0);
+                }
+                let deadline = s.bound.map(|b| Instant::now() + b);
+                s.in_recv = true;
+                wake.changed.notify_all();
+                let out = loop {
+                    if !s.incoming.is_empty() {
+                        let n = s.incoming.len().min(buf.len());
+                        buf[..n].copy_from_slice(&s.incoming[..n]);
+                        s.incoming.drain(..n);
+                        break Ok(n);
+                    }
+                    if s.aborted {
+                        s.aborted = false;
+                        break Err(io::Error::other("the I/O operation has been aborted"));
+                    }
+                    // `peer_closed` is deliberately not looked at here: the
+                    // wake-up for it was lost.
+                    match deadline {
+                        Some(d) if Instant::now() >= d => {
+                            s.timeouts += 1;
+                            break Err(io::ErrorKind::TimedOut.into());
+                        }
+                        Some(d) => {
+                            let _ = wake.changed.wait_until(&mut s, d);
+                        }
+                        None => wake.changed.wait(&mut s),
+                    }
+                };
+                s.in_recv = false;
+                wake.changed.notify_all();
+                out
+            }
+            fn send(&self, data: &[u8]) -> io::Result<usize> {
+                Ok(data.len())
+            }
+            fn shutdown_write(&self) -> io::Result<()> {
+                Ok(())
+            }
+            fn bound_recv(&self, every: Duration) -> io::Result<()> {
+                self.0.state.lock().bound = Some(every);
+                Ok(())
+            }
+            fn abort_recv(&self) -> io::Result<()> {
+                let wake = &*self.0;
+                let mut s = wake.state.lock();
+                if s.in_recv {
+                    s.aborted = true;
+                    wake.changed.notify_all();
+                }
+                Ok(())
+            }
+        }
+
+        /// The Windows hang in `concurrent_connections_survive_many_rounds`:
+        /// the server's receive was re-armed just as the client's half-close
+        /// arrived, and the end of the request never reached it. The bridge
+        /// bounds every `recv`, takes a receive that comes back empty-handed
+        /// for "nothing yet" rather than for the end, and so finds the end of
+        /// the stream on its next look.
+        #[test]
+        fn an_end_of_stream_whose_wakeup_is_lost_is_still_seen() {
+            let rt = runtime();
+            let wake = Arc::new(Wake::default());
+            let mut stream =
+                bridge(LosesEofWakeup(Arc::clone(&wake)), rt.handle().clone()).expect("bridge");
+
+            // A quiet spell longer than one bounded receive is not the end.
+            let mut s = wake.wait("a receive looks again after coming back empty", |s| {
+                s.timeouts >= 1 && s.in_recv
+            });
+            s.incoming.extend_from_slice(b"request");
+            wake.changed.notify_all();
+            drop(s);
+
+            // The request is taken and the next receive is waiting: the end
+            // of the stream lands on it, and its wake-up is lost.
+            let mut s = wake.wait("the request is taken and the receive re-armed", |s| {
+                s.incoming.is_empty() && s.in_recv
+            });
+            s.peer_closed = true;
+            drop(s);
+
+            let mut got = Vec::new();
+            rt.block_on(async {
+                tokio::time::timeout(quick(), stream.read_to_end(&mut got)).await
+            })
+            .expect("the end of the request within budget")
+            .expect("read");
+            assert_eq!(got, b"request");
         }
     }
 }
@@ -961,6 +1140,14 @@ mod imp {
 
         fn shutdown_write(&self) -> io::Result<()> {
             self.shutdown(Shutdown::Write)
+        }
+
+        /// `SO_RCVTIMEO`: a timed-out `recv` fails with `WSAETIMEDOUT`
+        /// (`TimedOut`). Effective because `socket2` opens sockets with
+        /// `WSA_FLAG_OVERLAPPED`; Winsock ends the wait by cancelling the
+        /// receive, the same path as [`BlockingSocket::abort_recv`].
+        fn bound_recv(&self, every: Duration) -> io::Result<()> {
+            self.set_read_timeout(Some(every))
         }
 
         /// `CancelIoEx` with no `OVERLAPPED` cancels every operation pending

@@ -1549,6 +1549,12 @@ lifetime.
     bridge's receiving thread was blocked in `recv` on it — the hub answering `400`/`404` and half-closing while still
     receiving, and the client waiting for an end that never came. There the receive steps out
     of `recv` for the half-close (cancelled with `CancelIoEx`, acknowledged, resumed after).
+  - **The end of a stream is never lost to a receive already waiting.** Measured on Windows:
+    the peer's half-close was not always delivered to a `recv` that was already waiting (the
+    server re-armed its receive as the client's half-close landed, and waited for the end of
+    the request forever), while a `recv` started afterwards returns it. Every bridge `recv` is
+    therefore bounded (`SO_RCVTIMEO`, 50 ms); one that comes back empty-handed means "nothing
+    yet", never the end of the stream, and the receive simply looks again.
   - **The ownership check binds the directory ahma chose, not one it was handed.** An
     operator-named `--unix-socket-path` (or `[http] unix_socket_path`) is a deliberate
     placement decision and is honoured; where its directory is writable by others *and* lacks
