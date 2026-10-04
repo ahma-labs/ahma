@@ -7,6 +7,8 @@
 #[cfg(unix)]
 pub mod broker;
 #[cfg(unix)]
+pub mod consent;
+#[cfg(unix)]
 pub mod host;
 pub mod keys;
 pub mod known_hosts;

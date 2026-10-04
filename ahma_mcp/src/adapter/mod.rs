@@ -257,6 +257,11 @@ pub struct Adapter {
     /// detection (the default). The notifier only *persists* an approved grant — it
     /// never widens the live session (SPEC R5).
     scope_grant_notifier: Option<Arc<dyn sandbox::ScopeGrantNotifier>>,
+    /// Gives each command an SSH key broker (SPEC R-CRED.1): its socket is the
+    /// command's `SSH_AUTH_SOCK`, and what it refused is one line in the
+    /// result. `None` leaves the human's own agent socket in place.
+    #[cfg(unix)]
+    credential_brokers: Option<Arc<dyn crate::credentials::ssh_agent::consent::BrokerFactory>>,
     /// Whether the trust-handoff deny tier is inventoried around each command
     /// (SPEC R6.1.7). [`HandoffWatchMode::Auto`] watches exactly where the
     /// kernel does not hold the tier; [`Adapter::with_handoff_watch`] overrides it.
@@ -312,6 +317,8 @@ impl Adapter {
             workspace_queue: workspace_queue::WorkspaceQueue::disabled(),
             queue_wait_notice: None,
             scope_grant_notifier: None,
+            #[cfg(unix)]
+            credential_brokers: None,
             handoff_watch: HandoffWatchMode::Auto,
         })
     }
@@ -469,6 +476,29 @@ impl Adapter {
     ) -> Self {
         self.scope_grant_notifier = Some(notifier);
         self
+    }
+
+    /// Serve each command an SSH key broker from `factory` (SPEC R-CRED.1).
+    #[cfg(unix)]
+    pub fn with_credential_brokers(
+        mut self,
+        factory: Arc<dyn crate::credentials::ssh_agent::consent::BrokerFactory>,
+    ) -> Self {
+        self.credential_brokers = Some(factory);
+        self
+    }
+
+    /// The broker lease for a command about to run in `working_dir`, with the
+    /// command pointed at it. Held until the command has finished.
+    #[cfg(unix)]
+    fn lease_credential_broker(
+        &self,
+        cmd: &mut tokio::process::Command,
+        working_dir: &std::path::Path,
+    ) -> Option<crate::credentials::ssh_agent::host::BrokerLease> {
+        let lease = self.credential_brokers.as_ref()?.lease(working_dir)?;
+        cmd.env("SSH_AUTH_SOCK", lease.socket());
+        Some(lease)
     }
 
     /// Validate a working directory against the sandbox scope, raising a scope-grant
@@ -848,6 +878,8 @@ impl Adapter {
             Err(e) => return SyncRun::failed(e),
         };
         stamp_lease(&mut cmd, lease);
+        #[cfg(unix)]
+        let broker = self.lease_credential_broker(&mut cmd, safe_wd);
 
         // Spawn manually (rather than `cmd.output()`) so a timeout can take down
         // the whole process group — `cmd.output()` drops the future on timeout,
@@ -934,6 +966,16 @@ impl Adapter {
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let exit_code = output.status.code();
         let result = interpret_sync_command_output(output);
+        // What the SSH key broker refused this command, one line each
+        // (SPEC R-CRED.10), on whichever side the result is.
+        #[cfg(unix)]
+        let result = match broker.as_ref().and_then(broker_refusals) {
+            Some(lines) => match result {
+                Ok(out) => Ok(format!("{out}\n{lines}")),
+                Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
+            },
+            None => result,
+        };
         if result.is_err() {
             return self
                 .finalize_sync_denial(command, op_id, exit_code, &stdout, &stderr, safe_wd, result)
@@ -1858,6 +1900,21 @@ const QUEUE_WAIT_WORTH_REPORTING: Duration = Duration::from_millis(500);
 
 /// Stamp a child spawned under a lease with it (SPEC R2.7.7), so an ahma the
 /// command itself starts does not wait for the lease its ancestor holds.
+/// The lines a broker's refusals leave in a command's result, once each.
+#[cfg(unix)]
+fn broker_refusals(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> Option<String> {
+    use crate::credentials::ssh_agent::broker::BrokerEvent;
+    let mut lines: Vec<String> = Vec::new();
+    for event in lease.events() {
+        if let BrokerEvent::Refused { why, .. } = event
+            && !lines.contains(&why)
+        {
+            lines.push(why);
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 fn stamp_lease(cmd: &mut tokio::process::Command, lease: Option<&workspace_queue::Lease>) {
     if let Some(lease) = lease {
         cmd.env(

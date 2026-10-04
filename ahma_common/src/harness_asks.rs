@@ -158,6 +158,55 @@ pub struct WorkspaceAsks {
     /// Questions answered at another surface before the dialog asked them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answered: Vec<Answered>,
+    /// Signatures the SSH key broker refused a hooked command (SPEC R-CRED.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_refusals: Vec<SshRefusal>,
+    /// Questions about them put to the human through the harness dialog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_asked: Vec<AskedSsh>,
+}
+
+/// One signature the SSH key broker refused a hooked command because no grant
+/// allowed it (SPEC R-CRED.3): asked about before the next command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshRefusal {
+    /// The key, `SHA256:…`.
+    pub key: String,
+    /// The key's comment, for the dialog text.
+    #[serde(default)]
+    pub key_comment: String,
+    /// What it would have signed for, as [`crate::ssh_sign::SshSignGrant`]
+    /// names it (`host:SHA256:…`, `sshsig:<namespace>`).
+    pub destination: String,
+    /// What the human reads for the destination: the server's names.
+    #[serde(default)]
+    pub label: String,
+    /// Unix seconds of the latest refusal.
+    pub at: u64,
+    /// The harness process whose life bounds a session grant for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_pid: Option<u32>,
+}
+
+impl SshRefusal {
+    fn same_subject(&self, other: &SshRefusal) -> bool {
+        self.key == other.key && self.destination == other.destination
+    }
+}
+
+/// A question about an SSH signature put to the human through a harness
+/// dialog, with the one-use token the approved command carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedSsh {
+    pub session_id: String,
+    pub refusal: SshRefusal,
+    pub token: String,
+    pub command_digest: String,
+    pub asked_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_pid: Option<u32>,
+    #[serde(default)]
+    pub used: bool,
 }
 
 /// The directory these records live in: `runtime_dir()/harness-asks`.
@@ -318,6 +367,89 @@ fn forget_expired(asks: &mut WorkspaceAsks, now: u64) {
         .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
     asks.answered
         .retain(|a| now.saturating_sub(a.at) <= MAX_AGE_SECS);
+    asks.ssh_refusals
+        .retain(|r| now.saturating_sub(r.at) <= MAX_AGE_SECS);
+    asks.ssh_asked
+        .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
+}
+
+/// Remember that the SSH key broker refused a hooked command in `workspace`.
+pub fn record_ssh_refusal(dir: &Path, workspace: &Path, refusal: SshRefusal) -> Result<()> {
+    update(dir, workspace, refusal.at, |asks| {
+        asks.ssh_refusals.retain(|r| !r.same_subject(&refusal));
+        asks.ssh_refusals.push(refusal);
+    })
+}
+
+/// The SSH signature to ask about next in harness session `session_id`: one
+/// no grant covers (`covered`) and not yet asked in this session, whatever
+/// the answer was.
+pub fn next_ssh_question(
+    asks: &WorkspaceAsks,
+    session_id: &str,
+    covered: &dyn Fn(&SshRefusal) -> bool,
+) -> Option<SshRefusal> {
+    asks.ssh_refusals
+        .iter()
+        .filter(|r| !covered(r))
+        .find(|r| {
+            !asks
+                .ssh_asked
+                .iter()
+                .any(|a| a.session_id == session_id && a.refusal.same_subject(r))
+        })
+        .cloned()
+}
+
+/// Record that `refusal` was put to the human in `session_id` for `command`,
+/// returning the one-use token the approved command will carry.
+pub fn mark_ssh_asked(
+    dir: &Path,
+    workspace: &Path,
+    session_id: &str,
+    refusal: &SshRefusal,
+    command: &str,
+    harness_pid: Option<u32>,
+    now: u64,
+) -> Result<String> {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let asked = AskedSsh {
+        session_id: session_id.to_string(),
+        refusal: refusal.clone(),
+        token: token.clone(),
+        command_digest: crate::digest::sha256_hex(command.as_bytes()),
+        asked_at: now,
+        harness_pid,
+        used: false,
+    };
+    update(dir, workspace, now, |asks| asks.ssh_asked.push(asked))?;
+    Ok(token)
+}
+
+/// Spend an SSH-signature `token`, as [`take_approved`] does for a path.
+pub fn take_ssh_approved(
+    dir: &Path,
+    workspace: &Path,
+    token: &str,
+    command: &str,
+    now: u64,
+) -> Option<AskedSsh> {
+    let digest = crate::digest::sha256_hex(command.as_bytes());
+    update(dir, workspace, now, |asks| {
+        let asked = asks.ssh_asked.iter_mut().find(|a| {
+            a.token == token
+                && !a.used
+                && a.command_digest == digest
+                && now.saturating_sub(a.asked_at) <= TOKEN_TTL_SECS
+        })?;
+        asked.used = true;
+        let asked = asked.clone();
+        asks.ssh_refusals
+            .retain(|r| !r.same_subject(&asked.refusal));
+        Some(asked)
+    })
+    .ok()
+    .flatten()
 }
 
 /// Every workspace's records in `dir`, without what has expired, ordered by
@@ -527,6 +659,60 @@ fn common_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R-CRED.3 through R-PERM.10: a refused signature is asked about
+    /// once per harness session, and its token approves only the command it
+    /// was issued for, once.
+    #[test]
+    fn a_refused_signature_is_asked_once_and_its_token_spent_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Path::new("/ws/repo");
+        let refusal = SshRefusal {
+            key: "SHA256:key".into(),
+            key_comment: "me@laptop".into(),
+            destination: "host:SHA256:host".into(),
+            label: "github.com".into(),
+            at: 100,
+            harness_pid: Some(7),
+        };
+        record_ssh_refusal(dir.path(), ws, refusal.clone()).unwrap();
+        record_ssh_refusal(
+            dir.path(),
+            ws,
+            SshRefusal {
+                at: 101,
+                ..refusal.clone()
+            },
+        )
+        .unwrap();
+        let asks = load(dir.path(), ws, 102);
+        assert_eq!(asks.ssh_refusals.len(), 1, "one subject, one refusal");
+        let never = |_: &SshRefusal| false;
+        let q = next_ssh_question(&asks, "s1", &never).expect("asked");
+        assert_eq!(q.label, "github.com");
+        let token = mark_ssh_asked(dir.path(), ws, "s1", &q, "git push", Some(7), 103).unwrap();
+        let asks = load(dir.path(), ws, 104);
+        assert!(
+            next_ssh_question(&asks, "s1", &never).is_none(),
+            "once per session"
+        );
+        assert!(
+            next_ssh_question(&asks, "s2", &never).is_some(),
+            "another session asks"
+        );
+        assert!(
+            next_ssh_question(&asks, "s2", &|_| true).is_none(),
+            "a grant that covers it asks nothing"
+        );
+        assert!(take_ssh_approved(dir.path(), ws, &token, "git pull", 105).is_none());
+        let asked = take_ssh_approved(dir.path(), ws, &token, "git push", 105).expect("approved");
+        assert_eq!(asked.refusal.key, "SHA256:key");
+        assert!(
+            take_ssh_approved(dir.path(), ws, &token, "git push", 106).is_none(),
+            "once"
+        );
+        assert!(load(dir.path(), ws, 107).ssh_refusals.is_empty());
+    }
 
     fn refusal(path: &Path, access: ScopeAccess) -> Refusal {
         let grant_dir = if path.extension().is_some() {

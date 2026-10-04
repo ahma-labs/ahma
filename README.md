@@ -307,6 +307,14 @@ The `ahma_core` crate exposes the sandbox, MCP service, and local-LLM agent runt
 
 See [docs/ahma-core-library.md](docs/ahma-core-library.md).
 
+### SSH key broker — `git push` over SSH inside the sandbox *(experimental)*
+
+A sandboxed command never reads a private key, but it can still sign in over SSH: each
+hooked command gets an SSH agent of its own, served by ahma outside the sandbox, that signs
+only for a server the connection proves it is talking to, and only after you allowed that key
+for that server in that workspace — once per session in Claude Code's own dialog, or for good
+with `ahma permissions grant ssh-sign`. See [docs/ssh-agent-broker.md](docs/ssh-agent-broker.md).
+
 ### Task Vaults — one directory per task *(experimental)*
 
 ```bash

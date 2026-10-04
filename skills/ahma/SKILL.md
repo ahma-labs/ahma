@@ -327,7 +327,7 @@ ahma tls init && ahma tls status        # ahma tls rotate replaces certificate
 * **Gradle, Maven, Xcode or SwiftPM cache denials** (`~/.gradle`, `~/.m2`, `DerivedData`, `~/Library/Caches/org.swift.swiftpm`): the shipped `android` and `apple` profiles already grant these; if a denial still names one, the profile is disabled in `[sandbox] profiles` — ask the human to re-enable it rather than requesting the paths one by one. The `sccache` profile gives each workspace its own sccache server and cache (`SCCACHE_SERVER_PORT`, `SCCACHE_DIR`); don't point a build at a shared server instead.
 * **"ahma is DEFERRING to … sandbox"**: ahma is inside an outer sandbox it can't nest inside (macOS Seatbelt refuses nesting). Commands still run, confined by the outer sandbox — expected when running ahma's own test suite or a nested `ahma serve`. For ahma's own enforcement, start it from a plain terminal.
 * **Tool still running**: `status(operation_id)` to check, or `cancel(operation_id)`. **Linux old kernel**: Landlock needs 5.13+; use `--no-sandbox` there.
-* **`Permission denied (publickey)`** on git push/fetch: private keys are unreadable by design and no grant changes that. Ask the human to load the key into the SSH agent on the host (`ssh-add <key>`, once per login); sandboxed ssh signs through the agent.
+* **`Permission denied (publickey)`** or **`Blocked until a human approves: ahma's SSH key broker…`** on git push/fetch: keys are unreadable by design; ahma's SSH key broker signs for a server once a human allows that key for it. In Claude Code just re-run: the dialog asks before the next command. Elsewhere, relay the `ahma permissions grant ssh-sign "…"` line from the refusal to the human.
 
 ---
 

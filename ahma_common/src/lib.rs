@@ -74,6 +74,7 @@ pub mod settings_origin;
 pub mod simplify_args;
 pub mod skills;
 pub mod sse;
+pub mod ssh_sign;
 pub mod state_machine;
 pub mod test_isolation;
 pub mod timeouts;

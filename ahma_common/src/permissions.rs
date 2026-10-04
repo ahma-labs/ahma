@@ -75,6 +75,9 @@ pub enum GrantKind {
     /// Consent for terminal hooks to run a command unsandboxed (session-scoped by
     /// R5.5.3 — recorded here for listing, never persisted to disk).
     HookUnsandboxed,
+    /// A key the SSH key broker may sign with for one destination in one
+    /// workspace (`[[sandbox.ssh_sign]]`, SPEC R-CRED.3).
+    SshSign,
 }
 
 impl GrantKind {
@@ -87,12 +90,14 @@ impl GrantKind {
             GrantKind::Tool => "tool",
             GrantKind::LogTarget => "log-target",
             GrantKind::HookUnsandboxed => "hook-unsandboxed",
+            GrantKind::SshSign => "ssh-sign",
         }
     }
 
     /// Every kind, in the order `ahma permissions list` groups them.
-    pub const ALL: [GrantKind; 6] = [
+    pub const ALL: [GrantKind; 7] = [
         GrantKind::FsScope,
+        GrantKind::SshSign,
         GrantKind::WebDomain,
         GrantKind::NetHost,
         GrantKind::Tool,
@@ -110,7 +115,8 @@ impl GrantKind {
             | GrantKind::WebDomain
             | GrantKind::NetHost
             | GrantKind::Tool
-            | GrantKind::LogTarget => true,
+            | GrantKind::LogTarget
+            | GrantKind::SshSign => true,
             GrantKind::HookUnsandboxed => false,
         }
     }
@@ -234,6 +240,25 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
                     .to_string(),
             }),
             expires_at: s.expires_at,
+        });
+    }
+
+    for g in &settings.sandbox.ssh_sign {
+        out.push(GrantRecord {
+            kind: GrantKind::SshSign,
+            subject: format!("{} for {}", g.key, g.destination),
+            access: None,
+            tier: if g.expires_at.is_some() {
+                GrantTier::Lease
+            } else {
+                GrantTier::Always
+            },
+            granted_by: g.granted_by.clone(),
+            granted_at: Some(crate::config::fmt_utc_datetime(g.granted_at)),
+            surface: None,
+            note: (!g.label.is_empty()).then(|| g.label.clone()),
+            scope_note: Some(format!("workspace {}", g.workspace.display())),
+            expires_at: g.expires_at,
         });
     }
 
@@ -1754,6 +1779,7 @@ mod tests {
             persisted,
             vec![
                 GrantKind::FsScope,
+                GrantKind::SshSign,
                 GrantKind::WebDomain,
                 GrantKind::NetHost,
                 GrantKind::Tool,
@@ -1761,6 +1787,10 @@ mod tests {
             ]
         );
         assert!(!GrantKind::HookUnsandboxed.is_persisted());
+        assert_eq!(
+            serde_json::to_string(&GrantKind::SshSign).unwrap(),
+            "\"ssh-sign\""
+        );
         assert_eq!(GrantKind::LogTarget.label(), "log-target");
         assert_eq!(
             serde_json::to_string(&GrantKind::LogTarget).unwrap(),
