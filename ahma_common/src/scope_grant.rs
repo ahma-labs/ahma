@@ -982,24 +982,34 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
     }
 }
 
-/// Credential directories and ahma's own settings directory, relative to the
-/// home directory: never granted, and never inside a grant (SPEC R5.4.5).
-const SENSITIVE: &[&[&str]] = &[
-    &[".ssh"],
-    &[".aws"],
-    &[".gnupg"],
-    &[".kube"],
-    &[".docker"],
-    &[".ahma"],
-    &[".config", "gh"],
-    &[".config", "gcloud"],
+/// Credential paths under home, `/`-separated, that a sandboxed command may
+/// not read by default (SPEC R5.4.5, R6.2.3). On Linux nothing in home is
+/// readable unless granted; this list is what the macOS profile denies
+/// explicitly. Every one is also never granted ([`sensitive_dirs`]), so no
+/// grant can make it readable again.
+pub const CREDENTIAL_READ_DENIED: &[&str] = &[
+    ".ahma", // ahma's own bearer token, TLS keys and grant ledger
+    ".aws",
+    ".gnupg",
+    ".config/gcloud",
+    ".kube",
+    ".docker",
+    ".netrc",
+    // git's `store` credential helper keeps tokens here in plain text.
+    ".git-credentials",
 ];
 
-/// The credential directories under `home`: never granted, never inside a grant.
+/// Credential directories a command reads parts of, but that are never
+/// granted: `~/.ssh` (the profile lets back in only the files that hold no
+/// secret) and `~/.config/gh` (the GitHub CLI reads its own configuration).
+const NEVER_GRANTED_READABLE: &[&str] = &[".ssh", ".config/gh"];
+
+/// The credential paths under `home`: never granted, never inside a grant.
 pub fn sensitive_dirs(home: &Path) -> Vec<PathBuf> {
-    SENSITIVE
+    CREDENTIAL_READ_DENIED
         .iter()
-        .map(|parts| parts.iter().fold(home.to_path_buf(), |p, c| p.join(c)))
+        .chain(NEVER_GRANTED_READABLE)
+        .map(|rel| rel.split('/').fold(home.to_path_buf(), |p, c| p.join(c)))
         .collect()
 }
 
@@ -1726,6 +1736,26 @@ mod request_context_tests {
         assert!(why.contains("ssh-add"), "{why}");
         assert!(!why.contains("still work"), "{why}");
     }
+
+    /// One list of credential paths. Every path the sandbox refuses to let a
+    /// command read by default is one no grant may open either: `.netrc` was
+    /// read-denied but grantable, and a granted scope outranks the read deny,
+    /// so a human-approved grant made it readable.
+    #[test]
+    fn every_credential_read_deny_is_never_granted() {
+        let home = crate::config::ahma_home_dir().expect("home");
+        for rel in CREDENTIAL_READ_DENIED {
+            let path = rel.split('/').fold(home.clone(), |p, c| p.join(c));
+            assert!(
+                refusal_reason(&path).is_some(),
+                "{rel} is read-denied but grantable"
+            );
+        }
+        for rel in [".netrc", ".git-credentials"] {
+            assert!(CREDENTIAL_READ_DENIED.contains(&rel), "{rel}");
+        }
+    }
+
     use crate::grant_prompt::{PromptBody, render};
 
     fn full_request() -> ScopeGrantRequest {

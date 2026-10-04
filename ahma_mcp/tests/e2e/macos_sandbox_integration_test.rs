@@ -464,6 +464,67 @@ fn test_credential_read_deny_is_kernel_enforced() {
     );
 }
 
+/// Kernel test for SSH and git client files (SPEC R6.2.3): with `~/.ssh` denied
+/// as a whole, every private key is unreadable whatever it is called — a key
+/// named `github_ed25519` was readable while only `id_*` was denied — while
+/// the files ssh and git need and that hold no secret stay readable.
+/// `~/.git-credentials` (git's plain-text token store) is denied.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_ssh_keys_are_unreadable_whatever_their_name() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{
+        Sandbox, SandboxMode, default_credential_read_denies, set_credential_read_denies,
+    };
+
+    let scope = TempDir::new().expect("scope dir");
+    let home = TempDir::new().expect("home dir");
+    let h = dunce::canonicalize(home.path()).expect("canonical home");
+    std::fs::create_dir_all(h.join(".ssh")).unwrap();
+    let files = [
+        (".ssh/id_ed25519", false),
+        (".ssh/github_ed25519", false),
+        (".ssh/deploy_key", false),
+        (".git-credentials", false),
+        (".ssh/config", true),
+        (".ssh/known_hosts", true),
+        (".ssh/id_ed25519.pub", true),
+        (".gitconfig", true),
+    ];
+    for (f, _) in files {
+        std::fs::write(h.join(f), format!("content-of-{f}")).unwrap();
+    }
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var("HOME", &h) };
+    set_credential_read_denies(default_credential_read_denies(&h));
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        true,  // no_temp_files: the fake home lives under /var/folders
+        false, // livelog
+        false, // tmp_access
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    set_credential_read_denies(Vec::new());
+
+    for (f, readable) in files {
+        let out = Command::new("sandbox-exec")
+            .args(["-p", &profile, "/bin/cat", &h.join(f).to_string_lossy()])
+            .current_dir(scope.path())
+            .output()
+            .expect("run sandbox-exec");
+        let read = out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains(&format!("content-of-{f}"));
+        assert_eq!(
+            read,
+            readable,
+            "{f}: readable={read}, expected {readable}. stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// Verify that real git operations inside a git worktree succeed under macOS Seatbelt,
 /// while writes to .git/hooks in the common repository remain strictly blocked by the kernel.
 #[cfg(target_os = "macos")]
