@@ -14,6 +14,39 @@ name = "sccache"
 description = "sccache: a compile-cache server, cache and port of its own per workspace"
 rules = []
 
+# Only where sccache compiles this workspace: the compiler wrapper names it, in
+# the environment or in cargo's configuration. Anywhere else these variables
+# would only create an empty `.sccache` in every project.
+[[when]]
+env = "RUSTC_WRAPPER"
+contains = "sccache"
+
+[[when]]
+env = "CARGO_BUILD_RUSTC_WRAPPER"
+contains = "sccache"
+
+[[when]]
+file = "${WORKSPACE}/.cargo/config.toml"
+contains = "sccache"
+
+[[when]]
+file = "${CARGO_HOME:-~/.cargo}/config.toml"
+contains = "sccache"
+
+# Never over sccache's own configuration: a cache location you chose there (or
+# a config file you point at) wins, as a variable you set yourself does.
+[[unless]]
+env = "SCCACHE_CONF"
+contains = ""
+
+[[unless]]
+file = "~/.config/sccache/config"
+contains = "[cache"
+
+[[unless]]
+file = "~/Library/Application Support/Mozilla.sccache/config"
+contains = "[cache"
+
 [[env]]
 name = "SCCACHE_DIR"
 value = "${WORKSPACE}/.sccache"

@@ -169,6 +169,42 @@ struct RawProfile {
     /// Variables set on every sandboxed command (SPEC R-PERM.5.5).
     #[serde(default)]
     env: Vec<RawEnv>,
+    /// The variables apply only when one of these holds: the tool is in use
+    /// here. Empty: always.
+    #[serde(default)]
+    when: Vec<RawCondition>,
+    /// The variables never apply when one of these holds: the user already
+    /// configured the tool themselves.
+    #[serde(default)]
+    unless: Vec<RawCondition>,
+}
+
+/// One condition on a profile's variables: an environment variable, or a file
+/// (`~`, `${VAR}` and `${WORKSPACE}` expanded), that contains `contains`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCondition {
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    file: Option<String>,
+    contains: String,
+}
+
+impl RawCondition {
+    fn holds(&self, workspace: &Path) -> bool {
+        if let Some(name) = &self.env
+            && std::env::var(name).is_ok_and(|v| v.contains(&self.contains))
+        {
+            return true;
+        }
+        self.file.as_ref().is_some_and(|f| {
+            let f = f.replace("${WORKSPACE}", &workspace.to_string_lossy());
+            resolve_path(&f)
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .is_some_and(|text| text.contains(&self.contains))
+        })
+    }
 }
 
 /// A rule with its path resolved against the real environment.
@@ -237,6 +273,9 @@ pub struct SandboxProfile {
     hosts: Vec<RawHost>,
     /// Variables it sets on sandboxed commands, values still unresolved.
     env: Vec<RawEnv>,
+    /// When the variables apply, and when they never do.
+    when: Vec<RawCondition>,
+    unless: Vec<RawCondition>,
 }
 
 /// The profiles ahma ships, parsed from the TOML data files in `profiles/`.
@@ -272,6 +311,8 @@ pub fn builtin_profiles() -> &'static [SandboxProfile] {
                     deny_write: raw.deny_write,
                     hosts: raw.hosts,
                     env: raw.env,
+                    when: raw.when,
+                    unless: raw.unless,
                 }),
                 Err(e) => {
                     // A malformed builtin is a build-time bug, not a user problem; it
@@ -372,22 +413,22 @@ pub fn applicable_rules(enabled: &[String], package_cache_write: bool) -> Vec<Re
     rules.into_iter().filter(|r| r.path.exists()).collect()
 }
 
-/// Create a rule's path if it is missing. Best-effort: a failure just means the
-/// rule is skipped by [`applicable_rules`], which is the safe direction.
+/// Create a rule's path if it is missing, inside a toolchain home that exists.
+/// Every profile is on by default, so creating the home itself would put
+/// `~/.gradle` on a machine that never ran Gradle; the toolchain creates its
+/// home when it is installed. Best-effort: a failure just means the rule is
+/// skipped by [`applicable_rules`], which is the safe direction.
 fn precreate(rule: &ResolvedRule) {
-    if rule.path.exists() {
+    if rule.path.exists() || !rule.path.parent().is_some_and(Path::is_dir) {
         return;
     }
     match rule.kind {
         RuleKind::Dir => {
-            if let Err(e) = std::fs::create_dir_all(&rule.path) {
+            if let Err(e) = std::fs::create_dir(&rule.path) {
                 tracing::debug!("could not pre-create {}: {e}", rule.path.display());
             }
         }
         RuleKind::File => {
-            if let Some(parent) = rule.path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
             if let Err(e) = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -512,6 +553,15 @@ pub fn profile_hosts(enabled: &[String]) -> Vec<ProfileHost> {
     out
 }
 
+impl SandboxProfile {
+    /// Whether this profile's variables apply to a command in `workspace`:
+    /// one `when` condition holds (or there are none), and no `unless` does.
+    fn env_applies(&self, workspace: &Path) -> bool {
+        (self.when.is_empty() || self.when.iter().any(|c| c.holds(workspace)))
+            && !self.unless.iter().any(|c| c.holds(workspace))
+    }
+}
+
 /// The variables every enabled profile sets, resolved for `workspace` (SPEC
 /// R-PERM.5.5). Values may use `${WORKSPACE}` (the workspace path),
 /// `${WORKSPACE_PORT}` (a port in 20000..60000 derived from it, stable across
@@ -523,7 +573,7 @@ pub fn profile_env(enabled: &[String], workspace: &Path) -> Vec<ProfileEnv> {
     let port = workspace_port(workspace).to_string();
     let mut out = Vec::new();
     for profile in builtin_profiles() {
-        if !enabled.iter().any(|n| n == &profile.name) {
+        if !enabled.iter().any(|n| n == &profile.name) || !profile.env_applies(workspace) {
             continue;
         }
         for raw in &profile.env {
@@ -738,6 +788,79 @@ pub fn is_profile_path(path: &Path, enabled: &[String], package_cache_write: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile's variables apply only where its tool is in use, and never
+    /// over the tool's own configuration: the sccache profile created
+    /// `<workspace>/.sccache` on every command in every project, and set
+    /// `SCCACHE_DIR` over a cache directory sccache's own config file names.
+    #[test]
+    fn profile_variables_apply_only_where_their_tool_is_in_use() {
+        let ws = tempfile::tempdir().unwrap();
+        let profile = |when: Vec<RawCondition>, unless: Vec<RawCondition>| SandboxProfile {
+            name: "t".into(),
+            description: String::new(),
+            cost: None,
+            rules: vec![],
+            deny_write: vec![],
+            hosts: vec![],
+            env: vec![],
+            when,
+            unless,
+        };
+        let file = |f: &str, c: &str| RawCondition {
+            env: None,
+            file: Some(f.into()),
+            contains: c.into(),
+        };
+        assert!(profile(vec![], vec![]).env_applies(ws.path()), "no condition: always");
+        let config = "${WORKSPACE}/.cargo/config.toml";
+        let in_use = profile(vec![file(config, "sccache")], vec![]);
+        assert!(!in_use.env_applies(ws.path()), "not configured here");
+        std::fs::create_dir_all(ws.path().join(".cargo")).unwrap();
+        std::fs::write(
+            ws.path().join(".cargo/config.toml"),
+            "[build]\nrustc-wrapper = \"sccache\"\n",
+        )
+        .unwrap();
+        assert!(in_use.env_applies(ws.path()));
+        let own_config = ws.path().join("sccache.conf");
+        std::fs::write(&own_config, "[cache.disk]\ndir = \"/big/disk\"\n").unwrap();
+        let yields = profile(
+            vec![file(config, "sccache")],
+            vec![file(&own_config.to_string_lossy(), "[cache.disk]")],
+        );
+        assert!(!yields.env_applies(ws.path()), "the user's own config wins");
+    }
+
+    /// A profile fills in a toolchain's missing cache directory; it never
+    /// creates the toolchain's home. Every profile is on by default, so
+    /// creating homes put `~/.gradle/caches` on machines that have never run
+    /// Gradle.
+    #[test]
+    fn precreate_fills_in_a_toolchain_it_never_installs_one() {
+        let home = tempfile::tempdir().unwrap();
+        let rule = |path: PathBuf, kind: RuleKind| ResolvedRule {
+            profile: "test".into(),
+            path,
+            access: ProfileAccess::Rw,
+            kind,
+            precreate: true,
+        };
+        let absent = home.path().join(".gradle").join("caches");
+        precreate(&rule(absent.clone(), RuleKind::Dir));
+        assert!(!home.path().join(".gradle").exists(), "no toolchain, no home");
+
+        std::fs::create_dir(home.path().join(".gradle")).unwrap();
+        precreate(&rule(absent.clone(), RuleKind::Dir));
+        assert!(absent.is_dir(), "an installed toolchain gets its cache dir");
+
+        let lock = home.path().join(".cargo").join(".package-cache");
+        precreate(&rule(lock.clone(), RuleKind::File));
+        assert!(!home.path().join(".cargo").exists());
+        std::fs::create_dir(home.path().join(".cargo")).unwrap();
+        precreate(&rule(lock.clone(), RuleKind::File));
+        assert!(lock.is_file());
+    }
 
     fn names() -> Vec<String> {
         default_profile_names()

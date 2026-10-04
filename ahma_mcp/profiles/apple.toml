@@ -21,7 +21,9 @@ project can edit a cached package checkout that is then built into an unrelated 
 off with `--no-package-cache-write` (or `[sandbox] package_cache_write = false`), which downgrades \
 these caches to read-only and leaves the toolchain runnable (SPEC R-HANDOFF.8)."""
 
-deny_write = []
+# SwiftPM's mirror and registry configuration decide where every package is
+# downloaded from: never writable from a build (SPEC R-HANDOFF.8).
+deny_write = ["~/Library/org.swift.swiftpm/configuration"]
 
 # Build products, indexes and module caches. Not optional: xcodebuild writes
 # here even when a project sets a custom build location.
@@ -34,16 +36,21 @@ access = "rw"
 path = "~/Library/Caches/com.apple.dt.Xcode"
 access = "rw"
 
-# SwiftPM: the manifest/package cache, and the per-user security and
-# configuration store (collection fingerprints, mirrors). `swift package resolve`
-# writes both.
+# SwiftPM: the manifest/package cache is written; of the per-user store, only
+# the package fingerprints `swift package resolve` records. Its configuration
+# (mirrors, registries) is read, never written by a build.
 [[rules]]
 path = "~/Library/Caches/org.swift.swiftpm"
 access = "rw"
 
 [[rules]]
 path = "~/Library/org.swift.swiftpm"
+access = "rx"
+
+[[rules]]
+path = "~/Library/org.swift.swiftpm/security"
 access = "rw"
+precreate = true
 
 # CocoaPods: the spec repos are read; the pod download cache is written.
 [[rules]]

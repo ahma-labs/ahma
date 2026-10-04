@@ -273,11 +273,20 @@ DerivedData, SwiftPM and CocoaPods caches, simulators read-only) exist so an iOS
 Android build does not have to stop and ask a human for five cache directories one
 at a time. Both carry a `cost` line in `ahma permissions list`: like the cargo
 caches, Gradle and SwiftPM *execute* what they find in those shared directories.
+Neither makes configuration writable that later builds run or that decides where
+packages come from: Gradle's init scripts and `gradle.properties`, Maven's
+`settings.xml` and SwiftPM's mirror and registry configuration stay read-only, and
+only the cache directories under them are writable. A profile creates a missing cache
+directory only inside a toolchain home that already exists, never the home itself.
 
 ### Profiles that set environment variables
 
-A profile may also set variables on every sandboxed command, each with a stated
-reason. The one that does today is `sccache`. sccache runs a long-lived server that
+A profile may also set variables on sandboxed commands, each with a stated reason,
+and say when they apply: `[[when]]` conditions (an environment variable or a file
+that contains some text) of which one must hold, and `[[unless]]` conditions none of
+which may. The one that does today is `sccache`, and only where sccache compiles the
+workspace (`RUSTC_WRAPPER`, or cargo's configuration, names it) and sccache's own
+configuration does not already choose a cache location. sccache runs a long-lived server that
 every compiler call talks to, and a server started by a sandboxed build can write
 only the checkout it started in, so every other checkout's builds failed through it.
 The `sccache` profile gives each workspace its own server instead:
