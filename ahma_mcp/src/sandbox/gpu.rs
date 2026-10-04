@@ -37,7 +37,7 @@ pub fn allow_gpu_enabled() -> bool {
 /// client that paravirtualised GPUs present inside a VM (Apple's own
 /// `ParavirtualizedGraphicsGPUTask.sb` allows exactly that one plus IOSurface),
 /// which is what a macOS CI runner has.
-const GPU_USER_CLIENTS: &[&str] = &[
+pub(super) const GPU_USER_CLIENTS: &[&str] = &[
     "AGXDeviceUserClient",
     "AGXSharedUserClient",
     "AGXCommandQueue",
