@@ -3205,8 +3205,13 @@ mod tests {
         )
         .unwrap();
         let lane_of = |line: String| adapter.resolve_lane(Some(&shell_args(&line)), None, &ws);
+        // Forward slashes: a backslash is a shell escape to the classifier,
+        // and every shell ahma runs (PowerShell included) accepts `/`.
         let watch = |to: &std::path::Path| {
-            format!("gh pr checks 1 --watch > {}", to.join("ci.txt").display())
+            format!(
+                "gh pr checks 1 --watch > {}",
+                to.join("ci.txt").to_string_lossy().replace('\\', "/")
+            )
         };
         assert_eq!(lane_of(watch(&scratch)), workspace_queue::Lane::Service);
         assert_eq!(lane_of(watch(&ws)), workspace_queue::Lane::Exclusive);
