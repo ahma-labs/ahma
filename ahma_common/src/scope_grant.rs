@@ -425,6 +425,9 @@ struct Inner {
     /// Unix seconds of every prompt raised automatically, for the budget
     /// (SPEC R-PERM.4.5). Explicit re-raises are not counted.
     raised_window: Vec<u64>,
+    /// When each budgeted question in flight was charged, so a question that
+    /// reached nobody can be refunded ([`GrantCoordinator::cancel_unseen`]).
+    charged: HashMap<String, u64>,
 }
 
 /// At most this many automatic prompts per [`PROMPT_WINDOW_SECS`] per session;
@@ -545,11 +548,14 @@ impl GrantCoordinator {
             }
             inner.raised_window.push(now);
         }
+        let decision_id = uuid::Uuid::new_v4().to_string();
+        if budgeted {
+            inner.charged.insert(decision_id.clone(), now);
+        }
         let entry = inner.ask_counts.entry(key.clone()).or_insert((0, now));
         entry.0 += 1;
         context.times_asked = entry.0;
         context.first_asked_at = Some(entry.1);
-        let decision_id = uuid::Uuid::new_v4().to_string();
         let req = ScopeGrantRequest {
             decision_id: decision_id.clone(),
             path: canonical,
@@ -667,6 +673,7 @@ impl GrantCoordinator {
     /// request if it was in flight.
     pub fn cancel(&self, decision_id: &str) -> Option<ScopeGrantRequest> {
         let mut inner = self.inner.lock();
+        inner.charged.remove(decision_id);
         let req = inner.in_flight.remove(decision_id);
         if let Some(r) = &req {
             inner.active_keys.remove(&(r.path.clone(), r.access));
@@ -674,6 +681,23 @@ impl GrantCoordinator {
         inner.raised_at.remove(decision_id);
         inner.resolved.insert(decision_id.to_string());
         req
+    }
+
+    /// Close a question that reached nobody (rung 3 of the ladder): as
+    /// [`Self::cancel`], and its prompt budget is given back (SPEC R-PERM.4.5).
+    /// The budget limits interruptions; a question no one saw interrupted no
+    /// one, and five of them used to silence ahma for ten minutes even after a
+    /// TUI was opened.
+    pub fn cancel_unseen(&self, decision_id: &str) -> Option<ScopeGrantRequest> {
+        {
+            let mut inner = self.inner.lock();
+            if let Some(at) = inner.charged.remove(decision_id)
+                && let Some(i) = inner.raised_window.iter().position(|t| *t == at)
+            {
+                inner.raised_window.remove(i);
+            }
+        }
+        self.cancel(decision_id)
     }
 
     /// Snapshot of the decisions currently awaiting an answer, for
@@ -1252,6 +1276,40 @@ mod tests {
                 .is_none(),
             "a no is remembered for the session"
         );
+    }
+
+    /// SPEC R-PERM.4.5: a question that reached nobody gives its budget back;
+    /// one that was shown keeps it spent.
+    #[test]
+    fn a_question_nobody_saw_costs_no_budget() {
+        let c = coord();
+        let dirs: Vec<_> = (0..PROMPT_BUDGET + 2).map(|_| tempdir().unwrap()).collect();
+        for d in &dirs {
+            let req = c
+                .begin(
+                    d.path(),
+                    ScopeAccess::Rw,
+                    GrantReason::StderrHeuristic,
+                    None,
+                )
+                .expect("within budget: nothing was seen");
+            c.cancel_unseen(&req.decision_id);
+        }
+        assert!(!c.budget_exhausted());
+
+        let c = coord();
+        for d in dirs.iter().take(PROMPT_BUDGET) {
+            let req = c
+                .begin(
+                    d.path(),
+                    ScopeAccess::Rw,
+                    GrantReason::StderrHeuristic,
+                    None,
+                )
+                .unwrap();
+            c.cancel(&req.decision_id);
+        }
+        assert!(c.budget_exhausted(), "questions that were shown count");
     }
 
     #[test]

@@ -827,7 +827,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // (the reporter shares the same coordinator), so a TUI approval takes effect for
     // the live session. Wired only in this hub/server path.
     let (web_req_tx, web_req_rx) = tokio::sync::mpsc::unbounded_channel();
-    service_handler.set_web_approval_sender(web_req_tx);
+    service_handler.set_web_approval_sender(web_req_tx, tui_viewers.clone());
     let web_coordinator = service_handler.web_approval.clone();
 
     // Register this worker with the hub so a TUI can see its work.

@@ -343,8 +343,11 @@ impl AhmaMcpService {
         // leave the decision in flight so the TUI answer resolves it; the
         // coordinator's dedup means the retry re-checks the session grant rather
         // than raising a second modal.
+        // Only while a TUI is watching (SPEC R-PERM.3.6): a hub connection alone
+        // is not a surface, and a question sent to nobody stays pending.
         let tx = self.web_approval_tx.lock().clone();
-        if let Some(tx) = tx
+        if let Some((tx, viewers)) = tx
+            && viewers.load(std::sync::atomic::Ordering::SeqCst) > 0
             && tx.send(req.clone()).is_ok()
         {
             tracing::info!(domain = %req.domain, "raised web-approval prompt in the ahma TUI");

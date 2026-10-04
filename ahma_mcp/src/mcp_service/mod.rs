@@ -204,11 +204,15 @@ pub struct AhmaMcpService {
     /// `elicitation/create`, the request is sent here; the hub reporter forwards
     /// it as `ClientMsg::Relay(HubRelay::WebApprovalRequested)` and routes
     /// the TUI's answer back into `web_approval`. `None` ⇒ no TUI surface wired.
+    /// Carries the hub's count of TUIs watching: the channel is a surface
+    /// only while it is above zero (SPEC R-PERM.3.6).
+    #[allow(clippy::type_complexity)]
     pub web_approval_tx: Arc<
         parking_lot::Mutex<
-            Option<
+            Option<(
                 tokio::sync::mpsc::UnboundedSender<ahma_common::web_approval::WebApprovalRequest>,
-            >,
+                Arc<std::sync::atomic::AtomicUsize>,
+            )>,
         >,
     >,
     /// The session's grant coordinator, when a permission broker is wired
@@ -999,8 +1003,9 @@ impl AhmaMcpService {
     pub fn set_web_approval_sender(
         &self,
         tx: tokio::sync::mpsc::UnboundedSender<ahma_common::web_approval::WebApprovalRequest>,
+        viewers: Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        *self.web_approval_tx.lock() = Some(tx);
+        *self.web_approval_tx.lock() = Some((tx, viewers));
     }
 
     /// Store the AppConfig that constructed this service so runtime events

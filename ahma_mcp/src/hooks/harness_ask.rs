@@ -70,7 +70,7 @@ pub(super) fn harness_pid() -> Option<u32> {
 
 /// Remember that a hooked command in `cwd`'s workspace was refused `path`.
 /// Best-effort: a store that cannot be written only means no question later.
-pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess) {
+pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess, command: &str) {
     let Some(dir) = harness_asks::default_dir() else {
         return;
     };
@@ -80,6 +80,7 @@ pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess) {
         access,
         at: ahma_common::session_grants::now_secs(),
         harness_pid: harness_pid(),
+        command_digest: Some(ahma_common::digest::sha256_hex(command.as_bytes())),
     };
     if let Err(e) = harness_asks::record_refusal(&dir, &workspace_for(cwd), refusal) {
         tracing::debug!("harness question not recorded: {e:#}");
@@ -105,7 +106,12 @@ pub(super) fn next_ask(
         crate::adapter::lane::classify_shell_command(command),
         crate::adapter::workspace_queue::Lane::ReadOnly
     );
-    asks.refusals.retain(|r| may_write || !r.access.is_write());
+    // Asked when the refused command is run again: a "no" then stops only
+    // the retry it was about, never an unrelated command (SPEC R-PERM.10).
+    asks.refusals.retain(|r| {
+        (may_write || !r.access.is_write())
+            && harness_asks::refused_for(r.command_digest.as_deref(), command)
+    });
     if asks.refusals.is_empty() {
         return None;
     }
@@ -211,6 +217,32 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<S
 mod tests {
     use super::*;
 
+    /// SPEC R-PERM.10: the dialog asks when the refused command is run again,
+    /// not before whatever command comes next. A "no" used to block an
+    /// unrelated command, and an unrelated command was held for a question
+    /// about a path it never touches.
+    #[test]
+    fn a_refusal_is_asked_about_when_its_command_runs_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let cache = tmp.path().join("tool-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cache = dunce::canonicalize(&cache).unwrap();
+        record_refusal(&ws, &cache.join("x.lock"), ScopeAccess::Rw, "make heavy");
+        if harness_pid().is_none() {
+            // No harness above this test process to bound a grant: nothing
+            // is asked anywhere, which `next_ask` already pins.
+            return;
+        }
+        assert!(
+            next_ask(&ws, "s1", "cargo build", &[]).is_none(),
+            "another command is not held for it"
+        );
+        assert!(next_ask(&ws, "s1", "make heavy", &[]).is_some());
+    }
+
     /// The whole R-PERM.10 loop at the hook: a refusal is recorded; the next
     /// Claude Code Bash call is answered `ask` with a token-carrying command;
     /// the same session is not asked again; a yes (the command running with
@@ -228,7 +260,12 @@ mod tests {
         let cache = tmp.path().join("tool-cache");
         std::fs::create_dir_all(&cache).unwrap();
         let cache = dunce::canonicalize(&cache).unwrap();
-        record_refusal(&ws, &cache.join("heavy.lock.holder"), ScopeAccess::Rw);
+        record_refusal(
+            &ws,
+            &cache.join("heavy.lock.holder"),
+            ScopeAccess::Rw,
+            "make heavy",
+        );
 
         let env = HookEnvironment {
             home_dir: tmp.path().join("home"),
@@ -329,6 +366,7 @@ mod tests {
                 access: ScopeAccess::Rw,
                 at: ahma_common::session_grants::now_secs(),
                 harness_pid: Some(stale),
+                command_digest: None,
             },
         )
         .unwrap();

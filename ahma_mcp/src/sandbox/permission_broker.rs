@@ -301,8 +301,9 @@ impl PermissionBroker {
         // Nobody holds this question, so it must not stay in flight: an
         // in-flight question blocks the same path from ever being asked again
         // this session, and reads to the agent as "waiting for a human" when no
-        // human was reached. Closing it records no decision (R5.3.1).
-        self.coordinator.cancel(&req.decision_id);
+        // human was reached. Closing it records no decision (R5.3.1), and gives
+        // back the budget it took: it interrupted no one (R-PERM.4.5).
+        self.coordinator.cancel_unseen(&req.decision_id);
         AskedAt::FailedClosed
     }
 
@@ -804,12 +805,18 @@ impl ElicitationSurface for PeerElicitationSurface {
             // The transport broke: the surface is genuinely unusable, which is
             // the one case that demotes it.
             Ok(Err(e)) => ElicitOutcome::Failed(e.to_string()),
-            // Our own budget expired (SPEC R-PERM.3.1): a surface that does not
-            // answer within the client's own deadline is treated as broken for
-            // the session, and the question moves on so it is not lost.
-            Err(_) => ElicitOutcome::Failed(format!("no answer within {timeout:?}")),
+            Err(_) => outcome_when_unanswered(timeout),
         }
     }
+}
+
+/// What our own wait expiring means (SPEC R-PERM.3.1): nobody answered in
+/// time — a person not looking, not a broken surface. A dismissal: no
+/// decision, no demotion, and the question moves down the ladder. Demoting
+/// here meant a human who took longer than the client's budget (45 s for
+/// several clients) was never asked in their client again that session.
+fn outcome_when_unanswered(waited: std::time::Duration) -> ElicitOutcome {
+    ElicitOutcome::Dismissed(format!("no answer within {waited:?}"))
 }
 
 /// Map the form's choice to a decision. Anything unrecognized is a **deny**: an
@@ -1004,6 +1011,15 @@ mod tests {
         violate(&broker, "/opt/two").await;
 
         assert_eq!(h.asks(), 2, "the harness stays trusted after a decline");
+    }
+
+    /// SPEC R-PERM.3.1: our own wait expiring is a dismissal, never a fault.
+    #[test]
+    fn an_unanswered_question_dismisses_and_never_demotes() {
+        assert!(matches!(
+            outcome_when_unanswered(std::time::Duration::from_secs(45)),
+            ElicitOutcome::Dismissed(why) if why.contains("45s")
+        ));
     }
 
     #[tokio::test]

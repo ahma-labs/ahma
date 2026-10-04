@@ -76,6 +76,17 @@ pub struct Refusal {
     /// The harness process whose life bounds a session grant for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_pid: Option<u32>,
+    /// Digest of the command that was refused: the dialog asks when that
+    /// command is run again, never before an unrelated one (SPEC R-PERM.10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_digest: Option<String>,
+}
+
+/// Whether a refusal recorded for `recorded` (a command digest) is one to
+/// ask about before `command` runs: the same command run again. A refusal
+/// recorded without a digest (an older ahma) matches any command.
+pub fn refused_for(recorded: Option<&str>, command: &str) -> bool {
+    recorded.is_none_or(|d| d == crate::digest::sha256_hex(command.as_bytes()))
 }
 
 /// A question put to the human through a harness dialog.
@@ -529,6 +540,7 @@ mod tests {
             access,
             at: 100,
             harness_pid: None,
+            command_digest: None,
         }
     }
 
