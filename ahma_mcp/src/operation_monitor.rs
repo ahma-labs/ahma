@@ -581,10 +581,45 @@ impl OperationMonitor {
         let mut ops = self.operations.write().await;
         if let Some(op) = ops.get_mut(id) {
             op.alerts.push(alert.clone());
+            drop(ops);
         } else {
-            return;
+            drop(ops);
+            let mut hist = self.completion_history.write().await;
+            if let Some(op) = hist.get_mut(id) {
+                op.alerts.push(alert.clone());
+            } else {
+                return;
+            }
         }
-        drop(ops);
+
+        self.events.emit(OperationEvent::Alert {
+            operation_id: id.to_string(),
+            message: alert,
+        });
+    }
+
+    /// Append `alert` to operation `id`'s alerts unless that exact string is already present.
+    /// Checks active operations first, then completion history.
+    pub async fn append_alert_unique(&self, id: &str, alert: String) {
+        let mut ops = self.operations.write().await;
+        if let Some(op) = ops.get_mut(id) {
+            if op.alerts.contains(&alert) {
+                return;
+            }
+            op.alerts.push(alert.clone());
+            drop(ops);
+        } else {
+            drop(ops);
+            let mut hist = self.completion_history.write().await;
+            if let Some(op) = hist.get_mut(id) {
+                if op.alerts.contains(&alert) {
+                    return;
+                }
+                op.alerts.push(alert.clone());
+            } else {
+                return;
+            }
+        }
 
         self.events.emit(OperationEvent::Alert {
             operation_id: id.to_string(),
@@ -1237,6 +1272,84 @@ mod tests {
         // 6. Verify it IS in the completion history map
         let history = monitor.completion_history.read().await;
         assert!(history.contains_key(&op_id));
+    }
+
+    #[tokio::test]
+    async fn test_append_alert_to_completed_operation() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let op_id = "op_completed_alert".to_string();
+        let op = Operation::new(
+            op_id.clone(),
+            "test_tool".to_string(),
+            "A test operation".to_string(),
+            None,
+        );
+
+        monitor.add_operation(op).await;
+        monitor
+            .update_status(
+                &op_id,
+                OperationStatus::Completed,
+                Some(serde_json::json!({"result": "success"})),
+            )
+            .await;
+
+        // Appending an alert after the operation moved to completion history must succeed.
+        monitor
+            .append_alert(&op_id, "Alert after completion".to_string())
+            .await;
+
+        let completed = monitor.check_completion_history_pub(&op_id).await.unwrap();
+        assert_eq!(completed.alerts, vec!["Alert after completion"]);
+    }
+
+    #[tokio::test]
+    async fn test_append_alert_unique_deduplication() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let op_id = "op_unique_alert".to_string();
+        let op = Operation::new(
+            op_id.clone(),
+            "test_tool".to_string(),
+            "A test operation".to_string(),
+            None,
+        );
+
+        monitor.add_operation(op).await;
+
+        // Active operation deduplication
+        monitor
+            .append_alert_unique(&op_id, "Unique alert 1".to_string())
+            .await;
+        monitor
+            .append_alert_unique(&op_id, "Unique alert 1".to_string())
+            .await;
+        monitor
+            .append_alert_unique(&op_id, "Unique alert 2".to_string())
+            .await;
+
+        let active = monitor.get_operation(&op_id).await.unwrap();
+        assert_eq!(active.alerts, vec!["Unique alert 1", "Unique alert 2"]);
+
+        // Move to history
+        monitor
+            .update_status(&op_id, OperationStatus::Completed, None)
+            .await;
+
+        // Completion history deduplication
+        monitor
+            .append_alert_unique(&op_id, "Unique alert 2".to_string())
+            .await;
+        monitor
+            .append_alert_unique(&op_id, "Unique alert 3".to_string())
+            .await;
+
+        let completed = monitor.check_completion_history_pub(&op_id).await.unwrap();
+        assert_eq!(
+            completed.alerts,
+            vec!["Unique alert 1", "Unique alert 2", "Unique alert 3"]
+        );
     }
 
     /// `completion_history` must not grow without bound: once
