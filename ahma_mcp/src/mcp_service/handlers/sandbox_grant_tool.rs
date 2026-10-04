@@ -153,6 +153,19 @@ impl AhmaMcpService {
             )));
         }
 
+        // Already allowed: nothing to ask, and nothing to preview. Saying "not
+        // raised, nothing is granted" here sent the agent to ask again for a
+        // path the human had already granted (SPEC R-PERM.4).
+        if self.adapter.sandbox().allows(&path, access) {
+            return Ok(common::text_result(format!(
+                "Already allowed: commands in this session may {} {}. Nothing to ask; re-run the \
+                 command. If it is still refused, the refusal is about something else: read its \
+                 error.",
+                if access.is_write() { "write" } else { "read" },
+                path.display()
+            )));
+        }
+
         // Gate 2: without explicit confirmation, only preview — write nothing.
         if !confirm {
             return Ok(common::text_result(preview_text(

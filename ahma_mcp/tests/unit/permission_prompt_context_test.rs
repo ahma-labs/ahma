@@ -252,3 +252,28 @@ async fn a_spent_prompt_budget_is_reported_to_the_agent() {
         "the agent is told why, so it asks in conversation instead: {text}"
     );
 }
+
+/// A path already allowed is not asked about again (SPEC R-PERM.4): the agent
+/// is told it already has the access. It was told "Not raised … Nothing is
+/// granted" after the human had granted it, and asked again.
+#[tokio::test]
+async fn a_path_already_allowed_is_reported_as_allowed_not_asked_again() {
+    let _home = private_home();
+    let workspace = TempDir::new().unwrap();
+    let inside = canonical_dir(workspace.path(), "build");
+
+    let client = RecordingClient::new("claude-code").with_elicitation(Some("deny"));
+    let log = client.elicitation().unwrap();
+    let (mcp, _broker) = create_in_process_mcp_with_broker(client, workspace.path(), None)
+        .await
+        .unwrap();
+
+    let text = request_grant(&mcp.client, &inside, "rw", "the build writes here").await;
+    assert!(
+        log.messages().is_empty(),
+        "nothing to ask: {:#?}",
+        log.messages()
+    );
+    assert!(text.starts_with("Already allowed"), "{text}");
+    assert!(!text.contains("Nothing is granted"), "{text}");
+}
