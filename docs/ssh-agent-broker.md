@@ -74,6 +74,46 @@ agent: load them once per login with `ssh-add <key>` (on macOS, `ssh-add
 --apple-use-keychain <key>` keeps the passphrase in the keychain). The broker still asks
 before the agent signs. `ahma doctor` says which of your keys need this.
 
+## Your own agent is not reachable around the broker
+
+Your agent signs for any process that connects to it, and its socket is easy to find
+(`launchctl getenv SSH_AUTH_SOCK`, or launchd's
+`/private/var/run/com.apple.launchd.*/Listeners`). A command that ignored its
+`SSH_AUTH_SOCK` and connected there would sign without asking. On macOS the sandbox
+refuses that connect: your agent's socket (the one the broker forwards to) and launchd's
+listener are denied to every sandboxed command, and only the broker's sockets are let
+through. On Linux this is not denied yet (see [Limitations](#limitations)).
+
+## Which agent a command gets (`[sandbox] ssh_agent`)
+
+| Mode | Command's `SSH_AUTH_SOCK` | Broker | Direct connect to your agent (macOS) | Use it when |
+| --- | --- | --- | --- | --- |
+| `"broker"` (default) | the command's own broker | yes | refused | always, unless one of the others fits |
+| `"passthrough"` | your own agent's, unchanged | no | allowed | your agent confirms every use itself (`ssh-add -c`); ahma warns at startup |
+| `"off"` | removed | no | refused | sandboxed commands should never sign anything |
+
+```toml
+# ~/.ahma/settings.toml
+[sandbox]
+ssh_agent = "passthrough"
+```
+
+It is user-owned: a workspace's `.ahma/settings.toml` cannot set it, and an unknown value
+stops ahma from starting rather than picking a mode.
+
+## Limitations
+
+- **Linux does not refuse a direct connect.** Landlock does not mediate a `connect(2)`
+  to a socket on the filesystem, so a command that ignores `SSH_AUTH_SOCK` and connects
+  to your agent's socket can still sign through it. ahma says so at startup. On Linux
+  the broker only controls commands that use the agent they were given.
+- **A command with no broker has no agent.** In `"broker"` mode the deny applies to every
+  sandboxed command. Every command ahma runs gets a broker (hooked, MCP and pseudo-terminal
+  commands alike); if one cannot be started, ssh in that command finds no agent it may use.
+- **An agent socket whose path holds a `"`, a `\` or a control character** cannot be
+  written into a sandbox rule, so ahma does not use it as the upstream and says so; the
+  broker then signs only with key files.
+
 ## What is refused, always
 
 | Request | Why |
@@ -89,6 +129,7 @@ before the agent signs. `ahma doctor` says which of your keys need this.
 
 | Setting / file | Meaning |
 | --- | --- |
+| `[sandbox] ssh_agent` in `~/.ahma/settings.toml` | `"broker"` (default), `"passthrough"` or `"off"`; see above |
 | `[[sandbox.ssh_sign]]` in `~/.ahma/settings.toml` | `always` and lease grants: `key`, `destination`, `workspace`, `granted_at`, optional `expires_at` |
 | `<runtime dir>/ssh-sign/` | session grants, one file each, bound to the harness process |
 | `<runtime dir>/agent/` | the brokers' sockets; a sandboxed command may connect, never create or remove |
@@ -98,4 +139,5 @@ before the agent signs. `ahma doctor` says which of your keys need this.
 
 - [Security sandbox](security-sandbox.md) — why key files are unreadable, and what is.
 - [Permissions and grants](permissions.md) — tiers, the ledger, the harness dialog.
-- [SPEC R-CRED](../SPEC.md) and R6.2.3.
+- [Settings file](settings.md) — every `[sandbox]` key.
+- [SPEC R-CRED](../SPEC.md) (R-CRED.11 for the modes and the connect deny) and R6.2.3.

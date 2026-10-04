@@ -99,6 +99,10 @@ impl Sandbox {
         let network_rules = self.get_macos_network_rules();
         let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
         let socket_connect_denies = container_socket_connect_denies(Path::new(&home_dir));
+        // SPEC R-CRED.11: the human's own agent signs for anyone who connects,
+        // so a command reaches it only through the broker. After the network
+        // rules; the broker's sockets are let back in by `broker_rules`.
+        let agent_connect_denies = super::ssh_agent::seatbelt_agent_connect_denies();
         let exec_config_deny_rules = self.get_macos_exec_config_deny_rules(&git_resolution_roots);
 
         // SPEC R6.2.6: signals stay inside this command's own sandbox unless
@@ -126,7 +130,7 @@ impl Sandbox {
 (allow pseudo-tty)
 (allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
 (allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]*") (extension "com.apple.sandbox.pty")))
-{exec_config_deny_rules}{network_rules}{socket_connect_denies}(allow mach-lookup)
+{exec_config_deny_rules}{network_rules}{socket_connect_denies}{agent_connect_denies}(allow mach-lookup)
 (allow ipc-posix-shm*)
 {broker_rules}"#,
             working_dir = wd_str,
@@ -144,6 +148,7 @@ impl Sandbox {
             exec_config_deny_rules = exec_config_deny_rules,
             network_rules = network_rules,
             socket_connect_denies = socket_connect_denies,
+            agent_connect_denies = agent_connect_denies,
             broker_rules = broker_rules(),
         );
 
@@ -541,11 +546,13 @@ fn broker_rules() -> String {
         return String::new();
     };
     let dir = dunce::canonicalize(&dir).unwrap_or(dir);
-    // Connecting needs no network rule: unix sockets are never denied by the
-    // network rules, which concern IP only (R-WEB.16).
+    // A connect is a network operation, and the agent denies (R-CRED.11) come
+    // before this: the broker's sockets are let back in after them, so no
+    // upstream path can shadow the broker.
     format!(
-        "(allow file-read* file-write-data (subpath \"{}\"))\n",
-        dir.display()
+        "(allow file-read* file-write-data (subpath \"{}\"))\n{}",
+        dir.display(),
+        super::ssh_agent::seatbelt_broker_connect_allow(&dir)
     )
 }
 
@@ -954,6 +961,115 @@ mod tests {
                 && l.contains(r"/\.colima/.*/docker\.sock$")),
             "colima connect deny missing:\n{profile}"
         );
+    }
+
+    fn agent_rule_fixture() -> (tempfile::TempDir, Sandbox, PathBuf) {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let upstream = dir.path().join("agent.sock");
+        super::super::ssh_agent::set_upstream_agent(Some(&upstream)).unwrap();
+        let canonical = dunce::canonicalize(dir.path()).unwrap().join("agent.sock");
+        (dir, sb, canonical)
+    }
+
+    fn upstream_deny(canonical: &Path) -> String {
+        format!(
+            "(deny network-outbound (remote unix-socket (path-literal \"{}\")))",
+            canonical.display()
+        )
+    }
+
+    fn launchd_deny() -> String {
+        format!(
+            "(deny network-outbound (remote unix-socket (path-regex #\"{}\")))",
+            super::super::ssh_agent::LAUNCHD_AGENT_REGEX
+        )
+    }
+
+    fn broker_connect_allow() -> Option<String> {
+        let dir = ahma_common::hub::runtime_dir()?.join("agent");
+        let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+        Some(format!(
+            "(allow network-outbound (remote unix-socket (subpath \"{}\")))",
+            dir.display()
+        ))
+    }
+
+    /// SPEC R-CRED.11, `"broker"`: a command cannot connect to the human's own
+    /// agent — the adopted upstream by canonical path, launchd's listener by
+    /// pattern, both after `(allow network*)` — and the broker's sockets are let
+    /// back in after those denies (SBPL is last-match-wins). The kernel test is
+    /// `test_a_sandboxed_command_reaches_the_broker_and_not_the_humans_agent`.
+    #[test]
+    fn the_humans_agent_is_denied_and_the_broker_let_back_in_after() {
+        use super::super::ssh_agent::{SshAgentMode, set_ssh_agent_mode, set_upstream_agent};
+        set_ssh_agent_mode(SshAgentMode::Broker);
+        let (dir, sb, canonical) = agent_rule_fixture();
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+
+        let network_allow = p.find("(allow network*)").expect("network allow");
+        let upstream = p
+            .find(&upstream_deny(&canonical))
+            .unwrap_or_else(|| panic!("upstream deny missing:\n{p}"));
+        let launchd = p
+            .find(&launchd_deny())
+            .unwrap_or_else(|| panic!("launchd agent deny missing:\n{p}"));
+        assert!(
+            upstream > network_allow && launchd > network_allow,
+            "the agent denies must follow the network allow:\n{p}"
+        );
+        let allow = broker_connect_allow().expect("a runtime dir");
+        let at = p
+            .find(&allow)
+            .unwrap_or_else(|| panic!("{allow} missing:\n{p}"));
+        assert!(
+            at > upstream && at > launchd,
+            "the broker allow must follow the agent denies:\n{p}"
+        );
+        set_upstream_agent(None).unwrap();
+    }
+
+    /// SPEC R-CRED.11, `"passthrough"`: the pre-broker profile — no agent deny
+    /// and no broker allow.
+    #[test]
+    fn passthrough_emits_no_agent_rules() {
+        use super::super::ssh_agent::{SshAgentMode, set_ssh_agent_mode, set_upstream_agent};
+        set_ssh_agent_mode(SshAgentMode::Passthrough);
+        let (dir, sb, canonical) = agent_rule_fixture();
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+        assert!(!p.contains(&upstream_deny(&canonical)), "{p}");
+        assert!(!p.contains("com\\.apple\\.launchd"), "{p}");
+        assert!(
+            !p.contains("(allow network-outbound (remote unix-socket"),
+            "{p}"
+        );
+        set_ssh_agent_mode(SshAgentMode::Broker);
+        set_upstream_agent(None).unwrap();
+    }
+
+    /// SPEC R-CRED.11, `"off"`: the agent is denied as in `"broker"`, and there
+    /// is no broker to let back in.
+    #[test]
+    fn off_denies_the_agent_and_lets_no_broker_in() {
+        use super::super::ssh_agent::{SshAgentMode, set_ssh_agent_mode, set_upstream_agent};
+        set_ssh_agent_mode(SshAgentMode::Off);
+        let (dir, sb, canonical) = agent_rule_fixture();
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+        assert!(p.contains(&upstream_deny(&canonical)), "{p}");
+        assert!(p.contains(&launchd_deny()), "{p}");
+        assert!(
+            !p.contains("(allow network-outbound (remote unix-socket"),
+            "{p}"
+        );
+        set_ssh_agent_mode(SshAgentMode::Broker);
+        set_upstream_agent(None).unwrap();
     }
 
     /// `~/.ssh` is denied as a whole, and the client files that hold no secret

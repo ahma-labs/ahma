@@ -672,6 +672,101 @@ UMVIXgsLH65MRi/7XnzQAAAADGZpeHR1cmVAYWhtYQE=
     );
 }
 
+/// Kernel test for SPEC R-CRED.11: in `"broker"` mode a sandboxed command
+/// that ignores its `SSH_AUTH_SOCK` cannot connect to the human's own agent —
+/// here a stand-in socket adopted as the upstream, exactly as startup adopts
+/// the real one — while a socket in the broker's agent directory stays
+/// reachable. In `"passthrough"` the agent is reachable, as before the broker.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_a_sandboxed_command_reaches_the_broker_and_not_the_humans_agent() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::credentials::ssh_agent::consent::adopt_upstream;
+    use ahma_mcp::credentials::ssh_agent::host::agent_dir;
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode, SshAgentMode, set_ssh_agent_mode};
+    use std::os::unix::net::UnixListener;
+
+    /// The broker-directory socket, removed however the test ends.
+    struct Unlink(std::path::PathBuf);
+    impl Drop for Unlink {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    // Each listener accepts and drops connections, so a client that gets in
+    // exits 0.
+    let listen = |sock: &Path| -> UnixListener {
+        let listener = UnixListener::bind(sock).expect("bind test socket");
+        let accepting = listener.try_clone().unwrap();
+        std::thread::spawn(move || for _ in accepting.incoming() {});
+        listener
+    };
+
+    let scope = TempDir::new().expect("scope dir");
+    let human = TempDir::new().expect("agent dir");
+    let upstream = human.path().join("agent.sock");
+    let _upstream_listener = listen(&upstream);
+    assert_eq!(
+        adopt_upstream(Some(upstream.clone())),
+        Some(upstream.clone()),
+        "the stand-in agent is adopted as the upstream"
+    );
+    let broker = Unlink(
+        agent_dir()
+            .expect("agent dir")
+            .join(format!("t{}.sock", std::process::id())),
+    );
+    let _ = std::fs::remove_file(&broker.0);
+    let _broker_listener = listen(&broker.0);
+
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        true,  // no_temp_files: the stand-in agent lives under /var/folders
+        false, // livelog
+        false, // tmp_access
+    )
+    .expect("build sandbox");
+    let connects = |profile: Option<&str>, sock: &Path| -> bool {
+        let mut cmd = match profile {
+            Some(profile) => {
+                let mut c = Command::new("sandbox-exec");
+                c.args(["-p", profile, "/usr/bin/nc"]);
+                c
+            }
+            None => Command::new("/usr/bin/nc"),
+        };
+        cmd.args(["-U", &sock.to_string_lossy()])
+            .current_dir(scope.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run nc")
+            .status
+            .success()
+    };
+    assert!(connects(None, &upstream), "the control connect failed");
+    assert!(connects(None, &broker.0), "the control connect failed");
+
+    set_ssh_agent_mode(SshAgentMode::Broker);
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    assert!(
+        !connects(Some(&profile), &upstream),
+        "broker mode: the human's agent must refuse a sandboxed connect\n{profile}"
+    );
+    assert!(
+        connects(Some(&profile), &broker.0),
+        "broker mode: the broker's socket must stay reachable\n{profile}"
+    );
+
+    set_ssh_agent_mode(SshAgentMode::Passthrough);
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    assert!(
+        connects(Some(&profile), &upstream),
+        "passthrough: the human's agent is reachable, as before the broker\n{profile}"
+    );
+    set_ssh_agent_mode(SshAgentMode::Broker);
+}
+
 /// SPEC R-DENY: a command refused a write outside its scope is reported from
 /// the kernel's own record — operation and exact path — not from its output,
 /// and a command that fails for its own reasons is not blamed on the sandbox.

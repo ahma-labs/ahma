@@ -1257,6 +1257,39 @@ impl LinuxDenyTier {
     }
 }
 
+/// Which SSH agent a sandboxed command may use (`[sandbox] ssh_agent`, SPEC
+/// R-CRED.11).
+///
+/// An unknown value is a parse error, so — `[sandbox]` being a security table —
+/// it aborts startup rather than silently picking a mode (R-CFG6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SshAgentMode {
+    /// Default. Each command's `SSH_AUTH_SOCK` is ahma's broker, which signs
+    /// only with a human's consent (R-CRED.1), and on macOS the profile
+    /// refuses a direct connect to your own agent's socket.
+    #[default]
+    Broker,
+    /// What ahma did before the broker: no broker, `SSH_AUTH_SOCK` passed
+    /// through, and your agent reachable from every command. For an agent
+    /// that confirms each use itself (`ssh-add -c`).
+    Passthrough,
+    /// No agent at all: no broker, `SSH_AUTH_SOCK` removed from every
+    /// command, and on macOS a direct connect to your agent refused.
+    Off,
+}
+
+impl SshAgentMode {
+    /// The TOML token (matches the serde representation).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SshAgentMode::Broker => "broker",
+            SshAgentMode::Passthrough => "passthrough",
+            SshAgentMode::Off => "off",
+        }
+    }
+}
+
 /// Sandbox and filesystem security settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1367,6 +1400,15 @@ pub struct SandboxSettings {
     /// Default: empty list
     #[serde(default)]
     pub ssh_sign: Vec<crate::ssh_sign::SshSignGrant>,
+    /// Which SSH agent sandboxed commands may use (SPEC R-CRED.11):
+    /// `"broker"` serves each command ahma's consent-checking broker and, on
+    /// macOS, refuses a direct connect to your own agent; `"passthrough"` keeps
+    /// the pre-broker behaviour (your `SSH_AUTH_SOCK`, no broker, no deny) for
+    /// an agent that confirms every use itself (`ssh-add -c`); `"off"` gives
+    /// commands no agent at all. See [`SshAgentMode`].
+    /// Default: `"broker"`
+    #[serde(default)]
+    pub ssh_agent: SshAgentMode,
     /// Environment-variable names to **preserve** in tool subprocess
     /// environments even though they match a built-in secret pattern
     /// (`*_API_KEY`, `*_SECRET`, `*_TOKEN`, `*PASSWORD*`, …).
@@ -1601,6 +1643,7 @@ impl Default for SandboxSettings {
             use_scratch_directory: false,
             persistent_scopes: Vec::new(),
             ssh_sign: Vec::new(),
+            ssh_agent: SshAgentMode::Broker,
             env_allow: Vec::new(),
             allow_keychain: true,
             signal_other_processes: false,
@@ -2608,6 +2651,12 @@ impl AhmaSettings {
             toml_ssh_sign(&d.sandbox.ssh_sign),
         );
         w.setting(
+            "Which SSH agent sandboxed commands use: \"broker\" (ahma signs only with your consent; macOS also refuses a direct connect to your own agent), \"passthrough\" (your SSH_AUTH_SOCK as before the broker, e.g. for ssh-add -c), or \"off\" (no agent) (SPEC R-CRED.11).",
+            "ssh_agent",
+            toml_str(self.sandbox.ssh_agent.as_str()),
+            toml_str(d.sandbox.ssh_agent.as_str()),
+        );
+        w.setting(
             "Env var names preserved in tool subprocesses despite matching a secret pattern (e.g. GITHUB_TOKEN). Everything else secret-looking is scrubbed.",
             "env_allow",
             toml_str_list(&self.sandbox.env_allow),
@@ -3496,6 +3545,7 @@ mod tests {
                 scratch_directory: Some(PathBuf::from("/scratch")),
                 use_scratch_directory: true,
                 ssh_sign: Vec::new(),
+                ssh_agent: SshAgentMode::Passthrough,
                 persistent_scopes: vec![PersistentScope {
                     path: PathBuf::from("~/Library/Caches/x.sccache"),
                     access: ScopeAccess::Ro,
@@ -4531,6 +4581,46 @@ persistent_scopes = [
         );
     }
 
+    /// `[sandbox] ssh_agent` (SPEC R-CRED.11): `broker` is the default, and
+    /// each value parses to its own mode and renders back to the same token.
+    #[test]
+    fn ssh_agent_defaults_to_broker_and_parses_each_value() {
+        assert_eq!(SandboxSettings::default().ssh_agent, SshAgentMode::Broker);
+        assert_eq!(
+            AhmaSettings::parse("[sandbox]\n")
+                .unwrap()
+                .sandbox
+                .ssh_agent,
+            SshAgentMode::Broker
+        );
+        for (token, want) in [
+            ("broker", SshAgentMode::Broker),
+            ("passthrough", SshAgentMode::Passthrough),
+            ("off", SshAgentMode::Off),
+        ] {
+            let parsed = AhmaSettings::parse(&format!("[sandbox]\nssh_agent = \"{token}\"\n"))
+                .unwrap_or_else(|e| panic!("'{token}' must parse: {e}"));
+            assert_eq!(parsed.sandbox.ssh_agent, want, "{token}");
+            assert_eq!(want.as_str(), token, "display round-trips");
+        }
+    }
+
+    /// A misspelt mode must fail the parse (and so abort startup, R-CFG6.1)
+    /// rather than quietly mean `broker` — or, worse, a typo of `off` leaving
+    /// the agent reachable.
+    #[test]
+    fn ssh_agent_unknown_value_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[sandbox]\nssh_agent = \"forward\"\n").unwrap();
+        let err = AhmaSettings::load_from_result(&path)
+            .expect_err("unknown ssh_agent value must be rejected");
+        assert!(
+            err.contains("ssh_agent") || err.contains("forward"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn grant_scope_adds_then_updates_in_place() {
         let mut sb = SandboxSettings::default();
@@ -4944,6 +5034,9 @@ mod tier_tests {
             // A cloned repository must not be able to switch kernel prevention
             // of its own hook directory off.
             ("sandbox", "linux_deny_tier"),
+            // A cloned repository must not be able to hand its commands your
+            // own SSH agent (R-CRED.11).
+            ("sandbox", "ssh_agent"),
             ("auth", "require_token"),
             ("auth", "require_token_path"),
             ("auth", "rate_limit_rps"),
@@ -5255,6 +5348,26 @@ timeout_secs = 42
             !merged.sandbox.disable,
             "the sandbox must be exactly as the user left it"
         );
+    }
+
+    /// SPEC R-CRED.11: a cloned repository cannot hand its commands your own
+    /// SSH agent. `ssh_agent = "passthrough"` from a project file is refused
+    /// and named, and the user's choice stands.
+    #[test]
+    fn a_project_file_cannot_choose_the_ssh_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_project(dir.path(), "[sandbox]\nssh_agent = \"passthrough\"\n");
+
+        let load = load_project_settings(&path).expect("a well-formed file parses");
+        assert!(
+            load.rejected_security
+                .iter()
+                .any(|k| k == "sandbox.ssh_agent"),
+            "rejected: {:?}",
+            load.rejected_security
+        );
+        let merged = merge_project_over_user(&AhmaSettings::default(), &load.accepted);
+        assert_eq!(merged.sandbox.ssh_agent, SshAgentMode::Broker);
     }
 
     #[test]

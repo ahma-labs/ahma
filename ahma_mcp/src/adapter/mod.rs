@@ -1403,6 +1403,8 @@ impl Adapter {
         let task_handles = self.task_handles.clone();
         let op_id_task = op_id.clone();
         let tool_task = tool_name.to_string();
+        #[cfg(unix)]
+        let credential_brokers = self.credential_brokers.clone();
         let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
         // A PTY command is an arbitrary shell command: exclusive (SPEC R2.7).
         let ticket = self.enqueue_exclusive(
@@ -1434,6 +1436,18 @@ impl Adapter {
             } else {
                 None
             };
+            // Its SSH key broker (SPEC R-CRED.1), as for any other command: a
+            // refused signature is an alert on this operation (R-CRED.10). Held
+            // until the PTY process is gone.
+            #[cfg(unix)]
+            let broker = credential_brokers
+                .as_ref()
+                .and_then(|f| f.lease(&safe_wd))
+                .inspect(|broker| alert_broker_refusals(broker, &monitor, &op_id_task));
+            #[cfg(unix)]
+            let broker_socket = broker.as_ref().map(|b| b.socket().to_path_buf());
+            #[cfg(not(unix))]
+            let broker_socket: Option<std::path::PathBuf> = None;
             let (outcome, exit_code) = pty_exec::run_pty_operation(
                 &sandbox,
                 &command_str,
@@ -1442,6 +1456,7 @@ impl Adapter {
                 &cancellation_token,
                 &op_id_task,
                 &monitor,
+                broker_socket.as_deref(),
             )
             .await;
             // The PTY path publishes its own result, so a deny-tier write here
@@ -1449,6 +1464,8 @@ impl Adapter {
             if let Some(watch) = handoff {
                 let _ = finish_handoff_watch(watch, &op_id_task, &tool_task).await;
             }
+            #[cfg(unix)]
+            drop(broker);
             drop(lease);
             audit::record_tool_complete(
                 &op_id_task,
@@ -1689,6 +1706,24 @@ struct AsyncOperationRun {
     credential_brokers: Option<Arc<dyn crate::credentials::ssh_agent::consent::BrokerFactory>>,
 }
 
+/// Report each signature `broker` refuses as an alert on operation `op_id`
+/// while it still runs (SPEC R-CRED.10).
+#[cfg(unix)]
+fn alert_broker_refusals(
+    broker: &crate::credentials::ssh_agent::host::BrokerLease,
+    monitor: &Arc<OperationMonitor>,
+    op_id: &str,
+) {
+    let (monitor, op_id) = (monitor.clone(), op_id.to_string());
+    let runtime = tokio::runtime::Handle::current();
+    broker.observe(Arc::new(move |event| {
+        if let crate::credentials::ssh_agent::broker::BrokerEvent::Refused { why, .. } = event {
+            let (monitor, op_id, why) = (monitor.clone(), op_id.clone(), why.clone());
+            runtime.spawn(async move { monitor.append_alert(&op_id, why).await });
+        }
+    }));
+}
+
 async fn run_async_operation(ctx: AsyncOperationRun) {
     let AsyncOperationRun {
         op_id,
@@ -1828,16 +1863,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         .and_then(|f| f.lease(&wd_path))
         .inspect(|broker| {
             proc_cmd.env("SSH_AUTH_SOCK", broker.socket());
-            let (monitor, op_id) = (monitor.clone(), op_id.clone());
-            let runtime = tokio::runtime::Handle::current();
-            broker.observe(Arc::new(move |event| {
-                if let crate::credentials::ssh_agent::broker::BrokerEvent::Refused { why, .. } =
-                    event
-                {
-                    let (monitor, op_id, why) = (monitor.clone(), op_id.clone(), why.clone());
-                    runtime.spawn(async move { monitor.append_alert(&op_id, why).await });
-                }
-            }));
+            alert_broker_refusals(broker, &monitor, &op_id);
         });
     // The tag the kernel's records of this operation's denials carry
     // (SPEC R-DENY.1), for the failure path to read them back.

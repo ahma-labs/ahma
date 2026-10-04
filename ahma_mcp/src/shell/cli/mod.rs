@@ -3253,6 +3253,40 @@ fn configure_linux_deny_tier(s: &ahma_common::config::AhmaSettings) {
     sandbox::set_linux_deny_tier(s.sandbox.linux_deny_tier);
 }
 
+/// Install `[sandbox] ssh_agent` (SPEC R-CRED.11) and, unless it is
+/// `"passthrough"`, adopt the human's agent: the one socket brokers forward to
+/// and the profile refuses a direct connect to. Settings-only, like
+/// `linux_deny_tier`: an enum with a safe default, in the security tier.
+fn configure_ssh_agent(s: &ahma_common::config::AhmaSettings) {
+    use sandbox::SshAgentMode;
+    let mode = s.sandbox.ssh_agent;
+    sandbox::set_ssh_agent_mode(mode);
+    #[cfg(unix)]
+    if mode != SshAgentMode::Passthrough {
+        use crate::credentials::ssh_agent::consent;
+        consent::adopt_upstream(consent::discover_upstream());
+    }
+    match mode {
+        SshAgentMode::Passthrough => tracing::warn!(
+            "[sandbox] ssh_agent=\"passthrough\": sandboxed commands use your own SSH agent \
+             directly, with no broker — any command may sign with any key it holds, for any \
+             server, without asking (SPEC R-CRED.11)"
+        ),
+        SshAgentMode::Off => tracing::info!(
+            "[sandbox] ssh_agent=\"off\": sandboxed commands get no SSH agent (SSH_AUTH_SOCK \
+             removed); git over ssh from inside the sandbox will not authenticate"
+        ),
+        SshAgentMode::Broker => {}
+    }
+    if cfg!(target_os = "linux") && mode != SshAgentMode::Passthrough {
+        tracing::info!(
+            "Linux: a sandboxed command that ignores SSH_AUTH_SOCK can still connect to your \
+             own SSH agent's socket; Landlock does not mediate a unix-socket connect \
+             (SPEC R-CRED.11)"
+        );
+    }
+}
+
 /// `--allow-git-hooks` / `--allow-project-tool-config` widen the default-denied
 /// policy; `[sandbox] allow_git_hooks` / `allow_project_tool_config` do the same
 /// persistently. Either source is enough.
@@ -3333,6 +3367,8 @@ pub fn build_app_config_with_settings(
     // installed before any Seatbelt profile is generated or any write is guarded.
     configure_handoff_allowances(cli, &s);
     configure_linux_deny_tier(&s);
+    // Before any profile is generated or any command spawned: both read it.
+    configure_ssh_agent(&s);
 
     // ── Tool loading ────────────────────────────────────────────────────────
     // R-CFG1.2: AHMA_TOOLS_DIR is RETIRED — warn and ignore.
@@ -3699,6 +3735,31 @@ mod tests {
             sandbox::HandoffAllowances::current(),
             sandbox::HandoffAllowances::default()
         );
+    }
+
+    /// `[sandbox] ssh_agent` reaches the process global every profile and
+    /// spawn reads (SPEC R-CRED.11); `"passthrough"` adopts no upstream, so
+    /// the profile has nothing to deny.
+    #[test]
+    fn configure_ssh_agent_installs_the_process_global() {
+        init_test();
+        let mut settings = ahma_common::config::AhmaSettings::default();
+        settings.sandbox.ssh_agent = sandbox::SshAgentMode::Off;
+        configure_ssh_agent(&settings);
+        assert_eq!(sandbox::ssh_agent_mode(), sandbox::SshAgentMode::Off);
+
+        settings.sandbox.ssh_agent = sandbox::SshAgentMode::Passthrough;
+        sandbox::set_upstream_agent(None).unwrap();
+        configure_ssh_agent(&settings);
+        assert_eq!(
+            sandbox::ssh_agent_mode(),
+            sandbox::SshAgentMode::Passthrough
+        );
+        assert_eq!(sandbox::upstream_agent(), None);
+
+        // Restore the default for anything sharing this process.
+        sandbox::set_ssh_agent_mode(sandbox::SshAgentMode::Broker);
+        sandbox::set_upstream_agent(None).unwrap();
     }
 
     /// `[sandbox] linux_deny_tier` reaches the process global every Linux spawn

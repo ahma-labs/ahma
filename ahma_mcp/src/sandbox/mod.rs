@@ -72,6 +72,7 @@ mod seatbelt;
 pub mod session_tier;
 pub mod setuid;
 pub mod signals;
+pub mod ssh_agent;
 mod types;
 /// Windows backend. Compiled on **every** platform, unlike `landlock`/`seatbelt`,
 /// because its argv protocol, container-name derivation, launcher resolution and
@@ -125,6 +126,9 @@ pub use scopes::{normalize_path_lexically, preflight_scope_candidate};
 pub use session_tier::{pid_alive, record_session_grant, session_scopes_for};
 pub use setuid::setuid_denial_note;
 pub use signals::{set_signal_other_processes, signal_denial_note, signal_other_processes_allowed};
+pub use ssh_agent::{
+    SshAgentMode, set_ssh_agent_mode, set_upstream_agent, ssh_agent_mode, upstream_agent,
+};
 pub use types::{SandboxMode, ScopesGuard};
 /// Re-entry hook for the Windows AppContainer launcher. Exported unconditionally
 /// (a no-op off Windows) so `main` can call it without a `cfg` of its own; it
