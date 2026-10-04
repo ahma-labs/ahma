@@ -126,6 +126,8 @@ const READ_ONLY_GIT: &[&str] = &[
     "rev-list",
     "merge-base",
     "name-rev",
+    // Asks the remote for its refs and writes nothing locally.
+    "ls-remote",
 ];
 
 /// Characters that make a command line mean more than "run some programs with
@@ -549,6 +551,10 @@ struct Reading {
     changes_dir: bool,
     /// Files `tee` writes, as written.
     tee_files: Vec<String>,
+    /// Some program is `git fetch` or `git push` ([`git_sync`]): it writes the
+    /// repository's metadata, so never the read-only lane, and `Some(true)`
+    /// when a push may run a hook.
+    syncs: Option<bool>,
 }
 
 /// Judge a command line's programs. `None` unless every one only reads (or is
@@ -563,6 +569,9 @@ fn read_line(command: &str) -> Option<(Line, Reading)> {
         if !inner_line.writes.is_empty() || !inner_reading.tee_files.is_empty() {
             return None;
         }
+        if inner_reading.syncs.is_some() {
+            return None;
+        }
         reading.writes_through_args |= inner_reading.writes_through_args;
         reading.watches |= inner_reading.watches;
     }
@@ -575,7 +584,11 @@ fn read_line(command: &str) -> Option<(Line, Reading)> {
 /// verdict the adapter uses.
 pub fn classify_shell_command(command: &str) -> Lane {
     match read_line(command) {
-        Some((line, reading)) if line.writes.is_empty() && reading.tee_files.is_empty() => {
+        Some((line, reading))
+            if line.writes.is_empty()
+                && reading.tee_files.is_empty()
+                && reading.syncs.is_none() =>
+        {
             Lane::ReadOnly
         }
         _ => Lane::Exclusive,
@@ -613,6 +626,22 @@ pub fn classify_shell_command_at(command: &str, site: &RunSite<'_>) -> Lane {
         return Lane::Exclusive;
     };
     let mut targets = line.writes.iter().chain(&reading.tee_files).peekable();
+    // `git fetch` / `git push` write only the repository's metadata, which no
+    // build touches, so they never wait behind one; a push that may run a
+    // pre-push hook, a line that also writes a file, or one that changes
+    // directory first still takes its turn.
+    if let Some(push) = reading.syncs {
+        let hook = push && push_runs_hook(site.cwd);
+        return if targets.peek().is_none()
+            && !reading.writes_through_args
+            && !reading.changes_dir
+            && !hook
+        {
+            Lane::Service
+        } else {
+            Lane::Exclusive
+        };
+    }
     if targets.peek().is_none() {
         return if site.read_only_enforced {
             Lane::ReadOnly
@@ -738,6 +767,10 @@ fn read_segments(segs: &[Segment]) -> Option<Reading> {
         // caller places like a redirection's.
         if program == "tee" {
             reading.tee_files.extend(tee_files(args)?);
+            continue;
+        }
+        if let Some(push) = git_sync(program, args) {
+            reading.syncs = Some(reading.syncs.unwrap_or(false) || push);
             continue;
         }
         if !program_is_read_only(program, args) {
@@ -976,21 +1009,192 @@ fn segment_effect(seg: &[String], declared: &[String]) -> SourceEffect {
 }
 
 fn git_is_read_only(args: &[String]) -> bool {
-    // Global options (`-c core.fsmonitor=…`, `-C dir`, `--exec-path`) come before
-    // the subcommand; any of them makes the call something other than a plain read.
-    let Some(sub) = args.first() else {
+    let Some((sub, rest)) = git_subcommand(args) else {
         return false;
     };
-    if sub.starts_with('-') {
-        return false;
-    }
-    if !READ_ONLY_GIT.contains(&sub.as_str()) {
-        return false;
-    }
+    let has = |names: &[&str]| rest.iter().any(|a| names.contains(&a.as_str()));
+    let starts = |prefixes: &[&str]| {
+        rest.iter()
+            .any(|a| prefixes.iter().any(|p| a.starts_with(p)))
+    };
+    let positional = || rest.iter().any(|a| !a.starts_with('-'));
+    let read = match sub {
+        // The listing forms: no name to create, no option that changes a ref.
+        "branch" => {
+            !has(&[
+                "-d",
+                "-D",
+                "--delete",
+                "-m",
+                "-M",
+                "--move",
+                "-c",
+                "-C",
+                "--copy",
+                "-f",
+                "--force",
+                "-u",
+                "--unset-upstream",
+                "--edit-description",
+                "-t",
+                "--track",
+                "--no-track",
+                "--create-reflog",
+            ]) && !starts(&["--set-upstream-to", "--track="])
+                && (!positional()
+                    || has(&[
+                        "-l",
+                        "--list",
+                        "-a",
+                        "--all",
+                        "-r",
+                        "--remotes",
+                        "--contains",
+                        "--no-contains",
+                        "--merged",
+                        "--no-merged",
+                        "--points-at",
+                    ]))
+        }
+        "tag" => {
+            !has(&[
+                "-d",
+                "--delete",
+                "-a",
+                "--annotate",
+                "-s",
+                "--sign",
+                "-m",
+                "-F",
+                "-f",
+                "--force",
+                "-u",
+                "-e",
+                "--edit",
+            ]) && (!positional()
+                || has(&[
+                    "-l",
+                    "--list",
+                    "--contains",
+                    "--no-contains",
+                    "--merged",
+                    "--no-merged",
+                    "--points-at",
+                ]))
+        }
+        "remote" => match rest.first().map(String::as_str) {
+            None | Some("-v" | "--verbose") => rest.len() <= 1,
+            Some("get-url" | "show") => true,
+            _ => false,
+        },
+        "config" => {
+            (has(&[
+                "-l",
+                "--list",
+                "--get",
+                "--get-all",
+                "--get-regexp",
+                "--get-urlmatch",
+                "--get-color",
+                "--get-colorbool",
+            ]) || rest.first().map(String::as_str) == Some("get")
+                || rest.first().map(String::as_str) == Some("list"))
+                && !has(&[
+                    "-e",
+                    "--edit",
+                    "--add",
+                    "--replace-all",
+                    "--unset",
+                    "--unset-all",
+                    "--rename-section",
+                    "--remove-section",
+                ])
+        }
+        "stash" => matches!(rest.first().map(String::as_str), Some("list" | "show")),
+        "worktree" => rest.first().map(String::as_str) == Some("list"),
+        sub => READ_ONLY_GIT.contains(&sub),
+    };
     // Options that make a reading subcommand write a file.
-    !args
+    read && !rest
         .iter()
         .any(|a| a == "--output" || a.starts_with("--output="))
+}
+
+/// The subcommand of a `git` call and its arguments, past the global options
+/// that only choose where and how it reads: `-C <dir>`, `--no-pager`, `-P`.
+/// `None` for any other global option (`-c core.fsmonitor=…` runs a program,
+/// `--exec-path` swaps git's own), or no subcommand at all.
+fn git_subcommand(args: &[String]) -> Option<(&str, &[String])> {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        match a.as_str() {
+            "-C" => {
+                args.get(i + 1)?;
+                i += 2;
+            }
+            "--no-pager" | "-P" => i += 1,
+            a if a.starts_with('-') => return None,
+            sub => return Some((sub, &args[i + 1..])),
+        }
+    }
+    None
+}
+
+/// `git fetch` or `git push`: commands that write only the repository's own
+/// metadata (objects and refs, which git locks itself) and never a file a
+/// build reads or writes. `None` for anything else, `Some(true)` for a push,
+/// which may run a pre-push hook.
+fn git_sync(program: &str, args: &[String]) -> Option<bool> {
+    if program != "git" {
+        return None;
+    }
+    // `-C` would move the repository away from the one whose hooks are
+    // checked; not worth following.
+    let (sub, rest) = match args.first().map(String::as_str) {
+        Some("--no-pager" | "-P") => (args.get(1)?.as_str(), &args[2..]),
+        Some(sub) if !sub.starts_with('-') => (sub, &args[1..]),
+        _ => return None,
+    };
+    // Options that check out or rewrite files, or run a program of the
+    // caller's choosing.
+    let bad = |a: &String| {
+        a == "--update-head-ok"
+            || a == "-u" && sub == "fetch"
+            || a.starts_with("--upload-pack")
+            || a.starts_with("--receive-pack")
+            || a.starts_with("--exec")
+    };
+    match sub {
+        "fetch" if !rest.iter().any(bad) => Some(false),
+        "push" if !rest.iter().any(bad) => Some(rest.iter().all(|a| a != "--no-verify")),
+        _ => None,
+    }
+}
+
+/// Whether a push from `cwd` runs a pre-push hook: the repository has one,
+/// or a `core.hooksPath` setting may point at one. Anything that cannot be
+/// told (a `.git` file of a linked worktree, no repository found) counts as
+/// a hook.
+fn push_runs_hook(cwd: &Path) -> bool {
+    let Some(repo) = cwd.ancestors().find(|a| a.join(".git").exists()) else {
+        return true;
+    };
+    let git = repo.join(".git");
+    if !git.is_dir() || git.join("hooks").join("pre-push").exists() {
+        return true;
+    }
+    let mentions_hooks_path = |file: PathBuf| {
+        std::fs::read_to_string(file)
+            .map(|t| t.to_ascii_lowercase().contains("hookspath"))
+            .unwrap_or(false)
+    };
+    let home = dirs::home_dir();
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".config")));
+    mentions_hooks_path(git.join("config"))
+        || home.is_some_and(|h| mentions_hooks_path(h.join(".gitconfig")))
+        || xdg.is_some_and(|x| mentions_hooks_path(x.join("git").join("config")))
 }
 
 #[cfg(test)]
@@ -1033,7 +1237,7 @@ mod tests {
             "git commit -m x",
             "git checkout main",
             "git stash",
-            "git branch",
+            "git branch new-feature",
             "rm -rf target",
             "sed -i s/a/b/ f",
             "npm test",
@@ -1068,8 +1272,8 @@ mod tests {
             "find . -exec rm {} ;",
             "rg --pre ./x foo",
             "git -c core.fsmonitor=evil status",
-            "git -C other status",
             "git diff --output=patch.diff",
+            "git -C other diff --output=patch.diff",
         ] {
             assert_eq!(lane(cmd), Lane::Exclusive, "{cmd}");
         }
@@ -1439,6 +1643,108 @@ mod watch_and_redirect_tests {
                 writes_workspace: &inside,
             },
         )
+    }
+
+    /// The read forms of git's listing subcommands, `ls-remote`, and a read
+    /// run against another directory with `-C`, are reads: each waited behind
+    /// a ten-minute test run although it writes nothing. Their writing forms
+    /// stay exclusive.
+    #[test]
+    fn git_listings_and_remote_reads_are_read_only() {
+        for cmd in [
+            "git ls-remote origin HEAD",
+            "git branch",
+            "git branch -a",
+            "git branch -vv",
+            "git branch --show-current",
+            "git branch --list 'fix/*'",
+            "git branch --contains HEAD",
+            "git remote",
+            "git remote -v",
+            "git remote get-url origin",
+            "git config --get user.name",
+            "git config --get-all credential.helper",
+            "git config --list",
+            "git config -l --show-origin",
+            "git tag",
+            "git tag -l 'v0.*'",
+            "git tag --list",
+            "git stash list",
+            "git stash show -p",
+            "git worktree list",
+            "git -C sub status",
+            "git -C ../other log --oneline -3",
+            "git --no-pager log -1",
+            "git -P diff",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::ReadOnly, "{cmd}");
+        }
+        for cmd in [
+            "git branch -D old",
+            "git branch -m a b",
+            "git branch --set-upstream-to origin/main",
+            "git remote add up https://example.com/x.git",
+            "git remote set-url origin https://example.com/x.git",
+            "git config user.name x",
+            "git config --unset user.name",
+            "git tag v1.0",
+            "git tag -d v1.0",
+            "git stash drop",
+            "git worktree add ../x",
+            "git -c core.fsmonitor=./x status",
+            "git -C",
+            "git --exec-path=/x status",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::Exclusive, "{cmd}");
+        }
+    }
+
+    /// `git fetch` and `git push` write only the repository's own metadata,
+    /// which git locks itself, and never the files a build reads or writes:
+    /// they waited behind a whole test run for nothing. A push that runs a
+    /// pre-push hook runs arbitrary code, so it still takes its turn.
+    #[test]
+    fn fetch_and_a_hookless_push_never_wait_behind_a_build() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git").join("hooks")).unwrap();
+        let site_at = |cmd: &str| {
+            let inside = |p: &Path| p.starts_with(&repo);
+            classify_shell_command_at(
+                cmd,
+                &RunSite {
+                    cwd: &repo,
+                    read_only_enforced: true,
+                    writes_workspace: &inside,
+                },
+            )
+        };
+        for cmd in [
+            "git fetch",
+            "git fetch origin main",
+            "git fetch --prune",
+            "git push",
+            "git push -u origin HEAD",
+            "git push origin --delete old-branch",
+        ] {
+            assert_eq!(site_at(cmd), Lane::Service, "{cmd}");
+        }
+        for cmd in [
+            "git pull",
+            "git fetch --recurse-submodules=on-demand && git checkout x",
+            "git push > out.log",
+        ] {
+            assert_eq!(site_at(cmd), Lane::Exclusive, "{cmd}");
+        }
+
+        std::fs::write(repo.join(".git/hooks/pre-push"), "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            site_at("git push"),
+            Lane::Exclusive,
+            "a pre-push hook runs code"
+        );
+        assert_eq!(site_at("git push --no-verify"), Lane::Service);
+        assert_eq!(site_at("git fetch"), Lane::Service, "fetch runs no hook");
     }
 
     #[test]

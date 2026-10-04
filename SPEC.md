@@ -320,10 +320,20 @@ drops work — and it is built so that no crash, kill or power loss can leave it
     is service in two cases, both only when no program writes through its own arguments
     (`sed`, `sort -o`, `curl -o`, …) or runs under an environment assignment: every program
     reads and every writing redirection or `tee` file lies outside the workspace and every
-    sandbox scope, resolved through symlinks (a CI log written to the session's scratch
-    directory); or the line is a watcher (`gh run watch`, `gh pr checks --watch`, `tail -f`)
-    where no read-only lane exists. Service trades the kernel's read-only guarantee for
-    ordering only, which is why it requires the stricter program set.
+    other repository the session can write, resolved through symlinks (a CI log written to
+    the session's scratch directory: a writable scope that is no repository — the harness's
+    own scratch directory, a cache, temp — is not a workspace); or the line is a watcher
+    (`gh run watch`, `gh pr checks --watch`, `tail -f`) where no read-only lane exists.
+    Service trades the kernel's read-only guarantee for ordering only, which is why it
+    requires the stricter program set.
+  - *`git fetch` and `git push`* are service: they write only the repository's own
+    metadata, which git locks itself and no build reads or writes, so they never wait
+    behind a build. A push that may run a pre-push hook (the repository has
+    `hooks/pre-push`, a git config mentions `core.hooksPath`, or the repository cannot be
+    told) is exclusive unless it passes `--no-verify`, because a hook runs arbitrary code.
+    A line that also writes a file, changes directory, or uses an option that checks out
+    files or runs a program of the caller's choosing (`--update-head-ok`, `--upload-pack`,
+    `--receive-pack`, `--exec`) is exclusive. They are never read-only: they write.
   - *MTDF tools* take their lane from `concurrency` (`exclusive` | `read_only` |
     `service`), the nearest declaration winning (subcommand over parent subcommand over
     tool), resolved once when the definition is parsed. The bundled tools **must** declare
@@ -331,7 +341,9 @@ drops work — and it is built so that no crash, kill or power loss can leave it
     `ls`/`cat`/`grep`/…, `git` `status`/`log`, `gh` list/view commands) are `read_only`, and
     `gh run_watch`, which follows a CI run for minutes, is `service`.
   - *Shell command lines* are classified by a conservative classifier. It reads as
-    readers: plain readers (`git status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, `tail` —
+    readers: plain readers (`git status/diff/log/show/ls-remote`, the listing forms of
+    `git branch/tag/remote/config/stash/worktree`, any of them after `-C <dir>`,
+    `--no-pager` or `-P`, `rg`, `grep`, `ls`, `cat`, `tail` —
     followers included, since a reader that never ends must not hold the workspace for its
     whole life —, `ps`, `sed` without `-i`, `gh` viewing commands including `gh run watch`
     (`gh api` only with no method other than GET and no `-f`/`-F`/`--field`/`--raw-field`/

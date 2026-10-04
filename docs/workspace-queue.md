@@ -31,16 +31,21 @@ status()                                     → ── Finished since your last
 - **Writers run one at a time, in arrival order.** A command that may write the workspace
   waits for every earlier one. If its call returns before it starts, the result says
   `NOT started — queued behind …` and names who it waits for; it runs by itself.
-- **Readers never wait.** `git status/diff/log/show`, `rg`, `grep`, `ls`, `cat`, `pgrep`, `ahma ps`, `sed -n`, `gh pr view`, `curl`, `sleep`, the diagnostics you run to see why a job is slow (`uptime`, `sysctl -n`, `vm_stat`, `top -l 1`, `lsof`) and similar — and **pipelines, lists and loops of them** (`grep … | head`, `cd src && ls`, `2>&1`, `>/dev/null`, `FOO=1 gh pr checks 87`, `S=/path; grep … $S`, `for f in a b; do grep -c x $f; done`, `until gh pr checks 87; do sleep 60; done`) —
+- **Readers never wait.** `git status/diff/log/show/ls-remote`, the listing forms of `git branch/tag/remote/config/stash/worktree` (also after `git -C <dir>`), `rg`, `grep`, `ls`, `cat`, `pgrep`, `ahma ps`, `sed -n`, `gh pr view`, `curl`, `sleep`, the diagnostics you run to see why a job is slow (`uptime`, `sysctl -n`, `vm_stat`, `top -l 1`, `lsof`) and similar — and **pipelines, lists and loops of them** (`grep … | head`, `cd src && ls`, `2>&1`, `>/dev/null`, `FOO=1 gh pr checks 87`, `S=/path; grep … $S`, `for f in a b; do grep -c x $f; done`, `until gh pr checks 87; do sleep 60; done`) —
   plain reads skip the queue — under a sandbox that grants the workspace **no write access**,
   so a misclassified command fails instead of writing.
 - **Watching CI never holds the workspace.** `gh run watch`, `gh pr checks --watch` and
   `tail -f` read until their subject ends, which can be most of an hour. They take no lease:
   read-only where the kernel enforces that lane, `service` where it does not.
+- **`git fetch` and `git push` never wait behind a build.** They write only git's own
+  metadata, which git locks itself and no build touches, so they run in the `service`
+  lane. A push that may run a pre-push hook (the repository has `hooks/pre-push`, or a git
+  config sets `core.hooksPath`) takes its turn like any writer, unless it passes
+  `--no-verify`.
 - **Output sent outside every workspace is not a workspace write.** A reader whose
   redirections (`>`, `>>`, `2>`, `&>`, `| tee`) write only files outside the workspace and
-  every other sandbox scope — `gh pr checks 87 --watch > /tmp/ci.log` — runs in the
-  `service` lane. The same line writing `ci.log` in the workspace queues as a writer, as
+  every other repository the session can write — `gh pr checks 87 --watch > /tmp/ci.log`,
+  or into the harness's own scratch directory — runs in the `service` lane. The same line writing `ci.log` in the workspace queues as a writer, as
   does any target the shell would expand (`$OUT`, a glob, `~`), a relative target after a
   `cd`, or a line with a program that can write through its own arguments (`sort -o`,
   `sed`, `env …`).

@@ -376,9 +376,18 @@ impl Adapter {
             .unwrap_or_else(|| match shell_command_line(args) {
                 Some(line) => {
                     // A redirection writes the workspace when its file lies in
-                    // this workspace or in any other the session can write.
+                    // this workspace or in another repository the session can
+                    // write. A scope that is no repository — the harness's own
+                    // scratch directory, a cache, temp — is not a workspace
+                    // (SPEC R2.7.2).
                     let workspace = self.workspace_key_for(working_dir);
-                    let scopes = self.sandbox.scopes().to_vec();
+                    let scopes: Vec<std::path::PathBuf> = self
+                        .sandbox
+                        .scopes()
+                        .iter()
+                        .filter(|s| s.ancestors().any(|a| a.join(".git").exists()))
+                        .cloned()
+                        .collect();
                     let writes_workspace =
                         |path: &std::path::Path| lane::writes_inside(path, &workspace, &scopes);
                     lane::classify_shell_command_at(
@@ -3158,6 +3167,54 @@ mod tests {
         let notices = notices.lock();
         assert_eq!(notices.len(), 1, "one notice per wait: {notices:?}");
         assert!(notices[0].contains("op_holder"), "{notices:?}");
+    }
+
+    /// SPEC R2.7.2, R2.7.4: a redirection into a scope that is not a workspace
+    /// — the harness's own scratch directory, a cache or temp directory the
+    /// session may write — does not make a reader a workspace writer. A
+    /// `gh pr checks --watch > <scratch>/ci.txt` held the workspace for a whole
+    /// CI run because the harness scratch directory is a writable scope.
+    #[test]
+    fn only_a_repository_is_a_workspace_for_a_redirection() {
+        let td = tempfile::tempdir().unwrap();
+        let ws = td.path().join("ws");
+        let other = td.path().join("other");
+        let scratch = td.path().join("scratch");
+        for d in [&ws, &other] {
+            std::fs::create_dir_all(d.join(".git")).unwrap();
+        }
+        std::fs::create_dir_all(&scratch).unwrap();
+        let sandbox = Arc::new(
+            crate::sandbox::Sandbox::new(
+                vec![ws.clone(), other.clone(), scratch.clone()],
+                crate::sandbox::SandboxMode::Test,
+                false,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let adapter = Adapter::new(
+            Arc::new(OperationMonitor::new(
+                crate::operation_monitor::MonitorConfig::with_timeout(Duration::from_secs(30)),
+            )),
+            Arc::new(ShellPoolManager::new(
+                crate::shell_pool::ShellPoolConfig::default(),
+            )),
+            sandbox,
+        )
+        .unwrap();
+        let lane_of = |line: String| adapter.resolve_lane(Some(&shell_args(&line)), None, &ws);
+        let watch = |to: &std::path::Path| {
+            format!("gh pr checks 1 --watch > {}", to.join("ci.txt").display())
+        };
+        assert_eq!(lane_of(watch(&scratch)), workspace_queue::Lane::Service);
+        assert_eq!(lane_of(watch(&ws)), workspace_queue::Lane::Exclusive);
+        assert_eq!(
+            lane_of(watch(&other)),
+            workspace_queue::Lane::Exclusive,
+            "another repository the session can write is a workspace too"
+        );
     }
 
     /// A grant question that waits on a human never answers.
