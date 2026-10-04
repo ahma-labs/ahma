@@ -35,7 +35,9 @@ ahma asks you in the best place available, in this order:
    the context of whatever you were doing.
 2. **The ahma TUI**, if one is open: a modal, over whichever view you're in. A question
    goes there only while a TUI is actually open; with none open it falls to the next rung
-   rather than waiting for a TUI nobody is looking at.
+   rather than waiting for a TUI nobody is looking at. Once there, it waits for an answer
+   for as long as the session lives, even when the session's connection to the hub drops:
+   the session asks it again when it reconnects.
 3. **Nowhere left to ask** → the command **fails**, and tells you exactly what to do:
 
    ```

@@ -2485,13 +2485,18 @@ async fn serve_instance<R, W>(
         native_terminal: reg.native_terminal,
     };
     let pid = reg.pid;
-    hub.instances.lock().await.insert(id.clone(), info.clone());
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<HubMsg>(100);
     let _ = tx.try_send(HubMsg::Viewers {
         count: hub.viewers.load(Ordering::SeqCst),
     });
+    // The channel goes in before the instance: it is what the connection this
+    // one replaces checks before tearing down, so nothing registered here can
+    // be removed by it. Held weakly, so replacing it still ends that
+    // connection's loop.
+    let own_tx = tx.downgrade();
     hub.instance_txs.lock().await.insert(id.clone(), tx);
+    hub.instances.lock().await.insert(id.clone(), info.clone());
 
     let _ = hub
         .broadcast
@@ -2629,8 +2634,24 @@ async fn serve_instance<R, W>(
         }
     }
 
+    // A session that re-registered on a new connection before this one's
+    // close was seen owns the id now (R-HUB.6). Its registration, and the
+    // questions it asked again (R-PERM.3.7), are not this connection's to
+    // clear.
+    {
+        let mut txs = hub.instance_txs.lock().await;
+        let superseded = txs.get(&id).is_some_and(|current| {
+            !own_tx
+                .upgrade()
+                .is_some_and(|own| own.same_channel(current))
+        });
+        if superseded {
+            debug!("hub: connection for id={id} superseded by its own re-registration");
+            return;
+        }
+        txs.remove(&id);
+    }
     let departed = hub.instances.lock().await.remove(&id);
-    hub.instance_txs.lock().await.remove(&id);
     hub.pending_approvals.lock().await.remove(&id);
     hub.pending_decisions
         .lock()
@@ -5377,6 +5398,113 @@ mod tests {
             first, second,
             "the same session must keep its instance id across a re-register"
         );
+    }
+
+    /// A session can re-register before the hub has seen its previous
+    /// connection close. The old connection's teardown used to clear the id
+    /// regardless: the live session was listed as ended, nothing could be
+    /// routed to it, and the questions it had just asked again were taken off
+    /// every TUI (SPEC R-HUB.6, R-PERM.3.7).
+    #[tokio::test]
+    async fn a_superseded_connection_leaves_its_successor_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hub.sock");
+        start_hub(&sock).await;
+        let wait = TestTimeouts::get(crate::timeouts::TimeoutCategory::Quick);
+
+        let register = || ClientMsg::Register {
+            pid: 12,
+            mode: "stdio".into(),
+            scope: "/ws".into(),
+            label: "ahma".into(),
+            client: None,
+            session_id: Some("mcp-session-9".into()),
+            client_pid: None,
+            sampling: false,
+            elicitation: false,
+            scopes: vec![],
+            read_scopes: vec![],
+            grants: vec![],
+            enforcement: None,
+            native_terminal: None,
+        };
+        // The viewer count is the first thing a registered instance hears,
+        // so receiving it means the hub has taken the registration.
+        async fn registered<R: tokio::io::AsyncRead + Unpin>(r: &mut BufReader<R>) {
+            match recv_msg::<_, HubMsg>(r).await.unwrap() {
+                HubMsg::Viewers { .. } => {}
+                other => panic!("expected the viewer count first, got {other:?}"),
+            }
+        }
+
+        let old = connect_to_hub_at(&sock).await.unwrap();
+        let (or, mut ow) = tokio::io::split(old);
+        let mut ordr = BufReader::new(or);
+        send_msg(&mut ow, &register()).await.unwrap();
+        tokio::time::timeout(wait, registered(&mut ordr))
+            .await
+            .expect("the first connection registers");
+
+        let new = connect_to_hub_at(&sock).await.unwrap();
+        let (nr, mut nw) = tokio::io::split(new);
+        let mut nrdr = BufReader::new(nr);
+        send_msg(&mut nw, &register()).await.unwrap();
+        tokio::time::timeout(wait, registered(&mut nrdr))
+            .await
+            .expect("the re-registration is taken");
+
+        // The hub closes the replaced connection once its teardown is done.
+        tokio::time::timeout(wait, async {
+            while recv_msg::<_, HubMsg>(&mut ordr).await.is_ok() {}
+        })
+        .await
+        .expect("the replaced connection is closed");
+
+        let instances = list_instances_at(&sock).await.unwrap();
+        let live: Vec<_> = instances
+            .iter()
+            .filter(|i| i.ended_epoch_ms.is_none())
+            .collect();
+        assert_eq!(live.len(), 1, "the session is still live: {instances:?}");
+        let id = live[0].id.clone();
+
+        // ...and still reachable: a question it asks is answered back to it.
+        send_msg(
+            &mut nw,
+            &ClientMsg::Relay(HubRelay::ScopeGrantRequested {
+                request: crate::scope_grant::ScopeGrantRequest {
+                    decision_id: "waiting".into(),
+                    path: std::path::PathBuf::from("/opt/x"),
+                    access: crate::config::ScopeAccess::Rw,
+                    reason: crate::scope_grant::GrantReason::StderrHeuristic,
+                    tool: None,
+                    context: Default::default(),
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        let tui = connect_to_hub_at(&sock).await.unwrap();
+        let (_tr, mut tw) = tokio::io::split(tui);
+        send_msg(
+            &mut tw,
+            &ClientMsg::SubmitScopeGrant {
+                decision_id: "waiting".into(),
+                decision: crate::scope_grant::GrantDecision::Deny,
+                target_instance_id: Some(id),
+                advice: None,
+                advice_followed: None,
+            },
+        )
+        .await
+        .unwrap();
+        let routed = tokio::time::timeout(wait, recv_instance_msg(&mut nrdr))
+            .await
+            .expect("the answer reaches the live connection");
+        match routed {
+            HubMsg::SubmitScopeGrant { decision_id, .. } => assert_eq!(decision_id, "waiting"),
+            other => panic!("expected the answer, got {other:?}"),
+        }
     }
 
     // ── serve_instance event forwarding ───────────────────────────────────────
