@@ -308,14 +308,19 @@ mod seatbelt_profile_tests {
         )
         .unwrap();
         let profile = profile_for(&sandbox, &scope);
-        // Narrowed from "no `(deny file-read*` at all" to "no credential-shaped
-        // deny": the profile now also carries unconditional container-socket and
-        // SSH-private-key denies, which are not part of the operator-installed
+        // Narrowed from "no `(deny file-read*` at all" to "no operator-list
+        // deny": the profile also carries unconditional container-socket and
+        // `~/.ssh` denies, which are not part of the operator-installed
         // credential list and must be present even when that list is empty.
-        // `(deny file-read* (subpath …))` is the credential rule's exact shape.
+        let ssh = std::path::Path::new(&std::env::var("HOME").unwrap_or_default()).join(".ssh");
+        let operator_denies: Vec<&str> = profile
+            .lines()
+            .filter(|l| l.starts_with("(deny file-read* (subpath"))
+            .filter(|l| !l.contains(&format!("\"{}\"", ssh.display())))
+            .collect();
         assert!(
-            !profile.contains("(deny file-read* (subpath"),
-            "no credential deny rules expected when none installed.\nProfile:\n{profile}"
+            operator_denies.is_empty(),
+            "no credential deny rules expected when none installed: {operator_denies:?}"
         );
     }
 }

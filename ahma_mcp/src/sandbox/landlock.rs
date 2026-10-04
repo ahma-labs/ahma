@@ -124,6 +124,7 @@ fn build_landlock_ruleset_with(
 
     add_landlock_system_rules(&mut ruleset, access_read)?;
     add_landlock_profile_rules(&mut ruleset, access_read, access_all, package_cache_write)?;
+    add_landlock_client_config_rules(&mut ruleset, access_read)?;
 
     if !no_temp_files {
         add_landlock_temp_rules(&mut ruleset, access_all)?;
@@ -370,6 +371,33 @@ fn add_landlock_profile_rules(
         }
     }
 
+    Ok(())
+}
+
+/// git's and ssh's own configuration in home, read-only (SPEC R6.2.3): the
+/// sandbox reads nothing in home by default, so git ran with no identity and
+/// no credential helper, and ssh without `known_hosts`. Files get `ReadFile`
+/// alone (Landlock refuses directory rights on a file); the private keys
+/// beside them in `~/.ssh` stay unreadable.
+#[cfg(target_os = "linux")]
+fn add_landlock_client_config_rules(
+    ruleset: &mut landlock::RulesetCreated,
+    access_read: landlock::BitFlags<landlock::AccessFs>,
+) -> Result<()> {
+    use landlock::{AccessFs, BitFlags, PathBeneath, PathFd, RulesetCreatedAttr};
+    let Some(home) = dirs::home_dir() else {
+        return Ok(());
+    };
+    for path in super::credential_reads::client_config_read_paths(&home) {
+        let access = if path.is_dir() {
+            access_read
+        } else {
+            BitFlags::from(AccessFs::ReadFile)
+        };
+        if let Ok(fd) = PathFd::new(&path) {
+            let _ = ruleset.add_rule(PathBeneath::new(fd, access));
+        }
+    }
     Ok(())
 }
 

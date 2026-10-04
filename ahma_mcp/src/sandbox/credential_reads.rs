@@ -42,22 +42,6 @@ static CREDENTIAL_READ_DENIES: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 /// default is to allow it; the paranoid opt back out via `allow_keychain = false`.
 static KEYCHAIN_ACCESS_ALLOWED: RwLock<bool> = RwLock::new(false);
 
-/// Home-relative credential directories denied by default. Chosen so no common
-/// build / test / VCS tool breaks: `~/.ssh` and `~/.config/gh` are intentionally
-/// **absent** (git-over-ssh and `gh` need them) and can be added via
-/// `[sandbox] deny_credential_reads`. `~/Library/Keychains` is likewise absent —
-/// it is governed by the dedicated `[sandbox] allow_keychain` toggle (default on;
-/// see `KEYCHAIN_ACCESS_ALLOWED`) which re-adds it to the deny set when disabled.
-const DEFAULT_DENY_RELATIVE: [&str; 7] = [
-    ".ahma", // ahma's own bearer token, TLS keys, and scope-grant store
-    ".aws",
-    ".gnupg",
-    ".config/gcloud",
-    ".kube",
-    ".docker",
-    ".netrc",
-];
-
 /// Container-daemon sockets at fixed, non-home locations.
 ///
 /// Reaching a container daemon is a *total* sandbox escape and does not require
@@ -105,31 +89,69 @@ pub fn container_socket_deny_regexes(home: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Anchored regex matching SSH **private** key material in `~/.ssh` (`id_rsa`,
-/// `id_ed25519`, `id_ecdsa_sk`, …).
-///
-/// `~/.ssh` as a whole is deliberately absent from `DEFAULT_DENY_RELATIVE` so
-/// that git-over-ssh keeps working, but that left the private keys themselves
-/// readable under the blanket macOS `(allow file-read*)`. Denying only the
-/// `id_*` files keeps `known_hosts` and `config` readable — which is what the
-/// ssh client actually needs from the sandbox — while the key bytes stay out of
-/// reach. The agent can still *use* ssh: `ssh-agent` and the `ssh` binary that
-/// reads the key run outside this profile's read policy for their own purposes.
-pub fn ssh_private_key_deny_regex(home: &Path) -> String {
+/// `~/.ssh`: denied as a whole (SPEC R6.2.3), so a private key is unreadable
+/// whatever it is called. Denying only `id_*` left `github_ed25519`,
+/// `deploy_key` and every other name readable. ssh uses keys through the
+/// agent, which never hands them over.
+pub fn ssh_dir(home: &Path) -> PathBuf {
+    home.join(".ssh")
+}
+
+/// Anchored regex for what ssh reads in `~/.ssh` that holds no secret: the
+/// directory itself, `config`, `known_hosts*`, public keys and certificates
+/// (`*.pub`) and `allowed_signers`. Emitted after the deny on [`ssh_dir`]
+/// (SBPL is last-match-wins).
+pub fn ssh_client_readable_regex(home: &Path) -> String {
     format!(
-        "^{}/\\.ssh/id_[^/]*$",
+        "^{}/\\.ssh(/(config|known_hosts[^/]*|[^/]*\\.pub|allowed_signers))?$",
         regex_escape(&home.to_string_lossy())
     )
 }
 
-/// Anchored regex re-allowing SSH **public** keys, which are not secret and are
-/// routinely read (e.g. to print a fingerprint). Must be emitted *after*
-/// [`ssh_private_key_deny_regex`] — SBPL is last-match-wins.
-pub fn ssh_public_key_allow_regex(home: &Path) -> String {
-    format!(
-        "^{}/\\.ssh/id_[^/]*\\.pub$",
-        regex_escape(&home.to_string_lossy())
-    )
+/// Whether a file directly in `~/.ssh` named `name` is one ssh reads that
+/// holds no secret — the same set [`ssh_client_readable_regex`] lets through.
+fn is_ssh_client_file(name: &str) -> bool {
+    name == "config"
+        || name == "allowed_signers"
+        || name.starts_with("known_hosts")
+        || name.ends_with(".pub")
+}
+
+/// Directories under `~/.ssh` that hold no secret: `config.d` (included
+/// configuration) and `agent` (where OpenSSH keeps agent sockets).
+pub fn ssh_client_readable_dirs(home: &Path) -> Vec<PathBuf> {
+    vec![ssh_dir(home).join("config.d"), ssh_dir(home).join("agent")]
+}
+
+/// The paths git and ssh read for their own configuration that exist under
+/// `home`: the ssh client files [`ssh_client_readable_regex`] lets through,
+/// `~/.ssh/config.d`, `~/.gitconfig` and `~/.config/git`. Linux grants these
+/// one by one, read-only, since its sandbox reads nothing in home by default:
+/// git ran with no identity and no credential helper, and ssh without
+/// `known_hosts`.
+pub fn client_config_read_paths(home: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(ssh_dir(home))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_ssh_client_file)
+        })
+        .collect();
+    out.extend(
+        [
+            ssh_dir(home).join("config.d"),
+            home.join(".gitconfig"),
+            home.join(".config").join("git"),
+        ]
+        .into_iter()
+        .filter(|p| p.exists()),
+    );
+    out
 }
 
 /// Escape regex metacharacters so a filesystem path can be embedded in an SBPL
@@ -164,9 +186,9 @@ fn expand_tilde(path: &Path, home: &Path) -> PathBuf {
 
 /// The built-in default deny set, resolved against `home`.
 pub fn default_credential_read_denies(home: &Path) -> Vec<PathBuf> {
-    DEFAULT_DENY_RELATIVE
+    ahma_common::scope_grant::CREDENTIAL_READ_DENIED
         .iter()
-        .map(|rel| home.join(rel))
+        .map(|rel| rel.split('/').fold(home.to_path_buf(), |p, c| p.join(c)))
         .collect()
 }
 
@@ -217,11 +239,20 @@ pub fn is_read_denied(path: &Path) -> bool {
     let Some(home) = ahma_common::config::ahma_home_dir() else {
         return false;
     };
-    path.parent() == Some(home.join(".ssh").as_path())
-        && path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name.starts_with("id_") && !name.ends_with(".pub"))
+    let ssh = ssh_dir(&home);
+    let Ok(inside) = path.strip_prefix(&ssh) else {
+        return false;
+    };
+    // `~/.ssh` is denied whole; only its client files, and the directories
+    // that hold no secret, are read.
+    let mut parts = inside.components();
+    match (parts.next(), parts.next()) {
+        (None, _) => false,
+        (Some(first), None) => !first.as_os_str().to_str().is_some_and(is_ssh_client_file),
+        (Some(first), Some(_)) => !ssh_client_readable_dirs(&home)
+            .iter()
+            .any(|d| d.file_name() == Some(first.as_os_str())),
+    }
 }
 
 /// Install whether sandboxed tools may access the macOS keychain (called once at
@@ -330,26 +361,81 @@ mod tests {
         );
     }
 
+    /// `~/.ssh` is denied as a whole and the files ssh needs that hold no
+    /// secret are let back in. Denying only `id_*` left every other key name
+    /// (`github_ed25519`, `deploy_key`) readable.
     #[test]
-    fn ssh_regexes_deny_private_keys_and_re_allow_public_ones() {
+    fn ssh_is_denied_but_its_client_files_are_readable() {
         let home = Path::new("/home/u");
-        let deny = ssh_private_key_deny_regex(home);
-        let allow = ssh_public_key_allow_regex(home);
-        assert_eq!(deny, r"^/home/u/\.ssh/id_[^/]*$");
-        assert_eq!(allow, r"^/home/u/\.ssh/id_[^/]*\.pub$");
+        assert_eq!(ssh_dir(home), Path::new("/home/u/.ssh"));
+        let allow = regex::Regex::new(&ssh_client_readable_regex(home)).unwrap();
+        for ok in [
+            "/home/u/.ssh",
+            "/home/u/.ssh/config",
+            "/home/u/.ssh/known_hosts",
+            "/home/u/.ssh/known_hosts.old",
+            "/home/u/.ssh/known_hosts2",
+            "/home/u/.ssh/id_ed25519.pub",
+            "/home/u/.ssh/github-cert.pub",
+            "/home/u/.ssh/allowed_signers",
+        ] {
+            assert!(allow.is_match(ok), "{ok}");
+        }
+        for key_path in [
+            "/home/u/.ssh/id_ed25519",
+            "/home/u/.ssh/github_ed25519",
+            "/home/u/.ssh/deploy_key",
+            "/home/u/.ssh/config.bak/id_rsa",
+            "/home/u/.ssh/sub/known_hosts",
+            "/home/uX/.ssh/config",
+        ] {
+            assert!(!allow.is_match(key_path), "{key_path}");
+        }
+        assert_eq!(
+            ssh_client_readable_dirs(home),
+            vec![
+                PathBuf::from("/home/u/.ssh/config.d"),
+                PathBuf::from("/home/u/.ssh/agent")
+            ]
+        );
+    }
 
-        // Sanity-check the intent with a real regex engine: `known_hosts` and
-        // `config` must not match the deny, and the allow must cover `.pub`.
-        let deny_re = regex::Regex::new(&deny).expect("deny regex compiles");
-        let allow_re = regex::Regex::new(&allow).expect("allow regex compiles");
-        assert!(deny_re.is_match("/home/u/.ssh/id_ed25519"));
-        assert!(deny_re.is_match("/home/u/.ssh/id_rsa"));
-        assert!(deny_re.is_match("/home/u/.ssh/id_ed25519.pub"));
-        assert!(allow_re.is_match("/home/u/.ssh/id_ed25519.pub"));
-        assert!(!deny_re.is_match("/home/u/.ssh/known_hosts"));
-        assert!(!deny_re.is_match("/home/u/.ssh/config"));
-        // The anchor must not let a look-alike home match.
-        assert!(!deny_re.is_match("/home/uX/.ssh/id_rsa"));
+    /// The paths a sandboxed git and ssh read for their own configuration,
+    /// listed from what exists: Linux grants them one by one, since its
+    /// sandbox reads nothing in home by default (git had no identity and no
+    /// credential helper there).
+    #[test]
+    fn client_config_paths_are_the_ones_that_exist() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join(".ssh/config.d")).unwrap();
+        std::fs::create_dir_all(h.join(".config/git")).unwrap();
+        for f in [
+            ".ssh/config",
+            ".ssh/known_hosts",
+            ".ssh/id_ed25519",
+            ".ssh/id_ed25519.pub",
+            ".ssh/github_ed25519",
+            ".gitconfig",
+            ".git-credentials",
+        ] {
+            std::fs::write(h.join(f), "x").unwrap();
+        }
+        let mut got = client_config_read_paths(h);
+        got.sort();
+        let mut want: Vec<PathBuf> = [
+            ".ssh/config",
+            ".ssh/known_hosts",
+            ".ssh/id_ed25519.pub",
+            ".ssh/config.d",
+            ".gitconfig",
+            ".config/git",
+        ]
+        .iter()
+        .map(|f| f.split('/').fold(h.to_path_buf(), |p, c| p.join(c)))
+        .collect();
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]

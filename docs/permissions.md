@@ -181,7 +181,8 @@ on_redirect_to_new_domain = "prompt"   # or "policy" (default), "block"
 
 ## Git authentication (SSH and HTTPS)
 
-The sandbox denies reads of your private keys (`~/.ssh/id_*`) and forwards the SSH
+The sandbox denies reads of your private keys (all of `~/.ssh` except `config`,
+`known_hosts` and public keys) and forwards the SSH
 agent socket instead, so a sandboxed `git fetch` or `git push` over SSH can
 authenticate only through the agent. On the host, ssh reads the key file directly,
 so an **empty agent is invisible until the first sandboxed push** fails with
@@ -344,7 +345,7 @@ log — detection, not prevention.
 See [`docs/security-sandbox.md`](security-sandbox.md#writable-but-not-everything-trust-handoff)
 and SPEC R-HANDOFF.
 
-**SSH credentials and agent authentication**: On macOS, Seatbelt denies direct disk reads to private keys (`~/.ssh/id_*`) from sandboxed commands. Ahma forwards `$SSH_AUTH_SOCK` into the sandbox, so SSH operations (such as `git fetch` or `git push` over SSH) authenticate seamlessly via the SSH agent. If a command fails with `Permission denied (publickey)`, run `ssh-add` on the host to load your key into the agent (e.g. `ssh-add ~/.ssh/id_ed25519`).
+**SSH credentials and agent authentication**: Sandboxed commands cannot read private keys: `~/.ssh` is denied as a whole, except `config`, `config.d/`, `known_hosts*`, public keys and `allowed_signers`. Ahma forwards `$SSH_AUTH_SOCK` into the sandbox, so SSH operations (such as `git fetch` or `git push` over SSH) authenticate seamlessly via the SSH agent. If a command fails with `Permission denied (publickey)`, run `ssh-add` on the host to load your key into the agent (e.g. `ssh-add ~/.ssh/id_ed25519`).
 
 ## Command reference
 

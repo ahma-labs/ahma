@@ -381,11 +381,18 @@ impl Sandbox {
             ));
         }
 
+        // `~/.ssh` as a whole, then what ssh reads there that holds no secret.
         rules.push_str(&format!(
-            "(deny file-read* (regex #\"{}\"))\n(allow file-read* (regex #\"{}\"))\n",
-            super::credential_reads::ssh_private_key_deny_regex(home),
-            super::credential_reads::ssh_public_key_allow_regex(home),
+            "(deny file-read* (subpath \"{}\"))\n(allow file-read* (regex #\"{}\"))\n",
+            super::credential_reads::ssh_dir(home).display(),
+            super::credential_reads::ssh_client_readable_regex(home),
         ));
+        for dir in super::credential_reads::ssh_client_readable_dirs(home) {
+            rules.push_str(&format!(
+                "(allow file-read* (subpath \"{}\"))\n",
+                dir.display()
+            ));
+        }
 
         rules
     }
@@ -875,11 +882,11 @@ mod tests {
         );
     }
 
-    /// SSH keeps working (`known_hosts`, `config` readable) but the private key
-    /// bytes are denied, with the `.pub` re-allow emitted afterwards so
-    /// last-match-wins lets public keys through.
+    /// `~/.ssh` is denied as a whole, and the client files that hold no secret
+    /// are let back in *after* the deny (SBPL is last-match-wins). Both come
+    /// after every allow a grant or scope could add, so nothing re-opens a key.
     #[test]
-    fn ssh_private_keys_denied_public_keys_reallowed_in_that_order() {
+    fn ssh_is_denied_whole_and_client_files_reallowed_after() {
         let dir = tempdir().unwrap();
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
@@ -892,25 +899,35 @@ mod tests {
         let profile = sb.generate_seatbelt_profile_test(dir.path());
 
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
-        let deny =
-            super::super::credential_reads::ssh_private_key_deny_regex(std::path::Path::new(&home));
-        let allow =
-            super::super::credential_reads::ssh_public_key_allow_regex(std::path::Path::new(&home));
-
+        let home = std::path::Path::new(&home);
+        let ssh = super::super::credential_reads::ssh_dir(home);
+        let allow = super::super::credential_reads::ssh_client_readable_regex(home);
         let deny_at = profile
-            .find(&format!("(deny file-read* (regex #\"{deny}\"))"))
-            .unwrap_or_else(|| panic!("ssh private-key deny missing:\n{profile}"));
+            .find(&format!(
+                "(deny file-read* (subpath \"{}\"))",
+                ssh.display()
+            ))
+            .unwrap_or_else(|| panic!("~/.ssh deny missing:\n{profile}"));
         let allow_at = profile
             .find(&format!("(allow file-read* (regex #\"{allow}\"))"))
-            .unwrap_or_else(|| panic!("ssh public-key re-allow missing:\n{profile}"));
+            .unwrap_or_else(|| panic!("ssh client-file allow missing:\n{profile}"));
         assert!(
             allow_at > deny_at,
-            "the .pub re-allow must come after the deny (last-match-wins):\n{profile}"
+            "the allow must follow the deny:\n{profile}"
         );
-        // `~/.ssh` itself is not blanket-denied — git-over-ssh needs known_hosts.
+        let scope_at = profile
+            .find(&format!(
+                "(subpath \"{}\")",
+                dunce::canonicalize(dir.path()).unwrap().display()
+            ))
+            .expect("the workspace scope rule");
         assert!(
-            !profile.contains(&format!("(deny file-read* (subpath \"{home}/.ssh\"))")),
-            "~/.ssh must not be denied wholesale:\n{profile}"
+            deny_at > scope_at,
+            "the deny must follow every scope allow:\n{profile}"
+        );
+        assert!(
+            !profile.contains("id_[^/]*"),
+            "the id_* rule is gone:\n{profile}"
         );
     }
 
