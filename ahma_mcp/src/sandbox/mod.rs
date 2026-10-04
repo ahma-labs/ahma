@@ -58,6 +58,7 @@ pub mod gpu;
 pub mod grant_channel;
 pub mod handoff_watch;
 pub mod host_detect;
+pub mod kernel_denials;
 #[cfg(target_os = "linux")]
 mod landlock;
 pub mod launch_services;
