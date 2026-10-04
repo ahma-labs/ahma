@@ -154,12 +154,19 @@ pub fn one_line(denial: &KernelDenial, class: &DenialClass) -> String {
     }
 }
 
-/// The denials among `lines` (a log excerpt) that `pids` made, in order.
+/// Denials every process makes that are nobody's concern: the dyld DTrace
+/// helper each process opens at start (seen on every `sandbox-exec` run).
+fn is_noise(denial: &KernelDenial) -> bool {
+    denial.target == "/dev/dtracehelper"
+}
+
+/// The denials among `lines` (a log excerpt) that `pids` made, in order,
+/// without the noise every process makes.
 pub fn denials_of(lines: &str, pids: &dyn Fn(u32) -> bool) -> Vec<KernelDenial> {
     lines
         .lines()
         .filter_map(KernelDenial::parse_seatbelt)
-        .filter(|d| pids(d.pid))
+        .filter(|d| pids(d.pid) && !is_noise(d))
         .collect()
 }
 
@@ -189,6 +196,18 @@ mod tests {
         let spaced = d("Sandbox: my tool(7) deny(1) file-read-data /a dir/with spaces");
         assert_eq!(spaced.process, "my tool");
         assert_eq!(spaced.target, "/a dir/with spaces");
+        // As recorded on macOS 15 (CI, 2026-10): the rule's operation name,
+        // and a tagged rule's message on the line after the record.
+        let real = d("2026-10-04 11:16:25.855 E  kernel[0:1bf69] \
+                      [com.apple.sandbox.reporting:violation] Sandbox: touch(49530) deny(1) \
+                      file-write* /private/var/folders/36/T/.tmpunEsrf/denied.txt");
+        assert_eq!(real.operation, "file-write*");
+        assert_eq!(
+            real.target,
+            "/private/var/folders/36/T/.tmpunEsrf/denied.txt"
+        );
+        let tagged = "Sandbox: nc(49511) deny(1) network-outbound remote:*:9\nahma-op-7";
+        assert_eq!(d(tagged.lines().next().unwrap()).target, "remote:*:9");
         let bare = d("Sandbox: kill(9) deny(1) signal");
         assert_eq!(
             (bare.operation.as_str(), bare.target.as_str()),
@@ -274,6 +293,7 @@ mod tests {
     #[test]
     fn only_the_commands_own_processes_count() {
         let log = "Sandbox: a(10) deny(1) file-write-create /x\n\
+                   Sandbox: a(10) deny(1) file-write-data /dev/dtracehelper\n\
                    Sandbox: b(20) deny(1) file-write-create /y\n\
                    unrelated line";
         let mine = denials_of(log, &|pid| pid == 10);
