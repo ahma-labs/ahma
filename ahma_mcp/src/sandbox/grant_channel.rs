@@ -151,9 +151,8 @@ fn grant_hint(path: &Path, access: ScopeAccess) -> String {
         ""
     };
     format!(
-        "run `ahma sandbox grant {}{}`. The grant is saved to settings — restart the \
-         bridge (the `restart` tool) to apply it now, otherwise it takes effect on the \
-         next server start.",
+        "run `ahma sandbox grant {}{}`. The grant is saved to settings and applies from \
+         the next command, in running servers too.",
         path.display(),
         ro_flag,
     )

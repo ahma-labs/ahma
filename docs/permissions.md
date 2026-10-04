@@ -141,9 +141,11 @@ next session; see
   long, declined, still waiting in the TUI, or that no surface could ask you. The
   tools never grant on their own: `confirm: true` only raises the
   question, for every client — a client that cannot show a prompt cannot approve, and
-  ahma never assumes it asked you before the call. For offline configuration edits
-  (`ahma sandbox grant` or `ahma network allow` CLI, or direct `~/.ahma/settings.toml`
-  edits), it takes effect on the next server start (or after using the `restart` tool).
+  ahma never assumes it asked you before the call. A filesystem grant made offline
+  (`ahma sandbox grant`, `revoke` or `renew`, or a direct `~/.ahma/settings.toml` edit)
+  takes effect from the next command, in a running server too: it re-reads the file
+  whenever it changes. Network allow-list edits (`ahma network allow`) take effect on
+  the next server start (or after using the `restart` tool).
 
 ## Web domains and redirects
 
