@@ -635,17 +635,12 @@ fn run_sandbox_grant(
     }
     println!("Recorded in: {}", file.display());
     println!();
-    // SPEC R-PERM.9: the first line answers "do I need to do anything?" and,
-    // when the answer is yes, names the exact action. Hooks and the edit guard
-    // re-read the ledger per command; a *running* MCP server does not yet.
+    // SPEC R-PERM.9: the first line answers "do I need to do anything?".
+    // Hooks and the edit guard re-read the ledger per command, and a running
+    // server re-reads it when the file changes (R-PERM.2).
     println!(
-        "Nothing more to do for terminal hooks and the edit guard: they apply it on your next \
-         command."
-    );
-    println!(
-        "One thing to do only if an ahma MCP session is already running for this workspace: \
-         restart its MCP connection in your client, or approve the same grant at the prompt it \
-         raises. New sessions start with it."
+        "Nothing more to do: terminal hooks, the edit guard and running ahma servers apply it \
+         from their next command."
     );
     println!();
     println!(
@@ -760,7 +755,8 @@ fn run_sandbox_list(file: &std::path::Path) -> Result<()> {
     }
     println!();
     println!("These survive every roots/list update. Use `ahma sandbox grant|revoke` (or");
-    println!("edit the file directly) to change them; restart the server to apply.");
+    println!("edit the file directly) to change them; running servers apply a change from");
+    println!("their next command.");
     Ok(())
 }
 
@@ -823,7 +819,7 @@ fn run_sandbox_revoke(
     );
     println!();
     println!("Updated: {}", file.display());
-    println!("Takes effect the next time an ahma server starts.");
+    println!("Takes effect from the next command, in running ahma servers too.");
     Ok(())
 }
 
@@ -1434,8 +1430,12 @@ fn revoke_permission(
     println!("✓ Revoked: {description}");
     println!();
     println!("Updated: {}", file.display());
-    if matches!(kind, GrantKind::FsScope | GrantKind::LogTarget) {
-        println!("Takes effect the next time an ahma server starts.");
+    match kind {
+        GrantKind::FsScope => {
+            println!("Takes effect from the next command, in running ahma servers too.")
+        }
+        GrantKind::LogTarget => println!("Takes effect the next time an ahma server starts."),
+        _ => {}
     }
     Ok(())
 }

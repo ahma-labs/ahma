@@ -665,9 +665,17 @@ fn resolve_persistent_scopes(cfg: &AppConfig) -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// and its workspace binding kept, for the sandbox to filter per session
 /// (SPEC R5.4.11).
 fn resolve_persistent_records(cfg: &AppConfig) -> Vec<ahma_common::config::PersistentScope> {
+    resolve_persistent_records_from(&cfg.persistent_scopes)
+}
+
+/// [`resolve_persistent_records`] over a list read from the settings file —
+/// at startup, and again by a running sandbox whenever the file changes.
+fn resolve_persistent_records_from(
+    scopes: &[ahma_common::config::PersistentScope],
+) -> Vec<ahma_common::config::PersistentScope> {
     use ahma_common::config::ScopeAccess;
     let mut out: Vec<ahma_common::config::PersistentScope> = Vec::new();
-    for scope in &cfg.persistent_scopes {
+    for scope in scopes {
         let mut paths = Vec::new();
         match scope.access {
             ScopeAccess::Rw => grant_persistent_write_scope(scope, &mut paths),
@@ -821,6 +829,25 @@ fn create_sandbox_instance(
     .with_scratch_dir(scratch_dir)
     .with_persistent_records(persistent_records)
     .with_package_cache_write(cfg.package_cache_write);
+    // A running server follows the ledger: `ahma sandbox grant`, `revoke`,
+    // `renew` and a prompt's `always` or lease answer apply from its next
+    // command (SPEC R-PERM.2).
+    let s = match cfg.settings_origin.user_settings_file() {
+        Some(file) => {
+            let path = file.clone();
+            s.with_ledger_source(
+                file,
+                std::sync::Arc::new(move || {
+                    ahma_common::config::AhmaSettings::load_from_result(&path)
+                        .ok()
+                        .map(|settings| {
+                            resolve_persistent_records_from(&settings.sandbox.persistent_scopes)
+                        })
+                }),
+            )
+        }
+        None => s,
+    };
 
     // SPEC R5.2 step 1: an explicit scope is **locked immediately** — commit it
     // now so the `tools/call` gate (which requires a committed scope, R5.1.2.1)
@@ -1902,9 +1929,9 @@ pub struct SandboxArgs {
 /// bound to one workspace (SPEC R5.4.11): it applies to sessions working in that
 /// project and to no other. Grants are stored in `[sandbox].persistent_scopes`
 /// in `~/.ahma/settings.toml` — a file that lives outside every sandbox scope
-/// and so cannot be edited by a sandboxed tool call. A CLI grant takes effect
-/// the next time an ahma server starts for that workspace; a grant approved at a
-/// prompt applies to that session at once.
+/// and so cannot be edited by a sandboxed tool call. A grant, revoke or renewal
+/// takes effect from the next command, in running servers too; a grant
+/// approved at a prompt applies to that session at once.
 #[derive(Subcommand, Debug, Clone)]
 pub enum SandboxCommand {
     /// Grant a directory persistent access in the sandbox, for one workspace.

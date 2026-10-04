@@ -340,15 +340,6 @@ pub struct Sandbox {
     /// `update_scopes` call so that `roots/list` replacements produce
     /// `roots ∪ {sandbox_dir}` rather than discarding the secondary scope.
     pub(super) scratch_dir: Option<PathBuf>,
-    /// User-granted external directories (writable) that survive `roots/list`
-    /// replacement, just like [`Self::scratch_dir`]. These come from
-    /// `[sandbox].persistent_scopes` with `access = "rw"` (e.g. an sccache cache
-    /// outside the workspace) and are re-appended on every `update_scopes` call.
-    pub(super) persistent_write_scopes: Vec<PathBuf>,
-    /// User-granted external directories (read-only) that survive `roots/list`
-    /// replacement. These come from `[sandbox].persistent_scopes` with
-    /// `access = "ro"` and are merged into `read_scopes` on every update.
-    pub(super) persistent_read_scopes: Vec<PathBuf>,
     /// When true, the scopes were explicitly provided by the user (via
     /// `--sandbox-scope`, `--working-directories`, or a task vault) and MUST NOT
     /// be widened or replaced via the MCP `roots/list` protocol (SPEC R5.5).
@@ -360,15 +351,15 @@ pub struct Sandbox {
     /// shared-process clients like Cursor — whose subprocess CWD is unrelated to
     /// the open workspace — get sandboxed to the correct workspace root.
     pub(super) explicit_scopes: bool,
-    /// Every persistent grant on this machine, canonicalized, with the workspace
-    /// it was made for (SPEC R5.4.11). Which of them apply is decided against
-    /// the scopes in force — at construction and again at every commit — by
-    /// [`Self::applicable_persistent`]; `persistent_write_scopes` /
-    /// `persistent_read_scopes` hold that answer for the current scopes.
-    pub(super) persistent_records: Vec<ahma_common::config::PersistentScope>,
-    /// Leases from `persistent_records` already withdrawn from the live scopes
-    /// because they expired (SPEC R-PERM.2.3), so each is retired once.
-    pub(super) retired_leases: parking_lot::RwLock<Vec<PathBuf>>,
+    /// The persistent-grant ledger (`[sandbox].persistent_scopes`) as this
+    /// sandbox last read it, and which of its grants apply to the scopes in
+    /// force. Its grants survive `roots/list` replacement and are re-appended
+    /// at every commit (SPEC R5.4.11).
+    pub(super) ledger: parking_lot::RwLock<Ledger>,
+    /// Where a running sandbox re-reads the ledger, so a grant, revoke or
+    /// renewal made while it runs applies from the next command (SPEC
+    /// R-PERM.2). `None` in tests and embedders that hand it records once.
+    pub(super) ledger_source: Option<std::sync::Arc<LedgerSource>>,
     pub(super) livelog: bool,
     /// Allow package-manager caches (cargo registry/git) to be written.
     /// Default `true`; disable with `--no-package-cache-write`.
@@ -454,6 +445,140 @@ impl ContainerNarrowing {
     }
 }
 
+/// The persistent-grant ledger as a sandbox last read it (SPEC R5.4).
+#[derive(Debug, Clone, Default)]
+pub(super) struct Ledger {
+    /// Every persistent grant on this machine, canonicalized, with the
+    /// workspace it was made for (SPEC R5.4.11), as admitted by
+    /// [`admit_records`].
+    pub(super) records: Vec<ahma_common::config::PersistentScope>,
+    /// The writable grants that apply to the scopes in force.
+    pub(super) write: Vec<PathBuf>,
+    /// The read-only grants that apply to the scopes in force.
+    pub(super) read: Vec<PathBuf>,
+    /// Leases already withdrawn because they expired (SPEC R-PERM.2.3), so
+    /// each is retired once.
+    pub(super) retired: Vec<PathBuf>,
+}
+
+/// Reads the ledger's records afresh: the settings file's
+/// `[sandbox].persistent_scopes`, canonicalized the way startup does it.
+/// `None` when the file cannot be read or parsed right now (a write in
+/// progress, a hand edit with a typo): the sandbox keeps the grants it has
+/// and tries again at the next command, rather than reading a broken file
+/// as "every grant revoked".
+pub type LedgerLoader =
+    std::sync::Arc<dyn Fn() -> Option<Vec<ahma_common::config::PersistentScope>> + Send + Sync>;
+
+/// The file a running sandbox watches for ledger changes, and how to read it.
+pub struct LedgerSource {
+    file: PathBuf,
+    load: LedgerLoader,
+    /// The file's modification time and length when last read.
+    seen: parking_lot::Mutex<Option<(std::time::SystemTime, u64)>>,
+}
+
+impl std::fmt::Debug for LedgerSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LedgerSource")
+            .field("file", &self.file)
+            .field("seen", &*self.seen.lock())
+            .finish()
+    }
+}
+
+/// What tells a changed ledger file apart without reading it: its
+/// modification time and length. `None` when it is missing.
+fn ledger_stamp(file: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(file).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// The records a sandbox may apply. The hard denylist binds what is already
+/// in the file too (SPEC R5.4.5): a record written by hand, or by a build
+/// whose denylist was narrower, is skipped and said so — recorded is not the
+/// same as allowed. A lease already expired is not applied, and is said so
+/// (SPEC R-PERM.2.3); the settings file keeps it until renewed or revoked.
+fn admit_records(
+    records: Vec<ahma_common::config::PersistentScope>,
+) -> Vec<ahma_common::config::PersistentScope> {
+    let now = ahma_common::config::unix_now();
+    records
+        .into_iter()
+        .filter(
+            |rec| match ahma_common::scope_grant::refusal_reason(&rec.path) {
+                Some(why) => {
+                    tracing::warn!(
+                        "Persistent grant {} is not applied: {why} Remove it with `ahma sandbox \
+                     revoke {}{}`.",
+                        rec.path.display(),
+                        rec.path.display(),
+                        rec.workspace
+                            .as_deref()
+                            .map(|w| format!(" --workspace {}", w.display()))
+                            .unwrap_or_else(|| " --global".to_string()),
+                    );
+                    false
+                }
+                None => true,
+            },
+        )
+        .filter(|rec| {
+            if rec.applies_at(now) {
+                return true;
+            }
+            tracing::info!(
+                "Persistent grant {} is a lease that expired on {}; not applied. Renew it \
+                 with `ahma sandbox renew {}`.",
+                rec.path.display(),
+                rec.expires_at
+                    .map(ahma_common::config::fmt_utc_datetime)
+                    .unwrap_or_default(),
+                rec.path.display()
+            );
+            false
+        })
+        .collect()
+}
+
+/// The grants among `records` that apply to a session scoped to `scopes`
+/// (SPEC R5.4.11), as `(writable, read-only)` path lists.
+fn applicable_records(
+    records: &[ahma_common::config::PersistentScope],
+    scopes: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut write = Vec::new();
+    let mut read = Vec::new();
+    let now = ahma_common::config::unix_now();
+    for rec in records {
+        if !rec.applies_at(now) {
+            continue;
+        }
+        if !ahma_common::scope_grant::grant_applies(rec.workspace.as_deref(), scopes) {
+            tracing::info!(
+                "Persistent grant {} is bound to workspace {} and does not apply to this \
+                 session (scopes {:?})",
+                rec.path.display(),
+                rec.workspace
+                    .as_deref()
+                    .map(|w| w.display().to_string())
+                    .unwrap_or_default(),
+                scopes
+            );
+            continue;
+        }
+        let target = if rec.access.is_write() {
+            &mut write
+        } else {
+            &mut read
+        };
+        if !target.contains(&rec.path) {
+            target.push(rec.path.clone());
+        }
+    }
+    (write, read)
+}
+
 impl Clone for Sandbox {
     fn clone(&self) -> Self {
         Self {
@@ -464,11 +589,9 @@ impl Clone for Sandbox {
             tmp_access: self.tmp_access,
             tmp_consent: parking_lot::Mutex::new(*self.tmp_consent.lock()),
             scratch_dir: self.scratch_dir.clone(),
-            persistent_write_scopes: self.persistent_write_scopes.clone(),
-            persistent_read_scopes: self.persistent_read_scopes.clone(),
             explicit_scopes: self.explicit_scopes,
-            persistent_records: self.persistent_records.clone(),
-            retired_leases: parking_lot::RwLock::new(self.retired_leases.read().clone()),
+            ledger: parking_lot::RwLock::new(self.ledger.read().clone()),
+            ledger_source: self.ledger_source.clone(),
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
             egress_proxy_addr: parking_lot::RwLock::new(*self.egress_proxy_addr.read()),
@@ -491,8 +614,7 @@ impl std::fmt::Debug for Sandbox {
             .field("tmp_access", &self.tmp_access)
             .field("tmp_consent", &*self.tmp_consent.lock())
             .field("scratch_dir", &self.scratch_dir)
-            .field("persistent_write_scopes", &self.persistent_write_scopes)
-            .field("persistent_read_scopes", &self.persistent_read_scopes)
+            .field("ledger", &*self.ledger.read())
             .field("explicit_scopes", &self.explicit_scopes)
             .field("livelog", &self.livelog)
             .field("package_cache_write", &self.package_cache_write)
@@ -549,11 +671,9 @@ impl Sandbox {
             tmp_access,
             tmp_consent: parking_lot::Mutex::new(TmpConsent::NotAsked),
             scratch_dir: None,
-            persistent_write_scopes: Vec::new(),
-            persistent_read_scopes: Vec::new(),
             explicit_scopes: false,
-            persistent_records: Vec::new(),
-            retired_leases: parking_lot::RwLock::new(Vec::new()),
+            ledger: parking_lot::RwLock::new(Ledger::default()),
+            ledger_source: None,
             livelog,
             package_cache_write: true,
             egress_proxy_addr: parking_lot::RwLock::new(None),
@@ -669,96 +789,107 @@ impl Sandbox {
     /// another workspace never leaks into this session (SPEC R5.4.11).
     #[must_use]
     pub fn with_persistent_records(
-        mut self,
+        self,
         records: Vec<ahma_common::config::PersistentScope>,
     ) -> Self {
-        // The hard denylist binds what is already in the file too (SPEC
-        // R5.4.5): a record written by hand, or by a build whose denylist was
-        // narrower, is skipped and said so — recorded is not the same as allowed.
-        let records = records
-            .into_iter()
-            .filter(|rec| match ahma_common::scope_grant::refusal_reason(&rec.path) {
-                Some(why) => {
-                    tracing::warn!(
-                        "Persistent grant {} is not applied: {why} Remove it with `ahma sandbox \
-                         revoke {}{}`.",
-                        rec.path.display(),
-                        rec.path.display(),
-                        rec.workspace
-                            .as_deref()
-                            .map(|w| format!(" --workspace {}", w.display()))
-                            .unwrap_or_else(|| " --global".to_string()),
-                    );
-                    false
-                }
-                None => true,
-            })
-            // A lease that has already expired is not applied, and is said so
-            // (SPEC R-PERM.2.3); the settings file keeps it until it is renewed
-            // or revoked.
-            .filter(|rec| {
-                let now = ahma_common::config::unix_now();
-                if rec.applies_at(now) {
-                    return true;
-                }
-                tracing::info!(
-                    "Persistent grant {} is a lease that expired on {}; not applied. Renew it \
-                     with `ahma sandbox renew {}`.",
-                    rec.path.display(),
-                    rec.expires_at
-                        .map(ahma_common::config::fmt_utc_datetime)
-                        .unwrap_or_default(),
-                    rec.path.display()
-                );
-                false
-            })
-            .collect();
-        self.persistent_records = records;
-        let (write, read) = self.applicable_persistent(&self.scopes.read());
+        let records = admit_records(records);
+        let (write, read) = applicable_records(&records, &self.scopes.read());
         if !write.is_empty() {
             append_missing_scopes(&mut self.scopes.write(), &write);
         }
         if !read.is_empty() {
             append_missing_scopes(&mut self.read_scopes.write(), &read);
         }
-        self.persistent_write_scopes = write;
-        self.persistent_read_scopes = read;
+        *self.ledger.write() = Ledger {
+            records,
+            write,
+            read,
+            retired: Vec::new(),
+        };
         self
+    }
+
+    /// Re-read the ledger from `file` with `load` whenever the file changes, at
+    /// the start of each command (SPEC R-PERM.2). The records this sandbox
+    /// already holds are taken to be the file as it is now.
+    #[must_use]
+    pub fn with_ledger_source(mut self, file: PathBuf, load: LedgerLoader) -> Self {
+        let seen = parking_lot::Mutex::new(ledger_stamp(&file));
+        self.ledger_source = Some(std::sync::Arc::new(LedgerSource { file, load, seen }));
+        self
+    }
+
+    /// Bring the live scopes in line with the ledger if its file changed since
+    /// it was last read: a grant added applies, one revoked or expired stops
+    /// applying, a lease renewed applies again. Runs as a command starts, so a
+    /// command already running keeps the policy it was spawned with.
+    ///
+    /// The settings file sits outside every sandbox scope and under the
+    /// credential read deny, so only ahma's control plane (every write audited
+    /// and checked against the hard denylist) or the human edits it, and what
+    /// is read here is admitted by the same rules as at startup.
+    fn sync_ledger(&self) {
+        let Some(source) = &self.ledger_source else {
+            return;
+        };
+        let stamp = ledger_stamp(&source.file);
+        if *source.seen.lock() == stamp {
+            return;
+        }
+        let Some(loaded) = (source.load)() else {
+            tracing::warn!(
+                "The grant ledger {} changed but could not be read; the grants in force stay \
+                 until it can be.",
+                source.file.display()
+            );
+            return;
+        };
+        *source.seen.lock() = stamp;
+        let records = admit_records(loaded);
+        let live = self.scopes.read().clone();
+        let (write, read) = applicable_records(&records, &live);
+        let now = ahma_common::config::unix_now();
+        let mut ledger = self.ledger.write();
+        let dropped_write: Vec<PathBuf> = ledger
+            .write
+            .iter()
+            .filter(|p| !write.contains(p))
+            .cloned()
+            .collect();
+        let dropped_read: Vec<PathBuf> = ledger
+            .read
+            .iter()
+            .filter(|p| !read.contains(p))
+            .cloned()
+            .collect();
+        self.scopes.write().retain(|p| !dropped_write.contains(p));
+        self.read_scopes
+            .write()
+            .retain(|p| !dropped_read.contains(p));
+        append_missing_scopes(&mut self.scopes.write(), &write);
+        append_missing_scopes(&mut self.read_scopes.write(), &read);
+        // A renewed lease applies again, and can expire again later.
+        ledger
+            .retired
+            .retain(|p| !records.iter().any(|r| &r.path == p && r.applies_at(now)));
+        tracing::info!(
+            "The grant ledger {} changed; reloaded: {} grant(s) apply, {} withdrawn.",
+            source.file.display(),
+            write.len() + read.len(),
+            dropped_write.len() + dropped_read.len()
+        );
+        *ledger = Ledger {
+            records,
+            write,
+            read,
+            retired: std::mem::take(&mut ledger.retired),
+        };
     }
 
     /// The persistent grants that apply to a session scoped to `scopes`
     /// (SPEC R5.4.11), as `(writable, read-only)` path lists.
     pub fn applicable_persistent(&self, scopes: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
-        let mut write = Vec::new();
-        let mut read = Vec::new();
-        let now = ahma_common::config::unix_now();
-        for rec in &self.persistent_records {
-            if !rec.applies_at(now) {
-                continue;
-            }
-            if !ahma_common::scope_grant::grant_applies(rec.workspace.as_deref(), scopes) {
-                tracing::info!(
-                    "Persistent grant {} is bound to workspace {} and does not apply to this \
-                     session (scopes {:?})",
-                    rec.path.display(),
-                    rec.workspace
-                        .as_deref()
-                        .map(|w| w.display().to_string())
-                        .unwrap_or_default(),
-                    scopes
-                );
-                continue;
-            }
-            let target = if rec.access.is_write() {
-                &mut write
-            } else {
-                &mut read
-            };
-            if !target.contains(&rec.path) {
-                target.push(rec.path.clone());
-            }
-        }
-        (write, read)
+        applicable_records(&self.ledger.read().records, scopes)
     }
 
     /// The persistent grants in force for this session, with provenance, for
@@ -774,7 +905,9 @@ impl Sandbox {
         now: u64,
     ) -> Vec<ahma_common::config::PersistentScope> {
         let scopes = self.scopes.read().clone();
-        self.persistent_records
+        self.ledger
+            .read()
+            .records
             .iter()
             .filter(|r| r.applies_at(now))
             .filter(|r| ahma_common::scope_grant::grant_applies(r.workspace.as_deref(), &scopes))
@@ -788,19 +921,22 @@ impl Sandbox {
     /// widen a scope (SPEC R5.1).
     pub fn retire_expired_leases(&self, now: u64) -> Vec<PathBuf> {
         let mut retired = Vec::new();
-        for rec in &self.persistent_records {
-            if rec.applies_at(now) || self.retired_leases.read().contains(&rec.path) {
+        let mut ledger = self.ledger.write();
+        let records = ledger.records.clone();
+        for rec in &records {
+            if rec.applies_at(now) || ledger.retired.contains(&rec.path) {
                 continue;
             }
-            let held_elsewhere = self
-                .persistent_records
+            let held_elsewhere = records
                 .iter()
                 .any(|other| other.path == rec.path && other.applies_at(now));
             if !held_elsewhere {
                 if rec.access.is_write() {
                     self.scopes.write().retain(|p| p != &rec.path);
+                    ledger.write.retain(|p| p != &rec.path);
                 } else {
                     self.read_scopes.write().retain(|p| p != &rec.path);
+                    ledger.read.retain(|p| p != &rec.path);
                 }
                 tracing::info!(
                     "The lease on {} expired; it no longer applies from this command on. Renew \
@@ -810,7 +946,7 @@ impl Sandbox {
                 );
                 retired.push(rec.path.clone());
             }
-            self.retired_leases.write().push(rec.path.clone());
+            ledger.retired.push(rec.path.clone());
         }
         retired
     }
@@ -880,6 +1016,7 @@ impl Sandbox {
         // A lease that expired since the last command is withdrawn now, before
         // this one spawns; a command already running keeps the policy it was
         // spawned with (SPEC R-PERM.2.3).
+        self.sync_ledger();
         self.retire_expired_leases(ahma_common::config::unix_now());
         let mut grants = self.once_grants.write();
         if grants.is_empty() {
@@ -888,10 +1025,13 @@ impl Sandbox {
         let (spent, fresh): (Vec<OnceGrant>, Vec<OnceGrant>) =
             grants.drain(..).partition(|g| g.armed);
         for g in spent {
-            let keep = if g.access.is_write() {
-                self.persistent_write_scopes.contains(&g.path)
-            } else {
-                self.persistent_read_scopes.contains(&g.path)
+            let keep = {
+                let ledger = self.ledger.read();
+                if g.access.is_write() {
+                    ledger.write.contains(&g.path)
+                } else {
+                    ledger.read.contains(&g.path)
+                }
             };
             if keep {
                 continue;
@@ -981,6 +1121,11 @@ impl Sandbox {
         // (e.g. Cursor sending its workspace root) does not silently drop them.
         // This is the durable half of the `ahma sandbox grant` flow.
         let (persistent_write, persistent_read) = self.applicable_persistent(&canonicalized);
+        {
+            let mut ledger = self.ledger.write();
+            ledger.write = persistent_write.clone();
+            ledger.read = persistent_read.clone();
+        }
         for dir in &persistent_write {
             if !canonicalized.contains(dir) {
                 tracing::info!(
@@ -1853,6 +1998,73 @@ mod live_grant_gate_tests {
             sb.retire_expired_leases(now + 7_200).is_empty(),
             "a lease is retired once"
         );
+    }
+
+    /// SPEC R-PERM.2, R-PERM.2.3: a running server follows the ledger. A grant
+    /// written by `ahma sandbox grant` (or by a prompt's `always`/lease answer)
+    /// applies from the next command; one revoked stops applying; a lease
+    /// expires on time. Before, the ledger was read once at startup, so a CLI
+    /// revoke never reached a running server and a lease granted at a prompt
+    /// never expired in one.
+    #[test]
+    fn a_running_sandbox_follows_the_ledger() {
+        use ahma_common::config::PersistentScope;
+        use std::sync::Arc;
+        let workspace = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let settings = tempdir().unwrap();
+        let file = settings.path().join("settings.toml");
+        std::fs::write(&file, "").unwrap();
+        let canon = |p: &std::path::Path| dunce::canonicalize(p).unwrap();
+        let ext = canon(external.path());
+        let ledger: Arc<parking_lot::Mutex<Vec<PersistentScope>>> = Arc::default();
+        let source = ledger.clone();
+        let sb = Sandbox::new(
+            vec![workspace.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap()
+        .with_ledger_source(file.clone(), Arc::new(move || Some(source.lock().clone())));
+        let in_scope = |p: &std::path::Path| sb.scopes().iter().any(|s| p.starts_with(s));
+        let base = std::time::SystemTime::now();
+        let write_ledger = |records: Vec<PersistentScope>, step: u64| {
+            *ledger.lock() = records;
+            let f = std::fs::File::options().write(true).open(&file).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(step))
+                .unwrap();
+        };
+        let record = |expires_at: Option<u64>| PersistentScope {
+            path: ext.clone(),
+            access: ScopeAccess::Rw,
+            workspace: None,
+            granted_by: Some("ahma sandbox grant".into()),
+            granted_at: None,
+            note: None,
+            expires_at,
+        };
+
+        sb.begin_command();
+        assert!(!in_scope(&ext), "nothing granted yet");
+
+        write_ledger(vec![record(None)], 1);
+        sb.begin_command();
+        assert!(in_scope(&ext), "a grant written while running applies");
+        assert_eq!(sb.persistent_grants_in_effect().len(), 1);
+
+        write_ledger(vec![], 2);
+        sb.begin_command();
+        assert!(!in_scope(&ext), "a revoke reaches the running sandbox");
+        assert!(sb.persistent_grants_in_effect().is_empty());
+
+        let now = ahma_common::config::unix_now();
+        write_ledger(vec![record(Some(now + 60))], 3);
+        sb.begin_command();
+        assert!(in_scope(&ext), "a lease written while running applies");
+        assert_eq!(sb.retire_expired_leases(now + 61), vec![ext.clone()]);
+        assert!(!in_scope(&ext), "and expires on time");
     }
 
     /// SPEC R5.4.5: the hard denylist holds for grants *already* in the
