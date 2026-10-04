@@ -136,6 +136,8 @@ pub mod client_type;
 pub mod config;
 /// Constants used for guidance and tool hints.
 pub mod constants;
+/// Credentials a sandboxed command uses without reading them (SPEC R-CRED).
+pub mod credentials;
 /// File operations provider.
 pub mod file_ops;
 /// The AI harnesses ahma can configure, and the facts that describe each.

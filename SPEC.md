@@ -162,6 +162,7 @@ may change.
 | Nested sandbox detection and deferral (R7) | tests-pass | Hooks and MCP server apply ahma's own sandbox; defer only on kernel proof (R7.6) |
 | Trust-handoff hardening (R-HANDOFF) | in-progress | Kernel-enforced on macOS; elsewhere ahma's file tools refuse and shell-command writes are detected after the fact (R6.1.7) |
 | Execution audit log | tests-pass | `<log dir>/audit.jsonl` on every execution path (R-HANDOFF.10) |
+| SSH key broker (R-CRED) | in-progress | Protocol, keys, session binding and `known_hosts` as a library (R-CRED.4, R-CRED.8); serving sandboxed commands open |
 | Unified permissions and doctor | tests-pass | One ledger under `~/.ahma`; `ahma doctor [--fix]` (R-PERM, R-DOCTOR) |
 | Grant prompts | tests-pass | One body on every surface, `grant_prompt::render` (R-PERM.3.4); per-session budget (R-PERM.4.5) |
 | Grant advisor and decision habits | tests-pass | R-PERM.8, R-DOCTOR.8 |
@@ -802,6 +803,23 @@ A "host sandbox" is an outer kernel sandbox ahma runs inside (Cursor, Claude Cod
   - Recorded fields **must** be redacted through the *same* function operation output uses, and every free-form field **must** be individually bounded, which keeps one event one `write` syscall so concurrent `O_APPEND` writes do not interleave without a process-wide lock.
   - A deny-tier write the kernel did not stop (R6.1.7) **must** land in the same log as a `handoff_write` event, one per entry.
   - **An audit write failure must never fail the operation it records** (R-PERM.2.2, generalized), but **must** be reported at `warn` naming the path.
+
+### R-CRED: Credentials Used, Never Read
+
+**Problem this family solves.** A sandboxed command may never read a credential file, and no grant can change that (R5.4.5, R6.2.3). What a command needs is to *use* a credential — `git push` signing in to a server over SSH — and before this family the only ways through were outside ahma: load the key into the human's SSH agent first, or rewrite the remote to HTTPS. A forwarded agent is also all-or-nothing: any sandboxed process may sign for any server with any key it holds, silently. The broker replaces both with one question per destination.
+
+- **R-CRED.1**: **The child talks to a broker, never to a key.** A sandboxed command's `SSH_AUTH_SOCK` names a socket served by the unsandboxed ahma process that spawned it, for that command alone. Key bytes never enter the sandbox; the broker reads a key file, or forwards to the human's own agent, outside it.
+- **R-CRED.2**: **List and sign, nothing else.** The broker answers identity listing and signing. Adding, removing or locking keys, smartcard requests and every extension other than `session-bind@openssh.com` are refused and audited.
+- **R-CRED.3**: **Consent is per key, destination and workspace.** A signature is given only for a destination a human allowed, at the tiers of R-PERM.2 (once, session, lease, always), through the R-PERM.3 ladder. A login's destination is the server's host key; an `SSHSIG` signature's is its namespace. A request whose purpose cannot be read is asked about once at most, never remembered.
+- **R-CRED.4**: **The destination is what the server proved, not what the client said.** The host key comes from the connection's `session-bind@openssh.com`, whose signature by that key over the session id **must** verify, and a login request **must** carry the bound session id. The name shown to the human comes from `known_hosts` and is shown as verified only when a line for that name holds the bound key; a `@revoked` key is refused. Verification is checked against OpenSSH's own signatures for every host-key type (`ssh-ed25519`, `ecdsa-sha2-nistp256/384`, `rsa-sha2-256/512`); SHA-1 `ssh-rsa` is never accepted.
+- **R-CRED.5**: **An unbound login is not remembered.** A login whose connection sent no verifiable binding (an old client, a library) offers once and session only.
+- **R-CRED.6**: **Forwarding is refused.** A signature on a connection bound with `is_forwarding` would hand the capability to another machine; the broker refuses it without asking.
+- **R-CRED.7**: **The human's agent is found where the human's shell finds it**, never from the long-lived hub's environment: the terminal hook's own `SSH_AUTH_SOCK`, the client's environment forwarded as a session option, then the platform's login agent. A candidate is used only if it is a socket owned by the user that answers.
+- **R-CRED.8**: **One crypto provider.** Host-side signing, verification and `known_hosts` hashing use `aws-lc-rs`. The host signs with unencrypted ed25519 key files itself; RSA, ECDSA, security-key and passphrase-protected keys are used through the human's agent, and a key the agent does not hold gets one actionable line.
+- **R-CRED.9**: **The broker runs outside every Landlock domain.** On Linux it runs on a thread started before any `restrict_self`, so a restricted worker can still reach the key it signs with and nothing else changes.
+- **R-CRED.10**: **Every use is audited and every refusal says what to do**, in one line (R-PERM.9), from the broker's own record of what it refused, not scraped from the command's output.
+
+Status: R-CRED.4 and R-CRED.8 are implemented as a library (`ahma_mcp::credentials::ssh_agent`: protocol, keys, purposes, session binding, `known_hosts`); the broker that serves sandboxed commands (R-CRED.1–3, 5–7, 9, 10) is open: §11.
 
 ### R-PERM: Unified Permissions Model
 
@@ -1967,4 +1985,5 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **Windows filesystem boundary** (R6.3.3, R6.3.9, R-HANDOFF.4): AppContainer spawn isolation holds both ways on `windows-latest` but is disabled: ordinary tools need `NUL` (denied to application packages; fixing it needs an administrator) and the scope's ancestors (traverse and stat denied). Enabling it needs a design for granting both.
 - **Linux trust-handoff deny tier** (R6.1.7): prevention exists but is opt-in (`linux_deny_tier = "namespace"`) and falls back to detection where unprivileged user namespaces are denied (stock Ubuntu 23.10+, Docker, a nested ahma). Still open: prevention by default (or an `ahma setup` AppArmor `userns` profile), paths created during a command, and Landlock's no-inherit rule once a kernel ships it.
 - **Developer-ID signing and notarization** (R-SIGN.1): wired in the release workflow and activates when the maintainer adds the six Apple secrets (docs/release-signing.md); until then releases are ad-hoc signed. `scripts/install.sh` and `ahma update` keep a valid Developer ID signature with the hardened runtime and re-sign anything else ad hoc (docs/release-signing.md).
+- **SSH key broker** (R-CRED.1–3, R-CRED.5–7, R-CRED.9, R-CRED.10): the protocol, signing and binding library exists; serving it to sandboxed commands, asking for consent on every surface, recording `ssh-sign` grants, discovering the human's agent and denying direct connects to it are not built yet. Until then `git push` over SSH works inside the sandbox only with the key already in the human's agent.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.
