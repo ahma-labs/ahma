@@ -181,7 +181,7 @@ on_redirect_to_new_domain = "prompt"   # or "policy" (default), "block"
 
 ## Git authentication (SSH and HTTPS)
 
-In terminal hooks, `git push` over SSH goes through ahma's [SSH key broker](ssh-agent-broker.md): it signs for a server once you allow that key for it (`ssh-sign` grants: the Claude Code dialog for a session, `ahma permissions grant ssh-sign` for good), with no key in your agent needed. The rest of this section applies to MCP commands, which do not use the broker yet.
+In terminal hooks, `git push` over SSH goes through ahma's [SSH key broker](ssh-agent-broker.md): it signs for a server once you allow that key for it (`ssh-sign` grants: the Claude Code dialog for a session, `ahma permissions grant ssh-sign` for good), with no key in your agent needed. MCP commands use it too; a refused one says so in an alert, and you grant with `ahma permissions grant ssh-sign`. The rest of this section is about keys the broker does not sign with itself.
 
 The sandbox denies reads of your private keys (all of `~/.ssh` except `config`,
 `known_hosts` and public keys) and forwards the SSH

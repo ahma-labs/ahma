@@ -1,8 +1,9 @@
 # SSH key broker — `git push` over SSH from inside the sandbox
 
 **Status:** Experimental (v0.22.3). Terminal hooks (Claude Code's Bash tool and other hooked
-shells) only so far; commands run through MCP `run_terminal_command` still use your own
-agent socket directly. SPEC: [R-CRED](../SPEC.md).
+shells) and commands run through MCP `run_terminal_command`. An MCP command that is refused
+says so in an alert while it runs; there is no mid-command question yet, so a human grants
+with `ahma permissions grant ssh-sign`. SPEC: [R-CRED](../SPEC.md).
 
 ## Why
 

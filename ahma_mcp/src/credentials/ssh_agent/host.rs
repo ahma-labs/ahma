@@ -114,6 +114,11 @@ impl BrokerLease {
     pub fn events(&self) -> Vec<BrokerEvent> {
         self.broker.events()
     }
+
+    /// Tell `observer` of each event as it happens.
+    pub fn observe(&self, observer: super::broker::EventObserver) {
+        self.broker.observe(observer);
+    }
 }
 
 impl Drop for BrokerLease {

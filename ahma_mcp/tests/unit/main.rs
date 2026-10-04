@@ -72,6 +72,7 @@ mod schema_validation_test;
 mod security_and_depth_test;
 mod sequence_failure_edge_cases_test;
 mod sequence_integration_coverage_test;
+mod ssh_broker_mcp_test;
 mod status_polling_anti_pattern_test;
 mod terminal_output_test;
 mod time_serde_test;

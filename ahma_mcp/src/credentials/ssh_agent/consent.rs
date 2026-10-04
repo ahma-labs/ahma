@@ -212,6 +212,30 @@ impl RecordedBrokers {
     }
 }
 
+/// The human's own agent socket (SPEC R-CRED.7): `SSH_AUTH_SOCK` as this
+/// process sees it, if it is a live socket; else, on macOS, the login
+/// session's agent as launchd knows it — what a long-lived server whose
+/// environment was inherited from elsewhere would otherwise miss.
+pub fn discover_upstream() -> Option<PathBuf> {
+    if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from)
+        && is_socket(&sock)
+    {
+        return Some(sock);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("launchctl")
+            .args(["getenv", "SSH_AUTH_SOCK"])
+            .output()
+            .ok()?;
+        let sock = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        if is_socket(&sock) {
+            return Some(sock);
+        }
+    }
+    None
+}
+
 fn is_socket(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     std::fs::metadata(path).is_ok_and(|m| m.file_type().is_socket())
