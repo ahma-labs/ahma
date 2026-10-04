@@ -14,6 +14,30 @@ name = "sccache"
 description = "sccache: a compile-cache server, cache and port of its own per workspace"
 rules = []
 
+# Only where sccache compiles this workspace: the compiler wrapper names it, in
+# the environment or in cargo's configuration. Anywhere else these variables
+# would only create an empty `.sccache` in every project.
+[[when]]
+env = "RUSTC_WRAPPER"
+contains = "sccache"
+
+[[when]]
+env = "CARGO_BUILD_RUSTC_WRAPPER"
+contains = "sccache"
+
+[[when]]
+file = "${WORKSPACE}/.cargo/config.toml"
+contains = "sccache"
+
+[[when]]
+file = "${CARGO_HOME:-~/.cargo}/config.toml"
+contains = "sccache"
+
+# A cache location set in sccache's own config file is overridden on purpose:
+# a server started inside the sandbox can write only the workspace, so a cache
+# anywhere else would fail every sandboxed build. A variable you set yourself
+# still wins (SPEC R-PERM.5.5).
+
 [[env]]
 name = "SCCACHE_DIR"
 value = "${WORKSPACE}/.sccache"

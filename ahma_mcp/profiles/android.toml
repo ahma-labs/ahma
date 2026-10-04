@@ -28,21 +28,80 @@ caches to read-only and leaves the toolchain runnable (SPEC R-HANDOFF.8)."""
 deny_write = [
   "~/.android/adbkey",
   "~/.android/adbkey.pub",
+  # Gradle runs these in every build of every project, outside any sandbox
+  # when you build from your own terminal or IDE: a planted init script or
+  # property is a planted build step (SPEC R-HANDOFF.8).
+  "~/.gradle/init.d",
+  "~/.gradle/init.gradle",
+  "~/.gradle/init.gradle.kts",
+  "~/.gradle/gradle.properties",
+  # Maven's repository and credential configuration.
+  "~/.m2/settings.xml",
+  "~/.m2/settings-security.xml",
   "${ANDROID_HOME:-~/Library/Android/sdk}/platform-tools",
   "${ANDROID_HOME:-~/Library/Android/sdk}/cmdline-tools",
 ]
 
-# Gradle: the dependency cache, wrapper distributions, daemon logs and the
-# per-user init scripts all live under one directory; Gradle needs to write it.
+# Gradle's user home: read + execute. What Gradle writes during a build is in
+# the directories below; the init scripts and `gradle.properties` beside them
+# are configuration every later build runs, so they stay read-only.
 [[rules]]
 path = "~/.gradle"
-access = "rw"
+access = "rx"
 
-# Maven local repository. Robolectric and most Android unit-test setups resolve
-# runtime jars into it on first use, so a read-only grant fails the first test run.
+# The dependency cache, wrapper distributions, daemon state and logs, native
+# libraries, provisioned JDKs, and Gradle's own temp and notification files.
+[[rules]]
+path = "~/.gradle/caches"
+access = "rw"
+precreate = true
+
+[[rules]]
+path = "~/.gradle/wrapper"
+access = "rw"
+precreate = true
+
+[[rules]]
+path = "~/.gradle/daemon"
+access = "rw"
+precreate = true
+
+[[rules]]
+path = "~/.gradle/native"
+access = "rw"
+precreate = true
+
+[[rules]]
+path = "~/.gradle/jdks"
+access = "rw"
+precreate = true
+
+[[rules]]
+path = "~/.gradle/.tmp"
+access = "rw"
+precreate = true
+
+[[rules]]
+path = "~/.gradle/notifications"
+access = "rw"
+precreate = true
+
+[[rules]]
+path = "~/.gradle/kotlin-profile"
+access = "rw"
+precreate = true
+
+# Maven: read + execute; the local repository is written. Robolectric and most
+# Android unit-test setups resolve runtime jars into it on first use, so a
+# read-only repository fails the first test run. `settings.xml` stays read-only.
 [[rules]]
 path = "~/.m2"
+access = "rx"
+
+[[rules]]
+path = "~/.m2/repository"
 access = "rw"
+precreate = true
 
 # Kotlin/Native downloads its toolchain and dependency cache here on first use.
 [[rules]]
