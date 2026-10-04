@@ -1008,16 +1008,22 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Called when a command starts: the once-grants an earlier command already
-    /// used are retired, and the fresh ones are marked as in use by this one.
-    /// A path that is also granted persistently stays, since that grant is not
-    /// ours to withdraw.
+    /// Called when any command starts: the ledger is re-read if its file
+    /// changed, and a lease that expired since the last command is withdrawn
+    /// now, before this one spawns; a command already running keeps the
+    /// policy it was spawned with (SPEC R-PERM.2, R-PERM.2.3).
     pub fn begin_command(&self) {
-        // A lease that expired since the last command is withdrawn now, before
-        // this one spawns; a command already running keeps the policy it was
-        // spawned with (SPEC R-PERM.2.3).
         self.sync_ledger();
         self.retire_expired_leases(ahma_common::config::unix_now());
+    }
+
+    /// Called when a command that may write starts: the once-grants an
+    /// earlier such command already used are retired, and the fresh ones are
+    /// marked as in use by this one. A read-only command (the write queue's
+    /// read lane) cannot use a write grant, so it never spends one: a `git
+    /// status` between the answer and the build used to. A path that is also
+    /// granted persistently stays, since that grant is not ours to withdraw.
+    pub fn spend_once_grants(&self) {
         let mut grants = self.once_grants.write();
         if grants.is_empty() {
             return;
@@ -1489,6 +1495,18 @@ impl Sandbox {
             scopes: final_scopes_guard.to_vec(),
         }
         .into())
+    }
+
+    /// Whether a command in this session may already reach `path` with
+    /// `access`: inside a writable scope, or — for a read — a read-only one.
+    pub fn allows(&self, path: &Path, access: ahma_common::config::ScopeAccess) -> bool {
+        if self.is_path_in_scope(path) {
+            return true;
+        }
+        !access.is_write() && {
+            let canon = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            self.read_scopes.read().iter().any(|r| canon.starts_with(r))
+        }
     }
 
     /// Whether `path` resolves to a location inside the current (locked) scopes.
@@ -2136,12 +2154,12 @@ mod once_grant_tests {
         .unwrap();
         sb.add_once_grant(cache.path(), ScopeAccess::Rw).unwrap();
         assert!(sb.scopes().iter().any(|s| s == &canon), "live at once");
-        sb.begin_command(); // the command it was approved for starts
+        sb.spend_once_grants(); // the command it was approved for starts
         assert!(
             sb.scopes().iter().any(|s| s == &canon),
             "still live for that command"
         );
-        sb.begin_command(); // the following command starts
+        sb.spend_once_grants(); // the following command starts
         assert!(
             !sb.scopes().iter().any(|s| s == &canon),
             "retired before the next command"

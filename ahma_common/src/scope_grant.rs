@@ -603,10 +603,10 @@ impl GrantCoordinator {
     /// Resolve a decision with the human's answer. First-answer-wins and idempotent:
     /// a second call for the same `decision_id` returns [`GrantResolveOutcome::AlreadyResolved`].
     ///
-    /// On any answer the `(path, access)` is dismissed for the session so the path —
-    /// which the live sandbox still blocks until restart — does not re-prompt. A
-    /// grant additionally dismisses the *other* access variant for the same path
-    /// (granting rw subsumes a pending ro need, and vice-versa).
+    /// A deny dismisses the `(path, access)` for the session, so it is not asked
+    /// again. A grant dismisses what it covers: its access, and a read under a
+    /// read-write grant; a `once` grant dismisses nothing, since it covers only
+    /// its one command (SPEC R-PERM.4).
     ///
     /// The answer is first held to what the question offered
     /// ([`GrantDecision::within_offer`]): every surface resolves through here,
@@ -640,10 +640,15 @@ impl GrantCoordinator {
                 }
             }
             Some(access) => {
-                // Grant: suppress both access variants for this path — the live
-                // session can't widen, so the path keeps tripping until restart.
-                inner.dismissed.insert((req.path.clone(), ScopeAccess::Ro));
-                inner.dismissed.insert((req.path.clone(), ScopeAccess::Rw));
+                // A grant settles what it covers, no more (R-PERM.4): read-write
+                // covers a read, a read does not cover a write, and a `once`
+                // grant covers its one command, so a later need is asked again.
+                if decision.tier() != crate::permissions::GrantTier::Once {
+                    inner.dismissed.insert((req.path.clone(), access));
+                    if access.is_write() {
+                        inner.dismissed.insert((req.path.clone(), ScopeAccess::Ro));
+                    }
+                }
                 GrantResolveOutcome::Persist {
                     path: req.path,
                     access,
@@ -1190,6 +1195,62 @@ mod tests {
         assert!(
             second.is_none(),
             "second ask for an in-flight key is suppressed"
+        );
+    }
+
+    /// An answer settles what it covers, no more (SPEC R-PERM.4): read-write
+    /// covers a later read; a read does not cover a later write, which is
+    /// asked; a `once` grant settles only its one command, so the next need is
+    /// asked again. Every grant used to dismiss both accesses for the session,
+    /// so a read-only grant made a later write need unaskable.
+    #[test]
+    fn an_answer_settles_what_it_covers_and_no_more() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        let answer = |c: &GrantCoordinator, access, decision| {
+            let req = c
+                .begin(p, access, GrantReason::PreExecViolation, None)
+                .expect("asked");
+            c.resolve(&req.decision_id, decision);
+        };
+
+        let c = coord();
+        answer(&c, ScopeAccess::Ro, GrantDecision::GrantRoSession);
+        assert!(
+            c.begin(p, ScopeAccess::Ro, GrantReason::PreExecViolation, None)
+                .is_none()
+        );
+        assert!(
+            c.begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
+                .is_some(),
+            "a read grant does not answer a write"
+        );
+
+        let c = coord();
+        answer(&c, ScopeAccess::Rw, GrantDecision::GrantRwSession);
+        assert!(
+            c.begin(p, ScopeAccess::Ro, GrantReason::PreExecViolation, None)
+                .is_none()
+        );
+        assert!(
+            c.begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
+                .is_none()
+        );
+
+        let c = coord();
+        answer(&c, ScopeAccess::Rw, GrantDecision::GrantRwOnce);
+        assert!(
+            c.begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
+                .is_some(),
+            "once is once: the next need is asked"
+        );
+
+        let c = coord();
+        answer(&c, ScopeAccess::Rw, GrantDecision::Deny);
+        assert!(
+            c.begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
+                .is_none(),
+            "a no is remembered for the session"
         );
     }
 

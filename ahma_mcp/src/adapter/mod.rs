@@ -359,6 +359,15 @@ impl Adapter {
         workspace_queue::workspace_key(working_dir, &self.sandbox.scopes())
     }
 
+    /// A command in `lane` is about to run: one that may write spends the
+    /// session's once-grants (SPEC R-PERM.2); a read-only one cannot use a
+    /// write grant, so it leaves them for the command that can.
+    fn command_starts(&self, lane: workspace_queue::Lane) {
+        if lane != workspace_queue::Lane::ReadOnly {
+            self.sandbox.spend_once_grants();
+        }
+    }
+
     /// Which lane a call runs in (SPEC R2.7.4): what the MTDF definition
     /// declares, else — for a shell command line run in `working_dir` — what
     /// the classifier says, else exclusive. A read-only verdict the kernel
@@ -472,8 +481,9 @@ impl Adapter {
         tool: &str,
     ) -> Result<std::path::PathBuf> {
         // Every execution path validates its working directory first, so this is
-        // where "a command starts" is observed: once-grants rotate here
-        // (SPEC R-PERM.2).
+        // where "a command starts" is observed: the ledger and leases are
+        // brought up to date here (SPEC R-PERM.2). Once-grants move on only
+        // when the command's lane is known ([`Self::command_starts`]).
         self.sandbox.begin_command();
         match self
             .sandbox
@@ -694,6 +704,7 @@ impl Adapter {
         // an async operation, so a hooked `sed -i` never lands in the middle of
         // an MCP `cargo nextest run`.
         let lane = self.resolve_lane(args.as_ref(), subcommand_config, &safe_wd);
+        self.command_starts(lane);
         let title = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| format!("{program} {}", args_vec.join(" ")));
@@ -1182,6 +1193,7 @@ impl Adapter {
         // Workspace write queue (SPEC R2.7): the place in line is taken here,
         // synchronously, before anything is spawned.
         let lane = self.resolve_lane(args.as_ref(), subcommand_config, &safe_wd);
+        self.command_starts(lane);
         let workspace = self.workspace_key_for(&safe_wd);
         let drift_root = workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd);
         let holder_title = operation
@@ -1264,6 +1276,8 @@ impl Adapter {
         id: Option<String>,
     ) -> Result<String> {
         let safe_wd = self.validate_working_dir(working_dir, tool_name).await?;
+        // No lane of its own: it may write.
+        self.command_starts(workspace_queue::Lane::Exclusive);
         let op_id = id.unwrap_or_else(|| generate_id(tool_name, command_str));
 
         let mut operation = Operation::new_with_timeout(
@@ -1388,6 +1402,8 @@ impl Adapter {
         id: Option<String>,
     ) -> Result<String> {
         let safe_wd = self.validate_working_dir(working_dir, tool_name).await?;
+        // No lane of its own: it may write.
+        self.command_starts(workspace_queue::Lane::Exclusive);
         let op_id = id.unwrap_or_else(|| generate_id(tool_name, command_str));
 
         let mut operation = Operation::new_with_timeout(
@@ -3220,6 +3236,27 @@ mod tests {
             workspace_queue::Lane::Exclusive,
             "another repository the session can write is a workspace too"
         );
+    }
+
+    /// SPEC R-PERM.2: a `once` write grant is spent by the next command that
+    /// may write, not by a read-only one that happens to run first.
+    #[test]
+    fn a_read_only_command_never_spends_a_once_grant() {
+        let (adapter, _td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let cache = tempfile::tempdir().unwrap();
+        let canon = dunce::canonicalize(cache.path()).unwrap();
+        adapter
+            .sandbox()
+            .add_once_grant(cache.path(), ahma_common::config::ScopeAccess::Rw)
+            .unwrap();
+        let live = || adapter.sandbox().scopes().iter().any(|s| s == &canon);
+        adapter.command_starts(workspace_queue::Lane::ReadOnly);
+        adapter.command_starts(workspace_queue::Lane::ReadOnly);
+        assert!(live(), "`git status` twice leaves it for the build");
+        adapter.command_starts(workspace_queue::Lane::Exclusive);
+        assert!(live(), "the build gets it");
+        adapter.command_starts(workspace_queue::Lane::Exclusive);
+        assert!(!live(), "and the command after it does not");
     }
 
     /// A grant question that waits on a human never answers.
